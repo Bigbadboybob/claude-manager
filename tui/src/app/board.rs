@@ -9,6 +9,9 @@ use super::*;
 use serde_json::{json, Value};
 use std::sync::mpsc;
 
+mod epics;
+pub(super) use epics::DRow;
+
 const POLL: Duration = Duration::from_secs(5);
 /// Holder states change without moving the board version, so the poll also
 /// re-reads the whole board this often (doc/items-board.md §7).
@@ -31,6 +34,12 @@ enum PromptKind {
     /// Check-back time after a `block` resolution's free-text reason.
     ResolveBlockCheck,
     ResolveDrop,
+    /// `g` on a group (board/epics.rs).
+    GroupRename,
+    GroupNew,
+    GroupPoc,
+    /// `done` or `cancelled`, then the close plan opens.
+    GroupClose,
 }
 
 /// A one-key menu.
@@ -71,6 +80,15 @@ pub(super) struct Board {
     /// Board to select when the list arrives: the focused session's
     /// `(initiative_id, root_task_id)`.
     preferred: (Option<String>, Option<String>),
+    /// Folded groups (S3 boards), by group id.
+    folds: HashSet<String>,
+    /// `g` on a group: the one-key group menu is open.
+    group_menu: bool,
+    /// An epic's close plan under review (`g` → `c`), board/epics.rs.
+    plan: Option<epics::ClosePlan>,
+    /// The epic whose close plan was asked for: `(name, outcome)`.
+    pending_close: Option<(String, String)>,
+    seq: u64,
     status: String,
     error: String,
 }
@@ -88,18 +106,17 @@ impl Board {
         self.data["recently_closed"].as_array().map(Vec::as_slice).unwrap_or(&[])
     }
 
-    /// Selectable rows: open items, then the recently-closed strip (so `o`
-    /// can reopen a closed item).
-    fn rows(&self) -> impl Iterator<Item = &Value> {
-        self.items().iter().chain(self.closed().iter().take(CLOSED_SHOWN))
-    }
-
     fn row_count(&self) -> usize {
-        self.items().len() + self.closed().len().min(CLOSED_SHOWN)
+        self.display_rows().len()
     }
 
+    /// The selected item (open or recently closed); `None` on a group row.
     fn selected(&self) -> Option<&Value> {
-        self.rows().nth(self.cursor)
+        match self.display_rows().get(self.cursor)? {
+            DRow::Item { idx, .. } => self.items().get(*idx),
+            DRow::Closed(j) => self.closed().get(*j),
+            DRow::Group { .. } => None,
+        }
     }
 
     fn selected_n(&self) -> Option<i64> {
@@ -152,18 +169,11 @@ impl App {
         let op = op.to_owned();
         let tag = params["board"].as_str().map(str::to_owned);
         std::thread::spawn(move || {
-            let mut errors = Vec::new();
-            for (host, socket, token) in targets {
-                match crate::client_session::rpc_messaging_board(&socket, &token, method, params.clone()) {
-                    Ok(v) => {
-                        let _ = tx.send((op, tag, Ok(v)));
-                        return;
-                    }
-                    Err(e) => errors.push(format!("{host}: {e}")),
-                }
-            }
-            let msg = if errors.is_empty() { "No daemon is reachable".to_owned() } else { errors.join("; ") };
-            let _ = tx.send((op, tag, Err(msg)));
+            // A group/epic/placement write to an older daemon or API says so.
+            let r = super::org_model::owner_rpc(&targets, method, &params).map_err(|f| {
+                if f.unsupported { format!("{method} is not supported by this daemon or planning API yet") } else { f.message }
+            });
+            let _ = tx.send((op, tag, r));
         });
     }
 
@@ -234,7 +244,10 @@ impl App {
                     self.board.list_backoff = (self.board.list_backoff * 2).clamp(LIST_BACKOFF, LIST_BACKOFF_MAX);
                     self.board.list_retry_at = Some(Instant::now() + self.board.list_backoff);
                 }
-                (_, Err(e)) => self.board.error = e,
+                (_, Err(e)) => {
+                    self.board.pending_close = None;
+                    self.board.error = e;
+                }
                 ("list", Ok(v)) => {
                     self.board.error.clear();
                     self.board.listed = true;
@@ -265,9 +278,10 @@ impl App {
                     self.board.error.clear();
                     self.board.accept(v);
                 }
-                (_, Ok(_)) => {
+                (_, Ok(v)) => {
                     self.board.error.clear();
                     self.board.status = "Saved".into();
+                    self.board_write_reply(&v);
                     // Re-read once the queue drains.
                     self.board.last_poll = None;
                 }
@@ -337,6 +351,7 @@ impl App {
                     self.board_write("item.resolve", json!({"n": n, "action": "drop", "reason": text}));
                 }
             }
+            PromptKind::GroupRename | PromptKind::GroupNew | PromptKind::GroupPoc | PromptKind::GroupClose => self.board_group_submit(kind, text),
             _ => {}
         }
     }
@@ -374,6 +389,20 @@ impl App {
                     self.board.prompt = Some((kind, text));
                 }
                 _ => self.board.prompt = Some((kind, text)),
+            }
+            return true;
+        }
+        if self.board.plan.is_some() {
+            if alt_b {
+                self.board.visible = false;
+            } else {
+                self.board_plan_event(key);
+            }
+            return true;
+        }
+        if std::mem::take(&mut self.board.group_menu) {
+            if let KeyCode::Char(c) = key.code {
+                self.board_group_key(c);
             }
             return true;
         }
@@ -464,6 +493,14 @@ impl App {
                 self.board_write("item.set", json!({"n": n, "status": "active"}));
             }
             KeyCode::Char('f') => self.board.show_free = !self.board.show_free,
+            // On a group row (S3 boards): fold it, or open the group menu.
+            KeyCode::Char(' ') if self.board.selected_group().is_some() => {
+                let id = self.board.selected_group().unwrap();
+                if !self.board.folds.remove(&id) {
+                    self.board.folds.insert(id);
+                }
+            }
+            KeyCode::Char('g') if self.board.selected_group().is_some() => self.board.group_menu = true,
             KeyCode::Char('g') => {
                 self.board.listed = false;
                 self.board.last_poll = None;
@@ -575,7 +612,8 @@ impl App {
             }
             lines.push(Line::from(""));
         }
-        // Items: flagged first (already ordered by the daemon), then groups.
+        // Items: flagged first (already ordered by the daemon), then groups:
+        // free-text headings, or on an S3 board the heading/epic tree.
         let items = b.items();
         let gated = items.iter().chain(b.closed()).any(|i| item_gate(i).is_some());
         let cols = Columns::with_gate(width, gated);
@@ -583,31 +621,49 @@ impl App {
         let index = item_index(b);
         let mut group: Option<String> = None;
         let mut cursor_line = 0usize;
-        for (i, item) in items.iter().enumerate() {
-            let flagged = item["flags"].as_array().is_some_and(|f| !f.is_empty());
-            let g = item["group"].as_str().unwrap_or("").to_owned();
-            if !flagged && group.as_deref() != Some(g.as_str()) {
-                lines.push(group_header(&g, items, width, tint));
-                group = Some(g);
-            }
-            if i == b.cursor {
+        let closed = b.closed();
+        let mut closed_heading = false;
+        for (r, row) in b.display_rows().iter().enumerate() {
+            let selected = r == b.cursor;
+            if selected {
                 cursor_line = lines.len();
             }
-            lines.push(self.item_row(item, &index, &cols, now, i == b.cursor, false));
-        }
-        let closed = b.closed();
-        if !closed.is_empty() {
-            lines.push(Line::from(""));
-            lines.push(Line::styled(
-                format!("Recently closed (24 h) \u{00b7} {} \u{00b7} o reopens", closed.len()),
-                dim.add_modifier(Modifier::BOLD),
-            ));
-            for (j, item) in closed.iter().take(CLOSED_SHOWN).enumerate() {
-                let selected = items.len() + j == b.cursor;
-                if selected {
-                    cursor_line = lines.len();
+            match row {
+                DRow::Group { id, depth } => {
+                    lines.push(self.board_group_row(id, *depth, width, tint, selected));
+                    group = None;
                 }
-                lines.push(self.item_row(item, &index, &cols, now, selected, true));
+                DRow::Item { idx, depth, loose } => {
+                    let item = &items[*idx];
+                    let flagged = item["flags"].as_array().is_some_and(|f| !f.is_empty());
+                    let g = item["group"].as_str().unwrap_or("").to_owned();
+                    if *loose && !flagged && group.as_deref() != Some(g.as_str()) {
+                        if selected {
+                            cursor_line += 1;
+                        }
+                        lines.push(group_header(&g, items, width, tint));
+                        group = Some(g);
+                    }
+                    let mut line = self.item_row(item, &index, &cols, now, selected, false);
+                    if *depth > 0 {
+                        line.spans.insert(0, Span::raw("  ".repeat(*depth)));
+                    }
+                    lines.push(line);
+                }
+                DRow::Closed(j) => {
+                    if !closed_heading {
+                        closed_heading = true;
+                        lines.push(Line::from(""));
+                        lines.push(Line::styled(
+                            format!("Recently closed (24 h) \u{00b7} {} \u{00b7} o reopens", closed.len()),
+                            dim.add_modifier(Modifier::BOLD),
+                        ));
+                        if selected {
+                            cursor_line += 2;
+                        }
+                    }
+                    lines.push(self.item_row(&closed[*j], &index, &cols, now, selected, true));
+                }
             }
         }
         // Layout: list, detail pane for the selected row, footer.
@@ -624,6 +680,13 @@ impl App {
         }
         .min(inner.height.saturating_sub(footer_h + 3));
         let list_h = inner.height.saturating_sub(footer_h + detail_h);
+        if b.plan.is_some() {
+            let body = Rect { height: inner.height.saturating_sub(footer_h), ..inner };
+            self.draw_close_plan(frame, body);
+            let footer = Rect { y: inner.y + body.height, height: footer_h.min(inner.height), ..inner };
+            frame.render_widget(Paragraph::new(vec![self.board_status_line(), board_help(width)]), footer);
+            return;
+        }
         let list = Rect { height: list_h, ..inner };
         let scroll = (cursor_line as u16).saturating_sub(list_h.saturating_sub(3));
         frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), list);
@@ -929,8 +992,15 @@ impl App {
                 PromptKind::ResolveBlockCheck => "Check back (e.g. 2h; empty for none)",
                 PromptKind::WaitingEta if b.strict() => "Job ETA, item stays active (e.g. 40m, 2h)",
                 PromptKind::WaitingEta => "ETA (e.g. 40m, 2h)",
+                PromptKind::GroupRename => "Group name",
+                PromptKind::GroupNew => "New heading under this group",
+                PromptKind::GroupPoc => "PoC (handle, member id or owner)",
+                PromptKind::GroupClose => "Close as (done / cancelled)",
             };
             return Line::styled(format!("{label}: {text}\u{2588}"), bold);
+        }
+        if b.group_menu {
+            return Line::styled("Group: e promote to epic \u{00b7} p set PoC \u{00b7} r rename \u{00b7} n new heading under it \u{00b7} c close epic", bold);
         }
         if let Some(menu) = b.menu {
             return Line::styled(
@@ -1429,7 +1499,7 @@ fn board_title(b: &Board) -> Vec<Span<'static>> {
 }
 
 fn board_help(width: usize) -> Line<'static> {
-    let full = "j/k move \u{00b7} Enter more detail \u{00b7} a add \u{00b7} s status \u{00b7} n note \u{00b7} r reassign \u{00b7} x resolve \u{00b7} d drop \u{00b7} o reopen \u{00b7} f free \u{00b7} Tab board \u{00b7} g refresh \u{00b7} Esc close";
+    let full = "j/k move \u{00b7} Enter more detail \u{00b7} a add \u{00b7} s status \u{00b7} n note \u{00b7} r reassign \u{00b7} x resolve \u{00b7} d drop \u{00b7} o reopen \u{00b7} f free \u{00b7} Tab board \u{00b7} g refresh (on a group: edit) \u{00b7} Space fold \u{00b7} Esc close";
     let short = "j/k \u{00b7} Enter \u{00b7} a s n r x d o \u{00b7} f \u{00b7} Tab \u{00b7} g \u{00b7} Esc";
     Line::styled(if full.chars().count() <= width { full } else { short }, Style::default().fg(theme::DIM))
 }
