@@ -26147,7 +26147,10 @@ while True:
         assert_eq!(
             sites,
             [
-                "compose_daemon_spawn_params",
+                // Reached through `compose_daemon_spawn_params` (covered
+                // above); its `fork` flag (#24 rotation) only swaps the
+                // Launch, not the model/effort arguments.
+                "compose_daemon_spawn_params_launch",
                 "compose_fork_spawn_params",
                 // The body behind `mcp_start_session` (which adds the O5
                 // worktree-cap hint).
