@@ -1,6 +1,6 @@
 # Org model: members, teams, epics and items
 
-Status: **revised draft, review round 3 folded** (Swarm-Coord, 2026-10-25).
+Status: **final draft, review round 4 folded** (Swarm-Coord, 2026-10-25).
 Owner-directed; Owner has decided O1 and O2; O3 and O4 are open (§15). Inputs are listed in §18.
 The interviews are a purposive sample (eight sessions, mostly the trader org
 plus CM and scraper triage), not an org-wide vote. EP answered only the group
@@ -195,18 +195,26 @@ so it can ship first; hires (§4.2) use it once members exist.
   - a **default engine** for work that matches no rule;
   - an optional **current preference** with a reason and an expiry ("prefer
     Codex: Codex limits are higher, until 2026-11-08").
+- **Precedence**, stated in every `staffing_note`: an explicit `type` or
+  `model` from the caller wins (the policy only comments); then the current
+  preference if its strength is `strong`; then the matching rule; then a
+  `lean` preference; then the default. Owner's "Codex limits are higher" is a
+  `strong` preference: it tips even fan-out coding to Codex until it expires.
 - **Delivery, so nobody has to remember:**
   - `start_session`, `fork_session` and `hire` return a one-line
     `staffing_note` when the chosen engine goes against the policy or the
     current preference;
   - `start_session` may omit `type`; the policy picks the engine from an
     optional `work_kind` hint (`math`, `design`, `architecture`, `metric`,
-    `coding`, `fanout`), else the default. A-n's default engine follows the
-    policy;
+    `coding`, `fanout`), else the default. A-n, A-s and the A-f launch dialogs
+    preselect the policy's engine (A-f stops resetting to `claude`);
+  - daemons cache the policy, so a spawn never waits on the API: they use the
+    last policy seen, else today's default, and `ping` serves it from the
+    daemon (headless continuous orchestrators included);
   - `ping` returns the policy digest and version; a change pushes a one-line
     notice to sessions that spawned anything in the last 3 days;
-  - `doc/ORCHESTRATION.md` §1 and the agent guide point at the live policy
-    instead of restating it.
+  - `doc/ORCHESTRATION.md` §1, the agent guide and the `orchestrate-swarm`
+    skill point at the live policy instead of restating it.
 - **Owner edits it** in a Staffing panel in F9 Global Settings (rules, default,
   preference with reason and expiry) or with `cm-op staffing.set`.
 - **Later:** CM suggests a preference from account usage ("Claude is at 85% of
@@ -426,20 +434,25 @@ attributed to the session that caused them (not the daemon's API token):
 | unchanged status (the old editor always sends one) | ignored |
 | `done` | item `done` |
 | `blocked` with a reason or blocker (new optional `reason` / `blocked_by` params on `set_subtask_status` and `update_task`) | item `blocked` with that trigger |
-| `blocked` alone (today's fix-ready call) | item `blocked` with `blocked_on = "legacy status write: no reason given"` and a `legacy_blocked` flag to the holder to fill in the real trigger. The label says what it is; no trigger is invented |
+| `blocked` alone (today's fix-ready call) | item `blocked` with `blocked_on = "legacy status write: no reason given"`, `check_back` = 24 h (strict boards require one; the label says it is a default), and a `legacy_blocked` flag to the holder to fill in the real trigger. No trigger is invented |
 | `backlog` | unplace (subject to the unplace rules) |
 | `running` (incl. spawn promotion from `start_session(task_id=…)`) | item `active`; if unheld, the spawned session (pre-S6) or its member becomes owner; if held, it becomes a contributor |
 
 Only writes with no item equivalent are refused, with `placed_on_board` and
 the replacement call.
 
-**Closes never arm the terminal sweep from the board.** The mirror writes
-`done` with `metadata.terminal_via = "item"`, and the daemon's terminal sweep
-skips non-ephemeral sessions for such tasks. Task-originated closes (A-d,
-`mark_subtask_done`, a direct PATCH, translated legacy `done`) keep today's
-behaviour, because they carry the original intent. So the guarantee that
-closing a board item never kills an employee does not depend on workspace
-classification.
+**Finishing work never kills an employee.** Two protections, both in S3:
+
+- **Board-originated closes never arm the terminal sweep.** The mirror writes
+  `done` with `metadata.terminal_via = "item"`, and the sweep skips
+  non-ephemeral sessions for such tasks, whatever their workspace kind.
+- **Every teardown path protects members.** The periodic sweep *and* explicit
+  teardown (`mark_subtask_done`'s `sweep_task_sessions` and its branch-mode
+  worktree removal, which run before the status PATCH) skip a member's main
+  session and never remove a `home`, `stream` or pinned workspace, for both
+  task- and item-originated completion. They only unassign. Ephemeral and
+  unclassified workspaces keep today's teardown. Retiring a member and closing
+  its workspace stay separate, explicit operations.
 
 **Lock order.** Every transaction that may write tasks or initiatives (place,
 unplace, mirrored status, board edits that write task text, team and epic
@@ -530,11 +543,16 @@ description, `kind`).
   `holder_gone` becomes `member_vacant`.
 - The active-item cap of strict boards counts per acting session (main or
   assistant), not per member.
-- When a member's main session becomes the owner-role holder of a placed item
-  (S3), CM records a creator edge (`agent_task_edges`) from that session to the
-  task, so the member can `start_session(task_id=…)` an assistant for it under
-  today's scope rule; the edge is retracted when the owner changes, and logged
-  like the §6.3 bootstrap rules.
+- **Launch permission for owners (S3).** The owner-role holder of a placed
+  item may `start_session(task_id=…)` / `item_resolve(launch)` an assistant for
+  that task even when today's scope rule would refuse (the caller is taskless,
+  or the task sits in another tree). This is a separate, revocable
+  `launch_grants` entry (holder session or member → task), written by the API
+  when the owner changes, persisted by the daemon, and checked explicitly in
+  the launch authorization path, including for taskless callers. It is not a
+  task-parent or creator edge, so a TUI tree push or restart does not drop it.
+  It is logged like the §6.3 bootstrap rules and grants launch only, not
+  control of other sessions on the task.
 - Delivering an item to a session composes the brief from the item's title,
   description, epic and goal, board and links; the team's charter link; and the
   member's and team's standing rules (§8.4). `start_session(task_id=…)` keeps
@@ -913,7 +931,7 @@ clients working. Permission changes run in shadow before they enforce.
 | **S0b bridge** | the §12 `org` preservation object and `org_preserve_v1` on brain and holder; `daemon.upgrade_holder` on cm-manager, cm-sessions and Owner's laptop; `workspace_kind` in local records (all existing = unclassified; new isolated mints recorded `ephemeral`) | needed before S2's `home` push and S3; does not block S1 |
 | **S1 prompt → description** | inventory (real instructions in prompts, empty descriptions, continuous contracts → continuous standing instructions); the compatibility table below; one marker-gated backfill appends real prompts under `## Instructions`; description-only delivery after the backfill and every dispatch path read description; commit trailer hook installed | the `prompt` column is never dropped (`sql/003` alters it on every start); the MCP param stays as a deprecated alias |
 | **S2 org core** | `members`, `incarnations`, `team_memberships`, manager tree, team columns (`coordinator_task_id` nullable + API models, `status`, `standing_rules`); Owner-approved roster (continuous members, initiative/division leads, long-lived lanes; dedupe by pid, coordinator and continuous ownership; handle collisions get a suffix, never steal an alias); an Owner-only **adopt** action (roster screen and `org(action="adopt")`) that binds a live session to a new member, so members can be added after the roster; roster and adopted workspaces marked `home` centrally **and pushed to each owning daemon**, which confirms; `org`, `ping`, A-i and F6 read members and managers | holds stay pid-keyed; nothing enforces |
-| **S3 epics, groups, placement** | `groups` with headings and epics; PoC as a member id with a real team; staffing flow; epic close plan (§7.6); link-first placement (§7.1) with field ownership, status mirror, translated legacy writes, `terminal_via=item` and the lock order; item roles, single owner, holder migration; description revisions; creator edges for owner-role holders; `possible_duplicate`; the planning view's read-only "on boards" section. **Lifecycle guard:** the terminal sweep skips `terminal_via=item` closes for non-ephemeral sessions, and skips `home`/`stream`/pinned workspaces entirely; ephemeral and unclassified workspaces keep today's behaviour for task-originated closes | per host: daemons ship and advertise `lifecycle_guard_v1` first; central mirroring for a task turns on only when every daemon holding its sessions advertises it. Rollback with placed tasks: mirroring off, links kept |
+| **S3 epics, groups, placement** | `groups` with headings and epics; PoC as a member id with a real team; staffing flow; epic close plan (§7.6); link-first placement (§7.1) with field ownership, status mirror, translated legacy writes, `terminal_via=item` and the lock order; item roles, single owner, holder migration; description revisions; launch grants for owner-role holders; `possible_duplicate`; the planning view's read-only "on boards" section. **Lifecycle guard:** the terminal sweep skips `terminal_via=item` closes for non-ephemeral sessions; the sweep and `mark_subtask_done` teardown both skip members' main sessions and never remove `home`/`stream`/pinned workspaces; ephemeral and unclassified workspaces keep today's teardown | per host: daemons ship and advertise `lifecycle_guard_v1` first; central mirroring for a task turns on only when every daemon holding its sessions advertises it. Rollback with placed tasks: mirroring off, links kept |
 | **S4 daemon stamping** | daemons stamp `member_id` and `acting_as` (`org_stamp_v1`); standing-rules delivery (§8.4) | occupancy rows and fencing wait for S6 (`occupancy_v1`) |
 | **S5 profiles, discovery, shadow scope** | `profile_set`, `org(view=member/team/directory)`, `who` over items, epics, receipts, `report_done`, commits and tags; staleness display; manager-chain scope and new board-edit rule computed and logged beside the old rules (observational) | end of v1 |
 | **S6 members become real** | occupancy rows and generations on spawn, revive and Fresh fires, fencing at the API (`occupancy_v1`); spawn defaults and `hire` (§4.2); `@handle` → main session; qualified body mentions; holds by member with every consumer updated together (holder checks, flags, capacity, pushes retargeted, orchestrator/steward, gate grantor and editor allowlists); handover checklist; offline standby; member workspace records and `cm-ws/` branches; `start_session(item=…)`; models resolve member before task; bootstrap allow rules (§6.3) | consumers roll before inherited holds turn on |
@@ -1024,9 +1042,9 @@ CREATE TABLE workspaces (id TEXT PRIMARY KEY, idem_key TEXT UNIQUE, daemon_id TE
   office_of TEXT REFERENCES members(id), team_id UUID, purpose TEXT,
   state TEXT, created_at TIMESTAMPTZ, closed_at TIMESTAMPTZ);
 ALTER TABLE items ADD COLUMN IF NOT EXISTS task_id UUID REFERENCES tasks(id);
+ALTER TABLE items ADD COLUMN IF NOT EXISTS link_archived_at TIMESTAMPTZ;   -- before the index
 CREATE UNIQUE INDEX IF NOT EXISTS items_task_link ON items (task_id)
-  WHERE task_id IS NOT NULL AND link_archived_at IS NULL;   -- one live link per task
-ALTER TABLE items ADD COLUMN IF NOT EXISTS link_archived_at TIMESTAMPTZ;
+  WHERE task_id IS NOT NULL AND link_archived_at IS NULL;   -- one live link per task (new index; none exists today)
 ALTER TABLE items ADD COLUMN IF NOT EXISTS description TEXT;        -- board-native items only
 ALTER TABLE items ADD COLUMN IF NOT EXISTS metadata JSONB;          -- board-native items only
 ALTER TABLE items ADD COLUMN IF NOT EXISTS group_id UUID REFERENCES groups(id);
@@ -1170,4 +1188,5 @@ viewers never poll.
 - Interviews (Swarm-Gardener): `…/interviews/summary.md`, verbatim replies in
   `interview-log.md`
 - Reviews: `…/reviews/codex.md`, `claude.md` (round 1), `codex-r2.md`,
-  `claude-r2.md` (round 2), `codex-r3.md`, `claude-r3.md` (round 3)
+  `claude-r2.md` (round 2), `codex-r3.md`, `claude-r3.md` (round 3),
+  `codex-r4.md`, `claude-r4.md` (round 4)
