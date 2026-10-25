@@ -178,6 +178,8 @@ pub(super) struct Team {
     pub status: String,
     pub parent_team_id: Option<String>,
     pub lead_member_id: Option<String>,
+    /// The team's coordinator (initiative) task; the root of its task tree.
+    pub coordinator_task_id: Option<String>,
     pub board: Option<String>,
     pub channel: Option<String>,
     pub members: Vec<TeamMembership>,

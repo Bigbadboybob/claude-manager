@@ -195,9 +195,15 @@ pub(super) struct OrgCard {
     pub top: Vec<(String, Style)>,
     /// Lines under the sessions (a team's epic chips).
     pub bottom: Vec<(String, Style)>,
-    /// Assistants folded under the member (`a` expands them): their
-    /// `(wi, si)`, drawn as one count line with state glyphs.
+    /// Assistants and workers folded under the box (`a` expands them):
+    /// their `(wi, si)`, drawn as one count line with state glyphs.
     pub folded: Vec<(usize, usize)>,
+    /// How each non-assistant session under the box was attached (by uid):
+    /// `spawned by X` or `task Y` (app/orgchart_teams.rs `Via`).
+    pub via: HashMap<String, String>,
+    /// Sessions attached through the task chain alone: the ambiguous case,
+    /// named on the card when expanded.
+    pub via_task: usize,
     /// The manager's handle when the drawn line doesn't show the manager
     /// (matrix cases): drawn as a dotted marker.
     pub matrix: Option<String>,
@@ -213,6 +219,11 @@ impl OrgCard {
     /// Card lines besides the session lines.
     pub(super) fn lines(&self) -> usize {
         self.top.len() + self.bottom.len() + usize::from(!self.folded.is_empty())
+    }
+
+    /// What `a` expands: the member's id, else (a leadless team) the team's.
+    pub(super) fn expand_key(&self) -> Option<String> {
+        self.member_id.clone().or_else(|| self.team_id.as_ref().map(|t| format!("team:{t}")))
     }
 }
 
@@ -599,7 +610,7 @@ fn chart_task_project(tasks: &TaskRows, task: &str, parents: &HashMap<&str, &str
     None
 }
 
-fn plural(n: usize, word: &str) -> String {
+pub(super) fn plural(n: usize, word: &str) -> String {
     if n == 1 { format!("1 {word}") } else { format!("{n} {word}s") }
 }
 
@@ -1015,7 +1026,7 @@ impl App {
         if let Some(uid) = uid.as_deref().filter(|u| model.find_session(u).is_none()) {
             let owner = model.nodes.iter().find_map(|n| {
                 let c = n.card.as_ref()?;
-                c.folded.iter().any(|&(wi, si)| self.workspaces.get(wi).and_then(|w| w.sessions.get(si)).is_some_and(|t| t.uid == uid)).then(|| c.member_id.clone()).flatten()
+                c.folded.iter().any(|&(wi, si)| self.workspaces.get(wi).and_then(|w| w.sessions.get(si)).is_some_and(|t| t.uid == uid)).then(|| c.expand_key()).flatten()
             });
             if let Some(id) = owner {
                 self.orgchart.expanded.insert(id);
@@ -1404,7 +1415,7 @@ impl App {
             (_, KeyCode::Char('a')) => {
                 // A member's assistants: one line each, or folded to a count.
                 let node = &model.nodes[focus];
-                let member = node.card.as_ref().and_then(|c| c.member_id.clone().filter(|id| !c.folded.is_empty() || self.orgchart.expanded.contains(id)));
+                let member = node.card.as_ref().and_then(|c| c.expand_key().filter(|id| !c.folded.is_empty() || self.orgchart.expanded.contains(id)));
                 match member {
                     Some(id) if self.orgchart.expanded.remove(&id) => self.orgchart.status = "Assistants folded".into(),
                     Some(id) => {
@@ -1923,6 +1934,11 @@ impl App {
             head.push(Span::styled(lead, Style::default().fg(theme::ATTN)));
         }
         lines.push(Line::from(head));
+        // An assistant drawn under a team or member box: how it got there.
+        if let Some(card) = node.card.as_ref().filter(|_| !s.lead) {
+            let how = card.via.get(&ts.uid).cloned().unwrap_or_else(|| "in the member's workspace".into());
+            lines.push(Line::from(vec![label("attached"), text(format!("assistant, {how}"))]));
+        }
         let (word, since) = self.chart_status(ts);
         let status = match since {
             Some(secs) => format!("{word} {}", board::age(secs)),

@@ -1,6 +1,10 @@
 //! The roster screen (`R` in F6; doc/org-model.md §11, S2): the proposed
 //! members from `org.roster` for Owner to approve, decline or edit in one
-//! pass, and the live agent sessions no member or proposal covers, to adopt.
+//! pass. Live agent sessions that are no member's main follow in folded
+//! groups: each member's assistants (sessions that reach it through
+//! `App::session_attachments`, as on F6), where promoting one to a member of
+//! its own (`p`) is a deliberate per-row action, then the few other sessions
+//! that reach no member, to adopt (`y`). `Y` approves proposals only.
 //!
 //! Proposals regenerate on every read; edits are kept by `proposal_id` until
 //! an apply accepts them. `A` sends every decided row in one
@@ -46,12 +50,18 @@ pub(super) struct Edit {
     pub home: Option<String>,
 }
 
-/// A selectable row: a proposal, or a session to adopt.
+/// A selectable row: a proposal, a group header, or a session to adopt.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Row {
     Proposal(usize),
-    Adopt { uid: String, label: String, host: String, continuous: bool },
+    /// A folding header: `assistants:<member or team:<id>>`, or `other`.
+    Group(String),
+    /// `of`: the member (or `team:<id>`) whose assistant it is; `None` for a
+    /// session that reaches no member.
+    Adopt { uid: String, label: String, host: String, continuous: bool, of: Option<String> },
 }
+
+pub(super) const OTHER_GROUP: &str = "other";
 
 type Reply = (&'static str, Result<Value, RpcFail>);
 
@@ -73,6 +83,8 @@ pub(super) struct Roster {
     pub(super) status: String,
     pub(super) error: String,
     seq: u64,
+    /// Unfolded groups (all start folded).
+    pub(super) open: HashSet<String>,
 }
 
 fn adopt_key(uid: &str) -> String {
@@ -127,11 +139,15 @@ impl App {
         format!("tui-roster-{what}-{}-{}", board::now_unix(), self.roster.seq)
     }
 
-    /// Rows in display order: proposals, then sessions to adopt.
-    pub(super) fn roster_rows(&self) -> Vec<Row> {
+    /// Every proposal and every session row, ignoring folds: what `A`
+    /// applies. Assistants come grouped by member (by handle), then the
+    /// other sessions.
+    pub(super) fn roster_all_rows(&self) -> Vec<Row> {
         let mut rows: Vec<Row> = (0..self.roster.reply.proposals.len()).map(Row::Proposal).collect();
         let snap = self.org.snapshot.as_ref();
+        let attached = snap.map(|s| self.session_attachments(s)).unwrap_or_default();
         let proposed = |uid: &str| self.roster.reply.proposals.iter().any(|p| p.pids.iter().any(|pid| pid.rsplit(':').next() == Some(uid)));
+        let mut sessions: Vec<(String, Row)> = Vec::new();
         for ws in self.workspaces.iter().filter(|w| !w.is_closed) {
             for ts in &ws.sessions {
                 let agent = matches!(ts.session_type.as_str(), "claude" | "claude-code" | "codex");
@@ -139,15 +155,68 @@ impl App {
                 if !agent || ts.session.exited || member || proposed(&ts.uid) {
                     continue;
                 }
-                rows.push(Row::Adopt { uid: ts.uid.clone(), label: ts.label.clone(), host: ts.host_id.to_string(), continuous: ts.continuous_task_id.is_some() });
+                let of = attached.get(&ts.uid).map(|(to, _)| match to {
+                    super::orgchart_teams::Attach::Member(m) => m.clone(),
+                    super::orgchart_teams::Attach::Team(t) => {
+                        let lead = snap.and_then(|s| s.team(t)).and_then(|t| t.lead_member_id.clone()).filter(|l| snap.and_then(|s| s.member(l)).is_some_and(|l| !l.is_owner() && !l.retired()));
+                        lead.unwrap_or_else(|| format!("team:{t}"))
+                    }
+                });
+                let order = match &of {
+                    Some(m) => format!("0{}", self.roster_group_name(m).to_lowercase()),
+                    None => "1".into(),
+                };
+                sessions.push((order, Row::Adopt { uid: ts.uid.clone(), label: ts.label.clone(), host: ts.host_id.to_string(), continuous: ts.continuous_task_id.is_some(), of }));
             }
         }
+        sessions.sort_by(|a, b| a.0.cmp(&b.0));
+        rows.extend(sessions.into_iter().map(|(_, r)| r));
         rows
+    }
+
+    /// Who a group is of: the member's handle, or the leadless team's name.
+    fn roster_group_name(&self, of: &str) -> String {
+        let snap = self.org.snapshot.as_ref();
+        match of.strip_prefix("team:") {
+            Some(t) => snap.and_then(|s| s.team(t)).map_or_else(|| t.to_owned(), |t| t.name.clone()),
+            None => snap.and_then(|s| s.member(of)).map_or_else(|| of.to_owned(), |m| m.handle.clone()),
+        }
+    }
+
+    fn group_key(of: Option<&str>) -> String {
+        of.map_or_else(|| OTHER_GROUP.to_owned(), |m| format!("assistants:{m}"))
+    }
+
+    /// Rows in display order: proposals, then each member's assistants and
+    /// the other sessions, each under a folding header.
+    pub(super) fn roster_rows(&self) -> Vec<Row> {
+        let mut rows = Vec::new();
+        let mut last: Option<String> = None;
+        for row in self.roster_all_rows() {
+            if let Row::Adopt { of, .. } = &row {
+                let key = Self::group_key(of.as_deref());
+                if last.as_deref() != Some(key.as_str()) {
+                    rows.push(Row::Group(key.clone()));
+                    last = Some(key.clone());
+                }
+                if !self.roster.open.contains(&key) {
+                    continue;
+                }
+            }
+            rows.push(row);
+        }
+        rows
+    }
+
+    /// How many session rows a group holds.
+    fn roster_group_len(&self, key: &str) -> usize {
+        self.roster_all_rows().iter().filter(|r| matches!(r, Row::Adopt { of, .. } if Self::group_key(of.as_deref()) == key)).count()
     }
 
     fn roster_key(&self, row: &Row) -> String {
         match row {
             Row::Proposal(i) => self.roster.reply.proposals[*i].proposal_id.clone(),
+            Row::Group(k) => format!("group:{k}"),
             Row::Adopt { uid, .. } => adopt_key(uid),
         }
     }
@@ -160,7 +229,12 @@ impl App {
                 let p: &Proposal = &self.roster.reply.proposals[*i];
                 (p.handle.clone(), p.kind.clone(), p.team_id.clone(), p.manager.clone(), p.home_workspace.as_ref().and_then(|h| h.path.clone()))
             }
-            Row::Adopt { label, continuous, .. } => (handle_from_label(label), if *continuous { "continuous" } else { "agent" }.to_owned(), None, Some("owner".to_owned()), None),
+            // A promoted assistant reports to the member it assisted.
+            Row::Adopt { label, continuous, of, .. } => {
+                let manager = of.as_deref().filter(|m| !m.starts_with("team:")).map_or("owner", |m| m).to_owned();
+                (handle_from_label(label), if *continuous { "continuous" } else { "agent" }.to_owned(), None, Some(manager), None)
+            }
+            Row::Group(_) => (String::new(), String::new(), None, None, None),
         };
         let pick = |edit: Option<String>, base: Option<String>| match edit {
             Some(v) if v.is_empty() => None,
@@ -221,7 +295,7 @@ impl App {
     /// The `org.roster_apply` rows: every decided proposal.
     pub(super) fn roster_apply_rows(&self) -> Vec<Value> {
         self
-            .roster_rows()
+            .roster_all_rows()
             .iter()
             .filter_map(|row| {
                 let Row::Proposal(i) = row else { return None };
@@ -269,19 +343,19 @@ impl App {
             self.roster.status = "Busy; try again".into();
             return;
         }
-        let decided = self.roster_rows().into_iter().filter(|r| self.roster.edits.get(&self.roster_key(r)).and_then(|e| e.approve) == Some(true));
+        let decided = self.roster_all_rows().into_iter().filter(|r| self.roster.edits.get(&self.roster_key(r)).and_then(|e| e.approve) == Some(true));
         if let Some(err) = decided.filter_map(|r| self.roster_home_param(&r).err()).next() {
             self.roster.status = err;
             return;
         }
         let rows = self.roster_apply_rows();
         let adopts: Vec<Row> = self
-            .roster_rows()
+            .roster_all_rows()
             .into_iter()
             .filter(|r| matches!(r, Row::Adopt { .. }) && self.roster.edits.get(&self.roster_key(r)).and_then(|e| e.approve) == Some(true))
             .collect();
         if rows.is_empty() && adopts.is_empty() {
-            self.roster.status = "Nothing decided yet (y approve or mark, x decline)".into();
+            self.roster.status = "Nothing decided yet (y approve or mark, p promote an assistant, x decline)".into();
             return;
         }
         self.roster.adopt_queue = adopts.into();
@@ -429,8 +503,9 @@ impl App {
         }
         let rows = self.roster_rows();
         let row = rows.get(self.roster.cursor).cloned();
+        let editable = row.clone().filter(|r| !matches!(r, Row::Group(_)));
         let prompt = |app: &mut App, field: Field| {
-            if let Some(row) = &row {
+            if let Some(row) = &editable {
                 let (handle, _, team, manager, home) = app.roster_values(row);
                 let current = match field {
                     Field::Handle => handle,
@@ -450,6 +525,30 @@ impl App {
                 self.roster.error.clear();
                 self.roster.support = Support::Unknown;
                 self.roster_load();
+            }
+            KeyCode::Char(' ') | KeyCode::Enter if matches!(row, Some(Row::Group(_))) => {
+                let Some(Row::Group(k)) = &row else { unreachable!() };
+                if !self.roster.open.remove(k) {
+                    self.roster.open.insert(k.clone());
+                }
+            }
+            // Promoting an assistant to a member of its own: the one reason
+            // to adopt it, only ever by its own key.
+            KeyCode::Char('p') => match &row {
+                Some(Row::Adopt { of: Some(_), .. }) => {
+                    if let Some(e) = self.roster_edit() {
+                        e.approve = if e.approve == Some(true) { None } else { Some(true) };
+                    }
+                }
+                _ => self.roster.status = "p promotes an assistant to a member".into(),
+            },
+            KeyCode::Char('x') if matches!(row, Some(Row::Adopt { of: Some(_), .. })) => {
+                if let Some(e) = self.roster_edit() {
+                    e.approve = None;
+                }
+            }
+            KeyCode::Char('y' | ' ') if matches!(row, Some(Row::Adopt { of: Some(_), .. })) => {
+                self.roster.status = "An assistant of its member: p promotes it to a member of its own".into();
             }
             KeyCode::Char(c @ ('y' | 'x' | ' ')) => match &row {
                 // An adopt row is marked (y / Space) or cleared (x); A sends it.
@@ -492,7 +591,7 @@ impl App {
             KeyCode::Char('m') => prompt(self, Field::Manager),
             KeyCode::Char('w') => prompt(self, Field::Home),
             KeyCode::Char('K') => {
-                if let Some(row) = &row {
+                if let Some(row) = &editable {
                     let (_, kind, ..) = self.roster_values(row);
                     let next = if kind == "agent" { "continuous" } else { "agent" };
                     if let Some(e) = self.roster_edit() {
@@ -552,17 +651,36 @@ impl App {
         let header = format!("     {:<18} {:<11} {:<18} {:<14} {:<22} {}", "handle", "kind", "team", "manager", "home workspace", "source");
         lines.push(Line::styled(crate::planning::truncate_with_ellipsis(&header, width), Style::default().fg(theme::HEADER)));
         let rows = self.roster_rows();
-        let mut adopt_heading = false;
         let mut cursor_line = 0;
         for (k, row) in rows.iter().enumerate() {
-            if matches!(row, Row::Adopt { .. }) && !adopt_heading {
-                adopt_heading = true;
+            if let Row::Group(g) = row {
+                let open = r.open.contains(g);
+                let n = self.roster_group_len(g);
+                let text = match g.strip_prefix("assistants:") {
+                    Some(of) => format!("{} assistants of {} ({n})", if open { "\u{25be}" } else { "\u{25b8}" }, self.roster_group_name(of)),
+                    None => format!("{} {}", if open { "\u{25be}" } else { "\u{25b8}" }, if n == 1 { "1 other session".to_owned() } else { format!("{n} other sessions") }),
+                };
+                let mut style = Style::default().fg(theme::HEADER);
+                if k == r.cursor {
+                    style = style.bg(theme::SELECT_BG);
+                    cursor_line = lines.len() + 1;
+                }
                 lines.push(Line::from(""));
-                lines.push(Line::styled("Sessions with no member (y marks for adoption; A adopts the marked ones)", Style::default().fg(theme::HEADER)));
+                lines.push(Line::styled(crate::planning::truncate_with_ellipsis(&text, width), style));
+                if open {
+                    let note = if g == OTHER_GROUP {
+                        "      These reach no member. Adopting one (y, then A) makes it a member of its own, under the manager shown."
+                    } else {
+                        "      Assistants stay with their member. p promotes one to a member of its own (then A); nothing else adopts them."
+                    };
+                    lines.push(Line::styled(crate::planning::truncate_with_ellipsis(note, width), dim));
+                }
+                continue;
             }
             let key = self.roster_key(row);
             let (handle, kind, team, manager, home) = self.roster_values(row);
             let mark = match (row, r.edits.get(&key).and_then(|e| e.approve)) {
+                (Row::Adopt { of: Some(_), .. }, Some(true)) => "[\u{2191}]",
                 (Row::Adopt { .. }, Some(true)) => "[+]",
                 (Row::Adopt { .. }, _) => "[ ]",
                 (_, Some(true)) => "[\u{2713}]",
@@ -572,6 +690,7 @@ impl App {
             let source = match row {
                 Row::Proposal(i) => r.reply.proposals[*i].source.clone(),
                 Row::Adopt { label, host, .. } => format!("{label} @ {host}"),
+                Row::Group(_) => String::new(),
             };
             let text = format!(
                 "{mark}  {:<18} {:<11} {:<18} {:<14} {:<22} {source}",
@@ -610,7 +729,7 @@ impl App {
                 Span::styled(text.clone(), Style::default().fg(theme::TEXT)),
             ]),
             None => {
-                let help = "j/k move  y approve  x decline  Space cycle  Y approve all clean  e handle  t team  m manager  w home  K kind  A apply  r reload  Esc back";
+                let help = "j/k move  y approve  x decline  Space cycle/fold  Y approve all clean proposals  p promote an assistant  e handle  t team  m manager  w home  K kind  A apply  r reload  Esc back";
                 let text = if r.status.is_empty() { help.to_owned() } else { format!("{}  \u{00b7}  {help}", r.status) };
                 Line::styled(crate::planning::truncate_with_ellipsis(&text, width), dim)
             }
@@ -655,18 +774,23 @@ mod tests {
     fn roster_app() -> App {
         let mut app = test_app();
         app.org.accept(snapshot(1, vec![owner(), member("m1", "ep", Some("mem-owner"), Some("t1"), Some("ts-10-0"))], vec![team("t1", "Swarm", None, Some("m1"), &[("m1", "primary")])]));
-        let mut w = Workspace {
+        let new_ws = |id: &str| Workspace {
             org: None,
-            color: None, pinned: false, id: "w".into(), name: "w".into(), is_closed: false, is_cloud: false, repo_url: None,
+            color: None, pinned: false, id: id.into(), name: id.into(), is_closed: false, is_cloud: false, repo_url: None,
             worktree_path: None, main_repo_path: None, worker_vm: None, worker_zone: None, host_id: HostId::new("sessions"), sessions: vec![], tombstones: vec![],
         };
+        let mut w = new_ws("w");
+        // Items Lane sits in its own workspace and reaches no member: an
+        // "other" session. (In ep's workspace it would be ep's assistant.)
+        let mut lone = new_ws("w-lone");
         for (uid, label, kind) in [("ts-10-0", "ep", "claude"), ("ts-20-0", "Items Lane", "codex"), ("ts-30-0", "proposed", "claude"), ("ts-40-0", "shell", "bash")] {
             let mut ts = dummy_ts(uid, false, HostId::new("sessions"));
             ts.label = label.into();
             ts.session_type = kind.into();
-            w.sessions.push(ts);
+            if uid == "ts-20-0" { lone.sessions.push(ts) } else { w.sessions.push(ts) }
         }
-        app.workspaces = vec![w];
+        app.workspaces = vec![w, lone];
+        app.roster.open.insert(OTHER_GROUP.into());
         app.open_roster();
         app.roster_accept("load", Ok(json!({
             "proposals": [
@@ -683,9 +807,10 @@ mod tests {
     fn rows_are_proposals_then_sessions_with_no_member() {
         let app = roster_app();
         let rows = app.roster_rows();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
         // ep is a member, ts-30-0 is proposed, bash is no agent: only Items Lane to adopt.
-        assert!(matches!(&rows[2], Row::Adopt { uid, host, .. } if uid == "ts-20-0" && host == "sessions"));
+        assert_eq!(rows[2], Row::Group(OTHER_GROUP.into()));
+        assert!(matches!(&rows[3], Row::Adopt { uid, host, of: None, .. } if uid == "ts-20-0" && host == "sessions"));
         assert_eq!(app.roster.reply.declined, ["lane:agent:d1:ts-77-0"]);
     }
 
@@ -765,7 +890,7 @@ mod tests {
     fn adopt_rows_are_marked_and_sent_with_a_not_on_y() {
         let mut app = roster_app();
         app.roster.visible = true;
-        app.roster.cursor = 2; // the adopt row
+        app.roster.cursor = 3; // the adopt row
         press(&mut app, "y");
         assert!(app.roster.rx.is_none(), "y only marks");
         assert_eq!(app.roster.edits["adopt:ts-20-0"].approve, Some(true));
@@ -784,7 +909,7 @@ mod tests {
     #[test]
     fn adopt_goes_by_session_uid_with_label_handle() {
         let app = roster_app();
-        let row = app.roster_rows()[2].clone();
+        let row = app.roster_rows()[3].clone();
         let p = app.roster_adopt_params(&row, "rid");
         assert_eq!(p["session_uid"], "ts-20-0");
         assert_eq!(p["handle"], "items-lane");

@@ -16,17 +16,27 @@ answered said so.
 Owner approves the proposed members in one pass (`org.roster`, then
 `org.roster_apply`). Each proposal row shows the handle, team, manager, kind
 and home workspace, any conflicts, and Owner's decision. Live claude and codex
-sessions that are neither members nor proposed follow as **adopt** rows.
+sessions that are neither members nor proposed follow in folded groups
+(Space or Enter on a header opens it):
+
+- **assistants of <member>**: sessions that reach the member as F6 places them
+  ([team mode](org-chart.md#team-mode)). They are part of the member's office
+  and are not offered for adoption; `p` on one deliberately promotes it to a
+  member of its own (reporting to that member), which is the only reason to
+  adopt an assistant.
+- **N other sessions**: the few that reach no member, mostly Owner's own.
+  Adopting one (`y`, then `A`) makes it a member of its own.
 
 | Key | Action |
 |---|---|
 | `j` / `k` | move |
-| `y` / `x` | approve / decline the proposal (a decline stops it being proposed again); on an adopt row, mark / unmark it |
-| Space | cycle approve → decline → undecided; on an adopt row, toggle the mark |
-| `Y` | approve every undecided proposal that has no conflict |
+| `y` / `x` | approve / decline the proposal (a decline stops it being proposed again); on an other-session row, mark / unmark it |
+| Space | cycle approve → decline → undecided; on an other-session row, toggle the mark; on a group header, fold or open it |
+| `p` | on an assistant, mark / unmark it for promotion to a member (`y` and Space leave assistants alone) |
+| `Y` | approve every undecided proposal that has no conflict (never an assistant or other session) |
 | `e` `t` `m` `w` | edit the handle, team, manager or home workspace (Enter saves, Esc cancels); team and manager take a name, handle or `owner` |
 | `K` | cycle the kind (agent / continuous) |
-| `A` | apply the decisions and adopt the marked sessions; rejected rows stay with their reason (`stale`, `handle_taken`, `cycle`, …) |
+| `A` | apply the decisions and adopt the marked sessions, folded or not; rejected rows stay with their reason (`stale`, `handle_taken`, `cycle`, …) |
 | `r` | reload |
 | Esc, `q` | back to the chart |
 
@@ -39,11 +49,13 @@ keep their marks for another `A`. Hire, move and retire come later.
 
 `A-v` cycles **Status → Task → Team**. The Team sub-view lists the teams
 parents-first. Under each team come its members, lead first (`★`; a vacant
-member shows `∅`), and under each member its main session, then the other
-sessions of its home workspace (else of its main session's workspace).
-Another member's main session always stays with that member. Sessions no
-member claims follow under **Unassigned**, and continuous sessions stay in the
-continuous column. Team and member rows are headers the cursor stops on;
+member shows `∅`), and under each member its main session, then its
+assistants, placed exactly as F6 places them
+([team mode](org-chart.md#team-mode): member stamp, spawner chain, task
+chain, workspace). Another member's main session always stays with that
+member. Sessions Owner started that reach no member follow under **Owner's
+sessions**, the rare rest under **Unassigned**, and continuous sessions stay
+in the continuous column. Team and member rows are headers the cursor stops on;
 Space or Enter folds one (`▸`, with the number of sessions it hides), and the
 folds are kept in the manifest (`folded_org`). `A-g` still reaches a session
 inside a fold.

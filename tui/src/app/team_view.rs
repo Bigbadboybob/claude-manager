@@ -1,7 +1,10 @@
 //! The Sessions sidebar's Team sub-view (doc/org-model.md §11, S2): teams
 //! parents-first, each team's members lead first, and under each member its
-//! main session and the sessions of its home workspace. Sessions no member
-//! claims follow under "Unassigned". `A-v` cycles Status → Task → Team; the
+//! main session and its assistants: every session that reaches it through
+//! the member stamp, its spawner chain, its task chain or its workspace
+//! (`App::session_attachments`, the same rule as F6). Sessions Owner started
+//! that reach no member follow under "Owner's sessions", the rare rest
+//! under "Unassigned". `A-v` cycles Status → Task → Team; the
 //! Team sub-view is skipped when the daemon has no org model, and draws the
 //! Task tree until a snapshot with members arrives (app/org_model.rs).
 //!
@@ -13,7 +16,9 @@ use super::org_model::{Member, OrgSnapshot, Team};
 use super::*;
 use std::collections::HashSet;
 
-pub(super) const UNASSIGNED_KEY: &str = "org:unassigned";
+pub(super) use super::orgchart_teams::{OWNER_SESSIONS_KEY, UNASSIGNED_KEY};
+use super::orgchart_teams::Attach;
+use std::collections::HashMap;
 
 impl App {
     /// The Team sub-view is selected and the org model is live.
@@ -124,17 +129,41 @@ impl App {
             let ws = &self.workspaces[wi];
             !ws.is_closed && !self.is_past_workspace(wi) && !continuous.contains(&(wi, si))
         };
+        let mut under: HashMap<Attach, Vec<(usize, usize)>> = HashMap::new();
+        {
+            let attached = self.session_attachments(snap);
+            for (wi, ws) in self.workspaces.iter().enumerate() {
+                for (si, ts) in ws.sessions.iter().enumerate() {
+                    if let Some((to, _)) = attached.get(&ts.uid) {
+                        under.entry(to.clone()).or_default().push((wi, si));
+                    }
+                }
+            }
+            for v in under.values_mut() {
+                v.sort_by_key(|&(wi, si)| super::orgchart_teams::spawn_order(&self.workspaces[wi].sessions[si].uid));
+            }
+        }
         let mut claimed: HashSet<(usize, usize)> = HashSet::new();
         let mut items = Vec::new();
         let mut placed: HashSet<&str> = HashSet::new();
         for (team, depth) in team_order(snap) {
             items.push(VisualItem::OrgHeader { key: format!("team:{}", team.id), depth });
+            // A team's own sessions (its coordinator task's tree) go with its
+            // lead; a leadless team's sit under the team header.
+            let led = team.lead_member_id.as_deref().and_then(|l| snap.member(l)).is_some_and(|l| !l.is_owner() && !l.retired());
+            if !led {
+                for (wi, si) in under.get(&Attach::Team(team.id.clone())).cloned().unwrap_or_default() {
+                    if shown(wi, si) && claimed.insert((wi, si)) {
+                        items.push(VisualItem::Session(wi, si));
+                    }
+                }
+            }
             for m in team_members(snap, team) {
                 if !placed.insert(m.id.as_str()) {
                     continue;
                 }
                 items.push(VisualItem::OrgHeader { key: format!("member:{}", m.id), depth: depth + 1 });
-                for (wi, si) in self.member_rows(m) {
+                for (wi, si) in self.member_rows(snap, m, &under) {
                     if shown(wi, si) && claimed.insert((wi, si)) {
                         items.push(VisualItem::Session(wi, si));
                     }
@@ -146,7 +175,7 @@ impl App {
         loose.sort_by_key(|m| m.handle.to_lowercase());
         for m in loose {
             items.push(VisualItem::OrgHeader { key: format!("member:{}", m.id), depth: 0 });
-            for (wi, si) in self.member_rows(m) {
+            for (wi, si) in self.member_rows(snap, m, &under) {
                 if shown(wi, si) && claimed.insert((wi, si)) {
                     items.push(VisualItem::Session(wi, si));
                 }
@@ -159,33 +188,28 @@ impl App {
             .flat_map(|(wi, ws)| (0..ws.sessions.len()).map(move |si| (wi, si)))
             .filter(|&(wi, si)| shown(wi, si) && !claimed.contains(&(wi, si)))
             .collect();
-        if !rest.is_empty() {
+        // Owner started it (no spawner), else Unassigned.
+        let (owners, orphans): (Vec<_>, Vec<_>) = rest.into_iter().partition(|&(wi, si)| self.workspaces[wi].sessions[si].managed_by_uid.is_none());
+        for (key, rows) in [(OWNER_SESSIONS_KEY, owners), (UNASSIGNED_KEY, orphans)] {
+            if rows.is_empty() {
+                continue;
+            }
             if !items.is_empty() {
                 items.push(VisualItem::Separator);
             }
-            items.push(VisualItem::OrgHeader { key: UNASSIGNED_KEY.to_owned(), depth: 0 });
-            items.extend(rest.into_iter().map(|(wi, si)| VisualItem::Session(wi, si)));
+            items.push(VisualItem::OrgHeader { key: key.to_owned(), depth: 0 });
+            items.extend(rows.into_iter().map(|(wi, si)| VisualItem::Session(wi, si)));
         }
         items
     }
 
-    /// A member's main session, then the other sessions of its home
-    /// workspace (else of its main session's workspace), by spawn order.
-    fn member_rows(&self, m: &Member) -> Vec<(usize, usize)> {
-        let main = m.main_uid().and_then(|uid| self.find_session_by_uid(uid));
-        let home = m.home_workspace.as_ref().and_then(|h| {
-            self.workspaces.iter().position(|w| {
-                !w.is_closed
-                    && (h.workspace_id.as_deref() == Some(w.id.as_str())
-                        || h.path.as_deref().is_some_and(|p| w.worktree_path.as_deref() == Some(std::path::Path::new(p))))
-            })
-        });
-        let mut out: Vec<(usize, usize)> = main.into_iter().collect();
-        if let Some(wi) = home.or(main.map(|(wi, _)| wi)) {
-            // Another member's main session is never this one's assistant.
-            let mains = self.org_live();
-            let other_main = |si: usize| mains.is_some_and(|s| s.member_by_main(&self.workspaces[wi].sessions[si].uid).is_some_and(|o| o.id != m.id));
-            out.extend((0..self.workspaces[wi].sessions.len()).filter(|&si| Some((wi, si)) != main && !other_main(si)).map(|si| (wi, si)));
+    /// A member's main session, then its assistants (spawn order), with the
+    /// sessions of the teams it leads.
+    fn member_rows(&self, snap: &OrgSnapshot, m: &Member, under: &HashMap<Attach, Vec<(usize, usize)>>) -> Vec<(usize, usize)> {
+        let mut out: Vec<(usize, usize)> = m.main_uid().and_then(|uid| self.find_session_by_uid(uid)).into_iter().collect();
+        out.extend(under.get(&Attach::Member(m.id.clone())).into_iter().flatten().copied());
+        for t in snap.teams.iter().filter(|t| !t.archived() && t.lead_member_id.as_deref() == Some(m.id.as_str())) {
+            out.extend(under.get(&Attach::Team(t.id.clone())).into_iter().flatten().copied());
         }
         out
     }
@@ -196,8 +220,9 @@ impl App {
         let pad = format!("{}{} ", "  ".repeat(depth as usize), if folded { "\u{25b8}" } else { "\u{25be}" });
         let count = if folded { format!(" ({})", self.org_header_hidden(key)) } else { String::new() };
         let snap = self.org_live();
-        if key == UNASSIGNED_KEY {
-            return Line::styled(format!("{pad}{}{count}", super::orgchart_teams::UNASSIGNED_LABEL), Style::default().fg(theme::DIM).add_modifier(Modifier::BOLD));
+        if key == UNASSIGNED_KEY || key == OWNER_SESSIONS_KEY {
+            let label = if key == UNASSIGNED_KEY { super::orgchart_teams::UNASSIGNED_LABEL } else { super::orgchart_teams::OWNER_SESSIONS_LABEL };
+            return Line::styled(format!("{pad}{label}{count}"), Style::default().fg(theme::DIM).add_modifier(Modifier::BOLD));
         }
         if let Some(t) = key.strip_prefix("team:").and_then(|id| snap?.team(id)) {
             let mut st = Style::default().fg(theme::HEADER).add_modifier(Modifier::BOLD);
@@ -225,6 +250,9 @@ impl App {
         let snap = self.org_live();
         if key == UNASSIGNED_KEY {
             return super::orgchart_teams::UNASSIGNED_LABEL.to_owned();
+        }
+        if key == OWNER_SESSIONS_KEY {
+            return super::orgchart_teams::OWNER_SESSIONS_LABEL.to_owned();
         }
         if let Some(t) = key.strip_prefix("team:").and_then(|id| snap?.team(id)) {
             return t.name.clone();
@@ -377,14 +405,23 @@ mod tests {
     }
 
     #[test]
-    fn unassigned_sessions_and_old_daemons() {
+    fn owner_sessions_unassigned_and_old_daemons() {
         let mut app = app_with_team();
         app.workspaces.push(ws("solo"));
         push(&mut app, 1, "ts-9-0", "solo");
         app.sidebar_view = SidebarView::Team;
         let items = app.visual_items();
-        let at = items.iter().position(|i| matches!(i, VisualItem::OrgHeader { key, .. } if key == UNASSIGNED_KEY)).unwrap();
+        // Owner started it and it reaches no member: Owner's sessions.
+        let at = items.iter().position(|i| matches!(i, VisualItem::OrgHeader { key, .. } if key == OWNER_SESSIONS_KEY)).unwrap();
         assert_eq!(items[at + 1], VisualItem::Session(1, 0));
+        assert!(!items.iter().any(|i| matches!(i, VisualItem::OrgHeader { key, .. } if key == UNASSIGNED_KEY)));
+        // Spawned by a session that is gone: the rare Unassigned.
+        push(&mut app, 1, "ts-a-0", "orphan");
+        app.workspaces[1].sessions[1].managed_by_uid = Some("ts-gone-0".into());
+        let items = app.visual_items();
+        let at = items.iter().position(|i| matches!(i, VisualItem::OrgHeader { key, .. } if key == UNASSIGNED_KEY)).unwrap();
+        assert_eq!(items[at + 1], VisualItem::Session(1, 1));
+        assert!(app.org_header_line(OWNER_SESSIONS_KEY, 0, 60).to_string().contains("Owner's sessions"));
         // Headers are cursor stops, and keys there don't reach a terminal.
         app.cursor = Cursor::Org("team:t1".into());
         app.handle_event(&CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT)));
