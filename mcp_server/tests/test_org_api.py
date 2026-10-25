@@ -64,6 +64,19 @@ class MigrationText(unittest.TestCase):
 
 
 class Helpers(unittest.TestCase):
+    def test_shell_continuous_orchestrators_are_never_roster_candidates(self):
+        inputs = {"live": [{"pid": pid("sh"), "session_uid": "sh", "daemon_id": D1,
+                            "engine": "bash", "continuous_task_id": "script", "managed_by_uid": None}],
+                  "member_pids": {}, "mapped": set(), "taken": set(), "declined": set(),
+                  "initiatives": [], "root_boards": [], "pins": {}, "task_names": {}, "holds": {},
+                  "continuous": [{"task_id": "script", "current_session_uid": "sh"}]}
+        self.assertEqual(org_db.generate_roster(inputs), [])
+        inputs["live"][0]["engine"] = "codex"
+        inputs["live"][0]["workspace_id"] = "ws"
+        rows = org_db.generate_roster(inputs)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["pids"], [pid("sh")])
+
     def test_handles(self):
         self.assertEqual(org_db.normalize_handle("Swarm-Coord"), "swarm-coord")
         self.assertEqual(org_db.normalize_handle("bug_triage  orchestrator!"), "bug-triage-orchestrator")
@@ -456,6 +469,31 @@ class OrgApiDb(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(wren["primary_team_id"], team["id"])
 
     # ---- adoption, heartbeat, reads --------------------------------------------
+
+    async def test_shell_adoption_and_holder_assignment_refuse_without_side_effects(self):
+        from dispatch import items_db
+        uid = uid_at(3)
+        root = await self.task("shell owner")
+        await self.beat(D1, [{"uid": uid, "engine": "bash", "task_id": root,
+                              "name": "shell", "ws": "ws-shell", "path": "/w/shell"}])
+        before = await self.snapshot()
+        result = await self.http.post("/org/adopt", json={"actor": OWNER, "pid": pid(uid),
+            "handle": "shell-member", "request_id": "adopt-shell"})
+        self.assertEqual(result.status_code, 422, result.text)
+        self.assertEqual(result.json()["detail"]["code"], "agent_only")
+        self.assertEqual((await self.snapshot())["members"], before["members"])
+        board = await items_db.resolve_board(self.pool, task_id=root)
+        result = await self.http.post(f"/boards/{board['slug']}/items", json={"actor": OWNER,
+            "items": [{"title": "work", "holders": [{"pid": pid(uid)}]}]})
+        self.assertEqual(result.status_code, 422, result.text)
+        self.assertEqual(result.json()["detail"]["code"], "agent_only")
+        view = await items_db.read_board(self.pool, board["slug"])
+        self.assertEqual(view["items"], [])
+        self.assertEqual(view["free_capacity"], [])
+        self.assertEqual(view["untracked"], [])
+        async with self.pool.acquire() as conn:
+            self.assertIsNone(await conn.fetchval("SELECT exited_at FROM session_states WHERE pid = $1", pid(uid)))
+            self.assertEqual(await conn.fetchval("SELECT count(*) FROM session_states WHERE pid = $1", pid(uid)), 1)
 
     async def test_adopt_binds_a_live_session_and_the_heartbeat_carries_it(self):
         uid = uid_at(3)

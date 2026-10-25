@@ -4339,7 +4339,8 @@ while True:
         let r = resp.result.expect("result");
         assert_eq!(r["state"], "ready", "daemon must echo transcript_path");
         assert_eq!(r["transcript_path"], predicted_path);
-        assert_eq!(r["engine"], "claude-code");
+        assert_eq!(r["engine"], "bash", "a shell never masquerades as the Claude transcript engine");
+        assert_eq!(r["kind"], "shell");
         // Cleanup.
         let _ = rpc_kill_session(&socket, "op-trsc", &uid);
         stop_test_daemon(&socket, stop, handle);

@@ -502,11 +502,13 @@ pub fn resolve_authorized_session(app: &App, caller_uid: &str, params: &Value) -
 fn engine_str(session_type: &str) -> &'static str {
     match session_type {
         "codex" => "codex",
+        "bash" => "bash",
         _ => "claude-code",
     }
 }
 
 fn resolve_live_path(ws: &Workspace, ts: &TerminalSession) -> Option<String> {
+    if ts.session_type == "bash" { return None; }
     let sid = ts.transcript_id.as_deref()?;
     let wt = ws.worktree_path.as_deref()?;
     let agent = agent::agent_for(&ts.session_type);
@@ -523,6 +525,7 @@ fn resolve_live_path(ws: &Workspace, ts: &TerminalSession) -> Option<String> {
 }
 
 fn resolve_exited_path(_ws: &Workspace, tomb: &SessionTombstone) -> Option<String> {
+    if tomb.session_type == "bash" { return None; }
     let sid = tomb.last_transcript_id.as_deref()?;
     // Use the tombstone's own worktree snapshot — survives subsequent
     // mutations of the live workspace (e.g. `push_active` clearing
@@ -590,6 +593,8 @@ fn find_codex_file(dir: &std::path::Path, transcript_id: &str) -> Option<std::pa
 
 #[derive(Deserialize, Default)]
 struct ListSessionsParams {
+    #[serde(default)]
+    include_shells: bool,
     #[serde(default)]
     task_id: Option<String>,
     #[serde(default)]
@@ -684,6 +689,7 @@ pub fn list_sessions(app: &App, caller_uid: &str, params: &Value) -> MethodResul
         // this, an agent polling `list_sessions` to decide "is the
         // sibling done?" gets a different answer than
         // `read_session_output`.
+        if !p.include_shells && ts.session_type == "bash" { continue; }
         let runtime = session_runtime_state(ts);
         out.push(json!({
             "session_uid": ts.uid,
@@ -695,6 +701,7 @@ pub fn list_sessions(app: &App, caller_uid: &str, params: &Value) -> MethodResul
             // list→copy-type→start_session round-trip fails because
             // start_session rejects "claude".
             "type": public_session_type(&ts.session_type),
+            "kind": if ts.session_type == "bash" { "shell" } else { "agent" },
             "state": runtime.kind.as_wire(),
             "idle": runtime.idle,
             // Engine-reported state (doc/SESSION_STATE.md), passed through
@@ -725,13 +732,14 @@ pub fn list_sessions(app: &App, caller_uid: &str, params: &Value) -> MethodResul
                         .unwrap_or(false),
                     None => caller_authorized_for(&caller, app, wi, task),
                 };
-                if !included {
+                if !included || (!p.include_shells && tomb.session_type == "bash") {
                     continue;
                 }
                 out.push(json!({
                     "session_uid": tomb.uid,
                     "label": tomb.label,
                     "type": public_session_type(&tomb.session_type),
+                    "kind": if tomb.session_type == "bash" { "shell" } else { "agent" },
                     "state": "exited",
                     "idle": Value::Null,
                     "managed_by_uid": tomb.managed_by_uid,

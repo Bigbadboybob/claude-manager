@@ -210,25 +210,12 @@ class StartSessionWaitTests(_SpawnStubMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res["status"], "awaiting_input")
         self.assertEqual(res["last_message"]["content"], "ALL DONE")
 
-    async def test_wait_bash_transcriptless_returns_null_message(self):
-        # A bash session never binds a transcript; wait must return after the
-        # pending-idle grace with last_message=None (not hang to timeout).
-        def _call(method, params, *a, **k):
-            if method == "mcp_start_session":
-                return {"session_uid": "ts-bash-0"}
-            return _pending(None)  # forever pending+quiet
-
-        control_client.call = _call
-        res = await start_session(
-            "bash", "sh", prompt="echo hi", wait=True,
-            poll_interval_s=0.02, pending_idle_grace_s=0.2, timeout_s=30,
-        )
-        self.assertTrue(res["completed"])
-        self.assertIsNone(res["last_message"])
-        self.assertEqual(res["status"], "starting")
-        self.assertEqual(res["session_uid"], "ts-bash-0")
-        # P1: the transcript-less read dead-end is now explained, not silent.
-        self.assertEqual(res["note"], _NO_TRANSCRIPT_NOTE)
+    async def test_wait_bash_refuses_without_spawning(self):
+        from unittest.mock import patch
+        with patch.object(control_client, "call") as call:
+            res = await start_session("bash", "sh", prompt="echo hi", wait=True)
+        self.assertEqual(res["error"], "agent_only")
+        call.assert_not_called()
 
 
 # ── Structured output ──────────────────────────────────────────────────

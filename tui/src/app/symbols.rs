@@ -25,6 +25,7 @@ pub(crate) fn engine(session_type: &str) -> (&'static str, Style) {
 pub(crate) fn engine_name(session_type: &str) -> &str {
     match session_type {
         "claude" | "claude-code" => "claude",
+        "bash" => "shell",
         other => other,
     }
 }

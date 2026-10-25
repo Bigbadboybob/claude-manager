@@ -96,6 +96,9 @@ def main(argv=None) -> int:
 
     result["mode"] = mode
     print(json.dumps(result))
+    if result.get("error"):
+        print(f"cm-wait: {result.get('message', result['error'])}", file=sys.stderr)
+        return 2
     done = [c["session_uid"] for c in result["completed"]]
     print(
         f"cm-wait: {len(done)} finished {done}, "

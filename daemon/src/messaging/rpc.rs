@@ -300,6 +300,12 @@ fn execute_with_freshness(
                         message: "Messaging caller is not a registered session".into(),
                     });
                 }
+                let engine = s.sessions.get(&c.session_uid).map(|v| v.session_type.as_str())
+                    .or_else(|| s.tui_sessions.get(&c.session_uid).and_then(|v| v.session_type.as_deref()));
+                if engine == Some("bash") {
+                    return Err(ChatError { code: "invalid_params".into(),
+                        message: "agent_only: chat identity requires an agent; bash is a shell".into() });
+                }
                 (c.session_uid.clone(), "agent")
             }
         };
@@ -404,7 +410,8 @@ fn execute_with_freshness(
     if store.sync_enabled() && store.is_coordinator() {
         let local = people
             .iter()
-            .filter(|p| p.id.starts_with(&format!("agent:{}:", store.daemon_id)))
+            .filter(|p| p.kind != "shell" && p.engine.as_deref() != Some("bash")
+                && p.id.starts_with(&format!("agent:{}:", store.daemon_id)))
             .cloned()
             .collect::<Vec<_>>();
         store.register_host(&store.daemon_id.clone(), true, true, &local)?;
@@ -552,7 +559,8 @@ fn execute_with_freshness(
             let mut value = store.people(&people);
             if let Some(items) = value.as_array_mut() {
                 items.retain(|v| {
-                    (p["include_exited"] == true || v["present"] == true)
+                    v["kind"] != "shell" && v["engine"] != "bash"
+                        && (p["include_exited"] == true || v["present"] == true)
                         && p["query"].as_str().is_none_or(|q| {
                             v.to_string().to_lowercase().contains(&q.to_lowercase())
                         })
@@ -889,7 +897,12 @@ mod tests {
         };
         assert_eq!(engine("a"), "claude-code", "the TUI's `claude` is the daemon's `claude-code`");
         assert_eq!(engine("b"), "codex");
-        assert_eq!(engine("sh"), "bash");
+        assert!(!page["items"].as_array().unwrap().iter().any(|p| p["session_uid"] == "sh"));
+        let refusal = call(&state, "sh", "open", json!({})).unwrap_err();
+        assert!(refusal.message.contains("bash is a shell"));
+        let target = { let slot = state.lock().unwrap().messaging.clone(); let s = slot.lock().unwrap(); s.as_ref().unwrap().participant_id("sh") };
+        let refusal = call(&state, "a", "send", json!({"dm":target,"body":"work","request_id":"shell-dm"})).unwrap_err();
+        assert!(refusal.message.contains("bash is a shell"));
         assert_eq!(engine("outsider"), Value::Null, "an unknown engine is omitted, not guessed");
     }
     #[test]

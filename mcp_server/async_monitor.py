@@ -38,6 +38,7 @@ import time
 from pathlib import Path
 
 from mcp_server import control_client, monitor_state
+from mcp_server.session_kind import is_shell, shell_refusal
 from mcp_server.launch_confirmation import await_launch_confirmation
 from mcp_server.monitor import (
     _monitor_sessions,
@@ -137,6 +138,8 @@ def _capture_baseline(uid: str) -> tuple[dict | None, bool, float | None]:
         )
     except (control_client.ControlError, control_client.TransportError):
         return None, False, None
+    if is_shell(resolved):
+        raise RegistrationError("agent_only", shell_refusal("monitor_sessions")["message"])
     state = resolved.get("state", "pending")
     idle = bool(resolved.get("idle", False))
     engine = resolved.get("engine", "claude-code")
@@ -236,6 +239,21 @@ def register_monitor(
             "no_event_loop", "monitor registration requires a running loop"
         )
 
+    baselines: dict[str, dict] = {}
+    report_anchors: dict[str, float] = {}
+    already_idle: list[str] = []
+    already_reported: list[str] = []
+    for uid in uids:
+        baseline, at_prompt, anchor = _capture_baseline(uid)
+        if edge:
+            if baseline is not None:
+                baselines[uid] = baseline
+            if at_prompt:
+                already_idle.append(uid)
+            if anchor is not None:
+                report_anchors[uid] = anchor
+                already_reported.append(uid)
+
     # Auto-registrations dedupe per target set: prompting the same
     # worker again re-anchors the watch rather than stacking a second
     # (stale) monitor that would fire twice.
@@ -265,20 +283,6 @@ def register_monitor(
             "let some fire first",
         )
 
-    baselines: dict[str, dict] = {}
-    report_anchors: dict[str, float] = {}
-    already_idle: list[str] = []
-    already_reported: list[str] = []
-    if edge:
-        for uid in uids:
-            baseline, at_prompt, anchor = _capture_baseline(uid)
-            if baseline is not None:
-                baselines[uid] = baseline
-            if at_prompt:
-                already_idle.append(uid)
-            if anchor is not None:
-                report_anchors[uid] = anchor
-                already_reported.append(uid)
     if source == "auto":
         # A just-prompted worker is EXPECTED to still be at its prompt
         # (the PTY delivery has seconds of runway) — reporting it as
@@ -577,6 +581,8 @@ def _format_fire_message(record: dict, result: dict) -> str:
     marker (also used for delivery verification)."""
     lines: list[str] = []
     head = f"[cm-monitor {record['monitor_id']} fired]"
+    if result.get("error"):
+        return f"{head} Watch refused: {result.get('message', result['error'])}"
     if result.get("submitted") is False and result.get("prompt_delivery"):
         receipt = result["prompt_delivery"]
         uncertainty = (

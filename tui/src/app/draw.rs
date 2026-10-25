@@ -980,7 +980,7 @@ impl App {
         let hidden_style = if active_field == 3 { white } else { dim };
         let notify_marker = if notify_on_idle { "[x]" } else { "[ ]" };
         let notify_style = if active_field == 4 { white } else { dim };
-        let perms_marker = if global_perms { "[x]" } else { "[ ]" };
+        let perms_marker = if session_type == "bash" { "[N/A]" } else if global_perms { "[x]" } else { "[ ]" };
         // Highlight the grant in yellow when on — it's a privileged,
         // cross-session capability, not a routine toggle.
         let perms_style = if active_field == 5 {
@@ -1026,7 +1026,9 @@ impl App {
                 Span::styled("   Global perms: ", dim),
                 Span::styled(perms_marker, perms_style),
                 Span::styled(
-                    if active_field == 5 {
+                    if session_type == "bash" {
+                        "  shell terminal"
+                    } else if active_field == 5 {
                         "  Space — control ANY session"
                     } else {
                         ""
@@ -1481,6 +1483,8 @@ impl App {
             let idle_bucket = self.display_idle_bucket(ts, now);
             let (indicator, indicator_style) = if self.reconnecting_sessions.contains(&ts.uid) {
                 ("\u{27f3}", Style::default().fg(theme::ATTN))
+            } else if ts.session_type == "bash" {
+                super::symbols::engine("bash")
             } else if ts.hidden {
                 (" ", Style::default())
             } else if let Some(engine) = self.agent_indicator(ts) {
@@ -2098,6 +2102,8 @@ impl App {
                         // for hidden sessions — a stuck stream is worth
                         // surfacing.
                         ("\u{27f3}", Style::default().fg(theme::ATTN))
+                    } else if ts.session_type == "bash" {
+                        super::symbols::engine("bash")
                     } else if ts.hidden {
                         (" ", Style::default())
                     } else if let Some(engine) = self.agent_indicator(ts) {
@@ -2698,7 +2704,7 @@ impl App {
                     n_alert += 1;
                     continue;
                 }
-                if ts.session.exited {
+                if ts.session.exited || ts.session_type == "bash" {
                     continue;
                 }
                 // Engine-reported state wins; waiting-on-human and errored

@@ -273,6 +273,13 @@ def _strict(board: dict) -> bool:
 
 
 async def _apply(conn, tx: BoardTx, *, mirror: bool = False) -> None:
+    holders = sorted({h["pid"] for n in tx.holders_changed for h in tx.items[n].holders})
+    if holders:
+        shells = await conn.fetch(
+            "SELECT pid FROM session_states WHERE pid = ANY($1::text[]) AND engine = 'bash'",
+            holders)
+        if shells:
+            raise ItemsError(422, "agent_only", "bash is a shell and cannot hold work items")
     now = tx.now
     board_id = uuid.UUID(tx.board["id"])
     for gid in tx.groups_created:
@@ -982,6 +989,8 @@ async def read_board(pool, ref: str, *, since_version: int | None = None,
                 out["gate"] = gates[it.id]
             for h, src in zip(out["holders"], it.holders):
                 h["state"] = holder_state(states.get(src["pid"]), now)
+                if (states.get(src["pid"]) or {}).get("engine") == "bash":
+                    h["kind"] = "shell"
             out["blocks"] = sorted(o.n for o in items.values()
                                    if it.n in o.blocked_by and o.status not in CLOSED)
             if history:

@@ -541,6 +541,7 @@ impl Runtime {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         super::live_sessions(&s)
             .into_iter()
+            .filter(|s| s.engine.as_deref() != Some("bash"))
             .map(|live| Person::present_agent(format!("agent:{}:{}", self.daemon_id, live.uid), live))
             .collect()
     }

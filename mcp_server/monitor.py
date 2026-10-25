@@ -19,6 +19,7 @@ import os
 import time
 
 from mcp_server import control_client
+from mcp_server.session_kind import is_shell, shell_refusal
 from mcp_server.transcripts import claude_code as transcripts_claude
 from mcp_server.transcripts import codex as transcripts_codex
 from mcp_server.transcripts import stream as transcript_stream
@@ -531,8 +532,8 @@ async def _monitor_sessions(
         time it pauses" — the fan-out case where a worker ends its
         launch turn with background subagents still running, and an
         orchestrator reading that as completion is a live incident.
-        Note a session that can't report (bash, or any agent that never
-        calls the tool) completes only on exit, so pair final mode with
+        An agent that never calls report_done completes only on exit;
+        shells are refused because they have no agent turns. Pair final mode with
         a `timeout_s` you're willing to wait.
 
     mode="any" (default): return as soon as >=1 session completes. The
@@ -609,6 +610,9 @@ async def _monitor_sessions(
                     })
                 remaining.remove(uid)
                 continue
+
+            if is_shell(resolved):
+                return {**shell_refusal("monitor_sessions"), "session_uid": uid}
 
             seen[uid] = True
             state = resolved.get("state", "pending")

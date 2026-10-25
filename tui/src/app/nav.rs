@@ -302,11 +302,12 @@ fn peek_session_lines(
 ) -> Vec<PeekLine> {
     let mut out = vec![
         PeekLine::Field {
-            label: "Session".into(),
+            label: if session_type == "bash" { "Shell" } else { "Session" }.into(),
             value: format!("{} ({})", label, super::symbols::engine_with_name(session_type)),
         },
         PeekLine::Field { label: "Uid".into(), value: uid.to_string() },
     ];
+    if session_type == "bash" { return out; }
     if let Some(s) = seeded_from {
         out.push(PeekLine::Field { label: "Seeded from".into(), value: s.to_string() });
     }
@@ -1961,6 +1962,14 @@ impl App {
                     ts.seeded_from_snapshot.as_deref(),
                     ts.last_delivery.as_ref().map(|(s, _)| s.as_str()),
                 ));
+                if ts.session_type == "bash" {
+                    out.push(PeekLine::Text("Shell terminal; no agent turns, transcript or work-item assignment.".into()));
+                    out.push(PeekLine::Field { label: "Workspace".into(), value: ws.name.clone() });
+                    if let Some(path) = &ws.worktree_path {
+                        out.push(PeekLine::Field { label: "Directory".into(), value: path.display().to_string() });
+                    }
+                    return out;
+                }
                 if let Some(model) = ts.model.as_deref() {
                     out.push(PeekLine::Field {
                         label: "Model".into(),
@@ -2590,10 +2599,19 @@ mod nav_quickswitch_tests {
         }));
         assert!(lines.contains(&PeekLine::Field { label: "Host".into(), value: "local".into() }));
         assert!(lines.contains(&PeekLine::Text("worker (\u{273b} claude) \u{2014} running".into())));
-        assert!(lines.contains(&PeekLine::Text("shell ($ bash) \u{2014} idle".into())));
+        assert!(lines.contains(&PeekLine::Text("shell ($ shell) \u{2014} idle".into())));
         // Empty roster shows the placeholder.
         let empty = peek_workspace_lines("ws", None, None, None, "local", &[]);
         assert!(empty.contains(&PeekLine::Text("(none)".into())));
+    }
+
+    #[test]
+    fn shell_peek_labels_the_terminal_and_omits_agent_prompt_provenance() {
+        let lines = peek_session_lines("terminal", "bash", "uid-shell", Some("old-snapshot"), Some("agent instructions"));
+        assert_eq!(lines, vec![
+            PeekLine::Field { label: "Shell".into(), value: "terminal ($ shell)".into() },
+            PeekLine::Field { label: "Uid".into(), value: "uid-shell".into() },
+        ]);
     }
 
     #[test]

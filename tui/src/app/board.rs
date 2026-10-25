@@ -866,7 +866,7 @@ impl App {
             for h in &holders {
                 let name = h["name"].as_str().or_else(|| h["pid"].as_str()).unwrap_or("?");
                 let state = h["state"]["state"].as_str().unwrap_or("unknown");
-                let (glyph, style) = holder_glyph(state, h["state"]["for_s"].as_i64(), self.spinner_frame());
+                let (glyph, style) = if h["kind"] == "shell" { super::symbols::engine("bash") } else { holder_glyph(state, h["state"]["for_s"].as_i64(), self.spinner_frame()) };
                 let chip = format!("{glyph} {name} ");
                 let w = chip.chars().count();
                 if used + w > cols.chips {
@@ -1024,7 +1024,7 @@ impl App {
         for h in other["holders"].as_array().into_iter().flatten() {
             let name = h["name"].as_str().or_else(|| h["pid"].as_str()).unwrap_or("?").to_owned();
             let state = h["state"]["state"].as_str().unwrap_or("unknown");
-            let (glyph, gstyle) = holder_glyph(state, h["state"]["for_s"].as_i64(), self.spinner_frame());
+            let (glyph, gstyle) = if h["kind"] == "shell" { super::symbols::engine("bash") } else { holder_glyph(state, h["state"]["for_s"].as_i64(), self.spinner_frame()) };
             spans.push(Span::styled(" \u{00b7} ", dim));
             spans.push(Span::styled(format!("{glyph} "), gstyle));
             spans.push(Span::styled(name, Style::default().fg(theme::MUTED)));

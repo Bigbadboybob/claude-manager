@@ -162,6 +162,9 @@ impl Store {
                     ))
                 }
             };
+            if people.iter().any(|p| p.id == id && (p.kind == "shell" || p.engine.as_deref() == Some("bash"))) {
+                return Err(err("invalid_mention", "agent_only: bash is a shell and cannot receive agent chat"));
+            }
             if dm_members.is_some_and(|v| !v.iter().any(|x| *x == id)) {
                 return Err(err(
                     "invalid_mention",

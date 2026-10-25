@@ -200,7 +200,7 @@ impl Store {
             .collect();
         actors.extend(self.memberships.values().flatten().cloned());
         actors.extend(self.conversations.values().flatten().cloned());
-        actors.extend(people.iter().map(|p| p.id.clone()));
+        actors.extend(people.iter().filter(|p| p.kind != "shell" && p.engine.as_deref() != Some("bash")).map(|p| p.id.clone()));
         actors.insert("owner".into());
         for actor in actors {
             self.enroll_participant(&actor)?;

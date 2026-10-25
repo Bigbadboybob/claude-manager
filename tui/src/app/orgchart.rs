@@ -943,6 +943,9 @@ impl App {
     /// The sidebar's glyph and colour for a session (draw.rs's session row),
     /// with exited sessions as `×`.
     pub(super) fn chart_glyph(&self, ts: &TerminalSession, now: Instant) -> (&'static str, Style) {
+        if ts.session_type == "bash" && !ts.session.exited {
+            return symbols::engine("bash");
+        }
         if ts.session.exited {
             return ("\u{00d7}", Style::default().fg(theme::DIM));
         }
@@ -1841,7 +1844,8 @@ impl App {
                         let room = w.saturating_sub(4 + 7);
                         let label_w = ts.label.chars().count();
                         let badge = self.row_badge(ts).filter(|b| super::agent_state::badge_fits(room, label_w, b));
-                        let label = crate::planning::truncate_with_ellipsis(&ts.label, room);
+                        let display_label = if ts.session_type == "bash" { format!("{} (shell)", ts.label) } else { ts.label.clone() };
+                        let label = crate::planning::truncate_with_ellipsis(&display_label, room);
                         let label_style = if ts.session.exited { Style::default().fg(theme::DIM) } else { Style::default().fg(theme::TEXT) };
                         put(buf, p.x + 1, y, &" ".repeat(w - 2), bg(Style::default()));
                         put(buf, p.x + 1, y, s.mark.unwrap_or(" "), bg(Style::default().fg(theme::ATTN)));
@@ -1945,6 +1949,14 @@ impl App {
         };
         let (mark, mark_style) = symbols::engine(&ts.session_type);
         lines.push(Line::from(vec![label("engine"), Span::styled(format!("{mark} "), mark_style), text(symbols::engine_name(&ts.session_type).to_owned())]));
+        if ts.session_type == "bash" {
+            lines.push(Line::from(vec![label("kind"), text("shell terminal".into())]));
+            lines.push(Line::from(vec![label("workspace"), text(ws.name.clone())]));
+            if let Some(path) = &ws.worktree_path {
+                lines.push(Line::from(vec![label("directory"), text(path.display().to_string())]));
+            }
+            return lines;
+        }
         if let Some(model) = ts.model.as_deref() {
             lines.push(Line::from(vec![
                 label("model"),

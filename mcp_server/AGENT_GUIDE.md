@@ -187,3 +187,15 @@ means self). Use a section ID/unique exact name, `auto` for parent inheritance, 
 workspace members. Delivery survives an offline viewer; check the observed receipt
 after reconnect, and do not claim a queued request was rendered. This is separate
 from planning initiatives. See `doc/sidebar-sections.md`.
+
+### Shell panes
+
+`list_sessions` and `list_sessions_grouped` show agent workers by default.
+Use `include_shells=true` to inspect bash terminals; they carry `kind: "shell"`
+and `status: "shell"` (or `exited`). Shells are never teammates, item holders,
+roster candidates, or free capacity. `send_input` explicitly runs shell commands
+with a newline and skips agent completion monitoring. Redirect command output
+to a file. Transcript reads, agent waits/monitors (including `until="final"`),
+`start_session(type="bash", wait=true)`, `report_done`, chat identity and org
+adoption require an agent and refuse shells clearly. This distinction does not
+close, kill, restart or move shell sessions.

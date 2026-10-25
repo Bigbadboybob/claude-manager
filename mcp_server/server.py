@@ -49,6 +49,7 @@ except ModuleNotFoundError:
 
 from mcp_server.launch_confirmation import await_launch_confirmation as _await_launch_confirmation
 from mcp_server import control_client
+from mcp_server.session_kind import is_shell, shell_refusal
 from mcp_server.transcripts.types import Role
 # Session status + transcript-tail helpers and the multi-session monitor
 # core live in `monitor` (FastMCP-free, so the cm-wait CLI can reuse them
@@ -2059,40 +2060,51 @@ def _annotate_shared_worktrees(sessions: list[dict]) -> None:
             continue
         for s in peers:
             s["workspace_shared_with"] = [
-                {"session_uid": o.get("session_uid"), "label": o.get("label")}
+                {"session_uid": o.get("session_uid"), "label": o.get("label"),
+                 **({"kind": "shell"} if is_shell(o) else {})}
                 for o in peers
                 if o.get("session_uid") != s.get("session_uid")
             ]
 
 
-def _list_sessions_raw(task_id: str | None, include_exited: bool) -> list[dict]:
+def _list_sessions_raw(task_id: str | None, include_exited: bool, include_shells: bool = False) -> list[dict]:
     """Shared implementation behind `list_sessions` and
     `list_sessions_grouped`: call the host, enrich each entry with the
     legible `status` word and the `workspace_shared_with` hint, and drop
     terminal-geometry noise."""
-    params: dict = {"include_exited": include_exited}
+    params: dict = {"include_exited": include_exited, "include_shells": include_shells}
     if task_id:
         params["task_id"] = task_id
     sessions = control_client.call("list_sessions", params)
     for s in sessions:
+        s["kind"] = "shell" if is_shell(s) else "agent"
         s["status"] = _session_status(
             s.get("state", "pending"),
             bool(s.get("idle", False)),
             bool(s.get("reported_done", False)),
             s.get("agent_state"),
         )
+        if is_shell(s):
+            s["status"] = "exited" if s.get("state") == "exited" else "shell"
+            for key in ("agent_state", "reported_done", "reported_done_at", "report_reason",
+                        "model", "model_source", "effort", "effort_source"):
+                s.pop(key, None)
         for k in _SESSION_NOISE_FIELDS:
             s.pop(k, None)
     _annotate_shared_worktrees(sessions)
-    return sessions
+    return [s for s in sessions if include_shells or not is_shell(s)]
 
 
 @mcp.tool()
 def list_sessions(
     task_id: str | None = None,
     include_exited: bool = False,
+    include_shells: bool = False,
 ) -> list[dict]:
     """List sessions visible to you.
+
+    Shells are omitted by default. Set include_shells=true to include
+    terminal panes labelled kind="shell"; they are never agent workers.
 
     Scope: your own task tree (or your whole workspace if you have no
     task). If you hold global permissions (check `ping().global_perms`),
@@ -2160,13 +2172,14 @@ def list_sessions(
     (Terminal geometry — `cols`/`rows` — is intentionally omitted; it's
     noise for orchestration.)
     """
-    return _list_sessions_raw(task_id, include_exited)
+    return _list_sessions_raw(task_id, include_exited, include_shells)
 
 
 @mcp.tool()
 def list_sessions_grouped(
     task_id: str | None = None,
     include_exited: bool = False,
+    include_shells: bool = False,
 ) -> dict:
     """List visible sessions as a tree grouped by workspace → task — the
     readable companion to `list_sessions`.
@@ -2207,7 +2220,7 @@ def list_sessions_grouped(
     launch, or a workspace re-created around an existing worktree), so a
     shared checkout does not always show up as a shared group.
     """
-    sessions = _list_sessions_raw(task_id, include_exited)
+    sessions = _list_sessions_raw(task_id, include_exited, include_shells)
 
     # Self-context so the agent can see at a glance whether it's
     # privileged and where it sits — saves a separate ping().
@@ -2464,6 +2477,8 @@ async def start_session(
     every spawn — doubly so when `global_perms=true`, which mints a child
     that can reach across the whole session graph.
     """
+    if type == "bash" and wait:
+        return shell_refusal("start_session(wait=true)")
     if not label.strip():
         return {"error": "invalid_params", "message": "label must be non-empty"}
     # isolated: branch a subtask worktree under the caller's task, then bind
@@ -2833,6 +2848,9 @@ async def send_input(
             the watch). Use "final" when the prompt kicks off work that
             will span several turns. See `monitor_sessions`.
 
+    Bash targets receive a shell command followed by a newline.
+    They do not register agent completion monitors.
+
     State your intent and ask the user before calling this tool.
     """
     res = await asyncio.to_thread(
@@ -2840,6 +2858,9 @@ async def send_input(
         "send_input",
         {"session_uid": session_uid, "text": text, "submit": submit},
     )
+    if isinstance(res, dict) and is_shell(res):
+        res["note"] = "Shell input delivered; agent completion monitoring does not apply."
+        return res
     if notify_on_done and isinstance(res, dict) and "error" not in res:
         try:
             res["monitor"] = async_monitor.register_monitor(
@@ -3126,6 +3147,8 @@ def read_session_output(
     except control_client.ControlError as e:
         return {"error": e.code, "message": e.message}
 
+    if is_shell(resolved):
+        return shell_refusal("read_session_output")
     state = resolved.get("state", "pending")
     engine = resolved.get("engine", "claude-code")
     transcript_path = resolved.get("transcript_path")
@@ -3210,6 +3233,8 @@ def read_last_turn(session_uid: str, context_messages: int = 6) -> dict:
     except control_client.ControlError as e:
         return {"error": e.code, "message": e.message}
 
+    if is_shell(resolved):
+        return shell_refusal("read_last_turn")
     state = resolved.get("state", "pending")
     engine = resolved.get("engine", "claude-code")
     transcript_path = resolved.get("transcript_path")
@@ -3618,6 +3643,8 @@ async def wait_for_session_idle(
                 }
             raise
         resolved_once = True
+        if is_shell(resolved):
+            return shell_refusal("wait_for_session_idle")
         state = resolved.get("state", "pending")
         idle = bool(resolved.get("idle", False))
         # The agent's own done signal, so this wait's `status` agrees with
@@ -3904,6 +3931,8 @@ async def _await_reply(
                 }
             raise
         resolved_once = True
+        if is_shell(resolved):
+            return shell_refusal("await_reply")
         state = resolved.get("state", "pending")
         idle = bool(resolved.get("idle", False))
         # Same as the wait loop above: the agent's own done signal, so the
@@ -4057,6 +4086,8 @@ async def _send_and_await(
             "resolve_authorized_session",
             {"session_uid": session_uid},
         )
+        if is_shell(pre):
+            return shell_refusal("send_and_await")
         engine = pre.get("engine", "claude-code")
         transcript_path = pre.get("transcript_path")
         generation = int(pre.get("generation", 0))
@@ -4358,8 +4389,8 @@ async def monitor_sessions(
                 wake you; you're woken when it is actually done. Right
                 for fan-outs you want to collect once. Use a generous
                 `timeout_s`, and note that a worker which never calls
-                `report_done` (or a bash session, which can't) will only
-                complete this watch by exiting. A final watch also holds
+                `report_done` will only complete this watch by exiting.
+                Bash shells are refused; they have no agent turns. A final watch also holds
                 its monitor slot for as long as the work takes, so watch
                 a fan-out as ONE `mode="all"` monitor rather than one per
                 worker if you're arming many.

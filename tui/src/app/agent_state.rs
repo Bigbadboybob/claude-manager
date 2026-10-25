@@ -171,6 +171,9 @@ impl App {
     /// (working-background, waiting-on-human, errored, unknown). None leaves
     /// the caller's existing working/idle rendering in place.
     pub(crate) fn agent_indicator(&self, ts: &TerminalSession) -> Option<(&'static str, Style)> {
+        if ts.session_type == "bash" && !ts.session.exited {
+            return Some(super::symbols::engine("bash"));
+        }
         if ts.session.exited {
             return None;
         }
@@ -604,6 +607,22 @@ mod tests {
     fn rows(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
         let area = buffer.area;
         (0..area.height).map(|y| (0..area.width).map(|x| buffer[(x, y)].symbol().to_string()).collect()).collect()
+    }
+
+    #[test]
+    fn shell_sidebar_row_has_a_terminal_marker_even_when_activity_is_hidden() {
+        use super::super::sections::layout_tests::{bare_ws, sidebar_buffer, test_app};
+        let mut app = test_app();
+        app.sidebar_view = SidebarView::Task;
+        app.workspaces = vec![bare_ws("w")];
+        session(&mut app, 0, "ts-1-0", "terminal");
+        let ts = &mut app.workspaces[0].sessions[0];
+        ts.session_type = "bash".into();
+        ts.hidden = true;
+        let text = rows(&sidebar_buffer(&mut app, 12));
+        let row = text.iter().find(|r| r.contains("terminal")).unwrap();
+        assert!(row.contains('$'), "{row}");
+        assert!(!row.contains('●'), "shell is not an idle worker: {row}");
     }
 
     /// The sidebar row: the compact badge right-aligned, dropped before the

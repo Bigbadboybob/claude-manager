@@ -132,6 +132,9 @@ impl Ctx {
             let live = crate::messaging::live_sessions(&s);
             (me, live, s.messaging.clone(), s.config.api_url.clone(), s.config.api_token.clone())
         };
+        if me.as_ref().is_some_and(|(_, _, _, _, engine, _)| engine.as_deref() == Some("bash")) {
+            return Err(bad("agent_only: item and org tools require an agent; bash is a shell"));
+        }
         let (daemon_id, people, my_name) = {
             let slot = handle.lock().unwrap_or_else(|p| p.into_inner());
             let store = slot.as_ref().ok_or_else(|| {
@@ -216,6 +219,17 @@ pub(crate) fn resolve_holder(ctx: &Ctx, reference: &str) -> RpcResult {
     let r = reference.trim().trim_start_matches('@');
     if r.is_empty() {
         return Err(bad("empty holder"));
+    }
+    if ctx.people.iter().any(|p| {
+        (p["kind"] == "shell" || p["engine"] == "bash")
+            && (p["id"] == r || p["session_uid"] == r
+                || p["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(r))
+                || p["aliases"].as_array().is_some_and(|a| a.iter().any(|n| n.as_str().is_some_and(|n| n.eq_ignore_ascii_case(r)))))
+    }) {
+        return Err(bad("agent_only: bash is a shell and cannot hold work items"));
+    }
+    if r.eq_ignore_ascii_case("me") && ctx.engine.as_deref() == Some("bash") {
+        return Err(bad("agent_only: bash is a shell and cannot hold work items"));
     }
     if r.eq_ignore_ascii_case("me") {
         return Ok(ctx.me());
@@ -690,6 +704,9 @@ fn parse_ts(value: &Value) -> Option<DateTime<Utc>> {
 
 fn holder_slim(h: &Value) -> String {
     let name = h["name"].as_str().or_else(|| h["pid"].as_str()).unwrap_or("?");
+    if h["kind"] == "shell" {
+        return format!("@{name}[shell]");
+    }
     let st = &h["state"];
     let state = st["state"].as_str().unwrap_or("unknown");
     // A role other than owner shows: `@ep(reviewer)[idle 3m]` (§7.2).
@@ -1140,6 +1157,19 @@ mod tests {
             json!({"id":"agent:d2:y-uid","name":"Twin","session_uid":"y-uid","kind":"agent"}),
             json!({"id":"owner","name":"Owner","session_uid":"","kind":"owner"}),
         ]
+    }
+
+    #[test]
+    fn shell_holders_refuse_names_aliases_uids_and_participant_ids() {
+        let mut ctx = ctx_with(vec![]);
+        ctx.people.push(json!({"id":"agent:d1:sh", "session_uid":"sh", "name":"terminal", "aliases":["old-shell"], "kind":"shell", "engine":"bash"}));
+        for reference in ["terminal", "old-shell", "sh", "agent:d1:sh"] {
+            let e = resolve_holder(&ctx, reference).unwrap_err();
+            assert!(e.1.contains("bash is a shell"), "{reference}: {e:?}");
+        }
+        ctx.engine = Some("bash".into());
+        assert!(resolve_holder(&ctx, "me").is_err());
+        assert_eq!(holder_slim(&json!({"name":"terminal", "kind":"shell", "state":{"state":"idle"}})), "@terminal[shell]");
     }
 
     #[test]

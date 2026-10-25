@@ -505,7 +505,8 @@ async def task_org(pool, task: dict) -> dict:
                  FROM session_states s
                  LEFT JOIN incarnations inc ON inc.pid = s.pid AND inc.role = 'main'
                                            AND inc.ended_at IS NULL
-                WHERE s.task_id = $1 AND s.exited_at IS NULL AND s.state <> 'exited'""",
+                WHERE s.task_id = $1 AND s.exited_at IS NULL AND s.state <> 'exited'
+                  AND s.engine IN ('claude', 'claude-code', 'codex')""",
             uuid.UUID(str(task_id)))
         ids = sorted({r["member_id"] for r in sessions if r["member_id"]})
         if team and team["lead_member_id"]:
@@ -612,7 +613,7 @@ def generate_roster(inputs: dict) -> list[dict]:
     and divisions by today's lead rule, and boards anchored by a root task),
     then long-lived lanes. Handles are normalised and collision-suffixed;
     a taken alias is never stolen."""
-    live = inputs["live"]
+    live = [s for s in inputs["live"] if (s.get("engine") or "").lower() in AGENT_ENGINES]
     by_uid: dict[str, list[dict]] = {}
     for s in live:
         by_uid.setdefault(s["session_uid"], []).append(s)
@@ -1121,12 +1122,14 @@ async def adopt(pool, actor: dict, *, pid: str, handle: str, title: str | None =
                 await _lock(conn)
                 await _replay_under_lock(conn, request_id, actor, "adopt")
                 facts = await conn.fetchrow(
-                    """SELECT s.daemon_id, s.session_uid, f.workspace_id, f.worktree_path,
+                    """SELECT s.daemon_id, s.session_uid, s.engine, f.workspace_id, f.worktree_path,
                               f.continuous_task_id
                          FROM session_states s LEFT JOIN org_session_facts f ON f.pid = s.pid
                         WHERE s.pid = $1 AND s.exited_at IS NULL AND s.state <> 'exited'""", pid)
                 if facts is None:
                     raise _err(404, "not_found", f"{pid} is not a live session")
+                if (facts["engine"] or "").lower() not in AGENT_ENGINES:
+                    raise _err(422, "agent_only", "adopt requires an agent session; bash is a shell")
                 continuous = None
                 aliases = []
                 if kind == "continuous":

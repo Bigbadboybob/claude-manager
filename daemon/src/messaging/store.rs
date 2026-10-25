@@ -288,7 +288,7 @@ impl Person {
             session_uid: live.uid,
             task: live.task,
             present: true,
-            kind: "agent".into(),
+            kind: if live.engine.as_deref() == Some("bash") { "shell" } else { "agent" }.into(),
             engine: live.engine,
         }
     }
@@ -1293,6 +1293,9 @@ impl Store {
                     ))
                 }
             };
+            if people.iter().any(|p| p.id == peer && (p.kind == "shell" || p.engine.as_deref() == Some("bash"))) {
+                return Err(err("invalid_target", "agent_only: bash is a shell and cannot receive agent chat"));
+            }
             if members.contains(&peer) {
                 return Err(err(
                     "invalid_target",

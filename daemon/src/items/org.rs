@@ -176,6 +176,9 @@ fn adopt(ctx: &Ctx, mut p: Map<String, Value>) -> RpcResult {
         (None, Some(uid)) => format!("agent:{}:{uid}", ctx.daemon_id),
         (None, None) => return Err(bad("org.adopt needs pid or session_uid")),
     };
+    if ctx.people.iter().any(|s| s["id"] == pid && (s["kind"] == "shell" || s["engine"] == "bash")) {
+        return Err(bad("agent_only: adopt requires an agent session; bash is a shell"));
+    }
     p.insert("pid".into(), json!(pid));
     api(ctx.api.post("/org/adopt", &with_actor(ctx, p)))
 }

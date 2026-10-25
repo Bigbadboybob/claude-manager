@@ -1976,14 +1976,8 @@ pub fn send_input(
         ));
     }
     if !p.submit {
-        // Phase-1 parity with the TUI: only submit=true is
-        // wired. A typing path (no Enter) would need different
-        // semantics around buffering / pending_clear and isn't
-        // needed by any current MCP caller.
-        return Err((
-            ErrorCode::InvalidParams,
-            "submit=false is not yet supported (matches TUI parity)".into(),
-        ));
+        return Err((ErrorCode::InvalidParams,
+            "submit=false is not yet supported (matches TUI parity)".into()));
     }
 
     // Sub-2a Finding #2 TOCTOU fix: auth + Arc clone happen in
@@ -2067,15 +2061,14 @@ pub fn send_input(
         Ok(with_heal(json!({ "ok": true, "delivery": "agent-kitty-async" })))
     } else {
         let mut payload = p.text.into_bytes();
-        payload.push(b'\n'); // submit=false is rejected above, so always Enter
+        payload.push(b'\n');
         handle.write_and_stamp(&payload).map_err(|e| {
             (
                 ErrorCode::Internal,
                 format!("send_input write to PTY: {}", e),
             )
         })?;
-        handle.note_turn_start();
-        Ok(with_heal(json!({ "ok": true })))
+        Ok(with_heal(json!({ "ok": true, "kind": "shell", "submitted": p.submit })))
     }
 }
 
@@ -2469,6 +2462,9 @@ pub fn read_session_output(
 /// honors them as documented above (no-ops for now).
 #[derive(Deserialize, Default)]
 struct ListSessionsParams {
+    /// Agent callers omit shells; operators keep terminal discovery.
+    #[serde(default)]
+    include_shells: Option<bool>,
     /// Future-proofs the wire signature for slice 10e
     /// (manifest ownership flip). Sub-1 accepts but ignores.
     #[serde(default)]
@@ -2511,6 +2507,7 @@ pub fn list_sessions(
         serde_json::from_value(params.clone())
             .map_err(|e| (ErrorCode::InvalidParams, format!("list_sessions params: {}", e)))?
     };
+    let include_shells = p.include_shells.unwrap_or(caller_uid.is_none());
     let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
 
     // Global-permissions grant: a global caller sees EVERY session
@@ -2641,7 +2638,8 @@ pub fn list_sessions(
 
     // Daemon-owned sessions (live PTY in `state.sessions`).
     for (uid, session) in state.sessions.iter() {
-        if !should_include(uid, session.task_id.as_deref()) {
+        if (!include_shells && session.session_type == "bash")
+            || !should_include(uid, session.task_id.as_deref()) {
             continue;
         }
         // Sub-2b-1 review-r#3 #1: single helper computes
@@ -2662,6 +2660,7 @@ pub fn list_sessions(
             "label": session.title,
             "name_revision": state.messaging_names.get(uid).map(|n|n.revision),
             "type": session.session_type,
+            "kind": if session.session_type == "bash" { "shell" } else { "agent" },
             "model": session.model,
             "model_source": session.model_source,
             "effort": session.effort,
@@ -2740,6 +2739,7 @@ pub fn list_sessions(
         return Ok(Value::Array(sessions));
     }
     for (uid, snap) in state.tui_sessions.iter() {
+        if !include_shells && snap.session_type.as_deref() == Some("bash") { continue; }
         if state.sessions.contains_key(uid) {
             continue;
         }
@@ -2764,6 +2764,7 @@ pub fn list_sessions(
         sessions.push(json!({
             "session_uid": uid,
             "label": snap.label.clone().unwrap_or_default(),
+            "kind": if snap.session_type.as_deref() == Some("bash") { "shell" } else { "agent" },
             "type": snap.session_type.clone().unwrap_or_else(|| "claude-code".into()),
             "state": "ready",
             "idle": false,
@@ -2816,13 +2817,14 @@ pub fn list_sessions(
                 .is_allow(),
                 (None, None) => true,
             };
-            if !include {
+            if !include || (!include_shells && tomb.session_type == "bash") {
                 continue;
             }
             sessions.push(json!({
                 "session_uid": uid,
                 "label": tomb.label,
                 "type": tomb.session_type,
+                "kind": if tomb.session_type == "bash" { "shell" } else { "agent" },
                 "model": tomb.model,
                 "model_source": tomb.model_source,
                 "effort": tomb.effort,
@@ -2973,6 +2975,7 @@ pub fn resolve_authorized_session(
         Ok(json!({
             "state": state_str,
             "engine": engine_str(&session.session_type),
+            "kind": if session.session_type == "bash" { "shell" } else { "agent" },
             "transcript_path": session.transcript_path.clone(),
             "generation": session.generation,
             "idle": idle,
@@ -3002,6 +3005,7 @@ pub fn resolve_authorized_session(
         Ok(json!({
             "state": "exited",
             "engine": engine_str(&tomb.session_type),
+            "kind": if tomb.session_type == "bash" { "shell" } else { "agent" },
             "transcript_path": tomb.transcript_path.clone(),
             "generation": tomb.generation,
             "continuous_task_id": tomb.continuous_task_id,
@@ -3690,12 +3694,7 @@ pub fn set_global_perms(
 fn engine_str(session_type: &str) -> &'static str {
     match session_type {
         "codex" => "codex",
-        // The TUI's helper defaults to "claude-code" for
-        // anything not "codex" — `bash` sessions return
-        // "claude-code" too (they have no transcript so the
-        // engine field is moot; Python tool short-circuits on
-        // `transcript_path: None`). Preserve that quirk so
-        // wire shapes match byte-for-byte.
+        "bash" => "bash",
         _ => "claude-code",
     }
 }
@@ -10093,7 +10092,9 @@ pub fn mcp_start_session(
     }
 
     // ux-1c / ux-5c: enrich the agent-facing return.
-    crate::staffing::record_spawn(state_arc, caller_uid, staffing.version);
+    if p.type_ != "bash" {
+        crate::staffing::record_spawn(state_arc, caller_uid, staffing.version);
+    }
     //
     // Pre-fix the caller got `{"session_uid": ...}` and had to guess
     // where the child actually landed — a `start_session(task_id=…)`
@@ -10109,11 +10110,14 @@ pub fn mcp_start_session(
     // decorates only the value `mcp_start_session` hands back.
     let mut response = start_result;
     if let Some(obj) = response.as_object_mut() {
-        obj.insert("staffing_version".into(), json!(staffing.version));
-        obj.insert("session_type".into(), json!(p.type_));
-        if let Some(note) = selection.note {
-            obj.insert("staffing_note".into(), json!(note));
+        obj.insert("kind".into(), json!(if p.type_ == "bash" { "shell" } else { "agent" }));
+        if p.type_ != "bash" {
+            obj.insert("staffing_version".into(), json!(staffing.version));
+            if let Some(note) = selection.note {
+                obj.insert("staffing_note".into(), json!(note));
+            }
         }
+        obj.insert("session_type".into(), json!(p.type_));
         obj.insert(
             "worktree_path".into(),
             Value::String(working_dir.to_string_lossy().into_owned()),
@@ -10183,7 +10187,11 @@ fn live_workspace_co_tenants(
         .sessions
         .iter()
         .filter(|(uid, s)| s.workspace_id == workspace_id && uid.as_str() != exclude_uid)
-        .map(|(uid, s)| json!({ "session_uid": uid, "label": s.title }))
+        .map(|(uid, s)| {
+            let mut peer = json!({ "session_uid": uid, "label": s.title });
+            if s.session_type == "bash" { peer["kind"] = json!("shell"); }
+            peer
+        })
         .collect();
     out.sort_by(|a, b| a["session_uid"].as_str().cmp(&b["session_uid"].as_str()));
     out
@@ -13274,6 +13282,10 @@ pub fn report_done(
                 ),
             )
         })?;
+        if session.session_type == "bash" {
+            return Err((ErrorCode::InvalidParams,
+                "agent_only: report_done requires an agent; bash is a shell, whose commands complete by exiting".into()));
+        }
         let out = (
             session.stamp_reported_done(p.reason.clone()),
             session.continuous_task_id.clone(),
@@ -19245,6 +19257,11 @@ pub fn org(
     };
     let caller_task = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let engine = caller_uid.and_then(|uid| state.sessions.get(uid).map(|s| s.session_type.as_str())
+            .or_else(|| state.tui_sessions.get(uid).and_then(|s| s.session_type.as_deref())));
+        if engine == Some("bash") {
+            return Err((ErrorCode::InvalidParams, "agent_only: org requires an agent session; bash is a shell".into()));
+        }
         org_caller_task(&state, caller_uid)
     };
     let creds = planning_creds(state_arc)?;

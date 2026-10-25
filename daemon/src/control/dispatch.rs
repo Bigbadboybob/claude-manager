@@ -5760,6 +5760,28 @@ mod tests {
         assert_eq!(shell["type"], "bash");
     }
 
+    #[test]
+    fn shell_sessions_are_opt_in_for_agents_and_cannot_report_done() {
+        let state = state_with_session_in_workspace("ts-agent", "ws-1");
+        add_session_typed(&state, "ts-shell", "ws-1", "bash");
+        let list = |params| {
+            let response = dispatch_request(&state, &session_request("list_sessions", params, "ts-agent")).into_response();
+            assert!(response.ok, "{:?}", response.error);
+            response.result.unwrap()
+        };
+        assert!(!list(serde_json::json!({})).as_array().unwrap().iter().any(|s| s["session_uid"] == "ts-shell"));
+        let all = list(serde_json::json!({"include_shells":true}));
+        let shell = all.as_array().unwrap().iter().find(|s| s["session_uid"] == "ts-shell").unwrap();
+        assert_eq!(shell["kind"], "shell");
+        let resolved = super::methods::resolve_authorized_session(&state, &serde_json::json!({"session_uid":"ts-shell"}), None).unwrap();
+        assert_eq!(resolved["engine"], "bash");
+        assert_eq!(resolved["kind"], "shell");
+        let refused = super::methods::report_done(&state, &Caller::session("ts-shell"), &serde_json::json!({})).unwrap_err();
+        assert!(refused.1.contains("bash is a shell"));
+        assert!(super::methods::org(&state, &serde_json::json!({}), Some("ts-shell")).unwrap_err().1.contains("bash is a shell"));
+        assert!(state.lock().unwrap().sessions.contains_key("ts-shell"), "refusal never closes the shell");
+    }
+
     /// Slice 10d-mcp-surface-1 review fix #2 + sub-2b-1 review-r#3 #1:
     /// `state` is one of the Python tool's `ready|pending|exited`
     /// enum (pre-fix it was `"running"`, which the tool didn't

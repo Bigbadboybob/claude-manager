@@ -701,6 +701,7 @@ pub(crate) struct NewTerminalSessionMut<'a> {
 }
 
 pub(crate) struct SessionSettingsMut<'a> {
+    pub is_shell: bool,
     pub ws_index: usize,
     pub session_index: usize,
     pub name: &'a mut String,
@@ -1388,16 +1389,28 @@ pub(crate) fn handle_session_settings(
         KeyCode::Esc => InputOutcome::Cancel,
         KeyCode::Tab => {
             *state.active_field = (*state.active_field + 1) % 8;
+            if state.is_shell && matches!(*state.active_field, 5 | 7) {
+                *state.active_field = (*state.active_field + 1) % 8;
+            }
             InputOutcome::Consumed
         }
         KeyCode::BackTab => {
             *state.active_field = (*state.active_field + 7) % 8;
+            if state.is_shell && matches!(*state.active_field, 5 | 7) {
+                *state.active_field = (*state.active_field + 7) % 8;
+            }
             InputOutcome::Consumed
         }
         // proper-resume: the Transcript field opens the picker; the
         // pick applies the bind itself (the form's other edits are
         // saved on the form's own Enter — save first if you changed
         // them).
+        KeyCode::Enter if state.is_shell && *state.active_field == 7 => {
+            InputOutcome::Status("Shells have no agent transcript".into())
+        }
+        KeyCode::Char(' ') if state.is_shell && *state.active_field == 5 => {
+            InputOutcome::Status("Agent permissions do not apply to a shell".into())
+        }
         KeyCode::Enter if *state.active_field == 7 => {
             InputOutcome::Submit(SubmitAction::OpenTranscriptPickerForSession {
                 ws_index: state.ws_index,
@@ -4091,10 +4104,11 @@ impl App {
                 color,
                 seeded_from_snapshot: _,
                 transcript_id: _,
-                session_type: _,
+                session_type,
                 active_field,
             } => handle_session_settings(
                 SessionSettingsMut {
+                    is_shell: session_type.as_str() == "bash",
                     ws_index: *ws_index,
                     session_index: *session_index,
                     name,
@@ -6451,6 +6465,7 @@ mod input_handler_tests {
         macro_rules! ss {
             () => {
                 SessionSettingsMut {
+                    is_shell: false,
                     ws_index: 3,
                     session_index: 1,
                     name: &mut name,
@@ -7055,6 +7070,30 @@ mod input_handler_tests {
     }
 
     #[test]
+    fn shell_settings_skip_and_refuse_agent_actions() {
+        let (mut name, mut idle, mut burst, mut hidden, mut notify, mut active) = session_settings_state(4);
+        let mut gp = false;
+        let mut color = None;
+        macro_rules! settings {
+            () => { SessionSettingsMut {
+                is_shell: true, ws_index: 0, session_index: 0,
+                name: &mut name, idle_timeout: &mut idle, burst_threshold: &mut burst,
+                hidden: &mut hidden, notify_on_idle: &mut notify,
+                global_perms: &mut gp, color: &mut color, active_field: &mut active,
+            } };
+        }
+        handle_session_settings(settings!(), ctx_no_repos(), &key(KeyCode::Tab));
+        assert_eq!(active, 6, "skip agent permissions");
+        handle_session_settings(settings!(), ctx_no_repos(), &key(KeyCode::Tab));
+        assert_eq!(active, 0, "skip transcript picker");
+        active = 5;
+        assert!(matches!(handle_session_settings(settings!(), ctx_no_repos(), &key(KeyCode::Char(' '))), InputOutcome::Status(_)));
+        assert!(!gp);
+        active = 7;
+        assert!(matches!(handle_session_settings(settings!(), ctx_no_repos(), &key(KeyCode::Enter)), InputOutcome::Status(_)));
+    }
+
+    #[test]
     fn session_settings_tab_cycles_active_field() {
         let (mut name, mut idle, mut burst, mut hidden, mut notify, mut active) =
             session_settings_state(0);
@@ -7062,6 +7101,7 @@ mod input_handler_tests {
             let mut color: Option<String> = None;
         let outcome = handle_session_settings(
             SessionSettingsMut {
+                is_shell: false,
                 ws_index: 1,
                 session_index: 2,
                 name: &mut name,
@@ -7088,6 +7128,7 @@ mod input_handler_tests {
             let mut color: Option<String> = None;
         let outcome = handle_session_settings(
             SessionSettingsMut {
+                is_shell: false,
                 ws_index: 0,
                 session_index: 0,
                 name: &mut name,
@@ -7115,6 +7156,7 @@ mod input_handler_tests {
         hidden = false;
         let outcome = handle_session_settings(
             SessionSettingsMut {
+                is_shell: false,
                 ws_index: 0,
                 session_index: 0,
                 name: &mut name,
@@ -7141,6 +7183,7 @@ mod input_handler_tests {
             let mut color: Option<String> = None;
         let outcome = handle_session_settings(
             SessionSettingsMut {
+                is_shell: false,
                 ws_index: 4,
                 session_index: 9,
                 name: &mut name,
