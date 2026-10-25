@@ -195,6 +195,7 @@ fn served_org(socket: &Path, token: &str, uid: &str) -> (bool, Option<serde_json
         .find(|row| row.get("session_uid").and_then(|v| v.as_str()) == Some(uid))
         .and_then(|row| row.get("org").cloned())
         .filter(|v| !v.is_null());
+    eprintln!("holder_skew_e2e: {uid}: brain org bridge={bridge}, served org={org:?}");
     (bridge, org)
 }
 
