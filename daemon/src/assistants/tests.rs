@@ -621,7 +621,7 @@ fn promote(state: &Arc<Mutex<DaemonState>>, caller: Caller, uid: &str) -> crate:
 fn promoting_an_assistant_makes_it_a_main_with_a_home_and_a_notice() {
     let _env = crate::test_support::env_lock();
     crate::items::org::reset_cache_for_test();
-    members(&[("ca-main", "mem_ep")]);
+    members(&[("ca-main", "mem_ep", "agent")]);
     let root = tempfile::tempdir().unwrap();
     let (url, seen) = crate::items::org::test_stub(|method, path, body| match (method, path) {
         ("POST", "/org/assistants/promote") => (200, json!({
@@ -636,16 +636,12 @@ fn promoting_an_assistant_makes_it_a_main_with_a_home_and_a_notice() {
         let mut st = state.lock().unwrap();
         let mut shell = session("ca-shell", Some("t-sub"), Some("ca-main"), "ws-asst");
         shell.session_type = "bash".into();
-        stamp(&mut shell.org, "mem_ep", "spawn:ca-main");
+        stamp(&mut shell.org, "mem_ep", ASSISTANT, "spawn:ca-main");
         st.sessions.insert("ca-shell".into(), shell);
         let mut cont = session("ca-cont", None, Some("ca-main"), "ws-cont");
         cont.continuous_task_id = Some("x".into());
-        stamp(&mut cont.org, "mem_ep", "spawn:ca-main");
+        stamp(&mut cont.org, "mem_ep", ASSISTANT, "spawn:ca-main");
         st.sessions.insert("ca-cont".into(), cont);
-        let mut worker = session("ca-worker", Some("t-sub"), Some("ca-main"), "ws-worker");
-        stamp(&mut worker.org, "mem_ep", "spawn:ca-main");
-        cm_holder_proto::org::set(&mut worker.org, ACTING_AS, json!("worker"));
-        st.sessions.insert("ca-worker".into(), worker);
     }
     // Refused here before the API is asked.
     for (uid, code) in [("ca-shell", "not_an_agent"), ("ca-main", "already_member"),
@@ -672,6 +668,14 @@ fn promoting_an_assistant_makes_it_a_main_with_a_home_and_a_notice() {
         // The backfill does not turn it back into an assistant.
         assert!(!backfill(&mut st).contains(&"ca-asst".to_string()));
         assert_eq!(stamped_member(st.sessions["ca-asst"].org.as_ref()), None);
+        // Its own record says the same, so a restart before the next beat
+        // (an empty cache) does not make it an assistant again either.
+        let org = st.sessions["ca-asst"].org.clone().unwrap();
+        assert_eq!((org.get(MEMBER_ID), org.get(ACTING_AS)), (Some(&json!("mem_new")), Some(&json!(MAIN))));
+        crate::items::org::reset_cache_for_test();
+        assert!(of_session(&st.sessions["ca-asst"]).is_none());
+        assert!(!backfill(&mut st).contains(&"ca-asst".to_string()));
+        assert!(!st.workspaces["ws-asst"].org.as_ref().unwrap().contains_key(IDLE_SINCE));
     }
     let notice = crate::notifications::get(root.path(), "ca-asst", "org-promoted:mem_new").unwrap().unwrap();
     let text = notice.to_string();

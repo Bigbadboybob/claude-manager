@@ -350,7 +350,11 @@ fn promote(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, mut p: Map<String, Value>
         note_main(&uid, &member);
         let ws_id = match s.sessions.get_mut(&uid) {
             Some(sess) => {
-                crate::assistants::unstamp(&mut sess.org);
+                // A main's record: the stamp's keys now name the new member as
+                // `main`, so neither the spawn stamp nor the backfill re-stamps
+                // it, and the cache (which wins) says the same.
+                crate::assistants::stamp(&mut sess.org, &member_id, crate::assistants::MAIN,
+                                         &format!("promote:{}", if ctx.owner { "operator" } else { ctx.uid.as_deref().unwrap_or("?") }));
                 Some(sess.workspace_id.clone())
             }
             None => None,
@@ -362,7 +366,8 @@ fn promote(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, mut p: Map<String, Value>
             bridge::set(&mut ws.org, bridge::WORKSPACE_KIND, json!("home"));
             bridge::set(&mut ws.org, OFFICE_OF, json!(member_id));
             if let Some(o) = ws.org.as_mut() {
-                o.remove("stream_of");
+                o.remove(crate::assistants::STREAM_OF);
+                o.remove(crate::assistants::IDLE_SINCE);
             }
         }).is_some();
         s.persist_sessions_best_effort();
