@@ -338,6 +338,11 @@ class Handler(BaseHTTPRequestHandler):
             return b.mark_read(self._body())
         if (method, path) == ("POST", "/api/react"):
             return b.react(self._body())
+        if (method, path) == ("POST", "/api/_dev/post"):
+            # Dev only (no real route): an agent posts, as a refresh would see.
+            p = self._body()
+            msg = b._post(p["conversation"], p.get("actor", "agent:hub:scout"), p.get("body", "ping"), now())
+            return {"id": msg["id"]}
         if (method, path) == ("GET", "/api/alerts"):
             return {"items": b.alerts, "seen_supported": True, "alert_hosts": b.alert_hosts}
         if (method, path) == ("POST", "/api/alerts/seen"):

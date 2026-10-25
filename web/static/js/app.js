@@ -9,7 +9,8 @@ import {
 import * as push from "./push.js";
 
 const PAGE = 50;
-const REFRESH_MS = 30_000;
+// `?refresh_ms=` shortens the background refresh for tests (web/dev/keyboard.mjs).
+const REFRESH_MS = Math.max(200, Number(new URLSearchParams(location.search).get("refresh_ms")) || 30_000);
 
 const state = {
   me: null,
@@ -53,6 +54,14 @@ function h(tag, attrs = {}, ...children) {
  *  (the DOM would render them as the text "null"). */
 function put(el, ...children) {
   el.replaceChildren(...children.flat().filter((c) => c !== null && c !== undefined && c !== false));
+}
+
+/** A text field has focus. Background updates then leave focus, the field's
+ *  node and every scroll position alone: on iOS Safari, blurring or replacing
+ *  the focused field (or scrolling it away) dismisses the keyboard. */
+function typing() {
+  const a = document.activeElement;
+  return !!a && a.matches("textarea, input");
 }
 
 function toast(message, error = false) {
@@ -181,8 +190,10 @@ async function openConversation(id, messageId = null) {
     for (let i = 0; messageId && i < 10 && state.conv.next && !state.conv.items.some((m) => m.id === messageId); i += 1) {
       await loadOlder(false);
     }
-    render();
-    scrollConversation(messageId);
+    // In place, not render(): Owner may already be typing in the composer.
+    renderHeader();
+    renderConversation();
+    if (!typing() || messageId) scrollConversation(messageId);
     await loadCounts();
     renderList();
   } catch (e) {
@@ -222,13 +233,14 @@ async function refreshConversation() {
     // Only mark read while the newest message is on screen.
     const page = await api.read({ conversation: c.id, newest_first: true, limit: PAGE, mark_read: c.atBottom });
     if (state.conv !== c) return;
-    const had = c.items.length;
+    const before = JSON.stringify(c.items);
     c.items = mergeItems(c.items, page.items || []);
     learnNames(state.knownNames, { messages: page.items || [] });
-    if (c.items.length !== had || (page.items || []).length) {
+    // Re-render only when something changed (every page used to count).
+    if (JSON.stringify(c.items) !== before) {
       const stick = c.atBottom;
-      renderConversation();
-      if (stick) scrollConversation();
+      renderConversation(true);
+      if (stick && !typing()) scrollConversation();
     }
   } catch (e) {
     fail(e);
@@ -312,7 +324,10 @@ async function sendDraft(c, draft) {
     state.conv.atBottom = true;
   }
   const box = document.querySelector(".composer textarea");
-  if (box) box.value = "";
+  if (box) {
+    box.value = "";
+    autosize(box);
+  }
   await refreshConversation();
   scrollConversation();
 }
@@ -452,6 +467,12 @@ function renderMain() {
 function renderList() {
   const el = document.getElementById("list");
   if (!el) return;
+  // The filter box is built once per list pane: a refresh only redraws the
+  // rows, so a focused filter keeps its node, value and caret.
+  if (el.querySelector(".search input") && document.getElementById("list-rows")) {
+    renderListRows();
+    return;
+  }
   const search = h("div", { class: "search" }, h("input", {
     type: "search", placeholder: "Filter conversations", value: state.query, "aria-label": "Filter",
     // Only the rows re-render, so the input keeps focus while typing.
@@ -539,6 +560,11 @@ function renderConversation(keepScroll = false) {
       : null,
     h("button", { onclick: () => markRead({ conversation: c.id }, "Marked read") }, "Mark read"));
   const list = h("div", { class: "messages" });
+  // The scroller and composer survive a re-render of the same conversation;
+  // only the toolbar and the message list are replaced.
+  const key = draftId(c);
+  let scroller = el.dataset.conv === key ? el.querySelector(":scope > .scroll") : null;
+  let toolbar = scroller ? el.querySelector(":scope > .toolbar") : null;
   if (c.next) list.append(h("button", { class: "older", onclick: () => loadOlder() }, "Load older"));
   let lastDay = "";
   for (const m of c.items) {
@@ -550,10 +576,16 @@ function renderConversation(keepScroll = false) {
     list.append(messageEl(m));
   }
   if (!c.items.length) list.append(h("div", { class: "empty" }, "No messages yet"));
-  const scroller = h("div", { class: "scroll", onscroll: onConversationScroll }, list);
-  put(el, tools, scroller, h("div", { id: "composer" }));
+  if (!scroller || !toolbar) {
+    scroller = h("div", { class: "scroll", onscroll: onConversationScroll });
+    put(el, tools, scroller, h("div", { id: "composer" }));
+    el.dataset.conv = key;
+  } else {
+    toolbar.replaceWith(tools);
+  }
+  put(scroller, list);
   renderComposer();
-  if (keepScroll && prevTop !== undefined) scroller.scrollTop = prevTop;
+  if ((keepScroll || typing()) && prevTop !== undefined) scroller.scrollTop = prevTop;
 }
 
 function onConversationScroll(e) {
@@ -583,39 +615,48 @@ function renderComposer() {
   const el = document.getElementById("composer");
   const c = state.conv;
   if (!el || !c) return;
-  const draft = loadDraft(draftId(c));
+  const key = draftId(c);
+  const draft = loadDraft(key);
   const replyTo = c.replyTo || (draft.reply_to ? c.items.find((m) => m.id === draft.reply_to) : null);
-  const box = h("textarea", {
-    rows: 1, placeholder: `Message ${c.id ? conversationTitle(c.id) : personName(c.dmTo)}`, "aria-label": "Message",
-    oninput: (e) => {
-      const d = loadDraft(draftId(c));
-      d.body = e.target.value;
-      saveDraft(draftId(c), d);
-      autosize(e.target);
-    },
-    onkeydown: (e) => {
-      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-        e.preventDefault();
-        send();
-      }
-    },
-  });
-  box.value = draft.body || "";
-  put(el, 
-    replyTo || draft.reply_to ? h("div", { class: "replying" },
+  // The textarea is built once per draft and then only updated: replacing
+  // the focused field closes the iOS keyboard and loses the caret.
+  let box = el.querySelector("textarea");
+  if (!box || box.dataset.draft !== key) {
+    box = h("textarea", {
+      rows: 1, "aria-label": "Message", "data-draft": key,
+      oninput: (e) => {
+        const d = loadDraft(key);
+        d.body = e.target.value;
+        saveDraft(key, d);
+        autosize(e.target);
+      },
+      onkeydown: (e) => {
+        if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+          e.preventDefault();
+          send();
+        }
+      },
+    });
+    box.value = draft.body || "";
+    put(el, h("div", { class: "composer" }, box, h("button", { class: "primary", onclick: send })));
+    autosize(box);
+  }
+  box.placeholder = `Message ${c.id ? conversationTitle(c.id) : personName(c.dmTo)}`;
+  const button = el.querySelector(".composer button");
+  button.disabled = state.busy.has("send");
+  button.textContent = state.busy.has("send") ? "…" : draft.request_id ? "Retry" : "Send";
+  el.querySelector(":scope > .replying")?.remove();
+  if (replyTo || draft.reply_to) {
+    el.prepend(h("div", { class: "replying" },
       `Replying to ${replyTo ? `${replyTo.actor?.name}: ${truncate(replyTo.body, 60)}` : "a message"}`,
       h("button", { class: "ghost", "aria-label": "Cancel reply", onclick: () => {
         c.replyTo = null;
-        const d = loadDraft(draftId(c));
+        const d = loadDraft(key);
         d.reply_to = null;
-        saveDraft(draftId(c), d);
+        saveDraft(key, d);
         renderComposer();
-      } }, "✕")) : null,
-    h("div", { class: "composer" }, box,
-      h("button", { class: "primary", disabled: state.busy.has("send"), onclick: send },
-        state.busy.has("send") ? "…" : draft.request_id ? "Retry" : "Send")),
-  );
-  autosize(box);
+      } }, "✕")));
+  }
 }
 
 function autosize(t) {
