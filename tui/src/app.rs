@@ -71,6 +71,9 @@ mod availability;
 mod agent_state;
 mod board;
 mod orgchart;
+mod orgchart_teams;
+mod org_model;
+mod roster;
 mod symbols;
 mod owner_blocked;
 mod maintenance;
@@ -283,6 +286,11 @@ pub struct App {
     board: board::Board,
     /// F6 org chart overlay (app/orgchart.rs).
     orgchart: orgchart::OrgChart,
+    /// The org model snapshot (app/org_model.rs), polled only while a
+    /// screen that draws it is open.
+    org: org_model::OrgState,
+    /// The roster screen (app/roster.rs), opened with `R` in F6.
+    roster: roster::Roster,
     owner_blocked: owner_blocked::OwnerBlocked,
     maintenance: maintenance::Maintenance,
     /// Reap requests submitted from the cleanup dialog, tracked after it closed.
@@ -1025,6 +1033,8 @@ impl App {
             availability: availability::Availability::load(),
             board: board::Board::default(),
             orgchart: orgchart::OrgChart::default(),
+            org: org_model::OrgState::default(),
+            roster: roster::Roster::default(),
             owner_blocked: owner_blocked::OwnerBlocked::default(),
             maintenance: maintenance::Maintenance::load(),
             cleanup_jobs: Vec::new(),

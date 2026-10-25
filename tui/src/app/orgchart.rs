@@ -147,6 +147,11 @@ pub(super) enum NodeKind {
     Orchestrator,
     /// A continuous orchestrator's report: its subtask, or a same-task worker.
     Worker,
+    /// An org-model team (F6 from teams, app/orgchart_teams.rs): its lead's
+    /// sessions on top, its members under it.
+    Team,
+    /// An org-model member (or a guest's or vacant member's empty box).
+    Member,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -176,7 +181,39 @@ pub(super) struct ChartNode {
     pub leader: bool,
     /// Sort rank among siblings (coordinator tasks first, then tasks, then
     /// loose workspaces); ties sort by title.
-    rank: u8,
+    pub(super) rank: u8,
+    /// Org-model extras for team and member boxes (F6 from teams).
+    pub card: Option<OrgCard>,
+}
+
+/// What a team or member box adds to a card (app/orgchart_teams.rs).
+#[derive(Clone, Debug, Default)]
+pub(super) struct OrgCard {
+    pub member_id: Option<String>,
+    pub team_id: Option<String>,
+    /// Lines above the sessions (a team box: its lead's handle and title).
+    pub top: Vec<(String, Style)>,
+    /// Lines under the sessions (a team's epic chips).
+    pub bottom: Vec<(String, Style)>,
+    /// Assistants folded under the member (`a` expands them): their
+    /// `(wi, si)`, drawn as one count line with state glyphs.
+    pub folded: Vec<(usize, usize)>,
+    /// The manager's handle when the drawn line doesn't show the manager
+    /// (matrix cases): drawn as a dotted marker.
+    pub matrix: Option<String>,
+    pub guest: bool,
+    /// Standby teams (and suspended members) are drawn greyed.
+    pub greyed: bool,
+    /// Kept by the prune with no session under it (teams, vacant members,
+    /// guests).
+    pub keep: bool,
+}
+
+impl OrgCard {
+    /// Card lines besides the session lines.
+    pub(super) fn lines(&self) -> usize {
+        self.top.len() + self.bottom.len() + usize::from(!self.folded.is_empty())
+    }
 }
 
 /// The org as a tree; `nodes[0]` is Owner.
@@ -186,9 +223,9 @@ pub(super) struct ChartModel {
 }
 
 impl ChartModel {
-    fn push(&mut self, parent: Option<usize>, key: String, kind: NodeKind, title: String, task_id: Option<String>, rank: u8) -> usize {
+    pub(super) fn push(&mut self, parent: Option<usize>, key: String, kind: NodeKind, title: String, task_id: Option<String>, rank: u8) -> usize {
         let i = self.nodes.len();
-        self.nodes.push(ChartNode { key, kind, title, task_id, sessions: Vec::new(), children: Vec::new(), parent, leader: false, rank });
+        self.nodes.push(ChartNode { key, kind, title, task_id, sessions: Vec::new(), children: Vec::new(), parent, leader: false, rank, card: None });
         if let Some(p) = parent {
             self.nodes[p].children.push(i);
         }
@@ -210,13 +247,14 @@ impl ChartModel {
     }
 
     /// Drop nodes with no session in their subtree (Owner always stays).
-    fn prune(self) -> Self {
+    pub(super) fn prune(self) -> Self {
         let n = self.nodes.len();
         let mut keep = vec![false; n];
         // Children always follow their parent, so a reverse pass sees every
         // child before its parent.
         for i in (0..n).rev() {
-            keep[i] = i == 0 || !self.nodes[i].sessions.is_empty() || self.nodes[i].children.iter().any(|&c| keep[c]);
+            let node = &self.nodes[i];
+            keep[i] = i == 0 || !node.sessions.is_empty() || node.card.as_ref().is_some_and(|c| c.keep) || node.children.iter().any(|&c| keep[c]);
         }
         let mut remap = vec![usize::MAX; n];
         let mut out = ChartModel::default();
@@ -235,7 +273,7 @@ impl ChartModel {
         out
     }
 
-    fn sort_children(&mut self) {
+    pub(super) fn sort_children(&mut self) {
         for i in 0..self.nodes.len() {
             let mut kids = std::mem::take(&mut self.nodes[i].children);
             kids.sort_by(|&a, &b| {
@@ -331,9 +369,10 @@ impl Layouter<'_> {
         if self.zoom.detail() != Detail::Full {
             return 1;
         }
-        let n = self.model.nodes[i].sessions.len();
-        let lines = n.clamp(1, self.zoom.max_sessions());
-        2 + lines as i32
+        let node = &self.model.nodes[i];
+        let n = node.sessions.len().min(self.zoom.max_sessions());
+        let extra = node.card.as_ref().map_or(0, OrgCard::lines);
+        2 + (n + extra).max(1) as i32
     }
 
     /// A box's reports in layout order: its stack (one column) first, then
@@ -525,9 +564,10 @@ fn orgchart_activity_legend_line() -> Line<'static> {
 }
 
 /// `?`: every symbol on the chart with its meaning, from `symbols::legend`.
-fn orgchart_legend_line() -> Line<'static> {
+fn orgchart_legend_line(org: bool) -> Line<'static> {
     let mut spans = Vec::new();
-    for (sym, style, word) in symbols::legend() {
+    let org_marks = if org { symbols::org_legend() } else { Vec::new() };
+    for (sym, style, word) in symbols::legend().into_iter().chain(org_marks) {
         spans.push(Span::styled(sym, style));
         spans.push(Span::styled(format!(" {word}  "), Style::default().fg(theme::MUTED)));
     }
@@ -578,6 +618,8 @@ pub(super) struct ChartBoards {
     slugs: Vec<String>,
     /// Open items per board slug.
     pub(super) items: BTreeMap<String, Vec<Value>>,
+    /// Groups (headings and epics, S3) per board slug; absent on old APIs.
+    pub(super) groups: BTreeMap<String, Vec<Value>>,
     /// Last read attempt per board, success or failure, so a failing board
     /// waits its turn instead of starving the rest.
     read_at: HashMap<String, Instant>,
@@ -590,6 +632,36 @@ pub(super) struct ChartBoards {
 }
 
 impl ChartBoards {
+    /// A team's current epics: open epic groups on any board whose team is
+    /// `team_id`, as `(board, group)`.
+    pub(super) fn epics_of(&self, team_id: &str) -> Vec<(String, Value)> {
+        let mut out = Vec::new();
+        for (board, groups) in &self.groups {
+            for g in groups {
+                let open = g["closed_at"].is_null() && matches!(g["epic_status"].as_str(), None | Some("active"));
+                if g["kind"] == "epic" && open && g["team_id"] == team_id {
+                    out.push((board.clone(), g.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// The open items held by any of `uids` or by member `member_id`
+    /// (holders carry `member_id` once S6 stamps it), by board then number.
+    pub(super) fn held_by_member(&self, member_id: &str, uids: &[&str]) -> Vec<HeldItem> {
+        let mut out = Vec::new();
+        for (board, items) in &self.items {
+            for item in items {
+                let holds = item["holders"].as_array().into_iter().flatten().any(|h| h["member_id"] == member_id || h["session_uid"].as_str().is_some_and(|u| uids.contains(&u)));
+                if holds {
+                    out.push(HeldItem { board: board.clone(), item: item.clone() });
+                }
+            }
+        }
+        out
+    }
+
     /// The open items session `uid` holds, by board then number.
     pub(super) fn held_by(&self, uid: &str) -> Vec<HeldItem> {
         let mut out = Vec::new();
@@ -627,6 +699,8 @@ pub(super) struct OrgChart {
     /// (the branch's head or any box under it, or a stacked box).
     pub(super) branch_focus: HashMap<String, String>,
     pub(super) show_bash: bool,
+    /// Members whose assistants are shown one per line (`a`), by member id.
+    pub(super) expanded: HashSet<String>,
     /// The bash session the chart was opened on: shown while bash is
     /// hidden, until the chart closes or `b` is pressed.
     pub(super) bash_uid: Option<String>,
@@ -659,8 +733,17 @@ pub(super) struct OrgChart {
 
 impl App {
 
-    /// Build the chart from the live session state.
+    /// Build the chart: from teams and managers when the org model is live
+    /// (app/orgchart_teams.rs), else from the task tree.
     pub(super) fn org_model(&self, show_bash: bool) -> ChartModel {
+        match self.org_live() {
+            Some(snap) => self.team_chart_model(snap, show_bash),
+            None => self.task_chart_model(show_bash),
+        }
+    }
+
+    /// The chart from the task tree and the live session state.
+    pub(super) fn task_chart_model(&self, show_bash: bool) -> ChartModel {
         let mut m = ChartModel::default();
         let owner = m.push(None, "owner".into(), NodeKind::Owner, "Owner".into(), None, 0);
         // The one bash session the chart was opened on shows even with bash hidden.
@@ -924,9 +1007,21 @@ impl App {
                 self.orgchart.bash_uid = Some(uid.clone());
             }
         }
+        self.org_refresh_soon();
         // Start on the sidebar's focus: its session, else the box for its
         // task or workspace header, else Owner. Never the last visit's focus.
-        let model = self.org_model(self.orgchart.show_bash);
+        let mut model = self.org_model(self.orgchart.show_bash);
+        // A folded assistant: open its member's assistants.
+        if let Some(uid) = uid.as_deref().filter(|u| model.find_session(u).is_none()) {
+            let owner = model.nodes.iter().find_map(|n| {
+                let c = n.card.as_ref()?;
+                c.folded.iter().any(|&(wi, si)| self.workspaces.get(wi).and_then(|w| w.sessions.get(si)).is_some_and(|t| t.uid == uid)).then(|| c.member_id.clone()).flatten()
+            });
+            if let Some(id) = owner {
+                self.orgchart.expanded.insert(id);
+                model = self.org_model(self.orgchart.show_bash);
+            }
+        }
         let start = match (&uid, &self.cursor) {
             (Some(uid), _) if model.find_session(uid).is_some() => model.find_session(uid).map(|(i, _)| (i, Some(uid.clone()))),
             (_, Cursor::Task { task_id, .. }) => model.find(&format!("task:{task_id}")).map(|i| (i, None)),
@@ -1148,8 +1243,8 @@ impl App {
         match (pending, key.code) {
             (Some('g'), KeyCode::Char('g')) => self.orgchart_set_focus(&model, 0),
             (Some('z'), KeyCode::Char('M')) => {
-                // Fold every project, split and division (zo then opens one level).
-                for n in model.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Project | NodeKind::Org) && !n.children.is_empty()) {
+                // Fold every project, split, division and team (zo then opens one level).
+                for n in model.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Project | NodeKind::Org | NodeKind::Team) && !n.children.is_empty()) {
                     self.orgchart.folds.insert(n.key.clone());
                 }
                 self.orgchart.follow.set(true);
@@ -1306,6 +1401,21 @@ impl App {
                 self.orgchart.follow.set(true);
             }
             (_, KeyCode::Char('c')) => self.orgchart_centre(&model),
+            (_, KeyCode::Char('a')) => {
+                // A member's assistants: one line each, or folded to a count.
+                let node = &model.nodes[focus];
+                let member = node.card.as_ref().and_then(|c| c.member_id.clone().filter(|id| !c.folded.is_empty() || self.orgchart.expanded.contains(id)));
+                match member {
+                    Some(id) if self.orgchart.expanded.remove(&id) => self.orgchart.status = "Assistants folded".into(),
+                    Some(id) => {
+                        self.orgchart.expanded.insert(id);
+                        self.orgchart.status = "Assistants shown (a folds them)".into();
+                    }
+                    None => self.orgchart.status = "No assistants here".into(),
+                }
+                self.orgchart.follow.set(true);
+            }
+            (_, KeyCode::Char('R')) => self.open_roster(),
             (_, KeyCode::Char('?')) => {
                 self.orgchart.legend = !self.orgchart.legend;
                 self.orgchart.follow.set(true);
@@ -1358,6 +1468,7 @@ impl App {
                     b.slugs = v.as_array().into_iter().flatten().filter_map(|x| x["slug"].as_str().map(str::to_owned)).collect();
                     let slugs = b.slugs.clone();
                     b.items.retain(|s, _| slugs.contains(s));
+                    b.groups.retain(|s, _| slugs.contains(s));
                     b.read_at.retain(|s, _| slugs.contains(s));
                     b.read_errors.retain(|s, _| slugs.contains(s));
                 }
@@ -1365,7 +1476,8 @@ impl App {
                     b.read_errors.remove(&slug);
                     b.read_at.insert(slug.clone(), Instant::now());
                     if v["unchanged"] != true {
-                        b.items.insert(slug, v["items"].as_array().cloned().unwrap_or_default());
+                        b.items.insert(slug.clone(), v["items"].as_array().cloned().unwrap_or_default());
+                        b.groups.insert(slug, v["groups"].as_array().cloned().unwrap_or_default());
                     }
                 }
             }
@@ -1439,7 +1551,7 @@ impl App {
         let body = Rect::new(inner.x, inner.y, inner.width, inner.height - 1 - legend_rows);
         if legend_rows == 2 {
             let legend_area = Rect::new(inner.x, inner.y + inner.height - 3, inner.width, 2);
-            frame.render_widget(Paragraph::new(vec![orgchart_legend_line(), orgchart_activity_legend_line()]), legend_area);
+            frame.render_widget(Paragraph::new(vec![orgchart_legend_line(self.org_live().is_some()), orgchart_activity_legend_line()]), legend_area);
         }
         let (chart_area, info_area) = if self.orgchart.hide_info {
             (body, None)
@@ -1593,8 +1705,11 @@ impl App {
                     put(buf, p.x + p.w - tail.chars().count() as i32, p.y, &tail, focus_bg(Style::default().fg(theme::MUTED)));
                 }
                 Detail::Full => {
+                    let greyed = node.card.as_ref().is_some_and(|c| c.greyed);
                     let border = if focused {
                         Style::default().fg(theme::ATTN).add_modifier(Modifier::BOLD)
+                    } else if greyed {
+                        Style::default().fg(theme::DIM)
                     } else if header {
                         Style::default().fg(theme::HEADER)
                     } else {
@@ -1606,7 +1721,13 @@ impl App {
                     let crown = if owner.is_some() { 2 } else { 0 };
                     let title = crate::planning::truncate_with_ellipsis(&node.title, w.saturating_sub(5 + crown + fold_tag.chars().count()));
                     put(buf, p.x, p.y, &format!("\u{256d}{}\u{256e}", "\u{2500}".repeat(w - 2)), border);
-                    let title_style = if header { Style::default().fg(theme::HEADER).add_modifier(Modifier::BOLD) } else { Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD) };
+                    let title_style = if greyed {
+                        Style::default().fg(theme::DIM)
+                    } else if header {
+                        Style::default().fg(theme::HEADER).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
+                    };
                     if owner.is_some() {
                         put(buf, p.x + 2, p.y, " ", title_style);
                         put(buf, p.x + 3, p.y, symbols::OWNER, symbols::owner_style());
@@ -1619,9 +1740,48 @@ impl App {
                         put(buf, p.x + p.w - 1, p.y + row, "\u{2502}", border);
                     }
                     put(buf, p.x, p.y + p.h - 1, &format!("\u{2570}{}\u{256f}", "\u{2500}".repeat(w - 2)), border);
+                    // Org cards (F6 from teams): lines above and below the
+                    // sessions, and the folded assistants.
+                    let card = node.card.as_ref();
+                    let top = card.map_or(&[][..], |c| c.top.as_slice());
+                    for (k, (text, style)) in top.iter().enumerate() {
+                        let style = if greyed { Style::default().fg(theme::DIM) } else { *style };
+                        put(buf, p.x + 2, p.y + 1 + k as i32, &crate::planning::truncate_with_ellipsis(text, w - 4), style);
+                    }
+                    let first_y = p.y + 1 + top.len() as i32;
+                    let n = node.sessions.len();
+                    let max = self.orgchart.zoom.max_sessions();
+                    let shown = if n > max { max - 1 } else { n };
+                    if let Some(c) = card {
+                        let mut y = first_y + n.min(max) as i32;
+                        if !c.folded.is_empty() {
+                            let mut x = p.x + 2;
+                            for (text, style) in self.assistants_line(&c.folded, now) {
+                                if x + text.chars().count() as i32 > p.x + p.w - 2 {
+                                    break;
+                                }
+                                put(buf, x, y, &text, style);
+                                x += text.chars().count() as i32;
+                            }
+                            y += 1;
+                        }
+                        for (text, style) in &c.bottom {
+                            put(buf, p.x + 2, y, &crate::planning::truncate_with_ellipsis(text, w - 4), *style);
+                            y += 1;
+                        }
+                    }
+                    if node.sessions.is_empty() && card.is_some_and(|c| c.lines() > 0) {
+                        if focused {
+                            put(buf, p.x + 1, p.y + 1, " ", focus_bg(Style::default()));
+                        }
+                        continue;
+                    }
                     if node.sessions.is_empty() {
                         let text = match node.kind {
-                            NodeKind::Owner => format!("{} \u{00b7} {}", plural(node.children.len(), "project"), plural(model.subtree_sessions(i), "session")),
+                            NodeKind::Owner => {
+                                let word = if self.org_live().is_some() { "report" } else { "project" };
+                                format!("{} \u{00b7} {}", plural(node.children.len(), word), plural(model.subtree_sessions(i), "session"))
+                            }
                             NodeKind::Project => format!("{} \u{00b7} {}", plural(model.subtree_sessions(i), "session"), node.children.iter().map(|&c| model.nodes[c].title.as_str()).collect::<Vec<_>>().join(" + ")),
                             NodeKind::Org => format!("{} \u{00b7} {}", plural(node.children.len(), "report"), plural(model.subtree_sessions(i), "session")),
                             _ => "no session here".into(),
@@ -1646,9 +1806,6 @@ impl App {
                         }
                         continue;
                     }
-                    let n = node.sessions.len();
-                    let max = self.orgchart.zoom.max_sessions();
-                    let shown = if n > max { max - 1 } else { n };
                     // Keep the selected session on screen inside a long box.
                     let first = match selected {
                         Some(s) if s >= shown => s + 1 - shown,
@@ -1657,7 +1814,7 @@ impl App {
                     for (row, k) in (first..(first + shown).min(n)).enumerate() {
                         let s = &node.sessions[k];
                         let Some(ts) = self.chart_ts(s) else { continue };
-                        let y = p.y + 1 + row as i32;
+                        let y = first_y + row as i32;
                         let sel = selected == Some(k);
                         let bg = |st: Style| if sel { st.bg(theme::SELECT_BG) } else { st };
                         let (g, gs) = self.chart_glyph(ts, now);
@@ -1694,7 +1851,7 @@ impl App {
                     }
                     if n > shown {
                         let more = n - shown;
-                        put(buf, p.x + 4, p.y + p.h - 2, &format!("+{more} more (Tab)"), Style::default().fg(theme::DIM));
+                        put(buf, p.x + 4, first_y + shown as i32, &format!("+{more} more (Tab)"), Style::default().fg(theme::DIM));
                     }
                 }
             }
@@ -1724,8 +1881,17 @@ impl App {
                 None => b.title.clone(),
             }
         };
+        // Team and member boxes (F6 from teams) open with their org facts;
+        // the member's items are listed there, not again per session.
+        let card_lines = node.card.as_ref().map(|c| self.org_card_info(node, c, width)).unwrap_or_default();
+        let member_items = node.card.as_ref().is_some_and(|c| c.member_id.is_some()) && !card_lines.is_empty();
+        let has_card = !card_lines.is_empty();
+        lines.extend(card_lines);
         let picked = self.orgchart_selected(node);
         let Some(s) = node.sessions.get(picked).cloned() else {
+            if has_card {
+                return lines;
+            }
             lines.push(Line::styled(node.title.clone(), Style::default().fg(theme::HEADER).add_modifier(Modifier::BOLD)));
             let kind = match node.kind {
                 NodeKind::Owner => "owner",
@@ -1815,6 +1981,9 @@ impl App {
         lines.push(Line::from(vec![label("host"), Span::styled(format!("{mark} "), mark_style), text(host)]));
         let wt = ws.worktree_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "—".into());
         lines.push(Line::from(vec![label("worktree"), text(wt)]));
+        if member_items {
+            return lines;
+        }
         lines.push(Line::from(""));
         let held = self.orgchart.boards.held_by(&ts.uid);
         let b = &self.orgchart.boards;
@@ -1868,7 +2037,13 @@ impl App {
                 Span::styled(format!("  {}", c.status), Style::default().fg(theme::MUTED)),
             ]);
         }
-        let help = "h/l sibling  j child  k boss  gg/G  Tab session  / n N  Space fold  zM/zR orgs  +/- zoom  HJKL pan  c centre  b bash  i info  ? legend  Enter go  F6 close";
+        let help = if self.org_live().is_some() {
+            "h/l sibling  j child  k boss  gg/G  Tab session  a assistants  R roster  / n N  Space fold  zM/zR teams  +/- zoom  HJKL pan  c centre  b bash  i info  ? legend  Enter go  F6 close"
+        } else if self.org.support == super::org_model::Support::On {
+            "h/l sibling  j child  k boss  gg/G  Tab session  R roster  / n N  Space fold  zM/zR orgs  +/- zoom  HJKL pan  c centre  b bash  i info  ? legend  Enter go  F6 close"
+        } else {
+            "h/l sibling  j child  k boss  gg/G  Tab session  / n N  Space fold  zM/zR orgs  +/- zoom  HJKL pan  c centre  b bash  i info  ? legend  Enter go  F6 close"
+        };
         let mut text = if c.status.is_empty() { help.to_owned() } else { format!("{}  \u{00b7}  {help}", c.status) };
         if let Some(p) = c.pending {
             text = format!("{p}…  {text}");

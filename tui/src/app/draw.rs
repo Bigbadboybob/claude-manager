@@ -124,6 +124,12 @@ impl App {
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
+        if self.roster.visible {
+            self.draw_roster(frame);
+            self.global_settings.draw(frame, frame.area());
+            self.draw_availability(frame, frame.area());
+            return;
+        }
         if self.orgchart.visible {
             self.draw_orgchart(frame);
             self.global_settings.draw(frame, frame.area());

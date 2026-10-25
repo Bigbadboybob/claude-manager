@@ -78,6 +78,13 @@ pub(crate) fn owner_label(stand_in: bool) -> &'static str {
     if stand_in { "Owner (stand-in)" } else { "Owner" }
 }
 
+/// Org model marks (F6 from teams): a team's current epic chip, a guest
+/// member, a manager the drawn line doesn't show (matrix), a vacant member.
+pub(crate) const EPIC: &str = "\u{27d0}";
+pub(crate) const GUEST: &str = "\u{22b9}";
+pub(crate) const MATRIX: &str = "\u{22ef}";
+pub(crate) const VACANT: &str = "\u{2205}";
+
 /// A board item that carries a flag (holder idle, overdue, …).
 pub(crate) const FLAG: &str = "\u{2691}";
 
@@ -178,6 +185,16 @@ pub(crate) fn legend() -> Vec<(String, Style, &'static str)> {
     out
 }
 
+/// The org model's marks, for the legend when F6 draws teams.
+pub(crate) fn org_legend() -> Vec<(String, Style, &'static str)> {
+    vec![
+        (EPIC.to_owned(), Style::default().fg(theme::HEADER), "epic"),
+        (GUEST.to_owned(), Style::default().fg(theme::MUTED), "guest"),
+        (MATRIX.to_owned(), Style::default().fg(theme::MUTED), "manager elsewhere"),
+        (VACANT.to_owned(), Style::default().fg(theme::DIM), "vacant"),
+    ]
+}
+
 /// The activity badge's marks with their meanings: the legend's second line.
 pub(crate) fn activity_legend() -> Vec<(String, Style, &'static str)> {
     let mut out = Vec::new();
@@ -204,7 +221,7 @@ mod tests {
     #[test]
     fn every_symbol_is_one_cell_wide_even_in_cjk_terminals() {
         use unicode_width::UnicodeWidthStr;
-        let mut all: Vec<(String, &str)> = legend().into_iter().chain(activity_legend()).map(|(s, _, w)| (s, w)).collect();
+        let mut all: Vec<(String, &str)> = legend().into_iter().chain(activity_legend()).chain(org_legend()).map(|(s, _, w)| (s, w)).collect();
         all.extend([(engine("other").0.to_owned(), "unknown engine"), (board_status("weird").0.to_owned(), "unknown status"), (HEADER_BOX.to_owned(), "header box")]);
         for (s, word) in all {
             assert_eq!(Span::raw(s.clone()).width(), 1, "{word}: {s:?}");
@@ -215,7 +232,7 @@ mod tests {
     #[test]
     fn glyphs_do_not_double_up() {
         // ◆ is the division header and the owner-blocked blink only.
-        let marks: Vec<String> = legend().into_iter().chain(activity_legend()).map(|(s, _, _)| s).collect();
+        let marks: Vec<String> = legend().into_iter().chain(activity_legend()).chain(org_legend()).map(|(s, _, _)| s).collect();
         assert!(!marks.contains(&DIVISION.to_owned()), "{marks:?}");
         assert!(!marks.contains(&HEADER_BOX.to_owned()) && HEADER_BOX != DIVISION);
         let unique: std::collections::HashSet<&String> = marks.iter().collect();

@@ -3010,6 +3010,7 @@ impl App {
         self.needs_redraw = true;
         if self.global_settings.handle_event(event) { return true; }
         if self.availability_event(event) { return true; }
+        if self.roster_event(event) { return true; }
         if self.orgchart_event(event) { return true; }
         if self.board_event(event) { return true; }
         // Alt+M toggles mouse capture, including while Messages is open.
