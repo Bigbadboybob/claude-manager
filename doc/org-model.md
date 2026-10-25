@@ -1,7 +1,7 @@
 # Org model: members, teams, epics and items
 
 Status: **final draft, review round 4 folded** (Swarm-Coord, 2026-10-25).
-Owner-directed; Owner has decided O1 and O2; O3 and O4 are open (§15). Inputs are listed in §18.
+Owner-directed; Owner has decided O1–O4 (§15). Inputs are listed in §18.
 The interviews are a purposive sample (eight sessions, mostly the trader org
 plus CM and scraper triage), not an org-wide vote. EP answered only the group
 question, and the Codex implementation worker has not replied.
@@ -1081,8 +1081,8 @@ viewers never poll.
   member id beside every pid.
 - **O2. An epic's PoC leads a real team — decided (Owner, 2026-10-25).** Not
   routing-only. Staffing is explicit (§7.3).
-- **O3. Link-first for tasks and items in v1 — open; Owner wants more context.**
-  Proceeding with link-first meanwhile.
+- **O3. Link-first for tasks and items in v1 — decided (Owner, 2026-10-25):**
+  link now, decide on a merge later using the evidence listed below.
 
   Today there are two kinds of work row: **tasks** (the planning view's
   backlog: what Owner files and launches) and **board items** (what agents
@@ -1114,7 +1114,7 @@ viewers never poll.
   - *Deciding later* uses: how often Owner moves work across boards, how often
     a single list is missed despite the "on boards" section, and the friction
     of placed tasks appearing twice.
-- **O4. Only deliberate hires are members — open.** One-shot workers
+- **O4. Only deliberate hires are members — decided (Owner, 2026-10-25).** One-shot workers
   (reviewers, bench runners, subtask workers, `detective-*`) are assistants:
   folded under their member on F6 as a count, with no handle, profile or
   vacancy flag, and not returned by `who`. Scale: about 180 agent-minted
@@ -1128,6 +1128,16 @@ viewers never poll.
     profiles and evidence fragmented across short-lived members.
   - *Recommendation:* deliberate hires (§4.2), with promotion (CM suggests it
     for an assistant alive 3 days that holds items as owner).
+  - *A one-off that needs its own worktree* is an assistant with an
+    **ephemeral workspace** (`isolated=true` or branch-mode `create_subtask`,
+    as today): its own checkout and `cm-sub/…` branch, owned by the member it
+    works for. It closes when its work is done, the assistant has ended, and
+    the reaper's protections pass (no live process, not dirty, evidence
+    released); the branch is kept, as today. If the branch is still needed
+    after the assistant ends (e.g. waiting on review), the member keeps it as
+    a `stream` workspace. If the assistant turns out to be long-lived, it is
+    promoted: it becomes a member, keeps its session and context, and its
+    ephemeral workspace becomes that member's home workspace.
 
 ### 15.2 Design decisions (override any)
 
