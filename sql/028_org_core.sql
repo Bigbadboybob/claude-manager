@@ -13,6 +13,13 @@
 -- deadlock against one that writes initiatives and then members), makes the
 -- org_changes seq commit-ordered like task_changes, and serialises the
 -- manager and parent-team cycle checks below.
+--
+-- The lock comes FIRST, before the ALTERs below take AccessExclusive on
+-- initiatives. Otherwise the seed INSERT (whose statement trigger takes the
+-- lock) waits on a live API transaction that holds the lock and wants
+-- initiatives, and the migration deadlocks. init_db sends this file as one
+-- simple query, so the lock is held to its end.
+SELECT pg_advisory_xact_lock(hashtext('cm_task_changes'));
 
 -- ---- teams: initiatives evolve in place ------------------------------------
 
@@ -54,6 +61,13 @@ BEGIN
                       AND conrelid = 'initiatives'::regclass) THEN
         ALTER TABLE initiatives ADD CONSTRAINT initiatives_kind_check
             CHECK (kind IN ('initiative', 'division', 'team'));
+    END IF;
+    -- Only a team may be taskless (every older row has a coordinator).
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                    WHERE conname = 'initiatives_team_coordinator_check'
+                      AND conrelid = 'initiatives'::regclass) THEN
+        ALTER TABLE initiatives ADD CONSTRAINT initiatives_team_coordinator_check
+            CHECK (kind = 'team' OR coordinator_task_id IS NOT NULL);
     END IF;
 END $$;
 
@@ -173,11 +187,12 @@ CREATE INDEX IF NOT EXISTS idx_org_events_subject ON org_events (subject_type, s
 
 -- Idempotent writes: a retried request_id returns the stored response.
 CREATE TABLE IF NOT EXISTS org_requests (
-    request_id TEXT PRIMARY KEY,
     actor_pid  TEXT NOT NULL,
     method     TEXT NOT NULL,
+    request_id TEXT NOT NULL,
     response   JSONB NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (actor_pid, method, request_id)
 );
 
 -- Roster proposals Owner declined, so they stop being proposed.

@@ -53,6 +53,12 @@ class MigrationText(unittest.TestCase):
         self.assertNotRegex(body, r"CREATE (UNIQUE )?INDEX (?!IF NOT EXISTS)")
         self.assertNotRegex(body, r"CREATE TRIGGER")
 
+    def test_the_feed_lock_is_the_first_statement(self):
+        # Before the ALTERs take AccessExclusive on initiatives (review #13).
+        text = (ROOT / "sql" / "028_org_core.sql").read_text()
+        body = [l for l in text.splitlines() if l.strip() and not l.lstrip().startswith("--")]
+        self.assertEqual(body[0], "SELECT pg_advisory_xact_lock(hashtext('cm_task_changes'));")
+
     def test_migration_number_is_unique(self):
         self.assertEqual(len(list((ROOT / "sql").glob("028_*.sql"))), 1)
 
@@ -78,6 +84,18 @@ class Helpers(unittest.TestCase):
         self.assertEqual(org_db.lead_session("gone", rows), early)
         self.assertEqual(org_db.lead_session(" Owner ", rows), "owner")
         self.assertIsNone(org_db.lead_session(None, rows[2:]))
+
+    def test_aliases_are_normalised_and_never_reserved_words(self):
+        self.assertEqual(org_db.normalize_alias("Bug_Triage-orchestrator"), "bug-triage-orchestrator")
+        for word in ("here", "ALL", "owner", "-"):
+            self.assertIsNone(org_db.normalize_alias(word))
+
+    def test_database_errors_always_map_to_org_errors(self):
+        import asyncpg
+        fk = org_db._db_error(asyncpg.ForeignKeyViolationError("insert violates foreign key"))
+        self.assertEqual((fk.status, fk.code), (422, "unknown_ref"))
+        other = org_db._db_error(asyncpg.NotNullViolationError("null value"))
+        self.assertEqual((other.status, other.code), (409, "conflict"))
 
 
 @unittest.skipUnless(DSN, "set CM_ORG_TEST_DSN to a scratch Postgres database")
@@ -201,6 +219,61 @@ class OrgApiDb(unittest.IsolatedAsyncioTestCase):
                 await conn.execute("INSERT INTO initiatives (slug, name, kind) VALUES ('t2', 'T2', 'squad')")
             with self.assertRaises(Exception):  # only Owner has no manager
                 await conn.execute("INSERT INTO members (id, handle, kind) VALUES ('mem_x', 'xx', 'agent')")
+            with self.assertRaises(Exception):  # only a team may be taskless
+                await conn.execute("INSERT INTO initiatives (slug, name, kind) VALUES ('i3', 'I3', 'initiative')")
+        # Old clients listing initiatives never see a taskless team.
+        self.assertNotIn("t1", [i["slug"] for i in await db.list_initiatives(self.pool)])
+        self.assertIn("t1", [i["slug"] for i in await db.list_initiatives(self.pool, kind="team")])
+
+    async def test_the_migration_waits_for_a_live_writer_instead_of_deadlocking(self):
+        # Review #13: a live transaction holding the feed lock that then
+        # touches initiatives used to deadlock against a re-running 028.
+        writer = await self.pool.acquire()
+        try:
+            tx = writer.transaction()
+            await tx.start()
+            await writer.execute("SELECT pg_advisory_xact_lock(hashtext('cm_task_changes'))")
+            migration = asyncio.ensure_future(self.pool.execute(
+                (ROOT / "sql" / "028_org_core.sql").read_text()))
+            await asyncio.sleep(0.5)
+            await writer.execute("UPDATE initiatives SET updated_at = now() WHERE false")
+            await tx.commit()
+            await asyncio.wait_for(migration, 20)
+        finally:
+            await self.pool.release(writer)
+
+    async def test_a_team_takes_its_coordinator_task_once(self):
+        root = await self.task("team root")
+        r = await self.http.post("/org/teams", json={"actor": OWNER, "name": "Anchored",
+                                                     "kind": "initiative", "coordinator_task_id": root})
+        self.assertEqual(r.status_code, 200, r.text)
+        async with self.pool.acquire() as conn:
+            attached = await conn.fetchval("SELECT initiative_id::text FROM tasks WHERE id = $1",
+                                           uuid.UUID(root))
+        self.assertEqual(attached, r.json()["id"])
+        r = await self.http.post("/org/teams", json={"actor": OWNER, "name": "Second",
+                                                     "kind": "initiative", "coordinator_task_id": root})
+        self.assertEqual((r.status_code, r.json()["detail"]["code"]), (409, "coordinator_taken"))
+        r = await self.http.post("/org/teams", json={"actor": OWNER, "name": "Ghost", "kind": "initiative",
+                                                     "coordinator_task_id": str(uuid.uuid4())})
+        self.assertEqual((r.status_code, r.json()["detail"]["code"]), (422, "unknown_ref"))
+        # An unknown parent on edit is a clean 422, not a 500.
+        team = (await self.http.post("/org/teams", json={"actor": OWNER, "name": "Loose"})).json()
+        r = await self.http.patch(f"/org/teams/{team['id']}", json={
+            "actor": OWNER, "parent_team_id": str(uuid.uuid4())})
+        self.assertEqual((r.status_code, r.json()["detail"]["code"]), (422, "unknown_team"))
+
+    async def test_request_ids_are_per_actor_and_method(self):
+        body = {"actor": OWNER, "name": "Once", "request_id": "rq-1"}
+        first = (await self.http.post("/org/teams", json=body)).json()
+        again = (await self.http.post("/org/teams", json=body)).json()
+        self.assertEqual(first["id"], again["id"])
+        other = await self.http.post("/org/teams", json={**body, "name": "Twice",
+                                                         "actor": {"pid": pid("x")}})
+        self.assertEqual(other.status_code, 403, other.text)  # not someone else's replay
+        r = await self.http.patch(f"/org/teams/{first['id']}", json={
+            "actor": OWNER, "charter": "c", "request_id": "rq-1"})
+        self.assertEqual((r.status_code, r.json()["charter"]), (200, "c"))  # another method
 
     async def test_manager_cycles_are_refused_in_the_writing_transaction(self):
         await self.swarm()
@@ -465,6 +538,27 @@ class OrgApiDb(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.json()["member"]["revision"], 2)
         events = (await self.http.get("/org/events", params={"subject_type": "member"})).json()
         self.assertEqual((events[0]["type"], events[0]["reason"]), ("move", "promote"))
+
+    async def test_a_team_only_move_leaves_the_manager_alone(self):
+        await self.swarm()
+        roster = await self.roster()
+        await self.apply([{"proposal_id": p["proposal_id"]} for p in roster["proposals"]])
+        team = (await self.http.post("/org/teams", json={"actor": OWNER, "name": "Side"})).json()
+        async with self.pool.acquire() as conn:
+            # A retired manager would refuse any write that fires the
+            # manager trigger; a team-only move must not.
+            await conn.execute("UPDATE members SET status = 'retired' WHERE handle = 'swarm-coord'")
+        r = await self.http.post("/org/members/org/move", json={
+            "actor": OWNER, "primary_team_id": team["id"], "reason": "side quest"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["member"]["primary_team_id"], team["id"])
+
+    async def test_an_idle_heartbeat_does_not_wait_for_the_feed_lock(self):
+        await self.beat(D1, [{"uid": uid_at(2)}])
+        async with self.pool.acquire() as holder:
+            async with holder.transaction():
+                await holder.execute("SELECT pg_advisory_xact_lock(hashtext('cm_task_changes'))")
+                await asyncio.wait_for(self.beat(D1, [{"uid": uid_at(2)}], acked_mark_ids=[999]), 5)
 
 
 if __name__ == "__main__":

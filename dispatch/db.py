@@ -436,6 +436,10 @@ async def list_initiatives(
         if kind:
             params.append(kind)
             conditions.append(f"i.kind = ${len(params)}")
+        else:
+            # Taskless teams (org model S2) are listed only when asked for:
+            # older clients assume every initiative has a coordinator task.
+            conditions.append("i.kind <> 'team'")
         if project:
             params.append(project)
             conditions.append(

@@ -20,8 +20,12 @@ keyed by participant id, and session scope is unchanged until S6/S7.
 Two triggers refuse manager cycles, unknown or retired managers, and parent-team
 cycles in the same transaction, with `409 {code: "cycle" | "unknown_manager" | …}`.
 Every org write takes the task feed's advisory lock, so cycle checks serialize
-and `org_changes.seq` is commit-ordered. The migration is idempotent and makes
-no row UPDATEs. It seeds `mem_owner` (handle `owner`).
+and `org_changes.seq` is commit-ordered. The migration takes that lock as its
+first statement, before its ALTERs lock `initiatives`, so it waits for live API
+writers instead of deadlocking with them. It is idempotent, makes no row
+UPDATEs, and seeds `mem_owner` (handle `owner`). A CHECK keeps every kind but
+`team` tied to a coordinator task, and `GET /initiatives` leaves out teams
+unless `kind=team` is asked for, so older clients never meet a taskless row.
 
 ## HTTP (`api/org.py`, prefix `/org`)
 
@@ -32,12 +36,24 @@ alias, `main/<handle>` or `owner`), `/teams/{id|slug}`, `/roster`, `/events`.
 
 Writes. The daemon stamps `actor`, and Owner is pid `owner`.
 
+**Trust model.** "Owner-only" is enforced by the daemon, not by the API. The
+daemon sends pid `owner` only for operator-socket callers, which carry the
+operator token. The API sits behind the shared bearer token and trusts
+`actor.pid` as sent, so any holder of that token could claim to be Owner. In S2
+this is cooperative, like the items API. A real server-side check is a tracked
+S6/S7 item.
+
 | Call | Who | Notes |
 |---|---|---|
-| `POST /roster/apply {rows:[{proposal_id, approve?, handle?, kind?, title?, team_id?, manager?, home_workspace?}], request_id}` | Owner | Each row is applied in its own transaction against a fresh generation. Per-row rejections are `stale`, `handle_taken`, `cycle`, `pid_already_member` and `unknown_manager`. `approve: false` records a decline. |
+| `POST /roster/apply {rows:[{proposal_id, approve?, handle?, kind?, title?, team_id?, manager?, home_workspace?}], request_id}` | Owner | Each row is applied in its own transaction, against proposals regenerated under the lock inside it, so a row sees the rows applied before it. Per-row rejections are `stale`, `handle_taken`, `cycle`, `pid_already_member`, `unknown_manager`, `unknown_ref`, `coordinator_taken` and `conflict`. `approve: false` records a decline. |
 | `POST /adopt {pid, handle, title?, kind, team_id?, manager?, home_workspace?, request_id}` | Owner | Returns `{member, home_mark: {state}}`. |
 | `POST /members/{ref}/move {manager?, primary_team_id?, reason, expected_revision?}` | Owner, or a member above the target in its manager chain | |
-| `POST /teams`, `PATCH /teams/{ref}` | Owner | Team create and edit. `org_db.create_team_conn(..., authorized_by=…)` is the trusted in-process creator for the items epic path. |
+| `POST /teams`, `PATCH /teams/{ref}` | Owner | Team create and edit. A `coordinator_task_id` is attached to the team as in `create_initiative`; a task that already belongs to another initiative is `409 coordinator_taken`. `org_db.create_team_conn(..., authorized_by=…)` is the trusted in-process creator for the items epic path. |
+
+Every write takes an optional `request_id`. A replay with the same actor,
+method and `request_id` returns the stored answer, and that check is repeated
+under the lock. Database refusals always come back as org errors: a missing
+reference is `422 unknown_ref`, anything else is `409 conflict`, never a 500.
 
 ### Roster
 
@@ -55,7 +71,8 @@ handle that collides gets a numeric suffix, and an alias is never taken.
 ## Heartbeat
 
 Session rows gain `workspace_id`, `worktree_path`, `continuous_task_id`,
-`managed_by_uid`, `workflow_run_id` and `spawned_age_s`. The reply gains
+`managed_by_uid`, `workflow_run_id` and `spawned_age_s`. A heartbeat with no
+marks to confirm or push never takes the feed lock. The reply gains
 `org: {members: {session_uid: member}, workspace_marks, capable}`. The daemon
 caches `members`, and `ping()` returns that cache as `member`.
 

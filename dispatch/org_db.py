@@ -84,6 +84,17 @@ def normalize_handle(text: str | None) -> str | None:
     return handle if len(handle) >= 2 else None
 
 
+def normalize_alias(text: str | None) -> str | None:
+    """An alias in handle form (it may be longer than a handle, e.g.
+    `<slug>-orchestrator`); None when unusable or a reserved word."""
+    if not text:
+        return None
+    alias = re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", str(text).lower())).strip("-")[:80]
+    if len(alias) < 2 or alias in RESERVED_HANDLES:
+        return None
+    return alias
+
+
 def check_handle(handle) -> str:
     if not isinstance(handle, str) or not HANDLE_RE.match(handle):
         raise _err(422, "invalid_handle",
@@ -187,7 +198,23 @@ def _db_error(exc: Exception) -> OrgError:
             return _err(409, "pid_already_member", "that session is already a member's session")
         if "initiatives_slug" in text:
             return _err(409, "slug_taken", "a team or initiative already has that slug")
-    raise exc
+    if isinstance(exc, asyncpg.ForeignKeyViolationError):
+        return _err(422, "unknown_ref", "a referenced member, team or task does not exist")
+    return _err(409, "conflict", f"refused by the database ({type(exc).__name__})")
+
+
+class _Replayed(Exception):
+    """A request_id already answered (found again under the lock)."""
+
+    def __init__(self, response):
+        super().__init__("replayed")
+        self.response = response
+
+
+async def _replay_under_lock(conn, request_id, actor, method) -> None:
+    stored = await _stored_request(conn, request_id, actor, method)
+    if stored is not None:
+        raise _Replayed(stored)
 
 
 # ---- reads ---------------------------------------------------------------------
@@ -535,6 +562,10 @@ async def _roster_inputs(conn, continuous_states) -> dict:
              WHERE b.initiative_id IS NULL AND b.root_task_id IS NOT NULL
                AND NOT EXISTS (SELECT 1 FROM initiatives i
                                 WHERE i.coordinator_task_id = b.root_task_id)
+               -- The team takes its root task as coordinator, which a task
+               -- already in an initiative cannot be (coordinator_taken).
+               AND EXISTS (SELECT 1 FROM tasks t
+                            WHERE t.id = b.root_task_id AND t.initiative_id IS NULL)
                AND EXISTS (SELECT 1 FROM items it
                             WHERE it.board_id = b.id AND it.archived_at IS NULL
                               AND it.status IN {OPEN_ITEM})
@@ -596,7 +627,7 @@ def generate_roster(inputs: dict) -> list[dict]:
         taken.add(handle)
         extra = []
         for alias in aliases:
-            alias = (alias or "").strip().lower()
+            alias = normalize_alias(alias)
             if not alias or alias == handle or alias in extra:
                 continue
             if alias in taken:
@@ -757,10 +788,13 @@ async def roster(pool, continuous_states=()) -> dict:
             "last_applied_at": _json_safe(last), "version": current}
 
 
-async def _stored_request(conn, request_id):
+async def _stored_request(conn, request_id, actor, method):
     if not request_id:
         return None
-    row = await conn.fetchrow("SELECT response FROM org_requests WHERE request_id = $1", request_id)
+    row = await conn.fetchrow(
+        """SELECT response FROM org_requests
+            WHERE actor_pid = $1 AND method = $2 AND request_id = $3""",
+        (actor or {}).get("pid") or "", method, request_id)
     return row["response"] if row else None
 
 
@@ -769,7 +803,7 @@ async def _store_request(conn, request_id, actor, method, response) -> None:
         await conn.execute(
             """INSERT INTO org_requests (request_id, actor_pid, method, response)
                VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING""",
-            request_id, actor.get("pid"), method, _json_safe(response))
+            request_id, actor.get("pid") or "", method, _json_safe(response))
 
 
 async def _event(conn, subject_type, subject_id, type_, actor, *, prev=None, new=None,
@@ -823,6 +857,19 @@ async def _create_team(conn, actor, *, name, slug=None, kind="team", parent_team
            VALUES ($1, $2, $3, 'active', $4, $5, $6, $7, $8, now(), $9) RETURNING id""",
         slug, _clip(name, 200) or slug, kind, coordinator_task_id, parent_team_id,
         lead_member_id, charter or "", standing_rules or [], actor.get("pid"))
+    if coordinator_task_id is not None:
+        # As db.create_initiative: the coordinator is the team's anchor, and
+        # a task already in another initiative would make the two ambiguous.
+        attached = await conn.fetchval(
+            """UPDATE tasks SET initiative_id = $2, updated_at = now()
+                WHERE id = $1 AND initiative_id IS NULL RETURNING id""",
+            coordinator_task_id, team_id)
+        if attached is None:
+            exists = await conn.fetchval("SELECT 1 FROM tasks WHERE id = $1", coordinator_task_id)
+            if not exists:
+                raise _err(422, "unknown_ref", f"no task {coordinator_task_id}")
+            raise _err(409, "coordinator_taken",
+                       f"task {coordinator_task_id} already belongs to an initiative or team")
     await _event(conn, "team", team_id, "team_created", actor,
                  new={"slug": slug, "kind": kind, "lead_member_id": lead_member_id,
                       "parent_team_id": parent_team_id,
@@ -906,7 +953,10 @@ async def _create_member(conn, actor, *, handle, kind, title, manager_ref, team_
         "INSERT INTO member_aliases (org_id, alias, member_id, kind) VALUES ($1, $2, $3, 'handle')",
         ORG, handle, member_id)
     notes = []
-    for alias in aliases:
+    for raw_alias in aliases:
+        alias = normalize_alias(raw_alias)
+        if not alias or alias == handle:
+            continue
         alias_kind = "orchestrator" if alias.endswith("-orchestrator") else "continuous_slug"
         inserted = await conn.fetchval(
             """INSERT INTO member_aliases (org_id, alias, member_id, kind) VALUES ($1, $2, $3, $4)
@@ -943,20 +993,23 @@ _SOURCE_ORDER = {"continuous": 0, "lead": 1, "lane": 2}
 async def roster_apply(pool, actor: dict, rows: list[dict], request_id: str | None,
                        continuous_states=()) -> dict:
     """Owner's decisions on roster proposals. Each row is applied in its own
-    transaction against a fresh generation, so one refusal (stale, handle
-    taken, cycle) names its row and leaves the others."""
+    locked transaction against a generation made inside it, so one refusal
+    (stale, handle taken, cycle) names its row and leaves the others, and a
+    row sees the rows applied before it."""
     _require_owner(actor, "approving the roster")
     if not isinstance(rows, list) or not rows or len(rows) > MAX_ROWS:
         raise _err(422, "invalid_field", f"rows must hold 1-{MAX_ROWS} decisions")
     async with pool.acquire() as conn:
-        stored = await _stored_request(conn, request_id)
+        stored = await _stored_request(conn, request_id, actor, "roster_apply")
         if stored is not None:
             return {**stored, "version": await version(conn)}
-        fresh = {p["proposal_id"]: p for p in generate_roster(
+        # Only for ordering (continuous, then leads, then lanes); each row is
+        # re-checked against a generation made under the lock.
+        initial = {p["proposal_id"]: p for p in generate_roster(
             await _roster_inputs(conn, continuous_states))}
         created, updated, declined, rejected = [], [], [], []
         order = sorted(enumerate(rows), key=lambda ir: (
-            _SOURCE_ORDER.get((fresh.get(ir[1].get("proposal_id")) or {}).get("source"), 9), ir[0]))
+            _SOURCE_ORDER.get((initial.get(ir[1].get("proposal_id")) or {}).get("source"), 9), ir[0]))
         for _, row in order:
             proposal_id = row.get("proposal_id") if isinstance(row, dict) else None
             if not isinstance(proposal_id, str) or not proposal_id:
@@ -975,6 +1028,8 @@ async def roster_apply(pool, actor: dict, rows: list[dict], request_id: str | No
                                      reason=row.get("reason"), request_id=request_id)
                         declined.append(proposal_id)
                         continue
+                    fresh = {p["proposal_id"]: p for p in generate_roster(
+                        await _roster_inputs(conn, continuous_states))}
                     proposal = fresh.get(proposal_id)
                     if proposal is None:
                         raise _err(409, "stale", "this proposal is no longer generated "
@@ -983,16 +1038,21 @@ async def roster_apply(pool, actor: dict, rows: list[dict], request_id: str | No
                     (updated if proposal["member_id"] else created).append(result)
             except OrgError as exc:
                 rejected.append({"proposal_id": proposal_id, **exc.detail()})
-            except (asyncpg.CheckViolationError, asyncpg.UniqueViolationError,
-                    asyncpg.RaiseError) as exc:
+            except asyncpg.PostgresError as exc:
                 rejected.append({"proposal_id": proposal_id, **_db_error(exc).detail()})
         response = {"created": created, "updated": updated, "declined": declined,
                     "rejected": rejected}
-        async with conn.transaction():
-            await _lock(conn)
-            if created or updated or declined:
-                await conn.execute("UPDATE org_meta SET roster_applied_at = now()")
-            await _store_request(conn, request_id, actor, "roster_apply", response)
+        try:
+            async with conn.transaction():
+                await _lock(conn)
+                # A concurrent call with the same request_id stored first: its
+                # answer stands (this call's rows were refused as stale).
+                await _replay_under_lock(conn, request_id, actor, "roster_apply")
+                if created or updated or declined:
+                    await conn.execute("UPDATE org_meta SET roster_applied_at = now()")
+                await _store_request(conn, request_id, actor, "roster_apply", response)
+        except _Replayed as replay:
+            response = dict(replay.response)
         response["version"] = await version(conn)
         return response
 
@@ -1050,12 +1110,13 @@ async def adopt(pool, actor: dict, *, pid: str, handle: str, title: str | None =
     """Owner binds a live session to a new member (after the roster)."""
     _require_owner(actor, "adopting a session")
     async with pool.acquire() as conn:
-        stored = await _stored_request(conn, request_id)
+        stored = await _stored_request(conn, request_id, actor, "adopt")
         if stored is not None:
             return {**stored, "version": await version(conn)}
         try:
             async with conn.transaction():
                 await _lock(conn)
+                await _replay_under_lock(conn, request_id, actor, "adopt")
                 facts = await conn.fetchrow(
                     """SELECT s.daemon_id, s.session_uid, f.workspace_id, f.worktree_path,
                               f.continuous_task_id
@@ -1071,7 +1132,7 @@ async def adopt(pool, actor: dict, *, pid: str, handle: str, title: str | None =
                         raise _err(422, "invalid_field", f"{pid} is not a continuous orchestrator")
                     continuous = {"daemon_id": facts["daemon_id"], "continuous_id": cid,
                                   "planning_task_id": None}
-                    aliases = [a for a in (cid.lower(), f"{cid.lower()}-orchestrator") if a != handle]
+                    aliases = [cid, f"{cid}-orchestrator"]
                 home = home_workspace or _home_of({**dict(facts), "pid": pid})
                 member_id, notes = await _create_member(
                     conn, actor, handle=handle, kind=kind, title=title, manager_ref=manager,
@@ -1082,7 +1143,9 @@ async def adopt(pool, actor: dict, *, pid: str, handle: str, title: str | None =
                 response = {"member": detail["member"], "notes": notes,
                             "home_mark": {"state": home_mark["state"]} if home_mark else None}
                 await _store_request(conn, request_id, actor, "adopt", response)
-        except (asyncpg.CheckViolationError, asyncpg.UniqueViolationError, asyncpg.RaiseError) as exc:
+        except _Replayed as replay:
+            response = dict(replay.response)
+        except asyncpg.PostgresError as exc:
             raise _db_error(exc) from None
         response["version"] = await version(conn)
         return response
@@ -1098,12 +1161,13 @@ async def move(pool, actor: dict, ref: str, *, reason: str, manager=None, primar
     if not fields & {"manager", "primary_team_id"}:
         raise _err(422, "invalid_field", "pass manager and/or primary_team_id")
     async with pool.acquire() as conn:
-        stored = await _stored_request(conn, request_id)
+        stored = await _stored_request(conn, request_id, actor, "move")
         if stored is not None:
             return stored
         try:
             async with conn.transaction():
                 await _lock(conn)
+                await _replay_under_lock(conn, request_id, actor, "move")
                 member_id = await _resolve_member_id(conn, ref)
                 if not member_id or member_id == OWNER_ID:
                     raise _err(404, "not_found", f"no movable member {ref!r}")
@@ -1132,13 +1196,14 @@ async def move(pool, actor: dict, ref: str, *, reason: str, manager=None, primar
                             "SELECT 1 FROM initiatives WHERE id = $1", team):
                         raise _err(422, "unknown_team", f"no team {primary_team_id}")
                     prev["primary_team_id"], new["primary_team_id"] = row["primary_team_id"], team
+                # Only the columns that move: a team-only move must not fire
+                # the manager-chain trigger (UPDATE OF manager_member_id).
+                cols = [c for c in ("manager_member_id", "primary_team_id") if c in new]
+                assign = ", ".join(f"{c} = ${n + 2}" for n, c in enumerate(cols))
                 await conn.execute(
-                    """UPDATE members SET manager_member_id = coalesce($2, manager_member_id),
-                                          primary_team_id = CASE WHEN $3 THEN $4 ELSE primary_team_id END,
-                                          revision = revision + 1, updated_at = now()
-                        WHERE id = $1""",
-                    member_id, new.get("manager_member_id"), "primary_team_id" in new,
-                    new.get("primary_team_id"))
+                    f"""UPDATE members SET {assign}, revision = revision + 1, updated_at = now()
+                         WHERE id = $1""",
+                    member_id, *[new[c] for c in cols])
                 if "primary_team_id" in new:
                     await conn.execute(
                         """UPDATE team_memberships SET until = now()
@@ -1155,7 +1220,9 @@ async def move(pool, actor: dict, ref: str, *, reason: str, manager=None, primar
                              reason=reason, request_id=request_id)
                 response = await _detail(conn, member_id)
                 await _store_request(conn, request_id, actor, "move", response)
-        except (asyncpg.CheckViolationError, asyncpg.UniqueViolationError, asyncpg.RaiseError) as exc:
+        except _Replayed as replay:
+            response = replay.response
+        except asyncpg.PostgresError as exc:
             raise _db_error(exc) from None
         return response
 
@@ -1165,12 +1232,13 @@ async def team_create(pool, actor: dict, *, name: str, slug=None, kind="team", p
                       request_id=None) -> dict:
     _require_owner(actor, "creating a team")
     async with pool.acquire() as conn:
-        stored = await _stored_request(conn, request_id)
+        stored = await _stored_request(conn, request_id, actor, "team_create")
         if stored is not None:
             return stored
         try:
             async with conn.transaction():
                 await _lock(conn)
+                await _replay_under_lock(conn, request_id, actor, "team_create")
                 lead_id = None
                 if lead:
                     lead_id = await _resolve_member_id(conn, lead)
@@ -1187,8 +1255,9 @@ async def team_create(pool, actor: dict, *, name: str, slug=None, kind="team", p
                     request_id=request_id)
                 response = (await _teams(conn, "WHERE i.id = $1", uuid.UUID(team_id)))[0]
                 await _store_request(conn, request_id, actor, "team_create", response)
-        except (asyncpg.CheckViolationError, asyncpg.UniqueViolationError, asyncpg.RaiseError,
-                asyncpg.ForeignKeyViolationError) as exc:
+        except _Replayed as replay:
+            response = replay.response
+        except asyncpg.PostgresError as exc:
             raise _db_error(exc) from None
         return response
 
@@ -1216,8 +1285,7 @@ async def create_team_conn(conn, actor: dict, *, name: str, slug=None, kind="tea
                 charter=charter, standing_rules=standing_rules,
                 coordinator_task_id=_uuid(coordinator_task_id, "coordinator_task_id"),
                 request_id=request_id, authorized_by=authorized_by)
-    except (asyncpg.CheckViolationError, asyncpg.UniqueViolationError,
-            asyncpg.ForeignKeyViolationError) as exc:
+    except asyncpg.PostgresError as exc:
         raise _db_error(exc) from None
     return team_id
 
@@ -1232,12 +1300,13 @@ async def team_update(pool, actor: dict, ref: str, changes: dict, *, reason=None
     if unknown or not changes:
         raise _err(422, "invalid_field", f"editable team fields: {sorted(TEAM_FIELDS)}")
     async with pool.acquire() as conn:
-        stored = await _stored_request(conn, request_id)
+        stored = await _stored_request(conn, request_id, actor, "team_update")
         if stored is not None:
             return stored
         try:
             async with conn.transaction():
                 await _lock(conn)
+                await _replay_under_lock(conn, request_id, actor, "team_update")
                 team = await _team_row(conn, ref)
                 if expected_revision is not None and team["team_revision"] != expected_revision:
                     raise _err(409, "revision_conflict", "the team changed; re-read it",
@@ -1256,7 +1325,11 @@ async def team_update(pool, actor: dict, ref: str, changes: dict, *, reason=None
                         raise _err(422, "invalid_field", f"status must be one of {sorted(TEAM_STATUSES)}")
                     sets["team_status"] = changes["status"]
                 if "parent_team_id" in changes:
-                    sets["parent_team_id"] = _uuid(changes["parent_team_id"], "parent_team_id")
+                    parent = _uuid(changes["parent_team_id"], "parent_team_id")
+                    if parent is not None and not await conn.fetchval(
+                            "SELECT 1 FROM initiatives WHERE id = $1", parent):
+                        raise _err(422, "unknown_team", f"no team {changes['parent_team_id']}")
+                    sets["parent_team_id"] = parent
                 if "lead" in changes:
                     lead_id = None
                     if changes["lead"]:
@@ -1278,8 +1351,9 @@ async def team_update(pool, actor: dict, ref: str, changes: dict, *, reason=None
                              request_id=request_id)
                 response = (await _teams(conn, "WHERE i.id = $1", team["id"]))[0]
                 await _store_request(conn, request_id, actor, "team_update", response)
-        except (asyncpg.CheckViolationError, asyncpg.UniqueViolationError, asyncpg.RaiseError,
-                asyncpg.ForeignKeyViolationError) as exc:
+        except _Replayed as replay:
+            response = replay.response
+        except asyncpg.PostgresError as exc:
             raise _db_error(exc) from None
         return response
 
@@ -1347,12 +1421,22 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
                 "SELECT $2 = ANY(capabilities) FROM org_daemons WHERE daemon_id = $1",
                 daemon_id, ORG_PRESERVE)
             marks = []
-            if acked_mark_ids:
+            # The marks table's statement trigger takes the feed lock even for
+            # a zero-row UPDATE, so look first (a plain read takes no lock):
+            # an idle beat must not queue behind org and task writes.
+            acked = [int(i) for i in acked_mark_ids or ()]
+            if acked and await conn.fetchval(
+                    """SELECT EXISTS (SELECT 1 FROM org_workspace_marks
+                                       WHERE daemon_id = $1 AND id = ANY($2::bigint[])
+                                         AND state <> 'confirmed')""", daemon_id, acked):
                 await conn.execute(
                     """UPDATE org_workspace_marks SET state = 'confirmed', confirmed_at = $3
                         WHERE daemon_id = $1 AND id = ANY($2::bigint[]) AND state <> 'confirmed'""",
-                    daemon_id, [int(i) for i in acked_mark_ids], now)
-            if capable:
+                    daemon_id, acked, now)
+            if capable and await conn.fetchval(
+                    """SELECT EXISTS (SELECT 1 FROM org_workspace_marks
+                                       WHERE daemon_id = $1 AND state <> 'confirmed'
+                                         AND attempts < $2)""", daemon_id, MAX_MARK_ATTEMPTS):
                 rows = await conn.fetch(
                     """UPDATE org_workspace_marks w
                           SET state = 'pushed', attempts = w.attempts + 1, pushed_at = $3
@@ -1364,7 +1448,7 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
                 marks = [dict(r) for r in rows]
             members = await conn.fetch(
                 f"""{_MEMBER_SELECT}
-                     WHERE inc.daemon_id = $1 AND inc.pid LIKE $2""", daemon_id, prefix + "%")
+                     WHERE inc.daemon_id = $1 AND left(inc.pid, length($2)) = $2""", daemon_id, prefix)
     return {
         "members": {r["main_session_uid"]: {**member_summary(_shape_member(r)), "acting_as": "main"}
                     for r in members},
