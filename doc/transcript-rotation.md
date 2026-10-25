@@ -84,7 +84,7 @@ badge shows `⧉1.7G` past 300 MB, and the A-i peek shows the transcript size.
 
 ## Codex
 
-Codex rollouts grow the same way: on the laptop, 1,817 rollouts take 17 GB
+Codex rollouts grow the same way: on cm-sessions, 1,817 rollouts take 17 GB
 and the largest is 3.2 GB. `codex fork` is the equivalent of Claude's fork,
 and already compacts: forks of a 257 MB rollout with 52 compactions came out
 at 7–9 MB. CM's launcher already builds Codex fork argv. A Codex rotation
