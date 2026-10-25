@@ -27,6 +27,8 @@ pub const METHODS: &[&str] = &[
     "org.team_create",
     "org.team_update",
     "org.move",
+    "org.retire",
+    "org.reinstate",
 ];
 
 /// The read-only ones (restart-barrier classification).
@@ -63,10 +65,14 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
                 let team = take_str(&mut p, "team")?.ok_or_else(|| bad("org.team_update needs team"))?;
                 api(ctx.api.patch(&format!("/org/teams/{}", encode(&team)), &with_actor(&ctx, p)))
             }
-            "org.move" => {
+            "org.move" | "org.retire" | "org.reinstate" => {
+                if req.method == "org.reinstate" {
+                    owner_only(&ctx, "reinstating a member")?;
+                }
+                let verb = &req.method["org.".len()..];
                 let mut p = p;
-                let member = take_str(&mut p, "member")?.ok_or_else(|| bad("org.move needs member"))?;
-                api(ctx.api.post(&format!("/org/members/{}/move", encode(&member)), &with_actor(&ctx, p)))
+                let member = take_str(&mut p, "member")?.ok_or_else(|| bad(format!("{} needs member", req.method)))?;
+                api(ctx.api.post(&format!("/org/members/{}/{verb}", encode(&member)), &with_actor(&ctx, p)))
             }
             other => Err((ErrorCode::UnknownMethod, format!("unknown org method {other}"))),
         }
@@ -530,6 +536,43 @@ mod tests {
         let (_, _, body) = seen.iter().find(|(m, _, _)| m == "POST").unwrap();
         assert_eq!(body["actor"]["pid"], format!("agent:{d}:me-uid"));
         assert!(body.get("member").is_none());
+    }
+
+    #[test]
+    fn org_tool_move_retire_and_reinstate_route_to_the_api_as_the_caller() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let (url, seen) = test_stub(|method, path, _| match (method, path) {
+            ("POST", p) if p.starts_with("/org/members/main/ep/") => (200, r#"{"member":{"handle":"ep"}}"#.into()),
+            _ => (500, "{}".into()),
+        });
+        let state = state(root.path(), &url);
+        let d = daemon_id(&state);
+        let tool = |caller: Caller, params: Value| {
+            crate::control::dispatch::dispatch_org(
+                &state, &Request { id: "t".into(), caller, method: "org".into(), params })
+        };
+        let me = Caller::session("me-uid");
+        let resp = tool(me.clone(), json!({"action": "move", "member": "main/ep", "manager": "kestrel",
+                                           "team": "swarm", "reason": "r", "request_id": "q1"}));
+        assert!(resp.ok, "{:?}", resp.error);
+        assert!(tool(me.clone(), json!({"action": "retire", "member": "main/ep", "reason": "done"})).ok);
+        // Retire takes no manager; reinstate is Owner's, refused before the API.
+        let err = tool(me.clone(), json!({"action": "retire", "member": "main/ep", "manager": "x", "reason": "r"}));
+        assert!(matches!(err.error.unwrap().code, ErrorCode::InvalidParams));
+        let err = tool(me, json!({"action": "reinstate", "member": "main/ep"})).error.unwrap();
+        assert!(matches!(err.code, ErrorCode::Unauthorized) && err.message.starts_with("owner_only"));
+        assert!(tool(Caller::operator("op"), json!({"action": "reinstate", "member": "main/ep"})).ok);
+        let seen = seen.lock().unwrap();
+        let posts: Vec<_> = seen.iter().filter(|(m, _, _)| m == "POST").collect();
+        assert_eq!(posts.iter().map(|(_, p, _)| p.as_str()).collect::<Vec<_>>(),
+                   ["/org/members/main/ep/move", "/org/members/main/ep/retire", "/org/members/main/ep/reinstate"]);
+        let move_body = &posts[0].2;
+        assert_eq!(move_body["actor"]["pid"], format!("agent:{d}:me-uid"));
+        assert_eq!((&move_body["manager"], &move_body["primary_team_id"], &move_body["request_id"]),
+                   (&json!("kestrel"), &json!("swarm"), &json!("q1")));
+        assert!(move_body.get("member").is_none() && move_body.get("action").is_none());
+        assert_eq!(posts[2].2["actor"]["pid"], "owner");
     }
 
     #[test]

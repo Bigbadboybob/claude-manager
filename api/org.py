@@ -72,6 +72,18 @@ class MoveBody(_Strict):
     request_id: RequestId | None = None
 
 
+class RetireBody(_Strict):
+    actor: Actor
+    reason: Annotated[str, Field(min_length=1, max_length=500)]
+    request_id: RequestId | None = None
+
+
+class ReinstateBody(_Strict):
+    actor: Actor
+    reason: Annotated[str, Field(min_length=1, max_length=500)] | None = None
+    request_id: RequestId | None = None
+
+
 class TeamCreateBody(_Strict):
     actor: Actor
     name: Short
@@ -146,6 +158,20 @@ async def move_member(ref: Ref, body: MoveBody, request: Request):
         _pool(request), body.actor.model_dump(), ref, reason=body.reason,
         manager=body.manager, primary_team_id=body.primary_team_id, fields=fields,
         expected_revision=body.expected_revision, request_id=body.request_id))
+
+
+@router.post("/members/{ref:path}/retire")
+async def retire_member(ref: Ref, body: RetireBody, request: Request):
+    return await _call(org_db.retire(
+        _pool(request), body.actor.model_dump(), ref, reason=body.reason,
+        request_id=body.request_id))
+
+
+@router.post("/members/{ref:path}/reinstate")
+async def reinstate_member(ref: Ref, body: ReinstateBody, request: Request):
+    return await _call(org_db.reinstate(
+        _pool(request), body.actor.model_dump(), ref, reason=body.reason,
+        request_id=body.request_id))
 
 
 @router.get("/teams/{ref}")

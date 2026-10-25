@@ -1443,7 +1443,16 @@
     "division": {
      "type": "string"
     },
+    "manager": {
+     "type": "string"
+    },
     "member": {
+     "type": "string"
+    },
+    "reason": {
+     "type": "string"
+    },
+    "request_id": {
      "type": "string"
     },
     "session_uid": {

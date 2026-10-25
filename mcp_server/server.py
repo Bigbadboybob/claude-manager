@@ -1544,6 +1544,9 @@ def org(
     session_uid: str | None = None,
     member: str | None = None,
     team: str | None = None,
+    manager: str | None = None,
+    reason: str | None = None,
+    request_id: str | None = None,
 ) -> dict:
     """Find your place in the org: your boss, your reports, your division.
 
@@ -1589,13 +1592,30 @@ def org(
         a task above `task_id`), and never on its own task.
       - `action="clear_lead"`: remove the pin, so the fallback rule applies.
 
+    Moving and retiring members (leads deciding who stays). Allowed for
+    Owner, or for an active member up `member`'s manager chain acting as its
+    main session; anyone else is refused (`not_member`: you are not an
+    active member's main session; `not_manager`: `member` is not below you).
+      - `action="move", member=..., manager=None, team=None, reason=...`:
+        give `member` a new manager (a member ref, or "owner") and/or a new
+        primary team (id or slug). `reason` is required.
+      - `action="retire", member=..., reason=...`: mark `member` retired.
+        Its reports move up to its manager and teams it leads lose their
+        lead. Its sessions are never killed. Owner can reverse it.
+      - `action="reinstate", member=...`: Owner's undo of a retire.
+    `request_id` (generated if omitted) makes a retry return the first
+    answer instead of acting twice.
+
     Adopting a session as a member (`action="adopt"`) and approving the
     roster are Owner's, from the TUI; an agent's call is refused.
     """
+    if action in ("move", "retire", "reinstate") and request_id is None:
+        request_id = f"org-{action}-{uuid.uuid4()}"
     params = {key: value for key, value in {
         "view": view, "action": action, "task_id": task_id,
         "division": division, "session_uid": session_uid,
-        "member": member, "team": team,
+        "member": member, "team": team, "manager": manager,
+        "reason": reason, "request_id": request_id,
     }.items() if value is not None}
     route = control_client.resolve_socket_route()
     if not route.chose_daemon:

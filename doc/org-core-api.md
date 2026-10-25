@@ -47,8 +47,23 @@ S6/S7 item.
 |---|---|---|
 | `POST /roster/apply {rows:[{proposal_id, approve?, handle?, kind?, title?, team_id?, manager?, home_workspace?}], request_id}` | Owner | Each row is applied in its own transaction, against proposals regenerated under the lock inside it, so a row sees the rows applied before it. Per-row rejections are `stale`, `handle_taken`, `cycle`, `pid_already_member`, `unknown_manager`, `unknown_ref`, `coordinator_taken` and `conflict`. `approve: false` records a decline. |
 | `POST /adopt {pid, handle, title?, kind, team_id?, manager?, home_workspace?, request_id}` | Owner | Returns `{member, home_mark: {state}}`. |
-| `POST /members/{ref}/move {manager?, primary_team_id?, reason, expected_revision?}` | Owner, or a member above the target in its manager chain | |
+| `POST /members/{ref}/move {manager?, primary_team_id?, reason, expected_revision?}` | Owner, or a member above the target in its manager chain | `primary_team_id` is a team id or slug (`422 unknown_team`). |
+| `POST /members/{ref}/retire {reason, request_id?}` | Owner, or a member above the target in its manager chain | Status `retired`. Its reports move up to its manager (one `move` event each, `via: "retire"`) and the teams it leads lose their lead. Returns `{member, …, reports_moved, teams_unled}`. Incarnations and sessions are untouched: nothing is killed, and the handle stays reserved. `409 already_retired`. |
+| `POST /members/{ref}/reinstate {reason?, request_id?}` | Owner | Undoes a retire: `active` again, and it leads again any team from the `retire` event that has had no lead since (`teams_led_again`). Reports that moved up stay put. `409 not_retired`; `409 retired_manager` when its manager is retired too (reinstate that one first). |
 | `POST /teams`, `PATCH /teams/{ref}` | Owner | Team create and edit. A `coordinator_task_id` is attached to the team as in `create_initiative`; a task that already belongs to another initiative is `409 coordinator_taken`. `org_db.create_team_conn(..., authorized_by=…)` is the trusted in-process creator for the items epic path. |
+
+**Move and retire authority.** Owner, or an *active* member up the target's
+manager chain whose main session is the caller (an open `incarnations` row
+with `role = 'main'`). Anyone else gets `403`: `not_member` when the caller is
+not an active member's main session, `not_manager` when it is but the target
+is not below it (sideways, its own manager, or itself). `org_db._require_chain`
+is the one check.
+
+**Roster managers.** A lane reports to the lead of its board's team by
+default: the lead member, or the lead proposed in the same batch
+(`manager_handle`). Apply orders continuous, then leads, then lanes, so a
+lane row listed before its lead still lands under it; a row's `manager`
+overrides the default.
 
 Every write takes an optional `request_id`. A replay with the same actor,
 method and `request_id` returns the stored answer, and that check is repeated
@@ -91,11 +106,15 @@ host advertises `org_marks_v1`, its marks stay `central`.
 
 `org.snapshot`, `org.member`, `org.team` and `org.roster` are reads.
 `org.roster_apply`, `org.adopt` (`session_uid` may stand in for `pid`; the daemon
-fills in its own id), `org.team_create`, `org.team_update` and `org.move` are
-writes. The roster and adopt are refused for session callers. An old API answers
+fills in its own id), `org.team_create`, `org.team_update`, `org.move`, `org.retire` and
+`org.reinstate` are writes (`org.reinstate` is refused for session callers). The roster and adopt are refused for session callers. An old API answers
 `unknown_method` with `unsupported: …`, so the TUI turns the feature off.
 
 The `org` MCP tool keeps `me`, `reports` and `division`, and adds `member`, plus
 `team` as `division`'s org-model name. `me` adds `member`, `acting_as`,
 `manager_chain`, `teams` and `member_reports`. `action="adopt"` is Owner's. From
-the operator socket it routes to `org.adopt`.
+the operator socket it routes to `org.adopt`. `action="move"` (`member`,
+`manager` and/or `team`, `reason`), `action="retire"` (`member`, `reason`) and
+`action="reinstate"` (`member`) route to `org.move` / `org.retire` /
+`org.reinstate` from any caller, with the caller as actor, so the API decides
+who may. The tool generates a `request_id` when none is passed.

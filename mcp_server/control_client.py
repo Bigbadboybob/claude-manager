@@ -365,6 +365,8 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "org.team_create",
     "org.team_update",
     "org.move",
+    "org.retire",
+    "org.reinstate",
     # Gate receipts on items (doc/gate-receipts.md): same daemon-only proxy.
     "gate.report",
     "gate.receipts",

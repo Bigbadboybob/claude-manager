@@ -19079,6 +19079,9 @@ struct OrgParams {
     home_workspace: Option<Value>,
     #[allow(dead_code)]
     request_id: Option<Value>,
+    /// `action="move" | "retire" | "reinstate"` (routed before methods::org).
+    #[allow(dead_code)]
+    reason: Option<Value>,
 }
 
 /// Upper bound on the reporting chain walk (guards a corrupt parent cycle).
@@ -19260,7 +19263,7 @@ pub fn org(
             )),
             other => Err((
                 ErrorCode::InvalidParams,
-                format!("org: unknown action '{}' (expected set_lead, clear_lead or adopt)", other),
+                format!("org: unknown action '{}' (expected set_lead, clear_lead, move, retire, reinstate or adopt)", other),
             )),
         };
     }

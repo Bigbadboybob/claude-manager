@@ -1154,6 +1154,25 @@ async def adopt(pool, actor: dict, *, pid: str, handle: str, title: str | None =
         return response
 
 
+async def _require_chain(conn, actor: dict, member_id: str, what: str) -> None:
+    """Owner, or an active member up `member_id`'s manager chain acting as its
+    main session (doc/org-model.md §10: move / retire a member)."""
+    if _is_owner(actor):
+        return
+    actor_member = await conn.fetchval(
+        """SELECT i.member_id FROM incarnations i JOIN members m ON m.id = i.member_id
+            WHERE i.pid = $1 AND i.role = 'main' AND i.ended_at IS NULL
+              AND m.status = 'active'""", actor.get("pid"))
+    if not actor_member:
+        raise _err(403, "not_member",
+                   f"only Owner or a member up this member's manager chain may {what} it; "
+                   "this session is not an active member's main session")
+    chain = [m["id"] for m in await _chain(conn, member_id)]
+    if actor_member not in chain:
+        raise _err(403, "not_manager",
+                   f"only Owner or a member up this member's manager chain may {what} it")
+
+
 async def move(pool, actor: dict, ref: str, *, reason: str, manager=None, primary_team_id=None,
                fields: set[str], expected_revision: int | None = None,
                request_id: str | None = None) -> dict:
@@ -1175,15 +1194,7 @@ async def move(pool, actor: dict, ref: str, *, reason: str, manager=None, primar
                 if not member_id or member_id == OWNER_ID:
                     raise _err(404, "not_found", f"no movable member {ref!r}")
                 row = await conn.fetchrow("SELECT * FROM members WHERE id = $1", member_id)
-                if not _is_owner(actor):
-                    actor_member = await conn.fetchval(
-                        """SELECT member_id FROM incarnations
-                            WHERE pid = $1 AND role = 'main' AND ended_at IS NULL""",
-                        actor.get("pid"))
-                    chain = [m["id"] for m in await _chain(conn, member_id)]
-                    if not actor_member or actor_member not in chain:
-                        raise _err(403, "not_manager",
-                                   "only Owner or a member up this member's manager chain may move it")
+                await _require_chain(conn, actor, member_id, "move")
                 if expected_revision is not None and row["revision"] != expected_revision:
                     raise _err(409, "revision_conflict", "the member changed; re-read it",
                                current_revision=row["revision"])
@@ -1194,10 +1205,12 @@ async def move(pool, actor: dict, ref: str, *, reason: str, manager=None, primar
                         raise _err(422, "unknown_manager", f"no member {manager!r}")
                     prev["manager_member_id"], new["manager_member_id"] = row["manager_member_id"], manager_id
                 if "primary_team_id" in fields:
-                    team = _uuid(primary_team_id, "primary_team_id")
-                    if team is not None and not await conn.fetchval(
-                            "SELECT 1 FROM initiatives WHERE id = $1", team):
-                        raise _err(422, "unknown_team", f"no team {primary_team_id}")
+                    team = None
+                    if primary_team_id is not None:
+                        try:
+                            team = (await _team_row(conn, primary_team_id))["id"]
+                        except OrgError:
+                            raise _err(422, "unknown_team", f"no team {primary_team_id}") from None
                     prev["primary_team_id"], new["primary_team_id"] = row["primary_team_id"], team
                 # Only the columns that move: a team-only move must not fire
                 # the manager-chain trigger (UPDATE OF manager_member_id).
@@ -1228,6 +1241,123 @@ async def move(pool, actor: dict, ref: str, *, reason: str, manager=None, primar
         except asyncpg.PostgresError as exc:
             raise _db_error(exc) from None
         return response
+
+
+async def _member_write(pool, actor, request_id, method, body) -> dict:
+    """Run `body(conn)` in one locked transaction, idempotent per request id."""
+    async with pool.acquire() as conn:
+        stored = await _stored_request(conn, request_id, actor, method)
+        if stored is not None:
+            return stored
+        try:
+            async with conn.transaction():
+                await _lock(conn)
+                await _replay_under_lock(conn, request_id, actor, method)
+                response = await body(conn)
+                await _store_request(conn, request_id, actor, method, response)
+        except _Replayed as replay:
+            response = replay.response
+        except asyncpg.PostgresError as exc:
+            raise _db_error(exc) from None
+        return response
+
+
+async def retire(pool, actor: dict, ref: str, *, reason: str, request_id: str | None = None) -> dict:
+    """Mark a member retired: Owner, or an active member up its manager chain.
+
+    Its reports move to its manager and the teams it leads lose their lead
+    (both recorded on the event, so a reinstate can give the leads back).
+    Its sessions are never touched: the main session keeps running and keeps
+    its occupancy row. The handle stays reserved. Owner can reverse it."""
+    if not reason or not str(reason).strip():
+        raise _err(422, "invalid_field", "retiring a member needs a reason")
+
+    async def body(conn):
+        member_id = await _resolve_member_id(conn, ref)
+        if not member_id or member_id == OWNER_ID:
+            raise _err(404, "not_found", f"no retirable member {ref!r}")
+        row = await conn.fetchrow("SELECT * FROM members WHERE id = $1", member_id)
+        await _require_chain(conn, actor, member_id, "retire")
+        if row["status"] == "retired":
+            raise _err(409, "already_retired", f"{row['handle']} is already retired")
+        reports = [r["id"] for r in await conn.fetch(
+            """SELECT id FROM members WHERE manager_member_id = $1 AND status <> 'retired'
+                ORDER BY id""", member_id)]
+        for report in reports:
+            await conn.execute(
+                """UPDATE members SET manager_member_id = $2, revision = revision + 1,
+                                      updated_at = now() WHERE id = $1""",
+                report, row["manager_member_id"])
+            await _event(conn, "member", report, "move", actor,
+                         prev={"manager_member_id": member_id},
+                         new={"manager_member_id": row["manager_member_id"], "via": "retire"},
+                         reason=f"manager {row['handle']} retired: {reason}", request_id=request_id)
+        led = [str(r["id"]) for r in await conn.fetch(
+            "SELECT id FROM initiatives WHERE lead_member_id = $1 ORDER BY id", member_id)]
+        for team_id in led:
+            await conn.execute(
+                """UPDATE initiatives SET lead_member_id = NULL, team_revision = team_revision + 1,
+                                          updated_at = now() WHERE id = $1""", uuid.UUID(team_id))
+            await _event(conn, "team", team_id, "lead_set", actor, prev={"lead_member_id": member_id},
+                         new={"lead_member_id": None, "via": "retire"}, request_id=request_id)
+        # Item holds are not handed back yet: #21's items-side
+        # hand_back_holds(conn, from_pid, to_pid) is called here once it lands.
+        await conn.execute(
+            """UPDATE members SET status = 'retired', retired_at = now(), revision = revision + 1,
+                                  updated_at = now() WHERE id = $1""", member_id)
+        await _event(conn, "member", member_id, "retire", actor,
+                     prev={"status": row["status"], "reports": reports, "lead_of": led},
+                     new={"status": "retired", "reports_to": row["manager_member_id"]},
+                     reason=reason, request_id=request_id)
+        detail = await _detail(conn, member_id)
+        return {**detail, "reports_moved": reports, "teams_unled": led}
+
+    return await _member_write(pool, actor, request_id, "retire", body)
+
+
+async def reinstate(pool, actor: dict, ref: str, *, reason: str | None = None,
+                    request_id: str | None = None) -> dict:
+    """Owner reverses a retirement: the member is active again and gets back
+    the leads of teams that have had none since. Reports that moved up stay
+    where they are (move them back by hand)."""
+    _require_owner(actor, "reinstating a member")
+
+    async def body(conn):
+        member_id = await _resolve_member_id(conn, ref)
+        if not member_id or member_id == OWNER_ID:
+            raise _err(404, "not_found", f"no member {ref!r}")
+        row = await conn.fetchrow("SELECT * FROM members WHERE id = $1", member_id)
+        if row["status"] != "retired":
+            raise _err(409, "not_retired", f"{row['handle']} is not retired")
+        if await conn.fetchval("SELECT status = 'retired' FROM members WHERE id = $1",
+                               row["manager_member_id"]):
+            raise _err(409, "retired_manager", f"{row['handle']}'s manager is retired; "
+                       "reinstate it first, or move this member after reinstating")
+        last = await conn.fetchval(
+            """SELECT prev FROM org_events WHERE subject_type = 'member' AND subject_id = $1
+                 AND type = 'retire' ORDER BY id DESC LIMIT 1""", member_id)
+        restored = []
+        for team_id in (last or {}).get("lead_of") or []:
+            done = await conn.fetchval(
+                """UPDATE initiatives SET lead_member_id = $2, team_revision = team_revision + 1,
+                                          updated_at = now()
+                    WHERE id = $1 AND lead_member_id IS NULL RETURNING id""",
+                uuid.UUID(team_id), member_id)
+            if done:
+                restored.append(team_id)
+                await _event(conn, "team", team_id, "lead_set", actor, prev={"lead_member_id": None},
+                             new={"lead_member_id": member_id, "via": "reinstate"},
+                             request_id=request_id)
+        await conn.execute(
+            """UPDATE members SET status = 'active', retired_at = NULL, revision = revision + 1,
+                                  updated_at = now() WHERE id = $1""", member_id)
+        await _event(conn, "member", member_id, "reinstate", actor, prev={"status": "retired"},
+                     new={"status": "active", "lead_of": restored}, reason=reason,
+                     request_id=request_id)
+        detail = await _detail(conn, member_id)
+        return {**detail, "teams_led_again": restored}
+
+    return await _member_write(pool, actor, request_id, "reinstate", body)
 
 
 async def team_create(pool, actor: dict, *, name: str, slug=None, kind="team", parent_team_id=None,

@@ -566,6 +566,92 @@ class OrgApiDb(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.json()["member"]["primary_team_id"], team["id"])
 
+    async def applied_swarm(self):
+        await self.swarm()
+        roster = await self.roster()
+        await self.apply([{"proposal_id": p["proposal_id"]} for p in roster["proposals"]])
+
+    async def member_write(self, verb, ref, actor, status=200, **body):
+        r = await self.http.post(f"/org/members/{ref}/{verb}", json={"actor": actor, **body})
+        self.assertEqual(r.status_code, status, r.text)
+        return r.json()
+
+    async def test_move_and_retire_authority_follows_the_manager_chain(self):
+        await self.applied_swarm()
+        coord, org, orch = {"pid": pid(self.coord)}, {"pid": pid(self.lane)}, {"pid": pid(self.orch)}
+        for verb, body in (("move", {"manager": "bug-triage", "reason": "r"}), ("retire", {"reason": "r"})):
+            # Sideways (another branch under Owner), down (a report on its
+            # lead), self, and a session that is not a member's main.
+            for actor, ref, code in ((orch, "org", "not_manager"), (org, "swarm-coord", "not_manager"),
+                                     (org, "org", "not_manager"), ({"pid": pid(self.helper)}, "org", "not_member"),
+                                     ({"pid": "agent:d9:ghost"}, "org", "not_member")):
+                r = await self.member_write(verb, ref, actor, status=403, **body)
+                self.assertEqual(r["detail"]["code"], code, (verb, actor, ref))
+        # A retired lead loses its authority over its old reports.
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE members SET status = 'suspended' WHERE handle = 'swarm-coord'")
+        r = await self.member_write("retire", "org", coord, status=403, reason="r")
+        self.assertEqual(r["detail"]["code"], "not_member")
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE members SET status = 'active' WHERE handle = 'swarm-coord'")
+        # Up the chain: the lead moves its lane to a team by slug, then retires it.
+        r = await self.member_write("move", "org", coord, primary_team_id="swarm", reason="home team")
+        self.assertEqual(r["member"]["primary_team_id"], self.init_id)
+        r = await self.member_write("move", "org", coord, status=422, primary_team_id="nope", reason="r")
+        self.assertEqual(r["detail"]["code"], "unknown_team")
+        r = await self.member_write("retire", "org", coord, reason="lane finished", request_id="ret-1")
+        self.assertEqual((r["member"]["status"], r["reports_moved"], r["teams_unled"]), ("retired", [], []))
+        self.assertEqual(await self.member_write("retire", "org", coord, reason="lane finished",
+                                                 request_id="ret-1"), r)
+        r = await self.member_write("retire", "org", coord, status=409, reason="again")
+        self.assertEqual(r["detail"]["code"], "already_retired")
+        r = await self.member_write("retire", "org", coord, status=422)
+        self.assertEqual(r["detail"][0]["loc"][-1], "reason")
+
+    async def test_retire_moves_reports_up_keeps_sessions_and_owner_reinstates(self):
+        await self.applied_swarm()
+        snap = await self.snapshot()
+        by = {m["handle"]: m for m in snap["members"]}
+        coord_id, org_id = by["swarm-coord"]["id"], by["org"]["id"]
+        r = await self.member_write("retire", "swarm-coord", OWNER, reason="wound down")
+        self.assertEqual((r["reports_moved"], r["teams_unled"]), ([org_id], [self.init_id]))
+        snap = await self.snapshot()
+        by = {m["handle"]: m for m in snap["members"]}
+        self.assertEqual(by["org"]["manager_member_id"], "mem_owner")
+        self.assertIsNone(next(t for t in snap["teams"] if t["id"] == self.init_id)["lead_member_id"])
+        async with self.pool.acquire() as conn:
+            # Its main session keeps running and keeps its occupancy row.
+            self.assertEqual(await conn.fetchval(
+                """SELECT count(*) FROM incarnations WHERE member_id = $1 AND role = 'main'
+                     AND ended_at IS NULL""", coord_id), 1)
+            self.assertEqual(await conn.fetchval(
+                "SELECT status FROM members WHERE id = $1", coord_id), "retired")
+        # Reinstating is Owner's alone.
+        r = await self.member_write("reinstate", "swarm-coord", {"pid": pid(self.coord)}, status=403)
+        self.assertEqual(r["detail"]["code"], "owner_only")
+        r = await self.member_write("reinstate", "swarm-coord", OWNER, reason="back")
+        self.assertEqual((r["member"]["status"], r["teams_led_again"]), ("active", [self.init_id]))
+        self.assertIsNone(r["member"]["retired_at"])
+        snap = await self.snapshot()
+        self.assertEqual(next(t for t in snap["teams"] if t["id"] == self.init_id)["lead_member_id"], coord_id)
+        # The moved report stays with Owner until someone moves it back.
+        self.assertEqual({m["handle"]: m for m in snap["members"]}["org"]["manager_member_id"], "mem_owner")
+        r = await self.member_write("reinstate", "swarm-coord", OWNER, status=409)
+        self.assertEqual(r["detail"]["code"], "not_retired")
+        events = (await self.http.get("/org/events", params={"subject_type": "member"})).json()
+        self.assertEqual([e["type"] for e in events if e["subject_id"] == coord_id][:2], ["reinstate", "retire"])
+
+    async def test_a_report_of_a_retired_manager_waits_for_its_manager(self):
+        await self.applied_swarm()
+        await self.member_write("retire", "org", OWNER, reason="done")
+        # A retired report does not move up with the others: it still names
+        # its retired manager, so it cannot come back before it.
+        await self.member_write("retire", "swarm-coord", OWNER, reason="done")
+        r = await self.member_write("reinstate", "org", OWNER, status=409)
+        self.assertEqual(r["detail"]["code"], "retired_manager")
+        await self.member_write("reinstate", "swarm-coord", OWNER)
+        await self.member_write("reinstate", "org", OWNER)
+
     async def test_an_idle_heartbeat_does_not_wait_for_the_feed_lock(self):
         await self.beat(D1, [{"uid": uid_at(2)}])
         async with self.pool.acquire() as holder:

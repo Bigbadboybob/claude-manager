@@ -901,7 +901,8 @@ pub fn dispatch_request(
         // Org model S2 (doc/org-model.md): members, teams, the roster and
         // adoption, proxied like items. Roster and adoption are Owner's.
         "org.snapshot" | "org.member" | "org.team" | "org.roster" | "org.roster_apply"
-        | "org.adopt" | "org.team_create" | "org.team_update" | "org.move" => {
+        | "org.adopt" | "org.team_create" | "org.team_update" | "org.move" | "org.retire"
+        | "org.reinstate" => {
             DispatchOutcome::Done(crate::items::org::dispatch(state, req))
         }
         // Gate receipts (doc/gate-receipts.md §9): same proxy shape as items.
@@ -1724,7 +1725,7 @@ fn dispatch_get_initiative(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Re
 
 /// `org` — reporting-line views (open to every caller) plus `set_lead` on
 /// the caller's own task. The Session caller's uid scopes "me".
-fn dispatch_org(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+pub(crate) fn dispatch_org(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
     // `org(action="adopt", …)` from Owner is the `org.adopt` RPC (org model
     // S2). An agent's call falls through to methods::org, which refuses it.
     if matches!(req.caller, Caller::Operator(_)) && req.params["action"] == "adopt" {
@@ -1734,6 +1735,27 @@ fn dispatch_org(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
             obj.remove("action");
         }
         return crate::items::org::dispatch(state, &adopt);
+    }
+    // `org(action="move" | "retire" | "reinstate", member=…)` is the matching
+    // `org.*` RPC from any caller: the API decides who may (Owner, or an
+    // active member up the target's manager chain acting as its main
+    // session; reinstate is Owner's), with the caller stamped as actor.
+    if let Some(verb @ ("move" | "retire" | "reinstate")) = req.params["action"].as_str() {
+        let mut fwd = req.clone();
+        fwd.method = format!("org.{verb}");
+        let mut body = serde_json::Map::new();
+        for (from, to) in [("member", "member"), ("manager", "manager"), ("team", "primary_team_id"),
+                           ("reason", "reason"), ("request_id", "request_id")] {
+            if let Some(v) = req.params.get(from).filter(|v| !v.is_null()) {
+                body.insert(to.into(), v.clone());
+            }
+        }
+        if verb != "move" && (body.contains_key("manager") || body.contains_key("primary_team_id")) {
+            return Response::err(req.id.clone(), ErrorCode::InvalidParams,
+                format!("org: action=\"{verb}\" takes member and reason; use action=\"move\" to change a manager or team"));
+        }
+        fwd.params = serde_json::Value::Object(body);
+        return crate::items::org::dispatch(state, &fwd);
     }
     let caller_uid: Option<String> = match &req.caller {
         Caller::Operator(_) => None,
