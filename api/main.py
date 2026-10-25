@@ -27,8 +27,9 @@ from api.dispatch_daemon import dispatch_loop, warm_pool_loop
 from api.board_engine import board_loop
 from api.items import router as items_router
 from api.staffing import router as staffing_router
+from api.org import router as org_router
 from api.task_changes import ChangeBroker, change_log_maintenance_loop
-from dispatch import db, task_text
+from dispatch import db, org_db, task_text
 from dispatch.config import DB_DSN, REPOS
 
 logging.basicConfig(level=logging.INFO)
@@ -131,6 +132,7 @@ app = FastAPI(title="Claude Manager", lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 app.include_router(items_router)
 app.include_router(staffing_router)
+app.include_router(org_router)
 
 
 @app.exception_handler(RequestValidationError)
@@ -432,7 +434,14 @@ async def list_task_changes(
 
 @app.get("/tasks/{task_id}", response_model=TaskResponse, dependencies=[Depends(verify_token)])
 async def get_task(task_id: str, pool=Depends(get_pool)):
-    return await _get_task_or_error(pool, task_id)
+    task = await _get_task_or_error(pool, task_id)
+    # Org facts (team, lead member, members working on it) for get_task and
+    # A-i. Best-effort: a failure here never hides the task.
+    try:
+        task["org"] = await org_db.task_org(pool, task)
+    except Exception:  # noqa: BLE001
+        logger.exception("task org facts failed for %s", task_id)
+    return task
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +481,10 @@ def _read_continuous_states() -> list[dict]:
             # Missing dir / half-written file — skip; the view is best-effort.
             continue
     return states
+
+
+# The org roster reads continuous records too (api/org.py).
+app.state.read_continuous_states = _read_continuous_states
 
 
 def _shape_subtask(t: dict) -> dict:

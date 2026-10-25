@@ -153,6 +153,11 @@ class HeartbeatBody(_Strict):
     sessions: list[dict] = Field(default_factory=list, max_length=2000)
     exited: list[str] = Field(default_factory=list, max_length=2000)
     acked_push_ids: list[Annotated[int, Field(ge=1)]] = Field(default_factory=list, max_length=1000)
+    # Org model (api/org.py): daemon capabilities (doc/org-model.md §12) and
+    # the home-workspace marks it applied. Daemons send them only once the
+    # API accepts them (this body forbids unknown fields).
+    capabilities: list[Annotated[str, Field(max_length=64)]] | None = Field(default=None, max_length=64)
+    acked_mark_ids: list[Annotated[int, Field(ge=1)]] = Field(default_factory=list, max_length=1000)
 
 
 # ---- gate receipts (doc/gate-receipts.md §9) -----------------------------------

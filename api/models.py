@@ -215,6 +215,9 @@ class TaskResponse(BaseModel):
     initiative: dict | None = None
     # Free-form JSONB bag. Reads come back as a dict (or None).
     metadata: dict | None = None
+    # Org facts on a single-task read (GET /tasks/{id}): {team, lead_member,
+    # members}. Null in lists and the change feed.
+    org: dict | None = None
 
     class Config:
         from_attributes = True
@@ -291,7 +294,8 @@ class InitiativeResponse(BaseModel):
     status: str
     kind: str = "initiative"
     color: str | None = None
-    coordinator_task_id: str
+    # Null for a taskless team (kind 'team', org model S2).
+    coordinator_task_id: str | None = None
     coordinator_project: str | None = None
     docs_path: str
     shared_channel: str | None = None
@@ -302,3 +306,11 @@ class InitiativeResponse(BaseModel):
     updated_at: datetime
     projects: list[dict] = Field(default_factory=list)
     task_counts: dict[str, int] = Field(default_factory=dict)
+    # Team fields (org model S2, sql/026).
+    parent_team_id: str | None = None
+    lead_member_id: str | None = None
+    charter: str = ""
+    standing_rules: list = Field(default_factory=list)
+    team_status: str = "active"
+    org_id: str = "main"
+    team_revision: int = 0

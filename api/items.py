@@ -22,10 +22,13 @@ from api.items_models import (
     ItemsPatchBody,
     ItemsTouchBody,
 )
-from dispatch import gate_db, items_db
+import logging
+
+from dispatch import gate_db, items_db, org_db
 from dispatch.items_rules import ItemsError
 
 router = APIRouter(dependencies=[Depends(verify_token)])
+logger = logging.getLogger("cm.api.items")
 
 
 def _pool(request: Request):
@@ -191,7 +194,16 @@ async def held_items(request: Request, holder_pid: str = Query(..., min_length=1
 @router.post("/hosts/{daemon_id}/heartbeat")
 async def heartbeat(body: HeartbeatBody, request: Request,
                     daemon_id: str = Path(min_length=1, max_length=200)):
-    return await _call(items_db.heartbeat(
+    reply = await _call(items_db.heartbeat(
         _pool(request), daemon_id, host_label=body.host_label,
         sessions=body.sessions, exited=body.exited,
         acked_push_ids=body.acked_push_ids))
+    # The org half (session facts, capabilities, home marks, the member
+    # cache for ping). Best-effort: it never fails the items beat.
+    try:
+        reply["org"] = await org_db.heartbeat_extras(
+            _pool(request), daemon_id, body.sessions, capabilities=body.capabilities,
+            acked_mark_ids=body.acked_mark_ids)
+    except Exception:  # noqa: BLE001
+        logger.exception("org heartbeat extras failed for %s", daemon_id)
+    return reply
