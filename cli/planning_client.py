@@ -78,7 +78,10 @@ class PlanningClient:
         initiative_id: str | None = None,
         parent_task_id: str | None = None,
     ) -> dict:
-        """Create a task with source='claude' in draft status."""
+        """File a task with source='claude' into the project's backlog.
+
+        `prompt` is a deprecated alias: the API folds it into the description
+        (doc/org-model.md §13.2)."""
         if not repo_url:
             repo_url = _detect_repo_url()
 
@@ -88,7 +91,7 @@ class PlanningClient:
             "name": name,
             "project": project,
             "description": description,
-            "prompt": prompt or name,
+            "prompt": prompt,
             "source": "claude",
             "is_cloud": False,
             "priority": 0,

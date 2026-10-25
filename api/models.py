@@ -181,7 +181,15 @@ class TaskResponse(BaseModel):
     repo_url: str
     repo_branch: str
     name: str | None
+    # Deprecated (doc/org-model.md §13.2): always "", never an echo, so an old
+    # composer that joins description + prompt delivers the brief once. The
+    # description is the whole brief; the column keeps the original text.
     prompt: str | None
+
+    @field_validator("prompt", mode="after")
+    @classmethod
+    def _no_prompt(cls, value):
+        return ""
     status: str
     priority: int
     worker_vm: str | None

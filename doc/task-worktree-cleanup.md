@@ -110,11 +110,19 @@ python3 ~/.cm/worktree-tools/worktree_lineage.py register /absolute/child /absol
 ```
 
 Register only a parent supported by creation evidence. To install the chained
-hook in another repository:
+hooks in another repository:
 
 ```bash
 python3 ~/.cm/worktree-tools/worktree_lineage.py install /absolute/repository
 ```
+
+The same install also chains a `prepare-commit-msg` hook (org model §8.3).
+A commit made inside a CM session gets a `CM-Session: <session uid>` trailer,
+and `CM-Member: <id>` once sessions carry a member id. The hook runs after any
+pre-existing hook and keeps that hook's exit status. It never fails a commit,
+leaves merge commits alone, and keeps a trailer the message already has, so an
+amend or rebase by another session still credits the author. The same
+conflict rules apply as for post-checkout.
 
 ## A session that deleted its own checkout
 

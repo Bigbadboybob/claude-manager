@@ -81,9 +81,8 @@ struct ProposeTaskBody<'a> {
     name: &'a str,
     project: &'a str,
     description: &'a str,
-    /// Worker activation prompt. Falls back to `name` when the
-    /// MCP caller didn't supply one (matches the Python tool's
-    /// `prompt or name` shape).
+    /// Deprecated (doc/org-model.md §13.2): sent as given; the API folds a
+    /// real one into the description.
     prompt: &'a str,
     source: &'static str,
     is_cloud: bool,
@@ -409,14 +408,7 @@ pub fn propose_task(
         name: req.name,
         project: req.project,
         description: req.description,
-        // Match the Python tool's `prompt or name` fallback so
-        // the worker agent gets a non-empty activation prompt
-        // even when the MCP caller passed prompt="".
-        prompt: if req.prompt.is_empty() {
-            req.name
-        } else {
-            req.prompt
-        },
+        prompt: req.prompt,
         source: "claude",
         is_cloud: false,
         priority: 0,
@@ -790,11 +782,10 @@ mod tests {
         clear_env();
     }
 
-    /// Empty `prompt` falls back to `name` — mirrors the
-    /// Python tool's `prompt or name` shape at
-    /// `cli/planning_client.py:64`.
+    /// An empty `prompt` is sent empty: the description is the brief, and a
+    /// copy of the name would only be noise (doc/org-model.md §13.2).
     #[test]
-    fn propose_task_empty_prompt_falls_back_to_name() {
+    fn propose_task_empty_prompt_stays_empty() {
         let _g = env_lock();
         let (port, captured) = spawn_stub_api(
             200,
@@ -817,8 +808,8 @@ mod tests {
         let _ = propose_task(&req, None, None).expect("ok");
         let cap = captured.lock().unwrap();
         assert_eq!(
-            cap.body_json()["prompt"], "the-name",
-            "empty prompt must fall back to name",
+            cap.body_json()["prompt"], "",
+            "empty prompt is not replaced by the name",
         );
         clear_env();
     }

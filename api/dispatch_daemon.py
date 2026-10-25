@@ -6,7 +6,7 @@ import subprocess
 import time
 import uuid
 from datetime import datetime, timezone
-from dispatch import db
+from dispatch import db, task_text
 from dispatch.config import (
     GCP_PROJECT, GCP_ZONE, MAX_WORKERS, MANAGER_URL, API_TOKEN,
     MAX_BACKTEST_WORKERS, BACKTEST_VM_DEFAULTS, BACKTEST_SECRETS_PROJECT,
@@ -123,7 +123,7 @@ async def _assign_to_warm_vm(pool, task, warm_vm):
     logger.info(f"Assigning task {task['id']} to warm VM {warm_vm['vm_name']}")
 
     branch = task.get("wip_branch") or task["repo_branch"]
-    prompt = task.get("prompt") or ""
+    prompt = task_text.compose_brief(task.get("description"), task.get("prompt"), task.get("name"))
 
     try:
         if branch != "main":
@@ -534,7 +534,8 @@ def _launch_worker_sync(task, branch):
         task_id=str(task["id"]),
         repo_url=task["repo_url"],
         repo_branch=branch,
-        prompt=task["prompt"],
+        prompt=task_text.compose_brief(task.get("description"), task.get("prompt"),
+                                       task.get("name")),
         manager_callback_url=MANAGER_URL,
         task_metadata=task.get("metadata"),
     )

@@ -95,6 +95,53 @@ class CleanupTests(unittest.TestCase):
         after = lineage.records()[before['id']]
         self.assertEqual(before['parents'], after['parents'])
 
+    def commit(self, *args, session=''):
+        env = {**os.environ, 'CM_TUI_SESSION_ID': session}
+        subprocess.run(['git', '-C', str(self.repo), 'commit', '-q', '--allow-empty', *args],
+                       check=True, capture_output=True, env=env)
+        return self.git(self.repo, 'log', '-1', '--format=%B')
+
+    def test_commit_trailer_hook_credits_the_authoring_session(self):
+        hook = self.repo / '.git/hooks/prepare-commit-msg'
+        hook.write_text('#!/bin/sh\nprintf "\\n[template]\\n" >> "$1"\n')
+        hook.chmod(0o755)
+        results = lineage.install_hooks(self.repo)
+        self.assertEqual([Path(r['hook']).name for r in results], ['post-checkout', 'prepare-commit-msg'])
+        lineage.install_hooks(self.repo)
+        self.assertEqual(hook.read_text().count(lineage.TRAILER_MARKER), 1)
+        message = self.commit('-m', 'feat: one', session='ts-author-1')
+        self.assertIn('[template]', message, 'the pre-existing hook still runs')
+        self.assertTrue(message.rstrip().endswith('CM-Session: ts-author-1'), message)
+        # An amend by another session keeps the author's trailer.
+        message = self.commit('--amend', '--no-edit', session='ts-lander-2')
+        self.assertIn('CM-Session: ts-author-1', message)
+        self.assertNotIn('ts-lander-2', message)
+        # Outside a session nothing is added.
+        self.assertNotIn('CM-Session', self.commit('-m', 'plain'))
+
+    def test_commit_trailer_hook_skips_merges_and_keeps_a_failing_hook(self):
+        lineage.install_trailer_hook(self.repo)
+        msg = self.base / 'MERGE_MSG'
+        msg.write_text('Merge branch x\n')
+        with patch.dict(os.environ, {'CM_TUI_SESSION_ID': 'ts-lander'}):
+            lineage.trailers([str(msg), 'merge'])
+            self.assertEqual(msg.read_text(), 'Merge branch x\n')
+            lineage.trailers([str(msg), 'message'])
+        self.assertIn('CM-Session: ts-lander', msg.read_text())
+        with patch.dict(os.environ, {'CM_TUI_SESSION_ID': 'ts-a', 'CM_MEMBER_ID': 'm-7'}):
+            self.assertEqual(lineage.commit_trailers(), ['CM-Session: ts-a', 'CM-Member: m-7'])
+
+        other = self.base / 'other'
+        other.mkdir()
+        self.git(other, 'init', '-b', 'main')
+        hook = other / '.git/hooks/prepare-commit-msg'
+        hook.write_text('#!/bin/sh\nexit 3\n')
+        hook.chmod(0o755)
+        lineage.install_trailer_hook(other)
+        proc = subprocess.run(['git', '-C', str(other), '-c', 'user.name=t', '-c', 'user.email=t@t',
+                               'commit', '-q', '--allow-empty', '-m', 'x'], capture_output=True)
+        self.assertNotEqual(proc.returncode, 0, 'a failing pre-existing hook still aborts the commit')
+
     def test_checkout_local_hooks_are_not_modified_or_claimed_as_tracked(self):
         hooks = self.repo / '.hooks'
         hooks.mkdir()

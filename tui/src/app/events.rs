@@ -2695,11 +2695,21 @@ impl App {
             let display_name = task
                 .name
                 .as_deref()
+                .or(task.description.as_deref().filter(|d| !d.trim().is_empty()))
                 .or(task.prompt.as_deref())
                 .unwrap_or(&task.id[..8.min(task.id.len())])
                 .chars()
                 .take(60)
                 .collect::<String>();
+
+            // The task's brief (doc/org-model.md §13.2): the API now returns
+            // `prompt: ""`, so the description carries it.
+            let brief = Some(crate::planning::task_brief(
+                task.description.as_deref().unwrap_or(""),
+                task.prompt.as_deref().unwrap_or(""),
+                task.name.as_deref().unwrap_or(""),
+            ))
+            .filter(|b| !b.is_empty());
 
             let is_cloud = task.is_cloud;
             // Local recovery covers both top-level CM branches (`cm/...`)
@@ -2722,7 +2732,7 @@ impl App {
                 entry.name = display_name.clone();
                 entry.api_status = TaskStatus::from_api(&task.status);
                 entry.repo_url = Some(task.repo_url.clone());
-                entry.prompt = task.prompt.clone();
+                entry.prompt = brief.clone();
                 entry.wip_branch = task.wip_branch.clone();
                 entry.session_id = task.session_id.clone();
                 entry.blocked_at = task.blocked_at.clone();
@@ -2738,7 +2748,7 @@ impl App {
                     name: display_name.clone(),
                     api_status: TaskStatus::from_api(&task.status),
                     repo_url: Some(task.repo_url.clone()),
-                    prompt: task.prompt.clone(),
+                    prompt: brief,
                     wip_branch: task.wip_branch.clone(),
                     session_id: task.session_id.clone(),
                     blocked_at: task.blocked_at.clone(),

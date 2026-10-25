@@ -558,38 +558,36 @@ pub struct WorkspaceCandidate {
 /// Reduce a repo URL to a comparable form so SSH and HTTPS pointers to the
 /// same repo match. `git@github.com:org/repo.git` and
 /// `https://github.com/org/repo.git` both collapse to `github.com/org/repo`.
-/// Compose the activation text delivered to a worker agent on planning
-/// launch. The agent only sees ONE string at session-spawn time, but
-/// tasks have two natural fields: `description` (background/motivation
-/// for the user reading the planning queue) and `prompt` (instructions
-/// for the agent). We combine both so the agent always has the WHY plus
-/// the HOW, separated by a clear delimiter so a smart worker can ignore
-/// the background if it's irrelevant.
-///
-/// Precedence:
-///   - Both present: "{description}\n\n---\n\n{prompt}"
-///   - Only prompt: prompt verbatim (most common today; older tasks)
-///   - Only description: description verbatim (description-only tasks
-///     are rare but the agent should still get something useful)
-///   - Neither: title fallback (prevents the empty-prompt class of
-///     bug where the worker spawns with nothing to do)
-///
-/// Whitespace-only fields are treated as empty.
+/// A task's brief (doc/org-model.md §13.2): its description, plus a legacy
+/// `prompt` only when that says something the description does not. A
+/// prompt that is empty, equal to the title, or contained in the
+/// description (the S1 backfill's `## Instructions`) is skipped, so nothing
+/// is delivered twice. Empty when there is nothing but the title.
+pub(crate) fn task_brief(description: &str, prompt: &str, title: &str) -> String {
+    let description = description.trim();
+    let prompt = prompt.trim();
+    if prompt.is_empty() || prompt == title.trim() || description.contains(prompt) {
+        description.to_string()
+    } else if description.is_empty() {
+        prompt.to_string()
+    } else {
+        format!("{}\n\n---\n\n{}", description, prompt)
+    }
+}
+
+/// The activation text delivered to a worker on planning launch: the
+/// task's brief, else its title (so a worker never spawns with nothing to
+/// do). Whitespace-only fields are treated as empty.
 pub(crate) fn compose_launch_prompt(
     description: &str,
     prompt: &str,
     title: &str,
 ) -> String {
-    let description = description.trim();
-    let prompt = prompt.trim();
-    if !description.is_empty() && !prompt.is_empty() {
-        format!("{}\n\n---\n\n{}", description, prompt)
-    } else if !prompt.is_empty() {
-        prompt.to_string()
-    } else if !description.is_empty() {
-        description.to_string()
-    } else {
+    let brief = task_brief(description, prompt, title);
+    if brief.is_empty() {
         title.to_string()
+    } else {
+        brief
     }
 }
 
@@ -806,23 +804,18 @@ fn write_temp_task(task: &PlanTask, parent_slug: Option<&str>) -> Option<PathBuf
     let yaml = serde_yaml::to_string(&front).ok()?;
     let yaml = yaml.trim_end_matches('\n');
 
-    let body = if task.description.is_empty() && task.prompt.is_empty() {
-        "## Description\n\n\n\n## Prompt\n".to_string()
-    } else {
-        let mut body = String::new();
-        if !task.description.is_empty() {
-            body.push_str(&task.description);
-        } else {
-            body.push_str("## Description\n");
+    // One brief (doc/org-model.md §13.2): the body is the description. A
+    // legacy prompt it lacks (a row from an older API) is shown under
+    // `## Instructions`, so saving folds it in rather than losing it.
+    let mut body = task.description.trim_end().to_string();
+    let prompt = task.prompt.trim();
+    if !prompt.is_empty() && prompt != task.title.trim() && !body.contains(prompt) {
+        if !body.trim().is_empty() {
+            body.push_str("\n\n");
         }
-        if !task.prompt.is_empty() {
-            if !body.contains("## Prompt") {
-                body.push_str("\n\n## Prompt\n");
-            }
-            body.push_str(&task.prompt);
-        }
-        body
-    };
+        body.push_str("## Instructions\n\n");
+        body.push_str(prompt);
+    }
 
     let content = format!("---\n{}\n---\n\n{}", yaml, body);
     std::fs::write(&path, content).ok()?;
@@ -899,26 +892,16 @@ fn parse_temp_task(path: &Path) -> Option<TempTaskParsed> {
         }
     };
 
-    // Extract prompt section from body.
-    let mut in_prompt = false;
-    let mut prompt_lines = vec![];
-    let mut desc_lines = vec![];
-    for line in body.lines() {
-        if line.starts_with("## Prompt") {
-            in_prompt = true;
-            continue;
-        }
-        if in_prompt {
-            if line.starts_with("## ") {
-                in_prompt = false;
-                desc_lines.push(line);
-            } else {
-                prompt_lines.push(line);
-            }
-        } else {
-            desc_lines.push(line);
-        }
-    }
+    // The whole body is the description. A `## Prompt` section (an older
+    // editor's template) is kept, renamed to the `## Instructions` heading.
+    let description = body
+        .lines()
+        .map(|line| match line.strip_prefix("## Prompt") {
+            Some(rest) => format!("## Instructions{}", rest),
+            None => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     Some(TempTaskParsed {
         title: front.title,
@@ -927,8 +910,7 @@ fn parse_temp_task(path: &Path) -> Option<TempTaskParsed> {
         depends,
         branch,
         parent,
-        description: desc_lines.join("\n").trim().to_string(),
-        prompt: prompt_lines.join("\n").trim().to_string(),
+        description: description.trim().to_string(),
     })
 }
 
@@ -943,7 +925,6 @@ struct TempTaskParsed {
     /// cycle/scope validation.
     parent: FieldUpdate<String>,
     description: String,
-    prompt: String,
 }
 
 /// Build the PATCH map sent to the API for an editor save. Cleared
@@ -958,7 +939,6 @@ fn build_patch_fields(parsed: &TempTaskParsed) -> HashMap<String, serde_json::Va
         "description".to_string(),
         serde_json::json!(parsed.description),
     );
-    fields.insert("prompt".to_string(), serde_json::json!(parsed.prompt));
 
     match &parsed.difficulty {
         FieldUpdate::Absent => {}
@@ -3864,7 +3844,7 @@ impl PlanningView {
                         task.parent_task_id = p;
                     }
                     task.description = parsed.description.clone();
-                    task.prompt = parsed.prompt.clone();
+                    task.prompt.clear();
 
                     let mut fields = build_patch_fields(&parsed);
                     if let Some(v) = parent_field {
@@ -6591,6 +6571,39 @@ mod tests {
         parsed
     }
 
+    /// org-model §13.2: the editor edits one brief. A legacy prompt the
+    /// description lacks is shown under `## Instructions` and saved into the
+    /// description; the PATCH never carries a prompt.
+    #[test]
+    fn editor_folds_a_legacy_prompt_into_the_description() {
+        let mut task = make_plan_task("brief-rt-legacy");
+        task.description = "Why.".to_string();
+        task.prompt = "Never push to main.".to_string();
+        let parsed = round_trip(&task);
+        assert_eq!(parsed.description, "Why.\n\n## Instructions\n\nNever push to main.");
+        let fields = build_patch_fields(&parsed);
+        assert!(!fields.contains_key("prompt"));
+        assert_eq!(fields["description"], serde_json::json!(parsed.description));
+
+        // Already folded (or equal to the title): shown once.
+        task.description = parsed.description.clone();
+        assert_eq!(round_trip(&task).description, parsed.description);
+        task.description = "Why.".to_string();
+        task.prompt = task.title.clone();
+        assert_eq!(round_trip(&task).description, "Why.");
+    }
+
+    #[test]
+    fn editor_keeps_an_old_prompt_section_as_instructions() {
+        let dir = std::env::temp_dir().join("cm-planning");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("brief-old-template.md");
+        std::fs::write(&path, "---\ntitle: t\nstatus: backlog\n---\n\nWhy.\n\n## Prompt\nStep 1.\n").unwrap();
+        let parsed = parse_temp_task(&path).expect("parse");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(parsed.description, "Why.\n\n## Instructions\nStep 1.");
+    }
+
     #[test]
     fn frontmatter_title_with_colon_round_trips() {
         let mut task = make_plan_task("yaml-rt-colon");
@@ -6995,6 +7008,18 @@ mod tests {
         // with nothing to do.
         let out = compose_launch_prompt("", "", "Untitled task");
         assert_eq!(out, "Untitled task");
+    }
+
+    #[test]
+    fn compose_skips_a_prompt_the_description_already_has() {
+        // org-model §13.2: the S1 backfill appends the prompt under
+        // `## Instructions`; an old row read after it must not deliver the
+        // instructions twice, and a prompt that is only the title adds
+        // nothing.
+        let backfilled = "Why.\n\n## Instructions\n\nDo it.";
+        assert_eq!(compose_launch_prompt(backfilled, "Do it.", "T"), backfilled);
+        assert_eq!(compose_launch_prompt("Why.", "T", "T"), "Why.");
+        assert_eq!(task_brief("", " T ", "T"), "");
     }
 
     #[test]

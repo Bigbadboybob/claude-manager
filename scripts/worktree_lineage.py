@@ -16,6 +16,7 @@ import time
 import uuid
 
 MARKER = '# cm-worktree-lineage v1'
+TRAILER_MARKER = '# cm-commit-trailers v1'
 
 
 def cm_home() -> Path:
@@ -236,9 +237,13 @@ def register(path: Path, parent: Path | None = None, task_ids=(), source='git-ho
     return value
 
 
-def install_hook(repo: Path) -> dict:
-    """Chain the existing hook in place; never change core.hooksPath or bootstrap."""
-    hook = Path(git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'hooks/post-checkout'))
+def _chain_hook(repo: Path, name: str, marker: str, ours: str, ours_first: bool) -> dict:
+    """Chain the existing `name` hook in place; never change core.hooksPath or bootstrap.
+
+    `ours` is the shell line CM adds. With `ours_first` it runs before the
+    pre-existing hook (which can exit, exec or change cwd); otherwise after
+    it. Either way the pre-existing hook's exit status is preserved."""
+    hook = Path(git(repo, 'rev-parse', '--path-format=absolute', '--git-path', f'hooks/{name}'))
     try:
         configured = git(repo, 'config', '--get', 'core.hooksPath')
     except subprocess.CalledProcessError:
@@ -263,28 +268,89 @@ def install_hook(repo: Path) -> dict:
         if hook.is_symlink():
             raise ValueError(f'leaving symlink hook unchanged: {hook}')
         original = hook.read_text() if hook.exists() else ''
-        if MARKER in original:
+        if marker in original:
             return {'hook': str(hook), 'installed': True}
-        previous = hook.with_name('post-checkout.before-cm-lineage')
+        previous = hook.with_name(f'{name}.before-cm-lineage')
         if previous.exists():
             raise ValueError(f'hook was replaced since installation; inspect {hook}')
         executable = hook.exists() and os.access(hook, os.X_OK)
         if hook.exists():
             os.replace(hook, previous)
-        script = shlex.quote(str(Path(__file__).resolve()))
-        # Run tracking before the pre-existing hook: that hook can exit, exec,
-        # change cwd, or create further worktrees. Its exit status is preserved.
-        body = f'#!/bin/sh\n{MARKER}\n/usr/bin/python3 {script} hook "$@" >/dev/null 2>&1 || :\n'
-        if executable:
-            body += f'exec {shlex.quote(str(previous))} "$@"\n'
+        body = f'#!/bin/sh\n{marker}\n'
+        if ours_first or not executable:
+            body += ours
+            body += f'exec {shlex.quote(str(previous))} "$@"\n' if executable else 'exit 0\n'
         else:
-            body += 'exit 0\n'
-        fd, name = tempfile.mkstemp(prefix='.post-checkout-', dir=hook.parent)
+            body += f'{shlex.quote(str(previous))} "$@" || exit $?\n{ours}exit 0\n'
+        fd, tmp = tempfile.mkstemp(prefix=f'.{name}-', dir=hook.parent)
         with os.fdopen(fd, 'w') as stream:
             stream.write(body)
-        os.chmod(name, 0o755)
-        os.replace(name, hook)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, hook)
     return {'hook': str(hook), 'installed': True}
+
+
+def install_hook(repo: Path) -> dict:
+    """The post-checkout lineage hook. Tracking runs before the pre-existing
+    hook: that hook can exit, exec, change cwd, or create further worktrees."""
+    script = shlex.quote(str(Path(__file__).resolve()))
+    return _chain_hook(repo, 'post-checkout', MARKER,
+                       f'/usr/bin/python3 {script} hook "$@" >/dev/null 2>&1 || :\n', ours_first=True)
+
+
+def install_trailer_hook(repo: Path) -> dict:
+    """The prepare-commit-msg hook adding CM-Session / CM-Member trailers
+    (doc/org-model.md §8.3). It runs after the pre-existing hook, so a hook
+    that rewrites the message keeps the trailers, and never fails a commit."""
+    script = shlex.quote(str(Path(__file__).resolve()))
+    return _chain_hook(repo, 'prepare-commit-msg', TRAILER_MARKER,
+                       f'/usr/bin/python3 {script} trailers "$@" >/dev/null 2>&1 || :\n', ours_first=False)
+
+
+def install_hooks(repo: Path) -> list[dict]:
+    """Both CM hooks; one refusing (a tracked or checkout-local hook) does
+    not stop the other. Raises the first refusal after trying both."""
+    results, errors = [], []
+    for install in (install_hook, install_trailer_hook):
+        try:
+            results.append(install(repo))
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            errors.append(exc)
+    if errors:
+        raise errors[0]
+    return results
+
+
+def commit_trailers(env=os.environ) -> list[str]:
+    """`CM-Session: <uid>` for a commit made inside a CM session, plus
+    `CM-Member: <id>` once sessions carry a member id (org model S2+)."""
+    out = []
+    uid = env.get('CM_TUI_SESSION_ID', '').strip()
+    if uid:
+        out.append(f'CM-Session: {uid}')
+    member = env.get('CM_MEMBER_ID', '').strip()
+    if member:
+        out.append(f'CM-Member: {member}')
+    return out
+
+
+def trailers(args: list[str]) -> None:
+    """prepare-commit-msg payload: `<message file> [source [sha]]`. Credits
+    authors, not landers, so a merge commit gets no trailer; an amended or
+    reused message keeps the trailers it already has."""
+    if not args or (len(args) > 1 and args[1] == 'merge'):
+        return
+    try:
+        lines = Path(args[0]).read_text().splitlines()
+    except OSError:
+        return
+    for trailer in commit_trailers():
+        key = trailer.split(':', 1)[0] + ':'
+        if any(line.startswith(key) for line in lines):
+            continue
+        subprocess.run(['git', 'interpret-trailers', '--in-place', '--if-exists', 'doNothing',
+                        '--trailer', trailer, args[0]], check=True, timeout=15,
+                       capture_output=True)
 
 
 def hook(args: list[str]) -> None:
@@ -315,8 +381,10 @@ def hook(args: list[str]) -> None:
 if __name__ == '__main__':
     if sys.argv[1:2] == ['hook']:
         hook(sys.argv[2:])
+    elif sys.argv[1:2] == ['trailers']:
+        trailers(sys.argv[2:])
     elif sys.argv[1:2] == ['install']:
         for arg in sys.argv[2:]:
-            print(json.dumps(install_hook(Path(arg))))
+            print(json.dumps(install_hooks(Path(arg))))
     elif sys.argv[1:2] == ['register']:
         print(json.dumps(register(Path(sys.argv[2]), Path(sys.argv[3]) if len(sys.argv) > 3 else None, source='cm')))

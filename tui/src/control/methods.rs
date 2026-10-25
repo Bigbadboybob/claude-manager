@@ -1125,12 +1125,11 @@ struct StartSessionParams {
 /// daemon's API round trip. `None` ⇒ spawn promptless, exactly as
 /// before ux-5c.
 ///
-/// `TaskEntry` carries the task's `prompt` and display `name` but not
-/// its `description` (that lives only in the planning-board rows), so
-/// the composition here degenerates to "prompt verbatim". The daemon
-/// path — which reads the full API row — is the one that folds in the
-/// description. Both refuse to fall back to the bare title: a task with
-/// no stored prompt has nothing worth auto-delivering.
+/// `TaskEntry.prompt` holds the task's brief (its description plus any
+/// legacy prompt the description lacks; see `planning::task_brief`), the
+/// same text the daemon path composes from the full API row. Both refuse
+/// to fall back to the bare title: a task with no brief has nothing worth
+/// auto-delivering.
 fn task_autodelivery_prompt(
     tasks: &[crate::app::TaskEntry],
     task_id: &str,

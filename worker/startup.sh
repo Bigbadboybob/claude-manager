@@ -16,7 +16,9 @@ META_HEADER="Metadata-Flavor: Google"
 TASK_ID=$(curl -sf "$META_URL/task-id" -H "$META_HEADER")
 REPO_URL=$(curl -sf "$META_URL/repo-url" -H "$META_HEADER")
 REPO_BRANCH=$(curl -sf "$META_URL/repo-branch" -H "$META_HEADER")
-TASK_PROMPT=$(curl -sf "$META_URL/task-prompt" -H "$META_HEADER")
+# The dispatcher puts the task's brief here; it may be absent or empty
+# (doc/org-model.md §13 S0a), in which case the description below is used.
+TASK_PROMPT=$(curl -sf "$META_URL/task-prompt" -H "$META_HEADER" || echo "")
 MANAGER_URL=$(curl -sf "$META_URL/manager-callback-url" -H "$META_HEADER" || echo "")
 API_TOKEN=$(curl -sf "$META_URL/api-token" -H "$META_HEADER" || echo "")
 
@@ -40,6 +42,9 @@ if [ -n "$MANAGER_URL" ] && [ -n "$API_TOKEN" ]; then
     TASK_JSON=$(curl -sf "$MANAGER_URL/tasks/$TASK_ID" \
         -H "Authorization: Bearer $API_TOKEN" || echo "{}")
     SESSION_ID=$(echo "$TASK_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('session_id') or '')" 2>/dev/null || echo "")
+    if [ -z "$TASK_PROMPT" ]; then
+        TASK_PROMPT=$(echo "$TASK_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('description') or '')" 2>/dev/null || echo "")
+    fi
 fi
 echo "[cm-worker] Session ID: ${SESSION_ID:-none}"
 

@@ -2,6 +2,13 @@
 
 use super::*;
 
+/// How long an untracked taskless daemon session must stay untracked before
+/// the adopt pass takes it (doc/org-model.md §13 S0a). Longer than any spawn
+/// response of ours not covered by an in-flight set.
+const TASKLESS_ADOPT_GRACE: Duration = Duration::from_secs(30);
+/// First-seen entries for uids no pass has listed lately are dropped.
+const TASKLESS_SEEN_TTL: Duration = Duration::from_secs(24 * 3600);
+
 /// How often the TUI re-reports the session it keeps showing. Well inside
 /// the daemon sweep's two-hour owner grace.
 pub(crate) const VIEWED_REPORT_INTERVAL: std::time::Duration =
@@ -903,12 +910,20 @@ impl App {
                     }
                 }
 
+                let in_flight = self.session_uids_in_flight();
                 let tracked: std::collections::HashSet<&str> = self
                     .workspaces
                     .iter()
                     .flat_map(|w| w.sessions.iter().map(|s| s.uid.as_str()))
                     .collect();
-                let adoptees = Self::select_daemon_adoptees(summaries, &tracked);
+                let settled = Self::settle_taskless(
+                    &mut self.taskless_seen,
+                    &summaries.iter().collect::<Vec<_>>(),
+                    &|uid| tracked.contains(uid),
+                    &in_flight,
+                    Instant::now(),
+                );
+                let adoptees = Self::select_daemon_adoptees(summaries, &tracked, &settled);
                 drop(tracked);
                 for s in adoptees {
                     let (target_ws_id, worktree) = self
@@ -996,9 +1011,19 @@ impl App {
         // continuous sessions, a duplicate orchestrator) per poll until it binds.
         let attaching: std::collections::HashSet<String> =
             self.attaching.keys().cloned().collect();
+        let in_flight = self.session_uids_in_flight();
+        let all: Vec<&crate::client_session::DaemonSessionSummary> =
+            remote.iter().flat_map(|(_, summaries)| summaries.iter()).collect();
+        let settled = Self::settle_taskless(
+            &mut self.taskless_seen,
+            &all,
+            &|uid| tracked.contains(uid) || pending.contains(uid) || attaching.contains(uid),
+            &in_flight,
+            Instant::now(),
+        );
         for (host, summaries) in remote {
             for s in summaries {
-                if !Self::is_remote_adoptee(&s, &tracked, &pending, &attaching) {
+                if !Self::is_remote_adoptee(&s, &tracked, &pending, &attaching, &settled) {
                     continue;
                 }
                 let (target_ws_id, _worktree) = self.resolve_adopt_workspace(&s, &host);
@@ -1201,30 +1226,81 @@ impl App {
         tracked: &std::collections::HashSet<String>,
         pending: &std::collections::HashSet<String>,
         attaching: &std::collections::HashSet<String>,
+        settled_taskless: &std::collections::HashSet<String>,
     ) -> bool {
-        (s.managed_by_uid.is_some() || s.continuous_task_id.is_some() || s.task_id.is_some())
+        Self::adoptable_binding(s, settled_taskless)
             && !tracked.contains(&s.session_uid)
             && !pending.contains(&s.session_uid)
             && !attaching.contains(&s.session_uid)
     }
 
+    /// Whether a summary's binding makes it adoptable: agent-spawned,
+    /// task-bound or continuous-tagged (`continuous_task_id.is_some()` —
+    /// scheduler/operator spawns whose `managed_by_uid` is `None`) at once,
+    /// and a TASKLESS one (doc/org-model.md §13 S0a: members' sessions need
+    /// not have a task) once it is in `settled_taskless`, i.e. untracked for
+    /// `TASKLESS_ADOPT_GRACE` with no spawn of ours in flight for it.
+    fn adoptable_binding(
+        s: &crate::client_session::DaemonSessionSummary,
+        settled_taskless: &std::collections::HashSet<String>,
+    ) -> bool {
+        Self::is_bound_summary(s) || settled_taskless.contains(&s.session_uid)
+    }
+
+    fn is_bound_summary(s: &crate::client_session::DaemonSessionSummary) -> bool {
+        s.managed_by_uid.is_some() || s.continuous_task_id.is_some() || s.task_id.is_some()
+    }
+
+    /// Track untracked taskless summaries and return those that have stayed
+    /// untracked for `TASKLESS_ADOPT_GRACE` and are not being spawned,
+    /// revived or restarted by one of our own workers. A TUI spawn binds its
+    /// own session when its response lands; the grace keeps the adopt pass
+    /// from racing it into a duplicate slot.
+    fn settle_taskless(
+        seen: &mut HashMap<String, Instant>,
+        summaries: &[&crate::client_session::DaemonSessionSummary],
+        tracked: &dyn Fn(&str) -> bool,
+        in_flight: &std::collections::HashSet<String>,
+        now: Instant,
+    ) -> std::collections::HashSet<String> {
+        let candidates: Vec<&str> = summaries
+            .iter()
+            .filter(|s| !Self::is_bound_summary(s) && !tracked(&s.session_uid))
+            .map(|s| s.session_uid.as_str())
+            .collect();
+        // Forget uids that got bound or tracked; the local and cached passes
+        // each see only some hosts, so entries for other hosts stay.
+        for s in summaries {
+            if !candidates.contains(&s.session_uid.as_str()) {
+                seen.remove(&s.session_uid);
+            }
+        }
+        seen.retain(|_, first| now.duration_since(*first) < TASKLESS_SEEN_TTL);
+        candidates
+            .into_iter()
+            .filter(|uid| {
+                let first = *seen.entry(uid.to_string()).or_insert(now);
+                !in_flight.contains(*uid) && now.duration_since(first) >= TASKLESS_ADOPT_GRACE
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
     /// Select which daemon-session summaries the adoption pass should take:
-    /// agent-spawned, task-bound, or continuous-tagged
-    /// (`continuous_task_id.is_some()` — scheduler/operator spawns whose
-    /// `managed_by_uid` is `None`), and not already tracked in any TUI
-    /// workspace. Unbound TUI/operator spawns are excluded —
-    /// they're tracked through the normal spawn path. Pure (no `self`) so the
-    /// gate + dedup is unit-testable without a live daemon.
+    /// an adoptable binding (`adoptable_binding`) not already tracked in any
+    /// TUI workspace. Pure (no `self`) so the gate + dedup is unit-testable
+    /// without a live daemon.
     fn select_daemon_adoptees(
         summaries: Vec<crate::client_session::DaemonSessionSummary>,
         tracked_uids: &std::collections::HashSet<&str>,
+        settled_taskless: &std::collections::HashSet<String>,
     ) -> Vec<crate::client_session::DaemonSessionSummary> {
         summaries
             .into_iter()
             .filter(|s| {
                 // Task-bound operator launches also need recovery when a create
                 // response was lost or a different TUI launched the task.
-                (s.managed_by_uid.is_some() || s.continuous_task_id.is_some() || s.task_id.is_some())
+                Self::adoptable_binding(s, settled_taskless)
                     && !tracked_uids.contains(s.session_uid.as_str())
             })
             .collect()
@@ -1595,7 +1671,9 @@ mod adopt_daemon_session_tests {
     //! and task-bound daemon sessions without duplicating tracked sessions.
     use super::App;
     use crate::client_session::DaemonSessionSummary;
-    use std::collections::HashSet;
+    use super::TASKLESS_ADOPT_GRACE;
+    use std::collections::{HashMap, HashSet};
+    use std::time::Instant;
 
     fn summary(uid: &str, managed_by_uid: Option<&str>) -> DaemonSessionSummary {
         DaemonSessionSummary {
@@ -1627,22 +1705,54 @@ mod adopt_daemon_session_tests {
             summary("operator-1", None),           // skip: not agent-spawned
             summary("already-here", Some("ts-parent")), // skip: already tracked
         ];
-        let picked = App::select_daemon_adoptees(summaries, &tracked);
+        let picked = App::select_daemon_adoptees(summaries, &tracked, &HashSet::new());
         let uids: Vec<&str> = picked.iter().map(|s| s.session_uid.as_str()).collect();
         assert_eq!(uids, vec!["agent-1"]);
+    }
+
+    /// org-model S0a: a taskless session is adopted once it has stayed
+    /// untracked for the grace period, never while one of our own spawns
+    /// for it is in flight, and a bound one still is at once.
+    #[test]
+    fn taskless_sessions_are_adopted_after_the_grace() {
+        let t0 = Instant::now();
+        let mut seen = HashMap::new();
+        let loose = summary("loose", None);
+        let flying = summary("flying", None);
+        let bound = summary("agent", Some("ts-parent"));
+        let all = [&loose, &flying, &bound];
+        let in_flight = HashSet::from(["flying".to_string()]);
+        let untracked = |_: &str| false;
+        let settled = App::settle_taskless(&mut seen, &all, &untracked, &in_flight, t0);
+        assert!(settled.is_empty(), "nothing taskless settles on first sight");
+        let picked = App::select_daemon_adoptees(
+            vec![loose.clone(), bound.clone()], &HashSet::new(), &settled);
+        assert_eq!(picked.iter().map(|s| s.session_uid.as_str()).collect::<Vec<_>>(), ["agent"]);
+
+        let later = t0 + TASKLESS_ADOPT_GRACE;
+        let settled = App::settle_taskless(&mut seen, &all, &untracked, &in_flight, later);
+        assert_eq!(settled, HashSet::from(["loose".to_string()]));
+        assert!(App::is_remote_adoptee(&loose, &HashSet::new(), &HashSet::new(), &HashSet::new(), &settled));
+        assert!(!App::is_remote_adoptee(&flying, &HashSet::new(), &HashSet::new(), &HashSet::new(), &settled));
+
+        // Once tracked, the first-seen entry is forgotten: a later untrack
+        // starts a fresh grace.
+        let tracked = |uid: &str| uid == "loose";
+        App::settle_taskless(&mut seen, &all, &tracked, &in_flight, later);
+        assert!(!seen.contains_key("loose"));
     }
 
     #[test]
     fn task_bound_operator_spawn_recovers_without_duplicate_attachments() {
         let mut s = summary("lost-launch", None);
         s.task_id = Some("task-new".into());
-        assert_eq!(App::select_daemon_adoptees(vec![s.clone()], &HashSet::new()).len(), 1);
+        assert_eq!(App::select_daemon_adoptees(vec![s.clone()], &HashSet::new(), &HashSet::new()).len(), 1);
         let none = HashSet::new();
         let uid = HashSet::from([s.session_uid.clone()]);
-        assert!(App::is_remote_adoptee(&s, &none, &none, &none));
-        assert!(!App::is_remote_adoptee(&s, &uid, &none, &none));
-        assert!(!App::is_remote_adoptee(&s, &none, &uid, &none));
-        assert!(!App::is_remote_adoptee(&s, &none, &none, &uid));
+        assert!(App::is_remote_adoptee(&s, &none, &none, &none, &HashSet::new()));
+        assert!(!App::is_remote_adoptee(&s, &uid, &none, &none, &HashSet::new()));
+        assert!(!App::is_remote_adoptee(&s, &none, &uid, &none, &HashSet::new()));
+        assert!(!App::is_remote_adoptee(&s, &none, &none, &uid, &HashSet::new()));
     }
 
     #[test]
@@ -1707,7 +1817,7 @@ mod adopt_daemon_session_tests {
     fn plain_operator_spawn_is_never_adopted() {
         // Neither agent-spawned (managed_by_uid) nor continuous-tagged → skip.
         let tracked: HashSet<&str> = HashSet::new();
-        let picked = App::select_daemon_adoptees(vec![summary("x", None)], &tracked);
+        let picked = App::select_daemon_adoptees(vec![summary("x", None)], &tracked, &HashSet::new());
         assert!(
             picked.is_empty(),
             "plain TUI/operator-spawned sessions (both fields None) must not be adopted"
@@ -1722,7 +1832,7 @@ mod adopt_daemon_session_tests {
         let tracked: HashSet<&str> = HashSet::new();
         let mut s = summary("bug-triage-orch", None);
         s.continuous_task_id = Some("bug-triage".to_string());
-        let picked = App::select_daemon_adoptees(vec![s], &tracked);
+        let picked = App::select_daemon_adoptees(vec![s], &tracked, &HashSet::new());
         let uids: Vec<&str> = picked.iter().map(|s| s.session_uid.as_str()).collect();
         assert_eq!(uids, vec!["bug-triage-orch"]);
     }
@@ -1733,7 +1843,7 @@ mod adopt_daemon_session_tests {
         let tracked: HashSet<&str> = ["bug-triage-orch"].into_iter().collect();
         let mut s = summary("bug-triage-orch", None);
         s.continuous_task_id = Some("bug-triage".to_string());
-        let picked = App::select_daemon_adoptees(vec![s], &tracked);
+        let picked = App::select_daemon_adoptees(vec![s], &tracked, &HashSet::new());
         assert!(picked.is_empty(), "tracked continuous session must not double-adopt");
     }
 
@@ -1802,14 +1912,14 @@ mod adopt_daemon_session_tests {
         // Not yet in-flight → it IS an adoptee (proves the path is live).
         let empty: Set<String> = Set::new();
         assert!(
-            App::is_remote_adoptee(&s, &tracked, &pending, &empty),
+            App::is_remote_adoptee(&s, &tracked, &pending, &empty, &HashSet::new()),
             "a fresh continuous adoptee must be picked up",
         );
 
         // In-flight in the attach worker → must be skipped.
         let attaching: Set<String> = ["orch".to_string()].into_iter().collect();
         assert!(
-            !App::is_remote_adoptee(&s, &tracked, &pending, &attaching),
+            !App::is_remote_adoptee(&s, &tracked, &pending, &attaching, &HashSet::new()),
             "an in-flight (attaching) uid must NOT be re-adopted — it would mint \
              a duplicate workspace per poll",
         );

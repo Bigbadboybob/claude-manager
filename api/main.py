@@ -28,7 +28,7 @@ from api.board_engine import board_loop
 from api.items import router as items_router
 from api.staffing import router as staffing_router
 from api.task_changes import ChangeBroker, change_log_maintenance_loop
-from dispatch import db
+from dispatch import db, task_text
 from dispatch.config import DB_DSN, REPOS
 
 logging.basicConfig(level=logging.INFO)
@@ -263,9 +263,8 @@ async def _validate_task_initiative(
 # else in TaskUpdate maps to a NOT NULL column; an explicit null there is
 # a client bug and we reject it with 400 rather than letting Postgres
 # raise a generic 500.
-# Note: ``prompt`` is column-nullable but treated as a string downstream
-# (cli list views, /workers preview, dispatch_daemon), so allowing null
-# would just shift the 500 from Postgres to a TypeError elsewhere.
+# ``prompt`` is deprecated (doc/org-model.md §13.2): a PATCH prompt is
+# ignored or refused before it reaches the column, never written as null.
 NULLABLE_TASK_FIELDS = frozenset({
     "name",
     "worker_vm", "worker_zone", "ttyd_url",
@@ -281,7 +280,16 @@ BACKTEST_DEFAULT_SCRIPT = "analysis.backtests.backtest_actrader_grid"
 
 @app.post("/tasks", response_model=TaskResponse, dependencies=[Depends(verify_token)])
 async def create_task(body: TaskCreate, pool=Depends(get_pool)):
+    # One brief per task (doc/org-model.md §13.2): an old client's prompt is
+    # folded into the description unless the description already says it.
+    # The column still records what was sent. Like the 027 backfill, not for
+    # continuous rows (their contract lives on the continuous record and must
+    # never become an auto-delivered brief) or backtests (a synthesized
+    # prompt nothing delivers).
     prompt = body.prompt or ""
+    description = body.description
+    if body.kind not in task_text.UNFOLDED_KINDS:
+        description = task_text.fold_prompt(body.description, prompt, body.name)
     initiative_id = body.initiative_id
     project = body.project
     if body.parent_task_id and "initiative_id" not in body.model_fields_set:
@@ -323,7 +331,7 @@ async def create_task(body: TaskCreate, pool=Depends(get_pool)):
     task = await db.add_task(
         pool, body.repo_url, body.repo_branch, prompt, body.priority,
         status=body.status, project=project, slug=slug, name=body.name,
-        description=body.description, difficulty=body.difficulty,
+        description=description, difficulty=body.difficulty,
         depends=body.depends, source=body.source, is_cloud=is_cloud,
         kind=body.kind,
         parent_task_id=body.parent_task_id, worktree_mode=body.worktree_mode,
@@ -853,6 +861,21 @@ async def resolve_task_model(task_id: str, engine: str = Query(..., pattern=r"^(
     }
 
 
+def _drop_redundant_prompt(task: dict, fields: dict) -> None:
+    """A PATCH prompt is ignored when it adds nothing to the description that
+    will be stored; a real one is refused, since a person typed it
+    (doc/org-model.md §13.2)."""
+    prompt = fields.pop("prompt")
+    description = fields["description"] if "description" in fields else task.get("description")
+    name = fields["name"] if "name" in fields else task.get("name")
+    if not task_text.prompt_is_redundant(prompt, description, name):
+        raise HTTPException(status_code=409, detail={
+            "code": "prompt_deprecated",
+            "message": "put instructions in the description: tasks no longer "
+                       "have a separate prompt",
+        })
+
+
 @app.patch("/tasks/{task_id}", response_model=TaskResponse, dependencies=[Depends(verify_token)])
 async def update_task(task_id: str, body: TaskUpdate, pool=Depends(get_pool)):
     task = await _get_task_or_error(pool, task_id)
@@ -863,6 +886,8 @@ async def update_task(task_id: str, body: TaskUpdate, pool=Depends(get_pool)):
     # both into "missing", which made nullable columns un-clearable once set.
     dumped = body.model_dump(exclude_unset=True)
     fields = {k: dumped[k] for k in body.model_fields_set if k in dumped}
+    if "prompt" in fields:
+        _drop_redundant_prompt(task, fields)
 
     bad = sorted(
         k for k, v in fields.items()
@@ -1138,7 +1163,7 @@ async def list_workers(pool=Depends(get_pool)):
             "worker_vm": t["worker_vm"],
             "status": t["status"],
             "ttyd_url": t["ttyd_url"],
-            "prompt": t["prompt"][:80],
+            "prompt": task_text.compose_brief(t["description"], t["prompt"], t["name"])[:80],
         }
         for t in tasks
         if t["status"] in ("running", "blocked") and t["worker_vm"]

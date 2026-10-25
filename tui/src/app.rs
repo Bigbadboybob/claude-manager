@@ -561,6 +561,10 @@ pub struct App {
     pub attaching: std::collections::HashMap<String, PendingRemoteReattach>,
     plan_launches: Vec<plan_launch::PlanLaunchFlight>,
     remote_creates: Vec<remote_create::RemoteCreateFlight>,
+    /// When the adopt pass first saw each untracked TASKLESS daemon session
+    /// (uid → instant). One is adopted only after `TASKLESS_ADOPT_GRACE`,
+    /// so a spawn whose own response is still on its way lands once.
+    taskless_seen: HashMap<String, Instant>,
     /// A-R restarts/revives whose daemon RPCs are in flight (`restart.rs`).
     restarts: Vec<restart::RestartFlight>,
     /// A-O remote restores in flight.
@@ -1103,6 +1107,7 @@ impl App {
             attaching: HashMap::new(),
             plan_launches: Vec::new(),
             remote_creates: Vec::new(),
+            taskless_seen: HashMap::new(),
             restarts: Vec::new(),
             restores: Vec::new(),
             remote_adds: Vec::new(),

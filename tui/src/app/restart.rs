@@ -94,6 +94,8 @@ pub(super) struct RestoreJob {
 
 pub(super) struct RestoreFlight {
     pub ws_id: String,
+    /// The uids being revived, so the adopt pass leaves them alone.
+    pub uids: Vec<String>,
     pub host_id: HostId,
     pub total: usize,
     /// Tombstones that could not even be attempted (no worktree).
@@ -200,6 +202,19 @@ fn run_remote_add(pool: &crate::host_pool::HostPool, job: &RemoteAdd) -> AddOutc
 impl App {
     pub(super) fn restart_in_flight(&self, uid: &str) -> bool {
         self.restarts.iter().any(|f| f.uid == uid)
+    }
+
+    /// Uids a worker is spawning, reviving or restarting right now; their own
+    /// result binds them, so the adopt pass must not.
+    pub(super) fn session_uids_in_flight(&self) -> HashSet<String> {
+        self.restarts
+            .iter()
+            .map(|f| f.uid.clone())
+            .chain(self.restores.iter().flat_map(|f| f.uids.iter().cloned()))
+            .chain(self.remote_adds.iter().map(|f| f.job.uid.clone()))
+            .chain(self.remote_creates.iter().map(|f| f.spec.uid.clone()))
+            .chain(self.plan_launches.iter().map(|f| f.spec.uid.clone()))
+            .collect()
     }
 
     /// Start A-R's daemon half on a worker: kill a live session and wait
@@ -428,6 +443,7 @@ impl App {
         }
         let total = ws.tombstones.len();
         let ws_id = ws.id.clone();
+        let uids: Vec<String> = jobs.iter().map(|job| job.uid.clone()).collect();
         let pool = std::sync::Arc::clone(&self.host_pool);
         let (tx, result) = mpsc::channel();
         let job_host = host_id.clone();
@@ -459,7 +475,7 @@ impl App {
             self.set_status_msg(&format!("Could not start the restore worker: {e}"));
             return;
         }
-        self.restores.push(RestoreFlight { ws_id, host_id: host_id.clone(), total, errors, result });
+        self.restores.push(RestoreFlight { ws_id, uids, host_id: host_id.clone(), total, errors, result });
         self.set_status_msg(&format!(
             "Restoring {total} session{} on `{}`…",
             if total == 1 { "" } else { "s" },

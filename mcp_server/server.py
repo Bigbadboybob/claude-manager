@@ -253,7 +253,7 @@ def _check_parameter_confusion(field_name: str, value: str) -> None:
         if marker in value:
             raise ValueError(
                 f"propose_task: `{field_name}` contains literal '{marker}'. "
-                f"`description`, `prompt`, and `difficulty` are SEPARATE "
+                f"`description` (the whole brief) and `difficulty` are "
                 f"top-level parameters of this tool, not nested fields. "
                 f"Pass each as its own parameter; do not embed XML-style "
                 f"tags inside one string. Re-call the tool with the fields "
@@ -1161,8 +1161,9 @@ def propose_task(
 ) -> str:
     """Propose a new task to the project backlog.
 
-    The task is created with source='claude' in draft status.
-    The project owner will review and accept or reject it in the TUI.
+    The task is filed into the project's backlog with source='claude'. Owner
+    sees it on the planning board and may reprioritize, edit or drop it; it
+    does not wait for an accept before it can be launched.
 
     If YOU have a bound task, the task you propose counts as part of
     your own scope: you can later `start_session(task_id=<proposed id>)`
@@ -1171,32 +1172,28 @@ def propose_task(
     its own worktree under your task; prefer propose_task when the user
     should triage it on the planning board first.
 
-    Without `reports_to` the draft is a top-level task. When the work is
-    your direct report, pass `reports_to="me"`: the draft becomes a
+    Without `reports_to` the proposal is a top-level task. When the work
+    is your direct report, pass `reports_to="me"`: the task becomes a
     subtask of your task (`parent_task_id`), joins your division or
     initiative, and shows under you in the org tree (see `org`).
 
-    `description` and `prompt` serve different purposes — set BOTH:
-      - `description`: what the user sees in the planning queue when
-        deciding whether to accept the task. Context, motivation,
-        background. The user reads this.
-      - `prompt`: the launch instructions the worker agent receives when
-        the task is accepted and launched. Concrete steps, files to
-        touch, constraints. The agent reads this.
-    They are SEPARATE top-level parameters. Do NOT serialize one inside
-    the other — calls that contain literal `<prompt>`, `</prompt>`,
-    `<description>`, etc. inside a string field will be rejected.
+    `description` is the task's one brief: why the work matters, what done
+    looks like, and the instructions a worker needs. Owner reads it on the
+    board and the worker receives it at launch. `prompt` is a deprecated
+    alias: anything it adds is appended to the description under
+    `## Instructions`. Do not serialize other parameters inside a string:
+    calls containing literal `<prompt>`, `<description>`, etc. are rejected.
 
     Args:
         project: Project name (use list_projects to see valid names)
         name: Short task title
-        description: Background/motivation shown to the user in the queue
-        prompt: Launch instructions delivered to the worker agent
+        description: The brief: context, goal and worker instructions
+        prompt: Deprecated alias, appended to the description
         difficulty: Optional difficulty rating (1-10)
         depends: Optional list of task slugs this depends on
         initiative_id: Existing initiative UUID or slug to attach this task to
         reports_to: Reporting line: "me" (your own task) or a task id. Sets
-            the draft's parent task; omit for a standalone task.
+            the task's parent task; omit for a standalone task.
         model: Optional default model for the task (`metadata.models.<engine>`),
             used by its sessions and inherited by its subtasks. Omitted: it
             inherits its parent's, else the engine default.
@@ -1304,12 +1301,14 @@ def propose_task(
         )
     # Inline round-trip preview so the caller sees what actually landed
     # without an extra get_task. Truncated to keep the response readable.
-    desc_preview = (description or "")[:140]
-    prompt_preview = (prompt or "")[:140]
+    stored = task.get("description")
+    if stored is None:
+        stored = description or ""
+    desc_preview = stored[:140]
     return (
-        f"Proposed task '{name}' in project '{project}' (id: {task['id']})\n"
-        f"  description ({len(description)} chars): {desc_preview}{'...' if len(description) > 140 else ''}\n"
-        f"  prompt ({len(prompt)} chars): {prompt_preview}{'...' if len(prompt) > 140 else ''}"
+        f"Proposed task '{name}' in project '{project}' (id: {task['id']}, "
+        f"status: {task.get('status') or 'backlog'})\n"
+        f"  description ({len(stored)} chars): {desc_preview}{'...' if len(stored) > 140 else ''}"
     )
 
 
@@ -1627,7 +1626,7 @@ def update_task(
 
     This tool can modify ANY task — including tasks created by the human
     owner (source="user"). That power cuts both ways: be conservative when
-    touching user tasks. Don't rewrite their prompt, change scope, or move
+    touching user tasks. Don't rewrite their description, change scope, or move
     them between statuses unless the user explicitly asked you to. Agent-
     proposed tasks (source="claude") are fair game for self-revision.
 
@@ -1641,8 +1640,11 @@ def update_task(
     Args:
         task_id: Task UUID.
         name: New title.
-        description: New description.
-        prompt: New launch prompt.
+        description: New description: the task's whole brief, including
+            any worker instructions.
+        prompt: Deprecated. Ignored when the description already contains
+            it; any other prompt is refused with `prompt_deprecated`
+            (put instructions in `description`).
         status: "draft", "backlog", "running", "blocked", "done", or "archived".
         priority: Lower number = higher priority.
         difficulty: 1-10.
@@ -4261,10 +4263,10 @@ def create_subtask(
     Args:
         name: Display name for the subtask. Slugified for the branch
             name (alphanumerics + dash, max 40 chars).
-        prompt: Optional initial prompt for the subtask's worker.
-            Recorded on the task row (that's where the planning view
-            reads it from); since this call spawns nothing, pass the
-            prompt to `start_session` too if you want it delivered.
+        prompt: Optional brief for the subtask's worker, stored as the
+            task's description (tasks have one brief; the name is
+            historical). `start_session(task_id=<task_id>)` with no prompt
+            delivers it.
         worktree_mode: "inherit" (default) — same worktree as parent;
             sessions spawn in the parent's worktree directory.
             "branch" — new worktree branched off the parent's

@@ -9560,7 +9560,7 @@ pub fn mcp_start_session(
                     Some(row) => {
                         let field =
                             |k: &str| row.get(k).and_then(|v| v.as_str()).unwrap_or("");
-                        compose_task_launch_prompt(field("description"), field("prompt"))
+                        compose_task_launch_prompt(field("description"), field("prompt"), field("name"))
                     }
                     None => task_autodelivery_prompt(state_arc, tid),
                 };
@@ -10100,7 +10100,7 @@ fn task_autodelivery_prompt(
         }
     };
     let field = |k: &str| row.get(k).and_then(|v| v.as_str()).unwrap_or("");
-    compose_task_launch_prompt(field("description"), field("prompt"))
+    compose_task_launch_prompt(field("description"), field("prompt"), field("name"))
 }
 
 /// Daemon-side twin of `tui/src/planning.rs::compose_launch_prompt`,
@@ -10114,7 +10114,10 @@ fn task_autodelivery_prompt(
 /// title at a fresh agent would be noise. `None` means "spawn
 /// promptless", which is exactly the pre-ux-5c behavior.
 ///
-/// Precedence otherwise matches the operator path:
+/// The description is the task's brief (doc/org-model.md §13.2). A legacy
+/// `prompt` is added only when it says something the description does not:
+/// one that is empty, equal to the name, or contained in the description is
+/// skipped, so a backfilled row is delivered once. Otherwise:
 ///   - both present  → `"{description}\n\n---\n\n{prompt}"`
 ///   - only prompt   → prompt verbatim
 ///   - only descr.   → description verbatim
@@ -10124,9 +10127,12 @@ fn task_autodelivery_prompt(
 /// over-long task prompt is truncated at a char boundary with a visible
 /// marker rather than rejected, since rejecting would fail a spawn the
 /// caller never asked to carry a prompt at all.
-fn compose_task_launch_prompt(description: &str, prompt: &str) -> Option<String> {
+fn compose_task_launch_prompt(description: &str, prompt: &str, name: &str) -> Option<String> {
     let description = description.trim();
-    let prompt = prompt.trim();
+    let mut prompt = prompt.trim();
+    if prompt == name.trim() || description.contains(prompt) {
+        prompt = "";
+    }
     let composed = if !description.is_empty() && !prompt.is_empty() {
         format!("{}\n\n---\n\n{}", description, prompt)
     } else if !prompt.is_empty() {
@@ -29001,13 +29007,27 @@ while True:
     #[test]
     fn compose_task_launch_prompt_precedence() {
         assert_eq!(
-            compose_task_launch_prompt("why", "how").as_deref(),
+            compose_task_launch_prompt("why", "how", "T").as_deref(),
             Some("why\n\n---\n\nhow"),
         );
-        assert_eq!(compose_task_launch_prompt("", "how").as_deref(), Some("how"));
-        assert_eq!(compose_task_launch_prompt("why", "  ").as_deref(), Some("why"));
-        assert_eq!(compose_task_launch_prompt("  \n ", "\t"), None);
-        assert_eq!(compose_task_launch_prompt("", ""), None);
+        assert_eq!(compose_task_launch_prompt("", "how", "T").as_deref(), Some("how"));
+        assert_eq!(compose_task_launch_prompt("why", "  ", "T").as_deref(), Some("why"));
+        assert_eq!(compose_task_launch_prompt("  \n ", "\t", "T"), None);
+        assert_eq!(compose_task_launch_prompt("", "", "T"), None);
+    }
+
+    /// org-model §13.2: a prompt the description already carries (the S1
+    /// backfill's `## Instructions`), or one that is just the name, is not
+    /// delivered a second time.
+    #[test]
+    fn compose_task_launch_prompt_skips_a_contained_prompt() {
+        let backfilled = "why\n\n## Instructions\n\nhow";
+        assert_eq!(
+            compose_task_launch_prompt(backfilled, "how", "T").as_deref(),
+            Some(backfilled),
+        );
+        assert_eq!(compose_task_launch_prompt("why", "T", "T").as_deref(), Some("why"));
+        assert_eq!(compose_task_launch_prompt("", " T ", "T"), None, "a bare title is noise");
     }
 
     /// ux-5c: an over-long task prompt is TRUNCATED, not rejected —
@@ -29017,7 +29037,7 @@ while True:
     #[test]
     fn compose_task_launch_prompt_truncates_over_cap() {
         let huge = "x".repeat(MAX_SEND_INPUT_BYTES + 10_000);
-        let out = compose_task_launch_prompt("", &huge).expect("still composes");
+        let out = compose_task_launch_prompt("", &huge, "T").expect("still composes");
         assert!(
             out.len() <= MAX_SEND_INPUT_BYTES,
             "truncated body must fit the send_input cap, got {}",

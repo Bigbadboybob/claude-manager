@@ -384,6 +384,8 @@ pub struct TaskEntry {
     pub name: String,
     pub api_status: TaskStatus,
     pub repo_url: Option<String>,
+    /// The task's brief: its description plus any legacy prompt the
+    /// description lacks (`planning::task_brief`). The name is historical.
     pub prompt: Option<String>,
     pub wip_branch: Option<String>,
     pub session_id: Option<String>,

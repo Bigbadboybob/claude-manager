@@ -224,7 +224,7 @@ fn task_status_label(s: &TaskStatus) -> &'static str {
 }
 
 /// Peek body for a bound task: name, status, metadata, and the full
-/// prompt (the main payload — "what was this agent asked to do").
+/// brief (the main payload — "what was this agent asked to do").
 /// `parent_name` is the resolved parent task's name when the caller
 /// could find it; the raw id is shown otherwise.
 fn peek_task_lines(task: &TaskEntry, parent_name: Option<&str>) -> Vec<PeekLine> {
@@ -246,14 +246,14 @@ fn peek_task_lines(task: &TaskEntry, parent_name: Option<&str>) -> Vec<PeekLine>
         out.push(PeekLine::Field { label: "Branch".into(), value: b.to_string() });
     }
     out.push(PeekLine::Blank);
-    out.push(PeekLine::Field { label: "Prompt".into(), value: String::new() });
+    out.push(PeekLine::Field { label: "Brief".into(), value: String::new() });
     match task.prompt.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
         Some(p) => {
             for l in p.lines() {
                 out.push(PeekLine::Text(l.to_string()));
             }
         }
-        None => out.push(PeekLine::Text("(no prompt)".into())),
+        None => out.push(PeekLine::Text("(no description)".into())),
     }
     out
 }
@@ -2534,7 +2534,7 @@ mod nav_quickswitch_tests {
             value: "t0".into()
         }));
         // Missing prompt renders the placeholder rather than nothing.
-        assert!(without.contains(&PeekLine::Text("(no prompt)".into())));
+        assert!(without.contains(&PeekLine::Text("(no description)".into())));
     }
 
     #[test]

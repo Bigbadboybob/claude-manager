@@ -170,7 +170,8 @@ class TaskChangesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cache[a["id"]]["priority"], 7)
         self.assertEqual(cache[b["id"]]["name"], "b2")
         # Full row shape (what /tasks returns) travels in each change.
-        self.assertEqual(cache[a["id"]]["prompt"], "prompt a")
+        # (An old client's prompt arrives folded into the description.)
+        self.assertEqual(cache[a["id"]]["description"], "## Instructions\n\nprompt a")
         cursor = page["cursor"]
 
         # Several edits to one task collapse to one entry carrying the latest row.
@@ -707,10 +708,10 @@ class TaskChangesTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_gzip_negotiation_on_list_and_feed(self):
         big = "x" * 4000
-        await self.create("a", prompt=big)
+        await self.create("a", description=big)
         r = await self.client.get("/tasks", headers={"Accept-Encoding": "gzip"})
         self.assertEqual(r.headers.get("content-encoding"), "gzip")
-        self.assertEqual(r.json()[0]["prompt"], big)
+        self.assertTrue(r.json()[0]["description"].startswith(big))
         raw = await self.client.get("/tasks", headers={"Accept-Encoding": "identity"})
         self.assertIsNone(raw.headers.get("content-encoding"))
 

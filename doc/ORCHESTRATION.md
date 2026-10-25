@@ -212,7 +212,7 @@ so it shows under you in the Sessions tree and the `org` tool:
 
 - `create_subtask(...)` and then `start_session(task_id=...)`, or
   `start_session(isolated=true)`, which does both in one call;
-- `propose_task(..., reports_to="me")` when Owner should triage the draft first.
+- `propose_task(..., reports_to="me")` to file it into the backlog under you, where Owner sees it.
 
 A plain `propose_task` creates a standalone task, and `start_session` without
 `isolated` or `task_id` adds a co-worker on your own task. Neither creates a

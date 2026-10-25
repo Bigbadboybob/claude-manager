@@ -113,7 +113,7 @@ def inventory(ctx: reaper.ScanContext, root: Path | None = None) -> tuple[dict[s
             for line in lineage.git(path, 'worktree', 'list', '--porcelain').splitlines():
                 if line.startswith('worktree '):
                     known.add(Path(line[9:]).resolve())
-            lineage.install_hook(path)
+            lineage.install_hooks(path)
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             warnings.append(f'{path}: {exc}')
     registered = False

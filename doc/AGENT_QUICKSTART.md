@@ -240,7 +240,7 @@ After dispatching, end your turn; the monitor, mention or board push wakes you. 
 | Need | Tools and usage |
 |---|---|
 | Find your context and work | `ping`, `list_projects`, `list_tasks`, `get_task`, `list_subtasks` |
-| File work for Owner to review | `propose_task(project=..., name=..., description=..., prompt=...)`; description explains why/what, prompt gives worker instructions |
+| File work into the backlog | `propose_task(project=..., name=..., description=...)`; the description is the whole brief: why, what done looks like, and the worker's instructions (`prompt` is a deprecated alias appended to it) |
 | Inspect other sessions | `list_sessions`, `list_sessions_grouped`, `read_last_turn(session_uid=...)`, `read_session_output` |
 | Delegate an authorized task | `start_session(type="claude-code", label=..., prompt=..., isolated=True, notify_until="final")` launches a worker in a separate worktree; `type="codex"` also works |
 | Work from a task | `start_session(type=..., label=..., task_id=...)`; an omitted prompt uses the named task's stored instructions when available |
