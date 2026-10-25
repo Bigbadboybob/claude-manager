@@ -305,6 +305,7 @@ pub struct EventsSubscribeHandle {
 /// comment in [`dispatch_request`]).
 pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "ping",
+    "staffing.get",
     "list_sessions",
     "read_session_output",
     "resolve_authorized_session",
@@ -422,6 +423,7 @@ pub fn dispatch_request(
         None
     };
     match req.method.as_str() {
+        "staffing.get" | "staffing.set" => DispatchOutcome::Done(crate::staffing::dispatch(state, req)),
         "owner.board_token" => DispatchOutcome::Done(super::board_token::manage(state, req)),
         "messaging.sync" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.open" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
@@ -3227,6 +3229,7 @@ fn dispatch_ping(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
             // Owner availability from the messaging store's projection: a
             // small local file, so ping stays lock-free and network-free.
             let owner_availability = crate::owner_availability::exposure(&messaging_root);
+            let staffing = crate::staffing::exposure(state);
             let maintenance = crate::maintenance::field_for(state);
             let mut body = serde_json::json!({
                     "pong": true,
@@ -3242,6 +3245,7 @@ fn dispatch_ping(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
                     "managed_by_session_id": managed_by_session_id,
                     "worktree_path": worktree_path,
                     "owner_availability": owner_availability,
+                    "staffing": staffing,
                 });
             if let Some(m) = maintenance {
                 body["maintenance"] = serde_json::json!(m);
@@ -4046,9 +4050,9 @@ mod tests {
         assert!(result["owner_availability"].get("level").is_some());
         assert_eq!(
             result.as_object().map(|o| o.len()),
-            Some(13),
+            Some(14),
             "keys: pong, uid, caller_kind, global_perms, task/workspace and filer context, \
-             owner_availability. Any other key drift would be a client-visible change.",
+             owner_availability and staffing. Any other key drift would be a client-visible change.",
         );
     }
 

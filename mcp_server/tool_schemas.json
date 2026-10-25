@@ -1693,12 +1693,12 @@
     },
     "wait": {
      "type": "boolean"
+    },
+    "work_kind": {
+     "type": "string"
     }
    },
-   "required": [
-    "label",
-    "type"
-   ]
+   "required": []
   },
   "start_workflow": {
    "params": {

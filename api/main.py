@@ -26,6 +26,7 @@ from api.models import (
 from api.dispatch_daemon import dispatch_loop, warm_pool_loop
 from api.board_engine import board_loop
 from api.items import router as items_router
+from api.staffing import router as staffing_router
 from api.task_changes import ChangeBroker, change_log_maintenance_loop
 from dispatch import db
 from dispatch.config import DB_DSN, REPOS
@@ -129,6 +130,7 @@ app = FastAPI(title="Claude Manager", lifespan=lifespan)
 # the tens of milliseconds; the incremental feed makes snapshots rare anyway.
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 app.include_router(items_router)
+app.include_router(staffing_router)
 
 
 @app.exception_handler(RequestValidationError)

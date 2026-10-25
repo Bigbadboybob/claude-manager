@@ -409,6 +409,7 @@ pub struct PlanningParent {
 /// almost always mutate — even read-only-looking calls like
 /// `list_sessions` need a consistent snapshot.
 pub struct DaemonState {
+    pub staffing: Arc<Mutex<crate::staffing::Cache>>,
     pub messaging: Arc<Mutex<Option<crate::messaging::Store>>>,
     /// One background opener per brain; rebuilding never holds daemon/store locks.
     pub messaging_startup: Arc<std::sync::atomic::AtomicBool>,
@@ -876,6 +877,7 @@ impl Default for DaemonState {
             workflow_definitions: HashMap::new(),
             base_workflow_definitions: HashMap::new(),
             messaging: Arc::new(Mutex::new(None)),
+            staffing: Arc::new(Mutex::new(crate::staffing::Cache::default())),
             messaging_startup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             messaging_registry_restored: false,
             messaging_delivery: Arc::new(Mutex::new(())),

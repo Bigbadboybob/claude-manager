@@ -1788,6 +1788,7 @@ def ping() -> dict:
          task_id: str | null,       # ← the task you're bound to (if any)
          workspace_id: str | null,  # ← the workspace you live in
          owner_availability: {level, set, changed_at, age_s, ...},
+         staffing: {version, digest, policy, recommended_engine, source},
          mcp: {version, proxy, update_pending?, note?}}
 
     `mcp` is this session's CM MCP server code. `update_pending` names a
@@ -2059,8 +2060,8 @@ def list_sessions_grouped(
 
 @mcp.tool()
 async def start_session(
-    type: str,
-    label: str,
+    type: str = "",
+    label: str = "",
     prompt: str = "",
     task_id: str | None = None,
     global_perms: bool = False,
@@ -2076,6 +2077,7 @@ async def start_session(
     allow_shared_workspace: bool = False,
     model: str | None = None,
     effort: str | None = None,
+    work_kind: str | None = None,
 ) -> dict:
     """Spawn a new agent or shell session in your workspace.
 
@@ -2091,7 +2093,11 @@ async def start_session(
     `Agent(isolation="worktree")`.
 
     Args:
-        type: "claude-code", "codex", or "bash". A bash session is a raw
+        type: "claude-code", "codex", or "bash". Omit for the cached Owner
+            staffing policy (ping().staffing); an explicit type or model wins.
+            work_kind may be math, design, architecture, metric, coding or fanout.
+            A conflicting choice returns staffing_note with the policy precedence.
+            A bash session is a raw
             shell in the workspace's worktree — useful when you want to
             drive a terminal and have the user share it. No MCP
             injection, no transcript, but `send_input` and
@@ -2270,6 +2276,8 @@ async def start_session(
     every spawn — doubly so when `global_perms=true`, which mints a child
     that can reach across the whole session graph.
     """
+    if not label.strip():
+        return {"error": "invalid_params", "message": "label must be non-empty"}
     # isolated: branch a subtask worktree under the caller's task, then bind
     # the new session there. Folds the create_subtask(branch)+start_session
     # dance into one flag. Requires a bound task (create_subtask enforces it).
@@ -2301,7 +2309,11 @@ async def start_session(
     elif schema is not None:
         body = _schema_instruction(schema).lstrip("\n-")
 
-    params: dict = {"type": type, "label": label}
+    params: dict = {"label": label}
+    if type:
+        params["type"] = type
+    if work_kind is not None:
+        params["work_kind"] = work_kind
     if body:
         params["prompt"] = body
     if task_id:
@@ -2389,6 +2401,7 @@ async def start_session(
         tree)."""
         if isinstance(d, dict) and isinstance(spawn, dict):
             for key in (
+                "staffing_note", "staffing_version", "session_type",
                 "worktree_path",
                 "task_id",
                 "prompt_source",

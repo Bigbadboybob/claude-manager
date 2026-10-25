@@ -102,6 +102,7 @@ pub mod task_parent_refresh;
 pub mod terminal_sweep;
 pub mod session_watch;
 pub mod state;
+pub mod staffing;
 pub mod notifications;
 pub mod owner_notifications;
 pub mod owner_alert_relay;
@@ -1223,6 +1224,7 @@ pub fn run() -> anyhow::Result<()> {
     messaging::tasks::spawn(&state);
     items::start(&state);
     usage::start(&state);
+    staffing::start(&state);
     worktree_watch::start(&state);
 
     // Spawn the workflow on_idle poller — the daemon's SOLE workflow driver

@@ -7380,8 +7380,10 @@ pub fn workflow_reject_finding(
 
 #[derive(Deserialize)]
 struct McpStartSessionParams {
-    #[serde(rename = "type")]
+    #[serde(default, rename = "type")]
     type_: String,
+    #[serde(default)]
+    work_kind: Option<String>,
     label: String,
     /// Initial prompt for the child. ux-5c: when this is absent or
     /// blank AND the spawn is task-bound AND the child is an agent
@@ -9141,8 +9143,20 @@ pub fn mcp_start_session(
     params: &Value,
     caller_uid: Option<&str>,
 ) -> MethodResult {
-    let p: McpStartSessionParams = serde_json::from_value(params.clone())
+    let mut p: McpStartSessionParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("mcp_start_session params: {}", e)))?;
+    let staffing = {
+        let s = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let snapshot = s.staffing.lock().unwrap_or_else(|p| p.into_inner())
+            .snapshot.clone();
+        snapshot
+    };
+    let selection = staffing.policy.select(
+        params.get("type").and_then(Value::as_str),
+        p.model.as_deref().filter(|s| !s.trim().is_empty()),
+        p.work_kind.as_deref(), chrono::Utc::now(),
+    ).map_err(|e| (ErrorCode::InvalidParams, e))?;
+    p.type_ = selection.engine;
     // H3: drain gate FIRST — while the operator is draining for a
     // restart, minting new sessions is exactly what must not happen
     // (they'd be killed moments later, possibly before first turn).
@@ -9955,6 +9969,7 @@ pub fn mcp_start_session(
     }
 
     // ux-1c / ux-5c: enrich the agent-facing return.
+    crate::staffing::record_spawn(state_arc, caller_uid, staffing.version);
     //
     // Pre-fix the caller got `{"session_uid": ...}` and had to guess
     // where the child actually landed — a `start_session(task_id=…)`
@@ -9970,6 +9985,11 @@ pub fn mcp_start_session(
     // decorates only the value `mcp_start_session` hands back.
     let mut response = start_result;
     if let Some(obj) = response.as_object_mut() {
+        obj.insert("staffing_version".into(), json!(staffing.version));
+        obj.insert("session_type".into(), json!(p.type_));
+        if let Some(note) = selection.note {
+            obj.insert("staffing_note".into(), json!(note));
+        }
         obj.insert(
             "worktree_path".into(),
             Value::String(working_dir.to_string_lossy().into_owned()),
@@ -18169,6 +18189,17 @@ fn session_fork_once(
     if let Some(cgroup) = start_result.get("cgroup_path") {
         out["cgroup_path"] = cgroup.clone();
     }
+    let staffing = {
+        let s = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let snapshot = s.staffing.lock().unwrap_or_else(|p| p.into_inner())
+            .snapshot.clone();
+        snapshot
+    };
+    out["staffing_version"] = json!(staffing.version);
+    if let Some(note) = staffing.policy.note(&source.engine, None, chrono::Utc::now()) {
+        out["staffing_note"] = json!(note);
+    }
+    crate::staffing::record_spawn(state_arc, caller_uid, staffing.version);
     Ok(out)
 }
 
@@ -28678,6 +28709,64 @@ while True:
             assert_eq!(resp["model_source"], "engine_default");
             drop(reqs);
             kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn mcp_start_session_staffing_default_and_explicit_override_are_local() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_mcp_spawn_fixture(&state, "ts-caller", None);
+            {
+                let s = state.lock().unwrap();
+                let mut cache = s.staffing.lock().unwrap();
+                cache.snapshot = crate::staffing::Snapshot {
+                    version: 7,
+                    policy: crate::staffing::Policy::default(),
+                    updated_at: None,
+                };
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".into(), vec!["120".into()])));
+            let chosen = mcp_start_session(
+                &state,
+                &json!({"label":"policy-child","work_kind":"fanout"}),
+                Some("ts-caller"),
+            )
+            .unwrap();
+            assert_eq!(chosen["session_type"], "claude-code");
+            assert_eq!(chosen["staffing_version"], 7);
+            assert!(chosen.get("staffing_note").is_none());
+            if let Some(mut child) = state
+                .lock()
+                .unwrap()
+                .sessions
+                .remove(chosen["session_uid"].as_str().unwrap())
+            {
+                let _ = child.kill();
+            }
+            {
+                let s = state.lock().unwrap();
+                s.staffing.lock().unwrap().snapshot.policy.preference =
+                    Some(crate::staffing::Preference {
+                        engine: crate::staffing::Engine::Codex,
+                        strength: crate::staffing::Strength::Strong,
+                        reason: "limits".into(),
+                        expires_at: chrono::Utc::now() + chrono::Duration::days(1),
+                    });
+            }
+            let explicit = mcp_start_session(
+                &state,
+                &json!({"label":"explicit-child","type":"claude-code"}),
+                Some("ts-caller"),
+            )
+            .unwrap();
+            assert_eq!(explicit["session_type"], "claude-code");
+            assert!(explicit["staffing_note"]
+                .as_str()
+                .unwrap()
+                .contains(crate::staffing::PRECEDENCE));
+            kill_all_sessions(&state);
+            set_spawn_program_override_for_test(None);
         });
     }
 

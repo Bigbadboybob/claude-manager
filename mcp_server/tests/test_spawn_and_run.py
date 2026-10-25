@@ -144,6 +144,24 @@ class _SpawnStubMixin:
 
 
 class StartSessionWaitTests(_SpawnStubMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_staffing_omits_type_and_forwards_work_kind_and_note(self):
+        def _call(method, params, *a, **k):
+            self.assertEqual(method, "mcp_start_session")
+            self.assertNotIn("type", params)
+            self.assertEqual(params["work_kind"], "math")
+            return {"session_uid": "ts-policy", "session_type": "codex", "staffing_version": 4,
+                    "staffing_note": "Policy note"}
+        control_client.call = _call
+        res = await start_session(label="math-worker", work_kind="math")
+        self.assertEqual(res["staffing_note"], "Policy note")
+        self.assertEqual(res["staffing_version"], 4)
+
+    async def test_staffing_missing_label_is_rejected_before_isolation(self):
+        def _call(*a, **k):
+            self.fail("missing label must not mint a task or session")
+        control_client.call = _call
+        self.assertEqual((await start_session(isolated=True))["error"], "invalid_params")
+
     async def test_wait_false_unchanged(self):
         # The default path must return exactly {"session_uid": ...} and never
         # touch resolve_authorized_session.
