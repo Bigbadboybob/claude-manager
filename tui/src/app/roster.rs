@@ -151,7 +151,9 @@ impl App {
         for ws in self.workspaces.iter().filter(|w| !w.is_closed) {
             for ts in &ws.sessions {
                 let agent = matches!(ts.session_type.as_str(), "claude" | "claude-code" | "codex");
-                let member = snap.is_some_and(|s| s.member_by_main(&ts.uid).is_some());
+                // A member's main (the snapshot's, or stamped `main`).
+                let main = matches!(attached.get(&ts.uid), Some((_, super::orgchart_teams::Via::Main)));
+                let member = main || snap.is_some_and(|s| s.member_by_main(&ts.uid).is_some());
                 if !agent || ts.session.exited || member || proposed(&ts.uid) {
                     continue;
                 }
@@ -190,16 +192,20 @@ impl App {
     /// Rows in display order: proposals, then each member's assistants and
     /// the other sessions, each under a folding header.
     pub(super) fn roster_rows(&self) -> Vec<Row> {
+        Self::roster_visible(&self.roster.open, self.roster_all_rows())
+    }
+
+    fn roster_visible(open: &HashSet<String>, all: Vec<Row>) -> Vec<Row> {
         let mut rows = Vec::new();
         let mut last: Option<String> = None;
-        for row in self.roster_all_rows() {
+        for row in all {
             if let Row::Adopt { of, .. } = &row {
                 let key = Self::group_key(of.as_deref());
                 if last.as_deref() != Some(key.as_str()) {
                     rows.push(Row::Group(key.clone()));
                     last = Some(key.clone());
                 }
-                if !self.roster.open.contains(&key) {
+                if !open.contains(&key) {
                     continue;
                 }
             }
@@ -208,9 +214,15 @@ impl App {
         rows
     }
 
-    /// How many session rows a group holds.
-    fn roster_group_len(&self, key: &str) -> usize {
-        self.roster_all_rows().iter().filter(|r| matches!(r, Row::Adopt { of, .. } if Self::group_key(of.as_deref()) == key)).count()
+    /// How many session rows each group holds.
+    fn roster_group_lens(all: &[Row]) -> HashMap<String, usize> {
+        let mut out = HashMap::new();
+        for r in all {
+            if let Row::Adopt { of, .. } = r {
+                *out.entry(Self::group_key(of.as_deref())).or_insert(0) += 1;
+            }
+        }
+        out
     }
 
     fn roster_key(&self, row: &Row) -> String {
@@ -650,12 +662,15 @@ impl App {
         }
         let header = format!("     {:<18} {:<11} {:<18} {:<14} {:<22} {}", "handle", "kind", "team", "manager", "home workspace", "source");
         lines.push(Line::styled(crate::planning::truncate_with_ellipsis(&header, width), Style::default().fg(theme::HEADER)));
-        let rows = self.roster_rows();
+        // One pass over the sessions per frame: the rows and the group sizes.
+        let all = self.roster_all_rows();
+        let lens = Self::roster_group_lens(&all);
+        let rows = Self::roster_visible(&r.open, all);
         let mut cursor_line = 0;
         for (k, row) in rows.iter().enumerate() {
             if let Row::Group(g) = row {
                 let open = r.open.contains(g);
-                let n = self.roster_group_len(g);
+                let n = lens.get(g).copied().unwrap_or(0);
                 let text = match g.strip_prefix("assistants:") {
                     Some(of) => format!("{} assistants of {} ({n})", if open { "\u{25be}" } else { "\u{25b8}" }, self.roster_group_name(of)),
                     None => format!("{} {}", if open { "\u{25be}" } else { "\u{25b8}" }, if n == 1 { "1 other session".to_owned() } else { format!("{n} other sessions") }),
