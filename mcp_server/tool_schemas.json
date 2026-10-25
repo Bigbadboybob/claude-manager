@@ -1370,10 +1370,16 @@
     "division": {
      "type": "string"
     },
+    "member": {
+     "type": "string"
+    },
     "session_uid": {
      "type": "string"
     },
     "task_id": {
+     "type": "string"
+    },
+    "team": {
      "type": "string"
     },
     "view": {

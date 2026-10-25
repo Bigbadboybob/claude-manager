@@ -345,6 +345,16 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "board.read",
     "board.settings",
     "board.owner_blocked",
+    # Org model S2 (doc/org-core-api.md): daemon-only proxies to /org.
+    "org.snapshot",
+    "org.member",
+    "org.team",
+    "org.roster",
+    "org.roster_apply",
+    "org.adopt",
+    "org.team_create",
+    "org.team_update",
+    "org.move",
     # Gate receipts on items (doc/gate-receipts.md): same daemon-only proxy.
     "gate.report",
     "gate.receipts",
