@@ -538,3 +538,88 @@ class OrgS3Db(unittest.IsolatedAsyncioTestCase):
             until = await conn.fetchval(
                 "SELECT until FROM team_memberships WHERE member_id = 'mem_lane' AND role = 'guest'")
         self.assertIsNotNone(until, "the guest membership ended")
+
+    # ---- review of 6522623 ---------------------------------------------
+    async def test_the_mirror_gate_fails_closed_and_legacy_writes_still_land(self):
+        async with self.pool.acquire() as conn:
+            await conn.execute("DELETE FROM org_daemons")
+        t = await self.task("ungated")
+        n = (await self.place(t, holder=LANE)).json()["n"]
+        row = await self.task_row(t)
+        self.assertEqual((row["status"], row["placement"]["mirror"],
+                          row["placement"]["mirror_waiting_on"]),
+                         ("backlog", "off", ["no_fresh_daemons"]))
+        # A board close is not mirrored: no terminal_via for an old sweep.
+        await self.patch_items(n, actor=LANE, set={"status": "done"})
+        row = await self.task_row(t)
+        self.assertEqual(row["status"], "backlog")
+        self.assertNotIn("terminal_via", row["metadata"] or {})
+        # A daemon that heartbeats without the guard keeps it closed.
+        await self.beat(agent("x", daemon="d7"), daemon="d7", caps=[])
+        await self.beat(ORCH, task=self.root, caps=["lifecycle_guard_v1"])
+        t2 = await self.task("legacy while closed")
+        await self.place(t2, holder=LANE)
+        self.assertEqual((await self.task_row(t2))["placement"]["mirror_waiting_on"], ["d7"])
+        # Legacy status writes still update the task row as today.
+        await self.legacy(t2, status="blocked", reason="EP GO", actor=LANE)
+        self.assertEqual((await self.task_row(t2))["status"], "blocked")
+        # Once every fresh daemon advertises the guard, the engine's pass
+        # writes the waiting tasks through.
+        await self.beat(agent("x", daemon="d7"), daemon="d7", caps=["lifecycle_guard_v1"])
+        from dispatch import placement
+        self.assertGreaterEqual(await placement.remirror_pending(self.pool), 2)
+        row = await self.task_row(t)
+        self.assertEqual((row["status"], row["metadata"]["terminal_via"]), ("done", "item"))
+        self.assertNotIn("mirror", row["placement"])
+
+    async def test_naming_yourself_owner_grants_no_launch(self):
+        t = await self.task("someone else's")
+        n = (await self.place(t, holder=LANE)).json()["n"]   # placed by the orchestrator
+        await self.patch_items(n, actor=OTHER, owner=OTHER, set={})
+        roles = {h["name"]: h["role"] for h in (await self.item(n))["holders"]}
+        self.assertEqual(roles["other"], "owner")
+        reply = await self.beat(ORCH, task=self.root, caps=["lifecycle_guard_v1"])
+        self.assertEqual(reply["launch_grants"], [], "the role, but no grant")
+        async with self.pool.acquire() as conn:
+            reason = await conn.fetchval("SELECT reason FROM launch_grants WHERE pid = $1",
+                                         LANE["pid"])
+        self.assertEqual(reason, "owner changed")
+        # Handing back revokes with its own label.
+        t2 = await self.task("handed back")
+        n2 = (await self.place(t2, holder=OTHER)).json()["n"]
+        await self.patch_items(n2, actor=OTHER, set={"holders": []})
+        async with self.pool.acquire() as conn:
+            reason = await conn.fetchval(
+                "SELECT reason FROM launch_grants WHERE task_id = $1", uuid.UUID(t2))
+        self.assertEqual(reason, "handed back")
+
+    async def test_a_close_plan_applies_only_on_its_board_and_skips_stale_items(self):
+        e = await self.epic("Latent")
+        await self.http.post(f"/boards/{self.ref}/items", json={
+            "actor": LANE, "items": [{"title": "a", "group_id": e["id"]},
+                                     {"title": "b", "group_id": e["id"]}]})
+        plan = (await self.http.post(f"/boards/{self.ref}/epics/{e['id']}/close-plan",
+                                     json={"actor": ORCH, "outcome": "done"})).json()
+        other = (await self.http.post("/boards/resolve",
+                                      json={"task_id": await self.task("other root")})).json()
+        body = {"actor": OWNER, "revision": plan["revision"],
+                "choices": {"items": {"1": "drop", "2": "drop"}}}
+        r = await self.http.post(f"/boards/{other['slug']}/close-plans/{plan['plan_id']}/apply",
+                                 json=body)
+        self.assertEqual((r.status_code, r.json()["detail"]["code"]), (404, "not_found"))
+        # #2 closed since the plan was built: skipped and recorded.
+        await self.patch_items(2, actor=LANE, set={"status": "done"})
+        r = await self.http.post(f"/boards/{self.ref}/close-plans/{plan['plan_id']}/apply",
+                                 json={**body, "actor": ORCH})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["skipped"], [{"n": 2, "reason": "no longer open"}])
+
+    async def test_archiving_a_placed_task(self):
+        t = await self.task("archived")
+        n = (await self.place(t, holder=LANE)).json()["n"]
+        r = await self.legacy(t, ok=False, status="archived")
+        self.assertEqual(r.json()["detail"]["code"], "placed_on_board")
+        await self.patch_items(n, actor=LANE, set={"status": "done"})
+        await self.legacy(t, status="archived")
+        row = await self.task_row(t)
+        self.assertEqual((row["status"], row["placement"]), ("archived", None))

@@ -212,7 +212,7 @@ impl App {
     /// (the messages pane's host), then every other configured host, so a
     /// laptop daemon that predates a method falls through to one that has
     /// it. `(host name, socket, operator token)`; resolved non-blocking.
-    pub(super) fn owner_rpc_targets(&self) -> Vec<(String, PathBuf, String)> {
+    pub(crate) fn owner_rpc_targets(&self) -> Vec<(String, PathBuf, String)> {
         // Tests never reach a real daemon, inside or outside the sandbox: a
         // board/F7 write from a test must not touch live items or levels.
         if cfg!(test) {

@@ -841,6 +841,13 @@ async def board_loop(pool, interval: float = 30.0, close_out_every: int = 20) ->
                     logger.exception("board engine: board %s failed", board_id)
             if tick % close_out_every == 0:
                 await close_out(pool)
+            # Placed tasks whose status mirror waited on the gate
+            # (doc/org-model.md §7.1): write them through once it opens.
+            try:
+                from dispatch import placement
+                await placement.remirror_pending(pool)
+            except Exception:
+                logger.exception("board engine: re-mirror pass failed")
         except asyncio.CancelledError:
             raise
         except Exception:

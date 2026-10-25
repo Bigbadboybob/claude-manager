@@ -9237,6 +9237,7 @@ pub fn mcp_start_session(
         cap_inherit,
         caller_cols,
         caller_rows,
+        launch_grant,
     ) = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         let cuid = caller_uid.ok_or((
@@ -9271,9 +9272,6 @@ pub fn mcp_start_session(
         let granted = p.task_id.as_deref().and_then(|req| {
             crate::items::grants::find(&state.launch_grants, cuid, req).cloned()
         });
-        if let Some(grant) = &granted {
-            crate::items::grants::log_use(grant, cuid);
-        }
         if let Some(req_task) = p.task_id.as_deref().filter(|_| granted.is_none()) {
             match caller.task_id.as_deref() {
                 None => {
@@ -9484,6 +9482,7 @@ pub fn mcp_start_session(
             cap_inherit,
             caller.last_cols,
             caller.last_rows,
+            granted,
         )
     };
 
@@ -10048,6 +10047,10 @@ pub fn mcp_start_session(
                 )),
             );
         }
+    }
+    // Logged once the spawn has happened, like the §6.3 bootstrap rules.
+    if let (Some(grant), Some(uid)) = (&launch_grant, caller_uid) {
+        crate::items::grants::log_use(grant, uid);
     }
     Ok(response)
 }
@@ -20114,9 +20117,18 @@ fn teardown_subtask_done(
     // pinned workspace is never removed: finishing work only unassigns
     // (lifecycle_guard_v1, doc/org-model.md §7.1).
     let mut worktree_removed = false;
+    // A member's main session the sweep spared may live in this worktree:
+    // removing it would pull the floor from under the member (review of
+    // 6522623), so it is kept as "member".
     let workspace_kept: Option<&'static str> = cleanup.as_ref().and_then(|(ws_id, _, _)| {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-        state.workspaces.get(ws_id).and_then(crate::lifecycle_guard::protected_workspace)
+        state.workspaces.get(ws_id).and_then(crate::lifecycle_guard::protected_workspace).or_else(|| {
+            state
+                .sessions
+                .values()
+                .any(|s| &s.workspace_id == ws_id && crate::lifecycle_guard::is_member_main(s))
+                .then_some("member")
+        })
     });
     if p.close_worktree && was_branch_mode && workspace_kept.is_none() {
         let (ws_id, wt_opt, mr_opt) = cleanup.ok_or((
@@ -20173,9 +20185,12 @@ fn teardown_subtask_done(
         }
     }
 
-    // Phase 3 — only NOW commit the Done status.
-    api_update_task(&creds, &p.task_id, &json!({ "status": "done" }))
-        .map_err(|e| e.to_method_err())?;
+    // Phase 3 — only NOW commit the Done status, attributed to the caller.
+    let mut done = json!({ "status": "done" });
+    if let Some(actor) = crate::items::rpc::session_actor(state_arc, killer) {
+        done["actor"] = actor;
+    }
+    api_update_task(&creds, &p.task_id, &done).map_err(|e| e.to_method_err())?;
 
     let mut out = json!({ "ok": true, "worktree_removed": worktree_removed });
     if let Some(kind) = workspace_kept {

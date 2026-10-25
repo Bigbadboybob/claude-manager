@@ -529,13 +529,15 @@ same transaction, so the task change feed carries it.
 blocked_on_owner → blocked; done → done; dropped → done with
 `metadata.dropped`. A board close stamps `metadata.terminal_via = "item"`,
 which the daemon's lifecycle guard reads (the terminal sweep only unassigns).
-Mirroring for a task is on only while every daemon holding its live sessions
-advertises `lifecycle_guard_v1` in its heartbeat `capabilities` (stored in org
-S2's `org_daemons`; advertised only by a build with both the sweep guard and
-org's home-mark apply, so until both have landed the mirror stays off);
-otherwise
-`placement.mirror = "off"` and the task status is left alone.
-`CM_ORG_MIRROR=0` turns it off (links kept). Item writes take the task-change
+The mirror **fails closed**: it runs only while every daemon that
+heartbeated in the last 120 s advertises `lifecycle_guard_v1` (org S2's
+`org_daemons`), there is at least one, and every daemon holding the task's
+live sessions is among them. Otherwise `placement.mirror = "off"` with
+`mirror_waiting_on`, the task status is left alone, and legacy status writes
+keep updating the task row as before. The board engine re-mirrors such
+tasks once the gate opens. The capability is advertised only by a build with
+both the sweep guard and org's home-mark apply, so until both have landed
+the mirror is off everywhere. `CM_ORG_MIRROR=0` turns it off (links kept). Item writes take the task-change
 advisory lock first, then the board and task rows.
 
 **Legacy task writes** to a placed task (`PATCH /tasks/{id}`,
@@ -546,7 +548,9 @@ item; `blocked` with a reason or blockers blocks the item on them (reason →
 `blocked_on = "legacy status write: no reason given"`, a 24 h check-back and a
 `legacy_blocked` flag pushed to the holders; `backlog` unplaces; `running`
 activates (an unheld item's new owner is the writing session, e.g. the one a
-spawn just started); anything else is `409 placed_on_board`. A description
+spawn just started); `archived` on a closed item archives the link too
+(planning's bulk archive), on an open one it is refused; anything else is
+`409 placed_on_board`. A description
 PATCH goes through the item: `description_rev` moves and the holders get a
 `description_changed` push.
 
@@ -561,7 +565,11 @@ owner leaves with one holder left, that holder becomes owner. Hand-back is
 unchanged (strict boards keep the item active and unheld).
 
 **Launch grants.** The owner of a placed item holds a `launch_grants` row for
-its task (moved when the owner changes, revoked on close or unplace). Each
+its task, granted only when Owner, the board's orchestrator or steward, or
+the previous owner handing over made the owner (a session naming itself
+owner gets the role, not the grant); revoked on close, hand-back or unplace.
+Placing and unplacing need the task in the caller's tree (or Owner/global),
+and unplacing needs edit rights on the link's board. Each
 heartbeat reply carries the daemon's full live set (`launch_grants`); the
 daemon persists it and admits `start_session(task_id=…)` /
 `item_resolve(launch)` for that task from the grant holder even where the
@@ -580,7 +588,7 @@ org_core_missing`):
 | `POST /boards/{ref}/epics/{gid}/poc {actor, member, team_id?}` | the epic is run by `member`'s team: `team_id` (one it leads), the epic's team if it leads it, else a new `kind='team'` team (parent: the enclosing epic's team, else the board's). Returns `staffing` offers for the current holders (`primary` = a move under the PoC, `guest` = keeps its manager) |
 | `POST /boards/{ref}/epics/{gid}/staff {actor, member, as}` | accept an offer: a guest membership, or org's `move` (manager chain or Owner) |
 | `POST /boards/{ref}/epics/{gid}/close-plan {actor, outcome}` | build and persist the close plan: `{plan_id, revision, items[{n, title, choice_options[move,unplace,drop]}], move_targets, team{options, default}, members[{member_id, role, options, default, needs}], workspaces[]}`. Refused with active sub-epics; a rebuild bumps the revision; a plan being applied is resumed, never replaced |
-| `POST /boards/{ref}/close-plans/{id}/apply {actor, revision, choices}` | validates every item choice, then applies step by step (recorded, so a retry resumes); choices the closer cannot authorize (team standby/archive without Owner, member move/retire) return as `pending` with `who_must_decide`; ends guest memberships; after a final nothing-left-open check under the board lock the epic closes with a `close_record` |
+| `POST /boards/{ref}/close-plans/{id}/apply {actor, revision, choices}` | only on the epic's own board; one applier at a time (409 `close_in_progress`); validates every item choice, then applies step by step (recorded, so a retry resumes); items closed or unplaced since the plan are `skipped`; team standby/archive without Owner and every member move/retire come back as `pending` with `who_must_decide` (the move itself is org's `move`); ends guest memberships; after a final nothing-left-open check under the board lock the epic closes with a `close_record` |
 
 Read-only: `GET /items/on-boards` → `{epics[], items[]}` (open epics and open
 board-native items, across boards).
@@ -590,3 +598,10 @@ Daemon RPCs (all daemon-only, actor stamped): `item.place`, `item.unplace`,
 `epic.close_apply`, `boards.on_boards` (read-only). MCP tools: `place`,
 `unplace`, `epic(action=create|promote|set_poc|staff|close)`, and on
 `item`/`item_set`: `group_id`, `description`, `owner`, `role`, `team_id`.
+
+**Lifecycle guard (daemon, TUI).** The terminal sweep and `mark_subtask_done`
+(daemon and TUI routes) never close a member's main session (org S2's member
+cache, persisted at `<cm>/org-members.json` so a restarted brain still knows
+them) and never remove a pinned (later home/stream) workspace or one a spared
+member main still uses (`workspace_kept: "pinned" | "member"`). A
+`terminal_via=item` close closes only ephemeral workspaces' sessions.

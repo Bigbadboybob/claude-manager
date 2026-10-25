@@ -300,8 +300,26 @@ async def close_apply(pool, ref: str, actor: dict, plan_id: int, revision: int,
     Choices the closer cannot authorize become pending; the epic still
     closes."""
     choices = choices or {}
+    # One applier per plan at a time: a session-level advisory lock held on
+    # this connection for the whole apply (released if the API dies, so a
+    # crashed apply is simply resumed by the next call).
+    async with pool.acquire() as guard:
+        if not await guard.fetchval("SELECT pg_try_advisory_lock(hashtext('epic_close_plan'), $1)",
+                                    int(plan_id)):
+            raise ItemsError(409, "close_in_progress",
+                             f"close plan {plan_id} is being applied right now; retry shortly")
+        try:
+            return await _close_apply(pool, ref, actor, int(plan_id), revision, choices)
+        finally:
+            await guard.execute("SELECT pg_advisory_unlock(hashtext('epic_close_plan'), $1)",
+                                int(plan_id))
+
+
+async def _close_apply(pool, ref: str, actor: dict, plan_id: int, revision: int,
+                       choices: dict) -> dict:
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM epic_close_plans WHERE id = $1", int(plan_id))
+        row = await conn.fetchrow("SELECT p.*, g.board_id FROM epic_close_plans p "
+                                  "JOIN groups g ON g.id = p.group_id WHERE p.id = $1", plan_id)
         if row is None:
             raise ItemsError(404, "not_found", f"no close plan {plan_id}")
         if row["revision"] != revision:
@@ -312,6 +330,11 @@ async def close_apply(pool, ref: str, actor: dict, plan_id: int, revision: int,
             return {"applied": True, "pending": (row["choices"] or {}).get("_pending", []),
                     "replayed": True}
         board = await items_db._board_by_ref(conn, ref)
+        # A plan applies only on the board its epic is on: item numbers are
+        # per board (review of 6522623).
+        if str(row["board_id"]) != board["id"]:
+            raise ItemsError(404, "not_found",
+                             f"close plan {plan_id} belongs to another board, not {board['slug']}")
         await _authorize(conn, board, actor, "close_epic")
         plan = row["plan"]
         # Every open item needs a valid choice before anything is applied.
@@ -339,10 +362,23 @@ async def close_apply(pool, ref: str, actor: dict, plan_id: int, revision: int,
                 """UPDATE epic_close_plans SET progress = progress || to_jsonb($2::text),
                           updated_at = now() WHERE id = $1""", row["id"], step)
 
-    # 1. Open items: moved, unplaced or dropped, each its own write.
+    # 1. Open items: moved, unplaced or dropped, each its own write. One
+    # closed or unplaced since the plan was built is skipped and recorded.
+    skipped: list[dict] = []
     for it in plan["items"]:
         step = f"item:{it['n']}"
         if step in done:
+            continue
+        async with pool.acquire() as conn:
+            now_row = await conn.fetchrow(
+                """SELECT status, link_archived_at, archived_at FROM items
+                    WHERE board_id = $1 AND number = $2""", uuid.UUID(board["id"]), it["n"])
+        if (now_row is None or now_row["status"] in CLOSED or now_row["link_archived_at"]
+                or now_row["archived_at"]):
+            skipped.append({"n": it["n"], "reason": "no longer open"
+                            if now_row is not None and now_row["status"] in CLOSED
+                            else "unplaced or gone"})
+            await mark(step)
             continue
         kind, _, arg = str(item_choices[str(it["n"])]).partition(":")
         if kind == "move":
@@ -381,9 +417,13 @@ async def close_apply(pool, ref: str, actor: dict, plan_id: int, revision: int,
                         WHERE team_id = $1 AND member_id = $2 AND role = 'guest'
                           AND (until IS NULL OR until > now())""",
                     uuid.UUID(team["team_id"]), m["member_id"])
-        elif choice in ("move", "retire") and not is_owner:
+        elif choice in ("move", "retire"):
+            # The move or retire itself is the org core's (with its manager
+            # chain checks): never done silently here, even for Owner.
             pending.append({"row": f"member:{m['member_id']}", "choice": choice,
-                            "who_must_decide": "manager_chain"})
+                            "who_must_decide": "owner" if is_owner else "manager_chain",
+                            "how": f"org(action=\"{'move' if choice == 'move' else 'retire'}\", "
+                                   f"member=\"{m['member_id']}\", ...)"})
         await mark(step)
 
     # 3. The final "nothing left open" check, under the board lock item
@@ -409,6 +449,7 @@ async def close_apply(pool, ref: str, actor: dict, plan_id: int, revision: int,
                     WHERE i.board_id = $1 AND i.group_id = ANY($2::uuid[])""",
                 uuid.UUID(board["id"]), sub)
             record = {"outcome": plan["outcome"], "choices": choices, "pending": pending,
+                      "skipped": skipped,
                       "contributors": sorted(r["actor_pid"] for r in holders),
                       "closed_at": iso(now)}
             await conn.execute(
@@ -423,5 +464,6 @@ async def close_apply(pool, ref: str, actor: dict, plan_id: int, revision: int,
                 """UPDATE epic_close_plans SET status = 'applied', applied_at = $2,
                           choices = COALESCE(choices, '{}'::jsonb) || jsonb_build_object('_pending', $3::jsonb),
                           updated_at = $2 WHERE id = $1""", row["id"], now, pending)
-    return {"applied": True, "pending": pending, "epic_status": plan["outcome"]}
+    return {"applied": True, "pending": pending, "skipped": skipped,
+            "epic_status": plan["outcome"]}
 

@@ -39,6 +39,8 @@ pub fn start(state: &Arc<Mutex<DaemonState>>) {
         let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
         let root = s.messaging_root.clone();
         s.launch_grants = crate::items::grants::load(&root);
+        // Members' main sessions stay protected across a brain restart.
+        super::org::load_cache(&root);
     }
     let state = Arc::clone(state);
     let spawned = std::thread::Builder::new()
@@ -285,6 +287,9 @@ impl Beat {
             crate::items::grants::replace(&mut s.launch_grants, &root, grants);
         }
         super::org::absorb_reply(&reply, crate::agent_state::unix_now());
+        if reply["org"]["members"].is_object() {
+            super::org::save_cache(&snap.root);
+        }
         for push in reply["pushes"].as_array().into_iter().flatten() {
             let Some(id) = push["id"].as_i64() else { continue };
             if self.deliver(state, &snap.root, push) {

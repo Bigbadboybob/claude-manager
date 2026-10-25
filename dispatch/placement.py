@@ -47,19 +47,82 @@ def placement_json(board: dict, it, **extra) -> dict:
     return out
 
 
+# A daemon counts toward the gate while its last heartbeat is this fresh.
+GATE_FRESH_S = 120
+
+
 async def mirror_gate(conn, task_id: str) -> list[str]:
-    """Daemons holding live sessions of the task that do not advertise the
-    lifecycle guard. Mirroring a task's status is safe only when this is
-    empty: an old daemon would sweep the task's sessions on a mirrored done."""
+    """Why the task's status may not be mirrored now; empty = mirror.
+
+    Fails closed (review of 6522623): an old sweep would kill a task's
+    sessions on a mirrored `done`, and a daemon that never beats, an old
+    brain or a session in its first 30 s may hold sessions no row shows. So
+    the mirror runs only while EVERY freshly heartbeating daemon advertises
+    lifecycle_guard_v1 in `org_daemons` (org S2), there is at least one, and
+    every daemon holding the task's live sessions is among them. No build
+    advertises it yet, so today the mirror is off everywhere."""
     if not mirror_enabled():
         return ["disabled"]
     rows = await conn.fetch(
-        """SELECT DISTINCT s.daemon_id, c.capabilities
-             FROM session_states s
-             LEFT JOIN org_daemons c ON c.daemon_id = s.daemon_id
-            WHERE s.task_id = $1 AND s.exited_at IS NULL""",
+        """SELECT daemon_id, capabilities FROM org_daemons
+            WHERE seen_at > now() - make_interval(secs => $1)""", GATE_FRESH_S)
+    if not rows:
+        return ["no_fresh_daemons"]
+    blocking = {r["daemon_id"] for r in rows if GUARD_CAP not in (r["capabilities"] or [])}
+    guarded = {r["daemon_id"] for r in rows} - blocking
+    holding = {r["daemon_id"] for r in await conn.fetch(
+        """SELECT DISTINCT daemon_id FROM session_states
+            WHERE task_id = $1 AND exited_at IS NULL""", uuid.UUID(task_id))}
+    blocking |= holding - guarded
+    return sorted(blocking)
+
+
+async def mirror_is_open(pool, task_id: str) -> bool:
+    async with pool.acquire() as conn:
+        return not await mirror_gate(conn, task_id)
+
+
+async def _write_task_side(conn, task_id: str, item_status: str, place: dict, now, *,
+                           extra: dict | None = None) -> None:
+    """Write a placed task's side of its item: task-owned `extra` fields,
+    the placement copy, and, while the gate is open, the mirrored status
+    and its terminal marks. With the gate closed the task status is left
+    as it is (legacy writes keep updating it) and placement says why."""
+    row = await conn.fetchrow(
+        "SELECT status, metadata, placement FROM tasks WHERE id = $1 FOR UPDATE",
         uuid.UUID(task_id))
-    return sorted(r["daemon_id"] for r in rows if GUARD_CAP not in (r["capabilities"] or []))
+    if row is None:
+        return
+    sets: dict = dict(extra or {})
+    place = dict(place)
+    waiting_on = await mirror_gate(conn, task_id)
+    if waiting_on:
+        place["mirror"] = "off"
+        place["mirror_waiting_on"] = waiting_on
+    else:
+        target = MIRROR.get(item_status)
+        if target and target != row["status"]:
+            sets["status"] = target
+            if target == "blocked":
+                sets["blocked_at"] = now
+        meta = dict(row["metadata"] or {})
+        before = dict(meta)
+        meta.pop("terminal_via", None)
+        meta.pop("dropped", None)
+        if item_status in CLOSED:
+            # A board-originated close never arms the terminal sweep against
+            # members (§7.1); the daemon's guard reads this.
+            meta["terminal_via"] = "item"
+            if item_status == "dropped":
+                meta["dropped"] = True
+        if meta != before:
+            sets["metadata"] = meta
+    if place != (row["placement"] or None):
+        sets["placement"] = place
+    if sets:
+        cols = ", ".join(f"{k} = ${i + 2}" for i, k in enumerate(sets))
+        await conn.execute(f"UPDATE tasks SET {cols}, updated_at = now() WHERE id = $1",
+                           uuid.UUID(task_id), *sets.values())
 
 
 async def apply_task_side(conn, tx: BoardTx) -> None:
@@ -70,65 +133,81 @@ async def apply_task_side(conn, tx: BoardTx) -> None:
         it = tx.items[n]
         if not it.task_id or it.link_archived_at is not None:
             continue
-        row = await conn.fetchrow(
-            "SELECT status, metadata, placement FROM tasks WHERE id = $1 FOR UPDATE",
-            uuid.UUID(it.task_id))
-        if row is None:
-            continue
-        sets: dict = {}
         writes = tx.task_writes.get(n, {})
+        extra: dict = {}
         if "name" in writes:
-            sets["name"] = writes["name"]
+            extra["name"] = writes["name"]
         if "description" in writes:
-            sets["description"] = writes["description"]
-            sets["description_rev"] = it.description_rev
-        waiting_on = await mirror_gate(conn, it.task_id)
-        place = placement_json(tx.board, it, item_id=it.id)
-        if waiting_on:
-            place["mirror"] = "off"
-            place["mirror_waiting_on"] = waiting_on
-        else:
-            target = MIRROR.get(it.status)
-            if target and target != row["status"]:
-                sets["status"] = target
-                if target == "blocked":
-                    sets["blocked_at"] = tx.now
-            meta = dict(row["metadata"] or {})
-            before = dict(meta)
-            meta.pop("terminal_via", None)
-            meta.pop("dropped", None)
-            if it.status in CLOSED:
-                # A board-originated close never arms the terminal sweep
-                # against members (§7.1); the daemon's guard reads this.
-                meta["terminal_via"] = "item"
-                if it.status == "dropped":
-                    meta["dropped"] = True
-            if meta != before:
-                sets["metadata"] = meta
-        if place != (row["placement"] or None):
-            sets["placement"] = place
-        if sets:
-            cols = ", ".join(f"{k} = ${i + 2}" for i, k in enumerate(sets))
-            await conn.execute(f"UPDATE tasks SET {cols}, updated_at = now() WHERE id = $1",
-                               uuid.UUID(it.task_id), *sets.values())
+            extra["description"] = writes["description"]
+            extra["description_rev"] = it.description_rev
+        await _write_task_side(conn, it.task_id, it.status,
+                               placement_json(tx.board, it, item_id=it.id), tx.now, extra=extra)
     await _move_launch_grants(conn, tx)
+
+
+async def remirror_pending(pool, limit: int = 50) -> int:
+    """Placed tasks whose mirror was off (the gate closed): once the gate
+    opens, write the item's status through. Run by the board engine loop;
+    each task in its own transaction, advisory lock first. Returns how many
+    it mirrored."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT t.id FROM tasks t WHERE t.placement->>'mirror' = 'off'
+                ORDER BY t.updated_at LIMIT $1""", limit)
+    mirrored = 0
+    for r in rows:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(items_db.TASK_WRITE_LOCK_SQL)
+                if await mirror_gate(conn, str(r["id"])):
+                    continue
+                item = await conn.fetchrow(
+                    """SELECT i.id, i.number, i.status, i.group_id, i.grp, b.id AS board_id, b.slug
+                         FROM items i JOIN boards b ON b.id = i.board_id
+                        WHERE i.task_id = $1 AND i.link_archived_at IS NULL""", r["id"])
+                if item is None:
+                    continue
+                place = {"board": item["slug"], "board_id": str(item["board_id"]),
+                         "n": item["number"], "status": item["status"],
+                         "group_id": str(item["group_id"]) if item["group_id"] else None,
+                         "group": item["grp"], "item_id": item["id"]}
+                await _write_task_side(conn, str(r["id"]), item["status"], place,
+                                       items_db.utcnow())
+                mirrored += 1
+    return mirrored
+
+
+async def _may_grant(conn, tx: BoardTx, old_pid: str | None) -> bool:
+    """Who can make an owner a launch grantee (review of 6522623): Owner, the
+    board's orchestrator or steward, or the previous owner handing over. A
+    session naming itself owner of somebody else's task gets the role but
+    no grant, so ownership never widens anyone's launch scope by itself."""
+    pid = tx.actor["pid"]
+    if pid == OWNER_PID or (old_pid and pid == old_pid):
+        return True
+    if pid in (tx.board.get("steward_pid"), tx.board.get("orchestrator_pid")):
+        return True
+    return pid == await _orchestrator_pid(conn, tx.board)
 
 
 async def _move_launch_grants(conn, tx: BoardTx) -> None:
     """The owner-role holder of a placed item may launch for its task (§7.4).
-    The grant follows the owner; closing or unplacing revokes it."""
+    The grant follows the owner when an authorized actor moves it; closing,
+    handing back or unplacing revokes it."""
     for n, old_pid, new in tx.owner_changes:
         it = tx.items[n]
         if not it.task_id:
             continue
         task = uuid.UUID(it.task_id)
         if old_pid:
+            reason = ("item closed" if it.status in CLOSED
+                      else "handed back" if new is None else "owner changed")
             await conn.execute(
                 """UPDATE launch_grants SET revoked_at = $3, revoked_by = $4, reason = $5
                     WHERE task_id = $1 AND pid = $2 AND revoked_at IS NULL""",
-                task, old_pid, tx.now, tx.actor["pid"],
-                "item closed" if new is None else "owner changed")
-        if new is not None and it.link_archived_at is None and it.status not in CLOSED:
+                task, old_pid, tx.now, tx.actor["pid"], reason)
+        if (new is not None and it.link_archived_at is None and it.status not in CLOSED
+                and await _may_grant(conn, tx, old_pid)):
             await conn.execute(
                 """INSERT INTO launch_grants (task_id, pid, daemon_id, session_uid, item_id,
                                               granted_by, granted_at)
@@ -322,6 +401,34 @@ async def _unplace_locked(conn, board: dict, task_id: str, n: int, actor: dict, 
         uuid.UUID(task_id))
 
 
+async def archive_link(pool, task_id: str, actor: dict) -> dict:
+    """Archive a closed placed item's link along with its task (planning's
+    bulk archive). The item keeps its number and history, read-only."""
+    now = items_db.utcnow()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(items_db.TASK_WRITE_LOCK_SQL)
+            task = await _lock_task(conn, task_id)
+            link = await _live_link(conn, str(task["id"]))
+            if link is None:
+                return {"archived": False}
+            board = await items_db._board_by_ref(conn, str(link["board_id"]), lock=True)
+            items = await items_db._load_items(conn, board["id"], [link["number"]])
+            it = items[link["number"]]
+            if it.status not in CLOSED:
+                raise ItemsError(409, "placed_on_board", f"#{it.n} is still {it.status}")
+            tx = BoardTx(board, items, actor, now)
+            it.link_archived_at = now
+            it.archived_at = it.archived_at or now
+            tx.dirty.add(it.n)
+            tx._event(it, "unplaced", prev={"task_id": str(task["id"]), "status": it.status},
+                      new={"link_archived_at": iso(now)}, reason="task archived")
+            await items_db._apply(conn, tx)
+            await revoke_task_grants(conn, str(task["id"]), actor, now, "task archived")
+            await conn.execute("UPDATE tasks SET placement = NULL WHERE id = $1", task["id"])
+            return {"archived": True, "board": board["slug"], "n": it.n}
+
+
 async def unplace_task(pool, task_id: str, actor: dict, *, reason: str | None = None) -> dict:
     """Archive a task's link and send the task back to the backlog (§7.1)."""
     now = items_db.utcnow()
@@ -357,6 +464,15 @@ async def translate_task_status(pool, task: dict, status: str, actor: dict, *,
     if status == "backlog":
         return await unplace_task(pool, str(task["id"]), actor,
                                   reason=reason or "legacy status write: backlog")
+    if status == "archived":
+        # A-A bulk archive: a closed item's link is archived with its task;
+        # an open one is still work on the board.
+        if current in CLOSED:
+            return await archive_link(pool, str(task["id"]), actor)
+        raise ItemsError(409, "placed_on_board",
+                         f"task {str(task['id'])[:8]} is still {current} on board "
+                         f"{placement.get('board')} as #{n}; close or unplace it before archiving",
+                         board=placement.get("board"), n=n)
     if status == "done":
         return await items_db.update_items(pool, ref, actor, [n], {"status": "done"},
                                            reason=reason or "legacy status write: done",

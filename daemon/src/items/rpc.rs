@@ -32,8 +32,8 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
         "item.resolve" => item_resolve(state, &ctx, &req.params),
         "board.read" => board_read(&ctx, &req.params),
         "board.settings" => board_settings(&ctx, &req.params),
-        "item.place" => item_place(&ctx, &req.params),
-        "item.unplace" => item_unplace(&ctx, &req.params),
+        "item.place" => item_place(state, &ctx, &req.params),
+        "item.unplace" => item_unplace(state, &ctx, &req.params),
         "group.create" => group_create(&ctx, &req.params),
         "group.set" => group_set(&ctx, &req.params),
         "epic.set_poc" | "epic.staff" | "epic.close_plan" | "epic.close_apply" => {
@@ -936,10 +936,31 @@ fn board_settings(ctx: &Ctx, params: &Value) -> RpcResult {
 /// `place(task, board, group=…, holder=…)` (doc/org-model.md §7.1). Editing
 /// the target board needs the usual board rights; the API enforces what
 /// placement itself refuses.
-fn item_place(ctx: &Ctx, params: &Value) -> RpcResult {
+/// Placing or unplacing a task writes that task (its status, its owner's
+/// launch grant), so it takes the same scope as any task write: the
+/// caller's own task or a descendant, unless Owner or global (review of
+/// 6522623: placing someone else's task, then owning it, must not widen the
+/// caller's launch scope).
+fn require_task_scope(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, task: &str) -> RpcResult<()> {
+    if ctx.owner || ctx.global {
+        return Ok(());
+    }
+    let own = ctx.task_id.as_deref().ok_or_else(|| {
+        (ErrorCode::Unauthorized, format!("a taskless session cannot place or unplace task {task}"))
+    })?;
+    let s = state.lock().unwrap_or_else(|p| p.into_inner());
+    if crate::control::auth::task_in_scope(&s, task, own) {
+        Ok(())
+    } else {
+        Err((ErrorCode::Unauthorized, format!("task {task} is not the caller's task or a descendant")))
+    }
+}
+
+fn item_place(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, params: &Value) -> RpcResult {
     let task = params.get("task_id").or_else(|| params.get("task")).and_then(Value::as_str)
         .filter(|t| !t.trim().is_empty())
         .ok_or_else(|| bad("task_id is required"))?;
+    require_task_scope(state, ctx, task.trim())?;
     let board = resolve_board(ctx, params)?;
     authorize_edit(ctx, params, &board)?;
     let slug = slug(&board)?;
@@ -964,10 +985,17 @@ fn item_place(ctx: &Ctx, params: &Value) -> RpcResult {
     ctx.api.post(&format!("/tasks/{}/place", task.trim()), &body)
 }
 
-fn item_unplace(ctx: &Ctx, params: &Value) -> RpcResult {
+fn item_unplace(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, params: &Value) -> RpcResult {
     let task = params.get("task_id").or_else(|| params.get("task")).and_then(Value::as_str)
         .filter(|t| !t.trim().is_empty())
         .ok_or_else(|| bad("task_id is required"))?;
+    require_task_scope(state, ctx, task.trim())?;
+    // Unplacing edits the link's board: the usual board rights there.
+    let row = ctx.api.get(&format!("/tasks/{}", task.trim()), &[])?;
+    let board_ref = row["placement"]["board"].as_str()
+        .ok_or_else(|| bad(format!("task {} is not on a board", task.trim())))?;
+    let board = resolve_board(ctx, &json!({"board": board_ref}))?;
+    authorize_edit(ctx, &json!({"board": board_ref}), &board)?;
     let mut body = json!({"actor": ctx.actor()});
     if let Some(reason) = params.get("reason").and_then(Value::as_str) {
         body["reason"] = json!(reason);
@@ -1516,8 +1544,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (url, seen) = stub(|method, path, _| match (method, path) {
             ("POST", "/boards/resolve") => (200, BOARD.into()),
-            ("POST", "/tasks/t-1/place") => (200, r#"{"board":"sfd","n":7,"item_status":"active","task_status":"running"}"#.into()),
-            ("POST", "/tasks/t-1/unplace") => (200, r#"{"unplaced":true}"#.into()),
+            ("POST", "/tasks/task-a/place") => (200, r#"{"board":"sfd","n":7,"item_status":"active","task_status":"running"}"#.into()),
+            ("POST", "/tasks/task-a/unplace") => (200, r#"{"unplaced":true}"#.into()),
+            ("GET", "/tasks/task-a") => (200, r#"{"id":"task-a","placement":{"board":"sfd","n":7}}"#.into()),
             ("POST", "/boards/sfd/groups") => (200, r#"{"id":"g-1","name":"Latent","kind":"epic"}"#.into()),
             ("PATCH", "/boards/sfd/groups/g-1") => (200, r#"{"id":"g-1"}"#.into()),
             ("PATCH", "/boards/sfd/items") => (200, r#"{"items":[],"unblocked":[],"warnings":[]}"#.into()),
@@ -1532,21 +1561,27 @@ mod tests {
         assert!(call(&state, "me-uid", "epic.close_plan", json!({"group_id":"g-1","outcome":"done"})).ok);
         let applied = call(&state, "me-uid", "epic.close_apply", json!({"plan_id":3,"revision":0,"choices":{"items":{}}}));
         assert_eq!(applied.result.as_ref().unwrap()["applied"], true);
-        let resp = call(&state, "me-uid", "item.place", json!({"task_id":"t-1","group":"Latent","holder":"me","replace":true}));
+        let resp = call(&state, "me-uid", "item.place", json!({"task_id":"task-a","group":"Latent","holder":"me","replace":true}));
         assert!(resp.ok, "{:?}", resp.error);
         assert_eq!(resp.result.as_ref().unwrap()["n"], 7);
-        assert!(call(&state, "me-uid", "item.unplace", json!({"task_id":"t-1","reason":"later"})).ok);
+        assert!(call(&state, "me-uid", "item.unplace", json!({"task_id":"task-a","reason":"later"})).ok);
+        // Another tree's task: placing or unplacing it is a task write the
+        // caller has no scope for (review of 6522623).
+        let resp = call(&state, "me-uid", "item.place", json!({"task_id":"t-elsewhere"}));
+        assert_eq!(resp.error.as_ref().unwrap().code, ErrorCode::Unauthorized);
+        let resp = call(&state, "me-uid", "item.unplace", json!({"task_id":"t-elsewhere"}));
+        assert_eq!(resp.error.as_ref().unwrap().code, ErrorCode::Unauthorized);
         assert!(call(&state, "me-uid", "group.create", json!({"name":"Latent","kind":"epic","goal":"ship"})).ok);
         assert!(call(&state, "me-uid", "group.set", json!({"group_id":"g-1","kind":"epic","expected_revision":2})).ok);
         assert!(!call(&state, "me-uid", "group.set", json!({"kind":"epic"})).ok, "group_id is required");
         assert!(call(&state, "me-uid", "item.set", json!({"n":3,"owner":"me","role":"reviewer"})).ok);
         let seen = seen.lock().unwrap();
         let body = |m: &str, p: &str| seen.iter().find(|(mm, pp, _)| mm == m && pp == p).map(|(_, _, b)| b.clone()).unwrap();
-        let place = body("POST", "/tasks/t-1/place");
+        let place = body("POST", "/tasks/task-a/place");
         assert_eq!((place["board"].clone(), place["group"].clone(), place["replace"].clone()), (json!("sfd"), json!("Latent"), json!(true)));
         assert!(place["holder"]["pid"].as_str().unwrap().ends_with(":me-uid"));
         assert!(place["actor"]["pid"].as_str().unwrap().ends_with(":me-uid"));
-        assert_eq!(body("POST", "/tasks/t-1/unplace")["reason"], "later");
+        assert_eq!(body("POST", "/tasks/task-a/unplace")["reason"], "later");
         assert_eq!(body("POST", "/boards/sfd/groups")["kind"], "epic");
         assert_eq!(body("PATCH", "/boards/sfd/groups/g-1")["expected_revision"], 2);
         let set = body("PATCH", "/boards/sfd/items");

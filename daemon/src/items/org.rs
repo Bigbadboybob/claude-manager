@@ -268,6 +268,41 @@ pub(crate) fn absorb_reply(reply: &Value, now: f64) {
     c.at = Some(now);
 }
 
+fn cache_path(root: &std::path::Path) -> std::path::PathBuf {
+    root.join("org-members.json")
+}
+
+/// Persist the member cache beside `launch-grants.json`. Teardown reads it
+/// to spare members' main sessions (lifecycle_guard_v1), so after a brain
+/// restart it must not start empty and let `mark_subtask_done` close a
+/// member before the first beat (review of 6522623).
+pub(crate) fn save_cache(root: &std::path::Path) {
+    let snapshot = {
+        let c = cache().lock().unwrap_or_else(|p| p.into_inner());
+        json!({"at": c.at, "members": c.by_uid})
+    };
+    let tmp = cache_path(root).with_extension("json.tmp");
+    if let Ok(bytes) = serde_json::to_vec(&snapshot) {
+        if std::fs::write(&tmp, bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, cache_path(root));
+        }
+    }
+}
+
+/// Load the persisted cache at brain start, unless a beat already filled it.
+pub(crate) fn load_cache(root: &std::path::Path) {
+    let Some(saved) = std::fs::read(cache_path(root)).ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else { return };
+    let mut c = cache().lock().unwrap_or_else(|p| p.into_inner());
+    if c.at.is_some() {
+        return;
+    }
+    if let Some(members) = saved["members"].as_object() {
+        c.by_uid = members.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        c.at = saved["at"].as_f64();
+    }
+}
+
 /// The member a session on this daemon works as, from the last heartbeat
 /// (at most ~30 s old). Never blocks on the network: `ping` reads it.
 pub fn cached_member(uid: &str) -> Value {
@@ -336,6 +371,19 @@ pub(crate) fn test_stub(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_member_cache_survives_a_brain_restart() {
+        let root = tempfile::tempdir().unwrap();
+        absorb_reply(&json!({"org": {"members": {"persist-uid": {"id": "mem_p", "acting_as": "main"}}}}),
+                     1_700_000_000.0);
+        save_cache(root.path());
+        reset_cache_for_test();
+        assert!(cached_member("persist-uid").is_null(), "a fresh brain starts empty");
+        load_cache(root.path());
+        assert_eq!(cached_member("persist-uid")["acting_as"], "main");
+        reset_cache_for_test();
+    }
+
     use super::*;
     use crate::control::protocol::Caller;
 

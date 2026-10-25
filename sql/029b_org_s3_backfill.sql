@@ -12,15 +12,16 @@ BEGIN
         ON CONFLICT (name) DO NOTHING;
     IF FOUND THEN
         INSERT INTO groups (board_id, name, kind, created_by)
-        SELECT DISTINCT ON (board_id, lower(grp)) board_id, grp, 'heading', 'system:migration'
+        SELECT DISTINCT ON (board_id, lower(btrim(grp))) board_id, btrim(grp), 'heading',
+               'system:migration'
           FROM items
          WHERE grp IS NOT NULL AND btrim(grp) <> ''
-         ORDER BY board_id, lower(grp), grp
+         ORDER BY board_id, lower(btrim(grp)), btrim(grp)
         ON CONFLICT DO NOTHING;
         UPDATE items i SET group_id = g.id
           FROM groups g
          WHERE g.board_id = i.board_id AND g.parent_group_id IS NULL
-           AND lower(g.name) = lower(i.grp) AND i.group_id IS NULL;
+           AND lower(g.name) = lower(btrim(i.grp)) AND i.group_id IS NULL;
     END IF;
 END $$;
 

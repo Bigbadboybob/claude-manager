@@ -931,8 +931,14 @@ async def update_task(task_id: str, body: TaskUpdate, pool=Depends(get_pool)):
         try:
             if "status" in fields:
                 await placement.translate_task_status(
-                    pool, task, fields.pop("status"), actor, reason=reason,
+                    pool, task, fields["status"], actor, reason=reason,
                     blocked_by=blocked_by)
+                # While the mirror's gate is closed (or CM_ORG_MIRROR=0) the
+                # task row takes the write as it always did; open, the item
+                # transition just mirrored it.
+                # `archived` archives the link too, so nothing mirrors it.
+                if fields["status"] != "archived" and await placement.mirror_is_open(pool, task_id):
+                    fields.pop("status")
             if "description" in fields and fields["description"] != task.get("description"):
                 await placement.task_description_changed(pool, task, fields.pop("description"),
                                                          actor)
