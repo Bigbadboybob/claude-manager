@@ -36,6 +36,9 @@ ORG_MARKS = "org_marks_v1"
 # is proposed as a long-lived lane.
 LANE_MIN_AGE_S = float(os.environ.get("CM_ORG_LANE_MIN_AGE_S", 24 * 3600))
 MAX_MARK_ATTEMPTS = 10
+# What a daemon stamps a spawned session as (O5): a durable assistant, or a
+# continuous member's worker (attributed, torn down as today).
+STAMPED_ROLES = ("assistant", "worker")
 MAX_ROWS = 200
 
 HANDLE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$")
@@ -459,12 +462,13 @@ async def member_for_pid(pool, pid: str) -> dict:
                 WHERE pid = $1 AND role = 'main' AND ended_at IS NULL""", pid)
         if not member_id:
             # O5: an assistant, as its daemon last reported it.
-            member_id = await conn.fetchval(
-                """SELECT f.member_id FROM org_session_facts f JOIN members m ON m.id = f.member_id
-                    WHERE f.pid = $1 AND f.acting_as = 'assistant'""", pid)
-            if member_id:
-                detail = await _detail(conn, member_id)
-                return {"pid": pid, "acting_as": "assistant", **detail}
+            row = await conn.fetchrow(
+                """SELECT f.member_id, f.acting_as FROM org_session_facts f
+                     JOIN members m ON m.id = f.member_id
+                    WHERE f.pid = $1 AND f.acting_as IN ('assistant', 'worker')""", pid)
+            if row:
+                detail = await _detail(conn, row["member_id"])
+                return {"pid": pid, "acting_as": row["acting_as"], **detail}
             return {"pid": pid, "member": None, "acting_as": None,
                     "version": await version(conn)}
         detail = await _detail(conn, member_id)
@@ -1261,11 +1265,13 @@ async def hand_back_holds(conn, actor: dict, from_pid: str, to_pid: str | None, 
 
 
 async def close_assistant(pool, actor: dict, *, pid: str, member_id: str, reason: str,
-                          request_id: str | None = None) -> dict:
+                          ended_by: str | None = None, request_id: str | None = None) -> dict:
     """Deliberately close one of a member's assistants (doc/org-model.md
     §4.3, O5): Owner, the member's main session or its manager chain. Its
     open holds go back to the member's current main session; the daemon
-    then closes the session. Recorded as an `org_event`."""
+    then closes the session. Recorded as an `org_event`. With
+    `ended_by="kill_session"` the daemon already killed it under
+    kill_session's scope: no authority check, the holds still go back."""
     if not reason or not str(reason).strip():
         raise _err(422, "invalid_field", "closing an assistant needs a reason")
     async with pool.acquire() as conn:
@@ -1285,13 +1291,20 @@ async def close_assistant(pool, actor: dict, *, pid: str, member_id: str, reason
                             WHERE pid = $1 AND role = 'main' AND ended_at IS NULL""", pid):
                     raise _err(409, "not_an_assistant",
                                f"{pid} is a member's main session; replace or retire the member")
-                await _require_chain(conn, actor, member_id, "close an assistant of", self_ok=True)
+                if await conn.fetchval(
+                        "SELECT acting_as = 'worker' FROM org_session_facts WHERE pid = $1", pid):
+                    raise _err(409, "not_an_assistant",
+                               f"{pid} is a continuous member's worker; kill_session it instead")
+                if ended_by != "kill_session":
+                    await _require_chain(conn, actor, member_id, "close an assistant of",
+                                         self_ok=True)
                 main_pid = await _main_pid(conn, member_id)
                 holds = await hand_back_holds(conn, actor, pid, main_pid,
                                               reason=f"assistant closed: {reason}")
                 await conn.execute(
                     "UPDATE org_session_facts SET acting_as = 'closed' WHERE pid = $1", pid)
-                await _event(conn, "member", member_id, "close_assistant", actor,
+                await _event(conn, "member", member_id,
+                             "assistant_killed" if ended_by else "close_assistant", actor,
                              prev={"assistant": pid}, new={"holds": holds},
                              reason=reason, request_id=request_id)
                 response = {"pid": pid, "member_id": member_id, "main_pid": main_pid,
@@ -1673,7 +1686,8 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
                       _clip(raw.get("continuous_task_id"), 200),
                       _clip(raw.get("managed_by_uid"), 200),
                       _clip(raw.get("workflow_run_id"), 200), spawned,
-                      _clip(raw.get("member_id"), 64) if raw.get("acting_as") == "assistant" else None))
+                      _clip(raw.get("member_id"), 64) if raw.get("acting_as") in STAMPED_ROLES else None,
+                      raw.get("acting_as") if raw.get("acting_as") in STAMPED_ROLES else None))
     async with pool.acquire() as conn:
         async with conn.transaction():
             for f in facts:
@@ -1682,8 +1696,8 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
                                                       worktree_path, continuous_task_id,
                                                       managed_by_uid, workflow_run_id, spawned_at,
                                                       member_id, acting_as, reported_at)
-                       VALUES ($1, $11, $2, $3, $4, $5, $6, $7, $8, $9,
-                               CASE WHEN $9::text IS NULL THEN NULL ELSE 'assistant' END, $10)
+                       VALUES ($1, $12, $2, $3, $4, $5, $6, $7, $8, $9,
+                               CASE WHEN $9::text IS NULL THEN NULL ELSE $10 END, $11)
                        ON CONFLICT (pid) DO UPDATE SET
                            member_id = coalesce(EXCLUDED.member_id, org_session_facts.member_id),
                            acting_as = CASE WHEN org_session_facts.acting_as = 'closed'

@@ -133,11 +133,12 @@ everyone who holds what, with each holder's live state, so nobody has to ask.
   hand them back.
 - Assistants: every agent a member's session spawns is that member's
   assistant (`list_sessions` shows `member`), as durable as its main session.
-  Finishing a task or item never closes it, so reuse an idle one (board free
-  capacity lists them as `rev1 (for ep)`) before spawning. Close one on
-  purpose with `org(action="close_assistant", session_uid=..., reason=...)`:
-  allowed for its member's main session, the member's manager chain or Owner.
-  Its holds go back to the member.
+  A continuous member's spawns are workers and keep today's teardown.
+  Finishing a task or item never closes an assistant, so reuse an idle one
+  (board free capacity lists them as `rev1 (for ep)`) before spawning. Close
+  one on purpose with `org(action="close_assistant", session_uid=...,
+  reason=...)` (its member's main session, the member's manager chain or
+  Owner) or `kill_session`; either way its holds go back to the member.
 
 ## Orchestrating other sessions
 

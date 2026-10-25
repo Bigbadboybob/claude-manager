@@ -183,32 +183,17 @@ fn member(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, p: &Map<String, Value>) ->
 /// `org.close_assistant` (doc/org-model.md §4.3, O5): deliberately close
 /// one of a member's assistants on this daemon. The planning API decides
 /// authority (Owner, the member's main session, or a member up its manager
-/// chain; the same check as `move`) and hands the assistant's board holds
-/// back to the member's main session. Then the session is closed with that
+/// chain; the check shared with move and retire) and hands the assistant's
+/// board holds back to the member's main session. Membership is checked
+/// again after that answer, then the session is closed with that
 /// attribution, and a `stream` checkout it was minted for goes back to
 /// `ephemeral`, so the reaper's normal protections decide when it goes.
-/// Against a planning API without the route, only Owner or the member's
-/// main session may close it, and holds stay where they are.
+/// Against a planning API without the route, only Owner or the member's main
+/// session may close it, and holds stay where they are.
 fn close_assistant(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, mut p: Map<String, Value>) -> RpcResult {
     let uid = take_str(&mut p, "session_uid")?.ok_or_else(|| bad("org.close_assistant needs session_uid"))?;
     let reason = take_str(&mut p, "reason")?.unwrap_or_else(|| "closed by its member".into());
-    let (member_id, ws_id) = {
-        let s = state.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(sess) = s.sessions.get(&uid) else {
-            return Err((ErrorCode::NotFound, format!("not_found: no live session '{uid}' on this daemon")));
-        };
-        match crate::assistants::of_session(sess) {
-            Some(m) if m.acting_as == crate::assistants::ASSISTANT => (m.member_id, sess.workspace_id.clone()),
-            Some(_) => {
-                return Err((ErrorCode::Conflict, format!(
-                    "not_an_assistant: '{uid}' is a member's main session; replace or retire the member instead")));
-            }
-            None => {
-                return Err((ErrorCode::Conflict, format!(
-                    "not_an_assistant: '{uid}' belongs to no member; close it with kill_session")));
-            }
-        }
-    };
+    let member_id = assistant_of(state, &uid)?;
     let pid = format!("agent:{}:{uid}", ctx.daemon_id);
     let mut body = Map::new();
     body.insert("pid".into(), json!(pid));
@@ -232,17 +217,24 @@ fn close_assistant(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, mut p: Map<String
     let attribution = format!("{} (close_assistant)", if ctx.owner { "operator" } else { ctx.uid.as_deref().unwrap_or("?") });
     let released = {
         let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+        // The API call ran unlocked: the session may have exited, been
+        // revived as someone else's, or been closed meanwhile. Kill only what
+        // is still this member's assistant.
+        let still = s.sessions.get(&uid).and_then(crate::assistants::of_session);
+        if still.as_ref().map(|m| (m.member_id.as_str(), m.acting_as))
+            != Some((member_id.as_str(), crate::assistants::ASSISTANT))
+        {
+            return Err((ErrorCode::Conflict, format!(
+                "changed: '{uid}' is no longer {member_id}'s live assistant; nothing was closed \
+                 (holds already handed back: {})", central["holds"])));
+        }
+        let (_, released) = crate::assistants::end_assistant(&mut s, &uid).unwrap_or_default();
         if let Some(sess) = s.sessions.get_mut(&uid) {
-            // The tombstone keeps who it worked for, marked closed, so the
-            // reaper stops protecting its checkout.
-            cm_holder_proto::org::set(&mut sess.org, crate::assistants::CLOSED_AT,
-                                      json!(chrono::Utc::now().to_rfc3339()));
             sess.last_exit.mark_operator_kill_requested();
             sess.set_kill_attribution(&attribution);
             let _ = sess.kill();
         }
         s.record_kill_request(&uid, &attribution, crate::agent_state::unix_now());
-        let released = crate::assistants::release_workspace(&mut s, &ws_id, &uid);
         s.persist_sessions_best_effort();
         released
     };
@@ -250,6 +242,51 @@ fn close_assistant(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, mut p: Map<String
         "closed": uid, "member_id": member_id, "killed_by": attribution,
         "holds": central["holds"], "workspace_released": released,
     }))
+}
+
+/// The member `uid` (live on this daemon) is an assistant of, or the
+/// refusal that says what it is instead.
+fn assistant_of(state: &Arc<Mutex<DaemonState>>, uid: &str) -> RpcResult<String> {
+    let s = state.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(sess) = s.sessions.get(uid) else {
+        return Err((ErrorCode::NotFound, format!("not_found: no live session '{uid}' on this daemon")));
+    };
+    match crate::assistants::of_session(sess) {
+        Some(m) if m.acting_as == crate::assistants::ASSISTANT => Ok(m.member_id),
+        Some(m) if m.acting_as == crate::assistants::WORKER => Err((ErrorCode::Conflict, format!(
+            "not_an_assistant: '{uid}' is a continuous member's worker; close it with kill_session"))),
+        Some(_) => Err((ErrorCode::Conflict, format!(
+            "not_an_assistant: '{uid}' is a member's main session; replace or retire the member instead"))),
+        None => Err((ErrorCode::Conflict, format!(
+            "not_an_assistant: '{uid}' belongs to no member; close it with kill_session"))),
+    }
+}
+
+/// After an agent's `kill_session` ended a member's assistant: hand its
+/// holds back to the member's main session, off the dispatch thread. The
+/// kill was already authorized by `kill_session`'s own scope, so the API
+/// records it (`ended_by: kill_session`) without the close authority check.
+/// Best-effort: a failure is logged and the holds stay (the board flags them
+/// as held by an exited session).
+pub(crate) fn hand_back_after_kill(state: &Arc<Mutex<DaemonState>>, req: &Request, uid: &str, member_id: &str) {
+    let ctx = match Ctx::capture(state, req) {
+        Ok(ctx) => ctx,
+        Err((_, e)) => {
+            eprintln!("cm org: holds of killed assistant {uid} not handed back: {e}");
+            return;
+        }
+    };
+    let body = json!({
+        "pid": format!("agent:{}:{uid}", ctx.daemon_id), "member_id": member_id,
+        "reason": "killed with kill_session", "ended_by": "kill_session", "actor": ctx.actor(),
+        "request_id": format!("kill-{uid}"),
+    });
+    let uid = uid.to_string();
+    std::thread::spawn(move || {
+        if let Err((_, e)) = api(ctx.api.post("/org/assistants/close", &body)) {
+            eprintln!("cm org: holds of killed assistant {uid} not handed back: {e}");
+        }
+    });
 }
 
 /// `org.adopt`: Owner binds a live session to a new member. The TUI may
@@ -335,11 +372,12 @@ pub(crate) fn session_facts(state: &DaemonState, sess: &DaemonSession, now: f64)
     facts.insert("continuous_task_id".into(), json!(sess.continuous_task_id));
     facts.insert("managed_by_uid".into(), json!(sess.managed_by_uid));
     facts.insert("workflow_run_id".into(), json!(sess.workflow_run_id));
-    // O5: an assistant's member (the API learns mains from incarnations).
-    if let Some(member) = crate::assistants::stamped_member(sess.org.as_ref()) {
+    // O5: whom an assistant or worker works for (the API learns mains from
+    // incarnations).
+    if let Some((member, role)) = crate::assistants::stamped(sess.org.as_ref()) {
         if crate::assistants::main_member(&sess.uid).is_none() {
             facts.insert("member_id".into(), json!(member));
-            facts.insert("acting_as".into(), json!(crate::assistants::ASSISTANT));
+            facts.insert("acting_as".into(), json!(role));
         }
     }
     if let Some(age) = spawned_age_s(&sess.uid, now) {
@@ -471,6 +509,13 @@ pub(crate) fn apply_marks(state: &mut DaemonState, reply: &Value) -> Vec<i64> {
 
 /// The workspace org-object key naming the member whose home it is.
 pub const OFFICE_OF: &str = "office_of";
+
+/// A member's `kind` (`agent`, `continuous`, …) when the cache holds it,
+/// i.e. when its main session is on this daemon.
+pub fn cached_member_kind(member_id: &str) -> Option<String> {
+    let c = cache().lock().unwrap_or_else(|p| p.into_inner());
+    c.by_uid.values().find(|m| m["id"] == member_id).and_then(|m| m["kind"].as_str()).map(str::to_string)
+}
 
 /// Whether the member cache has heard from an API that serves members (a
 /// beat, or the persisted cache at brain start). The assistant backfill

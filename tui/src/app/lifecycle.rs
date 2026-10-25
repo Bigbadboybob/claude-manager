@@ -1550,7 +1550,7 @@ impl App {
                     return;
                 }
             };
-            if let Err(e) = crate::client_session::close_session_deliberately(
+            if let Err(e) = crate::client_session::rpc_kill_session(
                 &socket,
                 &host_pool.operator_token_for(&ts.host_id),
                 uid,
@@ -1572,7 +1572,13 @@ impl App {
         host_pool: &std::sync::Arc<crate::host_pool::HostPool>,
         ts: &TerminalSession,
     ) {
-        if ts.host_id == cm_daemon::host_id::HostId::local() || ts.session.daemon_session_uid.is_none() {
+        // A local non-assistant keeps today's synchronous kill. An assistant
+        // (by its row's stamp) closes through `org.close_assistant`, which
+        // waits on the planning API, so it runs off the input thread on any
+        // host (O5).
+        if ts.session.daemon_session_uid.is_none()
+            || (ts.host_id == cm_daemon::host_id::HostId::local() && !is_open_assistant_row(ts))
+        {
             Self::kill_daemon_session_if_attached(host_pool, ts);
             return;
         }
@@ -3415,9 +3421,12 @@ impl App {
         // workspace-level sessions in the same workspace stay running.
         // Tombstone each so post-done `read_session_output` keeps working.
         // Helper persists the manifest before returning.
+        // A member's assistant is only unassigned, never closed (O5,
+        // doc/org-model.md §4.3); read from its row's stamp so the input
+        // thread never waits on a daemon.
         let target = tid.clone();
         self.tombstone_and_remove(wi, |ts| {
-            ts.task_id.as_deref() == Some(target.as_str())
+            ts.task_id.as_deref() == Some(target.as_str()) && !is_open_assistant_row(ts)
         });
         // Spent-workspace cleanup is no longer a per-site call here: the
         // task was just marked Done locally, so `is_past_workspace` hides
@@ -9204,4 +9213,15 @@ mod spent_workspace_tests {
         assert!(!app.workspaces[3].is_closed);
         assert_eq!(app.tasks.len(), 4);
     }
+}
+
+/// A row the daemon stamped as a member's (durable) assistant and that was
+/// not closed: finishing its task leaves it running (O5). Workers of a
+/// continuous member and member-less rows return false.
+pub(crate) fn is_open_assistant_row(ts: &TerminalSession) -> bool {
+    ts.org.as_ref().is_some_and(|o| {
+        o.get("acting_as").and_then(|v| v.as_str()) == Some("assistant")
+            && o.get("member_id").and_then(|v| v.as_str()).is_some_and(|m| !m.is_empty())
+            && !o.contains_key("assistant_closed_at")
+    })
 }

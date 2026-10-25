@@ -3205,7 +3205,15 @@ fn dispatch_kill_session(
         Caller::Session(s) => Some(s.session_uid.clone()),
     };
     match methods::kill_session(state, &req.params, caller_uid.as_deref()) {
-        Ok(value) => Response::ok(req.id.clone(), value),
+        Ok(value) => {
+            // O5: the killed assistant's holds go back to its member, off the
+            // dispatch thread (the planning API may be slow or down).
+            if let Some(member_id) = value["assistant_ended"]["member_id"].as_str() {
+                let uid = req.params["session_uid"].as_str().unwrap_or_default().to_string();
+                crate::items::org::hand_back_after_kill(state, req, &uid, member_id);
+            }
+            Response::ok(req.id.clone(), value)
+        }
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
 }

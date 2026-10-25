@@ -86,15 +86,23 @@ class WorktreeReaperTests(unittest.TestCase):
 
     def test_durable_workspaces_and_open_assistants_checkouts_are_protected(self) -> None:
         # doc/org-model.md §5, O5: a member's home/stream workspace, or a
-        # checkout a member's assistant worked in and was never deliberately
-        # closed from, survives a done task. A deliberately closed assistant
-        # (its stream released to ephemeral) leaves the normal rules.
+        # checkout an assistant was live in within 7 days, survives a done
+        # task. A closed assistant, or one dead longer (any death path: plain
+        # kill, crash, memory cap, natural exit), leaves the normal rules.
         manifest = self.base / "daemon-sessions.json"
+        day = 86400.0
 
-        def decide(org, record_org):
-            manifest.write_text(reaper.json.dumps({"workspaces": {"ws": {
-                "id": "ws", "worktree_path": str(self.worktree), "org": org,
-                "sessions": [], "tombstones": [{"uid": "u", "task_id": "task-1", "org": record_org}]}}}))
+        def decide(org, record_org, *, exited_days_ago=None, live=False, tui_shape=False):
+            record = {"uid": "u", "task_id": "task-1"}
+            if tui_shape:
+                record["entry"] = {"org": record_org}
+            else:
+                record["org"] = record_org
+            if exited_days_ago is not None:
+                record["exited_at"] = self.now - exited_days_ago * day
+            ws = {"id": "ws", "worktree_path": str(self.worktree), "org": org,
+                  "sessions": [record] if live else [], "tombstones": [] if live else [record]}
+            manifest.write_text(reaper.json.dumps({"workspaces": {"ws": ws}}))
             facts = reaper.load_workspace_facts([manifest])[self.worktree.resolve()]
             context = self.context()
             context.workspaces = {self.worktree.resolve(): facts}
@@ -102,15 +110,28 @@ class WorktreeReaperTests(unittest.TestCase):
 
         open_assistant = {"member_id": "mem_ep", "acting_as": "assistant"}
         closed = {**open_assistant, "assistant_closed_at": "2026-10-25T12:00:00Z"}
+        worker = {"member_id": "mem_bt", "acting_as": "worker"}
+        claimed = {"workspace_kind": "stream", "stream_of": "assistant"}
         self.assertEqual(decide({"workspace_kind": "stream"}, None).reason, "stream_workspace")
         self.assertEqual(decide({"workspace_kind": "home"}, None).reason, "home_workspace")
-        self.assertEqual(decide(None, open_assistant).reason, "assistant_checkout")
-        released = decide({"workspace_kind": "ephemeral"}, closed)
-        self.assertTrue(released.eligible, released.reason)
-        member_less = decide({"workspace_kind": "ephemeral"}, None)
-        self.assertTrue(member_less.eligible, "a member-less checkout keeps today's rules")
+        # An open assistant dead 2 days (daemon and TUI manifest shapes).
+        self.assertEqual(decide(None, open_assistant, exited_days_ago=2).reason, "assistant_checkout")
+        self.assertEqual(decide(None, open_assistant, exited_days_ago=2, tui_shape=True).reason,
+                         "assistant_checkout")
+        # Dead 8 days: normal rules, unclassified or claimed stream alike.
+        self.assertTrue(decide(None, open_assistant, exited_days_ago=8).eligible)
+        stale = {**claimed, "assistant_idle_since": self.now - 8 * day}
+        self.assertTrue(decide(stale, open_assistant, exited_days_ago=8).eligible)
+        # A claimed stream the daemon has watched idle only 3 days stays.
+        recent = {**claimed, "assistant_idle_since": self.now - 3 * day}
+        self.assertEqual(decide(recent, open_assistant, exited_days_ago=8).reason, "assistant_checkout")
+        # Closed, a worker, nobody's: normal rules.
+        self.assertTrue(decide({"workspace_kind": "ephemeral"}, closed, exited_days_ago=1).eligible)
+        self.assertTrue(decide({"workspace_kind": "ephemeral"}, worker, exited_days_ago=1).eligible)
+        self.assertTrue(decide({"workspace_kind": "ephemeral"}, None).eligible)
         self.assertTrue(reaper.is_open_assistant(open_assistant))
         self.assertFalse(reaper.is_open_assistant(closed))
+        self.assertFalse(reaper.is_open_assistant(worker))
         self.assertFalse(reaper.is_open_assistant({"acting_as": "main", "member_id": "mem_ep"}))
 
     def test_nonterminal_and_young_unowned_worktrees_fail_closed(self) -> None:

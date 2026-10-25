@@ -82,7 +82,7 @@ mod maintenance;
 mod color_grid;
 mod unread;
 
-pub(crate) use lifecycle::{attach_via_daemon, try_attach_via_daemon_with_deps};
+pub(crate) use lifecycle::{attach_via_daemon, is_open_assistant_row, try_attach_via_daemon_with_deps};
 
 pub(crate) use model::{
     new_workspace_id, parse_worktree_mode, PendingWrite, SessionStatus, TaskEntry, TaskStatus,

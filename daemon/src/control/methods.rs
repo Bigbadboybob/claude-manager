@@ -858,10 +858,12 @@ pub(crate) fn start_session_with_spawn_fn(
         // O5: an agent spawned by a member's session (main or assistant)
         // is that member's assistant, and a checkout minted for it is a
         // `stream` of the member's office, not `ephemeral`.
-        if crate::assistants::stamp_spawn(&st, &session_uid, p.managed_by_uid.as_deref(), &mut org) {
-            if let Some(member) = crate::assistants::stamped_member(org.as_ref()) {
-                crate::assistants::claim_workspace(&mut st, &p.workspace_id, &member);
-            }
+        // A continuous member's spawns are workers: attributed only. A
+        // fork arrives already stamped from its source.
+        crate::assistants::stamp_spawn(
+            &st, &session_uid, p.managed_by_uid.as_deref(), &p.session_type, &mut org);
+        if let Some(member) = crate::assistants::stamped_member(org.as_ref()) {
+            crate::assistants::claim_workspace(&mut st, &p.workspace_id, &member);
         }
         org
     };
@@ -2206,6 +2208,16 @@ pub fn kill_session(
         );
         return_auth_error_if_denied_with_state(decision, cuid, &p.session_uid, Some(&state))?;
     }
+    // O5: an agent's kill of a member's assistant ends it like a close: its
+    // tombstone stops protecting its checkout and a stream it claimed goes
+    // back to `ephemeral`; the dispatcher hands its holds back. Operator kills
+    // (A-R restarts, workflow fresh-role respawns, A-w's fallback) stay plain
+    // kills and are covered by the 7-day stream release.
+    let ended_assistant = if caller_uid.is_some() && state.sessions.contains_key(&p.session_uid) {
+        crate::assistants::end_assistant(&mut state, &p.session_uid)
+    } else {
+        None
+    };
     // 10e-a r1 F2: do NOT remove the session from the registry
     // here. Pre-r1 we removed-then-Drop'd, which fired SIGKILL
     // via the dropped session's pidfd — but the reaper's on_exit
@@ -2267,8 +2279,15 @@ pub fn kill_session(
     // route (TUI A-w, `resolve_stuck`, the continuous scheduler's watchdog).
     let killer = caller_uid.unwrap_or(OPERATOR_KILLER).to_string();
     state.record_kill_request(&p.session_uid, &killer, now_unix_f64());
+    if ended_assistant.is_some() {
+        state.persist_sessions_best_effort();
+    }
 
-    Ok(json!({ "ok": true }))
+    let mut out = json!({ "ok": true });
+    if let Some((member_id, released)) = ended_assistant {
+        out["assistant_ended"] = json!({"member_id": member_id, "workspace_released": released});
+    }
+    Ok(out)
 }
 
 /// Attribution recorded for a kill that came in on the OPERATOR route
@@ -9267,7 +9286,34 @@ fn ensure_ready_worktree(
     Ok(report)
 }
 
+/// O5: a worktree-cap refusal names the caller's member's idle assistants,
+/// with how to reuse (`send_input`) or close (`close_assistant`) them.
+fn with_cap_hint(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    caller_uid: Option<&str>,
+    result: MethodResult,
+) -> MethodResult {
+    result.map_err(|(code, message)| {
+        if !message.contains("worktree limit reached") {
+            return (code, message);
+        }
+        let hint = caller_uid.and_then(|uid| {
+            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            crate::assistants::cap_hint(&state, uid)
+        });
+        (code, format!("{message}{}", hint.unwrap_or_default()))
+    })
+}
+
 pub fn mcp_start_session(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
+    with_cap_hint(state_arc, caller_uid, mcp_start_session_inner(state_arc, params, caller_uid))
+}
+
+fn mcp_start_session_inner(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
     caller_uid: Option<&str>,
@@ -17112,6 +17158,14 @@ pub fn create_subtask(
     params: &Value,
     caller_uid: Option<&str>,
 ) -> MethodResult {
+    with_cap_hint(state_arc, caller_uid, create_subtask_inner(state_arc, params, caller_uid))
+}
+
+fn create_subtask_inner(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
     let p: CreateSubtaskParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("create_subtask params: {}", e)))?;
     let (base, leaf_slug) = validate_create_subtask(&p)?;
@@ -18283,7 +18337,7 @@ fn session_fork_once(
             return Err(e);
         }
     };
-    let full = match compose_fork_spawn_params(
+    let mut full = match compose_fork_spawn_params(
         &session_uid,
         &workspace_id,
         &label,
@@ -18313,6 +18367,14 @@ fn session_fork_once(
     } else {
         Vec::new()
     };
+    // O5: a fork works for the SOURCE's member (as its assistant, or as a
+    // continuous member's worker), not the caller's.
+    {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(org) = crate::assistants::fork_org(&state, &p.source_uid, &source.engine) {
+            full["org"] = Value::Object(org);
+        }
+    }
     let start_result = match start_session(state_arc, &full) {
         Ok(v) => v,
         Err(e) => {
@@ -25942,7 +26004,9 @@ while True:
             [
                 "compose_daemon_spawn_params",
                 "compose_fork_spawn_params",
-                "mcp_start_session",
+                // The body behind `mcp_start_session` (which adds the O5
+                // worktree-cap hint).
+                "mcp_start_session_inner",
                 "resolve_workflow_spawn_program",
             ],
             "a new agent-argv call site: cover it in this test, then list it here"

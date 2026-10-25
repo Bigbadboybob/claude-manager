@@ -2318,6 +2318,7 @@ impl App {
                 }
                 self.apply_messaging_name(&host, &uid, &entry);
                 self.apply_global_perms_from_diff(&uid, &entry);
+                self.apply_org_from_diff(&uid, &entry);
                 self.apply_transcript_from_diff(&host, &uid, &entry);
                 // Option B (criterion #4): adopt daemon-launched WORKFLOW
                 // PARTICIPANTS into the sidebar from broadcasts. The helper is
@@ -2342,6 +2343,24 @@ impl App {
     /// whether a row changed. No-op when the entry lacks the field or
     /// the uid isn't tracked; persists the manifest on a real change so
     /// the TUI's own durable view stops disagreeing with the daemon's.
+    /// O5: the daemon broadcasts `Updated {member, org}` when it stamps a
+    /// session as a member's assistant or worker; mirror the org object onto
+    /// the row (the F6 chart and A-D read it). Diffs without `org` leave it.
+    pub(crate) fn apply_org_from_diff(&mut self, uid: &str, entry: &serde_json::Value) -> bool {
+        let Some(org) = entry.get("org").and_then(|v| v.as_object()) else {
+            return false;
+        };
+        let Some((wi, si)) = crate::control::methods::find_live_session(&self.workspaces, uid) else {
+            return false;
+        };
+        if self.workspaces[wi].sessions[si].org.as_ref() == Some(org) {
+            return false;
+        }
+        self.workspaces[wi].sessions[si].org = Some(org.clone());
+        self.save_session_manifest();
+        true
+    }
+
     pub(crate) fn apply_global_perms_from_diff(
         &mut self,
         uid: &str,

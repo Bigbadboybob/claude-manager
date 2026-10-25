@@ -201,3 +201,35 @@ class AssistantsDb(unittest.IsolatedAsyncioTestCase):
         items = (await self.http.get(f"/boards/{self.board['slug']}")).json()["items"]
         work = next(i for i in items if i["title"] == "work")
         self.assertEqual([(h["pid"], h["role"]) for h in work["holders"]], [(pid(self.coord), "owner")])
+
+    async def test_an_agents_kill_session_hands_holds_back_without_the_close_check(self):
+        await self.members()
+        # The daemon already killed it under kill_session's scope (its own
+        # spawner, which is not in org's chain): the API hands holds back.
+        r = await self.http.post("/org/assistants/close", json={
+            "actor": {"pid": pid("someone-in-scope")}, "pid": pid(self.helper),
+            "member_id": self.ids["org"], "reason": "killed with kill_session",
+            "ended_by": "kill_session"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual([h["to"] for h in r.json()["holds"]["handed_back"]], [pid(self.lane)])
+        events = (await self.http.get("/org/events", params={"subject_type": "member"})).json()
+        self.assertIn("assistant_killed", [e["type"] for e in events])
+        # Any other ended_by is refused.
+        r = await self.http.post("/org/assistants/close", json={
+            "actor": {"pid": pid("x")}, "pid": pid(self.rev), "member_id": self.ids["org"],
+            "reason": "r", "ended_by": "anything"})
+        self.assertEqual(r.status_code, 422, r.text)
+
+    async def test_workers_are_attributed_but_never_free_capacity_assistants(self):
+        await self.members()
+        worker = uid_at(0.3, 13)
+        await self.report([{"uid": worker, "name": "bt-fix", "task_id": self.elsewhere,
+                            "member_id": self.ids["org"], "acting_as": "worker"}])
+        async with self.pool.acquire() as conn:
+            acting = await conn.fetchval("SELECT acting_as FROM org_session_facts WHERE pid = $1", pid(worker))
+        self.assertEqual(acting, "worker")
+        read = (await self.http.get(f"/boards/{self.board['slug']}")).json()
+        self.assertNotIn("bt-fix", {r["name"] for r in read["free_capacity"]})
+        # Not an assistant: closing it is refused (kill_session it instead).
+        body = await self.close(OWNER["pid"], pid(worker), status=409)
+        self.assertEqual(body["detail"]["code"], "not_an_assistant")

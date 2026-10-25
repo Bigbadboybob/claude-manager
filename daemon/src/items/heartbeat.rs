@@ -318,6 +318,17 @@ impl Beat {
             // O5: sessions a member's session spawned, or that work under a
             // member's task, are that member's assistants.
             let stamped = crate::assistants::backfill(&mut s);
+            // A stream whose assistant has been gone 7 days goes back to
+            // normal reaper eligibility.
+            let (released, changed) =
+                crate::assistants::release_idle_streams(&mut s, crate::agent_state::unix_now());
+            if !released.is_empty() {
+                eprintln!("cm org: released {} idle assistant stream(s) to ephemeral: {}",
+                          released.len(), released.join(", "));
+            }
+            if changed && stamped.is_empty() {
+                s.persist_sessions_best_effort();
+            }
             if !stamped.is_empty() {
                 eprintln!("cm org: stamped {} session(s) as members' assistants: {}",
                           stamped.len(), stamped.join(", "));

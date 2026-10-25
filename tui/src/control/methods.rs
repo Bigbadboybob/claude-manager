@@ -3138,6 +3138,24 @@ mod tests {
         }
     }
 
+    /// O5: A-D and A-w read a row's own stamp (no daemon round trip on the
+    /// input thread): open assistants are spared / closed deliberately;
+    /// workers, closed assistants and member-less rows are not.
+    #[test]
+    fn open_assistant_rows_are_read_from_the_rows_stamp() {
+        use crate::app::is_open_assistant_row;
+        let with = |org: serde_json::Value| {
+            let mut ts = live_ts("ts-a", Some("t"));
+            ts.org = org.as_object().cloned();
+            ts
+        };
+        assert!(is_open_assistant_row(&with(json!({"member_id": "m", "acting_as": "assistant"}))));
+        assert!(!is_open_assistant_row(&with(json!({"member_id": "m", "acting_as": "worker"}))));
+        assert!(!is_open_assistant_row(&with(json!({"member_id": "m", "acting_as": "assistant",
+                                                     "assistant_closed_at": "2026-10-25T00:00:00Z"}))));
+        assert!(!is_open_assistant_row(&live_ts("ts-b", Some("t"))));
+    }
+
     #[test]
     fn tui_task_filer_uses_authenticated_session_context() {
         let mut session = live_ts("ts-filer", Some("task-parent"));

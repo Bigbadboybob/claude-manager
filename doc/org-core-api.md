@@ -131,49 +131,63 @@ the operator socket it routes to `org.adopt`.
 Owner decision O5 (doc/org-model.md §4.2, §4.3, §15.1): an assistant is as
 durable as its member's main session.
 
-**Who is whose.** The daemon stamps each assistant session's org object with
-`member_id`, `acting_as: "assistant"` and `member_via`
-(`daemon/src/assistants.rs`).
-- At spawn: the child of a member's session (its main, or one of its
-  assistants) is that member's assistant.
-- Each beat, a backfill covers sessions spawned before this: first the
-  `managed_by_uid` chain, then the task's parent chain up to a task with a
-  member's main session on this daemon.
-- The nearest member wins, and a member's main is never stamped. Mains come
-  only from the member cache.
+**Who is whose.** The daemon stamps a spawned session's org object with
+`member_id`, `acting_as` and `member_via` (`daemon/src/assistants.rs`).
+- At spawn, the child of a member's session (its main, or one of its
+  assistants) works for that member. A fork works for its source's member.
+- Each beat, a backfill covers sessions spawned before this. It walks the
+  `managed_by_uid` chain. Only when that chain is broken (a spawner gone with
+  no record) does it fall back to the task's parent chain, up to a task with a
+  member's main session on this daemon. A chain that ends at a live session
+  with no member stays unstamped.
+- Never stamped:
+  - a session with no spawner (Owner- or operator-started);
+  - a shell (`bash`; only Owner closes, kills or restarts one);
+  - a member's main, which comes only from the member cache and always wins.
 - Nothing is stamped until the cache has heard from the API.
+
+**Assistants and workers.** A continuous member's spawns, and everything
+below them, are `acting_as: "worker"`. Workers are attributed but not
+durable: `mark_subtask_done`, the terminal sweep and the reaper treat them
+exactly as today, and their checkouts are never promoted. Every other
+member's spawns are `"assistant"`.
 
 **Where to read it.**
 - `list_sessions` rows (live and exited) carry `member: {member_id, acting_as}` or `null`.
-- Manifest snapshot entries carry the stamp in `org`.
-- The backfill broadcasts `Updated {member, org}` diffs.
+- Manifest entries carry the stamp in `org`, and the backfill broadcasts `Updated {member, org}`; the TUI mirrors it onto the row.
 - The heartbeat reports `member_id` / `acting_as` per session into `org_session_facts` (`sql/031`).
-- `GET /members/by-pid` answers `acting_as: "assistant"` with the member's detail.
+- `GET /members/by-pid` answers `acting_as: "assistant" | "worker"` with the member's detail.
 - The daemon's `org.member` answers for its own assistants locally.
 
 **Lifecycle.**
-- Finishing work never closes an assistant: the terminal sweep (planning or board close), `mark_subtask_done` (daemon and TUI) and teardown leave it running and only unassigned, as they do a member's main session.
-- Its checkout is never removed by those paths. `workspace_kept` is `stream` or `home` by kind, else `member` or `assistant`.
-- A checkout minted `ephemeral` for an assistant is recorded at spawn as a `stream` of the member's office (`office_of`, `stream_of: "assistant"`). Unclassified and centrally marked workspaces are left alone.
-- The worktree reaper protects `home`/`stream` workspaces, and checkouts with an assistant record that was never closed (`assistant_closed_at`).
-- Member-less sessions keep today's teardown.
+- Finishing work never closes an assistant or removes its checkout: the terminal sweep (planning or board close), `mark_subtask_done` (daemon and TUI), teardown and Owner's A-D on its task leave it running, only unassigned, as they do a member's main session. `workspace_kept` is `stream` or `home` by kind, else `member` or `assistant`.
+- A checkout minted `ephemeral` for an assistant becomes a `stream` of the member's office (`office_of`, `stream_of: "assistant"`). Unclassified and centrally marked workspaces are left alone.
+- How an assistant's end releases its checkout:
+
+| How it ends | Effect |
+|---|---|
+| `org(action="close_assistant")` / `org.close_assistant`, Owner's A-w | Authority from the API; holds go back to the member; `assistant_closed_at` is set; a claimed stream goes back to `ephemeral` at once. |
+| An agent's `kill_session` (the daemon route) | The same release at once, under `kill_session`'s own scope. The holds go back asynchronously (`ended_by: "kill_session"`, event `assistant_killed`). |
+| Anything else: an operator kill (A-R restart, workflow fresh-role respawn, A-w's fallback, the TUI-routed kill), a crash or memory cap, a natural exit | A plain kill. The daemon notes when the stream first had no live assistant (`assistant_idle_since`) and releases it after 7 days. A revive within that window clears the clock. |
+
+- The reaper protects `home`/`stream` workspaces, and checkouts whose assistant was live within 7 days and never closed (`assistant_closed_at`). It reads the tombstone's `exited_at` and the stream's `assistant_idle_since`.
+- Member-less sessions and workers keep today's teardown.
 
 **Closing one deliberately.**
 
 | Call | Who | Effect |
 |---|---|---|
-| `POST /org/assistants/close {pid, member_id, reason, request_id?}` | Owner, the member's main session, or an active member up its manager chain (`_require_chain(..., self_ok=True)`, the check shared with move and retire) | `403 not_member` / `not_manager` otherwise; `409 not_an_assistant` for a main. Hands the assistant's open holds to the member's main pid in their roles (`hand_back_holds`, shared with retire); a vacant member's holds stay, listed as `kept`. Records `close_assistant` and marks the facts row `closed`. |
-| `org.close_assistant {session_uid, reason?, request_id?}` (daemon), `org(action="close_assistant", …)` (MCP), Owner's A-w | as above | The API answers first, then the daemon closes the session with `killed_by: "<uid> (close_assistant)"` and sets `assistant_closed_at` on it. A stream it claimed goes back to `ephemeral`, so the reaper's normal protections decide. Against an API without the route, only Owner or the member's main may close it, and holds stay where they are. |
+| `POST /org/assistants/close {pid, member_id, reason, ended_by?, request_id?}` | Owner, the member's main session, or an active member up its manager chain (`_require_chain(..., self_ok=True)`, the check shared with move and retire). `ended_by: "kill_session"` skips it. | `403 not_member` / `not_manager` otherwise; `409 not_an_assistant` for a main or a worker. Hands the assistant's open holds to the member's main pid in their roles (`hand_back_holds`, shared with retire); a vacant member's holds stay, listed as `kept`. Records the event and marks the facts row `closed`. |
+| `org.close_assistant {session_uid, reason?, request_id?}` (daemon), `org(action="close_assistant", …)` (MCP), Owner's A-w (off the input thread) | as above | The API answers first. The daemon re-checks that the session is still that member's assistant, then closes it with `killed_by: "<uid> (close_assistant)"`. Against an API without the route, only Owner or the member's main may close it, and holds stay where they are. |
 
-`kill_session` is unchanged.
-
-**Free capacity.** `board().free_capacity` lists the assistants of the
-board's members, wherever their task is now. That means members whose main
-session is on the board, plus the board team's lead and members. They show
-as `rev1 (for ep)` and carry `assistant_of`, so a lead reuses an idle one
-before spawning.
+**Reuse before spawning.** `board().free_capacity` lists the assistants
+(not workers) of the board's members, wherever their task is now. That means
+members whose main session is on the board, plus the board team's lead and
+members. They show as `rev1 (for ep)` and carry `assistant_of`. A
+worktree-cap refusal (`worktree limit reached`) names the caller's member's
+idle assistants, with how to reuse them (`send_input`) or free their
+checkouts (`close_assistant`).
 
 **Gate.** `assistant_guard_v1` is brain-only, so the rollback pin must have
 it too. The status mirror writes a task's close only when every fresh daemon
-advertises both it and `lifecycle_guard_v1`. A brain from S3 alone would sweep
-an assistant on a mirrored `done`.
+advertises both it and `lifecycle_guard_v1`.

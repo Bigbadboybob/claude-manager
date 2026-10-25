@@ -1610,9 +1610,10 @@ def org(
     answer instead of acting twice.
     Assistants (O5): every agent a member's session spawns is that member's
     assistant, as durable as its main session (`list_sessions` shows
-    `member: {member_id, acting_as}`). Finishing a task or item never closes
-    it; reuse an idle one (board free capacity lists them as `rev1 (for
-    ep)`) before spawning another.
+    `member: {member_id, acting_as}`); a continuous member's spawns are
+    `worker`s and keep today's teardown. Finishing a task or item never
+    closes an assistant; reuse an idle one (board free capacity lists them as
+    `rev1 (for ep)`) before spawning another.
       - `action="close_assistant", session_uid=..., reason=...`: close one
         deliberately. Allowed for the member's main session, a member up its
         manager chain, or Owner. Its board holds go back to the member's

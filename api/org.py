@@ -68,6 +68,9 @@ class CloseAssistantBody(_Strict):
     pid: Annotated[str, Field(min_length=1, max_length=300)]
     member_id: Short
     reason: Annotated[str, Field(min_length=1, max_length=500)]
+    # "kill_session": an agent already killed it under kill_session's own
+    # scope; record it and hand its holds back without the close check.
+    ended_by: str | None = Field(default=None, pattern=r"^kill_session$")
     request_id: RequestId | None = None
 
 
@@ -186,7 +189,7 @@ async def close_assistant(body: CloseAssistantBody, request: Request):
     holds hand-back; the session's daemon then closes it."""
     return await _call(org_db.close_assistant(
         _pool(request), body.actor.model_dump(), pid=body.pid, member_id=body.member_id,
-        reason=body.reason, request_id=body.request_id))
+        reason=body.reason, ended_by=body.ended_by, request_id=body.request_id))
 
 
 @router.get("/teams/{ref}")
