@@ -1597,8 +1597,10 @@ def org(
     main session; anyone else is refused (`not_member`: you are not an
     active member's main session; `not_manager`: `member` is not below you).
       - `action="move", member=..., manager=None, team=None, reason=...`:
-        give `member` a new manager (a member ref, or "owner") and/or a new
-        primary team (id or slug). `reason` is required.
+        give `member` a new manager and/or a new primary team (id or slug;
+        `team="none"` clears it). `reason` is required. Unless you are
+        Owner, the new manager must be you or a member below you; any other
+        destination is Owner's (`needs_owner`).
       - `action="retire", member=..., reason=...`: mark `member` retired.
         Its reports move up to its manager and teams it leads lose their
         lead. Its sessions are never killed. Owner can reverse it.

@@ -1750,6 +1750,13 @@ pub(crate) fn dispatch_org(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Re
                 body.insert(to.into(), v.clone());
             }
         }
+        // `team=""` / `"none"` clears the primary team (an explicit null).
+        if verb == "move"
+            && body.get("primary_team_id").and_then(|v| v.as_str())
+                .is_some_and(|t| t.trim().is_empty() || t.trim().eq_ignore_ascii_case("none"))
+        {
+            body.insert("primary_team_id".into(), serde_json::Value::Null);
+        }
         if verb != "move" && (body.contains_key("manager") || body.contains_key("primary_team_id")) {
             return Response::err(req.id.clone(), ErrorCode::InvalidParams,
                 format!("org: action=\"{verb}\" takes member and reason; use action=\"move\" to change a manager or team"));

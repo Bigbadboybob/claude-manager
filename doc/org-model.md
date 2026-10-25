@@ -156,11 +156,11 @@ suggests it for an assistant alive 3 days that holds items as owner. Today's lon
 | **Fencing** | a session whose main row was closed by a replacement can no longer act as the member: member-scoped writes from it are refused (`not_main_session`), checked by occupancy generation at the API. If revived, it comes back as an assistant, with a notice |
 | **Vacate** | the main session is dead and unreplaced for 24 h: the member is `vacant` and its items flag `member_vacant` to its manager; routing goes to its deputy, else its manager. The main row stays open; reviving that session clears the vacancy |
 | **Suspend** | parked on purpose, or vacant 14 days with no holds (automatic): no flags, hidden from `who` and the directory |
-| **Move** | change primary team and/or manager; Owner or the current manager chain; holds stay |
+| **Move** | change primary team and/or manager; Owner or the current manager chain; holds stay. A non-Owner may only move a report under itself or under a member of its own subtree; any other destination is Owner's (`needs_owner`) until an accept step exists |
 | **Close an assistant** | deliberate only: its member's main session, the member's manager chain, or Owner. Its holds hand back to its member; its `stream` checkout closes with it once the reaper's protections pass. Task/item completion, `mark_subtask_done` and the terminal sweep never close an assistant |
-| **Retire** | holds hand back to the manager; reports move to the manager; the main session is closed (asked first); handle tombstoned; history permanent. Closing a member's home workspace asks "retire member X?" (default yes when it holds no open items) |
+| **Retire** | Owner or the member's manager chain, with a reason. Reports move to the manager; teams it leads lose their lead; holds hand back to the manager through #21's `hand_back_holds`. Its sessions are untouched (Owner, O5: sessions are durable): the main session keeps running and its main row stays open, so nothing is killed. Handle tombstoned; history permanent. Owner can reinstate: the pre-retire status comes back, plus the leads of teams still without one; moved reports stay. Closing a member's home workspace asks "retire member X?" (default yes when it holds no open items) |
 
-Only Replace and Retire close a main row. Working memory (transcript,
+Only Replace closes a main row. Working memory (transcript,
 compaction, `agent_memory`) belongs to the session and is not copied.
 Continuity on a replacement comes from the board, the profile, the standing
 rules (§8.4) and a **handoff record**: the durable checklist of §7.5, plus an

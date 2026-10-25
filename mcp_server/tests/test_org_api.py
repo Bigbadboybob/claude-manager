@@ -543,8 +543,12 @@ class OrgApiDb(unittest.IsolatedAsyncioTestCase):
         r = await self.http.post("/org/members/org/move", json={
             "actor": {"pid": pid(self.orch)}, "manager": "bug-triage", "reason": "steal"})
         self.assertEqual(r.json()["detail"]["code"], "not_manager")
+        # The lead may not hand its report to Owner (or anyone outside its subtree).
         r = await self.http.post("/org/members/org/move", json={
-            "actor": {"pid": pid(self.coord)}, "manager": "owner", "reason": "promote",
+            "actor": {"pid": pid(self.coord)}, "manager": "owner", "reason": "promote"})
+        self.assertEqual((r.status_code, r.json()["detail"]["code"]), (403, "needs_owner"))
+        r = await self.http.post("/org/members/org/move", json={
+            "actor": OWNER, "manager": "owner", "reason": "promote",
             "expected_revision": 1})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.json()["member"]["manager_member_id"], "mem_owner")
@@ -587,7 +591,7 @@ class OrgApiDb(unittest.IsolatedAsyncioTestCase):
                                      ({"pid": "agent:d9:ghost"}, "org", "not_member")):
                 r = await self.member_write(verb, ref, actor, status=403, **body)
                 self.assertEqual(r["detail"]["code"], code, (verb, actor, ref))
-        # A retired lead loses its authority over its old reports.
+        # A suspended lead loses its authority over its old reports.
         async with self.pool.acquire() as conn:
             await conn.execute("UPDATE members SET status = 'suspended' WHERE handle = 'swarm-coord'")
         r = await self.member_write("retire", "org", coord, status=403, reason="r")
@@ -640,6 +644,34 @@ class OrgApiDb(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r["detail"]["code"], "not_retired")
         events = (await self.http.get("/org/events", params={"subject_type": "member"})).json()
         self.assertEqual([e["type"] for e in events if e["subject_id"] == coord_id][:2], ["reinstate", "retire"])
+
+    async def test_a_lead_moves_reports_only_within_its_own_subtree(self):
+        await self.applied_swarm()
+        r = await self.http.post("/org/adopt", json={"actor": OWNER, "pid": pid(self.helper),
+                                                     "handle": "helper", "manager": "org"})
+        self.assertEqual(r.status_code, 200, r.text)
+        coord = {"pid": pid(self.coord)}
+        r = await self.member_write("move", "helper", coord, manager="swarm-coord", reason="flatten")
+        self.assertEqual(r["member"]["manager_handle"], "swarm-coord")
+        r = await self.member_write("move", "helper", coord, manager="org", reason="back under org")
+        self.assertEqual(r["member"]["manager_handle"], "org")
+        # Another lead's branch, or Owner: Owner's call.
+        for dest in ("bug-triage", "owner"):
+            r = await self.member_write("move", "org", coord, status=403, manager=dest, reason="r")
+            self.assertEqual(r["detail"]["code"], "needs_owner", dest)
+        # A team-only move has no destination to check; clearing the team too.
+        r = await self.member_write("move", "org", coord, primary_team_id=None, reason="no team")
+        self.assertIsNone(r["member"]["primary_team_id"])
+        r = await self.member_write("move", "org", OWNER, manager="bug-triage", reason="Owner may")
+        self.assertEqual(r["member"]["manager_handle"], "bug-triage")
+
+    async def test_reinstate_restores_the_status_before_the_retire(self):
+        await self.applied_swarm()
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE members SET status = 'vacant' WHERE handle = 'org'")
+        await self.member_write("retire", "org", OWNER, reason="gone")
+        r = await self.member_write("reinstate", "org", OWNER)
+        self.assertEqual(r["member"]["status"], "vacant")
 
     async def test_a_report_of_a_retired_manager_waits_for_its_manager(self):
         await self.applied_swarm()

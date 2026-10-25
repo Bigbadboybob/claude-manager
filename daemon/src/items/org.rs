@@ -118,12 +118,17 @@ fn with_actor(ctx: &Ctx, mut p: Map<String, Value>) -> Value {
     Value::Object(p)
 }
 
-/// An old planning API has no `/org` routes: FastAPI answers a bare
-/// `Not Found`, which callers (the TUI) read as "feature off".
+/// An old planning API lacks the route: FastAPI answers a bare `Not Found`,
+/// or `Method Not Allowed` when the path matches a read route (a POST to
+/// `/members/x/retire` hits `GET /members/{ref:path}`). Callers (the TUI)
+/// read either as "feature off".
 fn api(result: RpcResult) -> RpcResult {
     result.map_err(|(code, message)| {
-        if matches!(code, ErrorCode::NotFound) && message == "Not Found" {
-            (ErrorCode::UnknownMethod, "unsupported: the planning API has no org endpoints yet".into())
+        if (matches!(code, ErrorCode::NotFound) && message == "Not Found")
+            || message == "Method Not Allowed"
+        {
+            (ErrorCode::UnknownMethod,
+             "unsupported: the planning API has no such org endpoint yet (needs an API deploy)".into())
         } else {
             (code, message)
         }
@@ -557,6 +562,7 @@ mod tests {
                                            "team": "swarm", "reason": "r", "request_id": "q1"}));
         assert!(resp.ok, "{:?}", resp.error);
         assert!(tool(me.clone(), json!({"action": "retire", "member": "main/ep", "reason": "done"})).ok);
+        assert!(tool(me.clone(), json!({"action": "move", "member": "main/ep", "team": "none", "reason": "r"})).ok);
         // Retire takes no manager; reinstate is Owner's, refused before the API.
         let err = tool(me.clone(), json!({"action": "retire", "member": "main/ep", "manager": "x", "reason": "r"}));
         assert!(matches!(err.error.unwrap().code, ErrorCode::InvalidParams));
@@ -566,13 +572,16 @@ mod tests {
         let seen = seen.lock().unwrap();
         let posts: Vec<_> = seen.iter().filter(|(m, _, _)| m == "POST").collect();
         assert_eq!(posts.iter().map(|(_, p, _)| p.as_str()).collect::<Vec<_>>(),
-                   ["/org/members/main/ep/move", "/org/members/main/ep/retire", "/org/members/main/ep/reinstate"]);
+                   ["/org/members/main/ep/move", "/org/members/main/ep/retire", "/org/members/main/ep/move",
+                    "/org/members/main/ep/reinstate"]);
+        // `team="none"` (or "") clears the primary team: an explicit null.
+        assert!(posts[2].2.get("primary_team_id").is_some_and(Value::is_null), "{:?}", posts[2].2);
         let move_body = &posts[0].2;
         assert_eq!(move_body["actor"]["pid"], format!("agent:{d}:me-uid"));
         assert_eq!((&move_body["manager"], &move_body["primary_team_id"], &move_body["request_id"]),
                    (&json!("kestrel"), &json!("swarm"), &json!("q1")));
         assert!(move_body.get("member").is_none() && move_body.get("action").is_none());
-        assert_eq!(posts[2].2["actor"]["pid"], "owner");
+        assert_eq!(posts[3].2["actor"]["pid"], "owner");
     }
 
     #[test]
@@ -610,6 +619,9 @@ mod tests {
         let err = api(Err((ErrorCode::NotFound, "Not Found".into()))).unwrap_err();
         assert!(matches!(err.0, ErrorCode::UnknownMethod));
         assert!(err.1.starts_with("unsupported"));
+        let (code, body) = crate::items::api::map_error(405, r#"{"detail":"Method Not Allowed"}"#);
+        let err = api(Err((code, body))).unwrap_err();
+        assert!(matches!(err.0, ErrorCode::UnknownMethod) && err.1.contains("needs an API deploy"), "{err:?}");
         let err = api(Err((ErrorCode::NotFound, "not_found: no member 'x'".into()))).unwrap_err();
         assert!(matches!(err.0, ErrorCode::NotFound));
     }
