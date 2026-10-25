@@ -1935,8 +1935,7 @@ impl App {
         }
         lines.push(Line::from(head));
         // An assistant drawn under a team or member box: how it got there.
-        if let Some(card) = node.card.as_ref().filter(|_| !s.lead) {
-            let how = card.via.get(&ts.uid).cloned().unwrap_or_else(|| "in the member's workspace".into());
+        if let Some(how) = node.card.as_ref().filter(|_| !s.lead).and_then(|c| c.via.get(&ts.uid)) {
             lines.push(Line::from(vec![label("attached"), text(format!("assistant, {how}"))]));
         }
         let (word, since) = self.chart_status(ts);

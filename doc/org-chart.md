@@ -85,16 +85,23 @@ setting. The snapshot is polled only while something shows it (see
 - **Assistants** are every other session that reaches a member (doc/org-model.md
   O5: as durable as main sessions). They are found by walking up from the
   session until a member's main session or a team's task is reached:
-  1. the daemon's member stamp (`org.member_id`, S4), when present;
+  1. the daemon's member stamp (`org.member_id`, S4), when present. It is
+     checked on the session and on each spawner up the chain before that
+     spawner's own spawner, so a stamp always wins. A stamp with
+     `acting_as = main` makes the session that member's main: drawn in its
+     box, never counted as an assistant;
   2. its spawner (`managed_by_uid`), transitively: EP's assistant and that
      assistant's own sub-worker, each in its own ephemeral worktree, are all
-     EP's;
+     EP's. Sessions in closed workspaces still link the chain but are not
+     drawn;
   3. its task's `parent_task_id` chain: a task some member's main session is
      bound to, or a team's coordinator task (then the team's lead box);
   4. its workspace: the member's home workspace, else its main session's.
 
   Placement never depends on how long a session lives or what kind of
-  workspace it is in. Assistants fold under the box as `+N assistants` with
+  workspace it is in. Ties (two mains on one task or in one workspace) go to
+  the more senior member (fewer steps up the manager chain), then by handle,
+  so a redraw never moves a session. Assistants fold under the box as `+N assistants` with
   their state glyphs; `a` expands or folds them (a card then names the ones
   placed through the task tree, and the info pane's `attached` line says how
   each one got there). Ended assistants are hidden.

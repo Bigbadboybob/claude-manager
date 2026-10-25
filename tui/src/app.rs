@@ -426,6 +426,9 @@ pub struct App {
     pub(crate) folded_divisions: HashSet<String>,
     /// Folded Team sub-view headers (app/team_view.rs).
     pub(crate) folded_org: HashSet<String>,
+    /// The last `App::session_attachments` result and the key it was
+    /// computed for (F6, the Team sidebar and the roster share it).
+    pub(crate) attach_cache: std::cell::RefCell<Option<(u64, std::rc::Rc<orgchart_teams::Attachments>)>>,
     /// Set per frame while an A-e form is open on a nested workspace: the
     /// read-only Section value it inherits (`App::nested_section_label`).
     pub(crate) section_note: Option<String>,
@@ -1092,6 +1095,7 @@ impl App {
             folded_tasks,
             folded_divisions,
             folded_org,
+            attach_cache: Default::default(),
             section_note: None,
             last_drawn_cursor: None,
             sections,
