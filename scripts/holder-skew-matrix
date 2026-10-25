@@ -27,6 +27,9 @@ BASELINE_REF="${CM_SKEW_BASELINE:-5190083}"
 OLDEST_REF="${CM_SKEW_OLDEST:-}"
 
 set -euo pipefail
+# Every cell must run: a cell whose binaries are missing fails instead of
+# skipping (daemon/tests/holder_skew_e2e.rs).
+export CM_SKEW_REQUIRED=1
 cd "$(dirname "$0")/.."
 REPO_ROOT="$(pwd)"
 
@@ -66,7 +69,8 @@ BASE_BINS="$(build_ref "$BASELINE_REF")"
 run_cell() { # $1 = label, $2 = holder bin, $3 = brain bin, [$4 = filter]
     step "cell: $1"
     CM_SKEW_HOLDER_BIN="$2" CM_SKEW_BRAIN_BIN="$3" \
-        cargo test -q -p cm-daemon --test holder_skew_e2e -- --nocapture ${4:-} \
+        cargo test -q -p cm-daemon --test holder_skew_e2e -- --nocapture \
+            "${4:-skew_pair_clears_the_compat_floor}" \
         || { echo "MATRIX CELL FAILED: $1" >&2; exit 1; }
 }
 

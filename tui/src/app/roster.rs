@@ -623,6 +623,7 @@ mod tests {
         let mut app = test_app();
         app.org.accept(snapshot(1, vec![owner(), member("m1", "ep", Some("mem-owner"), Some("t1"), Some("ts-10-0"))], vec![team("t1", "Swarm", None, Some("m1"), &[("m1", "primary")])]));
         let mut w = Workspace {
+            org: None,
             color: None, pinned: false, id: "w".into(), name: "w".into(), is_closed: false, is_cloud: false, repo_url: None,
             worktree_path: None, main_repo_path: None, worker_vm: None, worker_zone: None, host_id: HostId::new("sessions"), sessions: vec![], tombstones: vec![],
         };

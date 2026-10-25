@@ -199,16 +199,23 @@ fn served_org(socket: &Path, token: &str, uid: &str) -> (bool, Option<serde_json
     (bridge, org)
 }
 
+/// The cells skip without their binaries (they are matrix-driven), but a
+/// skip is not a pass: under `CM_SKEW_REQUIRED=1` (the matrix sets it) a
+/// missing variable fails the test.
+fn skip_or_fail(why: &str) {
+    if std::env::var_os("CM_SKEW_REQUIRED").is_some_and(|v| v == "1") {
+        panic!("holder_skew_e2e: {why}, and CM_SKEW_REQUIRED=1: a skipped cell is not a pass");
+    }
+    eprintln!("holder_skew_e2e: {why} — skipping (run scripts/holder-skew-matrix to exercise the matrix)");
+}
+
 #[test]
 fn skew_pair_clears_the_compat_floor() {
     let (Some(holder_bin), Some(brain_bin)) = (
         std::env::var_os("CM_SKEW_HOLDER_BIN"),
         std::env::var_os("CM_SKEW_BRAIN_BIN"),
     ) else {
-        eprintln!(
-            "holder_skew_e2e: CM_SKEW_HOLDER_BIN/CM_SKEW_BRAIN_BIN unset — \
-             skipping (run scripts/holder-skew-matrix to exercise the matrix)"
-        );
+        skip_or_fail("CM_SKEW_HOLDER_BIN/CM_SKEW_BRAIN_BIN unset");
         return;
     };
     assert!(
@@ -450,10 +457,7 @@ fn reverse_migration_manifest_boots_the_target_monolith() {
         std::env::var_os("CM_SKEW_BRAIN_BIN"),
         std::env::var_os("CM_SKEW_MONOLITH_BIN"),
     ) else {
-        eprintln!(
-            "holder_skew_e2e: CM_SKEW_MONOLITH_BIN (with HOLDER/BRAIN) unset — \
-             skipping the V9 cell (run scripts/holder-skew-matrix)"
-        );
+        skip_or_fail("CM_SKEW_MONOLITH_BIN (with HOLDER/BRAIN) unset");
         return;
     };
     for b in [&holder_bin, &brain_bin, &monolith_bin] {

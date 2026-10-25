@@ -288,6 +288,7 @@ mod tests {
 
     fn ws(id: &str) -> Workspace {
         Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: id.into(),
