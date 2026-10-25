@@ -30,8 +30,13 @@ out of each other's checkouts; share a checkout only when you mean to.
 Pick the model too. Every spawn names one: the `model=` you pass, else the
 task's default (`metadata.models`, inherited by subtasks), else the host's
 `[models]` engine default (Claude `claude-opus-5-5`, Codex `gpt-6.1-sol`).
-Give routine, well-specified work a cheaper model (`model="gpt-6-luna"`), and
-set a task default with `create_subtask(model=...)` so a whole subtree
+**Busywork and low-intelligence work goes to Codex Luna** (Owner, 2026-10-25:
+Luna is very cheap): `start_session(type="codex", model="gpt-6-luna")`. That
+covers mechanical edits, renames and reformatting, running and triaging known
+tests or scripts, collecting logs or data, filling templates, checklist
+verification, and simple well-specified fixes. Keep the default model for
+design, debugging unknowns, review verdicts and anything judgement-heavy.
+Set a task default with `create_subtask(model=...)` so a whole subtree
 inherits it. Effort works the same way (`effort=`, default `xhigh`; levels
 low/medium/high/xhigh, plus max on Claude): lower it for mechanical work.
 See [explicit model and effort](models.md).
