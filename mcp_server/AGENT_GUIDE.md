@@ -129,8 +129,10 @@ everyone who holds what, with each holder's live state, so nobody has to ask.
 If you run other sessions, read `~/.cm/policies/orchestration.md` on your host
 (source: `doc/ORCHESTRATION.md` in CM). Core norms:
 
-- Codex for hard, technical, low-volume work; Claude as a lead with up to about
-  six native subagents for broader work.
+- Read `ping().staffing` for Owner's live engine guidance. Omit `type` and
+  pass `work_kind` to `start_session` to use it; explicit type/model wins,
+  then strong preference, work rule, lean preference, default. Read any
+  `staffing_note` returned by a launch or fork; expiring preferences can change.
 - Reuse a session that holds good context: give it the next piece with
   `send_input` rather than a new `start_session`.
 - Every piece of work in flight is an item with one named holder; `board()` is

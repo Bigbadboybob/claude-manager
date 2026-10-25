@@ -66,6 +66,10 @@ cancels. The second row turns the **activity badges** on or off (default on).
 Preferences live on the laptop in `~/.cm/tui-settings.toml` and apply
 immediately when saved. See [sidebar appearance settings](doc/sidebar-sections.md#layout).
 
+The **Staffing policy** row (`s`) edits Owner's central engine guidance: rules,
+default and an optional expiring preference. A-n, A-s and A-f preselect from
+the cached policy. See [staffing policy](doc/staffing-policy.md).
+
 ## If you are running inside CM
 
 Use the `claude-manager` MCP tools to inspect your context (`ping`), look up work (`list_tasks`, `get_task`), file draft tasks (`propose_task`), delegate authorized work (`start_session`, `create_subtask`), and communicate with other sessions (`chat_open`, `chat_read`, `chat_send`). Start workers in separate worktrees when appropriate, and use background monitors to follow their progress.
@@ -202,8 +206,8 @@ Global:
 - `A-,` — toggle the activity feed (5-line strip above the status bar showing recent agent-initiated mutations: start_session, send_input, kill_session, start/stop_workflow, create_subtask, mark_subtask_done). Off by default.
 
 Sessions view:
-- `A-n` — new workspace (creates a worktree); Tab to Engine and ←/→ to choose Claude or Codex, default Codex. **Reports to** (last field): Standalone by default; Enter or typing opens the type-to-filter task picker, Backspace returns to Standalone. With a parent chosen, A-n first creates the workspace's task under it (`parent_task_id`, inheriting its division), then launches it like a planning launch. It can't be combined with Seed.
-- `A-s` — add a session to the focused task (defaults to Codex). The form has a **Resume** field (Tab to it, Enter opens a picker of the worktree's claude/codex transcripts, newest first with age, size, and the first prompt): the new session spawns `claude --resume <id>` / `codex resume <id>` with its row bound to that transcript from the start. This is the native replacement for "A-s, then `/resume` inside the pane". Mutually exclusive with the Seed field.
+- `A-n` — new workspace (creates a worktree); Tab to Engine and ←/→ to choose Claude or Codex, preselected by staffing policy. **Reports to** (last field): Standalone by default; Enter or typing opens the type-to-filter task picker, Backspace returns to Standalone. With a parent chosen, A-n first creates the workspace's task under it (`parent_task_id`, inheriting its division), then launches it like a planning launch. It can't be combined with Seed.
+- `A-s` — add a session to the focused task (preselected by staffing policy). The form has a **Resume** field (Tab to it, Enter opens a picker of the worktree's claude/codex transcripts, newest first with age, size, and the first prompt): the new session spawns `claude --resume <id>` / `codex resume <id>` with its row bound to that transcript from the start. This is the native replacement for "A-s, then `/resume` inside the pane". Mutually exclusive with the Seed field.
 - `A-a` — attach
 - `A-F` — **fork into a task**: on a Claude/Codex session row, opens a form — Into (new task / existing task), Task (name prefilled `<label> fork`, or a type-to-filter task picker), Parent (new task only: the source's task, top-level in the same project, or any task via the picker), Base (source HEAD / trunk). No prompt: the fork waits at its composer for your first message. The source's host runs the engine-native fork (`claude --resume <id> --fork-session --session-id <new>` / `codex fork <id>`) in the new task's own `cm-sub/...` worktree, or in the existing task's workspace (shared checkouts allowed). The source is untouched and CM keeps no history copy (unlike `A-b` snapshots). The status line names the source branch, the source commits not carried over, and any uncommitted source files left behind. Same daemon RPC (`session.fork`) as the MCP `fork_session` tool. See [doc/fork-session-into-task.md](doc/fork-session-into-task.md).
 - `A-w` — close session
@@ -236,12 +240,13 @@ Planning view:
 
 The `A-f` launch dialogs (the "Launch Into" workspace picker and the
 "Launch Task" branch prompt) carry an **Engine** field — `claude`
-(default) or `codex` — cycled with `←`/`→`/`Tab`. The choice is picked
+or `codex` — cycled with `←`/`→`/`Tab`. The choice is picked
 once in the workspace picker and rides into the branch dialog, so both
 launch routes (new worktree / existing workspace) spawn the chosen
-agent. It resets to `claude` on every launch (not sticky). The
-equivalent for agent-driven launches is `start_session(type="codex")`,
-which the MCP already supported. Both dialogs also show **Reports to**
+agent. Each fresh dialog preselects Owner's cached staffing policy (Codex
+when no policy has been seen). Agents can omit `type` in `start_session`
+and pass `work_kind` for the same selection; explicit choices win.
+Both dialogs also show **Reports to**
 (the task's current parent, or Standalone). **Alt+r** opens the task
 picker; it lists open tasks, excluding the task's own subtree. A change
 is PATCHed as `parent_task_id` when the task launches.

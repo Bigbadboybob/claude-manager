@@ -420,6 +420,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         app.tick_idle_ages();
         app.messaging_tick();
         app.availability_tick();
+        app.staffing_tick();
         app.board_tick();
         app.orgchart_tick();
         app.owner_blocked_tick();

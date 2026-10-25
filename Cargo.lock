@@ -362,6 +362,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "base64",
+ "chrono",
  "cm-daemon",
  "crossterm",
  "libc",

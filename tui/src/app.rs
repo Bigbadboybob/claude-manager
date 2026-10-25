@@ -66,6 +66,7 @@ use transcripts::*;
 mod draw;
 mod messages;
 mod global_settings;
+mod staffing;
 mod availability;
 mod agent_state;
 mod board;

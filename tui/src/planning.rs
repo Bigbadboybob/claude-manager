@@ -461,6 +461,12 @@ pub enum LaunchEngine {
 }
 
 impl LaunchEngine {
+    pub(crate) fn for_staffing(policy: &cm_daemon::staffing::Policy) -> Self {
+        match policy.recommend(None, chrono::Utc::now()).0 {
+            cm_daemon::staffing::Engine::Codex => Self::Codex,
+            cm_daemon::staffing::Engine::Claude => Self::Claude,
+        }
+    }
     /// Internal TUI session-type vocabulary (`"claude"` / `"codex"`) —
     /// what `try_spawn_via_daemon` and `TerminalSession::session_type`
     /// expect. NOT the public MCP wire form (`"claude-code"`).
@@ -1212,6 +1218,7 @@ fn repo_url_for_project(project: &str) -> String {
 // ── PlanningView ────────────────────────────────────────────
 
 pub struct PlanningView {
+    pub staffing_policy: cm_daemon::staffing::Policy,
     pub keybinding_helper_visible: bool,
     pub launch_host: crate::hosts::HostId,
     launch_hosts: Vec<crate::hosts::HostId>,
@@ -1345,6 +1352,7 @@ impl PlanningView {
 
     pub fn new() -> Self {
         PlanningView {
+            staffing_policy: cm_daemon::staffing::Snapshot::default().policy,
             keybinding_helper_visible: true,
             launch_host: crate::hosts::HostId::local(),
             launch_hosts: vec![crate::hosts::HostId::local()],
@@ -4063,13 +4071,14 @@ impl PlanningView {
     }
 
     fn start_launch(&mut self) -> PlanAction {
+        let engine = LaunchEngine::for_staffing(&self.staffing_policy);
         self.launch_host = self.default_launch_host.clone();
         self.launch_picker = None;
         if let Some((pi, ti)) = self.selected_task_loc() {
             self.launch_reports_to = self.reports_to_of(pi, ti);
             self.launch_reports_to_orig = self.launch_reports_to.clone();
             self.launch_model = crate::app::model_field::ModelField::for_task(
-                LaunchEngine::default().as_session_type(),
+                engine.as_session_type(),
                 self.task_models_of(pi, ti, cm_daemon::models::Setting::Model),
                 self.task_models_of(pi, ti, cm_daemon::models::Setting::Effort),
             );
@@ -4079,7 +4088,7 @@ impl PlanningView {
                 selected: 0,
                 // Fresh default per launch — the engine choice is
                 // deliberately not sticky.
-                engine: LaunchEngine::default(),
+                engine,
             };
         }
         PlanAction::Consumed
@@ -6369,6 +6378,40 @@ mod tests {
 
         let mut view = focused();
         assert!(is_done(&view.handle_event(&key('D', KeyModifiers::ALT))), "Shift folded into the char");
+    }
+
+    #[test]
+    fn staffing_launch_dialog_preselects_policy_without_changing_open_choice() {
+        let mut view = view_with_one_task();
+        view.project_data[0].layout.columns = vec![vec![GridItem::Task("toplevel".into())]];
+        view.rebuild_unified_cols();
+        view.cursor = GridCursor { col: 0, row: 0 };
+        assert!(view.selected_task_loc().is_some());
+        view.staffing_policy.default_engine = cm_daemon::staffing::Engine::Claude;
+        view.start_launch();
+        assert!(matches!(
+            view.input_mode,
+            PlanInputMode::WorkspacePicker {
+                engine: LaunchEngine::Claude,
+                ..
+            }
+        ));
+        view.staffing_policy.default_engine = cm_daemon::staffing::Engine::Codex;
+        assert!(matches!(
+            view.input_mode,
+            PlanInputMode::WorkspacePicker {
+                engine: LaunchEngine::Claude,
+                ..
+            }
+        ));
+        view.start_launch();
+        assert!(matches!(
+            view.input_mode,
+            PlanInputMode::WorkspacePicker {
+                engine: LaunchEngine::Codex,
+                ..
+            }
+        ));
     }
 
     /// Default is Codex, and ←/→ toggles to Claude. The chosen engine

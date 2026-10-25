@@ -3121,6 +3121,7 @@ impl App {
 
         // Delegate to planning view when in Planning mode.
         if self.view_mode == ViewMode::Planning {
+            self.planning.staffing_policy = self.global_settings.staffing.snapshot.policy.clone();
             // Keep planning's workspace picker in sync with the current
             // set of open workspaces before it sees the event.
             let candidates = self.collect_workspace_candidates();

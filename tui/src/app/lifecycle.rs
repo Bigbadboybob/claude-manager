@@ -1459,9 +1459,10 @@ impl App {
 
         self.new_session_reports_to = Default::default();
         self.new_session_picker = None;
-        self.form_model = super::model_field::ModelField::new(LaunchEngine::default().as_session_type());
+        let engine = self.global_settings.staffing.engine();
+        self.form_model = super::model_field::ModelField::new(engine.as_session_type());
         self.input_mode = InputMode::NewSession {
-            engine: LaunchEngine::default(),
+            engine,
             label_text: String::new(),
             branch_text: String::new(),
             idle_timeout_text: DEFAULT_IDLE_TIMEOUT_SECS.to_string(),
@@ -1494,11 +1495,12 @@ impl App {
         // by submit time.
         let workspace_id = self.workspaces[wi].id.clone();
         self.session_form_host = Some(self.workspaces[wi].host_id.clone());
+        let engine = self.global_settings.staffing.engine();
         self.form_model =
-            self.model_field_for_task(LaunchEngine::default().as_session_type(), task_id.as_deref());
+            self.model_field_for_task(engine.as_session_type(), task_id.as_deref());
         self.input_mode = InputMode::NewTerminalSession {
             workspace_id,
-            session_type: LaunchEngine::default().as_session_type().to_string(),
+            session_type: engine.as_session_type().to_string(),
             task_id,
             seed_from: None,
             resume_from: None,

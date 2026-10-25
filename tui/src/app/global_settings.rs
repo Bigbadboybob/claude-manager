@@ -181,6 +181,7 @@ struct Dialog {
 }
 
 pub(super) struct GlobalSettings {
+    pub(super) staffing: super::staffing::Staffing,
     path: PathBuf,
     saved: Preferences,
     /// File-only `[models]` section (no F9 row). See `cm_daemon::models`.
@@ -245,6 +246,7 @@ impl GlobalSettings {
             }
         };
         Self {
+            staffing: Default::default(),
             path,
             saved,
             models,
@@ -326,6 +328,7 @@ impl GlobalSettings {
 
     /// Consume every event while open so preview keys never reach a session.
     pub(super) fn handle_event(&mut self, event: &CrosstermEvent) -> bool {
+        if self.staffing.event(event) { return true; }
         let CrosstermEvent::Key(key) = event else {
             return self.is_open();
         };
@@ -341,10 +344,13 @@ impl GlobalSettings {
             return true;
         }
         let dialog = self.dialog.as_mut().unwrap();
+        if key.code == KeyCode::Char('s') || dialog.row == 2 && matches!(key.code, KeyCode::Enter | KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+            self.staffing.open();
+            return true;
+        }
         match key.code {
-            KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab => {
-                dialog.row = 1 - dialog.row;
-            }
+            KeyCode::Down | KeyCode::Tab => dialog.row = (dialog.row + 1) % 3,
+            KeyCode::Up | KeyCode::BackTab => dialog.row = (dialog.row + 2) % 3,
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Char('-') | KeyCode::Char('+')
                 if dialog.row == 1 =>
             {
@@ -381,7 +387,7 @@ impl GlobalSettings {
             return;
         };
         let width = 60.min(area.width);
-        let height = (if dialog.error.is_some() { 19 } else { 15 }).min(area.height);
+        let height = (if dialog.error.is_some() { 21 } else { 18 }).min(area.height);
         let area = Rect::new(
             area.x + area.width.saturating_sub(width) / 2,
             area.y + area.height.saturating_sub(height) / 2,
@@ -433,6 +439,8 @@ impl GlobalSettings {
                 row_style(dialog.row == 1),
             ),
             Line::from("What each agent is doing, on rows and F6 cards."),
+            Line::styled(format!("{}Staffing policy → (s)", pointer(dialog.row == 2)), row_style(dialog.row == 2)),
+            Line::from("Engine guidance shared across this org."),
             Line::from(""),
             Line::from("Live preview · Opacity unchanged."),
             Line::from("↑/↓ row · Home reset · Enter save · Esc cancel"),
@@ -447,5 +455,6 @@ impl GlobalSettings {
             Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
             inner,
         );
+        self.staffing.draw(frame, frame.area());
     }
 }

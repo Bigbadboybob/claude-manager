@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 # Workspace sibling. Transitional Phase-1 dep that lets the TUI call into
 # modules already relocated into the daemon (worktree, eventually
 # mcp_config / workflow / etc.) without breaking the build during the

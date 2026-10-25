@@ -15,15 +15,16 @@ question was buried in a progress log. The rules below exist to close those gaps
 
 ## 1. Pick the engine for the work
 
-- **Codex** is a strong individual contributor: hard, technical, low-volume
-  work with little internal parallelism (a tricky fix, a careful refactor, a
-  performance investigation).
-- **Claude** is a lead with up to about six native subagents: broader or
-  higher-volume work (a sweep across many files, docs plus code, a review
-  fan-out).
+Read `ping().staffing` for Owner's current engine guidance and policy version.
+It includes rules by kind of work, the default, and any expiring preference.
+Use `start_session(label=..., work_kind="math" | "design" | "architecture" |
+"metric" | "coding" | "fanout", isolated=true, ...)` to let that policy choose.
+An explicit `type` or `model` wins; otherwise precedence is strong preference,
+matching work rule, lean preference, default. A `staffing_note` explains a
+choice against the policy or preference. Forks keep their source engine and
+report the same note. See [staffing policy](staffing-policy.md).
 
-`start_session(type="codex" | "claude-code", isolated=true, ...)` launches
-either one. `isolated=true` (or a `task_id` with its own worktree) keeps workers
+`isolated=true` (or a `task_id` with its own worktree) keeps workers
 out of each other's checkouts; share a checkout only when you mean to.
 
 Pick the model too. Every spawn names one: the `model=` you pass, else the
