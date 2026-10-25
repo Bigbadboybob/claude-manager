@@ -5,7 +5,10 @@
 //! Team sub-view is skipped when the daemon has no org model, and draws the
 //! Task tree until a snapshot with members arrives (app/org_model.rs).
 //!
-//! Team and member rows are headers only: the cursor moves over sessions.
+//! Team, member and Unassigned rows are tree headers, like task headers:
+//! Space/Enter fold them (kept in the manifest as `folded_org`), and keys
+//! typed there reach no terminal. A folded team hides its members and
+//! sub-teams; a folded member hides its sessions.
 use super::org_model::{Member, OrgSnapshot, Team};
 use super::*;
 use std::collections::HashSet;
@@ -16,6 +19,90 @@ impl App {
     /// The Team sub-view is selected and the org model is live.
     pub(super) fn team_view_shown(&self) -> bool {
         self.sidebar_view == SidebarView::Team && self.view_mode == ViewMode::Sessions
+    }
+
+    /// The sidebar draws the Task tree: the Task sub-view, or the Team
+    /// sub-view while the org model isn't live.
+    pub(super) fn tree_view(&self) -> bool {
+        match self.sidebar_view {
+            SidebarView::Task => true,
+            SidebarView::Team => self.org_live().is_none(),
+            SidebarView::Status => false,
+        }
+    }
+
+    /// The Team rows with folds applied.
+    pub(super) fn visual_items_team(&self) -> Vec<VisualItem> {
+        if self.org_live().is_none() {
+            return self.visual_items_task();
+        }
+        let mut out = Vec::new();
+        // Inside a folded team: skip until a header at its depth or above.
+        let mut team_fold: Option<u8> = None;
+        let mut member_fold = false;
+        for item in self.visual_items_team_unfolded() {
+            if let VisualItem::OrgHeader { key, depth } = &item {
+                if team_fold.is_some_and(|d| *depth > d) {
+                    continue;
+                }
+                team_fold = None;
+                member_fold = false;
+                if self.folded_org.contains(key) {
+                    if key.starts_with("team:") {
+                        team_fold = Some(*depth);
+                    } else {
+                        member_fold = true;
+                    }
+                }
+                out.push(item);
+                continue;
+            }
+            if matches!(item, VisualItem::Separator) {
+                team_fold = None;
+                member_fold = false;
+                out.push(item);
+                continue;
+            }
+            if team_fold.is_none() && !member_fold {
+                out.push(item);
+            }
+        }
+        out
+    }
+
+    /// Sessions a header's fold hides (the count beside a folded header).
+    pub(super) fn org_header_hidden(&self, key: &str) -> usize {
+        let items = self.visual_items_team_unfolded();
+        let Some(at) = items.iter().position(|i| matches!(i, VisualItem::OrgHeader { key: k, .. } if k == key)) else { return 0 };
+        let VisualItem::OrgHeader { depth, .. } = &items[at] else { return 0 };
+        let team = key.starts_with("team:");
+        items[at + 1..]
+            .iter()
+            .take_while(|i| match i {
+                VisualItem::OrgHeader { depth: d, .. } => team && d > depth,
+                VisualItem::Separator => false,
+                _ => true,
+            })
+            .filter(|i| matches!(i, VisualItem::Session(..)))
+            .count()
+    }
+
+    /// A header the cursor stands on that no longer draws falls back to the
+    /// first session (or workspace) of the current view.
+    pub(super) fn clamp_org_cursor(&mut self) {
+        let Cursor::Org(key) = &self.cursor else { return };
+        let items = self.visual_items();
+        if items.iter().any(|i| matches!(i, VisualItem::OrgHeader { key: k, .. } if k == key)) {
+            return;
+        }
+        self.cursor = items
+            .iter()
+            .find_map(|i| match i {
+                VisualItem::Session(wi, si) => Some(Cursor::Session(*wi, *si)),
+                VisualItem::WorkspaceHeader(wi) => Some(Cursor::Workspace(*wi)),
+                _ => None,
+            })
+            .unwrap_or(Cursor::Workspace(0));
     }
 
     /// A-v: Status → Task → Team → Status. Team is skipped once the daemon
@@ -29,7 +116,8 @@ impl App {
         }
     }
 
-    pub(super) fn visual_items_team(&self) -> Vec<VisualItem> {
+    /// Every Team row, ignoring folds (A-g reaches into folds through it).
+    pub(super) fn visual_items_team_unfolded(&self) -> Vec<VisualItem> {
         let Some(snap) = self.org_live() else { return self.visual_items_task() };
         let continuous = self.continuous_members();
         let shown = |wi: usize, si: usize| {
@@ -104,10 +192,12 @@ impl App {
 
     /// The text of a team / member / unassigned header row.
     pub(super) fn org_header_line(&self, key: &str, depth: u8, width: usize) -> Line<'static> {
-        let pad = "  ".repeat(depth as usize + 1);
+        let folded = self.folded_org.contains(key);
+        let pad = format!("{}{} ", "  ".repeat(depth as usize), if folded { "\u{25b8}" } else { "\u{25be}" });
+        let count = if folded { format!(" ({})", self.org_header_hidden(key)) } else { String::new() };
         let snap = self.org_live();
         if key == UNASSIGNED_KEY {
-            return Line::styled(format!("{pad}{}", super::orgchart_teams::UNASSIGNED_LABEL), Style::default().fg(theme::DIM).add_modifier(Modifier::BOLD));
+            return Line::styled(format!("{pad}{}{count}", super::orgchart_teams::UNASSIGNED_LABEL), Style::default().fg(theme::DIM).add_modifier(Modifier::BOLD));
         }
         if let Some(t) = key.strip_prefix("team:").and_then(|id| snap?.team(id)) {
             let mut st = Style::default().fg(theme::HEADER).add_modifier(Modifier::BOLD);
@@ -116,14 +206,14 @@ impl App {
             }
             let lead = t.lead_member_id.as_deref().map(|l| format!("  \u{2605} {}", snap.map_or_else(String::new, |s| s.handle(l)))).unwrap_or_default();
             let glyph = if t.kind == "division" { symbols::DIVISION } else { symbols::HEADER_BOX };
-            let text = format!("{pad}{glyph} {}{}{lead}", t.name, if t.standby() { " (standby)" } else { "" });
+            let text = format!("{pad}{glyph} {}{}{lead}{count}", t.name, if t.standby() { " (standby)" } else { "" });
             return Line::styled(crate::planning::truncate_with_ellipsis(&text, width), st);
         }
         if let Some(m) = key.strip_prefix("member:").and_then(|id| snap?.member(id)) {
             let lead = snap.is_some_and(|s| s.teams.iter().any(|t| t.lead_member_id.as_deref() == Some(m.id.as_str())));
             let mark = if m.vacant() { format!("{} ", symbols::VACANT) } else if lead { "\u{2605} ".to_owned() } else { String::new() };
             let title = m.title.as_deref().filter(|t| !t.is_empty()).map(|t| format!(" \u{00b7} {t}")).unwrap_or_default();
-            let text = format!("{pad}{mark}{}{title}", m.handle);
+            let text = format!("{pad}{mark}{}{title}{count}", m.handle);
             let st = if m.vacant() { Style::default().fg(theme::DIM) } else { Style::default().fg(theme::TEXT) };
             return Line::styled(crate::planning::truncate_with_ellipsis(&text, width), st);
         }
@@ -294,12 +384,37 @@ mod tests {
         let items = app.visual_items();
         let at = items.iter().position(|i| matches!(i, VisualItem::OrgHeader { key, .. } if key == UNASSIGNED_KEY)).unwrap();
         assert_eq!(items[at + 1], VisualItem::Session(1, 0));
-        // Headers are not cursor stops.
+        // Headers are cursor stops, and keys there don't reach a terminal.
+        app.cursor = Cursor::Org("team:t1".into());
         app.handle_event(&CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT)));
-        assert!(matches!(app.cursor, Cursor::Session(..)));
+        assert_eq!(app.cursor, Cursor::Org("member:m1".into()));
         // No live org: the Team view draws the Task tree.
         let mut app = test_app();
         app.sidebar_view = SidebarView::Team;
         assert!(!app.visual_items().iter().any(|i| matches!(i, VisualItem::OrgHeader { .. })));
+    }
+
+    #[test]
+    fn space_folds_team_and_member_headers_and_a_g_reaches_into_folds() {
+        let mut app = app_with_team();
+        app.sidebar_view = SidebarView::Team;
+        let space = CrosstermEvent::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.cursor = Cursor::Org("member:m1".into());
+        app.handle_event(&space);
+        assert!(app.folded_org.contains("member:m1"));
+        let rows = |app: &App| app.visual_items().iter().filter(|i| matches!(i, VisualItem::Session(..))).count();
+        assert_eq!(rows(&app), 1, "ep's sessions fold; beta's stays");
+        let line = app.org_header_line("member:m1", 1, 60).to_string();
+        assert!(line.contains("\u{25b8} \u{2605} ep") && line.ends_with(" (2)"), "{line}");
+        app.cursor = Cursor::Org("team:t1".into());
+        app.handle_event(&space);
+        assert_eq!(app.visual_items(), vec![VisualItem::OrgHeader { key: "team:t1".into(), depth: 0 }]);
+        assert_eq!(app.org_header_hidden("team:t1"), 3);
+        // A-g still sees the folded sessions.
+        assert_eq!(app.visual_items_team_unfolded().iter().filter(|i| matches!(i, VisualItem::Session(..))).count(), 3);
+        // Leaving the Team view moves the cursor off a header that no longer draws.
+        app.sidebar_view = SidebarView::Status;
+        app.clamp_cursor();
+        assert!(matches!(app.cursor, Cursor::Session(..)));
     }
 }

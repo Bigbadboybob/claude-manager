@@ -21,18 +21,19 @@ sessions that are neither members nor proposed follow as **adopt** rows.
 | Key | Action |
 |---|---|
 | `j` / `k` | move |
-| `y` / `x` | approve / decline the proposal (a decline stops it being proposed again) |
-| Space | cycle approve → decline → undecided; on an adopt row, adopt it now |
+| `y` / `x` | approve / decline the proposal (a decline stops it being proposed again); on an adopt row, mark / unmark it |
+| Space | cycle approve → decline → undecided; on an adopt row, toggle the mark |
 | `Y` | approve every undecided proposal that has no conflict |
 | `e` `t` `m` `w` | edit the handle, team, manager or home workspace (Enter saves, Esc cancels); team and manager take a name, handle or `owner` |
 | `K` | cycle the kind (agent / continuous) |
-| `A` | apply the decisions; rejected rows stay with their reason (`stale`, `handle_taken`, `cycle`, …) |
+| `A` | apply the decisions and adopt the marked sessions; rejected rows stay with their reason (`stale`, `handle_taken`, `cycle`, …) |
 | `r` | reload |
 | Esc, `q` | back to the chart |
 
-Adopting sends `org.adopt {session_uid, handle, kind, manager, team_id?,
-home_workspace?, request_id}` to the session's own host. Hire, move and retire
-come later.
+Nothing is written before `A`. Adopting sends `org.adopt {session_uid, handle,
+kind, manager, team_id?, home_workspace?, request_id}` for each marked row, one
+at a time, to the session's own host; after an error the rows not yet sent
+keep their marks for another `A`. Hire, move and retire come later.
 
 ## Sessions sidebar: Team sub-view
 
@@ -42,11 +43,14 @@ member shows `∅`), and under each member its main session, then the other
 sessions of its home workspace (else of its main session's workspace).
 Another member's main session always stays with that member. Sessions no
 member claims follow under **Unassigned**, and continuous sessions stay in the
-continuous column. Team and member rows are headers: the cursor moves over
-sessions.
+continuous column. Team and member rows are headers the cursor stops on;
+Space or Enter folds one (`▸`, with the number of sessions it hides), and the
+folds are kept in the manifest (`folded_org`). `A-g` still reaches a session
+inside a fold.
 
 The view is skipped when the daemon has no org model. Until a snapshot with
-members arrives, it draws the Task tree (the sidebar title says "Tasks"). It
+members arrives, it draws the Task tree (the sidebar title says "Tasks") and
+behaves exactly like it. It
 is saved like the other sub-views (`view = "team"` in the manifest); an older
 viewer reads that as Status.
 
@@ -65,7 +69,7 @@ a strip of closed groups. Space on a group row folds it.
 | `p` | set the epic's PoC (a member handle) |
 | `r` | rename |
 | `n` | new heading under it |
-| `c` | close the epic: opens the close plan |
+| `c` | close the epic: `d` done or `c` cancelled, then the close plan opens |
 
 The **close plan** (`epic.close_plan`, doc/org-model.md §7.6) lists the
 epic's open items, its team, the team's members and their workspaces, each
@@ -73,12 +77,14 @@ with its options and the default picked. `j`/`k` move, Space/`l` and `h` step
 a row's choice, `A` applies (`epic.close_apply`). Rows someone else must
 decide come back as pending with who must decide. Esc or `q` closes it. Group
 writes send `expected_revision`, and a `revision_changed` refusal reloads the
-board.
+board. A prompt or menu keeps the group (id and revision) and item it opened
+on, so a poll that moves rows doesn't change its target.
 
 ## Planning view: placing tasks
 
-When the API serves placement (`boards.on_boards`, polled every 30 s and only
-while the planning view is shown):
+When the API serves placement (`boards.on_boards`: probed once on entering the
+planning view, then polled every 30 s only while the On-boards strip is shown
+and the terminal is focused):
 
 - **`A-f`** opens a chooser with **Launch** preselected, so Enter keeps
   today's launch flow (`l` also launches). **Place on a board…** (`p`, or ↓
@@ -102,6 +108,16 @@ while the planning view is shown):
 - **On boards** strip, read-only, under the board: open epics (board, name,
   status, PoC, open count) and board-native items (board, number, title,
   holders). `A-b` hides or shows it.
+
+## Polling
+
+The org snapshot (`org.snapshot`) is read every 5 s while the chart, the
+roster or the place dialog is open, and every 15 s while only a background
+screen wants it: the Team sub-view, the board overlay showing groups, or the
+On-boards strip. Background polls stop when the terminal loses focus (focus
+reporting) or another view is shown. Polls send `since_version` and get
+`unchanged` back when nothing moved; a full read happens at most every 5
+minutes, and whenever a screen opens.
 
 ## Code
 

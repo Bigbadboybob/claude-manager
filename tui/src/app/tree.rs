@@ -376,7 +376,7 @@ impl App {
     /// `(row, workspace, node)`. Only the folds above the node can hide it:
     /// a task's own fold hides its subtasks, never its header or sessions.
     fn cursor_target(&self) -> Option<(VisualItem, usize, Node)> {
-        if self.sidebar_view != SidebarView::Task || self.cursor_column != SidebarColumn::Main {
+        if !self.tree_view() || self.cursor_column != SidebarColumn::Main {
             return None;
         }
         let target = match &self.cursor {
@@ -573,7 +573,7 @@ impl App {
                 let ts = self.workspaces.get(*wi)?.sessions.get(*si)?;
                 Some(ts.task_id.clone().map_or(Node::Workspace(*wi), Node::Task))
             }
-            Cursor::Backtest(_) | Cursor::Section(_) => None,
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Org(_) => None,
         }
     }
 
@@ -599,6 +599,7 @@ impl App {
         let set = match &self.cursor {
             Cursor::Task { task_id, .. } => Some((&mut self.folded_tasks, task_id.clone())),
             Cursor::Division(id) => Some((&mut self.folded_divisions, id.clone())),
+            Cursor::Org(key) => Some((&mut self.folded_org, key.clone())),
             _ => None,
         };
         let Some((set, id)) = set else { return false };

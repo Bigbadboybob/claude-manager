@@ -1916,13 +1916,7 @@ impl App {
         // or folds.
         let moved = self.last_drawn_cursor.as_ref() != Some(&self.cursor);
         self.last_drawn_cursor = Some(self.cursor.clone());
-        // The Team sub-view draws the Task tree until the org model is live.
-        let task_tree = match self.sidebar_view {
-            SidebarView::Task => true,
-            SidebarView::Team => self.org_live().is_none(),
-            SidebarView::Status => false,
-        };
-        let mut tree = task_tree.then(|| self.task_tree());
+        let mut tree = self.tree_view().then(|| self.task_tree());
         let mut visual = match &tree {
             Some(t) => self.filter_visual_items(t.items.clone()),
             None => self.visual_items(),
@@ -2220,7 +2214,7 @@ impl App {
                     };
                     // Vertical line prefix for sessions inside a workflow group
                     // (only in task view where grouping makes sense visually).
-                    if in_active_workflow && self.sidebar_view == SidebarView::Task {
+                    if in_active_workflow && self.tree_view() {
                         spans.push(Span::styled(
                             "\u{2502} ",
                             Style::default().fg(theme::DIM),
@@ -2673,7 +2667,7 @@ impl App {
         // there reach no terminal.
         let center = if center.is_empty()
             && self.view_mode == ViewMode::Sessions
-            && matches!(self.cursor, Cursor::Task { .. } | Cursor::Division(_))
+            && matches!(self.cursor, Cursor::Task { .. } | Cursor::Division(_) | Cursor::Org(_))
         {
             "Space/Enter fold \u{00b7} headers don't send keys to a terminal".to_string()
         } else {

@@ -83,7 +83,7 @@ impl App {
         rows: &[VisualItem],
         block_root: &dyn Fn(usize) -> usize,
     ) -> Vec<Option<Color>> {
-        if self.sidebar_view != SidebarView::Task || self.sections.is_empty() {
+        if !self.tree_view() || self.sections.is_empty() {
             return vec![None; rows.len()];
         }
         let mut workspace_sections = HashMap::new();
@@ -230,7 +230,7 @@ impl App {
                 let root = self.task_tree().block_root.get(wi).copied().unwrap_or(*wi);
                 self.section_of_workspace(root)
             }
-            Cursor::Backtest(_) | Cursor::Division(_) => None,
+            Cursor::Backtest(_) | Cursor::Division(_) | Cursor::Org(_) => None,
         }
     }
 

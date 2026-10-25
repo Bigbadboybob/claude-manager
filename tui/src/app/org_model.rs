@@ -18,10 +18,14 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::mpsc;
 
+/// While an org screen (F6, the roster, a dialog) is open.
 const POLL: Duration = Duration::from_secs(5);
-/// Session links (main, occupancy) can move without the org version, so the
-/// poll also re-reads the whole snapshot this often.
-const FULL_READ: Duration = Duration::from_secs(30);
+/// While only a background view (the Team sub-view, PoC chips) wants it.
+const BACKGROUND_POLL: Duration = Duration::from_secs(15);
+/// Polls send `since_version` and get `{unchanged}` back. Session links
+/// (main, occupancy) can move without the org version, so the whole
+/// snapshot is re-read this often, and whenever a screen opens.
+const FULL_READ: Duration = Duration::from_secs(300);
 const ERROR_RETRY: Duration = Duration::from_secs(15);
 /// An unsupported feature is asked again this long after it was turned off.
 pub(super) const OFF_RETRY: Duration = Duration::from_secs(300);
@@ -44,15 +48,16 @@ pub(super) struct RpcFail {
     pub message: String,
 }
 
-/// Whether `err` says the method (or the API route behind it) doesn't exist:
-/// an old daemon (`UnknownMethod`), a daemon's own `unsupported`, or a
-/// FastAPI route miss proxied as `NotFound` with the bare default detail.
+/// Whether `err` says the method (or the API route behind it) doesn't
+/// exist, by error code: `UnknownMethod` from an old daemon, or from a new
+/// one whose planning API lacks the routes (daemon/src/items/org.rs maps
+/// that). Routes the daemon proxies without that mapping (the items lane's)
+/// surface FastAPI's route miss as `NotFound` with its bare default detail,
+/// which no structured `not_found` carries.
 pub(super) fn is_unsupported(err: &anyhow::Error) -> bool {
     err.chain().any(|c| {
         c.downcast_ref::<DaemonRpcError>().is_some_and(|e| {
-            e.code == ErrorCode::UnknownMethod
-                || e.message.contains("unsupported")
-                || (e.code == ErrorCode::NotFound && e.message.trim() == "Not Found")
+            e.code == ErrorCode::UnknownMethod || (e.code == ErrorCode::NotFound && e.message.trim() == "Not Found")
         })
     })
 }
@@ -337,7 +342,20 @@ impl OrgState {
 impl App {
     /// Whether a screen that draws the org model is open.
     pub(super) fn org_wanted(&self) -> bool {
-        self.orgchart.visible || self.roster.visible || self.team_view_shown() || self.planning_place_open()
+        self.org_screen_open() || self.org_background_wanted()
+    }
+
+    /// A screen that is about the org itself is open.
+    fn org_screen_open(&self) -> bool {
+        self.orgchart.visible || self.roster.visible || self.planning_place_open()
+    }
+
+    /// Views that only label things with members: the Team sub-view, the
+    /// board overlay's PoC chips, the On boards strip. Paused while the
+    /// viewer is unfocused.
+    fn org_background_wanted(&self) -> bool {
+        let board_groups = self.board.visible && self.board.groups().is_some_and(|g| !g.is_empty());
+        self.focused && (self.team_view_shown() || board_groups || self.place_strip_shown())
     }
 
 
@@ -348,8 +366,11 @@ impl App {
     }
 
     /// Ask for the snapshot now (a screen just opened).
+    /// Read the whole snapshot on the next tick (a screen opened, or a
+    /// write landed).
     pub(super) fn org_refresh_soon(&mut self) {
         self.org.last_poll = None;
+        self.org.last_full = None;
         if self.org.support == Support::Off && self.org.retry_at.is_some_and(|t| Instant::now() < t) {
             return;
         }
@@ -369,7 +390,8 @@ impl App {
         if !self.org_wanted() || self.org.rx.is_some() {
             return;
         }
-        if self.org.retry_at.is_some_and(|t| Instant::now() < t) || self.org.last_poll.is_some_and(|t| t.elapsed() < POLL) {
+        let every = if self.org_screen_open() { POLL } else { BACKGROUND_POLL };
+        if self.org.retry_at.is_some_and(|t| Instant::now() < t) || self.org.last_poll.is_some_and(|t| t.elapsed() < every) {
             return;
         }
         let mut params = json!({});
@@ -440,7 +462,7 @@ mod tests {
     #[test]
     fn old_daemons_and_apis_read_as_unsupported() {
         assert!(is_unsupported(&rpc_err(ErrorCode::UnknownMethod, "unknown method: org.snapshot")));
-        assert!(is_unsupported(&rpc_err(ErrorCode::Internal, "org.snapshot unsupported by this planning API")));
+        assert!(!is_unsupported(&rpc_err(ErrorCode::Internal, "org.snapshot unsupported by this planning API")), "by code, not by wording");
         // A FastAPI route miss, proxied by the daemon.
         assert!(is_unsupported(&rpc_err(ErrorCode::NotFound, "Not Found")));
         // A real not-found (a member or board that isn't there) is not.

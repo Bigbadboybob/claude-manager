@@ -2846,6 +2846,9 @@ impl App {
             Cursor::Division(_) => {
                 self.set_status_msg("Divisions are edited in planning (update_initiative) — Space/Enter folds");
             }
+            Cursor::Org(_) => {
+                self.set_status_msg("Members and teams are edited in the roster (F6, then R) — Space/Enter folds");
+            }
         }
     }
 
@@ -3007,6 +3010,17 @@ impl App {
             }
         }
 
+        match event {
+            CrosstermEvent::FocusGained => {
+                self.focused = true;
+                return false;
+            }
+            CrosstermEvent::FocusLost => {
+                self.focused = false;
+                return false;
+            }
+            _ => {}
+        }
         self.needs_redraw = true;
         if self.global_settings.handle_event(event) { return true; }
         if self.availability_event(event) { return true; }
@@ -3368,6 +3382,7 @@ impl App {
                         if self.sidebar_view == SidebarView::Team {
                             self.org_refresh_soon();
                         }
+                        self.clamp_cursor();
                         self.save_session_manifest();
                         return true;
                     }
@@ -3636,7 +3651,7 @@ impl App {
         if let CrosstermEvent::Key(key) = event {
             let header = matches!(
                 self.cursor,
-                Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Task { .. } | Cursor::Division(_)
+                Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Task { .. } | Cursor::Division(_) | Cursor::Org(_)
             );
             if header
                 && matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter)

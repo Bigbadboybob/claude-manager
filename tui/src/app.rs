@@ -294,6 +294,9 @@ pub struct App {
     /// The roster screen (app/roster.rs), opened with `R` in F6.
     roster: roster::Roster,
     place: place::Place,
+    /// The viewer's terminal has focus (focus reports; true until a
+    /// terminal says otherwise, so one without them polls as before).
+    pub(crate) focused: bool,
     owner_blocked: owner_blocked::OwnerBlocked,
     maintenance: maintenance::Maintenance,
     /// Reap requests submitted from the cleanup dialog, tracked after it closed.
@@ -421,6 +424,8 @@ pub struct App {
     /// manifest.
     pub(crate) folded_tasks: HashSet<String>,
     pub(crate) folded_divisions: HashSet<String>,
+    /// Folded Team sub-view headers (app/team_view.rs).
+    pub(crate) folded_org: HashSet<String>,
     /// Set per frame while an A-e form is open on a nested workspace: the
     /// read-only Section value it inherits (`App::nested_section_label`).
     pub(crate) section_note: Option<String>,
@@ -799,6 +804,7 @@ impl App {
         let task_colors = manifest.task_colors.clone();
         let folded_tasks: HashSet<String> = manifest.folded_tasks.iter().cloned().collect();
         let folded_divisions: HashSet<String> = manifest.folded_divisions.iter().cloned().collect();
+        let folded_org: HashSet<String> = manifest.folded_org.iter().cloned().collect();
         let sections = manifest.sections.clone();
         // Only keep bindings whose target workspace still exists in the
         // manifest — otherwise we'd set workspace_id to a dangling id that
@@ -1040,6 +1046,7 @@ impl App {
             org: org_model::OrgState::default(),
             roster: roster::Roster::default(),
             place: place::Place::default(),
+            focused: true,
             owner_blocked: owner_blocked::OwnerBlocked::default(),
             maintenance: maintenance::Maintenance::load(),
             cleanup_jobs: Vec::new(),
@@ -1084,6 +1091,7 @@ impl App {
             task_colors,
             folded_tasks,
             folded_divisions,
+            folded_org,
             section_note: None,
             last_drawn_cursor: None,
             sections,
@@ -1197,7 +1205,7 @@ impl App {
             Cursor::Workspace(wi) => *wi,
             Cursor::Task { ws_idx, .. } => *ws_idx,
             Cursor::Session(wi, _) => *wi,
-            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) => return None,
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => return None,
         };
         (wi < self.workspaces.len()).then_some(wi)
     }
@@ -1221,7 +1229,7 @@ impl App {
             Cursor::Backtest(_) => None,
             // A section header is a display grouping, not a task; nor is a
             // division header (task actions there would hit its root task).
-            Cursor::Section(_) | Cursor::Division(_) => None,
+            Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => None,
         }
     }
 
@@ -1247,7 +1255,7 @@ impl App {
             Cursor::Task { .. } => None,
             // No PTY behind backtest rows — plain keys fall through to the
             // fold toggle in input.rs instead of a terminal.
-            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) => None,
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => None,
         }
     }
 
@@ -1267,7 +1275,7 @@ impl App {
                 }
             }
             Cursor::Task { .. } => None,
-            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) => None,
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => None,
         }
     }
 

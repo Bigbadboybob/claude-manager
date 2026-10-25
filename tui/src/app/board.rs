@@ -38,8 +38,6 @@ enum PromptKind {
     GroupRename,
     GroupNew,
     GroupPoc,
-    /// `done` or `cancelled`, then the close plan opens.
-    GroupClose,
 }
 
 /// A one-key menu.
@@ -47,6 +45,19 @@ enum PromptKind {
 enum Menu {
     Status,
     Resolve,
+    /// Close an epic as `d` done or `c` cancelled (board/epics.rs).
+    Close,
+}
+
+/// What a prompt or menu acts on, fixed when it opens: a poll that moves
+/// rows while Owner types must not redirect the write to another item or
+/// group (or send that group's revision).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct Target {
+    pub n: Option<i64>,
+    pub group_id: Option<String>,
+    pub revision: Value,
+    pub group_name: String,
 }
 
 /// `(op, board slug the request was for, result)`.
@@ -84,6 +95,8 @@ pub(super) struct Board {
     folds: HashSet<String>,
     /// `g` on a group: the one-key group menu is open.
     group_menu: bool,
+    /// The row the open prompt or menu acts on.
+    pub(super) target: Option<Target>,
     /// An epic's close plan under review (`g` → `c`), board/epics.rs.
     plan: Option<epics::ClosePlan>,
     /// The epic whose close plan was asked for: `(name, outcome)`.
@@ -225,7 +238,9 @@ impl App {
             return;
         }
         if let Some((method, params)) = self.board.queued.pop_front() {
-            self.board_request("write", method, params);
+            // The close plan's own reply (and error) is told apart.
+            let op = if method == "epic.close_plan" { "close_plan" } else { "write" };
+            self.board_request(op, method, params);
         }
     }
 
@@ -245,10 +260,12 @@ impl App {
                     self.board.list_retry_at = Some(Instant::now() + self.board.list_backoff);
                 }
                 (_, Err(e)) => {
-                    self.board.pending_close = None;
+                    if op == "close_plan" {
+                        self.board.pending_close = None;
+                    }
                     // A group edited elsewhere since our read: re-read it so
                     // the next edit carries the new revision.
-                    let reread = op == "write" && e.contains("revision_changed");
+                    let reread = op != "read" && op != "list" && e.contains("revision_changed");
                     self.board.error = e;
                     if reread {
                         self.board.version = None;
@@ -307,9 +324,22 @@ impl App {
         }
     }
 
+    /// The selected row as a prompt or menu target.
+    fn board_target(&self) -> Target {
+        let b = &self.board;
+        let group_id = b.selected_group();
+        let g = group_id.as_deref().and_then(|id| b.group(id));
+        Target {
+            n: b.selected_n(),
+            revision: g.map_or(Value::Null, |g| g["revision"].clone()),
+            group_name: g.and_then(|g| g["name"].as_str()).unwrap_or("").to_owned(),
+            group_id,
+        }
+    }
+
     fn board_submit_prompt(&mut self, kind: PromptKind, text: String) {
         let text = text.trim().to_owned();
-        let n = self.board.selected_n();
+        let n = self.board.target.as_ref().and_then(|t| t.n);
         match kind {
             PromptKind::Add if !text.is_empty() => {
                 self.board_write("item.create", json!({"title": text, "status": "open", "holder": "none"}))
@@ -358,13 +388,26 @@ impl App {
                     self.board_write("item.resolve", json!({"n": n, "action": "drop", "reason": text}));
                 }
             }
-            PromptKind::GroupRename | PromptKind::GroupNew | PromptKind::GroupPoc | PromptKind::GroupClose => self.board_group_submit(kind, text),
+            PromptKind::GroupRename | PromptKind::GroupNew | PromptKind::GroupPoc => self.board_group_submit(kind, text),
             _ => {}
         }
     }
 
-    /// Alt+B toggles; while visible every key is consumed.
+    /// Alt+B toggles; while visible every key is consumed. A prompt or menu
+    /// that opens takes its target row then (`Target`).
     pub(super) fn board_event(&mut self, event: &CrosstermEvent) -> bool {
+        let open = |b: &Board| b.prompt.is_some() || b.menu.is_some() || b.group_menu;
+        let before = open(&self.board);
+        let consumed = self.board_event_inner(event);
+        if !open(&self.board) {
+            self.board.target = None;
+        } else if !before {
+            self.board.target = Some(self.board_target());
+        }
+        consumed
+    }
+
+    fn board_event_inner(&mut self, event: &CrosstermEvent) -> bool {
         let CrosstermEvent::Key(key) = event else {
             return self.board.visible;
         };
@@ -414,7 +457,13 @@ impl App {
             return true;
         }
         if let Some(menu) = self.board.menu.take() {
-            let n = self.board.selected_n();
+            let n = self.board.target.as_ref().and_then(|t| t.n);
+            if menu == Menu::Close {
+                if let KeyCode::Char(c @ ('d' | 'c')) = key.code {
+                    self.board_close_epic(if c == 'd' { "done" } else { "cancelled" });
+                }
+                return true;
+            }
             match (menu, key.code, n) {
                 (Menu::Status, KeyCode::Char(c), Some(n)) => {
                     let strict = self.board.strict();
@@ -1002,7 +1051,6 @@ impl App {
                 PromptKind::GroupRename => "Group name",
                 PromptKind::GroupNew => "New heading under this group",
                 PromptKind::GroupPoc => "PoC (handle, member id or owner)",
-                PromptKind::GroupClose => "Close as (done / cancelled)",
             };
             return Line::styled(format!("{label}: {text}\u{2588}"), bold);
         }
@@ -1015,6 +1063,7 @@ impl App {
                     Menu::Status if b.strict() => "Status (strict board): a active \u{00b7} w job eta (stays active) \u{00b7} b blocked \u{00b7} O on Owner \u{00b7} d done",
                     Menu::Status => "Status: o open \u{00b7} a active \u{00b7} w waiting \u{00b7} b blocked \u{00b7} O on Owner \u{00b7} d done",
                     Menu::Resolve => "Resolve flag: 1 nudge \u{00b7} 2 reassign \u{00b7} 3 block \u{00b7} 4 drop \u{00b7} 5 apply suggestion \u{00b7} 6 dismiss",
+                    Menu::Close => "Close the epic as: d done \u{00b7} c cancelled (the close plan opens next)",
                 },
                 bold,
             );

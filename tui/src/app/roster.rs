@@ -67,6 +67,9 @@ pub(super) struct Roster {
     pub(super) rejected: HashMap<String, RosterRejection>,
     pub(super) prompt: Option<(Field, String)>,
     rx: Option<mpsc::Receiver<Reply>>,
+    /// Marked adopt rows still to send after `A` (one `org.adopt` each, to
+    /// the session's own host).
+    adopt_queue: std::collections::VecDeque<Row>,
     pub(super) status: String,
     pub(super) error: String,
     seq: u64,
@@ -240,14 +243,34 @@ impl App {
             return;
         }
         let rows = self.roster_apply_rows();
+        let adopts: Vec<Row> = self
+            .roster_rows()
+            .into_iter()
+            .filter(|r| matches!(r, Row::Adopt { .. }) && self.roster.edits.get(&self.roster_key(r)).and_then(|e| e.approve) == Some(true))
+            .collect();
+        if rows.is_empty() && adopts.is_empty() {
+            self.roster.status = "Nothing decided yet (y approve or mark, x decline)".into();
+            return;
+        }
+        self.roster.adopt_queue = adopts.into();
         if rows.is_empty() {
-            self.roster.status = "Nothing decided yet (y approve, x decline)".into();
+            self.roster_pump_adopts();
             return;
         }
         let targets = self.owner_rpc_targets();
         let request_id = self.roster_request_id("apply");
         self.roster.status = format!("Applying {} row{}…", rows.len(), if rows.len() == 1 { "" } else { "s" });
         self.roster_request("apply", "org.roster_apply", json!({"rows": rows, "request_id": request_id}), targets);
+    }
+
+    /// Send the next marked adopt once nothing is in flight.
+    fn roster_pump_adopts(&mut self) {
+        if self.roster.rx.is_some() {
+            return;
+        }
+        if let Some(row) = self.roster.adopt_queue.pop_front() {
+            self.roster_adopt(&row);
+        }
     }
 
     fn roster_adopt(&mut self, row: &Row) {
@@ -290,8 +313,13 @@ impl App {
             (_, Err(f)) if f.unsupported => {
                 self.roster.support = Support::Off;
                 self.roster.error.clear();
+                self.roster.adopt_queue.clear();
             }
-            (_, Err(f)) => self.roster.error = f.message,
+            (_, Err(f)) => {
+                // Unsent adopts keep their marks for another A.
+                self.roster.adopt_queue.clear();
+                self.roster.error = f.message;
+            }
             ("load", Ok(v)) => {
                 self.roster.support = Support::On;
                 self.roster.error.clear();
@@ -338,6 +366,7 @@ impl App {
             self.roster.rx = None;
             self.roster_accept(op, r);
         }
+        self.roster_pump_adopts();
         if self.roster.visible && !self.roster.loaded && self.roster.rx.is_none() && self.roster.support != Support::Off && self.roster.error.is_empty() {
             self.roster_load();
         }
@@ -391,6 +420,17 @@ impl App {
                 self.roster_load();
             }
             KeyCode::Char(c @ ('y' | 'x' | ' ')) => match &row {
+                // An adopt row is marked (y / Space) or cleared (x); A sends it.
+                Some(Row::Adopt { .. }) => {
+                    if let Some(e) = self.roster_edit() {
+                        e.approve = match (c, e.approve) {
+                            ('y', _) => Some(true),
+                            ('x', _) => None,
+                            (_, Some(true)) => None,
+                            (_, _) => Some(true),
+                        };
+                    }
+                }
                 Some(Row::Proposal(_)) => {
                     if let Some(e) = self.roster_edit() {
                         e.approve = match (c, e.approve) {
@@ -401,10 +441,6 @@ impl App {
                             (_, Some(false)) => None,
                         };
                     }
-                }
-                Some(r @ Row::Adopt { .. }) if c != 'x' => {
-                    let r = r.clone();
-                    self.roster_adopt(&r);
                 }
                 _ => {}
             },
@@ -490,12 +526,13 @@ impl App {
             if matches!(row, Row::Adopt { .. }) && !adopt_heading {
                 adopt_heading = true;
                 lines.push(Line::from(""));
-                lines.push(Line::styled("Sessions with no member (y adopts, after e/t/m/w edits)", Style::default().fg(theme::HEADER)));
+                lines.push(Line::styled("Sessions with no member (y marks for adoption; A adopts the marked ones)", Style::default().fg(theme::HEADER)));
             }
             let key = self.roster_key(row);
             let (handle, kind, team, manager, home) = self.roster_values(row);
             let mark = match (row, r.edits.get(&key).and_then(|e| e.approve)) {
-                (Row::Adopt { .. }, _) => "[+]",
+                (Row::Adopt { .. }, Some(true)) => "[+]",
+                (Row::Adopt { .. }, _) => "[ ]",
                 (_, Some(true)) => "[\u{2713}]",
                 (_, Some(false)) => "[\u{2717}]",
                 (_, None) => "[ ]",
@@ -660,6 +697,26 @@ mod tests {
         assert!(!app.roster.edits.contains_key("lane:agent:d1:ts-30-0"));
         assert!(app.roster.edits.contains_key("lead:init-9"));
         assert_eq!(app.roster.rejected["lead:init-9"].code, "handle_taken");
+    }
+
+    #[test]
+    fn adopt_rows_are_marked_and_sent_with_a_not_on_y() {
+        let mut app = roster_app();
+        app.roster.visible = true;
+        app.roster.cursor = 2; // the adopt row
+        press(&mut app, "y");
+        assert!(app.roster.rx.is_none(), "y only marks");
+        assert_eq!(app.roster.edits["adopt:ts-20-0"].approve, Some(true));
+        press(&mut app, " ");
+        assert_eq!(app.roster.edits["adopt:ts-20-0"].approve, None, "Space clears a mark");
+        press(&mut app, " ");
+        let rows: Vec<Row> = app.roster_rows().into_iter().filter(|r| matches!(r, Row::Adopt { .. }) && app.roster.edits.get(&app.roster_key(r)).and_then(|e| e.approve) == Some(true)).collect();
+        assert_eq!(rows.len(), 1);
+        // An adopt error keeps the remaining marks for another A.
+        app.roster.adopt_queue = rows.clone().into();
+        app.roster_accept("adopt", Err(RpcFail { unsupported: false, message: "handle_taken".into() }));
+        assert!(app.roster.adopt_queue.is_empty());
+        assert_eq!(app.roster.edits["adopt:ts-20-0"].approve, Some(true));
     }
 
     #[test]

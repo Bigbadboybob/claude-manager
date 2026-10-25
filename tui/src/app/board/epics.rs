@@ -129,7 +129,7 @@ impl ClosePlan {
 }
 
 impl Board {
-    pub(super) fn groups(&self) -> Option<&[Value]> {
+    pub(crate) fn groups(&self) -> Option<&[Value]> {
         self.data["groups"].as_array().map(Vec::as_slice)
     }
 
@@ -285,12 +285,14 @@ impl App {
     }
 
     /// `g` on a group row: the group menu. Elsewhere `g` keeps refreshing.
+    /// The group the open menu or prompt was opened on (`Target`).
     pub(super) fn board_group_key(&mut self, c: char) {
         self.board.group_menu = false;
-        let Some(id) = self.board.selected_group() else { return };
+        let Some(t) = self.board.target.clone() else { return };
+        let Some(id) = t.group_id else { return };
         let Some(g) = self.board.group(&id).cloned() else { return };
         let epic = g["kind"] == "epic";
-        let rev = g["revision"].clone();
+        let rev = t.revision;
         match c {
             'e' if !epic => {
                 let rid = self.board_request_id("promote");
@@ -299,9 +301,9 @@ impl App {
             'e' => self.board.status = "Already an epic".into(),
             'p' if epic => self.board.prompt = Some((PromptKind::GroupPoc, String::new())),
             'p' => self.board.status = "Promote it to an epic first (e)".into(),
-            'r' => self.board.prompt = Some((PromptKind::GroupRename, g["name"].as_str().unwrap_or("").to_owned())),
+            'r' => self.board.prompt = Some((PromptKind::GroupRename, t.group_name.clone())),
             'n' => self.board.prompt = Some((PromptKind::GroupNew, String::new())),
-            'c' if epic => self.board.prompt = Some((PromptKind::GroupClose, "done".into())),
+            'c' if epic => self.board.menu = Some(Menu::Close),
             'c' => self.board.status = "Only an epic closes (e promotes it)".into(),
             _ => {}
         }
@@ -314,8 +316,9 @@ impl App {
 
     /// The group prompts' Enter.
     pub(super) fn board_group_submit(&mut self, kind: PromptKind, text: String) {
-        let Some(id) = self.board.selected_group() else { return };
-        let rev = self.board.group(&id).map(|g| g["revision"].clone()).unwrap_or(Value::Null);
+        let Some(t) = self.board.target.clone() else { return };
+        let Some(id) = t.group_id else { return };
+        let rev = t.revision;
         match kind {
             PromptKind::GroupRename if !text.is_empty() => {
                 let rid = self.board_request_id("rename");
@@ -331,18 +334,20 @@ impl App {
                 let rid = self.board_request_id("poc");
                 self.board_write("epic.set_poc", json!({"group_id": id, "member": member, "request_id": rid}));
             }
-            PromptKind::GroupClose => {
-                let outcome = if text.trim().starts_with('c') { "cancelled" } else { "done" };
-                let name = self.board.group(&id).and_then(|g| g["name"].as_str()).unwrap_or("").to_owned();
-                self.board.pending_close = Some((name, outcome.to_owned()));
-                self.board_write("epic.close_plan", json!({"group_id": id, "outcome": outcome}));
-            }
             _ => {}
         }
     }
 
     /// A write reply that carries more than "saved": PoC staffing offers,
     /// a close plan, a close outcome.
+    /// The one-key close menu: ask for the epic's close plan.
+    pub(super) fn board_close_epic(&mut self, outcome: &str) {
+        let Some(t) = self.board.target.clone() else { return };
+        let Some(id) = t.group_id else { return };
+        self.board.pending_close = Some((t.group_name, outcome.to_owned()));
+        self.board_write("epic.close_plan", json!({"group_id": id, "outcome": outcome}));
+    }
+
     pub(super) fn board_write_reply(&mut self, v: &Value) {
         if let Some((name, outcome)) = self.board.pending_close.take().filter(|_| !v["plan_id"].is_null()) {
             self.board.plan = Some(ClosePlan::from_reply(v, &name, &outcome));
@@ -548,6 +553,35 @@ mod tests {
     }
 
     #[test]
+    fn a_prompt_keeps_the_row_it_opened_on_when_a_poll_moves_rows() {
+        let mut app = s3_app();
+        hold(&mut app);
+        app.board.cursor = 1; // the Org model epic
+        assert_eq!(app.board.selected_group().as_deref(), Some("g-epic"));
+        press(&mut app, "gr");
+        // A poll lands mid-typing and the selection now points elsewhere.
+        app.board.cursor = 5;
+        assert_ne!(app.board.selected_group().as_deref(), Some("g-epic"));
+        for _ in 0.."Org model".len() {
+            key(&mut app, KeyCode::Backspace);
+        }
+        press(&mut app, "Org");
+        key(&mut app, KeyCode::Enter);
+        let (m, p) = app.board.queued.pop_front().unwrap();
+        assert_eq!((m, p["group_id"].as_str(), p["name"].as_str(), p["expected_revision"].as_i64()), ("group.set", Some("g-epic"), Some("Org"), Some(3)));
+        assert!(app.board.target.is_none(), "the target ends with its prompt");
+        // An item prompt likewise: the note goes to the item it opened on.
+        app.board.cursor = 0;
+        let n = app.board.selected_n().unwrap();
+        press(&mut app, "n");
+        app.board.cursor = 2;
+        press(&mut app, "x");
+        key(&mut app, KeyCode::Enter);
+        let (m, p) = app.board.queued.pop_front().unwrap();
+        assert_eq!((m, p["n"].as_i64()), ("item.set", Some(n)));
+    }
+
+    #[test]
     fn g_on_a_group_edits_it_and_g_elsewhere_still_refreshes() {
         let mut app = s3_app();
         // On an item, g refreshes as before.
@@ -584,8 +618,7 @@ mod tests {
         let mut app = s3_app();
         app.board.cursor = 1;
         hold(&mut app);
-        press(&mut app, "gc");
-        key(&mut app, KeyCode::Enter); // default "done"
+        press(&mut app, "gcd"); // one key: d done, c cancelled
         let (m, p) = app.board.queued.pop_front().unwrap();
         assert_eq!((m, p["outcome"].as_str()), ("epic.close_plan", Some("done")));
         app.board_write_reply(&json!({

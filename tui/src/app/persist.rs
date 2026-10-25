@@ -141,6 +141,7 @@ impl App {
             task_colors: self.task_colors.clone(),
             folded_tasks: self.folded_tasks.iter().cloned().collect(),
             folded_divisions: self.folded_divisions.iter().cloned().collect(),
+            folded_org: self.folded_org.iter().cloned().collect(),
             sections: self.sections.clone(),
             workspace_sections: self.workspace_sections.clone(),
             sidebar_receipts: self.sidebar_receipts.clone(),

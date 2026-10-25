@@ -339,6 +339,9 @@ pub enum Cursor {
     /// Cursor is on a division header (Task sub-view), by initiative id.
     /// Space/Enter fold it; no terminal behind it.
     Division(String),
+    /// Cursor is on a Team sub-view header (`team:<id>`, `member:<id>` or
+    /// the unassigned group; app/team_view.rs). Space/Enter fold it.
+    Org(String),
 }
 
 /// Which row of the `backtests` group the cursor is on. Space/Enter (which
@@ -596,7 +599,7 @@ impl App {
             ),
             // Backtest rows live outside the workspace list — the reorder
             // can't move them, so the cursor needs no re-resolution.
-            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) => (None, None, None),
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => (None, None, None),
         };
         self.workspaces.sort_by_key(|w| !w.pinned);
         if let Some(id) = saved_ws_id {
@@ -663,6 +666,10 @@ impl App {
         }
         // A division header that no longer draws (its blocks closed, or the
         // initiative is no longer a division) falls back to the first row.
+        if matches!(self.cursor, Cursor::Org(_)) {
+            self.clamp_org_cursor();
+            return;
+        }
         if let Cursor::Division(id) = &self.cursor {
             let items = self.task_tree().items;
             if !items.iter().any(|vi| matches!(vi, VisualItem::DivisionHeader(d) if d == id)) {
@@ -716,7 +723,7 @@ impl App {
                 }
             }
             // Fully handled by the early-returns at the top of this fn.
-            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) => {}
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => {}
         }
     }
 
@@ -791,6 +798,7 @@ impl App {
             (Cursor::Task { ws_idx, task_id }, VisualItem::TaskHeader { ws_idx: a, task_id: b }) => ws_idx == a && task_id == b,
             (Cursor::Section(a), VisualItem::SectionHeader(b)) => a == b,
             (Cursor::Division(a), VisualItem::DivisionHeader(b)) => a == b,
+            (Cursor::Org(a), VisualItem::OrgHeader { key: b, .. }) => a == b,
             (Cursor::Backtest(BacktestCursor::Group), VisualItem::BacktestHeader) => true,
             (Cursor::Backtest(BacktestCursor::Fleet(a)), VisualItem::BacktestFleet(b)) => a == b,
             (Cursor::Backtest(BacktestCursor::Run(a)), VisualItem::BacktestRun { task_id: b, .. }) => a == b,
@@ -1459,7 +1467,8 @@ impl App {
             // Continuous header is presentation-only, like
             // other decorative headers; skip it in cursor navigation.
             VisualItem::ContinuousHeader => false,
-            VisualItem::OrgHeader { .. } => false,
+            // Team sub-view headers fold on Space/Enter.
+            VisualItem::OrgHeader { .. } => true,
             // Backtest rows are all selectable — the header and fleet rows
             // for the Space/Enter fold toggle, run rows for the A-i peek.
             VisualItem::BacktestHeader => true,
@@ -1500,6 +1509,7 @@ impl App {
                 ) => tid == vtid,
                 (Cursor::Section(id), VisualItem::SectionHeader(vid)) => id == vid,
                 (Cursor::Division(id), VisualItem::DivisionHeader(vid)) => id == vid,
+                (Cursor::Org(key), VisualItem::OrgHeader { key: vkey, .. }) => key == vkey,
                 _ => false,
             })
             .map(|p| p as i32)
@@ -1547,6 +1557,9 @@ impl App {
             VisualItem::DivisionHeader(id) => {
                 self.cursor = Cursor::Division(id.clone());
             }
+            VisualItem::OrgHeader { key, .. } => {
+                self.cursor = Cursor::Org(key.clone());
+            }
             _ => {}
         }
         true
@@ -1566,9 +1579,12 @@ impl App {
         let mut rows: Vec<(usize, usize, bool)> = Vec::new();
         // Folded sessions count: an alert inside a fold must still be
         // reachable (the jump unfolds it).
-        let main = match self.sidebar_view {
-            SidebarView::Task => self.filter_visual_items(self.task_tree_unfolded().items),
-            SidebarView::Status | SidebarView::Team => self.visual_items(),
+        let main = if self.tree_view() {
+            self.filter_visual_items(self.task_tree_unfolded().items)
+        } else if self.sidebar_view == SidebarView::Team {
+            self.filter_visual_items(self.visual_items_team_unfolded())
+        } else {
+            self.visual_items()
         };
         for vi in main {
             if let VisualItem::Session(wi, si) = vi {
@@ -2042,6 +2058,12 @@ impl App {
                 out.push(PeekLine::Field { label: "Initiative".into(), value: id.clone() });
                 out.push(PeekLine::Blank);
                 out.push(PeekLine::Text("Space/Enter fold · keys don't reach a terminal here".into()));
+            }
+            Cursor::Org(key) => {
+                out.push(PeekLine::Title(self.org_header_text(key)));
+                out.push(PeekLine::Field { label: "Row".into(), value: key.clone() });
+                out.push(PeekLine::Blank);
+                out.push(PeekLine::Text("Space/Enter fold · F6 shows the member's facts · keys don't reach a terminal here".into()));
             }
         }
         if out.is_empty() {

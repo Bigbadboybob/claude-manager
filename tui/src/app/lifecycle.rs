@@ -1432,7 +1432,7 @@ impl App {
             }
             // Backtest rows have no hidden bit — the group folds instead;
             // section headers likewise.
-            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) => return,
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => return,
         };
         if let Some(ts) = self
             .workspaces
@@ -2118,6 +2118,9 @@ impl App {
             }
             Cursor::Division(_) => {
                 self.set_status_msg("A division header has no session to close");
+            }
+            Cursor::Org(_) => {
+                self.set_status_msg("A team or member header has no session to close");
             }
         }
     }
@@ -3521,7 +3524,7 @@ impl App {
             Cursor::Workspace(wi) | Cursor::Session(wi, _) => *wi,
             Cursor::Task { ws_idx, .. } => *ws_idx,
             // Not on any workspace — nothing to exempt from the sweep.
-            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) => usize::MAX,
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => usize::MAX,
         };
 
         let mut changed = false;
@@ -6134,6 +6137,7 @@ mod slice_12e_tests {
             task_colors: Default::default(),
             folded_tasks: Default::default(),
             folded_divisions: Default::default(),
+            folded_org: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             agent_task_edges: HashMap::new(),
@@ -6332,6 +6336,7 @@ remote_socket = "/remote/manager.sock"
             task_colors: Default::default(),
             folded_tasks: Default::default(),
             folded_divisions: Default::default(),
+            folded_org: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             agent_task_edges: HashMap::new(),

@@ -74,7 +74,10 @@ type Reply = (&'static str, Result<Value, RpcFail>);
 pub(super) struct Place {
     pub(super) support: Support,
     pub(super) on_boards: Value,
-    rx: Option<mpsc::Receiver<Reply>>,
+    /// Replies in flight: the on-boards poll, a board list, a place or
+    /// unplace, a hire. Each is kept until it answers.
+    rx: Vec<mpsc::Receiver<Reply>>,
+    on_boards_inflight: bool,
     last_poll: Option<Instant>,
     retry_at: Option<Instant>,
     pub(super) chooser: Option<Chooser>,
@@ -97,7 +100,7 @@ impl App {
         std::thread::spawn(move || {
             let _ = tx.send((op, owner_rpc(&targets, method, &params)));
         });
-        self.place.rx = Some(rx);
+        self.place.rx.push(rx);
     }
 
     fn place_request_id(&mut self, what: &str) -> String {
@@ -121,11 +124,29 @@ impl App {
 
     /// Replies, and the planning-only on-boards poll.
     pub fn place_tick(&mut self) {
-        if let Some((op, r)) = self.place.rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
-            self.place.rx = None;
+        let mut ready = Vec::new();
+        self.place.rx.retain(|rx| match rx.try_recv() {
+            Ok(reply) => {
+                ready.push(reply);
+                false
+            }
+            Err(mpsc::TryRecvError::Empty) => true,
+            Err(mpsc::TryRecvError::Disconnected) => false,
+        });
+        for (op, r) in ready {
+            if op == "on_boards" {
+                self.place.on_boards_inflight = false;
+            }
             self.place_accept(op, r);
         }
-        if self.view_mode != ViewMode::Planning || self.place.rx.is_some() || cfg!(test) {
+        // Probe support once in Planning; after that, read only while the
+        // strip shows and the viewer is focused.
+        let wanted = match self.place.support {
+            Support::Off => self.view_mode == ViewMode::Planning,
+            Support::On => self.place_strip_shown() && self.focused,
+            _ => self.view_mode == ViewMode::Planning && self.place.last_poll.is_none(),
+        };
+        if !wanted || self.place.on_boards_inflight || cfg!(test) {
             return;
         }
         if self.place.retry_at.is_some_and(|t| Instant::now() < t) || self.place.last_poll.is_some_and(|t| t.elapsed() < ON_BOARDS_EVERY) {
@@ -133,7 +154,14 @@ impl App {
         }
         self.place.last_poll = Some(Instant::now());
         self.place.retry_at = None;
+        self.place.on_boards_inflight = true;
         self.place_request("on_boards", "boards.on_boards", json!({}));
+    }
+
+    /// The read-only On boards strip is on screen (or would be, once it has
+    /// rows): the planning view with placement supported and `A-b` not off.
+    pub(super) fn place_strip_shown(&self) -> bool {
+        self.view_mode == ViewMode::Planning && self.place.support == Support::On && !self.place.hide_strip
     }
 
     /// Apply a reply (also the test entry point).
@@ -151,7 +179,11 @@ impl App {
                 self.planning.placement_on = false;
                 self.place.retry_at = Some(Instant::now() + OFF_RETRY);
             }
-            ("on_boards", Err(_)) => self.place.retry_at = Some(Instant::now() + ERROR_RETRY),
+            ("on_boards", Err(_)) => {
+                // Unknown support stays unknown; probe again after the retry.
+                self.place.last_poll = None;
+                self.place.retry_at = Some(Instant::now() + ERROR_RETRY);
+            }
             ("boards", Ok(v)) => {
                 if let Some(d) = self.place.dialog.as_mut() {
                     d.boards = v.as_array().cloned().unwrap_or_default();
@@ -272,7 +304,13 @@ impl App {
             let r = crate::api::list_open_boards(&url, &token).map(Value::from).map_err(|e| RpcFail { unsupported: false, message: e.to_string() });
             let _ = tx.send(("boards", r));
         });
-        self.place.rx = Some(rx);
+        self.place.rx.push(rx);
+        // The epic list reads the on-boards data: fresh, even with the strip off.
+        if !self.place.on_boards_inflight && !cfg!(test) {
+            self.place.on_boards_inflight = true;
+            self.place.last_poll = Some(Instant::now());
+            self.place_request("on_boards", "boards.on_boards", json!({}));
+        }
     }
 
     fn place_unplace(&mut self, task_id: &str) {
@@ -390,11 +428,11 @@ impl App {
         let snap = self.org.snapshot.as_ref();
         if let Some(c) = &self.place.chooser {
             let opts = c.options();
-            let h = opts.len() as u16 + 4;
+            let h = (opts.len() as u16 + 4).min(area.height);
             let w = 56.min(area.width);
-            let r = Rect::new(area.x + (area.width - w) / 2, area.y + area.height.saturating_sub(h) / 2, w, h);
+            let r = Rect::new(area.x + area.width.saturating_sub(w) / 2, area.y + area.height.saturating_sub(h) / 2, w, h);
             frame.render_widget(Clear, r);
-            let block = Block::default().borders(Borders::ALL).title(format!(" {} ", crate::planning::truncate_with_ellipsis(&c.title, w as usize - 4))).border_style(Style::default().fg(theme::ATTN));
+            let block = Block::default().borders(Borders::ALL).title(format!(" {} ", crate::planning::truncate_with_ellipsis(&c.title, (w as usize).saturating_sub(4)))).border_style(Style::default().fg(theme::ATTN));
             let inner = block.inner(r);
             frame.render_widget(block, r);
             let mut lines: Vec<Line> = opts
@@ -412,7 +450,7 @@ impl App {
         let Some(d) = &self.place.dialog else { return };
         let w = 72.min(area.width);
         let h = 9u16.min(area.height);
-        let r = Rect::new(area.x + (area.width - w) / 2, area.y + area.height.saturating_sub(h) / 2, w, h);
+        let r = Rect::new(area.x + area.width.saturating_sub(w) / 2, area.y + area.height.saturating_sub(h) / 2, w, h);
         frame.render_widget(Clear, r);
         let block = Block::default().borders(Borders::ALL).title(" Place on a board ").border_style(Style::default().fg(theme::ATTN));
         let inner = block.inner(r);
@@ -434,7 +472,7 @@ impl App {
             Line::from(vec![Span::styled(format!(" {label:<8}"), Style::default().fg(theme::DIM)), Span::styled(value, st)])
         };
         let mut lines = vec![
-            Line::styled(format!(" {}", crate::planning::truncate_with_ellipsis(&d.title, w as usize - 4)), Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)),
+            Line::styled(format!(" {}", crate::planning::truncate_with_ellipsis(&d.title, (w as usize).saturating_sub(4))), Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)),
             row(0, "board", board),
             row(1, "epic", epic),
             row(2, "holder", holder),

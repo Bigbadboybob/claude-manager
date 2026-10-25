@@ -69,8 +69,8 @@ the chart's focused session selected.
 When the daemon serves the org model (`org.snapshot`, doc/org-model.md) and it
 has members besides Owner, the chart is drawn from teams and managers instead
 of tasks. Old daemons and APIs keep the task chart above; the switch needs no
-setting. The snapshot is polled only while the chart, the roster, the Team
-sub-view or the planning place dialog is open.
+setting. The snapshot is polled only while something shows it (see
+[polling](org-tui.md#polling)).
 
 - **Owner** at the top, then the **teams** parents-first (divisions, then
   teams, then by name). Each team box puts its lead on top (`★ handle`) and
@@ -86,7 +86,8 @@ sub-view or the planning place dialog is open.
   its main session's workspace) fold under the member as `+N assistants`
   with their state glyphs; `a` expands or folds them. Ended assistants are
   hidden.
-- A **vacant** member is drawn empty with `∅` and its stand-in.
+- A **vacant** member, the team lead included, is drawn empty with `∅` and
+  its stand-in.
 - A **standby** team is greyed.
 - Sessions no member claims sit under **Unassigned**, by task or workspace.
 

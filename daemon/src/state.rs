@@ -1235,6 +1235,7 @@ impl DaemonState {
             task_colors: HashMap::new(),
             folded_tasks: Default::default(),
             folded_divisions: Default::default(),
+            folded_org: Default::default(),
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
             sidebar_receipts: HashMap::new(),

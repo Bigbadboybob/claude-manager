@@ -642,6 +642,10 @@ pub struct Manifest {
     /// Folded division headers in the same tree, by initiative id.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub folded_divisions: BTreeSet<String>,
+    /// Folded Team sub-view headers (`team:<id>`, `member:<id>`, the
+    /// unassigned group).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub folded_org: BTreeSet<String>,
     /// Viewer receipts prevent replayed remote moves from undoing Owner edits.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub sidebar_receipts: HashMap<String, crate::sidebar::Receipt>,

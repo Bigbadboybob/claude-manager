@@ -2653,7 +2653,7 @@ impl App {
             Cursor::Session(wi, _) => self.workspaces.get(*wi).map(|w| w.id.clone()),
             Cursor::Task { ws_idx, .. } => self.workspaces.get(*ws_idx).map(|w| w.id.clone()),
             // Not workspace-scoped; clamp_cursor re-validates it at the end.
-            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) => None,
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => None,
         };
         let saved_session_uid = match &self.cursor {
             Cursor::Session(wi, si) => self
@@ -6450,6 +6450,7 @@ pub(super) mod pending_workflow_events_tests {
             task_colors: Default::default(),
             folded_tasks: Default::default(),
             folded_divisions: Default::default(),
+            folded_org: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             agent_task_edges: HashMap::new(),
@@ -6674,6 +6675,7 @@ pub(super) mod pending_workflow_events_tests {
             task_colors: Default::default(),
             folded_tasks: Default::default(),
             folded_divisions: Default::default(),
+            folded_org: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             agent_task_edges: HashMap::new(),
@@ -6895,6 +6897,7 @@ pub(super) mod pending_workflow_events_tests {
             task_colors: Default::default(),
             folded_tasks: Default::default(),
             folded_divisions: Default::default(),
+            folded_org: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             agent_task_edges: HashMap::new(),
@@ -7054,6 +7057,7 @@ pub(super) mod pending_workflow_events_tests {
             task_colors: Default::default(),
             folded_tasks: Default::default(),
             folded_divisions: Default::default(),
+            folded_org: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             agent_task_edges: HashMap::new(),
@@ -7203,6 +7207,7 @@ pub(super) mod pending_workflow_events_tests {
             task_colors: Default::default(),
             folded_tasks: Default::default(),
             folded_divisions: Default::default(),
+            folded_org: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             agent_task_edges: HashMap::new(),

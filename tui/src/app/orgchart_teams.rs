@@ -139,14 +139,16 @@ impl App {
                 Some(l) if l.is_owner() => top.push((format!("{} Owner", symbols::OWNER), symbols::owner_style())),
                 Some(l) if lead_home.get(l.id.as_str()) == Some(&i) => {
                     top.push((member_line(l), Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)));
-                    if l.vacant() {
-                        top.push((self.vacant_line(snap, l), dim));
-                    }
-                    let (sessions, folded) = self.member_sessions(l, &mut claimed, &keep);
-                    m.nodes[i].sessions = sessions;
                     let card = m.nodes[i].card.as_mut().unwrap();
                     card.member_id = Some(l.id.clone());
-                    card.folded = folded;
+                    // A vacant lead is drawn like a vacant member: empty, with its stand-in.
+                    if l.vacant() {
+                        top.push((self.vacant_line(snap, l), dim));
+                    } else {
+                        let (sessions, folded) = self.member_sessions(l, &mut claimed, &keep);
+                        m.nodes[i].sessions = sessions;
+                        m.nodes[i].card.as_mut().unwrap().folded = folded;
+                    }
                 }
                 Some(l) => {
                     let home = lead_home.get(l.id.as_str()).map(|&h| m.nodes[h].title.clone());
@@ -606,6 +608,18 @@ mod tests {
         // Nobody's session: Unassigned, by task.
         assert_eq!(node(&m, "task:loose").sessions[0].uid, "ts-90-0");
         assert_eq!(node(&m, "org:unassigned").title, UNASSIGNED_LABEL);
+    }
+
+    #[test]
+    fn a_vacant_lead_draws_like_a_vacant_member() {
+        let mut app = team_app();
+        let mut snap = app.org.snapshot.clone().unwrap();
+        snap.members.iter_mut().find(|x| x.id == "m3").unwrap().status = "vacant".into();
+        app.org.snapshot = Some(snap);
+        let m = app.org_model(false);
+        let items = node(&m, "team:t2");
+        assert!(items.sessions.is_empty(), "{:?}", items.sessions);
+        assert!(items.card.as_ref().unwrap().top.iter().any(|(t, _)| t.starts_with(&format!("{} vacant", symbols::VACANT))));
     }
 
     #[test]

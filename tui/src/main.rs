@@ -49,6 +49,7 @@ use crossterm::event::{
     PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
     EnableBracketedPaste, DisableBracketedPaste,
     EnableMouseCapture, DisableMouseCapture,
+    EnableFocusChange, DisableFocusChange,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -166,6 +167,9 @@ fn main() -> anyhow::Result<()> {
         EnterAlternateScreen,
         EnableBracketedPaste,
         EnableMouseCapture,
+        // Focus reports let background polls (the org model) pause while
+        // the viewer's terminal is in the background.
+        EnableFocusChange,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         )
@@ -211,6 +215,7 @@ fn main() -> anyhow::Result<()> {
         PopKeyboardEnhancementFlags,
         DisableBracketedPaste,
         DisableMouseCapture,
+        DisableFocusChange,
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
