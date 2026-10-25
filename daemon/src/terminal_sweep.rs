@@ -187,12 +187,16 @@ impl TerminalTaskSweeper {
             if self.shutdown.load(Ordering::SeqCst) {
                 break;
             }
-            let status = match crate::planning_client::fetch_task_status(
+            let (status, via_item) = match crate::planning_client::fetch_task_terminal(
                 &task_id,
                 Some(api_url.as_str()),
                 Some(api_token.as_str()),
             ) {
-                Ok(Some(status)) => status,
+                Ok(Some(row)) => {
+                    let via_item = row.terminal_via.as_deref()
+                        == Some(crate::lifecycle_guard::TERMINAL_VIA_ITEM);
+                    (row.status, via_item)
+                }
                 // A deleted planning row is not evidence that the work is
                 // finished; leave the session alone and let the reaper's
                 // unowned-checkout policy handle the checkout.
@@ -207,11 +211,15 @@ impl TerminalTaskSweeper {
             if !self.due(&task_id, &status) {
                 continue;
             }
+            // A board-originated close (the status mirror) only unassigns:
+            // the guard lets the sweep close ephemeral sessions alone
+            // (doc/org-model.md §7.1).
             let swept = crate::control::methods::sweep_terminal_task_sessions(
                 &self.state,
                 &task_id,
                 "terminal-task-sweep",
                 Some(self.grace),
+                via_item,
             );
             if !swept.is_empty() {
                 eprintln!(

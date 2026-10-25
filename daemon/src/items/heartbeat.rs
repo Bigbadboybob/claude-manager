@@ -33,6 +33,13 @@ pub fn poke() {
 }
 
 pub fn start(state: &Arc<Mutex<DaemonState>>) {
+    {
+        // Fail-static launch grants: what the last beat granted holds until
+        // the API answers again (doc/org-model.md §7.4).
+        let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+        let root = s.messaging_root.clone();
+        s.launch_grants = crate::items::grants::load(&root);
+    }
     let state = Arc::clone(state);
     let spawned = std::thread::Builder::new()
         .name("items-heartbeat".into())
@@ -60,6 +67,12 @@ pub fn start(state: &Arc<Mutex<DaemonState>>) {
         eprintln!("cm items: heartbeat thread failed to start: {e}");
     }
 }
+
+/// What this daemon advertises in every beat (doc/org-model.md §12). The API
+/// turns a feature on for a host only when it is listed here; e.g. it
+/// mirrors a placed task's status only while every daemon holding the task's
+/// sessions lists `lifecycle_guard_v1`. One list for every org capability.
+pub const CAPABILITIES: &[&str] = &[crate::lifecycle_guard::CAPABILITY];
 
 /// What one beat reads from the daemon, captured under the lock.
 pub(crate) struct Snapshot {
@@ -247,6 +260,7 @@ impl Beat {
             "sessions": snap.sessions,
             "exited": [],
             "acked_push_ids": acked,
+            "capabilities": CAPABILITIES,
         });
         let reply = match api.post(&format!("/hosts/{}/heartbeat", snap.daemon_id), &body) {
             Ok(reply) => reply,
@@ -257,6 +271,11 @@ impl Beat {
         };
         for id in &acked {
             self.acks.remove(id);
+        }
+        if let Some(grants) = crate::items::grants::from_reply(&reply) {
+            let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+            let root = s.messaging_root.clone();
+            crate::items::grants::replace(&mut s.launch_grants, &root, grants);
         }
         super::org::absorb_reply(&reply, crate::agent_state::unix_now());
         for push in reply["pushes"].as_array().into_iter().flatten() {
@@ -427,8 +446,9 @@ mod tests {
                 reader.read_exact(&mut body).unwrap();
                 log.lock().unwrap().push(serde_json::from_slice(&body).unwrap());
                 let reply = if i == 0 {
-                    r#"{"pushes":[{"id":41,"session_uid":"me-uid","text":"[cm-board sfd] assigned","board":"sfd","board_id":"b-1","owner_alert":false},{"id":42,"session_uid":"gone","text":"x","board":"sfd","owner_alert":false}],"org":{"members":{"me-uid":{"id":"mem_1","handle":"ep","acting_as":"main"}}}}"#
+                    r#"{"pushes":[{"id":41,"session_uid":"me-uid","text":"[cm-board sfd] assigned","board":"sfd","board_id":"b-1","owner_alert":false},{"id":42,"session_uid":"gone","text":"x","board":"sfd","owner_alert":false}],"org":{"members":{"me-uid":{"id":"mem_1","handle":"ep","acting_as":"main"}}},"launch_grants":[{"task_id":"t-1","session_uid":"me-uid","pid":"agent:d:me-uid","board":"sfd","n":4}]}"#
                 } else {
+                    // An older API sends no grants: the cache stays.
                     r#"{"pushes":[]}"#
                 };
                 let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len());
@@ -460,6 +480,12 @@ mod tests {
         assert_eq!(bodies[0]["sessions"].as_array().unwrap().len(), 1);
         assert_eq!(bodies[0]["sessions"][0]["state"], "unknown"); // TUI-only row
         assert_eq!(bodies[1]["acked_push_ids"], json!([41, 42]));
+        // Every beat advertises the org capabilities (doc/org-model.md §12).
+        assert_eq!(bodies[0]["capabilities"], json!(["lifecycle_guard_v1"]));
+        // The reply's launch grants replace the cache and are persisted.
+        let s = state.lock().unwrap();
+        assert_eq!(s.launch_grants.len(), 1);
+        assert_eq!(crate::items::grants::load(root.path()), s.launch_grants);
         // The second reply had no `org` key (a pre-S2 API): the cache stays.
         assert_eq!(super::super::org::cached_member("me-uid")["handle"], "ep");
         super::super::org::reset_cache_for_test();

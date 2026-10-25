@@ -323,6 +323,7 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "backtest.result",
     "board.read",
     "board.owner_blocked",
+    "boards.on_boards",
     "gate.receipts",
     "usage.read",
     "continuous.list",
@@ -892,7 +893,9 @@ pub fn dispatch_request(
             },
         ),
         "item.create" | "item.set" | "item.resolve" | "board.read" | "board.settings"
-        | "board.owner_blocked" => {
+        | "board.owner_blocked" | "item.place" | "item.unplace" | "group.create" | "group.set"
+        | "boards.on_boards" | "epic.set_poc" | "epic.staff" | "epic.close_plan"
+        | "epic.close_apply" => {
             DispatchOutcome::Done(crate::items::rpc::dispatch(state, req))
         }
         // Org model S2 (doc/org-model.md): members, teams, the roster and

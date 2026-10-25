@@ -1425,11 +1425,15 @@ pub(crate) fn start_session_with_spawn_fn(
                 let st = state_arc.lock().unwrap_or_else(|e| e.into_inner());
                 (st.config.api_url.clone(), st.config.api_token.clone())
             };
+            // The spawned session is the actor: on a placed, unheld task's
+            // item it becomes the owner (doc/org-model.md §7.1).
+            let actor = crate::items::rpc::session_actor(state_arc, &session_uid);
             spawn_task_status_promotion(
                 task_id,
                 session_uid.clone(),
                 api_url_cfg,
                 api_token_cfg,
+                actor,
             );
         }
     }
@@ -9261,8 +9265,16 @@ pub fn mcp_start_session(
         }
         // Task auth: if caller supplied a task_id, it must be
         // self-or-descendant of caller's task. Taskless caller +
-        // explicit task_id → Unauthorized.
-        if let Some(req_task) = p.task_id.as_deref() {
+        // explicit task_id → Unauthorized. Unless the caller holds a
+        // launch grant for it: the owner-role holder of the task's board
+        // item may launch for it from anywhere (doc/org-model.md §7.4).
+        let granted = p.task_id.as_deref().and_then(|req| {
+            crate::items::grants::find(&state.launch_grants, cuid, req).cloned()
+        });
+        if let Some(grant) = &granted {
+            crate::items::grants::log_use(grant, cuid);
+        }
+        if let Some(req_task) = p.task_id.as_deref().filter(|_| granted.is_none()) {
             match caller.task_id.as_deref() {
                 None => {
                     return Err((
@@ -16687,6 +16699,7 @@ enum TaskStatusPromotion {
 fn promote_task_to_running(
     creds: &PlanningApiCreds,
     task_id: &str,
+    actor: Option<&Value>,
 ) -> Result<TaskStatusPromotion, PlanningClientError> {
     let row = api_get_task(creds, task_id)?;
     let kind = row.get("kind").and_then(Value::as_str).unwrap_or("oneshot");
@@ -16697,7 +16710,11 @@ fn promote_task_to_running(
     if status != "draft" && status != "backlog" {
         return Ok(TaskStatusPromotion::LeftAlone);
     }
-    api_update_task(creds, task_id, &json!({ "status": "running" }))?;
+    let mut body = json!({ "status": "running" });
+    if let Some(actor) = actor {
+        body["actor"] = actor.clone();
+    }
+    api_update_task(creds, task_id, &body)?;
     Ok(TaskStatusPromotion::Promoted { from: status.to_string() })
 }
 
@@ -16712,6 +16729,7 @@ fn spawn_task_status_promotion(
     session_uid: String,
     api_url_cfg: String,
     api_token_cfg: String,
+    actor: Option<Value>,
 ) {
     // Test hermeticity: parallel tests own CM_API_URL/CM_API_TOKEN under
     // the crate env lock, which this call site does not hold. A test that
@@ -16739,7 +16757,7 @@ fn spawn_task_status_promotion(
     let task_id_for_log = task_id.clone();
     let spawned = std::thread::Builder::new()
         .name(format!("task-promote-{}", session_uid))
-        .spawn(move || match promote_task_to_running(&creds, &task_id) {
+        .spawn(move || match promote_task_to_running(&creds, &task_id, actor.as_ref()) {
             Ok(TaskStatusPromotion::Promoted { from }) => eprintln!(
                 "cm-daemon: task '{}' status {} → running (session {} launched)",
                 task_id, from, session_uid,
@@ -18481,6 +18499,14 @@ struct SetSubtaskStatusParams {
     #[serde(default)]
     task_id: Option<String>,
     status: String,
+    /// The trigger of a `blocked` write (doc/org-model.md §7.1): on a placed
+    /// task it becomes the item's `blocked_on` (`reason`) or `blocked_by`
+    /// (item numbers on its board). Without either a placed task's item gets
+    /// a labelled default trigger and a `legacy_blocked` flag.
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    blocked_by: Option<Vec<i64>>,
 }
 
 /// `set_subtask_status` — Session-callable. Set the planning status of the
@@ -18538,8 +18564,17 @@ pub fn set_subtask_status(
     };
     let creds =
         PlanningApiCreds::from_config(&api_url_cfg, &api_token_cfg).map_err(|e| e.to_method_err())?;
-    api_update_task(&creds, &target_task_id, &json!({ "status": p.status }))
-        .map_err(|e| e.to_method_err())?;
+    let mut body = json!({ "status": p.status });
+    if let Some(reason) = p.reason.as_deref().filter(|r| !r.trim().is_empty()) {
+        body["reason"] = json!(reason);
+    }
+    if let Some(blocked_by) = p.blocked_by.as_ref().filter(|b| !b.is_empty()) {
+        body["blocked_by"] = json!(blocked_by);
+    }
+    if let Some(actor) = caller_uid.and_then(|uid| crate::items::rpc::session_actor(state_arc, uid)) {
+        body["actor"] = actor;
+    }
+    api_update_task(&creds, &target_task_id, &body).map_err(|e| e.to_method_err())?;
     Ok(json!({ "task_id": target_task_id, "status": p.status }))
 }
 
@@ -18587,6 +18622,9 @@ pub fn update_task(
         "metadata",
         "parent_task_id",
         "initiative_id",
+        // Org model S3: a `blocked` write's trigger on a placed task.
+        "reason",
+        "blocked_by",
     ];
     let mut rejected: Vec<&str> = fields
         .keys()
@@ -18669,6 +18707,10 @@ pub fn update_task(
     };
     let creds =
         PlanningApiCreds::from_config(&api_url_cfg, &api_token_cfg).map_err(|e| e.to_method_err())?;
+    let mut fields = fields;
+    if let Some(actor) = caller_uid.and_then(|uid| crate::items::rpc::session_actor(state_arc, uid)) {
+        fields.insert("actor".into(), actor);
+    }
     api_update_task(&creds, &target_task_id, &Value::Object(fields))
         .map_err(|e| e.to_method_err())?;
     // Re-read the row so the tool returns the updated task (api_update_task
@@ -19897,6 +19939,9 @@ pub(crate) fn sweep_terminal_task_sessions(
     task_id: &str,
     killer: &str,
     owner_grace: Option<crate::terminal_sweep::OwnerGrace>,
+    // The task was closed from its board item (`terminal_via = "item"`):
+    // only ephemeral workspaces' sessions close (lifecycle_guard_v1).
+    via_item: bool,
 ) -> Vec<String> {
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     let targets: Vec<String> = state
@@ -19904,6 +19949,11 @@ pub(crate) fn sweep_terminal_task_sessions(
         .iter()
         .filter(|(uid, s)| {
             s.task_id.as_deref() == Some(task_id)
+                && !crate::lifecycle_guard::is_member_main(s)
+                && (!via_item
+                    || crate::lifecycle_guard::sweepable_after_item_close(
+                        state.workspaces.get(&s.workspace_id),
+                    ))
                 && !owner_grace.is_some_and(|grace| {
                     crate::terminal_sweep::owner_recently_used(&state, uid, s, grace)
                 })
@@ -19940,7 +19990,10 @@ fn sweep_task_sessions(state_arc: &Arc<Mutex<DaemonState>>, task_id: &str, kille
     let targets: Vec<String> = state
         .sessions
         .iter()
-        .filter(|(_, s)| s.task_id.as_deref() == Some(task_id))
+        // A member's main session is only unassigned (lifecycle_guard_v1).
+        .filter(|(_, s)| {
+            s.task_id.as_deref() == Some(task_id) && !crate::lifecycle_guard::is_member_main(s)
+        })
         .map(|(uid, _)| uid.clone())
         .collect();
     let swept_at = now_unix_f64();
@@ -20057,9 +20110,15 @@ fn teardown_subtask_done(
 
     // Phase 1/2 — cleanup BEFORE the API flip. Only branch mode owns a
     // dedicated worktree; inherit shares the parent's, in-place runs in
-    // the main repo (worktree_path == main_repo_path).
+    // the main repo (worktree_path == main_repo_path). A home, stream or
+    // pinned workspace is never removed: finishing work only unassigns
+    // (lifecycle_guard_v1, doc/org-model.md §7.1).
     let mut worktree_removed = false;
-    if p.close_worktree && was_branch_mode {
+    let workspace_kept: Option<&'static str> = cleanup.as_ref().and_then(|(ws_id, _, _)| {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        state.workspaces.get(ws_id).and_then(crate::lifecycle_guard::protected_workspace)
+    });
+    if p.close_worktree && was_branch_mode && workspace_kept.is_none() {
         let (ws_id, wt_opt, mr_opt) = cleanup.ok_or((
             ErrorCode::Conflict,
             format!(
@@ -20118,7 +20177,11 @@ fn teardown_subtask_done(
     api_update_task(&creds, &p.task_id, &json!({ "status": "done" }))
         .map_err(|e| e.to_method_err())?;
 
-    Ok(json!({ "ok": true, "worktree_removed": worktree_removed }))
+    let mut out = json!({ "ok": true, "worktree_removed": worktree_removed });
+    if let Some(kind) = workspace_kept {
+        out["workspace_kept"] = json!(kind);
+    }
+    Ok(out)
 }
 
 pub fn mark_subtask_done(
@@ -29052,6 +29115,41 @@ while True:
                 *reqs,
             );
             drop(reqs);
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// Launch grants (doc/org-model.md §7.4): the owner-role holder of a
+    /// placed item may launch for its task from outside the task tree, even
+    /// taskless. Without the grant the same call is refused.
+    #[test]
+    fn mcp_start_session_admits_a_launch_grant_for_a_taskless_owner() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_mcp_spawn_fixture(&state, "ts-caller", None);
+            // The task's workspace is known here (as after a mint).
+            state.lock().unwrap().task_workspaces.insert("task-9".into(), "ws-1".into());
+            set_spawn_program_override_for_test(Some((
+                "/bin/sleep".to_string(),
+                vec!["120".to_string()],
+            )));
+            let params = json!({ "type": "bash", "label": "assistant", "task_id": "task-9" });
+            let err = mcp_start_session(&state, &params, Some("ts-caller")).unwrap_err();
+            assert_eq!(err.0, ErrorCode::Unauthorized, "{err:?}");
+            state.lock().unwrap().launch_grants.push(crate::items::grants::LaunchGrant {
+                task_id: "task-9".into(),
+                session_uid: "ts-caller".into(),
+                pid: "agent:d1:ts-caller".into(),
+                board: Some("sfd".into()),
+                n: Some(4),
+            });
+            let resp = mcp_start_session(&state, &params, Some("ts-caller")).expect("granted");
+            assert_eq!(resp["task_id"].as_str(), Some("task-9"));
+            // A grant for another session or task admits nothing.
+            state.lock().unwrap().launch_grants[0].session_uid = "ts-someone-else".into();
+            let err = mcp_start_session(&state, &params, Some("ts-caller")).unwrap_err();
+            assert_eq!(err.0, ErrorCode::Unauthorized);
+            set_spawn_program_override_for_test(None);
             kill_all_sessions(&state);
         });
     }
@@ -39403,7 +39501,7 @@ while True:
             });
             state.lock().unwrap().sessions.insert(uid.into(), session);
         }
-        let mut swept = sweep_terminal_task_sessions(&state, "done-task", "test", None);
+        let mut swept = sweep_terminal_task_sessions(&state, "done-task", "test", None, false);
         swept.sort();
         assert_eq!(
             swept,
@@ -39441,7 +39539,13 @@ while True:
         // A different task's worker is untouched even though it is idle.
         state.lock().unwrap().sessions.insert("ts-other".into(), make("ts-other", "task-open"));
 
-        let mut swept = sweep_terminal_task_sessions(&state, "task-done", "terminal-task-sweep", None);
+        // A board-originated close (terminal_via = "item") only unassigns:
+        // nothing is classified ephemeral yet, so nothing closes
+        // (lifecycle_guard_v1, doc/org-model.md §7.1).
+        assert!(sweep_terminal_task_sessions(&state, "task-done", "terminal-task-sweep", None, true).is_empty());
+        assert!(!state.lock().unwrap().sessions["ts-w1"].last_exit.operator_kill_requested());
+
+        let mut swept = sweep_terminal_task_sessions(&state, "task-done", "terminal-task-sweep", None, false);
         swept.sort(); // `sessions` is a HashMap; the sweep's order is not a contract.
         assert_eq!(swept, vec!["ts-w1".to_string(), "ts-w2".to_string()]);
 
@@ -39573,7 +39677,7 @@ while True:
             floor: long_ago,
         };
         let mut swept =
-            sweep_terminal_task_sessions(&state, "task-owner", "terminal-task-sweep", Some(grace));
+            sweep_terminal_task_sessions(&state, "task-owner", "terminal-task-sweep", Some(grace), false);
         swept.sort();
         assert_eq!(swept, ["ts-stale-typed", "ts-untouched"]);
 
@@ -39587,7 +39691,7 @@ while True:
             *sess.last_activity_at.lock().unwrap() = None;
         }
         assert!(
-            sweep_terminal_task_sessions(&state, "task-owner", "terminal-task-sweep", Some(fresh))
+            sweep_terminal_task_sessions(&state, "task-owner", "terminal-task-sweep", Some(fresh), false)
                 .is_empty()
         );
 

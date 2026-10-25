@@ -53,6 +53,19 @@ class ItemToolsTests(unittest.TestCase):
         self.assertEqual(params, {"view": "slim", "mine": False, "include_closed": True,
                                   "archived": False})
 
+    def test_place_unplace_and_roles_route_to_the_daemon(self):
+        method, params = self.call(server.place, "t-1", group="Latent", holder="me")
+        self.assertEqual(method, "item.place")
+        self.assertRegex(params.pop("request_id"), r"^[0-9a-f]{32}$")
+        self.assertEqual(params, {"task_id": "t-1", "group": "Latent", "holder": "me"})
+        method, params = self.call(server.unplace, "t-1", reason="later")
+        self.assertEqual((method, params), ("item.unplace", {"task_id": "t-1", "reason": "later"}))
+        _, params = self.call(server.item_set, 14, owner="rl", add_holder="ep", role="reviewer")
+        self.assertEqual(params, {"n": 14, "owner": "rl", "add_holder": "ep", "role": "reviewer"})
+        for method in ("item.place", "item.unplace", "group.create", "group.set",
+                       "boards.on_boards"):
+            self.assertIn(method, control_client.DAEMON_METHODS)
+
     def test_item_set_reopen_and_expect_status(self):
         _, params = self.call(server.item_set, 14, "blocked", reopen=True, expect_status="done")
         self.assertEqual(params, {"n": 14, "status": "blocked", "reopen": True,

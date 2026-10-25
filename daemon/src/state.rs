@@ -605,6 +605,11 @@ pub struct DaemonState {
     /// (`daemon-sessions.json`) so the creator keeps scope over
     /// its spawned workers across a daemon restart.
     pub agent_task_edges: HashMap<String, String>,
+    /// Launch grants for owner-role holders of placed items
+    /// (doc/org-model.md §7.4): replaced by every board heartbeat reply,
+    /// persisted at `<messaging_root>/launch-grants.json`, checked by the
+    /// spawn authorization path. Never a task-tree edge.
+    pub launch_grants: Vec<crate::items::grants::LaunchGrant>,
     /// `task → parent` edges read from the planning API for tasks the
     /// pushed `task_tree` doesn't carry, for a host no TUI has pushed to
     /// lately (a headless cm-manager). Written only by the background
@@ -867,6 +872,7 @@ impl Default for DaemonState {
             task_workspaces: HashMap::new(),
             task_tree_pushed: false,
             agent_task_edges: HashMap::new(),
+            launch_grants: Vec::new(),
             planning_task_parents: HashMap::new(),
             planning_parent_failures: HashMap::new(),
             mcp_preflight: None,

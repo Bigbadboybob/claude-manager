@@ -34,6 +34,8 @@ class Holder(_Strict):
     name: Short | None = None
     session_uid: Short | None = None
     daemon_id: Short | None = None
+    # owner | contributor | reviewer | approver (doc/org-model.md §7.2)
+    role: Short | None = None
 
 
 class ItemFields(_Strict):
@@ -48,6 +50,11 @@ class ItemFields(_Strict):
     eta: When | None = None
     job: Short | None = None
     links: list[str] | None = None
+    # Org model S3 (doc/org-model.md §7): the group by id (else `group` by
+    # name), a board-native item's description, the owning team.
+    group_id: Short | None = None
+    description: str | None = Field(default=None, max_length=20000)
+    team_id: Short | None = None
     # Gate bindings (doc/gate-receipts.md §8); item_set only.
     head: Short | None = None
     mf: Short | None = None
@@ -107,6 +114,75 @@ class ItemsPatchBody(_Strict):
     reopen: bool = False
     # Compare-and-set: refused (409 status_changed) unless the item's status is this.
     expect_status: Short | None = None
+    # Transfer ownership (one atomic write), and the role for add_holders.
+    owner: Holder | None = None
+    role: Short | None = None
+
+
+class PlaceBody(_Strict):
+    actor: Actor
+    board: Short
+    group: Short | None = None
+    group_id: Short | None = None
+    holder: Holder | None = None
+    role: Short | None = None
+    # Placed on another board: unplace there and place here, one step.
+    replace: bool = False
+
+
+class UnplaceBody(_Strict):
+    actor: Actor
+    reason: Reason | None = None
+
+
+class GroupCreateBody(_Strict):
+    actor: Actor
+    name: Short
+    kind: Short = "heading"
+    parent_group_id: Short | None = None
+    description: str | None = Field(default=None, max_length=20000)
+    goal: str | None = Field(default=None, max_length=20000)
+    ord: Annotated[int, Field(ge=-100000, le=100000)] | None = None
+
+
+class EpicPocBody(_Strict):
+    actor: Actor
+    member: Short
+    team_id: Short | None = None
+    request_id: Short | None = None
+
+
+class EpicStaffBody(_Strict):
+    actor: Actor
+    member: Short
+    as_: Short = Field(alias="as")
+    reason: Reason | None = None
+    request_id: Short | None = None
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+
+class EpicClosePlanBody(_Strict):
+    actor: Actor
+    outcome: Short
+
+
+class EpicCloseApplyBody(_Strict):
+    actor: Actor
+    revision: Annotated[int, Field(ge=0)]
+    choices: dict = Field(default_factory=dict)
+    request_id: Short | None = None
+
+
+class GroupPatchBody(_Strict):
+    actor: Actor
+    expected_revision: Annotated[int, Field(ge=0)] | None = None
+    name: Short | None = None
+    kind: Short | None = None
+    parent_group_id: Short | None = None
+    description: str | None = Field(default=None, max_length=20000)
+    goal: str | None = Field(default=None, max_length=20000)
+    ord: Annotated[int, Field(ge=-100000, le=100000)] | None = None
 
 
 class ItemsTouchBody(_Strict):

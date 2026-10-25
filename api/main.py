@@ -914,11 +914,42 @@ async def update_task(task_id: str, body: TaskUpdate, pool=Depends(get_pool)):
             ),
         )
 
+    # Not columns: who wrote it, and a blocked write's trigger.
+    actor = fields.pop("actor", None) or {"pid": "system:legacy-task-write",
+                                          "name": "legacy task write"}
+    if not actor.get("pid"):
+        raise HTTPException(status_code=400, detail="actor.pid is required")
+    reason = fields.pop("reason", None)
+    blocked_by = fields.pop("blocked_by", None)
     if not fields:
         return task
 
+    # A placed task's status and description go through its item (§7.1).
+    if task.get("placement"):
+        from dispatch import placement
+        from dispatch.items_rules import ItemsError
+        try:
+            if "status" in fields:
+                await placement.translate_task_status(
+                    pool, task, fields.pop("status"), actor, reason=reason,
+                    blocked_by=blocked_by)
+            if "description" in fields and fields["description"] != task.get("description"):
+                await placement.task_description_changed(pool, task, fields.pop("description"),
+                                                         actor)
+        except ItemsError as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail()) from exc
+        if not fields:
+            return await _get_task_or_error(pool, task_id)
+    elif "description" in fields and fields["description"] != task.get("description"):
+        fields["description_rev"] = (task.get("description_rev") or 0) + 1
+
     if "metadata" in fields:
         fields["metadata"] = _keep_lead_pin(task, fields["metadata"])
+        if task.get("placement") and isinstance(fields["metadata"], dict):
+            # The mirror's marks stay while the task is placed.
+            for key in ("terminal_via", "dropped"):
+                if key in (task.get("metadata") or {}):
+                    fields["metadata"].setdefault(key, task["metadata"][key])
 
     # Reparenting inherits the new parent's initiative (and project, if the
     # task has none), mirroring create_task. Without this, moving a standalone

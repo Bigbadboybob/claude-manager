@@ -12,9 +12,15 @@ from datetime import datetime, timedelta, timezone
 
 import asyncpg
 
-from dispatch.items_rules import CLOSED, OWNER_BLOCKED, OWNER_PID, BoardTx, Item, ItemsError, iso
+from dispatch.items_rules import (CLOSED, OWNER_BLOCKED, OWNER_PID, BoardTx, Group, Item,
+                                  ItemsError, iso)
 
 STATE_FRESH_S = 90
+# The task change-feed advisory lock (dispatch/db.py TASK_WRITE_LOCK_SQL; a
+# test keeps the two equal). An item write may write its placed task (the
+# status mirror, doc/org-model.md §7.1), so it takes this lock FIRST, before
+# the board row: the order every task writer uses.
+TASK_WRITE_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext('cm_task_changes'))"
 BOARD_SETTINGS = (
     "idle_s", "stale_s", "unassigned_s", "repush_s", "escalate_s", "digest_s",
     "stale_background_s", "nudge_grace_s",
@@ -157,7 +163,7 @@ async def resolve_board(pool: asyncpg.Pool, *, task_id: str | None = None,
 # ---- loading and applying a write ----------------------------------------
 
 def _item_from_row(row) -> Item:
-    return Item(
+    it = Item(
         id=row["id"], n=row["number"], title=row["title"], status=row["status"],
         note=row["note"], group=row["grp"], blocked_on=row["blocked_on"],
         check_back_at=row["check_back_at"], eta_at=row["eta_at"],
@@ -171,7 +177,20 @@ def _item_from_row(row) -> Item:
         launched_at=row.get("launched_at"),
         flag_pushed=dict(row.get("flag_pushed") or {}),
         gate_head=(row.get("gate_binding") or {}).get("head"),
+        group_id=_str_or_none(row.get("group_id")), team_id=_str_or_none(row.get("team_id")),
+        task_id=_str_or_none(row.get("task_id")), link_archived_at=row.get("link_archived_at"),
+        description=row.get("description"), description_rev=row.get("description_rev") or 0,
     )
+    # A placed item shows its task's title and description: one copy (§7.1).
+    if it.task_id and row.get("task_name") is not None:
+        it.title = row["task_name"]
+        it.description = row.get("task_description")
+        it.description_rev = row.get("task_description_rev") or 0
+    return it
+
+
+def _str_or_none(value):
+    return None if value is None else str(value)
 
 
 async def _load_items(conn, board_id: str, extra_ns=(), *, archived: bool = False) -> dict[int, Item]:
@@ -180,12 +199,16 @@ async def _load_items(conn, board_id: str, extra_ns=(), *, archived: bool = Fals
         """WITH base AS (
                SELECT * FROM items
                 WHERE board_id = $1
-                  AND ($3 OR archived_at IS NULL OR number = ANY($2::int[])))
-           SELECT * FROM base
-           UNION
-           SELECT i.* FROM items i
-             JOIN item_deps d ON d.blocker_id = i.id
-             JOIN base b ON b.id = d.item_id""",
+                  AND ($3 OR archived_at IS NULL OR number = ANY($2::int[]))),
+           rows AS (
+               SELECT * FROM base
+               UNION
+               SELECT i.* FROM items i
+                 JOIN item_deps d ON d.blocker_id = i.id
+                 JOIN base b ON b.id = d.item_id)
+           SELECT r.*, t.name AS task_name, t.description AS task_description,
+                  t.description_rev AS task_description_rev
+             FROM rows r LEFT JOIN tasks t ON t.id = r.task_id""",
         uuid.UUID(board_id), list(extra_ns), archived,
     )
     items = {r["number"]: _item_from_row(r) for r in rows}
@@ -197,10 +220,13 @@ async def _load_items(conn, board_id: str, extra_ns=(), *, archived: bool = Fals
         "SELECT * FROM item_holders WHERE item_id = ANY($1::bigint[]) ORDER BY added_at, pid",
         ids,
     ):
-        by_id[h["item_id"]].holders.append({
+        holder = {
             "pid": h["pid"], "name": h["name"], "session_uid": h["session_uid"],
             "daemon_id": h["daemon_id"], "added_at": h["added_at"],
-        })
+        }
+        if h.get("role") is not None:
+            holder["role"] = h["role"]
+        by_id[h["item_id"]].holders.append(holder)
     for d in await conn.fetch(
         "SELECT item_id, blocker_id FROM item_deps WHERE item_id = ANY($1::bigint[])", ids
     ):
@@ -230,9 +256,33 @@ async def _load_items(conn, board_id: str, extra_ns=(), *, archived: bool = Fals
     return items
 
 
-async def _apply(conn, tx: BoardTx) -> None:
+async def _load_groups(conn, board_id: str) -> dict[str, Group]:
+    rows = await conn.fetch("SELECT * FROM groups WHERE board_id = $1 ORDER BY ord, lower(name)",
+                            uuid.UUID(board_id))
+    return {str(r["id"]): Group(
+        id=str(r["id"]), name=r["name"], kind=r["kind"],
+        parent_id=_str_or_none(r["parent_group_id"]), ord=r["ord"],
+        description=r["description"], goal=r["goal"], epic_status=r["epic_status"],
+        team_id=_str_or_none(r["team_id"]), revision=r["revision"],
+        closed_at=r["closed_at"], closed_by=r["closed_by"]) for r in rows}
+
+
+def _strict(board: dict) -> bool:
+    from dispatch.items_rules import strict
+    return strict(board)
+
+
+async def _apply(conn, tx: BoardTx, *, mirror: bool = False) -> None:
     now = tx.now
     board_id = uuid.UUID(tx.board["id"])
+    for gid in tx.groups_created:
+        g = tx.groups[gid]
+        await conn.execute(
+            """INSERT INTO groups (id, board_id, parent_group_id, name, kind, created_by,
+                                   created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $7)""",
+            uuid.UUID(gid), board_id, uuid.UUID(g.parent_id) if g.parent_id else None,
+            g.name, g.kind, tx.actor["pid"], now)
     if tx.board_changed:
         await conn.execute(
             "UPDATE boards SET next_number = $2, updated_at = $3 WHERE id = $1",
@@ -254,23 +304,28 @@ async def _apply(conn, tx: BoardTx) -> None:
                       waiting_set_at = $9, links = $10, touched_at = $11,
                       clock_reset_at = $12, closed_at = $13, archived_at = $14,
                       updated_at = $15, stale_nudged_at = $16, flag_pushed = flag_pushed || $17::jsonb,
-                      job = $18, actionable_at = $19, launched_at = $20, closed_by = $21
+                      job = $18, actionable_at = $19, launched_at = $20, closed_by = $21,
+                      group_id = $22, team_id = $23, task_id = $24, link_archived_at = $25,
+                      description = CASE WHEN $24::uuid IS NULL THEN $26 ELSE description END,
+                      description_rev = CASE WHEN $24::uuid IS NULL THEN $27 ELSE description_rev END
                 WHERE id = $1""",
             it.id, it.title, it.status, it.note, it.group, it.blocked_on,
             it.check_back_at, it.eta_at, it.waiting_set_at, list(it.links),
             it.touched_at, it.clock_reset_at, it.closed_at, it.archived_at, now,
             it.stale_nudged_at, dict(it.flag_pushed), it.job, it.actionable_at, it.launched_at,
-            it.closed_by,
+            it.closed_by, _uuid_or_none(it.group_id), _uuid_or_none(it.team_id),
+            _uuid_or_none(it.task_id), it.link_archived_at, it.description, it.description_rev,
         )
     for n in sorted(tx.holders_changed):
         it = tx.items[n]
         await conn.execute("DELETE FROM item_holders WHERE item_id = $1", it.id)
         for h in it.holders:
             await conn.execute(
-                """INSERT INTO item_holders (item_id, pid, session_uid, daemon_id, name, added_at)
-                   VALUES ($1, $2, $3, $4, $5, $6)""",
+                """INSERT INTO item_holders (item_id, pid, session_uid, daemon_id, name, added_at,
+                                             role)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)""",
                 it.id, h["pid"], h.get("session_uid"), h.get("daemon_id"), h.get("name"),
-                h.get("added_at") or now,
+                h.get("added_at") or now, h.get("role"),
             )
     for n in sorted(tx.deps_changed):
         it = tx.items[n]
@@ -318,19 +373,24 @@ async def _apply(conn, tx: BoardTx) -> None:
             board_id, p["daemon_id"], p["session_uid"], p["pid"], p["kind"], p["text"],
             p["dedupe"], now,
         )
+    if mirror:
+        from dispatch import placement
+        await placement.apply_task_side(conn, tx)
 
 
 async def _write(pool: asyncpg.Pool, ref: str, actor: dict, extra_ns, run, after=None):
     now = utcnow()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await conn.execute(TASK_WRITE_LOCK_SQL)
             board = await _board_by_ref(conn, ref, lock=True)
             items = await _load_items(conn, board["id"], extra_ns)
-            tx = BoardTx(board, items, actor, now)
+            groups = await _load_groups(conn, board["id"])
+            tx = BoardTx(board, items, actor, now, groups)
             result = run(tx)
             if after is not None:
                 await after(conn, tx)
-            await _apply(conn, tx)
+            await _apply(conn, tx, mirror=True)
             if tx.owner_transitions:
                 await _push_owner_transitions(conn, board, tx, now)
             return tx, result
@@ -385,12 +445,20 @@ async def _push_owner_transitions(conn, board: dict, tx: BoardTx, now: datetime)
 
 
 def _write_reply(tx: BoardTx, ns) -> dict:
-    return {
+    out = {
         "board": {"id": tx.board["id"], "slug": tx.board["slug"]},
         "items": [tx.items[n].public() for n in ns],
         "unblocked": sorted(set(tx.unblocked)),
         "warnings": tx.warnings,
     }
+    # possible_duplicate (doc/org-model.md §7.4): similar open items, for a
+    # new item; a hint only.
+    from dispatch.items_rules import duplicate_hints
+    hints = {n: duplicate_hints(tx.items[n], tx.items.values()) for n in tx.created if n in ns}
+    hints = {n: h for n, h in hints.items() if h}
+    if hints:
+        out["possible_duplicate"] = {str(n): h for n, h in hints.items()}
+    return out
 
 
 async def create_items(pool, ref: str, actor: dict, specs: list[dict], *,
@@ -403,6 +471,7 @@ async def create_items(pool, ref: str, actor: dict, specs: list[dict], *,
     now = utcnow()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await conn.execute(TASK_WRITE_LOCK_SQL)
             board = await _board_by_ref(conn, ref, lock=True)
             prior = await conn.fetchval(
                 "SELECT numbers FROM item_requests WHERE board_id = $1 AND request_id = $2",
@@ -415,9 +484,9 @@ async def create_items(pool, ref: str, actor: dict, specs: list[dict], *,
                 reply["replayed"] = True
                 return reply
             items = await _load_items(conn, board["id"])
-            tx = BoardTx(board, items, actor, now)
+            tx = BoardTx(board, items, actor, now, await _load_groups(conn, board["id"]))
             ns = tx.create(specs)
-            await _apply(conn, tx)
+            await _apply(conn, tx, mirror=True)
             await conn.execute(
                 """INSERT INTO item_requests (board_id, request_id, actor_pid, numbers, created_at)
                    VALUES ($1, $2, $3, $4, $5)""",
@@ -428,20 +497,21 @@ async def create_items(pool, ref: str, actor: dict, specs: list[dict], *,
 
 async def update_items(pool, ref: str, actor: dict, ns: list[int], fields: dict, *,
                        add_holders=None, remove_holders=None, reason=None,
-                       reopen: bool = False, expect_status: str | None = None) -> dict:
+                       reopen: bool = False, expect_status: str | None = None,
+                       owner: dict | None = None, role: str | None = None) -> dict:
     from dispatch import gate_db  # gate bindings (doc/gate-receipts.md §8)
 
     fields, gate = gate_db.split_binding(dict(fields))
     only_gate = gate and not fields and not add_holders and not remove_holders
 
     def run(tx):
-        if only_gate and expect_status is None:
+        if only_gate and expect_status is None and owner is None:
             for n in ns:
                 tx.item(n)
             return list(ns)
         return tx.update(ns, fields, add_holders=add_holders,
                          remove_holders=remove_holders, reason=reason, reopen=reopen,
-                         expect_status=expect_status)
+                         expect_status=expect_status, owner=owner, role=role)
 
     async def after(conn, tx):
         if gate:
@@ -458,7 +528,8 @@ DB_LOST = (asyncpg.exceptions.ConnectionDoesNotExistError, asyncpg.exceptions.In
 
 async def update_items_each(pool, ref: str, actor: dict, ns: list[int], fields: dict, *,
                             add_holders=None, remove_holders=None, reason=None,
-                            reopen: bool = False, expect_status: str | None = None) -> dict:
+                            reopen: bool = False, expect_status: str | None = None,
+                            owner: dict | None = None, role: str | None = None) -> dict:
     """Bulk edit with per-item results (Board-Steward's ask): each item is
     its own write, so one refused item never blocks the rest. Any failure is
     that item's result; if the database goes away mid-way, the items already
@@ -471,7 +542,8 @@ async def update_items_each(pool, ref: str, actor: dict, ns: list[int], fields: 
         try:
             reply = await update_items(pool, ref, actor, [n], dict(fields),
                                        add_holders=add_holders, remove_holders=remove_holders,
-                                       reason=reason, reopen=reopen, expect_status=expect_status)
+                                       reason=reason, reopen=reopen, expect_status=expect_status,
+                                       owner=owner, role=role)
         except ItemsError as exc:
             results.append({"n": n, "ok": False, "error": exc.detail()})
             continue
@@ -944,6 +1016,8 @@ async def read_board(pool, ref: str, *, since_version: int | None = None,
             "items": live,
             "recently_closed": closed,
         }
+        from dispatch import placement
+        out["groups"] = await placement.group_rows(conn, board)
         orch_pid = (header.get("orchestrator") or {}).get("pid")
         free, untracked = await _free_capacity(
             conn, board, now, [orch_pid, board.get("steward_pid")])
@@ -1144,9 +1218,16 @@ async def heartbeat(pool, daemon_id: str, *, host_label: str | None, sessions: l
                           (SELECT slug FROM boards b WHERE b.id = p.board_id) AS board""",
                 daemon_id, MAX_PUSHES_PER_BEAT,
             )
+            # Capabilities are org S2's (org_db.heartbeat_extras ->
+            # org_daemons); the status mirror's gate reads them there.
+            from dispatch import placement
+            grants = await placement.daemon_launch_grants(conn, daemon_id)
     out = {
         "pushes": sorted((_str_ids(dict(r)) for r in rows), key=lambda r: r["id"]),
         "server_time": iso(now),
+        # The owner-role launch grants this daemon enforces (§7.4); the full
+        # live set every beat, so a revoke is a row that disappears.
+        "launch_grants": grants,
     }
     if dropped:
         out["dropped_sessions"] = dropped

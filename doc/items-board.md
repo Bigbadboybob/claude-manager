@@ -492,3 +492,98 @@ item_resolve(n: int, action: "nudge"|"reassign"|"launch"|"block"|"drop"|"answer"
   seconds.
 - If the planning API is unreachable, item tools fail fast with
   `planning_api_unavailable`; there is no local queue.
+
+## 8. Groups, epics, placement and roles (org model S3)
+
+Design: [org-model.md](org-model.md) §7. Migrations `sql/029` (DDL) and
+`029b` (one-time: `items.grp` → heading groups; holder roles).
+
+**Groups.** `groups` rows per board: `kind` `heading` (a topic label, as
+`items.grp` was) or `epic` (goal, `epic_status` active|done|cancelled, a team
+from org S2 whose lead is the PoC; `poc_member_id` is derived, never stored).
+Both nest; a name is unique among siblings; cycles are `409 cycle`.
+`item_set(group="X")` finds the group by name (unique match, else the
+top-level one; several → `422 ambiguous_group`) or creates a top-level
+heading; `group_id` picks one by id. `items.grp` keeps the name for old
+readers. A closed epic takes no new items (`409 epic_closed`). Creating or
+promoting an epic, setting its PoC and closing it are Owner's or the board
+lead's (its orchestrator's) acts; headings are anyone's.
+
+**Placement.** `POST /tasks/{id}/place {actor, board, group?, group_id?,
+holder?, role?, replace?}` links a planning task to a new item (`items.task_id`;
+one live link per task). The task owns title, description and metadata
+(board edits write the task); the item owns status, holders, group and flags.
+Refused (`409 not_placeable`): backtests, continuous tasks, auto-dispatchable
+cloud tasks; also a task with no description (`422 description_required`), a
+done or archived task (`409 task_closed`), and a task placed on another board
+(`409 placed_elsewhere` unless `replace`). Placing a draft accepts it.
+Re-placing on the same board reactivates the archived link (same number).
+`POST /tasks/{id}/unplace {actor, reason?}` archives the link (the item stays,
+read-only: writes are `409 link_archived`) and returns the task to `backlog`;
+refused while live `blocked_by` edges touch the item (`409 has_dependencies`).
+Task rows carry `placement: {board, board_id, n, status, group_id, group,
+item_id, mirror?, mirror_waiting_on?}` (null when not placed), written in the
+same transaction, so the task change feed carries it.
+
+**Status mirror.** open → backlog; active, waiting → running; blocked,
+blocked_on_owner → blocked; done → done; dropped → done with
+`metadata.dropped`. A board close stamps `metadata.terminal_via = "item"`,
+which the daemon's lifecycle guard reads (the terminal sweep only unassigns).
+Mirroring for a task is on only while every daemon holding its live sessions
+advertises `lifecycle_guard_v1` in its heartbeat `capabilities`; otherwise
+`placement.mirror = "off"` and the task status is left alone.
+`CM_ORG_MIRROR=0` turns it off (links kept). Item writes take the task-change
+advisory lock first, then the board and task rows.
+
+**Legacy task writes** to a placed task (`PATCH /tasks/{id}`,
+`set_subtask_status`, `update_task`; optional `actor`, `reason`,
+`blocked_by`): the status it already mirrors is ignored; `done` closes the
+item; `blocked` with a reason or blockers blocks the item on them (reason →
+`blocked_on` with a 24 h check-back); `blocked` alone gets
+`blocked_on = "legacy status write: no reason given"`, a 24 h check-back and a
+`legacy_blocked` flag pushed to the holders; `backlog` unplaces; `running`
+activates (an unheld item's new owner is the writing session, e.g. the one a
+spawn just started); anything else is `409 placed_on_board`. A description
+PATCH goes through the item: `description_rev` moves and the holders get a
+`description_changed` push.
+
+**Roles.** `item_holders.role`: `owner`, `contributor`, `reviewer`,
+`approver`, or the migrated `holder` (co-owner). An active, waiting or blocked
+item that is held has exactly one owner (`422 owner_required` /
+`one_owner`); items with migrated co-owners are exempt until one is named
+(`pick_owner` flag for the steward). New holders: the first is owner, later
+ones contribute; `add_holders` takes `role`; `owner` transfers ownership in
+one write (the previous owner and any co-owners become contributors); when the
+owner leaves with one holder left, that holder becomes owner. Hand-back is
+unchanged (strict boards keep the item active and unheld).
+
+**Launch grants.** The owner of a placed item holds a `launch_grants` row for
+its task (moved when the owner changes, revoked on close or unplace). Each
+heartbeat reply carries the daemon's full live set (`launch_grants`); the
+daemon persists it and admits `start_session(task_id=…)` /
+`item_resolve(launch)` for that task from the grant holder even where the
+task-tree scope would refuse (taskless included), logging each use. Launch
+only; no control of the task's other sessions.
+
+**possible_duplicate.** Create and place replies carry hints for open items on
+the board sharing two significant title words (≥40% of them) or a linked
+path.
+
+**Epics** (`dispatch/epics.py`, needs org S2 for teams; else `409
+org_core_missing`):
+
+| Call | Effect |
+|---|---|
+| `POST /boards/{ref}/epics/{gid}/poc {actor, member, team_id?}` | the epic is run by `member`'s team: `team_id` (one it leads), the epic's team if it leads it, else a new `kind='team'` team (parent: the enclosing epic's team, else the board's). Returns `staffing` offers for the current holders (`primary` = a move under the PoC, `guest` = keeps its manager) |
+| `POST /boards/{ref}/epics/{gid}/staff {actor, member, as}` | accept an offer: a guest membership, or org's `move` (manager chain or Owner) |
+| `POST /boards/{ref}/epics/{gid}/close-plan {actor, outcome}` | build and persist the close plan: `{plan_id, revision, items[{n, title, choice_options[move,unplace,drop]}], move_targets, team{options, default}, members[{member_id, role, options, default, needs}], workspaces[]}`. Refused with active sub-epics; a rebuild bumps the revision; a plan being applied is resumed, never replaced |
+| `POST /boards/{ref}/close-plans/{id}/apply {actor, revision, choices}` | validates every item choice, then applies step by step (recorded, so a retry resumes); choices the closer cannot authorize (team standby/archive without Owner, member move/retire) return as `pending` with `who_must_decide`; ends guest memberships; after a final nothing-left-open check under the board lock the epic closes with a `close_record` |
+
+Read-only: `GET /items/on-boards` → `{epics[], items[]}` (open epics and open
+board-native items, across boards).
+
+Daemon RPCs (all daemon-only, actor stamped): `item.place`, `item.unplace`,
+`group.create`, `group.set`, `epic.set_poc`, `epic.staff`, `epic.close_plan`,
+`epic.close_apply`, `boards.on_boards` (read-only). MCP tools: `place`,
+`unplace`, `epic(action=create|promote|set_poc|staff|close)`, and on
+`item`/`item_set`: `group_id`, `description`, `owner`, `role`, `team_id`.

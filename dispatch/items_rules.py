@@ -8,6 +8,7 @@ recorded.  Keeping the rules here lets them be tested without Postgres.
 from __future__ import annotations
 
 import re
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -30,6 +31,14 @@ MAX_NOTE = 500
 MAX_GROUP = 80
 MAX_BLOCKED_ON = 200
 MAX_JOB = 200
+MAX_DESCRIPTION = 20000
+# Holder roles (doc/org-model.md §7.2). `holder` is the legacy co-owner role
+# multi-holder items migrated with; the single-owner rule skips such items.
+ROLES = ("owner", "contributor", "reviewer", "approver", "holder")
+# While an item is one of these and held, exactly one holder is its owner.
+OWNED_STATUSES = frozenset({"active", "waiting", "blocked"})
+GROUP_KINDS = ("heading", "epic")
+EPIC_CLOSED = frozenset({"done", "cancelled"})
 MAX_LINKS = 20
 MAX_LINK = 500
 MAX_ITEMS_PER_CALL = 50
@@ -144,6 +153,12 @@ class Item:
     eta_at: datetime | None = None
     waiting_set_at: datetime | None = None
     job: str | None = None                            # the job in flight (active only)
+    group_id: str | None = None                       # its heading or epic (groups.id)
+    team_id: str | None = None                        # the owning team (org S2)
+    task_id: str | None = None                        # the planning task it was placed from
+    link_archived_at: datetime | None = None          # unplaced: read-only from then on
+    description: str | None = None                    # the task's, for a placed item
+    description_rev: int = 0
     actionable_at: datetime | None = None             # unlaunched clock start
     launched_at: datetime | None = None               # a holder's own last write / #N post
     links: list = field(default_factory=list)
@@ -173,8 +188,10 @@ class Item:
             "check_back_at": iso(self.check_back_at),
             "eta_at": iso(self.eta_at),
             "job": self.job,
+            "group_id": self.group_id,
             "links": list(self.links),
             "holders": [h["pid"] for h in self.holders],
+            "owner": next((h["pid"] for h in self.holders if h.get("role") == "owner"), None),
         }
 
     def public(self) -> dict:
@@ -183,9 +200,15 @@ class Item:
             "title": self.title,
             "status": self.status,
             "holders": [
-                {k: h.get(k) for k in ("pid", "name", "session_uid", "daemon_id")}
+                {k: h.get(k) for k in ("pid", "name", "session_uid", "daemon_id", "role")}
                 for h in self.holders
             ],
+            "group_id": self.group_id,
+            "team_id": self.team_id,
+            "task_id": self.task_id,
+            "link_archived_at": iso(self.link_archived_at),
+            "description": self.description,
+            "description_rev": self.description_rev,
             "note": self.note,
             "group": self.group,
             "blocked_by": sorted(self.blocked_by),
@@ -206,6 +229,73 @@ class Item:
             "created_at": iso(self.created_at),
             "flags": sorted(self.open_flags),
         }
+
+
+@dataclass
+class Group:
+    """A board group (doc/org-model.md §7.3): a topic heading, or an epic with
+    a goal, a status and (from org S2) a team whose lead is its PoC."""
+    id: str
+    name: str
+    kind: str = "heading"
+    parent_id: str | None = None
+    ord: int = 0
+    description: str | None = None
+    goal: str | None = None
+    epic_status: str | None = None
+    team_id: str | None = None
+    revision: int = 0
+    closed_at: datetime | None = None
+    closed_by: str | None = None
+
+    @property
+    def closed(self) -> bool:
+        return self.kind == "epic" and self.epic_status in EPIC_CLOSED
+
+    def public(self, poc_member_id: str | None = None) -> dict:
+        return {
+            "id": self.id, "name": self.name, "kind": self.kind,
+            "parent_group_id": self.parent_id, "ord": self.ord,
+            "description": self.description, "goal": self.goal,
+            "epic_status": self.epic_status, "team_id": self.team_id,
+            "poc_member_id": poc_member_id, "revision": self.revision,
+            "closed_at": iso(self.closed_at), "closed_by": self.closed_by,
+        }
+
+
+_TOKEN = re.compile(r"[a-z0-9][a-z0-9_-]{3,}")
+_STOP = frozenset({
+    "with", "from", "that", "this", "into", "onto", "when", "then", "than", "them",
+    "make", "makes", "should", "would", "could", "about", "after", "before", "over",
+    "under", "more", "less", "also", "only", "just", "item", "task", "work", "done",
+})
+
+
+def title_tokens(title: str | None) -> set[str]:
+    return {t for t in _TOKEN.findall((title or "").lower()) if t not in _STOP}
+
+
+def duplicate_hints(it: "Item", others) -> list[dict]:
+    """`possible_duplicate` (doc/org-model.md §7.4): open items whose titles
+    share at least two significant words and 40% of them, or that link the
+    same path. A hint only; nothing is refused."""
+    mine = title_tokens(it.title)
+    paths = {link for link in it.links if "/" in link}
+    out = []
+    for o in others:
+        if o.n == it.n or o.status in CLOSED or o.archived_at is not None or o.link_archived_at:
+            continue
+        theirs = title_tokens(o.title)
+        shared = mine & theirs
+        why = []
+        if len(shared) >= 2 and len(shared) / max(1, len(mine | theirs)) >= 0.4:
+            why.append("title: " + ", ".join(sorted(shared)))
+        same = paths & {link for link in o.links if "/" in link}
+        if same:
+            why.append("links: " + ", ".join(sorted(same)[:3]))
+        if why:
+            out.append({"n": o.n, "title": o.title, "status": o.status, "why": "; ".join(why)})
+    return out[:5]
 
 
 def _text(value, limit: int, name: str, *, required: bool = False) -> str | None:
@@ -243,12 +333,20 @@ def _links(value) -> list:
 def _holder(value) -> dict:
     if not isinstance(value, dict) or not isinstance(value.get("pid"), str) or not value["pid"]:
         raise invalid("invalid_field", "each holder needs a pid", field="holders")
-    return {
+    role = value.get("role")
+    if role is not None and role not in ROLES:
+        raise invalid("invalid_field", f"role must be one of {', '.join(ROLES)}", field="role")
+    out = {
         "pid": value["pid"],
         "name": value.get("name"),
         "session_uid": value.get("session_uid"),
         "daemon_id": value.get("daemon_id"),
     }
+    if role is not None:
+        out["role"] = role
+    if value.get("added_at") is not None:
+        out["added_at"] = value["added_at"]
+    return out
 
 
 def _dedupe_holders(holders) -> list:
@@ -261,11 +359,21 @@ def _dedupe_holders(holders) -> list:
 class BoardTx:
     """One locked board's write transaction, recorded for `items_db` to apply."""
 
-    def __init__(self, board: dict, items: dict[int, Item], actor: dict, now: datetime):
+    def __init__(self, board: dict, items: dict[int, Item], actor: dict, now: datetime,
+                 groups: dict[str, Group] | None = None):
         if not actor or not actor.get("pid"):
             raise invalid("invalid_field", "actor.pid is required", field="actor")
         self.board = board
         self.items = items
+        self.groups: dict[str, Group] = groups if groups is not None else {}
+        # Heading groups created by this transaction (item_set(group="new")).
+        self.groups_created: list[str] = []
+        # Placed items: task fields to write in the same transaction (the
+        # task owns title and description, doc/org-model.md §7.1).
+        self.task_writes: dict[int, dict] = {}
+        # (n, previous owner pid | None, new owner holder | None): the
+        # launch grants to move (§7.4).
+        self.owner_changes: list[tuple[int, str | None, dict | None]] = []
         self.actor = actor
         self.now = now
         self.created: list[int] = []
@@ -379,6 +487,83 @@ class BoardTx:
                 return [frm, *rest]
         return None
 
+    # ---- roles ---------------------------------------------------------
+    @staticmethod
+    def _assign_roles(holders: list[dict], prev_pids: set, *, replaced: bool) -> list[dict]:
+        """Give each new holder a role: the first becomes owner when there is
+        none, the rest contributors. Holders that predate roles (migrated
+        co-owners) keep theirs."""
+        out = [dict(h) for h in holders]
+        has_owner = any(h.get("role") == "owner" for h in out)
+        for h in out:
+            if h.get("role") is not None or (h["pid"] in prev_pids and not replaced):
+                continue
+            h["role"] = "contributor" if has_owner else "owner"
+            has_owner = True
+        return out
+
+    def _check_owner(self, it: Item, status: str, holders: list[dict]):
+        """Exactly one owner while active, waiting or blocked and held (§7.2).
+        Items still carrying migrated co-owners are exempt until one is named."""
+        if status not in OWNED_STATUSES or not holders:
+            return
+        if any(h.get("role") in (None, "holder") for h in holders):
+            return
+        owners = [h["pid"] for h in holders if h.get("role") == "owner"]
+        if not owners:
+            raise invalid("owner_required",
+                          f"#{it.n} needs an owner while it is {status}: name one with "
+                          f"item_set({it.n}, owner=...), or hand it back (holder=\"none\")",
+                          field="owner")
+        if len(owners) > 1:
+            raise invalid("one_owner",
+                          f"#{it.n} can have one owner; transfer it with item_set({it.n}, owner=...)",
+                          field="owner", owners=owners)
+
+    def _notify_description(self, it: Item):
+        who = self.actor.get("name") or self.actor["pid"]
+        for h in it.holders:
+            if h["pid"] == self.actor["pid"]:
+                continue
+            self._push(it, h, "description_changed",
+                       f"{self._prefix()} the description of #{it.n} \"{it.title}\" was changed "
+                       f"by {who} (revision {it.description_rev}). Re-read it before you go on: "
+                       f"board(view=\"full\", query=\"{it.title[:40]}\").")
+
+    # ---- groups --------------------------------------------------------
+    def resolve_group(self, *, name: str | None = None, group_id: str | None = None,
+                      create: bool = True) -> Group | None:
+        """The group an item write names: by id, or by name (a unique match
+        anywhere on the board, else the top-level one), creating a top-level
+        heading for a new name, as free-text groups always worked."""
+        if group_id:
+            g = self.groups.get(str(group_id))
+            if g is None:
+                raise invalid("invalid_group", f"no group {group_id} on board {self.board['slug']}",
+                              field="group_id")
+            return g
+        name = _text(name, MAX_GROUP, "group")
+        if not name:
+            return None
+        matches = [g for g in self.groups.values() if g.name.lower() == name.lower()]
+        if len(matches) == 1:
+            return matches[0]
+        top = [g for g in matches if g.parent_id is None]
+        if top:
+            return top[0]
+        if matches:
+            raise invalid("ambiguous_group",
+                          f"{len(matches)} groups on board {self.board['slug']} are named "
+                          f"{name!r}: pass group_id", field="group",
+                          candidates=[{"id": g.id, "parent_group_id": g.parent_id} for g in matches])
+        if not create:
+            raise invalid("invalid_group", f"no group {name!r} on board {self.board['slug']}",
+                          field="group")
+        g = Group(id=str(uuid.uuid4()), name=name)
+        self.groups[g.id] = g
+        self.groups_created.append(g.id)
+        return g
+
     # ---- strict boards -------------------------------------------------
     def _launch_min(self) -> int:
         return max(1, int((self.board.get("launch_s") or 900) // 60))
@@ -447,7 +632,8 @@ class BoardTx:
 
     def update(self, ns: list[int], fields: dict, *, add_holders=None,
                remove_holders=None, reason: str | None = None, reopen: bool = False,
-               expect_status: str | None = None) -> list[int]:
+               expect_status: str | None = None, owner=None,
+               role: str | None = None) -> list[int]:
         if not ns:
             raise invalid("invalid_field", "ns must not be empty", field="ns")
         if len(ns) > MAX_ITEMS_PER_CALL:
@@ -458,7 +644,11 @@ class BoardTx:
         replace = None
         if "holders" in fields:
             replace = [_holder(h) for h in (fields.pop("holders") or [])]
-        adds = [_holder(h) for h in (add_holders or [])]
+        if role is not None and role not in ROLES:
+            raise invalid("invalid_field", f"role must be one of {', '.join(ROLES)}", field="role")
+        adds = [_holder({**h, "role": h.get("role") or role} if isinstance(h, dict) else h)
+                for h in (add_holders or [])]
+        owner_h = _holder(owner) if owner is not None else None
         removes = [h if isinstance(h, str) else _holder(h)["pid"] for h in (remove_holders or [])]
         if expect_status is not None and expect_status not in STATUSES:
             raise invalid("invalid_status",
@@ -475,24 +665,32 @@ class BoardTx:
                                  f"(board(query=...)) before writing", n=n,
                                  current_status=it.status, expected=expect_status)
             self.apply(n, fields, holders=replace, add=adds, remove=removes, reason=reason,
-                       reopen=reopen)
+                       reopen=reopen, owner=owner_h)
             out.append(n)
         return out
 
     def apply(self, n: int, fields: dict, *, holders=None, add=(), remove=(),
-              reason=None, creating=False, answered=False, reopen=False):
+              reason=None, creating=False, answered=False, reopen=False, owner=None):
         """Apply one item's field changes and every rule that follows from them."""
         it = self.item(n)
         unknown = set(fields) - {
-            "status", "title", "note", "group", "blocked_by", "blocked_on",
-            "check_back", "eta", "job", "links",
+            "status", "title", "note", "group", "group_id", "blocked_by", "blocked_on",
+            "check_back", "eta", "job", "links", "description", "team_id",
         }
         if unknown:
             raise invalid("invalid_field", f"unknown fields: {sorted(unknown)}",
                           field=sorted(unknown)[0])
+        # An unplaced task's item is history: its number still resolves, but
+        # writing through it could revive a stale assignment (§7.1).
+        if it.link_archived_at is not None and not creating:
+            raise ItemsError(409, "link_archived",
+                             f"#{n} was unplaced at {iso(it.link_archived_at)} and is read-only. "
+                             f"To work on the task again, place it: place(task=\"{it.task_id}\", "
+                             f"board=\"{self.board['slug']}\")", n=n, task_id=it.task_id)
         prev = None if creating else it.snapshot()
         prev_status = None if creating else it.status
         prev_pids = [] if creating else [h["pid"] for h in it.holders]
+        prev_owner = next((h["pid"] for h in it.holders if h.get("role") == "owner"), None)
         strict_board = strict(self.board)
 
         explicit = fields.get("status")
@@ -501,10 +699,31 @@ class BoardTx:
                           f"status must be one of {', '.join(STATUSES)}", field="status")
         if "title" in fields:
             it.title = _text(fields["title"], MAX_TITLE, "title", required=True)
+            if it.task_id and not creating:
+                # The task owns it: one copy, so get_task and deliveries agree.
+                self.task_writes.setdefault(n, {})["name"] = it.title
+        if "description" in fields:
+            text = _text(fields["description"], MAX_DESCRIPTION, "description")
+            if text != it.description:
+                it.description = text
+                it.description_rev += 1
+                if it.task_id:
+                    self.task_writes.setdefault(n, {})["description"] = text
+                if not creating:
+                    self._notify_description(it)
         if "note" in fields:
             it.note = _text(fields["note"], MAX_NOTE, "note")
-        if "group" in fields:
-            it.group = _text(fields["group"], MAX_GROUP, "group")
+        if "group" in fields or "group_id" in fields:
+            g = (self.resolve_group(group_id=fields["group_id"]) if fields.get("group_id")
+                 else self.resolve_group(name=fields.get("group")))
+            if g is not None and g.id != it.group_id and g.closed:
+                raise ItemsError(409, "epic_closed",
+                                 f"epic {g.name!r} is {g.epic_status}; put #{n} in an open group",
+                                 group_id=g.id)
+            it.group_id = g.id if g else None
+            it.group = g.name if g else None
+        if "team_id" in fields:
+            it.team_id = _text(fields["team_id"], 64, "team_id")
         if "links" in fields:
             it.links = _links(fields["links"])
         if "blocked_on" in fields:
@@ -528,11 +747,32 @@ class BoardTx:
             it.waiting_set_at = self.now if eta_given else None
 
         # Holders.
-        new_holders = list(it.holders) if holders is None else holders
+        # Copies: roles are adjusted below and compared with the old list.
+        new_holders = [dict(h) for h in (it.holders if holders is None else holders)]
         for h in add:
-            new_holders.append(h)
+            new_holders.append(dict(h))
         new_holders = [h for h in _dedupe_holders(new_holders) if h["pid"] not in set(remove)]
-        holders_changed = creating or [h["pid"] for h in new_holders] != prev_pids
+        if owner is not None:
+            # Transferring ownership is one atomic write (§7.2): the named
+            # holder becomes owner (added if new), any other owner contributes.
+            new_holders = [h for h in new_holders if h["pid"] != owner["pid"]]
+            for h in new_holders:
+                # Naming the owner also settles a migrated item's co-owners.
+                if h.get("role") in ("owner", "holder", None):
+                    h["role"] = "contributor"
+            existing = next((h for h in it.holders if h["pid"] == owner["pid"]), None)
+            new_holders.insert(0, {**(existing or owner), "role": "owner"})
+        new_holders = self._assign_roles(new_holders, set(prev_pids), replaced=holders is not None)
+        # The owner left and one holder remains: the successor is not in
+        # doubt (today's add-then-remove hand-off keeps working). With
+        # several left, _check_owner asks for an explicit owner.
+        if (prev_owner and len(new_holders) == 1
+                and not any(h.get("role") == "owner" for h in new_holders)
+                and new_holders[0].get("role") not in (None, "holder")):
+            new_holders[0]["role"] = "owner"
+        holders_changed = (creating or [h["pid"] for h in new_holders] != prev_pids
+                           or [h.get("role") for h in new_holders]
+                           != [h.get("role") for h in it.holders])
         if holders_changed:
             it.holders = new_holders
             self.holders_changed.add(n)
@@ -702,7 +942,17 @@ class BoardTx:
         if self.actor["pid"] in [h["pid"] for h in it.holders]:
             it.launched_at = self.now
 
+        self._check_owner(it, status, new_holders if holders_changed else it.holders)
         it.status = status
+        owner_now = next((h for h in it.holders if h.get("role") == "owner"), None)
+        if status in CLOSED and prev_owner and status != prev_status:
+            # Closing unassigns: no launch grant outlives the work.
+            self.owner_changes.append((n, prev_owner, None))
+        elif (owner_now or {}).get("pid") != prev_owner and status not in CLOSED:
+            self.owner_changes.append((n, prev_owner, owner_now))
+        if (owner_now and "pick_owner" in it.open_flags
+                and not any(h.get("role") in (None, "holder") for h in it.holders)):
+            self.resolve_flag(it, "pick_owner", "cleared")
         if strict_board:
             reason_ = strict_violation(it, self.board, self.now)
             if reason_:

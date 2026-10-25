@@ -681,6 +681,58 @@
     "queue"
    ]
   },
+  "epic": {
+   "params": {
+    "action": {
+     "type": "string"
+    },
+    "board": {
+     "type": "string"
+    },
+    "choices": {
+     "type": "object"
+    },
+    "goal": {
+     "type": "string"
+    },
+    "group_id": {
+     "type": "string"
+    },
+    "member": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "outcome": {
+     "type": "string"
+    },
+    "parent_group_id": {
+     "type": "string"
+    },
+    "plan_id": {
+     "type": "integer"
+    },
+    "reason": {
+     "type": "string"
+    },
+    "request_id": {
+     "type": "string"
+    },
+    "revision": {
+     "type": "integer"
+    },
+    "staff_as": {
+     "type": "string"
+    },
+    "team_id": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "action"
+   ]
+  },
   "fork_session": {
    "params": {
     "base": {
@@ -969,10 +1021,16 @@
     "board": {
      "type": "string"
     },
+    "description": {
+     "type": "string"
+    },
     "eta": {
      "type": "string"
     },
     "group": {
+     "type": "string"
+    },
+    "group_id": {
      "type": "string"
     },
     "holder": {
@@ -1117,6 +1175,9 @@
     "check_back": {
      "type": "string"
     },
+    "description": {
+     "type": "string"
+    },
     "each": {
      "type": "boolean"
     },
@@ -1130,6 +1191,9 @@
      "type": "string"
     },
     "group": {
+     "type": "string"
+    },
+    "group_id": {
      "type": "string"
     },
     "head": {
@@ -1176,6 +1240,9 @@
     "note": {
      "type": "string"
     },
+    "owner": {
+     "type": "string"
+    },
     "reason": {
      "type": "string"
     },
@@ -1195,10 +1262,16 @@
     "reopen": {
      "type": "boolean"
     },
+    "role": {
+     "type": "string"
+    },
     "ruling": {
      "type": "string"
     },
     "status": {
+     "type": "string"
+    },
+    "team_id": {
      "type": "string"
     },
     "title": {
@@ -1391,6 +1464,37 @@
   "ping": {
    "params": {},
    "required": []
+  },
+  "place": {
+   "params": {
+    "board": {
+     "type": "string"
+    },
+    "group": {
+     "type": "string"
+    },
+    "group_id": {
+     "type": "string"
+    },
+    "holder": {
+     "type": "string"
+    },
+    "replace": {
+     "type": "boolean"
+    },
+    "request_id": {
+     "type": "string"
+    },
+    "role": {
+     "type": "string"
+    },
+    "task": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "task"
+   ]
   },
   "propose_initiative": {
    "params": {
@@ -1636,6 +1740,15 @@
   },
   "set_subtask_status": {
    "params": {
+    "blocked_by": {
+     "items": {
+      "type": "integer"
+     },
+     "type": "array"
+    },
+    "reason": {
+     "type": "string"
+    },
     "status": {
      "type": "string"
     },
@@ -1799,8 +1912,27 @@
     "task_id"
    ]
   },
+  "unplace": {
+   "params": {
+    "reason": {
+     "type": "string"
+    },
+    "task": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "task"
+   ]
+  },
   "update_task": {
    "params": {
+    "blocked_by": {
+     "items": {
+      "type": "integer"
+     },
+     "type": "array"
+    },
     "depends": {
      "items": {
       "type": "string"
@@ -1832,6 +1964,9 @@
      "type": "string"
     },
     "prompt": {
+     "type": "string"
+    },
+    "reason": {
      "type": "string"
     },
     "status": {

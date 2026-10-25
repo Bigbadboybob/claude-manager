@@ -8,6 +8,7 @@
 pub mod api;
 pub mod chat;
 pub mod gate;
+pub mod grants;
 pub mod heartbeat;
 pub mod held;
 pub mod org;

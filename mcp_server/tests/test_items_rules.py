@@ -444,8 +444,9 @@ class TouchEventsAndPushes(unittest.TestCase):
         tx = b.set(1, note="n", group="g", reason="why")
         (event,) = tx.events
         self.assertEqual(event["type"], "updated")
-        self.assertEqual(event["prev"], {"note": None, "group": None})
-        self.assertEqual(event["new"], {"note": "n", "group": "g"})
+        gid = b[1].group_id  # the new heading "g" (org model S3: groups are rows)
+        self.assertEqual(event["prev"], {"note": None, "group": None, "group_id": None})
+        self.assertEqual(event["new"], {"note": "n", "group": "g", "group_id": gid})
         self.assertEqual(event["reason"], "why")
 
     def test_noop_update_is_a_touch_event(self):

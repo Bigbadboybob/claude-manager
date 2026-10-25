@@ -9,6 +9,14 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 from api.auth import verify_token
 from api.items_models import (
     BoardPatchBody,
+    EpicCloseApplyBody,
+    EpicClosePlanBody,
+    EpicPocBody,
+    EpicStaffBody,
+    GroupCreateBody,
+    GroupPatchBody,
+    PlaceBody,
+    UnplaceBody,
     GrantBody,
     GrantUpdateBody,
     ProfileBody,
@@ -24,7 +32,7 @@ from api.items_models import (
 )
 import logging
 
-from dispatch import gate_db, items_db, org_db
+from dispatch import epics, gate_db, items_db, org_db, placement
 from dispatch.items_rules import ItemsError
 
 router = APIRouter(dependencies=[Depends(verify_token)])
@@ -97,7 +105,8 @@ async def update_items(ref: str, body: ItemsPatchBody, request: Request):
         _pool(request), ref, body.actor.model_dump(), body.ns, fields,
         add_holders=[h.model_dump() for h in body.add_holders or []],
         remove_holders=body.remove_holders, reason=body.reason,
-        reopen=body.reopen, expect_status=body.expect_status))
+        reopen=body.reopen, expect_status=body.expect_status,
+        owner=body.owner.model_dump() if body.owner else None, role=body.role))
 
 
 @router.post("/boards/{ref}/items/touch")
@@ -207,3 +216,68 @@ async def heartbeat(body: HeartbeatBody, request: Request,
     except Exception:  # noqa: BLE001
         logger.exception("org heartbeat extras failed for %s", daemon_id)
     return reply
+
+
+# ---- org model S3: placement and groups (doc/org-model.md §7) ------------------
+
+@router.post("/tasks/{task_id}/place")
+async def place_task(task_id: str, body: PlaceBody, request: Request):
+    return await _call(placement.place_task(
+        _pool(request), task_id, body.board, body.actor.model_dump(), group=body.group,
+        group_id=body.group_id, holder=body.holder.model_dump() if body.holder else None,
+        role=body.role, replace=body.replace))
+
+
+@router.post("/tasks/{task_id}/unplace")
+async def unplace_task(task_id: str, body: UnplaceBody, request: Request):
+    return await _call(placement.unplace_task(
+        _pool(request), task_id, body.actor.model_dump(), reason=body.reason))
+
+
+@router.post("/boards/{ref}/groups")
+async def create_group(ref: str, body: GroupCreateBody, request: Request):
+    return await _call(placement.create_group(
+        _pool(request), ref, body.actor.model_dump(), name=body.name, kind=body.kind,
+        parent_group_id=body.parent_group_id, description=body.description, goal=body.goal,
+        ord=body.ord))
+
+
+@router.patch("/boards/{ref}/groups/{group_id}")
+async def set_group(ref: str, group_id: str, body: GroupPatchBody, request: Request):
+    changes = body.model_dump(exclude_unset=True)
+    actor = changes.pop("actor")
+    expected = changes.pop("expected_revision", None)
+    return await _call(placement.set_group(
+        _pool(request), ref, actor, group_id, changes, expected_revision=expected))
+
+
+@router.post("/boards/{ref}/epics/{group_id}/poc")
+async def epic_set_poc(ref: str, group_id: str, body: EpicPocBody, request: Request):
+    return await _call(epics.set_poc(
+        _pool(request), ref, body.actor.model_dump(), group_id, body.member,
+        team_id=body.team_id, request_id=body.request_id))
+
+
+@router.post("/boards/{ref}/epics/{group_id}/staff")
+async def epic_staff(ref: str, group_id: str, body: EpicStaffBody, request: Request):
+    return await _call(epics.staff(
+        _pool(request), ref, body.actor.model_dump(), group_id, body.member, body.as_,
+        reason=body.reason, request_id=body.request_id))
+
+
+@router.post("/boards/{ref}/epics/{group_id}/close-plan")
+async def epic_close_plan(ref: str, group_id: str, body: EpicClosePlanBody, request: Request):
+    return await _call(epics.close_plan(
+        _pool(request), ref, body.actor.model_dump(), group_id, body.outcome))
+
+
+@router.post("/boards/{ref}/close-plans/{plan_id}/apply")
+async def epic_close_apply(ref: str, body: EpicCloseApplyBody, request: Request,
+                           plan_id: int = Path(ge=1, le=2**62)):
+    return await _call(epics.close_apply(
+        _pool(request), ref, body.actor.model_dump(), plan_id, body.revision, body.choices))
+
+
+@router.get("/items/on-boards")
+async def on_boards(request: Request):
+    return await _call(placement.on_boards(_pool(request)))

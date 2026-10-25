@@ -99,6 +99,7 @@ pub mod log_pump;
 pub mod health;
 pub mod session;
 pub mod task_parent_refresh;
+pub mod lifecycle_guard;
 pub mod terminal_sweep;
 pub mod session_watch;
 pub mod state;

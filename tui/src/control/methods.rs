@@ -2482,6 +2482,10 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
     //     re-entering with `close_worktree=true` would bail on the
     //     missing `worktree_path` precheck before reaching Phase 3.
     let mut already_done = false;
+    // A pinned workspace is never removed: finishing work only unassigns
+    // (lifecycle_guard_v1, doc/org-model.md §7.1). Home/stream kinds join
+    // this once the TUI records them (S0b).
+    let mut workspace_kept: Option<&'static str> = None;
     let cleanup_target = if p.close_worktree && was_branch_mode {
         let ws_id = task.workspace_id.clone().ok_or((
             ErrorCode::Conflict,
@@ -2506,6 +2510,9 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
         // path-equality check is authoritative regardless of the label, so
         // we never trust `worktree_mode` alone to gate destruction.
         if app.workspaces[wi].is_in_place() {
+            None
+        } else if app.workspaces[wi].pinned {
+            workspace_kept = Some("pinned");
             None
         } else if app.workspaces[wi].worktree_path.is_none() {
             // The "already cleaned up" signal: Phase 2 sets
@@ -2661,7 +2668,11 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
         .filter(|t| t.task_id.as_deref() == Some(p.task_id.as_str()))
         .for_each(|t| t.api_status = crate::app::TaskStatus::Done);
 
-    Ok(json!({"ok": true, "worktree_removed": worktree_removed}))
+    let mut out = json!({"ok": true, "worktree_removed": worktree_removed});
+    if let Some(kind) = workspace_kept {
+        out["workspace_kept"] = json!(kind);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

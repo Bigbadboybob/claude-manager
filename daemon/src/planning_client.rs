@@ -355,6 +355,43 @@ pub fn fetch_task_status(
         .map(|s| s.trim().to_ascii_lowercase()))
 }
 
+/// What the terminal sweep needs from a task row: its status, and who closed
+/// it (`metadata.terminal_via`; `"item"` = the board's status mirror,
+/// doc/org-model.md §7.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskTerminal {
+    pub status: String,
+    pub terminal_via: Option<String>,
+}
+
+/// [`fetch_task_status`] plus `metadata.terminal_via`, one row per call.
+pub fn fetch_task_terminal(
+    task_id: &str,
+    api_url_override: Option<&str>,
+    api_token_override: Option<&str>,
+) -> Result<Option<TaskTerminal>, PlanningClientError> {
+    let api_url = resolve_api_url(api_url_override)?;
+    let api_token = resolve_api_token(api_token_override)?;
+    let endpoint = format!("{}/tasks/{}", api_url, task_id);
+    let response = build_agent()
+        .get(&endpoint)
+        .header("Authorization", &format!("Bearer {}", api_token))
+        .call()
+        .map_err(|e| PlanningClientError::Transport(format!("GET {}: {}", endpoint, e)))?;
+    if response.status().as_u16() == 404 {
+        return Ok(None);
+    }
+    let row: serde_json::Value = decode_json_response(response, "task row")?;
+    Ok(row.get("status").and_then(|v| v.as_str()).map(|s| TaskTerminal {
+        status: s.trim().to_ascii_lowercase(),
+        terminal_via: row
+            .get("metadata")
+            .and_then(|m| m.get("terminal_via"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    }))
+}
+
 /// `GET <CM_API_URL>/tasks/{id}` → the row's `parent_task_id`, for the
 /// headless parent refresher (`crate::task_parent_refresh`). `Ok(None)`
 /// for a missing row. `timeout` bounds the whole request.

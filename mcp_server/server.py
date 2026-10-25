@@ -326,6 +326,8 @@ def item(
     links: list[str] | None = None,
     board: str | None = None,
     request_id: str | None = None,
+    description: str | None = None,
+    group_id: str | None = None,
 ) -> dict:
     """Create one work item, or several from a list of titles, on your board.
 
@@ -345,6 +347,12 @@ def item(
     blocked work: waiting, open and unheld new items are refused, a job needs
     an eta, and blocked_on needs a check_back (at most 72 h out). Future work
     there is a planning task (propose_task), not an item.
+
+    group names a heading (a new name creates one; group_id picks one by id,
+    e.g. an epic's). description is the work contract (scope, acceptance
+    criteria); for a planning task already in the backlog use place(task,
+    ...) instead, which links the task. You become the owner; the reply may
+    carry possible_duplicate hints for similar open items.
 
     request_id makes a retry safe: the same id returns the first call's items
     instead of creating duplicates (one is generated when omitted and named
@@ -382,6 +390,11 @@ def item_set(
     each: bool = False,
     reopen: bool = False,
     expect_status: str | None = None,
+    owner: str | None = None,
+    role: str | None = None,
+    group_id: str | None = None,
+    description: str | None = None,
+    team_id: str | None = None,
 ) -> dict:
     """Update one or more items: item_set(14, "done"), item_set(14, "blocked",
     note="needs EP GO"), item_set(15, blocked_by=[14]),
@@ -411,6 +424,14 @@ def item_set(
     items waiting only on it and wakes their holders. Anyone on the board may
     edit any item; history is kept, so give a reason for drops and handoffs.
 
+    Roles (doc/org-model.md §7.2): an active, waiting or blocked item that is
+    held has exactly one owner. owner="name" transfers ownership in one write
+    (the old owner contributes); add_holder takes role= contributor (default),
+    reviewer or approver; when the owner leaves with one holder left, that
+    holder takes over. group_id moves the item to a heading or epic by id;
+    description edits the work contract (a placed task's description), and
+    the other holders are told it changed.
+
     A done item stays done: a write that would make it anything else
     (blocked, active, dropped, ...) is refused with reopen_required, naming
     who closed it and when; usually your read is stale, so re-read the board.
@@ -427,6 +448,117 @@ def item_set(
     if not reopen:
         params.pop("reopen")
     return _items_call("item.set", params)
+
+
+@mcp.tool()
+def place(
+    task: str,
+    board: str | None = None,
+    group: str | None = None,
+    group_id: str | None = None,
+    holder: str | None = None,
+    role: str | None = None,
+    replace: bool = False,
+    request_id: str | None = None,
+) -> dict:
+    """Place a planning task on a board (doc/org-model.md §7.1): the board
+    gets an item linked to the task, and from then on the item owns status,
+    holders, group and flags while the task owns title, description and
+    metadata (editing either side writes the same copy). The task's status
+    follows the item: open → backlog, active/waiting → running, blocked →
+    blocked, done/dropped → done.
+
+    board defaults to yours; group / group_id put it under a heading or epic;
+    holder makes that session (or "me") its owner. Placing a draft accepts
+    it. Refused: backtests, continuous tasks, auto-dispatchable cloud tasks,
+    a task with no description, and one placed on another board (pass
+    replace=True to move it: unplace there, place here). Re-placing on the
+    same board brings back the same item number.
+
+    Returns {board, n, item_status, task_status, item, possible_duplicate?}.
+    """
+    params = dict(locals())
+    params["task_id"] = params.pop("task")
+    if not replace:
+        params.pop("replace")
+    params["request_id"] = request_id or uuid.uuid4().hex
+    return _items_call("item.place", params)
+
+
+@mcp.tool()
+def epic(
+    action: str,
+    board: str | None = None,
+    group_id: str | None = None,
+    name: str | None = None,
+    goal: str | None = None,
+    parent_group_id: str | None = None,
+    member: str | None = None,
+    team_id: str | None = None,
+    staff_as: str | None = None,
+    outcome: str | None = None,
+    plan_id: int | None = None,
+    revision: int | None = None,
+    choices: dict | None = None,
+    reason: str | None = None,
+    request_id: str | None = None,
+) -> dict:
+    """Epics on a board (doc/org-model.md §7.3, §7.6): a body of work with a
+    goal, nested headings and sub-epics, and a PoC who leads its team.
+    Creating, promoting, setting the PoC and closing are Owner's or the
+    board lead's (its orchestrator's) acts.
+
+    - action="create", name=, goal=, parent_group_id=: a new epic.
+    - action="promote", group_id=: turn a heading into an epic.
+    - action="set_poc", group_id=, member= (member id, handle or "owner"),
+      team_id= (optional: a team the member already leads): the epic is run
+      by that member's team (created when needed). Returns the staffing
+      offers: each current holder, offered as a primary member or a guest.
+    - action="staff", group_id=, member=, staff_as="guest"|"primary": accept
+      one offer. A primary move needs the member's manager chain or Owner.
+    - action="close", group_id=, outcome="done"|"cancelled": builds the close
+      plan (open items, team, members, workspaces) and returns it with its
+      plan_id and revision. Call again with plan_id, revision and choices
+      {"items": {"<n>": "move:<group_id>"|"unplace"|"drop"}, "team": ...,
+      "members": {"<member_id>": ...}} to apply it. The plan is persisted: a
+      retry resumes, and choices you cannot authorize come back as pending
+      with who must decide; the epic still closes.
+    """
+    rid = request_id or uuid.uuid4().hex
+    if action == "create":
+        return _items_call("group.create", {"board": board, "name": name, "kind": "epic",
+                                            "goal": goal, "parent_group_id": parent_group_id,
+                                            "request_id": rid})
+    if action == "promote":
+        return _items_call("group.set", {"board": board, "group_id": group_id, "kind": "epic",
+                                         "request_id": rid})
+    if action == "set_poc":
+        return _items_call("epic.set_poc", {"board": board, "group_id": group_id,
+                                            "member": member, "team_id": team_id,
+                                            "request_id": rid})
+    if action == "staff":
+        return _items_call("epic.staff", {"board": board, "group_id": group_id, "member": member,
+                                          "as": staff_as, "reason": reason, "request_id": rid})
+    if action == "close":
+        if plan_id is None:
+            return _items_call("epic.close_plan", {"board": board, "group_id": group_id,
+                                                   "outcome": outcome})
+        return _items_call("epic.close_apply", {"board": board, "plan_id": plan_id,
+                                                "revision": revision, "choices": choices or {},
+                                                "request_id": rid})
+    raise ValueError("action must be create, promote, set_poc, staff or close")
+
+
+@mcp.tool()
+def unplace(task: str, reason: str | None = None) -> dict:
+    """Take a placed task off its board (doc/org-model.md §7.1): the item is
+    archived read-only (its number still resolves in history, writes through
+    it are refused) and the task goes back to the backlog. Refused while the
+    item has live blocked_by edges either way; clear or re-point them first.
+
+    Returns {board, n, task_status: "backlog", unplaced: true}.
+    """
+    return _items_call("item.unplace", {"task_id": task, "reason": reason})
 
 
 @mcp.tool()
@@ -1638,6 +1770,8 @@ def update_task(
     parent_task_id: str | None = None,
     initiative_id: str | None = None,
     metadata: dict | None = None,
+    reason: str | None = None,
+    blocked_by: list[int] | None = None,
 ) -> dict:
     """Edit a task's planning fields.
 
@@ -1684,6 +1818,13 @@ def update_task(
             (`metadata.resume.design_doc_path`,
             `metadata.resume.designer_session_uid`); other skills should
             namespace their own keys here rather than churn the schema.
+        reason / blocked_by: the trigger of a `blocked` write. A task placed on
+            a board (its `placement` is set) takes its status from the item:
+            `blocked` becomes the item's blocked_on=reason (or blocked_by=[item
+            numbers]); with neither, the item gets a labelled default trigger
+            and a legacy_blocked flag asking you for the real one. `done`,
+            `running` and `backlog` (unplace) translate too; other statuses
+            are refused with placed_on_board.
     """
     if metadata is not None and "lead_session_uid" in metadata:
         raise ValueError(
@@ -1702,6 +1843,8 @@ def update_task(
             "depends": depends,
             "metadata": metadata,
             "initiative_id": initiative_id if initiative_id != "null" else None,
+            "reason": reason,
+            "blocked_by": blocked_by,
         }.items() if v is not None
     }
     if initiative_id == "null":
@@ -4424,7 +4567,8 @@ def mark_subtask_done(
 
 
 @mcp.tool()
-def set_subtask_status(status: str, task_id: str | None = None) -> dict:
+def set_subtask_status(status: str, task_id: str | None = None, reason: str | None = None,
+                       blocked_by: list[int] | None = None) -> dict:
     """Set the planning status of your task (or a descendant subtask).
 
     The headless-capable way to flip a task's status. It works even where
@@ -4447,6 +4591,11 @@ def set_subtask_status(status: str, task_id: str | None = None) -> dict:
     Returns: {"task_id": <id>, "status": <status>}.
     """
     params: dict = {"status": status}
+    # A placed task's blocked write needs its trigger (doc/org-model.md §7.1).
+    if reason:
+        params["reason"] = reason
+    if blocked_by:
+        params["blocked_by"] = blocked_by
     if task_id:
         params["task_id"] = task_id
     return control_client.call("set_subtask_status", params)

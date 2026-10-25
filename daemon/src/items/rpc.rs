@@ -12,8 +12,12 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 use std::sync::{Arc, Mutex};
 
-pub const METHODS: &[&str] =
-    &["item.create", "item.set", "item.resolve", "board.read", "board.settings", "board.owner_blocked"];
+pub const METHODS: &[&str] = &[
+    "item.create", "item.set", "item.resolve", "board.read", "board.settings", "board.owner_blocked",
+    // Org model S3 (doc/org-model.md §7): placement, groups, the on-boards list.
+    "item.place", "item.unplace", "group.create", "group.set", "boards.on_boards",
+    "epic.set_poc", "epic.staff", "epic.close_plan", "epic.close_apply",
+];
 
 pub(crate) type RpcResult<T = Value> = Result<T, (ErrorCode, String)>;
 
@@ -28,6 +32,15 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
         "item.resolve" => item_resolve(state, &ctx, &req.params),
         "board.read" => board_read(&ctx, &req.params),
         "board.settings" => board_settings(&ctx, &req.params),
+        "item.place" => item_place(&ctx, &req.params),
+        "item.unplace" => item_unplace(&ctx, &req.params),
+        "group.create" => group_create(&ctx, &req.params),
+        "group.set" => group_set(&ctx, &req.params),
+        "epic.set_poc" | "epic.staff" | "epic.close_plan" | "epic.close_apply" => {
+            epic_call(&ctx, req.method.as_str(), &req.params)
+        }
+        // Read-only, open to every session: epics and board-native items.
+        "boards.on_boards" => ctx.api.get("/items/on-boards", &[]),
         // Every item blocked on Owner, across boards (the TUI's sidebar marker).
         "board.owner_blocked" => ctx.api.get("/items/owner-blocked", &[]),
         other => Err((ErrorCode::UnknownMethod, format!("unknown items method {other}"))),
@@ -36,6 +49,34 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
+}
+
+/// The actor a task write is attributed to (doc/org-model.md §7.1): the
+/// session's participant id and name, so a translated legacy status write on
+/// a placed task is the session's, not the daemon's API token. None when the
+/// messaging store is not open (no participant identity) or the uid is
+/// unknown. Takes the state lock, releases it, then the store slot (the
+/// usual order).
+pub fn session_actor(state: &Arc<Mutex<DaemonState>>, uid: &str) -> Option<Value> {
+    let (handle, title, task_id) = {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        let sess = s.sessions.get(uid)?;
+        (s.messaging.clone(), sess.title.clone(), sess.task_id.clone())
+    };
+    let slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+    let store = slot.as_ref()?;
+    let name = store
+        .names
+        .get(&store.participant_id(uid))
+        .map(|n| n.name.clone())
+        .unwrap_or(title);
+    Some(json!({
+        "pid": format!("agent:{}:{uid}", store.daemon_id),
+        "name": name,
+        "session_uid": uid,
+        "daemon_id": store.daemon_id,
+        "task_id": task_id,
+    }))
 }
 
 /// Who is calling, resolved on this daemon.
@@ -314,10 +355,12 @@ pub(crate) fn slug(board: &Value) -> RpcResult<String> {
 /// Fields passed straight through to the API; "" clears a text field.
 const PASS_FIELDS: &[&str] = &[
     "status", "note", "group", "blocked_on", "check_back", "eta", "job", "title", "links", "blocked_by",
+    // Org model S3: a group by id, a board-native item's description, its team.
+    "group_id", "description", "team_id",
     // Gate bindings (doc/gate-receipts.md §8).
     "head", "mf", "ruling", "gate_class",
 ];
-const CLEARABLE: &[&str] = &["note", "group", "blocked_on", "check_back", "eta", "job", "head", "mf", "ruling", "gate_class"];
+const CLEARABLE: &[&str] = &["note", "group", "group_id", "description", "team_id", "blocked_on", "check_back", "eta", "job", "head", "mf", "ruling", "gate_class"];
 
 fn item_fields(ctx: &Ctx, params: &Value, skip_title: bool) -> RpcResult<Map<String, Value>> {
     let mut fields = Map::new();
@@ -377,6 +420,10 @@ fn write_reply(board_slug: &str, reply: &Value, items_key: &str) -> Value {
     if reply["warnings"].as_array().is_some_and(|w| !w.is_empty()) {
         out["warnings"] = reply["warnings"].clone();
     }
+    // Similar open items for a new one (doc/org-model.md §7.4): a hint.
+    if reply.get("possible_duplicate").is_some_and(|d| !d.is_null()) {
+        out["possible_duplicate"] = reply["possible_duplicate"].clone();
+    }
     out
 }
 
@@ -422,6 +469,17 @@ fn item_set(ctx: &Ctx, params: &Value) -> RpcResult {
     if let Some(add) = present(params, "add_holder") {
         body["add_holders"] = json!(holders_arg(ctx, &add)?);
     }
+    // One atomic ownership transfer; the role for added holders (§7.2).
+    if let Some(owner) = present(params, "owner") {
+        let mut owners = holders_arg(ctx, &owner)?;
+        if owners.len() != 1 {
+            return Err(bad("owner names exactly one holder"));
+        }
+        body["owner"] = owners.remove(0);
+    }
+    if let Some(role) = params.get("role").and_then(Value::as_str).filter(|r| !r.trim().is_empty()) {
+        body["role"] = json!(role.trim());
+    }
     if let Some(remove) = present(params, "remove_holder") {
         let pids: Vec<Value> = holders_arg(ctx, &remove)?.into_iter().map(|h| h["pid"].clone()).collect();
         body["remove_holders"] = json!(pids);
@@ -444,6 +502,7 @@ fn item_set(ctx: &Ctx, params: &Value) -> RpcResult {
     if body["set"].as_object().is_some_and(Map::is_empty)
         && body.get("add_holders").is_none()
         && body.get("remove_holders").is_none()
+        && body.get("owner").is_none()
     {
         return Err(bad("nothing to change: pass status, note, holder or another field"));
     }
@@ -629,7 +688,10 @@ fn holder_slim(h: &Value) -> String {
     let name = h["name"].as_str().or_else(|| h["pid"].as_str()).unwrap_or("?");
     let st = &h["state"];
     let state = st["state"].as_str().unwrap_or("unknown");
-    let mut out = format!("@{name}[{state}");
+    // A role other than owner shows: `@ep(reviewer)[idle 3m]` (§7.2).
+    let role = h["role"].as_str().filter(|r| !matches!(*r, "owner" | "holder"))
+        .map(|r| format!("({r})")).unwrap_or_default();
+    let mut out = format!("@{name}{role}[{state}");
     if let Some(for_s) = st["for_s"].as_i64() {
         out.push_str(&format!(" {}", short_duration(for_s)));
     }
@@ -793,6 +855,10 @@ pub(crate) fn shape_board(read: &Value, pid: &str, params: &Value, now: DateTime
         read["recently_closed"].as_array().map(|v| v.iter().filter(keep).collect()).unwrap_or_default()
     };
     let mut out = json!({"board": board_header(&read["board"]), "free_capacity": names(&read["free_capacity"])});
+    // Headings and epics (doc/org-model.md §7.3), for the Alt+B tree.
+    if let Some(groups) = read["groups"].as_array().filter(|g| !g.is_empty()) {
+        out["groups"] = json!(groups);
+    }
     // Working sessions on the board that hold no item: work it can't see.
     if read["untracked"].as_array().is_some_and(|u| !u.is_empty()) {
         out["untracked"] = json!(names(&read["untracked"]));
@@ -865,6 +931,126 @@ fn board_settings(ctx: &Ctx, params: &Value) -> RpcResult {
     }
     let header = ctx.api.patch(&format!("/boards/{slug}"), &body)?;
     Ok(json!({"board": slug, "settings": header["settings"]}))
+}
+
+/// `place(task, board, group=…, holder=…)` (doc/org-model.md §7.1). Editing
+/// the target board needs the usual board rights; the API enforces what
+/// placement itself refuses.
+fn item_place(ctx: &Ctx, params: &Value) -> RpcResult {
+    let task = params.get("task_id").or_else(|| params.get("task")).and_then(Value::as_str)
+        .filter(|t| !t.trim().is_empty())
+        .ok_or_else(|| bad("task_id is required"))?;
+    let board = resolve_board(ctx, params)?;
+    authorize_edit(ctx, params, &board)?;
+    let slug = slug(&board)?;
+    let mut body = json!({"actor": ctx.actor(), "board": slug});
+    for key in ["group", "group_id", "role"] {
+        if let Some(v) = params.get(key).and_then(Value::as_str).filter(|v| !v.trim().is_empty()) {
+            body[key] = json!(v.trim());
+        }
+    }
+    if let Some(holder) = present(params, "holder") {
+        let mut hs = holders_arg(ctx, &holder)?;
+        if hs.len() > 1 {
+            return Err(bad("place takes one holder; add others with item_set(add_holder=...)"));
+        }
+        if let Some(h) = hs.pop() {
+            body["holder"] = h;
+        }
+    }
+    if params["replace"] == true {
+        body["replace"] = json!(true);
+    }
+    ctx.api.post(&format!("/tasks/{}/place", task.trim()), &body)
+}
+
+fn item_unplace(ctx: &Ctx, params: &Value) -> RpcResult {
+    let task = params.get("task_id").or_else(|| params.get("task")).and_then(Value::as_str)
+        .filter(|t| !t.trim().is_empty())
+        .ok_or_else(|| bad("task_id is required"))?;
+    let mut body = json!({"actor": ctx.actor()});
+    if let Some(reason) = params.get("reason").and_then(Value::as_str) {
+        body["reason"] = json!(reason);
+    }
+    ctx.api.post(&format!("/tasks/{}/unplace", task.trim()), &body)
+}
+
+const GROUP_FIELDS: &[&str] = &["name", "kind", "parent_group_id", "description", "goal", "ord"];
+
+fn group_create(ctx: &Ctx, params: &Value) -> RpcResult {
+    let board = resolve_board(ctx, params)?;
+    authorize_edit(ctx, params, &board)?;
+    let slug = slug(&board)?;
+    let mut body = json!({"actor": ctx.actor()});
+    for key in GROUP_FIELDS {
+        if let Some(v) = present(params, key) {
+            body[*key] = v;
+        }
+    }
+    ctx.api.post(&format!("/boards/{slug}/groups"), &body)
+}
+
+fn group_set(ctx: &Ctx, params: &Value) -> RpcResult {
+    let id = params.get("group_id").and_then(Value::as_str).filter(|g| !g.trim().is_empty())
+        .ok_or_else(|| bad("group_id is required"))?;
+    let board = resolve_board(ctx, params)?;
+    authorize_edit(ctx, params, &board)?;
+    let slug = slug(&board)?;
+    let mut body = json!({"actor": ctx.actor()});
+    for key in GROUP_FIELDS {
+        if let Some(v) = present(params, key) {
+            body[*key] = v;
+        }
+    }
+    if let Some(rev) = params.get("expected_revision").and_then(Value::as_i64) {
+        body["expected_revision"] = json!(rev);
+    }
+    ctx.api.patch(&format!("/boards/{slug}/groups/{}", id.trim()), &body)
+}
+
+/// The epic writes (doc/org-model.md §7.3, §7.6). The API decides who may:
+/// Owner or the board's lead for a PoC and a close; the org core checks a
+/// staffing move's manager chain.
+fn epic_call(ctx: &Ctx, method: &str, params: &Value) -> RpcResult {
+    let board = resolve_board(ctx, params)?;
+    let slug = slug(&board)?;
+    let mut body = json!({"actor": ctx.actor()});
+    let group = || {
+        params.get("group_id").and_then(Value::as_str).filter(|g| !g.trim().is_empty())
+            .map(|g| g.trim().to_string())
+            .ok_or_else(|| bad("group_id (the epic) is required"))
+    };
+    let path = match method {
+        "epic.set_poc" | "epic.staff" => {
+            let member = params.get("member").and_then(Value::as_str).filter(|m| !m.trim().is_empty())
+                .ok_or_else(|| bad("member (a member id, handle or owner) is required"))?;
+            body["member"] = json!(member.trim());
+            for key in ["team_id", "as", "reason", "request_id"] {
+                if let Some(v) = params.get(key).filter(|v| !v.is_null()) {
+                    body[key] = v.clone();
+                }
+            }
+            let tail = if method == "epic.set_poc" { "poc" } else { "staff" };
+            format!("/boards/{slug}/epics/{}/{tail}", group()?)
+        }
+        "epic.close_plan" => {
+            body["outcome"] = params.get("outcome").cloned()
+                .ok_or_else(|| bad("outcome (done or cancelled) is required"))?;
+            format!("/boards/{slug}/epics/{}/close-plan", group()?)
+        }
+        _ => {
+            let plan = params.get("plan_id").and_then(Value::as_i64)
+                .ok_or_else(|| bad("plan_id is required"))?;
+            body["revision"] = params.get("revision").cloned()
+                .ok_or_else(|| bad("revision (from epic.close_plan) is required"))?;
+            body["choices"] = params.get("choices").cloned().unwrap_or_else(|| json!({}));
+            if let Some(r) = params.get("request_id").filter(|v| !v.is_null()) {
+                body["request_id"] = r.clone();
+            }
+            format!("/boards/{slug}/close-plans/{plan}/apply")
+        }
+    };
+    ctx.api.post(&path, &body)
 }
 
 fn board_read(ctx: &Ctx, params: &Value) -> RpcResult {
@@ -1020,6 +1206,10 @@ mod tests {
             "job":"cm-gate pins L3","holders":[{"pid":"p","name":"release-4","state":{"state":"idle","for_s":720}}],
             "flags":[]});
         assert_eq!(slim_item(&item, now), "#1216 active \"pins gate\" @release-4[idle 12m] job: cm-gate pins L3 (eta 25m)");
+        let roles = json!({"n":3,"status":"active","title":"t","flags":[],"holders":[
+            {"pid":"a","name":"lane","role":"owner","state":{"state":"working"}},
+            {"pid":"b","name":"ep","role":"reviewer","state":{"state":"idle","for_s":180}}]});
+        assert_eq!(slim_item(&roles, now), "#3 active \"t\" @lane[working] @ep(reviewer)[idle 3m]");
         let no_job = json!({"n":2,"status":"active","title":"t","eta_at":"2026-10-06T12:00:00Z","holders":[],"flags":[]});
         assert_eq!(slim_item(&no_job, now), "#2 active \"t\" (no holder) eta passed 20m ago");
         assert_eq!(launch_line(&json!({"unlaunched":[],"free":["a"]}), now), None);
@@ -1318,6 +1508,50 @@ mod tests {
         let bodies: Vec<&Value> = seen.iter().filter(|(m, _, _)| m == "PATCH").map(|(_, _, b)| b).collect();
         assert_eq!((bodies[0]["reopen"].clone(), bodies[0]["expect_status"].clone()), (json!(true), json!("done")));
         assert!(bodies[1].get("reopen").is_none() && bodies[1].get("expect_status").is_none());
+    }
+
+    #[test]
+    fn place_groups_and_owner_forward_to_the_api() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let (url, seen) = stub(|method, path, _| match (method, path) {
+            ("POST", "/boards/resolve") => (200, BOARD.into()),
+            ("POST", "/tasks/t-1/place") => (200, r#"{"board":"sfd","n":7,"item_status":"active","task_status":"running"}"#.into()),
+            ("POST", "/tasks/t-1/unplace") => (200, r#"{"unplaced":true}"#.into()),
+            ("POST", "/boards/sfd/groups") => (200, r#"{"id":"g-1","name":"Latent","kind":"epic"}"#.into()),
+            ("PATCH", "/boards/sfd/groups/g-1") => (200, r#"{"id":"g-1"}"#.into()),
+            ("PATCH", "/boards/sfd/items") => (200, r#"{"items":[],"unblocked":[],"warnings":[]}"#.into()),
+            ("POST", "/boards/sfd/epics/g-1/poc") => (200, r#"{"team_id":"tm-1","staffing":[]}"#.into()),
+            ("POST", "/boards/sfd/epics/g-1/close-plan") => (200, r#"{"plan_id":3,"revision":0,"items":[]}"#.into()),
+            ("POST", "/boards/sfd/close-plans/3/apply") => (200, r#"{"applied":true,"pending":[]}"#.into()),
+            _ => (500, "{}".into()),
+        });
+        let state = state_with_session(root.path(), &url);
+        assert!(call(&state, "me-uid", "epic.set_poc", json!({"group_id":"g-1","member":"lfl"})).ok);
+        assert!(!call(&state, "me-uid", "epic.set_poc", json!({"group_id":"g-1"})).ok, "member is required");
+        assert!(call(&state, "me-uid", "epic.close_plan", json!({"group_id":"g-1","outcome":"done"})).ok);
+        let applied = call(&state, "me-uid", "epic.close_apply", json!({"plan_id":3,"revision":0,"choices":{"items":{}}}));
+        assert_eq!(applied.result.as_ref().unwrap()["applied"], true);
+        let resp = call(&state, "me-uid", "item.place", json!({"task_id":"t-1","group":"Latent","holder":"me","replace":true}));
+        assert!(resp.ok, "{:?}", resp.error);
+        assert_eq!(resp.result.as_ref().unwrap()["n"], 7);
+        assert!(call(&state, "me-uid", "item.unplace", json!({"task_id":"t-1","reason":"later"})).ok);
+        assert!(call(&state, "me-uid", "group.create", json!({"name":"Latent","kind":"epic","goal":"ship"})).ok);
+        assert!(call(&state, "me-uid", "group.set", json!({"group_id":"g-1","kind":"epic","expected_revision":2})).ok);
+        assert!(!call(&state, "me-uid", "group.set", json!({"kind":"epic"})).ok, "group_id is required");
+        assert!(call(&state, "me-uid", "item.set", json!({"n":3,"owner":"me","role":"reviewer"})).ok);
+        let seen = seen.lock().unwrap();
+        let body = |m: &str, p: &str| seen.iter().find(|(mm, pp, _)| mm == m && pp == p).map(|(_, _, b)| b.clone()).unwrap();
+        let place = body("POST", "/tasks/t-1/place");
+        assert_eq!((place["board"].clone(), place["group"].clone(), place["replace"].clone()), (json!("sfd"), json!("Latent"), json!(true)));
+        assert!(place["holder"]["pid"].as_str().unwrap().ends_with(":me-uid"));
+        assert!(place["actor"]["pid"].as_str().unwrap().ends_with(":me-uid"));
+        assert_eq!(body("POST", "/tasks/t-1/unplace")["reason"], "later");
+        assert_eq!(body("POST", "/boards/sfd/groups")["kind"], "epic");
+        assert_eq!(body("PATCH", "/boards/sfd/groups/g-1")["expected_revision"], 2);
+        let set = body("PATCH", "/boards/sfd/items");
+        assert!(set["owner"]["pid"].as_str().unwrap().ends_with(":me-uid"));
+        assert_eq!(set["role"], "reviewer");
     }
 
     #[test]

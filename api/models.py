@@ -64,6 +64,12 @@ class TaskUpdate(BaseModel):
     # Free-form JSONB bag. PATCH replaces the whole object — callers that
     # want to merge should read first and re-send the merged dict.
     metadata: dict | None = None
+    # Org model S3 (doc/org-model.md §7.1): who caused this write (a session's
+    # actor, stamped by its daemon), and the trigger of a `blocked` write. A
+    # placed task's status write becomes the matching item transition.
+    actor: dict | None = None
+    reason: str | None = None
+    blocked_by: list[int] | None = None
 
 
 # A model string is opaque: only non-empty and argv-safe (mirrors
@@ -218,6 +224,10 @@ class TaskResponse(BaseModel):
     # Org facts on a single-task read (GET /tasks/{id}): {team, lead_member,
     # members}. Null in lists and the change feed.
     org: dict | None = None
+    # Org model S3: where the task is placed ({board, board_id, n, status,
+    # group_id, group}), null when it isn't; and its description revision.
+    placement: dict | None = None
+    description_rev: int = 0
 
     class Config:
         from_attributes = True
