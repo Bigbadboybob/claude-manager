@@ -134,6 +134,33 @@ class WorktreeReaperTests(unittest.TestCase):
         self.assertFalse(reaper.is_open_assistant(worker))
         self.assertFalse(reaper.is_open_assistant({"acting_as": "main", "member_id": "mem_ep"}))
 
+    def test_daemon_only_host_exits_in_daemon_tombstones_protect_an_assistants_checkout(self) -> None:
+        # cm-sessions keeps no workspace tombstones in daemon-sessions.json:
+        # exits go to daemon-tombstones.json. Fixtures copy the live shapes.
+        fixtures = Path(__file__).parent / "fixtures" / "o5_reaper"
+        day = 86400.0
+
+        def decide(exited_days_ago, *, by_path=True, org_key=True):
+            sessions = (fixtures / "daemon-sessions.json").read_text().replace("WORKTREE", str(self.worktree))
+            tombs = reaper.json.loads((fixtures / "daemon-tombstones.json").read_text())
+            rec = tombs["recently_exited"][0]
+            rec["exited_at"] = self.now - exited_days_ago * day
+            rec["worktree_path"] = str(self.worktree) if by_path else None
+            if not org_key:
+                rec.pop("org")
+            (self.base / "daemon-sessions.json").write_text(sessions)
+            (self.base / "daemon-tombstones.json").write_text(reaper.json.dumps(tombs))
+            facts = reaper.load_workspace_facts([self.base / "daemon-sessions.json",
+                                                 self.base / "daemon-tombstones.json"])
+            context = self.context()
+            context.workspaces = {self.worktree.resolve(): facts[self.worktree.resolve()]}
+            return reaper.decision(self.worktree, context)
+
+        self.assertEqual(decide(2).reason, "assistant_checkout", "crashed 2 days ago: kept")
+        self.assertEqual(decide(2, by_path=False).reason, "assistant_checkout", "found by workspace id")
+        self.assertTrue(decide(8).eligible, "dead 8 days: normal rules")
+        self.assertTrue(decide(2, org_key=False).eligible, "a member-less exit changes nothing")
+
     def test_nonterminal_and_young_unowned_worktrees_fail_closed(self) -> None:
         running = reaper.decision(self.worktree, self.context(status="running"))
         self.assertFalse(running.eligible)

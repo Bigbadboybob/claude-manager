@@ -134,7 +134,7 @@ Members are created deliberately and rarely. Everything else is an assistant.
 | Continuous scheduler respawn | new main session of the continuous member (§9.1) |
 | Revive, A-R, Alt+s Resume, daemon/brain restart | same uid, same occupancy row; nothing changes |
 | Any other agent spawn: plain `start_session`, `isolated=true`, `create_subtask` + spawn, `fork_session` without `hire`, `item_resolve(launch)`, `start_session(task_id=…)` | assistant of the caller's member, durable like a main session (§4.3). `isolated=true` (or `create_subtask` branch mode) gives it its own checkout, recorded as a `stream` workspace of the member's office. A spawn by a session that belongs to no member keeps today's **ephemeral** workspace |
-| Owner A-s (add a session to a workspace) | assistant of the workspace's member; Owner can tick "new member" |
+| Owner A-s (add a session to a workspace) | no spawner, so nobody's assistant (as below): it keeps today's lifecycle, and Owner can adopt it as a new member |
 | Owner A-F fork | assistant of the source's member unless Owner ticks "new member" |
 | Any agent spawn by a continuous member's session (its orchestrator, or anything that orchestrator spawned) | a **worker** of that member: stamped for attribution only, never durable. `mark_subtask_done`, the terminal sweep and the reaper treat it exactly as today, and its checkout is never promoted to `stream` (Swarm-Coord, 2026-10-25: continuous hosts run near their worktree cap and triage close-out reclaims checkouts) |
 | A session no session spawned (no spawner: Owner- or operator-started) | not an assistant of anyone; it keeps today's lifecycle unless Owner adopts it |

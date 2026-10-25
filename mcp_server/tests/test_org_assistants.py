@@ -233,3 +233,21 @@ class AssistantsDb(unittest.IsolatedAsyncioTestCase):
         # Not an assistant: closing it is refused (kill_session it instead).
         body = await self.close(OWNER["pid"], pid(worker), status=409)
         self.assertEqual(body["detail"]["code"], "not_an_assistant")
+
+    async def test_a_close_must_name_the_member_the_daemon_reported(self):
+        await self.members()
+        # The coordinator's main names itself as the member: it would take the
+        # lane's assistant's holds. Refused, with and without ended_by.
+        for extra in ({}, {"ended_by": "kill_session"}):
+            r = await self.http.post("/org/assistants/close", json={
+                "actor": OWNER, "pid": pid(self.helper), "member_id": self.ids["swarm-coord"],
+                "reason": "take over", **extra})
+            self.assertEqual(r.status_code, 409, r.text)
+            self.assertEqual(r.json()["detail"]["code"], "not_an_assistant")
+        # A session its daemon never reported as anyone's assistant.
+        r = await self.http.post("/org/assistants/close", json={
+            "actor": OWNER, "pid": pid("never-reported"), "member_id": self.ids["org"], "reason": "r"})
+        self.assertEqual(r.status_code, 409, r.text)
+        items = (await self.http.get(f"/boards/{self.board['slug']}")).json()["items"]
+        helper_item = next(i for i in items if i["title"] == "helper work")
+        self.assertEqual([h["pid"] for h in helper_item["holders"]], [pid(self.helper)], "holds untouched")

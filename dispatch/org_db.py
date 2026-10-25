@@ -1291,10 +1291,20 @@ async def close_assistant(pool, actor: dict, *, pid: str, member_id: str, reason
                             WHERE pid = $1 AND role = 'main' AND ended_at IS NULL""", pid):
                     raise _err(409, "not_an_assistant",
                                f"{pid} is a member's main session; replace or retire the member")
-                if await conn.fetchval(
-                        "SELECT acting_as = 'worker' FROM org_session_facts WHERE pid = $1", pid):
+                # The session's daemon must have reported it as THIS member's
+                # assistant: a caller cannot name another member to take an
+                # assistant's holds (with or without ended_by).
+                facts = await conn.fetchrow(
+                    "SELECT member_id, acting_as FROM org_session_facts WHERE pid = $1", pid)
+                if facts and facts["acting_as"] == "worker":
                     raise _err(409, "not_an_assistant",
                                f"{pid} is a continuous member's worker; kill_session it instead")
+                if not facts or facts["acting_as"] not in ("assistant", "closed") \
+                        or facts["member_id"] != member_id:
+                    raise _err(409, "not_an_assistant",
+                               f"{pid} is not reported as an assistant of {member_id} (its daemon "
+                               "reports assistants on each heartbeat; retry after the next one)",
+                               reported_member_id=facts["member_id"] if facts else None)
                 if ended_by != "kill_session":
                     await _require_chain(conn, actor, member_id, "close an assistant of",
                                          self_ok=True)

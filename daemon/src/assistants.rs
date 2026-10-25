@@ -131,7 +131,9 @@ pub fn is_assistant(sess: &DaemonSession) -> bool {
     of_session(sess).is_some_and(|m| m.acting_as == ASSISTANT)
 }
 
-fn is_shell(session_type: &str) -> bool {
+/// A shell (`bash`): only Owner closes, kills or restarts one, so no sweep
+/// or teardown touches it, and its checkout stays while it lives.
+pub fn is_shell(session_type: &str) -> bool {
     session_type == "bash"
 }
 
@@ -311,7 +313,7 @@ pub fn release_idle_streams(state: &mut DaemonState, now: f64) -> (Vec<String>, 
 }
 
 /// Whether a teardown must keep this workspace: its kind (home, stream,
-/// pinned) or a member's session (main or assistant) still in it.
+/// pinned), or a member's session (main or assistant) or a shell still in it.
 pub fn workspace_kept(state: &DaemonState, ws_id: &str) -> Option<&'static str> {
     if let Some(why) = state.workspaces.get(ws_id).and_then(crate::lifecycle_guard::protected_workspace) {
         return Some(why);
@@ -321,6 +323,7 @@ pub fn workspace_kept(state: &DaemonState, ws_id: &str) -> Option<&'static str> 
         match of_session(s).map(|m| m.acting_as) {
             Some(MAIN) => return Some("member"),
             Some(ASSISTANT) => kept = Some("assistant"),
+            _ if is_shell(&s.session_type) => kept = kept.or(Some("shell")),
             _ => {}
         }
     }

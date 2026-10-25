@@ -376,11 +376,18 @@ def iter_manifest_workspaces(data: dict[str, Any]) -> Iterable[dict[str, Any]]:
 
 def load_workspace_facts(manifest_paths: Iterable[Path]) -> dict[Path, WorkspaceFacts]:
     facts: dict[Path, WorkspaceFacts] = defaultdict(WorkspaceFacts)
+    # Daemon exits (`recently_exited`: daemon-tombstones.json, and older
+    # daemon-sessions.json files) are read after every workspace is known,
+    # so a record that names only its workspace id still finds its checkout.
+    exits: list[dict] = []
+    path_of: dict[str, Path] = {}
     for manifest_path in manifest_paths:
         try:
             data = json.loads(manifest_path.read_text())
         except (OSError, json.JSONDecodeError):
             continue
+        if isinstance(data, dict) and isinstance(data.get("recently_exited"), list):
+            exits.extend(r for r in data["recently_exited"] if isinstance(r, dict))
         bindings = data.get("bindings") or {}
         by_workspace: dict[str, set[str]] = defaultdict(set)
         if isinstance(bindings, dict):
@@ -395,6 +402,7 @@ def load_workspace_facts(manifest_paths: Iterable[Path]) -> dict[Path, Workspace
             current = facts[path]
             workspace_id = workspace.get("id")
             if isinstance(workspace_id, str):
+                path_of[workspace_id] = path
                 current.workspace_ids.add(workspace_id)
                 current.task_ids.update(by_workspace.get(workspace_id, set()))
             current.pinned = current.pinned or bool(workspace.get("pinned"))
@@ -431,6 +439,20 @@ def load_workspace_facts(manifest_paths: Iterable[Path]) -> dict[Path, Workspace
                     stamp = parse_timestamp(record.get(key))
                     if stamp is not None:
                         current.manifest_activity.append(stamp)
+    # Only the assistant clock is read from daemon exits (O5): nothing else
+    # about a checkout's ownership changes with this source.
+    for record in exits:
+        if not is_open_assistant(record_org(record)):
+            continue
+        raw_path = record.get("worktree_path")
+        path = (Path(raw_path).resolve(strict=False) if isinstance(raw_path, str) and raw_path
+                else path_of.get(record.get("workspace_id")))
+        seen = parse_timestamp(record.get("exited_at"))
+        if path is None or seen is None:
+            continue
+        current = facts[path]
+        if current.assistant_seen is None or seen > current.assistant_seen:
+            current.assistant_seen = seen
     return dict(facts)
 
 
@@ -1361,7 +1383,8 @@ def decision(
 def build_context(args: argparse.Namespace) -> tuple[ScanContext, list[str]]:
     root = args.root.expanduser().resolve(strict=False)
     cm_home = args.cm_home.expanduser().resolve(strict=False)
-    manifests = tuple(args.manifest or [cm_home / "daemon-sessions.json", cm_home / "tui-sessions.json"])
+    manifests = tuple(args.manifest or [cm_home / "daemon-sessions.json", cm_home / "tui-sessions.json",
+                                        cm_home / "daemon-tombstones.json"])
     workspace_facts = load_workspace_facts(path for path in manifests if path.is_file())
     tasks, task_ok, task_error = load_tasks(args.config.expanduser())
     live_paths, sessions_ok, session_error = load_live_paths(cm_home)

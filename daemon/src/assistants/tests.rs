@@ -576,3 +576,30 @@ fn the_heartbeat_reports_an_assistants_member_and_never_a_mains() {
     let _ = main.kill();
     crate::items::org::reset_cache_for_test();
 }
+
+/// Owner's rule: only Owner closes, kills or restarts a shell. Neither the
+/// terminal sweep nor mark_subtask_done's sweep touches one, and its checkout
+/// is kept while it lives.
+#[test]
+fn shells_survive_the_sweeps_and_keep_their_checkout() {
+    let _env = crate::test_support::env_lock();
+    crate::items::org::reset_cache_for_test();
+    let state = Arc::new(Mutex::new(DaemonState::new()));
+    {
+        let mut st = state.lock().unwrap();
+        st.sessions.insert("sh-1".into(), session_of("sh-1", Some("t-done"), None, "ws-t", "bash"));
+        st.sessions.insert("sh-w".into(), session("sh-w", Some("t-done"), None, "ws-t"));
+        st.workspaces.insert("ws-t".into(), workspace("ws-t", Some("ephemeral")));
+    }
+    for via_item in [true, false] {
+        let swept = crate::control::methods::sweep_terminal_task_sessions(&state, "t-done", "sweep", None, via_item);
+        assert!(!swept.contains(&"sh-1".to_string()), "{swept:?}");
+    }
+    crate::control::methods::sweep_task_sessions(&state, "t-done", "op");
+    let st = state.lock().unwrap();
+    assert!(!st.sessions["sh-1"].last_exit.operator_kill_requested());
+    assert!(st.sessions["sh-w"].last_exit.operator_kill_requested());
+    assert_eq!(workspace_kept(&st, "ws-t"), Some("shell"));
+    drop(st);
+    kill_all(&state);
+}

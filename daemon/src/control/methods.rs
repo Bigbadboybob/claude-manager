@@ -853,18 +853,15 @@ pub(crate) fn start_session_with_spawn_fn(
     // local A-R go through `rpc_start_session_full`, and older TUIs never
     // know the field).
     spawn_params.org = {
-        let mut st = state_arc.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let st = state_arc.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut org = p.org.clone().or_else(|| persisted_org(&st, &session_uid));
         // O5: an agent spawned by a member's session (main or assistant)
-        // is that member's assistant, and a checkout minted for it is a
-        // `stream` of the member's office, not `ephemeral`.
-        // A continuous member's spawns are workers: attributed only. A
-        // fork arrives already stamped from its source.
+        // is that member's assistant (its checkout is claimed as a `stream`
+        // once the spawn succeeded, below). A continuous member's spawns are
+        // workers: attributed only. A fork arrives already stamped from its
+        // source.
         crate::assistants::stamp_spawn(
             &st, &session_uid, p.managed_by_uid.as_deref(), &p.session_type, &mut org);
-        if let Some(member) = crate::assistants::stamped_member(org.as_ref()) {
-            crate::assistants::claim_workspace(&mut st, &p.workspace_id, &member);
-        }
         org
     };
     spawn_params.model_source = model.as_ref().and(
@@ -1376,6 +1373,13 @@ pub(crate) fn start_session_with_spawn_fn(
         session.title = name.name.clone();
     }
     state.sessions.insert(session_uid.clone(), session);
+    // O5: the spawn succeeded, so an assistant's ephemeral checkout becomes a
+    // `stream` of its member's office (a failed spawn leaves it as it was).
+    let claim = state.sessions.get(&session_uid)
+        .and_then(|s| crate::assistants::stamped_member(s.org.as_ref()).map(|m| (m, s.workspace_id.clone())));
+    if let Some((member, ws_id)) = claim {
+        crate::assistants::claim_workspace(&mut state, &ws_id, &member);
+    }
     // P0 session durability (S1): persist the registry now that the
     // new session is live, so a daemon restart can restore it. Covers
     // every production spawn — `mcp_start_session` and
@@ -9288,7 +9292,7 @@ fn ensure_ready_worktree(
 
 /// O5: a worktree-cap refusal names the caller's member's idle assistants,
 /// with how to reuse (`send_input`) or close (`close_assistant`) them.
-fn with_cap_hint(
+pub(crate) fn with_cap_hint(
     state_arc: &Arc<Mutex<DaemonState>>,
     caller_uid: Option<&str>,
     result: MethodResult,
@@ -20168,7 +20172,9 @@ fn wait_for_task_sessions_gone(
             state
                 .sessions
                 .values()
-                .any(|s| s.task_id.as_deref() == Some(task_id))
+                // Only the sessions the sweep asked to die: spared members,
+                // assistants and shells stay (O5).
+                .any(|s| s.task_id.as_deref() == Some(task_id) && s.last_exit.operator_kill_requested())
         };
         if !any || std::time::Instant::now() >= deadline {
             return;
@@ -20243,8 +20249,10 @@ pub(crate) fn sweep_terminal_task_sessions(
         .filter(|(uid, s)| {
             s.task_id.as_deref() == Some(task_id)
                 // Members' main sessions and their assistants are only
-                // unassigned (lifecycle_guard_v1, assistant_guard_v1).
+                // unassigned (lifecycle_guard_v1, assistant_guard_v1), and a
+                // shell is Owner's alone to close.
                 && !crate::assistants::is_member_session(s)
+                && !crate::assistants::is_shell(&s.session_type)
                 && (!via_item
                     || crate::lifecycle_guard::sweepable_after_item_close(
                         state.workspaces.get(&s.workspace_id),
@@ -20287,8 +20295,11 @@ pub(crate) fn sweep_task_sessions(state_arc: &Arc<Mutex<DaemonState>>, task_id: 
         .iter()
         // A member's main session or assistant is only unassigned
         // (lifecycle_guard_v1, assistant_guard_v1).
+        // A shell is Owner's alone to close, kill or restart.
         .filter(|(_, s)| {
-            s.task_id.as_deref() == Some(task_id) && !crate::assistants::is_member_session(s)
+            s.task_id.as_deref() == Some(task_id)
+                && !crate::assistants::is_member_session(s)
+                && !crate::assistants::is_shell(&s.session_type)
         })
         .map(|(uid, _)| uid.clone())
         .collect();

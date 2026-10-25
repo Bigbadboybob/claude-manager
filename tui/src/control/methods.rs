@@ -2618,7 +2618,7 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
     // doc/org-model.md §4.3, §7.1).
     let candidates: Vec<String> = app.workspaces.iter()
         .flat_map(|w| w.sessions.iter())
-        .filter(|ts| ts.task_id.as_deref() == Some(target_task.as_str()))
+        .filter(|ts| ts.task_id.as_deref() == Some(target_task.as_str()) && ts.session_type != "bash")
         .map(|ts| ts.uid.clone())
         .collect();
     let targets = app.owner_rpc_targets();
@@ -2629,14 +2629,14 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
                 .is_ok_and(|v| v["acting_as"] == "main" || v["acting_as"] == "assistant")
         })
     });
+    // A shell is Owner's alone to close, kill or restart: it is spared too,
+    // and its checkout kept while it lives.
     for wi in 0..app.workspaces.len() {
-        let _ = app.tombstone_and_remove(wi, |ts| {
-            ts.task_id.as_deref() == Some(target_task.as_str()) && !spared.contains(&ts.uid)
-        });
+        let _ = app.tombstone_and_remove(wi, |ts| subtask_done_closes(ts, &target_task, &spared));
     }
     if let Some((wi, _, _)) = &cleanup_target {
-        if app.workspaces[*wi].sessions.iter().any(|ts| spared.contains(&ts.uid)) {
-            workspace_kept = Some("member");
+        if let Some(why) = subtask_done_keeps(&app.workspaces[*wi].sessions, &spared) {
+            workspace_kept = Some(why);
         }
     }
     let cleanup_target = if workspace_kept.is_some() { None } else { cleanup_target };
@@ -2717,6 +2717,25 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
         out["workspace_kept"] = json!(kind);
     }
     Ok(out)
+}
+
+/// Whether `mark_subtask_done` closes `ts`: a session of the done task that
+/// is no member's main or assistant (`spared`) and no shell (Owner's alone
+/// to close, kill or restart).
+fn subtask_done_closes(ts: &TerminalSession, task: &str, spared: &std::collections::HashSet<String>) -> bool {
+    ts.task_id.as_deref() == Some(task) && !spared.contains(&ts.uid) && ts.session_type != "bash"
+}
+
+/// Why `mark_subtask_done` must keep the task's checkout, if it must: a
+/// spared member's session or a shell still lives in it.
+fn subtask_done_keeps(sessions: &[TerminalSession], spared: &std::collections::HashSet<String>) -> Option<&'static str> {
+    if sessions.iter().any(|ts| spared.contains(&ts.uid)) {
+        Some("member")
+    } else if sessions.iter().any(|ts| ts.session_type == "bash") {
+        Some("shell")
+    } else {
+        None
+    }
 }
 
 /// Which of `uids` are members' sessions (main or assistant), by
@@ -3136,6 +3155,28 @@ mod tests {
             sessions,
             tombstones,
         }
+    }
+
+    /// Owner's rule: only Owner closes, kills or restarts a shell. A done
+    /// subtask's shell is spared and keeps its checkout.
+    #[test]
+    fn mark_subtask_done_spares_shells_and_keeps_their_checkout() {
+        let shell = || {
+            let mut ts = live_ts("ts-sh", Some("t"));
+            ts.session_type = "bash".into();
+            ts
+        };
+        let worker = || live_ts("ts-w", Some("t"));
+        let main = || live_ts("ts-m", Some("t"));
+        let spared: std::collections::HashSet<String> = ["ts-m".to_string()].into();
+        assert!(!subtask_done_closes(&shell(), "t", &spared));
+        assert!(!subtask_done_closes(&main(), "t", &spared));
+        assert!(subtask_done_closes(&worker(), "t", &spared));
+        assert!(!subtask_done_closes(&worker(), "other", &spared));
+        let none = std::collections::HashSet::new();
+        assert_eq!(subtask_done_keeps(&[shell(), worker()], &none), Some("shell"));
+        assert_eq!(subtask_done_keeps(&[main(), shell()], &spared), Some("member"));
+        assert_eq!(subtask_done_keeps(&[worker()], &none), None);
     }
 
     /// O5: A-D and A-w read a row's own stamp (no daemon round trip on the

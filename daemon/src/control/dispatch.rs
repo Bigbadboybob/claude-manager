@@ -1216,7 +1216,9 @@ fn dispatch_session_fork(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Resp
         }
         Caller::Session(s) => Some(s.session_uid.clone()),
     };
-    match methods::session_fork(state, &req.params, caller_uid.as_deref()) {
+    // O5: a worktree-cap refusal names the caller's idle assistants.
+    match methods::with_cap_hint(state, caller_uid.as_deref(),
+                                 methods::session_fork(state, &req.params, caller_uid.as_deref())) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
