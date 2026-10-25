@@ -82,14 +82,33 @@ setting. The snapshot is polled only while something shows it (see
   handle.
 - A member who is a **guest** in another team also appears there, as a
   second box marked `⊹`.
-- **Assistants** (the other sessions of a member's home workspace, else of
-  its main session's workspace) fold under the member as `+N assistants`
-  with their state glyphs; `a` expands or folds them. Ended assistants are
-  hidden.
+- **Assistants** are every other session that reaches a member (doc/org-model.md
+  O5: as durable as main sessions). They are found by walking up from the
+  session until a member's main session or a team's task is reached:
+  1. the daemon's member stamp (`org.member_id`, S4), when present;
+  2. its spawner (`managed_by_uid`), transitively: EP's assistant and that
+     assistant's own sub-worker, each in its own ephemeral worktree, are all
+     EP's;
+  3. its task's `parent_task_id` chain: a task some member's main session is
+     bound to, or a team's coordinator task (then the team's lead box);
+  4. its workspace: the member's home workspace, else its main session's.
+
+  Placement never depends on how long a session lives or what kind of
+  workspace it is in. Assistants fold under the box as `+N assistants` with
+  their state glyphs; `a` expands or folds them (a card then names the ones
+  placed through the task tree, and the info pane's `attached` line says how
+  each one got there). Ended assistants are hidden.
 - A **vacant** member, the team lead included, is drawn empty with `∅` and
   its stand-in.
 - A **standby** team is greyed.
-- Sessions no member claims sit under **Unassigned**, by task or workspace.
+- Sessions Owner started directly (no spawner) that reach no member sit in an
+  **Owner's sessions** box under Owner, by task or workspace. **Unassigned**
+  holds only the rare rest (spawned by a session that leads nowhere either)
+  and is usually absent.
+- A box with more than three report boxes that have no reports of their own
+  (Owner's sessions, a lead's lanes) stacks them in one column, as leaders
+  do, so a wide fan-out never needs horizontal scrolling; up to three sit side
+  by side.
 
 The info pane shows, for a team: kind and status, lead, parent, member counts
 by role, board, channel and epics; for a member: kind and status, team,
