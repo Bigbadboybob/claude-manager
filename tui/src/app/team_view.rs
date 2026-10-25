@@ -94,7 +94,10 @@ impl App {
         });
         let mut out: Vec<(usize, usize)> = main.into_iter().collect();
         if let Some(wi) = home.or(main.map(|(wi, _)| wi)) {
-            out.extend((0..self.workspaces[wi].sessions.len()).map(|si| (wi, si)).filter(|p| Some(*p) != main));
+            // Another member's main session is never this one's assistant.
+            let mains = self.org_live();
+            let other_main = |si: usize| mains.is_some_and(|s| s.member_by_main(&self.workspaces[wi].sessions[si].uid).is_some_and(|o| o.id != m.id));
+            out.extend((0..self.workspaces[wi].sessions.len()).filter(|&si| Some((wi, si)) != main && !other_main(si)).map(|si| (wi, si)));
         }
         out
     }
@@ -241,7 +244,8 @@ mod tests {
         let mut ep = member("m1", "ep", Some("mem-owner"), Some("t1"), Some("ts-1-0"));
         ep["home_workspace"] = serde_json::json!({"workspace_id": "other"});
         let lead_team = team("t1", "Swarm", None, Some("m1"), &[("m1", "lead"), ("m2", "member")]);
-        app.org.accept(snapshot(3, vec![owner(), ep, member("m2", "beta", Some("m1"), Some("t1"), None)], vec![lead_team]));
+        // beta's main session sits in ep's workspace: it stays beta's.
+        app.org.accept(snapshot(3, vec![owner(), ep, member("m2", "beta", Some("m1"), Some("t1"), Some("ts-3-0"))], vec![lead_team]));
         app
     }
 
@@ -274,8 +278,8 @@ mod tests {
             })
             .collect();
         // ep's main session is s0; its home workspace isn't open, so its main
-        // session's workspace supplies the rest (s1, s2).
-        assert_eq!(keys, ["0:team:t1", "1:member:m1", "s0", "s1", "s2", "1:member:m2"]);
+        // session's workspace supplies the rest (s1, not beta's s2).
+        assert_eq!(keys, ["0:team:t1", "1:member:m1", "s0", "s1", "1:member:m2", "s2"]);
         let line = app.org_header_line("team:t1", 0, 60).to_string();
         assert!(line.contains("Swarm") && line.contains("\u{2605} ep"), "{line}");
         assert!(app.org_header_line("member:m1", 1, 60).to_string().contains("\u{2605} ep"));

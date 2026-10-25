@@ -856,7 +856,8 @@ ask(topic=None, to=None, text, item=None)            # write, later
 - **Sessions sidebar** gains a Team sub-view (team → member → sessions,
   folding as today). The Task sub-view stays selectable until S8.
 - **Planning view** is the backlog, as today. `A-f` places a task on a board,
-  with "assign to member" and "hire a new member for it". Placed tasks show a
+  with "assign to member" and "hire a new member for it". `A-f` opens a
+  chooser with Launch preselected (Enter launches as today; `p`/↓ places). Placed tasks show a
   board chip and their item status. A read-only "on boards" section lists
   epics and board-native items, so everything in flight is visible from one
   place.

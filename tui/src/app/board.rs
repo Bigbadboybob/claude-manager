@@ -246,7 +246,14 @@ impl App {
                 }
                 (_, Err(e)) => {
                     self.board.pending_close = None;
+                    // A group edited elsewhere since our read: re-read it so
+                    // the next edit carries the new revision.
+                    let reread = op == "write" && e.contains("revision_changed");
                     self.board.error = e;
+                    if reread {
+                        self.board.version = None;
+                        self.board_read(false);
+                    }
                 }
                 ("list", Ok(v)) => {
                     self.board.error.clear();

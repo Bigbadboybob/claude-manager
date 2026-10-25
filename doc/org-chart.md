@@ -64,6 +64,39 @@ the chart's focused session selected.
 - Apart from stacks, every level is laid out in one row, left to right; the
   chart grows as wide as it needs and the viewport pans to it.
 
+## Team mode
+
+When the daemon serves the org model (`org.snapshot`, doc/org-model.md) and it
+has members besides Owner, the chart is drawn from teams and managers instead
+of tasks. Old daemons and APIs keep the task chart above; the switch needs no
+setting. The snapshot is polled only while the chart, the roster, the Team
+sub-view or the planning place dialog is open.
+
+- **Owner** at the top, then the **teams** parents-first (divisions, then
+  teams, then by name). Each team box puts its lead on top (`★ handle`) and
+  its current epics as chips (`⟐ name`, from the board overlay's groups).
+- **Members** sit under their manager's box: a member whose manager is the
+  team lead hangs from the team box, and one managed by another member hangs
+  from that member. A manager line that crosses teams (manager outside the
+  member's team) is a **matrix** case and carries `⋯` with the manager's
+  handle.
+- A member who is a **guest** in another team also appears there, as a
+  second box marked `⊹`.
+- **Assistants** (the other sessions of a member's home workspace, else of
+  its main session's workspace) fold under the member as `+N assistants`
+  with their state glyphs; `a` expands or folds them. Ended assistants are
+  hidden.
+- A **vacant** member is drawn empty with `∅` and its stand-in.
+- A **standby** team is greyed.
+- Sessions no member claims sit under **Unassigned**, by task or workspace.
+
+The info pane shows, for a team: kind and status, lead, parent, member counts
+by role, board, channel and epics; for a member: kind and status, team,
+manager (matrix noted), guest teams, vacancy, mandate, focus and the board
+items it holds. (The four S5 facts replace mandate and focus when they land.)
+
+`R` opens the roster (doc/org-tui.md).
+
 ## Keys
 
 | Key | Action |
@@ -80,6 +113,8 @@ the chart's focused session selected.
 | `H` `J` `K` `L`, arrows | pan |
 | `c` | centre on the focused box |
 | `i` | show or hide the info pane |
+| `a` | team mode: expand or fold the focused member's assistants |
+| `R` | team mode: open the roster |
 | Enter (or `A-t`) | open the Sessions view with that session focused; folded sidebar headers above it unfold. Enter on a box with no session stays in the chart |
 | F6, Esc, `q` | the same, except that with no session selected (a box without one, or a header the chart opened on and you haven't moved from) the sidebar cursor goes back exactly where it was when the chart opened |
 
@@ -116,6 +151,10 @@ view's A-i peek all use.
 | ◆ | a division (as in the sidebar; ◆ is otherwise only the owner-blocked blink) |
 | ∘ | a task box whose sessions are all further down its subtree |
 | ▸ | a folded box |
+| ⟐ | team mode: an epic chip on a team box |
+| ⊹ | team mode: a guest member's box in another team |
+| ⋯ | team mode: a matrix manager line (manager outside the member's team) |
+| ∅ | team mode: a vacant member |
 | ⚙ ⧗ ☛ ⚠ ✕ ↻ ⏱ | the activity badge: working, background jobs, waits on you, rate limited, error, retrying, stalled (second legend line; see [activity badge](sidebar-sections.md#activity-badge)) |
 
 Cards use only the symbols. The info pane and the A-i peek keep the word
@@ -162,7 +201,9 @@ number of reports and how many sessions are under it.
 
 ## Code
 
-`tui/src/app/orgchart.rs` contains the model (`org_model`), the layout
+Team mode is `tui/src/app/orgchart_teams.rs` (`team_chart_model`, the info
+pane's member and team lines) over the snapshot client in
+`tui/src/app/org_model.rs`. `tui/src/app/orgchart.rs` contains the model (`org_model`), the layout
 (`layout`), the keys, drawing and the board poll. The chart reuses
 `task_leads`, `task_level`, `leader_glyph` and `planning.task_division`
 (`app/tree.rs`), the palette jump,
