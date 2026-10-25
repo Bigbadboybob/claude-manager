@@ -98,6 +98,7 @@ pub fn handle_attach_stream(
         session_uid,
         fanout_rx,
         last_exit,
+        kill_attribution,
         request_id,
         binary,
     } = handle;
@@ -147,6 +148,7 @@ pub fn handle_attach_stream(
                 &writer_session_uid,
                 writer_stop,
                 writer_last_exit,
+                kill_attribution,
                 binary,
             );
         });
@@ -478,6 +480,7 @@ fn run_outbound(
     session_uid: &str,
     stop: Arc<AtomicBool>,
     last_exit: SharedLastExit,
+    kill_attribution: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     binary: bool,
 ) {
     loop {
@@ -538,7 +541,10 @@ fn run_outbound(
                 // means the child exited — `build_end_payload`
                 // spins briefly waiting for `waitpid` to return
                 // and populate the kernel-exit slot.
-                let payload = build_end_payload(&last_exit);
+                let mut payload = build_end_payload(&last_exit);
+                if let Some(who) = kill_attribution.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+                    payload["killed_by"] = serde_json::json!(who);
+                }
                 let _ = wire::write_stream_frame(
                     &mut write_socket,
                     &StreamFrame::end(request_id, payload),
@@ -800,6 +806,7 @@ mod tests {
             session_uid: session_uid.to_string(),
             fanout_rx: session.fanout.subscribe_output(),
             last_exit: session.last_exit.clone(),
+            kill_attribution: session.kill_attribution_cell(),
             request_id: request_id.to_string(),
             binary: false,
         }
@@ -822,7 +829,8 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let worker = std::thread::spawn(move || run_outbound(writer, rx, "request", "session",
-            worker_stop, Arc::new(crate::session::LastExitProbe::new("session".into(), None, 0)), false));
+            worker_stop, Arc::new(crate::session::LastExitProbe::new("session".into(), None, 0)),
+            Arc::new(std::sync::Mutex::new(None)), false));
         // Leave the peer unread so the writer exhausts the kernel send buffer.
         worker.join().unwrap();
         assert!(stop.load(Ordering::SeqCst), "writer failure must stop the connection");

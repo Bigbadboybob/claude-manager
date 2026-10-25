@@ -521,11 +521,13 @@ pub struct TranscriptRotationConfig {
     /// Default on.
     #[serde(default = "default_rotation_enabled")]
     pub enabled: bool,
-    /// Transcript size that triggers a rotation. Default 300 MB.
+    /// Transcript size that triggers a rotation. Default 800 MB (the first
+    /// release; to be lowered once big rotations are timed in production).
     #[serde(default = "default_rotation_max_bytes")]
     pub max_bytes: u64,
     /// Compaction count that triggers a rotation (a long session can pass
-    /// it while still small). Default 200; 0 disables the count.
+    /// it while still small). 0 disables the count, the first release's
+    /// default: only the size threshold rotates for now.
     #[serde(default = "default_rotation_max_compactions")]
     pub max_compactions: u64,
     /// The session must have been idle this long, with nothing in flight.
@@ -534,6 +536,8 @@ pub struct TranscriptRotationConfig {
     pub idle_secs: u64,
     /// Owner must not have viewed or typed in the session for this long
     /// (the viewer reports a shown session every 5 minutes). Default 600 s.
+    /// Keystrokes since the agent's last turn ended (a possible unsent
+    /// draft) block it until a new turn starts, however long ago.
     #[serde(default = "default_rotation_owner_quiet_secs")]
     pub owner_quiet_secs: u64,
     /// How often the policy checks. Default 300 s.
@@ -555,8 +559,8 @@ impl Default for TranscriptRotationConfig {
 }
 
 fn default_rotation_enabled() -> bool { true }
-fn default_rotation_max_bytes() -> u64 { 300 * 1000 * 1000 }
-fn default_rotation_max_compactions() -> u64 { 200 }
+fn default_rotation_max_bytes() -> u64 { 800 * 1000 * 1000 }
+fn default_rotation_max_compactions() -> u64 { 0 }
 fn default_rotation_idle_secs() -> u64 { 300 }
 fn default_rotation_owner_quiet_secs() -> u64 { 600 }
 fn default_rotation_check_secs() -> u64 { 300 }

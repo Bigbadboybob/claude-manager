@@ -1242,6 +1242,10 @@ pub fn run() -> anyhow::Result<()> {
     messaging::delivery::spawn(&state);
     messaging::tasks::spawn(&state);
     items::start(&state);
+    // #24: a rotation the previous brain left between stop and respawn
+    // resumes its original transcript (after restore and adoption, so a
+    // session that did come back is seen as live).
+    rotation::recover_inflight(&state);
     rotation::start_policy(&state);
     usage::start(&state);
     staffing::start(&state);

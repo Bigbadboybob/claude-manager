@@ -18,6 +18,16 @@ class RotationGraceTests(unittest.TestCase):
         with mock.patch.object(monitor.time, "monotonic", return_value=1000.0 + monitor.ROTATION_GRACE_S + 1):
             self.assertFalse(monitor._rotating("ts-a", rotated, seen), "a rotation that never came back is an exit")
 
+    def test_one_turn_is_absorbed_per_rotation_after_arming(self):
+        absorbed = {}
+        before = {"rotation": {"started_at": 50.0}}
+        self.assertFalse(monitor._rotation_turn("ts-a", before, 100.0, absorbed), "rotated before the watch")
+        after = {"rotation": {"started_at": 150.0}}
+        self.assertTrue(monitor._rotation_turn("ts-a", after, 100.0, absorbed))
+        self.assertFalse(monitor._rotation_turn("ts-a", after, 100.0, absorbed), "only the notice's turn")
+        self.assertTrue(monitor._rotation_turn("ts-a", {"rotation": {"started_at": 300.0}}, 100.0, absorbed))
+        self.assertFalse(monitor._rotation_turn("ts-a", {}, 100.0, absorbed))
+
     def test_other_exits_are_exits_and_reset_the_clock(self):
         seen = {"ts-a": 1.0}
         self.assertFalse(monitor._rotating("ts-a", {"killed_by": "operator"}, seen))

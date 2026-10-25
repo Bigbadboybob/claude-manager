@@ -3061,6 +3061,8 @@ pub fn resolve_authorized_session(
             "reported_done": report.is_some(),
             "reported_done_at": report.as_ref().map(|r| r.at_unix),
             "report_reason": report.as_ref().and_then(|r| r.reason.clone()),
+            // #24: monitors absorb the turn CM's own after-notice causes.
+            "rotation": crate::rotation::status(&p.session_uid),
         }))
     } else if let Some(tomb) = state.exited_tombstone(&p.session_uid) {
         // Read-after-exit: the session left the registry but its transcript
@@ -26993,6 +26995,30 @@ while True:
         // A freshly spawned process is not idle (or not idle long enough).
         let why = crate::rotation::boundary(&s, "ts-cl-0", idle, quiet).unwrap_err();
         assert!(why.contains("idle"), "{why}");
+        // Idle for 1000 s with nothing in flight: at a boundary.
+        let ago = |secs: u64| std::time::Instant::now().checked_sub(std::time::Duration::from_secs(secs));
+        {
+            let c = s.sessions.get("ts-cl-0").unwrap();
+            *c.last_input_at.lock().unwrap() = ago(1100);
+            *c.last_activity_at.lock().unwrap() = ago(1000);
+            *c.last_turn_end_at.lock().unwrap() = ago(1000);
+        }
+        assert_eq!(crate::rotation::boundary(&s, "ts-cl-0", idle, quiet), Ok(()));
+        // A pending scheduled wakeup blocks it (a restart would lose it).
+        s.sessions.get("ts-cl-0").unwrap().agent_state.lock().unwrap().inputs.background.crons.push(
+            crate::agent_state::Cron { id: "c1".into(), schedule: "44 23 * * *".into(), recurring: false });
+        let why = crate::rotation::boundary(&s, "ts-cl-0", idle, quiet).unwrap_err();
+        assert!(why.contains("scheduled wakeup"), "{why}");
+        s.sessions.get("ts-cl-0").unwrap().agent_state.lock().unwrap().inputs.background.crons.clear();
+        // Owner typing recently, or typing since the last turn (a draft).
+        *s.sessions.get("ts-cl-0").unwrap().last_operator_input_at.lock().unwrap() = ago(100);
+        assert!(crate::rotation::boundary(&s, "ts-cl-0", idle, quiet).unwrap_err().contains("Owner typed in it"));
+        *s.sessions.get("ts-cl-0").unwrap().last_operator_input_at.lock().unwrap() = ago(700);
+        assert!(crate::rotation::boundary(&s, "ts-cl-0", idle, quiet).unwrap_err().contains("draft"));
+        let zero = std::time::Duration::ZERO;
+        assert_eq!(crate::rotation::boundary(&s, "ts-cl-0", zero, zero), Ok(()), "a forced rotation decided");
+        *s.sessions.get("ts-cl-0").unwrap().last_operator_input_at.lock().unwrap() = ago(1050);
+        assert_eq!(crate::rotation::boundary(&s, "ts-cl-0", idle, quiet), Ok(()), "typed before the turn");
         s.sessions.clear();
     }
 

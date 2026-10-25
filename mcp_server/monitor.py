@@ -496,6 +496,21 @@ ROTATION_KILLER = "transcript-rotation"
 ROTATION_GRACE_S = 300.0
 
 
+def _rotation_turn(uid: str, resolved: dict, armed_at: float, absorbed: dict) -> bool:
+    """Whether the turn that just ended is the one CM's own notice caused
+    after a transcript rotation (#24) that started after this watch armed.
+    Each rotation absorbs one turn end: the agent reads the notice and
+    stops, which is not the worker finishing its assignment."""
+    record = resolved.get("rotation") or {}
+    started = record.get("started_at")
+    if not isinstance(started, (int, float)) or started < armed_at:
+        return False
+    if absorbed.get(uid) == started:
+        return False
+    absorbed[uid] = started
+    return True
+
+
 def _rotating(uid: str, resolved: dict, seen: dict) -> bool:
     """Whether an exited `uid` is mid-rotation (stopped by CM's transcript
     rotation, #24), for at most ROTATION_GRACE_S after it was first seen so."""
@@ -603,6 +618,8 @@ async def _monitor_sessions(
     remaining = list(uids)
     completed: list[dict] = []
     rotation_seen: dict[str, float] = {}
+    rotation_absorbed: dict[str, float] = {}
+    armed_at = time.time()
 
     while True:
         now = time.monotonic()
@@ -743,6 +760,14 @@ async def _monitor_sessions(
                         interim_turn_ends[uid] += 1
                     done = False
 
+            if (done and edge_ok and state != "exited" and not shell and not reported
+                    and _rotation_turn(uid, resolved, armed_at, rotation_absorbed)):
+                # #24: the turn the rotation's after-notice caused. Re-arm
+                # past it, like an interim turn in final mode.
+                new_baseline = await asyncio.to_thread(baseline_for, engine, tpath, resolved)
+                if new_baseline is not None:
+                    baselines[uid] = new_baseline
+                done = False
             if not edge_ok:
                 # Idle on the pre-arm turn: not a completion, keep waiting
                 # for the next edge.

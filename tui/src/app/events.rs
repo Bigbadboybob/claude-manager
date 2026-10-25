@@ -2197,6 +2197,12 @@ impl App {
                     return;
                 }
                 let memory_cap_kill = last_exit.memory_cap_kill;
+                // #24/#25: a rotation or handoff stop comes straight back at
+                // the same uid: keep the row (its section and placement).
+                let respawning = last_exit
+                    .killed_by
+                    .as_deref()
+                    .is_some_and(crate::term_shim::is_respawn_killer);
                 let mut found = false;
                 // Workspace index holding the exited session IFF it's an
                 // agent-spawned ephemeral that should be PRUNED (see below).
@@ -2242,6 +2248,7 @@ impl App {
                             if ts.managed_by_uid.is_some()
                                 && ts.workflow_run_id.is_none()
                                 && !self.revive_failed.contains_key(&uid)
+                                && !respawning
                             {
                                 prune_ws = Some(wi);
                             }
@@ -3463,6 +3470,27 @@ mod apply_manifest_diff_tests {
             "an agent-managed session must be removed from the \
              sidebar on exit",
         );
+    }
+
+    /// #24/#25: a worker CM stopped to rotate or hand it off comes straight
+    /// back at the same uid; its row (section, placement) stays.
+    #[test]
+    fn exited_diff_keeps_a_worker_that_is_being_respawned() {
+        for killer in ["transcript-rotation", "handoff"] {
+            let mut app = build_app_with_session("ts-agent");
+            app.workspaces[0].sessions[0].managed_by_uid = Some("orch".into());
+            app.apply_manifest_diff(ManifestDiff::Exited {
+                uid: "ts-agent".into(),
+                last_exit: LastExit {
+                    killed_by: Some(killer.into()),
+                    code: Some(143),
+                    memory_cap_kill: false,
+                    kills_file_offset: None,
+                    exited_at: 1.0,
+                },
+            });
+            assert_eq!(app.workspaces[0].sessions.len(), 1, "{killer}: the row stays");
+        }
     }
 
     /// A USER-created session (`managed_by_uid == None`) is NOT

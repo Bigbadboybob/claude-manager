@@ -2499,6 +2499,11 @@ impl ContinuousScheduler {
     /// gap). Prefers the immutable `kernel_set()` read over `try_wait` (which
     /// needs `&mut`). The lock drops on return — before any fire.
     fn session_is_dead(&self, uid: &str) -> bool {
+        // #24: a transcript rotation stops the process and brings it back at
+        // the same uid; supervision must not respawn over it meanwhile.
+        if crate::rotation::in_progress(uid) {
+            return false;
+        }
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state
             .sessions
@@ -4386,6 +4391,19 @@ mod tests {
             assert_eq!(current.last_run.unwrap().status, RunStatus::Running);
             assert!(!sched.session_is_dead(uid));
         });
+    }
+
+    #[test]
+    fn a_session_mid_rotation_is_not_dead() {
+        // #24: supervision must not respawn over a rotation (the process is
+        // stopped and comes back at the same uid).
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        let sched = ContinuousScheduler::new(Arc::clone(&state));
+        assert!(sched.session_is_dead("ts-rot-sched"), "absent = dead");
+        crate::rotation::test_set_running("ts-rot-sched", true);
+        assert!(!sched.session_is_dead("ts-rot-sched"));
+        crate::rotation::test_set_running("ts-rot-sched", false);
+        assert!(sched.session_is_dead("ts-rot-sched"));
     }
 
     #[test]

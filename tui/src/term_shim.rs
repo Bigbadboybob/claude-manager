@@ -473,14 +473,24 @@ impl<R: Read> Read for StreamReader<R> {
                         .get("memory_cap_kill")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
+                    // #24/#25: CM stopped it to bring it straight back at
+                    // the same uid (a transcript rotation or a handoff).
+                    // The viewer keeps the slot and reattaches, exactly as
+                    // after a transport death.
+                    let respawning = frame
+                        .payload
+                        .get("killed_by")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_respawn_killer);
                     self.child_event = Some(ChildEvent::Exited {
                         code,
                         memory_cap_kill,
                         // Structured `End` frame → a genuine
                         // daemon-side child exit, NOT a transport
                         // death. The exit handler tears the session
-                        // down normally (no reconnect).
-                        transport_eof: false,
+                        // down normally (no reconnect) — unless CM
+                        // is respawning it.
+                        transport_eof: respawning,
                     });
                     self.eof = true;
                     return Ok(0);
@@ -780,6 +790,12 @@ impl<W: Write> Write for StreamWriter<W> {
     }
 }
 
+/// `killed_by` values of the stops after which CM brings a session straight
+/// back at the same uid: a transcript rotation (#24) and a handoff (#25).
+pub fn is_respawn_killer(killed_by: &str) -> bool {
+    matches!(killed_by, "transcript-rotation" | "handoff")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1068,6 +1084,17 @@ mod tests {
             }
         );
         assert!(r.take_child_event().is_none());
+    }
+
+    #[test]
+    fn a_rotation_or_handoff_stop_reads_as_a_reconnect_not_an_exit() {
+        for (killed_by, respawning) in [("transcript-rotation", true), ("handoff", true), ("operator", false)] {
+            let wire = frame_bytes(StreamKind::End, serde_json::json!({ "exit_code": 143, "killed_by": killed_by }));
+            let mut r = StreamReader::new(Cursor::new(wire));
+            assert_eq!(r.read(&mut [0u8; 8]).unwrap(), 0);
+            let Some(ChildEvent::Exited { transport_eof, .. }) = r.take_child_event() else { panic!("exit event") };
+            assert_eq!(transport_eof, respawning, "{killed_by}");
+        }
     }
 
     #[test]

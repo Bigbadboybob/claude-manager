@@ -2564,6 +2564,8 @@ impl App {
     /// transcript at the same session (#24). Owner asked, so the daemon
     /// does it now rather than waiting for an idle point; the session comes
     /// back in place.
+    /// Alt+T: ask before moving the focused Claude session to a fresh
+    /// transcript (it restarts in place), naming the session and its size.
     pub(super) fn rotate_active_session(&mut self) {
         let Cursor::Session(wi, si) = self.cursor.clone() else {
             self.set_status_msg("Focus a Claude session to rotate its transcript");
@@ -2578,6 +2580,25 @@ impl App {
             self.set_status_msg("The session is not running; A-R revives it");
             return;
         }
+        let size = self
+            .transcript_bytes(ts)
+            .map(super::agent_state::short_size)
+            .unwrap_or_else(|| "size unknown".into());
+        let prompt = format!(
+            "Rotate '{}' ({size} transcript) now? It restarts in place, continuing from its latest \
+             compaction in a fresh transcript. [y/N]",
+            sanitize_for_display(&ts.label)
+        );
+        self.input_mode = InputMode::Confirm { prompt, action: ConfirmAction::RotateTranscript { uid: ts.uid.clone() } };
+    }
+
+    /// The confirmed Alt+T: a forced rotation (the idle and Owner-quiet waits
+    /// are skipped; anything in flight still refuses).
+    pub(super) fn rotate_session(&mut self, uid: &str) {
+        let Some(ts) = self.workspaces.iter().flat_map(|w| w.sessions.iter()).find(|s| s.uid == uid) else {
+            self.set_status_msg("Session no longer in the sidebar");
+            return;
+        };
         let (uid, host) = (ts.uid.clone(), ts.host_id.clone());
         let socket = match self.host_pool.for_host(&host).ok().and_then(|h| h.socket_path()) {
             Some(socket) => socket,
