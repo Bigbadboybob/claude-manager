@@ -227,19 +227,51 @@ impl App {
                 let Row::Proposal(i) = row else { return None };
                 let id = self.roster.reply.proposals[*i].proposal_id.clone();
                 let approve = self.roster.edits.get(&id)?.approve?;
-                let (handle, kind, team, manager, home) = self.roster_values(row);
-                Some(json!({
+                let (handle, kind, team, manager, _) = self.roster_values(row);
+                let mut out = json!({
                     "proposal_id": id, "approve": approve, "handle": handle, "kind": kind,
                     "team_id": team, "manager": manager,
-                    "home_workspace": home.map(|p| json!({"path": p})),
-                }))
+                });
+                if let Ok(Some(home)) = self.roster_home_param(row) {
+                    out["home_workspace"] = home;
+                }
+                Some(out)
             })
             .collect()
+    }
+
+    /// The `home_workspace` to send for `row`: nothing unless Owner edited it
+    /// (the server keeps the proposal's own), null when cleared, else the
+    /// full `{daemon_id, workspace_id, path}` of a known workspace with that
+    /// path. The API needs both ids, so a path alone is refused here.
+    pub(super) fn roster_home_param(&self, row: &Row) -> Result<Option<Value>, String> {
+        let Some(path) = self.roster.edits.get(&self.roster_key(row)).and_then(|e| e.home.clone()) else {
+            return Ok(None);
+        };
+        if path.is_empty() {
+            return Ok(Some(Value::Null));
+        }
+        let members = self.org.snapshot.as_ref().map(|s| s.members.as_slice()).unwrap_or_default();
+        self.roster
+            .reply
+            .proposals
+            .iter()
+            .filter_map(|p| p.home_workspace.as_ref())
+            .chain(members.iter().filter_map(|m| m.home_workspace.as_ref()))
+            .find(|h| h.path.as_deref() == Some(path.as_str()))
+            .and_then(|h| Some(json!({"daemon_id": h.daemon_id.clone()?, "workspace_id": h.workspace_id.clone()?, "path": path})))
+            .map(Some)
+            .ok_or_else(|| format!("No known workspace at {path}; leave home unset and change it after applying"))
     }
 
     fn roster_apply(&mut self) {
         if self.roster.rx.is_some() {
             self.roster.status = "Busy; try again".into();
+            return;
+        }
+        let decided = self.roster_rows().into_iter().filter(|r| self.roster.edits.get(&self.roster_key(r)).and_then(|e| e.approve) == Some(true));
+        if let Some(err) = decided.filter_map(|r| self.roster_home_param(&r).err()).next() {
+            self.roster.status = err;
             return;
         }
         let rows = self.roster_apply_rows();
@@ -295,13 +327,13 @@ impl App {
     /// fills in the pid).
     pub(super) fn roster_adopt_params(&self, row: &Row, request_id: &str) -> Value {
         let Row::Adopt { uid, .. } = row else { return Value::Null };
-        let (handle, kind, team, manager, home) = self.roster_values(row);
+        let (handle, kind, team, manager, _) = self.roster_values(row);
         let mut params = json!({"session_uid": uid, "handle": handle, "kind": kind, "manager": manager, "request_id": request_id});
         if let Some(t) = team {
             params["team_id"] = json!(t);
         }
-        if let Some(p) = home {
-            params["home_workspace"] = json!({"path": p});
+        if let Ok(Some(home)) = self.roster_home_param(row) {
+            params["home_workspace"] = home;
         }
         params
     }
@@ -592,6 +624,7 @@ mod tests {
     use super::*;
 
     use super::super::org_model::fixtures::{member, owner, snapshot, team};
+    use super::super::org_model::HomeWorkspace;
     use crate::app::lifecycle::revive_session_tests::dummy_ts;
     use cm_daemon::host_id::HostId;
     use crossterm::event::KeyEvent;
@@ -685,6 +718,34 @@ mod tests {
         press(&mut app, "nope");
         enter(&mut app);
         assert_eq!(app.roster.status, "No team nope");
+    }
+
+    #[test]
+    fn home_is_sent_only_when_edited_and_as_the_full_workspace() {
+        let mut app = roster_app();
+        app.roster.reply.proposals[0].home_workspace = Some(HomeWorkspace { daemon_id: Some("d1".into()), workspace_id: Some("w1".into()), path: Some("/wt/a".into()) });
+        press(&mut app, "y");
+        // Unedited: the key is absent, so the server keeps the proposal's own
+        // home (a path-only object was refused for every row, 2026-10-25).
+        assert!(app.roster_apply_rows()[0].get("home_workspace").is_none());
+        press(&mut app, "w");
+        app.roster.prompt.as_mut().unwrap().1.clear();
+        press(&mut app, "/wt/a");
+        enter(&mut app);
+        assert_eq!(app.roster_apply_rows()[0]["home_workspace"], json!({"daemon_id": "d1", "workspace_id": "w1", "path": "/wt/a"}));
+        // A path no known workspace has is refused before anything is sent.
+        press(&mut app, "w");
+        app.roster.prompt.as_mut().unwrap().1.clear();
+        press(&mut app, "/nowhere");
+        enter(&mut app);
+        press(&mut app, "A");
+        assert!(app.roster.rx.is_none());
+        assert!(app.roster.status.starts_with("No known workspace at /nowhere"), "{}", app.roster.status);
+        // Clearing it sends null.
+        press(&mut app, "w");
+        app.roster.prompt.as_mut().unwrap().1.clear();
+        enter(&mut app);
+        assert_eq!(app.roster_apply_rows()[0]["home_workspace"], Value::Null);
     }
 
     #[test]
