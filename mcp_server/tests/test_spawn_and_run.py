@@ -210,12 +210,16 @@ class StartSessionWaitTests(_SpawnStubMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res["status"], "awaiting_input")
         self.assertEqual(res["last_message"]["content"], "ALL DONE")
 
-    async def test_wait_bash_refuses_without_spawning(self):
-        from unittest.mock import patch
-        with patch.object(control_client, "call") as call:
-            res = await start_session("bash", "sh", prompt="echo hi", wait=True)
-        self.assertEqual(res["error"], "agent_only")
-        call.assert_not_called()
+    async def test_wait_bash_returns_after_pty_quiet_without_a_reply(self):
+        def call(method, params=None, **kwargs):
+            if method in ("mcp_start_session", "start_session"):
+                return {"session_uid": "ts-shell", "session_type": "bash"}
+            return {"engine": "bash", "state": "pending", "idle": True}
+        control_client.call = call
+        res = await start_session("bash", "sh", prompt="echo hi", wait=True)
+        self.assertTrue(res["completed"])
+        self.assertEqual(res["kind"], "shell")
+        self.assertIsNone(res["last_message"])
 
 
 # ── Structured output ──────────────────────────────────────────────────

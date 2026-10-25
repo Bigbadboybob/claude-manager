@@ -195,7 +195,10 @@ Use `include_shells=true` to inspect bash terminals; they carry `kind: "shell"`
 and `status: "shell"` (or `exited`). Shells are never teammates, item holders,
 roster candidates, or free capacity. `send_input` explicitly runs shell commands
 with a newline and skips agent completion monitoring. Redirect command output
-to a file. Transcript reads, agent waits/monitors (including `until="final"`),
-`start_session(type="bash", wait=true)`, `report_done`, chat identity and org
-adoption require an agent and refuse shells clearly. This distinction does not
+to a file. `wait_for_session_idle`, `start_session(type="bash", wait=true)`,
+`monitor_sessions(until="turn_end")` and `cm-wait` wait for PTY quiet or exit
+and return shell-labelled results without an assistant reply. Quiet output
+does not prove a command succeeded. Transcript reads, assistant reply waits,
+`until="final"`, `report_done`, chat identity and org adoption require an agent
+and refuse shells clearly. This distinction does not
 close, kill, restart or move shell sessions.

@@ -506,7 +506,7 @@ async def task_org(pool, task: dict) -> dict:
                  LEFT JOIN incarnations inc ON inc.pid = s.pid AND inc.role = 'main'
                                            AND inc.ended_at IS NULL
                 WHERE s.task_id = $1 AND s.exited_at IS NULL AND s.state <> 'exited'
-                  AND s.engine IN ('claude', 'claude-code', 'codex')""",
+                  AND s.engine IS DISTINCT FROM 'bash'""",
             uuid.UUID(str(task_id)))
         ids = sorted({r["member_id"] for r in sessions if r["member_id"]})
         if team and team["lead_member_id"]:
@@ -1128,7 +1128,7 @@ async def adopt(pool, actor: dict, *, pid: str, handle: str, title: str | None =
                         WHERE s.pid = $1 AND s.exited_at IS NULL AND s.state <> 'exited'""", pid)
                 if facts is None:
                     raise _err(404, "not_found", f"{pid} is not a live session")
-                if (facts["engine"] or "").lower() not in AGENT_ENGINES:
+                if facts["engine"] == "bash":
                     raise _err(422, "agent_only", "adopt requires an agent session; bash is a shell")
                 continuous = None
                 aliases = []

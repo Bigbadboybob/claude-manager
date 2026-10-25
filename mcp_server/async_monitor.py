@@ -11,10 +11,11 @@ the shared native notification queue.
 
 Termination discipline (`until`):
   - "turn_end" (default) — the watch completes on the next completed
-    turn, exit, or eviction;
+    turn, exit, or eviction; shells complete on PTY quiet or exit,
+    without an assistant reply, regardless of transcript edge settings;
   - "final" — only an exit or the agent's own `report_done` counts.
     Interim turn ends re-arm the watch instead of firing it, which is
-    what makes a monitor safe to arm on a worker that pauses mid-task or
+    Shells refuse final watches. This makes a monitor safe to arm on a worker that pauses mid-task or
     ends a turn with background subagents still running.
 
 Delivery discipline:
@@ -121,7 +122,7 @@ def _prune_finished() -> None:
         _MONITORS.pop(k, None)
 
 
-def _capture_baseline(uid: str) -> tuple[dict | None, bool, float | None]:
+def _capture_baseline(uid: str, *, until: str = "turn_end") -> tuple[dict | None, bool, float | None]:
     """One resolve of `uid` at ARM time. Returns (baseline-or-None,
     currently_at_prompt, report_anchor-or-None).
 
@@ -139,7 +140,9 @@ def _capture_baseline(uid: str) -> tuple[dict | None, bool, float | None]:
     except (control_client.ControlError, control_client.TransportError):
         return None, False, None
     if is_shell(resolved):
-        raise RegistrationError("agent_only", shell_refusal("monitor_sessions")["message"])
+        if until == "final":
+            raise RegistrationError("agent_only", shell_refusal("monitor_sessions(until=final)")["message"])
+        return None, False, None
     state = resolved.get("state", "pending")
     idle = bool(resolved.get("idle", False))
     engine = resolved.get("engine", "claude-code")
@@ -151,7 +154,7 @@ def _capture_baseline(uid: str) -> tuple[dict | None, bool, float | None]:
     if engine_state(resolved) is not None:
         return baseline_for(engine, tpath, resolved), bool(engine_turn_complete(resolved)), anchor
     if state != "ready" or not tpath:
-        # Starting / transcript-less (bash): nothing to anchor an edge
+        # Starting / transcript-less agent: nothing to anchor an edge
         # on — level behavior, which is right for a fresh spawn (its
         # first completed turn should fire).
         return None, False, anchor
@@ -183,6 +186,8 @@ def register_monitor(
         completed turn, the default) or "final" (only an exit or an
         explicit `report_done`; interim turn ends re-arm the watch).
         `until="task_done"` is accepted as a synonym for "final".
+        Shells support only turn_end: wait for PTY quiet or exit without
+        an assistant reply, regardless of edge settings.
 
     Because agents reach for the axis they remember, `mode="final"` is
     accepted as sugar for `mode="any", until="final"` — the one-word
@@ -244,7 +249,7 @@ def register_monitor(
     already_idle: list[str] = []
     already_reported: list[str] = []
     for uid in uids:
-        baseline, at_prompt, anchor = _capture_baseline(uid)
+        baseline, at_prompt, anchor = _capture_baseline(uid, until=until)
         if edge:
             if baseline is not None:
                 baselines[uid] = baseline
@@ -507,6 +512,9 @@ def _entry_lines(entry: dict) -> list[str]:
     continuation lines — so existing consumers keep parsing.
     """
     uid = entry.get("session_uid", "?")
+    if entry.get("kind") == "shell":
+        status = entry.get("status", "quiet")
+        return [f"- {uid} (shell {status}): PTY {status}; no assistant reply."]
     status = entry.get("status", "?")
     lm = entry.get("last_message") or {}
     content = (lm.get("content") or "").strip()

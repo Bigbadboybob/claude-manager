@@ -819,6 +819,13 @@ pub fn send_input(app: &mut App, caller_uid: &str, params: &Value) -> MethodResu
         ));
     }
     let session_type = app.workspaces[wi].sessions[si].session_type.clone();
+    if session_type == "bash" {
+        let mut payload = p.text.into_bytes();
+        payload.push(b'\n');
+        app.workspaces[wi].sessions[si].session.write(&payload)
+            .map_err(|e| (ErrorCode::Internal, format!("shell input: {e}")))?;
+        return Ok(json!({"ok": true, "kind": "shell", "submitted": true}));
+    }
     let agent = agent::agent_for(&session_type);
     let wt = app.workspaces[wi]
         .worktree_path
@@ -3960,6 +3967,37 @@ mod tests {
             unsafe { std::env::remove_var("HOME") };
         }
         std::mem::forget(tmp);
+    }
+
+    #[test]
+    fn send_input_shell_submits_a_command_without_an_agent_prompt_queue() {
+        with_app_and_repo("shell-send", |app, repo| {
+            let wi = app.workspaces.len() - 1;
+            app.workspaces[wi].sessions.push(live_ts("caller", None));
+            let mut shell = live_ts("shell", None);
+            shell.session_type = "bash".into();
+            shell.session = crate::session::Session::new(
+                "/bin/bash", &["--noprofile".into(), "--norc".into()], 80, 24,
+                Some(repo.to_path_buf()), HashMap::new(), None,
+            ).expect("shell PTY");
+            app.workspaces[wi].sessions.push(shell);
+
+            let reply = send_input(app, "caller", &json!({
+                "session_uid": "shell",
+                "text": "printf 'submitted' > shell-result",
+                "submit": true,
+            })).expect("shell send");
+            assert_eq!(reply["kind"], "shell");
+            assert_eq!(reply["submitted"], true);
+            assert!(app.workspaces[wi].sessions[1].pending_prompt.is_none());
+
+            let marker = repo.join("shell-result");
+            let deadline = Instant::now() + std::time::Duration::from_secs(3);
+            while std::fs::read_to_string(&marker).ok().as_deref() != Some("submitted") {
+                assert!(Instant::now() < deadline, "submitted shell command did not execute");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
     }
 
     /// TUI twin of the daemon's reaped-worktree heal: a task bound to a

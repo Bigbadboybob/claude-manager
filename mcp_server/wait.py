@@ -9,6 +9,10 @@ orchestrator with the output. That lets the orchestrator stay free to handle
 the user or launch other work while N workers run, instead of parking inside
 a blocking MCP tool call. (See the orchestrator skills for the pattern.)
 
+Shell targets complete when their PTY goes quiet or exits. Their entries
+carry kind="shell", idle_source="pty", and no assistant reply. PTY quiet
+does not prove a command succeeded.
+
 Usage:
     python3 mcp_server/wait.py <uid> [<uid> ...] [options]
 

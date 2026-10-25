@@ -270,6 +270,19 @@ impl Sandbox {
     }
 
     fn spawn_bash_with_env(&mut self, uid: &str, env: serde_json::Value) -> i32 {
+        self.spawn_typed_bash(uid, env, "bash")
+    }
+
+    fn spawn_typed_bash(&mut self, uid: &str, mut env: serde_json::Value, session_type: &str) -> i32 {
+        if session_type == "claude-code" {
+            // Bash is the private test agent's stand-in. Accept the agent's
+            // keyboard Enter so output markers prove command execution.
+            let inputrc = self.home.join("agent.inputrc");
+            std::fs::write(&inputrc, r#""\e[13u": accept-line
+"\e[13;1u": accept-line
+"#).expect("agent readline bindings");
+            env["INPUTRC"] = serde_json::json!(inputrc.to_string_lossy());
+        }
         let start = self.op(
             "start_session",
             serde_json::json!({
@@ -279,7 +292,9 @@ impl Sandbox {
                 "label": uid,
                 "argv": ["bash", "--norc"],
                 "working_dir": self.home.to_string_lossy(),
-                "session_type": "bash",
+                "session_type": session_type,
+                "model": (session_type == "claude-code").then_some("claude-opus-5-5"),
+                "effort": (session_type == "claude-code").then_some("low"),
                 "cols": 120,
                 "rows": 40,
                 "env": env
@@ -433,7 +448,7 @@ fn kill_attribution_survives_a_brain_crash() {
 fn report_done_survives_a_brain_crash() {
     let mut sb = launch_sandbox("r11");
     let uid = "ts-d02e-1";
-    sb.spawn_bash(uid);
+    sb.spawn_typed_bash(uid, serde_json::json!({}), "claude-code");
     // The session itself reports done (session-caller RPC).
     let resp = round_trip(
         &sb.socket,
@@ -901,7 +916,7 @@ fn brain_crash_kills_no_session_end_to_end() {
 fn brain_deploy_via_daemon_restart_rides_sessions_through() {
     let mut sb = launch_sandbox("deploy");
     let uid = "ts-de91-1";
-    let bash_pid = sb.spawn_bash(uid);
+    let bash_pid = sb.spawn_typed_bash(uid, serde_json::json!({}), "claude-code");
     let bash_start = proc_starttime(bash_pid).expect("starttime");
 
     let h = sb.op("daemon.health", serde_json::json!({}));

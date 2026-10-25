@@ -470,6 +470,20 @@ class OrgApiDb(unittest.IsolatedAsyncioTestCase):
 
     # ---- adoption, heartbeat, reads --------------------------------------------
 
+    async def test_missing_and_null_engine_sessions_can_be_adopted_and_appear_as_task_peers(self):
+        root = await self.task("legacy TUI rows")
+        for n, engine_fields in enumerate(({}, {"engine": None}), 1):
+            uid = uid_at(3, n)
+            r = await self.http.post(f"/hosts/{D1}/heartbeat", json={"sessions": [{
+                "pid": pid(uid), "session_uid": uid, "state": "idle", "task_id": root,
+                **engine_fields}]})
+            self.assertEqual(r.status_code, 200, r.text)
+            r = await self.http.post("/org/adopt", json={"actor": OWNER, "pid": pid(uid),
+                "handle": f"legacy-{n}", "request_id": f"legacy-adopt-{n}"})
+            self.assertEqual(r.status_code, 200, r.text)
+            peers = await org_db.task_org(self.pool, {"id": root})
+            self.assertIn(uid, [row["session_uid"] for row in peers["members"]])
+
     async def test_shell_adoption_and_holder_assignment_refuse_without_side_effects(self):
         from dispatch import items_db
         uid = uid_at(3)

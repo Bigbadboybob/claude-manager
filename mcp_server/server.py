@@ -2389,13 +2389,15 @@ async def start_session(
             `mark_subtask_done(task_id)` when finished. An explicit `task_id`
             arg is ignored when isolated (the subtask is always a child of
             YOUR task).
-        wait: Block until the spawned worker replies to `prompt`, then
-            return its final message (see Returns). Default false.
+        wait: Block until the spawned agent replies to `prompt`, then
+            return its final message (see Returns). For bash, wait for
+            PTY quiet or exit and return last_message=null. Default false.
         timeout_s / poll_interval_s / pending_idle_grace_s: Waiting knobs,
             same semantics as `send_input_and_wait`. Only used when wait.
-        schema: Optional JSON Schema for structured output (only meaningful
-            with wait). The initial prompt is decorated with a "reply with
-            ONLY JSON matching this schema" instruction; the reply is
+        schema: Agent-only JSON Schema for structured output (only meaningful
+            with wait). Bash refuses it before spawning. The initial prompt
+            is decorated with a "reply with ONLY JSON matching this schema"
+            instruction; the reply is
             parsed + validated at the tool layer, with up to
             `schema_retries` re-prompts on a miss. The parsed value comes
             back as `result`.
@@ -2477,8 +2479,8 @@ async def start_session(
     every spawn — doubly so when `global_perms=true`, which mints a child
     that can reach across the whole session graph.
     """
-    if type == "bash" and wait:
-        return shell_refusal("start_session(wait=true)")
+    if type == "bash" and schema is not None:
+        return shell_refusal("start_session(schema=...)")
     if not label.strip():
         return {"error": "invalid_params", "message": "label must be non-empty"}
     # isolated: branch a subtask worktree under the caller's task, then bind
@@ -2604,7 +2606,7 @@ async def start_session(
         tree)."""
         if isinstance(d, dict) and isinstance(spawn, dict):
             for key in (
-                "staffing_note", "staffing_version", "session_type",
+                "staffing_note", "staffing_version", "session_type", "kind",
                 "worktree_path",
                 "task_id",
                 "prompt_source",
@@ -2670,16 +2672,24 @@ async def start_session(
     # Anchor there even after confirmation, retaining a fast completed launch
     # turn while rejecting startup idle. Old receipts use a fresh counter of 0.
     # Legacy engines still use their initial transcript cursor.
-    res = await _await_reply(
-        session_uid,
-        engine="claude-code", transcript_path=None,
-        anchor_cursor=None, generation=0,
-        deadline=deadline, interval=interval, grace=grace,
-        agent_baseline=({"kind": "agent", "value": (
-            launch_receipt.get("turn_seq_before", 0)
-            if isinstance(launch_receipt, dict) else 0
-        ), "no_turn_at": None} if delivered_a_prompt else None),
-    )
+    if type == "bash" or is_shell(spawn):
+        quiet = await wait_for_session_idle(
+            session_uid, timeout_s=max(1.0, deadline - time.monotonic()),
+            poll_interval_s=interval, pending_idle_grace_s=grace,
+        )
+        res = {**quiet, "completed": quiet.get("idle", False) and not quiet.get("timed_out", False),
+               "last_message": None}
+    else:
+        res = await _await_reply(
+            session_uid,
+            engine="claude-code", transcript_path=None,
+            anchor_cursor=None, generation=0,
+            deadline=deadline, interval=interval, grace=grace,
+            agent_baseline=({"kind": "agent", "value": (
+                launch_receipt.get("turn_seq_before", 0)
+                if isinstance(launch_receipt, dict) else 0
+            ), "no_turn_at": None} if delivered_a_prompt else None),
+        )
     res["session_uid"] = session_uid
     if schema is not None:
         res = await _settle_schema(
@@ -2873,7 +2883,14 @@ async def send_input(
                 source="auto",
             )
         except async_monitor.RegistrationError as e:
-            res["monitor"] = {"error": e.code, "message": str(e)}
+            if e.code == "agent_only":
+                # Older TUI replies omit kind and only identify the shell
+                # during monitor registration. Preserve an unknown submitted
+                # value instead of turning queued input into a false receipt.
+                res["kind"] = "shell"
+                res["note"] = "Shell input accepted; automatic agent monitoring does not apply."
+            else:
+                res["monitor"] = {"error": e.code, "message": str(e)}
     return res
 
 
@@ -2907,7 +2924,8 @@ async def send_key(
             restart; the engine's default is used).
         notify_on_done: Register an async monitor on the sessions that got
             the key, waking you when they finish the turn it starts (all of
-            them, when there are several). Default false: a key often
+            the agents, when there are several). Shells are omitted from
+            this automatic monitor. Default false: a key often
             starts no turn at all (menu navigation).
         notify_until: "turn_end" (default) or "final"; see `monitor_sessions`.
 
@@ -2930,6 +2948,15 @@ async def send_key(
     res = await asyncio.to_thread(control_client.call, "send_key", {"session_uids": uids, "key": key})
     if notify_on_done and isinstance(res, dict) and "error" not in res:
         sent = [r["session_uid"] for r in res.get("results", []) if r.get("status") == "ok"]
+        agents = []
+        for uid in sent:
+            try:
+                target = await asyncio.to_thread(control_client.call, "resolve_authorized_session", {"session_uid": uid})
+            except (control_client.ControlError, control_client.TransportError):
+                continue
+            if not is_shell(target):
+                agents.append(uid)
+        sent = agents
         if sent:
             try:
                 res["monitor"] = async_monitor.register_monitor(
@@ -3535,8 +3562,12 @@ async def wait_for_session_idle(
     poll_interval_s: float = 2.0,
     pending_idle_grace_s: float = 8.0,
 ) -> dict:
-    """Block until a session becomes idle (agent at the prompt), then
-    return.
+    """Block until an agent becomes idle or a shell's PTY goes quiet or exits.
+
+    Shells use PTY activity only, without a transcript grace period or
+    assistant reply. Results carry kind="shell", idle_source="pty" and
+    status="quiet", "working" (timeout) or "exited". PTY quiet does not
+    prove a command succeeded.
 
     Low-level primitive. For the common cases prefer the front door:
     `start_session(wait=true)` to spawn a worker and get its first reply,
@@ -3565,7 +3596,7 @@ async def wait_for_session_idle(
     bind into `ready` — if it stays continuously pending+quiet past the
     grace, we return idle anyway with state="pending" rather than
     blocking to `timeout_s`. This bounds the wait for sessions that will
-    NEVER bind a transcript (bash sessions, or claude/codex on a daemon
+    NEVER bind a transcript (claude/codex on a daemon
     with no transcript detector watching it) while still letting a
     freshly-spawned agent's transcript self-heal first. Any busy poll
     resets the grace clock.
@@ -3589,8 +3620,7 @@ async def wait_for_session_idle(
         - status="exited" (state="exited"): session terminated.
         - status="starting" (state="pending", idle): PTY quiet but no
           transcript bound; best-effort idle after the grace window
-          (transcript never bound — e.g. a bash session or a
-          detector-less daemon).
+          (transcript never bound — e.g. a detector-less daemon).
         - status="working" (idle=False, timed_out=True): deadline
           reached while still busy.
 
@@ -3643,14 +3673,20 @@ async def wait_for_session_idle(
                 }
             raise
         resolved_once = True
-        if is_shell(resolved):
-            return shell_refusal("wait_for_session_idle")
         state = resolved.get("state", "pending")
         idle = bool(resolved.get("idle", False))
         # The agent's own done signal, so this wait's `status` agrees with
         # what `list_sessions` says about the same session.
         reported = bool(resolved.get("reported_done", False))
         now = time.monotonic()
+        if is_shell(resolved):
+            quiet = state == "exited" or bool(resolved.get("pty_idle", idle))
+            if quiet or now >= deadline:
+                return {"kind": "shell", "state": state, "idle": quiet,
+                        "timed_out": not quiet, "idle_source": "pty",
+                        "status": "exited" if state == "exited" else "quiet" if quiet else "working"}
+            await asyncio.sleep(interval)
+            continue
         if state == "exited":
             return _with_outcome({
                 "idle": True, "timed_out": False, "state": state,
@@ -4284,7 +4320,9 @@ async def wait_for_any_session_idle(
 
     Each session uses the same idle rule as `wait_for_session_idle`
     (ready+quiet, or exited; a transcript-less pending+quiet session
-    reports after `pending_idle_grace_s`). SAME race caveat too: a session
+    reports after `pending_idle_grace_s`). Shells wait for PTY quiet or
+    exit without a transcript grace period and return kind="shell",
+    idle_source="pty", and last_message=null. SAME race caveat too: a session
     that is already quiet at call time is reported immediately, so don't
     pass a worker you JUST sent input to here — use `send_input_and_wait`
     for that one, then monitor the rest with this.
@@ -4381,7 +4419,10 @@ async def monitor_sessions(
             finishes; "all" fires once when EVERY one has.
         until: WHAT counts as finished for each session.
             "turn_end" (default) — the next completed turn. Right when
-                you're driving a conversation turn by turn.
+                you're driving a conversation turn by turn. For shells,
+                wait for PTY quiet or exit and return a shell-labelled
+                result without an assistant reply. Quiet output does not
+                prove a command succeeded.
             "final" — only an EXIT or an explicit `report_done`. Every
                 interim turn end silently re-arms the watch, so a worker
                 that pauses mid-task, asks itself a question, or ends a
@@ -4410,6 +4451,7 @@ async def monitor_sessions(
             can `read_last_turn` it right now instead. Set false only
             if you genuinely want "fire immediately if it's already
             idle" (level-triggered).
+            Shells have no transcript edge; either setting waits for PTY quiet.
 
     Returns: {monitor_id, watching, mode, until, already_idle,
     already_reported, async_note} immediately. A non-empty

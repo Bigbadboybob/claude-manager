@@ -2,7 +2,7 @@
 
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from mcp_server import async_monitor, control_client, monitor, server
 
@@ -48,7 +48,7 @@ class ShellLists(unittest.TestCase):
             {"error": "agent_only", "message": "bash is a shell"})
         self.assertIn("Watch refused: bash is a shell", message)
 
-    def test_cli_shell_watch_exits_with_a_clear_error(self):
+    def test_cli_shell_watch_waits_for_pty_quiet(self):
         import contextlib
         import io
         import sys
@@ -58,9 +58,10 @@ class ShellLists(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()) as output, \
              contextlib.redirect_stderr(io.StringIO()) as errors:
             code = wait.main()
-        self.assertEqual(code, 2)
-        self.assertIn('"error": "agent_only"', output.getvalue())
-        self.assertIn("bash is a shell", errors.getvalue())
+        self.assertEqual(code, 0)
+        self.assertIn('"kind": "shell"', output.getvalue())
+        self.assertIn('"status": "quiet"', output.getvalue())
+        self.assertIn("1 finished", errors.getvalue())
 
 
 class ShellAsync(unittest.IsolatedAsyncioTestCase):
@@ -78,21 +79,90 @@ class ShellAsync(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["error"], "agent_only")
         self.assertEqual([c.args[0] for c in call.call_args_list], ["resolve_authorized_session"])
 
-    async def test_wait_spawn_refuses_before_creating_anything(self):
+    async def test_wait_spawn_waits_for_a_shell_without_assistant_reply(self):
+        def call(method, params=None, **kwargs):
+            if method in ("mcp_start_session", "start_session"):
+                return {"session_uid": "shell", "kind": "shell", "prompt_source": "caller"}
+            self.assertEqual(method, "resolve_authorized_session")
+            return SHELL
+        with patch.object(control_client, "call", side_effect=call):
+            result = await server.start_session("bash", "sh", prompt="printf ok", wait=True)
+        self.assertTrue(result["completed"])
+        self.assertEqual(result["kind"], "shell")
+        self.assertIsNone(result["last_message"])
+
+    async def test_shell_structured_reply_refuses_before_spawning_or_decorating_a_command(self):
         with patch.object(control_client, "call") as call:
-            result = await server.start_session("bash", "sh", wait=True, isolated=True)
+            result = await server.start_session("bash", "sh", prompt="printf ok",
+                                                wait=True, schema={"type": "object"}, isolated=True)
         self.assertEqual(result["error"], "agent_only")
         call.assert_not_called()
 
-    async def test_monitor_refusal_applies_to_turn_and_final_and_level_watches(self):
+    async def test_final_monitors_refuse_shells_including_aliases(self):
         with patch.object(control_client, "call", return_value=SHELL), \
              patch.dict(os.environ, {"CM_TUI_SESSION_ID": "caller"}):
-            for until in ("turn_end", "final"):
+            for until in ("final", "task_done"):
                 for edge in (True, False):
                     with self.assertRaises(async_monitor.RegistrationError) as caught:
                         async_monitor.register_monitor(["shell"], until=until, edge=edge)
                     self.assertEqual(caught.exception.code, "agent_only")
-                result = await monitor._monitor_sessions(["shell"], until=until)
-                self.assertEqual(result["error"], "agent_only")
-            result = await server.wait_for_session_idle("shell")
+            result = await monitor._monitor_sessions(["shell"], until="final")
             self.assertEqual(result["error"], "agent_only")
+
+    async def test_shell_quiet_waits_ignore_agent_and_transcript_signals(self):
+        busy = {**SHELL, "idle": True, "pty_idle": False,
+                "agent_state": {"state": "idle", "source": "hook", "turn_seq": 9}}
+        quiet = {**busy, "pty_idle": True}
+        with patch.object(control_client, "call", side_effect=[busy, quiet]) as call, \
+             patch.object(server.asyncio, "sleep", new_callable=AsyncMock):
+            result = await server.wait_for_session_idle("shell")
+        self.assertEqual(call.call_count, 2)
+        self.assertEqual((result["kind"], result["status"], result["idle_source"]), ("shell", "quiet", "pty"))
+        # A stale bound transcript / reported flag must never become a reply.
+        quiet.update(transcript_path="/not-a-shell-transcript", reported_done=True)
+        with patch.object(control_client, "call", side_effect=[busy, quiet]), \
+             patch.object(monitor.asyncio, "sleep", new_callable=AsyncMock):
+            result = await monitor._monitor_sessions(["shell"], until="turn_end")
+        entry = result["completed"][0]
+        self.assertEqual((entry["kind"], entry["status"]), ("shell", "quiet"))
+        self.assertIsNone(entry["last_message"])
+
+    async def test_exited_shell_wait_is_labelled_without_agent_completion(self):
+        exited = {**SHELL, "state": "exited", "pty_idle": False, "reported_done": True}
+        with patch.object(control_client, "call", return_value=exited):
+            result = await server.wait_for_session_idle("shell")
+        self.assertEqual((result["kind"], result["status"], result["idle_source"]), ("shell", "exited", "pty"))
+        self.assertTrue(result["idle"])
+        self.assertFalse(result["timed_out"])
+
+    async def test_shell_turn_end_registration_accepts_both_edge_modes(self):
+        with patch.object(control_client, "call", return_value=SHELL), \
+             patch.dict(os.environ, {"CM_TUI_SESSION_ID": "caller"}), \
+             patch.object(async_monitor, "persist_state"), \
+             patch.object(async_monitor, "_run_monitor", new_callable=AsyncMock):
+            for edge in (True, False):
+                result = async_monitor.register_monitor(["shell"], until="turn_end", edge=edge)
+                self.assertEqual(result["watching"], ["shell"])
+                async_monitor._MONITORS[result["monitor_id"]]["task"].cancel()
+                del async_monitor._MONITORS[result["monitor_id"]]
+
+    async def test_legacy_tui_shell_reply_does_not_gain_a_false_receipt_or_monitor_error(self):
+        with patch.object(control_client, "call", return_value={"ok": True}), \
+             patch.object(async_monitor, "register_monitor", side_effect=async_monitor.RegistrationError("agent_only", "shell")):
+            result = await server.send_input("shell", "printf ok", notify_until="final")
+        self.assertEqual(result["kind"], "shell")
+        self.assertNotIn("monitor", result)
+        self.assertNotIn("submitted", result)
+
+    async def test_mixed_send_key_auto_monitor_keeps_only_agents(self):
+        def call(method, params=None, **kwargs):
+            if method == "send_key":
+                return {"sent": 2, "results": [{"session_uid": "shell", "status": "ok"},
+                                                {"session_uid": "agent", "status": "ok"}]}
+            return SHELL if params["session_uid"] == "shell" else {"engine": "codex"}
+        with patch.object(control_client, "call", side_effect=call), \
+             patch.object(async_monitor, "register_monitor", return_value={"monitor_id": "agents"}) as register:
+            result = await server.send_key(["shell", "agent"], "enter", notify_on_done=True, notify_until="final")
+        register.assert_called_once()
+        self.assertEqual(register.call_args.args[0], ["agent"])
+        self.assertEqual(result["monitor"]["monitor_id"], "agents")

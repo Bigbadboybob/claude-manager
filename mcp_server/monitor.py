@@ -28,6 +28,8 @@ from mcp_server.transcripts.types import Role
 
 def engine_state(resolved: dict) -> dict | None:
     """Authoritative engine state; explicit PTY/transcript fallbacks stay legacy."""
+    if is_shell(resolved):
+        return None
     value = resolved.get("agent_state")
     if not isinstance(value, dict) or value.get("source") in ("pty", "transcript"):
         return None
@@ -462,7 +464,8 @@ def _monitor_completed_entry(
     no_turn = bool(exit_meta and no_turn_at(engine_state(exit_meta)) is not None
                    and exit_meta.get("state") != "exited")
     last_message = None
-    if include_message and transcript_path is not None and not no_turn:
+    shell = engine == "bash" or bool(exit_meta and is_shell(exit_meta))
+    if include_message and transcript_path is not None and not no_turn and not shell:
         try:
             # Backward scan, not a full parse: completions run in executor
             # threads, and a whole large transcript per completion grew the
@@ -477,6 +480,8 @@ def _monitor_completed_entry(
         "idle": idle,
         "last_message": last_message,
     }
+    if shell:
+        entry.update(kind="shell", idle_source="pty")
     if no_turn:
         entry["completion_kind"] = "no_turn"
     for key in _EXIT_PROVENANCE_KEYS:
@@ -517,6 +522,8 @@ async def _monitor_sessions(
     `exited`; a transcript-less pending+quiet session reports after
     `pending_idle_grace_s`. A bad/unauthorized uid is reported once with
     status="error" so a typo can't block the whole monitor.
+    Shells instead complete on PTY quiet or exit, without a transcript
+    grace period or assistant reply, and carry kind="shell", idle_source="pty".
 
     `until` selects WHAT counts as finished for each session:
 
@@ -533,8 +540,8 @@ async def _monitor_sessions(
         launch turn with background subagents still running, and an
         orchestrator reading that as completion is a live incident.
         An agent that never calls report_done completes only on exit;
-        shells are refused because they have no agent turns. Pair final mode with
-        a `timeout_s` you're willing to wait.
+        shells refuse final mode, while turn_end waits for PTY quiet.
+        Pair final mode with a `timeout_s` you're willing to wait.
 
     mode="any" (default): return as soon as >=1 session completes. The
         `completed` batch may hold more than one if several finished in
@@ -611,14 +618,15 @@ async def _monitor_sessions(
                 remaining.remove(uid)
                 continue
 
-            if is_shell(resolved):
-                return {**shell_refusal("monitor_sessions"), "session_uid": uid}
+            shell = is_shell(resolved)
+            if shell and final_mode:
+                return {**shell_refusal("monitor_sessions(until=final)"), "session_uid": uid}
 
             seen[uid] = True
             state = resolved.get("state", "pending")
-            idle = bool(resolved.get("idle", False))
+            idle = bool(resolved.get("pty_idle", resolved.get("idle", False)) if shell else resolved.get("idle", False))
             engine = resolved.get("engine", "claude-code")
-            tpath = resolved.get("transcript_path")
+            tpath = None if shell else resolved.get("transcript_path")
             gen = int(resolved.get("generation", 0))
             last_meta[uid] = (engine, tpath, gen)
 
@@ -637,6 +645,8 @@ async def _monitor_sessions(
                     baselines[uid] = _agent_baseline(engine_state(resolved), baselines[uid])
             if state == "exited":
                 done = True
+            elif shell:
+                done = idle
             elif engine_done is not None:
                 done = engine_done
             elif state == "ready" and idle:
@@ -673,14 +683,14 @@ async def _monitor_sessions(
             # Edge gate: an idle observation on the SAME turn that existed
             # when the watch was armed is not a completion.
             edge_ok = True
-            if done and state != "exited" and baselines:
+            if done and state != "exited" and baselines and not shell:
                 b = baselines.get(uid)
                 if b is not None and not legacy_edge_passed and not await asyncio.to_thread(
                     _edge_passed, b, engine, tpath, resolved
                 ):
                     edge_ok = False
 
-            reported = bool(resolved.get("reported_done"))
+            reported = not shell and bool(resolved.get("reported_done"))
             if final_mode and state != "exited":
                 if _report_is_new(resolved, report_anchors.get(uid)):
                     # The report IS the edge. Deciding this off the
@@ -700,8 +710,8 @@ async def _monitor_sessions(
                         baseline_for, engine, tpath, resolved
                     )
                     # Count only turns we can actually pin. A
-                    # transcript-less session — bash, or an agent still
-                    # coming up — has no turn boundary to re-arm against,
+                    # transcript-less agent still coming up has no
+                    # turn boundary to re-arm against,
                     # and incrementing per poll would make the count a
                     # poll counter.
                     if (
@@ -729,6 +739,8 @@ async def _monitor_sessions(
                     if reported
                     else status_override or _session_status(state, idle, False, resolved.get("agent_state"))
                 )
+                if shell:
+                    status_word = "exited" if state == "exited" else "quiet"
                 entry = await asyncio.to_thread(
                     _monitor_completed_entry, uid,
                     status_word,
