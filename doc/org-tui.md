@@ -84,7 +84,8 @@ on, so a poll that moves rows doesn't change its target.
 
 When the API serves placement (`boards.on_boards`: probed once on entering the
 planning view, then polled every 30 s only while the On-boards strip is shown
-and the terminal is focused):
+and the terminal is focused, with `since_version` so an idle board answers
+`unchanged`; a full read at most every 5 minutes):
 
 - **`A-f`** opens a chooser with **Launch** preselected, so Enter keeps
   today's launch flow (`l` also launches). **Place on a board…** (`p`, or ↓

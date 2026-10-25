@@ -25,7 +25,7 @@ const BACKGROUND_POLL: Duration = Duration::from_secs(15);
 /// Polls send `since_version` and get `{unchanged}` back. Session links
 /// (main, occupancy) can move without the org version, so the whole
 /// snapshot is re-read this often, and whenever a screen opens.
-const FULL_READ: Duration = Duration::from_secs(300);
+pub(super) const FULL_READ: Duration = Duration::from_secs(300);
 const ERROR_RETRY: Duration = Duration::from_secs(15);
 /// An unsupported feature is asked again this long after it was turned off.
 pub(super) const OFF_RETRY: Duration = Duration::from_secs(300);

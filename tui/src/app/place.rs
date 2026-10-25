@@ -78,6 +78,8 @@ pub(super) struct Place {
     /// unplace, a hire. Each is kept until it answers.
     rx: Vec<mpsc::Receiver<Reply>>,
     on_boards_inflight: bool,
+    /// When the last full (non-`unchanged`) on-boards read was sent.
+    on_boards_full: Option<Instant>,
     last_poll: Option<Instant>,
     retry_at: Option<Instant>,
     pub(super) chooser: Option<Chooser>,
@@ -155,7 +157,21 @@ impl App {
         self.place.last_poll = Some(Instant::now());
         self.place.retry_at = None;
         self.place.on_boards_inflight = true;
-        self.place_request("on_boards", "boards.on_boards", json!({}));
+        let params = self.on_boards_params();
+        self.place_request("on_boards", "boards.on_boards", params);
+    }
+
+    /// `since_version` once a versioned read is held (an older API ignores
+    /// it and answers in full); a full read at most every five minutes.
+    fn on_boards_params(&mut self) -> Value {
+        let version = self.place.on_boards["version"].as_i64();
+        match version {
+            Some(v) if self.place.on_boards_full.is_some_and(|t| t.elapsed() < super::org_model::FULL_READ) => json!({"since_version": v}),
+            _ => {
+                self.place.on_boards_full = Some(Instant::now());
+                json!({})
+            }
+        }
     }
 
     /// The read-only On boards strip is on screen (or would be, once it has
@@ -170,7 +186,9 @@ impl App {
         match (op, r) {
             ("on_boards", Ok(v)) => {
                 self.place.support = Support::On;
-                self.place.on_boards = v;
+                if v["unchanged"].as_bool() != Some(true) {
+                    self.place.on_boards = v;
+                }
                 self.planning.placement_on = true;
             }
             ("on_boards", Err(f)) if f.unsupported => {
@@ -309,7 +327,8 @@ impl App {
         if !self.place.on_boards_inflight && !cfg!(test) {
             self.place.on_boards_inflight = true;
             self.place.last_poll = Some(Instant::now());
-            self.place_request("on_boards", "boards.on_boards", json!({}));
+            let params = self.on_boards_params();
+            self.place_request("on_boards", "boards.on_boards", params);
         }
     }
 
@@ -579,6 +598,19 @@ mod tests {
         assert_eq!(app.place.support, Support::Off);
         assert!(!key(&mut app, KeyCode::Char('f'), KeyModifiers::ALT));
         assert_eq!(app.on_boards_height(Rect::new(0, 0, 100, 40)), 0);
+    }
+
+    #[test]
+    fn on_boards_polls_send_since_version_and_keep_data_on_unchanged() {
+        let mut app = test_app();
+        assert_eq!(app.on_boards_params(), json!({}), "first read is full");
+        app.place_accept("on_boards", Ok(json!({"version": 4, "epics": [{"board": "swarm", "name": "S3"}], "items": []})));
+        assert_eq!(app.on_boards_params(), json!({"since_version": 4}));
+        app.place_accept("on_boards", Ok(json!({"unchanged": true, "version": 4})));
+        assert_eq!(app.place.on_boards["epics"][0]["name"], "S3");
+        // An API without versions always reads in full.
+        app.place_accept("on_boards", Ok(json!({"epics": [], "items": []})));
+        assert_eq!(app.on_boards_params(), json!({}));
     }
 
     #[test]
