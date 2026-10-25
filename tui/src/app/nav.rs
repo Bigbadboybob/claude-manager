@@ -367,6 +367,9 @@ pub enum SidebarColumn {
 pub enum SidebarView {
     Status,
     Task,
+    /// Teams and members (app/team_view.rs); the Task tree when the org
+    /// model isn't live.
+    Team,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -412,6 +415,9 @@ pub(super) enum VisualItem {
     /// top-level blocks of the division's tree. Selectable; Space/Enter
     /// fold it. See `app/tree.rs`.
     DivisionHeader(String),
+    /// Team sub-view header (app/team_view.rs): `team:<id>`, `member:<id>`
+    /// or the unassigned group. Not a cursor stop.
+    OrgHeader { key: String, depth: u8 },
 }
 
 /// One row in the dedicated continuous column (the two-column panel, S2 of
@@ -721,6 +727,7 @@ impl App {
         let items = match self.sidebar_view {
             SidebarView::Status => self.visual_items_status(),
             SidebarView::Task => self.visual_items_task(),
+            SidebarView::Team => self.visual_items_team(),
         };
         self.filter_visual_items(items)
     }
@@ -772,6 +779,7 @@ impl App {
             VisualItem::BacktestHeader => contains("backtest") || self.backtest_rows.iter().any(|r| contains(&r.label)),
             VisualItem::BacktestFleet(stem) => contains(stem),
             VisualItem::BacktestRun { task_id, .. } => self.backtest_rows.iter().find(|r| r.task_id == *task_id).is_some_and(|r| contains(&r.label) || contains(task_id)),
+            VisualItem::OrgHeader { key, .. } => contains(&self.org_header_text(key)),
             VisualItem::ContinuousHeader | VisualItem::Separator | VisualItem::SectionEnd => false,
         }
     }
@@ -1451,6 +1459,7 @@ impl App {
             // Continuous header is presentation-only, like
             // other decorative headers; skip it in cursor navigation.
             VisualItem::ContinuousHeader => false,
+            VisualItem::OrgHeader { .. } => false,
             // Backtest rows are all selectable — the header and fleet rows
             // for the Space/Enter fold toggle, run rows for the A-i peek.
             VisualItem::BacktestHeader => true,
@@ -1559,7 +1568,7 @@ impl App {
         // reachable (the jump unfolds it).
         let main = match self.sidebar_view {
             SidebarView::Task => self.filter_visual_items(self.task_tree_unfolded().items),
-            SidebarView::Status => self.visual_items(),
+            SidebarView::Status | SidebarView::Team => self.visual_items(),
         };
         for vi in main {
             if let VisualItem::Session(wi, si) = vi {

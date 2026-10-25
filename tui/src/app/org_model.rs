@@ -340,10 +340,6 @@ impl App {
         self.orgchart.visible || self.roster.visible || self.team_view_shown() || self.planning_place_open()
     }
 
-    /// The Team sub-view is showing (it polls the org model).
-    pub(super) fn team_view_shown(&self) -> bool {
-        false
-    }
 
     /// The live org snapshot (support on, members present), else `None`:
     /// every screen falls back to today's view on `None`.

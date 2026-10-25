@@ -1843,7 +1843,8 @@ impl App {
     pub(super) fn draw_session_list(&mut self, frame: &mut Frame, area: Rect) {
         let view_label = match self.sidebar_view {
             SidebarView::Status => " Sessions ",
-            SidebarView::Task => " Tasks ",
+            SidebarView::Team if self.org_live().is_some() => " Teams ",
+            SidebarView::Task | SidebarView::Team => " Tasks ",
         };
         let view_label = if let Some(filter) = self.sidebar_filter.as_deref() {
             format!("{} · /{} ", view_label.trim(), filter)
@@ -1915,7 +1916,13 @@ impl App {
         // or folds.
         let moved = self.last_drawn_cursor.as_ref() != Some(&self.cursor);
         self.last_drawn_cursor = Some(self.cursor.clone());
-        let mut tree = (self.sidebar_view == SidebarView::Task).then(|| self.task_tree());
+        // The Team sub-view draws the Task tree until the org model is live.
+        let task_tree = match self.sidebar_view {
+            SidebarView::Task => true,
+            SidebarView::Team => self.org_live().is_none(),
+            SidebarView::Status => false,
+        };
+        let mut tree = task_tree.then(|| self.task_tree());
         let mut visual = match &tree {
             Some(t) => self.filter_visual_items(t.items.clone()),
             None => self.visual_items(),
@@ -2169,7 +2176,8 @@ impl App {
                             let full = format!("{} / {}", ws.name, ts.label);
                             crate::planning::truncate_with_ellipsis(&full, max_name)
                         }
-                        SidebarView::Task => {
+                        SidebarView::Team if tree.is_none() => format!("      {}", ts.label),
+                        SidebarView::Task | SidebarView::Team => {
                             // Indent levels (Phase 6 deepened by 2 cells per tier
                             // so workflow-participant nesting reads cleanly):
                             //   - Workspace-level (no task): 2 spaces.
@@ -2501,6 +2509,9 @@ impl App {
                             .add_modifier(Modifier::BOLD),
                     )]);
                     items.push(ListItem::new(line));
+                }
+                VisualItem::OrgHeader { key, depth } => {
+                    items.push(ListItem::new(self.org_header_line(key, *depth, inner.width as usize)));
                 }
                 VisualItem::BacktestHeader
                 | VisualItem::BacktestFleet(_)

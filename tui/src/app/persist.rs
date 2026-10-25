@@ -125,6 +125,7 @@ impl App {
         let view = match self.sidebar_view {
             SidebarView::Status => "status",
             SidebarView::Task => "task",
+            SidebarView::Team => "team",
         };
         let manifest = Manifest {
             messaging_names: self.messaging_manifest_names(),

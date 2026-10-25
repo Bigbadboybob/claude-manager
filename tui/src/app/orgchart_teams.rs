@@ -28,7 +28,7 @@ use std::collections::{HashMap, HashSet};
 /// The Owner-level box for sessions no member claims.
 pub(super) const UNASSIGNED_LABEL: &str = "Unassigned";
 
-fn team_rank(t: &Team) -> u8 {
+pub(super) fn team_rank(t: &Team) -> u8 {
     match t.kind.as_str() {
         "division" => 0,
         "team" => 1,

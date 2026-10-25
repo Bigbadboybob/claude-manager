@@ -74,6 +74,7 @@ mod orgchart;
 mod orgchart_teams;
 mod org_model;
 mod place;
+mod team_view;
 mod roster;
 pub(crate) mod symbols;
 mod owner_blocked;
@@ -787,6 +788,7 @@ impl App {
         let manifest = Self::load_manifest();
         let sidebar_view = match manifest.view.as_deref() {
             Some("task") => SidebarView::Task,
+            Some("team") => SidebarView::Team,
             _ => SidebarView::Status,
         };
         let hide_continuous = manifest.hide_continuous;

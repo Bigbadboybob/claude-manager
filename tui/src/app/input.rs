@@ -3364,10 +3364,10 @@ impl App {
                         return true;
                     }
                     KeyCode::Char('v') => {
-                        self.sidebar_view = match self.sidebar_view {
-                            SidebarView::Status => SidebarView::Task,
-                            SidebarView::Task => SidebarView::Status,
-                        };
+                        self.sidebar_view = self.next_sidebar_view();
+                        if self.sidebar_view == SidebarView::Team {
+                            self.org_refresh_soon();
+                        }
                         self.save_session_manifest();
                         return true;
                     }
