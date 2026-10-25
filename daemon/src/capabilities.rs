@@ -38,13 +38,6 @@ pub fn brain() -> Vec<String> {
     caps
 }
 
-/// Whether the running holder supports `cap`: it lists it, or `cap` is
-/// brain-only and the holder carries the org object.
-fn holder_supports(cap: &str, holder: &[String]) -> bool {
-    holder.iter().any(|h| h == cap)
-        || (BRAIN_ONLY.contains(&cap) && holder.iter().any(|h| h == ORG_PRESERVE_V1))
-}
-
 /// The running holder's list (`None` when this brain is not split).
 pub fn holder() -> Option<Vec<String>> {
     crate::holder_mode::global().map(|client| client.holder_capabilities())
@@ -182,6 +175,16 @@ fn pin_from(path: &Path, at: &Epoch, current: Option<&str>) -> Vec<String> {
     Vec::new()
 }
 
+/// Keep what the running holder supports: a name it lists, or a brain-only
+/// name when it preserves the org object. `None` (not split) keeps all.
+fn intersect_holder(base: Vec<String>, holder: Option<&[String]>) -> Vec<String> {
+    let Some(holder) = holder else { return base };
+    let preserves = holder.iter().any(|c| c == ORG_PRESERVE_V1);
+    base.into_iter()
+        .filter(|c| holder.contains(c) || (preserves && BRAIN_ONLY.contains(&c.as_str())))
+        .collect()
+}
+
 fn intersect(base: Vec<String>, other: Option<&[String]>) -> Vec<String> {
     match other {
         Some(other) => base.into_iter().filter(|c| other.contains(c)).collect(),
@@ -213,12 +216,7 @@ pub fn report(previous_pin: Option<bool>) -> Value {
     // A brain that has not recorded its boot yet (the first instant after
     // start) cannot vouch for its pin: advertise nothing until it has.
     let pin = if BOOT_EPOCH.get().is_none() { Some(Vec::new()) } else { pin };
-    let advertised: Vec<String> = brain
-        .iter()
-        .filter(|c| holder.as_deref().is_none_or(|h| holder_supports(c, h)))
-        .cloned()
-        .collect();
-    let advertised = intersect(advertised, pin.as_deref());
+    let advertised = intersect(intersect_holder(brain.clone(), holder.as_deref()), pin.as_deref());
     json!({
         "brain": brain,
         "holder": holder,
@@ -302,15 +300,11 @@ mod tests {
     }
 
     #[test]
-    fn brain_only_capabilities_need_the_holder_to_carry_the_org_object() {
-        let carrying = vec![ORG_PRESERVE_V1.to_string()];
-        assert!(holder_supports(ORG_PRESERVE_V1, &carrying));
-        assert!(!holder_supports(ORG_PRESERVE_V1, &[]), "a pre-S0b holder");
-        for cap in BRAIN_ONLY {
-            assert!(holder_supports(cap, &carrying));
-            assert!(!holder_supports(cap, &[]));
-        }
-        assert!(!holder_supports(LIFECYCLE_GUARD_V1, &carrying) || BRAIN_ONLY.contains(&LIFECYCLE_GUARD_V1));
+    fn org_preserve_needs_the_holder_and_brain_only_names_ride_on_it() {
+        let s0b_holder = vec![ORG_PRESERVE_V1.to_string()];
+        assert_eq!(intersect_holder(brain(), Some(&s0b_holder)), brain());
+        assert!(intersect_holder(brain(), Some(&[])).is_empty(), "a pre-S0b holder admits nothing");
+        assert_eq!(intersect_holder(brain(), None), brain(), "not split");
     }
 
     #[test]
