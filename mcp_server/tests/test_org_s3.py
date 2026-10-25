@@ -400,6 +400,9 @@ class OrgS3Db(unittest.IsolatedAsyncioTestCase):
         body = r.json()
         self.assertEqual([e["name"] for e in body["epics"]], ["Latent"])
         self.assertEqual([i["n"] for i in body["items"]], [1], "board-native items only")
+        again = (await self.http.get("/items/on-boards",
+                                     params={"since_version": body["version"]})).json()
+        self.assertEqual(again, {"unchanged": True, "version": body["version"]})
 
     # ---- epics -----------------------------------------------------------
     async def epic(self, name, actor=ORCH, **kw):

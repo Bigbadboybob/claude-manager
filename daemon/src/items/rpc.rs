@@ -40,7 +40,11 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
             epic_call(&ctx, req.method.as_str(), &req.params)
         }
         // Read-only, open to every session: epics and board-native items.
-        "boards.on_boards" => ctx.api.get("/items/on-boards", &[]),
+        "boards.on_boards" => {
+            let since: Vec<(&str, String)> = req.params.get("since_version").and_then(Value::as_i64)
+                .map(|v| vec![("since_version", v.to_string())]).unwrap_or_default();
+            ctx.api.get("/items/on-boards", &since)
+        }
         // Every item blocked on Owner, across boards (the TUI's sidebar marker).
         "board.owner_blocked" => ctx.api.get("/items/owner-blocked", &[]),
         other => Err((ErrorCode::UnknownMethod, format!("unknown items method {other}"))),

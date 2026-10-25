@@ -716,10 +716,15 @@ async def _group_rows(conn, board: dict, ids: list[str] | None) -> list[dict]:
     return out
 
 
-async def on_boards(pool) -> dict:
+async def on_boards(pool, since_version: int | None = None) -> dict:
     """The planning view's read-only "on boards" section (§11): open epics
-    and open board-native items, across boards."""
+    and open board-native items, across boards. `version` is the newest
+    board event (items and groups write one on every change); with
+    `since_version` equal to it the answer is `{unchanged, version}`."""
     async with pool.acquire() as conn:
+        version = int(await conn.fetchval("SELECT COALESCE(max(id), 0) FROM item_events"))
+        if since_version is not None and since_version == version:
+            return {"unchanged": True, "version": version}
         epics = await conn.fetch(
             """SELECT g.*, b.slug FROM groups g JOIN boards b ON b.id = g.board_id
                 WHERE g.kind = 'epic' AND g.epic_status = 'active'
@@ -743,6 +748,7 @@ async def on_boards(pool) -> dict:
                 holders.setdefault(h["item_id"], []).append(
                     {"pid": h["pid"], "name": h["name"], "role": h["role"]})
     return {
+        "version": version,
         "epics": [{"board": e["slug"], "group_id": str(e["id"]), "name": e["name"],
                    "epic_status": e["epic_status"],
                    "poc_member_id": leads.get(str(e["team_id"])) if e["team_id"] else None,

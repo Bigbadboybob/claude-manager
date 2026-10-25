@@ -590,7 +590,7 @@ org_core_missing`):
 | `POST /boards/{ref}/epics/{gid}/close-plan {actor, outcome}` | build and persist the close plan: `{plan_id, revision, items[{n, title, choice_options[move,unplace,drop]}], move_targets, team{options, default}, members[{member_id, role, options, default, needs}], workspaces[]}`. Refused with active sub-epics; a rebuild bumps the revision; a plan being applied is resumed, never replaced |
 | `POST /boards/{ref}/close-plans/{id}/apply {actor, revision, choices}` | only on the epic's own board; one applier at a time (409 `close_in_progress`); validates every item choice, then applies step by step (recorded, so a retry resumes); items closed or unplaced since the plan are `skipped`; team standby/archive without Owner and every member move/retire come back as `pending` with `who_must_decide` (the move itself is org's `move`); ends guest memberships; after a final nothing-left-open check under the board lock the epic closes with a `close_record` |
 
-Read-only: `GET /items/on-boards` → `{epics[], items[]}` (open epics and open
+Read-only: `GET /items/on-boards?since_version=` → `{version, epics[], items[]}` or `{unchanged, version}` (open epics and open
 board-native items, across boards).
 
 Daemon RPCs (all daemon-only, actor stamped): `item.place`, `item.unplace`,

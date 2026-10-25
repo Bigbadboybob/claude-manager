@@ -279,5 +279,6 @@ async def epic_close_apply(ref: str, body: EpicCloseApplyBody, request: Request,
 
 
 @router.get("/items/on-boards")
-async def on_boards(request: Request):
-    return await _call(placement.on_boards(_pool(request)))
+async def on_boards(request: Request,
+                    since_version: int | None = Query(None, ge=0, le=2**63 - 1)):
+    return await _call(placement.on_boards(_pool(request), since_version=since_version))
