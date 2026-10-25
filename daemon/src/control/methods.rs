@@ -16647,7 +16647,11 @@ fn resolve_spawn_pick_with_rule(
         if setting == Setting::Model && crate::models::takes_model(engine) {
             if let Some(rule) = rule_model {
                 let task_model = task.get(setting);
-                if task_model.as_deref().is_none_or(|m| crate::models::validate_model(m).is_err()) {
+                if task_model.as_deref().is_none_or(|m| {
+                    crate::models::validate_model(m)
+                        .and_then(|m| crate::models::check_engine(engine, &m))
+                        .is_err()
+                }) {
                     crate::models::check_engine(engine, rule).map_err(|e| (ErrorCode::InvalidParams, e))?;
                     // A timed-out task lookup remains provisional on restore.
                     let source = if task.timed_out { crate::models::ModelSource::LookupTimeout }
@@ -29415,11 +29419,11 @@ while True:
         with_temp_home(|| {
             let state = make_state_arc();
             seed_mcp_spawn_fixture(&state, "ts-caller", Some("task-1"));
-            let task_has_model = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let toggle = task_has_model.clone();
+            let task_model = Arc::new(Mutex::new(None::<&str>));
+            let stub_model = task_model.clone();
             let stub = spawn_routed_stub(move |method, path, _| {
                 assert!(method == "GET" && path.starts_with("/tasks/task-1/model"));
-                let model = toggle.load(std::sync::atomic::Ordering::SeqCst).then_some("gpt-6-astra");
+                let model = *stub_model.lock().unwrap();
                 (200, json!({"engine":"codex","model":model,"effort":"medium"}).to_string())
             });
             {
@@ -29436,11 +29440,12 @@ while True:
             }
             set_spawn_program_override_for_test(Some(("/bin/sleep".into(), vec!["120".into()])));
             for (explicit, task_default, want, source, note) in [
-                (None, false, "gpt-6-luna", "staffing_rule", false),
-                (Some("gpt-6.1-sol"), true, "gpt-6.1-sol", "explicit", false),
-                (None, true, "gpt-6-astra", "task", true),
+                (None, None, "gpt-6-luna", "staffing_rule", false),
+                (Some("gpt-6.1-sol"), Some("gpt-6-astra"), "gpt-6.1-sol", "explicit", false),
+                (None, Some("gpt-6-astra"), "gpt-6-astra", "task", true),
+                (None, Some("claude-sonnet-5-5"), "gpt-6-luna", "staffing_rule", false),
             ] {
-                task_has_model.store(task_default, std::sync::atomic::Ordering::SeqCst);
+                *task_model.lock().unwrap() = task_default;
                 let mut params = json!({"label":"busy-worker","work_kind":"busywork"});
                 if let Some(model) = explicit { params["model"] = json!(model); }
                 let result = mcp_start_session(&state, &params, Some("ts-caller")).unwrap();

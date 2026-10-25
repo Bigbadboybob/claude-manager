@@ -240,7 +240,16 @@ impl Policy {
         } else {
             recommended.wire().into()
         };
-        let note = self.note(&engine, kind, now);
+        let mut note = self.note(&engine, kind, now);
+        if let Some((kind, rule)) = kind.and_then(|k| self.rules.get(k).map(|r| (k, r))) {
+            if let Some(model) = rule
+                .model()
+                .filter(|_| Engine::parse(&engine).is_some_and(|chosen| chosen != rule.engine()))
+            {
+                let dropped = format!("Staffing: skipped {kind} rule model {model} ({}); chosen engine is {engine}. Precedence: {PRECEDENCE}.", rule.engine().wire());
+                note = Some(note.map_or_else(|| dropped.clone(), |n| format!("{n} {dropped}")));
+            }
+        }
         let rule_model = kind
             .and_then(|k| self.rules.get(k))
             .filter(|rule| Some(rule.engine()) == Engine::parse(&engine))
@@ -309,23 +318,39 @@ mod tests {
         let selected = policy.select(None, None, Some("busywork"), future).unwrap();
         assert_eq!(selected.engine, "codex");
         assert_eq!(selected.rule_model.as_deref(), Some("gpt-6-luna"));
+        assert!(selected.note.is_none());
         assert!(policy.digest(future).contains("no expiry"));
         assert!(policy.digest(future).contains("gpt-6-luna"));
         assert_eq!(
             serde_json::to_value(&policy).unwrap()["rules"]["fanout"],
             "claude-code"
         );
-        assert!(policy
-            .select(Some("claude-code"), None, Some("busywork"), future)
-            .unwrap()
-            .rule_model
-            .is_none());
+        for (explicit, model) in [
+            (Some("claude-code"), None),
+            (None, Some("claude-sonnet-5-5")),
+        ] {
+            let selected = policy
+                .select(explicit, model, Some("busywork"), future)
+                .unwrap();
+            assert!(selected.rule_model.is_none());
+            let note = selected.note.unwrap();
+            assert!(note.contains("current preference codex"));
+            assert!(note.contains("skipped busywork rule model gpt-6-luna (codex)"));
+            assert!(note.contains("chosen engine is claude-code"));
+            assert!(note.contains(PRECEDENCE));
+        }
         policy.preference.as_mut().unwrap().engine = Engine::Claude;
-        assert!(policy
-            .select(None, None, Some("busywork"), future)
+        let selected = policy.select(None, None, Some("busywork"), future).unwrap();
+        assert!(selected.rule_model.is_none());
+        assert!(selected
+            .note
             .unwrap()
-            .rule_model
-            .is_none());
+            .contains("skipped busywork rule model gpt-6-luna (codex)"));
+        let shell = policy
+            .select(Some("bash"), None, Some("busywork"), future)
+            .unwrap();
+        assert!(shell.rule_model.is_none());
+        assert!(shell.note.is_none());
         policy.rules.insert(
             "busywork".into(),
             Rule::new(Engine::Claude, Some("gpt-6-luna".into())),

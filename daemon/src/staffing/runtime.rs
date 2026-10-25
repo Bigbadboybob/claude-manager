@@ -10,6 +10,8 @@ use std::time::Duration;
 type State = Arc<Mutex<DaemonState>>;
 type Result<T> = std::result::Result<T, (ErrorCode, String)>;
 const RECENT_DAYS: i64 = 3;
+const FULL_CACHE_FILE: &str = "staffing-v2.json";
+const LEGACY_INDEFINITE_EXPIRY: &str = "9999-12-31T23:59:59Z";
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Cache {
@@ -24,22 +26,69 @@ struct Spawner {
     notified_version: u64,
 }
 impl Cache {
-    fn load(root: &Path) -> Self {
-        let path = root.join("staffing.json");
-        let mut cache: Self = std::fs::read(&path)
+    fn read(path: &Path) -> Option<Self> {
+        std::fs::read(path)
             .ok()
             .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
             .filter(|c| c.snapshot.policy.validate().is_ok())
-            .unwrap_or_default();
+    }
+    fn load(root: &Path) -> Self {
+        let path = root.join("staffing.json");
+        let legacy = Self::read(&path);
+        let mut cache = Self::read(&root.join(FULL_CACHE_FILE))
+            .unwrap_or_else(|| legacy.clone().unwrap_or_default());
+        if let Some(legacy) = legacy {
+            // An old brain may have refreshed policy or recorded spawners
+            // during rollback. Prefer the full policy on equal versions.
+            if legacy.snapshot.version > cache.snapshot.version {
+                cache.snapshot = legacy.snapshot;
+            }
+            for (uid, spawner) in legacy.spawners {
+                cache
+                    .spawners
+                    .entry(uid)
+                    .and_modify(|s| {
+                        s.at = s.at.max(spawner.at);
+                        s.notified_version = s.notified_version.max(spawner.notified_version);
+                    })
+                    .or_insert(spawner);
+            }
+        }
         cache.path = Some(path);
+        // Also migrate caches written by a pre-dual-file build, even if the
+        // API is offline or still serves the same policy version.
+        cache.save();
         cache
     }
     fn save(&self) {
         if let Some(path) = &self.path {
-            if let Err(e) =
-                crate::state::write_json_atomic(path, &serde_json::to_string(self).unwrap(), true)
-            {
-                eprintln!("cm staffing: cache save failed: {e}");
+            let mut legacy = self.clone();
+            legacy
+                .snapshot
+                .policy
+                .rules
+                .retain(|kind, _| kind != "busywork");
+            for rule in legacy.snapshot.policy.rules.values_mut() {
+                *rule = Rule::Engine(rule.engine());
+            }
+            if let Some(preference) = legacy.snapshot.policy.preference.as_mut() {
+                if preference.expires_at.is_none() {
+                    preference.expires_at = Some(LEGACY_INDEFINITE_EXPIRY.parse().unwrap());
+                }
+            }
+            // Write rollback protection first. Both files use atomic renames;
+            // load reconciles versions if a crash interrupts the pair.
+            for (path, cache) in [
+                (path.clone(), &legacy),
+                (path.with_file_name(FULL_CACHE_FILE), self),
+            ] {
+                if let Err(e) = crate::state::write_json_atomic(
+                    &path,
+                    &serde_json::to_string(cache).unwrap(),
+                    true,
+                ) {
+                    eprintln!("cm staffing: cache save failed ({}): {e}", path.display());
+                }
             }
         }
     }
@@ -48,7 +97,9 @@ impl Cache {
             .policy
             .validate()
             .map_err(|e| (ErrorCode::InvalidParams, e))?;
-        if snapshot.version > self.snapshot.version {
+        // An equal-version API response restores fields omitted by a legacy
+        // cache after rollback or an interrupted dual-file save.
+        if snapshot.version >= self.snapshot.version && snapshot != self.snapshot {
             self.snapshot = snapshot;
             self.save();
         }
@@ -249,6 +300,200 @@ pub(crate) fn dispatch(state: &State, req: &Request) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Frozen a9ffdcb cache contract: deliberately do not use today's Policy
+    // or Preference, which accept the new wire shapes.
+    #[derive(Serialize, Deserialize)]
+    struct LegacyCache {
+        snapshot: LegacySnapshot,
+        spawners: BTreeMap<String, Spawner>,
+    }
+    #[derive(Serialize, Deserialize)]
+    struct LegacySnapshot {
+        version: u64,
+        policy: LegacyPolicy,
+        #[serde(default)]
+        updated_at: Option<DateTime<Utc>>,
+    }
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyPolicy {
+        default_engine: Engine,
+        rules: BTreeMap<String, Engine>,
+        preference: Option<LegacyPreference>,
+    }
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyPreference {
+        engine: Engine,
+        strength: Strength,
+        reason: String,
+        expires_at: DateTime<Utc>,
+    }
+    impl LegacyCache {
+        fn load(root: &Path) -> Self {
+            let legacy: Self =
+                serde_json::from_slice(&std::fs::read(root.join("staffing.json")).unwrap())
+                    .unwrap();
+            assert!(legacy.snapshot.policy.rules.keys().all(|k| {
+                [
+                    "math",
+                    "design",
+                    "architecture",
+                    "metric",
+                    "coding",
+                    "fanout",
+                ]
+                .contains(&k.as_str())
+            }));
+            if let Some(p) = &legacy.snapshot.policy.preference {
+                assert!(!p.reason.trim().is_empty());
+                assert!(p.reason.chars().count() <= 500);
+                assert!(!p.reason.chars().any(char::is_control));
+            }
+            legacy
+        }
+        fn save(&self, root: &Path) {
+            std::fs::write(
+                root.join("staffing.json"),
+                serde_json::to_vec(self).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+    fn indefinite_snapshot(now: DateTime<Utc>) -> Snapshot {
+        let mut policy = Policy::default();
+        policy.preference = Some(Preference {
+            engine: Engine::Codex,
+            strength: Strength::Strong,
+            reason: "limits".into(),
+            expires_at: None,
+        });
+        policy.rules.insert(
+            "coding".into(),
+            Rule::new(Engine::Codex, Some("gpt-6.1-sol".into())),
+        );
+        Snapshot {
+            version: 4,
+            policy,
+            updated_at: Some(now),
+        }
+    }
+    #[test]
+    fn staffing_cache_legacy_parser_preserves_preference_and_engine_rules() {
+        let root = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let snapshot = indefinite_snapshot(now);
+        let mut cache = Cache::load(root.path());
+        cache.apply(snapshot.clone()).unwrap();
+        cache.record("recent", 4, now);
+        let legacy = LegacyCache::load(root.path());
+        assert_eq!(legacy.snapshot.version, 4);
+        assert_eq!(legacy.snapshot.updated_at, Some(now));
+        assert_eq!(legacy.snapshot.policy.default_engine, Engine::Codex);
+        assert_eq!(legacy.snapshot.policy.rules["coding"], Engine::Codex);
+        assert_eq!(legacy.snapshot.policy.rules["fanout"], Engine::Claude);
+        assert!(!legacy.snapshot.policy.rules.contains_key("busywork"));
+        let pref = legacy.snapshot.policy.preference.unwrap();
+        assert_eq!(pref.engine, Engine::Codex);
+        assert_eq!(pref.strength, Strength::Strong);
+        assert!(pref.expires_at > now + chrono::Duration::days(36500));
+        assert_eq!(legacy.spawners["recent"].notified_version, 4);
+        assert_eq!(Cache::load(root.path()).snapshot, snapshot);
+
+        // Real dated expiries must not be extended by the legacy projection.
+        let mut dated = snapshot;
+        dated.version += 1;
+        dated.policy.preference.as_mut().unwrap().expires_at = Some(now);
+        cache.apply(dated.clone()).unwrap();
+        assert_eq!(
+            LegacyCache::load(root.path())
+                .snapshot
+                .policy
+                .preference
+                .unwrap()
+                .expires_at,
+            now
+        );
+        assert_eq!(Cache::load(root.path()).snapshot, dated);
+    }
+    #[test]
+    fn staffing_cache_migrates_existing_new_shape_and_recovers_missing_full_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let snapshot = indefinite_snapshot(Utc::now());
+        let old_path = root.path().join("staffing.json");
+        std::fs::write(
+            &old_path,
+            serde_json::to_vec(&Cache {
+                snapshot: snapshot.clone(),
+                ..Cache::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(serde_json::from_slice::<LegacyCache>(&std::fs::read(&old_path).unwrap()).is_err());
+        assert_eq!(Cache::load(root.path()).snapshot, snapshot);
+        LegacyCache::load(root.path()); // load repaired rollback compatibility
+        assert_eq!(Cache::load(root.path()).snapshot, snapshot);
+
+        for invalid in [
+            None,
+            Some("{broken"),
+            Some(
+                r#"{"snapshot":{"version":99,"policy":{"default_engine":"codex","rules":{"unknown":"codex"},"preference":null}},"spawners":{}}"#,
+            ),
+        ] {
+            let full_path = root.path().join(FULL_CACHE_FILE);
+            if let Some(invalid) = invalid {
+                std::fs::write(&full_path, invalid).unwrap();
+            } else {
+                std::fs::remove_file(&full_path).unwrap();
+            }
+            let restored = Cache::load(root.path());
+            assert_eq!(restored.snapshot.version, 4);
+            assert!(restored
+                .snapshot
+                .policy
+                .active_preference(Utc::now())
+                .is_some());
+            // The API can rehydrate full fields at the same version, even
+            // after another offline restart persisted the legacy fallback.
+            let mut restored = Cache::load(root.path());
+            restored.apply(snapshot.clone()).unwrap();
+            assert_eq!(Cache::load(root.path()).snapshot, snapshot);
+        }
+    }
+    #[test]
+    fn staffing_cache_preserves_changes_made_during_rollback() {
+        let root = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let snapshot = indefinite_snapshot(now);
+        let mut cache = Cache::load(root.path());
+        cache.apply(snapshot.clone()).unwrap();
+        cache.record("recent", 3, now);
+        let mut legacy = LegacyCache::load(root.path());
+        legacy.spawners.get_mut("recent").unwrap().notified_version = 4;
+        legacy.spawners.insert(
+            "during-rollback".into(),
+            Spawner {
+                at: now,
+                notified_version: 4,
+            },
+        );
+        legacy.save(root.path());
+        let restored = Cache::load(root.path());
+        assert_eq!(restored.snapshot, snapshot); // same version keeps full fields
+        assert!(restored.pending(now).is_empty()); // no duplicate notices
+        assert!(restored.spawners.contains_key("during-rollback"));
+
+        legacy.snapshot.version = 5;
+        legacy.snapshot.policy.preference = None;
+        legacy.save(root.path());
+        let restored = Cache::load(root.path());
+        assert_eq!(restored.snapshot.version, 5); // newer legacy policy wins
+        assert!(restored.snapshot.policy.preference.is_none());
+        assert_eq!(restored.pending(now).len(), 2);
+    }
     #[test]
     fn staffing_cache_restart_monotonic_and_recent_spawners() {
         let root = tempfile::tempdir().unwrap();

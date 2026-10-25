@@ -22,9 +22,12 @@ Rules accept the legacy engine string or `{engine, model?}`. For example,
 `start_session(label="rename-files", work_kind="busywork")` use Luna when the
 selected engine is Codex. Model precedence is **explicit spawn model → task or
 inherited task default → matching work-rule model → host default**. A task
-default that overrides a different rule model returns a `staffing_note`. Rule
-models apply only to their engine: a strong Codex preference still allows a
-Codex busywork rule to choose Luna, while a Claude override skips that model.
+default that overrides a different rule model returns a `staffing_note`. A task
+model incompatible with the selected engine falls through to the rule model.
+Rule models apply only to their engine: a strong Codex preference still allows a
+Codex busywork rule to choose Luna, while a Claude override skips that model
+and returns a `staffing_note` explaining the engine mismatch (including when
+a strong preference or explicit type/model selects Claude).
 Effort resolution stays explicit → task → host. `model_source=staffing_rule`
 records a rule selection; a task lookup timeout remains provisional.
 
@@ -55,9 +58,15 @@ agent has global session permissions. The API trusts the authenticated daemon's
 Owner stamp, as it does board actors.
 
 Daemons fetch `/staffing` in the background every 30 seconds and persist the
-last policy and recent spawners in `<CM root>/staffing.json`. An API outage keeps
-that policy across restarts. With no cached policy, launches use today's Codex
-default. Expiry is checked at selection time, so an offline cache cannot keep
+last policy and recent spawners in `<CM root>/staffing-v2.json`. They also write
+`staffing.json` for old brains: indefinite expiry becomes `9999-12-31T23:59:59Z`,
+rules become engine strings, and busywork is omitted. Rollback therefore keeps
+the preference and supported engine rules. New brains prefer the full file at
+equal versions, accept a newer legacy policy, and merge spawner checkpoints from
+both files. Loading an older single-file cache writes both formats; an
+equal-version API refresh restores full fields after falling back to the legacy
+copy. An API outage keeps that policy across restarts. With no cached policy,
+launches use today's Codex default. Expiry is checked at selection time, so an offline cache cannot keep
 an expired preference active. A new policy version sends one durable native
 notice to live sessions that launched/forked anything within the last three
 days. Notice IDs and delivery checkpoints prevent duplicate notices on retry.
