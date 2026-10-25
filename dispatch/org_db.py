@@ -613,7 +613,8 @@ def generate_roster(inputs: dict) -> list[dict]:
     and divisions by today's lead rule, and boards anchored by a root task),
     then long-lived lanes. Handles are normalised and collision-suffixed;
     a taken alias is never stolen."""
-    live = [s for s in inputs["live"] if (s.get("engine") or "").lower() in AGENT_ENGINES]
+    # Only shells are left out; a row with no engine (an older TUI) is an agent.
+    live = [s for s in inputs["live"] if (s.get("engine") or "").lower() != "bash"]
     by_uid: dict[str, list[dict]] = {}
     for s in live:
         by_uid.setdefault(s["session_uid"], []).append(s)
