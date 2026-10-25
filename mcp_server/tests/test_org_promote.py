@@ -95,13 +95,15 @@ class PromoteDb(unittest.IsolatedAsyncioTestCase):
 
     async def test_refusals(self):
         await self.members()
-        shell, cont, stray = uid_at(0.3, 13), uid_at(0.3, 14), uid_at(0.3, 15)
+        shell, cont, stray, worker = uid_at(0.3, 13), uid_at(0.3, 14), uid_at(0.3, 15), uid_at(0.3, 16)
         await self.report([
             {"uid": shell, "name": "bash", "engine": "bash", "member_id": self.ids["org"],
              "acting_as": "assistant"},
             {"uid": cont, "name": "x-orchestrator", "continuous": "x", "member_id": self.ids["org"],
              "acting_as": "assistant"},
             {"uid": stray, "name": "stray", "task_id": self.elsewhere},
+            {"uid": worker, "name": "bug-triage-w1", "managed_by": self.orch, "member_id": self.ids["org"],
+             "acting_as": "worker"},
         ])
         cases = [
             # Sideways: a member outside org's chain (the continuous member).
@@ -113,6 +115,8 @@ class PromoteDb(unittest.IsolatedAsyncioTestCase):
             (OWNER["pid"], pid(self.lane), 409, "already_member", {}),
             (OWNER["pid"], pid(cont), 409, "continuous", {}),
             (OWNER["pid"], pid(stray), 409, "not_an_assistant", {}),
+            # A non-durable (continuous) worker is no assistant.
+            (OWNER["pid"], pid(worker), 409, "not_an_assistant", {}),
             (OWNER["pid"], pid(self.rev), 409, "handle_taken", {"handle": "org"}),
             # A lead places the new member only inside its own subtree, and
             # gives it only a team it leads.

@@ -642,10 +642,15 @@ fn promoting_an_assistant_makes_it_a_main_with_a_home_and_a_notice() {
         cont.continuous_task_id = Some("x".into());
         stamp(&mut cont.org, "mem_ep", "spawn:ca-main");
         st.sessions.insert("ca-cont".into(), cont);
+        let mut worker = session("ca-worker", Some("t-sub"), Some("ca-main"), "ws-worker");
+        stamp(&mut worker.org, "mem_ep", "spawn:ca-main");
+        cm_holder_proto::org::set(&mut worker.org, ACTING_AS, json!("worker"));
+        st.sessions.insert("ca-worker".into(), worker);
     }
     // Refused here before the API is asked.
     for (uid, code) in [("ca-shell", "not_an_agent"), ("ca-main", "already_member"),
-                        ("ca-plain", "not_an_assistant"), ("ca-cont", "continuous")] {
+                        ("ca-plain", "not_an_assistant"), ("ca-cont", "continuous"),
+                        ("ca-worker", "not_an_assistant")] {
         let err = promote(&state, Caller::session("ca-main"), uid).error.unwrap();
         assert!(matches!(err.code, ErrorCode::Conflict) && err.message.starts_with(code), "{uid}: {err:?}");
     }

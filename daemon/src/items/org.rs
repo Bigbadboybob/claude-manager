@@ -322,10 +322,12 @@ fn promote(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, mut p: Map<String, Value>
         }
         match crate::assistants::of_session(sess) {
             Some(m) if m.acting_as == crate::assistants::ASSISTANT => m.member_id,
-            Some(_) => {
+            Some(m) if m.acting_as == crate::assistants::MAIN => {
                 return Err((ErrorCode::Conflict, format!("already_member: '{uid}' is already a member's main session")));
             }
-            None => {
+            // Member-less, or a member's non-durable worker (a continuous
+            // worker): only an assistant is promoted.
+            _ => {
                 return Err((ErrorCode::Conflict, format!("not_an_assistant: '{uid}' is not an assistant of a member")));
             }
         }
