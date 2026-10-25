@@ -187,9 +187,11 @@ one grants nothing (no deploy rights, no authority over other sessions there).
   protections pass: no live process, not dirty, evidence released).
 - The kind is stored in the daemon's local workspace record and manifest from
   S0. Existing workspaces start **unclassified**, which behaves exactly as
-  today. The S2 roster marks members' workspaces `home`; Owner can mark any
-  workspace durable (pinning already exists and counts). Nothing is
-  classified from a branch prefix or spawn origin.
+  today. From S0, workspaces minted for `isolated=true` / branch-mode spawns
+  are recorded `ephemeral` at mint (an explicit fact about that spawn, not a
+  guess). The S2 roster marks members' workspaces `home`; Owner can mark any
+  workspace durable (pinning already exists and counts). Existing workspaces
+  are never classified from a branch prefix or spawn origin.
 - Owned by a member (`office_of`), or by a team for shared integration
   checkouts.
 - Assistants that only read, review or run commands may share the office;
