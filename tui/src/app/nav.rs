@@ -1982,6 +1982,17 @@ impl App {
                         value: super::model_field::with_source(effort, ts.effort_source.as_deref()),
                     });
                 }
+                // #24: the transcript's size, flagged past the rotation
+                // threshold.
+                if let Some(bytes) = self.transcript_bytes(ts) {
+                    let size = super::agent_state::short_size(bytes);
+                    let value = if bytes >= super::agent_state::HEAVY_TRANSCRIPT_BYTES {
+                        format!("{size} \u{29c9} past the rotation threshold: CM moves it to a fresh transcript at an idle point")
+                    } else {
+                        size
+                    };
+                    out.push(PeekLine::Field { label: "Transcript".into(), value });
+                }
                 if let Some(note) = super::model::exit_note(ts.preserved_last_exit.as_ref()) {
                     out.push(PeekLine::Field { label: "Status".into(), value: note.to_string() });
                 }

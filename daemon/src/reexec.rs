@@ -2305,7 +2305,8 @@ fn adopted_meta_from_record(
         workspace_id: rec.workspace_id.clone(),
         managed_by_uid: rec.managed_by_uid.clone(),
         task_id: rec.task_id.clone(),
-        transcript_path: rec.transcript_path.clone(),
+        transcript_path: crate::transcript_chain::followed_path(&rec.session_type, rec.transcript_path.as_deref())
+            .or_else(|| rec.transcript_path.clone()),
         memory_cap_soft_bytes: rec.memory_cap_soft_bytes,
         memory_cap_hard_bytes: rec.memory_cap_hard_bytes,
         cgroup_prefix: rec.cgroup_prefix.clone().map(PathBuf::from),

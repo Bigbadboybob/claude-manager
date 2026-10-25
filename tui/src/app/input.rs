@@ -3099,7 +3099,11 @@ impl App {
             }
         }
         if let CrosstermEvent::Key(key) = event {
-            if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('t') {
+            // Alt+t (not Alt+Shift+t, which is #24's transcript rotation).
+            if key.modifiers.contains(KeyModifiers::ALT)
+                && !key.modifiers.contains(KeyModifiers::SHIFT)
+                && key.code == KeyCode::Char('t')
+            {
                 self.view_mode = match self.view_mode {
                     ViewMode::Sessions => {
                         // Refresh planning tasks when switching to planning view.
@@ -3472,6 +3476,16 @@ impl App {
                     // as A-W / A-w above).
                     KeyCode::Char('R') => {
                         self.revive_active_session();
+                        return true;
+                    }
+                    // #24: Alt+T moves the focused Claude session to a fresh
+                    // transcript at the same session (Shift baked in or not).
+                    KeyCode::Char('T') => {
+                        self.rotate_active_session();
+                        return true;
+                    }
+                    KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        self.rotate_active_session();
                         return true;
                     }
                     KeyCode::Char('r')
@@ -6434,8 +6448,8 @@ mod input_handler_tests {
     #[test]
     fn transcript_picker_keys_and_settings_entry() {
         let cands = vec![
-            TranscriptCandidate { id: "id-a".into(), modified: std::time::UNIX_EPOCH, size_bytes: 1, preview: String::new(), bound_to: None },
-            TranscriptCandidate { id: "id-b".into(), modified: std::time::UNIX_EPOCH, size_bytes: 1, preview: String::new(), bound_to: Some(String::new()) },
+            TranscriptCandidate { id: "id-a".into(), modified: std::time::UNIX_EPOCH, size_bytes: 1, preview: String::new(), bound_to: None, rotated_to: None },
+            TranscriptCandidate { id: "id-b".into(), modified: std::time::UNIX_EPOCH, size_bytes: 1, preview: String::new(), bound_to: Some(String::new()), rotated_to: None },
         ];
         let key = |c: KeyCode| CrosstermEvent::Key(KeyEvent::new(c, KeyModifiers::NONE));
         let mut sel = 0usize;

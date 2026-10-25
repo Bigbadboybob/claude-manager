@@ -1642,6 +1642,9 @@ pub struct DaemonSessionSummary {
     /// The session's org object (doc/org-model.md §12), opaque; carried
     /// into the adopted row's manifest entry.
     pub org: Option<cm_daemon::org_bridge::OrgObject>,
+    /// The bound transcript's size in bytes (#24; `None` from an older
+    /// daemon or without a transcript).
+    pub transcript_bytes: Option<u64>,
 }
 
 /// Parse one `list_sessions` array entry into a [`DaemonSessionSummary`].
@@ -1683,6 +1686,7 @@ pub fn parse_daemon_session_summary(entry: &serde_json::Value) -> Option<DaemonS
         effort: str_field("effort"),
         effort_source: str_field("effort_source"),
         org: entry.get("org").and_then(|v| v.as_object()).cloned(),
+        transcript_bytes: entry.get("transcript_bytes").and_then(|v| v.as_u64()),
     })
 }
 
@@ -1714,10 +1718,11 @@ pub fn rpc_list_daemon_sessions(
 /// The `list_sessions` row fields [`parse_daemon_session_summary`] reads.
 /// Asking for only these drops `agent_state` (three quarters of the reply;
 /// the TUI gets it from `manifest.watch`). Older daemons ignore the list.
-const SUMMARY_FIELDS: [&str; 18] = [
+const SUMMARY_FIELDS: [&str; 19] = [
     "session_uid", "label", "type", "managed_by_uid", "workspace_id", "task_id",
     "workflow_run_id", "workflow_role", "worktree_path", "continuous_task_id", "cols",
     "rows", "global_perms", "model", "model_source", "effort", "effort_source", "org",
+    "transcript_bytes",
 ];
 
 /// [`rpc_list_daemon_sessions`] for a poller: pass the etag of the list it
@@ -2373,6 +2378,29 @@ pub fn rpc_register_agent_subtask(
         }),
     };
     rpc_round_trip(daemon_socket, &req).map(|_| ())
+}
+
+/// `session.rotate_transcript` (#24): move a Claude session to a fresh
+/// transcript at the same uid. Operator route; `force` skips the safe
+/// boundary (Owner asked for it from the session row). Returns the
+/// rotation record.
+pub fn rpc_rotate_transcript(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+    uid: &str,
+    force: bool,
+) -> anyhow::Result<serde_json::Value> {
+    let req = Request {
+        id: next_request_id(),
+        caller: Caller::operator(operator_token_id),
+        method: "session.rotate_transcript".into(),
+        params: serde_json::json!({ "uid": uid, "force": force, "reason": "Owner asked (Alt+T)" }),
+    };
+    let resp = rpc_round_trip(daemon_socket, &req)?;
+    if let Some(err) = resp.error {
+        anyhow::bail!("{}", err.message);
+    }
+    Ok(resp.result.unwrap_or_default())
 }
 
 pub fn rpc_task_update_tree(

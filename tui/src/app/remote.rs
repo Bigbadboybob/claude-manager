@@ -1301,6 +1301,39 @@ impl App {
         }
     }
 
+    /// A daemon respawned `uid` at the same identity on `host` (its
+    /// `Added` diff arrived) while this viewer's slot for it shows exited:
+    /// the daemon's own restart, e.g. a transcript rotation (#24). Reattach
+    /// the slot in place, as a reconnect would. A restart this viewer is
+    /// driving (A-R) reattaches by itself and is left alone. Returns whether
+    /// a reattach was queued.
+    pub(crate) fn reattach_respawned(&mut self, host: &cm_daemon::host_id::HostId, uid: &str) -> bool {
+        if self.restart_in_flight(uid)
+            || self.attaching.contains_key(uid)
+            || self.pending_remote_reattach.iter().any(|p| p.entry.uid == uid)
+        {
+            return false;
+        }
+        let found = self.workspaces.iter_mut().find_map(|w| {
+            if w.is_closed {
+                return None;
+            }
+            let ws_id = w.id.clone();
+            w.sessions
+                .iter_mut()
+                .find(|s| s.uid == uid && &s.host_id == host && s.session.exited)
+                .map(|ts| {
+                    ts.session.exited = false;
+                    (ws_id, ts.to_manifest_entry())
+                })
+        });
+        let Some((ws_id, entry)) = found else { return false };
+        self.reconnecting_sessions.insert(uid.to_string());
+        self.pending_remote_reattach.push(PendingRemoteReattach::new(ws_id, entry));
+        self.needs_redraw = true;
+        true
+    }
+
     /// Manual "reconnect now" lever, invoked by `A-r` (refresh). The auto-
     /// reattach already recovers a remote session whose attach stream died
     /// (transport EOF → reconnecting → retry → rebind once the daemon/tunnel
@@ -2207,6 +2240,7 @@ mod remote_reconnect_tests {
         let rendered: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
         assert!(rendered.contains("(no session)"), "sessionless row must actually render");
         let summary = crate::client_session::DaemonSessionSummary {
+            transcript_bytes: None,
             org: None,
             model: None,
             model_source: None,
@@ -2867,6 +2901,43 @@ mod remote_reconnect_tests {
         );
 
         match orig {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// #24: a rotation respawns a remote session at the same uid; the
+    /// `Added` diff rebinds the exited slot in place. A slot already being
+    /// reattached, or on another host, is left alone.
+    #[test]
+    fn a_respawned_remote_uid_reattaches_its_exited_slot() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".cm")).unwrap();
+        let local_sock = home.join(".cm/daemon.sock");
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let mut app = app_with_manager_host(&local_sock);
+        let (mut rotated, _tx, _teof) = session_with_injected_exit("uid-rot", manager_host(), false);
+        rotated.session.exited = true;
+        app.workspaces.push(workspace_with(rotated));
+
+        assert!(!app.reattach_respawned(&cm_daemon::host_id::HostId::local(), "uid-rot"), "wrong host");
+        assert!(app.reattach_respawned(&manager_host(), "uid-rot"));
+        assert!(!app.workspaces[0].sessions[0].session.exited);
+        assert!(app.reconnecting_sessions.contains("uid-rot"));
+        assert_eq!(app.pending_remote_reattach.iter().filter(|p| p.entry.uid == "uid-rot").count(), 1);
+        // A second diff while the reattach is queued does not queue twice.
+        app.workspaces[0].sessions[0].session.exited = true;
+        assert!(!app.reattach_respawned(&manager_host(), "uid-rot"));
+        assert_eq!(app.pending_remote_reattach.iter().filter(|p| p.entry.uid == "uid-rot").count(), 1);
+        // A live slot (never exited) needs nothing.
+        assert!(!app.reattach_respawned(&manager_host(), "uid-other"));
+
+        match orig_home {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
             None => unsafe { std::env::remove_var("HOME") },
         }

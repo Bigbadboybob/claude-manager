@@ -133,6 +133,8 @@ pub(crate) enum Doing {
     Retrying,
     /// It is working, but has shown no progress for a while.
     Stalled,
+    /// Its Claude transcript is past the rotation threshold (#24).
+    Heavy,
 }
 
 /// The badge's mark and style. A rate limit stands out (bold, reversed),
@@ -147,6 +149,7 @@ pub(crate) fn doing(kind: Doing) -> (&'static str, Style) {
         Doing::Errored => ("\u{2715}", bold(theme::ERROR)),
         Doing::Retrying => ("\u{21bb}", Style::default().fg(theme::ATTN)),
         Doing::Stalled => ("\u{23f1}", Style::default().fg(theme::ATTN)),
+        Doing::Heavy => ("\u{29c9}", Style::default().fg(theme::ATTN)),
     }
 }
 
@@ -207,6 +210,7 @@ pub(crate) fn activity_legend() -> Vec<(String, Style, &'static str)> {
         (Doing::Errored, "error"),
         (Doing::Retrying, "retrying"),
         (Doing::Stalled, "stalled"),
+        (Doing::Heavy, "huge transcript (rotates)"),
     ] {
         let (s, st) = doing(kind);
         out.push((s.to_owned(), st, word));

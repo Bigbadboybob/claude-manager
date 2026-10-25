@@ -2,6 +2,30 @@
 
 use super::*;
 
+/// The row a local Claude resume should use when its transcript moved on
+/// (#24, `cm_daemon::transcript_chain`): the same entry bound to the newest
+/// session in the `continued-in` chain. `None` when nothing moved (or the
+/// files are not on this host).
+pub(crate) fn follow_claude_entry(
+    entry: &ManifestEntry,
+    worktree: Option<&std::path::Path>,
+) -> Option<ManifestEntry> {
+    if !matches!(entry.session_type.as_str(), "claude" | "claude-code") {
+        return None;
+    }
+    let id = follow_claude_id(worktree?, entry.transcript_id.as_deref()?)?;
+    let mut followed = entry.clone();
+    followed.transcript_id = Some(id);
+    followed.transcript_path = None;
+    Some(followed)
+}
+
+/// The newest session in `id`'s `continued-in` chain, when it moved.
+pub(crate) fn follow_claude_id(worktree: &std::path::Path, id: &str) -> Option<String> {
+    let path = cm_daemon::transcript_detect::claude_transcript_path(worktree, id)?;
+    cm_daemon::transcript_chain::follow(&path).map(|f| f.id)
+}
+
 /// How long an untracked taskless daemon session must stay untracked before
 /// the adopt pass takes it (doc/org-model.md §13 S0a). Longer than any spawn
 /// response of ours not covered by an in-flight set.
@@ -1370,6 +1394,10 @@ impl App {
         live_daemon_uids: &std::collections::HashSet<String>,
     ) -> Option<(TerminalSession, RestoreOutcome)> {
         let config = &self.config;
+        // #24: a Claude transcript that moved on (`continued-in`) restores
+        // the newest session in its chain, and the row rebinds to it.
+        let followed = follow_claude_entry(entry, ws.worktree_path.as_deref());
+        let entry = followed.as_ref().unwrap_or(entry);
         // migrate-tui-local Issue J: default is Spawned — the
         // common case for fresh manifest entries / clean daemon
         // restarts. The attach-success arm below upgrades to
@@ -1685,6 +1713,7 @@ mod adopt_daemon_session_tests {
 
     fn summary(uid: &str, managed_by_uid: Option<&str>) -> DaemonSessionSummary {
         DaemonSessionSummary {
+            transcript_bytes: None,
             org: None,
             model: None,
             model_source: None,
@@ -2009,5 +2038,49 @@ mod adopt_daemon_session_tests {
         ];
         let picked = App::select_size_drift_uids(&summaries, &tracked, want);
         assert!(picked.is_empty(), "unmeasured sessions must be skipped: {picked:?}");
+    }
+}
+
+#[cfg(test)]
+mod follow_chain_tests {
+    //! #24: TUI-side resumes (startup restore, A-O) follow a superseded
+    //! Claude transcript's `continued-in` chain to the newest session.
+    use super::follow_claude_entry;
+
+    #[test]
+    fn a_two_hop_chain_rebinds_the_restored_entry() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let orig_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", tmp.path()) };
+        let wt = std::path::Path::new("/home/u/proj");
+        let dir = cm_daemon::transcript_detect::claude_transcript_dir_for(wt).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = |v: serde_json::Value| format!("{v}\n");
+        let user = serde_json::json!({"type": "user", "message": {"content": "hi"}});
+        let moved = |a: &str, b: &str| serde_json::json!({"type": "continued-in", "sessionId": a, "continuedInSessionId": b});
+        std::fs::write(dir.join("aaaa.jsonl"), line(user.clone()) + &line(moved("aaaa", "bbbb"))).unwrap();
+        std::fs::write(dir.join("bbbb.jsonl"), line(user.clone()) + &line(moved("bbbb", "cccc"))).unwrap();
+        std::fs::write(dir.join("cccc.jsonl"), line(user)).unwrap();
+
+        let entry: cm_daemon::manifest::ManifestEntry = serde_json::from_value(serde_json::json!({
+            "uid": "ts-x-0", "label": "x", "session_type": "claude",
+            "transcript_id": "aaaa", "transcript_path": dir.join("aaaa.jsonl"),
+        }))
+        .unwrap();
+        let followed = follow_claude_entry(&entry, Some(wt)).expect("superseded");
+        assert_eq!(followed.transcript_id.as_deref(), Some("cccc"));
+        assert_eq!(followed.uid, "ts-x-0", "same identity");
+        let mut codex = entry.clone();
+        codex.session_type = "codex".into();
+        assert!(follow_claude_entry(&codex, Some(wt)).is_none(), "claude only");
+        let mut newest = entry;
+        newest.transcript_id = Some("cccc".into());
+        assert!(follow_claude_entry(&newest, Some(wt)).is_none());
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
     }
 }

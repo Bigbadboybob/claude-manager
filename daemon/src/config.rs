@@ -505,7 +505,61 @@ pub struct DaemonConfig {
     /// picks up edits.
     #[serde(default)]
     pub models: crate::models::ModelConfig,
+    /// `[transcript_rotation]` — move an oversized Claude conversation to a
+    /// fresh transcript at a safe idle point (#24, `crate::rotation`).
+    #[serde(default)]
+    pub transcript_rotation: TranscriptRotationConfig,
 }
+
+/// `[transcript_rotation]` in `daemon.toml`. Claude Code replays and keeps
+/// the whole transcript file in memory on every resume, and compaction never
+/// shrinks it, so a long-lived session slows to a crawl (a 1.67 GB file left
+/// one idling at ~50% CPU). Past either threshold the daemon forks the
+/// session into a fresh transcript at the next safe boundary.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TranscriptRotationConfig {
+    /// Default on.
+    #[serde(default = "default_rotation_enabled")]
+    pub enabled: bool,
+    /// Transcript size that triggers a rotation. Default 300 MB.
+    #[serde(default = "default_rotation_max_bytes")]
+    pub max_bytes: u64,
+    /// Compaction count that triggers a rotation (a long session can pass
+    /// it while still small). Default 200; 0 disables the count.
+    #[serde(default = "default_rotation_max_compactions")]
+    pub max_compactions: u64,
+    /// The session must have been idle this long, with nothing in flight.
+    /// Default 300 s.
+    #[serde(default = "default_rotation_idle_secs")]
+    pub idle_secs: u64,
+    /// Owner must not have viewed or typed in the session for this long
+    /// (the viewer reports a shown session every 5 minutes). Default 600 s.
+    #[serde(default = "default_rotation_owner_quiet_secs")]
+    pub owner_quiet_secs: u64,
+    /// How often the policy checks. Default 300 s.
+    #[serde(default = "default_rotation_check_secs")]
+    pub check_secs: u64,
+}
+
+impl Default for TranscriptRotationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_rotation_enabled(),
+            max_bytes: default_rotation_max_bytes(),
+            max_compactions: default_rotation_max_compactions(),
+            idle_secs: default_rotation_idle_secs(),
+            owner_quiet_secs: default_rotation_owner_quiet_secs(),
+            check_secs: default_rotation_check_secs(),
+        }
+    }
+}
+
+fn default_rotation_enabled() -> bool { true }
+fn default_rotation_max_bytes() -> u64 { 300 * 1000 * 1000 }
+fn default_rotation_max_compactions() -> u64 { 200 }
+fn default_rotation_idle_secs() -> u64 { 300 }
+fn default_rotation_owner_quiet_secs() -> u64 { 600 }
+fn default_rotation_check_secs() -> u64 { 300 }
 
 fn default_presence_idle_enabled() -> bool { true }
 fn default_chat_search_budget_bytes() -> usize { 512 * 1024 * 1024 }
@@ -546,6 +600,7 @@ impl Default for DaemonConfig {
             notify_command: None,
             codex_inline_scrollback: true,
             models: crate::models::ModelConfig::default(),
+            transcript_rotation: TranscriptRotationConfig::default(),
         }
     }
 }
@@ -825,6 +880,7 @@ mode = "ssh-trust"
     #[test]
     fn serde_round_trip() {
         let original = DaemonConfig {
+            transcript_rotation: Default::default(),
             chat_search_budget_bytes: 128 * 1024 * 1024,
             presence_idle_enabled: false,
             workflow_state_gate: true,

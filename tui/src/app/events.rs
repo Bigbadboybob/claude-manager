@@ -2291,51 +2291,62 @@ impl App {
                 // hasn't loaded; future divergence cases). No
                 // panic, no log, no toast.
             }
-            ManifestDiff::Added { uid, entry }
-            | ManifestDiff::Updated { uid, entry } => {
-                // Global-perms convergence: the daemon is the auth
-                // authority, and `session.set_global_perms` broadcasts
-                // the grant it now holds. Mirror it onto an
-                // already-tracked row so the sidebar / A-e form show
-                // the daemon's truth (another client's grant, or a
-                // re-assert that healed a drifted row). Entries that
-                // don't carry the field (workflow-binding `Updated`s,
-                // `Added`s) are left alone.
-                if let Some(value) = entry.get("sidebar_assignment") {
-                    if let Ok(assignment) = serde_json::from_value(value.clone()) {
-                        self.receive_sidebar_assignment(&host, assignment);
-                    }
-                }
-                if let Some(value) = entry.get("owner_attention") {
-                    if value.is_null() {
-                        self.apply_owner_attention(&host, &uid, None);
-                    } else if let Ok(alert) = serde_json::from_value(value.clone()) {
-                        self.apply_owner_attention(&host, &uid, Some(alert));
-                    }
-                }
-                if let Some(value) = entry.get("agent_state") {
-                    self.apply_agent_state(&host, &uid, value);
-                }
-                self.apply_messaging_name(&host, &uid, &entry);
-                self.apply_global_perms_from_diff(&uid, &entry);
-                self.apply_org_from_diff(&uid, &entry);
-                self.apply_transcript_from_diff(&host, &uid, &entry);
-                // Option B (criterion #4): adopt daemon-launched WORKFLOW
-                // PARTICIPANTS into the sidebar from broadcasts. The helper is
-                // deliberately scoped to entries carrying `workflow_run_id` —
-                // those are daemon-created in Phase 4 and have NO locally-built
-                // TerminalSession, so adopting them can't duplicate or race the
-                // TUI-local row creation that A-n/A-s/mcp_start_session use.
-                // Non-workflow daemon sessions keep their existing behavior
-                // (the broader manifest-sync consumer stays deferred — 10e-d/10f)
-                // EXCEPT remote ones — see `adopt_daemon_workflow_participant_on_host`.
-                self.adopt_daemon_workflow_participant_on_host(&host, &uid, &entry);
+            ManifestDiff::Added { uid, entry } => {
+                // A daemon-side respawn at a uid this viewer still shows as
+                // exited (a transcript rotation, #24): reattach in place.
+                self.reattach_respawned(&host, &uid);
+                self.apply_manifest_upsert(&host, uid, entry);
+            }
+            ManifestDiff::Updated { uid, entry } => {
+                self.apply_manifest_upsert(&host, uid, entry);
             }
             ManifestDiff::Tombstoned { .. } => {
                 // Session removal reaches the TUI via `Exited` (and the
                 // attach-stream teardown); tombstone is a no-op here.
             }
         }
+    }
+
+    /// The shared `Added` / `Updated` handling of a manifest diff.
+    fn apply_manifest_upsert(&mut self, host: &cm_daemon::host_id::HostId, uid: String, entry: serde_json::Value) {
+        let host = host.clone();
+        // Global-perms convergence: the daemon is the auth
+        // authority, and `session.set_global_perms` broadcasts
+        // the grant it now holds. Mirror it onto an
+        // already-tracked row so the sidebar / A-e form show
+        // the daemon's truth (another client's grant, or a
+        // re-assert that healed a drifted row). Entries that
+        // don't carry the field (workflow-binding `Updated`s,
+        // `Added`s) are left alone.
+        if let Some(value) = entry.get("sidebar_assignment") {
+            if let Ok(assignment) = serde_json::from_value(value.clone()) {
+                self.receive_sidebar_assignment(&host, assignment);
+            }
+        }
+        if let Some(value) = entry.get("owner_attention") {
+            if value.is_null() {
+                self.apply_owner_attention(&host, &uid, None);
+            } else if let Ok(alert) = serde_json::from_value(value.clone()) {
+                self.apply_owner_attention(&host, &uid, Some(alert));
+            }
+        }
+        if let Some(value) = entry.get("agent_state") {
+            self.apply_agent_state(&host, &uid, value);
+        }
+        self.apply_messaging_name(&host, &uid, &entry);
+        self.apply_global_perms_from_diff(&uid, &entry);
+        self.apply_org_from_diff(&uid, &entry);
+        self.apply_transcript_from_diff(&host, &uid, &entry);
+        // Option B (criterion #4): adopt daemon-launched WORKFLOW
+        // PARTICIPANTS into the sidebar from broadcasts. The helper is
+        // deliberately scoped to entries carrying `workflow_run_id` —
+        // those are daemon-created in Phase 4 and have NO locally-built
+        // TerminalSession, so adopting them can't duplicate or race the
+        // TUI-local row creation that A-n/A-s/mcp_start_session use.
+        // Non-workflow daemon sessions keep their existing behavior
+        // (the broader manifest-sync consumer stays deferred — 10e-d/10f)
+        // EXCEPT remote ones — see `adopt_daemon_workflow_participant_on_host`.
+        self.adopt_daemon_workflow_participant_on_host(&host, &uid, &entry);
     }
 
     /// Mirror a broadcast `global_perms` onto the tracked row for `uid`

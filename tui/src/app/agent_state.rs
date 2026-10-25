@@ -404,6 +404,33 @@ pub(crate) fn badge(v: &AgentStateView, now: f64) -> Option<Badge> {
     Some(Badge { kind, short, gap: false, full })
 }
 
+/// Transcript size from which a row is badged (the daemon's default
+/// `[transcript_rotation] max_bytes`).
+pub(crate) const HEAVY_TRANSCRIPT_BYTES: u64 = 300 * 1000 * 1000;
+
+/// `1.7G` / `420M`.
+pub(crate) fn short_size(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1}G", bytes as f64 / 1e9)
+    } else {
+        format!("{}M", bytes / 1_000_000)
+    }
+}
+
+/// The over-threshold transcript badge (#24).
+pub(crate) fn heavy_badge(bytes: u64) -> Option<Badge> {
+    (bytes >= HEAVY_TRANSCRIPT_BYTES).then(|| Badge {
+        kind: symbols::Doing::Heavy,
+        short: short_size(bytes),
+        gap: false,
+        full: format!(
+            "transcript {} (CM moves it to a fresh one past {} at an idle point)",
+            short_size(bytes),
+            short_size(HEAVY_TRANSCRIPT_BYTES)
+        ),
+    })
+}
+
 /// The compact badge as spans: the mark, then its text.
 pub(crate) fn badge_spans(b: &Badge) -> Vec<Span<'static>> {
     let (mark, mark_style) = symbols::doing(b.kind);
@@ -436,7 +463,19 @@ impl App {
         if ts.session.exited {
             return None;
         }
-        badge(self.agent_view(ts)?, now_unix())
+        let activity = self.agent_view(ts).and_then(|view| badge(view, now_unix()));
+        // #24: an idle Claude row whose transcript is past the rotation
+        // threshold says so; activity always wins.
+        activity.or_else(|| heavy_badge(self.transcript_bytes(ts)?))
+    }
+
+    /// The row's transcript size, from the daemon's session list.
+    pub(crate) fn transcript_bytes(&self, ts: &TerminalSession) -> Option<u64> {
+        self.remote_session_lists
+            .get(&ts.host_id)?
+            .iter()
+            .find(|s| s.session_uid == ts.uid)?
+            .transcript_bytes
     }
 
     /// The badge for sidebar rows and org chart cards: as
@@ -450,6 +489,15 @@ impl App {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_huge_transcript_gets_the_heavy_badge() {
+        assert!(heavy_badge(HEAVY_TRANSCRIPT_BYTES - 1).is_none());
+        let b = heavy_badge(1_670_000_000).expect("over the threshold");
+        assert_eq!((b.kind, b.short.as_str()), (symbols::Doing::Heavy, "1.7G"));
+        assert!(b.full.contains("300M"), "{}", b.full);
+        assert_eq!(short_size(420_000_000), "420M");
+    }
 
     #[test]
     fn parse_maps_every_contract_state_and_unknown_never_reads_idle() {

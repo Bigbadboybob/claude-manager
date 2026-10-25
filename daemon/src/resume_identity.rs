@@ -52,6 +52,12 @@ pub struct History {
     records: BTreeMap<String, Record>,
     #[serde(default)]
     preferences: BTreeMap<String, Preferences>,
+    /// #24 rotation lineage: superseded transcript id → the id it rotated
+    /// to. CM never writes into Claude's own files, so this is the only
+    /// record that a rotated transcript moved on (the A-s Resume picker
+    /// labels it, `transcript_catalog::rotated_lineage_in`).
+    #[serde(default)]
+    rotated: BTreeMap<String, String>,
     #[serde(skip)]
     loaded: bool,
     #[serde(skip)]
@@ -202,6 +208,18 @@ pub fn remember(state: &DaemonState, r: Record) -> std::io::Result<()> {
     h.load(state)?;
     h.remember(r);
     Ok(())
+}
+/// #24: record that transcript `from` rotated to `to`, durably.
+pub fn record_rotation(state: &DaemonState, from: &str, to: &str) -> std::io::Result<()> {
+    {
+        let mut h = state
+            .resume_history
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        h.load(state)?;
+        h.rotated.insert(from.to_string(), to.to_string());
+    }
+    persist(state)
 }
 pub fn lookup_uid(state: &DaemonState, uid: &str) -> std::io::Result<Option<Record>> {
     let mut h = state
@@ -449,6 +467,23 @@ mod tests {
         assert_eq!(recovered.worktree_path, original.worktree_path);
         // Messaging ids are daemon-id + this UID; no person is minted on Resume.
         assert_eq!(recovered.entry.uid, "ts-abc-0");
+    }
+    /// #24: rotation lineage is durable and readable by the transcript
+    /// catalog from the archive file alone (the TUI reads it locally).
+    #[test]
+    fn rotation_lineage_persists_for_the_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cm = tmp.path().join(".cm");
+        std::fs::create_dir_all(&cm).unwrap();
+        let mut s = DaemonState::new();
+        s.daemon_sessions_path = Some(cm.join("daemon-sessions.json"));
+        remember(&s, record("ts-abc-0", "old-id")).unwrap();
+        record_rotation(&s, "old-id", "new-id").unwrap();
+        let lineage = crate::transcript_catalog::rotated_lineage_in(tmp.path());
+        assert_eq!(lineage.get("old-id").map(String::as_str), Some("new-id"));
+        // A later persist keeps it.
+        persist(&s).unwrap();
+        assert_eq!(crate::transcript_catalog::rotated_lineage_in(tmp.path()).len(), 1);
     }
     /// S0b (doc/org-model.md §12): a resumed identity keeps its org
     /// object (its member id) across a restart, and a later record rebuilt

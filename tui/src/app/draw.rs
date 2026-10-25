@@ -3012,11 +3012,14 @@ impl App {
                 } else {
                     cand.preview.clone()
                 };
-                let tag = match cand.bound_to.as_deref() {
+                let mut tag = match cand.bound_to.as_deref() {
                     Some("") => " (this)".to_string(),
                     Some(label) => format!(" [{}]", label),
                     None => String::new(),
                 };
+                if let Some(to) = cand.rotated_to.as_deref() {
+                    tag.push_str(&format!(" (rotated \u{2192} {})", transcripts::short_id(to)));
+                }
                 let tag_len = tag.chars().count();
                 let budget = preview_budget.saturating_sub(tag_len);
                 if preview.chars().count() > budget {
