@@ -3131,6 +3131,10 @@ impl App {
                 self.default_launch_host(),
             );
             self.planning.set_workspace_candidates(candidates);
+            if self.place_event(event) {
+                self.needs_redraw = true;
+                return true;
+            }
             let action = self.planning.handle_event(event);
             match action {
                 PlanAction::Consumed => return true,

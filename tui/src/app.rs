@@ -73,8 +73,9 @@ mod board;
 mod orgchart;
 mod orgchart_teams;
 mod org_model;
+mod place;
 mod roster;
-mod symbols;
+pub(crate) mod symbols;
 mod owner_blocked;
 mod maintenance;
 mod color_grid;
@@ -291,6 +292,7 @@ pub struct App {
     org: org_model::OrgState,
     /// The roster screen (app/roster.rs), opened with `R` in F6.
     roster: roster::Roster,
+    place: place::Place,
     owner_blocked: owner_blocked::OwnerBlocked,
     maintenance: maintenance::Maintenance,
     /// Reap requests submitted from the cleanup dialog, tracked after it closed.
@@ -1035,6 +1037,7 @@ impl App {
             orgchart: orgchart::OrgChart::default(),
             org: org_model::OrgState::default(),
             roster: roster::Roster::default(),
+            place: place::Place::default(),
             owner_blocked: owner_blocked::OwnerBlocked::default(),
             maintenance: maintenance::Maintenance::load(),
             cleanup_jobs: Vec::new(),

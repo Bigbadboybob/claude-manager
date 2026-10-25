@@ -425,6 +425,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         app.orgchart_tick();
         app.org_tick();
         app.roster_tick();
+        app.place_tick();
         app.owner_blocked_tick();
         app.maintenance_tick();
         app.unread_tick();

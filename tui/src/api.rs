@@ -59,6 +59,11 @@ pub struct Task {
     /// the schema doesn't churn for every new shape. None = no bag.
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+    /// The task's live board link (S3 placement, doc/org-model.md §7.1):
+    /// `{board, board_id, n, status, group_id, group}`; null or absent when
+    /// not placed (and on APIs that predate placement).
+    #[serde(default)]
+    pub placement: Option<serde_json::Value>,
 }
 
 /// Provenance stamped on agent-filed tasks at `metadata.filer`.

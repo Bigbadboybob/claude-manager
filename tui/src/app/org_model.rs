@@ -345,11 +345,6 @@ impl App {
         false
     }
 
-    /// The planning place dialog is open.
-    pub(super) fn planning_place_open(&self) -> bool {
-        false
-    }
-
     /// The live org snapshot (support on, members present), else `None`:
     /// every screen falls back to today's view on `None`.
     pub(super) fn org_live(&self) -> Option<&OrgSnapshot> {

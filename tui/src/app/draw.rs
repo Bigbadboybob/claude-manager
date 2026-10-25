@@ -237,7 +237,11 @@ impl App {
             }
             ViewMode::Planning => {
                 let t = std::time::Instant::now();
-                self.planning.draw(frame, content_area);
+                let strip = self.on_boards_height(content_area);
+                let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(strip)]).split(content_area);
+                self.planning.draw(frame, rows[0]);
+                self.draw_on_boards(frame, rows[1]);
+                self.draw_place(frame, rows[0]);
                 log_draw_section("planning", t.elapsed());
             }
         }

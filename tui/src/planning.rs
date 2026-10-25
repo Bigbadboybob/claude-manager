@@ -1246,6 +1246,13 @@ pub struct PlanningView {
     editing_project_idx: Option<usize>,
     editing_temp_path: Option<PathBuf>,
     input_mode: PlanInputMode,
+    /// Board links by task id (`Task::placement`, S3): the board chip and
+    /// the detail line. Kept beside the rows so a missing API field is
+    /// simply an empty map.
+    pub placements: HashMap<String, serde_json::Value>,
+    /// The API places tasks on boards (app/place.rs): `A-f` opens the
+    /// launch-or-place chooser and `A-b` toggles the on-boards strip.
+    pub placement_on: bool,
     pub needs_redraw: bool,
     last_editor_size: (u16, u16),
     initialized: bool,
@@ -1358,6 +1365,8 @@ impl PlanningView {
             editing_project_idx: None,
             editing_temp_path: None,
             input_mode: PlanInputMode::Normal,
+            placements: HashMap::new(),
+            placement_on: false,
             needs_redraw: true,
             last_editor_size: (80, 24),
             initialized: false,
@@ -1451,6 +1460,7 @@ impl PlanningView {
     /// Update planning data from API tasks. Called when BackendEvent::PlanTasksUpdated arrives.
     /// Merges API state into existing local state rather than rebuilding from scratch.
     pub fn update_from_api(&mut self, api_tasks: Vec<Task>) {
+        self.placements = api_tasks.iter().filter_map(|t| Some((t.id.clone(), t.placement.clone().filter(|p| !p.is_null())?))).collect();
         // Group incoming tasks by project.
         let mut by_project: HashMap<String, Vec<PlanTask>> = HashMap::new();
         for task in &api_tasks {
@@ -1604,6 +1614,7 @@ impl PlanningView {
 
     /// Handle a single task being created via the API.
     pub fn on_task_created(&mut self, task: Task) {
+        self.note_placement(&task);
         if let Some(ref project_name) = task.project {
             let plan_task = PlanTask::from_api(&task);
             let slug = plan_task.slug.clone();
@@ -1680,6 +1691,7 @@ impl PlanningView {
     /// Handle a single task being updated via the API response.
     /// Merges the API state into the existing local task without rebuilding.
     pub fn on_task_updated(&mut self, api_task: Task) {
+        self.note_placement(&api_task);
         for pd in &mut self.project_data {
             if let Some(task) = pd.tasks.iter_mut().find(|t| t.id == api_task.id) {
                 task.title = api_task.name.clone().unwrap_or_else(|| {
@@ -1854,6 +1866,36 @@ impl PlanningView {
         let pi = self.cursor_project_idx()?;
         let ti = self.project_data[pi].tasks.iter().position(|t| t.slug == slug)?;
         Some((pi, ti))
+    }
+
+    fn note_placement(&mut self, task: &Task) {
+        match task.placement.clone().filter(|p| !p.is_null()) {
+            Some(p) => self.placements.insert(task.id.clone(), p),
+            None => self.placements.remove(&task.id),
+        };
+    }
+
+    /// No dialog, editor or prompt is open (plain board navigation).
+    pub fn normal_mode(&self) -> bool {
+        matches!(self.input_mode, PlanInputMode::Normal) && self.editor.is_none()
+    }
+
+    /// The selected task's id and title.
+    pub fn selected_task_ref(&self) -> Option<(String, String)> {
+        self.selected_task().map(|(t, _)| (t.id.clone(), t.title.clone()))
+    }
+
+    /// A-f's launch dialog, as the plain key opens it.
+    pub fn open_launch(&mut self) -> PlanAction {
+        self.cancel_visual();
+        self.start_launch()
+    }
+
+    /// The board chip for a placed task: `swarm #15 ➤`.
+    fn placement_chip(&self, task_id: &str) -> Option<(String, Style)> {
+        let p = self.placements.get(task_id)?;
+        let (mark, style) = crate::app::symbols::board_status(p["status"].as_str().unwrap_or(""));
+        Some((format!("[{} #{} {mark}] ", p["board"].as_str().unwrap_or("?"), p["n"]), style))
     }
 
     fn selected_task(&self) -> Option<(&PlanTask, &str)> {
@@ -4501,8 +4543,9 @@ impl PlanningView {
             " A-j/k nav \u{00b7} A-h/l cols \u{00b7} A-J/K reorder \u{00b7} A-H/L move \u{00b7} A-v visual \u{00b7} A-g linear \u{00b7} / search \u{00b7} n/N match",
             dim,
         )));
+        let launch = if self.placement_on { "A-f launch/place \u{00b7} A-b on boards" } else { "A-f launch" };
         help_lines.push(Line::from(Span::styled(
-            " A-e edit \u{00b7} A-n new \u{00b7} A-i header \u{00b7} A-Ent sep \u{00b7} A-Spc empty \u{00b7} Spc fold \u{00b7} A-s status \u{00b7} A-D done \u{00b7} A-a accept \u{00b7} A-A archive done \u{00b7} A-V show arch \u{00b7} A-x del \u{00b7} A-f launch \u{00b7} A-U unlaunch \u{00b7} A-c col \u{00b7} A-r refresh \u{00b7} A-q quit",
+            format!(" A-e edit \u{00b7} A-n new \u{00b7} A-i header \u{00b7} A-Ent sep \u{00b7} A-Spc empty \u{00b7} Spc fold \u{00b7} A-s status \u{00b7} A-D done \u{00b7} A-a accept \u{00b7} A-A archive done \u{00b7} A-V show arch \u{00b7} A-x del \u{00b7} {launch} \u{00b7} A-U unlaunch \u{00b7} A-c col \u{00b7} A-r refresh \u{00b7} A-q quit"),
             dim,
         )));
         frame.render_widget(Paragraph::new(help_lines), help_area);
@@ -4615,8 +4658,10 @@ impl PlanningView {
 
                     let claude_prefix = if is_claude { "[C] " } else { "" };
                     let initiative_marker = task.map(PlanTask::initiative_marker).unwrap_or("");
+                    let chip = task.and_then(|t| self.placement_chip(&t.id));
                     let prefix_len = indent.len() + 2 /*fold*/ + 2 /*ind+space*/
-                        + claude_prefix.len() + initiative_marker.chars().count();
+                        + claude_prefix.len() + initiative_marker.chars().count()
+                        + chip.as_ref().map_or(0, |(c, _)| c.chars().count());
                     let max_title = width.saturating_sub(prefix_len + count_suffix.len());
                     let title_display = truncate_with_ellipsis(&title_str, max_title);
 
@@ -4630,6 +4675,9 @@ impl PlanningView {
                         spans.push(Span::styled(claude_prefix, Style::default().fg(theme::REMOTE)));
                     }
                     spans.push(Span::raw(initiative_marker));
+                    if let Some((c, st)) = chip {
+                        spans.push(Span::styled(c, st));
+                    }
                     self.push_title_spans(&mut spans, title_display, task, search_q.as_deref());
                     if !count_suffix.is_empty() {
                         spans.push(Span::styled(count_suffix, Style::default().fg(theme::DIM)));
@@ -4713,9 +4761,9 @@ impl PlanningView {
         frame.render_widget(block, area);
         if inner.height < 4 || inner.width < 4 { return; }
 
-        let help_entries: Vec<(&str, &str)> = vec![
+        let mut help_entries: Vec<(&str, &str)> = vec![
             ("A-j/k  nav", "A-D    done"),
-            ("A-J/K  reorder", "A-f    launch"),
+            ("A-J/K  reorder", if self.placement_on { "A-f    launch/place" } else { "A-f    launch" }),
             ("A-e    edit", "A-a    accept"),
             ("A-n    new", "A-x    delete"),
             ("A-N    subtask", "A-O    reopen done"),
@@ -4727,6 +4775,9 @@ impl PlanningView {
             ("A-p    filter", "/      search"),
             ("n      next match", "N      prev match"),
         ];
+        if self.placement_on {
+            help_entries.push(("A-b    on boards", ""));
+        }
         let help_rows = if self.keybinding_helper_visible { help_entries.len() as u16 } else { 0 };
         let help_height = if self.keybinding_helper_visible { help_rows + 2 } else { 0 };
         let list_height = inner.height.saturating_sub(help_height) as usize;
@@ -4915,6 +4966,15 @@ impl PlanningView {
             }
             lines.push(Line::from(meta));
 
+            if let Some(p) = self.placements.get(&task.id) {
+                let group = p["group"].as_str().map(|g| format!(" \u{00b7} {g}")).unwrap_or_default();
+                let mirror = if p["mirror"] == "off" { " \u{00b7} status mirror off" } else { "" };
+                lines.push(Line::from(vec![
+                    Span::styled("  Board: ", Style::default().fg(theme::DIM)),
+                    Span::styled(format!("{} #{} ({}){group}", p["board"].as_str().unwrap_or("?"), p["n"], p["status"].as_str().unwrap_or("?")), Style::default().fg(theme::HEADER)),
+                    Span::styled(mirror, Style::default().fg(theme::DIM)),
+                ]));
+            }
             if let Some(name) = task.initiative_name.as_deref() {
                 let status = task.initiative_status.as_deref().unwrap_or("unknown");
                 lines.push(Line::from(vec![
@@ -5782,6 +5842,7 @@ mod tests {
             initiative: None,
             worktree_mode: "inherit".to_string(),
             metadata: None,
+            placement: None,
         }
     }
 
