@@ -31,6 +31,17 @@ impl Cache {
             .ok()
             .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
             .filter(|c| c.snapshot.policy.validate().is_ok())
+            .map(|mut cache| {
+                // Old brains need a dated expiry on disk. Restore its meaning
+                // before exposing either cache, including full files persisted
+                // by an earlier build after a legacy-only recovery.
+                if let Some(preference) = cache.snapshot.policy.preference.as_mut() {
+                    if preference.expires_at == Some(LEGACY_INDEFINITE_EXPIRY.parse().unwrap()) {
+                        preference.expires_at = None;
+                    }
+                }
+                cache
+            })
     }
     fn load(root: &Path) -> Self {
         let path = root.join("staffing.json");
@@ -493,6 +504,108 @@ mod tests {
         assert_eq!(restored.snapshot.version, 5); // newer legacy policy wins
         assert!(restored.snapshot.policy.preference.is_none());
         assert_eq!(restored.pending(now).len(), 2);
+    }
+    #[test]
+    fn staffing_cache_sentinel_fallback_digest_and_ping_have_no_expiry() {
+        // Lost full cache, newer legacy cache, and an older build's full cache
+        // containing the sentinel must all expose the same no-expiry meaning.
+        for (keep_full, legacy_version) in [(false, 4), (true, 5), (true, 3)] {
+            let root = tempfile::tempdir().unwrap();
+            let sentinel: DateTime<Utc> = LEGACY_INDEFINITE_EXPIRY.parse().unwrap();
+            let mut snapshot = indefinite_snapshot(Utc::now());
+            snapshot.policy.preference.as_mut().unwrap().expires_at = Some(sentinel);
+            let mut cache = Cache::load(root.path());
+            cache.apply(snapshot).unwrap();
+            let mut legacy = LegacyCache::load(root.path());
+            legacy.snapshot.version = legacy_version;
+            legacy.save(root.path());
+            if !keep_full {
+                std::fs::remove_file(root.path().join(FULL_CACHE_FILE)).unwrap();
+            }
+
+            let restored = Cache::load(root.path());
+            assert_eq!(restored.snapshot.version, legacy_version.max(4));
+            assert_eq!(
+                restored
+                    .snapshot
+                    .policy
+                    .preference
+                    .as_ref()
+                    .unwrap()
+                    .expires_at,
+                None
+            );
+            let digest = restored.snapshot.policy.digest(Utc::now());
+            assert!(digest.contains("no expiry"));
+            assert!(!digest.contains("9999"));
+            let mut s = DaemonState::default();
+            s.messaging_root = root.path().into();
+            s.staffing = Arc::new(Mutex::new(restored));
+            let state = Arc::new(Mutex::new(s));
+            let response = crate::control::dispatch::dispatch_request(
+                &state,
+                &Request {
+                    id: "sentinel-ping".into(),
+                    method: "ping".into(),
+                    caller: Caller::session("sentinel-test"),
+                    params: Value::Null,
+                },
+            )
+            .into_response();
+            assert!(response.ok);
+            let result = response.result.unwrap();
+            assert_eq!(
+                result["staffing"]["policy"]["preference"].get("expires_at"),
+                Some(&Value::Null)
+            );
+            assert_eq!(result["staffing"]["digest"], digest);
+
+            // Saving the normalized cache repairs the full file without
+            // breaking the old brain's mandatory expiry field.
+            let full: Value =
+                serde_json::from_slice(&std::fs::read(root.path().join(FULL_CACHE_FILE)).unwrap())
+                    .unwrap();
+            assert_eq!(
+                full["snapshot"]["policy"]["preference"].get("expires_at"),
+                Some(&Value::Null)
+            );
+            assert_eq!(
+                Cache::load(root.path())
+                    .snapshot
+                    .policy
+                    .preference
+                    .unwrap()
+                    .expires_at,
+                None
+            );
+            assert_eq!(
+                LegacyCache::load(root.path())
+                    .snapshot
+                    .policy
+                    .preference
+                    .unwrap()
+                    .expires_at,
+                sentinel
+            );
+        }
+    }
+    #[test]
+    fn staffing_cache_only_normalizes_the_exact_sentinel() {
+        for expiry in ["2099-12-31T23:59:59Z", "9999-12-31T23:59:59.000000001Z"] {
+            let root = tempfile::tempdir().unwrap();
+            let expiry: DateTime<Utc> = expiry.parse().unwrap();
+            let mut snapshot = indefinite_snapshot(Utc::now());
+            snapshot.policy.preference.as_mut().unwrap().expires_at = Some(expiry);
+            let mut cache = Cache::load(root.path());
+            cache.apply(snapshot).unwrap();
+            for file in ["staffing.json", FULL_CACHE_FILE] {
+                let restored = Cache::read(&root.path().join(file)).unwrap();
+                assert_eq!(
+                    restored.snapshot.policy.preference.unwrap().expires_at,
+                    Some(expiry)
+                );
+            }
+        }
     }
     #[test]
     fn staffing_cache_restart_monotonic_and_recent_spawners() {

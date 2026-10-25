@@ -60,8 +60,9 @@ Owner stamp, as it does board actors.
 Daemons fetch `/staffing` in the background every 30 seconds and persist the
 last policy and recent spawners in `<CM root>/staffing-v2.json`. They also write
 `staffing.json` for old brains: indefinite expiry becomes `9999-12-31T23:59:59Z`,
-rules become engine strings, and busywork is omitted. Rollback therefore keeps
-the preference and supported engine rules. New brains prefer the full file at
+rules become engine strings, and busywork is omitted. Both cache readers map
+exactly that timestamp back to no expiry before exposing the policy. Rollback
+therefore keeps the preference and supported engine rules. New brains prefer the full file at
 equal versions, accept a newer legacy policy, and merge spawner checkpoints from
 both files. Loading an older single-file cache writes both formats; an
 equal-version API refresh restores full fields after falling back to the legacy
