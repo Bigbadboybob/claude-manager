@@ -21,6 +21,12 @@ pub use cm_holder_proto::org::{LIFECYCLE_GUARD_V1, OCCUPANCY_V1, ORG_PRESERVE_V1
 pub const KNOWN: [&str; 4] = [ORG_PRESERVE_V1, LIFECYCLE_GUARD_V1, ORG_STAMP_V1, OCCUPANCY_V1];
 
 /// What this brain build implements.
+///
+/// `lifecycle_guard_v1` means the sweep honours item closes and workspace
+/// kinds AND local `home` marks are applied, so it is registered here only
+/// by a build with both items' sweep guard ([`crate::lifecycle_guard`]) and
+/// org's mark-apply (Swarm-Coord, 2026-10-25): whichever lands second pushes
+/// it. Until then the API's per-task gate keeps the central mirror off.
 pub fn brain() -> Vec<String> {
     // The record code is shared with the holder (holder-proto), so what the
     // brain preserves is what that crate preserves.

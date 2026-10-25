@@ -70,19 +70,6 @@ pub fn start(state: &Arc<Mutex<DaemonState>>) {
     }
 }
 
-/// What this daemon advertises in every beat (doc/org-model.md §12). The API
-/// turns a feature on for a host only when it is listed here; e.g. it
-/// mirrors a placed task's status only while every daemon holding the task's
-/// sessions lists `lifecycle_guard_v1`.
-///
-/// `lifecycle_guard_v1` means the sweep honours item closes and workspace
-/// kinds AND local `home` marks are applied, so it is advertised only by a
-/// build with both this lane's sweep guard ([`crate::lifecycle_guard`]) and
-/// org's mark-apply (Swarm-Coord, 2026-10-25). Whichever lands second adds it
-/// (S0b's `capabilities::advertised()` replaces this list); until then the
-/// API's per-task gate keeps the central mirror off, the safe default.
-pub const CAPABILITIES: &[&str] = &[];
-
 /// What one beat reads from the daemon, captured under the lock.
 pub(crate) struct Snapshot {
     pub daemon_id: String,
@@ -251,7 +238,14 @@ pub(crate) struct Beat {
     /// Pushes handled since the last successful beat, acked on the next one.
     acks: BTreeSet<i64>,
     warned: bool,
+    /// When an API that predates `HeartbeatBody.capabilities` last refused
+    /// the field (its body model forbids unknown keys). The beat then goes
+    /// without it, and tries again after [`CAPS_RETRY`].
+    caps_refused_at: Option<std::time::Instant>,
 }
+
+/// How long to leave `capabilities` off after an older API refused it.
+const CAPS_RETRY: std::time::Duration = std::time::Duration::from_secs(600);
 
 impl Beat {
     pub(crate) fn run(&mut self, state: &Arc<Mutex<DaemonState>>) {
@@ -264,14 +258,31 @@ impl Beat {
             return;
         };
         let acked: Vec<i64> = self.acks.iter().copied().collect();
-        let body = json!({
+        let mut body = json!({
             "host_label": snap.host_label,
             "sessions": snap.sessions,
             "exited": [],
             "acked_push_ids": acked,
-            "capabilities": CAPABILITIES,
         });
-        let reply = match api.post(&format!("/hosts/{}/heartbeat", snap.daemon_id), &body) {
+        // doc/org-model.md §12: what this host advertises (brain ∩ holder ∩
+        // rollback pin), unless an older API refused the field recently.
+        let send_caps = self.caps_refused_at.is_none_or(|at| at.elapsed() >= CAPS_RETRY);
+        if send_caps {
+            body["capabilities"] = json!(crate::capabilities::advertised());
+        }
+        let path = format!("/hosts/{}/heartbeat", snap.daemon_id);
+        let mut result = api.post(&path, &body);
+        if send_caps {
+            if let Err((crate::control::protocol::ErrorCode::InvalidParams, message)) = &result {
+                if message.contains("capabilities") {
+                    eprintln!("cm items: the planning API predates heartbeat capabilities; beating without them");
+                    self.caps_refused_at = Some(std::time::Instant::now());
+                    body.as_object_mut().map(|b| b.remove("capabilities"));
+                    result = api.post(&path, &body);
+                }
+            }
+        }
+        let reply = match result {
             Ok(reply) => reply,
             Err((_, message)) => {
                 eprintln!("cm items: heartbeat failed: {message}");
@@ -492,11 +503,12 @@ mod tests {
         assert_eq!(bodies[0]["sessions"].as_array().unwrap().len(), 1);
         assert_eq!(bodies[0]["sessions"][0]["state"], "unknown"); // TUI-only row
         assert_eq!(bodies[1]["acked_push_ids"], json!([41, 42]));
-        // Every beat sends the capability list (doc/org-model.md §12); this
-        // build does not claim lifecycle_guard_v1 yet (it needs org's
-        // home-mark apply too).
-        assert_eq!(bodies[0]["capabilities"], json!(CAPABILITIES));
-        assert!(!CAPABILITIES.contains(&crate::lifecycle_guard::CAPABILITY));
+        // Every beat sends what the host advertises (doc/org-model.md
+        // §12); this build does not claim lifecycle_guard_v1 yet (it needs
+        // org's home-mark apply too).
+        assert_eq!(bodies[0]["capabilities"], json!(crate::capabilities::advertised()));
+        assert_eq!(bodies[0]["capabilities"], json!(["org_preserve_v1"]), "not split: the brain's list");
+        assert!(!crate::capabilities::brain().iter().any(|c| c == crate::lifecycle_guard::CAPABILITY));
         // The reply's launch grants replace the cache and are persisted.
         let s = state.lock().unwrap();
         assert_eq!(s.launch_grants.len(), 1);
@@ -504,5 +516,64 @@ mod tests {
         // The second reply had no `org` key (a pre-S2 API): the cache stays.
         assert_eq!(super::super::org::cached_member("me-uid")["handle"], "ep");
         super::super::org::reset_cache_for_test();
+    }
+
+    /// An API whose heartbeat model predates `capabilities` refuses the
+    /// unknown field (422): the beat is resent without it at once, and
+    /// later beats leave it off for a while instead of failing every 30 s.
+    #[test]
+    fn an_older_api_that_refuses_capabilities_still_gets_the_beat() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let bodies: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let log = bodies.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Read, Write};
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let mut length = 0;
+                loop {
+                    let mut h = String::new();
+                    reader.read_line(&mut h).unwrap();
+                    if h.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                let refuse = body.get("capabilities").is_some();
+                log.lock().unwrap().push(body);
+                let (status, reply) = if refuse {
+                    ("422 Unprocessable Entity", r#"{"detail":[{"type":"extra_forbidden","loc":["body","capabilities"],"msg":"Extra inputs are not permitted"}]}"#)
+                } else {
+                    ("200 OK", r#"{"pushes":[]}"#)
+                };
+                let _ = write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len());
+            }
+        });
+        let mut st = DaemonState::default();
+        st.messaging_root = root.path().into();
+        st.config.api_url = url;
+        st.config.api_token = "tok".into();
+        let state = Arc::new(Mutex::new(st));
+        crate::messaging::startup::open_for_test(&state).unwrap();
+        let mut beat = Beat::default();
+        beat.run(&state);
+        beat.run(&state);
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 3, "refused, resent without, then sent without: {bodies:?}");
+        assert!(bodies[0].get("capabilities").is_some());
+        assert!(bodies[1].get("capabilities").is_none());
+        assert!(bodies[2].get("capabilities").is_none());
+        assert!(beat.caps_refused_at.is_some());
     }
 }
