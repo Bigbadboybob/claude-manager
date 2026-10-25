@@ -1,0 +1,14 @@
+# /etc/logrotate.d/claude-manager — the planning API log on cm-manager.
+# systemd opens the file with append:, so copytruncate is safe (writes land
+# at the new end). The log grows ~40 MB/day; keep two weeks, compressed.
+/var/log/claude-manager.log {
+    daily
+    maxsize 500M
+    rotate 14
+    compress
+    delaycompress
+    copytruncate
+    missingok
+    notifempty
+    dateext
+}

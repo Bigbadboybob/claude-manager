@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily claude-manager deploy backup pruning
+
+[Timer]
+OnCalendar=*-*-* 13:10:00 UTC
+RandomizedDelaySec=10m
+Persistent=true
+Unit=cm-prune-backups.service
+
+[Install]
+WantedBy=timers.target
