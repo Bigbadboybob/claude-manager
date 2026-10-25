@@ -234,7 +234,7 @@ CREATE TABLE IF NOT EXISTS org_daemons (
 
 -- Workspace kind marks (`home` from the roster and adoption). Recorded
 -- centrally at once; pushed in the owning daemon's heartbeat reply only once
--- that daemon advertises org_preserve_v1, and confirmed by its ack.
+-- that daemon advertises org_marks_v1, and confirmed by its ack.
 CREATE TABLE IF NOT EXISTS org_workspace_marks (
     id           BIGSERIAL PRIMARY KEY,
     daemon_id    TEXT NOT NULL,

@@ -476,25 +476,38 @@ class OrgApiDb(unittest.IsolatedAsyncioTestCase):
         r = await self.http.post("/org/adopt", json={**body, "pid": pid("gone"), "request_id": "adopt-3"})
         self.assertEqual(r.status_code, 404)
         # The member cache rides the heartbeat reply; marks wait for the
-        # daemon to advertise org_preserve_v1, and its ack confirms them.
+        # daemon to advertise org_marks_v1 (an S0b brain only preserves the
+        # org object: it would drop them), and its ack confirms them.
         reply = await self.beat(D1, [{"uid": uid, "name": "rev1", "ws": "ws-r"}])
         self.assertEqual(reply["org"]["members"][uid]["handle"], "reviewer")
         self.assertEqual(reply["org"]["members"][uid]["acting_as"], "main")
         self.assertEqual(reply["org"]["workspace_marks"], [])
         reply = await self.beat(D1, [{"uid": uid, "ws": "ws-r"}], capabilities=["org_preserve_v1"])
+        self.assertEqual((reply["org"]["workspace_marks"], reply["org"]["capable"]), ([], False))
+        reply = await self.beat(D1, [{"uid": uid, "ws": "ws-r"}], capabilities=["org_marks_v1"])
         marks = reply["org"]["workspace_marks"]
         self.assertEqual([(m["workspace_id"], m["handle"]) for m in marks], [("ws-r", "reviewer")])
         version = (await self.snapshot())["version"]
-        reply = await self.beat(D1, [{"uid": uid, "ws": "ws-r"}], capabilities=["org_preserve_v1"])
+        reply = await self.beat(D1, [{"uid": uid, "ws": "ws-r"}], capabilities=["org_marks_v1"])
         self.assertEqual(len(reply["org"]["workspace_marks"]), 1)  # re-sent until acked
         self.assertEqual((await self.snapshot())["version"], version)  # attempts don't feed
-        reply = await self.beat(D1, [{"uid": uid, "ws": "ws-r"}], capabilities=["org_preserve_v1"],
+        reply = await self.beat(D1, [{"uid": uid, "ws": "ws-r"}], capabilities=["org_marks_v1"],
                                 acked_mark_ids=[marks[0]["id"]])
         self.assertEqual(reply["org"]["workspace_marks"], [])
         member = (await self.http.get("/org/members/main/reviewer")).json()["member"]
         self.assertEqual(member["home_workspace"]["state"], "confirmed")
         # A remote daemon's beat never carries this daemon's members.
         self.assertEqual((await self.beat(D2, []))["org"]["members"], {})
+
+    async def test_a_beat_without_capabilities_records_none(self):
+        # A rollback to a brain from before S0b sends no `capabilities`: the
+        # host must stop counting as capable (marks, the lifecycle gate).
+        await self.beat(D1, [], capabilities=["org_marks_v1", "lifecycle_guard_v1"])
+        reply = await self.beat(D1, [])
+        self.assertFalse(reply["org"]["capable"])
+        async with self.pool.acquire() as conn:
+            caps = await conn.fetchval("SELECT capabilities FROM org_daemons WHERE daemon_id = $1", D1)
+        self.assertEqual(caps, [])
 
     async def test_reads_by_pid_handle_and_task(self):
         await self.swarm()

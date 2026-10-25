@@ -149,6 +149,13 @@ pub fn binding_guarded(ws: &ManifestWorkspace) -> bool {
     cm_holder_proto::org::binding_epoch(ws.org.as_ref()).is_some()
 }
 
+/// Whether a workspace is durable by kind (`home`/`stream`, set by a central
+/// mark, doc/org-model.md §5): it is persisted even with no live session, so
+/// the mark survives a restart. The API never re-pushes a confirmed mark.
+pub fn durable_kind(ws: &ManifestWorkspace) -> bool {
+    matches!(cm_holder_proto::org::workspace_kind(ws.org.as_ref()), Some("home" | "stream"))
+}
+
 /// Bound on [`DaemonState::kill_requests`]. A request is normally
 /// consumed within milliseconds (the reaper's `handle_session_exit`
 /// takes it while building the tombstone), so anything still resident
@@ -1220,7 +1227,9 @@ impl DaemonState {
     ///
     /// Only workspaces that actually own a live session are emitted —
     /// restore needs no others, and a headless daemon's `workspaces`
-    /// map is exactly the set auto-registered at spawn anyway. All
+    /// map is exactly the set auto-registered at spawn anyway — plus
+    /// [`durable_kind`] ones, whose org object must outlive their
+    /// sessions. All
     /// `bindings` are kept (small, and symmetric with
     /// [`Self::load_manifest_from_disk`]).
     pub fn build_daemon_manifest(&self) -> Manifest {
@@ -1246,6 +1255,13 @@ impl DaemonState {
                     },
                 });
             ws.sessions.push(crate::resume_identity::entry(self, sess));
+        }
+        for (id, w) in self.workspaces.iter().filter(|(_, w)| durable_kind(w)) {
+            workspaces.entry(id.clone()).or_insert_with(|| ManifestWorkspace {
+                sessions: Vec::new(),
+                tombstones: Vec::new(),
+                ..w.clone()
+            });
         }
         Manifest {
             messaging_names: self.messaging_names.clone(),

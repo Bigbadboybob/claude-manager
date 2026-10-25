@@ -6,8 +6,9 @@
 //! for a host only when all three have it, so [`advertised`] is their
 //! intersection and the per-role lists are reported beside it.
 //!
-//! Registering a capability is one entry in [`brain`]. S0b registers
-//! `org_preserve_v1`; `lifecycle_guard_v1`, `org_stamp_v1` and
+//! Registering a capability is one entry in [`brain`] (or [`BRAIN_ONLY`]).
+//! S0b registers `org_preserve_v1`; the mark-apply build registers
+//! `org_marks_v1` and `lifecycle_guard_v1`; `org_stamp_v1` and
 //! `occupancy_v1` are reserved names, added by the build that implements
 //! them.
 
@@ -17,8 +18,14 @@ use std::path::{Path, PathBuf};
 
 pub use cm_holder_proto::org::{LIFECYCLE_GUARD_V1, OCCUPANCY_V1, ORG_PRESERVE_V1, ORG_STAMP_V1};
 
+/// Applies the home/stream workspace marks a heartbeat reply hands this
+/// daemon, and acks them ([`crate::items::org::apply_marks`]). The API pushes
+/// marks only to a host advertising it.
+pub const ORG_MARKS_V1: &str = "org_marks_v1";
+
 /// Every capability name the org model defines.
-pub const KNOWN: [&str; 4] = [ORG_PRESERVE_V1, LIFECYCLE_GUARD_V1, ORG_STAMP_V1, OCCUPANCY_V1];
+pub const KNOWN: [&str; 5] =
+    [ORG_PRESERVE_V1, LIFECYCLE_GUARD_V1, ORG_STAMP_V1, OCCUPANCY_V1, ORG_MARKS_V1];
 
 /// Brain-only capabilities: implemented entirely in the brain, so the holder
 /// need not list them, only carry the org object (`org_preserve_v1`); the
@@ -26,9 +33,9 @@ pub const KNOWN: [&str; 4] = [ORG_PRESERVE_V1, LIFECYCLE_GUARD_V1, ORG_STAMP_V1,
 /// `lifecycle_guard_v1` (the sweep honours item closes and workspace kinds
 /// AND local `home` marks are applied) is pushed here only by a build with
 /// both items' sweep guard ([`crate::lifecycle_guard`]) and org's
-/// mark-apply, and lights up from the second deploy of such a build. Until
-/// then the API's per-task gate keeps the central mirror off.
-pub const BRAIN_ONLY: &[&str] = &[];
+/// mark-apply, and lights up from the second deploy of such a build. This is
+/// that build.
+pub const BRAIN_ONLY: &[&str] = &[ORG_MARKS_V1, LIFECYCLE_GUARD_V1];
 
 /// What this brain build implements: the record capabilities it shares with
 /// the holder (holder-proto) plus [`BRAIN_ONLY`].
@@ -263,9 +270,13 @@ mod tests {
     }
 
     #[test]
-    fn names_are_the_designed_four() {
-        assert_eq!(KNOWN, ["org_preserve_v1", "lifecycle_guard_v1", "org_stamp_v1", "occupancy_v1"]);
-        assert_eq!(brain(), vec![ORG_PRESERVE_V1.to_string()]);
+    fn names_are_the_designed_ones() {
+        assert_eq!(
+            KNOWN,
+            ["org_preserve_v1", "lifecycle_guard_v1", "org_stamp_v1", "occupancy_v1", "org_marks_v1"],
+        );
+        assert_eq!(brain(), ["org_preserve_v1", "org_marks_v1", "lifecycle_guard_v1"]);
+        assert_eq!(LIFECYCLE_GUARD_V1, crate::lifecycle_guard::CAPABILITY);
     }
 
     #[test]
@@ -305,6 +316,9 @@ mod tests {
         assert_eq!(intersect_holder(brain(), Some(&s0b_holder)), brain());
         assert!(intersect_holder(brain(), Some(&[])).is_empty(), "a pre-S0b holder admits nothing");
         assert_eq!(intersect_holder(brain(), None), brain(), "not split");
+        // The pin must list them itself: a pin from the S0b build lacks them.
+        let advertised = intersect(intersect_holder(brain(), Some(&s0b_holder)), Some(&s0b_holder));
+        assert_eq!(advertised, [ORG_PRESERVE_V1]);
     }
 
     #[test]

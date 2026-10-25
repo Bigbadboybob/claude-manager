@@ -27,7 +27,10 @@ from dispatch.items_rules import ItemsError
 ORG = "main"
 OWNER_ID = "mem_owner"
 OWNER_PID = "owner"
-ORG_PRESERVE = "org_preserve_v1"
+# Applies and acks pushed home/stream marks (doc/org-model.md §12). Marks go
+# only to a daemon advertising this: an S0b brain preserves the org object
+# but would drop the marks and burn their attempts.
+ORG_MARKS = "org_marks_v1"
 
 # A session this old that holds open board items (or orchestrates a board)
 # is proposed as a long-lived lane.
@@ -817,7 +820,7 @@ async def _event(conn, subject_type, subject_id, type_, actor, *, prev=None, new
 
 async def _home_mark(conn, member_id: str, home: dict | None) -> dict | None:
     """Record a member's home workspace centrally. The owning daemon gets it
-    in a heartbeat reply once it advertises org_preserve_v1."""
+    in a heartbeat reply once it advertises org_marks_v1."""
     if not home or not home.get("daemon_id") or not home.get("workspace_id"):
         return None
     row = await conn.fetchrow(
@@ -1366,7 +1369,9 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
     capabilities, confirm acked home marks, and return
     `{members: {session_uid: member summary}, workspace_marks: [...]}` for
     this daemon. Marks are handed out only to a daemon advertising
-    org_preserve_v1; older daemons ignore the whole `org` reply key."""
+    org_marks_v1; older daemons ignore the whole `org` reply key. A beat
+    without `capabilities` (a brain from before S0b) records none, so a
+    rollback never leaves a host marked capable."""
     prefix = f"agent:{daemon_id}:"
     now = utcnow()
     facts = []
@@ -1410,16 +1415,13 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
                 """DELETE FROM org_session_facts
                     WHERE daemon_id = $1 AND reported_at < $2 AND NOT (pid = ANY($3::text[]))""",
                 daemon_id, now - timedelta(days=7), [f[0] for f in facts])
-            if capabilities is not None:
-                caps = sorted({str(c)[:64] for c in capabilities if isinstance(c, str)})[:64]
-                await conn.execute(
-                    """INSERT INTO org_daemons (daemon_id, capabilities, seen_at) VALUES ($1, $2, $3)
-                       ON CONFLICT (daemon_id) DO UPDATE SET capabilities = EXCLUDED.capabilities,
-                                                             seen_at = EXCLUDED.seen_at""",
-                    daemon_id, caps, now)
-            capable = await conn.fetchval(
-                "SELECT $2 = ANY(capabilities) FROM org_daemons WHERE daemon_id = $1",
-                daemon_id, ORG_PRESERVE)
+            caps = sorted({c[:64] for c in capabilities or () if isinstance(c, str)})[:64]
+            await conn.execute(
+                """INSERT INTO org_daemons (daemon_id, capabilities, seen_at) VALUES ($1, $2, $3)
+                   ON CONFLICT (daemon_id) DO UPDATE SET capabilities = EXCLUDED.capabilities,
+                                                         seen_at = EXCLUDED.seen_at""",
+                daemon_id, caps, now)
+            capable = ORG_MARKS in caps
             marks = []
             # The marks table's statement trigger takes the feed lock even for
             # a zero-row UPDATE, so look first (a plain read takes no lock):

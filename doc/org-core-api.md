@@ -76,10 +76,16 @@ marks to confirm or push never takes the feed lock. The reply gains
 `org: {members: {session_uid: member}, workspace_marks, capable}`. The daemon
 caches `members`, and `ping()` returns that cache as `member`.
 
-**Home-mark push (S0b contract).** Marks are sent only to a daemon whose
-heartbeat body has `capabilities: ["org_preserve_v1"]`. That daemon applies
-`reply.org.workspace_marks` and acks them with `acked_mark_ids` on the next
-beat, which confirms them. Until S0b, marks stay `central`.
+**Home-mark push.** Each beat replaces the daemon's row in `org_daemons`
+with its `capabilities`; a beat without the field (a brain from before S0b)
+records none. Marks are sent only to a daemon advertising `org_marks_v1`
+(`capable` in the reply); `org_preserve_v1` alone is not enough, since that
+brain would drop them. The daemon sets the workspace's `org.workspace_kind`
+(`home`/`stream`) and `org.office_of` (the member id), finding it by id and
+then by a unique path, persists it, and acks with `acked_mark_ids` on the
+next beat, which confirms the mark. A mark for a workspace the daemon does
+not hold stays unacked and is re-sent until its attempts run out. Until a
+host advertises `org_marks_v1`, its marks stay `central`.
 
 ## Daemon RPCs and the MCP tool
 

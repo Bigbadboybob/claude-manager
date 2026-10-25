@@ -303,6 +303,63 @@ pub(crate) fn load_cache(root: &std::path::Path) {
     }
 }
 
+/// Apply the home/stream workspace marks a heartbeat reply hands this
+/// daemon (`reply.org.workspace_marks`, doc/org-model.md §5 and §12) and
+/// return the ids to ack on the next beat. A mark sets the workspace's
+/// `org.workspace_kind` and `org.office_of` (the member); it overrides a
+/// local kind, since the central roster and adoption are authoritative. A
+/// mark for a workspace this daemon does not hold, matched by id and then
+/// by path, stays unacked: the API pushes it again until its attempts run
+/// out. Persisted (best effort, like every lifecycle write) before the ids
+/// are returned; a re-push of an applied mark is a no-op that acks again.
+pub(crate) fn apply_marks(state: &mut DaemonState, reply: &Value) -> Vec<i64> {
+    use cm_holder_proto::org as bridge;
+    let Some(marks) = reply["org"]["workspace_marks"].as_array() else { return Vec::new() };
+    let mut acked = Vec::new();
+    let mut changed = false;
+    for mark in marks {
+        let Some(id) = mark["id"].as_i64() else { continue };
+        let kind = match mark["kind"].as_str() {
+            Some(k @ ("home" | "stream")) => k,
+            other => {
+                eprintln!("cm org: workspace mark {id} has unknown kind {other:?}; not applied");
+                continue;
+            }
+        };
+        let ws_id = mark["workspace_id"].as_str().filter(|w| state.workspaces.contains_key(*w));
+        let ws_id = ws_id.map(str::to_string).or_else(|| {
+            let path = std::path::Path::new(mark["path"].as_str()?);
+            let mut hits = state
+                .workspaces
+                .iter()
+                .filter(|(_, ws)| ws.worktree_path.as_deref() == Some(path));
+            match (hits.next(), hits.next()) {
+                (Some((id, _)), None) => Some(id.clone()),
+                _ => None,
+            }
+        });
+        let Some(ws) = ws_id.and_then(|w| state.workspaces.get_mut(&w)) else {
+            eprintln!("cm org: workspace mark {id} names a workspace this daemon does not hold");
+            continue;
+        };
+        let member = mark["member_id"].clone();
+        let org = ws.org.as_ref();
+        if bridge::workspace_kind(org) != Some(kind) || org.and_then(|o| o.get(OFFICE_OF)) != Some(&member) {
+            bridge::set(&mut ws.org, bridge::WORKSPACE_KIND, Value::String(kind.into()));
+            bridge::set(&mut ws.org, OFFICE_OF, member);
+            changed = true;
+        }
+        acked.push(id);
+    }
+    if changed {
+        state.persist_sessions_best_effort();
+    }
+    acked
+}
+
+/// The workspace org-object key naming the member whose home it is.
+pub const OFFICE_OF: &str = "office_of";
+
 /// The member a session on this daemon works as, from the last heartbeat
 /// (at most ~30 s old). Never blocks on the network: `ping` reads it.
 pub fn cached_member(uid: &str) -> Value {
@@ -512,5 +569,64 @@ mod tests {
         assert!(err.1.starts_with("unsupported"));
         let err = api(Err((ErrorCode::NotFound, "not_found: no member 'x'".into()))).unwrap_err();
         assert!(matches!(err.0, ErrorCode::NotFound));
+    }
+
+    fn ws(id: &str, path: &str, org: Value) -> crate::manifest::ManifestWorkspace {
+        serde_json::from_value(json!({"id": id, "worktree_path": path, "org": org, "sessions": []})).unwrap()
+    }
+
+    fn marks(list: Value) -> Value {
+        json!({"org": {"workspace_marks": list}})
+    }
+
+    /// Org model S2's home push (doc/org-model.md §12): a mark finds its
+    /// workspace by id, then by a unique path; overrides a local kind;
+    /// keeps the org object's other keys; persists; and is acked. A mark
+    /// for a workspace this daemon does not hold, or with an unknown kind,
+    /// stays unacked so the API retries it.
+    #[test]
+    fn workspace_marks_apply_persist_and_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = DaemonState::default();
+        st.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
+        st.workspaces.insert("ws-a".into(), ws("ws-a", "/w/a", json!({"workspace_kind": "ephemeral", "later": 1})));
+        st.workspaces.insert("ws-b".into(), ws("ws-b", "/w/b", Value::Null));
+        st.workspaces.insert("ws-c".into(), ws("ws-c", "/w/same", Value::Null));
+        st.workspaces.insert("ws-d".into(), ws("ws-d", "/w/same", Value::Null));
+        let reply = marks(json!([
+            {"id": 1, "workspace_id": "ws-a", "path": "/w/a", "kind": "home", "member_id": "mem_1", "handle": "ep"},
+            // Unknown id on this daemon: found by its path.
+            {"id": 2, "workspace_id": "elsewhere", "path": "/w/b", "kind": "stream", "member_id": "mem_2"},
+            // Two workspaces share the path: no guess.
+            {"id": 3, "workspace_id": "nope", "path": "/w/same", "kind": "home", "member_id": "mem_3"},
+            {"id": 4, "workspace_id": "nope", "path": "/w/none", "kind": "home", "member_id": "mem_4"},
+            {"id": 5, "workspace_id": "ws-c", "kind": "ephemeral", "member_id": "mem_5"},
+            {"workspace_id": "ws-d", "kind": "home", "member_id": "mem_6"},
+        ]));
+        assert_eq!(apply_marks(&mut st, &reply), vec![1, 2]);
+        let a = st.workspaces["ws-a"].org.clone().unwrap();
+        assert_eq!(a["workspace_kind"], "home", "the central mark overrides a local kind");
+        assert_eq!(a[OFFICE_OF], "mem_1");
+        assert_eq!(a["later"], 1, "other org keys are kept");
+        assert_eq!(crate::lifecycle_guard::workspace_kind(&st.workspaces["ws-a"]),
+                   crate::lifecycle_guard::WorkspaceKind::Home);
+        assert_eq!(st.workspaces["ws-b"].org.as_ref().unwrap()["workspace_kind"], "stream");
+        assert!(st.workspaces["ws-c"].org.is_none() && st.workspaces["ws-d"].org.is_none());
+        let saved = std::fs::read_to_string(dir.path().join("daemon-sessions.json")).unwrap();
+        let saved: Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(saved["workspaces"]["ws-a"]["org"][OFFICE_OF], "mem_1", "{saved}");
+        // The mark outlives the workspace's sessions: a fresh brain loads
+        // it, while an unmarked session-less workspace is not persisted.
+        let mut fresh = DaemonState::default();
+        assert!(fresh.load_manifest_from_disk(&dir.path().join("daemon-sessions.json")).unwrap());
+        assert_eq!(fresh.workspaces["ws-a"].org.as_ref().unwrap()[OFFICE_OF], "mem_1");
+        assert!(!fresh.workspaces.contains_key("ws-c"));
+        // A re-push (the ack was lost) is a no-op that acks again.
+        std::fs::remove_file(dir.path().join("daemon-sessions.json")).unwrap();
+        let again = marks(json!([{"id": 1, "workspace_id": "ws-a", "kind": "home", "member_id": "mem_1"}]));
+        assert_eq!(apply_marks(&mut st, &again), vec![1]);
+        assert!(!dir.path().join("daemon-sessions.json").exists(), "nothing changed: no rewrite");
+        // A reply without marks (an older API) applies nothing.
+        assert!(apply_marks(&mut st, &json!({"pushes": []})).is_empty());
     }
 }

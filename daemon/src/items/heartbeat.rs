@@ -237,6 +237,9 @@ pub(crate) fn plan(push: &Value, engine_of: impl Fn(&str) -> Option<String>) -> 
 pub(crate) struct Beat {
     /// Pushes handled since the last successful beat, acked on the next one.
     acks: BTreeSet<i64>,
+    /// Home/stream workspace marks applied since the last successful beat
+    /// (org model S2), acked on the next one as `acked_mark_ids`.
+    mark_acks: BTreeSet<i64>,
     warned: bool,
     /// When an API that predates `HeartbeatBody.capabilities` last refused
     /// the field (its body model forbids unknown keys). The beat then goes
@@ -264,6 +267,11 @@ impl Beat {
             "exited": [],
             "acked_push_ids": acked,
         });
+        // Only an API that hands out marks (org S2+) knows this field.
+        let mark_acked: Vec<i64> = self.mark_acks.iter().copied().collect();
+        if !mark_acked.is_empty() {
+            body["acked_mark_ids"] = json!(mark_acked);
+        }
         // doc/org-model.md §12: what this host advertises (brain ∩ holder ∩
         // rollback pin), unless an older API refused the field recently.
         let send_caps = self.caps_refused_at.is_none_or(|at| at.elapsed() >= CAPS_RETRY);
@@ -292,6 +300,9 @@ impl Beat {
         for id in &acked {
             self.acks.remove(id);
         }
+        for id in &mark_acked {
+            self.mark_acks.remove(id);
+        }
         if let Some(grants) = crate::items::grants::from_reply(&reply) {
             let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
             let root = s.messaging_root.clone();
@@ -301,13 +312,18 @@ impl Beat {
         if reply["org"]["members"].is_object() {
             super::org::save_cache(&snap.root);
         }
+        let applied = {
+            let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+            super::org::apply_marks(&mut s, &reply)
+        };
+        self.mark_acks.extend(applied);
         for push in reply["pushes"].as_array().into_iter().flatten() {
             let Some(id) = push["id"].as_i64() else { continue };
             if self.deliver(state, &snap.root, push) {
                 self.acks.insert(id);
             }
         }
-        if !self.acks.is_empty() {
+        if !self.acks.is_empty() || !self.mark_acks.is_empty() {
             poke(); // ack promptly rather than in 30 s
         }
     }
@@ -438,6 +454,47 @@ mod tests {
         assert_eq!(row["engine"].as_str().unwrap().chars().count(), 40);
     }
 
+    /// Org model S2's home push: a beat applies the reply's workspace marks
+    /// and acks them on the next beat only (`acked_mark_ids`), once.
+    #[test]
+    fn a_beat_applies_workspace_marks_and_acks_them_next_time() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (url, seen) = super::super::org::test_stub(move |_, _, _| {
+            // The API confirms the ack, so it pushes the mark only once.
+            let reply = if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                json!({"pushes": [], "org": {"members": {}, "workspace_marks": []}})
+            } else {
+                json!({"pushes": [], "org": {"members": {}, "workspace_marks": [
+                    {"id": 7, "workspace_id": "ws-home", "path": "/w/home", "kind": "home", "member_id": "mem_1"}]}})
+            };
+            (200, reply.to_string())
+        });
+        let mut st = DaemonState::default();
+        st.messaging_root = root.path().into();
+        st.config.api_url = url;
+        st.config.api_token = "tok".into();
+        st.workspaces.insert(
+            "ws-home".into(),
+            serde_json::from_value(json!({"id": "ws-home", "worktree_path": "/w/home", "sessions": []})).unwrap(),
+        );
+        let state = Arc::new(Mutex::new(st));
+        crate::messaging::startup::open_for_test(&state).unwrap();
+        let mut beat = Beat::default();
+        beat.run(&state);
+        assert_eq!(beat.mark_acks, BTreeSet::from([7]));
+        let kind = state.lock().unwrap().workspaces["ws-home"].org.as_ref().unwrap()["workspace_kind"].clone();
+        assert_eq!(kind, "home");
+        beat.run(&state);
+        beat.run(&state);
+        assert!(beat.mark_acks.is_empty());
+        let bodies: Vec<Value> = seen.lock().unwrap().iter().map(|(_, _, b)| b.clone()).collect();
+        assert!(bodies[0].get("acked_mark_ids").is_none());
+        assert_eq!(bodies[1]["acked_mark_ids"], json!([7]));
+        assert!(bodies[2].get("acked_mark_ids").is_none(), "acked once");
+    }
+
     #[test]
     fn a_beat_posts_the_snapshot_delivers_and_acks_next_time() {
         let _env = crate::test_support::env_lock();
@@ -504,10 +561,14 @@ mod tests {
         assert_eq!(bodies[0]["sessions"][0]["state"], "unknown"); // TUI-only row
         assert_eq!(bodies[1]["acked_push_ids"], json!([41, 42]));
         // Every beat sends what the host advertises (doc/org-model.md
-        // §12); this build does not claim lifecycle_guard_v1 yet (it needs
-        // org's home-mark apply too).
+        // §12); with org's mark-apply and items' sweep guard both in, this
+        // build claims lifecycle_guard_v1.
         assert_eq!(bodies[0]["capabilities"], json!(crate::capabilities::advertised()));
-        assert!(!crate::capabilities::brain().iter().any(|c| c == crate::lifecycle_guard::CAPABILITY));
+        // (What is advertised also depends on the rollback pin; the brain
+        // list is this build's own claim.)
+        assert!(crate::capabilities::brain().iter().any(|c| c == crate::lifecycle_guard::CAPABILITY));
+        assert!(crate::capabilities::brain().iter().any(|c| c == crate::capabilities::ORG_MARKS_V1));
+        assert!(bodies[0].get("acked_mark_ids").is_none(), "no marks yet: the field stays off");
         // The reply's launch grants replace the cache and are persisted.
         let s = state.lock().unwrap();
         assert_eq!(s.launch_grants.len(), 1);

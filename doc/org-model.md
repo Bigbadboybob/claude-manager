@@ -903,9 +903,16 @@ Rules:
   |---|---|---|
   | `org_preserve_v1` | round-trips the `org` object (S0b) | anything that populates org fields |
   | `lifecycle_guard_v1` | terminal sweep honours `terminal_via=item` and workspace kinds; local `home` marks applied (S3) | central status mirroring for tasks with sessions on that host |
+  | `org_marks_v1` | applies and acks the `home`/`stream` workspace marks the heartbeat reply pushes (S2) | the central home-mark push |
   | `org_stamp_v1` | stamps `member_id` / `acting_as` on writes (S4) | member attribution |
   | `occupancy_v1` | maintains occupancy rows and generations on spawn, revive and Fresh fires; standby; fencing (S6) | inherited holds, replacement |
 
+- **Brain-only capabilities.** `org_marks_v1` and `lifecycle_guard_v1` run
+  in the brain; the holder only carries the `org` object they write. The
+  holder vouches for them by advertising `org_preserve_v1`, while the rollback
+  pin must list them itself. A host therefore advertises them from the second
+  deploy of a build that has them, so a rollback never lands on a brain
+  without them while the host still advertises them.
 - **Compatibility floor.** The S0b build (brain and holder) is the minimum
   rollback pin once any org field is populated. Old pid-based calls keep
   working throughout v1 unless they invoke a new member-scoped operation.
