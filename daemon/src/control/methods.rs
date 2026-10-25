@@ -2294,6 +2294,32 @@ pub fn kill_session(
     Ok(out)
 }
 
+/// Kill `uid` on the daemon's own behalf, attributed to `who` (e.g. the
+/// transcript rotation's `transcript-rotation`), through the same exit
+/// pipeline an operator kill uses. A missing session is a no-op.
+pub(crate) fn kill_with_attribution(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, who: &str) {
+    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(session) = state.sessions.get_mut(uid) else { return };
+    session.last_exit.mark_operator_kill_requested();
+    session.set_kill_attribution(who);
+    let _ = session.kill();
+    state.record_kill_request(uid, who, now_unix_f64());
+}
+
+/// Deliver `prompt` to an agent session as one submitted message, waiting
+/// for a fresh spawn's startup first (`fresh_spawn`), with delivery
+/// confirmation. The daemon's own sends (rotation notices) use it.
+pub(crate) fn deliver_agent_prompt(
+    handle: crate::session::InputHandle,
+    fanout: std::sync::Arc<crate::session::PtyByteFanout>,
+    session_uid: String,
+    prompt: String,
+    fresh_spawn: bool,
+    state: Arc<Mutex<DaemonState>>,
+) {
+    spawn_agent_prompt_delivery(handle, fanout, session_uid, prompt, fresh_spawn, Some(state));
+}
+
 /// Attribution recorded for a kill that came in on the OPERATOR route
 /// (no caller session): the TUI's A-w, `resolve_stuck`, the continuous
 /// scheduler's watchdog. Agent kills record the caller's session uid.
@@ -2727,6 +2753,14 @@ pub fn list_sessions(
             // doc/org-model.md §12: the opaque org object, so an adopting
             // TUI can round-trip it into its manifest. Absent when unset.
             "org": session.org,
+            // #24: the transcript's size (the rotation policy's input) and
+            // the latest rotation, if any.
+            "transcript_bytes": session
+                .transcript_path
+                .as_deref()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len()),
+            "rotation": crate::rotation::status(uid),
             "worktree_path": state
                 .workspaces
                 .get(&session.workspace_id)
@@ -10490,7 +10524,35 @@ struct AddSessionParams {
 /// workspace auto-registers via `start_session`'s `worktree_path`
 /// branch) and `None` for `add_session` (whose workspace is already
 /// known). Remote sessions are uncapped — no memory-cap triple is set.
+#[allow(clippy::too_many_arguments)]
 fn compose_daemon_spawn_params(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    uid: &str,
+    workspace_id: &str,
+    label: &str,
+    engine: &str,
+    working_dir: &std::path::Path,
+    task_id: Option<&str>,
+    cols: u16,
+    rows: u16,
+    auto_register_worktree: Option<&std::path::Path>,
+    resume_session_id: Option<&str>,
+    model: &Resolved,
+    effort: &Resolved,
+) -> MethodResult {
+    compose_daemon_spawn_params_launch(
+        state_arc, uid, workspace_id, label, engine, working_dir, task_id, cols, rows,
+        auto_register_worktree, resume_session_id, false, model, effort,
+    )
+}
+
+/// [`compose_daemon_spawn_params`] that can FORK the resumed Claude
+/// conversation instead (`fork = true`, #24 transcript rotation): the argv
+/// is `--resume <id> --fork-session --session-id <pin>`, so the session
+/// continues in a new transcript holding only the chain after the last
+/// compact boundary, and its transcript_path is the pinned new file.
+#[allow(clippy::too_many_arguments)]
+fn compose_daemon_spawn_params_launch(
     state_arc: &Arc<Mutex<DaemonState>>,
     uid: &str,
     workspace_id: &str,
@@ -10506,6 +10568,7 @@ fn compose_daemon_spawn_params(
     // `None` is a fresh spawn. Only restore passes `Some`; every other
     // caller passes `None`.
     resume_session_id: Option<&str>,
+    fork: bool,
     // The resolved model and effort with their sources
     // (`resolve_spawn_pick`); required for claude and codex, `None` for
     // bash. Recorded on the session.
@@ -10530,6 +10593,14 @@ fn compose_daemon_spawn_params(
     // visible fresh start instead. Only claude is checked: codex resume
     // writes a NEW rollout file and is rebound by the detector, so its id
     // has no such file to look for.
+    // #24: every daemon resume composes here (restore, revive,
+    // session.revive, A-s Resume): a superseded Claude transcript resumes
+    // the newest session in its `continued-in` chain.
+    let followed = match (resume_session_id, engine) {
+        (Some(id), "claude-code") => crate::transcript_chain::resolve_claude_resume(uid, working_dir, id),
+        _ => None,
+    };
+    let resume_session_id = followed.as_ref().map(|f| f.id.as_str()).or(resume_session_id);
     let resume_session_id = match (resume_session_id, engine) {
         (Some(id), "claude-code") => {
             let exists = crate::transcript_detect::claude_transcript_path(working_dir, id)
@@ -10547,12 +10618,17 @@ fn compose_daemon_spawn_params(
         }
         (other, _) => other,
     };
-    let (program, argv_tail, pinned_session_id) = crate::mcp_config::build_args(
+    let launch = match (resume_session_id, fork && engine == "claude-code") {
+        (Some(id), true) => crate::mcp_config::Launch::Fork(id),
+        (Some(id), false) => crate::mcp_config::Launch::Resume(id),
+        (None, _) => crate::mcp_config::Launch::Fresh,
+    };
+    let (program, argv_tail, pinned_session_id) = crate::mcp_config::build_launch_args(
         engine,
         uid,
         None,
         configured_mcp_server_path.as_deref(),
-        resume_session_id,
+        launch,
         model.as_ref().map(|(m, _)| m.as_str()),
         effort.as_ref().map(|(e, _)| e.as_str()),
     )
@@ -10601,6 +10677,11 @@ fn compose_daemon_spawn_params(
         if let Some(path) = resume_session_id.and_then(crate::transcript_detect::codex_transcript_path) {
             full.insert("transcript_path".into(), json!(path));
         }
+    }
+    // A followed chain names its file exactly (it may sit in another
+    // project directory).
+    if let (Some(f), None) = (&followed, pinned_session_id.as_deref()) {
+        full.insert("transcript_path".into(), json!(f.path.to_string_lossy()));
     }
     full.insert("cols".into(), Value::Number(cols.into()));
     full.insert("rows".into(), Value::Number(rows.into()));
@@ -11379,12 +11460,26 @@ fn compose_restore_params(
 
 /// [`compose_restore_params`] with an optional prefetched task-model cache
 /// (startup restore); `None` looks the task default up live.
+#[cfg(test)]
 fn compose_restore_params_with(
     state_arc: &Arc<Mutex<DaemonState>>,
     workspace_id: &str,
     worktree: &std::path::Path,
     e: &crate::manifest::ManifestEntry,
     task_models: Option<&TaskModelCache>,
+) -> MethodResult {
+    compose_restore_params_launch(state_arc, workspace_id, worktree, e, task_models, false)
+}
+
+/// [`compose_restore_params_with`] that forks a Claude resume into a fresh
+/// transcript (`fork`, #24).
+fn compose_restore_params_launch(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    workspace_id: &str,
+    worktree: &std::path::Path,
+    e: &crate::manifest::ManifestEntry,
+    task_models: Option<&TaskModelCache>,
+    fork: bool,
 ) -> MethodResult {
     crate::continuous::retirement::ensure_open(&e.uid).map_err(|err| (ErrorCode::Conflict, err.to_string()))?;
     let mut continuous = TaskDefaults::default();
@@ -11399,7 +11494,15 @@ fn compose_restore_params_with(
     // conversation" — the argv gets `--resume <id>` (claude) / the `resume`
     // subcommand (codex). `None` → fresh spawn (a session that never bound a
     // transcript falls back to fresh; never blocks — decision 3).
-    let resume = e.transcript_id.as_deref();
+    // #24: a Claude transcript that moved to a fresh session ("Resume from
+    // summary" wrote `continued-in` into it) resumes the newest session in
+    // its chain, never the superseded file; the session's transcript_path
+    // below is that file, so the row rebinds.
+    let followed = match (e.session_type.as_str(), e.transcript_id.as_deref()) {
+        ("claude-code", Some(id)) => crate::transcript_chain::resolve_claude_resume(&e.uid, worktree, id),
+        _ => None,
+    };
+    let resume = followed.as_ref().map(|f| f.id.as_str()).or(e.transcript_id.as_deref());
     // The recorded model → (resuming) the transcript's → the continuous
     // task's or task default → the engine default.
     let transcript = resume.map(|id| {
@@ -11444,7 +11547,7 @@ fn compose_restore_params_with(
             _ => None,
         };
     let resume = normalized_codex_resume.as_deref().or(resume);
-    let mut params = compose_daemon_spawn_params(
+    let mut params = compose_daemon_spawn_params_launch(
         state_arc,
         &e.uid,
         workspace_id,
@@ -11459,6 +11562,7 @@ fn compose_restore_params_with(
         // restart (headless hosts have no tui-sessions.json to reload it).
         Some(worktree),
         resume,
+        fork,
         &model,
         &effort,
     )?;
@@ -11492,7 +11596,7 @@ fn compose_restore_params_with(
         // can't help here — the file pre-exists, so a new-file scan never binds
         // it. (Codex resume writes a NEW rollout, so it relies on the detector
         // armed after spawn instead.)
-        if e.session_type == "claude-code" {
+        if e.session_type == "claude-code" && !fork {
             if let Some(id) = resume {
                 if let Some(tp) =
                     crate::transcript_detect::claude_transcript_path(worktree, id)
@@ -11586,6 +11690,19 @@ fn restore_one_session_with(
     e: &crate::manifest::ManifestEntry,
     task_models: Option<&TaskModelCache>,
 ) -> MethodResult {
+    restore_one_session_launch(state_arc, workspace_id, worktree, e, task_models, false)
+}
+
+/// [`restore_one_session_with`] that can fork a Claude resume into a fresh
+/// transcript (#24 rotation): same uid, same identity, new file.
+pub(crate) fn restore_one_session_launch(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    workspace_id: &str,
+    worktree: &std::path::Path,
+    e: &crate::manifest::ManifestEntry,
+    task_models: Option<&TaskModelCache>,
+    fork: bool,
+) -> MethodResult {
     let resume = e.transcript_id.as_deref();
 
     // Snapshot existing transcript ids BEFORE the spawn so the detector armed
@@ -11607,7 +11724,7 @@ fn restore_one_session_with(
     // removed its own worktree): re-create it from its branch first, and
     // report it, instead of spawning into a missing cwd.
     let worktree_report = ensure_ready_worktree(state_arc, workspace_id, worktree, e.task_id.as_deref())?;
-    let params = compose_restore_params_with(state_arc, workspace_id, worktree, e, task_models)?;
+    let params = compose_restore_params_launch(state_arc, workspace_id, worktree, e, task_models, fork)?;
     {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         // Explicit Resume already checked the archive. Startup restore can
@@ -11631,11 +11748,27 @@ fn restore_one_session_with(
                 });
             }
         }
+        // #24: a resume that followed a `continued-in` chain rebinds the
+        // row to the session it actually resumed, and tells viewers.
+        let mut stored = e.clone();
+        let rebound = state.sessions.get(&e.uid).and_then(|sess| {
+            let path = sess.transcript_path.clone()?;
+            let id = crate::session::transcript_id_from_path(&path)?;
+            (e.session_type == "claude-code" && Some(id.as_str()) != e.transcript_id.as_deref())
+                .then(|| (id, path, transcript_updated_entry(sess)))
+        });
+        if let Some((id, path, _)) = &rebound {
+            stored.transcript_id = Some(id.clone());
+            stored.transcript_path = Some(path.clone());
+        }
         if let Some(ws) = state.workspaces.get_mut(workspace_id) {
             ws.sessions.retain(|old| old.uid != e.uid);
-            ws.sessions.push(e.clone());
+            ws.sessions.push(stored);
         }
         state.persist_sessions_best_effort();
+        if let Some((_, _, entry)) = rebound {
+            broadcast_transcript_updated(&state, &e.uid, entry);
+        }
     }
 
     // Arm a transcript detector so the session's transcript binds + persists.
@@ -23025,6 +23158,7 @@ mod tests {
                 },
             );
             s.config = crate::config::DaemonConfig {
+                transcript_rotation: Default::default(),
                 chat_search_budget_bytes: 512 * 1024 * 1024,
                 presence_idle_enabled: true,
                 workflow_state_gate: false,
@@ -26784,6 +26918,81 @@ while True:
     /// uuid, so restore must normalize legacy rows at compose time. Rows
     /// persisted post-4f already carry the uuid (via
     /// `transcript_id_from_path`) and pass through untouched.
+    /// #24: a Claude restore of a superseded transcript resumes the newest
+    /// session of its two-hop `continued-in` chain, and the session's
+    /// transcript_path (its resume key) is that file.
+    #[test]
+    fn restore_follows_a_two_hop_continued_in_chain() {
+        with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("rwt-chain");
+            std::fs::create_dir_all(&wt).unwrap();
+            let dir = crate::transcript_detect::claude_transcript_dir_for(&wt).unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            use crate::transcript_chain::tests::{moved, user, write};
+            let (a, b, c) = (
+                "aaaaaaaa-0000-4000-8000-000000000001",
+                "bbbbbbbb-0000-4000-8000-000000000002",
+                "cccccccc-0000-4000-8000-000000000003",
+            );
+            write(&dir, a, &[user("one"), moved(a, b)]);
+            write(&dir, b, &[user("two"), moved(b, c)]);
+            write(&dir, c, &[user("three")]);
+            let state = make_state_arc();
+            let mut e = me("ts-cccccccccccccccc-7", "claude-code");
+            e.transcript_id = Some(a.to_string());
+            let params = compose_restore_params(&state, "ws-chain", &wt, &e).expect("compose");
+            let argv: Vec<String> =
+                params["argv"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+            assert!(argv.windows(2).any(|w| w[0] == "--resume" && w[1] == c), "{argv:?}");
+            assert!(!argv.iter().any(|x| x == a || x == b));
+            assert_eq!(params["transcript_path"], json!(dir.join(format!("{c}.jsonl")).to_string_lossy()));
+
+            // A fork launch (the rotation) resumes the same source but
+            // pins a NEW transcript for the session.
+            e.transcript_id = Some(c.to_string());
+            let forked = compose_restore_params_launch(&state, "ws-chain", &wt, &e, None, true).expect("fork");
+            let argv: Vec<String> =
+                forked["argv"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+            let at = argv.iter().position(|x| x == "--fork-session").expect("--fork-session");
+            assert_eq!(argv[at - 2..at], ["--resume".to_string(), c.to_string()]);
+            assert_eq!(argv[at + 1], "--session-id");
+            let pin = &argv[at + 2];
+            assert_ne!(pin, c);
+            assert_eq!(forked["transcript_path"], json!(dir.join(format!("{pin}.jsonl")).to_string_lossy()));
+        });
+    }
+
+    /// #24: the rotation's safe boundary refuses the cases it must.
+    #[test]
+    fn rotation_boundary_refusals() {
+        let state = make_state_arc();
+        let idle = std::time::Duration::from_secs(300);
+        let quiet = std::time::Duration::from_secs(600);
+        let spawn = |uid: &str, ty: &str| {
+            let mut sp = crate::session::SpawnParams::new(uid, "r", "/bin/sleep");
+            sp.args = vec!["60".into()];
+            sp.session_type = ty.into();
+            crate::session::DaemonSession::spawn(sp).expect("spawn")
+        };
+        let mut s = state.lock().unwrap();
+        assert!(crate::rotation::boundary(&s, "ts-none-0", idle, quiet).unwrap_err().contains("not live"));
+        s.sessions.insert("ts-bash-0".into(), spawn("ts-bash-0", "bash"));
+        assert!(crate::rotation::boundary(&s, "ts-bash-0", idle, quiet).unwrap_err().contains("only Claude"));
+        let mut c = spawn("ts-cl-0", "claude-code");
+        s.sessions.insert("ts-cl-0".into(), spawn("ts-cl-1", "claude-code"));
+        assert!(crate::rotation::boundary(&s, "ts-cl-0", idle, quiet).unwrap_err().contains("no bound transcript"));
+        c.transcript_path = Some("/tmp/x.jsonl".into());
+        c.workflow_run_id = Some("wf".into());
+        s.sessions.insert("ts-cl-0".into(), c);
+        assert!(crate::rotation::boundary(&s, "ts-cl-0", idle, quiet).unwrap_err().contains("workflow"));
+        s.sessions.get_mut("ts-cl-0").unwrap().workflow_run_id = None;
+        // A freshly spawned process is not idle (or not idle long enough).
+        let why = crate::rotation::boundary(&s, "ts-cl-0", idle, quiet).unwrap_err();
+        assert!(why.contains("idle"), "{why}");
+        s.sessions.clear();
+    }
+
     #[test]
     fn compose_restore_params_normalizes_legacy_codex_rollout_stem() {
         with_temp_home(|| {

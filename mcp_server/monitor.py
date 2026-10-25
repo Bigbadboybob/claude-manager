@@ -490,6 +490,22 @@ def _monitor_completed_entry(
     return entry
 
 
+# A rotation's stop (`killed_by` below) is followed by the same uid coming
+# back within seconds; past this grace the exit is treated as real.
+ROTATION_KILLER = "transcript-rotation"
+ROTATION_GRACE_S = 300.0
+
+
+def _rotating(uid: str, resolved: dict, seen: dict) -> bool:
+    """Whether an exited `uid` is mid-rotation (stopped by CM's transcript
+    rotation, #24), for at most ROTATION_GRACE_S after it was first seen so."""
+    if resolved.get("killed_by") != ROTATION_KILLER:
+        seen.pop(uid, None)
+        return False
+    first = seen.setdefault(uid, time.monotonic())
+    return time.monotonic() - first < ROTATION_GRACE_S
+
+
 async def _monitor_sessions(
     session_uids: list[str],
     *,
@@ -586,6 +602,7 @@ async def _monitor_sessions(
     last_meta: dict[str, tuple[str, str | None, int]] = {}
     remaining = list(uids)
     completed: list[dict] = []
+    rotation_seen: dict[str, float] = {}
 
     while True:
         now = time.monotonic()
@@ -643,7 +660,11 @@ async def _monitor_sessions(
                         _edge_passed, baselines[uid], engine, tpath
                     )
                     baselines[uid] = _agent_baseline(engine_state(resolved), baselines[uid])
-            if state == "exited":
+            if state == "exited" and _rotating(uid, resolved, rotation_seen):
+                # #24: a transcript rotation stops the process and brings
+                # it straight back at the same uid; that is not an exit.
+                done = False
+            elif state == "exited":
                 done = True
             elif shell:
                 done = idle

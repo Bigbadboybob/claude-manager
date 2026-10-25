@@ -2143,7 +2143,10 @@ fn adopted_meta_from_manifest_entry(
         // phase-3 gap) — transcript reads work immediately
         // post-adopt. Older files default `None`; the TUI's next
         // `session.set_transcript_path` heals those.
-        transcript_path: e.transcript_path.clone(),
+        // #24: follow a `continued-in` chain so the resume key is the
+        // conversation the session moved to.
+        transcript_path: crate::transcript_chain::followed_path(&e.session_type, e.transcript_path.as_deref())
+            .or_else(|| e.transcript_path.clone()),
         memory_cap_soft_bytes: e.memory_cap_soft_bytes,
         memory_cap_hard_bytes: e.memory_cap_hard_bytes,
         cgroup_prefix: e.cgroup_prefix.clone(),

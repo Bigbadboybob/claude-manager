@@ -726,6 +726,11 @@ pub fn dispatch_request(
             DispatchOutcome::Done(dispatch_session_revive(state, req))
         }
         "session.viewed" => DispatchOutcome::Done(dispatch_session_viewed(state, req)),
+        // #24 transcript rotation: operator for any session (and `force`);
+        // a Session caller may rotate only itself, at a safe boundary.
+        "session.rotate_transcript" => {
+            DispatchOutcome::Done(dispatch_session_rotate_transcript(state, req))
+        }
 
         // Sub-2b-2: `propose_task` — daemon-side HTTP forwarder
         // to the planning API. Both Operator and Session callers
@@ -2043,6 +2048,63 @@ fn dispatch_session_viewed(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Re
         guard.note_owner_activity(uid);
     }
     Response::ok(req.id.clone(), serde_json::json!({ "uid": uid, "known": known }))
+}
+
+/// `session.rotate_transcript {uid?, reason?, force?, status?}` (#24): move a
+/// Claude session's conversation to a fresh transcript at the same uid
+/// (`crate::rotation`). `status: true` only reports the latest rotation.
+fn dispatch_session_rotate_transcript(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let p = &req.params;
+    let asked = p.get("uid").or_else(|| p.get("session_uid")).and_then(serde_json::Value::as_str);
+    let force = p.get("force").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let reason = p.get("reason").and_then(serde_json::Value::as_str).unwrap_or("").trim().to_string();
+    let (uid, origin) = match &req.caller {
+        Caller::Operator(_) => match asked {
+            Some(uid) => (uid.to_string(), crate::rotation::Origin::Operator),
+            None => return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session.rotate_transcript requires uid"),
+        },
+        Caller::Session(s) => {
+            if asked.is_some_and(|u| u != s.session_uid) {
+                return Response::err(
+                    req.id.clone(),
+                    ErrorCode::Unauthorized,
+                    "a session may rotate only its own transcript",
+                );
+            }
+            if force {
+                return Response::err(req.id.clone(), ErrorCode::Unauthorized, "force is operator-only");
+            }
+            (s.session_uid.clone(), crate::rotation::Origin::Agent)
+        }
+    };
+    if p.get("status").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+        return Response::ok(
+            req.id.clone(),
+            serde_json::json!({ "session_uid": uid, "rotation": crate::rotation::status(&uid) }),
+        );
+    }
+    let reason = if reason.is_empty() { format!("{} request", origin_label(origin)) } else { reason };
+    if origin == crate::rotation::Origin::Agent {
+        // An agent asks mid-turn; the policy carries it out at its next
+        // safe boundary.
+        let guard = state.lock().unwrap_or_else(|p| p.into_inner());
+        return match crate::rotation::request(&guard, &uid, &reason) {
+            Ok(v) => Response::ok(req.id.clone(), v),
+            Err((code, message)) => Response::err(req.id.clone(), code, message),
+        };
+    }
+    match crate::rotation::start(state, &uid, &reason, origin, force) {
+        Ok(v) => Response::ok(req.id.clone(), v),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn origin_label(origin: crate::rotation::Origin) -> &'static str {
+    match origin {
+        crate::rotation::Origin::Operator => "operator",
+        crate::rotation::Origin::Agent => "agent",
+        crate::rotation::Origin::Policy => "policy",
+    }
 }
 
 /// `session.revive` — operator-triggered resurrection of an exited
@@ -10397,6 +10459,7 @@ mod tests {
         {
             let mut st = state.lock().unwrap();
             st.config = crate::config::DaemonConfig {
+                transcript_rotation: Default::default(),
                 chat_search_budget_bytes: 512 * 1024 * 1024,
                 presence_idle_enabled: true,
                 workflow_state_gate: false,
@@ -10503,6 +10566,7 @@ mod tests {
     fn set_stub_api_config(state: &Arc<Mutex<DaemonState>>, port: u16) {
         let mut st = state.lock().unwrap();
         st.config = crate::config::DaemonConfig {
+            transcript_rotation: Default::default(),
             chat_search_budget_bytes: 512 * 1024 * 1024,
             presence_idle_enabled: true,
             workflow_state_gate: false,

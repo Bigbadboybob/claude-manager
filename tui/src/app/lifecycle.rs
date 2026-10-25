@@ -1060,6 +1060,12 @@ impl App {
 
         for tomb in tombstones {
             let session_uid = new_session_uid();
+            // #24: a moved Claude conversation restores the newest session
+            // in its `continued-in` chain, and the row binds to it.
+            let followed_resume: Option<String> = (tomb.session_type == "claude")
+                .then(|| Some((worktree.as_deref()?, tomb.last_transcript_id.as_deref()?)))
+                .flatten()
+                .and_then(|(wt, id)| super::persist::follow_claude_id(wt, id));
             let result = match tomb.session_type.as_str() {
                 "claude" | "codex" | "bash" => {
                     // migrate-tui-local: route restored claude/codex/bash
@@ -1082,7 +1088,6 @@ impl App {
                     // no transcript, so `resume` and
                     // `pre_spawn_transcript` resolve to None
                     // naturally.
-                    let resume = tomb.last_transcript_id.as_deref();
                     let session_type = tomb.session_type.as_str();
                     let Some(wt_path) = worktree.as_deref() else {
                         self.set_status_msg(
@@ -1091,6 +1096,7 @@ impl App {
                         failed.push(tomb);
                         continue;
                     };
+                    let resume = followed_resume.as_deref().or(tomb.last_transcript_id.as_deref());
                     // migrate-tui-local Issue 3: claude tombstone
                     // restores have a deterministic transcript
                     // path (worktree + transcript_id); hand it
@@ -1184,7 +1190,7 @@ impl App {
                     // Codex the live id is rebound by the detector when the
                     // post-resume rollout appears in `pending_jsonl_files`.
                     if tomb.session_type == "claude" {
-                        ts.transcript_id = tomb.last_transcript_id.clone();
+                        ts.transcript_id = followed_resume.clone().or_else(|| tomb.last_transcript_id.clone());
                     }
                     self.workspaces[wi].sessions.push(ts);
                     restored += 1;
@@ -2554,6 +2560,49 @@ impl App {
     /// `session.revive` (same-uid resumed respawn composed daemon-side)
     /// and then ride the existing deferred-reattach machinery to rebind
     /// the slot once the spawn lands.
+    /// Alt+T: move the focused Claude session's conversation to a fresh
+    /// transcript at the same session (#24). Owner asked, so the daemon
+    /// does it now rather than waiting for an idle point; the session comes
+    /// back in place.
+    pub(super) fn rotate_active_session(&mut self) {
+        let Cursor::Session(wi, si) = self.cursor.clone() else {
+            self.set_status_msg("Focus a Claude session to rotate its transcript");
+            return;
+        };
+        let Some(ts) = self.workspaces.get(wi).and_then(|w| w.sessions.get(si)) else { return };
+        if ts.session_type != "claude" {
+            self.set_status_msg("Only Claude sessions rotate their transcript");
+            return;
+        }
+        if ts.session.exited {
+            self.set_status_msg("The session is not running; A-R revives it");
+            return;
+        }
+        let (uid, host) = (ts.uid.clone(), ts.host_id.clone());
+        let socket = match self.host_pool.for_host(&host).ok().and_then(|h| h.socket_path()) {
+            Some(socket) => socket,
+            None => {
+                self.set_status_msg(&format!("Host `{}` not reachable", host.as_str()));
+                return;
+            }
+        };
+        let token = self.host_pool.operator_token_for(&host);
+        self.set_status_msg("Moving the conversation to a fresh transcript…");
+        self.run_in_background(Some(format!("rotate:{uid}")), move || {
+            let result = crate::client_session::rpc_rotate_transcript(&socket, &token, &uid, true);
+            Box::new(move |app: &mut App| match result {
+                Ok(v) => {
+                    let from = v.pointer("/rotation/from_bytes").and_then(|b| b.as_u64()).unwrap_or(0);
+                    app.set_status_msg(&format!(
+                        "Rotating ({} transcript); the session restarts in place and says so in its first message",
+                        super::agent_state::short_size(from)
+                    ));
+                }
+                Err(e) => app.set_status_msg(&format!("Rotation refused: {e}")),
+            })
+        });
+    }
+
     pub(super) fn revive_active_session(&mut self) {
         let (wi, si) = match self.cursor.clone() {
             Cursor::Session(wi, si) => (wi, si),

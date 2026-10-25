@@ -4912,6 +4912,36 @@ def clear_continuous_hold(reason: str, dry_run: bool = False) -> dict:
 
 
 @mcp.tool()
+def rotate_transcript(reason: str = "", status: bool = False) -> dict:
+    """Ask CM to move YOUR conversation to a fresh transcript (Claude only).
+
+    Claude Code slows down badly once a session's transcript file reaches a
+    few hundred MB: every resume rereads the whole file and compaction never
+    shrinks it. CM rotates automatically past a size or compaction threshold;
+    call this when you notice lag earlier, or before a long new phase.
+
+    It is queued, not immediate: at your next safe idle point (a few minutes
+    idle, nothing running, nothing waiting to be delivered) CM restarts you at
+    the SAME CM session, with the same chat name, task, workspace and
+    permissions, continuing from your latest compaction summary in a new
+    transcript. Your first message afterwards says so. End your turn normally
+    after calling it. Anything a successor must not lose belongs in files,
+    board items or notes, as always.
+
+    Args:
+        reason: Why (shown in the rotation record).
+        status: True to only report the latest rotation of your session.
+
+    Returns: {"queued": true, "note": ...}, or with status=True
+    {"rotation": {phase, outcome, from_transcript_id, to_transcript_id, ...}|null}.
+    """
+    params: dict = {"reason": reason}
+    if status:
+        params["status"] = True
+    return control_client.call("session.rotate_transcript", params)
+
+
+@mcp.tool()
 def report_done(reason: str | None = None) -> dict:
     """Signal that YOUR work is finished — call this when you're done.
 

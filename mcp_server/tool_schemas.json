@@ -1664,6 +1664,17 @@
     "task_id"
    ]
   },
+  "rotate_transcript": {
+   "params": {
+    "reason": {
+     "type": "string"
+    },
+    "status": {
+     "type": "boolean"
+    }
+   },
+   "required": []
+  },
   "send_input": {
    "params": {
     "notify_on_done": {

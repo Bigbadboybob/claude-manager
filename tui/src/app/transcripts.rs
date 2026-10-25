@@ -300,6 +300,18 @@ mod tests {
         assert_eq!(got[1].id, "11111111-aaaa-bbbb-cccc-000000000001");
         assert_eq!(got[1].preview, "fix the flaky restore test", "tag-led + tool_result turns are skipped");
         assert!(got.iter().all(|c| c.bound_to.is_none()));
+        assert!(got.iter().all(|c| c.rotated_to.is_none()));
+
+        // #24: the daemon's rotation lineage labels the superseded file.
+        std::fs::create_dir_all(home.path().join(".cm")).unwrap();
+        std::fs::write(
+            home.path().join(".cm/daemon-resume-identities.json"),
+            r#"{"records":{},"rotated":{"11111111-aaaa-bbbb-cccc-000000000001":"22222222-aaaa-bbbb-cccc-000000000002"}}"#,
+        )
+        .unwrap();
+        let got = list_transcript_candidates_in(home.path(), wt, "claude");
+        assert_eq!(got[1].rotated_to.as_deref(), Some("22222222-aaaa-bbbb-cccc-000000000002"));
+        assert_eq!(got[0].rotated_to, None);
     }
 
     #[test]
