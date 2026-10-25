@@ -530,7 +530,10 @@ blocked_on_owner → blocked; done → done; dropped → done with
 `metadata.dropped`. A board close stamps `metadata.terminal_via = "item"`,
 which the daemon's lifecycle guard reads (the terminal sweep only unassigns).
 Mirroring for a task is on only while every daemon holding its live sessions
-advertises `lifecycle_guard_v1` in its heartbeat `capabilities`; otherwise
+advertises `lifecycle_guard_v1` in its heartbeat `capabilities` (stored in org
+S2's `org_daemons`; advertised only by a build with both the sweep guard and
+org's home-mark apply, so until both have landed the mirror stays off);
+otherwise
 `placement.mirror = "off"` and the task status is left alone.
 `CM_ORG_MIRROR=0` turns it off (links kept). Item writes take the task-change
 advisory lock first, then the board and task rows.

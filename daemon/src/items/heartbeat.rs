@@ -71,8 +71,15 @@ pub fn start(state: &Arc<Mutex<DaemonState>>) {
 /// What this daemon advertises in every beat (doc/org-model.md §12). The API
 /// turns a feature on for a host only when it is listed here; e.g. it
 /// mirrors a placed task's status only while every daemon holding the task's
-/// sessions lists `lifecycle_guard_v1`. One list for every org capability.
-pub const CAPABILITIES: &[&str] = &[crate::lifecycle_guard::CAPABILITY];
+/// sessions lists `lifecycle_guard_v1`.
+///
+/// `lifecycle_guard_v1` means the sweep honours item closes and workspace
+/// kinds AND local `home` marks are applied, so it is advertised only by a
+/// build with both this lane's sweep guard ([`crate::lifecycle_guard`]) and
+/// org's mark-apply (Swarm-Coord, 2026-10-25). Whichever lands second adds it
+/// (S0b's `capabilities::advertised()` replaces this list); until then the
+/// API's per-task gate keeps the central mirror off, the safe default.
+pub const CAPABILITIES: &[&str] = &[];
 
 /// What one beat reads from the daemon, captured under the lock.
 pub(crate) struct Snapshot {
@@ -480,8 +487,11 @@ mod tests {
         assert_eq!(bodies[0]["sessions"].as_array().unwrap().len(), 1);
         assert_eq!(bodies[0]["sessions"][0]["state"], "unknown"); // TUI-only row
         assert_eq!(bodies[1]["acked_push_ids"], json!([41, 42]));
-        // Every beat advertises the org capabilities (doc/org-model.md §12).
-        assert_eq!(bodies[0]["capabilities"], json!(["lifecycle_guard_v1"]));
+        // Every beat sends the capability list (doc/org-model.md §12); this
+        // build does not claim lifecycle_guard_v1 yet (it needs org's
+        // home-mark apply too).
+        assert_eq!(bodies[0]["capabilities"], json!(CAPABILITIES));
+        assert!(!CAPABILITIES.contains(&crate::lifecycle_guard::CAPABILITY));
         // The reply's launch grants replace the cache and are persisted.
         let s = state.lock().unwrap();
         assert_eq!(s.launch_grants.len(), 1);
