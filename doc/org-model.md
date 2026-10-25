@@ -388,15 +388,15 @@ queue, seeded explicitly by Owner (e.g. EP = prod GO, SEJD = law review).
 Tasks and items stay separate tables in v1 (O3, §15). The backlog **is** the
 planning task list, as today.
 
-- `propose_task` and `create_subtask` keep creating tasks (`propose_task` as
-  `draft`, per the S0a fix). Every existing task tool keeps working.
+- `propose_task` and `create_subtask` keep creating tasks (`propose_task` into
+  the backlog, as today). Every existing task tool keeps working.
 - **Placing** a task on a board (from the planning view or `place(task, board,
   group=…, holder=…)`) creates an item linked to it (`items.task_id`; at most
   one *live* link per task). Re-placing on the same board reactivates the
   archived link; placing on a different board creates a new item and leaves
   the old one archived and resolvable. Placing a task that is
   auto-dispatchable (`is_cloud ∧ project IS NULL`), a backtest or a continuous
-  task row is refused. Placing a `draft` task accepts it (as A-a does).
+  task row is refused. Placing a `draft` task (one Owner created as a draft) accepts it, as A-a does.
 - **Unplacing** archives the link and sets the task back to `backlog`. It is
   refused while the item has live incoming or outgoing `blocked_by` edges
   (clear or re-point them first; blockers never silently become links). An
@@ -933,8 +933,8 @@ clients working. Permission changes run in shadow before they enforce.
 
 | Stage | What | Notes |
 |---|---|---|
-| **S0a guards** | NULL-safe `prompt` readers (`/workers`, CLI, `worker/startup.sh`); `propose_task` files `draft` as documented (confirmed: both clients omit status and the API defaults to `backlog`; the dispatcher predicate does not match project-bound drafts); TUI adoption keeps taskless sessions | API/CLI/TUI only; ships before S1 |
-| **S0b bridge** | the §12 `org` preservation object and `org_preserve_v1` on brain and holder; `daemon.upgrade_holder` on cm-manager, cm-sessions and Owner's laptop; `workspace_kind` in local records (all existing = unclassified; new isolated mints recorded `ephemeral`) | needed before S2's `home` push and S3; does not block S1 |
+| **S0a guards** | NULL-safe `prompt` readers (`/workers`, CLI, `worker/startup.sh`); TUI adoption keeps taskless sessions; `propose_task` keeps filing into the backlog (Owner, 2026-10-25: proposals must not all wait for an A-a accept), and its docstrings and the agent guide stop saying "draft" | API/CLI/TUI only; ships before S1 |
+| **S0b bridge** | the §12 `org` preservation object and `org_preserve_v1` on brain and holder; `daemon.upgrade_holder` on cm-manager, cm-sessions and Owner's laptop; `workspace_kind` in local records (all existing = unclassified; new isolated mints recorded `ephemeral`) | needed before S2's `home` push and S3; does not block S1. **The holder upgrade runs only on Owner's explicit call** (planned into a deploy, not run without it) |
 | **S1 prompt → description** | inventory (real instructions in prompts, empty descriptions, continuous contracts → continuous standing instructions); the compatibility table below; one marker-gated backfill appends real prompts under `## Instructions`; description-only delivery after the backfill and every dispatch path read description; commit trailer hook installed | the `prompt` column is never dropped (`sql/003` alters it on every start); the MCP param stays as a deprecated alias |
 | **S2 org core** | `members`, `incarnations`, `team_memberships`, manager tree, team columns (`coordinator_task_id` nullable + API models, `status`, `standing_rules`); Owner-approved roster (continuous members, initiative/division leads, long-lived lanes; dedupe by pid, coordinator and continuous ownership; handle collisions get a suffix, never steal an alias); an Owner-only **adopt** action (roster screen and `org(action="adopt")`) that binds a live session to a new member, so members can be added after the roster; roster and adopted workspaces marked `home` centrally **and pushed to each owning daemon**, which confirms; `org`, `ping`, A-i and F6 read members and managers | holds stay pid-keyed; nothing enforces |
 | **S3 epics, groups, placement** | `groups` with headings and epics; PoC as a member id with a real team; staffing flow; epic close plan (§7.6); link-first placement (§7.1) with field ownership, status mirror, translated legacy writes, `terminal_via=item` and the lock order; item roles, single owner, holder migration; description revisions; launch grants for owner-role holders; `possible_duplicate`; the planning view's read-only "on boards" section. **Lifecycle guard:** the terminal sweep skips `terminal_via=item` closes for non-ephemeral sessions; the sweep and `mark_subtask_done` teardown both skip members' main sessions and never remove `home`/`stream`/pinned workspaces; ephemeral and unclassified workspaces keep today's teardown | per host: daemons ship and advertise `lifecycle_guard_v1` first; central mirroring for a task turns on only when every daemon holding its sessions advertises it. Rollback with placed tasks: mirroring off, links kept |
