@@ -29,16 +29,40 @@ pub(super) struct PlanRow {
     /// The item number or member/workspace id (empty for the team row).
     pub key: String,
     pub label: String,
+    /// The wire values (`move:<group_id>`, `unplace`, `keep`, …).
     pub options: Vec<String>,
+    /// What each option reads as (`move → Ops`).
+    pub labels: Vec<String>,
     pub choice: usize,
-    /// Who must authorize it when the closer can't (`manager_chain`, `owner`).
-    pub needs: Option<String>,
+    /// Per option: who must authorize it when the closer can't
+    /// (`manager_chain`, `owner`).
+    pub needs: Vec<Option<String>>,
+}
+
+impl PlanRow {
+    fn new(section: &'static str, key: String, label: String, x: &Value, options: Vec<(String, String)>) -> Self {
+        let needs = options
+            .iter()
+            .map(|(o, _)| {
+                let kind = o.split(':').next().unwrap_or("");
+                x["needs_by_option"][kind].as_str().or(x["needs"].as_str()).filter(|n| *n != "closer").map(str::to_owned)
+            })
+            .collect();
+        let choice = x["default"].as_str().and_then(|d| options.iter().position(|(o, _)| o == d)).unwrap_or(0);
+        let (options, labels) = options.into_iter().unzip();
+        PlanRow { section, key, label, options, labels, choice, needs }
+    }
+
+    pub(super) fn needs_now(&self) -> Option<&str> {
+        self.needs.get(self.choice)?.as_deref()
+    }
 }
 
 /// `epic.close_plan`'s reply, under review.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct ClosePlan {
-    pub plan_id: String,
+    /// As the API gave it (a number on the planning API), sent back as is.
+    pub plan_id: Value,
     pub revision: i64,
     pub name: String,
     pub outcome: String,
@@ -52,48 +76,34 @@ pub(super) struct ClosePlan {
 impl ClosePlan {
     pub(super) fn from_reply(v: &Value, name: &str, outcome: &str) -> Self {
         let mut rows = Vec::new();
-        let opts = |x: &Value, key: &str| -> Vec<String> { x[key].as_array().into_iter().flatten().filter_map(|o| o.as_str().map(str::to_owned)).collect() };
-        let pick = |options: &[String], x: &Value| x["default"].as_str().and_then(|d| options.iter().position(|o| o == d)).unwrap_or(0);
+        let opts = |x: &Value, key: &str| -> Vec<(String, String)> { x[key].as_array().into_iter().flatten().filter_map(|o| o.as_str().map(|o| (o.to_owned(), o.to_owned()))).collect() };
+        // An item's `move` is one choice per target group: `move:<group_id>`.
+        let targets: Vec<(String, String)> = v["move_targets"].as_array().into_iter().flatten().filter_map(|t| Some((t["group_id"].as_str()?.to_owned(), t["name"].as_str().unwrap_or("?").to_owned()))).collect();
         for it in v["items"].as_array().into_iter().flatten() {
-            let options = opts(it, "choice_options");
-            rows.push(PlanRow {
-                section: "items",
-                key: it["n"].to_string(),
-                label: format!("#{} {}", it["n"], it["title"].as_str().unwrap_or("")),
-                choice: pick(&options, it),
-                options,
-                needs: None,
-            });
+            let mut options = Vec::new();
+            for (o, l) in opts(it, "choice_options") {
+                if o == "move" && !targets.is_empty() {
+                    options.extend(targets.iter().map(|(id, n)| (format!("move:{id}"), format!("move \u{2192} {n}"))));
+                } else {
+                    options.push((o, l));
+                }
+            }
+            rows.push(PlanRow::new("items", it["n"].to_string(), format!("#{} {}", it["n"], it["title"].as_str().unwrap_or("")), it, options));
         }
         let team = &v["team"];
         if team.is_object() {
-            let options = opts(team, "options");
-            rows.push(PlanRow { section: "team", key: String::new(), label: format!("team {}", team["name"].as_str().unwrap_or("")), choice: pick(&options, team), options, needs: team["needs"].as_str().map(str::to_owned) });
+            rows.push(PlanRow::new("team", String::new(), format!("team {}", team["name"].as_str().unwrap_or("")), team, opts(team, "options")));
         }
         for m in v["members"].as_array().into_iter().flatten() {
-            let options = opts(m, "options");
-            rows.push(PlanRow {
-                section: "members",
-                key: m["member_id"].as_str().unwrap_or("").to_owned(),
-                label: format!("{} ({})", m["handle"].as_str().or(m["member_id"].as_str()).unwrap_or("?"), m["role"].as_str().unwrap_or("member")),
-                choice: pick(&options, m),
-                options,
-                needs: m["needs"].as_str().filter(|n| *n != "closer").map(str::to_owned),
-            });
+            let label = format!("{} ({})", m["handle"].as_str().or(m["member_id"].as_str()).unwrap_or("?"), m["role"].as_str().unwrap_or("member"));
+            rows.push(PlanRow::new("members", m["member_id"].as_str().unwrap_or("").to_owned(), label, m, opts(m, "options")));
         }
         for w in v["workspaces"].as_array().into_iter().flatten() {
-            let options = opts(w, "options");
-            rows.push(PlanRow {
-                section: "workspaces",
-                key: w["workspace_id"].as_str().unwrap_or("").to_owned(),
-                label: format!("workspace {}", w["path"].as_str().or(w["workspace_id"].as_str()).unwrap_or("?")),
-                choice: pick(&options, w),
-                options,
-                needs: None,
-            });
+            let label = format!("workspace {}", w["path"].as_str().or(w["workspace_id"].as_str()).unwrap_or("?"));
+            rows.push(PlanRow::new("workspaces", w["workspace_id"].as_str().unwrap_or("").to_owned(), label, w, opts(w, "options")));
         }
         ClosePlan {
-            plan_id: v["plan_id"].as_str().unwrap_or("").to_owned(),
+            plan_id: v["plan_id"].clone(),
             revision: v["revision"].as_i64().unwrap_or(0),
             name: name.to_owned(),
             outcome: outcome.to_owned(),
@@ -334,7 +344,7 @@ impl App {
     /// A write reply that carries more than "saved": PoC staffing offers,
     /// a close plan, a close outcome.
     pub(super) fn board_write_reply(&mut self, v: &Value) {
-        if let Some((name, outcome)) = self.board.pending_close.take().filter(|_| v["plan_id"].is_string()) {
+        if let Some((name, outcome)) = self.board.pending_close.take().filter(|_| !v["plan_id"].is_null()) {
             self.board.plan = Some(ClosePlan::from_reply(v, &name, &outcome));
             self.board.status = "Close plan: review the choices, A applies".into();
         } else if let Some(staff) = v["staffing"].as_array() {
@@ -399,8 +409,8 @@ impl App {
                 };
                 lines.push(Line::styled(title, Style::default().fg(theme::HEADER)));
             }
-            let choice = r.options.get(r.choice).cloned().unwrap_or_else(|| "—".into());
-            let needs = r.needs.as_deref().map(|n| format!("  (needs {n})")).unwrap_or_default();
+            let choice = r.labels.get(r.choice).cloned().unwrap_or_else(|| "\u{2014}".into());
+            let needs = r.needs_now().map(|n| format!("  (needs {n})")).unwrap_or_default();
             let text = format!("  {:<40} {choice}{needs}", truncate(&r.label, 40));
             let mut style = Style::default().fg(theme::TEXT);
             if k == plan.cursor {
@@ -579,22 +589,24 @@ mod tests {
         let (m, p) = app.board.queued.pop_front().unwrap();
         assert_eq!((m, p["outcome"].as_str()), ("epic.close_plan", Some("done")));
         app.board_write_reply(&json!({
-            "plan_id": "plan-1", "revision": 2,
+            "plan_id": 3, "revision": 2,
             "items": [{"n": 13, "title": "org core", "choice_options": ["move", "unplace", "drop"]}],
-            "team": {"name": "Swarm", "options": ["keep", "standby", "archive"], "default": "keep"},
-            "members": [{"member_id": "m2", "handle": "orgchart", "role": "primary", "options": ["keep", "move", "retire"], "default": "keep", "needs": "manager_chain"}],
+            "move_targets": [{"group_id": "g-ops", "name": "Ops", "kind": "heading"}],
+            "team": {"name": "Swarm", "options": ["keep", "standby", "archive"], "default": "keep", "needs": "closer", "needs_by_option": {"keep": "closer", "standby": "owner", "archive": "owner"}},
+            "members": [{"member_id": "m2", "handle": "orgchart", "role": "primary", "options": ["keep", "move", "retire"], "default": "retire", "needs": "closer", "needs_by_option": {"keep": "closer", "move": "manager_chain", "retire": "manager_chain"}}],
             "workspaces": []
         }));
         assert!(app.board.plan.is_some());
         let s = screen(&mut app);
-        assert!(s.contains("Close epic Org model as done") && s.contains("#13 org core") && s.contains("needs manager_chain"), "{s}");
+        assert!(s.contains("Close epic Org model as done") && s.contains("#13 org core") && s.contains("move \u{2192} Ops") && s.contains("needs manager_chain"), "{s}");
         press(&mut app, "j "); // team → standby
+        assert!(screen(&mut app).contains("standby  (needs owner)"));
         press(&mut app, "A");
         let (m, p) = app.board.queued.pop_front().unwrap();
         assert_eq!(m, "epic.close_apply");
-        assert_eq!(p["plan_id"], "plan-1");
+        assert_eq!(p["plan_id"], 3);
         assert_eq!(p["revision"], 2);
-        assert_eq!(p["choices"], json!({"items": {"13": "move"}, "team": "standby", "members": {"m2": "keep"}, "workspaces": {}}));
+        assert_eq!(p["choices"], json!({"items": {"13": "move:g-ops"}, "team": "standby", "members": {"m2": "retire"}, "workspaces": {}}));
         app.board_write_reply(&json!({"applied": true, "pending": [{"row": "m2", "who_must_decide": "ep"}]}));
         assert_eq!(app.board.status, "Epic closed; 1 pending");
         assert!(screen(&mut app).contains("m2 \u{2192} ep"));
