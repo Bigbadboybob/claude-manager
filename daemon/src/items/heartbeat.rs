@@ -120,7 +120,7 @@ fn capture(state: &Arc<Mutex<DaemonState>>) -> Option<Snapshot> {
                 .get(uid)
                 .map(|n| n.name.clone())
                 .unwrap_or_else(|| sess.title.clone());
-            session_row(
+            let mut row = session_row(
                 &daemon_id,
                 uid,
                 &name,
@@ -129,7 +129,13 @@ fn capture(state: &Arc<Mutex<DaemonState>>) -> Option<Snapshot> {
                 &st,
                 sess.reported_done().is_some(),
                 now,
-            )
+            );
+            // Org model S2: what the roster needs (workspace, continuous
+            // ownership, age). An API before S2 ignores these keys.
+            if let Some(obj) = row.as_object_mut() {
+                obj.extend(super::org::session_facts(&s, sess, now));
+            }
+            row
         })
         .collect();
     // TUI-owned rows have no engine state here; report them as unknown
@@ -252,6 +258,7 @@ impl Beat {
         for id in &acked {
             self.acks.remove(id);
         }
+        super::org::absorb_reply(&reply, crate::agent_state::unix_now());
         for push in reply["pushes"].as_array().into_iter().flatten() {
             let Some(id) = push["id"].as_i64() else { continue };
             if self.deliver(state, &snap.root, push) {
@@ -420,7 +427,7 @@ mod tests {
                 reader.read_exact(&mut body).unwrap();
                 log.lock().unwrap().push(serde_json::from_slice(&body).unwrap());
                 let reply = if i == 0 {
-                    r#"{"pushes":[{"id":41,"session_uid":"me-uid","text":"[cm-board sfd] assigned","board":"sfd","board_id":"b-1","owner_alert":false},{"id":42,"session_uid":"gone","text":"x","board":"sfd","owner_alert":false}]}"#
+                    r#"{"pushes":[{"id":41,"session_uid":"me-uid","text":"[cm-board sfd] assigned","board":"sfd","board_id":"b-1","owner_alert":false},{"id":42,"session_uid":"gone","text":"x","board":"sfd","owner_alert":false}],"org":{"members":{"me-uid":{"id":"mem_1","handle":"ep","acting_as":"main"}}}}"#
                 } else {
                     r#"{"pushes":[]}"#
                 };
@@ -437,9 +444,12 @@ mod tests {
         );
         let state = Arc::new(Mutex::new(st));
         crate::messaging::startup::open_for_test(&state).unwrap();
+        super::super::org::reset_cache_for_test();
         let mut beat = Beat::default();
         beat.run(&state);
         assert_eq!(beat.acks, BTreeSet::from([41, 42]));
+        // Org model S2: the reply's member map feeds `ping`'s member.
+        assert_eq!(super::super::org::cached_member("me-uid")["handle"], "ep");
         let delivered = crate::notifications::get(root.path(), "me-uid", "board-push:41").unwrap().unwrap();
         assert_eq!(delivered["text"], "[cm-board sfd] assigned");
         assert_eq!(delivered["source"], "board");
@@ -450,5 +460,8 @@ mod tests {
         assert_eq!(bodies[0]["sessions"].as_array().unwrap().len(), 1);
         assert_eq!(bodies[0]["sessions"][0]["state"], "unknown"); // TUI-only row
         assert_eq!(bodies[1]["acked_push_ids"], json!([41, 42]));
+        // The second reply had no `org` key (a pre-S2 API): the cache stays.
+        assert_eq!(super::super::org::cached_member("me-uid")["handle"], "ep");
+        super::super::org::reset_cache_for_test();
     }
 }

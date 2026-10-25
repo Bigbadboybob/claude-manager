@@ -330,6 +330,11 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "continuous.dispatch_pending",
     "queue.stats",
     "owner_attention.list",
+    // Org model S2 reads (planning API proxies; items::org::READ_METHODS).
+    "org.snapshot",
+    "org.member",
+    "org.team",
+    "org.roster",
 ];
 
 /// Coordinator-adjacent methods that must NOT count as mutations even
@@ -889,6 +894,12 @@ pub fn dispatch_request(
         "item.create" | "item.set" | "item.resolve" | "board.read" | "board.settings"
         | "board.owner_blocked" => {
             DispatchOutcome::Done(crate::items::rpc::dispatch(state, req))
+        }
+        // Org model S2 (doc/org-model.md): members, teams, the roster and
+        // adoption, proxied like items. Roster and adoption are Owner's.
+        "org.snapshot" | "org.member" | "org.team" | "org.roster" | "org.roster_apply"
+        | "org.adopt" | "org.team_create" | "org.team_update" | "org.move" => {
+            DispatchOutcome::Done(crate::items::org::dispatch(state, req))
         }
         // Gate receipts (doc/gate-receipts.md §9): same proxy shape as items.
         "gate.report" | "gate.receipts" | "gate.waive" | "gate.profile" => {
@@ -1711,6 +1722,16 @@ fn dispatch_get_initiative(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Re
 /// `org` — reporting-line views (open to every caller) plus `set_lead` on
 /// the caller's own task. The Session caller's uid scopes "me".
 fn dispatch_org(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    // `org(action="adopt", …)` from Owner is the `org.adopt` RPC (org model
+    // S2). An agent's call falls through to methods::org, which refuses it.
+    if matches!(req.caller, Caller::Operator(_)) && req.params["action"] == "adopt" {
+        let mut adopt = req.clone();
+        adopt.method = "org.adopt".into();
+        if let Some(obj) = adopt.params.as_object_mut() {
+            obj.remove("action");
+        }
+        return crate::items::org::dispatch(state, &adopt);
+    }
     let caller_uid: Option<String> = match &req.caller {
         Caller::Operator(_) => None,
         Caller::Session(s) => Some(s.session_uid.clone()),
@@ -3246,6 +3267,10 @@ fn dispatch_ping(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
                     "worktree_path": worktree_path,
                     "owner_availability": owner_availability,
                     "staffing": staffing,
+                    // The member this session works as (org model S2),
+                    // from the last heartbeat reply; null when it is an
+                    // assistant or the planning API predates S2.
+                    "member": crate::items::org::cached_member(&s.session_uid),
                 });
             if let Some(m) = maintenance {
                 body["maintenance"] = serde_json::json!(m);
@@ -4048,11 +4073,13 @@ mod tests {
         // Owner availability is always present; unset until Owner picks a level.
         assert!(result["owner_availability"]["set"].is_boolean());
         assert!(result["owner_availability"].get("level").is_some());
+        // Org model S2: the member this session works as (null: none known).
+        assert_eq!(result["member"], serde_json::Value::Null);
         assert_eq!(
             result.as_object().map(|o| o.len()),
-            Some(14),
+            Some(15),
             "keys: pong, uid, caller_kind, global_perms, task/workspace and filer context, \
-             owner_availability and staffing. Any other key drift would be a client-visible change.",
+             owner_availability, staffing and member. Any other key drift would be a client-visible change.",
         );
     }
 

@@ -18854,6 +18854,30 @@ struct OrgParams {
     division: Option<String>,
     /// `action="set_lead"`: the session to pin (default: the caller).
     session_uid: Option<String>,
+    /// `view="member"`: a member id, handle, alias or `main/<handle>`.
+    member: Option<String>,
+    /// `view="team"`: a team (initiative) id or slug; `division` is the
+    /// old name and is accepted too.
+    team: Option<String>,
+    /// `action="adopt"` fields (Owner's `org.adopt`, routed before
+    /// methods::org). Accepted so an agent's call gets the Owner-only
+    /// answer rather than a params error.
+    #[allow(dead_code)]
+    pid: Option<Value>,
+    #[allow(dead_code)]
+    handle: Option<Value>,
+    #[allow(dead_code)]
+    title: Option<Value>,
+    #[allow(dead_code)]
+    kind: Option<Value>,
+    #[allow(dead_code)]
+    manager: Option<Value>,
+    #[allow(dead_code)]
+    team_id: Option<Value>,
+    #[allow(dead_code)]
+    home_workspace: Option<Value>,
+    #[allow(dead_code)]
+    request_id: Option<Value>,
 }
 
 /// Upper bound on the reporting chain walk (guards a corrupt parent cycle).
@@ -19026,9 +19050,16 @@ pub fn org(
         }
         return match action {
             "set_lead" | "clear_lead" => org_set_lead(state_arc, &creds, &p, action, caller_uid, caller_task),
+            // Owner-only (the operator's `org.adopt`, routed in dispatch_org).
+            "adopt" => Err((
+                ErrorCode::Unauthorized,
+                "owner_only: org(action=\"adopt\") binds a session to a new member and is Owner's \
+                 (the TUI roster screen); ask Owner"
+                    .into(),
+            )),
             other => Err((
                 ErrorCode::InvalidParams,
-                format!("org: unknown action '{}' (expected set_lead or clear_lead)", other),
+                format!("org: unknown action '{}' (expected set_lead, clear_lead or adopt)", other),
             )),
         };
     }
@@ -19038,7 +19069,45 @@ pub fn org(
             format!("org: {} needs a caller bound to a task, or an explicit id", what),
         ))
     };
+    // The caller's member (org model S2): who it works as, its manager
+    // chain, reports and teams. Best-effort: a planning API before S2 (or
+    // an outage) leaves the task-based views exactly as they were.
+    let my_member = |body: &mut Value| {
+        let Some(uid) = caller_uid else { return };
+        match crate::items::org::member_for_session(state_arc, uid) {
+            Ok(Some(found)) => {
+                body["member"] = found["member"].clone();
+                body["acting_as"] = found["acting_as"].clone();
+                body["manager_chain"] = found.get("chain").cloned().unwrap_or(Value::Null);
+                body["member_reports"] = found.get("reports").cloned().unwrap_or(Value::Null);
+                body["teams"] = found.get("teams").cloned().unwrap_or(Value::Null);
+            }
+            Ok(None) => {}
+            Err((_, message)) => body["member_error"] = json!(message),
+        }
+    };
     match p.view.as_deref().unwrap_or("me") {
+        "me" if caller_task.is_none() => {
+            // A taskless session can still be a member.
+            let mut body = json!({"view": "me", "session_uid": caller_uid, "task": null});
+            my_member(&mut body);
+            if body.get("member").is_some_and(|m| !m.is_null()) {
+                return Ok(body);
+            }
+            Err((
+                ErrorCode::InvalidParams,
+                "org: view=\"me\" needs a caller bound to a task (or a member), or an explicit id".into(),
+            ))
+        }
+        "member" => {
+            let reference = p.member.clone().ok_or((
+                ErrorCode::InvalidParams,
+                "org: view=\"member\" needs member (an id, handle or main/<handle>)".to_string(),
+            ))?;
+            let mut found = crate::items::org::member_detail(state_arc, &reference)?;
+            found["view"] = json!("member");
+            Ok(found)
+        }
         "me" => {
             let own = need_task("view=\"me\"")?;
             let mut row = api_get_task(&creds, &own).map_err(|e| e.to_method_err())?;
@@ -19068,7 +19137,7 @@ pub fn org(
                 lead["task_id"] = t.get("id").cloned().unwrap_or(Value::Null);
                 Some(lead)
             });
-            Ok(json!({
+            let mut body = json!({
                 "view": "me",
                 "session_uid": caller_uid,
                 "task": org_task(&state, &me),
@@ -19078,7 +19147,10 @@ pub fn org(
                 "division": if is_division { unit.clone() } else { Value::Null },
                 "initiative": if is_division { Value::Null } else { unit },
                 "lead_scope": "sessions on this host",
-            }))
+            });
+            drop(state);
+            my_member(&mut body);
+            Ok(body)
         }
         "reports" => {
             let target = match p.task_id.clone() {
@@ -19094,15 +19166,28 @@ pub fn org(
                 .filter(|t| t.get("parent_task_id").and_then(Value::as_str) == Some(id.as_str()))
                 .map(|t| org_task(&state, t))
                 .collect();
-            Ok(json!({
+            let mut body = json!({
                 "view": "reports",
                 "task": org_task(&state, &task),
                 "reports": reports,
                 "lead_scope": "sessions on this host",
-            }))
+            });
+            drop(state);
+            if p.task_id.is_none() {
+                // Your reports as a member (manager_member_id = you).
+                my_member(&mut body);
+                for key in ["member", "acting_as", "manager_chain", "teams"] {
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.remove(key);
+                    }
+                }
+            }
+            Ok(body)
         }
-        "division" => {
-            let reference = match p.division.clone() {
+        // `team` is the org-model name; `division` stays as its alias.
+        "division" | "team" => {
+            let view = p.view.clone().unwrap_or_default();
+            let reference = match p.team.clone().or_else(|| p.division.clone()) {
                 Some(d) => d,
                 None => {
                     let own = need_task("view=\"division\"")?;
@@ -19133,8 +19218,11 @@ pub fn org(
                     .unwrap_or_else(|| json!({"id": root}));
                 org_lead_with(&state, &row, kind == "division")
             };
+            drop(state);
+            let team = crate::items::org::team_detail(state_arc, &init_id).unwrap_or(None);
             Ok(json!({
-                "view": "division",
+                "view": view,
+                "team": team,
                 "division": {
                     "id": init.get("id"),
                     "slug": init.get("slug"),
@@ -19151,7 +19239,7 @@ pub fn org(
         }
         other => Err((
             ErrorCode::InvalidParams,
-            format!("org: unknown view '{}' (expected me, reports or division)", other),
+            format!("org: unknown view '{}' (expected me, member, reports, team or division)", other),
         )),
     }
 }

@@ -40,7 +40,7 @@ def uid_at(hours_ago: float, n: int = 1) -> str:
 
 class MigrationText(unittest.TestCase):
     def test_migration_is_rerunnable(self):
-        text = (ROOT / "sql" / "026_org_core.sql").read_text()
+        text = (ROOT / "sql" / "028_org_core.sql").read_text()
         body = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("--"))
         self.assertNotRegex(body, r"\bUPDATE\s+\w+\s+SET")
         for insert in re.findall(r"INSERT INTO \w+[^;]*;", body):
@@ -54,7 +54,7 @@ class MigrationText(unittest.TestCase):
         self.assertNotRegex(body, r"CREATE TRIGGER")
 
     def test_migration_number_is_unique(self):
-        self.assertEqual(len(list((ROOT / "sql").glob("026_*.sql"))), 1)
+        self.assertEqual(len(list((ROOT / "sql").glob("028_*.sql"))), 1)
 
 
 class Helpers(unittest.TestCase):

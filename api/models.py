@@ -306,7 +306,7 @@ class InitiativeResponse(BaseModel):
     updated_at: datetime
     projects: list[dict] = Field(default_factory=list)
     task_counts: dict[str, int] = Field(default_factory=dict)
-    # Team fields (org model S2, sql/026).
+    # Team fields (org model S2, sql/028).
     parent_team_id: str | None = None
     lead_member_id: str | None = None
     charter: str = ""

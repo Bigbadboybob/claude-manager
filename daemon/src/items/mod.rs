@@ -10,6 +10,7 @@ pub mod chat;
 pub mod gate;
 pub mod heartbeat;
 pub mod held;
+pub mod org;
 pub mod rpc;
 
 /// Start the items background work (the holder-state heartbeat and the

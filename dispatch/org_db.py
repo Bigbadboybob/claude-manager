@@ -1,5 +1,5 @@
 """Org model S2: members, managers, teams, the roster and adoption
-(doc/org-model.md §4, §6, §9.1-9.2, §12, §14; schema in sql/026_org_core.sql).
+(doc/org-model.md §4, §6, §9.1-9.2, §12, §14; schema in sql/028_org_core.sql).
 
 Agents reach these functions only through their host daemon, which stamps the
 actor; Owner is the actor pid ``owner`` (the daemon's operator caller).

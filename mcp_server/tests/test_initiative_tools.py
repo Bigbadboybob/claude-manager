@@ -83,6 +83,14 @@ class InitiativeToolsTests(unittest.TestCase):
                 "org", {"action": "set_lead", "session_uid": "ts-1-2"},
                 socket_path=self.route.path,
             )
+            call.reset_mock()
+            server.org(view="member", member="main/ep")
+            call.assert_called_once_with(
+                "org", {"view": "member", "member": "main/ep"}, socket_path=self.route.path,
+            )
+            call.reset_mock()
+            server.org(view="team", team="swarm")
+            self.assertEqual(call.call_args.args[1], {"view": "team", "team": "swarm"})
         with mock.patch.object(control_client, "resolve_socket_route",
                                return_value=control_client.SocketRoute(Path("/tmp/tui.sock"), False)):
             with self.assertRaises(RuntimeError):

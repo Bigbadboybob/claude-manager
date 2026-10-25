@@ -1410,8 +1410,17 @@ def org(
     task_id: str | None = None,
     division: str | None = None,
     session_uid: str | None = None,
+    member: str | None = None,
+    team: str | None = None,
 ) -> dict:
     """Find your place in the org: your boss, your reports, your division.
+
+    Members and teams (org model, doc/org-model.md): a member is a durable
+    role with a handle, a manager and teams; a session works as one when
+    Owner adopted it or approved it on the roster. When you are a member,
+    `view="me"` adds `member`, `acting_as`, `manager_chain`, `teams` and
+    `member_reports`; `ping()` returns the same `member` (from the last
+    heartbeat). Nothing is enforced by membership yet.
 
     Reporting lines follow the task tree: a task reports to its parent task,
     and a task with no parent is standalone. Each task's lead is its pinned
@@ -1433,7 +1442,11 @@ def org(
         `task_id`) with their leads.
       - `view="division", division=None`: the task tree under your division
         (or the given initiative id/slug), rooted at its coordinator task,
-        with the division's `leader`.
+        with the division's `leader`. `view="team", team=...` is the same
+        view under its org-model name and adds `team` (lead member,
+        members, sub-teams, charter).
+      - `view="member", member=...`: a member by id, handle, alias or
+        `main/<handle>`: profile, manager chain, reports and teams.
 
     Actions (your own task only):
       - `action="set_lead", session_uid=None`: pin the lead of your task to
@@ -1443,10 +1456,14 @@ def org(
         lead of `task_id`. Only an orchestrator may (global permissions, or
         a task above `task_id`), and never on its own task.
       - `action="clear_lead"`: remove the pin, so the fallback rule applies.
+
+    Adopting a session as a member (`action="adopt"`) and approving the
+    roster are Owner's, from the TUI; an agent's call is refused.
     """
     params = {key: value for key, value in {
         "view": view, "action": action, "task_id": task_id,
         "division": division, "session_uid": session_uid,
+        "member": member, "team": team,
     }.items() if value is not None}
     route = control_client.resolve_socket_route()
     if not route.chose_daemon:
@@ -1791,7 +1808,11 @@ def ping() -> dict:
          workspace_id: str | null,  # ← the workspace you live in
          owner_availability: {level, set, changed_at, age_s, ...},
          staffing: {version, digest, policy, recommended_engine, source},
+         member: {id, handle, qualified, title, manager_handle, ...} | null,
          mcp: {version, proxy, update_pending?, note?}}
+
+    `member` is the org member you work as (see `org`), as of the last
+    heartbeat (about 30 s); null when you are not one.
 
     `mcp` is this session's CM MCP server code. `update_pending` names a
     newer deploy; CM activates it on its own when you are idle.

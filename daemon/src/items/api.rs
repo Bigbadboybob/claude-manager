@@ -116,6 +116,7 @@ fn finish(
 /// `{"detail": [{"loc", "msg"}, …]}`.
 pub fn map_error(status: u16, body: &str) -> (ErrorCode, String) {
     let code = match status {
+        403 => ErrorCode::Unauthorized,
         404 => ErrorCode::NotFound,
         409 => ErrorCode::Conflict,
         400 | 422 => ErrorCode::InvalidParams,
