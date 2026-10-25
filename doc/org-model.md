@@ -1,7 +1,7 @@
 # Org model: members, teams, epics and items
 
-Status: **revised draft, review round 2 folded** (Swarm-Coord, 2026-10-25).
-Owner-directed; Owner has answered O1 and O2 (§15). Inputs are listed in §18.
+Status: **revised draft, review round 3 folded** (Swarm-Coord, 2026-10-25).
+Owner-directed; Owner has decided O1 and O2; O3 and O4 are open (§15). Inputs are listed in §18.
 The interviews are a purposive sample (eight sessions, mostly the trader org
 plus CM and scraper triage), not an org-wide vote. EP answered only the group
 question, and the Codex implementation worker has not replied.
@@ -95,6 +95,9 @@ UI and docs use: **member**, **main session**, **assistant**, **workspace**,
 | **Epic** | a group with a goal, a status and an end; optionally a PoC and a team |
 | **PoC** | an epic's lead; the lead of the epic's team |
 
+An **initiative** is a team with its own board (cross-repo, longer-lived); an
+**epic** is a group *within* a board, run by a team.
+
 ## 4. Members and sessions
 
 ### 4.1 Identity
@@ -108,7 +111,8 @@ UI and docs use: **member**, **main session**, **assistant**, **workspace**,
   id `agent:<daemon_id>:<uid>` is unchanged. A member *references* pids and
   never replaces them.
 - **Occupancy** (schema: `incarnations`): one row per (member, session uid,
-  role), with a monotonic `generation` per member. A same-uid model or effort
+  role), with a monotonic `occupancy_generation` per member (distinct from the
+  existing transcript `generation` field in manifests). A same-uid model or effort
   change, revive or resume stays the same row with a change event. At most one
   open `main` row per member.
 - Every write that records a pid today also records `member_id` and
@@ -142,8 +146,8 @@ an assistant alive 3 days that holds items as owner. Today's long-lived lanes
 |---|---|
 | **Hire** | create the member; the spawn becomes its main session |
 | **Reassign** | the member moves to other work (a new epic, a new team); its main session keeps running with its context. This is the normal end of an epic (§7.6) |
-| **Replace** | only when the main session cannot continue (context exhausted, unrecoverable crash, host move, Owner asks for a fresh start): the main row closes with a reason; a new main row opens with `predecessor` and `generation + 1`; handover runs (§7.5) |
-| **Fencing** | a session whose main row was closed by a replacement can no longer act as the member: member-scoped writes from it are refused (`not_main_session`), checked by generation at the API. If revived, it comes back as an assistant, with a notice |
+| **Replace** | only when the main session cannot continue (context exhausted, unrecoverable crash, host move, Owner asks for a fresh start): the main row closes with a reason; a new main row opens with `predecessor` and `occupancy_generation + 1`; handover runs (§7.5) |
+| **Fencing** | a session whose main row was closed by a replacement can no longer act as the member: member-scoped writes from it are refused (`not_main_session`), checked by occupancy generation at the API. If revived, it comes back as an assistant, with a notice |
 | **Vacate** | the main session is dead and unreplaced for 24 h: the member is `vacant` and its items flag `member_vacant` to its manager; routing goes to its deputy, else its manager. The main row stays open; reviving that session clears the vacancy |
 | **Suspend** | parked on purpose, or vacant 14 days with no holds (automatic): no flags, hidden from `who` and the directory |
 | **Move** | change primary team and/or manager; Owner or the current manager chain; holds stay |
@@ -175,6 +179,41 @@ note is an optimisation, because a killed session cannot write one.
   each new main session.
 - **Later (not v1):** member mail (§16).
 
+### 4.5 Staffing policy (which engine to hire)
+
+Owner's guidance on which engine to use changes with the work and with
+account limits ("we've been spawning lots of Claudes, but Codex limits are
+higher now"), and agents forget it unless it reaches them when they spawn. It
+is a small, standalone feature with no dependency on the rest of this design,
+so it can ship first; hires (§4.2) use it once members exist.
+
+- **One Owner-editable policy per org** (central, with a version), containing:
+  - **rules by kind of work**, starting with Owner's: Codex for math, design,
+    architecture-heavy work and maximizing specific metrics; Claude for
+    large-scale coding and work that fans out to many agents (better subagent
+    management);
+  - a **default engine** for work that matches no rule;
+  - an optional **current preference** with a reason and an expiry ("prefer
+    Codex: Codex limits are higher, until 2026-11-08").
+- **Delivery, so nobody has to remember:**
+  - `start_session`, `fork_session` and `hire` return a one-line
+    `staffing_note` when the chosen engine goes against the policy or the
+    current preference;
+  - `start_session` may omit `type`; the policy picks the engine from an
+    optional `work_kind` hint (`math`, `design`, `architecture`, `metric`,
+    `coding`, `fanout`), else the default. A-n's default engine follows the
+    policy;
+  - `ping` returns the policy digest and version; a change pushes a one-line
+    notice to sessions that spawned anything in the last 3 days;
+  - `doc/ORCHESTRATION.md` §1 and the agent guide point at the live policy
+    instead of restating it.
+- **Owner edits it** in a Staffing panel in F9 Global Settings (rules, default,
+  preference with reason and expiry) or with `cm-op staffing.set`.
+- **Later:** CM suggests a preference from account usage ("Claude is at 85% of
+  its weekly limit; shift to Codex?"), and a hire records the engine, model and
+  reason in its `org_event`, so the policy can favour reusing a member's
+  existing session over starting a new one.
+
 ## 5. Workspaces
 
 A workspace is infrastructure: a checkout on a host, its branch, its local
@@ -186,10 +225,11 @@ one grants nothing (no deploy rights, no authority over other sessions there).
   closes after its work closes, the assistant ends, and the reaper's existing
   protections pass: no live process, not dirty, evidence released).
 - The kind is stored in the daemon's local workspace record and manifest from
-  S0. Existing workspaces start **unclassified**, which behaves exactly as
-  today. From S0, workspaces minted for `isolated=true` / branch-mode spawns
+  S0b. Existing workspaces start **unclassified**, which behaves exactly as
+  today. From S0b, workspaces minted for `isolated=true` / branch-mode spawns
   are recorded `ephemeral` at mint (an explicit fact about that spawn, not a
-  guess). The S2 roster marks members' workspaces `home`; Owner can mark any
+  guess). The S2 roster (and later adoptions) mark members' workspaces `home`,
+  centrally and on the owning daemon; Owner can mark any
   workspace durable (pinning already exists and counts). Existing workspaces
   are never classified from a branch prefix or spawn origin.
 - Owned by a member (`office_of`), or by a team for shared integration
@@ -276,9 +316,12 @@ Rollout:
   are listed in the log and are the only enforcement change before S7.
 - **S7 cutover, per host:** after a week of shadow logs with only expected
   differences, the new rule becomes authoritative. Daemons cache a
-  manager-chain snapshot with the bindings (bounded staleness, 5 min) so
-  control keeps working through an API outage; only org changes (hire, move,
-  PoC) need the API.
+  manager-chain snapshot with the bindings and refresh it every 5 minutes.
+  During an API outage they are **fail-static**: relations in the last
+  snapshot keep working until the API answers; only org changes (hire, move,
+  PoC) and relations created after the snapshot are refused. Central writes
+  are fenced immediately by occupancy generation; local session control is
+  fenced at the next snapshot refresh.
 - **Rollback from S7** is to *shadow with the bootstrap rules kept*, not to the
   bare old rule, because S6-era sessions exist that the old rule cannot place.
   `agent_task_edges` and task bindings are retained through S7; retiring them
@@ -338,13 +381,20 @@ Tasks and items stay separate tables in v1 (O3, §15). The backlog **is** the
 planning task list, as today.
 
 - `propose_task` and `create_subtask` keep creating tasks (`propose_task` as
-  `draft`, per the S0 fix). Every existing task tool keeps working.
+  `draft`, per the S0a fix). Every existing task tool keeps working.
 - **Placing** a task on a board (from the planning view or `place(task, board,
-  group=…, holder=…)`) creates an item linked to it (`items.task_id`, unique),
-  or reactivates the task's archived link. Placing a task that is
-  auto-dispatchable (`is_cloud ∧ project IS NULL`) or a backtest is refused.
-- **Unplacing** archives the link (the item number stays resolvable) and sets
-  the task back to `backlog`.
+  group=…, holder=…)`) creates an item linked to it (`items.task_id`; at most
+  one *live* link per task). Re-placing on the same board reactivates the
+  archived link; placing on a different board creates a new item and leaves
+  the old one archived and resolvable. Placing a task that is
+  auto-dispatchable (`is_cloud ∧ project IS NULL`), a backtest or a continuous
+  task row is refused. Placing a `draft` task accepts it (as A-a does).
+- **Unplacing** archives the link and sets the task back to `backlog`. It is
+  refused while the item has live incoming or outgoing `blocked_by` edges
+  (clear or re-point them first; blockers never silently become links). An
+  archived item is read-only: its number resolves for history, and writes
+  through it are refused, so a stale caller can't revive the old assignment.
+  "Unplace and re-place on epic F" is one step.
 - Board-native items (the `item` tool) stay as today, with no task. They
   cannot be unplaced.
 - Moving items between boards, backlog boards and item aliases are not in v1
@@ -368,11 +418,34 @@ planning task list, as today.
 | `dropped` | `done` (with `metadata.dropped = true`) |
 | link archived (unplaced) | `backlog` |
 
-**Legacy status writes to a placed task** are translated, not refused: an
-unchanged status (the old editor always sends one) is ignored; `done` →
-item `done`; `blocked` → item `blocked`; `backlog` → unplace; `running` → item
-`active`. Each translated write is recorded with its actor. Only writes with no
-item equivalent are refused, with `placed_on_board` and the replacement call.
+**Legacy status writes to a placed task** are translated, not refused, and
+attributed to the session that caused them (not the daemon's API token):
+
+| Legacy write | Item transition |
+|---|---|
+| unchanged status (the old editor always sends one) | ignored |
+| `done` | item `done` |
+| `blocked` with a reason or blocker (new optional `reason` / `blocked_by` params on `set_subtask_status` and `update_task`) | item `blocked` with that trigger |
+| `blocked` alone (today's fix-ready call) | item `blocked` with `blocked_on = "legacy status write: no reason given"` and a `legacy_blocked` flag to the holder to fill in the real trigger. The label says what it is; no trigger is invented |
+| `backlog` | unplace (subject to the unplace rules) |
+| `running` (incl. spawn promotion from `start_session(task_id=…)`) | item `active`; if unheld, the spawned session (pre-S6) or its member becomes owner; if held, it becomes a contributor |
+
+Only writes with no item equivalent are refused, with `placed_on_board` and
+the replacement call.
+
+**Closes never arm the terminal sweep from the board.** The mirror writes
+`done` with `metadata.terminal_via = "item"`, and the daemon's terminal sweep
+skips non-ephemeral sessions for such tasks. Task-originated closes (A-d,
+`mark_subtask_done`, a direct PATCH, translated legacy `done`) keep today's
+behaviour, because they carry the original intent. So the guarantee that
+closing a board item never kills an employee does not depend on workspace
+classification.
+
+**Lock order.** Every transaction that may write tasks or initiatives (place,
+unplace, mirrored status, board edits that write task text, team and epic
+changes) takes the task-change advisory lock first (`_serialize_task_writes`),
+then board, task and initiative row locks, as `dispatch/db.py` already
+requires.
 
 ### 7.2 What an item carries
 
@@ -388,8 +461,10 @@ item equivalent are refused, with `placed_on_board` and the replacement call.
 - Holders with a role: `owner` (does it; the coordination owner interviewees
   asked for), `contributor`, `reviewer`, `approver`. Exactly one `owner` while
   the item is `active`, `waiting` or `blocked` and held; zero is fine for
-  `open`, closed or unplaced work. Hand-back removes the owner (the item goes
-  `open`); transferring ownership is one atomic write. Holding, reviewing or
+  `open`, unheld, closed or unplaced work. Hand-back removes the owner and
+  otherwise keeps today's rules: on a strict board the item stays `active`,
+  unheld, and flags `unlaunched`; elsewhere it goes `open`. Transferring
+  ownership is one atomic write. Holding, reviewing or
   witnessing never changes anyone's manager.
 - `group` (and so its epic, §7.3) and `team` (the owning team: defaults to the
   epic's team, else the board's team; settable independently, as EP asked, so
@@ -455,6 +530,11 @@ description, `kind`).
   `holder_gone` becomes `member_vacant`.
 - The active-item cap of strict boards counts per acting session (main or
   assistant), not per member.
+- When a member's main session becomes the owner-role holder of a placed item
+  (S3), CM records a creator edge (`agent_task_edges`) from that session to the
+  task, so the member can `start_session(task_id=…)` an assistant for it under
+  today's scope rule; the edge is retracted when the owner changes, and logged
+  like the §6.3 bootstrap rules.
 - Delivering an item to a session composes the brief from the item's title,
   description, epic and goal, board and links; the team's charter link; and the
   member's and team's standing rules (§8.4). `start_session(task_id=…)` keeps
@@ -484,30 +564,58 @@ Replacement and reassignment run through a durable, idempotent checklist:
 ### 7.6 Finishing an epic
 
 An epic ends when its PoC, the board team's lead or Owner closes it (`done`
-or `cancelled`). Closing runs a checklist, shown to the closer and posted to
-the epic's team channel:
+or `cancelled`). Closing builds a **close plan**, authorizes it, then applies
+it. The plan is shown to the closer, posted to the team channel, and
+persisted, so it is resumable and idempotent: each step records the expected
+revision of what it changes and is re-checked before it runs.
 
-1. **Open items.** Each open item is moved to another epic or heading on the
-   board, unplaced back to the backlog (placed tasks), or dropped with a
-   reason. The epic cannot close while any item is unresolved.
-2. **The team.** One of:
-   - **Keep and reassign**: the team, its lead, members and channel move to a
-     new epic (the team becomes that epic's team; the PoC stays the lead).
-     Members keep their main sessions and context.
-   - **Standby**: the team stays together with no epic (`status=standby`). The
-     lead is flagged after 7 days on standby with no epic.
-   - **Split**: each member is moved individually (to another team, another
-     manager, or back to the lead's own team), or retired. The team is
-     archived once empty.
-3. **Members.** For each member, the closer picks keep (default), move or
-   retire. Retiring asks before closing the main session and hands its holds
-   back. Assistants of the team's members that were working on the epic end,
-   and their ephemeral workspaces close per §5.
-4. **Workspaces.** Stream workspaces opened for the epic are offered for
-   closing once their branches are merged or archived; home workspaces stay.
-5. **Record.** The epic becomes one past-work unit on every member who held an
-   item in it, with their roles, and on the team profile. Its channel stays
-   with the team if the team is kept, and is archived with the team otherwise.
+**Preconditions.** No active sub-epics (close them first, or include them in
+the same plan). The final "nothing left open" check runs under the board lock
+that item writers use.
+
+**1. Open items.** Each open item is moved to another epic or heading on the
+board, unplaced back to the backlog, unplaced and re-placed on an epic
+elsewhere (placed tasks), or dropped with a reason. Bulk actions apply to all
+of them at once ("move all to heading X", "unplace all"). Items with live
+`blocked_by` edges move together with their blockers or are re-pointed first.
+
+**2. Team and members (one table).** A row for the team and one per member:
+
+| Row | Choices | Default |
+|---|---|---|
+| team | **keep and reassign** to another epic · **standby** (no epic; lead flagged after 7 days) · **archive** (once no members remain) | keep |
+| each primary member | **keep** · **move** (to another team or manager) · **retire** | keep (the session and its context stay) |
+| each guest | **end guest membership** · keep as guest on the team | end |
+| each assistant | **keep** (it still holds an item that was carried forward, has a declared job, or has a dirty workspace) · **end** | keep if it has remaining work, else end |
+
+- A team that still runs other active epics only **detaches** from this one;
+  standby and archive are offered only when this was its last epic, and the
+  team's channel, staffing and parent are untouched.
+- Reassigning to an epic in the same team tree is free. Reassigning into a
+  different team tree (another board's team, another division) changes the
+  team's parent and is a move for the lead: Owner or the lead's manager chain,
+  with an offer to change the lead's manager to match.
+- Every choice needs exactly the authority it needs outside a close (§6.2,
+  §6.4). Choices the closer cannot authorize become **pending**: the epic
+  still closes, the affected members stay on the team until the manager chain
+  or Owner accepts or withdraws, and the closer is told who must decide.
+  Moves into another lead's team are pending until that lead accepts.
+- **Retire during a close needs the member's manager chain or Owner, never
+  just the closer**, because it is the one choice that throws away a
+  session's context (O1).
+- Assistants are ended only after their remaining assignments are checked
+  again at apply time; one that picked up carried-forward work in the meantime
+  is kept.
+
+**3. Workspaces.** Stream workspaces opened for the epic are offered for
+closing once their branches are merged or archived; home workspaces stay;
+ephemeral workspaces close per §5.
+
+**4. Record.** The epic becomes one past-work unit on every member who held an
+item in it (with their roles) and on the team's profile. The epic's own
+discussion stays in the team channel, which is named after the team, not the
+epic, so it still makes sense when the team is reassigned. A team that is
+archived archives its channel.
 
 `org(view="team")` and F6 show a team's current and past epics, so "who has
 done this kind of epic before" is answerable.
@@ -725,7 +833,9 @@ ask(topic=None, to=None, text, item=None)            # write, later
   folding as today). The Task sub-view stays selectable until S8.
 - **Planning view** is the backlog, as today. `A-f` places a task on a board,
   with "assign to member" and "hire a new member for it". Placed tasks show a
-  board chip and their item status.
+  board chip and their item status. A read-only "on boards" section lists
+  epics and board-native items, so everything in flight is visible from one
+  place.
 - **Board overlay (Alt+B)** shows headings and epics as a folding tree, with a
   PoC chip and team on each epic; `g` on a group edits it (promote to epic, set
   PoC, close epic, which opens the §7.6 checklist).
@@ -734,48 +844,61 @@ ask(topic=None, to=None, text, item=None)            # write, later
   place to hire, move and retire.
 - **A-e** on a session edits its member's profile; on a team header, the
   team's charter, rules and lead.
+- **F9 → Staffing** edits the staffing policy (§4.5).
 
 ## 12. Persisted state
 
 New fields are added without a manifest-schema bump (no `--hard` deploy) and
 without changing the holder wire schema.
 
-**S0 preservation bridge.** Today's records are typed projections
+**S0b preservation bridge.** Today's records are typed projections
 (`ManifestEntry`, the monolith `SessionRecord`, `holder-proto`'s reexec
 record), and an old holder reparses rollback records into its own typed shape,
-so unknown fields would be dropped. S0 adds one flattened, opaque `org`
-extension map to each of them, round-tripped unchanged by every path:
+so unknown fields would be dropped. S0b adds one **nested**, opaque `org`
+object to each of them (not serde-flattened into the record, so nothing
+collides with existing top-level fields such as the transcript `generation`),
+round-tripped unchanged by every path:
 
 | State | Where | Carried in `org` |
 |---|---|---|
-| durable manifest + tombstones | `daemon/src/manifest.rs`, `session.rs` | `member_id`, `occupancy_id`, `generation`, `acting_as`, `workspace_kind`, `binding_epoch` |
+| durable manifest + tombstones | `daemon/src/manifest.rs`, `session.rs` | `org.member_id`, `org.occupancy_id`, `org.occupancy_generation`, `org.acting_as`, `org.workspace_kind`, `org.binding_epoch` |
 | reexec record (split and monolith) | `daemon/src/reexec.rs`, `holder-proto/src/reexec_manifest.rs` | same |
-| holder adoption and rollback | `daemon/src/holder_mode.rs`, `holder/src/holder.rs` | same; needs the S0 holder (`daemon.upgrade_holder`) |
+| holder adoption and rollback | `daemon/src/holder_mode.rs`, `holder/src/holder.rs` | same; needs the S0b holder (`daemon.upgrade_holder`) |
 | resume identities | `daemon/src/resume_identity.rs` | `member_id` |
 | TUI manifest and snapshot pushes | `tui-sessions.json`, `task.update_tree` | `member_id`; old TUI snapshots must not overwrite member/binding relations (`binding_epoch` guard) |
 | continuous state | `~/.cm/continuous-tasks/<id>/` | unchanged; the member mapping lives centrally |
 
 Rules:
 
-- **Compatibility floor.** The S0 build (brain and holder) is the minimum
-  rollback pin once any org field is populated. Daemons advertise
-  `org_fields_v1`; the API does not ask a daemon to stamp org fields until that
-  daemon, its holder and its configured rollback pin all advertise it.
+- **Capabilities.** Daemons advertise each role separately, and the API
+  activates a feature for a host only when that daemon, its holder and its
+  configured rollback pin advertise what it needs:
+
+  | Capability | Means | Needed by |
+  |---|---|---|
+  | `org_preserve_v1` | round-trips the `org` object (S0b) | anything that populates org fields |
+  | `lifecycle_guard_v1` | terminal sweep honours `terminal_via=item` and workspace kinds; local `home` marks applied (S3) | central status mirroring for tasks with sessions on that host |
+  | `org_stamp_v1` | stamps `member_id` / `acting_as` on writes (S4) | member attribution |
+  | `occupancy_v1` | maintains occupancy rows and generations on spawn, revive and Fresh fires; standby; fencing (S6) | inherited holds, replacement |
+
+- **Compatibility floor.** The S0b build (brain and holder) is the minimum
+  rollback pin once any org field is populated. Old pid-based calls keep
+  working throughout v1 unless they invoke a new member-scoped operation.
 - Fixtures cover a pre-feature binary (fields absent, nothing breaks) and a
   bridge-capable old binary (fields preserved), across adopt, reexec, revive,
-  resume and rollback, asserting member id, occupancy, generation and acting
-  role survive.
+  resume and rollback, asserting member id, occupancy, both generation
+  counters (set to different values) and acting role survive independently.
 - The API is authoritative for member bindings; daemons cache them with the
   manager-chain snapshot. After a brain restart the daemon admits member-scoped
-  calls from the cache within its staleness bound and refreshes from the API.
+  calls from the cache (fail-static, §6.3) and refreshes from the API.
 - Both task→workspace reconstruction paths (`state.rs` rehydration and the
   `methods.rs` restore path) are gated on `binding_epoch`.
 - **Offline spawns.** If the API is unreachable when a member's main session
   would start, the session starts as an **unbound standby**: no work delivered,
   no member-scoped capabilities, no writes to the member's home workspace. It
   becomes main only after an atomic occupancy claim succeeds (generation
-  compare-and-set at the API); a losing session stays an assistant and never
-  executes the disputed assignment. The API checks the caller's generation on
+  compare-and-set on `occupancy_generation` at the API); a losing session stays an assistant and never
+  executes the disputed assignment. The API checks the caller's occupancy generation on
   every member-scoped write, so a stale main on another host is fenced the
   moment a replacement commits.
 
@@ -786,18 +909,20 @@ clients working. Permission changes run in shadow before they enforce.
 
 | Stage | What | Notes |
 |---|---|---|
-| **S0 guards + bridge** | NULL-safe `prompt` readers (`/workers`, CLI, `worker/startup.sh`); `propose_task` files `draft` as documented (confirmed: both clients omit status and the API defaults to `backlog`; the dispatcher predicate does not match project-bound drafts); TUI adoption keeps taskless sessions; the §12 preservation bridge and holder upgrade; `workspace_kind` in local records (all existing = unclassified) | no visible behaviour change except the draft fix |
+| **S0a guards** | NULL-safe `prompt` readers (`/workers`, CLI, `worker/startup.sh`); `propose_task` files `draft` as documented (confirmed: both clients omit status and the API defaults to `backlog`; the dispatcher predicate does not match project-bound drafts); TUI adoption keeps taskless sessions | API/CLI/TUI only; ships before S1 |
+| **S0b bridge** | the §12 `org` preservation object and `org_preserve_v1` on brain and holder; `daemon.upgrade_holder` on cm-manager, cm-sessions and Owner's laptop; `workspace_kind` in local records (all existing = unclassified; new isolated mints recorded `ephemeral`) | needed before S2's `home` push and S3; does not block S1 |
 | **S1 prompt → description** | inventory (real instructions in prompts, empty descriptions, continuous contracts → continuous standing instructions); the compatibility table below; one marker-gated backfill appends real prompts under `## Instructions`; description-only delivery after the backfill and every dispatch path read description; commit trailer hook installed | the `prompt` column is never dropped (`sql/003` alters it on every start); the MCP param stays as a deprecated alias |
-| **S2 org core (central)** | `members`, `incarnations`, `team_memberships`, manager tree, team columns (`coordinator_task_id` nullable + API models, `status`, `standing_rules`); Owner-approved roster (continuous members, initiative/division leads, long-lived lanes; dedupe by pid, coordinator and continuous ownership; handle collisions get a suffix, never steal an alias); roster workspaces marked `home`; `org`, `ping`, A-i and F6 read members and managers | central only; holds stay pid-keyed; nothing enforces |
-| **S3 epics, groups, placement** | `groups` with headings and epics; PoC as a member id with a real team; staffing flow; epic close checklist (§7.6); link-first placement (§7.1) with field ownership, status mirror and translated legacy writes; item roles, single owner, holder migration; description revisions; `possible_duplicate`. **Lifecycle guard in the same stage:** the terminal sweep and `mark_subtask_done` skip sessions in `home`/`stream`/pinned workspaces and only unassign them; `ephemeral` (set at mint for new isolated spawns from S0) and unclassified workspaces keep today's behaviour | the guard ships with the mirror, and S2's roster has already marked every member's workspace `home`, so closing a placed item can never kill an employee |
-| **S4 daemon stamping** | daemons stamp `member_id`, `acting_as`, `generation` (gated on `org_fields_v1`); standing-rules delivery (§8.4); fencing at the API by generation | |
+| **S2 org core** | `members`, `incarnations`, `team_memberships`, manager tree, team columns (`coordinator_task_id` nullable + API models, `status`, `standing_rules`); Owner-approved roster (continuous members, initiative/division leads, long-lived lanes; dedupe by pid, coordinator and continuous ownership; handle collisions get a suffix, never steal an alias); an Owner-only **adopt** action (roster screen and `org(action="adopt")`) that binds a live session to a new member, so members can be added after the roster; roster and adopted workspaces marked `home` centrally **and pushed to each owning daemon**, which confirms; `org`, `ping`, A-i and F6 read members and managers | holds stay pid-keyed; nothing enforces |
+| **S3 epics, groups, placement** | `groups` with headings and epics; PoC as a member id with a real team; staffing flow; epic close plan (§7.6); link-first placement (§7.1) with field ownership, status mirror, translated legacy writes, `terminal_via=item` and the lock order; item roles, single owner, holder migration; description revisions; creator edges for owner-role holders; `possible_duplicate`; the planning view's read-only "on boards" section. **Lifecycle guard:** the terminal sweep skips `terminal_via=item` closes for non-ephemeral sessions, and skips `home`/`stream`/pinned workspaces entirely; ephemeral and unclassified workspaces keep today's behaviour for task-originated closes | per host: daemons ship and advertise `lifecycle_guard_v1` first; central mirroring for a task turns on only when every daemon holding its sessions advertises it. Rollback with placed tasks: mirroring off, links kept |
+| **S4 daemon stamping** | daemons stamp `member_id` and `acting_as` (`org_stamp_v1`); standing-rules delivery (§8.4) | occupancy rows and fencing wait for S6 (`occupancy_v1`) |
 | **S5 profiles, discovery, shadow scope** | `profile_set`, `org(view=member/team/directory)`, `who` over items, epics, receipts, `report_done`, commits and tags; staleness display; manager-chain scope and new board-edit rule computed and logged beside the old rules (observational) | end of v1 |
-| **S6 members become real** | spawn defaults and `hire` (§4.2); `@handle` → main session; qualified body mentions; holds by member with every consumer updated together (holder checks, flags, capacity, pushes retargeted, orchestrator/steward, gate grantor and editor allowlists); handover checklist; offline standby; member workspace records and `cm-ws/` branches; `start_session(item=…)`; models resolve member before task; bootstrap allow rules (§6.3) | consumers roll before inherited holds turn on |
+| **S6 members become real** | occupancy rows and generations on spawn, revive and Fresh fires, fencing at the API (`occupancy_v1`); spawn defaults and `hire` (§4.2); `@handle` → main session; qualified body mentions; holds by member with every consumer updated together (holder checks, flags, capacity, pushes retargeted, orchestrator/steward, gate grantor and editor allowlists); handover checklist; offline standby; member workspace records and `cm-ws/` branches; `start_session(item=…)`; models resolve member before task; bootstrap allow rules (§6.3) | consumers roll before inherited holds turn on |
 | **S7 scope cutover** | per host, after a week of shadow logs with only expected differences: manager-chain scope and the new board-edit rule authoritative | rollback = shadow with bootstrap rules (§6.3) |
 | **S8 cleanup** | retire `agent_task_edges` and task bindings for scope (irreversible, announced); Task sub-view becomes a filter; decide full convergence (§16) | |
 
 ### 13.1 v1 cut line
 
+- **Standalone, any time:** the staffing policy (§4.5).
 - **v1 (S0–S5):** all five of Owner's asks in visible form: no prompt field;
   members with profiles, managers and teams; workspaces as offices; epics and
   groups with PoC teams and a defined ending; backlog → board placement;
@@ -816,7 +941,7 @@ clients working. Permission changes run in shadow before they enforce.
 | CREATE with description only | stored as given |
 | CREATE with prompt (old client, incl. today's `propose_task` which sends both) | a non-empty prompt that differs from the name and isn't contained in the description is appended to the description under `## Instructions`, so it is delivered |
 | PATCH with description only | stored; revision bumped |
-| PATCH with prompt empty, equal to the name, or contained in the description | prompt ignored |
+| PATCH with prompt empty, equal to the name, or contained in the description that **will be stored** (the request's description if it has one) | prompt ignored |
 | PATCH with a different, non-empty prompt | `409 prompt_deprecated`: "put instructions in the description" (a person typed it; it is not silently dropped) |
 | responses | `prompt: ""` (not an echo, which old composers would deliver twice) |
 
@@ -865,7 +990,7 @@ CREATE TABLE members (
   status TEXT NOT NULL,                      -- active | vacant | suspended | retired
   manager_member_id TEXT REFERENCES members(id),   -- NULL only for owner; acyclic
   primary_team_id UUID REFERENCES initiatives(id),
-  generation INT NOT NULL DEFAULT 0,         -- bumps on each replacement; fencing
+  occupancy_generation INT NOT NULL DEFAULT 0,  -- bumps on each replacement; fencing
   profile JSONB NOT NULL DEFAULT '{}',       -- authored fields {value,set_by,via,set_at}
   standing_rules JSONB NOT NULL DEFAULT '[]',-- [{text, source}]
   revision INT NOT NULL DEFAULT 0,
@@ -879,7 +1004,7 @@ CREATE TABLE continuous_members (daemon_id TEXT, continuous_id TEXT, member_id T
 CREATE TABLE incarnations (                  -- occupancy
   id BIGSERIAL PRIMARY KEY, member_id TEXT NOT NULL REFERENCES members(id),
   role TEXT NOT NULL,                        -- main | assistant | standby
-  generation INT, pid TEXT NOT NULL, daemon_id TEXT NOT NULL, session_uid TEXT NOT NULL,
+  occupancy_generation INT, pid TEXT NOT NULL, daemon_id TEXT NOT NULL, session_uid TEXT NOT NULL,
   workspace_id TEXT, predecessor BIGINT REFERENCES incarnations(id),
   started_at TIMESTAMPTZ NOT NULL, ended_at TIMESTAMPTZ, end_reason TEXT
 );
@@ -899,7 +1024,8 @@ CREATE TABLE workspaces (id TEXT PRIMARY KEY, idem_key TEXT UNIQUE, daemon_id TE
   office_of TEXT REFERENCES members(id), team_id UUID, purpose TEXT,
   state TEXT, created_at TIMESTAMPTZ, closed_at TIMESTAMPTZ);
 ALTER TABLE items ADD COLUMN IF NOT EXISTS task_id UUID REFERENCES tasks(id);
-CREATE UNIQUE INDEX IF NOT EXISTS items_task_link ON items (task_id) WHERE task_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS items_task_link ON items (task_id)
+  WHERE task_id IS NOT NULL AND link_archived_at IS NULL;   -- one live link per task
 ALTER TABLE items ADD COLUMN IF NOT EXISTS link_archived_at TIMESTAMPTZ;
 ALTER TABLE items ADD COLUMN IF NOT EXISTS description TEXT;        -- board-native items only
 ALTER TABLE items ADD COLUMN IF NOT EXISTS metadata JSONB;          -- board-native items only
@@ -939,30 +1065,51 @@ viewers never poll.
   routing-only. Staffing is explicit (§7.3).
 - **O3. Link-first for tasks and items in v1 — open; Owner wants more context.**
   Proceeding with link-first meanwhile.
-  - *Link-first (drafted):* the backlog stays the planning task list. Placing a
-    task on a board creates a linked item; while placed, the board owns status
-    and holders and the task keeps the text and metadata (§7.1). Owner sees: the
-    planning view unchanged except a board chip on placed tasks and their
-    status coming from the board; A-d/A-s on a placed task act on the item.
-    Agents see: every task tool unchanged. Cost: two kinds of work row stay
-    (tasks and board-native items), so "all work" queries union two tables, and
-    moving work between boards waits.
-  - *Full merge now:* one table for all work; the backlog becomes a board;
-    tasks shrink to execution records. Owner sees: one list everywhere, work
-    moves freely between backlog and boards. Cost: the largest migration in the
-    design (API, dispatch, planning view, board engine, every task tool behind
-    an adapter); it would delay epics, members and discovery by several stages.
-  - *Recommendation:* link-first now, and decide the merge once placement has
-    been used for a few weeks (its preconditions are in §16). Link-first is a
-    step towards the merge, not a detour: the field-ownership split is the same
-    one a merge would use.
+
+  Today there are two kinds of work row: **tasks** (the planning view's
+  backlog: what Owner files and launches) and **board items** (what agents
+  create on boards to track work in flight; most items today). The question
+  is whether to keep both and link them, or merge them into one.
+
+  | Owner does | Link-first (recommended) | Merge now |
+  |---|---|---|
+  | files an idea | planning backlog, as today (a task) | a backlog board (an item) |
+  | puts it into epic Latent on the sejd board | `A-f` place: a chip in the planning view, an item on the board | move it |
+  | an agent tracks work on a board | an item, visible on the board (and in the planning view's read-only "on boards" section, see below) | the same single list |
+  | moves work to another board | unplace and re-place, one step | move |
+  | marks it done | `A-d` in either place acts on the item | one row |
+  | sees everything EP holds | `org`, F6 or the board; the same either way | same |
+
+  - *Link-first* keeps every task tool and the planning view working as they
+    are; the board owns status and holders of a placed task, and the task keeps
+    its text and metadata (§7.1). Cost: two kinds of row remain; placed tasks
+    show in both places; a later merge would move the text and metadata a
+    second time (only the status/holder authority carries over).
+  - *Merge now* gives one list everywhere and free moves. Cost: the largest
+    migration in the design (API, dispatch, planning view, board engine, every
+    task tool behind an adapter). It delays placement and anything built on
+    it; members (S2), discovery (S5) and epics on board-native items do not
+    depend on it.
+  - *Cheap middle step, included in S3:* the planning view gains a read-only
+    "on boards" section listing epics and board-native items, so Owner has one
+    place to look without merging tables.
+  - *Deciding later* uses: how often Owner moves work across boards, how often
+    a single list is missed despite the "on boards" section, and the friction
+    of placed tasks appearing twice.
 - **O4. Only deliberate hires are members — open.** One-shot workers
-  (reviewers, bench runners, subtask workers, `detective-*`) are assistants,
-  folded under their member on F6, and do not get handles, profiles or vacancy
-  flags. Alternative: every new workspace's leader is a member, which is closer
-  to "a workspace has a leader" but produces hundreds of short-lived members a
-  week. Recommendation: deliberate hires (§4.2), with promotion for assistants
-  that turn out to be long-lived.
+  (reviewers, bench runners, subtask workers, `detective-*`) are assistants:
+  folded under their member on F6 as a count, with no handle, profile or
+  vacancy flag, and not returned by `who`. Scale: about 180 agent-minted
+  subtask worktrees were active in the last 7 days across cm-sessions and
+  cm-manager (directory mtime; an upper bound on new ones). Promoting an
+  assistant keeps its session and context, so choosing "assistant" loses
+  nothing if a worker turns out to be valuable (O1).
+  - *Alternative at its strongest:* every new workspace's leader is a member,
+    retired automatically when its ephemeral workspace closes (so no vacancy
+    noise). Costs: handle and roster churn, a box per worker on F6, and
+    profiles and evidence fragmented across short-lived members.
+  - *Recommendation:* deliberate hires (§4.2), with promotion (CM suggests it
+    for an assistant alive 3 days that holds items as owner).
 
 ### 15.2 Design decisions (override any)
 
@@ -1023,4 +1170,4 @@ viewers never poll.
 - Interviews (Swarm-Gardener): `…/interviews/summary.md`, verbatim replies in
   `interview-log.md`
 - Reviews: `…/reviews/codex.md`, `claude.md` (round 1), `codex-r2.md`,
-  `claude-r2.md` (round 2)
+  `claude-r2.md` (round 2), `codex-r3.md`, `claude-r3.md` (round 3)
