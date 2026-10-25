@@ -3,8 +3,8 @@
 Status: **revised draft, review round 1 folded** (Swarm-Coord, 2026-10-25).
 Owner-directed. Inputs are listed in §18. The interviews are a purposive
 sample (eight sessions, mostly the trader org plus CM and scraper triage),
-not an org-wide vote; EP's main answers arrived late and are noted where
-they changed something.
+not an org-wide vote. EP answered only the group question so far, and the
+Codex implementation worker has not replied.
 
 ## 1. Summary
 
