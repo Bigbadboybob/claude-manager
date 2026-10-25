@@ -1,7 +1,7 @@
 # Org model: members, teams, epics and items
 
 Status: **final draft, review round 4 folded** (Swarm-Coord, 2026-10-25).
-Owner-directed; Owner has decided O1–O4 (§15). Inputs are listed in §18.
+Owner-directed; Owner has decided O1–O5 (§15). Inputs are listed in §18.
 The interviews are a purposive sample (eight sessions, mostly the trader org
 plus CM and scraper triage), not an org-wide vote. EP's answers are folded in;
 the Codex implementation worker never replied.
@@ -23,8 +23,10 @@ This design separates **who**, **where** and **what**:
   their sessions carry useful context; the main session is only replaced when
   it must be (context exhausted, crash with no resume, host move).
 - **Where** is a **workspace**: a checkout on a host. A member has a home
-  workspace (its office). Assistants that write code get their own ephemeral
-  workspace.
+  workspace (its office). Assistants are as durable as main sessions (Owner,
+  2026-10-25): they belong to the office, and an assistant that writes code
+  gets its own checkout in the office (a `stream` workspace) that lives as
+  long as the assistant does.
 - **Who works with whom** is a **team**: a lead, members, and optionally a
   channel and charter. Divisions, initiatives and epic teams are teams. Every
   member except Owner has exactly one **manager**, stored and cycle-checked.
@@ -131,13 +133,17 @@ Members are created deliberately and rarely. Everything else is an assistant.
 | `start_session(member="<handle>")` | fills a vacant member as its main session (a replacement); needs that member's manager chain or Owner |
 | Continuous scheduler respawn | new main session of the continuous member (§9.1) |
 | Revive, A-R, Alt+s Resume, daemon/brain restart | same uid, same occupancy row; nothing changes |
-| Any other agent spawn: plain `start_session`, `isolated=true`, `create_subtask` + spawn, `fork_session` without `hire`, `item_resolve(launch)`, `start_session(task_id=…)` | assistant of the caller's member. `isolated=true` (or `create_subtask` branch mode) gives it an **ephemeral** workspace, as today |
+| Any other agent spawn: plain `start_session`, `isolated=true`, `create_subtask` + spawn, `fork_session` without `hire`, `item_resolve(launch)`, `start_session(task_id=…)` | assistant of the caller's member, durable like a main session (§4.3). `isolated=true` (or `create_subtask` branch mode) gives it its own checkout, recorded as a `stream` workspace of the member's office. A spawn by a session that belongs to no member keeps today's **ephemeral** workspace |
 | Owner A-s (add a session to a workspace) | assistant of the workspace's member; Owner can tick "new member" |
 | Owner A-F fork | assistant of the source's member unless Owner ticks "new member" |
 | Bash sessions, backtest watch views, cloud dispatch workers | not members; bash/watch views are assistants of the workspace's member, cloud workers stay as today (§9.4) |
 
-An assistant that turns out to be long-lived is promoted; CM suggests it for
-an assistant alive 3 days that holds items as owner. Today's long-lived lanes
+Assistants are not temporary. Finishing an item or a task does not end an
+assistant: it stays in its member's office with its context and is the first
+choice for the member's next piece of work (reuse before spawning). An
+assistant ends only when it is deliberately closed (§4.3, **Close an
+assistant**). An assistant can also be promoted to its own member; CM
+suggests it for an assistant alive 3 days that holds items as owner. Today's long-lived lanes
 (msgfix, org, items, …) are members from the S2 roster.
 
 ### 4.3 Lifecycle
@@ -151,6 +157,7 @@ an assistant alive 3 days that holds items as owner. Today's long-lived lanes
 | **Vacate** | the main session is dead and unreplaced for 24 h: the member is `vacant` and its items flag `member_vacant` to its manager; routing goes to its deputy, else its manager. The main row stays open; reviving that session clears the vacancy |
 | **Suspend** | parked on purpose, or vacant 14 days with no holds (automatic): no flags, hidden from `who` and the directory |
 | **Move** | change primary team and/or manager; Owner or the current manager chain; holds stay |
+| **Close an assistant** | deliberate only: its member's main session, the member's manager chain, or Owner. Its holds hand back to its member; its `stream` checkout closes with it once the reaper's protections pass. Task/item completion, `mark_subtask_done` and the terminal sweep never close an assistant |
 | **Retire** | holds hand back to the manager; reports move to the manager; the main session is closed (asked first); handle tombstoned; history permanent. Closing a member's home workspace asks "retire member X?" (default yes when it holds no open items) |
 
 Only Replace and Retire close a main row. Working memory (transcript,
@@ -229,8 +236,10 @@ venv/target/caches. It is not an org unit, has no reporting line, and being in
 one grants nothing (no deploy rights, no authority over other sessions there).
 
 - **Kinds.** `home` (a member's office; a replacement respawns there),
-  `stream` (a member's extra durable checkout), `ephemeral` (an assistant's;
-  closes after its work closes, the assistant ends, and the reaper's existing
+  `stream` (a member's extra durable checkout, including each code-writing
+  assistant's own checkout; it closes only when its assistant is closed or
+  the member retires), `ephemeral` (a session that belongs to no member;
+  closes after its work closes, the session ends, and the reaper's existing
   protections pass: no live process, not dirty, evidence released).
 - The kind is stored in the daemon's local workspace record and manifest from
   S0b. Existing workspaces start **unclassified**, which behaves exactly as
@@ -243,13 +252,13 @@ one grants nothing (no deploy rights, no authority over other sessions there).
 - Owned by a member (`office_of`), or by a team for shared integration
   checkouts.
 - Assistants that only read, review or run commands may share the office;
-  assistants that write code get an ephemeral workspace by default, so an
-  office never implies a shared dirty checkout.
+  assistants that write code get their own `stream` checkout in the office by
+  default, so an office never implies a shared dirty checkout.
 - **Records and branches (S6).** New member workspaces get a central record
   and a local durable record, both storing id, branch, base SHA, host and path.
   Creation reserves the id under an idempotency key before any filesystem or
   spawn work and moves `creating → ready | failed`. Creating a member workspace
-  needs the API; assistants' ephemeral workspaces keep today's task-derived
+  needs the API; assistants' checkouts keep today's task-derived
   path and need nothing new. New member workspaces use `cm-ws/<handle>-<ws7>`
   branches; the stored branch wins over inference, a handle edit never renames
   a branch, and the `cm-sub/` and `cm/` parsers stay forever.
@@ -1155,6 +1164,19 @@ viewers never poll.
     a `stream` workspace. If the assistant turns out to be long-lived, it is
     promoted: it becomes a member, keeps its session and context, and its
     ephemeral workspace becomes that member's home workspace.
+  - *Superseded in part (Owner, 2026-10-25, O5):* assistants "should be just
+    as durable as the main sessions". An assistant's own checkout is a
+    `stream` workspace of its member's office, not ephemeral, and nothing
+    automatic closes the assistant or its checkout (§4.2, §4.3).
+- **O5. Assistants are as durable as main sessions — decided (Owner,
+  2026-10-25).** An assistant belongs to its member's office and keeps its
+  session, context and checkout until it is deliberately closed by its
+  member, the member's manager chain or Owner. Completing a task or item,
+  `mark_subtask_done` and the terminal sweep never close it; the member
+  reuses it for its next work. `ephemeral` remains only for sessions that
+  belong to no member. Cost: idle assistants and their checkouts stay
+  resident, so reuse comes before spawning, and the board's free capacity
+  lists idle assistants.
 
 ### 15.2 Design decisions (override any)
 
