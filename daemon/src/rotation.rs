@@ -109,6 +109,21 @@ pub fn status(uid: &str) -> Option<Value> {
     registry().lock().unwrap_or_else(|p| p.into_inner()).get(uid).map(Rotation::to_json)
 }
 
+/// Tests: mark `uid` as mid-rotation (`done` finishes it).
+#[cfg(test)]
+pub(crate) fn test_set_running(uid: &str, running: bool) {
+    let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
+    if running {
+        reg.insert(uid.into(), Rotation {
+            phase: "forking", origin: Origin::Operator, reason: String::new(), started_at: now(),
+            from_id: String::new(), from_bytes: 0, to_id: None, to_bytes: None, path: "fork",
+            outcome: None, finished_at: None,
+        });
+    } else {
+        reg.remove(uid);
+    }
+}
+
 /// Whether `uid` is being rotated right now (its process is expected to
 /// stop and come back).
 pub fn in_progress(uid: &str) -> bool {
@@ -161,9 +176,27 @@ pub fn boundary(state: &DaemonState, uid: &str, idle: Duration, owner_quiet: Dur
     if !agent.background.jobs.is_empty() {
         return Err(format!("{} background job(s) running", agent.background.jobs.len()));
     }
+    // A scheduled wakeup lives in the process: a restart would lose it (CM
+    // does not carry session crons across a fork).
+    if !agent.background.crons.is_empty() {
+        return Err(format!("{} scheduled wakeup(s) pending", agent.background.crons.len()));
+    }
     if let Some(at) = state.owner_seen.get(uid) {
         if at.elapsed() < owner_quiet {
             return Err(format!("Owner viewed or typed in it {}s ago", at.elapsed().as_secs()));
+        }
+    }
+    let typed = *sess.last_operator_input_at.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(at) = typed {
+        if at.elapsed() < owner_quiet {
+            return Err(format!("Owner typed in it {}s ago", at.elapsed().as_secs()));
+        }
+        // Keystrokes after the agent's last turn ended, with no turn since:
+        // an unsent draft may sit in its composer. An operator forcing it
+        // (no quiet window) has decided.
+        let typed_unix = now() - at.elapsed().as_secs_f64();
+        if !owner_quiet.is_zero() && typed_unix > agent.since {
+            return Err("Owner typed in it since its last turn (a draft may be unsent)".into());
         }
     }
     let pending = crate::notifications::snapshot(&state.messaging_root, uid)
@@ -239,6 +272,16 @@ pub fn start(
         // workflow transition or continuous run still refuses.
         let (idle, quiet) = if force { (Duration::ZERO, Duration::ZERO) } else { (idle, quiet) };
         boundary(&state, uid, idle, quiet).map_err(|why| (ErrorCode::Conflict, format!("not at a safe boundary: {why}")))?;
+        // One rotation at a time on a host, with a pause between them (a
+        // fork reads its whole source; a deploy may find many big sessions).
+        if let Some(other) = running_any() {
+            return Err((ErrorCode::Conflict, format!("another rotation is running ({other}); one at a time per host")));
+        }
+        if origin != Origin::Operator {
+            if let Some(left) = pause_left() {
+                return Err((ErrorCode::Conflict, format!("pausing {}s after the last rotation", left.as_secs())));
+            }
+        }
         let snap = snapshot(&state, uid).map_err(|e| (ErrorCode::Conflict, e))?;
         let rotation = Rotation {
             phase: "stopping",
@@ -257,17 +300,33 @@ pub fn start(
     };
     let record = rotation.to_json();
     registry().lock().unwrap_or_else(|p| p.into_inner()).insert(uid.to_string(), rotation);
+    // A brain restart between the stop and the respawn must not leave the
+    // session dead: the marker lets the next brain resume the old transcript.
+    if let Err(e) = inflight_put(&state_arc.lock().unwrap_or_else(|p| p.into_inner()), uid, &snap) {
+        eprintln!("cm-daemon: rotation of {uid}: in-flight marker not written: {e}");
+    }
     let state = Arc::clone(state_arc);
     let uid_owned = uid.to_string();
     std::thread::Builder::new()
         .name(format!("cm-rotate-{uid}"))
-        .spawn(move || run(&state, &uid_owned, snap))
+        .spawn(move || {
+            run(&state, &uid_owned, snap);
+            inflight_remove(&state.lock().unwrap_or_else(|p| p.into_inner()), &uid_owned);
+        })
         .map_err(|e| (ErrorCode::Internal, format!("rotation worker: {e}")))?;
     Ok(json!({ "ok": true, "session_uid": uid, "rotation": record }))
 }
 
 const STOP_DEADLINE: Duration = Duration::from_secs(20);
-const VERIFY_DEADLINE: Duration = Duration::from_secs(180);
+/// How long the fork has to record its first message: 180 s plus 60 s per
+/// GB of source (Claude reads the whole source to fork it; a 1.7 GB
+/// transcript forked in 23 s on cm-sessions with a warm cache), at most 20 min.
+fn verify_deadline(source_bytes: u64) -> Duration {
+    Duration::from_secs((source_bytes / 1_000_000_000).saturating_mul(60).saturating_add(180).min(1200))
+}
+
+/// The pause between two rotations on a host (not for an operator's own).
+const PAUSE_BETWEEN: Duration = Duration::from_secs(120);
 
 fn wait_gone(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) -> bool {
     let deadline = Instant::now() + STOP_DEADLINE;
@@ -338,6 +397,138 @@ fn finish(uid: &str, phase: &'static str, outcome: String) {
         r.outcome = Some(outcome);
         r.finished_at = Some(now());
     });
+    *last_finished().lock().unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
+    let mut f = failures().lock().unwrap_or_else(|p| p.into_inner());
+    if phase == "failed" {
+        f.entry(uid.to_string()).or_default().0 += 1;
+        if let Some(e) = f.get_mut(uid) {
+            e.1 = now();
+        }
+    } else {
+        f.remove(uid);
+    }
+}
+
+/// A failed rotation: recorded, and Owner is alerted from the second
+/// consecutive failure on (the policy backs off exponentially meanwhile).
+fn fail(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, outcome: String) {
+    finish(uid, "failed", outcome.clone());
+    let count = failures().lock().unwrap_or_else(|p| p.into_inner()).get(uid).map_or(0, |e| e.0);
+    if count >= 2 {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let message = format!(
+            "Transcript rotation of this session failed {count} times in a row (latest: {outcome}). \
+             CM backs off and retries later; Alt+T retries now."
+        );
+        if let Err(e) = crate::owner_attention::raise_system(&state, uid, &message) {
+            eprintln!("cm-daemon: rotation alert for {uid}: {e}");
+        }
+    }
+}
+
+/// Consecutive failed rotations per session: (count, last failure at).
+fn failures() -> &'static Mutex<HashMap<String, (u32, f64)>> {
+    static F: std::sync::OnceLock<Mutex<HashMap<String, (u32, f64)>>> = std::sync::OnceLock::new();
+    F.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn last_finished() -> &'static Mutex<Option<Instant>> {
+    static L: std::sync::OnceLock<Mutex<Option<Instant>>> = std::sync::OnceLock::new();
+    L.get_or_init(|| Mutex::new(None))
+}
+
+fn pause_left() -> Option<Duration> {
+    let at = (*last_finished().lock().unwrap_or_else(|p| p.into_inner()))?;
+    PAUSE_BETWEEN.checked_sub(at.elapsed()).filter(|d| !d.is_zero())
+}
+
+/// The session being rotated now, if any (one at a time per host).
+fn running_any() -> Option<String> {
+    registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|(_, r)| r.finished_at.is_none())
+        .map(|(uid, _)| uid.clone())
+}
+
+// ---- in-flight markers (a brain restart mid-rotation) ------------------------
+
+fn inflight_path(state: &DaemonState) -> Option<PathBuf> {
+    state.daemon_sessions_path.as_ref().map(|p| p.with_file_name("rotations-inflight.json"))
+}
+
+fn inflight_read(path: &Path) -> serde_json::Map<String, Value> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn inflight_put(state: &DaemonState, uid: &str, snap: &Snapshot) -> std::io::Result<()> {
+    let Some(path) = inflight_path(state) else { return Ok(()) };
+    let mut all = inflight_read(&path);
+    all.insert(
+        uid.to_string(),
+        json!({
+            "workspace_id": snap.workspace_id,
+            "worktree": snap.worktree,
+            "from_id": snap.from_id,
+            "entry": snap.entry,
+            "at": now(),
+        }),
+    );
+    crate::state::write_json_atomic(&path, &Value::Object(all).to_string(), true)
+}
+
+fn inflight_remove(state: &DaemonState, uid: &str) {
+    let Some(path) = inflight_path(state) else { return };
+    let mut all = inflight_read(&path);
+    if all.remove(uid).is_some() {
+        let _ = if all.is_empty() {
+            std::fs::remove_file(&path)
+        } else {
+            crate::state::write_json_atomic(&path, &Value::Object(all).to_string(), true)
+        };
+    }
+}
+
+/// At brain start: a rotation the previous brain left between stopping a
+/// session and confirming its fork. A session that is not live is resumed
+/// on its original transcript and told so; a live one (the fork came up) is
+/// left as it is. Returns how many were resumed.
+pub fn recover_inflight(state_arc: &Arc<Mutex<DaemonState>>) -> usize {
+    let (path, all) = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(path) = inflight_path(&state) else { return 0 };
+        let all = inflight_read(&path);
+        (path, all)
+    };
+    let mut resumed = 0;
+    for (uid, v) in &all {
+        if state_arc.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid) {
+            eprintln!("cm-daemon: rotation of {uid} was interrupted by a restart; the session is live, leaving it");
+            continue;
+        }
+        let entry: Option<crate::manifest::ManifestEntry> = serde_json::from_value(v["entry"].clone()).ok();
+        let (Some(entry), Some(ws), Some(wt)) = (entry, v["workspace_id"].as_str(), v["worktree"].as_str()) else {
+            eprintln!("cm-daemon: rotation marker for {uid} is unreadable; dropped");
+            continue;
+        };
+        match crate::control::methods::restore_one_session_launch(state_arc, ws, Path::new(wt), &entry, None, false) {
+            Ok(_) => {
+                resumed += 1;
+                deliver(state_arc, uid, fallback_notice("a daemon restart interrupted it"));
+                eprintln!("cm-daemon: rotation of {uid} was interrupted by a restart; resumed its original transcript");
+            }
+            Err((_, e)) => eprintln!("cm-daemon: rotation of {uid} was interrupted; resuming it failed: {e}"),
+        }
+    }
+    if !all.is_empty() {
+        let _ = std::fs::remove_file(&path);
+    }
+    resumed
 }
 
 fn run(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: Snapshot) {
@@ -345,7 +536,7 @@ fn run(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: Snapshot) {
     //    `transcript-rotation`: the uid comes straight back.
     crate::control::methods::kill_with_attribution(state_arc, uid, ROTATION_KILLER);
     if !wait_gone(state_arc, uid) {
-        finish(uid, "failed", "the session did not stop; left as it was".into());
+        fail(state_arc, uid, "the session did not stop; left as it was".into());
         return;
     }
     // 2. Fork at the same uid.
@@ -383,7 +574,7 @@ fn run(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: Snapshot) {
         return;
     }
     update(uid, |r| r.phase = "verifying");
-    let deadline = Instant::now() + VERIFY_DEADLINE;
+    let deadline = Instant::now() + verify_deadline(snap.from_bytes);
     while Instant::now() < deadline {
         if let Some(bytes) = fork_written(&to_path) {
             update(uid, |r| r.to_bytes = Some(bytes));
@@ -423,7 +614,7 @@ fn resume_old(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: &Snapshot, w
     if live {
         crate::control::methods::kill_with_attribution(state_arc, uid, ROTATION_KILLER);
         if !wait_gone(state_arc, uid) {
-            finish(uid, "failed", format!("{why}; the forked process did not stop either"));
+            fail(state_arc, uid, format!("{why}; the forked process did not stop either"));
             return;
         }
     }
@@ -438,9 +629,9 @@ fn resume_old(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: &Snapshot, w
         Ok(_) => {
             deliver(state_arc, uid, fallback_notice(why));
             update(uid, |r| r.path = "fallback-resume");
-            finish(uid, "failed", format!("{why}; resumed the original transcript {}", snap.from_id));
+            fail(state_arc, uid, format!("{why}; resumed the original transcript {}", snap.from_id));
         }
-        Err((_, e)) => finish(uid, "failed", format!("{why}; resuming the original also failed: {e}")),
+        Err((_, e)) => fail(state_arc, uid, format!("{why}; resuming the original also failed: {e}")),
     }
 }
 
@@ -551,10 +742,16 @@ pub fn request(state: &DaemonState, uid: &str, reason: &str) -> Result<Value, (E
 /// After a failed rotation the policy leaves the session alone this long.
 const FAILURE_BACKOFF_SECS: f64 = 6.0 * 3600.0;
 
+/// Whether the policy should still leave `uid` alone after failures: 6 h
+/// after the first, doubling with each consecutive one, at most a week.
 fn recently_failed(uid: &str) -> bool {
-    registry().lock().unwrap_or_else(|p| p.into_inner()).get(uid).is_some_and(|r| {
-        r.phase == "failed" && r.finished_at.is_some_and(|at| now() - at < FAILURE_BACKOFF_SECS)
+    failures().lock().unwrap_or_else(|p| p.into_inner()).get(uid).is_some_and(|&(count, at)| {
+        now() - at < backoff_secs(count)
     })
+}
+
+fn backoff_secs(failures: u32) -> f64 {
+    (FAILURE_BACKOFF_SECS * 2f64.powi(failures.saturating_sub(1).min(16) as i32)).min(7.0 * 86400.0)
 }
 
 /// One policy pass: notice, then rotate at a safe boundary.
@@ -588,12 +785,27 @@ pub fn tick(state_arc: &Arc<Mutex<DaemonState>>) {
             Err((_, refusal)) => eprintln!("cm-daemon: requested rotation of {uid} deferred: {refusal}"),
         }
     }
-    for (uid, path) in candidates {
+    // Sizes first (a stat each); compactions are counted only for files big
+    // enough to matter, off a low-priority thread (the first pass after a
+    // brain start reads them from the beginning).
+    let sized: Vec<(String, PathBuf, u64)> = candidates
+        .into_iter()
+        .map(|(uid, path)| {
+            let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            (uid, path, bytes)
+        })
+        .collect();
+    let scan: Vec<PathBuf> = sized
+        .iter()
+        .filter(|(_, _, bytes)| cfg.max_compactions > 0 && *bytes >= compaction_scan_floor(&cfg))
+        .map(|(_, p, _)| p.clone())
+        .collect();
+    let counted = count_compactions_quietly(scan);
+    for (uid, path, bytes) in sized {
         if requests().lock().unwrap_or_else(|p| p.into_inner()).contains_key(&uid) {
             continue;
         }
-        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        let why = over_threshold(&cfg, bytes, compactions(&path));
+        let why = over_threshold(&cfg, bytes, counted.get(&path).copied().unwrap_or(0));
         let Some(why) = why else { continue };
         if recently_failed(&uid) {
             continue;
@@ -623,11 +835,58 @@ pub fn tick(state_arc: &Arc<Mutex<DaemonState>>) {
             continue; // rotate on a later pass, after the notice settles
         }
         match start(state_arc, &uid, &why, Origin::Policy, false) {
-            Ok(_) => eprintln!("cm-daemon: rotating {uid}: {why}"),
+            Ok(_) => {
+                eprintln!("cm-daemon: rotating {uid}: {why}");
+                return; // one per pass; the next waits for it and a pause
+            }
             Err((_, refusal)) => {
                 eprintln!("cm-daemon: rotation of {uid} deferred: {refusal}")
             }
         }
+    }
+}
+
+/// Files smaller than this are not scanned for compactions: a quarter of
+/// the size threshold (a session that compacts that often grows fast).
+fn compaction_scan_floor(cfg: &crate::config::TranscriptRotationConfig) -> u64 {
+    if cfg.max_bytes == 0 {
+        0
+    } else {
+        cfg.max_bytes / 4
+    }
+}
+
+/// [`compactions`] for each path, on a short-lived thread at the lowest CPU
+/// and idle I/O priority. (Niceness is per thread and inherited, so the
+/// policy thread itself, whose rotation workers respawn sessions, keeps its
+/// own.)
+fn count_compactions_quietly(paths: Vec<PathBuf>) -> HashMap<PathBuf, u64> {
+    if paths.is_empty() {
+        return HashMap::new();
+    }
+    std::thread::Builder::new()
+        .name("cm-rotation-scan".into())
+        .spawn(move || {
+            lower_priority();
+            paths.into_iter().map(|p| {
+                let n = compactions(&p);
+                (p, n)
+            }).collect()
+        })
+        .ok()
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default()
+}
+
+/// nice 19 and the idle I/O class, for the calling thread only.
+fn lower_priority() {
+    // SAFETY: plain syscalls on the calling thread's own id.
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+        libc::setpriority(libc::PRIO_PROCESS, tid, 19);
+        const IOPRIO_WHO_PROCESS: libc::c_int = 1;
+        const IOPRIO_CLASS_IDLE: libc::c_int = 3;
+        libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, tid as libc::c_int, IOPRIO_CLASS_IDLE << 13);
     }
 }
 
@@ -648,11 +907,56 @@ mod tests {
     #[test]
     fn thresholds_name_the_reason() {
         let cfg = crate::config::TranscriptRotationConfig::default();
-        assert!(over_threshold(&cfg, 299_000_000, 10).is_none());
-        assert!(over_threshold(&cfg, 300_000_000, 0).unwrap().contains("300 MB"));
+        assert!(over_threshold(&cfg, 799_000_000, 10_000).is_none(), "the first release counts no compactions");
+        assert!(over_threshold(&cfg, 800_000_000, 0).unwrap().contains("800 MB"));
+        let cfg = crate::config::TranscriptRotationConfig { max_compactions: 200, ..cfg };
         assert!(over_threshold(&cfg, 1_000, 200).unwrap().contains("200 compactions"));
+        assert_eq!(compaction_scan_floor(&cfg), 200_000_000);
         let off = crate::config::TranscriptRotationConfig { max_bytes: 0, max_compactions: 0, ..cfg };
         assert!(over_threshold(&off, u64::MAX, u64::MAX).is_none());
+    }
+
+    #[test]
+    fn deadlines_and_backoff_scale() {
+        assert_eq!(verify_deadline(9_000_000), Duration::from_secs(180));
+        assert_eq!(verify_deadline(1_700_000_000), Duration::from_secs(240));
+        assert_eq!(verify_deadline(u64::MAX), Duration::from_secs(1200));
+        assert_eq!(backoff_secs(1), 6.0 * 3600.0);
+        assert_eq!(backoff_secs(3), 24.0 * 3600.0);
+        assert_eq!(backoff_secs(30), 7.0 * 86400.0);
+    }
+
+    #[test]
+    fn failures_count_until_a_success() {
+        finish("ts-fail-x", "failed", "a".into());
+        finish("ts-fail-x", "failed", "b".into());
+        assert_eq!(failures().lock().unwrap().get("ts-fail-x").map(|e| e.0), Some(2));
+        assert!(recently_failed("ts-fail-x"));
+        finish("ts-fail-x", "done", "ok".into());
+        assert!(!recently_failed("ts-fail-x"));
+    }
+
+    #[test]
+    fn an_interrupted_rotation_marker_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::new();
+        state.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
+        let entry: crate::manifest::ManifestEntry =
+            serde_json::from_value(json!({"uid": "ts-m-0", "label": "m", "session_type": "claude-code",
+                                          "transcript_id": "old"})).unwrap();
+        let snap = Snapshot {
+            entry,
+            workspace_id: "ws".into(),
+            worktree: dir.path().to_path_buf(),
+            from_path: dir.path().join("old.jsonl"),
+            from_id: "old".into(),
+            from_bytes: 1,
+        };
+        inflight_put(&state, "ts-m-0", &snap).unwrap();
+        let all = inflight_read(&inflight_path(&state).unwrap());
+        assert_eq!(all["ts-m-0"]["entry"]["transcript_id"], "old");
+        inflight_remove(&state, "ts-m-0");
+        assert!(!inflight_path(&state).unwrap().exists(), "the last marker removes the file");
     }
 
     #[test]

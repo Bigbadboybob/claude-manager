@@ -349,6 +349,8 @@ pub enum ConfirmAction {
     /// tombstoned sessions. Y respawns one session per tombstone (claude
     /// /codex resume via `--resume`, bash starts fresh in the worktree).
     RestoreTombstones { ws_id: String },
+    /// Alt+T (#24): move this session's conversation to a fresh transcript.
+    RotateTranscript { uid: String },
 }
 
 /// Per-role slot in the launch modal. The user cycles through `options` with
@@ -481,6 +483,8 @@ pub(crate) enum InputOutcome {
 pub(crate) enum SubmitAction {
     /// A-F form submitted; the form itself rides in the replaced input mode.
     ForkSession,
+    /// Alt+T confirmed: rotate `uid`'s transcript now.
+    RotateTranscript { uid: String },
     /// Submit attempted but the inputs produced no work to do (e.g.
     /// empty workspace name, no workflow selected). Modal still closes.
     None,
@@ -2465,6 +2469,7 @@ pub(crate) fn handle_confirm(
                 ConfirmAction::RestoreTombstones { ws_id } => {
                     SubmitAction::RestoreTombstones { ws_id }
                 }
+                ConfirmAction::RotateTranscript { uid } => SubmitAction::RotateTranscript { uid },
             };
             InputOutcome::Submit(submit)
         }
@@ -4764,6 +4769,7 @@ impl App {
             SubmitAction::RestoreTombstones { ws_id } => {
                 self.restore_tombstones_for_workspace(&ws_id);
             }
+            SubmitAction::RotateTranscript { uid } => self.rotate_session(&uid),
             SubmitAction::PaletteJump { target } => {
                 self.apply_palette_jump(target);
             }

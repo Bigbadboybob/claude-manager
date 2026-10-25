@@ -131,6 +131,10 @@ pub struct AttachStreamHandle {
     /// emission to encode `{exit_code, memory_cap_kill}` into the
     /// payload.
     pub last_exit: SharedLastExit,
+    /// The session's pending kill attribution (`killed_by`), so the End
+    /// frame can say who stopped it (#24: a rotation or handoff stop is a
+    /// restart the viewer keeps the slot for).
+    pub kill_attribution: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// Echoed back on every outbound `StreamFrame`. Matches the
     /// `attach.open` request id so the client can demux.
     pub request_id: String,
@@ -2945,7 +2949,7 @@ fn bind_attach_stream_with(
     // session.attach already minted a ticket for a uid that has
     // since exited — surface as Conflict so the client knows the
     // attach can't proceed.
-    let (fanout_rx, last_exit, replay_bytes, offset, ring) = match state.sessions.get_mut(&session_uid) {
+    let (fanout_rx, (last_exit, kill_attribution), replay_bytes, offset, ring) = match state.sessions.get_mut(&session_uid) {
         Some(session) => {
             // Apply the client's terminal size server-side, in the
             // same locked critical section that binds the stream.
@@ -2977,7 +2981,7 @@ fn bind_attach_stream_with(
             } else {
                 None
             };
-            (a.rx, session.last_exit.clone(), a.replay_len, (a.offset, a.stream_id, kind), a.screen_ring)
+            (a.rx, (session.last_exit.clone(), session.kill_attribution_cell()), a.replay_len, (a.offset, a.stream_id, kind), a.screen_ring)
         }
         None => {
             return (DispatchOutcome::Done(Response::err(
@@ -3011,6 +3015,7 @@ fn bind_attach_stream_with(
         session_uid,
         fanout_rx,
         last_exit,
+        kill_attribution,
         request_id: req.id.clone(),
         binary: false,
     };

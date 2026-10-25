@@ -406,7 +406,7 @@ pub(crate) fn badge(v: &AgentStateView, now: f64) -> Option<Badge> {
 
 /// Transcript size from which a row is badged (the daemon's default
 /// `[transcript_rotation] max_bytes`).
-pub(crate) const HEAVY_TRANSCRIPT_BYTES: u64 = 300 * 1000 * 1000;
+pub(crate) const HEAVY_TRANSCRIPT_BYTES: u64 = 800 * 1000 * 1000;
 
 /// `1.7G` / `420M`.
 pub(crate) fn short_size(bytes: u64) -> String {
@@ -495,7 +495,7 @@ mod tests {
         assert!(heavy_badge(HEAVY_TRANSCRIPT_BYTES - 1).is_none());
         let b = heavy_badge(1_670_000_000).expect("over the threshold");
         assert_eq!((b.kind, b.short.as_str()), (symbols::Doing::Heavy, "1.7G"));
-        assert!(b.full.contains("300M"), "{}", b.full);
+        assert!(b.full.contains("800M"), "{}", b.full);
         assert_eq!(short_size(420_000_000), "420M");
     }
 

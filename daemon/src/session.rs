@@ -3528,6 +3528,11 @@ impl DaemonSession {
     /// holder mode (monolith kills stay pidfd-direct and the
     /// attribution rides `DaemonState::record_kill_request` as
     /// always).
+    /// The shared attribution cell (read by an attach stream's End frame).
+    pub fn kill_attribution_cell(&self) -> Arc<Mutex<Option<String>>> {
+        Arc::clone(&self.kill_attribution)
+    }
+
     pub fn set_kill_attribution(&self, who: &str) {
         *self
             .kill_attribution
