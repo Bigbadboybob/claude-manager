@@ -121,6 +121,14 @@ everyone who holds what, with each holder's live state, so nobody has to ask.
   board, by anyone holding an item there, by `global_perms` sessions and by
   Owner; every session can read every board. History is kept, so give a short
   `reason` for drops and handoffs.
+- A planning task goes on a board with `place(task, group=..., holder=...)`:
+  the item then owns status, holders and group, the task keeps title,
+  description and metadata, and the task's status follows the item.
+  `unplace(task)` sends it back to the backlog. A held item that is active,
+  waiting or blocked has one owner: `item_set(n, owner="name")` transfers it,
+  `add_holder=` takes `role=` (contributor, reviewer, approver). Groups are
+  headings or epics; an epic has a goal, a PoC who leads its team, and a close
+  plan (`epic(action="close", ...)`) that settles its open items and team.
 - When you call `report_done`, it lists items you still hold: close them or
   hand them back.
 
