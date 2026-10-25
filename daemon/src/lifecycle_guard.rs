@@ -13,6 +13,9 @@
 //!   `home`, `stream` or pinned workspace. Ephemeral and unclassified
 //!   workspaces keep today's teardown.
 //!
+//! Members' assistants (O5) get the same protection as main sessions; see
+//! [`crate::assistants`] (`assistant_guard_v1`).
+//!
 //! The API turns central status mirroring on for a task only when every
 //! daemon holding its sessions advertises the capability, so a host without
 //! this guard never sees a mirrored `done` for a task it holds sessions of.

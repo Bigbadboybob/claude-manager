@@ -852,10 +852,19 @@ pub(crate) fn start_session_with_spawn_fn(
     // object even when the caller doesn't send one (TUI startup restore and
     // local A-R go through `rpc_start_session_full`, and older TUIs never
     // know the field).
-    spawn_params.org = p.org.clone().or_else(|| {
-        let st = state_arc.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        persisted_org(&st, &session_uid)
-    });
+    spawn_params.org = {
+        let mut st = state_arc.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut org = p.org.clone().or_else(|| persisted_org(&st, &session_uid));
+        // O5: an agent spawned by a member's session (main or assistant)
+        // is that member's assistant, and a checkout minted for it is a
+        // `stream` of the member's office, not `ephemeral`.
+        if crate::assistants::stamp_spawn(&st, &session_uid, p.managed_by_uid.as_deref(), &mut org) {
+            if let Some(member) = crate::assistants::stamped_member(org.as_ref()) {
+                crate::assistants::claim_workspace(&mut st, &p.workspace_id, &member);
+            }
+        }
+        org
+    };
     spawn_params.model_source = model.as_ref().and(
         p.model_source
             .as_deref()
@@ -2673,6 +2682,9 @@ pub fn list_sessions(
             "reported_done_at": report.as_ref().map(|r| r.at_unix),
             "report_reason": report.as_ref().and_then(|r| r.reason.clone()),
             "managed_by_uid": session.managed_by_uid,
+            // O5: whom the session works for, `{member_id, acting_as}`
+            // (`main` by the member cache, `assistant` by its stamp) or null.
+            "member": crate::assistants::wire(uid, session.org.as_ref()),
             // Global-permissions grant — surfaced so an agent (and
             // the grouped MCP view) can tell which sessions are
             // privileged orchestrators.
@@ -2834,6 +2846,7 @@ pub fn list_sessions(
                 "pty_idle": true,
                 "agent_state": {"state": "exited"},
                 "managed_by_uid": tomb.managed_by_uid,
+                "member": crate::assistants::wire(uid, tomb.org.as_ref()),
                 "workspace_id": tomb.workspace_id,
                 "task_id": tomb.task_id,
                 "continuous_task_id": tomb.continuous_task_id,
@@ -19319,7 +19332,7 @@ pub fn org(
             )),
             other => Err((
                 ErrorCode::InvalidParams,
-                format!("org: unknown action '{}' (expected set_lead, clear_lead, move, retire, reinstate or adopt)", other),
+                format!("org: unknown action '{}' (expected set_lead, clear_lead, move, retire, reinstate, close_assistant or adopt)", other),
             )),
         };
     }
@@ -20167,7 +20180,9 @@ pub(crate) fn sweep_terminal_task_sessions(
         .iter()
         .filter(|(uid, s)| {
             s.task_id.as_deref() == Some(task_id)
-                && !crate::lifecycle_guard::is_member_main(s)
+                // Members' main sessions and their assistants are only
+                // unassigned (lifecycle_guard_v1, assistant_guard_v1).
+                && !crate::assistants::is_member_session(s)
                 && (!via_item
                     || crate::lifecycle_guard::sweepable_after_item_close(
                         state.workspaces.get(&s.workspace_id),
@@ -20203,14 +20218,15 @@ pub(crate) fn sweep_terminal_task_sessions(
 }
 
 /// fast the children die.
-fn sweep_task_sessions(state_arc: &Arc<Mutex<DaemonState>>, task_id: &str, killer: &str) {
+pub(crate) fn sweep_task_sessions(state_arc: &Arc<Mutex<DaemonState>>, task_id: &str, killer: &str) {
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     let targets: Vec<String> = state
         .sessions
         .iter()
-        // A member's main session is only unassigned (lifecycle_guard_v1).
+        // A member's main session or assistant is only unassigned
+        // (lifecycle_guard_v1, assistant_guard_v1).
         .filter(|(_, s)| {
-            s.task_id.as_deref() == Some(task_id) && !crate::lifecycle_guard::is_member_main(s)
+            s.task_id.as_deref() == Some(task_id) && !crate::assistants::is_member_session(s)
         })
         .map(|(uid, _)| uid.clone())
         .collect();
@@ -20332,18 +20348,12 @@ fn teardown_subtask_done(
     // pinned workspace is never removed: finishing work only unassigns
     // (lifecycle_guard_v1, doc/org-model.md §7.1).
     let mut worktree_removed = false;
-    // A member's main session the sweep spared may live in this worktree:
-    // removing it would pull the floor from under the member (review of
-    // 6522623), so it is kept as "member".
+    // A member's main session or assistant the sweep spared may live in
+    // this worktree: removing it would pull the floor from under it (review
+    // of 6522623, O5), so it is kept as "member" / "assistant".
     let workspace_kept: Option<&'static str> = cleanup.as_ref().and_then(|(ws_id, _, _)| {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-        state.workspaces.get(ws_id).and_then(crate::lifecycle_guard::protected_workspace).or_else(|| {
-            state
-                .sessions
-                .values()
-                .any(|s| &s.workspace_id == ws_id && crate::lifecycle_guard::is_member_main(s))
-                .then_some("member")
-        })
+        crate::assistants::workspace_kept(&state, ws_id)
     });
     if p.close_worktree && was_branch_mode && workspace_kept.is_none() {
         let (ws_id, wt_opt, mr_opt) = cleanup.ok_or((

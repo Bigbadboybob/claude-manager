@@ -823,9 +823,21 @@ fn board_header(header: &Value) -> Value {
     })
 }
 
+/// Session names, `rev1 (for ep)` for a member's assistant (O5).
 fn names(rows: &Value) -> Vec<Value> {
     rows.as_array()
-        .map(|v| v.iter().map(|s| s["name"].as_str().map(|n| json!(n)).unwrap_or_else(|| s["pid"].clone())).collect())
+        .map(|v| {
+            v.iter()
+                .map(|s| {
+                    let name = s["name"].as_str().map(str::to_string)
+                        .unwrap_or_else(|| s["pid"].as_str().unwrap_or("?").to_string());
+                    match s["assistant_of"].as_str() {
+                        Some(member) => json!(format!("{name} (for {member})")),
+                        None => json!(name),
+                    }
+                })
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -1238,7 +1250,8 @@ mod tests {
                  "blocked_by":[14],"blocked_on":null,"flags":[],"note":null}
             ],
             "recently_closed": [{"n":9,"status":"done","title":"x","closed_at":"2026-10-06T10:00:00Z","note":"abc123","holders":[]}],
-            "free_capacity": [{"pid":"agent:d1:f","name":"idle-lane","state":"idle"}],
+            "free_capacity": [{"pid":"agent:d1:f","name":"idle-lane","state":"idle"},
+                              {"pid":"agent:d1:r","name":"rev1","state":"idle","assistant_of":"ep"}],
             "untracked": [{"pid":"agent:d1:u","name":"busy-lane","state":"working"}],
             "launch": {"unlaunched": [{"n":15,"title":"bench","since":"2026-10-06T12:02:00Z"}], "free": ["idle-lane"]}
         })
@@ -1256,7 +1269,7 @@ mod tests {
             "#15 blocked \"bench\" (no holder) ⊸#14",
         ]));
         assert_eq!(out["recently_closed"], json!(["#9 done \"x\" 2h20m ago · abc123"]));
-        assert_eq!(out["free_capacity"], json!(["idle-lane"]));
+        assert_eq!(out["free_capacity"], json!(["idle-lane", "rev1 (for ep)"]));
         assert_eq!(out["untracked"], json!(["busy-lane"]));
         assert_eq!(out["launch"], "1 unlaunched (#15 18m) · free: idle-lane");
     }

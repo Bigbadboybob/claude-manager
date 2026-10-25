@@ -29,6 +29,7 @@ pub const METHODS: &[&str] = &[
     "org.move",
     "org.retire",
     "org.reinstate",
+    "org.close_assistant",
 ];
 
 /// The read-only ones (restart-barrier classification).
@@ -45,7 +46,7 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
                 }
                 api(ctx.api.get("/org/snapshot", &query))
             }
-            "org.member" => member(&ctx, &p),
+            "org.member" => member(state, &ctx, &p),
             "org.team" => {
                 let team = str_param(&p, "team")?.ok_or_else(|| bad("org.team needs team"))?;
                 api(ctx.api.get(&format!("/org/teams/{}", encode(&team)), &[]))
@@ -74,6 +75,7 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
                 let member = take_str(&mut p, "member")?.ok_or_else(|| bad(format!("{} needs member", req.method)))?;
                 api(ctx.api.post(&format!("/org/members/{}/{verb}", encode(&member)), &with_actor(&ctx, p)))
             }
+            "org.close_assistant" => close_assistant(state, &ctx, p),
             other => Err((ErrorCode::UnknownMethod, format!("unknown org method {other}"))),
         }
     });
@@ -148,7 +150,7 @@ fn encode(segment: &str) -> String {
     out
 }
 
-fn member(ctx: &Ctx, p: &Map<String, Value>) -> RpcResult {
+fn member(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, p: &Map<String, Value>) -> RpcResult {
     if let Some(reference) = str_param(p, "member")? {
         return api(ctx.api.get(&format!("/org/members/{}", encode(&reference)), &[]));
     }
@@ -158,7 +160,96 @@ fn member(ctx: &Ctx, p: &Map<String, Value>) -> RpcResult {
         (None, None) if !ctx.owner => ctx.pid.clone(),
         (None, None) => return api(ctx.api.get("/org/members/owner", &[])),
     };
+    // An assistant of a member on this daemon (O5) is known here, from its
+    // stamp; a member's main session (the cache) still asks the API.
+    let local = pid.strip_prefix(&format!("agent:{}:", ctx.daemon_id)).and_then(|uid| {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        let org = s.sessions.get(uid).map(|sess| sess.org.clone())
+            .unwrap_or_else(|| crate::control::methods::persisted_org(&s, uid));
+        match crate::assistants::membership(uid, org.as_ref()) {
+            Some(m) if m.acting_as == crate::assistants::ASSISTANT => Some(json!({
+                "pid": pid, "acting_as": "assistant", "member": {"id": m.member_id},
+                "member_via": org.as_ref().and_then(|o| o.get(crate::assistants::MEMBER_VIA)).cloned(),
+            })),
+            _ => None,
+        }
+    });
+    if let Some(answer) = local {
+        return Ok(answer);
+    }
     api(ctx.api.get("/org/members/by-pid", &[("pid", pid)]))
+}
+
+/// `org.close_assistant` (doc/org-model.md §4.3, O5): deliberately close
+/// one of a member's assistants on this daemon. The planning API decides
+/// authority (Owner, the member's main session, or a member up its manager
+/// chain; the same check as `move`) and hands the assistant's board holds
+/// back to the member's main session. Then the session is closed with that
+/// attribution, and a `stream` checkout it was minted for goes back to
+/// `ephemeral`, so the reaper's normal protections decide when it goes.
+/// Against a planning API without the route, only Owner or the member's
+/// main session may close it, and holds stay where they are.
+fn close_assistant(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, mut p: Map<String, Value>) -> RpcResult {
+    let uid = take_str(&mut p, "session_uid")?.ok_or_else(|| bad("org.close_assistant needs session_uid"))?;
+    let reason = take_str(&mut p, "reason")?.unwrap_or_else(|| "closed by its member".into());
+    let (member_id, ws_id) = {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(sess) = s.sessions.get(&uid) else {
+            return Err((ErrorCode::NotFound, format!("not_found: no live session '{uid}' on this daemon")));
+        };
+        match crate::assistants::of_session(sess) {
+            Some(m) if m.acting_as == crate::assistants::ASSISTANT => (m.member_id, sess.workspace_id.clone()),
+            Some(_) => {
+                return Err((ErrorCode::Conflict, format!(
+                    "not_an_assistant: '{uid}' is a member's main session; replace or retire the member instead")));
+            }
+            None => {
+                return Err((ErrorCode::Conflict, format!(
+                    "not_an_assistant: '{uid}' belongs to no member; close it with kill_session")));
+            }
+        }
+    };
+    let pid = format!("agent:{}:{uid}", ctx.daemon_id);
+    let mut body = Map::new();
+    body.insert("pid".into(), json!(pid));
+    body.insert("member_id".into(), json!(member_id));
+    body.insert("reason".into(), json!(reason));
+    if let Some(id) = p.get("request_id").cloned() {
+        body.insert("request_id".into(), id);
+    }
+    let central = match api(ctx.api.post("/org/assistants/close", &with_actor(ctx, body))) {
+        Ok(v) => v,
+        Err((ErrorCode::UnknownMethod, _)) => {
+            let own_main = ctx.uid.as_deref().and_then(crate::assistants::main_member);
+            if !ctx.owner && own_main.as_deref() != Some(member_id.as_str()) {
+                return Err((ErrorCode::Unauthorized, "not_manager: the planning API cannot check the \
+                    manager chain yet; only Owner or the member's main session may close its assistant".into()));
+            }
+            json!({"holds": {"handed_back": [], "kept": "planning API predates close_assistant"}})
+        }
+        Err(e) => return Err(e),
+    };
+    let attribution = format!("{} (close_assistant)", if ctx.owner { "operator" } else { ctx.uid.as_deref().unwrap_or("?") });
+    let released = {
+        let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(sess) = s.sessions.get_mut(&uid) {
+            // The tombstone keeps who it worked for, marked closed, so the
+            // reaper stops protecting its checkout.
+            cm_holder_proto::org::set(&mut sess.org, crate::assistants::CLOSED_AT,
+                                      json!(chrono::Utc::now().to_rfc3339()));
+            sess.last_exit.mark_operator_kill_requested();
+            sess.set_kill_attribution(&attribution);
+            let _ = sess.kill();
+        }
+        s.record_kill_request(&uid, &attribution, crate::agent_state::unix_now());
+        let released = crate::assistants::release_workspace(&mut s, &ws_id, &uid);
+        s.persist_sessions_best_effort();
+        released
+    };
+    Ok(json!({
+        "closed": uid, "member_id": member_id, "killed_by": attribution,
+        "holds": central["holds"], "workspace_released": released,
+    }))
 }
 
 /// `org.adopt`: Owner binds a live session to a new member. The TUI may
@@ -244,6 +335,13 @@ pub(crate) fn session_facts(state: &DaemonState, sess: &DaemonSession, now: f64)
     facts.insert("continuous_task_id".into(), json!(sess.continuous_task_id));
     facts.insert("managed_by_uid".into(), json!(sess.managed_by_uid));
     facts.insert("workflow_run_id".into(), json!(sess.workflow_run_id));
+    // O5: an assistant's member (the API learns mains from incarnations).
+    if let Some(member) = crate::assistants::stamped_member(sess.org.as_ref()) {
+        if crate::assistants::main_member(&sess.uid).is_none() {
+            facts.insert("member_id".into(), json!(member));
+            facts.insert("acting_as".into(), json!(crate::assistants::ASSISTANT));
+        }
+    }
     if let Some(age) = spawned_age_s(&sess.uid, now) {
         facts.insert("spawned_age_s".into(), json!(age));
     }
@@ -374,6 +472,13 @@ pub(crate) fn apply_marks(state: &mut DaemonState, reply: &Value) -> Vec<i64> {
 /// The workspace org-object key naming the member whose home it is.
 pub const OFFICE_OF: &str = "office_of";
 
+/// Whether the member cache has heard from an API that serves members (a
+/// beat, or the persisted cache at brain start). The assistant backfill
+/// waits for it, so a brain that has seen no beat stamps nothing.
+pub fn cache_loaded() -> bool {
+    cache().lock().unwrap_or_else(|p| p.into_inner()).at.is_some()
+}
+
 /// The member a session on this daemon works as, from the last heartbeat
 /// (at most ~30 s old). Never blocks on the network: `ping` reads it.
 pub fn cached_member(uid: &str) -> Value {
@@ -444,6 +549,8 @@ pub(crate) fn test_stub(
 mod tests {
     #[test]
     fn the_member_cache_survives_a_brain_restart() {
+        // The cache is process-global: every test that writes it holds the lock.
+        let _env = crate::test_support::env_lock();
         let root = tempfile::tempdir().unwrap();
         absorb_reply(&json!({"org": {"members": {"persist-uid": {"id": "mem_p", "acting_as": "main"}}}}),
                      1_700_000_000.0);

@@ -110,6 +110,11 @@ class WorkspaceFacts:
     task_ids: set[str] = dataclasses.field(default_factory=set)
     pinned: bool = False
     continuous: bool = False
+    # doc/org-model.md §5, O5: a member's `home`/`stream` workspace, or a
+    # checkout a member's assistant worked in and was never deliberately
+    # closed from, is durable.
+    durable_kind: str | None = None
+    assistant: bool = False
     open_workspace: bool = False
     manifest_activity: list[float] = dataclasses.field(default_factory=list)
 
@@ -319,6 +324,16 @@ def parse_timestamp(value: Any) -> float | None:
     return parsed.timestamp()
 
 
+DURABLE_KINDS = ("home", "stream")
+
+
+def is_open_assistant(org: Any) -> bool:
+    """A record of a member's assistant (O5) that was not deliberately
+    closed (`assistant_closed_at`): its checkout stays."""
+    return (isinstance(org, dict) and org.get("acting_as") == "assistant"
+            and bool(org.get("member_id")) and not org.get("assistant_closed_at"))
+
+
 def iter_manifest_workspaces(data: dict[str, Any]) -> Iterable[dict[str, Any]]:
     raw = data.get("workspaces") or {}
     if isinstance(raw, dict):
@@ -351,6 +366,10 @@ def load_workspace_facts(manifest_paths: Iterable[Path]) -> dict[Path, Workspace
                 current.workspace_ids.add(workspace_id)
                 current.task_ids.update(by_workspace.get(workspace_id, set()))
             current.pinned = current.pinned or bool(workspace.get("pinned"))
+            org = workspace.get("org")
+            kind = org.get("workspace_kind") if isinstance(org, dict) else None
+            if kind in DURABLE_KINDS:
+                current.durable_kind = current.durable_kind or kind
             current.open_workspace = current.open_workspace or not bool(workspace.get("is_closed"))
             for record in list(workspace.get("sessions") or []) + list(workspace.get("tombstones") or []):
                 if not isinstance(record, dict):
@@ -359,6 +378,7 @@ def load_workspace_facts(manifest_paths: Iterable[Path]) -> dict[Path, Workspace
                 if isinstance(task_id, str):
                     current.task_ids.add(task_id)
                 current.continuous = current.continuous or bool(record.get("continuous_task_id"))
+                current.assistant = current.assistant or is_open_assistant(record.get("org"))
                 # Closure/report timestamps are bookkeeping and are often bulk-updated.
                 # Only timestamps tied to the checkout's actual use belong in its clock.
                 for key in ("created_at", "last_input_at"):
@@ -1096,7 +1116,9 @@ def decision(
             return Decision(path, "protect", "cleanup_scope_changed", False, details=(str(exc),))
     if extra:
         workspace = dataclasses.replace(workspace, task_ids=workspace.task_ids | extra.task_ids,
-            pinned=workspace.pinned or extra.pinned, continuous=workspace.continuous or extra.continuous)
+            pinned=workspace.pinned or extra.pinned, continuous=workspace.continuous or extra.continuous,
+            durable_kind=workspace.durable_kind or extra.durable_kind,
+            assistant=workspace.assistant or extra.assistant)
 
     parent_link = ctx.native_parents.get(resolved)
     common: dict[str, Any] = {
@@ -1109,6 +1131,10 @@ def decision(
         return Decision(path, "protect", "pinned_workspace", False, **common)
     if workspace.continuous:
         return Decision(path, "protect", "continuous_workspace", False, **common)
+    if workspace.durable_kind:
+        return Decision(path, "protect", f"{workspace.durable_kind}_workspace", False, **common)
+    if workspace.assistant:
+        return Decision(path, "protect", "assistant_checkout", False, **common)
     if resolved in ctx.live_paths:
         return Decision(path, "protect", "live_session", False, **common)
     process_paths = process_references(ctx.root) if refresh_processes else ctx.process_paths

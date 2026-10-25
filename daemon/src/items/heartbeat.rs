@@ -314,7 +314,25 @@ impl Beat {
         }
         let applied = {
             let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
-            super::org::apply_marks(&mut s, &reply)
+            let applied = super::org::apply_marks(&mut s, &reply);
+            // O5: sessions a member's session spawned, or that work under a
+            // member's task, are that member's assistants.
+            let stamped = crate::assistants::backfill(&mut s);
+            if !stamped.is_empty() {
+                eprintln!("cm org: stamped {} session(s) as members' assistants: {}",
+                          stamped.len(), stamped.join(", "));
+                s.persist_sessions_best_effort();
+                // The TUI's chart reads `member` off manifest diffs.
+                for uid in &stamped {
+                    let org = s.sessions.get(uid).and_then(|sess| sess.org.clone());
+                    s.manifest_watcher.broadcast(crate::manifest::ManifestDiff::Updated {
+                        uid: uid.clone(),
+                        entry: json!({"member": crate::assistants::wire(uid, org.as_ref()),
+                                      "org": org}),
+                    });
+                }
+            }
+            applied
         };
         self.mark_acks.extend(applied);
         for push in reply["pushes"].as_array().into_iter().flatten() {

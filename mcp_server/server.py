@@ -1608,11 +1608,21 @@ def org(
       - `action="reinstate", member=...`: Owner's undo of a retire.
     `request_id` (generated if omitted) makes a retry return the first
     answer instead of acting twice.
+    Assistants (O5): every agent a member's session spawns is that member's
+    assistant, as durable as its main session (`list_sessions` shows
+    `member: {member_id, acting_as}`). Finishing a task or item never closes
+    it; reuse an idle one (board free capacity lists them as `rev1 (for
+    ep)`) before spawning another.
+      - `action="close_assistant", session_uid=..., reason=...`: close one
+        deliberately. Allowed for the member's main session, a member up its
+        manager chain, or Owner. Its board holds go back to the member's
+        main session; its own checkout then goes through the reaper's usual
+        protections.
 
     Adopting a session as a member (`action="adopt"`) and approving the
     roster are Owner's, from the TUI; an agent's call is refused.
     """
-    if action in ("move", "retire", "reinstate") and request_id is None:
+    if action in ("move", "retire", "reinstate", "close_assistant") and request_id is None:
         request_id = f"org-{action}-{uuid.uuid4()}"
     params = {key: value for key, value in {
         "view": view, "action": action, "task_id": task_id,

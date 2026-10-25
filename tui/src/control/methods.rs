@@ -2613,19 +2613,20 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
     //   - branch-mode subtasks (own workspace): every session in
     //     that workspace closes, since they're all subtask-tagged.
     let target_task = p.task_id.clone();
-    // A member's main session is only unassigned, never closed, and its
-    // workspace is kept (lifecycle_guard_v1, doc/org-model.md §7.1).
+    // A member's main session or assistant is only unassigned, never
+    // closed, and its workspace is kept (lifecycle_guard_v1, O5;
+    // doc/org-model.md §4.3, §7.1).
     let candidates: Vec<String> = app.workspaces.iter()
         .flat_map(|w| w.sessions.iter())
         .filter(|ts| ts.task_id.as_deref() == Some(target_task.as_str()))
         .map(|ts| ts.uid.clone())
         .collect();
     let targets = app.owner_rpc_targets();
-    let spared = member_mains(&candidates, |uid| {
+    let spared = member_sessions(&candidates, |uid| {
         targets.iter().any(|(_, socket, token)| {
             crate::client_session::rpc_messaging_board(socket, token, "org.member",
                                                        json!({"session_uid": uid}))
-                .is_ok_and(|v| v["acting_as"] == "main")
+                .is_ok_and(|v| v["acting_as"] == "main" || v["acting_as"] == "assistant")
         })
     });
     for wi in 0..app.workspaces.len() {
@@ -2718,11 +2719,11 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
     Ok(out)
 }
 
-/// Which of `uids` are members' main sessions, by `is_main` (the host
-/// daemon's `org.member`). A lookup that fails counts as not a member, as on
-/// a host without org S2.
-fn member_mains(uids: &[String], is_main: impl Fn(&str) -> bool) -> std::collections::HashSet<String> {
-    uids.iter().filter(|uid| is_main(uid)).cloned().collect()
+/// Which of `uids` are members' sessions (main or assistant), by
+/// `is_member` (the host daemon's `org.member`). A lookup that fails counts
+/// as not a member, as on a host without org S2.
+fn member_sessions(uids: &[String], is_member: impl Fn(&str) -> bool) -> std::collections::HashSet<String> {
+    uids.iter().filter(|uid| is_member(uid)).cloned().collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -3063,11 +3064,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn member_mains_are_spared_by_the_lookup_and_a_failed_lookup_spares_nothing() {
+    fn member_sessions_are_spared_by_the_lookup_and_a_failed_lookup_spares_nothing() {
         let uids = vec!["a".to_string(), "b".to_string()];
-        let spared = member_mains(&uids, |uid| uid == "b");
+        let spared = member_sessions(&uids, |uid| uid == "b");
         assert_eq!(spared.into_iter().collect::<Vec<_>>(), vec!["b".to_string()]);
-        assert!(member_mains(&uids, |_| false).is_empty());
+        assert!(member_sessions(&uids, |_| false).is_empty());
     }
     use crate::app::{SessionStatus, TerminalSession};
     use std::collections::HashMap;

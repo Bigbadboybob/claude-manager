@@ -48,7 +48,7 @@ S6/S7 item.
 | `POST /roster/apply {rows:[{proposal_id, approve?, handle?, kind?, title?, team_id?, manager?, home_workspace?}], request_id}` | Owner | Each row is applied in its own transaction, against proposals regenerated under the lock inside it, so a row sees the rows applied before it. Per-row rejections are `stale`, `handle_taken`, `cycle`, `pid_already_member`, `unknown_manager`, `unknown_ref`, `coordinator_taken` and `conflict`. `approve: false` records a decline. |
 | `POST /adopt {pid, handle, title?, kind, team_id?, manager?, home_workspace?, request_id}` | Owner | Returns `{member, home_mark: {state}}`. |
 | `POST /members/{ref}/move {manager?, primary_team_id?, reason, expected_revision?}` | Owner, or a member above the target in its manager chain | `primary_team_id` is a team id or slug (`422 unknown_team`). |
-| `POST /members/{ref}/retire {reason, request_id?}` | Owner, or a member above the target in its manager chain | Status `retired`. Its reports move up to its manager (one `move` event each, `via: "retire"`) and the teams it leads lose their lead. Returns `{member, …, reports_moved, teams_unled}`. Incarnations and sessions are untouched: nothing is killed, and the handle stays reserved. `409 already_retired`. |
+| `POST /members/{ref}/retire {reason, request_id?}` | Owner, or a member above the target in its manager chain | Status `retired`. Its reports move up to its manager (one `move` event each, `via: "retire"`) and the teams it leads lose their lead. Its main session's open board holds go to its manager's main session, or Owner (`hand_back_holds`, as for closing an assistant); a vacant manager's stay, listed as `kept`. Returns `{member, …, reports_moved, teams_unled, holds}`. Incarnations and sessions are untouched: nothing is killed, and the handle stays reserved. `409 already_retired`. |
 | `POST /members/{ref}/reinstate {reason?, request_id?}` | Owner | Undoes a retire: the status before the retire comes back (`active`, `vacant` or `suspended`), and it leads again any team from the `retire` event that has had no lead since (`teams_led_again`). Reports that moved up stay put. `409 not_retired`; `409 retired_manager` when its manager is retired too (reinstate that one first). |
 | `POST /teams`, `PATCH /teams/{ref}` | Owner | Team create and edit. A `coordinator_task_id` is attached to the team as in `create_initiative`; a task that already belongs to another initiative is `409 coordinator_taken`. `org_db.create_team_conn(..., authorized_by=…)` is the trusted in-process creator for the items epic path. |
 
@@ -124,3 +124,56 @@ team), `action="retire"` (`member`, `reason`) and
 `action="reinstate"` (`member`) route to `org.move` / `org.retire` /
 `org.reinstate` from any caller, with the caller as actor, so the API decides
 who may. The tool generates a `request_id` when none is passed.
+the operator socket it routes to `org.adopt`.
+
+## Assistants (O5)
+
+Owner decision O5 (doc/org-model.md §4.2, §4.3, §15.1): an assistant is as
+durable as its member's main session.
+
+**Who is whose.** The daemon stamps each assistant session's org object with
+`member_id`, `acting_as: "assistant"` and `member_via`
+(`daemon/src/assistants.rs`).
+- At spawn: the child of a member's session (its main, or one of its
+  assistants) is that member's assistant.
+- Each beat, a backfill covers sessions spawned before this: first the
+  `managed_by_uid` chain, then the task's parent chain up to a task with a
+  member's main session on this daemon.
+- The nearest member wins, and a member's main is never stamped. Mains come
+  only from the member cache.
+- Nothing is stamped until the cache has heard from the API.
+
+**Where to read it.**
+- `list_sessions` rows (live and exited) carry `member: {member_id, acting_as}` or `null`.
+- Manifest snapshot entries carry the stamp in `org`.
+- The backfill broadcasts `Updated {member, org}` diffs.
+- The heartbeat reports `member_id` / `acting_as` per session into `org_session_facts` (`sql/031`).
+- `GET /members/by-pid` answers `acting_as: "assistant"` with the member's detail.
+- The daemon's `org.member` answers for its own assistants locally.
+
+**Lifecycle.**
+- Finishing work never closes an assistant: the terminal sweep (planning or board close), `mark_subtask_done` (daemon and TUI) and teardown leave it running and only unassigned, as they do a member's main session.
+- Its checkout is never removed by those paths. `workspace_kept` is `stream` or `home` by kind, else `member` or `assistant`.
+- A checkout minted `ephemeral` for an assistant is recorded at spawn as a `stream` of the member's office (`office_of`, `stream_of: "assistant"`). Unclassified and centrally marked workspaces are left alone.
+- The worktree reaper protects `home`/`stream` workspaces, and checkouts with an assistant record that was never closed (`assistant_closed_at`).
+- Member-less sessions keep today's teardown.
+
+**Closing one deliberately.**
+
+| Call | Who | Effect |
+|---|---|---|
+| `POST /org/assistants/close {pid, member_id, reason, request_id?}` | Owner, the member's main session, or an active member up its manager chain (`_require_chain(..., self_ok=True)`, the check shared with move and retire) | `403 not_member` / `not_manager` otherwise; `409 not_an_assistant` for a main. Hands the assistant's open holds to the member's main pid in their roles (`hand_back_holds`, shared with retire); a vacant member's holds stay, listed as `kept`. Records `close_assistant` and marks the facts row `closed`. |
+| `org.close_assistant {session_uid, reason?, request_id?}` (daemon), `org(action="close_assistant", …)` (MCP), Owner's A-w | as above | The API answers first, then the daemon closes the session with `killed_by: "<uid> (close_assistant)"` and sets `assistant_closed_at` on it. A stream it claimed goes back to `ephemeral`, so the reaper's normal protections decide. Against an API without the route, only Owner or the member's main may close it, and holds stay where they are. |
+
+`kill_session` is unchanged.
+
+**Free capacity.** `board().free_capacity` lists the assistants of the
+board's members, wherever their task is now. That means members whose main
+session is on the board, plus the board team's lead and members. They show
+as `rev1 (for ep)` and carry `assistant_of`, so a lead reuses an idle one
+before spawning.
+
+**Gate.** `assistant_guard_v1` is brain-only, so the rollback pin must have
+it too. The status mirror writes a task's close only when every fresh daemon
+advertises both it and `lifecycle_guard_v1`. A brain from S3 alone would sweep
+an assistant on a mirrored `done`.

@@ -1532,6 +1532,29 @@ pub fn rpc_kill_session(
     rpc_round_trip(daemon_socket, &req).map(|_| ())
 }
 
+/// Owner's A-w close (doc/org-model.md §4.3, O5): a member's assistant is
+/// closed deliberately through `org.close_assistant`, which hands its board
+/// holds back to its member and releases its checkout to the reaper's
+/// normal protections. Any other session (no member, a main, or a daemon
+/// without the RPC) is killed as before.
+pub fn close_session_deliberately(
+    daemon_socket: &Path,
+    operator_token_id: &str,
+    session_uid: &str,
+) -> anyhow::Result<()> {
+    let closed = rpc_messaging_board(
+        daemon_socket,
+        operator_token_id,
+        "org.close_assistant",
+        serde_json::json!({"session_uid": session_uid, "reason": "closed by Owner (A-w)"}),
+    )
+    .is_ok_and(|v| v["closed"].is_string());
+    if closed {
+        return Ok(());
+    }
+    rpc_kill_session(daemon_socket, operator_token_id, session_uid)
+}
+
 /// migrate-tui-local Issue 1: enumerate the daemon's currently
 /// known session UIDs. The manifest-restore path uses this on TUI
 /// startup to distinguish "daemon already has this session"

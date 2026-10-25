@@ -451,12 +451,20 @@ async def get_member(pool, ref: str) -> dict:
 
 async def member_for_pid(pool, pid: str) -> dict:
     """Whom a session works as: the member whose open main row it is
-    (`acting_as: main`), else none. Assistant attribution arrives with S4."""
+    (`acting_as: main`), else the member whose assistant its daemon reports
+    it to be (`acting_as: assistant`, O5), else none."""
     async with pool.acquire() as conn:
         member_id = await conn.fetchval(
             """SELECT member_id FROM incarnations
                 WHERE pid = $1 AND role = 'main' AND ended_at IS NULL""", pid)
         if not member_id:
+            # O5: an assistant, as its daemon last reported it.
+            member_id = await conn.fetchval(
+                """SELECT f.member_id FROM org_session_facts f JOIN members m ON m.id = f.member_id
+                    WHERE f.pid = $1 AND f.acting_as = 'assistant'""", pid)
+            if member_id:
+                detail = await _detail(conn, member_id)
+                return {"pid": pid, "acting_as": "assistant", **detail}
             return {"pid": pid, "member": None, "acting_as": None,
                     "version": await version(conn)}
         detail = await _detail(conn, member_id)
@@ -1158,9 +1166,13 @@ async def adopt(pool, actor: dict, *, pid: str, handle: str, title: str | None =
         return response
 
 
-async def _require_chain(conn, actor: dict, member_id: str, what: str) -> str | None:
+async def _require_chain(conn, actor: dict, member_id: str, what: str, *,
+                         self_ok: bool = False) -> str | None:
     """Owner, or an active member up `member_id`'s manager chain acting as its
-    main session (doc/org-model.md §10: move / retire a member)."""
+    main session (doc/org-model.md §10: move / retire a member). With
+    `self_ok`, also the member's own main session (closing its own assistant,
+    §4.3). The one authority check for move, retire and close_assistant.
+    Returns the acting member (None for Owner)."""
     if _is_owner(actor):
         return None
     actor_member = await conn.fetchval(
@@ -1171,11 +1183,125 @@ async def _require_chain(conn, actor: dict, member_id: str, what: str) -> str | 
         raise _err(403, "not_member",
                    f"only Owner or a member up this member's manager chain may {what} it; "
                    "this session is not an active member's main session")
+    if self_ok and actor_member == member_id:
+        return actor_member
     chain = [m["id"] for m in await _chain(conn, member_id)]
     if actor_member not in chain:
         raise _err(403, "not_manager",
                    f"only Owner or a member up this member's manager chain may {what} it")
     return actor_member
+
+
+async def _main_pid(conn, member_id: str | None) -> str | None:
+    """The member's current main session's pid, if it has one."""
+    if not member_id:
+        return None
+    return await conn.fetchval(
+        """SELECT pid FROM incarnations
+            WHERE member_id = $1 AND role = 'main' AND ended_at IS NULL""", member_id)
+
+
+async def hand_back_holds(conn, actor: dict, from_pid: str, to_pid: str | None, *,
+                          reason: str) -> dict:
+    """Hand every open board item `from_pid` holds to `to_pid` in its role
+    (an owner's hold transfers ownership; the receiver keeps a role it
+    already has). Call inside a transaction that holds the task-change lock;
+    each board is locked and written through the item rules, so holder
+    history, mirrors and pushes behave as for any reassignment. With no
+    `to_pid` (a vacant member) nothing moves and the holds are listed as
+    `kept`. Shared by close_assistant and retire."""
+    from dispatch import items_db
+    from dispatch.items_rules import BoardTx
+
+    boards = [r["board_id"] for r in await conn.fetch(
+        """SELECT DISTINCT i.board_id FROM item_holders h JOIN items i ON i.id = h.item_id
+            WHERE h.pid = $1 AND i.closed_at IS NULL AND i.archived_at IS NULL
+              AND i.link_archived_at IS NULL ORDER BY i.board_id""", from_pid)]
+    handed, kept = [], []
+    to = None
+    if to_pid:
+        state = await conn.fetchrow(
+            "SELECT name, session_uid, daemon_id FROM session_states WHERE pid = $1", to_pid)
+        uid = to_pid.rsplit(":", 1)[-1]
+        daemon = to_pid.split(":")[1] if to_pid.count(":") >= 2 else None
+        to = {"pid": to_pid, "name": state["name"] if state else None,
+              "session_uid": state["session_uid"] if state else uid,
+              "daemon_id": state["daemon_id"] if state else daemon}
+    from dispatch.items_rules import ItemsError as _ItemsError
+
+    now = utcnow()
+    for board_id in boards:
+        board = await items_db._board_by_ref(conn, str(board_id), lock=True)
+        items = await items_db._load_items(conn, board["id"])
+        held = [(n, h.get("role")) for n, it in sorted(items.items())
+                if it.closed_at is None and it.archived_at is None and it.link_archived_at is None
+                for h in it.holders if h["pid"] == from_pid]
+        if to is None:
+            kept += [{"board": board["slug"], "n": n, "role": role} for n, role in held]
+            continue
+        groups = await items_db._load_groups(conn, board["id"])
+        for n, role in held:
+            # One savepoint per item: an item the rules refuse (say, blocked
+            # on Owner) keeps its holder and the others still move.
+            try:
+                async with conn.transaction():
+                    tx = BoardTx(board, await items_db._load_items(conn, board["id"], [n]),
+                                 actor, now, groups)
+                    if role == "owner":
+                        tx.apply(n, {}, remove=[from_pid], owner=dict(to), reason=reason)
+                    else:
+                        tx.apply(n, {}, add=[{**to, "role": role}] if role else [dict(to)],
+                                 remove=[from_pid], reason=reason)
+                    await items_db._apply(conn, tx, mirror=True)
+            except _ItemsError as exc:
+                kept.append({"board": board["slug"], "n": n, "role": role, "error": exc.detail()})
+                continue
+            handed.append({"board": board["slug"], "n": n, "role": role, "to": to_pid})
+    return {"handed_back": handed, "kept": kept}
+
+
+async def close_assistant(pool, actor: dict, *, pid: str, member_id: str, reason: str,
+                          request_id: str | None = None) -> dict:
+    """Deliberately close one of a member's assistants (doc/org-model.md
+    §4.3, O5): Owner, the member's main session or its manager chain. Its
+    open holds go back to the member's current main session; the daemon
+    then closes the session. Recorded as an `org_event`."""
+    if not reason or not str(reason).strip():
+        raise _err(422, "invalid_field", "closing an assistant needs a reason")
+    async with pool.acquire() as conn:
+        stored = await _stored_request(conn, request_id, actor, "close_assistant")
+        if stored is not None:
+            return stored
+        try:
+            async with conn.transaction():
+                await _lock(conn)
+                await _replay_under_lock(conn, request_id, actor, "close_assistant")
+                member = await conn.fetchrow(
+                    "SELECT id, status FROM members WHERE id = $1", member_id)
+                if member is None:
+                    raise _err(404, "not_found", f"no member {member_id}")
+                if await conn.fetchval(
+                        """SELECT 1 FROM incarnations
+                            WHERE pid = $1 AND role = 'main' AND ended_at IS NULL""", pid):
+                    raise _err(409, "not_an_assistant",
+                               f"{pid} is a member's main session; replace or retire the member")
+                await _require_chain(conn, actor, member_id, "close an assistant of", self_ok=True)
+                main_pid = await _main_pid(conn, member_id)
+                holds = await hand_back_holds(conn, actor, pid, main_pid,
+                                              reason=f"assistant closed: {reason}")
+                await conn.execute(
+                    "UPDATE org_session_facts SET acting_as = 'closed' WHERE pid = $1", pid)
+                await _event(conn, "member", member_id, "close_assistant", actor,
+                             prev={"assistant": pid}, new={"holds": holds},
+                             reason=reason, request_id=request_id)
+                response = {"pid": pid, "member_id": member_id, "main_pid": main_pid,
+                            "holds": holds}
+                await _store_request(conn, request_id, actor, "close_assistant", response)
+        except _Replayed as replay:
+            response = replay.response
+        except asyncpg.PostgresError as exc:
+            raise _db_error(exc) from None
+        return response
 
 
 async def move(pool, actor: dict, ref: str, *, reason: str, manager=None, primary_team_id=None,
@@ -1312,8 +1438,15 @@ async def retire(pool, actor: dict, ref: str, *, reason: str, request_id: str | 
                                           updated_at = now() WHERE id = $1""", uuid.UUID(team_id))
             await _event(conn, "team", team_id, "lead_set", actor, prev={"lead_member_id": member_id},
                          new={"lead_member_id": None, "via": "retire"}, request_id=request_id)
-        # Item holds are not handed back yet: #21's items-side
-        # hand_back_holds(conn, from_pid, to_pid) is called here once it lands.
+        # Its main session's open holds go back to its manager (§4.3): the
+        # manager's main session, or Owner; a vacant manager's stay, listed.
+        main_pid = await _main_pid(conn, member_id)
+        holds = {"handed_back": [], "kept": []}
+        if main_pid:
+            to_pid = (OWNER_PID if row["manager_member_id"] == OWNER_ID
+                      else await _main_pid(conn, row["manager_member_id"]))
+            holds = await hand_back_holds(conn, actor, main_pid, to_pid,
+                                          reason=f"{row['handle']} retired: {reason}")
         await conn.execute(
             """UPDATE members SET status = 'retired', retired_at = now(), revision = revision + 1,
                                   updated_at = now() WHERE id = $1""", member_id)
@@ -1322,7 +1455,7 @@ async def retire(pool, actor: dict, ref: str, *, reason: str, request_id: str | 
                      new={"status": "retired", "reports_to": row["manager_member_id"]},
                      reason=reason, request_id=request_id)
         detail = await _detail(conn, member_id)
-        return {**detail, "reports_moved": reports, "teams_unled": led}
+        return {**detail, "reports_moved": reports, "teams_unled": led, "holds": holds}
 
     return await _member_write(pool, actor, request_id, "retire", body)
 
@@ -1539,7 +1672,8 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
                       _clip(raw.get("worktree_path"), 1000),
                       _clip(raw.get("continuous_task_id"), 200),
                       _clip(raw.get("managed_by_uid"), 200),
-                      _clip(raw.get("workflow_run_id"), 200), spawned))
+                      _clip(raw.get("workflow_run_id"), 200), spawned,
+                      _clip(raw.get("member_id"), 64) if raw.get("acting_as") == "assistant" else None))
     async with pool.acquire() as conn:
         async with conn.transaction():
             for f in facts:
@@ -1547,9 +1681,14 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
                     """INSERT INTO org_session_facts (pid, daemon_id, session_uid, workspace_id,
                                                       worktree_path, continuous_task_id,
                                                       managed_by_uid, workflow_run_id, spawned_at,
-                                                      reported_at)
-                       VALUES ($1, $10, $2, $3, $4, $5, $6, $7, $8, $9)
+                                                      member_id, acting_as, reported_at)
+                       VALUES ($1, $11, $2, $3, $4, $5, $6, $7, $8, $9,
+                               CASE WHEN $9::text IS NULL THEN NULL ELSE 'assistant' END, $10)
                        ON CONFLICT (pid) DO UPDATE SET
+                           member_id = coalesce(EXCLUDED.member_id, org_session_facts.member_id),
+                           acting_as = CASE WHEN org_session_facts.acting_as = 'closed'
+                                            THEN 'closed'
+                                            ELSE coalesce(EXCLUDED.acting_as, org_session_facts.acting_as) END,
                            session_uid = EXCLUDED.session_uid, workspace_id = EXCLUDED.workspace_id,
                            worktree_path = EXCLUDED.worktree_path,
                            continuous_task_id = EXCLUDED.continuous_task_id,

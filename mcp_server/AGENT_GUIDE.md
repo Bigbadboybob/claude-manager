@@ -131,6 +131,13 @@ everyone who holds what, with each holder's live state, so nobody has to ask.
   plan (`epic(action="close", ...)`) that settles its open items and team.
 - When you call `report_done`, it lists items you still hold: close them or
   hand them back.
+- Assistants: every agent a member's session spawns is that member's
+  assistant (`list_sessions` shows `member`), as durable as its main session.
+  Finishing a task or item never closes it, so reuse an idle one (board free
+  capacity lists them as `rev1 (for ep)`) before spawning. Close one on
+  purpose with `org(action="close_assistant", session_uid=..., reason=...)`:
+  allowed for its member's main session, the member's manager chain or Owner.
+  Its holds go back to the member.
 
 ## Orchestrating other sessions
 

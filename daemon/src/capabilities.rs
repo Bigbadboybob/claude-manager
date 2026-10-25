@@ -23,9 +23,21 @@ pub use cm_holder_proto::org::{LIFECYCLE_GUARD_V1, OCCUPANCY_V1, ORG_PRESERVE_V1
 /// marks only to a host advertising it.
 pub const ORG_MARKS_V1: &str = "org_marks_v1";
 
+/// Members' assistants are as durable as their main sessions (O5): no
+/// sweep or `mark_subtask_done` closes them or removes their checkouts
+/// ([`crate::assistants`]). The API's status mirror needs it beside
+/// `lifecycle_guard_v1`.
+pub const ASSISTANT_GUARD_V1: &str = crate::assistants::CAPABILITY;
+
 /// Every capability name the org model defines.
-pub const KNOWN: [&str; 5] =
-    [ORG_PRESERVE_V1, LIFECYCLE_GUARD_V1, ORG_STAMP_V1, OCCUPANCY_V1, ORG_MARKS_V1];
+pub const KNOWN: [&str; 6] = [
+    ORG_PRESERVE_V1,
+    LIFECYCLE_GUARD_V1,
+    ORG_STAMP_V1,
+    OCCUPANCY_V1,
+    ORG_MARKS_V1,
+    ASSISTANT_GUARD_V1,
+];
 
 /// Brain-only capabilities: implemented entirely in the brain, so the holder
 /// need not list them, only carry the org object (`org_preserve_v1`); the
@@ -34,8 +46,10 @@ pub const KNOWN: [&str; 5] =
 /// AND local `home` marks are applied) is pushed here only by a build with
 /// both items' sweep guard ([`crate::lifecycle_guard`]) and org's
 /// mark-apply, and lights up from the second deploy of such a build. This is
-/// that build.
-pub const BRAIN_ONLY: &[&str] = &[ORG_MARKS_V1, LIFECYCLE_GUARD_V1];
+/// that build. `assistant_guard_v1` likewise lights up only once the
+/// rollback pin has it, so a rollback never reaches a brain that would close
+/// an assistant this one keeps.
+pub const BRAIN_ONLY: &[&str] = &[ORG_MARKS_V1, LIFECYCLE_GUARD_V1, ASSISTANT_GUARD_V1];
 
 /// What this brain build implements: the record capabilities it shares with
 /// the holder (holder-proto) plus [`BRAIN_ONLY`].
@@ -273,9 +287,10 @@ mod tests {
     fn names_are_the_designed_ones() {
         assert_eq!(
             KNOWN,
-            ["org_preserve_v1", "lifecycle_guard_v1", "org_stamp_v1", "occupancy_v1", "org_marks_v1"],
+            ["org_preserve_v1", "lifecycle_guard_v1", "org_stamp_v1", "occupancy_v1", "org_marks_v1",
+             "assistant_guard_v1"],
         );
-        assert_eq!(brain(), ["org_preserve_v1", "org_marks_v1", "lifecycle_guard_v1"]);
+        assert_eq!(brain(), ["org_preserve_v1", "org_marks_v1", "lifecycle_guard_v1", "assistant_guard_v1"]);
         assert_eq!(LIFECYCLE_GUARD_V1, crate::lifecycle_guard::CAPABILITY);
     }
 

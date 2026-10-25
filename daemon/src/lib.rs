@@ -54,6 +54,7 @@
 #![cfg(target_os = "linux")]
 
 pub mod adopt;
+pub mod assistants;
 pub mod agent_state;
 pub mod attach;
 pub mod attach_output;

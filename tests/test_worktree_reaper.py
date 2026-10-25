@@ -84,6 +84,35 @@ class WorktreeReaperTests(unittest.TestCase):
         self.assertEqual(result.reason, "terminal_and_inactive")
         self.assertEqual(result.landed_reason, "head_is_ancestor")
 
+    def test_durable_workspaces_and_open_assistants_checkouts_are_protected(self) -> None:
+        # doc/org-model.md §5, O5: a member's home/stream workspace, or a
+        # checkout a member's assistant worked in and was never deliberately
+        # closed from, survives a done task. A deliberately closed assistant
+        # (its stream released to ephemeral) leaves the normal rules.
+        manifest = self.base / "daemon-sessions.json"
+
+        def decide(org, record_org):
+            manifest.write_text(reaper.json.dumps({"workspaces": {"ws": {
+                "id": "ws", "worktree_path": str(self.worktree), "org": org,
+                "sessions": [], "tombstones": [{"uid": "u", "task_id": "task-1", "org": record_org}]}}}))
+            facts = reaper.load_workspace_facts([manifest])[self.worktree.resolve()]
+            context = self.context()
+            context.workspaces = {self.worktree.resolve(): facts}
+            return reaper.decision(self.worktree, context)
+
+        open_assistant = {"member_id": "mem_ep", "acting_as": "assistant"}
+        closed = {**open_assistant, "assistant_closed_at": "2026-10-25T12:00:00Z"}
+        self.assertEqual(decide({"workspace_kind": "stream"}, None).reason, "stream_workspace")
+        self.assertEqual(decide({"workspace_kind": "home"}, None).reason, "home_workspace")
+        self.assertEqual(decide(None, open_assistant).reason, "assistant_checkout")
+        released = decide({"workspace_kind": "ephemeral"}, closed)
+        self.assertTrue(released.eligible, released.reason)
+        member_less = decide({"workspace_kind": "ephemeral"}, None)
+        self.assertTrue(member_less.eligible, "a member-less checkout keeps today's rules")
+        self.assertTrue(reaper.is_open_assistant(open_assistant))
+        self.assertFalse(reaper.is_open_assistant(closed))
+        self.assertFalse(reaper.is_open_assistant({"acting_as": "main", "member_id": "mem_ep"}))
+
     def test_nonterminal_and_young_unowned_worktrees_fail_closed(self) -> None:
         running = reaper.decision(self.worktree, self.context(status="running"))
         self.assertFalse(running.eligible)

@@ -729,7 +729,7 @@ async def _push_orchestrator(conn, board, items, states, orch, now, summary,
     if any(f["kind"] == "unlaunched" for f in due):
         rows, _ = await items_db._free_capacity(
             conn, board, now, [orch.get("pid"), board.get("steward_pid")])
-        free = [r["name"] or r["pid"] for r in rows if r["state"] == "idle"]
+        free = [items_db.free_label(r) for r in rows if r["state"] == "idle"]
     parts = [describe(f, items.get(f["n"]), states, now, free) for f in due]
     text = compose(board["slug"], parts, closed)
     await _push(conn, board["id"], orch, "board", text, now)

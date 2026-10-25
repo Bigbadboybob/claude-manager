@@ -27,6 +27,9 @@ def agent(name, daemon="d1"):
             "session_uid": f"{name}-uid", "daemon_id": daemon}
 
 
+# What a daemon with S3's guard and O5's assistant guard advertises.
+GUARDED = ["lifecycle_guard_v1", "assistant_guard_v1"]
+
 ORCH = agent("orch")
 LANE = agent("lane")
 OTHER = agent("other")
@@ -77,7 +80,7 @@ class OrgS3Db(unittest.IsolatedAsyncioTestCase):
         self.root = await self.task("root")
         self.board = (await self.http.post("/boards/resolve", json={"task_id": self.root})).json()
         self.ref = self.board["slug"]
-        await self.beat(ORCH, task=self.root, caps=["lifecycle_guard_v1"])
+        await self.beat(ORCH, task=self.root, caps=GUARDED)
 
     async def asyncTearDown(self):
         await self.http.aclose()
@@ -295,7 +298,12 @@ class OrgS3Db(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["status"], "backlog", "no mirror while d9 lacks the guard")
         self.assertEqual((row["placement"]["mirror"], row["placement"]["mirror_waiting_on"]),
                          ("off", ["d9"]))
+        # An S3 brain (no assistant guard) would sweep a member's assistant
+        # on a mirrored close: still no mirror (O5).
         await self.beat(old, task=t, daemon="d9", caps=["lifecycle_guard_v1"])
+        await self.patch_items(n, actor=ORCH, set={"note": "s3 only"})
+        self.assertEqual((await self.task_row(t))["placement"]["mirror_waiting_on"], ["d9"])
+        await self.beat(old, task=t, daemon="d9", caps=GUARDED)
         await self.patch_items(n, actor=ORCH, set={"note": "go"})
         self.assertEqual((await self.task_row(t))["status"], "running")
 
@@ -366,14 +374,14 @@ class OrgS3Db(unittest.IsolatedAsyncioTestCase):
     async def test_launch_grants_follow_the_owner(self):
         t = await self.task("granted")
         n = (await self.place(t, holder=LANE)).json()["n"]
-        reply = await self.beat(ORCH, task=self.root, caps=["lifecycle_guard_v1"])
+        reply = await self.beat(ORCH, task=self.root, caps=GUARDED)
         self.assertEqual([(g["task_id"], g["session_uid"]) for g in reply["launch_grants"]],
                          [(t, "lane-uid")])
         await self.patch_items(n, actor=LANE, owner=OTHER, set={})
-        reply = await self.beat(ORCH, task=self.root, caps=["lifecycle_guard_v1"])
+        reply = await self.beat(ORCH, task=self.root, caps=GUARDED)
         self.assertEqual([g["session_uid"] for g in reply["launch_grants"]], ["other-uid"])
         await self.patch_items(n, actor=OTHER, set={"status": "done"})
-        reply = await self.beat(ORCH, task=self.root, caps=["lifecycle_guard_v1"])
+        reply = await self.beat(ORCH, task=self.root, caps=GUARDED)
         self.assertEqual(reply["launch_grants"], [])
 
     async def test_create_with_a_request_id_reuses_existing_groups_and_hints_duplicates(self):
@@ -559,7 +567,7 @@ class OrgS3Db(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("terminal_via", row["metadata"] or {})
         # A daemon that heartbeats without the guard keeps it closed.
         await self.beat(agent("x", daemon="d7"), daemon="d7", caps=[])
-        await self.beat(ORCH, task=self.root, caps=["lifecycle_guard_v1"])
+        await self.beat(ORCH, task=self.root, caps=GUARDED)
         t2 = await self.task("legacy while closed")
         await self.place(t2, holder=LANE)
         self.assertEqual((await self.task_row(t2))["placement"]["mirror_waiting_on"], ["d7"])
@@ -568,7 +576,7 @@ class OrgS3Db(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.task_row(t2))["status"], "blocked")
         # Once every fresh daemon advertises the guard, the engine's pass
         # writes the waiting tasks through.
-        await self.beat(agent("x", daemon="d7"), daemon="d7", caps=["lifecycle_guard_v1"])
+        await self.beat(agent("x", daemon="d7"), daemon="d7", caps=GUARDED)
         from dispatch import placement
         self.assertGreaterEqual(await placement.remirror_pending(self.pool), 2)
         row = await self.task_row(t)
@@ -581,7 +589,7 @@ class OrgS3Db(unittest.IsolatedAsyncioTestCase):
         await self.patch_items(n, actor=OTHER, owner=OTHER, set={})
         roles = {h["name"]: h["role"] for h in (await self.item(n))["holders"]}
         self.assertEqual(roles["other"], "owner")
-        reply = await self.beat(ORCH, task=self.root, caps=["lifecycle_guard_v1"])
+        reply = await self.beat(ORCH, task=self.root, caps=GUARDED)
         self.assertEqual(reply["launch_grants"], [], "the role, but no grant")
         async with self.pool.acquire() as conn:
             reason = await conn.fetchval("SELECT reason FROM launch_grants WHERE pid = $1",

@@ -63,6 +63,14 @@ class AdoptBody(_Strict):
     request_id: RequestId | None = None
 
 
+class CloseAssistantBody(_Strict):
+    actor: Actor
+    pid: Annotated[str, Field(min_length=1, max_length=300)]
+    member_id: Short
+    reason: Annotated[str, Field(min_length=1, max_length=500)]
+    request_id: RequestId | None = None
+
+
 class MoveBody(_Strict):
     actor: Actor
     manager: Short | None = None
@@ -172,6 +180,13 @@ async def reinstate_member(ref: Ref, body: ReinstateBody, request: Request):
     return await _call(org_db.reinstate(
         _pool(request), body.actor.model_dump(), ref, reason=body.reason,
         request_id=body.request_id))
+@router.post("/assistants/close")
+async def close_assistant(body: CloseAssistantBody, request: Request):
+    """Deliberately close a member's assistant (O5): authority and the
+    holds hand-back; the session's daemon then closes it."""
+    return await _call(org_db.close_assistant(
+        _pool(request), body.actor.model_dump(), pid=body.pid, member_id=body.member_id,
+        reason=body.reason, request_id=body.request_id))
 
 
 @router.get("/teams/{ref}")

@@ -24,6 +24,10 @@ from dispatch.items_rules import (CLOSED, GROUP_KINDS, MAX_DESCRIPTION, MAX_GROU
 # The capability a daemon advertises once its terminal sweep honours
 # `terminal_via=item` and protects members' workspaces (§12).
 GUARD_CAP = "lifecycle_guard_v1"
+# ... and once it keeps members' assistants and their checkouts alive (O5).
+ASSISTANT_CAP = "assistant_guard_v1"
+# Every capability a daemon needs before a mirrored close may reach it.
+MIRROR_CAPS = (GUARD_CAP, ASSISTANT_CAP)
 # Item status -> task status (§7.1).
 MIRROR = {
     "open": "backlog", "active": "running", "waiting": "running",
@@ -58,7 +62,8 @@ async def mirror_gate(conn, task_id: str) -> list[str]:
     sessions on a mirrored `done`, and a daemon that never beats, an old
     brain or a session in its first 30 s may hold sessions no row shows. So
     the mirror runs only while EVERY freshly heartbeating daemon advertises
-    lifecycle_guard_v1 in `org_daemons` (org S2), there is at least one, and
+    lifecycle_guard_v1 and assistant_guard_v1 in `org_daemons` (org S2; an
+    S3-only sweep would close a member's assistant), there is at least one, and
     every daemon holding the task's live sessions is among them. No build
     advertises it yet, so today the mirror is off everywhere."""
     if not mirror_enabled():
@@ -68,7 +73,8 @@ async def mirror_gate(conn, task_id: str) -> list[str]:
             WHERE seen_at > now() - make_interval(secs => $1)""", GATE_FRESH_S)
     if not rows:
         return ["no_fresh_daemons"]
-    blocking = {r["daemon_id"] for r in rows if GUARD_CAP not in (r["capabilities"] or [])}
+    blocking = {r["daemon_id"] for r in rows
+                if not set(MIRROR_CAPS) <= set(r["capabilities"] or [])}
     guarded = {r["daemon_id"] for r in rows} - blocking
     holding = {r["daemon_id"] for r in await conn.fetch(
         """SELECT DISTINCT daemon_id FROM session_states

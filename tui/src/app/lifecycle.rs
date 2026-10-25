@@ -1550,7 +1550,7 @@ impl App {
                     return;
                 }
             };
-            if let Err(e) = crate::client_session::rpc_kill_session(
+            if let Err(e) = crate::client_session::close_session_deliberately(
                 &socket,
                 &host_pool.operator_token_for(&ts.host_id),
                 uid,
@@ -1586,7 +1586,7 @@ impl App {
                     eprintln!("cm-tui: A-w kill_session({uid}) skipped — host {} has no live socket", host.as_str());
                     return;
                 };
-                if let Err(e) = crate::client_session::rpc_kill_session(&socket, &pool.operator_token_for(&host), &uid) {
+                if let Err(e) = crate::client_session::close_session_deliberately(&socket, &pool.operator_token_for(&host), &uid) {
                     eprintln!("cm-tui: A-w kill_session({uid}) failed: {e} (orphan child will be reaped when it exits)");
                 }
             });

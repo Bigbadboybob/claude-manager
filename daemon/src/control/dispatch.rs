@@ -902,7 +902,7 @@ pub fn dispatch_request(
         // adoption, proxied like items. Roster and adoption are Owner's.
         "org.snapshot" | "org.member" | "org.team" | "org.roster" | "org.roster_apply"
         | "org.adopt" | "org.team_create" | "org.team_update" | "org.move" | "org.retire"
-        | "org.reinstate" => {
+        | "org.reinstate" | "org.close_assistant" => {
             DispatchOutcome::Done(crate::items::org::dispatch(state, req))
         }
         // Gate receipts (doc/gate-receipts.md §9): same proxy shape as items.
@@ -1763,6 +1763,17 @@ pub(crate) fn dispatch_org(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Re
         }
         fwd.params = serde_json::Value::Object(body);
         return crate::items::org::dispatch(state, &fwd);
+    }
+    // `org(action="close_assistant", session_uid, reason)` (O5) is the
+    // `org.close_assistant` RPC for any caller; the planning API checks who
+    // may close it.
+    if req.params["action"] == "close_assistant" {
+        let mut close = req.clone();
+        close.method = "org.close_assistant".into();
+        if let Some(obj) = close.params.as_object_mut() {
+            obj.remove("action");
+        }
+        return crate::items::org::dispatch(state, &close);
     }
     let caller_uid: Option<String> = match &req.caller {
         Caller::Operator(_) => None,

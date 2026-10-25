@@ -903,7 +903,12 @@ async def _free_capacity(conn, board: dict, now: datetime,
     open item there) that hold no active or waiting item on it, split into
     `free` (not working: available to launch onto) and `untracked` (working
     on something the board doesn't show). Bash panes, the orchestrator and
-    the steward are never capacity (doc/strict-boards.md §4.2)."""
+    the steward are never capacity (doc/strict-boards.md §4.2).
+
+    Members' assistants (O5) count too wherever their task now is: the
+    assistants of a member whose main session is on the board, or of the
+    board team's lead and members, so a lead reuses an idle assistant
+    before spawning. Their rows carry `assistant_of` (the member's handle)."""
     fresh = now - timedelta(seconds=STATE_FRESH_S)
     rows = await conn.fetch(
         """WITH RECURSIVE tree AS (
@@ -916,15 +921,32 @@ async def _free_capacity(conn, board: dict, now: datetime,
                SELECT id FROM tasks WHERE $3::uuid IS NOT NULL AND initiative_id = $3),
            holders AS (
                SELECT h.pid, i.status FROM item_holders h JOIN items i ON i.id = h.item_id
-                WHERE i.board_id = $1 AND i.closed_at IS NULL)
-           SELECT s.pid, s.name, s.state FROM session_states s
-            WHERE s.exited_at IS NULL AND s.reported_at > $4
-              AND COALESCE(s.engine, '') <> 'bash'
-              AND s.pid <> ALL($5::text[])
-              AND (s.task_id IN (SELECT id FROM board_tasks)
-                   OR s.pid IN (SELECT pid FROM holders))
-              AND s.pid NOT IN (SELECT pid FROM holders WHERE status IN ('active', 'waiting'))
-            ORDER BY s.name NULLS LAST, s.pid""",
+                WHERE i.board_id = $1 AND i.closed_at IS NULL),
+           base AS (
+               SELECT s.pid, s.name, s.state, s.task_id FROM session_states s
+                WHERE s.exited_at IS NULL AND s.reported_at > $4
+                  AND COALESCE(s.engine, '') <> 'bash'
+                  AND s.pid <> ALL($5::text[])),
+           on_board AS (
+               SELECT pid FROM base
+                WHERE task_id IN (SELECT id FROM board_tasks) OR pid IN (SELECT pid FROM holders)),
+           board_members AS (
+               SELECT inc.member_id FROM incarnations inc
+                WHERE inc.role = 'main' AND inc.ended_at IS NULL
+                  AND inc.pid IN (SELECT pid FROM on_board)
+               UNION
+               SELECT tm.member_id FROM team_memberships tm
+                WHERE $3::uuid IS NOT NULL AND tm.team_id = $3 AND tm.until IS NULL
+               UNION
+               SELECT i.lead_member_id FROM initiatives i
+                WHERE $3::uuid IS NOT NULL AND i.id = $3 AND i.lead_member_id IS NOT NULL)
+           SELECT b.pid, b.name, b.state, m.handle AS assistant_of FROM base b
+             LEFT JOIN org_session_facts f ON f.pid = b.pid AND f.acting_as = 'assistant'
+             LEFT JOIN members m ON m.id = f.member_id
+            WHERE (b.pid IN (SELECT pid FROM on_board)
+                   OR f.member_id IN (SELECT member_id FROM board_members))
+              AND b.pid NOT IN (SELECT pid FROM holders WHERE status IN ('active', 'waiting'))
+            ORDER BY b.name NULLS LAST, b.pid""",
         uuid.UUID(board["id"]),
         uuid.UUID(board["root_task_id"]) if board.get("root_task_id") else None,
         uuid.UUID(board["initiative_id"]) if board.get("initiative_id") else None,
@@ -936,6 +958,12 @@ async def _free_capacity(conn, board: dict, now: datetime,
     # Idle sessions first: they are the ones to launch onto.
     free.sort(key=lambda r: r["state"] != "idle")
     return free, untracked
+
+
+def free_label(row: dict) -> str:
+    """`rev1 (for ep)` for a member's assistant, else the session's name."""
+    name = row.get("name") or row["pid"]
+    return f"{name} (for {row['assistant_of']})" if row.get("assistant_of") else name
 
 
 async def read_board(pool, ref: str, *, since_version: int | None = None,
@@ -1040,7 +1068,7 @@ async def read_board(pool, ref: str, *, since_version: int | None = None,
                  for n, fs in flags.items() for f in fs
                  if f["kind"] == "unlaunched" and n in items),
                 key=lambda u: u["n"]),
-            "free": [r["name"] or r["pid"] for r in free],
+            "free": [free_label(r) for r in free],
         }
         out["flags"].sort(key=lambda f: (-f["age_s"], f["n"]))
         if archived:
