@@ -313,8 +313,9 @@ Rules that follow:
   brain gap may tombstone as a plain exit.
 - `daemon.restart`/`migrate_split` refuse on `[tls]`-configured daemons
   (listener handoff unimplemented; neither host uses TLS).
-- Skew matrix baseline is pinned at `924ff6a`; advancing it is a deprecation
-  event recorded in the design doc.
+- Skew matrix baseline is pinned at `5190083` (the shipped holder, since
+  2026-10-25; `CM_SKEW_OLDEST=4e1aead` adds the phase-3 cell); advancing it
+  is a deprecation event recorded in the design doc.
 
 ## 9. Tests
 

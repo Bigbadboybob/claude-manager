@@ -18,10 +18,13 @@
 #                                    with stronger assertions)
 #
 # BASELINE governance (the doc's rule): the pin advances ONLY with an
-# explicit deprecation note in DESIGN_HOLDER_BRAIN_SPLIT.md. Until a
-# holder ships to a real host, the pin is the first commit where a
-# holder and a brain could interoperate at all (phase 3).
-BASELINE_REF="${CM_SKEW_BASELINE:-924ff6a}"
+# explicit deprecation note in DESIGN_HOLDER_BRAIN_SPLIT.md. Since
+# 2026-10-25 the pin is 5190083, the holder source that shipped (merged
+# 2026-08-24, deployed on every host); the pre-ship pin 924ff6a no longer
+# exists after a history rewrite. Its phase-3 equivalent 4e1aead stays an
+# OPTIONAL oldest cell: set CM_SKEW_OLDEST=4e1aead to run it too.
+BASELINE_REF="${CM_SKEW_BASELINE:-5190083}"
+OLDEST_REF="${CM_SKEW_OLDEST:-}"
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -73,6 +76,15 @@ run_cell "old-brain x new-holder (the upgrade path)" \
     "$HEAD_BINS/cm-holder" "$BASE_BINS/cm-daemon"
 run_cell "new x new (control)" \
     "$HEAD_BINS/cm-holder" "$HEAD_BINS/cm-daemon"
+
+if [ -n "$OLDEST_REF" ]; then
+    step "building oldest binaries at $OLDEST_REF (optional cell)"
+    OLDEST_BINS="$(build_ref "$OLDEST_REF")"
+    run_cell "new-brain x oldest-holder ($OLDEST_REF)" \
+        "$OLDEST_BINS/cm-holder" "$HEAD_BINS/cm-daemon"
+    run_cell "oldest-brain x new-holder ($OLDEST_REF)" \
+        "$HEAD_BINS/cm-holder" "$OLDEST_BINS/cm-daemon"
+fi
 
 # V9 (phase 7): the prior-schema rollback-manifest emission — HEAD
 # split reverse-migrates INTO the baseline monolith image. Skipped if
