@@ -1140,12 +1140,6 @@ pub fn run() -> anyhow::Result<()> {
                 .expect("holder mode fetched the boot handshake at startup");
             holder_mode::adopt_at_boot(&state, client, boot);
         }
-        // doc/org-model.md §12: record this generation's capabilities so a
-        // later brain can vouch for it as its rollback pin. Off the boot
-        // path (it hashes the binary).
-        let _ = std::thread::Builder::new()
-            .name("cm-capabilities".into())
-            .spawn(crate::capabilities::record_boot);
         let preflight = mcp_config::run_mcp_preflight(server_override_owned.as_deref());
         {
             let mut st = state.lock().unwrap_or_else(|p| p.into_inner());
@@ -1215,6 +1209,17 @@ pub fn run() -> anyhow::Result<()> {
         None => control::methods::restore_sessions(&state),
     }
     } // !holder_active
+
+    // doc/org-model.md §12: record this generation's capabilities (by its
+    // lineage and epoch) so a later brain can vouch for it as its rollback
+    // pin. After adoption/handoff, so a monolith's reexec_generation is set;
+    // off the boot path (it hashes the binary).
+    {
+        let epoch = crate::capabilities::current_epoch(&state.lock().unwrap_or_else(|p| p.into_inner()));
+        let _ = std::thread::Builder::new()
+            .name("cm-capabilities".into())
+            .spawn(move || crate::capabilities::record_boot(epoch));
+    }
 
     // Restore only after all holder/re-exec adoption and fresh restoration.
     // Starting the tick earlier could overwrite the sidecar with an empty registry.

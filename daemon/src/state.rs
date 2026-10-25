@@ -616,6 +616,14 @@ pub struct DaemonState {
     /// (`daemon-sessions.json`) so the creator keeps scope over
     /// its spawned workers across a daemon restart.
     pub agent_task_edges: HashMap<String, String>,
+    /// task → workspace bindings [`DaemonState::load_manifest_from_disk`]
+    /// inferred from session task ids rather than read as recorded truth.
+    /// The TUI file it loads carries no daemon-recorded `org`, so a
+    /// workspace's `binding_epoch` is known only once
+    /// `rehydrate_derived_state` merges `daemon-sessions.json`; that pass
+    /// drops these for workspaces that turn out centrally bound
+    /// (doc/org-model.md §12).
+    pub inferred_bindings: Vec<(String, String)>,
     /// Launch grants for owner-role holders of placed items
     /// (doc/org-model.md §7.4): replaced by every board heartbeat reply,
     /// persisted at `<messaging_root>/launch-grants.json`, checked by the
@@ -883,6 +891,7 @@ impl Default for DaemonState {
             task_workspaces: HashMap::new(),
             task_tree_pushed: false,
             agent_task_edges: HashMap::new(),
+            inferred_bindings: Vec::new(),
             launch_grants: Vec::new(),
             planning_task_parents: HashMap::new(),
             planning_parent_failures: HashMap::new(),
@@ -1185,8 +1194,12 @@ impl DaemonState {
                     .filter_map(move |s| s.task_id.as_ref().map(|tid| (tid.clone(), ws_id.clone())))
             })
             .collect();
+        self.inferred_bindings.clear();
         for (task_id, ws_id) in derived {
-            self.bindings.entry(task_id).or_insert(ws_id);
+            if !self.bindings.contains_key(&task_id) {
+                self.bindings.insert(task_id.clone(), ws_id.clone());
+                self.inferred_bindings.push((task_id, ws_id));
+            }
         }
         Ok(true)
     }

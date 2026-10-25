@@ -617,6 +617,28 @@ pub fn start_session(
 /// Surface kept `pub(crate)` so the focused failure-injection test
 /// in this file's `tests` module can reach it without exposing the
 /// injection to external callers.
+/// The org object recorded for `uid` (doc/org-model.md §12): its
+/// persisted manifest entry, else its exit tombstone, else its resume
+/// identity. `None` for a uid nothing has recorded one for.
+pub(crate) fn persisted_org(
+    state: &DaemonState,
+    uid: &str,
+) -> Option<cm_holder_proto::org::OrgObject> {
+    state
+        .workspaces
+        .values()
+        .flat_map(|w| w.sessions.iter())
+        .find(|e| e.uid == uid)
+        .and_then(|e| e.org.clone())
+        .or_else(|| state.exited_tombstone(uid).and_then(|t| t.org.clone()))
+        .or_else(|| {
+            crate::resume_identity::lookup_uid(state, uid)
+                .ok()
+                .flatten()
+                .and_then(|r| r.entry.org)
+        })
+}
+
 pub(crate) fn start_session_with_spawn_fn(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
@@ -826,7 +848,14 @@ pub(crate) fn start_session_with_spawn_fn(
     // Phase-1 continuous wire field: carry the continuous-task tag
     // onto the DaemonSession. `None` for ordinary spawns.
     spawn_params.continuous_task_id = p.continuous_task_id.clone();
-    spawn_params.org = p.org.clone();
+    // doc/org-model.md §12: a respawn at an existing uid keeps its org
+    // object even when the caller doesn't send one (TUI startup restore and
+    // local A-R go through `rpc_start_session_full`, and older TUIs never
+    // know the field).
+    spawn_params.org = p.org.clone().or_else(|| {
+        let st = state_arc.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        persisted_org(&st, &session_uid)
+    });
     spawn_params.model_source = model.as_ref().and(
         p.model_source
             .as_deref()
@@ -4112,6 +4141,12 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
             ),
             None => (None, None, None, None, None),
         };
+    // doc/org-model.md §12: refresh the heartbeat's cached pin status
+    // from this round trip, then report each role and the intersection.
+    if let Some(pin) = previous_pin {
+        crate::capabilities::note_previous_pin(pin);
+    }
+    let capabilities = crate::capabilities::report(previous_pin);
     Ok(json!({
         "ok": true,
         "split": split,
@@ -4125,7 +4160,7 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         "holder_pings_unanswered": pings_unanswered,
         "previous_pin": previous_pin,
         // doc/org-model.md §12: each role's list and their intersection.
-        "capabilities": crate::capabilities::report(previous_pin),
+        "capabilities": capabilities,
         "holder_status_error": holder_status_err,
         "mcp_ok": mcp_ok,
         "mcp_detail": mcp_detail,
@@ -8958,8 +8993,13 @@ fn mint_task_workspace(
             .or_else(|| state.bindings.get(task_id))
             .cloned()
             .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
-        // A minted task worktree is ephemeral (doc/org-model.md §12); a
-        // re-registered identity keeps the org object it already had.
+        // A minted task worktree is ephemeral (doc/org-model.md §12). A
+        // re-registered identity (this id was the task's workspace before
+        // its checkout was reaped) keeps the org object it already had, so a
+        // kind set centrally (`home`) or a binding epoch survives the
+        // re-mint. One that has no org object yet, i.e. a workspace from
+        // before S0b being re-minted, is relabelled `ephemeral`: it is a
+        // task-derived `cm-sub/...` checkout, which is what that kind means.
         let org = state
             .workspaces
             .get(&workspace_id)
@@ -10856,6 +10896,16 @@ pub fn rehydrate_derived_state(
             // epoch): a TUI-loaded row without one takes the persisted one.
             if live.org.is_none() {
                 live.org = ws.org.clone();
+            }
+        }
+        // Bindings the TUI-file load inferred for a workspace that the merge
+        // above just showed to be centrally bound are not recorded truth:
+        // drop them (doc/org-model.md §12).
+        let inferred = std::mem::take(&mut st.inferred_bindings);
+        for (task_id, ws_id) in inferred {
+            let guarded = st.workspaces.get(&ws_id).is_some_and(crate::state::binding_guarded);
+            if guarded && st.bindings.get(&task_id) == Some(&ws_id) {
+                st.bindings.remove(&task_id);
             }
         }
         // Explicit persisted bindings first (recorded truth), then the
@@ -20740,6 +20790,30 @@ mod tests {
             assert_eq!(s.workspaces["ws-g"].org, guarded.org);
             drop(s);
 
+            // Review #3: a TUI file that carries no `org` (TUIs never
+            // learn the daemon-recorded object) lets the boot-time load
+            // infer task-g → ws-g; the rehydrate merge then shows ws-g is
+            // centrally bound and drops the inference.
+            let mut tui_manifest = manifest.clone();
+            for ws in tui_manifest.workspaces.values_mut() {
+                ws.org = None;
+            }
+            std::fs::write(&tui, serde_json::to_string(&tui_manifest).unwrap()).unwrap();
+            let booted = make_state_arc();
+            {
+                let mut s = booted.lock().unwrap();
+                s.load_manifest_from_disk(&tui).unwrap();
+                assert_eq!(s.bindings.get("task-g").map(String::as_str), Some("ws-g"), "inferred at load");
+                s.daemon_sessions_path = Some(path.clone());
+            }
+            rehydrate_derived_state(&booted);
+            {
+                let s = booted.lock().unwrap();
+                assert!(s.bindings.get("task-g").is_none(), "dropped once ws-g shows its epoch");
+                assert_eq!(s.bindings.get("task-p").map(String::as_str), Some("ws-p"));
+                assert_eq!(s.workspaces["ws-g"].org, guarded.org);
+            }
+
             register_agent_subtask(&state, &json!({
                 "task_id": "t-new", "parent_task_id": "t-parent", "workspace_id": "ws-new",
                 "worktree_path": "/tmp/ws-new", "workspace_kind": "ephemeral",
@@ -26744,6 +26818,40 @@ while True:
         assert_eq!(restored.generation, 42);
         assert_eq!(restored.seeded_from_snapshot.as_deref(), Some("seed"));
         assert_eq!(restored.managed_by_uid.as_deref(), Some("ts-parent-0"));
+        s.sessions.clear();
+    }
+
+    /// Review #1: a respawn at an existing uid whose caller sends no `org`
+    /// (TUI startup restore / local A-R through `rpc_start_session_full`,
+    /// older TUIs) keeps the uid's recorded org object.
+    #[test]
+    fn start_session_at_a_reused_uid_keeps_its_recorded_org() {
+        let org = crate::manifest::tests::bridge_org();
+        let state = make_state_arc();
+        let wt = std::env::temp_dir();
+        {
+            let mut s = state.lock().unwrap();
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "ws-reuse".into();
+            ws.worktree_path = Some(wt.clone());
+            let mut e = me("ts-e05e-0", "bash");
+            e.org = Some(org.clone());
+            ws.sessions = vec![e];
+            s.workspaces.insert("ws-reuse".into(), ws);
+            assert_eq!(persisted_org(&s, "ts-e05e-0"), Some(org.clone()));
+            assert_eq!(persisted_org(&s, "ts-never-0"), None);
+        }
+        start_session(
+            &state,
+            &json!({
+                "uid": "ts-e05e-0", "workspace_id": "ws-reuse", "label": "r",
+                "argv": ["/bin/sleep", "60"], "working_dir": wt.to_string_lossy(),
+                "session_type": "bash", "cols": 80, "rows": 24, "env": {},
+            }),
+        )
+        .expect("spawn");
+        let mut s = state.lock().unwrap();
+        assert_eq!(s.sessions["ts-e05e-0"].org.as_ref(), Some(&org));
         s.sessions.clear();
     }
 

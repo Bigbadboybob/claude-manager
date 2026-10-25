@@ -507,7 +507,6 @@ mod tests {
         // §12); this build does not claim lifecycle_guard_v1 yet (it needs
         // org's home-mark apply too).
         assert_eq!(bodies[0]["capabilities"], json!(crate::capabilities::advertised()));
-        assert_eq!(bodies[0]["capabilities"], json!(["org_preserve_v1"]), "not split: the brain's list");
         assert!(!crate::capabilities::brain().iter().any(|c| c == crate::lifecycle_guard::CAPABILITY));
         // The reply's launch grants replace the cache and are persisted.
         let s = state.lock().unwrap();

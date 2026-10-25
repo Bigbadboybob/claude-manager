@@ -370,13 +370,14 @@ fn skew_pair_clears_the_compat_floor() {
             .result
             .unwrap();
         let caps = &health["capabilities"];
-        let holder_has = caps["holder"]
-            .as_array()
-            .is_some_and(|c| c.iter().any(|c| c == "org_preserve_v1"));
-        let advertised = caps["advertised"]
-            .as_array()
-            .is_some_and(|c| c.iter().any(|c| c == "org_preserve_v1"));
-        assert_eq!(advertised, holder_has, "advertised = brain ∩ holder: {caps}");
+        let has = |role: &str| {
+            caps[role].as_array().map(|c| c.iter().any(|c| c == "org_preserve_v1"))
+        };
+        // A null role list does not constrain (no pin configured).
+        let expected = has("brain") == Some(true)
+            && has("holder") == Some(true)
+            && has("rollback_pin") != Some(false);
+        assert_eq!(has("advertised"), Some(expected), "advertised = brain ∩ holder ∩ rollback_pin: {caps}");
     } else {
         assert!(org.is_none(), "a pre-feature brain reports no org");
     }
