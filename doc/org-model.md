@@ -3,8 +3,8 @@
 Status: **final draft, review round 4 folded** (Swarm-Coord, 2026-10-25).
 Owner-directed; Owner has decided O1–O4 (§15). Inputs are listed in §18.
 The interviews are a purposive sample (eight sessions, mostly the trader org
-plus CM and scraper triage), not an org-wide vote. EP answered only the group
-question, and the Codex implementation worker has not replied.
+plus CM and scraper triage), not an org-wide vote. EP's answers are folded in;
+the Codex implementation worker never replied.
 
 ## 1. Summary
 
@@ -656,15 +656,16 @@ done this kind of epic before" is answerable.
 | `title` | manager chain or Owner | ≤ 60 chars |
 | `mandate` (what the member is for) | manager chain or Owner | ≤ 400 chars |
 | `focus` | **derived**: owner-role holds, epics, recent `report_done` reasons, workspace purposes | — |
-| `focus_note` | self; expires after 7 days | ≤ 120 chars |
+| `focus_note` | self; expires after 7 days. The manager chain or Owner may pin it instead (`focus_pinned`), which wins over the derived focus | ≤ 120 chars |
+| `on_call` | manager chain or Owner (with a window); self may only clear it | — |
 | `ask_me_about` | self; checked against evidence | ≤ 8 tags |
 | `not_my_area` (`deploys → swarm-coord`) | self or manager | ≤ 5 entries |
 | `deputy` | manager | a member |
 | `availability_note` | self; expires | ≤ 80 chars |
 | everything else (manager, team, reports, assistants, workspaces, host and how to reach it, engine/model, past work, expertise, contacts) | derived | — |
 
-Six of seven respondents wanted role and focus set by the lead, not the
-agent; deriving `focus` settles that. Authored values are stored as `{value,
+Seven of eight respondents, EP included, wanted role and focus set by the
+lead, not the agent; deriving `focus`, with a manager pin, settles that. Authored values are stored as `{value,
 set_by, via, set_at}` with history in `profile_events` and compare-and-set
 writes. Team profiles: `charter` and `standing_rules` (lead/Owner), lead, and
 derived members, epics (current and past), open items and evidence.
@@ -802,7 +803,7 @@ org(view="directory", query=None, team=None, project=None)
 who(topic, intent="explain"|"owner"|"approve", scope="team"|"org", available=False, limit=5)
     -> [{member, handle, title, team, score, why[≤3 checkable refs], availability, load,
          host, reachable_here, authority_unverified?}], teams[{team, lead, epics, score}]
-owner_of(path=None, component=None, repo=None)      # authored commits + claims (S5); resources later
+owner_of(path=None, component=None, repo=None)      # authored commits, claims, and open items whose links/job name the path (S5)
 who_decided(query=None, item=None, board=None)      # once rulings exist
 profile_set(member=None, …, expected_revision, request_id)   # write
 place(task, board, group=None, holder=None)          # write, S3
@@ -821,6 +822,11 @@ ask(topic=None, to=None, text, item=None)            # write, later
   deputy, never replaced by an expert without authority. `explain` ranks by
   expertise × availability (live idle 1.0, working 0.8, needs_human/errored
   0.3, vacant → deputy) × a load penalty.
+- **Custodians of artifacts.** `owner_of(path=…)` also answers "who holds this
+  artifact right now" (e.g. a set of signed manifests): the owner-role holders
+  of open items whose `links` or declared `job` name the path, then OWNER.md
+  files once that scanner ships. EP's example took three candidates, about
+  five minutes and one wrong read to find a manifest's custodian.
 - **Evidence.** Each row carries up to three refs an agent can check with
   existing tools. For code topics `owner_of` points at the author of the path.
   Discovery finds the person; agents still read the implementation.
@@ -973,7 +979,10 @@ delivered brief, API/daemon version skew.
 
 ### 13.3 Acceptance cases
 
-Same-uid revive and model change; revive after 24 h vacancy; Persistent and
+Item behaviour preserved through placement and member holds: mention-driven
+wakes, holder history, ruling and waiver trails, check-back and ETA flags;
+GO/waiver grants stay bound to their release content, not to an employee;
+same-uid revive and model change; revive after 24 h vacancy; Persistent and
 Fresh continuous fires; replacement while a push or a gate grant is pending,
 then issuing and revoking with the successor; a manager finishing its own item
 while its reports keep working, then managing them after a brain restart;
