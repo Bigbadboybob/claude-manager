@@ -4,9 +4,10 @@
 //!
 //! * A **board-originated close** (the status mirror writes `done` with
 //!   `metadata.terminal_via = "item"`) never arms the terminal sweep against
-//!   non-ephemeral sessions, whatever their workspace kind. Until S0b records
-//!   workspace kinds every workspace is *unclassified*, so such a close sweeps
-//!   nothing: the task's sessions are only unassigned.
+//!   non-ephemeral sessions, whatever their workspace kind. S0b records kinds
+//!   in the workspace's `org.workspace_kind`: new isolated/branch-mode mints
+//!   are `ephemeral`, everything older is *unclassified*, so such a close
+//!   only unassigns the sessions of an unclassified workspace.
 //! * **Every teardown path protects members**: the periodic sweep and
 //!   `mark_subtask_done` skip a member's main session and never remove a
 //!   `home`, `stream` or pinned workspace. Ephemeral and unclassified
@@ -25,8 +26,9 @@ pub const CAPABILITY: &str = "lifecycle_guard_v1";
 /// What a task's close says about who closed it.
 pub const TERMINAL_VIA_ITEM: &str = "item";
 
-/// A workspace's kind (doc/org-model.md §5). S0b records it; until then every
-/// workspace on a host is `Unclassified`, which keeps today's teardown.
+/// A workspace's kind (doc/org-model.md §5), recorded by S0b in the
+/// workspace's org object. Absent or unknown = `Unclassified`, which keeps
+/// today's teardown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspaceKind {
     Unclassified,
@@ -35,10 +37,15 @@ pub enum WorkspaceKind {
     Stream,
 }
 
-/// The kind this host knows for `ws`. No record carries one yet (S0b adds the
-/// `org.workspace_kind` field), so this is `Unclassified` everywhere.
-pub fn workspace_kind(_ws: &ManifestWorkspace) -> WorkspaceKind {
-    WorkspaceKind::Unclassified
+/// The kind this host knows for `ws`: its `org.workspace_kind`
+/// (doc/org-model.md §12).
+pub fn workspace_kind(ws: &ManifestWorkspace) -> WorkspaceKind {
+    match cm_holder_proto::org::workspace_kind(ws.org.as_ref()) {
+        Some("ephemeral") => WorkspaceKind::Ephemeral,
+        Some("home") => WorkspaceKind::Home,
+        Some("stream") => WorkspaceKind::Stream,
+        _ => WorkspaceKind::Unclassified,
+    }
 }
 
 /// Why a workspace must never be removed by a teardown, if it must not.
@@ -82,10 +89,28 @@ mod tests {
         assert_eq!(workspace_kind(&ws(false)), WorkspaceKind::Unclassified);
     }
 
+    fn kind(kind: &str) -> ManifestWorkspace {
+        let mut w = ws(false);
+        cm_holder_proto::org::set(&mut w.org, "workspace_kind", serde_json::json!(kind));
+        w
+    }
+
     #[test]
     fn an_item_close_sweeps_only_ephemeral_workspaces() {
-        // Nothing is classified ephemeral before S0b, so nothing is swept.
-        assert!(!sweepable_after_item_close(Some(&ws(false))));
+        assert!(!sweepable_after_item_close(Some(&ws(false))), "unclassified: unassigned only");
         assert!(!sweepable_after_item_close(None));
+        assert!(sweepable_after_item_close(Some(&kind("ephemeral"))));
+        assert!(sweepable_after_item_close(crate::manifest::ephemeral_workspace_org().map(|org| {
+            ManifestWorkspace { org: Some(org), ..ws(false) }
+        }).as_ref()), "what S0b's mints record");
+        assert!(!sweepable_after_item_close(Some(&kind("home"))));
+    }
+
+    #[test]
+    fn home_and_stream_workspaces_are_protected_and_unknown_kinds_are_unclassified() {
+        assert_eq!(protected_workspace(&kind("home")), Some("home"));
+        assert_eq!(protected_workspace(&kind("stream")), Some("stream"));
+        assert_eq!(protected_workspace(&kind("ephemeral")), None);
+        assert_eq!(workspace_kind(&kind("something-later")), WorkspaceKind::Unclassified);
     }
 }
