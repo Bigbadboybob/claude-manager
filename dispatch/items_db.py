@@ -905,6 +905,7 @@ async def _free_capacity(conn, board: dict, now: datetime,
     on something the board doesn't show). Bash panes, the orchestrator and
     the steward are never capacity (doc/strict-boards.md §4.2).
 
+    Sessions added to the board (`board_members`, #28) count as on it.
     Members' assistants (O5) count too wherever their task now is: the
     assistants of a member whose main session is on the board, or of the
     board team's lead and members, so a lead reuses an idle assistant
@@ -929,8 +930,9 @@ async def _free_capacity(conn, board: dict, now: datetime,
                   AND s.pid <> ALL($5::text[])),
            on_board AS (
                SELECT pid FROM base
-                WHERE task_id IN (SELECT id FROM board_tasks) OR pid IN (SELECT pid FROM holders)),
-           board_members AS (
+                WHERE task_id IN (SELECT id FROM board_tasks) OR pid IN (SELECT pid FROM holders)
+                   OR pid IN (SELECT pid FROM board_members WHERE board_id = $1)),
+           board_team AS (
                SELECT inc.member_id FROM incarnations inc
                 WHERE inc.role = 'main' AND inc.ended_at IS NULL
                   AND inc.pid IN (SELECT pid FROM on_board)
@@ -944,7 +946,7 @@ async def _free_capacity(conn, board: dict, now: datetime,
              LEFT JOIN org_session_facts f ON f.pid = b.pid AND f.acting_as = 'assistant'
              LEFT JOIN members m ON m.id = f.member_id
             WHERE (b.pid IN (SELECT pid FROM on_board)
-                   OR f.member_id IN (SELECT member_id FROM board_members))
+                   OR f.member_id IN (SELECT member_id FROM board_team))
               AND b.pid NOT IN (SELECT pid FROM holders WHERE status IN ('active', 'waiting'))
             ORDER BY b.name NULLS LAST, b.pid""",
         uuid.UUID(board["id"]),

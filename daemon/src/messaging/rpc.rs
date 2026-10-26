@@ -108,6 +108,15 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
     }
 }
 
+/// A session's current chat name and its revision, if it has claimed one
+/// (#28's spawn-time setup renames at that revision).
+pub fn current_name(state: &Arc<Mutex<DaemonState>>, uid: &str) -> Option<(String, u64)> {
+    let handle = state.lock().unwrap_or_else(|p| p.into_inner()).messaging.clone();
+    let slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+    let store = slot.as_ref()?;
+    store.names.get(&store.participant_id(uid)).filter(|n| !n.released).map(|n| (n.name.clone(), n.revision))
+}
+
 /// Label migration is permitted only after legacy workflow bindings have a
 /// unique run/role association. Labels are never an identity fallback.
 fn repair_legacy_binding(state: &Arc<Mutex<DaemonState>>, uid: &str) -> Result<(), ChatError> {

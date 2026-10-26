@@ -459,6 +459,8 @@ pub fn dispatch_request(
         "messaging.counts" | "messaging.mark_read" | "messaging.react" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.attention" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "session.set_name" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        // #28: spawn-time setup by the creator.
+        "session.setup" => DispatchOutcome::Done(crate::spawn_setup::dispatch(state, req)),
         "sidebar.list" | "sidebar.assign" => {
             if matches!(req.caller, Caller::Operator(_)) {
                 if let Err(resp) = require_operator(req, "Sidebar Operator calls require an authenticated Operator") {
@@ -904,7 +906,7 @@ pub fn dispatch_request(
         "item.create" | "item.set" | "item.resolve" | "board.read" | "board.settings"
         | "board.owner_blocked" | "item.place" | "item.unplace" | "group.create" | "group.set"
         | "boards.on_boards" | "epic.set_poc" | "epic.staff" | "epic.close_plan"
-        | "epic.close_apply" => {
+        | "epic.close_apply" | "board.join" => {
             DispatchOutcome::Done(crate::items::rpc::dispatch(state, req))
         }
         // Org model S2 (doc/org-model.md): members, teams, the roster and

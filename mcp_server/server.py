@@ -503,6 +503,7 @@ def epic(
     choices: dict | None = None,
     reason: str | None = None,
     request_id: str | None = None,
+    session: str | None = None,
 ) -> dict:
     """Epics on a board (doc/org-model.md §7.3, §7.6): a body of work with a
     goal, nested headings and sub-epics, and a PoC who leads its team.
@@ -511,10 +512,14 @@ def epic(
 
     - action="create", name=, goal=, parent_group_id=: a new epic.
     - action="promote", group_id=: turn a heading into an epic.
-    - action="set_poc", group_id=, member= (member id, handle or "owner"),
-      team_id= (optional: a team the member already leads): the epic is run
-      by that member's team (created when needed). Returns the staffing
-      offers: each current holder, offered as a primary member or a guest.
+    - action="set_poc", group_id=, member= (member id, handle or "owner")
+      or session= (a chat name, uid or participant id: the member whose main
+      session it is), team_id= (optional: a team the member already leads):
+      the epic is run by that member's team (created when needed). Owner,
+      the board's orchestrator or steward, or the epic's current PoC chain
+      may set it. A PoC that has not touched the board yet joins it in the
+      same call (`joined_board`). Returns the staffing offers: each current
+      holder, offered as a primary member or a guest.
     - action="staff", group_id=, member=, staff_as="guest"|"primary": accept
       one offer. A primary move needs the member's manager chain or Owner.
     - action="close", group_id=, outcome="done"|"cancelled": builds the close
@@ -535,8 +540,8 @@ def epic(
                                          "request_id": rid})
     if action == "set_poc":
         return _items_call("epic.set_poc", {"board": board, "group_id": group_id,
-                                            "member": member, "team_id": team_id,
-                                            "request_id": rid})
+                                            "member": member, "session": session,
+                                            "team_id": team_id, "request_id": rid})
     if action == "staff":
         return _items_call("epic.staff", {"board": board, "group_id": group_id, "member": member,
                                           "as": staff_as, "reason": reason, "request_id": rid})
@@ -1551,6 +1556,14 @@ def org(
     session: str | None = None,
     handle: str | None = None,
     title: str | None = None,
+    name: str | None = None,
+    channels: list[str] | None = None,
+    board: str | None = None,
+    group: str | None = None,
+    epic: str | None = None,
+    items: list[int] | None = None,
+    poc_of: str | None = None,
+    hire: dict | None = None,
 ) -> dict:
     """Find your place in the org: your boss, your reports, your division.
 
@@ -1636,11 +1649,24 @@ def org(
         (`already_member`), continuous orchestrators (`continuous`) and
         non-assistants (`not_an_assistant`); a taken handle is
         `handle_taken`. The session must be on this host.
+      - `action="setup", session_uid=..., name=, channels=, board=, group=,
+        epic=, items=, poc_of=, hire=`: set up a session you spawned, the
+        same steps as `start_session`'s spawn-time setup (see there), with
+        your authority; per-step results.
 
     Adopting a session that is no member's assistant (`action="adopt"`) and
     approving the roster are Owner's, from the TUI; an agent's call is
     refused.
     """
+    if action == "setup":
+        session_uid = session_uid or session
+        if not session_uid:
+            raise RuntimeError("org(action=\"setup\") needs session_uid (a session you spawned)")
+        spec = {key: value for key, value in {
+            "name": name, "channels": channels, "board": board, "group": group, "epic": epic,
+            "items": items, "poc_of": poc_of, "hire": hire,
+        }.items() if value not in (None, "", [])}
+        return {"session_uid": session_uid, "setup": _setup_session(session_uid, spec)}
     if action in ("move", "retire", "reinstate", "close_assistant", "promote") and request_id is None:
         request_id = f"org-{action}-{uuid.uuid4()}"
     params = {key: value for key, value in {
@@ -2289,6 +2315,17 @@ def list_sessions_grouped(
     return {"you": you, "total": len(sessions), "workspaces": workspaces}
 
 
+def _setup_session(session_uid: str, spec: dict) -> dict:
+    """`session.setup` for a session the caller spawned: per-step results, or
+    the reason setup as a whole could not run (the spawn stands either way)."""
+    try:
+        return control_client.call("session.setup", {"session_uid": session_uid, **spec}).get("setup", {})
+    except control_client.ControlError as e:
+        return {"error": f"{e.code}: {e.message}"}
+    except Exception as e:  # noqa: BLE001 - setup never fails a spawn
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 @mcp.tool()
 async def start_session(
     type: str = "",
@@ -2309,6 +2346,14 @@ async def start_session(
     model: str | None = None,
     effort: str | None = None,
     work_kind: str | None = None,
+    name: str | None = None,
+    channels: list[str] | None = None,
+    board: str | None = None,
+    group: str | None = None,
+    epic: str | None = None,
+    items: list[int] | None = None,
+    poc_of: str | None = None,
+    hire: dict | None = None,
 ) -> dict:
     """Spawn a new agent or shell session in your workspace.
 
@@ -2450,6 +2495,25 @@ async def start_session(
             hear from ONCE, when it is genuinely finished. See
             `monitor_sessions`.
 
+    Spawn-time setup (#28), run with YOUR authority right after the spawn,
+    before the new session's first message, so you never wait for it to act:
+        name: claim its chat name.
+        channels: channels it joins (an open channel directly; a closed one
+            through you as its admin).
+        board: a board it joins; `group` (a group name) or `epic` (an
+            epic's group_id) says which part of the board it works on.
+        items: item numbers it becomes the holder of (on `board`, else
+            your task's board).
+        poc_of: an epic's group_id it becomes the PoC of. A PoC must be a
+            member: pass `hire={"handle": ..., "title": ...}` to promote it
+            first (org #27), or promote it later and call
+            `org(action="setup", session_uid=..., poc_of=...)`.
+        hire: {handle, title?, team?, manager?}: make it a member (its own
+            main session) instead of your assistant.
+    Each step is reported in `setup` ("ok", "refused: <why>" when you could
+    not do that yourself, "failed: <why>"); a refused or failed step never
+    stops the spawn or the other steps.
+
     Returns:
         Every spawn returns, alongside the shape below:
           - `worktree_path` — the checkout the new session actually
@@ -2583,6 +2647,12 @@ async def start_session(
     spawn = await asyncio.to_thread(
         control_client.call, method, params, socket_path=route.path
     )
+    spec = {key: value for key, value in {
+        "name": name, "channels": channels, "board": board, "group": group, "epic": epic,
+        "items": items, "poc_of": poc_of, "hire": hire,
+    }.items() if value not in (None, "", [])}
+    if spec and isinstance(spawn, dict) and spawn.get("session_uid"):
+        spawn["setup"] = await asyncio.to_thread(_setup_session, spawn["session_uid"], spec)
 
     # wait=false remains a fast spawn/acceptance call. Its monitor consumes
     # the receipt in the background; pending never means submitted=false.
@@ -2652,6 +2722,7 @@ async def start_session(
                 "model_source",
                 "effort",
                 "effort_source",
+                "setup",
             ):
                 if spawn.get(key) is not None and d.get(key) is None:
                     d[key] = spawn[key]

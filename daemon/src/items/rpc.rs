@@ -17,6 +17,8 @@ pub const METHODS: &[&str] = &[
     // Org model S3 (doc/org-model.md §7): placement, groups, the on-boards list.
     "item.place", "item.unplace", "group.create", "group.set", "boards.on_boards",
     "epic.set_poc", "epic.staff", "epic.close_plan", "epic.close_apply",
+    // #28: add a session to a board (spawn-time setup).
+    "board.join",
 ];
 
 pub(crate) type RpcResult<T = Value> = Result<T, (ErrorCode, String)>;
@@ -36,6 +38,7 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
         "item.unplace" => item_unplace(state, &ctx, &req.params),
         "group.create" => group_create(&ctx, &req.params),
         "group.set" => group_set(&ctx, &req.params),
+        "board.join" => board_join(&ctx, &req.params),
         "epic.set_poc" | "epic.staff" | "epic.close_plan" | "epic.close_apply" => {
             epic_call(&ctx, req.method.as_str(), &req.params)
         }
@@ -336,7 +339,8 @@ pub(crate) fn resolve_board(ctx: &Ctx, params: &Value) -> RpcResult {
 }
 
 /// Editing rights (doc §2 rule 9): Owner, a global session, a session whose
-/// task resolves to the board, or a current holder of any item on it.
+/// task resolves to the board, a current holder of any item on it, or a
+/// session added to it (`board.join`, #28).
 pub(crate) fn authorize_edit(ctx: &Ctx, params: &Value, board: &Value) -> RpcResult<()> {
     if ctx.owner || ctx.global {
         return Ok(());
@@ -354,6 +358,13 @@ pub(crate) fn authorize_edit(ctx: &Ctx, params: &Value, board: &Value) -> RpcRes
     let held = ctx.api.get("/items", &[("holder_pid", ctx.pid.clone()), ("open", "true".into())])?;
     if held.as_array().is_some_and(|rows| rows.iter().any(|r| r["board"] == board["slug"])) {
         return Ok(());
+    }
+    // Added to the board by someone with authority over it (#28).
+    if let Ok(slug) = slug(board) {
+        let joined = ctx.api.get(&format!("/boards/{slug}/members"), &[("pid", ctx.pid.clone())]);
+        if joined.is_ok_and(|v| v["members"].as_array().is_some_and(|m| !m.is_empty())) {
+            return Ok(());
+        }
     }
     Err((
         ErrorCode::Unauthorized,
@@ -1072,6 +1083,25 @@ fn group_set(ctx: &Ctx, params: &Value) -> RpcResult {
 /// The epic writes (doc/org-model.md §7.3, §7.6). The API decides who may:
 /// Owner or the board's lead for a PoC and a close; the org core checks a
 /// staffing move's manager chain.
+/// `board.join` (#28): add a session to a board the caller may edit (the
+/// creator setting up a session it spawned, or anyone with editing rights
+/// bringing a session in). `session` is a chat name, uid or participant id;
+/// `group` / `group_id` names the group (an epic) it joins for.
+fn board_join(ctx: &Ctx, params: &Value) -> RpcResult {
+    let board = resolve_board(ctx, params)?;
+    authorize_edit(ctx, params, &board)?;
+    let reference = params.get("session").and_then(Value::as_str).filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| bad("session (a chat name, uid or participant id) is required"))?;
+    let target = resolve_holder(ctx, reference)?;
+    let mut body = json!({"actor": ctx.actor(), "pid": target["pid"], "name": target["name"]});
+    for key in ["group", "group_id", "reason"] {
+        if let Some(v) = present(params, key) {
+            body[key] = v;
+        }
+    }
+    ctx.api.post(&format!("/boards/{}/members", slug(&board)?), &body)
+}
+
 fn epic_call(ctx: &Ctx, method: &str, params: &Value) -> RpcResult {
     let board = resolve_board(ctx, params)?;
     let slug = slug(&board)?;
@@ -1083,9 +1113,16 @@ fn epic_call(ctx: &Ctx, method: &str, params: &Value) -> RpcResult {
     };
     let path = match method {
         "epic.set_poc" | "epic.staff" => {
-            let member = params.get("member").and_then(Value::as_str).filter(|m| !m.trim().is_empty())
-                .ok_or_else(|| bad("member (a member id, handle or owner) is required"))?;
-            body["member"] = json!(member.trim());
+            // `session=` names the PoC by its session (a chat name, uid or
+            // participant id); the API takes the member whose main it is.
+            let session = params.get("session").and_then(Value::as_str).filter(|m| !m.trim().is_empty());
+            let member = match session {
+                Some(reference) => resolve_holder(ctx, reference)?["pid"].as_str().unwrap_or_default().to_string(),
+                None => params.get("member").and_then(Value::as_str).filter(|m| !m.trim().is_empty())
+                    .ok_or_else(|| bad("member (a member id, handle or owner) or session is required"))?
+                    .trim().to_string(),
+            };
+            body["member"] = json!(member);
             for key in ["team_id", "as", "reason", "request_id"] {
                 if let Some(v) = params.get(key).filter(|v| !v.is_null()) {
                     body[key] = v.clone();

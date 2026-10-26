@@ -146,6 +146,13 @@ everyone who holds what, with each holder's live state, so nobody has to ask.
   authority; it keeps its session, context, checkout and holds, reports to
   that member, and gets a notice). Its checkout becomes its home only if it
   is no one else's, never its member's own checkout.
+- Set up what you spawn when you spawn it: `start_session(name=,
+  channels=, board=, group=/epic=, items=, poc_of=, hire=)` names it, joins
+  it to channels and a board, hands it items and makes it an epic's PoC, all
+  with your authority, and reports each step in `setup`. A step you could
+  not do yourself is refused alone. `org(action="setup", session_uid=...)`
+  does the same for a session you spawned earlier. A new lead: spawn, then
+  promote (`hire=`), then `poc_of`.
 
 ## Orchestrating other sessions
 

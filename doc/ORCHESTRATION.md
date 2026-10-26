@@ -242,3 +242,36 @@ session. Only an orchestrator can make Owner a task's lead, or undo it
 (`org(action="set_lead", session_uid="owner", task_id=...)` on a task below
 its own, or with global permissions), and never on its own task; Owner does it
 from A-e.
+
+## 11. Start a team: set the new session up when you launch it
+
+When you spawn a session, set it up in the same call instead of waiting for
+it to act. `start_session` takes the setup with your authority, right after
+the spawn and before the new session's first message:
+
+```
+start_session(type=..., isolated=true, prompt=...,
+              name="Latent-Lead",            # its chat name
+              channels=["initiative/latent"], # channels it joins
+              board="latent", epic="<group_id>", # on the board, working on that epic
+              items=[12, 14],                 # it holds these
+              hire={"handle": "latent-lead", "title": "Latent lead"},  # a member, not your assistant
+              poc_of="<group_id>")            # and the epic's PoC
+```
+
+The result carries `setup`, one entry per step: `"ok"`, `"refused: <why>"`
+(a step you could not do yourself, for example `poc_of` when you have no
+authority over the board) or `"failed: <why>"`. A refused or failed step
+never stops the spawn or the other steps. Fix the cause and repeat just that
+part with `org(action="setup", session_uid=..., ...)`, which works for any
+session you spawned.
+
+A new lead is a new member, and only a member can be an epic's PoC. The
+recipe is: spawn → promote (`hire=` at spawn, or `org(action="promote",
+session=...)` afterwards) → `set_poc` (`poc_of=` at spawn, or
+`epic(action="set_poc", session=...)`). Without `hire`, the spawn is your
+assistant and `poc_of` is refused with that hint. `set_poc` adds a PoC that
+has not touched the board yet to it, in the same call. Owner, the board's
+orchestrator or steward, or the epic's current PoC chain may set the PoC.
+`hire=` needs org's promote (#27) on your daemon; before it ships, that step
+reports `failed`.

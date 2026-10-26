@@ -108,6 +108,7 @@ pub mod task_parent_refresh;
 pub mod lifecycle_guard;
 pub mod terminal_sweep;
 pub mod session_watch;
+pub mod spawn_setup;
 pub mod state;
 pub mod staffing;
 pub mod notifications;

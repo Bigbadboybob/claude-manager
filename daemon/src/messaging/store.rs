@@ -1583,25 +1583,32 @@ impl Store {
         if let Some(e) = prior {
             return Ok(self.send_response(&e));
         }
-        let old = self.names.get(actor).ok_or_else(|| {
-            err(
-                "not_enrolled",
-                "This session has not chosen a messaging name yet",
-            )
-        })?;
-        if p["expected_name_revision"].as_u64() != Some(old.revision) {
-            return Err(err(
-                "name_revision_conflict",
-                format!("Current name revision is {}", old.revision),
-            ));
-        }
+        // A session with no name yet can claim its first one here, without
+        // a message (#28: its creator names it at spawn); it passes no
+        // expected_name_revision. Renaming still needs the current revision.
+        let first = match self.names.get(actor) {
+            None if p["expected_name_revision"].is_null() => true,
+            None => {
+                return Err(err(
+                    "not_enrolled",
+                    "This session has not chosen a messaging name yet",
+                ))
+            }
+            Some(old) if p["expected_name_revision"].as_u64() != Some(old.revision) => {
+                return Err(err(
+                    "name_revision_conflict",
+                    format!("Current name revision is {}", old.revision),
+                ));
+            }
+            Some(_) => false,
+        };
         let n = self.allocate(actor, &required(p, "name")?, uid)?;
         let mut v = serde_json::to_value(&n)?;
         v["participant_id"] = json!(actor);
         let e = self.publish(
             "identity.update",
             None,
-            &format!("Session renamed to {}", n.name),
+            &if first { format!("Session named {}", n.name) } else { format!("Session renamed to {}", n.name) },
             json!({"identity":v}),
             initiator,
             if initiator == "owner" {
@@ -2576,6 +2583,25 @@ mod tests {
                 .clone()
         );
     }
+    /// #28: a session with no name claims its first one without a message
+    /// (its creator names it at spawn); renaming still needs the revision.
+    #[test]
+    fn a_first_name_is_claimed_without_a_message_and_a_rename_still_needs_its_revision() {
+        let t = tempfile::tempdir().unwrap();
+        let mut s = Store::open(t.path()).unwrap();
+        let a = person(&s, "a");
+        let err = s.rename(&a.id, "a", &json!({"name": "Lead", "expected_name_revision": 1, "request_id": "r0"}))
+            .unwrap_err();
+        assert_eq!(err.code, "not_enrolled", "a revision for a name it never had");
+        let first = s.rename(&a.id, "a", &json!({"name": "Lead", "request_id": "r1"})).unwrap();
+        assert_eq!(first["event"]["body"], "Session named Lead");
+        assert_eq!(s.names.get(&a.id).map(|n| (n.name.as_str(), n.revision)), Some(("Lead", 1)));
+        assert_eq!(s.rename(&a.id, "a", &json!({"name": "Other", "request_id": "r2"})).unwrap_err().code,
+                   "name_revision_conflict", "a named session renames at its revision");
+        s.rename(&a.id, "a", &json!({"name": "Lead-2", "expected_name_revision": 1, "request_id": "r3"})).unwrap();
+        assert_eq!(s.names.get(&a.id).unwrap().aliases, ["Lead"]);
+    }
+
     #[test]
     fn historical_aliases_suffix_collisions_owner_rename_and_missing_bootstrap_recover() {
         let t = tempfile::tempdir().unwrap();

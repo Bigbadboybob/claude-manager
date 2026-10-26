@@ -145,6 +145,16 @@ class GroupCreateBody(_Strict):
     ord: Annotated[int, Field(ge=-100000, le=100000)] | None = None
 
 
+class BoardJoinBody(_Strict):
+    """Add a session to a board (#28); the daemon checked the actor may edit it."""
+    actor: Actor
+    pid: Short
+    name: Short | None = None
+    group_id: Short | None = None
+    group: Short | None = None
+    reason: Short | None = None
+
+
 class EpicPocBody(_Strict):
     actor: Actor
     member: Short

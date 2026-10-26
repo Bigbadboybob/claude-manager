@@ -722,6 +722,9 @@
     "revision": {
      "type": "integer"
     },
+    "session": {
+     "type": "string"
+    },
     "staff_as": {
      "type": "string"
     },
@@ -1446,16 +1449,46 @@
     "action": {
      "type": "string"
     },
+    "board": {
+     "type": "string"
+    },
+    "channels": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
     "division": {
+     "type": "string"
+    },
+    "epic": {
+     "type": "string"
+    },
+    "group": {
      "type": "string"
     },
     "handle": {
      "type": "string"
     },
+    "hire": {
+     "type": "object"
+    },
+    "items": {
+     "items": {
+      "type": "integer"
+     },
+     "type": "array"
+    },
     "manager": {
      "type": "string"
     },
     "member": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "poc_of": {
      "type": "string"
     },
     "reason": {
@@ -1800,19 +1833,46 @@
     "allow_shared_workspace": {
      "type": "boolean"
     },
+    "board": {
+     "type": "string"
+    },
+    "channels": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
     "effort": {
+     "type": "string"
+    },
+    "epic": {
      "type": "string"
     },
     "global_perms": {
      "type": "boolean"
     },
+    "group": {
+     "type": "string"
+    },
+    "hire": {
+     "type": "object"
+    },
     "isolated": {
      "type": "boolean"
+    },
+    "items": {
+     "items": {
+      "type": "integer"
+     },
+     "type": "array"
     },
     "label": {
      "type": "string"
     },
     "model": {
+     "type": "string"
+    },
+    "name": {
      "type": "string"
     },
     "notify_on_done": {
@@ -1823,6 +1883,9 @@
     },
     "pending_idle_grace_s": {
      "type": "number"
+    },
+    "poc_of": {
+     "type": "string"
     },
     "poll_interval_s": {
      "type": "number"

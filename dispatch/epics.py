@@ -56,18 +56,47 @@ async def _epic(conn, board: dict, group_id: str, *, lock: bool = False):
     return g, groups
 
 
-async def _authorize(conn, board: dict, actor: dict, what: str) -> str:
-    """Setting a PoC and closing an epic are Owner's or the board team's
-    lead's acts (§7.3, §7.6); until S2's team leads are wired to boards the
-    board team's lead is the board's orchestrator. Returns the authority
-    used, recorded on the org event."""
+async def _authorize(conn, board: dict, actor: dict, what: str, *, poc_team: str | None = None) -> str:
+    """Setting a PoC and closing an epic are acts of authority over the board
+    (§7.3, §7.6): Owner, the board's lead (its orchestrator), its steward, or
+    (with `poc_team`, the epic's current team) the current PoC or a member up
+    the PoC's manager chain, acting as its main session. The last two
+    apply to set_poc only. Returns the authority used, recorded on the org
+    event."""
     if actor["pid"] == OWNER_PID:
         return f"{what}:owner"
     orch = await placement._orchestrator_pid(conn, board)
     if orch and actor["pid"] == orch:
         return f"{what}:board_lead"
+    # The steward and the PoC chain may name a PoC (#28); closing an epic
+    # stays the board lead's or Owner's.
+    if what == "set_poc" and board.get("steward_pid") and actor["pid"] == board["steward_pid"]:
+        return f"{what}:steward"
+    if poc_team and await _has_org_tables(conn):
+        org = _org()
+        poc = (await placement._team_leads(conn, [poc_team])).get(str(poc_team))
+        actor_member = await conn.fetchval(
+            """SELECT member_id FROM incarnations
+                WHERE pid = $1 AND role = 'main' AND ended_at IS NULL""", actor["pid"])
+        if poc and actor_member:
+            if actor_member == poc:
+                return f"{what}:poc"
+            if actor_member in [m["id"] for m in await org._chain(conn, poc)]:
+                return f"{what}:poc_chain"
     raise ItemsError(403, "forbidden",
-                     f"only Owner or the board's lead (its orchestrator) may {what.replace('_', ' ')}")
+                     f"only Owner, the board's lead (its orchestrator), its steward or the epic's "
+                     f"current PoC chain may {what.replace('_', ' ')}")
+
+
+async def _member_of(conn, org, member: str) -> str | None:
+    """A member reference (id, handle, alias, `owner`) or a session's
+    participant id (`agent:<daemon>:<uid>`), which names the member whose
+    main session it is."""
+    if isinstance(member, str) and member.startswith("agent:"):
+        return await conn.fetchval(
+            """SELECT member_id FROM incarnations
+                WHERE pid = $1 AND role = 'main' AND ended_at IS NULL""", member)
+    return await org._resolve_member_id(conn, member)
 
 
 def _subtree(groups: dict, root_id: str) -> set[str]:
@@ -110,9 +139,14 @@ async def set_poc(pool, ref: str, actor: dict, group_id: str, member: str, *,
             g, groups = await _epic(conn, board, group_id, lock=True)
             if g.closed:
                 raise ItemsError(409, "epic_closed", f"epic {g.name!r} is {g.epic_status}")
-            authority = await _authorize(conn, board, actor, "set_poc")
-            member_id = await org._resolve_member_id(conn, member)
+            authority = await _authorize(conn, board, actor, "set_poc", poc_team=g.team_id)
+            member_id = await _member_of(conn, org, member)
             if not member_id:
+                if isinstance(member, str) and member.startswith("agent:"):
+                    raise invalid("unknown_member",
+                                  f"{member} is no member's main session yet: promote it first "
+                                  f"(org(action=\"promote\", session=...), or spawn it with "
+                                  f"hire={{handle, title}}), then set_poc", field="member")
                 raise invalid("unknown_member", f"no member {member!r}", field="member")
             leads = await placement._team_leads(conn, [t for t in (team_id, g.team_id) if t])
             if team_id:
@@ -125,9 +159,16 @@ async def set_poc(pool, ref: str, actor: dict, group_id: str, member: str, *,
                 chosen = g.team_id
             else:
                 parent = _enclosing_epic_team(groups, g) or board.get("initiative_id")
+                # A hand-over to a PoC that leads no team yet creates its team;
+                # the epic's earlier team keeps the plain slug.
+                slug = None
+                if g.team_id:
+                    handle = await conn.fetchval("SELECT handle FROM members WHERE id = $1", member_id)
+                    slug = f"{g.name}-{handle}"
                 chosen = await org.create_team_conn(
-                    conn, actor, name=g.name, kind="team", parent_team_id=parent, lead=member_id,
-                    charter=g.goal or "", authorized_by=authority, request_id=request_id)
+                    conn, actor, name=g.name, slug=slug, kind="team", parent_team_id=parent,
+                    lead=member_id, charter=g.goal or "", authorized_by=authority,
+                    request_id=request_id)
                 chosen = str(chosen)
             await conn.execute(
                 """UPDATE groups SET team_id = $2, revision = revision + 1, updated_at = $3
@@ -135,9 +176,21 @@ async def set_poc(pool, ref: str, actor: dict, group_id: str, member: str, *,
             await placement._group_event(conn, board, actor, "poc_set", {"team_id": g.team_id},
                                          {"team_id": chosen, "poc_member_id": member_id,
                                           "authorized_by": authority}, now)
+            # A PoC need not have touched the board yet (#28): with the
+            # authority checked above, its main session joins it here.
+            from dispatch import board_members
+            joined = []
+            main_pid = await conn.fetchval(
+                """SELECT pid FROM incarnations
+                    WHERE member_id = $1 AND role = 'main' AND ended_at IS NULL""", member_id)
+            if main_pid and await board_members.add(
+                    conn, board, main_pid, added_by=actor["pid"], group_id=g.id,
+                    reason=f"PoC of epic {g.name}"):
+                joined.append(main_pid)
             offers = await _staffing_offers(conn, board, groups, g, chosen)
             return {"group": (await placement._group_rows(conn, board, [g.id]))[0],
-                    "team_id": chosen, "poc_member_id": member_id, "staffing": offers}
+                    "team_id": chosen, "poc_member_id": member_id, "staffing": offers,
+                    "joined_board": joined}
 
 
 async def _staffing_offers(conn, board, groups, g, team_id) -> list[dict]:

@@ -11,6 +11,7 @@ from api.items_models import (
     BoardPatchBody,
     EpicCloseApplyBody,
     EpicClosePlanBody,
+    BoardJoinBody,
     EpicPocBody,
     EpicStaffBody,
     GroupCreateBody,
@@ -249,6 +250,22 @@ async def set_group(ref: str, group_id: str, body: GroupPatchBody, request: Requ
     expected = changes.pop("expected_revision", None)
     return await _call(placement.set_group(
         _pool(request), ref, actor, group_id, changes, expected_revision=expected))
+
+
+@router.post("/boards/{ref}/members")
+async def board_join(ref: str, body: BoardJoinBody, request: Request):
+    """Add a session to the board (#28): spawn-time setup and set_poc."""
+    from dispatch import board_members
+    return await _call(board_members.join(
+        _pool(request), ref, body.actor.model_dump(), pid=body.pid, name=body.name,
+        group_id=body.group_id, group=body.group, reason=body.reason))
+
+
+@router.get("/boards/{ref}/members")
+async def board_member_list(ref: str, request: Request,
+                            pid: str | None = Query(None, max_length=300)):
+    from dispatch import board_members
+    return await _call(board_members.members(_pool(request), ref, pid=pid))
 
 
 @router.post("/boards/{ref}/epics/{group_id}/poc")
