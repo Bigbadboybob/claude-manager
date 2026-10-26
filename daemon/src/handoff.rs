@@ -724,7 +724,10 @@ fn assistant_text(row: &Value) -> Option<String> {
 pub fn extract_document(path: &Path, marker: &str) -> Option<String> {
     let text = tail(path)?;
     let needle = format!("[cm-handoff-request {marker}]");
-    let after = &text[text.rfind(&needle)?..];
+    // The marker is a fresh nonce, so its first occurrence is the request
+    // itself. Claude also appends a `last-prompt` row repeating the request
+    // AFTER the reply; searching from the last occurrence missed the reply.
+    let after = &text[text.find(&needle)?..];
     let mut reply = String::new();
     for line in after.lines().skip(1) {
         let Ok(row) = serde_json::from_str::<Value>(line) else { continue };
@@ -1160,6 +1163,17 @@ mod tests {
     /// #25 review: a rotation and a handoff admitted from two threads (each
     /// under the state lock, as `rotation::start` and `tick` do) are never
     /// both running.
+    #[test]
+    fn document_found_when_a_last_prompt_row_repeats_the_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let req = json!({"type": "user", "message": {"role": "user", "content": "[cm-handoff-request abcd1234] write it"}});
+        let reply = json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "<cm-handoff>\n# Goal\nship it\n</cm-handoff>"}]}});
+        let last = json!({"type": "last-prompt", "lastPrompt": "[cm-handoff-request abcd1234] write it"});
+        std::fs::write(&path, format!("{req}\n{reply}\n{last}\n")).unwrap();
+        assert_eq!(extract_document(&path, "abcd1234").as_deref(), Some("# Goal\nship it"));
+    }
+
     #[test]
     fn a_rotation_and_a_handoff_never_both_get_the_same_session() {
         let _serial = crate::rotation::test_registry_lock();
