@@ -3030,6 +3030,26 @@ struct ResolveAuthorizedSessionParams {
     session_uid: String,
 }
 
+fn resolve_read_decision(
+    state: &DaemonState,
+    caller_uid: &str,
+    target_uid: &str,
+) -> crate::control::auth::AuthDecision {
+    if state.sessions.contains_key(target_uid) {
+        crate::control::auth::check_session_caller(state, caller_uid, target_uid)
+    } else if let Some(tomb) = state.exited_tombstone(target_uid) {
+        crate::control::auth::check_session_caller_for_exited(
+            state,
+            caller_uid,
+            target_uid,
+            tomb.task_id.as_deref(),
+            &tomb.workspace_id,
+        )
+    } else {
+        crate::control::auth::check_session_caller(state, caller_uid, target_uid)
+    }
+}
+
 /// Resolve a session's transcript metadata for the Python MCP
 /// tool's two-step read pattern. See module-level doc above for
 /// the why; this is just the wire shape implementation.
@@ -3050,56 +3070,56 @@ pub fn resolve_authorized_session(
     // denies, release the registry lock before asking the planning API for
     // the same manager-chain read authority used by session handoff.  An API
     // failure falls back to this denial, so the old scope remains fail-closed.
-    let needs_org_read = if let Some(cuid) = caller_uid {
+    let initial_decision = if let Some(cuid) = caller_uid {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-        let decision = if state.sessions.contains_key(&p.session_uid) {
-            crate::control::auth::check_session_caller(&state, cuid, &p.session_uid)
-        } else if let Some(tomb) = state.exited_tombstone(&p.session_uid) {
-            crate::control::auth::check_session_caller_for_exited(
-                &state,
+        resolve_read_decision(&state, cuid, &p.session_uid)
+    } else {
+        crate::control::auth::AuthDecision::Allow
+    };
+    let org_identity = if !initial_decision.is_allow() {
+        caller_uid.and_then(|cuid| {
+            crate::items::org::read_authorized_target(
+                state_arc,
                 cuid,
                 &p.session_uid,
-                tomb.task_id.as_deref(),
-                &tomb.workspace_id,
             )
-        } else {
-            crate::control::auth::check_session_caller(&state, cuid, &p.session_uid)
-        };
-        !decision.is_allow()
+        })
     } else {
-        false
+        None
     };
-    if needs_org_read {
-        if !crate::items::org::read_authorized_target(
-            state_arc,
-            caller_uid.expect("needs_org_read has a session caller"),
-            &p.session_uid,
-        )
-        .unwrap_or(false)
-        {
-            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-            let decision = if state.sessions.contains_key(&p.session_uid) {
-                crate::control::auth::check_session_caller(&state, caller_uid.unwrap(), &p.session_uid)
-            } else if let Some(tomb) = state.exited_tombstone(&p.session_uid) {
-                crate::control::auth::check_session_caller_for_exited(
-                    &state,
-                    caller_uid.unwrap(),
-                    &p.session_uid,
-                    tomb.task_id.as_deref(),
-                    &tomb.workspace_id,
-                )
-            } else {
-                crate::control::auth::check_session_caller(&state, caller_uid.unwrap(), &p.session_uid)
-            };
+    if !initial_decision.is_allow() && org_identity.is_none() {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let decision = caller_uid
+            .map(|cuid| resolve_read_decision(&state, cuid, &p.session_uid))
+            .unwrap_or(crate::control::auth::AuthDecision::Allow);
+        if let Some(cuid) = caller_uid {
             return_auth_error_if_denied_with_state(
                 decision,
-                caller_uid.unwrap(),
+                cuid,
                 &p.session_uid,
                 Some(&state),
             )?;
         }
     }
     let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(cuid) = caller_uid {
+        let current_decision = resolve_read_decision(&state, cuid, &p.session_uid);
+        let attribution_changed = org_identity.as_ref().is_some_and(|granted| {
+            crate::items::org::target_identity(&state, &p.session_uid).as_ref() != Some(granted)
+        });
+        // Re-check the current target after the API call.  A reused UID may
+        // now name a different task/member/transcript; the old grant cannot
+        // authorize that replacement.  If the current task scope itself now
+        // allows the target, the ordinary scope is sufficient.
+        if attribution_changed || org_identity.is_none() {
+            return_auth_error_if_denied_with_state(
+                current_decision,
+                cuid,
+                &p.session_uid,
+                Some(&state),
+            )?;
+        }
+    }
     // Auth passed (or Operator caller). Resolve the target: live session first,
     // then a recently-exited tombstone (read-after-exit), else NotFound.
     if let Some(session) = state.sessions.get(&p.session_uid) {

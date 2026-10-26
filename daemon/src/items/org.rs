@@ -116,6 +116,43 @@ pub(crate) struct ReadAuthorityTarget {
     pub session_uid: Option<String>,
 }
 
+/// Identity checked before and after the planning-API read.  A session UID is
+/// reusable across revive/rotation, so the UID alone cannot bind an old org
+/// grant to the transcript we are about to return.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReadTargetIdentity {
+    pub member_id: String,
+    pub task_id: Option<String>,
+    pub workspace_id: String,
+    pub generation: u64,
+    pub transcript_path: Option<String>,
+}
+
+/// Snapshot the current org/task/transcript identity for one target.  The
+/// caller must hold no other lock; this helper only borrows the supplied
+/// state and never performs network I/O.
+pub(crate) fn target_identity(state: &DaemonState, target_uid: &str) -> Option<ReadTargetIdentity> {
+    if let Some(session) = state.sessions.get(target_uid) {
+        let membership = crate::assistants::of_session(session)?;
+        return Some(ReadTargetIdentity {
+            member_id: membership.member_id,
+            task_id: session.task_id.clone(),
+            workspace_id: session.workspace_id.clone(),
+            generation: session.generation,
+            transcript_path: session.transcript_path.clone(),
+        });
+    }
+    let tomb = state.exited_tombstone(target_uid)?;
+    let membership = crate::assistants::membership(target_uid, tomb.org.as_ref())?;
+    Some(ReadTargetIdentity {
+        member_id: membership.member_id,
+        task_id: tomb.task_id.clone(),
+        workspace_id: tomb.workspace_id.clone(),
+        generation: tomb.generation,
+        transcript_path: tomb.transcript_path.clone(),
+    })
+}
+
 /// Ask the planning API for the subset of member sessions this caller may
 /// read.  The request is deliberately best-effort: an unavailable or older
 /// API returns `None`, and callers keep today's task/workspace scope.  The
@@ -126,23 +163,42 @@ fn read_authority_batch(
     caller_uid: &str,
     targets: &[ReadAuthorityTarget],
 ) -> Option<HashSet<String>> {
+    read_authority_batch_inner(state, caller_uid, targets, || {})
+}
+
+/// Implementation split out so the lock-order regression test can observe
+/// the exact seam: the state mutex is released before the messaging slot is
+/// acquired.  Production callers use the no-op hook above.
+fn read_authority_batch_inner<F: FnOnce()>(
+    state: &Arc<Mutex<DaemonState>>,
+    caller_uid: &str,
+    targets: &[ReadAuthorityTarget],
+    after_state_snapshot: F,
+) -> Option<HashSet<String>> {
     if targets.is_empty() {
         return Some(HashSet::new());
     }
-    let (api_url, api_token, daemon_id, task_id) = {
+    let (api_url, api_token, messaging, task_id) = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         let caller = s.sessions.get(caller_uid)?;
         if caller.global_perms {
             return Some(HashSet::new());
         }
-        let daemon_id = s
-            .messaging
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-            .map(|store| store.daemon_id.clone())?;
-        (s.config.api_url.clone(), s.config.api_token.clone(), daemon_id, caller.task_id.clone())
+        (
+            s.config.api_url.clone(),
+            s.config.api_token.clone(),
+            s.messaging.clone(),
+            caller.task_id.clone(),
+        )
     };
+    // Do not acquire messaging while the DaemonState mutex is held.  The
+    // messaging initializer can hold its slot and then acquire state.
+    after_state_snapshot();
+    let daemon_id = messaging
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .map(|store| store.daemon_id.clone())?;
     let mut seen = HashSet::new();
     let wire_targets: Vec<Value> = targets
         .iter()
@@ -215,31 +271,25 @@ pub(crate) fn read_scope_members(
 
 /// Whether a caller may read one target under the org manager chain.  This is
 /// used by `resolve_authorized_session` after the ordinary task/workspace
-/// check denies the target.  `None` means the API was unavailable.
+/// check denies the target.  `None` means the API was unavailable or denied.
 pub(crate) fn read_authorized_target(
     state: &Arc<Mutex<DaemonState>>,
     caller_uid: &str,
     target_uid: &str,
-) -> Option<bool> {
-    let member_id = {
+) -> Option<ReadTargetIdentity> {
+    let identity = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(session) = s.sessions.get(target_uid) {
-            crate::assistants::of_session(session).map(|m| m.member_id)
-        } else {
-            s.exited_tombstone(target_uid).and_then(|tomb| {
-                crate::assistants::membership(target_uid, tomb.org.as_ref()).map(|m| m.member_id)
-            })
-        }
+        target_identity(&s, target_uid)
     }?;
     let allowed = read_authority_batch(
         state,
         caller_uid,
         &[ReadAuthorityTarget {
-            member_id: member_id.clone(),
+            member_id: identity.member_id.clone(),
             session_uid: Some(target_uid.to_string()),
         }],
     )?;
-    Some(allowed.contains(&member_id))
+    allowed.contains(&identity.member_id).then_some(identity)
 }
 
 fn params(raw: &Value) -> RpcResult<Map<String, Value>> {
@@ -927,6 +977,47 @@ mod tests {
         let state = Arc::new(Mutex::new(st));
         crate::messaging::startup::open_for_test(&state).unwrap();
         state
+    }
+
+    #[test]
+    fn read_authority_drops_state_before_locking_messaging() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let (url, _seen) = test_stub(|method, path, _| match (method, path) {
+            ("POST", "/org/members/authority-batch") => (
+                200,
+                r#"{"allowed":[{"member_id":"mem-report"}]}"#.into(),
+            ),
+            _ => (500, "{}".into()),
+        });
+        let state = state(root.path(), &url);
+        {
+            let mut st = state.lock().unwrap();
+            let mut params = crate::session::SpawnParams::new("me-uid", "me", "/bin/sleep");
+            params.args = vec!["30".into()];
+            params.session_type = "codex".into();
+            st.sessions.insert("me-uid".into(), crate::session::DaemonSession::spawn(params).unwrap());
+        }
+        let messaging = state.lock().unwrap().messaging.clone();
+        let messaging_guard = messaging.lock().unwrap();
+        let state_guard = state.lock().unwrap();
+        let (snapshot_done, snapshot_seen) = std::sync::mpsc::channel();
+        let worker_state = state.clone();
+        let worker = std::thread::spawn(move || {
+            read_authority_batch_inner(
+                &worker_state,
+                "me-uid",
+                &[ReadAuthorityTarget { member_id: "mem-report".into(), session_uid: None }],
+                || snapshot_done.send(()).unwrap(),
+            )
+        });
+        drop(state_guard);
+        snapshot_seen
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("state snapshot must complete before messaging lock");
+        assert!(state.try_lock().is_ok(), "state lock is held while messaging is locked");
+        drop(messaging_guard);
+        worker.join().unwrap();
     }
 
     fn daemon_id(state: &Arc<Mutex<DaemonState>>) -> String {

@@ -3854,6 +3854,81 @@ mod tests {
         crate::items::org::reset_cache_for_test();
     }
 
+    #[test]
+    fn resolve_rechecks_target_identity_after_org_authority_call() {
+        let _env = crate::test_support::env_lock();
+        crate::items::org::reset_cache_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let (request_seen_tx, request_seen_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (url, _seen) = crate::items::org::test_stub(move |method, path, _body| {
+            if method == "POST" && path == "/org/members/authority-batch" {
+                request_seen_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("test must release the API response");
+                return (
+                    200,
+                    serde_json::json!({"allowed": [{"member_id": "mem-report"}]}).to_string(),
+                );
+            }
+            (500, "{}".into())
+        });
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        {
+            let mut st = state.lock().unwrap();
+            st.messaging_root = root.path().into();
+            st.config.api_url = url;
+            st.config.api_token = "tok".into();
+        }
+        crate::messaging::startup::open_for_test(&state).unwrap();
+        let spawn = |uid: &str, task: &str| {
+            let mut params = crate::session::SpawnParams::new(uid, uid, "/bin/sleep");
+            params.args = vec!["30".into()];
+            params.session_type = "codex".into();
+            let mut session = crate::session::DaemonSession::spawn(params).unwrap();
+            session.task_id = Some(task.into());
+            session
+        };
+        {
+            let mut st = state.lock().unwrap();
+            st.sessions.insert("lead-race".into(), spawn("lead-race", "task-lead"));
+            st.sessions.insert("report-race".into(), spawn("report-race", "task-report"));
+        }
+        crate::items::org::absorb_reply(
+            &serde_json::json!({"org": {"members": {
+                "lead-race": {"id": "mem-lead", "acting_as": "main"},
+                "report-race": {"id": "mem-report", "acting_as": "main"}
+            }}}),
+            1_700_000_000.0,
+        );
+        let worker_state = state.clone();
+        let worker = std::thread::spawn(move || {
+            dispatch_resolve_authorized_session(
+                &worker_state,
+                &session_request(
+                    "resolve_authorized_session",
+                    serde_json::json!({"session_uid": "report-race"}),
+                    "lead-race",
+                ),
+            )
+        });
+        request_seen_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("resolve must reach the authority API");
+        {
+            let mut st = state.lock().unwrap();
+            st.sessions.get_mut("report-race").unwrap().task_id = Some("task-replaced".into());
+        }
+        release_tx.send(()).unwrap();
+        let response = worker.join().unwrap();
+        assert!(!response.ok, "stale org grant authorized replacement: {response:?}");
+        for session in state.lock().unwrap().sessions.values_mut() {
+            let _ = session.kill();
+        }
+        crate::items::org::reset_cache_for_test();
+    }
+
     /// #25: who may hand off what. A session only itself and never `now`;
     /// bulk is operator-only; shells and continuous sessions are refused.
     #[test]
