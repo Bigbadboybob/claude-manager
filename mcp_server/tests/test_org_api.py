@@ -494,6 +494,40 @@ class OrgApiDb(unittest.IsolatedAsyncioTestCase):
         snap = await self.snapshot()
         self.assertFalse({m["handle"] for m in snap["members"]} & {"shell", "continuous", "workflow", "assistant"})
 
+    async def test_auto_place_does_not_steal_an_existing_home_on_shared_workspace_path(self):
+        existing = uid_at(0.1, 10)
+        await self.beat(D1, [{"uid": existing, "name": "Existing", "ws": "ws-home",
+                              "path": "/w/shared"}])
+        adopted = await self.http.post("/org/adopt", json={
+            "actor": OWNER, "pid": pid(existing), "handle": "existing", "request_id": "adopt-existing-home"})
+        self.assertEqual(adopted.status_code, 200, adopted.text)
+        await self.beat(D1, [{"uid": existing, "name": "Existing", "ws": "ws-home",
+                              "path": "/w/shared"}])
+
+        fresh = uid_at(0.01, 11)
+        reply = await self.beat(D1, [
+            {"uid": existing, "name": "Existing", "ws": "ws-home", "path": "/w/shared"},
+            {"uid": fresh, "name": "New Agent", "ws": "ws-other", "path": "/w/shared",
+             "auto_place_owner": True},
+        ])
+        self.assertEqual(len(reply["org"]["auto_placed"]), 1)
+        new_member = (await self.http.get("/org/members/main/new-agent")).json()["member"]
+        existing_member = (await self.http.get("/org/members/main/existing")).json()["member"]
+        self.assertIsNone(new_member["home_workspace"])
+        self.assertEqual(existing_member["home_workspace"]["workspace_id"], "ws-home")
+
+    async def test_auto_place_heartbeat_waits_for_feed_lock_without_lock_cycle(self):
+        row = {"uid": uid_at(0.01, 12), "name": "locked", "ws": "ws-locked",
+               "path": "/w/locked", "auto_place_owner": True}
+        async with self.pool.acquire() as holder:
+            async with holder.transaction():
+                await holder.execute("SELECT pg_advisory_xact_lock(hashtext('cm_task_changes'))")
+                pending = asyncio.create_task(self.beat(D1, [row]))
+                await asyncio.sleep(0.1)
+                self.assertFalse(pending.done(), "candidate heartbeat must wait for the feed lock")
+            reply = await asyncio.wait_for(pending, 5)
+        self.assertEqual(len(reply["org"]["auto_placed"]), 1)
+
     async def test_missing_and_null_engine_sessions_can_be_adopted_and_appear_as_task_peers(self):
         root = await self.task("legacy TUI rows")
         for n, engine_fields in enumerate(({}, {"engine": None}), 1):

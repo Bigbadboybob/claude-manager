@@ -853,6 +853,38 @@ async def _home_mark(conn, member_id: str, home: dict | None) -> dict | None:
     return dict(row)
 
 
+async def _auto_place_home(conn, session: dict | None) -> dict | None:
+    """Return a home only when this fresh session owns an unclaimed checkout.
+
+    Auto-placement is a seating decision; it must not steal an existing
+    member's home when A-s joins that member's workspace or when a daemon has
+    two workspace ids pointing at the same path.
+    """
+    home = _home_of(session)
+    if not home:
+        return None
+    daemon_id, workspace_id, path = home["daemon_id"], home["workspace_id"], home.get("path")
+    mark = await conn.fetchrow(
+        """SELECT kind, member_id FROM org_workspace_marks
+            WHERE daemon_id = $1 AND workspace_id = $2""", daemon_id, workspace_id)
+    if mark and (mark["kind"] == "home" or mark["member_id"]):
+        return None
+    if path and await conn.fetchval(
+            """SELECT 1 FROM org_workspace_marks
+                WHERE daemon_id = $1 AND kind = 'home' AND path = $2
+                LIMIT 1""", daemon_id, path):
+        return None
+    if await conn.fetchval(
+            """SELECT 1 FROM org_session_facts f
+                 JOIN session_states s ON s.pid = f.pid
+                 JOIN incarnations i ON i.pid = f.pid AND i.ended_at IS NULL
+                WHERE s.daemon_id = $1 AND s.exited_at IS NULL AND s.state <> 'exited'
+                  AND (f.workspace_id = $2 OR ($3::text IS NOT NULL AND f.worktree_path = $3))
+                LIMIT 1""", daemon_id, workspace_id, path):
+        return None
+    return home
+
+
 async def _create_team(conn, actor, *, name, slug=None, kind="team", parent_team_id=None,
                        lead_member_id=None, charter="", standing_rules=None,
                        coordinator_task_id=None, request_id=None, authorized_by=None) -> str:
@@ -1861,6 +1893,7 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
     prefix = f"agent:{daemon_id}:"
     now = utcnow()
     facts = []
+    requires_org_lock = False
     for raw in sessions or []:
         if not isinstance(raw, dict):
             continue
@@ -1870,6 +1903,8 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
         uid = _clip(raw.get("session_uid"), 200)
         if not uid:
             continue
+        requires_org_lock |= any(raw.get(key) for key in (
+            "auto_place_owner", "managed_by_uid", "continuous_task_id", "workflow_run_id"))
         age = raw.get("spawned_age_s")
         spawned = None
         if isinstance(age, (int, float)) and 0 <= age < 10 * 365 * 86400:
@@ -1885,6 +1920,17 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
     auto_placed = []
     async with pool.acquire() as conn:
         async with conn.transaction():
+            # Explicit adoption/close/promote take the org advisory lock
+            # before touching facts. If this daemon has a placement intent (or
+            # a lifecycle tag that can cancel one), take the same lock before
+            # the heartbeat upsert so row-lock → advisory-lock inversion is
+            # impossible. Idle beats stay lock-free.
+            if not requires_org_lock:
+                requires_org_lock = bool(await conn.fetchval(
+                    """SELECT EXISTS (SELECT 1 FROM org_session_facts
+                                       WHERE daemon_id = $1 AND auto_place_owner)""", daemon_id))
+            if requires_org_lock:
+                await _lock(conn)
             for f in facts:
                 await conn.execute(
                     """INSERT INTO org_session_facts (pid, daemon_id, session_uid, workspace_id,
@@ -1892,7 +1938,10 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
                                                       managed_by_uid, workflow_run_id, spawned_at,
                                                       member_id, acting_as, auto_place_owner, reported_at)
                        VALUES ($1, $13, $2, $3, $4, $5, $6, $7, $8, $9,
-                               CASE WHEN $9::text IS NULL THEN NULL ELSE $10 END, $11, $12)
+                               CASE WHEN $9::text IS NULL THEN NULL ELSE $10 END,
+                               CASE WHEN $5::text IS NOT NULL OR $6::text IS NOT NULL
+                                         OR $7::text IS NOT NULL
+                                    THEN FALSE ELSE $11 END, $12)
                        ON CONFLICT (pid) DO UPDATE SET
                            member_id = coalesce(EXCLUDED.member_id, org_session_facts.member_id),
                            acting_as = CASE WHEN org_session_facts.acting_as IN ('closed', 'promoted')
@@ -1904,7 +1953,13 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
                            managed_by_uid = EXCLUDED.managed_by_uid,
                            workflow_run_id = EXCLUDED.workflow_run_id,
                            spawned_at = coalesce(org_session_facts.spawned_at, EXCLUDED.spawned_at),
-                           auto_place_owner = org_session_facts.auto_place_owner OR EXCLUDED.auto_place_owner,
+                           auto_place_owner = CASE
+                               WHEN EXCLUDED.workflow_run_id IS NOT NULL
+                                 OR EXCLUDED.continuous_task_id IS NOT NULL
+                                 OR EXCLUDED.managed_by_uid IS NOT NULL
+                               THEN FALSE
+                               ELSE org_session_facts.auto_place_owner OR EXCLUDED.auto_place_owner
+                           END,
                            reported_at = EXCLUDED.reported_at""",
                     *f, now, daemon_id)
             # Fresh top-level agent sessions carry a durable operator intent
@@ -1929,7 +1984,9 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
             # candidates under that lock before creating members.
             candidates = await conn.fetch(candidate_sql, daemon_id, sorted(AGENT_ENGINES))
             if candidates:
-                await _lock(conn)
+                if not requires_org_lock:
+                    await _lock(conn)
+                    requires_org_lock = True
                 candidates = await conn.fetch(candidate_sql, daemon_id, sorted(AGENT_ENGINES))
             if candidates:
                 taken = {r["alias"] for r in await conn.fetch(
@@ -1942,7 +1999,7 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
                         conn, {"pid": OWNER_PID, "name": "Owner"},
                         handle=handle, kind="agent", title=_clip(row["name"], 200) or handle,
                         manager_ref=OWNER_PID, team_id=None, pid=row["pid"],
-                        home=_home_of(dict(row)), source="auto_place",
+                        home=await _auto_place_home(conn, dict(row)), source="auto_place",
                         request_id=f"auto-place:{row['pid']}")
                     await conn.execute(
                         """UPDATE org_session_facts
