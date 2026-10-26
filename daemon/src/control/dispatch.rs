@@ -3710,6 +3710,139 @@ mod tests {
         }
     }
 
+    /// Org read scope is additive to the task tree: a lead can list a report
+    /// whose session was spawned elsewhere, while an unavailable planning API
+    /// leaves the old task-tree answer in place.
+    #[test]
+    fn list_sessions_includes_org_report_from_one_batched_authority_check() {
+        let _env = crate::test_support::env_lock();
+        crate::items::org::reset_cache_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let (url, seen) = crate::items::org::test_stub(|method, path, _body| match (method, path) {
+            ("POST", "/org/members/authority-batch") => (
+                200,
+                serde_json::json!({"allowed": [{"member_id": "mem-report"}]}).to_string(),
+            ),
+            _ => (500, "{}".into()),
+        });
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        {
+            let mut st = state.lock().unwrap();
+            st.messaging_root = root.path().into();
+            st.config.api_url = url;
+            st.config.api_token = "tok".into();
+        }
+        crate::messaging::startup::open_for_test(&state).unwrap();
+        let spawn = |uid: &str, task: &str| {
+            let mut params = crate::session::SpawnParams::new(uid, uid, "/bin/sleep");
+            params.args = vec!["30".into()];
+            params.session_type = "codex".into();
+            let mut session = crate::session::DaemonSession::spawn(params).unwrap();
+            session.task_id = Some(task.into());
+            session
+        };
+        {
+            let mut st = state.lock().unwrap();
+            st.sessions.insert("lead-uid".into(), spawn("lead-uid", "task-lead"));
+            st.sessions.insert("report-uid".into(), spawn("report-uid", "task-report"));
+        }
+        crate::items::org::absorb_reply(
+            &serde_json::json!({"org": {"members": {
+                "lead-uid": {"id": "mem-lead", "acting_as": "main"},
+                "report-uid": {"id": "mem-report", "acting_as": "main"}
+            }}}),
+            1_700_000_000.0,
+        );
+        let response = dispatch_list_sessions(
+            &state,
+            &session_request("list_sessions", serde_json::json!({}), "lead-uid"),
+        );
+        assert!(response.ok, "{:?}", response.error);
+        let rows = response.result.unwrap();
+        let uids: Vec<_> = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["session_uid"].as_str())
+            .collect();
+        assert!(uids.contains(&"lead-uid"));
+        assert!(uids.contains(&"report-uid"), "report rows: {uids:?}");
+        let resolved = dispatch_resolve_authorized_session(
+            &state,
+            &session_request(
+                "resolve_authorized_session",
+                serde_json::json!({"session_uid": "report-uid"}),
+                "lead-uid",
+            ),
+        );
+        assert!(resolved.ok, "{:?}", resolved.error);
+        let calls = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, path, _)| method == "POST" && path == "/org/members/authority-batch")
+            .count();
+        assert_eq!(calls, 1, "one batched authority request, not one per row");
+        for session in state.lock().unwrap().sessions.values_mut() {
+            let _ = session.kill();
+        }
+        crate::items::org::reset_cache_for_test();
+    }
+
+    #[test]
+    fn list_sessions_keeps_task_scope_when_org_api_is_unavailable() {
+        let _env = crate::test_support::env_lock();
+        crate::items::org::reset_cache_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let (url, _seen) = crate::items::org::test_stub(|_, _path, _| (503, "{}".into()));
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        {
+            let mut st = state.lock().unwrap();
+            st.messaging_root = root.path().into();
+            st.config.api_url = url;
+            st.config.api_token = "tok".into();
+        }
+        crate::messaging::startup::open_for_test(&state).unwrap();
+        let spawn = |uid: &str, task: &str| {
+            let mut params = crate::session::SpawnParams::new(uid, uid, "/bin/sleep");
+            params.args = vec!["30".into()];
+            params.session_type = "codex".into();
+            let mut session = crate::session::DaemonSession::spawn(params).unwrap();
+            session.task_id = Some(task.into());
+            session
+        };
+        {
+            let mut st = state.lock().unwrap();
+            st.sessions.insert("lead-down".into(), spawn("lead-down", "task-lead"));
+            st.sessions.insert("report-down".into(), spawn("report-down", "task-report"));
+        }
+        crate::items::org::absorb_reply(
+            &serde_json::json!({"org": {"members": {
+                "lead-down": {"id": "mem-lead-down", "acting_as": "main"},
+                "report-down": {"id": "mem-report-down", "acting_as": "main"}
+            }}}),
+            1_700_000_000.0,
+        );
+        let response = dispatch_list_sessions(
+            &state,
+            &session_request("list_sessions", serde_json::json!({}), "lead-down"),
+        );
+        assert!(response.ok, "{:?}", response.error);
+        let result = response.result.unwrap();
+        let uids: Vec<_> = result
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["session_uid"].as_str())
+            .collect();
+        assert!(uids.contains(&"lead-down"));
+        assert!(!uids.contains(&"report-down"), "API outage widened scope: {uids:?}");
+        for session in state.lock().unwrap().sessions.values_mut() {
+            let _ = session.kill();
+        }
+        crate::items::org::reset_cache_for_test();
+    }
+
     /// #25: who may hand off what. A session only itself and never `now`;
     /// bulk is operator-only; shells and continuous sessions are refused.
     #[test]

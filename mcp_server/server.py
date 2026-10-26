@@ -2180,9 +2180,12 @@ def list_sessions(
     terminal panes labelled kind="shell"; they are never agent workers.
 
     Scope: your own task tree (or your whole workspace if you have no
-    task). If you hold global permissions (check `ping().global_perms`),
-    this returns EVERY session across all tasks and workspaces. For a
-    readable tree grouped by workspace → task, use
+    task). A member lead also sees sessions attributed to members below it in
+    the org manager chain, including their assistants and workers; this
+    read-only widening is API-backed and falls back to the old scope if the
+    planning API is unavailable. If you hold global permissions (check
+    `ping().global_perms`), this returns EVERY session across all tasks and
+    workspaces. For a readable tree grouped by workspace → task, use
     `list_sessions_grouped` instead.
 
     Args:
@@ -2258,8 +2261,10 @@ def list_sessions_grouped(
     readable companion to `list_sessions`.
 
     Use this when you're orchestrating across more than one task or
-    workspace (the common case once you hold global permissions) and want
-    the structure handed to you instead of bucketing a flat list yourself.
+    workspace (including org reports visible through your manager chain) and
+    want the structure handed to you instead of bucketing a flat list
+    yourself. Its read scope matches `list_sessions` and does not grant any
+    write authority.
 
     Args: same as `list_sessions`.
 
@@ -3256,7 +3261,8 @@ def read_session_output(
     since_cursor: str | None = None,
     max_messages: int = 20,
 ) -> dict:
-    """Read transcript messages from a session you can see.
+    """Read transcript messages from a session you can see, including an
+    org report (or that report's assistant/worker) when your member leads it.
 
     Low-level primitive — pages FORWARD from a cursor. For the common
     "what did it just say?" question use `read_last_turn`; reach for this
@@ -3346,7 +3352,7 @@ def read_session_output(
 
 @mcp.tool()
 def read_last_turn(session_uid: str, context_messages: int = 6) -> dict:
-    """Read the TAIL of a session's transcript — the fast way to see what
+    """Read the TAIL of a visible session's transcript — the fast way to see what
     an agent just said without paging through the whole thing.
 
     `read_session_output` pages FORWARD from the start, so fetching the

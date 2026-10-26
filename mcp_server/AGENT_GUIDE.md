@@ -217,7 +217,11 @@ from planning initiatives. See `doc/sidebar-sections.md`.
 
 ### Shell panes
 
-`list_sessions` and `list_sessions_grouped` show agent workers by default.
+`list_sessions` and `list_sessions_grouped` show agent workers by default. A
+member lead's read scope also includes sessions attributed to members below it
+in the org manager chain, plus those members' assistants and workers; this is
+read-only and falls back to the task/workspace scope if the planning API is
+unavailable. It does not widen `send_input` or `kill_session`.
 Use `include_shells=true` to inspect bash terminals; they carry `kind: "shell"`
 and `status: "shell"` (or `exited`). Shells are never teammates, item holders,
 roster candidates, or free capacity. `send_input` explicitly runs shell commands

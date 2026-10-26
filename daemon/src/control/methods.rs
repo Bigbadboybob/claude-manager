@@ -2569,6 +2569,28 @@ pub fn list_sessions(
             .map_err(|e| (ErrorCode::InvalidParams, format!("list_sessions params: {}", e)))?
     };
     let include_shells = p.include_shells.unwrap_or(caller_uid.is_none());
+    // Org-report visibility is a read-only widening of the default scope.
+    // Snapshot the caller's global grant first, then make one batched API
+    // request before taking the registry lock used to build the rows.  An API
+    // outage leaves this `None`, which deliberately preserves today's scope.
+    let caller_is_global_snapshot = caller_uid
+        .and_then(|cuid| {
+            state_arc
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .sessions
+                .get(cuid)
+                .map(|s| s.global_perms)
+        })
+        .unwrap_or(false);
+    let org_read_members = if p.task_id.is_none()
+        && caller_uid.is_some()
+        && !caller_is_global_snapshot
+    {
+        crate::items::org::read_scope_members(state_arc, caller_uid.unwrap(), p.include_exited)
+    } else {
+        None
+    };
     let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
 
     // Global-permissions grant: a global caller sees EVERY session
@@ -2579,7 +2601,7 @@ pub fn list_sessions(
     let caller_is_global = caller_uid
         .and_then(|cuid| state.sessions.get(cuid))
         .map(|s| s.global_perms)
-        .unwrap_or(false);
+        .unwrap_or(caller_is_global_snapshot);
 
     // Sub-2a Finding #3: authorize the requested task scope
     // BEFORE iterating. Mirrors
@@ -2673,7 +2695,7 @@ pub fn list_sessions(
                 None => true,
             };
         }
-        match (scope_task.as_deref(), caller_uid) {
+        let legacy = match (scope_task.as_deref(), caller_uid) {
             // Explicit scope (param OR caller's task): include
             // only sessions whose task_id is self-or-descendant
             // of the scope. Mirrors TUI's `Some(scope) =>` arm.
@@ -2694,7 +2716,20 @@ pub fn list_sessions(
             }
             // No scope, Operator caller: every session.
             (None, None) => true,
+        };
+        if legacy {
+            return true;
         }
+        // A lead's org-chain read is additive only for the default listing
+        // (no explicit task filter).  The target must carry the same member
+        // attribution the API checked in the batch response.
+        org_read_members.as_ref().is_some_and(|allowed| {
+            state
+                .sessions
+                .get(uid)
+                .and_then(crate::assistants::of_session)
+                .is_some_and(|m| allowed.contains(&m.member_id))
+        })
     };
 
     // Daemon-owned sessions (live PTY in `state.sessions`).
@@ -2868,7 +2903,7 @@ pub fn list_sessions(
             if state.sessions.contains_key(uid) || state.tui_sessions.contains_key(uid) {
                 continue;
             }
-            let include = match (scope_task.as_deref(), caller_uid) {
+            let legacy_include = match (scope_task.as_deref(), caller_uid) {
                 (Some(scope), _) => tomb
                     .task_id
                     .as_deref()
@@ -2890,6 +2925,10 @@ pub fn list_sessions(
                 .is_allow(),
                 (None, None) => true,
             };
+            let include = legacy_include || org_read_members.as_ref().is_some_and(|allowed| {
+                crate::assistants::membership(uid, tomb.org.as_ref())
+                    .is_some_and(|m| allowed.contains(&m.member_id))
+            });
             if !include || (!include_shells && tomb.session_type == "bash") {
                 continue;
             }
@@ -3007,16 +3046,12 @@ pub fn resolve_authorized_session(
             )
         })?;
 
-    // Sub-2a Finding #2 TOCTOU shape: auth + read-target happen
-    // in one critical section. Target lookup happens AFTER auth
-    // passes so a deny decision doesn't leak metadata via timing
-    // on the existence check.
-    let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(cuid) = caller_uid {
-        // Auth against the LIVE session if present, else its read-after-exit
-        // TOMBSTONE (same descendant-task/workspace scope rule applies to a dead
-        // target), else the live path which yields TargetNotInRegistry for a
-        // genuinely-unknown uid.
+    // Keep the ordinary task/workspace decision local and cheap.  If it
+    // denies, release the registry lock before asking the planning API for
+    // the same manager-chain read authority used by session handoff.  An API
+    // failure falls back to this denial, so the old scope remains fail-closed.
+    let needs_org_read = if let Some(cuid) = caller_uid {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         let decision = if state.sessions.contains_key(&p.session_uid) {
             crate::control::auth::check_session_caller(&state, cuid, &p.session_uid)
         } else if let Some(tomb) = state.exited_tombstone(&p.session_uid) {
@@ -3030,8 +3065,41 @@ pub fn resolve_authorized_session(
         } else {
             crate::control::auth::check_session_caller(&state, cuid, &p.session_uid)
         };
-        return_auth_error_if_denied_with_state(decision, cuid, &p.session_uid, Some(&state))?;
+        !decision.is_allow()
+    } else {
+        false
+    };
+    if needs_org_read {
+        if !crate::items::org::read_authorized_target(
+            state_arc,
+            caller_uid.expect("needs_org_read has a session caller"),
+            &p.session_uid,
+        )
+        .unwrap_or(false)
+        {
+            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            let decision = if state.sessions.contains_key(&p.session_uid) {
+                crate::control::auth::check_session_caller(&state, caller_uid.unwrap(), &p.session_uid)
+            } else if let Some(tomb) = state.exited_tombstone(&p.session_uid) {
+                crate::control::auth::check_session_caller_for_exited(
+                    &state,
+                    caller_uid.unwrap(),
+                    &p.session_uid,
+                    tomb.task_id.as_deref(),
+                    &tomb.workspace_id,
+                )
+            } else {
+                crate::control::auth::check_session_caller(&state, caller_uid.unwrap(), &p.session_uid)
+            };
+            return_auth_error_if_denied_with_state(
+                decision,
+                caller_uid.unwrap(),
+                &p.session_uid,
+                Some(&state),
+            )?;
+        }
     }
+    let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     // Auth passed (or Operator caller). Resolve the target: live session first,
     // then a recently-exited tombstone (read-after-exit), else NotFound.
     if let Some(session) = state.sessions.get(&p.session_uid) {
