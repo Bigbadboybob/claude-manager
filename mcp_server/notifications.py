@@ -107,8 +107,11 @@ class Queue:
 
     def hold_until(self, now: float | None = None) -> float | None:
         """When the current hold ends, or None when nothing is held."""
+        path = self.path / "hold"
+        if not path.exists():  # the common case: a stat, no read
+            return None
         try:
-            until = json.loads((self.path / "hold").read_text()).get("until")
+            until = json.loads(path.read_text()).get("until")
         except (OSError, ValueError, AttributeError):
             return None
         if isinstance(until, (int, float)) and until > (time.time() if now is None else now):
