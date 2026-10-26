@@ -1528,6 +1528,9 @@ pub(crate) fn start_session_with_spawn_fn(
 /// `session.rs::arm_reaper`), so `build_last_exit` reads a
 /// populated kernel slot.
 pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
+    // #24: an exit ends a pending rotation's arm and wake hold (a rotation's
+    // or handoff's own stop is theirs; they respawn the uid).
+    crate::rotation::on_session_exit(uid);
     // Holder-split provenance (DESIGN_HOLDER_BRAIN_SPLIT § Exit
     // provenance): in holder mode the exit observer stashed the
     // HOLDER's authoritative info — `waitid`-time timestamp and the

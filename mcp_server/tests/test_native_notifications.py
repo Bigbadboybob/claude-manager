@@ -146,6 +146,12 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         await eventually(lambda: len(new.sent) == 2)
         self.assertEqual(sorted(e["id"] for e in new.sent), ["chat-1", "chat-2"], "nothing lost")
 
+    async def test_a_hold_shows_in_the_snapshot(self):
+        self.assertIsNone(self.queue.snapshot()["hold"])
+        until = time.time() + 60
+        (self.queue.path / "hold").write_text(json.dumps({"until": until}))
+        self.assertEqual(self.queue.snapshot()["hold"], {"until": until})
+
     async def test_an_expired_hold_does_not_block_delivery(self):
         (self.queue.path / "hold").write_text(json.dumps({"until": time.time() - 1}))
         adapter = Adapter()

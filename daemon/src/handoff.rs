@@ -271,6 +271,7 @@ pub(crate) fn recover_live(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap:
     let file = PathBuf::from(file);
     let state = Arc::clone(state_arc);
     let uid = uid.to_string();
+    crate::rotation::hold(&state_arc.lock().unwrap_or_else(|p| p.into_inner()), &uid, crate::rotation::HoldOwner::Handoff);
     {
         let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
         reg.running = Some(uid.clone());
@@ -307,7 +308,7 @@ pub(crate) fn recover_live(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap:
 
 fn finish(uid: &str, phase: &'static str, outcome: String) {
     eprintln!("cm-daemon: handoff of {uid}: {outcome}");
-    crate::rotation::unhold(uid);
+    crate::rotation::unhold(uid, crate::rotation::HoldOwner::Handoff);
     let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
     if let Some(r) = reg.records.get_mut(uid) {
         r.phase = phase;
@@ -518,7 +519,7 @@ pub fn tick(state_arc: &Arc<Mutex<DaemonState>>) {
         if q.plan.kind != Kind::Rotate {
             // Wakes wait for whatever runs at the uid once this is done, so
             // none gets in ahead of the handoff request or the takeover.
-            crate::rotation::hold(&state, &q.uid);
+            crate::rotation::hold(&state, &q.uid, crate::rotation::HoldOwner::Handoff);
         }
         if let Some(r) = reg.records.get_mut(&q.uid) {
             r.phase = "starting";

@@ -105,12 +105,18 @@ class Queue:
     # daemon that dies mid-rotation cannot hold delivery for good.
     HOLD_EXEMPT = frozenset({"rotation", "handoff"})
 
-    def held(self, now: float | None = None) -> bool:
+    def hold_until(self, now: float | None = None) -> float | None:
+        """When the current hold ends, or None when nothing is held."""
         try:
             until = json.loads((self.path / "hold").read_text()).get("until")
         except (OSError, ValueError, AttributeError):
-            return False
-        return isinstance(until, (int, float)) and until > (time.time() if now is None else now)
+            return None
+        if isinstance(until, (int, float)) and until > (time.time() if now is None else now):
+            return float(until)
+        return None
+
+    def held(self, now: float | None = None) -> bool:
+        return self.hold_until(now) is not None
 
     def event_path(self, event_id: str) -> Path:
         return self.path / (hashlib.sha256(event_id.encode()).hexdigest() + ".json")
@@ -283,6 +289,9 @@ class Queue:
             return {
                 "transport": transport,
                 "health": health,
+                # CM is rotating or handing off this session: pending wakes
+                # wait for the new process (until this time at most).
+                "hold": {"until": hold} if (hold := self.hold_until()) else None,
                 "notifications": sorted(events, key=lambda e: e["created_at"]),
             }
 

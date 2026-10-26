@@ -16,12 +16,13 @@ UPDATE = {"version": "abc123", "payload_hash": "h2", "tools_hash": "t1", "tools_
 
 
 class FakeQueue:
-    def __init__(self, events=()):
+    def __init__(self, events=(), hold=None):
         self.events = list(events)
+        self.hold = hold
         self.published = []
 
     def snapshot(self):
-        return {"notifications": self.events}
+        return {"notifications": self.events, "hold": self.hold}
 
     def publish(self, event_id, source, text, marker):
         self.published.append((event_id, source, text, marker))
@@ -104,6 +105,11 @@ class PolicyTests(unittest.TestCase):
                 self.policy = None
                 self.assertEqual(self.tick()["blocked"], reason)
                 self.assertEqual(self.sent, [])
+
+    def test_wakes_held_for_a_rotation_do_not_stall_activation(self):
+        self.queue = FakeQueue([{"status": "pending", "source": "chat"}], hold={"until": time.time() + 60})
+        self.tick()
+        self.assertEqual(self.sent, ["idle"])
 
     def test_our_own_pending_notice_does_not_block(self):
         self.queue = FakeQueue([{"status": "pending", "source": "mcp_update"}])

@@ -85,8 +85,20 @@ pub fn accept_own_startup(state: &Arc<Mutex<DaemonState>>, uid: &str, argv: &[St
                 }
                 return;
             }
+            // The client's composer (its footer) only draws once any startup
+            // dialog is past: stop there. The banner alone is not enough; a
+            // resume or fork can draw it before the dialog.
+            if client_ready(&screen) {
+                return;
+            }
         }
     });
+}
+
+/// Whether the rendered screen shows Claude Code's composer footer.
+fn client_ready(screen: &str) -> bool {
+    let compact: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
+    compact.contains("shift+tabtocycle") || compact.contains("?forshortcuts")
 }
 
 #[cfg(test)]
@@ -95,6 +107,14 @@ mod tests {
     const SCREEN: &str = "WARNING: Loading development channels\n\
         --dangerously-load-development-channels is for local channel development only.\n\
         Channels: server:claude-manager\n❯ 1. I am using this for local development\n2. Exit\nEnter to confirm";
+
+    #[test]
+    fn the_watcher_stops_at_the_composer_not_the_banner() {
+        assert!(!client_ready("Claude Code v2.1.310\n  /home/u/wt"), "a banner drawn first is not ready");
+        assert!(client_ready("❯ \n ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+        assert!(client_ready("  ? for shortcuts"));
+        assert!(!client_ready(SCREEN), "the consent dialog itself is not the composer");
+    }
 
     #[test]
     fn accepts_only_the_cm_channel_dialog() {

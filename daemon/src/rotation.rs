@@ -49,7 +49,7 @@ pub enum Origin {
 }
 
 impl Origin {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Origin::Operator => "operator",
             Origin::Agent => "agent",
@@ -182,7 +182,7 @@ pub fn boundary_for(
     owner_quiet: Duration,
     engines: &[&str],
 ) -> Result<(), String> {
-    boundary_checked(state, uid, engines, Checks { idle, owner_quiet, at_turn_end: false })
+    boundary_checked(state, uid, engines, Checks { idle, owner_quiet, draft: !owner_quiet.is_zero(), at_turn_end: false })
 }
 
 /// What a boundary check asks for.
@@ -193,14 +193,15 @@ pub(crate) struct Checks {
     /// How long Owner must not have viewed or typed in it (and whether a
     /// possible unsent draft blocks it): the automatic policy only.
     pub owner_quiet: Duration,
+    /// Whether Owner keystrokes since the agent's last turn (a possible
+    /// unsent draft) block it: everyone but an operator forcing it.
+    pub draft: bool,
     /// Checked right at a turn end (or forced): queued wakes do not block
     /// (they are held for the new process, `notifications::set_hold`), only
     /// one being submitted to the old process right now does.
     pub at_turn_end: bool,
 }
 
-/// How long a wake counts as "being submitted" to the old process.
-const IN_FLIGHT_SECS: f64 = 30.0;
 /// An unconfirmed receipt older than this does not block a boundary...
 const STALE_RECEIPT_SECS: f64 = 10.0 * 60.0;
 /// ...and one older than this is retired (`notifications::retire_stale`).
@@ -213,7 +214,7 @@ fn job_alive(job: &crate::agent_state::Job) -> bool {
 }
 
 pub(crate) fn boundary_checked(state: &DaemonState, uid: &str, engines: &[&str], checks: Checks) -> Result<(), String> {
-    let Checks { idle, owner_quiet, at_turn_end } = checks;
+    let Checks { idle, owner_quiet, draft, at_turn_end } = checks;
     let sess = state.sessions.get(uid).ok_or_else(|| format!("session '{uid}' is not live on this host"))?;
     if !engines.contains(&sess.session_type.as_str()) {
         return Err(format!("{} sessions cannot do this (only {})", sess.session_type, engines.join(", ")));
@@ -264,10 +265,10 @@ pub(crate) fn boundary_checked(state: &DaemonState, uid: &str, engines: &[&str],
             return Err(format!("Owner typed in it {}s ago", at.elapsed().as_secs()));
         }
         // Keystrokes after the agent's last turn ended, with no turn since:
-        // an unsent draft may sit in its composer. An operator forcing it
-        // (no quiet window) has decided.
+        // an unsent draft may sit in its composer. Only an operator forcing
+        // it has decided otherwise (an agent's own request has not).
         let typed_unix = now() - at.elapsed().as_secs_f64();
-        if !owner_quiet.is_zero() && typed_unix > agent.since {
+        if draft && typed_unix > agent.since {
             return Err("Owner typed in it since its last turn (a draft may be unsent)".into());
         }
     }
@@ -282,11 +283,10 @@ pub(crate) fn boundary_checked(state: &DaemonState, uid: &str, engines: &[&str],
                         // Queued wakes wait for the new process (held) at a
                         // turn end; on a poll they are still to come.
                         Some("pending") => !at_turn_end,
-                        // One going into the old process right now.
-                        Some("submitting" | "submitted") if at_turn_end => age < IN_FLIGHT_SECS,
-                        // An ambiguous receipt that stayed unconfirmed this
-                        // long never will be: it does not block anything.
-                        Some("submitted" | "uncertain") => !at_turn_end && age < STALE_RECEIPT_SECS,
+                        // Handed to the old process and not yet seen in its
+                        // transcript: a kill now could lose it. Past the age
+                        // limit it never will be seen, and does not block.
+                        Some("submitting" | "submitted" | "uncertain") => age < STALE_RECEIPT_SECS,
                         _ => false,
                     }
                 })
@@ -298,7 +298,7 @@ pub(crate) fn boundary_checked(state: &DaemonState, uid: &str, engines: &[&str],
         .unwrap_or(0);
     if pending > 0 {
         return Err(if at_turn_end {
-            format!("{pending} notification(s) being delivered right now")
+            format!("{pending} notification(s) being delivered (not yet confirmed)")
         } else {
             format!("{pending} notification(s) not yet delivered")
         });
@@ -316,9 +316,11 @@ fn permanent_refusal(why: &str) -> bool {
 }
 
 /// Whether a refusal is about the next few seconds (the agent is mid-turn,
-/// jobs, a wake being delivered): worth holding new wakes for.
+/// a wake being delivered): worth holding new wakes for.
 fn hold_worthy(why: &str) -> bool {
-    why.starts_with("not idle") || why.contains("background job") || why.contains("being delivered")
+    // "not idle (working)" only: working-background, a waiting human or an
+    // error can last for hours, and so can background jobs.
+    why.contains("not idle (working)") || why.contains("being delivered")
 }
 
 /// What a rotation needs from the live session, captured under the lock.
@@ -368,6 +370,13 @@ pub fn start(
     origin: Origin,
     force: bool,
 ) -> MethodResult {
+    // A running rotation or handoff is not a reason to arm a second one.
+    if in_progress(uid) {
+        return Err((ErrorCode::Conflict, "a rotation of this session is already running".into()));
+    }
+    if crate::handoff::in_progress(uid) {
+        return Err((ErrorCode::Conflict, "a handoff of this session is running".into()));
+    }
     let checks = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         let c = &state.config.transcript_rotation;
@@ -377,11 +386,12 @@ pub fn start(
             // the new process); a tool call, background job, a wake going in
             // right now, a workflow transition or a continuous run still
             // refuse, and then the request is ARMED for the next turn end.
-            Checks { idle: Duration::ZERO, owner_quiet: Duration::ZERO, at_turn_end: true }
+            Checks { idle: Duration::ZERO, owner_quiet: Duration::ZERO, draft: false, at_turn_end: true }
         } else {
             Checks {
                 idle: Duration::from_secs(c.idle_secs),
                 owner_quiet: if origin == Origin::Policy { Duration::from_secs(c.owner_quiet_secs) } else { Duration::ZERO },
+                draft: origin != Origin::Operator,
                 at_turn_end: false,
             }
         }
@@ -389,7 +399,7 @@ pub fn start(
     match start_with(state_arc, uid, reason, origin, checks) {
         Err((ErrorCode::Conflict, why)) if force && !permanent_refusal(&why) => {
             let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-            let mut v = arm(&state, uid, reason, origin, true)?;
+            let mut v = arm(&state, uid, reason, origin)?;
             v["deferred"] = json!(why);
             Ok(v)
         }
@@ -433,8 +443,8 @@ pub(crate) fn start_with(
         let record = rotation.to_json();
         admit(&state, uid, rotation).map_err(|why| (ErrorCode::Conflict, why))?;
         // New wakes wait for the new process (lifted when this finishes).
-        hold(&state, uid);
-        arms().lock().unwrap_or_else(|p| p.into_inner()).remove(uid);
+        hold(&state, uid, HoldOwner::Rotation);
+        arm_remove(uid);
         (snap, record)
     };
     // A brain restart between the stop and the respawn must not leave the
@@ -631,7 +641,7 @@ fn deliver_with(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, text: String, fr
 
 fn finish(uid: &str, phase: &'static str, outcome: String) {
     eprintln!("cm-daemon: rotation of {uid}: {outcome}");
-    unhold(uid);
+    unhold(uid, HoldOwner::Rotation);
     update(uid, |r| {
         r.phase = phase;
         r.outcome = Some(outcome);
@@ -809,6 +819,16 @@ pub(crate) fn inflight_remove(state: &DaemonState, uid: &str) {
 pub fn recover_inflight(state_arc: &Arc<Mutex<DaemonState>>) -> usize {
     let (path, all) = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        // Wake holds belong to rotations and handoffs of the previous brain;
+        // none survives it (the recoveries below hold again if they run).
+        let _ = messaging_root().set(state.messaging_root.clone());
+        let cleared = crate::notifications::clear_all_holds(&state.messaging_root);
+        if cleared > 0 {
+            eprintln!("cm-daemon: lifted {cleared} wake hold(s) left by the previous brain");
+        }
+        if let Some(p) = state.daemon_sessions_path.as_ref().map(|p| p.with_file_name("rotation-arms.json")) {
+            load_arms(&p);
+        }
         if let Some(p) = state.daemon_sessions_path.as_ref().map(|p| p.with_file_name("rotation-failures.json")) {
             load_failures(&p);
         }
@@ -911,6 +931,7 @@ fn complete_after_restart(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: 
         eprintln!("cm-daemon: rotation of {uid} interrupted by a restart; not completed now: {why}");
         return false;
     }
+    hold(&state_arc.lock().unwrap_or_else(|p| p.into_inner()), uid, HoldOwner::Rotation);
     let state = Arc::clone(state_arc);
     let uid = uid.to_string();
     let spawned = std::thread::Builder::new().name(format!("cm-rotate-recover-{uid}")).spawn(move || {
@@ -1147,6 +1168,56 @@ fn arms() -> &'static Mutex<HashMap<String, Arm>> {
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Where arms persist (set at brain start), so a restart keeps them.
+fn arms_path() -> &'static std::sync::OnceLock<PathBuf> {
+    static P: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    &P
+}
+
+fn save_arms(arms: &HashMap<String, Arm>) {
+    let Some(path) = arms_path().get() else { return };
+    let v: serde_json::Map<String, Value> = arms
+        .iter()
+        .map(|(uid, a)| (uid.clone(), json!({"reason": a.reason, "origin": a.origin.as_str(), "armed_at": a.armed_at})))
+        .collect();
+    if let Err(e) = crate::state::write_json_atomic(path, &Value::Object(v).to_string(), true) {
+        eprintln!("cm-daemon: rotation arms not saved: {e}");
+    }
+}
+
+/// Load persisted arms (brain start).
+fn load_arms(path: &Path) {
+    let _ = arms_path().set(path.to_path_buf());
+    let loaded: HashMap<String, Arm> = inflight_read(path)
+        .into_iter()
+        .filter_map(|(uid, v)| {
+            let origin = match v["origin"].as_str()? {
+                "operator" => Origin::Operator,
+                "agent" => Origin::Agent,
+                _ => Origin::Policy,
+            };
+            Some((uid, Arm { reason: v["reason"].as_str()?.to_string(), origin, armed_at: v["armed_at"].as_f64()? }))
+        })
+        .collect();
+    if !loaded.is_empty() {
+        eprintln!("cm-daemon: {} armed rotation(s) carried over from the previous brain", loaded.len());
+    }
+    arms().lock().unwrap_or_else(|p| p.into_inner()).extend(loaded);
+}
+
+fn arm_insert(uid: &str, arm: Arm) {
+    let mut a = arms().lock().unwrap_or_else(|p| p.into_inner());
+    a.insert(uid.to_string(), arm);
+    save_arms(&a);
+}
+
+fn arm_remove(uid: &str) {
+    let mut a = arms().lock().unwrap_or_else(|p| p.into_inner());
+    if a.remove(uid).is_some() {
+        save_arms(&a);
+    }
+}
+
 /// Whether a rotation of `uid` is armed (waits for its next turn end).
 pub fn armed(uid: &str) -> bool {
     arms().lock().unwrap_or_else(|p| p.into_inner()).contains_key(uid)
@@ -1159,31 +1230,106 @@ const ARM_EXPIRY_SECS: f64 = 6.0 * 3600.0;
 /// hold in place stops holding after this).
 const HOLD_SECS: f64 = 30.0 * 60.0;
 
-/// Where each held uid's queue lives, to lift it from `finish`.
-fn holds() -> &'static Mutex<HashMap<String, PathBuf>> {
-    static H: std::sync::OnceLock<Mutex<HashMap<String, PathBuf>>> = std::sync::OnceLock::new();
+/// Who holds a uid's wakes. Each feature lifts only its own hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HoldOwner {
+    /// A due rotation waiting for a clean turn end (capped per episode).
+    Due,
+    /// A rotation that is running.
+    Rotation,
+    /// A handoff that is running.
+    Handoff,
+}
+
+struct Hold {
+    root: PathBuf,
+    owner: HoldOwner,
+    /// When this due episode's hold began (the cap counts from here).
+    episode_start: f64,
+}
+
+fn holds() -> &'static Mutex<HashMap<String, Hold>> {
+    static H: std::sync::OnceLock<Mutex<HashMap<String, Hold>>> = std::sync::OnceLock::new();
     H.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Hold `uid`'s new wakes for the new process (`notifications::set_hold`).
-pub(crate) fn hold(state: &DaemonState, uid: &str) {
-    if let Err(e) = crate::notifications::set_hold(&state.messaging_root, uid, now() + HOLD_SECS) {
-        eprintln!("cm-daemon: rotation of {uid}: could not hold wakes: {e}");
-        return;
-    }
-    holds().lock().unwrap_or_else(|p| p.into_inner()).insert(uid.to_string(), state.messaging_root.clone());
+/// The messaging root, for lifting a hold this brain has no record of.
+fn messaging_root() -> &'static std::sync::OnceLock<PathBuf> {
+    static R: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    &R
 }
 
-/// Lift the hold: queued wakes go to whatever runs at the uid now.
-pub(crate) fn unhold(uid: &str) {
-    if let Some(root) = holds().lock().unwrap_or_else(|p| p.into_inner()).remove(uid) {
-        crate::notifications::clear_hold(&root, uid);
+/// A due session's wakes are held for at most this long in all (one
+/// episode); renewals never extend it, so wakes are delayed minutes, not
+/// hours.
+const DUE_HOLD_CAP_SECS: f64 = 10.0 * 60.0;
+/// After a spent episode, no new due hold for this long.
+const DUE_HOLD_REST_SECS: f64 = 60.0 * 60.0;
+
+/// Hold `uid`'s new wakes for the new process (`notifications::set_hold`).
+/// A due hold never replaces a running rotation's or handoff's, and stops
+/// renewing once its episode has held for [`DUE_HOLD_CAP_SECS`]. Returns
+/// whether wakes are held now.
+pub(crate) fn hold(state: &DaemonState, uid: &str, owner: HoldOwner) -> bool {
+    let _ = messaging_root().set(state.messaging_root.clone());
+    let t = now();
+    let mut h = holds().lock().unwrap_or_else(|p| p.into_inner());
+    let (episode_start, until) = match (owner, h.get(uid)) {
+        (HoldOwner::Due, Some(e)) if e.owner != HoldOwner::Due => return true,
+        (HoldOwner::Due, Some(e)) => {
+            let age = t - e.episode_start;
+            if age >= DUE_HOLD_CAP_SECS + DUE_HOLD_REST_SECS {
+                (t, t + DUE_HOLD_CAP_SECS)
+            } else if age >= DUE_HOLD_CAP_SECS {
+                return false;
+            } else {
+                (e.episode_start, e.episode_start + DUE_HOLD_CAP_SECS)
+            }
+        }
+        (HoldOwner::Due, None) => (t, t + DUE_HOLD_CAP_SECS),
+        (_, _) => (t, t + HOLD_SECS),
+    };
+    if let Err(e) = crate::notifications::set_hold(&state.messaging_root, uid, until) {
+        eprintln!("cm-daemon: could not hold wakes of {uid}: {e}");
+        return false;
     }
+    h.insert(uid.to_string(), Hold { root: state.messaging_root.clone(), owner, episode_start });
+    true
+}
+
+/// Lift `owner`'s hold on `uid`: queued wakes go to whatever runs there now.
+/// Another owner's hold is left alone. A spent due episode keeps its record
+/// (so it is not renewed at once), only the file goes.
+pub(crate) fn unhold(uid: &str, owner: HoldOwner) {
+    let mut h = holds().lock().unwrap_or_else(|p| p.into_inner());
+    let root = match h.get(uid) {
+        Some(e) if e.owner != owner => return,
+        Some(e) => {
+            let root = e.root.clone();
+            let spent = owner == HoldOwner::Due && now() - e.episode_start >= DUE_HOLD_CAP_SECS;
+            if !spent {
+                h.remove(uid);
+            }
+            root
+        }
+        // Nothing in this brain owns it (a hold from before a restart).
+        None => match messaging_root().get() {
+            Some(root) => root.clone(),
+            None => return,
+        },
+    };
+    crate::notifications::clear_hold(&root, uid);
+}
+
+/// Who holds `uid`'s wakes in this brain, if anyone.
+#[cfg(test)]
+fn hold_owner(uid: &str) -> Option<HoldOwner> {
+    holds().lock().unwrap_or_else(|p| p.into_inner()).get(uid).map(|h| h.owner)
 }
 
 /// Arm a rotation of `uid` for its next turn end, holding new wakes so that
 /// turn end is not raced by one. Returns what it will wait for.
-pub fn arm(state: &DaemonState, uid: &str, reason: &str, origin: Origin, _forced: bool) -> Result<Value, (ErrorCode, String)> {
+pub fn arm(state: &DaemonState, uid: &str, reason: &str, origin: Origin) -> Result<Value, (ErrorCode, String)> {
     match state.sessions.get(uid) {
         Some(s) if matches!(s.session_type.as_str(), "claude-code" | "codex") && s.transcript_path.is_some() => {}
         Some(s) if !matches!(s.session_type.as_str(), "claude-code" | "codex") => {
@@ -1192,11 +1338,8 @@ pub fn arm(state: &DaemonState, uid: &str, reason: &str, origin: Origin, _forced
         Some(_) => return Err((ErrorCode::Conflict, "the session has no bound transcript yet".into())),
         None => return Err((ErrorCode::NotFound, format!("session '{uid}' is not live on this host"))),
     }
-    arms().lock().unwrap_or_else(|p| p.into_inner()).insert(
-        uid.to_string(),
-        Arm { reason: reason.to_string(), origin, armed_at: now() },
-    );
-    hold(state, uid);
+    arm_insert(uid, Arm { reason: reason.to_string(), origin, armed_at: now() });
+    hold(state, uid, HoldOwner::Due);
     Ok(json!({
         "ok": true,
         "queued": true,
@@ -1210,7 +1353,7 @@ pub fn arm(state: &DaemonState, uid: &str, reason: &str, origin: Origin, _forced
 /// Queue `uid`'s own request (an agent asks mid-turn): armed for its next
 /// turn end.
 pub fn request(state: &DaemonState, uid: &str, reason: &str) -> Result<Value, (ErrorCode, String)> {
-    arm(state, uid, reason, Origin::Agent, false)
+    arm(state, uid, reason, Origin::Agent)
 }
 
 /// Called when `uid` reports a turn end (`session.turn_ended` /
@@ -1218,6 +1361,9 @@ pub fn request(state: &DaemonState, uid: &str, reason: &str) -> Result<Value, (E
 /// threshold) rotates right then, within about a second, before the next
 /// wake starts another turn. Runs on its own thread; returns at once.
 pub fn on_turn_end(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) {
+    if in_progress(uid) || crate::handoff::in_progress(uid) {
+        return;
+    }
     let due = armed(uid) || {
         let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         policy_due(&st, uid).is_some()
@@ -1258,7 +1404,7 @@ const TURN_END_POLL: Duration = Duration::from_millis(100);
 /// threshold, not backing off, a Claude session the boundary can accept).
 fn policy_due(state: &DaemonState, uid: &str) -> Option<String> {
     let cfg = &state.config.transcript_rotation;
-    if !cfg.enabled || in_progress(uid) || recently_failed(uid) {
+    if !cfg.enabled || in_progress(uid) || crate::handoff::in_progress(uid) || recently_failed(uid) {
         return None;
     }
     let s = state.sessions.get(uid)?;
@@ -1296,10 +1442,20 @@ fn retire_stale_receipts(state: &DaemonState, uid: &str) {
 
 /// The turn-end attempt for a due session.
 fn try_due(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) {
+    // A rotation or handoff already running owns this session (and its hold).
+    if in_progress(uid) || crate::handoff::in_progress(uid) {
+        return;
+    }
     retire_stale_receipts(&state_arc.lock().unwrap_or_else(|p| p.into_inner()), uid);
     let arm = arms().lock().unwrap_or_else(|p| p.into_inner()).get(uid).cloned();
     let (reason, origin, checks) = match arm {
-        Some(a) => (a.reason, a.origin, Checks { idle: Duration::ZERO, owner_quiet: Duration::ZERO, at_turn_end: true }),
+        // An armed request: no idle wait, no Owner-quiet window; only an
+        // operator's (Owner's) own request skips the unsent-draft check.
+        Some(a) => (
+            a.reason,
+            a.origin,
+            Checks { idle: Duration::ZERO, owner_quiet: Duration::ZERO, draft: a.origin != Origin::Operator, at_turn_end: true },
+        ),
         None => {
             let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
             let Some(why) = policy_due(&st, uid) else { return };
@@ -1308,29 +1464,42 @@ fn try_due(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) {
                 return;
             }
             let quiet = Duration::from_secs(st.config.transcript_rotation.owner_quiet_secs);
-            (why, Origin::Policy, Checks { idle: Duration::ZERO, owner_quiet: quiet, at_turn_end: true })
+            (why, Origin::Policy, Checks { idle: Duration::ZERO, owner_quiet: quiet, draft: true, at_turn_end: true })
         }
     };
     match start_with(state_arc, uid, &reason, origin, checks) {
         Ok(_) => eprintln!("cm-daemon: rotating {uid} at its turn end: {reason}"),
         Err((_, why)) if permanent_refusal(&why) => {
             eprintln!("cm-daemon: rotation of {uid} dropped: {why}");
-            arms().lock().unwrap_or_else(|p| p.into_inner()).remove(uid);
-            unhold(uid);
+            arm_remove(uid);
+            unhold(uid, HoldOwner::Due);
         }
         Err((_, why)) => {
             eprintln!("cm-daemon: rotation of {uid} deferred at its turn end: {why}");
             // A wake raced this turn end, or the agent went straight on:
             // hold new wakes so the next turn end is clean. A lasting reason
             // (Owner around, a scheduled wakeup) lets them flow meanwhile.
+            // Only this feature's own due hold is renewed or lifted, and a
+            // due hold is capped per episode (`hold`).
             if hold_worthy(&why) {
                 let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-                hold(&st, uid);
-            } else if !armed(uid) {
-                unhold(uid);
+                hold(&st, uid, HoldOwner::Due);
+            } else {
+                unhold(uid, HoldOwner::Due);
             }
         }
     }
+}
+
+/// A session exited on its own (or was killed by someone else): its arm and
+/// due hold go with it. A rotation's or handoff's own stop is theirs to
+/// handle. Called from `handle_session_exit` (state lock held).
+pub(crate) fn on_session_exit(uid: &str) {
+    if in_progress(uid) || crate::handoff::in_progress(uid) {
+        return;
+    }
+    arm_remove(uid);
+    unhold(uid, HoldOwner::Due);
 }
 
 /// Publish the policy's before-notice for `uid`'s current transcript, once.
@@ -1414,8 +1583,8 @@ pub fn tick(state_arc: &Arc<Mutex<DaemonState>>) {
     for (uid, armed_at) in asked {
         if now() - armed_at > ARM_EXPIRY_SECS {
             eprintln!("cm-daemon: armed rotation of {uid} expired without a usable turn end");
-            arms().lock().unwrap_or_else(|p| p.into_inner()).remove(&uid);
-            unhold(&uid);
+            arm_remove(&uid);
+            unhold(&uid, HoldOwner::Due);
             continue;
         }
         try_due(state_arc, &uid);
@@ -1448,7 +1617,6 @@ pub fn tick(state_arc: &Arc<Mutex<DaemonState>>) {
         if recently_failed(&uid) {
             continue;
         }
-        let _ = &path;
         retire_stale_receipts(&state_arc.lock().unwrap_or_else(|p| p.into_inner()), &uid);
         if notice_first(&state_arc.lock().unwrap_or_else(|p| p.into_inner()), &uid, &why) {
             continue; // rotate at its next turn end, after the notice
@@ -1623,8 +1791,8 @@ mod tests {
         let mut st = DaemonState::new();
         st.messaging_root = dir.path().to_path_buf();
         st.sessions.insert("ts-te-0".into(), idle_session("ts-te-0", 3));
-        let at_end = Checks { idle: Duration::ZERO, owner_quiet: Duration::ZERO, at_turn_end: true };
-        let polled = Checks { idle: Duration::ZERO, owner_quiet: Duration::ZERO, at_turn_end: false };
+        let at_end = Checks { idle: Duration::ZERO, owner_quiet: Duration::ZERO, draft: false, at_turn_end: true };
+        let polled = Checks { idle: Duration::ZERO, owner_quiet: Duration::ZERO, draft: false, at_turn_end: false };
         let engines = ["claude-code"];
         assert_eq!(boundary_checked(&st, "ts-te-0", &engines, at_end), Ok(()));
         crate::notifications::publish(dir.path(), "ts-te-0", "chat-1", "chat", "[m1] hi", "[m1]").unwrap();
@@ -1647,6 +1815,10 @@ mod tests {
         assert_eq!(boundary_checked(&st, "ts-te-0", &engines, at_end), Ok(()));
         assert_eq!(boundary_checked(&st, "ts-te-0", &engines, polled), Ok(()), "a stale receipt never blocks");
         set_status("submitted", now());
+        assert!(boundary_checked(&st, "ts-te-0", &engines, at_end).unwrap_err().contains("being delivered"));
+        // Accepted by the old process minutes ago and still not seen in its
+        // transcript: a kill could lose it, so it still blocks.
+        set_status("uncertain", now() - 120.0);
         assert!(boundary_checked(&st, "ts-te-0", &engines, at_end).unwrap_err().contains("being delivered"));
         set_status("observed", now());
         // A job whose process is gone has exited; a live one still blocks.
@@ -1696,13 +1868,98 @@ mod tests {
         registry().lock().unwrap().remove("ts-shrink-0");
     }
 
+    /// #24 review: each feature lifts only its own hold, a running
+    /// rotation's or handoff's hold is never replaced by a due one, and a due
+    /// episode's hold is capped.
+    #[test]
+    fn holds_are_owned_and_a_due_hold_is_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = DaemonState::new();
+        st.messaging_root = dir.path().to_path_buf();
+        let held = || crate::notifications::held(dir.path(), "ts-own-0", now());
+        assert!(hold(&st, "ts-own-0", HoldOwner::Handoff) && held());
+        assert!(hold(&st, "ts-own-0", HoldOwner::Due), "already held (by the handoff)");
+        assert_eq!(hold_owner("ts-own-0"), Some(HoldOwner::Handoff), "a due hold never replaces it");
+        unhold("ts-own-0", HoldOwner::Due);
+        unhold("ts-own-0", HoldOwner::Rotation);
+        assert!(held(), "only the handoff lifts its hold");
+        unhold("ts-own-0", HoldOwner::Handoff);
+        assert!(!held() && hold_owner("ts-own-0").is_none());
+        // A due hold, upgraded by the rotation that starts, lifted by it.
+        assert!(hold(&st, "ts-own-0", HoldOwner::Due));
+        assert!(hold(&st, "ts-own-0", HoldOwner::Rotation));
+        unhold("ts-own-0", HoldOwner::Due);
+        assert!(held(), "a turn-end attempt never lifts a running rotation's hold");
+        unhold("ts-own-0", HoldOwner::Rotation);
+        assert!(!held());
+        // A due episode that has held 10 minutes is not renewed.
+        holds().lock().unwrap().insert("ts-own-0".into(), Hold {
+            root: dir.path().to_path_buf(), owner: HoldOwner::Due, episode_start: now() - DUE_HOLD_CAP_SECS - 1.0,
+        });
+        assert!(!hold(&st, "ts-own-0", HoldOwner::Due), "spent: wakes flow");
+        assert!(!held());
+        unhold("ts-own-0", HoldOwner::Due);
+        assert_eq!(hold_owner("ts-own-0"), Some(HoldOwner::Due), "the spent episode is remembered");
+        // A fresh due hold expires within the cap, not 30 minutes.
+        holds().lock().unwrap().remove("ts-own-0");
+        assert!(hold(&st, "ts-own-0", HoldOwner::Due));
+        assert!(!crate::notifications::held(dir.path(), "ts-own-0", now() + DUE_HOLD_CAP_SECS + 1.0));
+        // An exit ends the episode.
+        on_session_exit("ts-own-0");
+        assert!(!held() && hold_owner("ts-own-0").is_none());
+        // After a restart nothing in memory owns a leftover hold: it is lifted.
+        crate::notifications::set_hold(dir.path(), "ts-own-1", now() + 600.0).unwrap();
+        let _ = messaging_root().set(dir.path().to_path_buf());
+        if messaging_root().get() == Some(&dir.path().to_path_buf()) {
+            unhold("ts-own-1", HoldOwner::Rotation);
+            assert!(!crate::notifications::held(dir.path(), "ts-own-1", now()));
+        }
+        crate::notifications::set_hold(dir.path(), "ts-own-2", now() + 600.0).unwrap();
+        assert!(crate::notifications::clear_all_holds(dir.path()) >= 1, "brain start clears leftovers");
+        assert!(!crate::notifications::held(dir.path(), "ts-own-2", now()));
+        assert!(!crate::notifications::held(dir.path(), "ts-own-1", now()));
+    }
+
+    /// A forced request while a rotation of that session runs is refused,
+    /// not armed as a second rotation.
+    #[test]
+    fn a_force_during_a_running_rotation_is_refused() {
+        let _serial = test_registry_lock();
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        test_set_running("ts-dup-0", true);
+        let r = start(&state, "ts-dup-0", "again", Origin::Operator, true);
+        test_set_running("ts-dup-0", false);
+        assert!(r.unwrap_err().1.contains("already running"));
+        assert!(!armed("ts-dup-0"));
+    }
+
+    /// Arms survive a brain restart.
+    #[test]
+    fn arms_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rotation-arms.json");
+        std::fs::write(&path, r#"{"ts-arm-p":{"reason":"agent asked","origin":"agent","armed_at":1e18}}"#).unwrap();
+        load_arms(&path);
+        assert!(armed("ts-arm-p"));
+        assert_eq!(arms().lock().unwrap()["ts-arm-p"].origin, Origin::Agent);
+        if arms_path().get() == Some(&path) {
+            arm_remove("ts-arm-p");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+        } else {
+            arm_remove("ts-arm-p");
+        }
+    }
+
     #[test]
     fn refusals_are_classified() {
         assert!(permanent_refusal("not at a safe boundary: workflow participant (its run drives it)"));
         assert!(permanent_refusal("bash sessions cannot do this (only claude-code)"));
         assert!(!permanent_refusal("not at a safe boundary: not idle (working)"));
-        assert!(hold_worthy("not idle (working)") && hold_worthy("1 notification(s) being delivered right now"));
+        assert!(hold_worthy("not idle (working)") && hold_worthy("1 notification(s) being delivered (not yet confirmed)"));
         assert!(!hold_worthy("Owner typed in it 3s ago") && !hold_worthy("1 scheduled wakeup(s) pending"));
+        // These can last for hours: never worth holding wakes for.
+        assert!(!hold_worthy("not idle (working-background)") && !hold_worthy("2 background job(s) running"));
+        assert!(!hold_worthy("not idle (waiting-on-human)"));
     }
 
     /// A forced request that meets a turn in progress is armed for the next
@@ -1728,8 +1985,8 @@ mod tests {
         // A permanent refusal is not armed.
         state.lock().unwrap().sessions.get_mut("ts-arm-0").unwrap().workflow_run_id = Some("wf".into());
         assert!(start(&state, "ts-arm-0", "x", Origin::Operator, true).is_err());
-        arms().lock().unwrap().remove("ts-arm-0");
-        unhold("ts-arm-0");
+        arm_remove("ts-arm-0");
+        unhold("ts-arm-0", HoldOwner::Due);
         assert!(!crate::notifications::held(dir.path(), "ts-arm-0", now()));
         for s in state.lock().unwrap().sessions.values_mut() {
             let _ = s.kill();

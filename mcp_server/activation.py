@@ -218,9 +218,13 @@ async def blocked_reason(uid: str, call, queue) -> str | None:
             return "unread_inbox"
     except Exception:  # noqa: BLE001
         return "inbox_unknown"
-    events = await asyncio.to_thread(lambda: queue.snapshot()["notifications"])
-    if any(e["status"] in {"pending", "submitting"} and e.get("source") != NOTICE_SOURCE
-           for e in events):
+    snapshot = await asyncio.to_thread(queue.snapshot)
+    # Wakes held for a rotation/handoff wait for the new process anyway; they
+    # must not stall an MCP activation (a capped hold, but minutes long).
+    held = bool(snapshot.get("hold"))
+    if any((e["status"] == "submitting" or (e["status"] == "pending" and not held))
+           and e.get("source") != NOTICE_SOURCE
+           for e in snapshot["notifications"]):
         return "notice_pending"
     return None
 

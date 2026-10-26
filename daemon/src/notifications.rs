@@ -62,6 +62,13 @@ pub fn clear_hold(root: &Path, uid: &str) {
     let _ = fs::remove_file(directory(root, uid).join("hold"));
 }
 
+/// Remove every hold under `root` (brain start: no hold outlives the brain
+/// that set it). Returns how many.
+pub fn clear_all_holds(root: &Path) -> usize {
+    let Ok(dirs) = fs::read_dir(root.join("notifications")) else { return 0 };
+    dirs.flatten().filter(|d| fs::remove_file(d.path().join("hold")).is_ok()).count()
+}
+
 /// Whether `uid`'s wakes are held right now.
 pub fn held(root: &Path, uid: &str, now: f64) -> bool {
     fs::read_to_string(directory(root, uid).join("hold"))

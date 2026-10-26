@@ -19,18 +19,28 @@ due when:
   operator's forced one (Alt+T) that met a turn in progress. A forced
   request that is refused for a reason that clears by itself (the agent is
   mid-turn, a job is running, a wake is being delivered) returns
-  `armed: true` and runs at the next turn end. An arm that finds no usable
-  turn end in 6 h is dropped.
+  `armed: true` and runs at the next turn end. A forced request while a
+  rotation or handoff of that session is running is refused, not armed. Arms
+  persist across a brain restart (`rotation-arms.json`); one that finds no
+  usable turn end in 6 h is dropped, and so is one whose session exits.
 
 The 5-minute policy pass stays as a fallback.
 
-**Wakes are held, not raced.** While a session is due and its turn-end
-attempt was refused by something short-lived, and while it rotates, CM holds
-its native wakes (chat messages, monitor fires): they stay `pending` in the
-durable queue (`notifications/<uid>/hold`, which expires after 30 minutes) and
-go to the new process once the rotation finishes, after its after-notice.
-Rotation and handoff notices are exempt. A handoff holds wakes the same way
-while it runs.
+**Wakes are held, not raced.** CM holds a session's native wakes (chat
+messages, monitor fires) while it rotates or is handed off, and, for at most
+10 minutes in all per due episode, while it is due and a turn-end attempt was
+refused by something that clears in seconds: the agent was mid-turn, or a
+wake was being delivered. Long-lived reasons (working-background, background
+jobs, Owner around, a scheduled wakeup) never hold wakes. Held wakes stay
+`pending` in the durable queue (`notifications/<uid>/hold`, shown as `hold` in
+`notification_status`) and go to the new process once the rotation finishes,
+after its after-notice. Rotation and handoff notices are exempt, and a hold
+does not stall an MCP activation.
+
+Each hold has one owner (a due rotation, a running rotation or a running
+handoff) and only that owner lifts it; a due hold never replaces a running
+one's. An exit lifts a due hold, and a brain start clears every hold left by
+the previous brain (the recoveries below hold again if they run).
 
 ## How a rotation runs
 
@@ -64,8 +74,9 @@ while it runs.
    running, and from the second consecutive failure otherwise.
 
 The restored session's own `--dangerously-load-development-channels`
-startup confirmation is accepted by CM for up to 3 minutes after launch, even
-when Claude first draws its banner (a large resume or fork does). Before
+startup confirmation is accepted by CM for up to 3 minutes after launch, until
+Claude's composer footer appears; the banner alone does not stop the watch (a
+large resume or fork draws it before the dialog). Before
 this, a rotated fork could stop at that dialog until someone pressed Enter.
 
 A brain restart between the stop and the confirmation leaves the marker. The
@@ -111,10 +122,11 @@ the lineage (old id → new id) is kept in `~/.cm/daemon-resume-identities.json`
 ## Safe boundary
 
 At a turn end (or when forced) the agent need not have been idle for
-`idle_secs`, and queued wakes do not block (they are held); only a wake being
-submitted to the old process in the last 30 s does. Owner-quiet and the
-unsent-draft check apply to the automatic policy only, not to an agent's or
-operator's request. Otherwise a rotation is refused or deferred unless all of
+`idle_secs`, and queued wakes do not block (they are held). A wake already
+handed to the old process and not yet seen in its transcript
+(`submitted`/`uncertain`, under 10 minutes old) does block: a kill could lose
+it. Owner-quiet applies to the automatic policy only. The unsent-draft check
+applies to everyone except an operator's (Owner's) forced request. Otherwise a rotation is refused or deferred unless all of
 these hold:
 
 - the session is live, Claude and not bash;
@@ -123,10 +135,10 @@ these hold:
   not count, even if the agent's last snapshot still lists it;
 - it has no pending scheduled wakeup (a session cron: CM does not carry
   crons across a fork, so a restart would lose it);
-- on the fallback pass, it has no queued or recently submitted native
-  notices (other than rotation's own). An unconfirmed receipt older than 10
-  minutes never blocks, and one older than 24 h is retired (`cancelled`,
-  `retired: "stale_receipt"`);
+- on the fallback pass, it has no queued native notices and no receipts
+  under 10 minutes old (other than rotation's own). An unconfirmed receipt
+  older than 10 minutes never blocks, and one older than 24 h is retired
+  (`cancelled`, `retired: "stale_receipt"`);
 - Owner has not viewed or typed in it for `owner_quiet_secs`, and has not
   typed in it since its last turn ended (an unsent draft may be in the
   composer; a forced rotation skips this);
