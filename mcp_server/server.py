@@ -577,6 +577,9 @@ def board(
     archived: bool = False,
     query: str | None = None,
     settings: dict | None = None,
+    membership: str | None = None,
+    session: str | None = None,
+    reason: str | None = None,
 ) -> dict:
     """Read your board: flags first, then items by group, recently closed
     items (24 h), free capacity (idle sessions on the board holding no
@@ -597,8 +600,22 @@ def board(
     launch_s, max_active_per_holder, check_back_max_s. Others: name, stale_s,
     unassigned_s, repush_s, escalate_s, digest_s, stale_background_s,
     nudge_grace_s, holder_idle_enabled, channel.
+
+    Board membership (#28) besides your task and your holds:
+    membership="join", session=... adds a session (you need edit rights;
+    `group=` names its part of the board); membership="leave" ends your own
+    join; membership="remove", session=... ends someone's (Owner, the
+    orchestrator or steward, or whoever added it while it can still edit).
+    A session that exits for good leaves on its own after 30 minutes.
     """
+    if membership is not None:
+        verb = {"join": "board.join", "leave": "board.leave", "remove": "board.remove_member"}.get(membership)
+        if verb is None:
+            raise ValueError("membership must be join, leave or remove")
+        return _items_call(verb, {"board": board, "session": session, "group": group, "reason": reason})
     params = dict(locals())
+    for key in ("membership", "session", "reason"):
+        params.pop(key, None)
     if params.pop("settings", None):
         _items_call("board.settings", {"board": board, "settings": settings})
     return _items_call("board.read", params)

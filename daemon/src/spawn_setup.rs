@@ -21,7 +21,8 @@
 //!
 //! The result is per step: `"ok"`, `"refused: <why>"` (an authority refusal)
 //! or `"failed: <why>"` (anything else), with `channels` and `items` per
-//! entry.
+//! entry. The name claimed inside a spawn reads `"pending"` when the hub is
+//! slower than [`CLAIM_WAIT`]; it still completes in the background.
 
 use crate::control::protocol::{Caller, ErrorCode, Request, Response};
 use crate::state::DaemonState;
@@ -197,17 +198,52 @@ fn hire_step(state: &Arc<Mutex<DaemonState>>, creator: &Caller, child: &str, hir
     }
 }
 
+/// How long the in-spawn name claim may hold `start_session` up. A replica
+/// forwards the claim to the messaging hub, whose own deadline is 30 s; past
+/// this the claim finishes in the background and the spawn returns, so a
+/// creator never retries into a duplicate spawn.
+pub const CLAIM_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The name step's result for `start_session`, which claims the name
-/// before the child's prompt is delivered (see `mcp_start_session`).
+/// before the child's prompt is delivered (see `mcp_start_session`):
+/// `"pending"` when the claim outlasts [`CLAIM_WAIT`] (it still completes,
+/// and is idempotent by its request id).
 pub fn claim_name(state: &Arc<Mutex<DaemonState>>, child: &str, name: &str) -> Value {
-    step(name_step(state, child, name))
+    claim_name_within(state, child, name, CLAIM_WAIT)
+}
+
+pub(crate) fn claim_name_within(
+    state: &Arc<Mutex<DaemonState>>,
+    child: &str,
+    name: &str,
+    wait: std::time::Duration,
+) -> Value {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (st, c, n) = (Arc::clone(state), child.to_string(), name.to_string());
+    let spawned = std::thread::Builder::new().name("cm-setup-name".into()).spawn(move || {
+        let result = step(name_step(&st, &c, &n));
+        if tx.send(result.clone()).is_err() {
+            eprintln!("cm setup: the name claim for {c} finished after its spawn returned: {result}");
+        }
+    });
+    if spawned.is_err() {
+        return step(name_step(state, child, name));
+    }
+    rx.recv_timeout(wait).unwrap_or_else(|_| json!("pending"))
 }
 
 /// Claim the new session's chat name as the session itself (a first claim:
 /// no message is sent). A session that already has a name keeps it: it may
 /// have claimed it itself, and a claim still in flight to the hub would
 /// conflict with ours (msgfix); it renames itself with `chat_rename`.
+/// Tests slow the name claim down to exercise [`CLAIM_WAIT`].
+#[cfg(test)]
+pub(crate) static NAME_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn name_step(state: &Arc<Mutex<DaemonState>>, child: &str, name: &str) -> RpcResult {
+    #[cfg(test)]
+    std::thread::sleep(std::time::Duration::from_millis(
+        NAME_DELAY_MS.load(std::sync::atomic::Ordering::SeqCst)));
     if let Some((now, _)) = crate::messaging::rpc::current_name(state, child) {
         if now.eq_ignore_ascii_case(name) {
             return Ok(json!("ok (already named)"));

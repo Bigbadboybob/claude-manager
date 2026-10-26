@@ -49,10 +49,19 @@
     "include_closed": {
      "type": "boolean"
     },
+    "membership": {
+     "type": "string"
+    },
     "mine": {
      "type": "boolean"
     },
     "query": {
+     "type": "string"
+    },
+    "reason": {
+     "type": "string"
+    },
+    "session": {
      "type": "string"
     },
     "settings": {

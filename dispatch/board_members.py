@@ -90,6 +90,55 @@ async def join(pool, ref: str, actor: dict, *, pid: str, name: str | None = None
             return {"board": board["slug"], "pid": pid, "joined": joined, "group_id": group_id}
 
 
+async def remove(pool, ref: str, actor: dict, *, pid: str, editor: bool = False,
+                 reason: str | None = None) -> dict:
+    """`POST /boards/{ref}/members/remove`: end an explicit join. The session
+    itself may leave; Owner, the board's orchestrator or steward may remove
+    anyone; whoever added it may remove it while it can still edit the board
+    (`editor`, checked by the daemon). A session on the board through its
+    task or a hold stays on it that way."""
+    from dispatch import placement
+    from dispatch.items_rules import OWNER_PID
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            board = await items_db._board_by_ref(conn, ref)
+            row = await conn.fetchrow(
+                "SELECT added_by FROM board_members WHERE board_id = $1 AND pid = $2 FOR UPDATE",
+                uuid.UUID(board["id"]), pid)
+            if row is None:
+                return {"board": board["slug"], "pid": pid, "removed": False}
+            who = actor.get("pid")
+            orch = await placement._orchestrator_pid(conn, board)
+            allowed = (who == pid or who == OWNER_PID or (orch and who == orch)
+                       or (board.get("steward_pid") and who == board["steward_pid"])
+                       or (editor and who == row["added_by"]))
+            if not allowed:
+                raise ItemsError(403, "forbidden",
+                                 "only the session itself, Owner, the board's orchestrator or "
+                                 "steward, or whoever added it (while it can edit the board) may "
+                                 "remove a board member")
+            await conn.execute("DELETE FROM board_members WHERE board_id = $1 AND pid = $2",
+                               uuid.UUID(board["id"]), pid)
+            return {"board": board["slug"], "pid": pid, "removed": True, "reason": reason}
+
+
+# A session that has been gone this long leaves every board it joined; a
+# revive or restart in between clears `exited_at`, so a rotation keeps it.
+EXIT_GRACE_S = 1800
+
+
+async def end_exited(conn, daemon_id: str | None = None) -> int:
+    """End the joins of sessions that exited for good (gone EXIT_GRACE_S),
+    optionally only for one daemon's sessions. Returns how many ended."""
+    result = await conn.execute(
+        """DELETE FROM board_members bm USING session_states s
+            WHERE s.pid = bm.pid AND s.exited_at IS NOT NULL
+              AND s.exited_at < now() - make_interval(secs => $1)
+              AND ($2::text IS NULL OR s.daemon_id = $2)""", EXIT_GRACE_S, daemon_id)
+    return int(result.split()[-1]) if result else 0
+
+
 async def members(pool, ref: str, *, pid: str | None = None) -> dict:
     """`GET /boards/{ref}/members`: the explicit joins (optionally one pid)."""
     async with pool.acquire() as conn:
@@ -104,4 +153,4 @@ async def members(pool, ref: str, *, pid: str | None = None) -> dict:
                 "on_board": (await on_board(conn, board, pid)) if pid else None}
 
 
-__all__ = ["ItemsError", "add", "join", "members", "on_board"]
+__all__ = ["EXIT_GRACE_S", "ItemsError", "add", "end_exited", "join", "members", "on_board", "remove"]

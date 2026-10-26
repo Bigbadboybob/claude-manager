@@ -155,6 +155,15 @@ class BoardJoinBody(_Strict):
     reason: Short | None = None
 
 
+class BoardLeaveBody(_Strict):
+    """End a board membership (#28): the daemon says whether the actor can
+    still edit the board (`editor`), for the adder's case."""
+    actor: Actor
+    pid: Short
+    editor: bool = False
+    reason: Short | None = None
+
+
 class EpicPocBody(_Strict):
     actor: Actor
     member: Short

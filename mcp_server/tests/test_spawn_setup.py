@@ -139,6 +139,69 @@ class SpawnSetupDb(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.status_code, 422, r.text)
 
 
+@unittest.skipUnless(DSN, "set CM_ITEMS_TEST_DSN to a scratch Postgres database")
+class MembershipEnds(SpawnSetupDb):
+    """#28 review: a board membership can end: the session leaves, Owner, the
+    orchestrator, the steward or its adder (while it can edit) removes it, or
+    it exits for good. Never psql."""
+
+    # Only this class's tests (the base class's run on their own).
+    test_set_poc_on_a_non_member_joins_it_with_authority_and_refuses_without = None
+    test_the_steward_and_the_pocs_chain_may_name_the_poc = None
+    test_a_session_that_is_no_member_says_how_to_make_it_one = None
+    test_a_joined_session_is_on_the_board_and_free_capacity_when_idle = None
+
+    async def join(self, pid, actor=ORCH):
+        r = await self.http.post(f"/boards/{self.ref}/members", json={"actor": actor, "pid": pid})
+        self.assertEqual(r.status_code, 200, r.text)
+
+    async def remove(self, pid, actor, editor=False, status=200):
+        r = await self.http.post(f"/boards/{self.ref}/members/remove",
+                                 json={"actor": actor, "pid": pid, "editor": editor})
+        self.assertEqual(r.status_code, status, r.text)
+        return r.json()
+
+    async def test_who_may_end_a_membership(self):
+        await self.members()
+        await self.join(NEW["pid"], actor=LANE)        # LANE added it
+        # A stranger, and the adder once it can no longer edit: refused.
+        self.assertEqual((await self.remove(NEW["pid"], STRANGER, status=403))["detail"]["code"], "forbidden")
+        await self.remove(NEW["pid"], LANE, editor=False, status=403)
+        # The adder while it can edit: removed.
+        self.assertTrue((await self.remove(NEW["pid"], LANE, editor=True))["removed"])
+        self.assertEqual((await self.joined(NEW["pid"]))["members"], [])
+        # The session itself leaves; Owner and the orchestrator remove anyone.
+        for actor in (NEW, OWNER, ORCH):
+            await self.join(NEW["pid"])
+            self.assertTrue((await self.remove(NEW["pid"], actor))["removed"], actor)
+        # Removing what is not joined is a no-op, not an error.
+        self.assertFalse((await self.remove(NEW["pid"], OWNER))["removed"])
+
+    async def test_a_session_gone_for_good_leaves_and_a_restart_keeps_it(self):
+        await self.members()
+        await self.join(NEW["pid"])
+        await self.join(BOSS["pid"])
+        from dispatch import board_members
+        async with self.pool.acquire() as conn:
+            # NEW exited 31 minutes ago; BOSS exited a minute ago (a restart).
+            for who, minutes in ((NEW, 31), (BOSS, 1)):
+                await conn.execute(
+                    """INSERT INTO session_states (pid, daemon_id, session_uid, state, reported_at,
+                                                   exited_at)
+                       VALUES ($1, $2, $3, 'exited', now(), now() - make_interval(mins => $4))
+                       ON CONFLICT (pid) DO UPDATE SET exited_at = EXCLUDED.exited_at,
+                                                       state = 'exited'""",
+                    who["pid"], who["daemon_id"], who["session_uid"], minutes)
+        # The heartbeat that reports the daemon's snapshot ends the stale joins.
+        await self.beat(ORCH, task=self.root, caps=s3.GUARDED)
+        await self.beat(LANE, daemon="d2", caps=s3.GUARDED)
+        self.assertEqual((await self.joined(NEW["pid"]))["members"], [], "gone for good: left")
+        self.assertEqual(len((await self.joined(BOSS["pid"]))["members"]), 1, "a restart keeps it")
+        async with self.pool.acquire() as conn:
+            self.assertEqual(await board_members.end_exited(conn), 0)
+        self.assertEqual(board_members.EXIT_GRACE_S, 1800)
+
+
 class StartSessionSetup(unittest.IsolatedAsyncioTestCase):
     """The MCP layer: start_session passes the setup keys to session.setup
     right after the spawn and returns its per-step result; a setup error never

@@ -353,6 +353,8 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "epic.close_plan",
     "epic.close_apply",
     "board.join",
+    "board.leave",
+    "board.remove_member",
     # #28: spawn-time setup of a session the caller spawned.
     "session.setup",
     "item.set",

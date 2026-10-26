@@ -17,8 +17,8 @@ pub const METHODS: &[&str] = &[
     // Org model S3 (doc/org-model.md §7): placement, groups, the on-boards list.
     "item.place", "item.unplace", "group.create", "group.set", "boards.on_boards",
     "epic.set_poc", "epic.staff", "epic.close_plan", "epic.close_apply",
-    // #28: add a session to a board (spawn-time setup).
-    "board.join",
+    // #28: board membership (spawn-time setup), and ending it.
+    "board.join", "board.leave", "board.remove_member",
 ];
 
 pub(crate) type RpcResult<T = Value> = Result<T, (ErrorCode, String)>;
@@ -39,6 +39,12 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
         "group.create" => group_create(&ctx, &req.params),
         "group.set" => group_set(&ctx, &req.params),
         "board.join" => board_join(&ctx, &req.params),
+        "board.leave" => board_leave(&ctx, &req.params, None),
+        "board.remove_member" => {
+            let reference = req.params.get("session").and_then(Value::as_str).filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| bad("session (a chat name, uid or participant id) is required"));
+            reference.and_then(|r| board_leave(&ctx, &req.params, Some(r)))
+        }
         "epic.set_poc" | "epic.staff" | "epic.close_plan" | "epic.close_apply" => {
             epic_call(&ctx, req.method.as_str(), &req.params)
         }
@@ -1100,6 +1106,23 @@ fn board_join(ctx: &Ctx, params: &Value) -> RpcResult {
         }
     }
     ctx.api.post(&format!("/boards/{}/members", slug(&board)?), &body)
+}
+
+/// `board.leave` (the caller leaves) and `board.remove_member` (#28): end
+/// an explicit join. The API decides who may remove whom; the daemon tells it
+/// whether the caller can still edit the board (the adder's case).
+fn board_leave(ctx: &Ctx, params: &Value, target: Option<&str>) -> RpcResult {
+    let board = resolve_board(ctx, params)?;
+    let pid = match target {
+        Some(reference) => resolve_holder(ctx, reference)?["pid"].as_str().unwrap_or_default().to_string(),
+        None => ctx.pid.clone(),
+    };
+    let editor = target.is_some() && authorize_edit(ctx, params, &board).is_ok();
+    let mut body = json!({"actor": ctx.actor(), "pid": pid, "editor": editor});
+    if let Some(reason) = present(params, "reason") {
+        body["reason"] = reason;
+    }
+    ctx.api.post(&format!("/boards/{}/members/remove", slug(&board)?), &body)
 }
 
 fn epic_call(ctx: &Ctx, method: &str, params: &Value) -> RpcResult {

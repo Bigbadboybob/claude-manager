@@ -12,6 +12,7 @@ from api.items_models import (
     EpicCloseApplyBody,
     EpicClosePlanBody,
     BoardJoinBody,
+    BoardLeaveBody,
     EpicPocBody,
     EpicStaffBody,
     GroupCreateBody,
@@ -259,6 +260,15 @@ async def board_join(ref: str, body: BoardJoinBody, request: Request):
     return await _call(board_members.join(
         _pool(request), ref, body.actor.model_dump(), pid=body.pid, name=body.name,
         group_id=body.group_id, group=body.group, reason=body.reason))
+
+
+@router.post("/boards/{ref}/members/remove")
+async def board_leave(ref: str, body: BoardLeaveBody, request: Request):
+    """End a board membership: `board.leave` (self) or `board.remove_member`."""
+    from dispatch import board_members
+    return await _call(board_members.remove(
+        _pool(request), ref, body.actor.model_dump(), pid=body.pid, editor=body.editor,
+        reason=body.reason))
 
 
 @router.get("/boards/{ref}/members")

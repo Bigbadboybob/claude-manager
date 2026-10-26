@@ -1232,6 +1232,10 @@ async def heartbeat(pool, daemon_id: str, *, host_label: str | None, sessions: l
                       AND (NOT (pid = ANY($2::text[])) OR pid = ANY($4::text[]))""",
                 daemon_id, live, now, list(exited),
             )
+            # #28: a session gone for good leaves the boards it joined, so
+            # free capacity and edit rights never accumulate.
+            from dispatch import board_members
+            await board_members.end_exited(conn, daemon_id)
             if acked_push_ids:
                 await conn.execute(
                     """UPDATE item_pushes SET delivered_at = $3

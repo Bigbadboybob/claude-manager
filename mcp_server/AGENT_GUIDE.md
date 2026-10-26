@@ -152,7 +152,8 @@ everyone who holds what, with each holder's live state, so nobody has to ask.
   with your authority, and reports each step in `setup`. A step you could
   not do yourself is refused alone. `org(action="setup", session_uid=...)`
   does the same for a session you spawned earlier. A new lead: spawn, then
-  promote (`hire=`), then `poc_of`.
+  promote (`hire=`), then `poc_of`. `board(membership="leave")` ends your
+  own board membership; a session that exits for good leaves on its own.
 
 ## Orchestrating other sessions
 

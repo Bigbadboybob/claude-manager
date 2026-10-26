@@ -587,6 +587,7 @@ org_core_missing`):
 |---|---|
 | `POST /boards/{ref}/epics/{gid}/poc {actor, member, team_id?}` | Owner, the board's orchestrator or steward, or the epic's current PoC (or a member up its manager chain). `member` is a member id, handle, `owner`, or a session's participant id (the member whose main it is; `422 unknown_member` says to promote/`hire` a session that is no member). The epic is run by `member`'s team: `team_id` (one it leads), the epic's team if it leads it, else a new `kind='team'` team (parent: the enclosing epic's team, else the board's; on a hand-over the slug gets the new PoC's handle). A PoC whose main session is not on the board joins it in the same call (`joined_board: [pid]`). Returns `staffing` offers for the current holders (`primary` = a move under the PoC, `guest` = keeps its manager) |
 | `POST /boards/{ref}/members {actor, pid, name?, group?, group_id?, reason?}` | add a session to the board (#28; the daemon checked the actor may edit the board). `{joined}` is false when it was already on the board (its task, a hold, or an earlier join). A joined session may edit the board and is free capacity when idle. `GET /boards/{ref}/members?pid=` lists joins and answers `on_board` |
+| `POST /boards/{ref}/members/remove {actor, pid, editor?, reason?}` | end a join: the session itself (`board.leave`), Owner, the board's orchestrator or steward, or whoever added it while it can still edit the board (`editor`, checked by the daemon; `board.remove_member`). `{removed}` is false when there was no join. A session that has been exited for 30 minutes (`EXIT_GRACE_S`) leaves every board it joined on its daemon's next heartbeat; a revive or restart in between keeps it |
 | `POST /boards/{ref}/epics/{gid}/staff {actor, member, as}` | accept an offer: a guest membership, or org's `move` (manager chain or Owner) |
 | `POST /boards/{ref}/epics/{gid}/close-plan {actor, outcome}` | build and persist the close plan: `{plan_id, revision, items[{n, title, choice_options[move,unplace,drop]}], move_targets, team{options, default}, members[{member_id, role, options, default, needs}], workspaces[]}`. Refused with active sub-epics; a rebuild bumps the revision; a plan being applied is resumed, never replaced |
 | `POST /boards/{ref}/close-plans/{id}/apply {actor, revision, choices}` | only on the epic's own board; one applier at a time (409 `close_in_progress`); validates every item choice, then applies step by step (recorded, so a retry resumes); items closed or unplaced since the plan are `skipped`; team standby/archive without Owner and every member move/retire come back as `pending` with `who_must_decide` (the move itself is org's `move`); ends guest memberships; after a final nothing-left-open check under the board lock the epic closes with a `close_record` |
@@ -597,7 +598,8 @@ board-native items, across boards).
 Daemon RPCs (all daemon-only, actor stamped): `item.place`, `item.unplace`,
 `group.create`, `group.set`, `epic.set_poc` (also `session=`: a chat name,
 uid or participant id), `epic.staff`, `epic.close_plan`, `epic.close_apply`,
-`board.join {board, session, group?, group_id?}`, `boards.on_boards`
+`board.join {board, session, group?, group_id?}`, `board.leave {board}`,
+`board.remove_member {board, session}`, `boards.on_boards`
 (read-only). MCP tools: `place`, `unplace`,
 `epic(action=create|promote|set_poc|staff|close)`, and on
 `item`/`item_set`: `group_id`, `description`, `owner`, `role`, `team_id`.
@@ -611,7 +613,9 @@ channel join as the new session, else `add_member` as the caller,
 `"ok"` / `"refused: …"` / `"failed: …"`. `start_session` runs it right after
 the spawn; `org(action="setup")` runs it later. A first chat name is claimed
 without a message: `session.set_name` with no `expected_name_revision` on a
-session that has none.
+session that has none. `start_session`'s name is claimed inside the spawn,
+before the first prompt, waiting at most 5 s (`"pending"` after that; it
+still completes); setup never renames a session that already has a name.
 
 **Lifecycle guard (daemon, TUI).** The terminal sweep and `mark_subtask_done`
 (daemon and TUI routes) never close a member's main session (org S2's member

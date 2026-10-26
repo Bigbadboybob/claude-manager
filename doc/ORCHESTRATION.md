@@ -259,7 +259,9 @@ start_session(type=..., isolated=true, prompt=...,
               poc_of="<group_id>")            # and the epic's PoC
 ```
 
-The result carries `setup`, one entry per step: `"ok"`, `"refused: <why>"`
+The name is claimed before the new session's first prompt; if the
+messaging hub is slow it reads `"pending"` and still lands, so never retry
+the spawn for it. The result carries `setup`, one entry per step: `"ok"`, `"refused: <why>"`
 (a step you could not do yourself, for example `poc_of` when you have no
 authority over the board) or `"failed: <why>"`. A refused or failed step
 never stops the spawn or the other steps. Fix the cause and repeat just that
@@ -273,5 +275,6 @@ session=...)` afterwards) → `set_poc` (`poc_of=` at spawn, or
 assistant and `poc_of` is refused with that hint. `set_poc` adds a PoC that
 has not touched the board yet to it, in the same call. Owner, the board's
 orchestrator or steward, or the epic's current PoC chain may set the PoC.
-`hire=` needs org's promote (#27) on your daemon; before it ships, that step
-reports `failed`.
+A session you add to a board stays on it until it leaves
+(`board(membership="leave")`), is removed (`membership="remove"`), or has been
+gone for 30 minutes.
