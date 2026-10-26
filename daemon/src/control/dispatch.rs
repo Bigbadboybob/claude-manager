@@ -3767,6 +3767,17 @@ mod tests {
             .collect();
         assert!(uids.contains(&"lead-uid"));
         assert!(uids.contains(&"report-uid"), "report rows: {uids:?}");
+        let list_calls = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, path, _)| method == "POST" && path == "/org/members/authority-batch")
+            .count();
+        assert_eq!(list_calls, 1, "list_sessions uses one batch, not one request per row");
+
+        // Transcript resolution is a separate read operation. It performs
+        // its own concrete-session check, so it should add exactly one more
+        // batched request rather than reuse the listing's member-only result.
         let resolved = dispatch_resolve_authorized_session(
             &state,
             &session_request(
@@ -3782,7 +3793,7 @@ mod tests {
             .iter()
             .filter(|(method, path, _)| method == "POST" && path == "/org/members/authority-batch")
             .count();
-        assert_eq!(calls, 1, "one batched authority request, not one per row");
+        assert_eq!(calls, 2, "one batch for listing plus one concrete-session check");
         for session in state.lock().unwrap().sessions.values_mut() {
             let _ = session.kill();
         }
