@@ -142,7 +142,8 @@ everyone who holds what, with each holder's live state, so nobody has to ask.
   A long-lived assistant can be promoted to its own member with
   `org(action="promote", session=..., handle=..., reason=...)` (same
   authority; it keeps its session, context, checkout and holds, reports to
-  that member, and gets a notice).
+  that member, and gets a notice). Its checkout becomes its home only if it
+  is no one else's, never its member's own checkout.
 
 ## Orchestrating other sessions
 

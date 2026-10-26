@@ -82,6 +82,9 @@ class PromoteBody(_Strict):
     team: Short | None = None
     manager: Short | None = None
     reason: Annotated[str, Field(min_length=1, max_length=500)]
+    # The owning daemon's verdict on the checkout (e.g. "shared_checkout"):
+    # when set, the new member gets no home.
+    home_refused: Short | None = None
     request_id: RequestId | None = None
 
 
@@ -202,7 +205,7 @@ async def promote_assistant(body: PromoteBody, request: Request):
     return await _call(org_db.promote(
         _pool(request), body.actor.model_dump(), pid=body.pid, handle=body.handle,
         title=body.title, team=body.team, manager=body.manager, reason=body.reason,
-        request_id=body.request_id))
+        home_refused=body.home_refused, request_id=body.request_id))
 
 
 @router.post("/assistants/close")

@@ -272,6 +272,60 @@ pub fn end_assistant(state: &mut DaemonState, uid: &str) -> Option<(String, bool
     Some((member_id, released))
 }
 
+/// Why `uid`'s checkout may not become the home of the member it is
+/// promoted to (its old member is `member_id`), or `None` when it may. Only
+/// an `ephemeral` or `stream` checkout that is unowned or `member_id`'s,
+/// with no other member's main session in it: a plain spawn shares its
+/// member's own checkout, and promoting it must not take that home away.
+pub fn home_refusal(state: &DaemonState, uid: &str, member_id: &str) -> Option<&'static str> {
+    let ws_id = &state.sessions.get(uid)?.workspace_id;
+    let Some(ws) = state.workspaces.get(ws_id) else { return Some("no_checkout") };
+    match bridge::workspace_kind(ws.org.as_ref()) {
+        Some("ephemeral") | Some("stream") => {}
+        Some("home") => return Some("shared_checkout"),
+        // Not classified here (a user-made or pre-S0b checkout): whose it is
+        // is unknown, so it is not given away.
+        _ => return Some("unclassified_checkout"),
+    }
+    let office = ws.org.as_ref().and_then(|o| o.get(crate::items::org::OFFICE_OF)).and_then(Value::as_str);
+    if office.is_some_and(|o| o != member_id) {
+        return Some("shared_checkout");
+    }
+    let other_main = state.sessions.values().any(|s| {
+        s.uid != uid && &s.workspace_id == ws_id && main_member(&s.uid).is_some()
+    });
+    other_main.then_some("shared_checkout")
+}
+
+/// A promote whose local half never ran (the brain died between the API's
+/// commit and the stamp): the member cache now says `uid` is a member's main
+/// while its own record still says assistant. Record it as that member's
+/// main, and drop the stream markers its checkout carried as an assistant's
+/// (a home mark, if the API gave it one, arrives as a central mark).
+/// Returns the uids fixed, for the promotion notice.
+pub fn reconcile_promoted(state: &mut DaemonState) -> Vec<String> {
+    let mut fixed = Vec::new();
+    let mut uids: Vec<String> = state.sessions.keys().cloned().collect();
+    uids.sort();
+    for uid in uids {
+        let Some(member_id) = main_member(&uid) else { continue };
+        let ws_id = {
+            let Some(sess) = state.sessions.get_mut(&uid) else { continue };
+            if stamped_member(sess.org.as_ref()).is_none() {
+                continue;
+            }
+            stamp(&mut sess.org, &member_id, MAIN, "promote:recovered");
+            sess.workspace_id.clone()
+        };
+        if let Some(o) = state.workspaces.get_mut(&ws_id).and_then(|ws| ws.org.as_mut()) {
+            o.remove(STREAM_OF);
+            o.remove(IDLE_SINCE);
+        }
+        fixed.push(uid);
+    }
+    fixed
+}
+
 /// O5 blocker 2: a stream claimed for assistants is not protected forever by
 /// an assistant that died some other way (a plain kill, a crash or memory
 /// cap, a natural exit). Each pass notes when such a stream first had no

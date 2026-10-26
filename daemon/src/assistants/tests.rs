@@ -617,6 +617,20 @@ fn promote(state: &Arc<Mutex<DaemonState>>, caller: Caller, uid: &str) -> crate:
     })
 }
 
+/// What the API answers a promote: a home unless the daemon refused one.
+fn promoted_reply(body: &Value) -> String {
+    let (home, why) = match body["home_refused"].as_str() {
+        Some(why) => (Value::Null, json!(why)),
+        None => (json!({"daemon_id": "d", "workspace_id": "ws-asst"}), Value::Null),
+    };
+    json!({
+        "member": {"id": "mem_new", "handle": body["handle"], "manager_member_id": "mem_ep",
+                   "manager_handle": "ep"},
+        "promoted_from": "mem_ep", "notes": [], "home": home, "home_reason": why,
+        "home_mark": if home.is_null() { Value::Null } else { json!({"state": "central"}) }, "version": 9,
+    }).to_string()
+}
+
 #[test]
 fn promoting_an_assistant_makes_it_a_main_with_a_home_and_a_notice() {
     let _env = crate::test_support::env_lock();
@@ -624,11 +638,7 @@ fn promoting_an_assistant_makes_it_a_main_with_a_home_and_a_notice() {
     members(&[("ca-main", "mem_ep", "agent")]);
     let root = tempfile::tempdir().unwrap();
     let (url, seen) = crate::items::org::test_stub(|method, path, body| match (method, path) {
-        ("POST", "/org/assistants/promote") => (200, json!({
-            "member": {"id": "mem_new", "handle": body["handle"], "manager_member_id": "mem_ep",
-                       "manager_handle": "ep"},
-            "promoted_from": "mem_ep", "notes": [], "home_mark": {"state": "pending"}, "version": 9,
-        }).to_string()),
+        ("POST", "/org/assistants/promote") => (200, promoted_reply(body)),
         _ => (500, "{}".into()),
     });
     let state = rpc_state(&url, root.path());
@@ -688,6 +698,123 @@ fn promoting_an_assistant_makes_it_a_main_with_a_home_and_a_notice() {
                (&json!("asst"), &json!("Asst"), &json!("swarm"), &json!("p1")));
     assert!(body.get("session").is_none() && body.get("action").is_none());
     drop(seen);
+    kill_all(&state);
+    crate::items::org::reset_cache_for_test();
+}
+
+#[test]
+fn an_assistant_in_its_members_home_is_promoted_without_taking_that_home() {
+    let _env = crate::test_support::env_lock();
+    crate::items::org::reset_cache_for_test();
+    members(&[("ca-main", "mem_ep", "agent")]);
+    let root = tempfile::tempdir().unwrap();
+    let (url, seen) = crate::items::org::test_stub(|method, path, body| match (method, path) {
+        ("POST", "/org/assistants/promote") => (200, promoted_reply(body)),
+        _ => (500, "{}".into()),
+    });
+    let state = rpc_state(&url, root.path());
+    {
+        let mut st = state.lock().unwrap();
+        // ep's home, and a plain (not isolated) spawn working in it.
+        let mut home = workspace("ws-ca-main", Some("home"));
+        bridge::set(&mut home.org, crate::items::org::OFFICE_OF, json!("mem_ep"));
+        st.workspaces.insert("ws-ca-main".into(), home);
+        st.sessions.insert("ca-twin".into(), assistant("ca-twin", Some("t-ep"), "ca-main", "ws-ca-main", "mem_ep"));
+        assert_eq!(home_refusal(&st, "ca-twin", "mem_ep"), Some("shared_checkout"));
+        // An unclassified checkout (user-made) is not given away either, nor
+        // an ephemeral one another member's main works in.
+        st.workspaces.insert("ws-plain".into(), workspace("ws-plain", None));
+        assert_eq!(home_refusal(&st, "ca-plain", "mem_ep"), Some("unclassified_checkout"));
+        st.workspaces.insert("ws-ca-main".into(), workspace("ws-ca-main", Some("ephemeral")));
+        assert_eq!(home_refusal(&st, "ca-twin", "mem_ep"), Some("shared_checkout"), "ep's main is in it");
+        let mut home = workspace("ws-ca-main", Some("home"));
+        bridge::set(&mut home.org, crate::items::org::OFFICE_OF, json!("mem_ep"));
+        st.workspaces.insert("ws-ca-main".into(), home);
+        // Its own stream is fine.
+        assert_eq!(home_refusal(&st, "ca-asst", "mem_ep"), None);
+    }
+    let resp = promote(&state, Caller::session("ca-main"), "ca-twin");
+    assert!(resp.ok, "{:?}", resp.error);
+    let out = resp.result.unwrap();
+    assert_eq!((&out["home"], &out["home_reason"], &out["home_marked_here"]),
+               (&Value::Null, &json!("shared_checkout"), &json!(false)));
+    let st = state.lock().unwrap();
+    let ws = st.workspaces["ws-ca-main"].org.clone().unwrap();
+    assert_eq!((ws.get("workspace_kind"), ws.get(crate::items::org::OFFICE_OF)),
+               (Some(&json!("home")), Some(&json!("mem_ep"))), "ep keeps its home");
+    assert_eq!(main_member("ca-twin").as_deref(), Some("mem_new"));
+    drop(st);
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen[0].2["home_refused"], "shared_checkout");
+    drop(seen);
+    kill_all(&state);
+    crate::items::org::reset_cache_for_test();
+}
+
+#[test]
+fn a_retried_promote_reaches_the_apis_replay_and_a_bare_one_does_not() {
+    let _env = crate::test_support::env_lock();
+    crate::items::org::reset_cache_for_test();
+    members(&[("ca-main", "mem_ep", "agent")]);
+    let root = tempfile::tempdir().unwrap();
+    let (url, seen) = crate::items::org::test_stub(|method, path, body| match (method, path) {
+        // The API replays the stored result for the same request id.
+        ("POST", "/org/assistants/promote") if body["request_id"] == "p1" => (200, promoted_reply(&json!({"handle": "asst"}))),
+        ("POST", "/org/assistants/promote") => (409, r#"{"detail":{"code":"already_member","message":"already asst's main session"}}"#.into()),
+        _ => (500, "{}".into()),
+    });
+    let state = rpc_state(&url, root.path());
+    assert!(promote(&state, Caller::session("ca-main"), "ca-asst").ok);
+    // The reply was lost; the caller retries with the same request id.
+    let again = promote(&state, Caller::session("ca-main"), "ca-asst");
+    assert!(again.ok, "{:?}", again.error);
+    let again = again.result.unwrap();
+    assert_eq!((again["member"]["id"].as_str(), again["was_assistant_of"].as_str()), (Some("mem_new"), Some("mem_ep")));
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    {
+        let st = state.lock().unwrap();
+        let ws = st.workspaces["ws-asst"].org.clone().unwrap();
+        assert_eq!(ws.get(crate::items::org::OFFICE_OF), Some(&json!("mem_new")), "the retry keeps the home");
+    }
+    // Without a request id it is refused here, before the API.
+    let bare = crate::control::dispatch::dispatch_org(&state, &Request {
+        id: "t".into(), caller: Caller::session("ca-main"), method: "org".into(),
+        params: json!({"action": "promote", "session": "ca-asst", "handle": "x", "reason": "r"}),
+    });
+    assert!(bare.error.unwrap().message.starts_with("already_member"));
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    kill_all(&state);
+    crate::items::org::reset_cache_for_test();
+}
+
+#[test]
+fn a_promote_whose_local_half_was_lost_is_finished_from_the_member_cache() {
+    let _env = crate::test_support::env_lock();
+    crate::items::org::reset_cache_for_test();
+    let root = tempfile::tempdir().unwrap();
+    let state = rpc_state("http://127.0.0.1:9", root.path());
+    let mut st = state.lock().unwrap();
+    let before = st.workspaces["ws-asst"].org.clone().unwrap();
+    assert!(before.contains_key(STREAM_OF));
+    // The API committed it, the brain died before stamping; the next beat's
+    // cache names ca-asst as mem_new's main.
+    crate::items::org::absorb_reply(&json!({"org": {"members": {
+        "ca-main": {"id": "mem_ep", "handle": "ep", "kind": "agent", "acting_as": "main"},
+        "ca-asst": {"id": "mem_new", "handle": "asst", "kind": "agent", "manager_handle": "ep", "acting_as": "main"},
+    }}}), 1_700_000_000.0);
+    assert_eq!(reconcile_promoted(&mut st), vec!["ca-asst".to_string()]);
+    let org = st.sessions["ca-asst"].org.clone().unwrap();
+    assert_eq!((org.get(MEMBER_ID), org.get(ACTING_AS)), (Some(&json!("mem_new")), Some(&json!(MAIN))));
+    let ws = st.workspaces["ws-asst"].org.clone().unwrap();
+    assert!(!ws.contains_key(STREAM_OF) && !ws.contains_key(IDLE_SINCE));
+    assert!(reconcile_promoted(&mut st).is_empty(), "once");
+    drop(st);
+    let member = crate::items::org::cached_member("ca-asst");
+    assert!(crate::items::org::notify_promoted(root.path(), "ca-asst", &member));
+    let notice = crate::notifications::get(root.path(), "ca-asst", "org-promoted:mem_new").unwrap().unwrap();
+    assert!(notice.to_string().contains("member asst (main session), reporting to ep"));
+    // The promote's own notice and the recovery's are one notice.
+    assert!(crate::items::org::notify_promoted(root.path(), "ca-asst", &member));
     kill_all(&state);
     crate::items::org::reset_cache_for_test();
 }

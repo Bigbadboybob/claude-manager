@@ -1626,8 +1626,11 @@ def org(
         manager=None, reason=...`: the assistant becomes the main session of
         a new member `handle` reporting to its member (or to `manager`: you
         or a member below you, else `needs_owner`; `team` only one you
-        lead). It keeps its uid, conversation, checkout (now the new
-        member's home) and board holds, and gets a notice. Allowed for the
+        lead). It keeps its uid, conversation, checkout and board holds,
+        and gets a notice. The checkout becomes the new member's home only
+        when it is no one else's; an assistant working in its member's own
+        checkout gets no home (`home: null`, `home_reason:
+        "shared_checkout"`). Allowed for the
         member's main session, a member up its manager chain, or Owner.
         Refused for shells (`not_an_agent`), members' sessions
         (`already_member`), continuous orchestrators (`continuous`) and

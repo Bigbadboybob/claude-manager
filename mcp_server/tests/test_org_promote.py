@@ -140,3 +140,31 @@ class PromoteDb(unittest.IsolatedAsyncioTestCase):
                          (self.ids["swarm-coord"], self.init_id))
         out = await self.promote(pid(self.coord), pid(self.helper), manager="org")
         self.assertEqual(out["member"]["manager_member_id"], self.ids["org"])
+
+    async def test_an_assistant_in_someone_elses_checkout_gets_no_home(self):
+        await self.members()
+        snap = await self.snapshot()
+        org_home = {m["handle"]: m for m in snap["members"]}["org"]["home_workspace"]
+        self.assertEqual(org_home["workspace_id"], "ws-org")
+        # A plain (not isolated) spawn: the assistant works in org's own checkout.
+        twin = uid_at(0.3, 17)
+        await self.report([{"uid": twin, "name": "twin", "task_id": self.lane_task, "managed_by": self.lane,
+                            "ws": "ws-org", "path": "/w/org", "member_id": self.ids["org"],
+                            "acting_as": "assistant"}])
+        out = await self.promote(pid(self.lane), pid(twin), handle="twin")
+        self.assertEqual((out["home"], out["home_reason"], out["home_mark"]), (None, "shared_checkout", None))
+        self.assertIsNone(out["member"]["home_workspace"])
+        # org keeps its home.
+        snap = await self.snapshot()
+        by_handle = {m["handle"]: m for m in snap["members"]}
+        self.assertEqual(by_handle["org"]["home_workspace"], org_home)
+        self.assertIsNone(by_handle["twin"]["home_workspace"])
+        async with self.pool.acquire() as conn:
+            marks = await conn.fetch("SELECT member_id FROM org_workspace_marks WHERE workspace_id = 'ws-org'")
+        self.assertNotIn(by_handle["twin"]["id"], [r["member_id"] for r in marks])
+        # The owning daemon's verdict counts too (it knows the local kind).
+        out = await self.promote(pid(self.lane), pid(self.helper), home_refused="shared_checkout")
+        self.assertEqual((out["home"], out["home_reason"]), (None, "shared_checkout"))
+        # An unshared checkout is still a home.
+        out = await self.promote(pid(self.lane), pid(self.rev), handle="rev")
+        self.assertEqual(out["home_reason"], "no_checkout", "rev reports no workspace")

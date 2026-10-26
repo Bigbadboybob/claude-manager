@@ -315,6 +315,22 @@ impl Beat {
         let applied = {
             let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
             let applied = super::org::apply_marks(&mut s, &reply);
+            // A promote whose local half was lost (the brain died after the
+            // API committed it): finish it now the cache shows the main.
+            let promoted = crate::assistants::reconcile_promoted(&mut s);
+            if !promoted.is_empty() {
+                eprintln!("cm org: finished {} promotion(s) from the member cache: {}",
+                          promoted.len(), promoted.join(", "));
+                s.persist_sessions_best_effort();
+                for uid in &promoted {
+                    let org = s.sessions.get(uid).and_then(|sess| sess.org.clone());
+                    s.manifest_watcher.broadcast(crate::manifest::ManifestDiff::Updated {
+                        uid: uid.clone(),
+                        entry: json!({"member": crate::assistants::wire(uid, org.as_ref()), "org": org}),
+                    });
+                    super::org::notify_promoted(&snap.root, uid, &crate::items::org::cached_member(uid));
+                }
+            }
             // O5: sessions a member's session spawned, or that work under a
             // member's task, are that member's assistants.
             let stamped = crate::assistants::backfill(&mut s);

@@ -307,7 +307,11 @@ fn promote(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, mut p: Map<String, Value>
     };
     let handle = take_str(&mut p, "handle")?.ok_or_else(|| bad("org.promote needs handle"))?;
     let reason = take_str(&mut p, "reason")?.ok_or_else(|| bad("org.promote needs reason"))?;
-    let boss = {
+    // A retry after a lost reply finds the session already recorded here as
+    // promoted: the API answers a stored request id with the first result
+    // (and refuses any other), so let it decide.
+    let retry = p.get("request_id").is_some_and(|v| v.is_string());
+    let (boss, home_refused) = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         let Some(sess) = s.sessions.get(&uid) else {
             return Err((ErrorCode::NotFound, format!("not_found: no live session '{uid}' on this daemon")));
@@ -320,8 +324,9 @@ fn promote(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, mut p: Map<String, Value>
             return Err((ErrorCode::Conflict, format!(
                 "continuous: '{uid}' is a continuous orchestrator; its scheduler owns it")));
         }
-        match crate::assistants::of_session(sess) {
+        let boss = match crate::assistants::of_session(sess) {
             Some(m) if m.acting_as == crate::assistants::ASSISTANT => m.member_id,
+            Some(m) if m.acting_as == crate::assistants::MAIN && retry && promoted_here(sess) => m.member_id,
             Some(m) if m.acting_as == crate::assistants::MAIN => {
                 return Err((ErrorCode::Conflict, format!("already_member: '{uid}' is already a member's main session")));
             }
@@ -330,7 +335,8 @@ fn promote(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, mut p: Map<String, Value>
             _ => {
                 return Err((ErrorCode::Conflict, format!("not_an_assistant: '{uid}' is not an assistant of a member")));
             }
-        }
+        };
+        (boss.clone(), crate::assistants::home_refusal(&s, &uid, &boss))
     };
     let pid = format!("agent:{}:{uid}", ctx.daemon_id);
     let mut body = Map::new();
@@ -342,7 +348,12 @@ fn promote(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, mut p: Map<String, Value>
             body.insert(key.into(), v.clone());
         }
     }
+    if let Some(why) = home_refused {
+        body.insert("home_refused".into(), json!(why));
+    }
     let reply = api(ctx.api.post("/org/assistants/promote", &with_actor(ctx, body)))?;
+    // The API grants the home (`home`), or says why not (`home_reason`).
+    let home_granted = reply["home"].is_object() && home_refused.is_none();
     let member = reply["member"].clone();
     let member_id = member["id"].as_str().unwrap_or_default().to_string();
     let (root, ws_marked) = {
@@ -360,36 +371,60 @@ fn promote(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, mut p: Map<String, Value>
             None => None,
         };
         // The checkout is the new member's home now (the central mark says
-        // the same and is acked on the next beat).
+        // the same and is acked on the next beat), unless it is someone
+        // else's: then only the assistant's stream markers go.
         let marked = ws_id.and_then(|w| s.workspaces.get_mut(&w)).map(|ws| {
             use cm_holder_proto::org as bridge;
-            bridge::set(&mut ws.org, bridge::WORKSPACE_KIND, json!("home"));
-            bridge::set(&mut ws.org, OFFICE_OF, json!(member_id));
-            if let Some(o) = ws.org.as_mut() {
-                o.remove(crate::assistants::STREAM_OF);
-                o.remove(crate::assistants::IDLE_SINCE);
+            if home_granted {
+                bridge::set(&mut ws.org, bridge::WORKSPACE_KIND, json!("home"));
+                bridge::set(&mut ws.org, OFFICE_OF, json!(member_id));
             }
-        }).is_some();
+            if let Some(o) = ws.org.as_mut() {
+                if home_granted || o.get(OFFICE_OF).and_then(Value::as_str) == Some(boss.as_str()) {
+                    o.remove(crate::assistants::STREAM_OF);
+                    o.remove(crate::assistants::IDLE_SINCE);
+                }
+            }
+            home_granted
+        }).unwrap_or(false);
         s.persist_sessions_best_effort();
         (s.messaging_root.clone(), marked)
     };
     save_cache(&root);
-    let manager = reply["member"]["manager_handle"].as_str().unwrap_or("owner").to_string();
-    let marker = "[cm-org]";
-    let text = format!(
-        "{marker} You are now member {handle} (main session), reporting to {manager}. Promoted by {} \
-         ({reason}). You keep this conversation, checkout and your board holds; this checkout is \
-         your home workspace. Agents you spawn from now on are your assistants. org(view=\"me\") shows it.",
-        if ctx.owner { "Owner".to_string() } else { ctx.name.clone() });
-    let noticed = crate::notifications::publish(&root, &uid, &format!("org-promoted:{member_id}"), "cm", &text, marker)
-        .map_err(|e| eprintln!("cm org: promote notice to {uid}: {e}"))
-        .is_ok();
+    let noticed = notify_promoted(&root, &uid, &member);
     let mut out = reply;
     out["session_uid"] = json!(uid);
-    out["was_assistant_of"] = json!(boss);
+    out["was_assistant_of"] = out.get("promoted_from").cloned().filter(|v| v.is_string()).unwrap_or(json!(boss));
     out["home_marked_here"] = json!(ws_marked);
     out["noticed"] = json!(noticed);
     Ok(out)
+}
+
+/// Whether this daemon recorded `sess` as a promoted assistant (the main
+/// record a promote, or its recovery, writes).
+fn promoted_here(sess: &crate::session::DaemonSession) -> bool {
+    sess.org.as_ref()
+        .and_then(|o| o.get(crate::assistants::MEMBER_VIA))
+        .and_then(Value::as_str)
+        .is_some_and(|via| via.starts_with("promote:"))
+}
+
+/// The promotion notice: one text per member, so the promote and the
+/// heartbeat's recovery of a lost promote publish the same notice (its id
+/// dedupes it).
+pub(crate) fn notify_promoted(root: &std::path::Path, uid: &str, member: &Value) -> bool {
+    let (Some(member_id), Some(handle)) = (member["id"].as_str(), member["handle"].as_str()) else {
+        return false;
+    };
+    let manager = member["manager_handle"].as_str().unwrap_or("Owner");
+    let marker = "[cm-org]";
+    let text = format!(
+        "{marker} You are now member {handle} (main session), reporting to {manager}. You keep this \
+         conversation, checkout and your board holds. Agents you spawn from now on are your \
+         assistants. org(view=\"me\") shows your member, including its home workspace if it has one.");
+    crate::notifications::publish(root, uid, &format!("org-promoted:{member_id}"), "cm", &text, marker)
+        .map_err(|e| eprintln!("cm org: promote notice to {uid}: {e}"))
+        .is_ok()
 }
 
 /// Record `uid` as `member`'s main session in the member cache before the

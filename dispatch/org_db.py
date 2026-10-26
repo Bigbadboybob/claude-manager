@@ -1339,13 +1339,47 @@ async def close_assistant(pool, actor: dict, *, pid: str, member_id: str, reason
         return response
 
 
+async def _promote_home(conn, facts, pid: str, boss: str, refused: str | None):
+    """The checkout a promoted assistant may take as its new member's home,
+    or why not: `(home, None)` or `(None, reason)`.
+
+    Only a checkout that is no one else's: no central `home` mark, no
+    `stream` mark owned by another member than `boss`, no other member's
+    live main session in it, and no refusal from the owning daemon (which
+    knows the local kind: only an unowned or boss-owned `stream` /
+    `ephemeral` checkout qualifies there). Otherwise a plain spawn in its
+    member's own checkout would take that member's home away."""
+    home = _home_of({**dict(facts), "pid": pid})
+    if home is None:
+        return None, "no_checkout"
+    if refused:
+        return None, refused
+    mark = await conn.fetchrow(
+        """SELECT kind, member_id FROM org_workspace_marks
+            WHERE daemon_id = $1 AND workspace_id = $2""", home["daemon_id"], home["workspace_id"])
+    if mark is not None and (mark["kind"] == "home" or (mark["member_id"] and mark["member_id"] != boss)):
+        return None, "shared_checkout"
+    other_main = await conn.fetchval(
+        """SELECT 1 FROM org_session_facts f
+             JOIN session_states s ON s.pid = f.pid AND s.exited_at IS NULL AND s.state <> 'exited'
+             JOIN incarnations i ON i.pid = f.pid AND i.ended_at IS NULL
+            WHERE f.pid <> $1 AND s.daemon_id = $2
+              AND (f.workspace_id = $3 OR ($4::text IS NOT NULL AND f.worktree_path = $4))
+            LIMIT 1""", pid, home["daemon_id"], home["workspace_id"], home.get("path"))
+    if other_main:
+        return None, "shared_checkout"
+    return home, None
+
+
 async def promote(pool, actor: dict, *, pid: str, handle: str, title: str | None = None,
                   team=None, manager: str | None = None, reason: str,
-                  request_id: str | None = None) -> dict:
+                  home_refused: str | None = None, request_id: str | None = None) -> dict:
     """Promote a member's assistant to a new member (doc/org-model.md §4.2):
     the session becomes the main session of a new member managed by the
     assistant's member M, keeping its session, uid, context, checkout and
-    holds; its checkout becomes the new member's `home`.
+    holds; its checkout becomes the new member's `home` when it is no one
+    else's (`_promote_home`), else the member has no home and the result
+    says why (`home: null, home_reason: "shared_checkout"`).
 
     Allowed for M's main session, a member up M's manager chain acting as its
     main, or Owner (`_require_chain(..., self_ok=True)`). `manager` defaults
@@ -1395,7 +1429,7 @@ async def promote(pool, actor: dict, *, pid: str, handle: str, title: str | None
             if actor_member is not None and team_row["lead_member_id"] != actor_member:
                 raise _err(403, "needs_owner", "a lead may give a promoted member only a team it leads")
             team_id = str(team_row["id"])
-        home = _home_of({**dict(facts), "pid": pid})
+        home, home_reason = await _promote_home(conn, facts, pid, boss, home_refused)
         member_id, notes = await _create_member(
             conn, actor, handle=handle, kind="agent", title=title, manager_ref=manager_id,
             team_id=team_id, pid=pid, home=home, source="promote", request_id=request_id,
@@ -1409,6 +1443,7 @@ async def promote(pool, actor: dict, *, pid: str, handle: str, title: str | None
         detail = await _detail(conn, member_id)
         home_mark = detail["member"]["home_workspace"]
         return {"member": detail["member"], "promoted_from": boss, "notes": notes,
+                "home": home, "home_reason": home_reason,
                 "home_mark": {"state": home_mark["state"]} if home_mark else None}
 
     response = await _member_write(pool, actor, request_id, "promote", body)
