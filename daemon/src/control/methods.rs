@@ -18314,6 +18314,23 @@ fn session_fork_once(
         (source, source_ws, cap_inherit, cols, rows, server_path, plan)
     };
 
+    // Reject incompatible explicit settings before creating a task/worktree.
+    // Native forks always use the source engine; model= cannot switch it.
+    if let Some(model) = p.model.as_deref().filter(|m| !m.trim().is_empty()) {
+        crate::models::check_engine(&source.engine, model).map_err(|error| (
+            ErrorCode::InvalidParams,
+            format!("fork_session keeps the source engine ({}): {error}. \
+                Use request_handoff to switch this CM identity (requires the source \
+                to answer), or start_session with the target engine and an explicit \
+                context prompt for a separate worker. No task or session was created.",
+                source.engine),
+        ))?;
+    }
+    if let Some(effort) = p.effort.as_deref().filter(|e| !e.trim().is_empty()) {
+        crate::models::validate_effort(&source.engine, effort)
+            .map_err(|error| (ErrorCode::InvalidParams, error))?;
+    }
+
     // The conversation must still exist where the engine will look for it.
     let source_file = match source.engine.as_str() {
         "claude-code" => crate::transcript_detect::claude_transcript_path(
@@ -37143,6 +37160,32 @@ while True:
         assert_eq!(fork_base_choice(Some("Source")), Ok(false));
         assert_eq!(fork_base_choice(Some("trunk")), Ok(true));
         assert_eq!(fork_base_choice(Some("main")).unwrap_err().0, ErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn session_fork_rejects_cross_engine_model_before_task_creation() {
+        with_home_and_repo("forkmodel", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let state = make_state_arc();
+            seed_fork_source(&state, &repo, name);
+            // Any API call would fail this test, including task creation.
+            let stub = spawn_routed_stub(|method, path, _| {
+                panic!("model preflight must not call the API: {method} {path}")
+            });
+            set_api_env(stub.port);
+            let before = state.lock().unwrap().sessions.len();
+            let err = session_fork(
+                &state,
+                &json!({"source_uid": "ts-src", "task_name": "wrong engine", "model": "gpt-6-astra"}),
+                None,
+            ).expect_err("cross-engine model is not a native fork");
+            assert_eq!(err.0, ErrorCode::InvalidParams);
+            assert!(err.1.contains("fork_session keeps the source engine"), "{}", err.1);
+            assert!(err.1.contains("No task or session was created"), "{}", err.1);
+            assert_eq!(state.lock().unwrap().sessions.len(), before);
+            kill_all_sessions(&state);
+            clear_api_env();
+        });
     }
 
     #[test]

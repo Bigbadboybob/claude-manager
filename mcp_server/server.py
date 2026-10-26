@@ -2860,7 +2860,10 @@ async def fork_session(
     unchanged; CM stores no history copy and does not ask the source for a
     safe-boundary turn. This is context-preserving replacement/spawn work,
     not an identity-preserving `request_handoff`, and it is distinct from a
-    fresh `start_session`.
+    fresh `start_session`. Native forks keep the source engine: `model=`
+    cannot switch Claude to Codex or vice versa. Use `request_handoff` for
+    an identity-preserving engine switch; an unavailable source needs a
+    separate `start_session` with explicit context supplied by the caller.
 
     The source may be live, rate-limited, errored, or a recent exit as long
     as CM still has a usable transcript on this host. If it does not, the
@@ -2890,8 +2893,10 @@ async def fork_session(
             transcript only on its first message, so an unprompted fork
             cannot be resumed after a daemon restart). Where it came from is
             in the result instead (`forked_from`, `commits_not_carried`).
-        request_id: Idempotency key; generated per call when omitted. A
-            retry with the same key returns the first fork.
+        request_id: Idempotency key; generated per call when omitted.
+            Successful results are cached for one hour in the current brain.
+            Retry the identical request with the same key; after a brain
+            restart or an uncertain failure, inspect sessions before retrying.
         label: Sidebar label for the new session (default: the task name).
         model: The fork's model; omitted = the source session's model.
         effort: The fork's reasoning effort; omitted = the source's.

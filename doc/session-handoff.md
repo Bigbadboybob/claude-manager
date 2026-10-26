@@ -90,16 +90,23 @@ These operations are deliberately separate:
 - `request_handoff` preserves the current CM identity and waits for that
   session's safe boundary. It needs the outgoing session to answer when the
   engine changes, so a rate-limited or errored source may remain queued.
-- `fork_session` starts a new session with a copied engine transcript and a
-  new task/workspace. It leaves the source running and does not preserve the
-  source identity. It can use a live session or an exit tombstone when CM
-  still has a usable transcript; it does not wait for another source turn.
+- `fork_session` starts a new session through the source engine's native
+  conversation fork, in a new task/workspace or an existing task's workspace.
+  It keeps the source engine; a model override cannot switch Claude to Codex
+  or vice versa. It leaves the source running and does not preserve the source
+  identity. It can use a live session or an exit tombstone when CM still has a
+  usable transcript; it does not wait for another source turn.
 - `start_session` is a fresh worker spawn. It has no source conversation and
   its task prompt is the only context CM supplies automatically.
 
-If a request is uncertain, inspect its returned receipt or query the session
-before retrying. A handoff request can be cancelled by the operator while it
-is still queued:
+If a request is uncertain, inspect its returned receipt and query sessions
+before retrying. A monitor error does not undo an accepted spawn or input.
+`fork_session` caches successful results for one hour under `request_id`;
+reuse the identical key and request for retries within the same brain lifetime.
+That cache does not survive a brain restart. `start_session` has no request ID
+deduplication: check the existing task/workspace sessions before another call.
+
+A handoff request can be cancelled by the operator while it is still queued:
 
 ```sh
 scripts/cm-op session.handoff_cancel '{"uid":"<session uid>"}'

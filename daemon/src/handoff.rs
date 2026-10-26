@@ -461,9 +461,7 @@ pub fn cancel_queued(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) -> MethodRe
             return Err((ErrorCode::NotFound, format!("no handoff record for session '{uid}'")));
         }
         reg.queue.remove(index);
-        let Some(record) = reg.records.get_mut(uid) else {
-            return Err((ErrorCode::NotFound, format!("no handoff record for session '{uid}'")));
-        };
+        let record = reg.records.get_mut(uid).expect("record checked under registry lock");
         record.phase = "cancelled";
         record.deferred = None;
         record.outcome = Some("cancelled by operator".into());
@@ -1115,6 +1113,34 @@ mod tests {
         assert!(plan("bash", None, None, &req(Some("codex"), None, None)).unwrap_err().contains("never"));
         assert!(plan("claude-code", None, None, &req(Some("gemini"), None, None)).is_err());
         assert!(plan("codex", None, None, &req(None, None, Some("max"))).is_err(), "codex has no max effort");
+    }
+
+    #[test]
+    fn cancel_queued_refuses_a_started_handoff_without_mutation() {
+        let uid = "ts-cancel-running-0";
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let mut sp = crate::session::SpawnParams::new(uid, "cancel test", "/bin/sleep");
+        sp.args = vec!["30".into()];
+        sp.session_type = "claude-code".into();
+        state.lock().unwrap().sessions.insert(uid.into(), crate::session::DaemonSession::spawn(sp).unwrap());
+        request(&state, uid, req(Some("codex"), None, None), None).unwrap();
+        {
+            let mut reg = registry().lock().unwrap();
+            reg.queue.retain(|q| q.uid != uid);
+            reg.running.insert(uid.into());
+            reg.records.get_mut(uid).unwrap().phase = "starting";
+        }
+        let before = status(uid).unwrap();
+        assert_eq!(cancel_queued(&state, uid).unwrap_err().0, ErrorCode::Conflict);
+        assert_eq!(status(uid).unwrap(), before);
+        assert!(registry().lock().unwrap().running.remove(uid));
+        // The starting record also refuses cancellation between bookkeeping steps.
+        assert_eq!(cancel_queued(&state, uid).unwrap_err().0, ErrorCode::Conflict);
+        assert_eq!(status(uid).unwrap(), before);
+        registry().lock().unwrap().records.remove(uid);
+        for session in state.lock().unwrap().sessions.values_mut() {
+            let _ = session.kill();
+        }
     }
 
     #[test]
