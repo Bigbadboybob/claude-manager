@@ -105,7 +105,7 @@ def persist_state() -> None:
 def _persist_best_effort() -> None:
     try:
         persist_state()
-    except (OSError, ValueError) as exc:
+    except (OSError, TypeError, ValueError) as exc:
         _log(f"durable monitor state unavailable ({type(exc).__name__}); drain remains blocked")
 
 
@@ -325,7 +325,7 @@ def register_monitor(
     _MONITORS[monitor_id] = record
     try:
         persist_state()
-    except (OSError, ValueError) as exc:
+    except (OSError, TypeError, ValueError) as exc:
         _MONITORS.pop(monitor_id, None)
         raise RegistrationError("tracking_failed", "Could not persist the monitor obligation; no watch or notification was started.") from exc
     record["task"] = loop.create_task(

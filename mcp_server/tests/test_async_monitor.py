@@ -657,6 +657,41 @@ if __name__ == "__main__":
 
 
 class DurableMonitorTests(_MonitorEnv):
+    def test_path_registration_is_persisted_as_a_string(self):
+        async def scenario():
+            reg = async_monitor.register_monitor(
+                [self.WORKER], edge=False,
+                launch_receipt={"status": "pending", "submitted": None},
+                launch_socket_path=Path("/tmp/cm-daemon.sock"),
+            )
+            persisted = async_monitor.monitor_state.read()["producers"][
+                async_monitor.monitor_state.PRODUCER_ID
+            ]["records"][reg["monitor_id"]]
+            self.assertEqual(persisted["launch_socket_path"], "/tmp/cm-daemon.sock")
+            async_monitor._MONITORS[reg["monitor_id"]]["task"].cancel()
+            await asyncio.sleep(0)
+
+        asyncio.run(scenario())
+
+    def test_send_input_rewrites_existing_path_record_and_keeps_receipt(self):
+        from mcp_server.server import send_input
+
+        async def scenario():
+            old = async_monitor.register_monitor(
+                [self.WORKER], edge=False,
+                launch_socket_path=Path("/tmp/old-daemon.sock"),
+            )
+            async_monitor._MONITORS[old["monitor_id"]]["task"].cancel()
+            await asyncio.sleep(0)
+            result = await send_input(self.WORKER, "go")
+            new = result.get("monitor", {})
+            self.assertEqual(result.get("ok"), True)
+            self.assertEqual(new.get("monitor_id") is not None, True)
+            async_monitor._MONITORS[new["monitor_id"]]["task"].cancel()
+            await asyncio.sleep(0)
+
+        asyncio.run(scenario())
+
     def test_tracking_failure_prevents_registering_or_sending(self):
         async def scenario():
             with mock.patch.object(async_monitor, "persist_state", side_effect=OSError("disk full")):
@@ -665,6 +700,16 @@ class DurableMonitorTests(_MonitorEnv):
             self.assertEqual(async_monitor._MONITORS, {})
         asyncio.run(scenario())
         self.assertEqual(self.sent, [])
+
+    def test_type_error_persistence_is_a_clean_registration_error(self):
+        async def scenario():
+            with mock.patch.object(async_monitor, "persist_state", side_effect=TypeError("Path")):
+                with self.assertRaises(async_monitor.RegistrationError) as caught:
+                    async_monitor.register_monitor([self.WORKER], edge=False)
+            self.assertEqual(caught.exception.code, "tracking_failed")
+            self.assertEqual(async_monitor._MONITORS, {})
+
+        asyncio.run(scenario())
 
     def test_tracking_failure_before_delivery_prevents_queued_input(self):
         real_publish = async_monitor.persist_state

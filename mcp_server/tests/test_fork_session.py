@@ -91,6 +91,24 @@ class ForkSessionToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(kwargs["edge"], "receipt-gated watch, like start_session")
         self.assertNotIn("submitted", res, "a pending receipt never claims submitted")
 
+    async def test_monitor_persistence_error_preserves_accepted_fork_receipt(self):
+        # Exercise the real registration path: a persistence TypeError must
+        # become a monitor error while the already accepted fork receipt stays
+        # in the response.
+        async_monitor.register_monitor = self._orig_register
+        receipt = {"status": "confirmed", "submitted": True, "turn_seq_before": 3}
+        self._stub({
+            "session_uid": "ts-fork-err", "task_id": "task-f",
+            "prompt_source": "caller", "prompt_delivery": receipt,
+        })
+        with mock.patch.dict("os.environ", {"CM_TUI_SESSION_ID": "ts-caller"}), mock.patch.object(
+            async_monitor, "persist_state", side_effect=TypeError("Path")
+        ):
+            res = await fork_session("ts-src-0", task_name="fork", prompt="go")
+        self.assertIs(res["prompt_delivery"], receipt)
+        self.assertTrue(res["submitted"])
+        self.assertEqual(res["monitor"]["error"], "tracking_failed")
+
     async def test_blank_prompt_is_not_sent_and_opt_out_skips_monitor(self):
         self._stub({"session_uid": "ts-fork-2", "prompt_source": "none"})
         await fork_session("ts-src-0", task_name="fork", prompt="   ")

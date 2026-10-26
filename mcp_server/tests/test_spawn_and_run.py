@@ -20,6 +20,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from mcp_server import control_client
 from mcp_server import server as srv
@@ -144,6 +145,29 @@ class _SpawnStubMixin:
 
 
 class StartSessionWaitTests(_SpawnStubMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_monitor_persistence_error_preserves_accepted_spawn_receipt(self):
+        receipt = {"status": "confirmed", "submitted": True, "turn_seq_before": 3}
+
+        def _call(method, params, *a, **k):
+            if method == "mcp_start_session":
+                return {
+                    "session_uid": "ts-spawn-err", "prompt_source": "caller",
+                    "prompt_delivery": receipt,
+                }
+            if method == "resolve_authorized_session":
+                return {"state": "ready", "idle": False, "engine": "claude-code",
+                        "transcript_path": None, "generation": 0}
+            raise AssertionError(f"unexpected method {method}")
+
+        control_client.call = _call
+        with mock.patch.dict("os.environ", {"CM_TUI_SESSION_ID": "ts-caller"}), mock.patch.object(
+            srv.async_monitor, "persist_state", side_effect=TypeError("Path")
+        ):
+            res = await start_session("claude-code", "worker", prompt="go")
+        self.assertIs(res["prompt_delivery"], receipt)
+        self.assertTrue(res["submitted"])
+        self.assertEqual(res["monitor"]["error"], "tracking_failed")
+
     async def test_staffing_omits_type_and_forwards_work_kind_and_note(self):
         def _call(method, params, *a, **k):
             self.assertEqual(method, "mcp_start_session")
