@@ -4395,6 +4395,7 @@ mod tests {
 
     #[test]
     fn a_session_mid_rotation_is_not_dead() {
+        let _serial = crate::rotation::test_registry_lock();
         // #24: supervision must not respawn over a rotation (the process is
         // stopped and comes back at the same uid).
         let state = Arc::new(Mutex::new(DaemonState::default()));
