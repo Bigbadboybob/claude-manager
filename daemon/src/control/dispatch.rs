@@ -2072,18 +2072,18 @@ fn dispatch_session_rotate_transcript(state: &Arc<Mutex<DaemonState>>, req: &Req
             None => return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session.rotate_transcript requires uid"),
         },
         Caller::Session(s) => {
-            if asked.is_some_and(|u| u != s.session_uid) {
-                return Response::err(
-                    req.id.clone(),
-                    ErrorCode::Unauthorized,
-                    "a session may rotate only its own transcript",
-                );
-            }
             if force {
                 return Response::err(req.id.clone(), ErrorCode::Unauthorized, "force is operator-only");
             }
-            (s.session_uid.clone(), crate::rotation::Origin::Agent)
+            (asked.unwrap_or(&s.session_uid).to_string(), crate::rotation::Origin::Agent)
         }
+    };
+    // #25 follow-up: a session may ask for another session it has authority
+    // over (its task tree / global perms, or as a lead up the target
+    // member's manager chain). Status reads need the same authority.
+    let requested_by = match authorize_target(state, req, &uid) {
+        Ok(by) => by,
+        Err((code, message)) => return Response::err(req.id.clone(), code, message),
     };
     if p.get("status").and_then(serde_json::Value::as_bool).unwrap_or(false) {
         return Response::ok(
@@ -2096,7 +2096,7 @@ fn dispatch_session_rotate_transcript(state: &Arc<Mutex<DaemonState>>, req: &Req
         // An agent asks mid-turn; the policy carries it out at its next
         // safe boundary.
         let guard = state.lock().unwrap_or_else(|p| p.into_inner());
-        return match crate::rotation::request(&guard, &uid, &reason) {
+        return match crate::rotation::request_by(&guard, &uid, &reason, requested_by) {
             Ok(v) => Response::ok(req.id.clone(), v),
             Err((code, message)) => Response::err(req.id.clone(), code, message),
         };
@@ -2117,7 +2117,74 @@ fn handoff_request(p: &serde_json::Value, origin: crate::rotation::Origin, now: 
         reason: text("reason").unwrap_or_else(|| format!("{} request", origin_label(origin))),
         origin,
         now,
+        requested_by: None,
     }
+}
+
+/// For a Session caller naming `target`: whether it may rotate or hand off
+/// that session. Its own session always; another one only under authority
+/// CM already enforces for controlling sessions, nothing looser:
+/// - the session-caller scope `send_input` / `kill_session` use (its task
+///   tree, managed-by descendants, global permissions);
+/// - or as a lead: the target is a member's main session, assistant or
+///   worker, and the caller is up that member's manager chain (the planning
+///   API's check for move and retire; the member's own main also counts for
+///   its assistants and workers).
+/// Shells, continuous sessions and workflow participants are refused as
+/// targets of another session. Returns who asked (`None`: the operator or
+/// the session itself), else the refusal.
+fn authorize_target(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+    target: &str,
+) -> Result<Option<String>, (ErrorCode, String)> {
+    let Caller::Session(s) = &req.caller else { return Ok(None) };
+    let caller = s.session_uid.as_str();
+    if caller == target {
+        return Ok(None);
+    }
+    let (decision, member, label, refusal) = {
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(t) = st.sessions.get(target) else {
+            return Err((ErrorCode::NotFound, format!("session '{target}' is not live on this host")));
+        };
+        let refusal = if t.session_type == "bash" {
+            Some("shell sessions are never rotated or handed off")
+        } else if t.continuous_task_id.is_some() {
+            Some("continuous sessions are scheduler-owned: change the continuous task instead")
+        } else if t.workflow_run_id.is_some() {
+            Some("workflow participants are driven by their run")
+        } else {
+            None
+        };
+        (
+            crate::control::auth::check_session_caller(&st, caller, target),
+            crate::assistants::of_session(t),
+            st.sessions.get(caller).map(|c| c.to_manifest_entry().label).unwrap_or_default(),
+            refusal,
+        )
+    };
+    if let Some(why) = refusal {
+        return Err((ErrorCode::Conflict, why.into()));
+    }
+    let by = Some(if label.is_empty() { caller.to_string() } else { format!("{label} ({caller})") });
+    if matches!(decision, crate::control::auth::AuthDecision::Allow) {
+        return Ok(by);
+    }
+    let lead_refusal = match member {
+        Some(m) => match crate::items::org::member_authority(state, req, &m.member_id, m.acting_as != crate::assistants::MAIN) {
+            Ok(_) => return Ok(by),
+            Err((_, e)) => format!("; not up member {}'s manager chain ({e})", m.member_id),
+        },
+        None => String::new(),
+    };
+    Err((
+        ErrorCode::Unauthorized,
+        format!(
+            "'{caller}' has no authority over session '{target}': it is not in your task tree \
+             (the send_input / kill_session scope){lead_refusal}"
+        ),
+    ))
 }
 
 /// `session.handoff {uid?, to_engine?, to_model?, to_effort?, reason?, now?,
@@ -2137,14 +2204,15 @@ fn dispatch_session_handoff(state: &Arc<Mutex<DaemonState>>, req: &Request) -> R
             None => return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session.handoff requires uid"),
         },
         Caller::Session(s) => {
-            if asked.is_some_and(|u| u != s.session_uid) {
-                return Response::err(req.id.clone(), ErrorCode::Unauthorized, "a session may hand off only itself");
-            }
             if now {
                 return Response::err(req.id.clone(), ErrorCode::Unauthorized, "now is operator-only");
             }
-            (s.session_uid.clone(), crate::rotation::Origin::Agent)
+            (asked.unwrap_or(&s.session_uid).to_string(), crate::rotation::Origin::Agent)
         }
+    };
+    let requested_by = match authorize_target(state, req, &uid) {
+        Ok(by) => by,
+        Err((code, message)) => return Response::err(req.id.clone(), code, message),
     };
     if p.get("status").and_then(serde_json::Value::as_bool).unwrap_or(false) {
         return Response::ok(
@@ -2154,7 +2222,9 @@ fn dispatch_session_handoff(state: &Arc<Mutex<DaemonState>>, req: &Request) -> R
         );
     }
     let wait = p.get("wait_secs").and_then(serde_json::Value::as_u64).map(std::time::Duration::from_secs);
-    match crate::handoff::request(state, &uid, handoff_request(p, origin, now), wait) {
+    let mut request = handoff_request(p, origin, now);
+    request.requested_by = requested_by;
+    match crate::handoff::request(state, &uid, request, wait) {
         Ok(v) => Response::ok(req.id.clone(), v),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -3521,6 +3591,73 @@ mod tests {
         }
     }
 
+    /// #25 follow-up: a session may rotate or hand off another session it has
+    /// authority over: its managed worker (the send_input / kill_session
+    /// scope), never an unrelated one; shells and continuous sessions are
+    /// refused as targets; who asked is recorded.
+    #[test]
+    fn a_lead_may_target_its_worker_and_nothing_else() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let spawn = |uid: &str, ty: &str| {
+            let mut sp = crate::session::SpawnParams::new(uid, uid, "/bin/sleep");
+            sp.args = vec!["30".into()];
+            sp.session_type = ty.into();
+            let mut s = crate::session::DaemonSession::spawn(sp).unwrap();
+            s.transcript_path = Some(format!("/tmp/{uid}.jsonl"));
+            s
+        };
+        {
+            let mut st = state.lock().unwrap();
+            st.sessions.insert("ts-lead-0".into(), spawn("ts-lead-0", "claude-code"));
+            let mut worker = spawn("ts-wkr-0", "claude-code");
+            worker.managed_by_uid = Some("ts-lead-0".into());
+            st.sessions.insert("ts-wkr-0".into(), worker);
+            // Another workspace and task: outside the lead's scope.
+            let mut other = spawn("ts-other-0", "claude-code");
+            other.workspace_id = "ws-elsewhere".into();
+            other.task_id = Some("task-elsewhere".into());
+            st.sessions.insert("ts-other-0".into(), other);
+            let mut shell = spawn("ts-wsh-0", "bash");
+            shell.managed_by_uid = Some("ts-lead-0".into());
+            st.sessions.insert("ts-wsh-0".into(), shell);
+            let mut ct = spawn("ts-wct-0", "claude-code");
+            ct.managed_by_uid = Some("ts-lead-0".into());
+            ct.continuous_task_id = Some("ct-x".into());
+            st.sessions.insert("ts-wct-0".into(), ct);
+        }
+        let as_lead = |method: &str, params: serde_json::Value| session_request(method, params, "ts-lead-0");
+        assert_eq!(authorize_target(&state, &as_lead("session.handoff", serde_json::json!({})), "ts-lead-0"), Ok(None), "self");
+        let by = authorize_target(&state, &as_lead("session.handoff", serde_json::json!({})), "ts-wkr-0").unwrap();
+        assert_eq!(by.as_deref(), Some("ts-lead-0 (ts-lead-0)"));
+        let err = authorize_target(&state, &as_lead("session.handoff", serde_json::json!({})), "ts-other-0").unwrap_err();
+        assert_eq!(err.0, ErrorCode::Unauthorized, "{}", err.1);
+        assert!(err.1.contains("no authority over session 'ts-other-0'"), "{}", err.1);
+        assert!(authorize_target(&state, &as_lead("session.handoff", serde_json::json!({})), "ts-wsh-0").unwrap_err().1.contains("shell"));
+        assert!(authorize_target(&state, &as_lead("session.handoff", serde_json::json!({})), "ts-wct-0").unwrap_err().1.contains("continuous"));
+        // Through the RPCs: the worker's rotation is armed with the
+        // requester recorded; an unrelated session's is refused.
+        let ok = dispatch_session_rotate_transcript(
+            &state, &as_lead("session.rotate_transcript", serde_json::json!({"uid": "ts-wkr-0", "reason": "lag"})));
+        assert!(ok.ok, "{:?}", ok.error);
+        assert_eq!(ok.result.unwrap()["armed"], true);
+        let refused = dispatch_session_rotate_transcript(
+            &state, &as_lead("session.rotate_transcript", serde_json::json!({"uid": "ts-other-0"})));
+        assert!(!refused.ok);
+        let handoff = dispatch_session_handoff(
+            &state, &as_lead("session.handoff", serde_json::json!({"uid": "ts-wkr-0", "to_engine": "codex", "reason": "cheap work"})));
+        let v = handoff.result.expect("queued");
+        assert_eq!(v["handoff"]["requested_by"], "ts-lead-0 (ts-lead-0)");
+        assert!(v["handoff"]["reason"].as_str().unwrap().contains("requested by ts-lead-0"));
+        let now = dispatch_session_handoff(
+            &state, &as_lead("session.handoff", serde_json::json!({"uid": "ts-wkr-0", "to_engine": "codex", "now": true})));
+        assert!(now.error.unwrap().message.contains("operator-only"), "no `now` for agents");
+        crate::rotation::test_drop_arm("ts-wkr-0");
+        crate::handoff::test_drop_queued("ts-wkr-0");
+        for s in state.lock().unwrap().sessions.values_mut() {
+            let _ = s.kill();
+        }
+    }
+
     /// #25: who may hand off what. A session only itself and never `now`;
     /// bulk is operator-only; shells and continuous sessions are refused.
     #[test]
@@ -3547,7 +3684,8 @@ mod tests {
             &state,
             &session_request("session.handoff", serde_json::json!({"uid": "ts-ho-sh", "to_engine": "codex"}), "ts-ho-a"),
         );
-        assert!(!other.ok && other.error.unwrap().message.contains("only itself"));
+        // Another session in scope may be named, but a shell never.
+        assert!(!other.ok && other.error.unwrap().message.contains("shell"));
         let now = dispatch_session_handoff(
             &state,
             &session_request("session.handoff", serde_json::json!({"to_engine": "codex", "now": true}), "ts-ho-a"),

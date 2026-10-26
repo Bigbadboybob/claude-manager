@@ -1196,6 +1196,18 @@ async def _require_chain(conn, actor: dict, member_id: str, what: str, *,
     return actor_member
 
 
+async def authority(pool, actor: dict, ref: str, *, self_ok: bool = False) -> dict:
+    """Whether `actor` may control member `ref`'s sessions (a lead
+    rotating or handing off a report's session): exactly `_require_chain`,
+    the check for move, retire and close_assistant. Read-only."""
+    async with pool.acquire() as conn:
+        member_id = await _resolve_member_id(conn, ref)
+        if not member_id:
+            raise _err(404, "not_found", f"no member {ref!r}")
+        acting = await _require_chain(conn, actor, member_id, "control", self_ok=self_ok)
+        return {"allowed": True, "member_id": member_id, "acting_member": acting}
+
+
 async def _require_destination(conn, actor_member: str | None, manager_id: str, what: str) -> None:
     """A non-Owner may place a member only under itself or a member of its
     own reporting subtree; anywhere else (another lead's branch, Owner) is

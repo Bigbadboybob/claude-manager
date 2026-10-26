@@ -81,7 +81,28 @@ pid. The API's heartbeat sees the engine change on that pid and records an
   `from_engine`; a selection never includes shells, continuous sessions or
   workflow participants. Each session waits for its own boundary.
 - **Agent:** the MCP tool `request_handoff(to_engine?, to_model?, to_effort?,
-  reason?)` hands off the caller's own session only, and never with `now`.
+  reason?, session_uid?)`, never with `now`. Without `session_uid` it hands
+  off the caller's own session. With it, another session the caller has
+  authority over (below).
+
+## Handing off (or rotating) another session
+
+`request_handoff(session_uid=…)` and `rotate_transcript(session_uid=…)` (RPC
+`uid`) target another session under authority CM already enforces for
+controlling sessions, nothing looser:
+- the session-caller scope `send_input` and `kill_session` use (the caller's
+  task tree and workspace, managed-by descendants; everything with global
+  permissions);
+- or, as a lead, a session of a member below the caller in the org: the
+  member's main session, assistants or workers, by the planning API's
+  manager-chain check, the one move and retire use (`POST
+  /org/members/{ref}/authority`; the member's own main also counts for its
+  assistants and workers).
+
+Anything else is refused as unauthorized. Shells, continuous sessions and
+workflow participants are refused as targets. The request waits for the
+target's own safe boundary (agents never get `now`). The record carries
+`requested_by` ("label (uid)"), and the target's notices say who asked.
 
 One handoff or rotation runs at a time per host. `list_sessions` rows and
 `resolve_authorized_session` carry the `handoff` record, and a `turn_end`

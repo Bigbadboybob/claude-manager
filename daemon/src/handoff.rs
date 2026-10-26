@@ -76,6 +76,9 @@ pub struct Request {
     pub origin: Origin,
     /// Waive the idle and Owner-quiet waits (an operator acting now).
     pub now: bool,
+    /// Another session that asked for this one ("label (uid)"), when it is
+    /// not the session itself or the operator.
+    pub requested_by: Option<String>,
 }
 
 /// The daemon's engine name for what a caller wrote (`claude` → `claude-code`).
@@ -147,6 +150,7 @@ struct Record {
     deferred: Option<String>,
     outcome: Option<String>,
     finished_at: Option<f64>,
+    requested_by: Option<String>,
 }
 
 impl Record {
@@ -168,6 +172,7 @@ impl Record {
             "deferred": self.deferred,
             "outcome": self.outcome,
             "finished_at": self.finished_at,
+            "requested_by": self.requested_by,
         })
     }
 }
@@ -215,6 +220,14 @@ fn take_slot(_locked: &DaemonState, reg: &mut Registry, uid: &str) -> bool {
     }
     reg.running = Some(uid.to_string());
     true
+}
+
+/// Tests: forget `uid`'s queued handoff.
+#[cfg(test)]
+pub(crate) fn test_drop_queued(uid: &str) {
+    let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
+    reg.queue.retain(|q| q.uid != uid);
+    reg.records.remove(uid);
 }
 
 /// The session being handed off now, if any (one at a time per host).
@@ -292,6 +305,7 @@ pub(crate) fn recover_live(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap:
             deferred: None,
             outcome: None,
             finished_at: None,
+            requested_by: None,
         });
     }
     let spawned = std::thread::Builder::new().name(format!("cm-handoff-recover-{uid}")).spawn(move || {
@@ -356,6 +370,15 @@ pub fn request(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, req: Request, wai
         return Err((ErrorCode::Conflict, "a handoff of this session is already running".into()));
     }
     reg.queue.retain(|q| q.uid != uid);
+    // The target's notices quote the reason: it says who asked.
+    let mut req = req;
+    if let Some(by) = &req.requested_by {
+        req.reason = if req.reason.trim().is_empty() {
+            format!("requested by {by}")
+        } else {
+            format!("{}; requested by {by}", req.reason)
+        };
+    }
     let record = Record {
         phase: "queued",
         kind: plan.kind,
@@ -373,6 +396,7 @@ pub fn request(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, req: Request, wai
         deferred: None,
         outcome: None,
         finished_at: None,
+        requested_by: req.requested_by.clone(),
     };
     let out = record.to_json();
     reg.records.insert(uid.to_string(), record);
@@ -1016,6 +1040,7 @@ mod tests {
             reason: String::new(),
             origin: Origin::Operator,
             now: false,
+            requested_by: None,
         }
     }
 

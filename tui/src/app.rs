@@ -621,6 +621,11 @@ pub struct App {
     /// Sessions whose last A-R failed, with the error: the row stays (no
     /// exit prune) and shows the failure until a later revive succeeds.
     pub(crate) revive_failed: HashMap<String, String>,
+    /// #24/#25: uids CM stopped to bring straight back (a transcript
+    /// rotation or a handoff), with when the stop was seen. While fresh, a
+    /// NotFound from the daemon is the gap before the new process, not a
+    /// gone session, and A-R leaves it to the automatic reattach.
+    pub(crate) respawning: HashMap<String, std::time::Instant>,
     /// Last `session.viewed` report: which session, and when. See
     /// `report_viewed_session`.
     pub(crate) viewed_report: Option<(String, std::time::Instant)>,
@@ -1125,6 +1130,7 @@ impl App {
             cap_kill_toasted: std::collections::HashSet::new(),
             restart_suppressed_exit_uids: std::collections::HashSet::new(),
             revive_failed: HashMap::new(),
+            respawning: HashMap::new(),
             viewed_report: None,
             viewed_pending: Default::default(),
             hosts,

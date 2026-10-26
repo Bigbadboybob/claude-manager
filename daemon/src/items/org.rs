@@ -87,6 +87,22 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
     }
 }
 
+/// Whether the caller of `req` may control member `member_id`'s sessions,
+/// by the planning API's manager-chain check (the one move and retire use;
+/// `self_ok`: the member's own main session too). `Ok` with the API's
+/// answer, else the refusal.
+pub(crate) fn member_authority(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+    member_id: &str,
+    self_ok: bool,
+) -> RpcResult<Value> {
+    let ctx = Ctx::capture(state, req)?;
+    let mut body = Map::new();
+    body.insert("self_ok".into(), json!(self_ok));
+    api(ctx.api.post(&format!("/org/members/{}/authority", encode(member_id)), &with_actor(&ctx, body)))
+}
+
 fn params(raw: &Value) -> RpcResult<Map<String, Value>> {
     match raw {
         Value::Null => Ok(Map::new()),

@@ -49,7 +49,16 @@ the previous brain (the recoveries below hold again if they run).
 1. Record an in-flight marker (`~/.cm/rotations-inflight.json`), then stop
    the process (`killed_by = "transcript-rotation"`). MCP monitors treat the
    stop as "still running" for up to 5 minutes. The TUI keeps the row (also
-   a worker's section and placement) and reattaches it once the uid is back.
+   a worker's section and placement) and reattaches it to the new process on
+   its own: the stop's Exited diff (or the attach stream's End) marks the uid
+   as respawning for up to 10 minutes. Meanwhile a NotFound from the daemon
+   is the gap, not a gone session, so the row never settles to exited.
+   A-R during the gap leaves it to the reattach, and a revive refused
+   because the session already runs again reattaches instead of showing
+   "revive failed". `session.revive` itself refuses while a rotation or
+   handoff of that uid runs. A TUI from before #24 lacks all of this
+   (Owner's laptop on 2026-10-26: frozen pane, then "revive failed"), so the
+   daemon and the TUI ship together.
 2. Respawn through the normal revive path as
    `claude --resume <old> --fork-session --session-id <new>`. The uid, chat
    name, org seat, task, workspace and global permissions are unchanged.
@@ -60,6 +69,14 @@ the previous brain (the recoveries below hold again if they run).
    and standing rules from CM, and its first message is what writes the new
    file. A `turn_end` monitor absorbs the turn this notice causes; it does
    not fire it as the worker's completion.
+   For a Claude session (the fork, and the original on a fallback) the
+   notice goes in only once the new process's composer is drawn and its
+   screen has been still for 1.5 s, waiting up to the verification deadline.
+   A large transcript keeps loading after the process is up, and text typed
+   meanwhile sat unsent (a 1.07 GB fork on 2026-10-26). Until the transcript
+   records the notice, CM presses Enter if it is visibly sitting in the
+   composer (up to 3 times, 10 s apart), or types it once more if it vanished
+   while the agent sits idle. Human input stops this.
 4. Confirm the rotation from the new transcript, not from keystrokes, within
    180 s plus 60 s per GB of source (fractional; at most 20 min). The fork
    took if it recorded the after-notice's marker or any new turn: a Claude

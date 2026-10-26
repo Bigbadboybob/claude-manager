@@ -73,6 +73,11 @@ class RotateTranscriptToolTests(unittest.TestCase):
                 "session.handoff", {"to_engine": "codex", "to_model": "gpt-6-luna", "reason": "cheap work"})
             fn(status=True)
             call.assert_called_with("session.handoff", {"status": True})
+            fn(to_engine="codex", session_uid=" ts-worker-1 ")
+            call.assert_called_with("session.handoff", {"to_engine": "codex", "uid": "ts-worker-1"})
+            rot = getattr(server.rotate_transcript, "fn", server.rotate_transcript)
+            rot(reason="lag", session_uid="ts-worker-1")
+            call.assert_called_with("session.rotate_transcript", {"reason": "lag", "uid": "ts-worker-1"})
 
 
 if __name__ == "__main__":

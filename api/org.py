@@ -103,6 +103,13 @@ class RetireBody(_Strict):
     request_id: RequestId | None = None
 
 
+class AuthorityBody(_Strict):
+    actor: Actor
+    # Also the member's own main session (its assistant or worker is the
+    # target, not the member's main itself).
+    self_ok: bool = False
+
+
 class ReinstateBody(_Strict):
     actor: Actor
     reason: Annotated[str, Field(min_length=1, max_length=500)] | None = None
@@ -190,6 +197,14 @@ async def retire_member(ref: Ref, body: RetireBody, request: Request):
     return await _call(org_db.retire(
         _pool(request), body.actor.model_dump(), ref, reason=body.reason,
         request_id=body.request_id))
+
+
+@router.post("/members/{ref:path}/authority")
+async def member_authority(ref: Ref, body: AuthorityBody, request: Request):
+    """Whether the actor may control this member's sessions: the check move
+    and retire use (Owner, or a member up its manager chain; with `self_ok`
+    also the member's own main session). 403 `not_member`/`not_manager`."""
+    return await _call(org_db.authority(_pool(request), body.actor.model_dump(), ref, self_ok=body.self_ok))
 
 
 @router.post("/members/{ref:path}/reinstate")

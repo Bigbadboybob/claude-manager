@@ -2658,6 +2658,16 @@ impl App {
             );
             return;
         }
+        if self.respawn_pending(&ts.uid) {
+            // A rotation or handoff stopped it and brings it straight back;
+            // a revive now would race that respawn.
+            let (uid, host) = (ts.uid.clone(), ts.host_id.clone());
+            self.expect_respawn(&host, &uid);
+            self.set_status_msg(
+                "CM is restarting this session (transcript rotation or handoff) — it reattaches on its own",
+            );
+            return;
+        }
         if ws.worktree_path.is_none() {
             self.set_status_msg("Workspace has no worktree path — can't revive");
             return;

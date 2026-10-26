@@ -473,10 +473,12 @@ impl App {
                         // retry indefinitely (the worker re-warms the tunnel on
                         // the next dispatch), so a deploy restart or tunnel churn
                         // never settles a live session to `exited`.
+                        // A uid CM is bringing straight back (rotation /
+                        // handoff) is in its gap, not gone.
                         let session_gone = matches!(
                             result.failure,
                             Some(crate::attach_worker::AttachFailureKind::SessionGone)
-                        );
+                        ) && !self.respawn_pending(&result.entry.uid);
                         if !session_gone {
                             self.note_reattach_failed(&result.entry.uid);
                             if self.history_fetch_failed(&result.entry.uid) {
@@ -903,6 +905,15 @@ impl App {
                                 ..p
                             });
                         }
+                        Err(crate::attach_worker::AttachFailureKind::SessionGone)
+                            if self.respawn_pending(&p.entry.uid) =>
+                        {
+                            // CM is bringing it straight back: keep trying.
+                            still_pending.push(PendingRemoteReattach {
+                                last_attempt_at: Some(now),
+                                ..p
+                            });
+                        }
                         Err(crate::attach_worker::AttachFailureKind::SessionGone) => {
                             // The daemon reached us and reported NotFound — the
                             // session is genuinely gone. Count toward the cap;
@@ -986,6 +997,14 @@ impl App {
                     // an offline/churning host never strands a live restore-
                     // deferred session; the raw entry stays in
                     // `skipped_manifest_entries` meanwhile.
+                    still_pending.push(PendingRemoteReattach {
+                        last_attempt_at: Some(now),
+                        ..p
+                    });
+                }
+                Err(crate::attach_worker::AttachFailureKind::SessionGone)
+                    if self.respawn_pending(&p.entry.uid) =>
+                {
                     still_pending.push(PendingRemoteReattach {
                         last_attempt_at: Some(now),
                         ..p
@@ -1307,6 +1326,39 @@ impl App {
     /// the slot in place, as a reconnect would. A restart this viewer is
     /// driving (A-R) reattaches by itself and is left alone. Returns whether
     /// a reattach was queued.
+    /// How long a uid CM stopped to bring back counts as respawning.
+    pub(crate) const RESPAWN_GRACE: Duration = Duration::from_secs(600);
+
+    /// Whether `uid` is in a rotation/handoff gap (see `App::respawning`).
+    pub(crate) fn respawn_pending(&self, uid: &str) -> bool {
+        self.respawning.get(uid).is_some_and(|at| at.elapsed() < Self::RESPAWN_GRACE)
+    }
+
+    /// A rotation or handoff stopped `uid` and brings it straight back: keep
+    /// the slot (not exited, not revive-failed) and queue its reattach, which
+    /// keeps retrying through the gap (`respawn_pending`).
+    pub(crate) fn expect_respawn(&mut self, host: &cm_daemon::host_id::HostId, uid: &str) -> bool {
+        if self.restart_in_flight(uid) {
+            return false;
+        }
+        let found = self.workspaces.iter().enumerate().find_map(|(wi, w)| {
+            if w.is_closed {
+                return None;
+            }
+            w.sessions.iter().position(|s| s.uid == uid && &s.host_id == host).map(|si| (wi, si))
+        });
+        let Some((wi, si)) = found else { return false };
+        self.revive_failed.remove(uid);
+        {
+            let ts = &mut self.workspaces[wi].sessions[si];
+            ts.session.exited = false;
+            ts.set_status(SessionStatus::Idle);
+        }
+        self.reattach_backoff.remove(uid);
+        self.needs_redraw = true;
+        self.requeue_remote_reconnect(wi, si, "CM is restarting it (transcript rotation / handoff)")
+    }
+
     pub(crate) fn reattach_respawned(&mut self, host: &cm_daemon::host_id::HostId, uid: &str) -> bool {
         if self.restart_in_flight(uid)
             || self.attaching.contains_key(uid)
@@ -3889,6 +3941,85 @@ mod remote_reconnect_tests {
             app.pending_remote_reattach.is_empty(),
             "the work item is dropped from the retry queue on give-up",
         );
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = dhandle.join();
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// #24/#25 (live 2026-10-26): a session CM stopped for a rotation or a
+    /// handoff is in a gap, not gone. The Exited diff keeps the row, queues
+    /// the reattach, and NotFound during the gap never settles it exited or
+    /// marks it revive-failed; A-R leaves it to the reattach.
+    #[test]
+    fn a_rotation_stop_reattaches_and_never_settles_or_fails() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let cm_dir = home.join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let orig_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let mgr_sock = cm_dir.join("manager.sock");
+        let state = std::sync::Arc::new(std::sync::Mutex::new(cm_daemon::state::DaemonState::new()));
+        let (stop, dhandle) =
+            crate::app::events::pending_workflow_events_tests::spawn_inproc_daemon(mgr_sock.clone(), state);
+        let (mut app, host) = app_with_daemon_host(&cm_dir, &mgr_sock);
+        let (ts, _tx, _teof) = session_with_injected_exit("uid-rot", host.clone(), false);
+        let mut ws = workspace_with(ts);
+        ws.worktree_path = Some(wt);
+        app.workspaces.push(ws);
+        app.workspaces[0].sessions[0].managed_by_uid = Some("lead".into());
+        app.sessions_restored = false;
+
+        app.apply_manifest_diff_from_host(
+            host.clone(),
+            cm_daemon::manifest::ManifestDiff::Exited {
+                uid: "uid-rot".into(),
+                last_exit: cm_daemon::manifest::LastExit {
+                    killed_by: Some("transcript-rotation".into()),
+                    code: Some(143),
+                    memory_cap_kill: false,
+                    kills_file_offset: None,
+                    exited_at: 1.0,
+                },
+            },
+        );
+        assert_eq!(app.workspaces[0].sessions.len(), 1, "the worker's row stays");
+        assert!(!app.workspaces[0].sessions[0].session.exited);
+        assert!(app.reconnecting_sessions.contains("uid-rot"));
+        assert!(app.pending_remote_reattach.iter().any(|p| p.entry.uid == "uid-rot"));
+        // The daemon has no such session yet (the gap): far past the give-up
+        // bound, the slot is still reconnecting, not exited or failed.
+        for _ in 0..(REMOTE_REATTACH_MAX_ATTEMPTS + 3) {
+            for p in &mut app.pending_remote_reattach {
+                p.last_attempt_at = None;
+            }
+            app.drain_deferred_remote_reattach();
+        }
+        assert!(!app.workspaces[0].sessions[0].session.exited, "a respawn gap never settles to exited");
+        assert!(app.pending_remote_reattach.iter().any(|p| p.entry.uid == "uid-rot"), "still trying");
+        assert!(!app.revive_failed.contains_key("uid-rot"));
+        // A-R during the gap does not revive (it would race the respawn).
+        app.cursor = Cursor::Session(0, 0);
+        app.revive_active_session();
+        assert!(!app.revive_failed.contains_key("uid-rot"));
+        assert!(app.restarts.is_empty(), "no revive was started");
+        // A revive refused because the session already runs again reattaches.
+        assert!(super::super::restart::revive_refused_as_live(
+            "session 'uid-rot' is still running — revive applies only to an exited session"
+        ));
+        assert!(super::super::restart::revive_refused_as_live(
+            "session 'uid-rot' is being restarted by CM (transcript rotation or handoff) and comes straight back"
+        ));
+        assert!(!super::super::restart::revive_refused_as_live("worktree /w/x missing"));
 
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = dhandle.join();

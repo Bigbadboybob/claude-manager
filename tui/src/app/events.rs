@@ -2291,6 +2291,13 @@ impl App {
                     // task-liveness gates still apply to them).
                     self.close_agent_marker_if_empty(wi);
                 }
+                if respawning && found {
+                    // The pane follows on its own: queue the reattach to the
+                    // new incarnation now, whether or not this viewer's attach
+                    // stream reported the stop (an old frame or none at all).
+                    self.respawning.insert(uid.clone(), std::time::Instant::now());
+                    self.expect_respawn(&host, &uid);
+                }
                 // R5: untracked uid — `found` stays false; silent
                 // no-op. The diff referenced a session the TUI
                 // doesn't know about (e.g. a session the daemon

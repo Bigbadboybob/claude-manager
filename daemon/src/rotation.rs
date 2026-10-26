@@ -72,6 +72,9 @@ pub(crate) struct Rotation {
     path: &'static str,
     outcome: Option<String>,
     finished_at: Option<f64>,
+    /// The session that asked for this rotation of another session (#25
+    /// follow-up), as "label (uid)".
+    requested_by: Option<String>,
 }
 
 impl Rotation {
@@ -88,6 +91,7 @@ impl Rotation {
             "path": self.path,
             "outcome": self.outcome,
             "finished_at": self.finished_at,
+            "requested_by": self.requested_by,
         })
     }
 }
@@ -117,13 +121,20 @@ pub(crate) fn test_registry_lock() -> std::sync::MutexGuard<'static, ()> {
     L.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// Tests: drop `uid`'s arm and due hold.
+#[cfg(test)]
+pub(crate) fn test_drop_arm(uid: &str) {
+    arm_remove(uid);
+    unhold(uid, HoldOwner::Due);
+}
+
 /// Tests: a rotation record for [`admit`].
 #[cfg(test)]
 pub(crate) fn test_rotation_record(uid: &str) -> Rotation {
     Rotation {
         phase: "stopping", origin: Origin::Operator, reason: String::new(), started_at: now(),
         from_id: uid.into(), from_bytes: 0, to_id: None, to_bytes: None, path: "fork",
-        outcome: None, finished_at: None,
+        outcome: None, finished_at: None, requested_by: None,
     }
 }
 
@@ -141,7 +152,7 @@ pub(crate) fn test_set_running(uid: &str, running: bool) {
         reg.insert(uid.into(), Rotation {
             phase: "forking", origin: Origin::Operator, reason: String::new(), started_at: now(),
             from_id: String::new(), from_bytes: 0, to_id: None, to_bytes: None, path: "fork",
-            outcome: None, finished_at: None,
+            outcome: None, finished_at: None, requested_by: None,
         });
     } else {
         reg.remove(uid);
@@ -427,6 +438,7 @@ pub(crate) fn start_with(
             }
         }
         let snap = snapshot(&state, uid).map_err(|e| (ErrorCode::Conflict, e))?;
+        let requested_by = arms().lock().unwrap_or_else(|p| p.into_inner()).get(uid).and_then(|a| a.requested_by.clone());
         let rotation = Rotation {
             phase: "stopping",
             origin,
@@ -439,6 +451,7 @@ pub(crate) fn start_with(
             path: "fork",
             outcome: None,
             finished_at: None,
+            requested_by,
         };
         let record = rotation.to_json();
         admit(&state, uid, rotation).map_err(|why| (ErrorCode::Conflict, why))?;
@@ -601,8 +614,13 @@ pub fn after_notice(from_bytes: u64) -> String {
 }
 
 fn after_notice_marked(from_bytes: u64, marker: &str) -> String {
+    after_notice_for(from_bytes, marker, None)
+}
+
+fn after_notice_for(from_bytes: u64, marker: &str, requested_by: Option<&str>) -> String {
+    let asked = requested_by.map(|by| format!(" {by} asked for it.")).unwrap_or_default();
     format!(
-        "[cm-rotation{marker}] CM moved this conversation to a fresh transcript: the old one was {}, \
+        "[cm-rotation{marker}] CM moved this conversation to a fresh transcript: the old one was {},{asked} \
          and the agent slows down badly past a few hundred MB. You continue from your latest \
          compaction summary. Nothing else changed: same CM session, chat name, task and workspace. \
          Before you continue, re-read anything handoff-critical from CM rather than assuming it: \
@@ -612,11 +630,159 @@ fn after_notice_marked(from_bytes: u64, marker: &str) -> String {
     )
 }
 
+/// A phrase only the fallback notice carries (its delivery confirmation).
+const FALLBACK_NEEDLE: &str = "CM tried to move this conversation to a fresh transcript";
+
 pub(crate) fn fallback_notice(why: &str) -> String {
     format!(
         "[cm-rotation] CM tried to move this conversation to a fresh transcript, but it did not \
          take ({why}). You are back on your original transcript; nothing was lost. Carry on."
     )
+}
+
+/// A live view of a session's rendered screen, fed from its PTY output.
+struct ScreenWatch {
+    text: Arc<Mutex<String>>,
+    last_output: Arc<Mutex<Instant>>,
+    enter: Arc<Mutex<&'static [u8]>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ScreenWatch {
+    fn start(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) -> Option<ScreenWatch> {
+        let (fanout, cols, rows) = {
+            let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            let s = st.sessions.get(uid)?;
+            (Arc::clone(&s.fanout), s.last_cols.max(80), s.last_rows.max(24))
+        };
+        let rx = fanout.subscribe();
+        let watch = ScreenWatch {
+            text: Arc::new(Mutex::new(String::new())),
+            last_output: Arc::new(Mutex::new(Instant::now())),
+            enter: Arc::new(Mutex::new(b"\r")),
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let (text, last, enter, stop) =
+            (Arc::clone(&watch.text), Arc::clone(&watch.last_output), Arc::clone(&watch.enter), Arc::clone(&watch.stop));
+        std::thread::Builder::new()
+            .name(format!("cm-rotate-screen-{uid}"))
+            .spawn(move || {
+                let mut tracker = crate::workflow::pty_tracker::PtyModeTracker::with_size(cols as usize, rows as usize);
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    match rx.recv_timeout(Duration::from_millis(100)) {
+                        Ok(bytes) => {
+                            tracker.feed(&bytes, Instant::now());
+                            *text.lock().unwrap_or_else(|p| p.into_inner()) = tracker.visible_text();
+                            *enter.lock().unwrap_or_else(|p| p.into_inner()) = tracker.enter_bytes();
+                            *last.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+            })
+            .ok()?;
+        Some(watch)
+    }
+
+    fn screen(&self) -> String {
+        self.text.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The composer is drawn and the screen has been still for `quiet`.
+    fn ready(&self, quiet: Duration) -> bool {
+        crate::claude_channels::client_ready(&self.screen())
+            && self.last_output.lock().unwrap_or_else(|p| p.into_inner()).elapsed() >= quiet
+    }
+}
+
+impl Drop for ScreenWatch {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// How a [`deliver_ready`] went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Delivered {
+    /// The transcript recorded it.
+    Confirmed,
+    /// Typed, but not seen in the transcript (the caller's own verification
+    /// decides what that means).
+    Unconfirmed,
+    /// The session is gone.
+    Vanished,
+}
+
+/// Deliver `text` to a Claude session that was just (re)started, once its
+/// composer is really up, and make sure it was submitted. A large transcript
+/// keeps loading after the process is up, and text typed meanwhile can sit
+/// unsent (#24, 1 GB fork, 2026-10-26). So: wait for the composer footer and
+/// a still screen (up to the size-scaled deadline); type it; then until the
+/// transcript records `needle`, press Enter if it is visibly sitting in the
+/// composer (up to 3 times), or type it once more if it vanished while the
+/// agent sits idle. Human input stops the re-drive.
+fn deliver_ready(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, text: String, needle: &str, source_bytes: u64) -> Delivered {
+    let Some(watch) = ScreenWatch::start(state_arc, uid) else { return Delivered::Vanished };
+    let started = Instant::now();
+    let budget = verify_deadline(source_bytes);
+    while !watch.ready(Duration::from_millis(1500)) {
+        if !state_arc.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid) {
+            return Delivered::Vanished;
+        }
+        if started.elapsed() >= budget {
+            eprintln!("cm-daemon: rotation of {uid}: no composer after {}s; typing anyway", budget.as_secs());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let waited = started.elapsed();
+    if !deliver_live(state_arc, uid, text.clone()) {
+        return Delivered::Vanished;
+    }
+    let typed = Instant::now();
+    let (mut enters, mut retyped) = (0, false);
+    while typed.elapsed() < Duration::from_secs(120) {
+        std::thread::sleep(Duration::from_secs(1));
+        let (live, path, handle, quiet) = {
+            let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            match st.sessions.get(uid) {
+                Some(s) => (true, s.transcript_path.clone(), Some(s.input_handle()),
+                            crate::agent_state::current(s).state != crate::agent_state::State::Working),
+                None => (false, None, None, false),
+            }
+        };
+        if !live {
+            return Delivered::Vanished;
+        }
+        if path.as_deref().is_some_and(|p| tail_contains(Path::new(p), needle)) {
+            eprintln!(
+                "cm-daemon: rotation of {uid}: notice confirmed (composer after {:.1}s, {enters} extra Enter(s){})",
+                waited.as_secs_f64(),
+                if retyped { ", retyped once" } else { "" }
+            );
+            return Delivered::Confirmed;
+        }
+        let Some(handle) = handle else { continue };
+        if handle.operator_quiet_for().is_some_and(|q| q < typed.elapsed()) {
+            eprintln!("cm-daemon: rotation of {uid}: Owner typed in it; leaving the notice to them");
+            return Delivered::Unconfirmed;
+        }
+        let since = typed.elapsed().as_secs();
+        let screen = watch.screen();
+        let sitting = screen.contains(needle.trim_end_matches(']'));
+        if sitting && enters < 3 && since >= 10 * (enters + 1) as u64 {
+            enters += 1;
+            let enter = *watch.enter.lock().unwrap_or_else(|p| p.into_inner());
+            eprintln!("cm-daemon: rotation of {uid}: the notice sits unsent in the composer; Enter ({enters}/3)");
+            let _ = handle.write_recovery_enter(enter, typed);
+        } else if !sitting && !retyped && since >= 30 && quiet && watch.ready(Duration::from_secs(2)) {
+            retyped = true;
+            eprintln!("cm-daemon: rotation of {uid}: the notice is neither in the composer nor recorded; typing it again");
+            deliver_live(state_arc, uid, text.clone());
+        }
+    }
+    Delivered::Unconfirmed
 }
 
 pub(crate) fn deliver(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, text: String) -> bool {
@@ -926,6 +1092,7 @@ fn complete_after_restart(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: 
         path: "fork",
         outcome: None,
         finished_at: None,
+        requested_by: None,
     };
     if let Err(why) = claim(uid, record) {
         eprintln!("cm-daemon: rotation of {uid} interrupted by a restart; not completed now: {why}");
@@ -999,8 +1166,19 @@ fn run(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: Snapshot) {
     //    rollout is bound by the detector. Either way the new transcript must
     //    record the notice (its marker) before the rotation counts.
     let marker = format!(" {}", nonce());
+    let requester = registry().lock().unwrap_or_else(|p| p.into_inner()).get(uid).and_then(|r| r.requested_by.clone());
     update(uid, |r| r.phase = "notifying");
-    if !deliver(state_arc, uid, after_notice_marked(snap.from_bytes, &marker)) {
+    let delivered = if snap.entry.session_type == "claude-code" {
+        // A large fork loads its history after the process is up: wait for
+        // its composer, then make sure the notice was submitted (#24: a 1 GB
+        // fork took the notice while still loading and never sent it).
+        deliver_ready(state_arc, uid, after_notice_for(snap.from_bytes, &marker, requester.as_deref()),
+                      &format!("[cm-rotation{marker}]"), snap.from_bytes)
+            != Delivered::Vanished
+    } else {
+        deliver(state_arc, uid, after_notice_for(snap.from_bytes, &marker, requester.as_deref()))
+    };
+    if !delivered {
         resume_old(state_arc, uid, &snap, "the forked session vanished before its first message");
         return;
     }
@@ -1073,7 +1251,12 @@ fn resume_old(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: &Snapshot, w
         false,
     ) {
         Ok(_) => {
-            deliver(state_arc, uid, fallback_notice(why));
+            if snap.entry.session_type == "claude-code" {
+                // The original transcript is the large one: same readiness.
+                deliver_ready(state_arc, uid, fallback_notice(why), FALLBACK_NEEDLE, snap.from_bytes);
+            } else {
+                deliver(state_arc, uid, fallback_notice(why));
+            }
             update(uid, |r| r.path = "fallback-resume");
             fail(state_arc, uid, format!("{why}; resumed the original transcript {}", snap.from_id));
         }
@@ -1161,6 +1344,7 @@ struct Arm {
     reason: String,
     origin: Origin,
     armed_at: f64,
+    requested_by: Option<String>,
 }
 
 fn arms() -> &'static Mutex<HashMap<String, Arm>> {
@@ -1178,7 +1362,10 @@ fn save_arms(arms: &HashMap<String, Arm>) {
     let Some(path) = arms_path().get() else { return };
     let v: serde_json::Map<String, Value> = arms
         .iter()
-        .map(|(uid, a)| (uid.clone(), json!({"reason": a.reason, "origin": a.origin.as_str(), "armed_at": a.armed_at})))
+        .map(|(uid, a)| {
+            (uid.clone(), json!({"reason": a.reason, "origin": a.origin.as_str(), "armed_at": a.armed_at,
+                                 "requested_by": a.requested_by}))
+        })
         .collect();
     if let Err(e) = crate::state::write_json_atomic(path, &Value::Object(v).to_string(), true) {
         eprintln!("cm-daemon: rotation arms not saved: {e}");
@@ -1196,7 +1383,12 @@ fn load_arms(path: &Path) {
                 "agent" => Origin::Agent,
                 _ => Origin::Policy,
             };
-            Some((uid, Arm { reason: v["reason"].as_str()?.to_string(), origin, armed_at: v["armed_at"].as_f64()? }))
+            Some((uid, Arm {
+                reason: v["reason"].as_str()?.to_string(),
+                origin,
+                armed_at: v["armed_at"].as_f64()?,
+                requested_by: v["requested_by"].as_str().map(str::to_string),
+            }))
         })
         .collect();
     if !loaded.is_empty() {
@@ -1330,6 +1522,17 @@ fn hold_owner(uid: &str) -> Option<HoldOwner> {
 /// Arm a rotation of `uid` for its next turn end, holding new wakes so that
 /// turn end is not raced by one. Returns what it will wait for.
 pub fn arm(state: &DaemonState, uid: &str, reason: &str, origin: Origin) -> Result<Value, (ErrorCode, String)> {
+    arm_by(state, uid, reason, origin, None)
+}
+
+/// [`arm`], recording which other session asked (`requested_by`).
+pub fn arm_by(
+    state: &DaemonState,
+    uid: &str,
+    reason: &str,
+    origin: Origin,
+    requested_by: Option<String>,
+) -> Result<Value, (ErrorCode, String)> {
     match state.sessions.get(uid) {
         Some(s) if matches!(s.session_type.as_str(), "claude-code" | "codex") && s.transcript_path.is_some() => {}
         Some(s) if !matches!(s.session_type.as_str(), "claude-code" | "codex") => {
@@ -1338,7 +1541,7 @@ pub fn arm(state: &DaemonState, uid: &str, reason: &str, origin: Origin) -> Resu
         Some(_) => return Err((ErrorCode::Conflict, "the session has no bound transcript yet".into())),
         None => return Err((ErrorCode::NotFound, format!("session '{uid}' is not live on this host"))),
     }
-    arm_insert(uid, Arm { reason: reason.to_string(), origin, armed_at: now() });
+    arm_insert(uid, Arm { reason: reason.to_string(), origin, armed_at: now(), requested_by });
     hold(state, uid, HoldOwner::Due);
     Ok(json!({
         "ok": true,
@@ -1354,6 +1557,18 @@ pub fn arm(state: &DaemonState, uid: &str, reason: &str, origin: Origin) -> Resu
 /// turn end.
 pub fn request(state: &DaemonState, uid: &str, reason: &str) -> Result<Value, (ErrorCode, String)> {
     arm(state, uid, reason, Origin::Agent)
+}
+
+/// An agent's request for its own session (`requested_by: None`) or, with
+/// authority checked by the caller, for another one: armed for that
+/// session's next turn end, at its own safe boundary.
+pub fn request_by(
+    state: &DaemonState,
+    uid: &str,
+    reason: &str,
+    requested_by: Option<String>,
+) -> Result<Value, (ErrorCode, String)> {
+    arm_by(state, uid, reason, Origin::Agent, requested_by)
 }
 
 /// Called when `uid` reports a turn end (`session.turn_ended` /
@@ -1720,7 +1935,7 @@ mod tests {
         let r = |uid: &str| Rotation {
             phase: "stopping", origin: Origin::Operator, reason: String::new(), started_at: now(),
             from_id: uid.into(), from_bytes: 0, to_id: None, to_bytes: None, path: "fork",
-            outcome: None, finished_at: None,
+            outcome: None, finished_at: None, requested_by: None,
         };
         claim("ts-claim-a", r("a")).unwrap();
         assert!(claim("ts-claim-b", r("b")).unwrap_err().contains("ts-claim-a"));

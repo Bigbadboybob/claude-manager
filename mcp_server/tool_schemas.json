@@ -1690,6 +1690,9 @@
     "reason": {
      "type": "string"
     },
+    "session_uid": {
+     "type": "string"
+    },
     "status": {
      "type": "boolean"
     },
@@ -1729,6 +1732,9 @@
   "rotate_transcript": {
    "params": {
     "reason": {
+     "type": "string"
+    },
+    "session_uid": {
      "type": "string"
     },
     "status": {

@@ -579,6 +579,37 @@ class OrgApiDb(unittest.IsolatedAsyncioTestCase):
         async with self.pool.acquire() as conn:
             self.assertEqual(await conn.fetchval("SELECT count(*) FROM org_events WHERE type = 'engine_switch'"), 1)
 
+    async def test_authority_is_the_manager_chain_check(self):
+        # A lead may control a report's sessions (rotate / hand off them), by
+        # the same check move and retire use; an unrelated member may not.
+        lead, report, other = uid_at(6), uid_at(7), uid_at(8)
+        await self.beat(D1, [{"uid": u, "engine": "claude-code"} for u in (lead, report, other)])
+        async def adopt(uid, handle, manager=None):
+            body = {"actor": OWNER, "pid": pid(uid), "handle": handle, "title": handle.title(),
+                    "request_id": f"adopt-{handle}"}
+            if manager:
+                body["manager"] = manager
+            r = await self.http.post("/org/adopt", json=body)
+            self.assertEqual(r.status_code, 200, r.text)
+            return r.json()["member"]["id"]
+        lead_id = await adopt(lead, "leadx")
+        report_id = await adopt(report, "reportx", manager=lead_id)
+        await adopt(other, "otherx")
+        r = await self.http.post(f"/org/members/{report_id}/authority", json={"actor": {"pid": pid(lead)}})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["acting_member"], lead_id)
+        r = await self.http.post(f"/org/members/{report_id}/authority", json={"actor": {"pid": pid(other)}})
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertIn("not_manager", r.text)
+        # The member's own main session, for its assistants and workers.
+        r = await self.http.post(f"/org/members/{report_id}/authority",
+                                 json={"actor": {"pid": pid(report)}, "self_ok": True})
+        self.assertEqual(r.status_code, 200, r.text)
+        r = await self.http.post(f"/org/members/{report_id}/authority", json={"actor": {"pid": pid(report)}})
+        self.assertEqual(r.status_code, 403, r.text)
+        r = await self.http.post(f"/org/members/{report_id}/authority", json={"actor": OWNER})
+        self.assertEqual(r.status_code, 200, r.text)
+
     async def test_a_beat_without_capabilities_records_none(self):
         # A rollback to a brain from before S0b sends no `capabilities`: the
         # host must stop counting as capable (marks, the lifecycle gate).

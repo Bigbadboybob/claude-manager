@@ -96,7 +96,7 @@ pub fn accept_own_startup(state: &Arc<Mutex<DaemonState>>, uid: &str, argv: &[St
 }
 
 /// Whether the rendered screen shows Claude Code's composer footer.
-fn client_ready(screen: &str) -> bool {
+pub(crate) fn client_ready(screen: &str) -> bool {
     let compact: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
     compact.contains("shift+tabtocycle") || compact.contains("?forshortcuts")
 }

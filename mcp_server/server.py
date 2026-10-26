@@ -5012,7 +5012,7 @@ def clear_continuous_hold(reason: str, dry_run: bool = False) -> dict:
 
 
 @mcp.tool()
-def rotate_transcript(reason: str = "", status: bool = False) -> dict:
+def rotate_transcript(reason: str = "", status: bool = False, session_uid: str = "") -> dict:
     """Ask CM to move YOUR conversation to a fresh transcript (Claude or Codex).
 
     An agent slows down badly once its transcript file reaches a few hundred
@@ -5029,14 +5029,28 @@ def rotate_transcript(reason: str = "", status: bool = False) -> dict:
     message afterwards says so. End your turn normally after calling it. Anything a successor must not lose belongs in files,
     board items or notes, as always.
 
+    Another session: pass `session_uid` to ask for a session you have
+    authority over, the same authority CM already enforces for controlling
+    sessions: a session in your task tree (the send_input / kill_session
+    scope; everything with global permissions), or, as a lead, a session
+    of a member below you in the org (its main session, assistants or
+    workers). Anything else is refused as unauthorized, and so are shells,
+    continuous sessions and workflow participants. It waits for that
+    session's own safe boundary (never `now`), and its notice says you
+    asked.
+
     Args:
         reason: Why (shown in the rotation record).
-        status: True to only report the latest rotation of your session.
+        status: True to only report the latest rotation of your session
+            (or of `session_uid`).
+        session_uid: Another session to rotate (see above); empty = yours.
 
     Returns: {"queued": true, "note": ...}, or with status=True
     {"rotation": {phase, outcome, from_transcript_id, to_transcript_id, ...}|null}.
     """
     params: dict = {"reason": reason}
+    if session_uid.strip():
+        params["uid"] = session_uid.strip()
     if status:
         params["status"] = True
     return control_client.call("session.rotate_transcript", params)
@@ -5049,6 +5063,7 @@ def request_handoff(
     to_effort: str = "",
     reason: str = "",
     status: bool = False,
+    session_uid: str = "",
 ) -> dict:
     """Ask CM to move YOUR session to another engine, model or effort.
 
@@ -5070,20 +5085,32 @@ def request_handoff(
 
     It is queued, not immediate. End your turn normally after calling it.
 
+    Another session: pass `session_uid` to ask for a session you have
+    authority over, the same authority CM already enforces for controlling
+    sessions: a session in your task tree (the send_input / kill_session
+    scope; everything with global permissions), or, as a lead, a session
+    of a member below you in the org (its main session, assistants or
+    workers). Anything else is refused as unauthorized, and so are shells,
+    continuous sessions and workflow participants. It waits for that
+    session's own safe boundary (never `now`), and its notice says you
+    asked.
+
+
     Args:
         to_engine: "claude" or "codex"; empty keeps your engine.
         to_model: The model to run, e.g. "gpt-6-luna"; empty takes the
             engine's or task's default (for a new engine) or keeps yours.
         to_effort: low / medium / high / xhigh (Claude also max).
         reason: Why (shown in the handoff record and to your successor).
-        status: True to only report your latest handoff.
+        status: True to only report your latest handoff (or `session_uid`'s).
+        session_uid: Another session to hand off (see above); empty = yours.
 
     Returns: {"queued": true, "handoff": {...}}, or with status=True
     {"handoff": {phase, kind, outcome, handoff_file, ...}|null, "rotation": ...}.
     """
     params: dict = {}
     for key, value in (("to_engine", to_engine), ("to_model", to_model),
-                       ("to_effort", to_effort), ("reason", reason)):
+                       ("to_effort", to_effort), ("reason", reason), ("uid", session_uid)):
         if value.strip():
             params[key] = value.strip()
     if status:

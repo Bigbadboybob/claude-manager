@@ -11968,6 +11968,18 @@ pub fn revive_session(
                 ),
             ));
         }
+        // A rotation or handoff stopped it and brings it straight back: a
+        // revive now would race (and could duplicate) that respawn.
+        if crate::rotation::in_progress(&p.uid) || crate::handoff::in_progress(&p.uid) {
+            return Err((
+                ErrorCode::Conflict,
+                format!(
+                    "session '{}' is being restarted by CM (transcript rotation or handoff) \
+                     and comes straight back",
+                    p.uid
+                ),
+            ));
+        }
         let archived = crate::resume_identity::lookup_uid(&state, &p.uid)
             .map_err(|e| (ErrorCode::Internal, format!("Resume archive: {e}")))?;
         let ws_entry: Option<(String, crate::manifest::ManifestEntry)> = archived.as_ref()

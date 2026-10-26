@@ -39,6 +39,12 @@ pub(super) struct RestartFlight {
     result: Receiver<RestartOutcome>,
 }
 
+/// Whether a `session.revive` refusal means the session is (about to be)
+/// running again, so the row should reattach rather than show a failure.
+pub(crate) fn revive_refused_as_live(error: &str) -> bool {
+    error.contains("is still running") || error.contains("comes straight back")
+}
+
 /// One remote revive: `(entry, workspace_id, worktree)`.
 type ReviveSpec = (ManifestEntry, String, String);
 
@@ -79,6 +85,9 @@ fn run_restart(
         Some((entry, ws_id, worktree)) => {
             match crate::client_session::rpc_session_revive(&socket, &token, entry, ws_id, worktree) {
                 Ok(()) => RestartOutcome::Revived,
+                // The daemon already runs it again (a rotation or handoff
+                // brought it back, or is about to): reattach, never "failed".
+                Err(e) if revive_refused_as_live(&e.to_string()) => RestartOutcome::Revived,
                 Err(e) => RestartOutcome::ReviveFailed(e.to_string()),
             }
         }
