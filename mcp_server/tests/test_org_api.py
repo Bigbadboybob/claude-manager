@@ -161,6 +161,7 @@ class OrgApiDb(unittest.IsolatedAsyncioTestCase):
              "task_id": s.get("task_id"), "workspace_id": s.get("ws"),
              "worktree_path": s.get("path"), "continuous_task_id": s.get("continuous"),
              "managed_by_uid": s.get("managed_by"), "workflow_run_id": s.get("workflow"),
+             "auto_place_owner": s.get("auto_place_owner", False),
              "spawned_age_s": s.get("age_s", 3 * 86400)}
             for s in sessions], **extra}
         r = await self.http.post(f"/hosts/{daemon}/heartbeat", json=body)
@@ -469,6 +470,29 @@ class OrgApiDb(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(wren["primary_team_id"], team["id"])
 
     # ---- adoption, heartbeat, reads --------------------------------------------
+
+    async def test_fresh_top_level_agents_auto_place_under_owner_and_exclusions_stay_unplaced(self):
+        uid = uid_at(0.01)
+        reply = await self.beat(D1, [{"uid": uid, "name": "Top-Level Agent", "ws": "ws-auto",
+                                      "path": "/w/auto", "auto_place_owner": True}])
+        self.assertEqual(reply["org"]["auto_placed"][0]["pid"], pid(uid))
+        member = (await self.http.get("/org/members/main/top-level-agent")).json()["member"]
+        self.assertEqual((member["manager_handle"], member["kind"], member["main"]["session_uid"]),
+                         ("owner", "agent", uid))
+        # The marker is consumed and a retry does not create another member.
+        reply = await self.beat(D1, [{"uid": uid, "name": "Top-Level Agent", "ws": "ws-auto",
+                                      "path": "/w/auto", "auto_place_owner": True}])
+        self.assertEqual(reply["org"]["auto_placed"], [])
+
+        excluded = [
+            {"uid": uid_at(0.02, 2), "name": "shell", "engine": "bash"},
+            {"uid": uid_at(0.02, 3), "name": "continuous", "continuous": "ct-1"},
+            {"uid": uid_at(0.02, 4), "name": "workflow", "workflow": "wf-1"},
+            {"uid": uid_at(0.02, 5), "name": "assistant", "managed_by": "parent"},
+        ]
+        await self.beat(D1, [{**row, "auto_place_owner": True} for row in excluded])
+        snap = await self.snapshot()
+        self.assertFalse({m["handle"] for m in snap["members"]} & {"shell", "continuous", "workflow", "assistant"})
 
     async def test_missing_and_null_engine_sessions_can_be_adopted_and_appear_as_task_peers(self):
         root = await self.task("legacy TUI rows")

@@ -2051,7 +2051,18 @@ fn note_owner_spawn(state: &Arc<Mutex<DaemonState>>, req: &Request, result: &ser
         .find_map(|k| result.get(*k).or_else(|| req.params.get(*k)))
         .and_then(serde_json::Value::as_str);
     if let Some(uid) = uid {
-        state.lock().unwrap_or_else(|p| p.into_inner()).note_owner_activity(uid);
+        let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+        guard.note_owner_activity(uid);
+        // Fresh operator/TUI spawns are the only top-level sessions that are
+        // auto-seated. Restore/revive and explicit resume paths never call
+        // this marker, while the daemon-side eligibility check also excludes
+        // shells, continuous sessions, workflows and existing attribution.
+        if matches!(req.method.as_str(), "start_session" | "create_session" | "add_session")
+            && crate::assistants::mark_owner_placement(&mut guard, uid)
+        {
+            guard.persist_sessions_best_effort();
+            crate::items::heartbeat::poke();
+        }
     }
 }
 
@@ -4177,6 +4188,37 @@ mod tests {
         assert!(state.lock().unwrap().owner_seen.contains_key("ts-seen"));
         for s in state.lock().unwrap().sessions.values_mut() {
             let _ = s.kill();
+        }
+    }
+
+    #[test]
+    fn operator_fresh_spawn_is_marked_for_owner_placement_but_revive_is_not() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let mut sp = crate::session::SpawnParams::new("ts-auto", "auto", "/bin/sleep");
+        sp.args = vec!["30".into()];
+        state.lock().unwrap().sessions.insert(
+            "ts-auto".into(),
+            crate::session::DaemonSession::spawn(sp).unwrap(),
+        );
+        note_owner_spawn(
+            &state,
+            &operator_request("start_session", serde_json::json!({"uid": "ts-auto"})),
+            &serde_json::json!({"session_uid": "ts-auto"}),
+        );
+        assert!(crate::assistants::wants_owner_placement(
+            state.lock().unwrap().sessions["ts-auto"].org.as_ref()
+        ));
+        state.lock().unwrap().sessions.get_mut("ts-auto").unwrap().org = None;
+        note_owner_spawn(
+            &state,
+            &operator_request("session.revive", serde_json::json!({"uid": "ts-auto"})),
+            &serde_json::json!({"session_uid": "ts-auto"}),
+        );
+        assert!(!crate::assistants::wants_owner_placement(
+            state.lock().unwrap().sessions["ts-auto"].org.as_ref()
+        ));
+        for session in state.lock().unwrap().sessions.values_mut() {
+            let _ = session.kill();
         }
     }
 

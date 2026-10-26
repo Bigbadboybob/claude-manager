@@ -233,3 +233,7 @@ does not prove a command succeeded. Transcript reads, assistant reply waits,
 `until="final"`, `report_done`, chat identity and org adoption require an agent
 and refuse shells clearly. This distinction does not
 close, kill, restart or move shell sessions.
+Fresh top-level agent sessions started by the TUI or operator are auto-placed
+as agent members reporting to Owner on the next org heartbeat, so Owner can
+move them afterward. This excludes shell, continuous-task, workflow, restore,
+and resume sessions.

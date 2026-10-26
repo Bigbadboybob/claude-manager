@@ -141,8 +141,13 @@ durable as its member's main session.
   member's main session on this daemon. A chain that ends at a live session
   with no member stays unstamped.
 - Never stamped:
-  - a session with no spawner (Owner- or operator-started);
+  - a session with no spawner (Owner- or operator-started), unless it is a
+    fresh top-level agent spawn from the TUI/operator. Those are automatically
+    seated as new `agent` members under Owner by the next org heartbeat so
+    Owner can move them later. The placement intent is durable across an API
+    outage and is never applied to restores or resumes;
   - a shell (`bash`; only Owner closes, kills or restarts one);
+  - a continuous-task session or workflow participant;
   - a member's main, which comes only from the member cache and always wins.
 - Nothing is stamped until the cache has heard from the API.
 

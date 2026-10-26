@@ -73,6 +73,43 @@ fn kind(ws: &ManifestWorkspace) -> lifecycle_guard::WorkspaceKind {
 }
 
 #[test]
+fn owner_placement_marker_only_marks_fresh_top_level_agents() {
+    let _env = crate::test_support::env_lock();
+    crate::items::org::reset_cache_for_test();
+    let mut state = DaemonState::default();
+    for (uid, kind, managed, continuous, workflow) in [
+        ("op-agent", "claude-code", None, None, None),
+        ("op-shell", "bash", None, None, None),
+        ("op-continuous", "codex", None, Some("ct"), None),
+        ("op-workflow", "codex", None, None, Some("wf")),
+        ("op-child", "codex", Some("parent"), None, None),
+    ] {
+        let mut s = session_of(uid, None, managed, uid, kind);
+        s.continuous_task_id = continuous.map(str::to_string);
+        s.workflow_run_id = workflow.map(str::to_string);
+        state.sessions.insert(uid.into(), s);
+    }
+    assert!(mark_owner_placement(&mut state, "op-agent"));
+    assert!(wants_owner_placement(state.sessions["op-agent"].org.as_ref()));
+    assert_eq!(
+        crate::items::org::session_facts(&state, &state.sessions["op-agent"], 1_700_000_000.0)
+            [AUTO_PLACE_OWNER],
+        true
+    );
+    assert!(!mark_owner_placement(&mut state, "op-agent"), "marker is idempotent");
+    assert!(clear_owner_placement(&mut state, "op-agent"));
+    assert!(!wants_owner_placement(state.sessions["op-agent"].org.as_ref()));
+    assert!(!clear_owner_placement(&mut state, "op-agent"));
+    assert!(mark_owner_placement(&mut state, "op-agent"));
+    for uid in ["op-shell", "op-continuous", "op-workflow", "op-child"] {
+        assert!(!mark_owner_placement(&mut state, uid), "{uid} is excluded");
+        assert!(!wants_owner_placement(state.sessions[uid].org.as_ref()));
+    }
+    kill_st(&mut state);
+    crate::items::org::reset_cache_for_test();
+}
+
+#[test]
 fn a_spawn_by_a_members_session_is_its_assistant_and_inherits_through_assistants() {
     let _env = crate::test_support::env_lock();
     crate::items::org::reset_cache_for_test();

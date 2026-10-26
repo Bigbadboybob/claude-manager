@@ -48,6 +48,11 @@ pub const CAPABILITY: &str = "assistant_guard_v1";
 pub const MEMBER_ID: &str = "member_id";
 pub const ACTING_AS: &str = "acting_as";
 pub const MEMBER_VIA: &str = "member_via";
+/// Set on a fresh top-level agent session created by the TUI/operator. The
+/// org heartbeat consumes this durable intent and seats the session under
+/// Owner; it is never set for restores, assistants, shells, continuous runs,
+/// or workflow participants.
+pub const AUTO_PLACE_OWNER: &str = "auto_place_owner";
 pub const ASSISTANT: &str = "assistant";
 /// A continuous member's spawn: attributed, not durable.
 pub const WORKER: &str = "worker";
@@ -135,6 +140,40 @@ pub fn is_assistant(sess: &DaemonSession) -> bool {
 /// or teardown touches it, and its checkout stays while it lives.
 pub fn is_shell(session_type: &str) -> bool {
     session_type == "bash"
+}
+
+/// Whether the org heartbeat should seat this session as a new top-level
+/// member under Owner. The marker is deliberately kept in the session's org
+/// object so a transient API outage does not lose the operator's intent.
+pub fn wants_owner_placement(org: Option<&OrgObject>) -> bool {
+    org.and_then(|o| o.get(AUTO_PLACE_OWNER)).and_then(Value::as_bool) == Some(true)
+}
+
+/// Mark a newly-created operator session for automatic Owner placement.
+/// Existing attribution and all non-agent lifecycle-owned sessions are left
+/// untouched. Returns whether the marker was added.
+pub fn mark_owner_placement(state: &mut DaemonState, uid: &str) -> bool {
+    let Some(session) = state.sessions.get_mut(uid) else { return false };
+    if !matches!(session.session_type.as_str(), "claude-code" | "codex")
+        || session.managed_by_uid.is_some()
+        || session.continuous_task_id.is_some()
+        || session.workflow_run_id.is_some()
+        || of_session(session).is_some()
+        || wants_owner_placement(session.org.as_ref())
+    {
+        return false;
+    }
+    bridge::set(&mut session.org, AUTO_PLACE_OWNER, json!(true));
+    true
+}
+
+/// Clear a placement intent once the planning API has seated the session as a
+/// main. This prevents a later same-UID revive, after the old facts expire,
+/// from being mistaken for a fresh operator hire.
+pub fn clear_owner_placement(state: &mut DaemonState, uid: &str) -> bool {
+    let Some(session) = state.sessions.get_mut(uid) else { return false };
+    let Some(org) = session.org.as_mut() else { return false };
+    org.remove(AUTO_PLACE_OWNER).is_some()
 }
 
 /// Stamp `org` as `acting_as` ([`ASSISTANT`] / [`WORKER`]) of `member_id`.

@@ -315,6 +315,16 @@ impl Beat {
         let applied = {
             let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
             let applied = super::org::apply_marks(&mut s, &reply);
+            // The API returns every main session it has seated on this
+            // daemon. Once a durable placement marker has been consumed,
+            // clear it locally so a later same-UID revive cannot look like a
+            // fresh operator hire after the old facts age out.
+            let mut placement_cleared = false;
+            if let Some(members) = reply["org"]["members"].as_object() {
+                for uid in members.keys() {
+                    placement_cleared |= crate::assistants::clear_owner_placement(&mut s, uid);
+                }
+            }
             // A promote whose local half was lost (the brain died after the
             // API committed it): finish it now the cache shows the main.
             let promoted = crate::assistants::reconcile_promoted(&mut s);
@@ -342,7 +352,7 @@ impl Beat {
                 eprintln!("cm org: released {} idle assistant stream(s) to ephemeral: {}",
                           released.len(), released.join(", "));
             }
-            if changed && stamped.is_empty() {
+            if (changed || placement_cleared) && stamped.is_empty() {
                 s.persist_sessions_best_effort();
             }
             if !stamped.is_empty() {

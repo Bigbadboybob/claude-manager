@@ -1880,7 +1880,9 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
                       _clip(raw.get("managed_by_uid"), 200),
                       _clip(raw.get("workflow_run_id"), 200), spawned,
                       _clip(raw.get("member_id"), 64) if raw.get("acting_as") in STAMPED_ROLES else None,
-                      raw.get("acting_as") if raw.get("acting_as") in STAMPED_ROLES else None))
+                      raw.get("acting_as") if raw.get("acting_as") in STAMPED_ROLES else None,
+                      raw.get("auto_place_owner") is True))
+    auto_placed = []
     async with pool.acquire() as conn:
         async with conn.transaction():
             for f in facts:
@@ -1888,9 +1890,9 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
                     """INSERT INTO org_session_facts (pid, daemon_id, session_uid, workspace_id,
                                                       worktree_path, continuous_task_id,
                                                       managed_by_uid, workflow_run_id, spawned_at,
-                                                      member_id, acting_as, reported_at)
-                       VALUES ($1, $12, $2, $3, $4, $5, $6, $7, $8, $9,
-                               CASE WHEN $9::text IS NULL THEN NULL ELSE $10 END, $11)
+                                                      member_id, acting_as, auto_place_owner, reported_at)
+                       VALUES ($1, $13, $2, $3, $4, $5, $6, $7, $8, $9,
+                               CASE WHEN $9::text IS NULL THEN NULL ELSE $10 END, $11, $12)
                        ON CONFLICT (pid) DO UPDATE SET
                            member_id = coalesce(EXCLUDED.member_id, org_session_facts.member_id),
                            acting_as = CASE WHEN org_session_facts.acting_as IN ('closed', 'promoted')
@@ -1902,8 +1904,53 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
                            managed_by_uid = EXCLUDED.managed_by_uid,
                            workflow_run_id = EXCLUDED.workflow_run_id,
                            spawned_at = coalesce(org_session_facts.spawned_at, EXCLUDED.spawned_at),
+                           auto_place_owner = org_session_facts.auto_place_owner OR EXCLUDED.auto_place_owner,
                            reported_at = EXCLUDED.reported_at""",
                     *f, now, daemon_id)
+            # Fresh top-level agent sessions carry a durable operator intent
+            # from the daemon. Seat them under Owner while the heartbeat
+            # transaction is already authoritative for liveness. The advisory
+            # lock serializes this with explicit adoption/moves, and the fact
+            # row is stamped immediately so retries are idempotent.
+            candidate_sql = """SELECT s.pid, s.daemon_id, s.session_uid, s.name,
+                                      f.workspace_id, f.worktree_path
+                                 FROM session_states s JOIN org_session_facts f ON f.pid = s.pid
+                                WHERE s.daemon_id = $1 AND s.exited_at IS NULL AND s.state <> 'exited'
+                                  AND s.engine = ANY($2::text[])
+                                  AND f.auto_place_owner AND f.member_id IS NULL
+                                  AND f.managed_by_uid IS NULL
+                                  AND f.continuous_task_id IS NULL
+                                  AND f.workflow_run_id IS NULL
+                                  AND NOT EXISTS (SELECT 1 FROM incarnations i
+                                                   WHERE i.pid = s.pid AND i.ended_at IS NULL)
+                                ORDER BY s.pid"""
+            # Idle heartbeats must stay lock-free. Only a beat carrying a
+            # placement intent takes the feed lock, then it rechecks the
+            # candidates under that lock before creating members.
+            candidates = await conn.fetch(candidate_sql, daemon_id, sorted(AGENT_ENGINES))
+            if candidates:
+                await _lock(conn)
+                candidates = await conn.fetch(candidate_sql, daemon_id, sorted(AGENT_ENGINES))
+            if candidates:
+                taken = {r["alias"] for r in await conn.fetch(
+                    "SELECT alias FROM member_aliases WHERE org_id = $1", ORG)}
+                for row in candidates:
+                    base = normalize_handle(row["name"]) or normalize_handle(row["session_uid"]) or "agent"
+                    handle = _free_handle(base, taken)
+                    taken.add(handle)
+                    member_id, _ = await _create_member(
+                        conn, {"pid": OWNER_PID, "name": "Owner"},
+                        handle=handle, kind="agent", title=_clip(row["name"], 200) or handle,
+                        manager_ref=OWNER_PID, team_id=None, pid=row["pid"],
+                        home=_home_of(dict(row)), source="auto_place",
+                        request_id=f"auto-place:{row['pid']}")
+                    await conn.execute(
+                        """UPDATE org_session_facts
+                              SET member_id = $2, acting_as = 'main'
+                            WHERE pid = $1 AND member_id IS NULL""",
+                        row["pid"], member_id)
+                    auto_placed.append({"pid": row["pid"], "member_id": member_id,
+                                        "handle": handle})
             await conn.execute(
                 """DELETE FROM org_session_facts
                     WHERE daemon_id = $1 AND reported_at < $2 AND NOT (pid = ANY($3::text[]))""",
@@ -1948,6 +1995,7 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
         "members": {r["main_session_uid"]: {**member_summary(_shape_member(r)), "acting_as": "main"}
                     for r in members},
         "workspace_marks": marks,
+        "auto_placed": auto_placed,
         "capable": bool(capable),
     }
 

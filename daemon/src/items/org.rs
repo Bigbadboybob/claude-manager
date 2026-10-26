@@ -765,6 +765,9 @@ pub(crate) fn session_facts(state: &DaemonState, sess: &DaemonSession, now: f64)
             facts.insert("acting_as".into(), json!(role));
         }
     }
+    if crate::assistants::wants_owner_placement(sess.org.as_ref()) {
+        facts.insert("auto_place_owner".into(), json!(true));
+    }
     if let Some(age) = spawned_age_s(&sess.uid, now) {
         facts.insert("spawned_age_s".into(), json!(age));
     }

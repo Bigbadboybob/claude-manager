@@ -3742,6 +3742,15 @@ pub fn set_workflow_context(
             }));
         }
     };
+    // A top-level operator spawn may be tagged as a workflow participant
+    // immediately after creation. Consume the pending Owner-placement intent
+    // before the next heartbeat so a transient workflow tag can never turn
+    // into a later auto-hire when the run is cleared.
+    if p.workflow_run_id.is_some() {
+        if let Some(org) = session.org.as_mut() {
+            org.remove(crate::assistants::AUTO_PLACE_OWNER);
+        }
+    }
     session.workflow_run_id = p.workflow_run_id;
     session.workflow_role = p.workflow_role;
     Ok(json!({

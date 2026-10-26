@@ -55,6 +55,7 @@ class AssistantsDb(unittest.IsolatedAsyncioTestCase):
                    "task_id": s.get("task_id"), "workspace_id": s.get("ws"),
                    "worktree_path": s.get("path"), "continuous_task_id": s.get("continuous"),
                    "managed_by_uid": s.get("managed_by"), "workflow_run_id": s.get("workflow"),
+                   "auto_place_owner": s.get("auto_place_owner", False),
                    "spawned_age_s": s.get("age_s", 3 * 86400)}
             for key in ("member_id", "acting_as"):
                 if s.get(key):
