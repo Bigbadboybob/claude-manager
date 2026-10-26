@@ -12891,6 +12891,14 @@ pub fn trigger(
 
     let is_persistent = task.run_mode == crate::continuous::task::RunMode::Persistent;
 
+    // #24: a transcript rotation has stopped the orchestrator and brings it
+    // back at the same uid. Its absence is not death: a fire now would mint a
+    // second orchestrator. Skip as busy (scheduled fires, queue admission and
+    // run_now all come through here).
+    if task.current_session_uid.as_deref().is_some_and(crate::rotation::in_progress) {
+        return Ok(json!({ "fired": false, "reason": "busy", "detail": "transcript rotation in progress" }));
+    }
+
     // PERSISTENT liveness + delivery-handle resolution (the ONLY DaemonState lock
     // the executor takes before a spawn/PTY write; dropped immediately). For a
     // pinned session that is still LIVE we deliver to its existing PTY and REUSE
@@ -33776,6 +33784,36 @@ while True:
             assert_eq!(reloaded.run_count, 1);
             assert!(reloaded.in_flight.is_none());
             assert_eq!(reloaded.current_session_uid.as_deref(), Some(new_uid));
+        });
+    }
+
+    /// #24: a persistent orchestrator that is being rotated is absent from
+    /// the registry for a moment; a fire then is a busy skip, never a fresh
+    /// uid (which would leave two orchestrators once the rotation returns).
+    #[test]
+    fn trigger_skips_while_the_orchestrator_is_rotating() {
+        let _serial = crate::rotation::test_registry_lock();
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let mut task = continuous_task(
+                "ct-rotating",
+                crate::continuous::task::Engine::Claude,
+                crate::continuous::task::RunMode::Persistent,
+                &wt,
+            );
+            task.current_session_uid = Some("ts-rot-orch-0".into());
+            crate::continuous::task::save(&task).expect("save");
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            crate::rotation::test_set_running("ts-rot-orch-0", true);
+            let resp = trigger(&state, &Caller::operator("op-token"), &json!({ "task_id": "ct-rotating" }))
+                .expect("trigger ok");
+            crate::rotation::test_set_running("ts-rot-orch-0", false);
+            assert_eq!((resp["fired"].clone(), resp["reason"].clone()), (json!(false), json!("busy")));
+            assert!(take_continuous_spawn_spy_for_test().is_empty(), "no second orchestrator");
+            let reloaded = crate::continuous::task::load_one("ct-rotating").unwrap();
+            assert_eq!(reloaded.current_session_uid.as_deref(), Some("ts-rot-orch-0"));
+            assert!(reloaded.in_flight.is_none() && reloaded.run_count == 0);
         });
     }
 

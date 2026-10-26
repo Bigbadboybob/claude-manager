@@ -109,6 +109,14 @@ pub fn status(uid: &str) -> Option<Value> {
     registry().lock().unwrap_or_else(|p| p.into_inner()).get(uid).map(Rotation::to_json)
 }
 
+/// Tests that touch the host-wide rotation registry take this, so a running
+/// record one test plants never trips another's one-at-a-time claim.
+#[cfg(test)]
+pub(crate) fn test_registry_lock() -> std::sync::MutexGuard<'static, ()> {
+    static L: Mutex<()> = Mutex::new(());
+    L.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Tests: mark `uid` as mid-rotation (`done` finishes it).
 #[cfg(test)]
 pub(crate) fn test_set_running(uid: &str, running: bool) {
@@ -272,11 +280,6 @@ pub fn start(
         // workflow transition or continuous run still refuses.
         let (idle, quiet) = if force { (Duration::ZERO, Duration::ZERO) } else { (idle, quiet) };
         boundary(&state, uid, idle, quiet).map_err(|why| (ErrorCode::Conflict, format!("not at a safe boundary: {why}")))?;
-        // One rotation at a time on a host, with a pause between them (a
-        // fork reads its whole source; a deploy may find many big sessions).
-        if let Some(other) = running_any() {
-            return Err((ErrorCode::Conflict, format!("another rotation is running ({other}); one at a time per host")));
-        }
         if origin != Origin::Operator {
             if let Some(left) = pause_left() {
                 return Err((ErrorCode::Conflict, format!("pausing {}s after the last rotation", left.as_secs())));
@@ -299,7 +302,7 @@ pub fn start(
         (snap, rotation)
     };
     let record = rotation.to_json();
-    registry().lock().unwrap_or_else(|p| p.into_inner()).insert(uid.to_string(), rotation);
+    claim(uid, rotation).map_err(|why| (ErrorCode::Conflict, why))?;
     // A brain restart between the stop and the respawn must not leave the
     // session dead: the marker lets the next brain resume the old transcript.
     if let Err(e) = inflight_put(&state_arc.lock().unwrap_or_else(|p| p.into_inner()), uid, &snap) {
@@ -322,7 +325,7 @@ const STOP_DEADLINE: Duration = Duration::from_secs(20);
 /// GB of source (Claude reads the whole source to fork it; a 1.7 GB
 /// transcript forked in 23 s on cm-sessions with a warm cache), at most 20 min.
 fn verify_deadline(source_bytes: u64) -> Duration {
-    Duration::from_secs((source_bytes / 1_000_000_000).saturating_mul(60).saturating_add(180).min(1200))
+    Duration::from_secs_f64((180.0 + 60.0 * source_bytes as f64 / 1e9).min(1200.0))
 }
 
 /// The pause between two rotations on a host (not for an operator's own).
@@ -404,9 +407,36 @@ fn finish(uid: &str, phase: &'static str, outcome: String) {
         if let Some(e) = f.get_mut(uid) {
             e.1 = now();
         }
-    } else {
-        f.remove(uid);
+    } else if f.remove(uid).is_none() {
+        return;
     }
+    save_failures(&f);
+}
+
+/// Where the failure counts persist (set at brain start, next to the
+/// session registry), so a deploy does not retry a failing session at once.
+fn failures_path() -> &'static std::sync::OnceLock<PathBuf> {
+    static P: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    &P
+}
+
+fn save_failures(f: &HashMap<String, (u32, f64)>) {
+    let Some(path) = failures_path().get() else { return };
+    let v: serde_json::Map<String, Value> =
+        f.iter().map(|(uid, (count, at))| (uid.clone(), json!({"count": count, "at": at}))).collect();
+    if let Err(e) = crate::state::write_json_atomic(path, &Value::Object(v).to_string(), true) {
+        eprintln!("cm-daemon: rotation failure counts not saved: {e}");
+    }
+}
+
+/// Load the persisted failure counts (brain start).
+fn load_failures(path: &Path) {
+    let _ = failures_path().set(path.to_path_buf());
+    let loaded: HashMap<String, (u32, f64)> = inflight_read(path)
+        .into_iter()
+        .filter_map(|(uid, v)| Some((uid, (v["count"].as_u64()? as u32, v["at"].as_f64()?))))
+        .collect();
+    failures().lock().unwrap_or_else(|p| p.into_inner()).extend(loaded);
 }
 
 /// A failed rotation: recorded, and Owner is alerted from the second
@@ -414,15 +444,24 @@ fn finish(uid: &str, phase: &'static str, outcome: String) {
 fn fail(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, outcome: String) {
     finish(uid, "failed", outcome.clone());
     let count = failures().lock().unwrap_or_else(|p| p.into_inner()).get(uid).map_or(0, |e| e.0);
-    if count >= 2 {
-        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-        let message = format!(
+    let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    // A session left not running needs Owner now; a repeated failure on a
+    // running one is worth knowing too.
+    let message = if !state.sessions.contains_key(uid) {
+        format!(
+            "Transcript rotation of this session failed and it is NOT running now ({outcome}). \
+             A-R revives it on its original transcript."
+        )
+    } else if count >= 2 {
+        format!(
             "Transcript rotation of this session failed {count} times in a row (latest: {outcome}). \
              CM backs off and retries later; Alt+T retries now."
-        );
-        if let Err(e) = crate::owner_attention::raise_system(&state, uid, &message) {
-            eprintln!("cm-daemon: rotation alert for {uid}: {e}");
-        }
+        )
+    } else {
+        return;
+    };
+    if let Err(e) = crate::owner_attention::raise_system(&state, uid, &message) {
+        eprintln!("cm-daemon: rotation alert for {uid}: {e}");
     }
 }
 
@@ -442,7 +481,21 @@ fn pause_left() -> Option<Duration> {
     PAUSE_BETWEEN.checked_sub(at.elapsed()).filter(|d| !d.is_zero())
 }
 
+/// Register `rotation` for `uid` unless another rotation is running: one at a
+/// time per host (a fork reads its whole source; a deploy may find many big
+/// sessions). Checked and inserted under one lock, so two starters (Alt+T
+/// and a policy pass) cannot both get in.
+fn claim(uid: &str, rotation: Rotation) -> Result<(), String> {
+    let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((other, _)) = reg.iter().find(|(_, r)| r.finished_at.is_none()) {
+        return Err(format!("another rotation is running ({other}); one at a time per host"));
+    }
+    reg.insert(uid.to_string(), rotation);
+    Ok(())
+}
+
 /// The session being rotated now, if any (one at a time per host).
+#[cfg(test)]
 fn running_any() -> Option<String> {
     registry()
         .lock()
@@ -501,21 +554,47 @@ fn inflight_remove(state: &DaemonState, uid: &str) {
 pub fn recover_inflight(state_arc: &Arc<Mutex<DaemonState>>) -> usize {
     let (path, all) = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(p) = state.daemon_sessions_path.as_ref().map(|p| p.with_file_name("rotation-failures.json")) {
+            load_failures(&p);
+        }
         let Some(path) = inflight_path(&state) else { return 0 };
         let all = inflight_read(&path);
         (path, all)
     };
     let mut resumed = 0;
     for (uid, v) in &all {
-        if state_arc.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid) {
-            eprintln!("cm-daemon: rotation of {uid} was interrupted by a restart; the session is live, leaving it");
-            continue;
-        }
         let entry: Option<crate::manifest::ManifestEntry> = serde_json::from_value(v["entry"].clone()).ok();
         let (Some(entry), Some(ws), Some(wt)) = (entry, v["workspace_id"].as_str(), v["worktree"].as_str()) else {
             eprintln!("cm-daemon: rotation marker for {uid} is unreadable; dropped");
             continue;
         };
+        let live_path = {
+            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            state.sessions.get(uid).map(|s| s.transcript_path.clone())
+        };
+        if let Some(live_path) = live_path {
+            let snap = Snapshot {
+                from_path: PathBuf::from(entry.transcript_path.clone().unwrap_or_default()),
+                from_id: v["from_id"].as_str().unwrap_or_default().to_string(),
+                from_bytes: 0,
+                workspace_id: ws.to_string(),
+                worktree: PathBuf::from(wt),
+                entry,
+            };
+            match live_path.map(PathBuf::from).filter(|p| p != &snap.from_path) {
+                // The fork never started, or the fallback already ran.
+                None => eprintln!("cm-daemon: rotation of {uid} was interrupted by a restart; it is on its original transcript"),
+                // A live fork: finish what the previous brain started (its
+                // marker stays until that is done).
+                Some(to_path) => {
+                    if complete_after_restart(state_arc, uid, snap, to_path) {
+                        continue;
+                    }
+                }
+            }
+            inflight_remove(&state_arc.lock().unwrap_or_else(|p| p.into_inner()), uid);
+            continue;
+        }
         match crate::control::methods::restore_one_session_launch(state_arc, ws, Path::new(wt), &entry, None, false) {
             Ok(_) => {
                 resumed += 1;
@@ -524,11 +603,68 @@ pub fn recover_inflight(state_arc: &Arc<Mutex<DaemonState>>) -> usize {
             }
             Err((_, e)) => eprintln!("cm-daemon: rotation of {uid} was interrupted; resuming it failed: {e}"),
         }
+        inflight_remove(&state_arc.lock().unwrap_or_else(|p| p.into_inner()), uid);
     }
-    if !all.is_empty() {
-        let _ = std::fs::remove_file(&path);
-    }
+    let _ = path;
     resumed
+}
+
+/// A fork the previous brain spawned but did not confirm: deliver the
+/// after-notice, verify the fork records it, record the lineage; else roll
+/// back to the original transcript. Runs on its own thread, holding the
+/// host's one rotation slot.
+fn complete_after_restart(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: Snapshot, to_path: PathBuf) -> bool {
+    let record = Rotation {
+        phase: "verifying",
+        origin: Origin::Policy,
+        reason: "completing a rotation a daemon restart interrupted".into(),
+        started_at: now(),
+        from_id: snap.from_id.clone(),
+        from_bytes: snap.from_bytes,
+        to_id: crate::session::transcript_id_from_path(&to_path.to_string_lossy()),
+        to_bytes: None,
+        path: "fork",
+        outcome: None,
+        finished_at: None,
+    };
+    if let Err(why) = claim(uid, record) {
+        eprintln!("cm-daemon: rotation of {uid} interrupted by a restart; not completed now: {why}");
+        return false;
+    }
+    let state = Arc::clone(state_arc);
+    let uid = uid.to_string();
+    let spawned = std::thread::Builder::new().name(format!("cm-rotate-recover-{uid}")).spawn(move || {
+        complete_fork(&state, &uid, &snap, &to_path);
+        inflight_remove(&state.lock().unwrap_or_else(|p| p.into_inner()), &uid);
+    });
+    spawned.is_ok()
+}
+
+fn complete_fork(state: &Arc<Mutex<DaemonState>>, uid: &str, snap: &Snapshot, to_path: &Path) {
+    if !deliver(state, uid, after_notice(snap.from_bytes)) {
+        resume_old(state, uid, snap, "the forked session vanished after a daemon restart");
+        return;
+    }
+    let deadline = Instant::now() + verify_deadline(std::fs::metadata(&snap.from_path).map(|m| m.len()).unwrap_or(0));
+    while Instant::now() < deadline {
+        if !state.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid) {
+            break;
+        }
+        if let Some(bytes) = fork_written(to_path) {
+            let to_id = crate::session::transcript_id_from_path(&to_path.to_string_lossy());
+            if let Some(to) = to_id.as_deref() {
+                let st = state.lock().unwrap_or_else(|p| p.into_inner());
+                if let Err(e) = crate::resume_identity::record_rotation(&st, &snap.from_id, to) {
+                    eprintln!("cm-daemon: rotation of {uid}: lineage not recorded: {e}");
+                }
+            }
+            update(uid, |r| r.to_bytes = Some(bytes));
+            finish(uid, "done", format!("completed after a restart: {} to {}", snap.from_id, to_id.unwrap_or_default()));
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    resume_old(state, uid, snap, "the fork a daemon restart interrupted wrote no transcript");
 }
 
 fn run(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: Snapshot) {
@@ -766,6 +902,13 @@ pub fn tick(state_arc: &Arc<Mutex<DaemonState>>) {
             .sessions
             .iter()
             .filter(|(_, s)| s.session_type == "claude-code")
+            // The boundary always refuses these: no notice, no attempt.
+            .filter(|(_, s)| s.workflow_run_id.is_none())
+            .filter(|(_, s)| {
+                s.continuous_task_id
+                    .as_deref()
+                    .is_none_or(|ct| crate::continuous::task::load_one(ct).is_none_or(|t| t.in_flight.is_none()))
+            })
             .filter_map(|(uid, s)| Some((uid.clone(), PathBuf::from(s.transcript_path.clone()?))))
             .collect();
         (cfg, candidates)
@@ -918,12 +1061,77 @@ mod tests {
 
     #[test]
     fn deadlines_and_backoff_scale() {
-        assert_eq!(verify_deadline(9_000_000), Duration::from_secs(180));
-        assert_eq!(verify_deadline(1_700_000_000), Duration::from_secs(240));
+        assert_eq!(verify_deadline(9_000_000), Duration::from_secs_f64(180.54));
+        assert_eq!(verify_deadline(0), Duration::from_secs(180));
+        assert_eq!(verify_deadline(1_700_000_000), Duration::from_secs(282));
         assert_eq!(verify_deadline(u64::MAX), Duration::from_secs(1200));
         assert_eq!(backoff_secs(1), 6.0 * 3600.0);
         assert_eq!(backoff_secs(3), 24.0 * 3600.0);
         assert_eq!(backoff_secs(30), 7.0 * 86400.0);
+    }
+
+    #[test]
+    fn only_one_rotation_can_claim_the_host() {
+        let _serial = test_registry_lock();
+        let r = |uid: &str| Rotation {
+            phase: "stopping", origin: Origin::Operator, reason: String::new(), started_at: now(),
+            from_id: uid.into(), from_bytes: 0, to_id: None, to_bytes: None, path: "fork",
+            outcome: None, finished_at: None,
+        };
+        claim("ts-claim-a", r("a")).unwrap();
+        assert!(claim("ts-claim-b", r("b")).unwrap_err().contains("ts-claim-a"));
+        assert_eq!(running_any().as_deref(), Some("ts-claim-a"));
+        finish("ts-claim-a", "done", "ok".into());
+        claim("ts-claim-b", r("b")).unwrap();
+        finish("ts-claim-b", "done", "ok".into());
+    }
+
+    #[test]
+    fn a_live_unconfirmed_fork_is_completed_after_a_restart() {
+        let _serial = test_registry_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old-id.jsonl");
+        let fork = dir.path().join("new-id.jsonl");
+        std::fs::write(&old, "{\"type\":\"user\",\"parentUuid\":null}\n").unwrap();
+        std::fs::write(&fork, "{\"type\":\"user\",\"parentUuid\":null}\n").unwrap();
+        let mut state = DaemonState::new();
+        state.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
+        let mut sp = crate::session::SpawnParams::new("ts-recover-0", "r", "/bin/sleep");
+        sp.args = vec!["30".into()];
+        sp.session_type = "claude-code".into();
+        let mut sess = crate::session::DaemonSession::spawn(sp).unwrap();
+        sess.transcript_path = Some(fork.to_string_lossy().into_owned());
+        state.sessions.insert("ts-recover-0".into(), sess);
+        let entry: crate::manifest::ManifestEntry = serde_json::from_value(json!({
+            "uid": "ts-recover-0", "label": "r", "session_type": "claude-code",
+            "transcript_id": "old-id", "transcript_path": old})).unwrap();
+        let snap = Snapshot { entry, workspace_id: "ws".into(), worktree: dir.path().into(),
+                              from_path: old.clone(), from_id: "old-id".into(), from_bytes: 0 };
+        inflight_put(&state, "ts-recover-0", &snap).unwrap();
+        let state = Arc::new(Mutex::new(state));
+        assert_eq!(recover_inflight(&state), 0, "nothing resumed: the fork is live");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while status("ts-recover-0").is_none_or(|r| r["finished_at"].is_null()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let r = status("ts-recover-0").expect("recorded");
+        assert_eq!(r["phase"], "done", "{r}");
+        let archive = std::fs::read_to_string(dir.path().join("daemon-resume-identities.json")).unwrap();
+        assert!(archive.contains("\"old-id\": \"new-id\""), "{archive}");
+        assert!(!dir.path().join("rotations-inflight.json").exists(), "the marker is cleared once done");
+        for s in state.lock().unwrap().sessions.values_mut() {
+            let _ = s.kill();
+        }
+    }
+
+    #[test]
+    fn failure_counts_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rotation-failures.json");
+        std::fs::write(&path, r#"{"ts-persist-f":{"count":3,"at":1e18}}"#).unwrap();
+        load_failures(&path);
+        assert!(recently_failed("ts-persist-f"), "a deploy keeps the backoff");
+        assert_eq!(failures().lock().unwrap()["ts-persist-f"].0, 3);
     }
 
     #[test]

@@ -25,16 +25,21 @@ only the conversation after the latest compaction boundary.
    file. A `turn_end` monitor absorbs the turn this notice causes; it does
    not fire it as the worker's completion.
 4. Confirm the rotation from the new transcript, not from keystrokes: the
-   notice's unique marker must be recorded there within 180 s plus 60 s per
-   GB of source (at most 20 min).
+   fork's file must hold the conversation's message rows within 180 s plus
+   60 s per GB of source (fractional; at most 20 min).
 5. If it is not (an API error, a rate-limit menu, an early exit), resume the
    old id unchanged and tell the agent. The policy then leaves the session
-   alone for 6 h, doubling with each consecutive failure (at most a week),
-   and alerts Owner from the second failure on.
+   alone for 6 h, doubling with each consecutive failure (at most a week;
+   the counts persist in `~/.cm/rotation-failures.json` across restarts).
+   Owner is alerted at once when a failed rotation leaves the session not
+   running, and from the second consecutive failure otherwise.
 
 A brain restart between the stop and the confirmation leaves the marker. The
-next brain resumes such a session on its original transcript (and tells it),
-unless the session is live.
+next brain resumes a session that is not live on its original transcript
+(and tells it). A live session still on its original transcript is left as
+it is. A live fork that has not confirmed gets the after-notice again and is
+verified the same way: on success the lineage is recorded, otherwise it is
+rolled back to the original transcript.
 
 CM never writes into Claude's files. The old transcript stays as it was, and
 the lineage (old id → new id) is kept in `~/.cm/daemon-resume-identities.json`
@@ -58,7 +63,8 @@ the lineage (old id → new id) is kept in `~/.cm/daemon-resume-identities.json`
   of `max_bytes` for compactions (when counted), on a thread at nice 19 and
   idle I/O priority. One rotation runs at a time per host, with a 2-minute
   pause between them; each pass starts at most one. A before-notice is
-  published once per transcript.
+  published once per transcript, and never to a session the boundary will
+  refuse anyway (a workflow participant, a continuous session mid-run).
 - **Operator:** `session.rotate_transcript {uid, force?, reason?}`, or
   `{uid, status: true}` to read the latest record. In the TUI, **Alt+T** on a
   Claude row asks first, naming the session and its transcript size. It is
@@ -84,7 +90,12 @@ A rotation is refused or deferred unless all of these hold:
 - it is not a workflow participant;
 - it is not a continuous task with a run in flight (and continuous
   supervision does not respawn a session while it is being rotated);
-- no other rotation is running on the host.
+- no other rotation is running on the host (checked and claimed under one
+  lock, so Alt+T and a policy pass cannot both start).
+
+A continuous task's fires (scheduled, queue admission, run_now) skip as busy
+while its orchestrator is being rotated, so the scheduler never mints a second
+orchestrator in the gap.
 
 ## Resume paths follow `continued-in`
 
