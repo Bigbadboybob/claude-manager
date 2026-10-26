@@ -268,7 +268,10 @@ class LaunchConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["submitted"])
         self.assertTrue(result["completed"])
         self.assertEqual(result["prompt_delivery"]["confirmed_by"], "presence")
-        self.assertEqual(reply.call_args.kwargs["agent_baseline"], {"kind":"agent", "value":4})
+        self.assertEqual(
+            reply.call_args.kwargs["agent_baseline"],
+            {"kind": "agent", "value": 4, "no_turn_at": None},
+        )
 
     async def test_launch_wait_ignores_idle_from_before_its_prompt(self):
         from mcp_server.tests.test_agent_state_consumers import observed

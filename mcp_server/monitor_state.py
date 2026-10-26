@@ -179,7 +179,12 @@ def adopt(predecessor_pid: int, predecessor_start: str | None) -> dict[str, dict
 
 
 def _write(path: Path, journal: dict) -> None:
-    data = json.dumps(journal, sort_keys=True, allow_nan=False).encode()
+    # Socket routes are represented as ``Path`` objects in the live monitor
+    # record.  The journal is the serialization boundary: normalize those
+    # values here so a Path from the current producer (or a retained record
+    # being rewritten) cannot make an otherwise accepted action fail with a
+    # raw ``TypeError``.
+    data = json.dumps(_normalize(journal), sort_keys=True, allow_nan=False).encode()
     if len(data) > MAX_BYTES:
         raise ValueError("monitor journal exceeds size limit; inspect retained obligations")
     fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
@@ -197,6 +202,23 @@ def _write(path: Path, journal: dict) -> None:
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def _normalize(value):
+    """Return a JSON-safe copy of journal values.
+
+    ``launch_socket_path`` is a ``pathlib.Path`` on the live registration
+    path.  Keep this conversion at the journal boundary so in-memory monitor
+    records retain their useful Path type while every persisted producer,
+    including older records rewritten during a later publish, is recoverable.
+    """
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _normalize(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize(item) for item in value]
+    return value
 
 
 def read() -> dict:
