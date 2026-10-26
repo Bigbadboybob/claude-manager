@@ -30,8 +30,8 @@ use serde_json::Value;
 
 /// Claude default: the full current Opus id, never an alias.
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-opus-5-5";
-/// Codex default: the "sol" workhorse codex-lb serves.
-pub const DEFAULT_CODEX_MODEL: &str = "gpt-6.1-sol";
+/// Codex default: "terra", the best performance per dollar (Owner, 2026-10-26).
+pub const DEFAULT_CODEX_MODEL: &str = "gpt-6.1-terra";
 
 /// `tasks.metadata` key holding a task's per-engine default models:
 /// `{"claude": "<id>", "codex": "<id>"}`. Subtasks inherit it.
@@ -82,6 +82,7 @@ impl Default for ModelConfig {
             ],
             codex_choices: vec![
                 DEFAULT_CODEX_MODEL.into(),
+                "gpt-6.1-sol".into(),
                 "gpt-6-luna".into(),
                 "gpt-6-astra".into(),
             ],

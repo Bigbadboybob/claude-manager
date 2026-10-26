@@ -40,9 +40,9 @@ Keep the two in step on a host.
 ```toml
 [models]
 claude = "claude-opus-5-5"          # default for claude sessions (full id, not an alias)
-codex = "gpt-6.1-sol"               # default for codex sessions (codex-lb)
+codex = "gpt-6.1-terra"             # default for codex sessions (codex-lb; best perf/dollar)
 claude_choices = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
-codex_choices = ["gpt-6.1-sol", "gpt-6-luna", "gpt-6-astra"]
+codex_choices = ["gpt-6.1-terra", "gpt-6.1-sol", "gpt-6-luna", "gpt-6-astra"]
 claude_effort = "xhigh"             # default effort for claude sessions
 codex_effort = "xhigh"              # default effort for codex sessions (no "max")
 ```

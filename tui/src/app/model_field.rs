@@ -179,7 +179,7 @@ impl ModelField {
             .map_err(|e| format!("Model: {e}"))
     }
 
-    /// One form line: `   Model: gpt-6.1-sol  (engine default)`.
+    /// One form line: `   Model: gpt-6.1-terra  (engine default)`.
     pub(crate) fn line(&self, label: &'static str, active: bool) -> Line<'static> {
         let dim = Style::default().fg(theme::DIM);
         let white = Style::default().fg(theme::TEXT);

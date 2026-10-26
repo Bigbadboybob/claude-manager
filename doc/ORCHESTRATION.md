@@ -30,7 +30,7 @@ out of each other's checkouts; share a checkout only when you mean to.
 Pick the model too. Every spawn names one: the `model=` you pass, else the
 task's default (`metadata.models`, inherited by subtasks), else the compatible
 work-rule model, else the host's
-`[models]` engine default (Claude `claude-opus-5-5`, Codex `gpt-6.1-sol`).
+`[models]` engine default (Claude `claude-opus-5-5`, Codex `gpt-6.1-terra`, the best performance per dollar).
 **Busywork and low-intelligence work goes to Codex Luna** (Owner, 2026-10-25:
 Luna is very cheap): `start_session(type="codex", model="gpt-6-luna")`, or
 `work_kind="busywork"` with a configured Luna rule (task defaults still win). That

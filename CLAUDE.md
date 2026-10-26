@@ -26,7 +26,7 @@ Resolution: explicit `model=` / `effort=` / form field → the task default
 ancestors; set via `POST /tasks/{id}/model`, `A-e` on a task, or
 `propose_task` / `create_subtask(model=, effort=, model_engine=)`) →
 `[models]` in `daemon.toml` and `tui-settings.toml` (defaults
-`claude-opus-5-5`, `gpt-6.1-sol`, effort `xhigh` for both; `claude_choices` /
+`claude-opus-5-5`, `gpt-6.1-terra`, effort `xhigh` for both; `claude_choices` /
 `codex_choices` are the form presets, with `gpt-6-luna` as the cheap option).
 Effort levels are low/medium/high/xhigh, plus max on Claude. Both are recorded
 on the session, reused by revive/resume (older sessions: what the transcript
