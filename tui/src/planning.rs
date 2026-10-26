@@ -2015,6 +2015,16 @@ impl PlanningView {
     // ── Navigation ──────────────────────────────────────────
 
     fn navigate_vertical(&mut self, direction: i32) {
+        self.navigate_vertical_step(direction, true);
+    }
+
+    fn page_vertical(&mut self, direction: i32) {
+        for _ in 0..(self.grid_rows_visible.get() / 2).max(1) {
+            self.navigate_vertical_step(direction, false);
+        }
+    }
+
+    fn navigate_vertical_step(&mut self, direction: i32, wrap: bool) {
         if self.unified_cols.is_empty() { return; }
         let prev_slug = self.selected_slug();
         let in_visual = self.visual_anchor.is_some();
@@ -2033,7 +2043,11 @@ impl PlanningView {
             let cur = selectable_positions.iter()
                 .position(|&(c, r)| c == self.cursor.col && r == self.cursor.row)
                 .unwrap_or(0);
-            let next = (cur as i32 + direction).rem_euclid(selectable_positions.len() as i32) as usize;
+            let next = if wrap {
+                (cur as i32 + direction).rem_euclid(selectable_positions.len() as i32) as usize
+            } else {
+                (cur as i32 + direction).clamp(0, selectable_positions.len() as i32 - 1) as usize
+            };
             self.cursor.col = selectable_positions[next].0;
             self.cursor.row = selectable_positions[next].1;
         } else {
@@ -2049,15 +2063,17 @@ impl PlanningView {
             } else {
                 let mut next = self.cursor.row as i32;
                 for _ in 0..rows.len() {
-                    next = (next + direction).rem_euclid(len);
+                    let candidate = next + direction;
+                    if !wrap && (candidate < 0 || candidate >= len) { return; }
+                    next = candidate.rem_euclid(len);
                     if rows.get(next as usize)
                         .map(|r| self.is_visible_row_selectable(r))
                         .unwrap_or(false)
                     {
+                        self.cursor.row = next as usize;
                         break;
                     }
                 }
-                self.cursor.row = next as usize;
             }
         }
         self.ensure_cursor_visible();
@@ -2463,6 +2479,9 @@ impl PlanningView {
                 match key.code {
                     KeyCode::Char('q') => return PlanAction::Quit,
                     KeyCode::Char('t') => return PlanAction::SwitchToSessions,
+                    KeyCode::Char('d') if !key.modifiers.contains(KeyModifiers::CONTROL) => { self.page_vertical(1); return PlanAction::Consumed; }
+                    KeyCode::Char('u') if !key.modifiers.contains(KeyModifiers::CONTROL) => { self.page_vertical(-1); return PlanAction::Consumed; }
+                    KeyCode::Char('U') => { return self.unlaunch_task(); }
                     KeyCode::Char('j') => { self.navigate_vertical(1); return PlanAction::Consumed; }
                     KeyCode::Char('k') => { self.navigate_vertical(-1); return PlanAction::Consumed; }
                     KeyCode::Char('h') => { self.navigate_horizontal(-1); return PlanAction::Consumed; }
@@ -2539,7 +2558,7 @@ impl PlanningView {
                     // terminal folds Shift into the char).
                     KeyCode::Char('D') => { return self.cycle_status_to_done(); }
                     KeyCode::Char('f') => { self.cancel_visual(); return self.start_launch(); }
-                    KeyCode::Char('u') => {
+                    KeyCode::Char('y') => {
                         self.cancel_visual();
                         if let Some((pi, ti)) = self.selected_task_loc() {
                             if let Some(task) = self.project_data.get(pi).and_then(|pd| pd.tasks.get(ti)) {
@@ -2903,6 +2922,12 @@ impl PlanningView {
                 _ => return PlanAction::Consumed,
             };
             let max = self.projects.len();
+            if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd')) {
+                let step = ((max + 1).min(self.grid_rows_visible.get()) / 2).max(1);
+                let selected = if key.code == KeyCode::Char('u') { selected.saturating_sub(step) } else { selected.saturating_add(step).min(max) };
+                self.input_mode = PlanInputMode::ProjectPicker { selected };
+                return PlanAction::Consumed;
+            }
             match key.code {
                 KeyCode::Esc => self.input_mode = PlanInputMode::Normal,
                 KeyCode::Char('j') | KeyCode::Down => {
@@ -2960,6 +2985,12 @@ impl PlanningView {
                 return PlanAction::Consumed;
             }
 
+            if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd')) {
+                let step = (total.min(self.grid_rows_visible.get()) / 2).max(1);
+                selected = if key.code == KeyCode::Char('u') { selected.saturating_sub(step) } else { selected.saturating_add(step).min(total - 1) };
+                self.input_mode = PlanInputMode::WorkspacePicker { project_idx, task_idx, selected, engine };
+                return PlanAction::Consumed;
+            }
             match key.code {
                 KeyCode::Esc => {
                     self.input_mode = PlanInputMode::Normal;
@@ -4540,12 +4571,12 @@ impl PlanningView {
             help_lines.push(Line::from(Span::styled(self.grid_debug_line(), Style::default().fg(theme::ATTN))));
         }
         help_lines.push(Line::from(Span::styled(
-            " A-j/k nav \u{00b7} A-h/l cols \u{00b7} A-J/K reorder \u{00b7} A-H/L move \u{00b7} A-v visual \u{00b7} A-g linear \u{00b7} / search \u{00b7} n/N match",
+            " A-j/k nav \u{00b7} A-u/d half page \u{00b7} A-h/l cols \u{00b7} A-J/K reorder \u{00b7} A-H/L move \u{00b7} A-v visual \u{00b7} A-g linear \u{00b7} / search \u{00b7} n/N match",
             dim,
         )));
         let launch = if self.placement_on { "A-f launch/place \u{00b7} A-b on boards" } else { "A-f launch" };
         help_lines.push(Line::from(Span::styled(
-            format!(" A-e edit \u{00b7} A-n new \u{00b7} A-i header \u{00b7} A-Ent sep \u{00b7} A-Spc empty \u{00b7} Spc fold \u{00b7} A-s status \u{00b7} A-D done \u{00b7} A-a accept \u{00b7} A-A archive done \u{00b7} A-V show arch \u{00b7} A-x del \u{00b7} {launch} \u{00b7} A-U unlaunch \u{00b7} A-c col \u{00b7} A-r refresh \u{00b7} A-q quit"),
+            format!(" A-e edit \u{00b7} A-n new \u{00b7} A-i header \u{00b7} A-Ent sep \u{00b7} A-Spc empty \u{00b7} Spc fold \u{00b7} A-s status \u{00b7} A-D done \u{00b7} A-a accept \u{00b7} A-A archive done \u{00b7} A-V show arch \u{00b7} A-x del \u{00b7} {launch} \u{00b7} A-y unbind \u{00b7} A-U unlaunch \u{00b7} A-c col \u{00b7} A-r refresh \u{00b7} A-q quit"),
             dim,
         )));
         frame.render_widget(Paragraph::new(help_lines), help_area);
@@ -4767,7 +4798,8 @@ impl PlanningView {
             ("A-e    edit", "A-a    accept"),
             ("A-n    new", "A-x    delete"),
             ("A-N    subtask", "A-O    reopen done"),
-            ("A-u    unbind", "A-U    unlaunch"),
+            ("A-u/d  half page", "A-y    unbind"),
+            ("A-U    unlaunch", ""),
             ("A-Ent  sep", "A-Spc  empty"),
             ("A-i    header", "A-A    archive done"),
             ("A-s/S  status", "A-V    show arch"),
@@ -5579,6 +5611,34 @@ mod tests {
         let mut buffer = ratatui::buffer::Buffer::empty(area);
         List::new(view.build_column_items(0, "p", 0, 0, 36, height as usize)).render(area, &mut buffer);
         buffer
+    }
+
+    #[test]
+    fn planning_half_page_stops_at_ends_and_preserves_task_actions() {
+        let mut view = subsection_test_view();
+        view.grid_rows_visible.set(4);
+        view.cursor.row = 1;
+        let event = |c, mods| CrosstermEvent::Key(crossterm::event::KeyEvent::new(KeyCode::Char(c), mods));
+        view.handle_event(&event('d', KeyModifiers::ALT));
+        assert_eq!(view.cursor.row, 3);
+        view.handle_event(&event('d', KeyModifiers::ALT));
+        assert_eq!(view.cursor.row, 4);
+        view.handle_event(&event('d', KeyModifiers::ALT));
+        assert_eq!(view.cursor.row, 4, "does not wrap");
+        view.handle_event(&event('u', KeyModifiers::ALT));
+        assert_eq!(view.cursor.row, 2);
+        assert!(matches!(view.handle_event(&event('y', KeyModifiers::ALT)), PlanAction::UnbindTask { .. }));
+        assert!(!matches!(view.handle_event(&event('D', KeyModifiers::ALT)), PlanAction::UnbindTask { .. }));
+        let mut linear = subsection_test_view();
+        linear.linear_mode = true;
+        linear.grid_rows_visible.set(4);
+        linear.cursor.row = 0;
+        linear.handle_event(&event('d', KeyModifiers::ALT));
+        assert_eq!(linear.cursor.row, 2);
+        for _ in 0..4 { linear.handle_event(&event('d', KeyModifiers::ALT)); }
+        assert_eq!(linear.cursor.row, 4);
+        linear.handle_event(&event('u', KeyModifiers::ALT));
+        assert_eq!(linear.cursor.row, 2);
     }
 
     #[test]

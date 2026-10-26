@@ -803,6 +803,13 @@ impl App {
             self.messages.keep_management_form();
             return true;
         }
+        if matches!(self.messages.mode.as_str(), "norm_preview" | "norm_conflict")
+            && key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd'))
+        {
+            let step = (self.messages.timeline_size.1 / 2).max(1);
+            self.messages.body_scroll = if key.code == KeyCode::Char('u') { self.messages.body_scroll.saturating_sub(step) } else { self.messages.body_scroll.saturating_add(step).min(self.messages.body_max_scroll) };
+            return true;
+        }
         if matches!(
             self.messages.mode.as_str(),
             "norm_preview" | "norm_conflict"
@@ -883,6 +890,19 @@ impl App {
             return false;
         }
         let in_norms = self.messages.target["norms"] == true;
+        if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd')) {
+            let step = (self.messages.timeline_size.1 as usize / 2).max(1);
+            if in_norms && self.messages.management.view != "history" {
+                self.messages.body_scroll = if key.code == KeyCode::Char('u') { self.messages.body_scroll.saturating_sub(step as u16) } else { self.messages.body_scroll.saturating_add(step as u16).min(self.messages.body_max_scroll) };
+            } else {
+                let count = if in_norms { self.messages.management.history.len() }
+                    else if self.messages.target["preferences"] == true { self.messages.management.prefs["rules"].as_array().map_or(0, Vec::len) }
+                    else if self.messages.management.view == "results" { self.messages.management.result["items"].as_array().map_or(0, Vec::len) }
+                    else { self.messages.management.monitors.len() };
+                self.messages.management.selected = if key.code == KeyCode::Char('u') { self.messages.management.selected.saturating_sub(step) } else { self.messages.management.selected.saturating_add(step).min(count.saturating_sub(1)) };
+            }
+            return true;
+        }
         match key.code {
             KeyCode::Char('j') | KeyCode::Down
                 if !in_norms || self.messages.management.view == "history" =>
@@ -1112,6 +1132,7 @@ impl App {
         let style = Style::default().fg(theme::CHAT_TEXT).bg(theme::CHAT_PANEL);
         let inner = area.inner(ratatui::layout::Margin::new(1, 1));
         let width = inner.width.max(1) as usize;
+        m.timeline_size = (inner.width, inner.height);
         if m.mode == "norm_edit" {
             let d = m.draft();
             let (lines, row, col) = wrap_draft(&d.body, d.cursor, width);
@@ -1371,6 +1392,8 @@ impl App {
         };
         let lines = wrap_readable(&text, width);
         let max_scroll = lines.len().saturating_sub(inner.height as usize);
+        m.body_max_scroll = max_scroll.min(u16::MAX as usize) as u16;
+        m.body_scroll = m.body_scroll.min(m.body_max_scroll);
         let scroll = if list {
             let marker = lines.iter().position(|l| l.starts_with('›')).unwrap_or(0);
             marker

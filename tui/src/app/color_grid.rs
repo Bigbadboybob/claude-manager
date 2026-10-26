@@ -51,6 +51,11 @@ impl App {
         };
         let step = |dr: i32, dc: i32| theme::color_grid_step(grid.cell, dr, dc);
         let next = match key.code {
+            KeyCode::Char('u' | 'd') if key.modifiers == KeyModifiers::ALT => {
+                let direction = if key.code == KeyCode::Char('u') { -1 } else { 1 };
+                let first = theme::color_grid_step(grid.cell, direction, 0);
+                Some(theme::color_grid_step(first, direction, 0))
+            }
             KeyCode::Left | KeyCode::Char('h') => Some(step(0, -1)),
             KeyCode::Right | KeyCode::Char('l') => Some(step(0, 1)),
             KeyCode::Up | KeyCode::Char('k') => Some(step(-1, 0)),

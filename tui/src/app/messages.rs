@@ -96,6 +96,7 @@ pub struct Messages {
     daemon_id: String,
     space_id: String,
     body_scroll: u16,
+    body_max_scroll: u16,
     timeline_scroll: usize,
     timeline_size: (u16, u16),
     reveal_selection: bool,
@@ -1233,12 +1234,10 @@ impl App {
             && self.messages.confirm.is_none()
             && !self.messages.reacting
             && self.messages.queued_events.is_empty()
-            && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-            && matches!(
-                key.code,
-                KeyCode::Char('j' | 'k') | KeyCode::Up | KeyCode::Down | KeyCode::PageUp
-                    | KeyCode::PageDown | KeyCode::Home | KeyCode::End
-            );
+            && ((key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd')))
+                || (!key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && matches!(key.code, KeyCode::Char('j' | 'k') | KeyCode::Up | KeyCode::Down
+                        | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End)));
         if self.messages.busy && !navigation {
             if key.code == KeyCode::Esc {
                 self.messages.visible = false;
@@ -1341,6 +1340,23 @@ impl App {
                     self.messages.edit_text(&c.to_string(), false)
                 }
                 _ => {}
+            }
+            return true;
+        }
+        // Page the focused list before single-letter actions such as drop or members.
+        // Management screens have their own selection and handle these keys below.
+        if self.messages.mode.is_empty() && !self.messages.management_view()
+            && key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd'))
+        {
+            let down = key.code == KeyCode::Char('d');
+            let rows = if self.messages.pane == 0 { self.last_term_size.1.saturating_sub(4) as usize }
+                else { self.messages.timeline_size.1 as usize };
+            let step = (rows / 2).max(1);
+            if self.messages.pane == 0 {
+                self.messages.menu = if down { self.messages.menu.saturating_add(step).min(self.messages.menu_items().len().saturating_sub(1)) } else { self.messages.menu.saturating_sub(step) };
+            } else {
+                self.messages.selected = if down { self.messages.selected.saturating_add(step).min(self.messages.items.len().saturating_sub(1)) } else { self.messages.selected.saturating_sub(step) };
+                self.messages.reveal_selection = true;
             }
             return true;
         }
@@ -2387,6 +2403,23 @@ fn wrap_draft(text: &str, cursor: usize, width: usize) -> (Vec<String>, usize, u
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn messaging_half_page_moves_selection_without_invoking_letter_actions() {
+        use crossterm::event::{Event, KeyEvent, KeyModifiers};
+        let mut app = owner_app();
+        app.messages.pane = 1;
+        app.messages.timeline_size = (80, 10);
+        app.messages.items = (0..20).map(|i| json!({"id": format!("m{i}")})).collect();
+        let alt = |c| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT));
+        app.messaging_event(&alt('d'));
+        assert_eq!(app.messages.selected, 5);
+        assert!(app.messages.mode.is_empty());
+        app.messaging_event(&alt('u'));
+        assert_eq!(app.messages.selected, 0);
+        app.messaging_event(&alt('u'));
+        assert_eq!(app.messages.selected, 0);
+    }
+
     #[test]
     fn messaging_read_status_shows_backfill_progress_instead_of_uncached() {
         let fetching = json!({"coverage":"backfilling","target":{"joined":true},

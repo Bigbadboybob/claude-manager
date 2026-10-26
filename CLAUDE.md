@@ -203,7 +203,7 @@ Global:
 - `A-?` — show/hide shortcut hints in Sessions and Planning; saved in `~/.cm/tui-sessions.json` and restored on viewer restart
 - `A-q` — quit
 - `A-j/k` — navigate
-- `A-u` / `A-d` — Sessions view: page the focused sidebar column (main or continuous) up / down by half its visible rows, like vim's Ctrl-u / Ctrl-d; stops at the ends
+- `A-u` / `A-d` — page the focused list up / down by half its visible rows, like vim's Ctrl-u / Ctrl-d; stops at the ends. In Planning, `A-y` unbinds a task and `A-U` unlaunches it
 - `A-D` — mark task done (Sessions and Planning; moved from `A-d` 2026-10-20)
 - `A-x` — delete
 - `A-,` — toggle the activity feed (5-line strip above the status bar showing recent agent-initiated mutations: start_session, send_input, kill_session, start/stop_workflow, create_subtask, mark_subtask_done). Off by default.

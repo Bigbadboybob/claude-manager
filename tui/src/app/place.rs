@@ -267,6 +267,12 @@ impl App {
         }
         if let Some(mut c) = self.place.chooser.take() {
             let n = c.options().len();
+            if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd')) {
+                let step = (n / 2).max(1);
+                c.cursor = if key.code == KeyCode::Char('u') { c.cursor.saturating_sub(step) } else { c.cursor.saturating_add(step).min(n.saturating_sub(1)) };
+                self.place.chooser = Some(c);
+                return true;
+            }
             match key.code {
                 KeyCode::Esc => {}
                 KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
@@ -511,8 +517,8 @@ impl App {
         if self.place.support != Support::On || self.place.hide_strip {
             return 0;
         }
-        let n = self.on_boards_lines(area.width as usize).len() as u16;
-        if n <= 1 { 0 } else { (n + 1).min(STRIP_MAX).min(area.height / 3) }
+        // Keep the list viewport fixed as selection and asynchronous results change.
+        STRIP_MAX.min(area.height / 3)
     }
 
     fn on_boards_lines(&self, width: usize) -> Vec<Line<'static>> {
@@ -598,6 +604,20 @@ mod tests {
         assert_eq!(app.place.support, Support::Off);
         assert!(!key(&mut app, KeyCode::Char('f'), KeyModifiers::ALT));
         assert_eq!(app.on_boards_height(Rect::new(0, 0, 100, 40)), 0);
+    }
+
+    #[test]
+    fn on_boards_strip_does_not_resize_with_selection_results() {
+        let mut app = placing_app();
+        let area = Rect::new(0, 0, 100, 40);
+        let height = app.on_boards_height(area);
+        assert!(height > 0);
+        app.place.on_boards = json!({"epics": [], "items": []});
+        assert_eq!(app.on_boards_height(area), height);
+        app.place.on_boards = on_boards();
+        assert_eq!(app.on_boards_height(area), height);
+        app.place.hide_strip = true;
+        assert_eq!(app.on_boards_height(area), 0);
     }
 
     #[test]

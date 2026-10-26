@@ -19,6 +19,7 @@ enum Update {
 pub(super) struct Menu {
     rows: Vec<Row>,
     selected: usize,
+    page_rows: std::cell::Cell<usize>,
     preferred: Option<(HostId, String)>,
     errors: HashMap<HostId, String>,
     rx: mpsc::Receiver<Update>,
@@ -95,6 +96,7 @@ impl Menu {
         Self {
             rows: Vec::new(),
             selected: 0,
+            page_rows: std::cell::Cell::new(1),
             preferred,
             errors: HashMap::new(),
             rx,
@@ -169,6 +171,12 @@ impl Menu {
     }
 
     pub fn key(&mut self, key: crossterm::event::KeyEvent) -> InputOutcome {
+        if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd')) {
+            let step = (self.page_rows.get() / 2).max(1);
+            self.selected = if key.code == KeyCode::Char('u') { self.selected.saturating_sub(step) } else { self.selected.saturating_add(step).min(self.rows.len().saturating_sub(1)) };
+            self.preferred = None;
+            return InputOutcome::Consumed;
+        }
         match key.code {
             KeyCode::Esc => return InputOutcome::Cancel,
             KeyCode::Up | KeyCode::Char('k') => {
@@ -260,6 +268,7 @@ impl Menu {
             Line::from(""),
         ];
         let count = inner.height.saturating_sub(8) as usize;
+        self.page_rows.set(count);
         let start = self.selected.saturating_sub(count.saturating_sub(1));
         for (index, row) in self.rows.iter().enumerate().skip(start).take(count) {
             let label = row.task["label"]
@@ -328,6 +337,7 @@ mod tests {
             Menu {
                 rows: vec![],
                 selected: 0,
+                page_rows: std::cell::Cell::new(1),
                 preferred: None,
                 errors: HashMap::new(),
                 rx,
