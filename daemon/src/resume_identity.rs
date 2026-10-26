@@ -238,6 +238,19 @@ pub fn record_rotation(state: &DaemonState, from: &str, to: &str) -> std::io::Re
 }
 /// #25: record an engine handoff, durably. A session that never bound a
 /// transcript has nothing to label, so it is kept under its uid.
+/// #25: whether a handoff from transcript `from_id` (or, with no
+/// transcript, of `uid`) completed and was recorded.
+pub fn handoff_recorded(state: &DaemonState, uid: &str, from_id: &str) -> bool {
+    let mut hist = state
+        .resume_history
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if hist.load(state).is_err() {
+        return false;
+    }
+    let key = if from_id.is_empty() { format!("uid:{uid}") } else { from_id.to_string() };
+    hist.handoffs.get(&key).is_some_and(|h| h.uid == uid)
+}
 pub fn record_handoff(state: &DaemonState, h: Handoff) -> std::io::Result<()> {
     {
         let mut hist = state

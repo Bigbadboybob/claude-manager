@@ -60,7 +60,7 @@ impl Origin {
 
 /// One rotation's record, kept for `status` / `list_sessions`.
 #[derive(Clone, Debug)]
-struct Rotation {
+pub(crate) struct Rotation {
     phase: &'static str,
     origin: Origin,
     reason: String,
@@ -115,6 +115,22 @@ pub fn status(uid: &str) -> Option<Value> {
 pub(crate) fn test_registry_lock() -> std::sync::MutexGuard<'static, ()> {
     static L: Mutex<()> = Mutex::new(());
     L.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Tests: a rotation record for [`admit`].
+#[cfg(test)]
+pub(crate) fn test_rotation_record(uid: &str) -> Rotation {
+    Rotation {
+        phase: "stopping", origin: Origin::Operator, reason: String::new(), started_at: now(),
+        from_id: uid.into(), from_bytes: 0, to_id: None, to_bytes: None, path: "fork",
+        outcome: None, finished_at: None,
+    }
+}
+
+/// Tests: finish `uid`'s rotation record.
+#[cfg(test)]
+pub(crate) fn test_finish(uid: &str) {
+    finish(uid, "done", "test".into());
 }
 
 /// Tests: mark `uid` as mid-rotation (`done` finishes it).
@@ -286,7 +302,7 @@ pub fn start(
     origin: Origin,
     force: bool,
 ) -> MethodResult {
-    let (snap, rotation) = {
+    let (snap, record) = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         let (idle, quiet) = {
             let c = &state.config.transcript_rotation;
@@ -300,10 +316,6 @@ pub fn start(
         // automatic policy stays Claude-only.
         let engines: &[&str] = if origin == Origin::Policy { &["claude-code"] } else { &["claude-code", "codex"] };
         boundary_for(&state, uid, idle, quiet, engines).map_err(|why| (ErrorCode::Conflict, format!("not at a safe boundary: {why}")))?;
-        // A handoff and a rotation never run together on a host.
-        if let Some(other) = crate::handoff::running() {
-            return Err((ErrorCode::Conflict, format!("a handoff is running ({other}); one at a time per host")));
-        }
         if origin != Origin::Operator {
             if let Some(left) = pause_left() {
                 return Err((ErrorCode::Conflict, format!("pausing {}s after the last rotation", left.as_secs())));
@@ -323,10 +335,10 @@ pub fn start(
             outcome: None,
             finished_at: None,
         };
-        (snap, rotation)
+        let record = rotation.to_json();
+        admit(&state, uid, rotation).map_err(|why| (ErrorCode::Conflict, why))?;
+        (snap, record)
     };
-    let record = rotation.to_json();
-    claim(uid, rotation).map_err(|why| (ErrorCode::Conflict, why))?;
     // A brain restart between the stop and the respawn must not leave the
     // session dead: the marker lets the next brain resume the old transcript.
     if let Err(e) = inflight_put(&state_arc.lock().unwrap_or_else(|p| p.into_inner()), uid, &snap) {
@@ -356,7 +368,11 @@ fn verify_deadline(source_bytes: u64) -> Duration {
 const PAUSE_BETWEEN: Duration = Duration::from_secs(120);
 
 pub(crate) fn wait_gone(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) -> bool {
-    let deadline = Instant::now() + STOP_DEADLINE;
+    wait_gone_for(state_arc, uid, STOP_DEADLINE)
+}
+
+fn wait_gone_for(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
     while Instant::now() < deadline {
         if !state_arc.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid) {
             return true;
@@ -364,6 +380,46 @@ pub(crate) fn wait_gone(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) -> bool 
         std::thread::sleep(Duration::from_millis(200));
     }
     false
+}
+
+/// How a stop went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stopped {
+    /// Gone within the stop deadline.
+    Yes,
+    /// Gone, but only after the deadline: Owner was alerted meanwhile.
+    Late,
+    /// Still running 10 minutes after the kill: Owner alerted.
+    Stuck,
+}
+
+/// Stop `uid` (attributed to `killer`) and wait for it. A process that is
+/// still there after the stop deadline is not "left as it was": the kill
+/// was sent, so Owner is alerted and CM keeps watching it for 10 minutes.
+pub(crate) fn stop_tracked(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, killer: &str, what: &str) -> Stopped {
+    crate::control::methods::kill_with_attribution(state_arc, uid, killer);
+    if wait_gone(state_arc, uid) {
+        return Stopped::Yes;
+    }
+    let alert = |message: String| {
+        let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        if let Err(e) = crate::owner_attention::raise_system(&st, uid, &message) {
+            eprintln!("cm-daemon: {what} alert for {uid}: {e}");
+        }
+    };
+    alert(format!(
+        "CM stopped this session for a {what}, but it is still running {}s later. CM keeps \
+         watching it and resumes its original conversation once it exits.",
+        STOP_DEADLINE.as_secs()
+    ));
+    if wait_gone_for(state_arc, uid, Duration::from_secs(600)) {
+        return Stopped::Late;
+    }
+    alert(format!(
+        "CM stopped this session for a {what}, but it is still running 10 minutes later. \
+         Check the process; kill_session or A-R once it is gone."
+    ));
+    Stopped::Stuck
 }
 
 /// A fork's transcript is in place: the file exists and holds message rows
@@ -542,6 +598,18 @@ fn pause_left() -> Option<Duration> {
     PAUSE_BETWEEN.checked_sub(at.elapsed()).filter(|d| !d.is_zero())
 }
 
+/// Admit a rotation of `uid` on the host: no handoff running and no other
+/// rotation, then claimed. Takes the state guard's target so it can only be
+/// called with the state lock held: a handoff admits under the same lock
+/// (`handoff::tick`), so the two cannot both get in (lock order state →
+/// handoff → rotation).
+pub(crate) fn admit(_locked: &DaemonState, uid: &str, rotation: Rotation) -> Result<(), String> {
+    if let Some(other) = crate::handoff::running() {
+        return Err(format!("a handoff is running ({other}); one at a time per host"));
+    }
+    claim(uid, rotation)
+}
+
 /// Register `rotation` for `uid` unless another rotation is running: one at a
 /// time per host (a fork reads its whole source; a deploy may find many big
 /// sessions). Checked and inserted under one lock, so two starters (Alt+T
@@ -643,8 +711,19 @@ pub fn recover_inflight(state_arc: &Arc<Mutex<DaemonState>>) -> usize {
             if v["kind"] == "handoff" {
                 // #25: the new engine is live (it came up before the
                 // restart); tell it about its handoff document if it switched.
-                crate::handoff::recover_live(state_arc, uid, &entry, v["file"].as_str());
-                inflight_remove(&state_arc.lock().unwrap_or_else(|p| p.into_inner()), uid);
+                let snap = Snapshot {
+                    from_path: PathBuf::from(entry.transcript_path.clone().unwrap_or_default()),
+                    from_id: v["from_id"].as_str().unwrap_or_default().to_string(),
+                    from_bytes: 0,
+                    workspace_id: ws.to_string(),
+                    worktree: PathBuf::from(wt),
+                    entry,
+                };
+                // Confirms or rolls back on its own thread; that thread clears
+                // the marker when it is done.
+                if !crate::handoff::recover_live(state_arc, uid, snap, v["file"].as_str()) {
+                    inflight_remove(&state_arc.lock().unwrap_or_else(|p| p.into_inner()), uid);
+                }
                 continue;
             }
             let snap = Snapshot {
@@ -751,10 +830,16 @@ fn complete_fork(state: &Arc<Mutex<DaemonState>>, uid: &str, snap: &Snapshot, to
 fn run(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: Snapshot) {
     // 1. Stop the process. Viewers and monitors see killed_by
     //    `transcript-rotation`: the uid comes straight back.
-    crate::control::methods::kill_with_attribution(state_arc, uid, ROTATION_KILLER);
-    if !wait_gone(state_arc, uid) {
-        fail(state_arc, uid, "the session did not stop; left as it was".into());
-        return;
+    match stop_tracked(state_arc, uid, ROTATION_KILLER, "transcript rotation") {
+        Stopped::Yes => {}
+        Stopped::Late => {
+            resume_old(state_arc, uid, &snap, "the session stopped only after a delay");
+            return;
+        }
+        Stopped::Stuck => {
+            fail(state_arc, uid, "the kill was sent but the process is still running after 10 min".into());
+            return;
+        }
     }
     // 2. Fork at the same uid.
     update(uid, |r| r.phase = "forking");
@@ -827,9 +912,8 @@ fn resume_old(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: &Snapshot, w
     update(uid, |r| r.phase = "falling back");
     let live = state_arc.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid);
     if live {
-        crate::control::methods::kill_with_attribution(state_arc, uid, ROTATION_KILLER);
-        if !wait_gone(state_arc, uid) {
-            fail(state_arc, uid, format!("{why}; the forked process did not stop either"));
+        if stop_tracked(state_arc, uid, ROTATION_KILLER, "transcript rotation") == Stopped::Stuck {
+            fail(state_arc, uid, format!("{why}; the forked process is still running 10 min after its kill"));
             return;
         }
     }

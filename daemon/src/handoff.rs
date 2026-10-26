@@ -45,6 +45,8 @@ const WRITE_DEADLINE: Duration = Duration::from_secs(10 * 60);
 const CONFIRM_DEADLINE: Duration = Duration::from_secs(5 * 60);
 /// A queued request that never reached a boundary is dropped after this.
 const DEFAULT_WAIT: Duration = Duration::from_secs(6 * 3600);
+/// The most a `now` request waits in the queue.
+const NOW_WAIT: Duration = Duration::from_secs(10 * 60);
 const TICK: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -204,6 +206,17 @@ pub fn status(uid: &str) -> Option<Value> {
     registry().lock().unwrap_or_else(|p| p.into_inner()).records.get(uid).map(Record::to_json)
 }
 
+/// Take the host's one handoff slot for `uid` unless a handoff or rotation
+/// holds it. Called with the state lock held (`_locked`), as rotation's
+/// `admit` is, so the two never both run.
+fn take_slot(_locked: &DaemonState, reg: &mut Registry, uid: &str) -> bool {
+    if reg.running.is_some() || crate::rotation::running_any().is_some() {
+        return false;
+    }
+    reg.running = Some(uid.to_string());
+    true
+}
+
 /// The session being handed off now, if any (one at a time per host).
 pub fn running() -> Option<String> {
     registry().lock().unwrap_or_else(|p| p.into_inner()).running.clone()
@@ -229,20 +242,67 @@ fn fail(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, outcome: String) {
     }
 }
 
-/// After a brain restart mid-handoff, with the uid live: if it is on the
-/// new engine (the switch spawned before the restart), give it its
-/// takeover notice again; on the old engine nothing happened yet.
-pub fn recover_live(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, old: &crate::manifest::ManifestEntry, file: Option<&str>) {
-    let engine = state_arc.lock().unwrap_or_else(|p| p.into_inner()).sessions.get(uid).map(|s| s.session_type.clone());
-    match (engine, file) {
-        (Some(engine), Some(file)) if engine != old.session_type => {
-            let from = who(&old.session_type, old.model.as_deref());
-            let marker = crate::rotation::nonce();
-            crate::rotation::deliver_live(state_arc, uid, takeover_notice(&marker, &old.label, &from, "resumed after a daemon restart", Path::new(file)));
-            eprintln!("cm-daemon: handoff of {uid} was interrupted by a restart after the switch; re-sent the takeover notice");
-        }
-        _ => eprintln!("cm-daemon: handoff of {uid} was interrupted by a restart before the switch; nothing to do"),
+/// After a brain restart mid-handoff, with the uid live. On the old engine
+/// nothing happened yet; a handoff already recorded in the lineage finished
+/// before the restart. Otherwise the new engine came up but was not
+/// confirmed: send its takeover notice again and confirm (or roll back to
+/// the old engine) exactly as the normal path does, on a worker thread.
+/// Returns whether that worker took the marker over.
+pub fn recover_live(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: crate::rotation::Snapshot, file: Option<&str>) -> bool {
+    let (engine, done) = {
+        let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            st.sessions.get(uid).map(|s| s.session_type.clone()),
+            crate::resume_identity::handoff_recorded(&st, uid, &snap.from_id),
+        )
+    };
+    let (Some(engine), Some(file)) = (engine, file) else {
+        eprintln!("cm-daemon: handoff of {uid} was interrupted by a restart before the switch; nothing to do");
+        return false;
+    };
+    if engine == snap.entry.session_type {
+        eprintln!("cm-daemon: handoff of {uid} was interrupted by a restart before the switch; nothing to do");
+        return false;
     }
+    if done {
+        eprintln!("cm-daemon: handoff of {uid} had finished before the restart; nothing to do");
+        return false;
+    }
+    let file = PathBuf::from(file);
+    let state = Arc::clone(state_arc);
+    let uid = uid.to_string();
+    {
+        let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
+        reg.running = Some(uid.clone());
+        reg.records.insert(uid.clone(), Record {
+            phase: "confirming",
+            kind: Kind::Switch,
+            origin: Origin::Operator,
+            reason: "completing a handoff a daemon restart interrupted".into(),
+            requested_at: now(),
+            started_at: Some(now()),
+            from_engine: snap.entry.session_type.clone(),
+            to_engine: engine.clone(),
+            to_model: None,
+            to_effort: None,
+            from_id: Some(snap.from_id.clone()).filter(|id| !id.is_empty()),
+            to_id: None,
+            handoff_file: Some(file.to_string_lossy().into_owned()),
+            deferred: None,
+            outcome: None,
+            finished_at: None,
+        });
+    }
+    let spawned = std::thread::Builder::new().name(format!("cm-handoff-recover-{uid}")).spawn(move || {
+        let from = who(&snap.entry.session_type, snap.entry.model.as_deref());
+        let to = who(&engine, None);
+        confirm_takeover(&state, &uid, &snap, &file, &from, &to, &engine, "resumed after a daemon restart");
+        crate::rotation::inflight_remove(&state.lock().unwrap_or_else(|p| p.into_inner()), &uid);
+    });
+    if spawned.is_err() {
+        registry().lock().unwrap_or_else(|p| p.into_inner()).running = None;
+    }
+    spawned.is_ok()
 }
 
 fn finish(uid: &str, phase: &'static str, outcome: String) {
@@ -274,6 +334,12 @@ pub fn request(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, req: Request, wai
             return Err((
                 ErrorCode::Conflict,
                 "continuous sessions are scheduler-owned: change the continuous task's engine or model instead".into(),
+            ));
+        }
+        if sess.workflow_run_id.is_some() {
+            return Err((
+                ErrorCode::Conflict,
+                "workflow participants are driven by their run: stop the workflow first".into(),
             ));
         }
         let plan = plan(&sess.session_type, sess.model.as_deref(), sess.effort.as_deref(), &req)
@@ -308,7 +374,11 @@ pub fn request(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, req: Request, wai
     };
     let out = record.to_json();
     reg.records.insert(uid.to_string(), record);
-    let until = Instant::now() + wait.unwrap_or(DEFAULT_WAIT);
+    // A `now` request passed its boundary check just now; if it still
+    // cannot start soon (another handoff or rotation holds the host), it is
+    // dropped rather than run long after Owner asked.
+    let wait = if req.now { wait.unwrap_or(NOW_WAIT).min(NOW_WAIT) } else { wait.unwrap_or(DEFAULT_WAIT) };
+    let until = Instant::now() + wait;
     if req.now {
         reg.queue.push_front(Queued { uid: uid.into(), req, plan, until });
     } else {
@@ -440,8 +510,9 @@ pub fn tick(state_arc: &Arc<Mutex<DaemonState>>) {
             }
             return;
         };
-        if q.plan.kind != Kind::Rotate {
-            reg.running = Some(q.uid.clone());
+        if q.plan.kind != Kind::Rotate && !take_slot(&state, &mut reg, &q.uid) {
+            reg.queue.push_front(q);
+            return;
         }
         if let Some(r) = reg.records.get_mut(&q.uid) {
             r.phase = "starting";
@@ -550,8 +621,10 @@ pub fn takeover_notice(marker: &str, label: &str, from: &str, reason: &str, file
         "[cm-handoff {marker}] You are taking over the CM session '{label}' from {from}{why}. \
          You keep its CM identity: chat name, task, workspace, permissions and board holds. \
          Your predecessor wrote a handoff document for you: {}. Read it first. Then re-read from \
-         CM rather than assuming: your board items, standing rules and Owner rulings, open \
-         monitors, and your chat inbox. Then continue with the next step it names.",
+         CM rather than assuming: your board items, standing rules and Owner rulings, and your \
+         chat inbox. Your predecessor's monitors stopped with it: check list_monitors and \
+         re-arm any watch the document says you still need (monitor_sessions). Then continue \
+         with the next step it names.",
         file.display()
     )
 }
@@ -663,10 +736,16 @@ fn idle_since(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, after: f64) -> boo
 /// and an assistant reply after it.
 fn confirmed(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, old: &Path, needle: &str) -> Result<(PathBuf, u64), String> {
     let deadline = Instant::now() + CONFIRM_DEADLINE;
+    let started = now();
     while Instant::now() < deadline {
         let (live, path) = live_transcript(state_arc, uid);
         if !live {
             return Err("the new session exited before answering".into());
+        }
+        // An engine failure (bad model, auth, rate limit) will not answer:
+        // fall back now rather than at the deadline.
+        if let Some(kind) = errored_since(state_arc, uid, started) {
+            return Err(format!("the new session errored ({kind})"));
         }
         if let Some(p) = path.filter(|p| p.as_path() != old) {
             if replied_after(&p, needle) {
@@ -679,6 +758,15 @@ fn confirmed(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, old: &Path, needle:
     Err("the new session did not answer its first message (API error or a menu?)".into())
 }
 
+/// The error kind, when `uid`'s agent errored after `since`.
+fn errored_since(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, since: f64) -> Option<String> {
+    let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    let a = crate::agent_state::current(st.sessions.get(uid)?);
+    (a.state == crate::agent_state::State::Errored && a.since >= since).then(|| {
+        a.detail.error_kind.clone().unwrap_or_else(|| "engine error".into())
+    })
+}
+
 /// Whether `path` holds `needle` followed by an assistant row.
 fn replied_after(path: &Path, needle: &str) -> bool {
     let Some(text) = tail(path) else { return false };
@@ -686,16 +774,17 @@ fn replied_after(path: &Path, needle: &str) -> bool {
     text[at..].lines().skip(1).any(|l| serde_json::from_str::<Value>(l).is_ok_and(|row| assistant_text(&row).is_some()))
 }
 
-fn stop(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) -> bool {
-    crate::control::methods::kill_with_attribution(state_arc, uid, HANDOFF_KILLER);
-    crate::rotation::wait_gone(state_arc, uid)
+fn stop(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) -> crate::rotation::Stopped {
+    crate::rotation::stop_tracked(state_arc, uid, HANDOFF_KILLER, "handoff")
 }
 
 /// Respawn the snapshot's own engine and conversation after a failed step.
 fn restore_old(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: &crate::rotation::Snapshot, why: &str, file: Option<&Path>) {
     update(uid, |r| r.phase = "falling back");
-    if state_arc.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid) && !stop(state_arc, uid) {
-        fail(state_arc, uid, format!("{why}; the new process did not stop either"));
+    if state_arc.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid)
+        && stop(state_arc, uid) == crate::rotation::Stopped::Stuck
+    {
+        fail(state_arc, uid, format!("{why}; the new process is still running 10 min after its kill"));
         return;
     }
     match crate::control::methods::restore_one_session_launch(state_arc, &snap.workspace_id, &snap.worktree, &snap.entry, None, false) {
@@ -727,9 +816,16 @@ fn set_pick(entry: &mut crate::manifest::ManifestEntry, plan: &Plan) {
 
 fn run_repick(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, plan: &Plan, _req: &Request, snap: crate::rotation::Snapshot) {
     update(uid, |r| r.phase = "stopping");
-    if !stop(state_arc, uid) {
-        fail(state_arc, uid, "the session did not stop; left as it was".into());
-        return;
+    match stop(state_arc, uid) {
+        crate::rotation::Stopped::Yes => {}
+        crate::rotation::Stopped::Late => {
+            restore_old(state_arc, uid, &snap, "the session stopped only after a delay", None);
+            return;
+        }
+        crate::rotation::Stopped::Stuck => {
+            fail(state_arc, uid, "the kill was sent but the process is still running after 10 min".into());
+            return;
+        }
     }
     let mut entry = snap.entry.clone();
     set_pick(&mut entry, plan);
@@ -821,9 +917,16 @@ fn run_switch(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, plan: &Plan, req: 
     }
     // 2. Stop the old engine.
     update(uid, |r| r.phase = "stopping");
-    if !stop(state_arc, uid) {
-        fail(state_arc, uid, "the session did not stop; left as it was".into());
-        return;
+    match stop(state_arc, uid) {
+        crate::rotation::Stopped::Yes => {}
+        crate::rotation::Stopped::Late => {
+            restore_old(state_arc, uid, &snap, "the session stopped only after a delay", None);
+            return;
+        }
+        crate::rotation::Stopped::Stuck => {
+            fail(state_arc, uid, "the kill was sent but the process is still running after 10 min".into());
+            return;
+        }
     }
     // 3. The new engine, fresh, at the same uid.
     let mut entry = snap.entry.clone();
@@ -837,10 +940,26 @@ fn run_switch(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, plan: &Plan, req: 
         return;
     }
     // 4. Its first message: read the document.
+    confirm_takeover(state_arc, uid, &snap, &file, &from_who, &to_who, &plan.to_engine, &req.reason);
+}
+
+/// Tell the new engine to take over, confirm from its transcript, record the
+/// lineage; else roll back to the old engine.
+#[allow(clippy::too_many_arguments)]
+fn confirm_takeover(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    uid: &str,
+    snap: &crate::rotation::Snapshot,
+    file: &Path,
+    from_who: &str,
+    to_who: &str,
+    to_engine: &str,
+    reason: &str,
+) {
     let marker = crate::rotation::nonce();
     update(uid, |r| r.phase = "confirming");
-    if !crate::rotation::deliver(state_arc, uid, takeover_notice(&marker, &snap.entry.label, &from_who, &req.reason, &file)) {
-        restore_old(state_arc, uid, &snap, "the new session vanished before its first message", Some(&file));
+    if !crate::rotation::deliver(state_arc, uid, takeover_notice(&marker, &snap.entry.label, from_who, reason, file)) {
+        restore_old(state_arc, uid, snap, "the new session vanished before its first message", Some(file));
         return;
     }
     let needle = format!("[cm-handoff {marker}]");
@@ -852,9 +971,9 @@ fn run_switch(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, plan: &Plan, req: 
                 let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
                 let lineage = crate::resume_identity::Handoff {
                     uid: uid.into(),
-                    from_engine: plan.from_engine.clone(),
+                    from_engine: snap.entry.session_type.clone(),
                     from_id: snap.from_id.clone(),
-                    to_engine: plan.to_engine.clone(),
+                    to_engine: to_engine.into(),
                     to_id: to_id.clone().unwrap_or_default(),
                     file: file.to_string_lossy().into_owned(),
                     at: now(),
@@ -874,7 +993,7 @@ fn run_switch(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, plan: &Plan, req: 
                 ),
             );
         }
-        Err(why) => restore_old(state_arc, uid, &snap, &why, Some(&file)),
+        Err(why) => restore_old(state_arc, uid, snap, &why, Some(file)),
     }
 }
 
@@ -940,6 +1059,7 @@ mod tests {
         }
         let t = takeover_notice("m2", "lane-a", "Claude", "", Path::new("/h/.cm/handoffs/u/1.md"));
         assert!(t.contains("/h/.cm/handoffs/u/1.md") && t.contains("board items") && t.contains("inbox"));
+        assert!(t.contains("re-arm") && t.contains("list_monitors"), "monitors died with the old engine");
         assert!(fallback_notice("x", Some(Path::new("/f.md"))).contains("/f.md"));
     }
 
@@ -979,6 +1099,95 @@ mod tests {
         let status = status("ts-tick-0").unwrap();
         assert!(status["deferred"].is_string(), "a fresh process is not idle: deferred, {status}");
         registry().lock().unwrap().queue.retain(|q| q.uid != "ts-tick-0");
+        for s in state.lock().unwrap().sessions.values_mut() {
+            let _ = s.kill();
+        }
+    }
+
+    /// #25 review: a rotation and a handoff admitted from two threads (each
+    /// under the state lock, as `rotation::start` and `tick` do) are never
+    /// both running.
+    #[test]
+    fn a_rotation_and_a_handoff_never_both_get_the_host() {
+        let _serial = crate::rotation::test_registry_lock();
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let both = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wins = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rot = {
+            let (state, both, wins) = (Arc::clone(&state), Arc::clone(&both), Arc::clone(&wins));
+            std::thread::spawn(move || {
+                for _ in 0..500 {
+                    let admitted = {
+                        let st = state.lock().unwrap();
+                        let ok = crate::rotation::admit(&st, "ts-race-r", crate::rotation::test_rotation_record("ts-race-r")).is_ok();
+                        if ok && running().is_some() {
+                            both.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        ok
+                    };
+                    if admitted {
+                        wins.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        std::thread::yield_now();
+                        crate::rotation::test_finish("ts-race-r");
+                    }
+                }
+            })
+        };
+        let hand = {
+            let (state, both, wins) = (Arc::clone(&state), Arc::clone(&both), Arc::clone(&wins));
+            std::thread::spawn(move || {
+                for _ in 0..500 {
+                    let admitted = {
+                        let st = state.lock().unwrap();
+                        let mut reg = registry().lock().unwrap();
+                        let ok = take_slot(&st, &mut reg, "ts-race-h");
+                        if ok && crate::rotation::running_any().is_some() {
+                            both.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        ok
+                    };
+                    if admitted {
+                        wins.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        std::thread::yield_now();
+                        registry().lock().unwrap().running = None;
+                    }
+                }
+            })
+        };
+        rot.join().unwrap();
+        hand.join().unwrap();
+        assert_eq!(both.load(std::sync::atomic::Ordering::SeqCst), 0, "never both");
+        assert!(wins.load(std::sync::atomic::Ordering::SeqCst) > 0, "the race actually admitted work");
+    }
+
+    /// #25 review: after a restart, a handoff already in the lineage (it
+    /// finished before the marker was cleared) gets no duplicate takeover,
+    /// and a session still on its old engine is left alone.
+    #[test]
+    fn recovery_skips_a_finished_handoff_and_one_not_yet_switched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = DaemonState::new();
+        st.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
+        let mut sp = crate::session::SpawnParams::new("ts-rl-0", "r", "/bin/sleep");
+        sp.args = vec!["30".into()];
+        sp.session_type = "codex".into();
+        st.sessions.insert("ts-rl-0".into(), crate::session::DaemonSession::spawn(sp).unwrap());
+        let snap = |engine: &str| crate::rotation::Snapshot {
+            entry: serde_json::from_value(json!({"uid": "ts-rl-0", "label": "r", "session_type": engine})).unwrap(),
+            workspace_id: "ws".into(),
+            worktree: dir.path().into(),
+            from_path: dir.path().join("old.jsonl"),
+            from_id: "old-id".into(),
+            from_bytes: 0,
+        };
+        crate::resume_identity::record_handoff(&st, crate::resume_identity::Handoff {
+            uid: "ts-rl-0".into(), from_engine: "claude-code".into(), from_id: "old-id".into(),
+            to_engine: "codex".into(), to_id: "new".into(), file: "/f.md".into(), at: 1.0,
+        }).unwrap();
+        let state = Arc::new(Mutex::new(st));
+        assert!(!recover_live(&state, "ts-rl-0", snap("claude-code"), Some("/f.md")), "finished: no duplicate");
+        assert!(!recover_live(&state, "ts-rl-0", snap("codex"), Some("/f.md")), "not switched yet");
+        assert!(running().is_none());
         for s in state.lock().unwrap().sessions.values_mut() {
             let _ = s.kill();
         }

@@ -3539,6 +3539,9 @@ mod tests {
             let mut ct = spawn("ts-ho-ct", "claude-code");
             ct.continuous_task_id = Some("ct-x".into());
             st.sessions.insert("ts-ho-ct".into(), ct);
+            let mut wf = spawn("ts-ho-wf", "claude-code");
+            wf.workflow_run_id = Some("wf-1".into());
+            st.sessions.insert("ts-ho-wf".into(), wf);
         }
         let other = dispatch_session_handoff(
             &state,
@@ -3565,6 +3568,12 @@ mod tests {
             &operator_request("session.handoff", serde_json::json!({"uid": "ts-ho-ct", "to_engine": "codex"})),
         );
         assert!(ct.error.unwrap().message.contains("scheduler-owned"));
+        // A named workflow participant is refused up front, not dropped later.
+        let wf = dispatch_session_handoff(
+            &state,
+            &operator_request("session.handoff", serde_json::json!({"uid": "ts-ho-wf", "to_engine": "codex"})),
+        );
+        assert!(wf.error.unwrap().message.contains("workflow participants"));
         // A bulk selection never names shells or continuous sessions.
         assert_eq!(crate::handoff::select(&state.lock().unwrap(), None), ["ts-ho-a"]);
         // Its own handoff is queued for its next boundary (it never gets
