@@ -439,6 +439,40 @@ pub fn request_many(state_arc: &Arc<Mutex<DaemonState>>, uids: &[String], req: &
     json!({"ok": true, "queued": queued, "refused": refused})
 }
 
+/// Cancel a queued handoff without touching a handoff that has already
+/// started. The state lock serializes this with `tick_one`, which removes a
+/// request from the queue before checking its boundary.
+pub fn cancel_queued(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) -> MethodResult {
+    let out = {
+        let _state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
+        if reg.running.contains(uid) {
+            return Err((ErrorCode::Conflict, format!("handoff of session '{uid}' is already running")));
+        }
+        let Some(index) = reg.queue.iter().position(|q| q.uid == uid) else {
+            if reg.records.get(uid).is_some_and(|r| matches!(r.phase, "starting" | "confirming")) {
+                return Err((ErrorCode::Conflict, format!("handoff of session '{uid}' has already started")));
+            }
+            return Err((ErrorCode::NotFound, format!("no queued handoff for session '{uid}'")));
+        };
+        // Validate the record before mutating the queue. A missing record is
+        // an internal inconsistency, and cancellation must remain atomic.
+        if !reg.records.contains_key(uid) {
+            return Err((ErrorCode::NotFound, format!("no handoff record for session '{uid}'")));
+        }
+        reg.queue.remove(index);
+        let Some(record) = reg.records.get_mut(uid) else {
+            return Err((ErrorCode::NotFound, format!("no handoff record for session '{uid}'")));
+        };
+        record.phase = "cancelled";
+        record.deferred = None;
+        record.outcome = Some("cancelled by operator".into());
+        record.finished_at = Some(now());
+        record.to_json()
+    };
+    Ok(json!({"ok": true, "session_uid": uid, "cancelled": true, "handoff": out}))
+}
+
 /// The live sessions a bulk selection names: every agent session on
 /// `from_engine` (or both engines), never shells, continuous sessions or
 /// workflow participants.

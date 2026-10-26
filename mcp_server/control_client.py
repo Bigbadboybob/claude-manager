@@ -105,6 +105,7 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # #24: an agent's own transcript rotation request (and its status).
     "session.rotate_transcript",
     "session.handoff",
+    "session.handoff_cancel",
     # Operator-only bulk handoff (#25): listed so the method sets match the
     # dispatcher; the daemon refuses Session callers.
     "session.handoff_many",

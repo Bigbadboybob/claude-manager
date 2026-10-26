@@ -18064,8 +18064,10 @@ fn resolve_fork_source(state: &DaemonState, uid: &str) -> Result<ForkSource, (Er
         .ok_or((
             ErrorCode::Conflict,
             format!(
-                "session '{}' has no bound transcript yet — nothing to fork until it has \
-                 completed a turn",
+                "source unavailable for fork context: session '{}' has no bound transcript \
+                 yet. fork_session uses the retained transcript and does not wait for a new \
+                 source turn; use start_session for a fresh worker or request_handoff to keep \
+                 this CM identity",
                 uid
             ),
         ))?;
@@ -18324,7 +18326,9 @@ fn session_fork_once(
         return Err((
             ErrorCode::NotFound,
             format!(
-                "source transcript {} is not on this host (nothing has been written to it yet?)",
+                "source unavailable for fork context: transcript {} is not on this host. \
+                 fork_session needs retained source context; use start_session for a fresh \
+                 worker or request_handoff to keep this CM identity",
                 source.transcript_id
             ),
         ));
@@ -37159,7 +37163,9 @@ while True:
             {
                 let mut s = state.lock().unwrap();
                 s.sessions.get_mut("ts-src").unwrap().transcript_path = None;
-                assert_eq!(resolve_fork_source(&s, "ts-src").unwrap_err().0, ErrorCode::Conflict);
+                let missing = resolve_fork_source(&s, "ts-src").unwrap_err();
+                assert_eq!(missing.0, ErrorCode::Conflict);
+                assert!(missing.1.contains("source unavailable for fork context"), "{}", missing.1);
                 s.sessions.get_mut("ts-src").unwrap().session_type = "bash".into();
                 assert_eq!(resolve_fork_source(&s, "ts-src").unwrap_err().0, ErrorCode::InvalidParams);
             }

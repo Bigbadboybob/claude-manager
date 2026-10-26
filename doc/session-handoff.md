@@ -85,6 +85,36 @@ pid. The API's heartbeat sees the engine change on that pid and records an
   off the caller's own session. With it, another session the caller has
   authority over (below).
 
+These operations are deliberately separate:
+
+- `request_handoff` preserves the current CM identity and waits for that
+  session's safe boundary. It needs the outgoing session to answer when the
+  engine changes, so a rate-limited or errored source may remain queued.
+- `fork_session` starts a new session with a copied engine transcript and a
+  new task/workspace. It leaves the source running and does not preserve the
+  source identity. It can use a live session or an exit tombstone when CM
+  still has a usable transcript; it does not wait for another source turn.
+- `start_session` is a fresh worker spawn. It has no source conversation and
+  its task prompt is the only context CM supplies automatically.
+
+If a request is uncertain, inspect its returned receipt or query the session
+before retrying. A handoff request can be cancelled by the operator while it
+is still queued:
+
+```sh
+scripts/cm-op session.handoff_cancel '{"uid":"<session uid>"}'
+```
+
+Cancellation is operator-only, affects only the named queued request, and
+returns `Conflict` once that handoff has started. It does not stop a running
+handoff, rotate a session, or kill a worker. A missing or already-finished
+request returns `NotFound`.
+
+When a fork cannot read the retained source transcript, the error means that
+there is no fork context on this host; wait for a transcript to be bound or
+use `start_session` for a fresh worker. When an engine switch is required for
+the same CM identity, use `request_handoff` rather than `fork_session`.
+
 ## Handing off (or rotating) another session
 
 `request_handoff(session_uid=…)` and `rotate_transcript(session_uid=…)` (RPC

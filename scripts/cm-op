@@ -3,6 +3,7 @@
 
     scripts/cm-op daemon.health
     scripts/cm-op daemon.restart '{"binary_path": "/path/to/cm-daemon"}'
+    scripts/cm-op session.handoff_cancel '{"uid": "<session uid>"}'
     scripts/cm-op --ssh cm-manager daemon.health
     scripts/cm-op --ssh cm-manager --batch '[["worktree.cleanup", {...}], ...]'
 

@@ -2385,6 +2385,12 @@ async def start_session(
     `isolated=true` additionally gives the worker its own git worktree — the analogue of
     `Agent(isolation="worktree")`.
 
+    `start_session` is a fresh spawn: it does not inherit another session's
+    transcript or CM identity. A daemon may have accepted the spawn before a
+    later setup/monitor response fails, so after a timeout or serialization
+    error inspect `session_uid`/task sessions before retrying; do not assume
+    that no worker was created.
+
     Args:
         type: "claude-code", "codex", or "bash". Omit for the cached Owner
             staffing policy (ping().staffing); an explicit type or model wins.
@@ -2848,10 +2854,20 @@ async def fork_session(
 ) -> dict:
     """Fork a Claude or Codex session's conversation into a task.
 
-    Starts a session that continues from a copy of the source's
+    Starts a new session that continues from the source's retained
     conversation via the engine's native fork (`claude --resume <id>
     --fork-session` / `codex fork <id>`). The source keeps running
-    unchanged; CM stores no history copy. Pass exactly one of:
+    unchanged; CM stores no history copy and does not ask the source for a
+    safe-boundary turn. This is context-preserving replacement/spawn work,
+    not an identity-preserving `request_handoff`, and it is distinct from a
+    fresh `start_session`.
+
+    The source may be live, rate-limited, errored, or a recent exit as long
+    as CM still has a usable transcript on this host. If it does not, the
+    error is `source unavailable for fork context`; use `start_session` for a
+    fresh worker or `request_handoff` when the original CM identity must stay.
+
+    Pass exactly one of:
 
     - `task_name`: a NEW task with its own `cm-sub/...` worktree. Parent
       defaults to the source session's task; `parent_task_id` overrides it
@@ -2863,7 +2879,9 @@ async def fork_session(
       a worktree minted at `base`.
 
     Args:
-        session_uid: The session to fork (must have completed a turn).
+        session_uid: The session whose retained conversation is forked. A
+            completed source turn is only needed to create the transcript;
+            the source need not be able to answer now.
         base: "source" (default) cuts new branches at the source worktree's
             committed HEAD; "trunk" at the project's main branch. Uncommitted
             source edits never come along (`uncommitted_left_behind`).

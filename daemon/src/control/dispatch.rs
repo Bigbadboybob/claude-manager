@@ -735,6 +735,7 @@ pub fn dispatch_request(
         // #24 transcript rotation: operator for any session (and `force`);
         // a Session caller may rotate only itself, at a safe boundary.
         "session.handoff" => DispatchOutcome::Done(dispatch_session_handoff(state, req)),
+        "session.handoff_cancel" => DispatchOutcome::Done(dispatch_session_handoff_cancel(state, req)),
         "session.handoff_many" => DispatchOutcome::Done(dispatch_session_handoff_many(state, req)),
         "session.rotate_transcript" => {
             DispatchOutcome::Done(dispatch_session_rotate_transcript(state, req))
@@ -2255,6 +2256,29 @@ fn dispatch_session_handoff(state: &Arc<Mutex<DaemonState>>, req: &Request) -> R
     }
 }
 
+/// `session.handoff_cancel {uid}`: remove a queued handoff without touching a
+/// handoff that has already started. Operator-only because this changes the
+/// transfer plan for any session, including one owned by another agent.
+fn dispatch_session_handoff_cancel(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(response) = require_operator(req, "Handoff cancellation is Operator-only") {
+        return response;
+    }
+    let uid = req
+        .params
+        .get("uid")
+        .or_else(|| req.params.get("session_uid"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|uid| !uid.is_empty());
+    let Some(uid) = uid else {
+        return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session.handoff_cancel requires uid");
+    };
+    match crate::handoff::cancel_queued(state, uid) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
 /// `session.handoff_many {uids? | from_engine?, to_engine?, to_model?,
 /// to_effort?, reason?, wait_secs?}` (#25): Owner's bulk handoff,
 /// operator-only. Named `uids`, or every agent session on `from_engine`
@@ -3724,6 +3748,7 @@ mod tests {
         {
             let mut st = state.lock().unwrap();
             st.sessions.insert("ts-ho-a".into(), spawn("ts-ho-a", "claude-code"));
+            st.sessions.insert("ts-ho-b".into(), spawn("ts-ho-b", "claude-code"));
             st.sessions.insert("ts-ho-sh".into(), spawn("ts-ho-sh", "bash"));
             let mut ct = spawn("ts-ho-ct", "claude-code");
             ct.continuous_task_id = Some("ct-x".into());
@@ -3765,7 +3790,7 @@ mod tests {
         );
         assert!(wf.error.unwrap().message.contains("workflow participants"));
         // A bulk selection never names shells or continuous sessions.
-        assert_eq!(crate::handoff::select(&state.lock().unwrap(), None), ["ts-ho-a"]);
+        assert_eq!(crate::handoff::select(&state.lock().unwrap(), None), ["ts-ho-a", "ts-ho-b"]);
         // Its own handoff is queued for its next boundary (it never gets
         // there in this test: a fresh process is not idle).
         let own = dispatch_session_handoff(
@@ -3779,9 +3804,44 @@ mod tests {
             &session_request("session.handoff", serde_json::json!({"status": true}), "ts-ho-a"),
         );
         assert_eq!(status.result.unwrap()["handoff"]["to_engine"], "codex");
+        let second = dispatch_session_handoff(
+            &state,
+            &operator_request("session.handoff", serde_json::json!({"uid": "ts-ho-b", "to_engine": "codex"})),
+        );
+        assert!(second.ok, "{second:?}");
+        let agent_cancel = dispatch_session_handoff_cancel(
+            &state,
+            &session_request("session.handoff_cancel", serde_json::json!({"uid": "ts-ho-a"}), "ts-ho-a"),
+        );
+        assert_eq!(agent_cancel.error.unwrap().code, ErrorCode::Unauthorized);
+        let cancelled = dispatch_session_handoff_cancel(
+            &state,
+            &operator_request("session.handoff_cancel", serde_json::json!({"uid": "ts-ho-a"})),
+        );
+        assert!(cancelled.ok, "{cancelled:?}");
+        let cancelled = cancelled.result.unwrap();
+        assert_eq!(cancelled["cancelled"], true);
+        assert_eq!(cancelled["handoff"]["phase"], "cancelled");
+        assert!(cancelled["handoff"]["deferred"].is_null());
+        let other_status = dispatch_session_handoff(
+            &state,
+            &operator_request("session.handoff", serde_json::json!({"uid": "ts-ho-b", "status": true})),
+        );
+        assert_eq!(other_status.result.unwrap()["handoff"]["phase"], "queued");
+        let status = dispatch_session_handoff(
+            &state,
+            &operator_request("session.handoff", serde_json::json!({"uid": "ts-ho-a", "status": true})),
+        );
+        assert_eq!(status.result.unwrap()["handoff"]["phase"], "cancelled");
+        let missing = dispatch_session_handoff_cancel(
+            &state,
+            &operator_request("session.handoff_cancel", serde_json::json!({"uid": "ts-ho-a"})),
+        );
+        assert_eq!(missing.error.unwrap().code, ErrorCode::NotFound);
         for s in state.lock().unwrap().sessions.values_mut() {
             let _ = s.kill();
         }
+        crate::handoff::test_drop_queued("ts-ho-b");
     }
 
     #[test]
