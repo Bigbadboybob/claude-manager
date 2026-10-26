@@ -3070,11 +3070,14 @@ pub fn resolve_authorized_session(
     // denies, release the registry lock before asking the planning API for
     // the same manager-chain read authority used by session handoff.  An API
     // failure falls back to this denial, so the old scope remains fail-closed.
-    let initial_decision = if let Some(cuid) = caller_uid {
+    let (initial_decision, initial_caller_identity) = if let Some(cuid) = caller_uid {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-        resolve_read_decision(&state, cuid, &p.session_uid)
+        (
+            resolve_read_decision(&state, cuid, &p.session_uid),
+            crate::items::org::caller_identity(&state, cuid),
+        )
     } else {
-        crate::control::auth::AuthDecision::Allow
+        (crate::control::auth::AuthDecision::Allow, None)
     };
     let org_identity = if !initial_decision.is_allow() {
         caller_uid.and_then(|cuid| {
@@ -3103,6 +3106,13 @@ pub fn resolve_authorized_session(
     }
     let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(cuid) = caller_uid {
+        let current_caller_identity = crate::items::org::caller_identity(&state, cuid);
+        if current_caller_identity != initial_caller_identity {
+            return Err((
+                ErrorCode::Unauthorized,
+                "caller session changed during read authorization; retry".into(),
+            ));
+        }
         let current_decision = resolve_read_decision(&state, cuid, &p.session_uid);
         let attribution_changed = org_identity.as_ref().is_some_and(|granted| {
             crate::items::org::target_identity(&state, &p.session_uid).as_ref() != Some(granted)

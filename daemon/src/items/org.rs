@@ -126,6 +126,34 @@ pub(crate) struct ReadTargetIdentity {
     pub workspace_id: String,
     pub generation: u64,
     pub transcript_path: Option<String>,
+    pub process_identity: u64,
+}
+
+/// Identity of the session asking to read.  The org grant is made for this
+/// exact caller incarnation; a reused UID must not inherit it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReadCallerIdentity {
+    pub member_id: Option<String>,
+    pub acting_as: Option<String>,
+    pub task_id: Option<String>,
+    pub workspace_id: String,
+    pub generation: u64,
+    pub global_perms: bool,
+    pub process_identity: u64,
+}
+
+pub(crate) fn caller_identity(state: &DaemonState, caller_uid: &str) -> Option<ReadCallerIdentity> {
+    let session = state.sessions.get(caller_uid)?;
+    let membership = crate::assistants::of_session(session);
+    Some(ReadCallerIdentity {
+        member_id: membership.as_ref().map(|m| m.member_id.clone()),
+        acting_as: membership.map(|m| m.acting_as.to_string()),
+        task_id: session.task_id.clone(),
+        workspace_id: session.workspace_id.clone(),
+        generation: session.generation,
+        global_perms: session.global_perms,
+        process_identity: session.pid as u64,
+    })
 }
 
 /// Snapshot the current org/task/transcript identity for one target.  The
@@ -140,6 +168,7 @@ pub(crate) fn target_identity(state: &DaemonState, target_uid: &str) -> Option<R
             workspace_id: session.workspace_id.clone(),
             generation: session.generation,
             transcript_path: session.transcript_path.clone(),
+            process_identity: session.pid as u64,
         });
     }
     let tomb = state.exited_tombstone(target_uid)?;
@@ -150,6 +179,7 @@ pub(crate) fn target_identity(state: &DaemonState, target_uid: &str) -> Option<R
         workspace_id: tomb.workspace_id.clone(),
         generation: tomb.generation,
         transcript_path: tomb.transcript_path.clone(),
+        process_identity: tomb.incarnation.unwrap_or_default(),
     })
 }
 
