@@ -417,6 +417,12 @@ impl App {
         if self.messages.mode != "dm_picker" {
             return false;
         }
+        if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd')) {
+            let step = (self.messages.timeline_size.1 as usize / 2).max(1);
+            let count = self.messages.picker_people().len();
+            self.messages.picker_selected = if key.code == KeyCode::Char('u') { self.messages.picker_selected.saturating_sub(step) } else { self.messages.picker_selected.saturating_add(step).min(count.saturating_sub(1)) };
+            return true;
+        }
         match key.code {
             KeyCode::Esc => self.messages.mode.clear(),
             KeyCode::Down => {

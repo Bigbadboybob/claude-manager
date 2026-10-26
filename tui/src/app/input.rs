@@ -1285,6 +1285,18 @@ pub(crate) fn handle_new_terminal_session(
     let CrosstermEvent::Key(key) = event else {
         return InputOutcome::Consumed;
     };
+    if *state.active_field == 0 && key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd')) {
+        let types = ["claude", "codex", "bash"];
+        let current = types.iter().position(|t| *t == state.session_type.as_str()).unwrap_or(0);
+        let next = if key.code == KeyCode::Char('u') { current.saturating_sub(1) } else { (current + 1).min(types.len() - 1) };
+        if next != current {
+            *state.session_type = types[next].to_owned();
+            *state.seed_from = None;
+            *state.resume_from = None;
+            state.model.retarget(state.session_type);
+        }
+        return InputOutcome::Consumed;
+    }
     // Four fields: 0 = session type, 1 = seed-from, 2 = resume-from,
     // 3 = model. Tab/BackTab cycle between them; j/k cycle the session
     // type when field 0 is active (within-field). j/k on the picker
@@ -4006,6 +4018,48 @@ impl App {
         // absorbed by the modal.
         if !matches!(event, CrosstermEvent::Key(_)) {
             return true;
+        }
+        // List-style modals use the same bounded half-page chords as the sidebar.
+        // Text-entry modes retain their own input handling.
+        if let CrosstermEvent::Key(key) = event {
+            if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd')) {
+                let down = key.code == KeyCode::Char('d');
+                let term_rows = self.last_term_size.1 as usize;
+                let advance = |selected: &mut usize, count: usize, visible: usize| {
+                    let step = (visible / 2).max(1);
+                    *selected = if down { selected.saturating_add(step).min(count.saturating_sub(1)) } else { selected.saturating_sub(step) };
+                };
+                let handled = match &mut self.input_mode {
+                    InputMode::TranscriptPicker { candidates, selected, .. } => {
+                        advance(selected, candidates.len(), term_rows.saturating_sub(8).min(candidates.len())); true
+                    }
+                    InputMode::WorkflowPicker { names, selected, .. } => {
+                        advance(selected, names.len(), term_rows.saturating_sub(7).min(names.len())); true
+                    }
+                    InputMode::SnapshotCatalog { snapshots, selected, mode: CatalogMode::Browse, .. } => {
+                        advance(selected, snapshots.len(), term_rows.min(28).saturating_sub(5).min(snapshots.len())); true
+                    }
+                    InputMode::WorkflowLaunchConfirm { slots, active_slot, .. } if *active_slot < slots.len() => {
+                        advance(active_slot, slots.len(), term_rows.saturating_sub(8).min(slots.len())); true
+                    }
+                    InputMode::TaskPeek { scroll, max_scroll, .. } => {
+                        let height = (term_rows * 6 / 10).max(8).min(term_rows.saturating_sub(2).max(1));
+                        let step = (height.saturating_sub(2) / 2).max(1) as u16;
+                        *scroll = if down { scroll.saturating_add(step).min(*max_scroll) } else { scroll.saturating_sub(step) }; true
+                    }
+                    InputMode::PastWorkspacePicker { candidates, query, selected } => {
+                        let count = past_workspace_match_indices(query, candidates).len();
+                        advance(selected, count, term_rows.saturating_sub(8).min(count)); true
+                    }
+                    InputMode::SessionPalette { candidates, query, selected } => {
+                        let displays: Vec<&str> = candidates.iter().map(|c| c.display.as_str()).collect();
+                        let count = palette_match_indices(query, &displays).len().min(PALETTE_MAX_RESULTS);
+                        advance(selected, count, term_rows.saturating_sub(8).min(count)); true
+                    }
+                    _ => false,
+                };
+                if handled { return true; }
+            }
         }
         let urls = sorted_repo_urls(&self.config.repos);
         // Configured hosts (local + any hosts.toml entries) in config order,

@@ -367,7 +367,15 @@ impl App {
 
     /// The close plan's keys; Esc leaves it (nothing applied).
     pub(super) fn board_plan_event(&mut self, key: &crossterm::event::KeyEvent) {
+        let step = (self.board.list_rows.get() / 2).max(1);
         let Some(plan) = self.board.plan.as_mut() else { return };
+        if key.modifiers == KeyModifiers::ALT {
+            match key.code {
+                KeyCode::Char('u') => { plan.cursor = plan.cursor.saturating_sub(step); return; }
+                KeyCode::Char('d') => { plan.cursor = plan.cursor.saturating_add(step).min(plan.rows.len().saturating_sub(1)); return; }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.board.plan = None;
@@ -396,6 +404,7 @@ impl App {
 
     pub(super) fn draw_close_plan(&self, frame: &mut Frame, area: Rect) {
         let Some(plan) = &self.board.plan else { return };
+        self.board.list_rows.set(area.height.saturating_sub(4) as usize);
         let width = area.width as usize;
         let mut lines = vec![
             Line::styled(format!("Close epic {} as {}", plan.name, plan.outcome), Style::default().fg(theme::HEADER).add_modifier(Modifier::BOLD)),

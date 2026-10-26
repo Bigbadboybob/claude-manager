@@ -1249,6 +1249,11 @@ impl App {
         let pending = self.orgchart.pending.take();
         let focus = self.orgchart_focus(&model);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd')) {
+            let half = (self.orgchart.viewport.get().1 as i32 / 2).max(1);
+            self.orgchart_pan(0, if key.code == KeyCode::Char('u') { -half } else { half });
+            return true;
+        }
         let (step_x, step_y) = match self.orgchart.zoom.detail() {
             Detail::Full => (16, 6),
             Detail::Compact => (12, 4),

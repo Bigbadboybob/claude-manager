@@ -72,6 +72,7 @@ pub(super) struct Board {
     version: Option<i64>,
     cursor: usize,
     detail: bool,
+    list_rows: std::cell::Cell<usize>,
     prompt: Option<(PromptKind, String)>,
     menu: Option<Menu>,
     rx: Option<mpsc::Receiver<Reply>>,
@@ -426,6 +427,13 @@ impl App {
             return true;
         }
         self.needs_redraw = true;
+        // Prompts and one-key menus must never treat a paging chord as an
+        // unmodified letter (A-d could otherwise mark an item done).
+        if key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char('u' | 'd' | 'U' | 'D'))
+            && (self.board.prompt.is_some() || self.board.menu.is_some() || self.board.group_menu)
+        {
+            return true;
+        }
         if let Some((kind, mut text)) = self.board.prompt.take() {
             match key.code {
                 KeyCode::Esc => self.board.pending_block = None,
@@ -518,6 +526,16 @@ impl App {
         }
         let count = self.board.row_count();
         let has_item = self.board.selected_n().is_some();
+        let half_page = key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd'));
+        if half_page {
+            let step = (self.board.list_rows.get() / 2).max(1);
+            self.board.cursor = if key.code == KeyCode::Char('u') {
+                self.board.cursor.saturating_sub(step)
+            } else {
+                self.board.cursor.saturating_add(step).min(count.saturating_sub(1))
+            };
+            return true;
+        }
         match key.code {
             _ if alt_b => self.board.visible = false,
             KeyCode::Esc => self.board.visible = false,
@@ -724,17 +742,24 @@ impl App {
         }
         // Layout: list, detail pane for the selected row, footer.
         let footer_h = 2u16;
-        // The compact pane grows by the selected row's Blocked by / Blocks
-        // lines, up to half the overlay.
-        let edge_lines = b.selected().map_or(0, |item| detail_edge_lines(item, &index) + gate_detail_lines(item)) as u16;
-        let detail_h: u16 = if b.selected().is_none() {
-            0
-        } else if b.detail {
-            (inner.height / 2).max(6 + edge_lines)
-        } else {
-            (6 + edge_lines).min((inner.height / 2).max(6))
+        // Reserve enough for the largest compact detail across the board, even
+        // on group rows. Only board data, terminal size or Enter can resize it.
+        let mut reverse_counts: HashMap<i64, usize> = HashMap::new();
+        for item in items.iter().chain(closed.iter()).filter(|i| !matches!(i["status"].as_str(), Some("done" | "dropped"))) {
+            for n in numbers(&item["blocked_by"]) { *reverse_counts.entry(n).or_default() += 1; }
         }
-        .min(inner.height.saturating_sub(footer_h + 3));
+        let edges = items.iter().chain(closed.iter()).map(|item| {
+            let by = numbers(&item["blocked_by"]).len() + usize::from(item["blocked_on"].as_str().is_some_and(|s| !s.is_empty()));
+            let blocks = item["blocks"].as_array().map(Vec::len)
+                .unwrap_or_else(|| item["n"].as_i64().and_then(|n| reverse_counts.get(&n).copied()).unwrap_or(0));
+            by + usize::from(by > 0) + blocks + usize::from(blocks > 0) + gate_detail_lines(item)
+        }).max().unwrap_or(0).min((u16::MAX - 6) as usize) as u16;
+        let detail_h: u16 = if b.detail {
+            (inner.height / 2).max(6 + edges)
+        } else {
+            (6 + edges).min((inner.height / 2).max(6))
+        };
+        let detail_h = detail_h.min(inner.height.saturating_sub(footer_h + 3));
         let list_h = inner.height.saturating_sub(footer_h + detail_h);
         if b.plan.is_some() {
             let body = Rect { height: inner.height.saturating_sub(footer_h), ..inner };
@@ -743,10 +768,11 @@ impl App {
             frame.render_widget(Paragraph::new(vec![self.board_status_line(), board_help(width)]), footer);
             return;
         }
+        b.list_rows.set(list_h as usize);
         let list = Rect { height: list_h, ..inner };
         let scroll = (cursor_line as u16).saturating_sub(list_h.saturating_sub(3));
         frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), list);
-        if detail_h > 0 {
+        if detail_h > 0 && b.selected().is_some() {
             let area = Rect { y: inner.y + list_h, height: detail_h, ..inner };
             self.draw_board_detail(frame, area, &index, now);
         }
@@ -1378,13 +1404,6 @@ fn gate_detail_lines(item: &Value) -> usize {
         .sum()
 }
 
-/// Lines the detail pane needs for its Blocked by / Blocks sections.
-fn detail_edge_lines(item: &Value, index: &ItemIndex) -> usize {
-    let by = numbers(&item["blocked_by"]).len() + usize::from(item["blocked_on"].as_str().is_some_and(|s| !s.is_empty()));
-    let blocks = blocks_of(item, index).len();
-    by + usize::from(by > 0) + blocks + usize::from(blocks > 0)
-}
-
 pub(super) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1555,8 +1574,8 @@ fn board_title(b: &Board) -> Vec<Span<'static>> {
 }
 
 fn board_help(width: usize) -> Line<'static> {
-    let full = "j/k move \u{00b7} Enter more detail \u{00b7} a add \u{00b7} s status \u{00b7} n note \u{00b7} r reassign \u{00b7} x resolve \u{00b7} d drop \u{00b7} o reopen \u{00b7} f free \u{00b7} Tab board \u{00b7} g refresh (on a group: edit) \u{00b7} Space fold \u{00b7} Esc close";
-    let short = "j/k \u{00b7} Enter \u{00b7} a s n r x d o \u{00b7} f \u{00b7} Tab \u{00b7} g \u{00b7} Esc";
+    let full = "j/k move \u{00b7} A-u/d half page \u{00b7} Enter more detail \u{00b7} a add \u{00b7} s status \u{00b7} n note \u{00b7} r reassign \u{00b7} x resolve \u{00b7} d drop \u{00b7} o reopen \u{00b7} f free \u{00b7} Tab board \u{00b7} g refresh (on a group: edit) \u{00b7} Space fold \u{00b7} Esc close";
+    let short = "j/k A-u/d \u{00b7} Enter \u{00b7} a s n r x d o \u{00b7} f \u{00b7} Tab \u{00b7} g \u{00b7} Esc";
     Line::styled(if full.chars().count() <= width { full } else { short }, Style::default().fg(theme::DIM))
 }
 
@@ -2000,6 +2019,37 @@ mod tests {
         let narrow = Columns::with_gate(98, true);
         assert!(2 + 5 + narrow.badge + narrow.gate + 2 + narrow.title + 1 + narrow.chips + narrow.note <= 98);
         assert_eq!(Columns::for_width(98).gate, 0, "no receipts, no gate column");
+    }
+
+    #[test]
+    fn board_half_page_and_detail_height_are_stable_across_rows() {
+        use crossterm::event::{Event, KeyEvent, KeyModifiers};
+        let mut app = test_app();
+        blockers(&mut app);
+        app.board.visible = true;
+        app.board.data["groups"] = json!([{ "id": "g", "name": "Group", "kind": "heading" }]);
+        let rows = app.board.display_rows();
+        let group = rows.iter().position(|r| matches!(r, DRow::Group { .. })).expect("group row");
+        let item = rows.iter().position(|r| matches!(r, DRow::Item { .. })).unwrap();
+        app.board.cursor = group;
+        screen_at(&mut app, 120, 30);
+        let group_height = app.board.list_rows.get();
+        app.board.cursor = item;
+        screen_at(&mut app, 120, 30);
+        assert_eq!(app.board.list_rows.get(), group_height);
+        app.board.cursor = 0;
+        let alt = |c| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT));
+        app.handle_event(&alt('d'));
+        assert_eq!(app.board.cursor, (group_height / 2).max(1).min(rows.len() - 1));
+        assert!(app.board.prompt.is_none(), "A-d must not trigger drop");
+        app.board.menu = Some(Menu::Status);
+        app.handle_event(&alt('d'));
+        assert_eq!(app.board.menu, Some(Menu::Status), "A-d must not select done in a menu");
+        app.board.menu = None;
+        app.handle_event(&alt('u'));
+        assert_eq!(app.board.cursor, 0);
+        app.handle_event(&alt('u'));
+        assert_eq!(app.board.cursor, 0);
     }
 
     #[test]

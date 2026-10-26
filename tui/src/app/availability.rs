@@ -290,6 +290,11 @@ impl App {
             }
             return true;
         }
+        if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd')) {
+            let step = (CHOICES.len() / 2).max(1);
+            dialog.cursor = if key.code == KeyCode::Char('u') { dialog.cursor.saturating_sub(step) } else { dialog.cursor.saturating_add(step).min(CHOICES.len() - 1) };
+            return true;
+        }
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => dialog.cursor = dialog.cursor.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => dialog.cursor = (dialog.cursor + 1).min(CHOICES.len() - 1),

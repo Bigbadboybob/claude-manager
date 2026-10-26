@@ -13,6 +13,8 @@ pub(super) struct Menu {
     submitted: bool,
     closed: bool,
     scroll: usize,
+    scroll_page: std::cell::Cell<usize>,
+    scroll_max: std::cell::Cell<usize>,
     updates: mpsc::Receiver<(HostId, Result<Value, String>)>,
     commands: HashMap<HostId, mpsc::Sender<()>>,
     jobs: HashMap<HostId, Value>,
@@ -87,6 +89,8 @@ impl Menu {
             submitted: false,
             closed: false,
             scroll: 0,
+            scroll_page: std::cell::Cell::new(1),
+            scroll_max: std::cell::Cell::new(0),
             updates,
             commands,
             jobs: HashMap::new(),
@@ -136,6 +140,11 @@ impl Menu {
     }
 
     pub fn key(&mut self, key: crossterm::event::KeyEvent) -> InputOutcome {
+        if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd')) {
+            let step = (self.scroll_page.get() / 2).max(1);
+            self.scroll = if key.code == KeyCode::Char('u') { self.scroll.saturating_sub(step) } else { self.scroll.saturating_add(step).min(self.scroll_max.get()) };
+            return InputOutcome::Consumed;
+        }
         match key.code {
             KeyCode::Esc => return InputOutcome::Cancel,
             KeyCode::Tab | KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
@@ -360,7 +369,9 @@ impl Menu {
         // hide their retention reason or make the final rows unreachable.
         let detail = wrap_details(detail, usize::from(inner.width));
         let available = usize::from(inner.height).saturating_sub(lines.len());
-        let start = self.scroll.min(detail.len().saturating_sub(available));
+        self.scroll_page.set(available);
+        self.scroll_max.set(detail.len().saturating_sub(available));
+        let start = self.scroll.min(self.scroll_max.get());
         lines.extend(
             detail
                 .into_iter()
@@ -575,6 +586,8 @@ mod tests {
                 submitted: false,
                 closed: false,
                 scroll: 0,
+                scroll_page: std::cell::Cell::new(1),
+                scroll_max: std::cell::Cell::new(0),
                 updates,
                 commands,
                 jobs: HashMap::new(),

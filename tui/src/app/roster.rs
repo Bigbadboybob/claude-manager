@@ -514,6 +514,15 @@ impl App {
             return true;
         }
         let rows = self.roster_rows();
+        if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd')) {
+            let step = (self.last_term_size.1.saturating_sub(3) as usize / 2).max(1);
+            self.roster.cursor = if key.code == KeyCode::Char('u') {
+                self.roster.cursor.saturating_sub(step)
+            } else {
+                self.roster.cursor.saturating_add(step).min(rows.len().saturating_sub(1))
+            };
+            return true;
+        }
         let row = rows.get(self.roster.cursor).cloned();
         let editable = row.clone().filter(|r| !matches!(r, Row::Group(_)));
         let prompt = |app: &mut App, field: Field| {
