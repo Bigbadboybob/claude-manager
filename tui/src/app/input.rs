@@ -7267,6 +7267,38 @@ mod input_handler_tests {
         }
     }
 
+    #[test]
+    fn session_settings_zero_burst_uses_global_default() {
+        let (mut name, mut idle, mut burst, mut hidden, mut notify, mut active) =
+            session_settings_state(0);
+        burst = String::new();
+        let mut gp = false;
+        let mut color: Option<String> = None;
+        let outcome = handle_session_settings(
+            SessionSettingsMut {
+                is_shell: false,
+                ws_index: 0,
+                session_index: 0,
+                name: &mut name,
+                idle_timeout: &mut idle,
+                burst_threshold: &mut burst,
+                hidden: &mut hidden,
+                notify_on_idle: &mut notify,
+                global_perms: &mut gp,
+                color: &mut color,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        match outcome {
+            InputOutcome::Submit(SubmitAction::SaveSessionSettings { burst_threshold, .. }) => {
+                assert_eq!(burst_threshold, 3);
+            }
+            other => panic!("expected SaveSessionSettings, got {:?}", other),
+        }
+    }
+
     // ── WorkspaceSettings ─────────────────────────────────────────
 
     #[test]

@@ -104,7 +104,7 @@ mod dirs {
 /// when sizing the PTY).
 pub const SIDEBAR_WIDTH: u16 = 36;
 /// Minimum Wakeups within the window to consider a session actively working.
-const WAKEUP_BURST_THRESHOLD: usize = 5;
+const WAKEUP_BURST_THRESHOLD: usize = 3;
 
 // ── MRU quick-switch (A-;) ──────────────────────────────────────
 
