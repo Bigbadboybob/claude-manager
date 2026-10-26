@@ -112,6 +112,21 @@ class AuthorityBody(_Strict):
     session: str | None = None
 
 
+class AuthorityTarget(_Strict):
+    member: Short
+    # When supplied, the API also verifies that this pid belongs to the
+    # referenced member.  Read callers use this for one target; list reads
+    # may omit it and submit one target per distinct member.
+    session: Short | None = None
+
+
+class AuthorityBatchBody(_Strict):
+    actor: Actor
+    targets: list[AuthorityTarget] = Field(min_length=1, max_length=2000)
+    # A member may read its own main's assistants/workers as well as reports.
+    self_ok: bool = True
+
+
 class ReinstateBody(_Strict):
     actor: Actor
     reason: Annotated[str, Field(min_length=1, max_length=500)] | None = None
@@ -208,6 +223,20 @@ async def member_authority(ref: Ref, body: AuthorityBody, request: Request):
     also the member's own main session). 403 `not_member`/`not_manager`."""
     return await _call(org_db.authority(
         _pool(request), body.actor.model_dump(), ref, self_ok=body.self_ok, session=body.session))
+
+
+@router.post("/members/authority-batch")
+async def member_authority_batch(body: AuthorityBatchBody, request: Request):
+    """Read-only manager-chain checks for a session listing.
+
+    This is the batched form of ``POST /members/{ref}/authority``.  It keeps
+    ``list_sessions`` to one planning-API request even when a lead has many
+    report sessions; denied or stale targets are returned simply as absent
+    from ``allowed`` so one unrelated member cannot poison the whole listing.
+    """
+    return await _call(org_db.authority_batch(
+        _pool(request), body.actor.model_dump(),
+        [target.model_dump() for target in body.targets], self_ok=body.self_ok))
 
 
 @router.post("/members/{ref:path}/reinstate")

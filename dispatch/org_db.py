@@ -1220,6 +1220,47 @@ async def authority(pool, actor: dict, ref: str, *, self_ok: bool = False,
         return {"allowed": True, "member_id": member_id, "acting_member": acting}
 
 
+async def authority_batch(pool, actor: dict, targets: list[dict], *, self_ok: bool = True) -> dict:
+    """Return the member ids in ``targets`` that ``actor`` may read.
+
+    This is the one-request read companion to :func:`authority`.  Each target
+    is checked with the same ``_require_chain`` manager rule; a target that is
+    unknown, stale or outside the chain is omitted while the rest of the
+    batch remains useful.  ``session`` is optional for list callers and, when
+    present, gets the same member-session check as the single-target route.
+    """
+    allowed: list[dict] = []
+    seen: set[tuple[str, str | None]] = set()
+    async with pool.acquire() as conn:
+        for target in targets:
+            if not isinstance(target, dict):
+                continue
+            ref = target.get("member")
+            session = target.get("session")
+            key = (str(ref), session if isinstance(session, str) else None)
+            if key in seen:
+                continue
+            seen.add(key)
+            member_id = await _resolve_member_id(conn, ref)
+            if not member_id:
+                continue
+            if session is not None and not await conn.fetchval(
+                    """SELECT 1 FROM incarnations
+                        WHERE pid = $1 AND member_id = $2 AND role = 'main' AND ended_at IS NULL
+                       UNION ALL
+                       SELECT 1 FROM org_session_facts
+                        WHERE pid = $1 AND member_id = $2 AND acting_as IN ('assistant', 'worker')
+                       LIMIT 1""", session, member_id):
+                continue
+            try:
+                acting = await _require_chain(conn, actor, member_id, "control", self_ok=self_ok)
+            except OrgError:
+                continue
+            allowed.append({"member": ref, "member_id": member_id,
+                            "session": session, "acting_member": acting})
+    return {"allowed": allowed}
+
+
 async def _require_destination(conn, actor_member: str | None, manager_id: str, what: str) -> None:
     """A non-Owner may place a member only under itself or a member of its
     own reporting subtree; anywhere else (another lead's branch, Owner) is

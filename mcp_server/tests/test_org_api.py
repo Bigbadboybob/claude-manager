@@ -619,6 +619,36 @@ class OrgApiDb(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.status_code, 403, r.text)
         self.assertIn("not_member_session", r.text)
 
+    async def test_authority_batch_returns_only_manager_chain_members(self):
+        lead, report, other = uid_at(16), uid_at(17), uid_at(18)
+        await self.beat(D1, [{"uid": u, "engine": "codex"} for u in (lead, report, other)])
+
+        async def adopt(uid, handle, manager=None):
+            body = {"actor": OWNER, "pid": pid(uid), "handle": handle,
+                    "title": handle.title(), "request_id": f"batch-{handle}"}
+            if manager:
+                body["manager"] = manager
+            r = await self.http.post("/org/adopt", json=body)
+            self.assertEqual(r.status_code, 200, r.text)
+            return r.json()["member"]["id"]
+
+        lead_id = await adopt(lead, "batch-lead")
+        report_id = await adopt(report, "batch-report", manager=lead_id)
+        other_id = await adopt(other, "batch-other")
+        r = await self.http.post("/org/members/authority-batch", json={
+            "actor": {"pid": pid(lead)},
+            "targets": [
+                {"member": report_id, "session": pid(report)},
+                {"member": other_id, "session": pid(other)},
+                # The report member is valid, but this pid is not its session.
+                {"member": report_id, "session": pid(other)},
+            ],
+        })
+        self.assertEqual(r.status_code, 200, r.text)
+        allowed = r.json()["allowed"]
+        self.assertEqual([row["member_id"] for row in allowed], [report_id])
+        self.assertEqual(allowed[0]["session"], pid(report))
+
     async def test_a_beat_without_capabilities_records_none(self):
         # A rollback to a brain from before S0b sends no `capabilities`: the
         # host must stop counting as capable (marks, the lifecycle gate).
