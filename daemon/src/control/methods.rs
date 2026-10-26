@@ -7599,6 +7599,11 @@ struct McpStartSessionParams {
     /// The child's reasoning effort, resolved like `model`.
     #[serde(default)]
     effort: Option<String>,
+    /// #28: the chat name the creator gives the child, claimed right after
+    /// the spawn and BEFORE its first prompt is delivered, so the child
+    /// cannot race a first claim of its own (reported as `name_setup`).
+    #[serde(default)]
+    name: Option<String>,
 }
 
 /// Kitty keyboard Enter (CSI 13 u). codex and claude-code both enable the
@@ -10063,6 +10068,13 @@ fn mcp_start_session_inner(
 
     let start_result = start_session(state_arc, &Value::Object(full_params))?;
 
+    // #28: the creator's name for the child lands before the child has a
+    // prompt to act on, so its own first chat_send can never claim the same
+    // first revision (msgfix: two first claims conflict at the hub).
+    let name_setup = p.name.as_deref().map(str::trim).filter(|n| !n.is_empty())
+        .filter(|_| p.type_ != "bash")
+        .map(|name| crate::spawn_setup::claim_name(state_arc, &session_uid, name));
+
     // Delivery stays asynchronous so the control RPC remains short. The MCP
     // tool polls the per-launch receipt before claiming the prompt started.
     let mut prompt_ticket = None;
@@ -10219,6 +10231,9 @@ fn mcp_start_session_inner(
     // (`session_uid` + optional `cgroup_path`) is untouched — this
     // decorates only the value `mcp_start_session` hands back.
     let mut response = start_result;
+    if let Some(named) = name_setup {
+        response["name_setup"] = named;
+    }
     if let Some(obj) = response.as_object_mut() {
         obj.insert("kind".into(), json!(if p.type_ == "bash" { "shell" } else { "agent" }));
         if p.type_ != "bash" {
@@ -29504,6 +29519,39 @@ while True:
     /// ux-5c corollary asserted here: a caller-supplied prompt reports
     /// `prompt_source: "caller"` and costs NO planning-API round trip
     /// (the stub records zero requests).
+    /// #28 (msgfix's race): the creator's name for the child is claimed
+    /// inside the spawn, before any prompt is delivered, and reported as
+    /// `name_setup`; a shell is never named.
+    #[test]
+    fn mcp_start_session_claims_the_creators_name_before_the_prompt() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let root = tempfile::tempdir().unwrap();
+            state.lock().unwrap().messaging_root = root.path().into();
+            crate::messaging::startup::open_for_test(&state).unwrap();
+            seed_mcp_spawn_fixture(&state, "ts-caller", Some("task-1"));
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            let resp = mcp_start_session(
+                &state,
+                &json!({ "type": "codex", "label": "lead", "name": "Lead-A" }),
+                Some("ts-caller"),
+            )
+            .expect("spawn ok");
+            let shell = mcp_start_session(
+                &state,
+                &json!({ "type": "bash", "label": "sh", "name": "Shell-A" }),
+                Some("ts-caller"),
+            )
+            .expect("spawn ok");
+            set_spawn_program_override_for_test(None);
+            let uid = resp["session_uid"].as_str().unwrap().to_string();
+            assert_eq!(resp["name_setup"], json!("ok"), "{resp}");
+            assert_eq!(crate::messaging::rpc::current_name(&state, &uid).map(|(n, _)| n).as_deref(), Some("Lead-A"));
+            assert!(shell.get("name_setup").is_none(), "a shell has no chat name");
+            kill_all_sessions(&state);
+        });
+    }
+
     #[test]
     fn mcp_start_session_returns_worktree_task_and_caller_prompt_source() {
         let _tmp = with_temp_home(|| {

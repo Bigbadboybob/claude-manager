@@ -203,3 +203,36 @@ class StartSessionSetup(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out, {"session_uid": "child-1", "setup": {"board": "ok"}})
         self.assertEqual(call.call_args.args, ("session.setup", {"session_uid": "child-1", "board": "team",
                                                                  "items": [2]}))
+
+
+class NameBeforePrompt(unittest.IsolatedAsyncioTestCase):
+    """msgfix's race: the name rides the spawn call itself, so the daemon claims
+    it before the first prompt; setup then runs the remaining steps."""
+
+    async def test_the_name_goes_with_the_spawn_and_comes_back_in_setup(self):
+        from pathlib import Path as P
+        from unittest.mock import patch
+
+        from mcp_server import control_client, server
+
+        calls = []
+
+        def call(method, params, **_):
+            calls.append((method, dict(params)))
+            if method == "session.setup":
+                return {"setup": {"board": "ok"}}
+            return {"session_uid": "child-1", "prompt_source": "caller", "name_setup": "ok"}
+
+        with (
+            patch.object(control_client, "resolve_socket_route",
+                         return_value=control_client.SocketRoute(path=P("/d.sock"), chose_daemon=True)),
+            patch.object(control_client, "call", side_effect=call),
+            patch.object(server.async_monitor, "register_monitor", return_value={"monitor_id": "m"}),
+        ):
+            result = await server.start_session("claude-code", "lead", prompt="go", name="Lead-A",
+                                                 board="team")
+        self.assertEqual(calls[0][0], "mcp_start_session")
+        self.assertEqual(calls[0][1]["name"], "Lead-A")
+        self.assertEqual(calls[1], ("session.setup", {"session_uid": "child-1", "board": "team"}))
+        self.assertEqual(result["setup"], {"name": "ok", "board": "ok"})
+        self.assertNotIn("name_setup", result)

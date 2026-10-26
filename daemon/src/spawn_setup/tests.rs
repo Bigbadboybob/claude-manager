@@ -93,9 +93,14 @@ fn every_step_runs_with_the_creators_authority_and_a_refused_one_stops_nothing()
     assert_eq!(poc.2["member"].as_str(), Some(pid.as_str()), "the PoC is named by its session");
     drop(seen);
 
-    // Setting it up again is idempotent where it can be.
+    // Setting it up again is idempotent where it can be, and never renames a
+    // session that has a name (its own claim may still be on its way to the
+    // hub; msgfix).
     let again = setup(&state, Caller::session("ss-creator"), json!({"session_uid": "ss-child", "name": "Lead-Alpha"}));
     assert_eq!(again.result.unwrap()["setup"]["name"], "ok (already named)");
+    let other = setup(&state, Caller::session("ss-creator"), json!({"session_uid": "ss-child", "name": "Other"}));
+    assert!(other.result.unwrap()["setup"]["name"].as_str().unwrap().starts_with("skipped: it is already named Lead-Alpha"));
+    assert_eq!(crate::messaging::rpc::current_name(&state, "ss-child").map(|(n, _)| n).as_deref(), Some("Lead-Alpha"));
     kill_all(&state);
 }
 

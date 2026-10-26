@@ -13,7 +13,7 @@
 //! | step | how | refused when |
 //! |---|---|---|
 //! | `hire` | `org.promote` as the creator (#27) | the creator may not promote it, or the daemon has no promote yet |
-//! | `name` | `session.set_name` as the new session, before its first message | the name is taken / the hub predates first claims |
+//! | `name` | `session.set_name` as the new session: inside `mcp_start_session`, before its first prompt is delivered | skipped when it already has a name; failed when the hub predates first claims |
 //! | `channels` | join as the new session (an open channel); else `add_member` as the creator | the creator is no admin of a closed channel |
 //! | `board` (+ `group` / `epic`) | `board.join` as the creator | the creator may not edit the board |
 //! | `items` | `item.set(holder=<new session>)` as the creator | the board's item rules refuse the creator |
@@ -197,18 +197,24 @@ fn hire_step(state: &Arc<Mutex<DaemonState>>, creator: &Caller, child: &str, hir
     }
 }
 
+/// The name step's result for `start_session`, which claims the name
+/// before the child's prompt is delivered (see `mcp_start_session`).
+pub fn claim_name(state: &Arc<Mutex<DaemonState>>, child: &str, name: &str) -> Value {
+    step(name_step(state, child, name))
+}
+
 /// Claim the new session's chat name as the session itself (a first claim:
-/// no message is sent). An already-named session is renamed at its current
-/// revision; the same name is a no-op.
+/// no message is sent). A session that already has a name keeps it: it may
+/// have claimed it itself, and a claim still in flight to the hub would
+/// conflict with ours (msgfix); it renames itself with `chat_rename`.
 fn name_step(state: &Arc<Mutex<DaemonState>>, child: &str, name: &str) -> RpcResult {
-    let current = crate::messaging::rpc::current_name(state, child);
-    let mut params = json!({"name": name, "request_id": format!("setup-name-{child}-{name}")});
-    if let Some((now, revision)) = current {
+    if let Some((now, _)) = crate::messaging::rpc::current_name(state, child) {
         if now.eq_ignore_ascii_case(name) {
             return Ok(json!("ok (already named)"));
         }
-        params["expected_name_revision"] = json!(revision);
+        return Ok(json!(format!("skipped: it is already named {now} (it renames itself with chat_rename)")));
     }
+    let params = json!({"name": name, "request_id": format!("setup-name-{child}-{name}")});
     call(state, &Caller::session(child), "session.set_name", params).map(|v| {
         match v["event"]["data"]["identity"]["name"].as_str() {
             Some(got) if !got.eq_ignore_ascii_case(name) => json!(format!("ok (named {got}: {name} was taken)")),

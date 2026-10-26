@@ -2629,6 +2629,7 @@ async def start_session(
         params["model"] = model.strip()
     if effort and effort.strip():
         params["effort"] = effort.strip()
+
     # Sub-2c review-2: single-decision binding (restoring the
     # round-8 #2 fix). `resolve_socket_route()` is called ONCE
     # to get both the chosen path AND the route-chose-daemon
@@ -2644,6 +2645,10 @@ async def start_session(
     # method shape to the wrong server.
     route = control_client.resolve_socket_route()
     method = "mcp_start_session" if route.chose_daemon else "start_session"
+    if name and name.strip() and route.chose_daemon:
+        # Claimed by the daemon right after the spawn and before the first
+        # prompt is delivered, so the child cannot race its own first claim.
+        params["name"] = name.strip()
     spawn = await asyncio.to_thread(
         control_client.call, method, params, socket_path=route.path
     )
@@ -2652,7 +2657,14 @@ async def start_session(
         "items": items, "poc_of": poc_of, "hire": hire,
     }.items() if value not in (None, "", [])}
     if spec and isinstance(spawn, dict) and spawn.get("session_uid"):
-        spawn["setup"] = await asyncio.to_thread(_setup_session, spawn["session_uid"], spec)
+        # A daemon that claimed the name inside the spawn (before the first
+        # prompt) reports it as name_setup; the rest runs now.
+        named = spawn.pop("name_setup", None)
+        if named is not None:
+            spec.pop("name", None)
+        spawn["setup"] = await asyncio.to_thread(_setup_session, spawn["session_uid"], spec) if spec else {}
+        if named is not None and isinstance(spawn["setup"], dict):
+            spawn["setup"] = {"name": named, **spawn["setup"]}
 
     # wait=false remains a fast spawn/acceptance call. Its monitor consumes
     # the receipt in the background; pending never means submitted=false.
