@@ -242,10 +242,15 @@ pub fn in_progress(uid: &str) -> bool {
 
 /// A failed handoff: recorded, and Owner is alerted when it left the uid not
 /// running.
+/// `killed_by` on the `Exited` viewers get when a handoff leaves the session
+/// not running (see `rotation::announce_not_back`).
+pub const KILLED_BY_FAILED: &str = "handoff failed";
+
 fn fail(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, outcome: String) {
     finish(uid, "failed", outcome.clone());
     let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     if !state.sessions.contains_key(uid) {
+        crate::rotation::announce_not_back(&state, uid, KILLED_BY_FAILED);
         let message = format!(
             "A handoff of this session failed and it is NOT running now ({outcome}). A-R revives it."
         );

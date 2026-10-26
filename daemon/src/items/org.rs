@@ -96,10 +96,13 @@ pub(crate) fn member_authority(
     req: &Request,
     member_id: &str,
     self_ok: bool,
+    target_uid: &str,
 ) -> RpcResult<Value> {
     let ctx = Ctx::capture(state, req)?;
     let mut body = Map::new();
     body.insert("self_ok".into(), json!(self_ok));
+    // The API confirms the target is still that member's session.
+    body.insert("session".into(), json!(format!("agent:{}:{target_uid}", ctx.daemon_id)));
     api(ctx.api.post(&format!("/org/members/{}/authority", encode(member_id)), &with_actor(&ctx, body)))
 }
 

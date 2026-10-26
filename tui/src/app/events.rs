@@ -2203,6 +2203,17 @@ impl App {
                     .killed_by
                     .as_deref()
                     .is_some_and(crate::term_shim::is_respawn_killer);
+                // The rotation or handoff that stopped it failed and left it
+                // down: the daemon asks Owner to A-R it, so the row stays.
+                let not_back = last_exit
+                    .killed_by
+                    .as_deref()
+                    .is_some_and(crate::term_shim::is_respawn_failure);
+                if !respawning {
+                    // Any other exit ends a respawn gap: what follows is a
+                    // real exit, revivable with A-R.
+                    self.respawning.remove(&uid);
+                }
                 let mut found = false;
                 // Workspace index holding the exited session IFF it's an
                 // agent-spawned ephemeral that should be PRUNED (see below).
@@ -2249,8 +2260,12 @@ impl App {
                                 && ts.workflow_run_id.is_none()
                                 && !self.revive_failed.contains_key(&uid)
                                 && !respawning
+                                && !not_back
                             {
                                 prune_ws = Some(wi);
+                            }
+                            if not_back {
+                                ts.session.exited = true;
                             }
                             // Break both loops via label so
                             // `last_exit`'s move into the assignment
@@ -2290,6 +2305,10 @@ impl App {
                     // left to the `reap_spent_workspaces` sweep, whose
                     // task-liveness gates still apply to them).
                     self.close_agent_marker_if_empty(wi);
+                }
+                if not_back && found {
+                    self.pending_remote_reattach.retain(|p| p.entry.uid != uid);
+                    self.reconnecting_sessions.remove(&uid);
                 }
                 if respawning && found {
                     // The pane follows on its own: queue the reattach to the

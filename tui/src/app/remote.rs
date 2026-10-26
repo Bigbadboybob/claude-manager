@@ -583,6 +583,8 @@ impl App {
 
     /// A reattach produced a live stream.
     pub(super) fn note_reattached(&mut self, uid: &str) {
+        // A live stream ends any rotation/handoff gap.
+        self.respawning.remove(uid);
         self.reattach_backoff.entry(uid.to_string()).or_default().attached_at =
             Some(Instant::now());
     }
@@ -983,6 +985,7 @@ impl App {
             match outcome {
                 Ok(ts) => {
                     self.workspaces[ws_idx].sessions.push(ts);
+                    self.note_reattached(&p.entry.uid);
                     self.remove_skipped_entry(&p.ws_id, &p.entry.uid);
                     self.attached_tunnel_generation.insert(
                         p.entry.uid.clone(),
@@ -3953,7 +3956,8 @@ mod remote_reconnect_tests {
     /// #24/#25 (live 2026-10-26): a session CM stopped for a rotation or a
     /// handoff is in a gap, not gone. The Exited diff keeps the row, queues
     /// the reattach, and NotFound during the gap never settles it exited or
-    /// marks it revive-failed; A-R leaves it to the reattach.
+    /// marks it revive-failed. The daemon's "failed" exit, or any other exit,
+    /// ends the gap; A-R in a gap is a revive the daemon decides.
     #[test]
     fn a_rotation_stop_reattaches_and_never_settles_or_fails() {
         let _guard = crate::test_support::home_lock();
@@ -4007,19 +4011,66 @@ mod remote_reconnect_tests {
         assert!(!app.workspaces[0].sessions[0].session.exited, "a respawn gap never settles to exited");
         assert!(app.pending_remote_reattach.iter().any(|p| p.entry.uid == "uid-rot"), "still trying");
         assert!(!app.revive_failed.contains_key("uid-rot"));
-        // A-R during the gap does not revive (it would race the respawn).
+        // The daemon says the rotation failed and left it down: the gap
+        // ends, the row stays (Owner is told to A-R it) and shows exited.
+        let exited = |killed_by: &str| cm_daemon::manifest::ManifestDiff::Exited {
+            uid: "uid-rot".into(),
+            last_exit: cm_daemon::manifest::LastExit {
+                killed_by: Some(killed_by.into()),
+                code: None,
+                memory_cap_kill: false,
+                kills_file_offset: None,
+                exited_at: 2.0,
+            },
+        };
+        app.apply_manifest_diff_from_host(host.clone(), exited("transcript-rotation failed"));
+        assert_eq!(app.workspaces[0].sessions.len(), 1, "a failed rotation keeps the worker's row");
+        assert!(app.workspaces[0].sessions[0].session.exited);
+        assert!(!app.respawn_pending("uid-rot"));
+        assert!(!app.pending_remote_reattach.iter().any(|p| p.entry.uid == "uid-rot"));
+        assert!(!app.reconnecting_sessions.contains("uid-rot"));
+        // Any other exit ends a gap too.
+        app.apply_manifest_diff_from_host(host.clone(), exited("transcript-rotation"));
+        assert!(app.respawn_pending("uid-rot"));
+        app.respawning.insert("uid-x".into(), std::time::Instant::now());
+        app.apply_manifest_diff_from_host(
+            host.clone(),
+            cm_daemon::manifest::ManifestDiff::Exited {
+                uid: "uid-x".into(),
+                last_exit: cm_daemon::manifest::LastExit {
+                    killed_by: Some("operator".into()),
+                    code: None,
+                    memory_cap_kill: false,
+                    kills_file_offset: None,
+                    exited_at: 3.0,
+                },
+            },
+        );
+        assert!(!app.respawn_pending("uid-x"));
+        // A-R in a gap goes to the daemon as a revive (never a kill: the row
+        // only looks live), which decides; the gap record is dropped.
         app.cursor = Cursor::Session(0, 0);
         app.revive_active_session();
         assert!(!app.revive_failed.contains_key("uid-rot"));
-        assert!(app.restarts.is_empty(), "no revive was started");
-        // A revive refused because the session already runs again reattaches.
-        assert!(super::super::restart::revive_refused_as_live(
-            "session 'uid-rot' is still running — revive applies only to an exited session"
-        ));
-        assert!(super::super::restart::revive_refused_as_live(
-            "session 'uid-rot' is being restarted by CM (transcript rotation or handoff) and comes straight back"
-        ));
-        assert!(!super::super::restart::revive_refused_as_live("worktree /w/x missing"));
+        assert_eq!(app.restarts.len(), 1, "a revive was started");
+        assert!(!app.restarts[0].was_live, "no kill in a respawn gap");
+        assert!(!app.respawn_pending("uid-rot"));
+        use super::super::restart::{classify_revive_refusal, ReviveRefusal};
+        let running = "session 'uid-rot' is still running — revive applies only to an exited session";
+        assert_eq!(classify_revive_refusal(running, false), ReviveRefusal::Running);
+        assert_eq!(
+            classify_revive_refusal(running, true),
+            ReviveRefusal::Failed,
+            "after A-R's own kill, still running means the kill did not land"
+        );
+        assert_eq!(
+            classify_revive_refusal(
+                "session 'uid-rot' is being restarted by CM (transcript rotation or handoff) and comes straight back",
+                false
+            ),
+            ReviveRefusal::ComingBack
+        );
+        assert_eq!(classify_revive_refusal("worktree /w/x missing", false), ReviveRefusal::Failed);
 
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = dhandle.join();

@@ -1196,14 +1196,26 @@ async def _require_chain(conn, actor: dict, member_id: str, what: str, *,
     return actor_member
 
 
-async def authority(pool, actor: dict, ref: str, *, self_ok: bool = False) -> dict:
+async def authority(pool, actor: dict, ref: str, *, self_ok: bool = False,
+                    session: str | None = None) -> dict:
     """Whether `actor` may control member `ref`'s sessions (a lead
     rotating or handing off a report's session): exactly `_require_chain`,
-    the check for move, retire and close_assistant. Read-only."""
+    the check for move, retire and close_assistant. With `session` (a pid),
+    that session must also be the member's: its open main row, or an
+    assistant/worker its daemon reported for it. Read-only."""
     async with pool.acquire() as conn:
         member_id = await _resolve_member_id(conn, ref)
         if not member_id:
             raise _err(404, "not_found", f"no member {ref!r}")
+        if session is not None and not await conn.fetchval(
+                """SELECT 1 FROM incarnations
+                    WHERE pid = $1 AND member_id = $2 AND role = 'main' AND ended_at IS NULL
+                   UNION ALL
+                   SELECT 1 FROM org_session_facts
+                    WHERE pid = $1 AND member_id = $2 AND acting_as IN ('assistant', 'worker')
+                   LIMIT 1""", session, member_id):
+            raise _err(403, "not_member_session",
+                       f"{session} is not a session of member {member_id}")
         acting = await _require_chain(conn, actor, member_id, "control", self_ok=self_ok)
         return {"allowed": True, "member_id": member_id, "acting_member": acting}
 

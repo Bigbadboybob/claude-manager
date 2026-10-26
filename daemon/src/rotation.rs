@@ -861,6 +861,7 @@ fn fail(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, outcome: String) {
     // A session left not running needs Owner now; a repeated failure on a
     // running one is worth knowing too.
     let message = if !state.sessions.contains_key(uid) {
+        announce_not_back(&state, uid, KILLED_BY_FAILED);
         format!(
             "Transcript rotation of this session failed and it is NOT running now ({outcome}). \
              A-R revives it on its original transcript."
@@ -876,6 +877,26 @@ fn fail(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, outcome: String) {
     if let Err(e) = crate::owner_attention::raise_system(&state, uid, &message) {
         eprintln!("cm-daemon: rotation alert for {uid}: {e}");
     }
+}
+
+/// `killed_by` on the `Exited` a viewer gets when a rotation leaves the
+/// session not running (the stop's own `Exited` said "transcript-rotation").
+pub const KILLED_BY_FAILED: &str = "transcript-rotation failed";
+
+/// Tell viewers that a uid a rotation or handoff stopped is NOT coming back:
+/// they followed the stop as a respawn gap (#24 B2) and keep the row
+/// reconnecting until they hear otherwise.
+pub(crate) fn announce_not_back(state: &DaemonState, uid: &str, killed_by: &str) {
+    state.manifest_watcher.broadcast(crate::manifest::ManifestDiff::Exited {
+        uid: uid.to_string(),
+        last_exit: crate::manifest::LastExit {
+            code: None,
+            memory_cap_kill: false,
+            kills_file_offset: None,
+            exited_at: now(),
+            killed_by: Some(killed_by.to_string()),
+        },
+    });
 }
 
 /// Consecutive failed rotations per session: (count, last failure at).
@@ -2146,6 +2167,23 @@ mod tests {
         test_set_running("ts-dup-0", false);
         assert!(r.unwrap_err().1.contains("already running"));
         assert!(!armed("ts-dup-0"));
+    }
+
+    /// A rotation that leaves the session down tells viewers it is not
+    /// coming back (they would otherwise wait out the respawn gap).
+    #[test]
+    fn a_failure_that_leaves_it_down_announces_it() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let (rx, _guard) = state.lock().unwrap().manifest_watcher.subscribe();
+        fail(&state, "ts-down-0", "resume failed".into());
+        match rx.try_recv().expect("an Exited diff") {
+            crate::manifest::ManifestDiff::Exited { uid, last_exit } => {
+                assert_eq!(uid, "ts-down-0");
+                assert_eq!(last_exit.killed_by.as_deref(), Some(KILLED_BY_FAILED));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        failures().lock().unwrap().remove("ts-down-0");
     }
 
     /// Arms survive a brain restart.

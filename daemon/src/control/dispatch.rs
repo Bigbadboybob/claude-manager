@@ -1058,6 +1058,21 @@ fn dispatch_start_session(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Res
     ) {
         return resp;
     }
+    // A viewer's restore/A-R spawn at a uid a rotation or handoff is about to
+    // bring back would race (and could duplicate) that respawn, which runs
+    // in-process and never comes through here.
+    if let Some(uid) = req.params.get("uid").and_then(|v| v.as_str()) {
+        if crate::rotation::in_progress(uid) || crate::handoff::in_progress(uid) {
+            return Response::err(
+                req.id.clone(),
+                ErrorCode::Conflict,
+                format!(
+                    "session '{uid}' is being restarted by CM (transcript rotation or handoff) \
+                     and comes straight back"
+                ),
+            );
+        }
+    }
     match methods::start_session(state, &req.params) {
         Ok(value) => {
             note_owner_spawn(state, req, &value);
@@ -2164,27 +2179,37 @@ fn authorize_target(
             refusal,
         )
     };
+    // Authority first: an unauthorized caller learns nothing about the
+    // target beyond "no authority".
+    let by = Some(if label.is_empty() { caller.to_string() } else { format!("{label} ({caller})") });
+    if !matches!(decision, crate::control::auth::AuthDecision::Allow) {
+        let lead_refusal = match member {
+            Some(m) => match crate::items::org::member_authority(
+                state,
+                req,
+                &m.member_id,
+                m.acting_as != crate::assistants::MAIN,
+                target,
+            ) {
+                Ok(_) => String::new(),
+                Err((_, e)) => format!("; not up member {}'s manager chain ({e})", m.member_id),
+            },
+            None => "; no org member it works for".to_string(),
+        };
+        if !lead_refusal.is_empty() {
+            return Err((
+                ErrorCode::Unauthorized,
+                format!(
+                    "'{caller}' has no authority over session '{target}': it is not in your task tree \
+                     (the send_input / kill_session scope){lead_refusal}"
+                ),
+            ));
+        }
+    }
     if let Some(why) = refusal {
         return Err((ErrorCode::Conflict, why.into()));
     }
-    let by = Some(if label.is_empty() { caller.to_string() } else { format!("{label} ({caller})") });
-    if matches!(decision, crate::control::auth::AuthDecision::Allow) {
-        return Ok(by);
-    }
-    let lead_refusal = match member {
-        Some(m) => match crate::items::org::member_authority(state, req, &m.member_id, m.acting_as != crate::assistants::MAIN) {
-            Ok(_) => return Ok(by),
-            Err((_, e)) => format!("; not up member {}'s manager chain ({e})", m.member_id),
-        },
-        None => String::new(),
-    };
-    Err((
-        ErrorCode::Unauthorized,
-        format!(
-            "'{caller}' has no authority over session '{target}': it is not in your task tree \
-             (the send_input / kill_session scope){lead_refusal}"
-        ),
-    ))
+    Ok(by)
 }
 
 /// `session.handoff {uid?, to_engine?, to_model?, to_effort?, reason?, now?,
@@ -3591,6 +3616,24 @@ mod tests {
         }
     }
 
+    /// A viewer's spawn at a uid a rotation is bringing back (TUI restore or
+    /// A-R) is refused: it would race the rotation's own respawn.
+    #[test]
+    fn start_session_at_a_rotating_uid_is_refused() {
+        let _serial = crate::rotation::test_registry_lock();
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        crate::rotation::test_set_running("ts-rotspawn-0", true);
+        let r = dispatch_start_session(
+            &state,
+            &operator_request("start_session", serde_json::json!({"uid": "ts-rotspawn-0", "type": "claude"})),
+        );
+        crate::rotation::test_set_running("ts-rotspawn-0", false);
+        let e = r.error.expect("refused");
+        assert_eq!(e.code, ErrorCode::Conflict);
+        assert!(e.message.contains("comes straight back"), "{}", e.message);
+        assert!(state.lock().unwrap().sessions.is_empty());
+    }
+
     /// #25 follow-up: a session may rotate or hand off another session it has
     /// authority over: its managed worker (the send_input / kill_session
     /// scope), never an unrelated one; shells and continuous sessions are
@@ -3624,6 +3667,10 @@ mod tests {
             ct.managed_by_uid = Some("ts-lead-0".into());
             ct.continuous_task_id = Some("ct-x".into());
             st.sessions.insert("ts-wct-0".into(), ct);
+            let mut far_shell = spawn("ts-fsh-0", "bash");
+            far_shell.workspace_id = "ws-elsewhere".into();
+            far_shell.task_id = Some("task-elsewhere".into());
+            st.sessions.insert("ts-fsh-0".into(), far_shell);
         }
         let as_lead = |method: &str, params: serde_json::Value| session_request(method, params, "ts-lead-0");
         assert_eq!(authorize_target(&state, &as_lead("session.handoff", serde_json::json!({})), "ts-lead-0"), Ok(None), "self");
@@ -3634,6 +3681,11 @@ mod tests {
         assert!(err.1.contains("no authority over session 'ts-other-0'"), "{}", err.1);
         assert!(authorize_target(&state, &as_lead("session.handoff", serde_json::json!({})), "ts-wsh-0").unwrap_err().1.contains("shell"));
         assert!(authorize_target(&state, &as_lead("session.handoff", serde_json::json!({})), "ts-wct-0").unwrap_err().1.contains("continuous"));
+        // Authority comes first: a shell outside the caller's scope reads as
+        // "no authority", never as a shell.
+        let far = authorize_target(&state, &as_lead("session.handoff", serde_json::json!({})), "ts-fsh-0").unwrap_err();
+        assert_eq!(far.0, ErrorCode::Unauthorized, "{}", far.1);
+        assert!(!far.1.contains("shell"), "{}", far.1);
         // Through the RPCs: the worker's rotation is armed with the
         // requester recorded; an unrelated session's is refused.
         let ok = dispatch_session_rotate_transcript(

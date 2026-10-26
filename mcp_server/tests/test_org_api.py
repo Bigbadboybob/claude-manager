@@ -609,6 +609,15 @@ class OrgApiDb(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.status_code, 403, r.text)
         r = await self.http.post(f"/org/members/{report_id}/authority", json={"actor": OWNER})
         self.assertEqual(r.status_code, 200, r.text)
+        # Naming the session: it must be the member's (its main here), not
+        # another member's session the daemon's record wrongly attributes.
+        r = await self.http.post(f"/org/members/{report_id}/authority",
+                                 json={"actor": {"pid": pid(lead)}, "session": pid(report)})
+        self.assertEqual(r.status_code, 200, r.text)
+        r = await self.http.post(f"/org/members/{report_id}/authority",
+                                 json={"actor": {"pid": pid(lead)}, "session": pid(other)})
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertIn("not_member_session", r.text)
 
     async def test_a_beat_without_capabilities_records_none(self):
         # A rollback to a brain from before S0b sends no `capabilities`: the

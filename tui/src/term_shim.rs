@@ -796,6 +796,12 @@ pub fn is_respawn_killer(killed_by: &str) -> bool {
     matches!(killed_by, "transcript-rotation" | "handoff")
 }
 
+/// Whether `killed_by` is the daemon saying a rotation or handoff that stopped
+/// the session failed and left it down (it is NOT coming back by itself).
+pub fn is_respawn_failure(killed_by: &str) -> bool {
+    matches!(killed_by, "transcript-rotation failed" | "handoff failed")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

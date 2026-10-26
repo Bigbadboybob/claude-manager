@@ -51,12 +51,17 @@ the previous brain (the recoveries below hold again if they run).
    stop as "still running" for up to 5 minutes. The TUI keeps the row (also
    a worker's section and placement) and reattaches it to the new process on
    its own: the stop's Exited diff (or the attach stream's End) marks the uid
-   as respawning for up to 10 minutes. Meanwhile a NotFound from the daemon
-   is the gap, not a gone session, so the row never settles to exited.
-   A-R during the gap leaves it to the reattach, and a revive refused
-   because the session already runs again reattaches instead of showing
-   "revive failed". `session.revive` itself refuses while a rotation or
-   handoff of that uid runs. A TUI from before #24 lacks all of this
+   as respawning. Meanwhile a NotFound from the daemon is the gap, not a
+   gone session, so the row never settles to exited. The gap ends when the
+   reattach succeeds, on any other exit of the uid, or after 10 minutes. If
+   the rotation (or handoff) fails and leaves the session down, the daemon
+   says so with an Exited diff `killed_by = "transcript-rotation failed"`
+   (`"handoff failed"`): the row shows exited and stays, and A-R revives it.
+   A-R during the gap is a revive (never a kill) that the daemon decides:
+   `session.revive` and `start_session` at that uid refuse while a rotation
+   or handoff of it runs (the row keeps waiting), and a revive refused
+   because the session already runs reattaches. After A-R's own kill,
+   "still running" is shown as a failure (the kill did not land). A TUI from before #24 lacks all of this
    (Owner's laptop on 2026-10-26: frozen pane, then "revive failed"), so the
    daemon and the TUI ship together.
 2. Respawn through the normal revive path as

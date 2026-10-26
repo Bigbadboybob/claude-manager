@@ -25,6 +25,8 @@ pub(super) enum RestartOutcome {
     ReviveFailed(String),
     /// Remote: the host respawned the session at the same uid.
     Revived,
+    /// A rotation or handoff is bringing it back at the same uid.
+    ComingBack,
     /// Local live session killed and gone; the UI thread respawns it.
     Killed,
 }
@@ -39,10 +41,28 @@ pub(super) struct RestartFlight {
     result: Receiver<RestartOutcome>,
 }
 
-/// Whether a `session.revive` refusal means the session is (about to be)
-/// running again, so the row should reattach rather than show a failure.
-pub(crate) fn revive_refused_as_live(error: &str) -> bool {
-    error.contains("is still running") || error.contains("comes straight back")
+/// What a refused `session.revive` means for the row.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReviveRefusal {
+    /// The daemon runs it: reattach.
+    Running,
+    /// A rotation or handoff is bringing it back: wait for that respawn.
+    ComingBack,
+    /// A real failure, shown as one.
+    Failed,
+}
+
+/// Classify a `session.revive` error. `killed`: this A-R killed the session
+/// first, so "still running" means the kill did not land (the old process),
+/// which is a failure to show, not a session to reattach to.
+pub(crate) fn classify_revive_refusal(error: &str, killed: bool) -> ReviveRefusal {
+    if error.contains("comes straight back") {
+        ReviveRefusal::ComingBack
+    } else if error.contains("is still running") && !killed {
+        ReviveRefusal::Running
+    } else {
+        ReviveRefusal::Failed
+    }
 }
 
 /// One remote revive: `(entry, workspace_id, worktree)`.
@@ -85,10 +105,11 @@ fn run_restart(
         Some((entry, ws_id, worktree)) => {
             match crate::client_session::rpc_session_revive(&socket, &token, entry, ws_id, worktree) {
                 Ok(()) => RestartOutcome::Revived,
-                // The daemon already runs it again (a rotation or handoff
-                // brought it back, or is about to): reattach, never "failed".
-                Err(e) if revive_refused_as_live(&e.to_string()) => RestartOutcome::Revived,
-                Err(e) => RestartOutcome::ReviveFailed(e.to_string()),
+                Err(e) => match classify_revive_refusal(&e.to_string(), kill_uid.is_some()) {
+                    ReviveRefusal::Running => RestartOutcome::Revived,
+                    ReviveRefusal::ComingBack => RestartOutcome::ComingBack,
+                    ReviveRefusal::Failed => RestartOutcome::ReviveFailed(e.to_string()),
+                },
             }
         }
     }
@@ -420,6 +441,14 @@ impl App {
                     if flight.was_live { "restarted" } else { "revived" },
                     flight.host_id.as_str(),
                 ));
+            }
+            RestartOutcome::ComingBack => {
+                unmark(self);
+                self.respawning.insert(flight.uid.clone(), Instant::now());
+                self.expect_respawn(&flight.host_id, &flight.uid);
+                self.set_status_msg(
+                    "CM is still bringing this session back (transcript rotation or handoff) — it reattaches on its own",
+                );
             }
             RestartOutcome::Killed => {
                 let Some((wi, si)) = found else { return };

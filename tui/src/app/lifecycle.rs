@@ -2658,16 +2658,12 @@ impl App {
             );
             return;
         }
-        if self.respawn_pending(&ts.uid) {
-            // A rotation or handoff stopped it and brings it straight back;
-            // a revive now would race that respawn.
-            let (uid, host) = (ts.uid.clone(), ts.host_id.clone());
-            self.expect_respawn(&host, &uid);
-            self.set_status_msg(
-                "CM is restarting this session (transcript rotation or handoff) — it reattaches on its own",
-            );
-            return;
-        }
+        // A rotation or handoff stopped it: the row only looks live (it is
+        // waiting for the respawn), so revive rather than kill, and let the
+        // daemon decide. It refuses while CM is still bringing the session
+        // back (the row then keeps waiting) and revives one the rotation or
+        // handoff left down.
+        let in_respawn_gap = self.respawning.remove(&ts.uid).is_some();
         if ws.worktree_path.is_none() {
             self.set_status_msg("Workspace has no worktree path — can't revive");
             return;
@@ -2676,7 +2672,11 @@ impl App {
         // for the reaper to clear the uid, then revive. A remote revive is an
         // RPC too. Both run on a worker (`restart.rs`), never this input
         // thread: over a slow link they took minutes and froze every pane.
-        let was_live = !ts.session.exited;
+        let was_live = !ts.session.exited && !in_respawn_gap;
+        if in_respawn_gap {
+            let uid = ts.uid.clone();
+            self.pending_remote_reattach.retain(|p| p.entry.uid != uid);
+        }
         if was_live || ts.host_id != cm_daemon::host_id::HostId::local() {
             self.start_restart(wi, si, was_live);
             return;

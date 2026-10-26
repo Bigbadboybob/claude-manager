@@ -96,11 +96,13 @@ controlling sessions, nothing looser:
 - or, as a lead, a session of a member below the caller in the org: the
   member's main session, assistants or workers, by the planning API's
   manager-chain check, the one move and retire use (`POST
-  /org/members/{ref}/authority`; the member's own main also counts for its
+  /org/members/{ref}/authority`, which also confirms the target is still
+  that member's session; the member's own main also counts for its
   assistants and workers).
 
-Anything else is refused as unauthorized. Shells, continuous sessions and
-workflow participants are refused as targets. The request waits for the
+Anything else is refused as unauthorized, before anything about the target
+is said. Shells, continuous sessions and workflow participants are refused
+as targets (to a caller with authority over them). The request waits for the
 target's own safe boundary (agents never get `now`). The record carries
 `requested_by` ("label (uid)"), and the target's notices say who asked.
 

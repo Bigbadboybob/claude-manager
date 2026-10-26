@@ -108,6 +108,8 @@ class AuthorityBody(_Strict):
     # Also the member's own main session (its assistant or worker is the
     # target, not the member's main itself).
     self_ok: bool = False
+    # The session to control (a pid): it must be one of the member's.
+    session: str | None = None
 
 
 class ReinstateBody(_Strict):
@@ -204,7 +206,8 @@ async def member_authority(ref: Ref, body: AuthorityBody, request: Request):
     """Whether the actor may control this member's sessions: the check move
     and retire use (Owner, or a member up its manager chain; with `self_ok`
     also the member's own main session). 403 `not_member`/`not_manager`."""
-    return await _call(org_db.authority(_pool(request), body.actor.model_dump(), ref, self_ok=body.self_ok))
+    return await _call(org_db.authority(
+        _pool(request), body.actor.model_dump(), ref, self_ok=body.self_ok, session=body.session))
 
 
 @router.post("/members/{ref:path}/reinstate")
