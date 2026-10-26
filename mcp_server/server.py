@@ -5013,12 +5013,13 @@ def clear_continuous_hold(reason: str, dry_run: bool = False) -> dict:
 
 @mcp.tool()
 def rotate_transcript(reason: str = "", status: bool = False) -> dict:
-    """Ask CM to move YOUR conversation to a fresh transcript (Claude only).
+    """Ask CM to move YOUR conversation to a fresh transcript (Claude or Codex).
 
-    Claude Code slows down badly once a session's transcript file reaches a
-    few hundred MB: every resume rereads the whole file and compaction never
-    shrinks it. CM rotates automatically past a size or compaction threshold;
-    call this when you notice lag earlier, or before a long new phase.
+    An agent slows down badly once its transcript file reaches a few hundred
+    MB: every resume rereads the whole file and compaction never shrinks it.
+    CM rotates Claude sessions automatically past a size or compaction
+    threshold; call this when you notice lag earlier, before a long new
+    phase, or on Codex (which CM does not rotate on its own).
 
     It is queued, not immediate: at your next safe idle point (a few minutes
     idle, nothing running, nothing waiting to be delivered) CM restarts you at
@@ -5039,6 +5040,55 @@ def rotate_transcript(reason: str = "", status: bool = False) -> dict:
     if status:
         params["status"] = True
     return control_client.call("session.rotate_transcript", params)
+
+
+@mcp.tool()
+def request_handoff(
+    to_engine: str = "",
+    to_model: str = "",
+    to_effort: str = "",
+    reason: str = "",
+    status: bool = False,
+) -> dict:
+    """Ask CM to move YOUR session to another engine, model or effort.
+
+    You keep your CM identity: the same CM session, chat name, task,
+    workspace, permissions and board holds. Only your own session can be
+    handed off this way.
+
+    - Another engine (`to_engine="codex"` or `"claude"`): at your next safe
+      idle point CM asks you to reply with a handoff document. Your successor
+      starts on the new engine with no memory of this conversation, so the
+      document is everything it gets. CM saves the reply under
+      `~/.cm/handoffs/`, starts the new engine and tells it to read the
+      document. If the new engine does not answer, you are resumed as you
+      were.
+    - Same engine, another model or effort: CM restarts you on it, keeping
+      this conversation.
+    - Same engine and nothing to change: a transcript rotation (see
+      `rotate_transcript`).
+
+    It is queued, not immediate. End your turn normally after calling it.
+
+    Args:
+        to_engine: "claude" or "codex"; empty keeps your engine.
+        to_model: The model to run, e.g. "gpt-6-luna"; empty takes the
+            engine's or task's default (for a new engine) or keeps yours.
+        to_effort: low / medium / high / xhigh (Claude also max).
+        reason: Why (shown in the handoff record and to your successor).
+        status: True to only report your latest handoff.
+
+    Returns: {"queued": true, "handoff": {...}}, or with status=True
+    {"handoff": {phase, kind, outcome, handoff_file, ...}|null, "rotation": ...}.
+    """
+    params: dict = {}
+    for key, value in (("to_engine", to_engine), ("to_model", to_model),
+                       ("to_effort", to_effort), ("reason", reason)):
+        if value.strip():
+            params[key] = value.strip()
+    if status:
+        params["status"] = True
+    return control_client.call("session.handoff", params)
 
 
 @mcp.tool()

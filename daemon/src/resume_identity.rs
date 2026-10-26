@@ -47,6 +47,18 @@ pub struct Record {
     #[serde(default)]
     pub transcript_ids: BTreeSet<String>,
 }
+/// #25: one engine handoff of a CM session (same uid, another engine).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Handoff {
+    pub uid: String,
+    pub from_engine: String,
+    pub from_id: String,
+    pub to_engine: String,
+    pub to_id: String,
+    /// The handoff document the outgoing agent wrote.
+    pub file: String,
+    pub at: f64,
+}
 #[derive(Default, Serialize, Deserialize)]
 pub struct History {
     records: BTreeMap<String, Record>,
@@ -58,6 +70,9 @@ pub struct History {
     /// labels it, `transcript_catalog::rotated_lineage_in`).
     #[serde(default)]
     rotated: BTreeMap<String, String>,
+    /// #25 engine handoffs, keyed by the transcript id handed off from.
+    #[serde(default)]
+    handoffs: BTreeMap<String, Handoff>,
     #[serde(skip)]
     loaded: bool,
     #[serde(skip)]
@@ -218,6 +233,20 @@ pub fn record_rotation(state: &DaemonState, from: &str, to: &str) -> std::io::Re
             .unwrap_or_else(|p| p.into_inner());
         h.load(state)?;
         h.rotated.insert(from.to_string(), to.to_string());
+    }
+    persist(state)
+}
+/// #25: record an engine handoff, durably. A session that never bound a
+/// transcript has nothing to label, so it is kept under its uid.
+pub fn record_handoff(state: &DaemonState, h: Handoff) -> std::io::Result<()> {
+    {
+        let mut hist = state
+            .resume_history
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        hist.load(state)?;
+        let key = if h.from_id.is_empty() { format!("uid:{}", h.uid) } else { h.from_id.clone() };
+        hist.handoffs.insert(key, h);
     }
     persist(state)
 }

@@ -2568,12 +2568,12 @@ impl App {
     /// transcript (it restarts in place), naming the session and its size.
     pub(super) fn rotate_active_session(&mut self) {
         let Cursor::Session(wi, si) = self.cursor.clone() else {
-            self.set_status_msg("Focus a Claude session to rotate its transcript");
+            self.set_status_msg("Focus a Claude or Codex session to rotate its transcript");
             return;
         };
         let Some(ts) = self.workspaces.get(wi).and_then(|w| w.sessions.get(si)) else { return };
-        if ts.session_type != "claude" {
-            self.set_status_msg("Only Claude sessions rotate their transcript");
+        if !matches!(ts.session_type.as_str(), "claude" | "codex") {
+            self.set_status_msg("Only Claude and Codex sessions rotate their transcript");
             return;
         }
         if ts.session.exited {

@@ -1685,6 +1685,26 @@
    },
    "required": []
   },
+  "request_handoff": {
+   "params": {
+    "reason": {
+     "type": "string"
+    },
+    "status": {
+     "type": "boolean"
+    },
+    "to_effort": {
+     "type": "string"
+    },
+    "to_engine": {
+     "type": "string"
+    },
+    "to_model": {
+     "type": "string"
+    }
+   },
+   "required": []
+  },
   "resolve_stuck": {
    "params": {
     "action": {

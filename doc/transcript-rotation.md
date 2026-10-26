@@ -118,7 +118,8 @@ badge shows `⧉1.7G` past 800 MB, and the A-i peek shows the transcript size.
 Codex rollouts grow the same way: on cm-sessions, 1,817 rollouts take 17 GB
 and the largest is 3.2 GB. `codex fork` is the equivalent of Claude's fork,
 and already compacts: forks of a 257 MB rollout with 52 compactions came out
-at 7–9 MB. CM's launcher already builds Codex fork argv. A Codex rotation
-still needs rollout detection without a pinned id, handling for the owned
-app-server, and its own e2e. It is left to the general `session.handoff`
-(#25), which shares that spawn.
+at 7–9 MB. An explicit rotation (Alt+T, the operator RPC, an agent's
+`rotate_transcript`, or `session.handoff` with nothing to change) rotates
+Codex too: the fork's new rollout is bound by the detector, and the
+rotation confirms once it records the after-notice's marker. The automatic
+policy stays Claude-only for now. See [session handoff](session-handoff.md).

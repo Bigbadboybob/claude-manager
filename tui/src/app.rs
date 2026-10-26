@@ -55,6 +55,7 @@ mod remote_create;
 mod restart;
 mod background;
 mod fork;
+mod handoff;
 mod image_paste;
 use lifecycle::*;
 mod input;

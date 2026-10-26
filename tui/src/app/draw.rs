@@ -266,6 +266,7 @@ impl App {
                 InputMode::ContinuousControl(menu) => menu.draw(frame, area),
                 InputMode::WorktreeCleanup(menu) => menu.draw(frame, area),
                 InputMode::ForkSession(form) => form.draw(frame, area),
+                InputMode::Handoff(form) => form.draw(frame, area),
                 InputMode::NewSession {
                     engine,
                     label_text,

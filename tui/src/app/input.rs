@@ -9,6 +9,8 @@ pub(super) enum InputMode {
     ContinuousControl(super::continuous_control::Menu),
     /// A-F: fork the focused session's conversation into a new task.
     ForkSession(super::fork::ForkForm),
+    /// Alt+Shift+E (#25): hand the session over to another engine/model.
+    Handoff(super::handoff::HandoffForm),
     WorktreeCleanup(super::worktree_cleanup::Menu),
     /// Configuring a new workspace and its initial agent session.
     NewSession {
@@ -485,6 +487,8 @@ pub(crate) enum SubmitAction {
     ForkSession,
     /// Alt+T confirmed: rotate `uid`'s transcript now.
     RotateTranscript { uid: String },
+    /// Alt+Shift+E form submitted (the form rides in the replaced mode).
+    Handoff,
     /// Submit attempted but the inputs produced no work to do (e.g.
     /// empty workspace name, no workflow selected). Modal still closes.
     None,
@@ -3528,6 +3532,16 @@ impl App {
                         }
                         return true;
                     }
+                    // #25: Alt+Shift+E hands the session over to another
+                    // engine/model (Shift baked in or not).
+                    KeyCode::Char('E') => {
+                        self.open_handoff();
+                        return true;
+                    }
+                    KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        self.open_handoff();
+                        return true;
+                    }
                     KeyCode::Char('e') => {
                         self.open_session_settings();
                         return true;
@@ -4059,6 +4073,10 @@ impl App {
                 CrosstermEvent::Key(key) => form.key(*key),
                 _ => InputOutcome::Consumed,
             },
+            InputMode::Handoff(form) => match event {
+                CrosstermEvent::Key(key) => form.key(*key),
+                _ => InputOutcome::Consumed,
+            },
             InputMode::ContinuousControl(menu) => match event {
                 CrosstermEvent::Key(key) => menu.key(*key),
                 _ => InputOutcome::Consumed,
@@ -4346,6 +4364,12 @@ impl App {
                 if let InputMode::ForkSession(form) = old {
                     if matches!(action, SubmitAction::ForkSession) {
                         self.submit_fork(form);
+                    }
+                    return true;
+                }
+                if let InputMode::Handoff(form) = old {
+                    if matches!(action, SubmitAction::Handoff) {
+                        self.submit_handoff(form);
                     }
                     return true;
                 }
@@ -4744,6 +4768,7 @@ impl App {
             }
             SubmitAction::CompleteWithCleanup => {}, // handled with the captured completion menu
             SubmitAction::ForkSession => {}, // handled with the captured fork form
+            SubmitAction::Handoff => {}, // handled with the captured handoff form
             SubmitAction::MarkActiveDone => self.mark_active_done(),
             SubmitAction::DeleteActive => self.delete_active(),
             SubmitAction::SaveSection { section_id, name, color } => match section_id {

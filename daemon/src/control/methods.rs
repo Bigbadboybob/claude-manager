@@ -2761,6 +2761,7 @@ pub fn list_sessions(
                 .and_then(|p| std::fs::metadata(p).ok())
                 .map(|m| m.len()),
             "rotation": crate::rotation::status(uid),
+            "handoff": crate::handoff::status(uid),
             "worktree_path": state
                 .workspaces
                 .get(&session.workspace_id)
@@ -3063,6 +3064,7 @@ pub fn resolve_authorized_session(
             "report_reason": report.as_ref().and_then(|r| r.reason.clone()),
             // #24: monitors absorb the turn CM's own after-notice causes.
             "rotation": crate::rotation::status(&p.session_uid),
+            "handoff": crate::handoff::status(&p.session_uid),
         }))
     } else if let Some(tomb) = state.exited_tombstone(&p.session_uid) {
         // Read-after-exit: the session left the registry but its transcript
@@ -10635,7 +10637,9 @@ fn compose_daemon_spawn_params_launch(
         }
         (other, _) => other,
     };
-    let launch = match (resume_session_id, fork && engine == "claude-code") {
+    // #24/#25: Claude forks pin the new session id; a Codex fork (`codex
+    // fork <id>`) writes a new rollout the detector binds after the spawn.
+    let launch = match (resume_session_id, fork && matches!(engine, "claude-code" | "codex")) {
         (Some(id), true) => crate::mcp_config::Launch::Fork(id),
         (Some(id), false) => crate::mcp_config::Launch::Resume(id),
         (None, _) => crate::mcp_config::Launch::Fresh,
@@ -10690,7 +10694,7 @@ fn compose_daemon_spawn_params_launch(
             );
         }
     }
-    if engine == "codex" {
+    if engine == "codex" && !fork {
         if let Some(path) = resume_session_id.and_then(crate::transcript_detect::codex_transcript_path) {
             full.insert("transcript_path".into(), json!(path));
         }
@@ -27006,7 +27010,7 @@ while True:
         let mut s = state.lock().unwrap();
         assert!(crate::rotation::boundary(&s, "ts-none-0", idle, quiet).unwrap_err().contains("not live"));
         s.sessions.insert("ts-bash-0".into(), spawn("ts-bash-0", "bash"));
-        assert!(crate::rotation::boundary(&s, "ts-bash-0", idle, quiet).unwrap_err().contains("only Claude"));
+        assert!(crate::rotation::boundary(&s, "ts-bash-0", idle, quiet).unwrap_err().contains("bash sessions cannot"));
         let mut c = spawn("ts-cl-0", "claude-code");
         s.sessions.insert("ts-cl-0".into(), spawn("ts-cl-1", "claude-code"));
         assert!(crate::rotation::boundary(&s, "ts-cl-0", idle, quiet).unwrap_err().contains("no bound transcript"));

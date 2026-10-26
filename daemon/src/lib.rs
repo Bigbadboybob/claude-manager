@@ -96,6 +96,7 @@ pub mod reader_gate;
 pub mod reap_gate;
 pub mod resume_identity;
 pub mod rotation;
+pub mod handoff;
 pub mod reaper;
 pub mod reexec;
 pub mod reexec_manifest;
@@ -1248,6 +1249,7 @@ pub fn run() -> anyhow::Result<()> {
     // session that did come back is seen as live).
     rotation::recover_inflight(&state);
     rotation::start_policy(&state);
+    handoff::start_worker(&state);
     usage::start(&state);
     staffing::start(&state);
     worktree_watch::start(&state);

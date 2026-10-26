@@ -1170,6 +1170,19 @@ def _uuid_or_none(value):
         return None
 
 
+async def _record_engine_switch(conn, daemon_id: str, pid: str, old: str, new: str) -> None:
+    """One `engine_switch` org event per member seated at `pid`."""
+    rows = await conn.fetch(
+        "SELECT member_id, role FROM incarnations WHERE pid = $1 AND ended_at IS NULL", pid)
+    for r in rows:
+        await conn.execute(
+            """INSERT INTO org_events (subject_type, subject_id, type, actor, prev, new, reason)
+               VALUES ('member', $1, 'engine_switch', $2, $3, $4, 'session handoff')""",
+            r["member_id"], {"daemon_id": daemon_id, "via": "heartbeat"},
+            {"engine": old, "pid": pid, "role": r["role"]},
+            {"engine": new, "pid": pid, "role": r["role"]})
+
+
 async def heartbeat(pool, daemon_id: str, *, host_label: str | None, sessions: list[dict],
                     exited: list[str], acked_push_ids: list[int]) -> dict:
     """Record one daemon's full session snapshot, ack delivered pushes, and
@@ -1198,6 +1211,19 @@ async def heartbeat(pool, daemon_id: str, *, host_label: str | None, sessions: l
 
     async with pool.acquire() as conn:
         async with conn.transaction():
+            # #25: an engine change on a live pid is a handoff at the same CM
+            # identity. Members keep their seat (incarnations are keyed by
+            # pid); the switch is recorded in org_events.
+            prev_engines = {
+                r["pid"]: r["engine"]
+                for r in await conn.fetch(
+                    "SELECT pid, engine FROM session_states WHERE pid = ANY($1::text[])",
+                    [s["pid"] for s in sessions])
+            }
+            for s in sessions:
+                old_engine, new_engine = prev_engines.get(s["pid"]), s.get("engine")
+                if old_engine and new_engine and old_engine != new_engine:
+                    await _record_engine_switch(conn, daemon_id, s["pid"], old_engine, new_engine)
             for s in sessions:
                 gone = s["state"] == "exited"
                 await conn.execute(

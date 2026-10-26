@@ -551,6 +551,34 @@ class OrgApiDb(unittest.IsolatedAsyncioTestCase):
         # A remote daemon's beat never carries this daemon's members.
         self.assertEqual((await self.beat(D2, []))["org"]["members"], {})
 
+    async def test_an_engine_switch_keeps_the_seat_and_is_an_org_event(self):
+        # #25: a handoff respawns the same uid on another engine. The member
+        # keeps its seat (the pid is unchanged) and the switch is recorded.
+        uid = uid_at(4)
+        await self.beat(D1, [{"uid": uid, "name": "lane", "ws": "ws-l", "engine": "claude-code"}])
+        r = await self.http.post("/org/adopt", json={"actor": OWNER, "pid": pid(uid), "handle": "lane",
+                                                     "title": "Lane", "request_id": "adopt-sw"})
+        self.assertEqual(r.status_code, 200, r.text)
+        member_id = r.json()["member"]["id"]
+        await self.beat(D1, [{"uid": uid, "name": "lane", "ws": "ws-l", "engine": "claude-code"}])
+        reply = await self.beat(D1, [{"uid": uid, "name": "lane", "ws": "ws-l", "engine": "codex"}])
+        self.assertEqual(reply["org"]["members"][uid]["handle"], "lane", "same seat")
+        self.assertEqual(reply["org"]["members"][uid]["acting_as"], "main")
+        await self.beat(D1, [{"uid": uid, "name": "lane", "ws": "ws-l", "engine": "codex"}])
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT subject_id, prev, new, reason FROM org_events WHERE type = 'engine_switch'")
+        self.assertEqual(len(rows), 1, "one event per switch, not per beat")
+        self.assertEqual(rows[0]["subject_id"], member_id)
+        self.assertEqual((rows[0]["prev"]["engine"], rows[0]["new"]["engine"], rows[0]["new"]["role"]),
+                         ("claude-code", "codex", "main"))
+        # A session nobody is seated at switches without an event.
+        other = uid_at(5)
+        await self.beat(D1, [{"uid": other, "engine": "claude-code"}])
+        await self.beat(D1, [{"uid": other, "engine": "codex"}])
+        async with self.pool.acquire() as conn:
+            self.assertEqual(await conn.fetchval("SELECT count(*) FROM org_events WHERE type = 'engine_switch'"), 1)
+
     async def test_a_beat_without_capabilities_records_none(self):
         # A rollback to a brain from before S0b sends no `capabilities`: the
         # host must stop counting as capable (marks, the lifecycle gate).

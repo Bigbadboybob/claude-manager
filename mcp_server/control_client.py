@@ -104,6 +104,10 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "owner.board_token",
     # #24: an agent's own transcript rotation request (and its status).
     "session.rotate_transcript",
+    "session.handoff",
+    # Operator-only bulk handoff (#25): listed so the method sets match the
+    # dispatcher; the daemon refuses Session callers.
+    "session.handoff_many",
     # One key to one or more sessions, for direct daemon clients. The MCP
     # tool calls `send_key` (TUI-routed, like send_input).
     "session.send_key",

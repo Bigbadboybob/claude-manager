@@ -493,28 +493,39 @@ def _monitor_completed_entry(
 # A rotation's stop (`killed_by` below) is followed by the same uid coming
 # back within seconds; past this grace the exit is treated as real.
 ROTATION_KILLER = "transcript-rotation"
-ROTATION_GRACE_S = 300.0
+HANDOFF_KILLER = "handoff"
+# Stops after which CM brings the session straight back at the same uid:
+# a transcript rotation (#24) or an engine/model handoff (#25).
+RESPAWN_KILLERS = frozenset({ROTATION_KILLER, HANDOFF_KILLER})
+ROTATION_GRACE_S = 600.0
 
 
 def _rotation_turn(uid: str, resolved: dict, armed_at: float, absorbed: dict) -> bool:
-    """Whether the turn that just ended is the one CM's own notice caused
-    after a transcript rotation (#24) that started after this watch armed.
-    Each rotation absorbs one turn end: the agent reads the notice and
-    stops, which is not the worker finishing its assignment."""
-    record = resolved.get("rotation") or {}
-    started = record.get("started_at")
-    if not isinstance(started, (int, float)) or started < armed_at:
-        return False
-    if absorbed.get(uid) == started:
-        return False
-    absorbed[uid] = started
-    return True
+    """Whether the turn that just ended is one CM's own prompts caused, after
+    a transcript rotation (#24) or handoff (#25) that started after this
+    watch armed: the agent read CM's notice and stopped, which is not the
+    worker finishing its assignment. A rotation or repick absorbs one turn
+    end; an engine switch two (the handoff document, then the takeover)."""
+    for key in ("rotation", "handoff"):
+        record = resolved.get(key) or {}
+        started = record.get("started_at")
+        if not isinstance(started, (int, float)) or started < armed_at:
+            continue
+        allowed = 2 if record.get("kind") == "switch" else 1
+        mark = (key, started)
+        used = absorbed.get(uid, {}).get(mark, 0)
+        if used >= allowed:
+            continue
+        absorbed.setdefault(uid, {})[mark] = used + 1
+        return True
+    return False
 
 
 def _rotating(uid: str, resolved: dict, seen: dict) -> bool:
-    """Whether an exited `uid` is mid-rotation (stopped by CM's transcript
-    rotation, #24), for at most ROTATION_GRACE_S after it was first seen so."""
-    if resolved.get("killed_by") != ROTATION_KILLER:
+    """Whether an exited `uid` is coming straight back (stopped by CM's
+    transcript rotation, #24, or a handoff, #25), for at most
+    ROTATION_GRACE_S after it was first seen so."""
+    if resolved.get("killed_by") not in RESPAWN_KILLERS:
         seen.pop(uid, None)
         return False
     first = seen.setdefault(uid, time.monotonic())

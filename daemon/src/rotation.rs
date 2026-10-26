@@ -154,15 +154,30 @@ fn now() -> f64 {
 /// workflow participant, not a continuous tick mid-run, and not already
 /// rotating.
 pub fn boundary(state: &DaemonState, uid: &str, idle: Duration, owner_quiet: Duration) -> Result<(), String> {
+    boundary_for(state, uid, idle, owner_quiet, &["claude-code"])
+}
+
+/// [`boundary`] for sessions of any of `engines` (#25: an explicit Codex
+/// rotation or a handoff; the automatic policy stays Claude-only).
+pub fn boundary_for(
+    state: &DaemonState,
+    uid: &str,
+    idle: Duration,
+    owner_quiet: Duration,
+    engines: &[&str],
+) -> Result<(), String> {
     let sess = state.sessions.get(uid).ok_or_else(|| format!("session '{uid}' is not live on this host"))?;
-    if sess.session_type != "claude-code" {
-        return Err(format!("only Claude sessions rotate (this is {})", sess.session_type));
+    if !engines.contains(&sess.session_type.as_str()) {
+        return Err(format!("{} sessions cannot do this (only {})", sess.session_type, engines.join(", ")));
     }
     if sess.transcript_path.is_none() {
         return Err("the session has no bound transcript".into());
     }
     if in_progress(uid) {
         return Err("a rotation is already running".into());
+    }
+    if crate::handoff::in_progress(uid) {
+        return Err("a handoff is running".into());
     }
     if sess.workflow_run_id.is_some() {
         return Err("workflow participant (its run drives it)".into());
@@ -214,7 +229,7 @@ pub fn boundary(state: &DaemonState, uid: &str, idle: Duration, owner_quiet: Dur
                 .filter(|e| matches!(e["status"].as_str(), Some("pending" | "submitted" | "uncertain")))
                 // The rotation's own before-notice never holds it back (a
                 // stuck consumer would otherwise block rotation forever).
-                .filter(|e| e["source"].as_str() != Some("rotation"))
+                .filter(|e| !matches!(e["source"].as_str(), Some("rotation" | "handoff")))
                 .count()
         })
         .unwrap_or(0);
@@ -225,16 +240,16 @@ pub fn boundary(state: &DaemonState, uid: &str, idle: Duration, owner_quiet: Dur
 }
 
 /// What a rotation needs from the live session, captured under the lock.
-struct Snapshot {
-    entry: crate::manifest::ManifestEntry,
-    workspace_id: String,
-    worktree: PathBuf,
-    from_path: PathBuf,
-    from_id: String,
-    from_bytes: u64,
+pub(crate) struct Snapshot {
+    pub(crate) entry: crate::manifest::ManifestEntry,
+    pub(crate) workspace_id: String,
+    pub(crate) worktree: PathBuf,
+    pub(crate) from_path: PathBuf,
+    pub(crate) from_id: String,
+    pub(crate) from_bytes: u64,
 }
 
-fn snapshot(state: &DaemonState, uid: &str) -> Result<Snapshot, String> {
+pub(crate) fn snapshot(state: &DaemonState, uid: &str) -> Result<Snapshot, String> {
     let sess = state.sessions.get(uid).ok_or_else(|| format!("session '{uid}' is not live"))?;
     let from_path = PathBuf::from(sess.transcript_path.clone().ok_or("no bound transcript")?);
     let from_id = crate::session::transcript_id_from_path(&from_path.to_string_lossy())
@@ -248,6 +263,8 @@ fn snapshot(state: &DaemonState, uid: &str) -> Result<Snapshot, String> {
     entry.transcript_id = Some(from_id.clone());
     entry.transcript_path = Some(from_path.to_string_lossy().into_owned());
     entry.last_exit = None;
+    entry.reported_done_at = None;
+    entry.report_reason = None;
     Ok(Snapshot {
         from_bytes: std::fs::metadata(&from_path).map(|m| m.len()).unwrap_or(0),
         entry,
@@ -279,7 +296,14 @@ pub fn start(
         // Owner-quiet waits: a tool call, background job, undelivered notice,
         // workflow transition or continuous run still refuses.
         let (idle, quiet) = if force { (Duration::ZERO, Duration::ZERO) } else { (idle, quiet) };
-        boundary(&state, uid, idle, quiet).map_err(|why| (ErrorCode::Conflict, format!("not at a safe boundary: {why}")))?;
+        // #25: an explicit request may rotate Codex too (`codex fork`); the
+        // automatic policy stays Claude-only.
+        let engines: &[&str] = if origin == Origin::Policy { &["claude-code"] } else { &["claude-code", "codex"] };
+        boundary_for(&state, uid, idle, quiet, engines).map_err(|why| (ErrorCode::Conflict, format!("not at a safe boundary: {why}")))?;
+        // A handoff and a rotation never run together on a host.
+        if let Some(other) = crate::handoff::running() {
+            return Err((ErrorCode::Conflict, format!("a handoff is running ({other}); one at a time per host")));
+        }
         if origin != Origin::Operator {
             if let Some(left) = pause_left() {
                 return Err((ErrorCode::Conflict, format!("pausing {}s after the last rotation", left.as_secs())));
@@ -331,7 +355,7 @@ fn verify_deadline(source_bytes: u64) -> Duration {
 /// The pause between two rotations on a host (not for an operator's own).
 const PAUSE_BETWEEN: Duration = Duration::from_secs(120);
 
-fn wait_gone(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) -> bool {
+pub(crate) fn wait_gone(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) -> bool {
     let deadline = Instant::now() + STOP_DEADLINE;
     while Instant::now() < deadline {
         if !state_arc.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid) {
@@ -342,15 +366,38 @@ fn wait_gone(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) -> bool {
     false
 }
 
-/// A fork's transcript is in place: the file exists and holds message rows.
+/// A fork's transcript is in place: the file exists and holds message rows
+/// (Claude's chain rows, or Codex's `response_item`s).
 fn fork_written(path: &Path) -> Option<u64> {
     let len = std::fs::metadata(path).ok()?.len();
     let mut head = vec![0u8; len.min(256 * 1024) as usize];
     use std::io::Read;
     std::fs::File::open(path).ok()?.read_exact(&mut head).ok()?;
     let text = String::from_utf8_lossy(&head);
-    (text.contains("\"parentUuid\":") && (text.contains("\"type\":\"user\"") || text.contains("\"type\":\"assistant\"")))
-        .then_some(len)
+    let claude = text.contains("\"parentUuid\":") && (text.contains("\"type\":\"user\"") || text.contains("\"type\":\"assistant\""));
+    let codex = text.contains("\"type\":\"response_item\"");
+    (claude || codex).then_some(len)
+}
+
+/// Whether the last `TAIL` bytes of `path` contain `marker` (the delivered
+/// notice was recorded in this transcript).
+pub(crate) fn tail_contains(path: &Path, marker: &str) -> bool {
+    const TAIL: u64 = 4 * 1024 * 1024;
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if f.seek(SeekFrom::Start(len.saturating_sub(TAIL))).is_err() {
+        return false;
+    }
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).is_ok() && buf.windows(marker.len()).any(|w| w == marker.as_bytes())
+}
+
+/// A short random id for a notice marker.
+pub(crate) fn nonce() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let n = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    format!("{:08x}", (n as u64 ^ (std::process::id() as u64).rotate_left(32)) & 0xffff_ffff)
 }
 
 fn mb(bytes: u64) -> String {
@@ -365,9 +412,13 @@ fn mb(bytes: u64) -> String {
 
 /// The first message of the rotated session (it writes the new file).
 pub fn after_notice(from_bytes: u64) -> String {
+    after_notice_marked(from_bytes, "")
+}
+
+fn after_notice_marked(from_bytes: u64, marker: &str) -> String {
     format!(
-        "[cm-rotation] CM moved this conversation to a fresh transcript: the old one was {}, \
-         and Claude Code slows down badly past a few hundred MB. You continue from your latest \
+        "[cm-rotation{marker}] CM moved this conversation to a fresh transcript: the old one was {}, \
+         and the agent slows down badly past a few hundred MB. You continue from your latest \
          compaction summary. Nothing else changed: same CM session, chat name, task and workspace. \
          Before you continue, re-read anything handoff-critical from CM rather than assuming it: \
          your board items, standing rules and Owner rulings, open monitors, and your chat inbox. \
@@ -376,20 +427,30 @@ pub fn after_notice(from_bytes: u64) -> String {
     )
 }
 
-fn fallback_notice(why: &str) -> String {
+pub(crate) fn fallback_notice(why: &str) -> String {
     format!(
         "[cm-rotation] CM tried to move this conversation to a fresh transcript, but it did not \
          take ({why}). You are back on your original transcript; nothing was lost. Carry on."
     )
 }
 
-fn deliver(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, text: String) -> bool {
+pub(crate) fn deliver(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, text: String) -> bool {
+    deliver_with(state_arc, uid, text, true)
+}
+
+/// [`deliver`] to a session that is already running (`fresh: false`: no
+/// wait for a startup render).
+pub(crate) fn deliver_live(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, text: String) -> bool {
+    deliver_with(state_arc, uid, text, false)
+}
+
+fn deliver_with(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, text: String, fresh: bool) -> bool {
     let io = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         state.sessions.get(uid).map(|s| (s.input_handle(), s.fanout.clone()))
     };
     let Some((handle, fanout)) = io else { return false };
-    crate::control::methods::deliver_agent_prompt(handle, fanout, uid.to_string(), text, true, Arc::clone(state_arc));
+    crate::control::methods::deliver_agent_prompt(handle, fanout, uid.to_string(), text, fresh, Arc::clone(state_arc));
     true
 }
 
@@ -495,8 +556,7 @@ fn claim(uid: &str, rotation: Rotation) -> Result<(), String> {
 }
 
 /// The session being rotated now, if any (one at a time per host).
-#[cfg(test)]
-fn running_any() -> Option<String> {
+pub(crate) fn running_any() -> Option<String> {
     registry()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -519,23 +579,30 @@ fn inflight_read(path: &Path) -> serde_json::Map<String, Value> {
         .unwrap_or_default()
 }
 
-fn inflight_put(state: &DaemonState, uid: &str, snap: &Snapshot) -> std::io::Result<()> {
+pub(crate) fn inflight_put(state: &DaemonState, uid: &str, snap: &Snapshot) -> std::io::Result<()> {
+    inflight_put_with(state, uid, snap, json!({}))
+}
+
+/// [`inflight_put`] with extra fields (#25: `kind: "handoff"` and the
+/// handoff document's `file`).
+pub(crate) fn inflight_put_with(state: &DaemonState, uid: &str, snap: &Snapshot, extra: Value) -> std::io::Result<()> {
     let Some(path) = inflight_path(state) else { return Ok(()) };
     let mut all = inflight_read(&path);
-    all.insert(
-        uid.to_string(),
-        json!({
-            "workspace_id": snap.workspace_id,
-            "worktree": snap.worktree,
-            "from_id": snap.from_id,
-            "entry": snap.entry,
-            "at": now(),
-        }),
-    );
+    let mut marker = json!({
+        "workspace_id": snap.workspace_id,
+        "worktree": snap.worktree,
+        "from_id": snap.from_id,
+        "entry": snap.entry,
+        "at": now(),
+    });
+    if let (Some(m), Some(x)) = (marker.as_object_mut(), extra.as_object()) {
+        m.extend(x.clone());
+    }
+    all.insert(uid.to_string(), marker);
     crate::state::write_json_atomic(&path, &Value::Object(all).to_string(), true)
 }
 
-fn inflight_remove(state: &DaemonState, uid: &str) {
+pub(crate) fn inflight_remove(state: &DaemonState, uid: &str) {
     let Some(path) = inflight_path(state) else { return };
     let mut all = inflight_read(&path);
     if all.remove(uid).is_some() {
@@ -573,6 +640,13 @@ pub fn recover_inflight(state_arc: &Arc<Mutex<DaemonState>>) -> usize {
             state.sessions.get(uid).map(|s| s.transcript_path.clone())
         };
         if let Some(live_path) = live_path {
+            if v["kind"] == "handoff" {
+                // #25: the new engine is live (it came up before the
+                // restart); tell it about its handoff document if it switched.
+                crate::handoff::recover_live(state_arc, uid, &entry, v["file"].as_str());
+                inflight_remove(&state_arc.lock().unwrap_or_else(|p| p.into_inner()), uid);
+                continue;
+            }
             let snap = Snapshot {
                 from_path: PathBuf::from(entry.transcript_path.clone().unwrap_or_default()),
                 from_id: v["from_id"].as_str().unwrap_or_default().to_string(),
@@ -598,7 +672,14 @@ pub fn recover_inflight(state_arc: &Arc<Mutex<DaemonState>>) -> usize {
         match crate::control::methods::restore_one_session_launch(state_arc, ws, Path::new(wt), &entry, None, false) {
             Ok(_) => {
                 resumed += 1;
-                deliver(state_arc, uid, fallback_notice("a daemon restart interrupted it"));
+                deliver(
+                    state_arc,
+                    uid,
+                    "[cm-rotation] A daemon restart interrupted CM while it was moving this session (a \
+                     transcript rotation or handoff). You are back on your original conversation; \
+                     nothing was lost. Carry on."
+                        .into(),
+                );
                 eprintln!("cm-daemon: rotation of {uid} was interrupted by a restart; resumed its original transcript");
             }
             Err((_, e)) => eprintln!("cm-daemon: rotation of {uid} was interrupted; resuming it failed: {e}"),
@@ -688,54 +769,52 @@ fn run(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: Snapshot) {
         resume_old(state_arc, uid, &snap, &format!("the fork did not start: {e}"));
         return;
     }
-    let to_path = state_arc
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .sessions
-        .get(uid)
-        .and_then(|s| s.transcript_path.clone())
-        .map(PathBuf::from);
-    let Some(to_path) = to_path.filter(|p| p != &snap.from_path) else {
-        resume_old(state_arc, uid, &snap, "the fork has no new transcript");
-        return;
-    };
-    let to_id = crate::session::transcript_id_from_path(&to_path.to_string_lossy());
-    update(uid, |r| {
-        r.phase = "notifying";
-        r.to_id = to_id.clone();
-    });
-    // 3. The first message writes the fork's file.
-    if !deliver(state_arc, uid, after_notice(snap.from_bytes)) {
+    // 3. The first message writes a Claude fork's file; a Codex fork's
+    //    rollout is bound by the detector. Either way the new transcript must
+    //    record the notice (its marker) before the rotation counts.
+    let marker = format!(" {}", nonce());
+    update(uid, |r| r.phase = "notifying");
+    if !deliver(state_arc, uid, after_notice_marked(snap.from_bytes, &marker)) {
         resume_old(state_arc, uid, &snap, "the forked session vanished before its first message");
         return;
     }
     update(uid, |r| r.phase = "verifying");
+    let needle = format!("[cm-rotation{marker}]");
     let deadline = Instant::now() + verify_deadline(snap.from_bytes);
     while Instant::now() < deadline {
-        if let Some(bytes) = fork_written(&to_path) {
-            update(uid, |r| r.to_bytes = Some(bytes));
-            if let Some(to) = to_id.as_deref() {
-                let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-                if let Err(e) = crate::resume_identity::record_rotation(&st, &snap.from_id, to) {
-                    eprintln!("cm-daemon: rotation of {uid}: lineage not recorded: {e}");
-                }
-            }
-            finish(
-                uid,
-                "done",
-                format!(
-                    "rotated {} ({}) to {} ({})",
-                    snap.from_id,
-                    mb(snap.from_bytes),
-                    to_id.as_deref().unwrap_or("?"),
-                    mb(bytes)
-                ),
-            );
-            return;
-        }
-        if !state_arc.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid) {
+        let (live, to_path) = {
+            let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            let sess = st.sessions.get(uid);
+            (sess.is_some(), sess.and_then(|s| s.transcript_path.clone()).map(PathBuf::from))
+        };
+        if !live {
             resume_old(state_arc, uid, &snap, "the forked session exited before writing its transcript");
             return;
+        }
+        if let Some(to_path) = to_path.filter(|p| p != &snap.from_path) {
+            let to_id = crate::session::transcript_id_from_path(&to_path.to_string_lossy());
+            update(uid, |r| r.to_id = to_id.clone());
+            if let Some(bytes) = fork_written(&to_path).filter(|_| tail_contains(&to_path, &needle)) {
+                update(uid, |r| r.to_bytes = Some(bytes));
+                if let Some(to) = to_id.as_deref() {
+                    let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Err(e) = crate::resume_identity::record_rotation(&st, &snap.from_id, to) {
+                        eprintln!("cm-daemon: rotation of {uid}: lineage not recorded: {e}");
+                    }
+                }
+                finish(
+                    uid,
+                    "done",
+                    format!(
+                        "rotated {} ({}) to {} ({})",
+                        snap.from_id,
+                        mb(snap.from_bytes),
+                        to_id.as_deref().unwrap_or("?"),
+                        mb(bytes)
+                    ),
+                );
+                return;
+            }
         }
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -854,9 +933,9 @@ fn requests() -> &'static Mutex<HashMap<String, String>> {
 /// Queue `uid`'s own request. Returns what it will wait for.
 pub fn request(state: &DaemonState, uid: &str, reason: &str) -> Result<Value, (ErrorCode, String)> {
     match state.sessions.get(uid) {
-        Some(s) if s.session_type == "claude-code" && s.transcript_path.is_some() => {}
-        Some(s) if s.session_type != "claude-code" => {
-            return Err((ErrorCode::InvalidParams, format!("only Claude sessions rotate (this is {})", s.session_type)))
+        Some(s) if matches!(s.session_type.as_str(), "claude-code" | "codex") && s.transcript_path.is_some() => {}
+        Some(s) if !matches!(s.session_type.as_str(), "claude-code" | "codex") => {
+            return Err((ErrorCode::InvalidParams, format!("only Claude and Codex sessions rotate (this is {})", s.session_type)))
         }
         Some(_) => return Err((ErrorCode::Conflict, "the session has no bound transcript yet".into())),
         None => return Err((ErrorCode::NotFound, format!("session '{uid}' is not live on this host"))),

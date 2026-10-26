@@ -2403,6 +2403,18 @@ pub fn rpc_rotate_transcript(
     Ok(resp.result.unwrap_or_default())
 }
 
+/// `session.handoff` (#25): another engine, model or effort at the same CM
+/// identity. `params` carries `uid`, `to_engine`, `to_model`, `to_effort`,
+/// `now`, `reason`.
+pub fn rpc_handoff(daemon_socket: &Path, operator_token_id: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let req = Request { id: next_request_id(), caller: Caller::operator(operator_token_id), method: "session.handoff".into(), params };
+    let resp = rpc_round_trip(daemon_socket, &req)?;
+    if let Some(err) = resp.error {
+        anyhow::bail!("{}", err.message);
+    }
+    Ok(resp.result.unwrap_or_default())
+}
+
 pub fn rpc_task_update_tree(
     daemon_socket: &Path,
     operator_token_id: &str,

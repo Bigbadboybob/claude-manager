@@ -2343,6 +2343,7 @@ impl App {
         self.apply_messaging_name(&host, &uid, &entry);
         self.apply_global_perms_from_diff(&uid, &entry);
         self.apply_org_from_diff(&uid, &entry);
+        self.apply_engine_from_diff(&uid, &entry);
         self.apply_transcript_from_diff(&host, &uid, &entry);
         // Option B (criterion #4): adopt daemon-launched WORKFLOW
         // PARTICIPANTS into the sidebar from broadcasts. The helper is
@@ -2364,6 +2365,40 @@ impl App {
     /// O5: the daemon broadcasts `Updated {member, org}` when it stamps a
     /// session as a member's assistant or worker; mirror the org object onto
     /// the row (the F6 chart and A-D read it). Diffs without `org` leave it.
+    /// #25: a handoff respawns the uid on another engine, model or effort.
+    /// Mirror the daemon's `session_type` / `model` / `effort` onto the row,
+    /// so its engine mark, keys and A-R follow. Diffs without the fields
+    /// leave them. Returns whether the row changed.
+    pub(crate) fn apply_engine_from_diff(&mut self, uid: &str, entry: &serde_json::Value) -> bool {
+        let Some((wi, si)) = crate::control::methods::find_live_session(&self.workspaces, uid) else {
+            return false;
+        };
+        let ts = &mut self.workspaces[wi].sessions[si];
+        let mut changed = false;
+        if let Some(engine) = entry.get("session_type").and_then(|v| v.as_str()) {
+            let engine = super::model::normalize_session_type_to_internal(engine);
+            if matches!(engine, "claude" | "codex") && matches!(ts.session_type.as_str(), "claude" | "codex") && ts.session_type != engine {
+                ts.session_type = engine.to_string();
+                changed = true;
+            }
+        }
+        for (key, slot, source_key) in [("model", 0, "model_source"), ("effort", 1, "effort_source")] {
+            let Some(v) = entry.get(key).and_then(|v| v.as_str()) else { continue };
+            let source = entry.get(source_key).and_then(|v| v.as_str()).map(str::to_string);
+            let (value, src) = if slot == 0 { (&mut ts.model, &mut ts.model_source) } else { (&mut ts.effort, &mut ts.effort_source) };
+            if value.as_deref() != Some(v) {
+                *value = Some(v.to_string());
+                *src = source;
+                changed = true;
+            }
+        }
+        if changed {
+            self.needs_redraw = true;
+            self.save_session_manifest();
+        }
+        changed
+    }
+
     pub(crate) fn apply_org_from_diff(&mut self, uid: &str, entry: &serde_json::Value) -> bool {
         let Some(org) = entry.get("org").and_then(|v| v.as_object()) else {
             return false;
@@ -3491,6 +3526,25 @@ mod apply_manifest_diff_tests {
             });
             assert_eq!(app.workspaces[0].sessions.len(), 1, "{killer}: the row stays");
         }
+    }
+
+    /// #25: a handoff's respawn on another engine updates the row's engine,
+    /// model and effort; bash rows and unknown engines are never touched.
+    #[test]
+    fn an_engine_switch_diff_updates_the_row() {
+        let mut app = build_app_with_session("ts-h");
+        app.workspaces[0].sessions[0].session_type = "claude".into();
+        let entry = serde_json::json!({"session_type": "codex", "model": "gpt-6-luna", "model_source": "explicit",
+                                       "effort": "high"});
+        assert!(app.apply_engine_from_diff("ts-h", &entry));
+        let ts = &app.workspaces[0].sessions[0];
+        assert_eq!((ts.session_type.as_str(), ts.model.as_deref(), ts.effort.as_deref()), ("codex", Some("gpt-6-luna"), Some("high")));
+        assert_eq!(ts.model_source.as_deref(), Some("explicit"));
+        assert!(!app.apply_engine_from_diff("ts-h", &entry), "no change twice");
+        assert!(app.apply_engine_from_diff("ts-h", &serde_json::json!({"session_type": "claude-code"})));
+        assert_eq!(app.workspaces[0].sessions[0].session_type, "claude");
+        app.workspaces[0].sessions[0].session_type = "bash".into();
+        assert!(!app.apply_engine_from_diff("ts-h", &serde_json::json!({"session_type": "codex"})));
     }
 
     /// A USER-created session (`managed_by_uid == None`) is NOT

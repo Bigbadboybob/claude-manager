@@ -28,6 +28,20 @@ class RotationGraceTests(unittest.TestCase):
         self.assertTrue(monitor._rotation_turn("ts-a", {"rotation": {"started_at": 300.0}}, 100.0, absorbed))
         self.assertFalse(monitor._rotation_turn("ts-a", {}, 100.0, absorbed))
 
+    def test_an_engine_switch_absorbs_its_two_turns(self):
+        absorbed = {}
+        switch = {"handoff": {"started_at": 200.0, "kind": "switch"}}
+        self.assertTrue(monitor._rotation_turn("ts-s", switch, 100.0, absorbed), "the handoff document")
+        self.assertTrue(monitor._rotation_turn("ts-s", switch, 100.0, absorbed), "the takeover")
+        self.assertFalse(monitor._rotation_turn("ts-s", switch, 100.0, absorbed), "then real work")
+        repick = {"handoff": {"started_at": 300.0, "kind": "repick"}}
+        self.assertTrue(monitor._rotation_turn("ts-s", repick, 100.0, absorbed))
+        self.assertFalse(monitor._rotation_turn("ts-s", repick, 100.0, absorbed))
+
+    def test_a_handoff_stop_gets_the_same_grace(self):
+        with mock.patch.object(monitor.time, "monotonic", return_value=5.0):
+            self.assertTrue(monitor._rotating("ts-h", {"killed_by": monitor.HANDOFF_KILLER}, {}))
+
     def test_other_exits_are_exits_and_reset_the_clock(self):
         seen = {"ts-a": 1.0}
         self.assertFalse(monitor._rotating("ts-a", {"killed_by": "operator"}, seen))
@@ -46,6 +60,19 @@ class RotateTranscriptToolTests(unittest.TestCase):
             call.assert_called_with("session.rotate_transcript", {"reason": "lag"})
             fn(status=True)
             call.assert_called_with("session.rotate_transcript", {"reason": "", "status": True})
+
+
+    def test_handoff_tool_sends_only_what_was_given(self):
+        from mcp_server import control_client, server
+
+        self.assertIn("session.handoff", control_client.DAEMON_METHODS)
+        with mock.patch.object(control_client, "call", return_value={"queued": True}) as call:
+            fn = getattr(server.request_handoff, "fn", server.request_handoff)
+            fn(to_engine="codex", to_model=" gpt-6-luna ", reason="cheap work")
+            call.assert_called_with(
+                "session.handoff", {"to_engine": "codex", "to_model": "gpt-6-luna", "reason": "cheap work"})
+            fn(status=True)
+            call.assert_called_with("session.handoff", {"status": True})
 
 
 if __name__ == "__main__":

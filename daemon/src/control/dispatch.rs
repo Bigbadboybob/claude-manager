@@ -734,6 +734,8 @@ pub fn dispatch_request(
         "session.viewed" => DispatchOutcome::Done(dispatch_session_viewed(state, req)),
         // #24 transcript rotation: operator for any session (and `force`);
         // a Session caller may rotate only itself, at a safe boundary.
+        "session.handoff" => DispatchOutcome::Done(dispatch_session_handoff(state, req)),
+        "session.handoff_many" => DispatchOutcome::Done(dispatch_session_handoff_many(state, req)),
         "session.rotate_transcript" => {
             DispatchOutcome::Done(dispatch_session_rotate_transcript(state, req))
         }
@@ -2105,6 +2107,94 @@ fn dispatch_session_rotate_transcript(state: &Arc<Mutex<DaemonState>>, req: &Req
     }
 }
 
+/// The handoff target fields of a `session.handoff*` request.
+fn handoff_request(p: &serde_json::Value, origin: crate::rotation::Origin, now: bool) -> crate::handoff::Request {
+    let text = |k: &str| p.get(k).and_then(serde_json::Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    crate::handoff::Request {
+        to_engine: text("to_engine").or_else(|| text("engine")),
+        to_model: text("to_model").or_else(|| text("model")),
+        to_effort: text("to_effort").or_else(|| text("effort")),
+        reason: text("reason").unwrap_or_else(|| format!("{} request", origin_label(origin))),
+        origin,
+        now,
+    }
+}
+
+/// `session.handoff {uid?, to_engine?, to_model?, to_effort?, reason?, now?,
+/// wait_secs?, status?}` (#25): move a session to another engine, model or
+/// effort at the same CM uid (same engine and nothing to change: a
+/// transcript rotation). Queued for the session's next safe boundary;
+/// `now` (operator-only) waives the idle and Owner-quiet waits and refuses
+/// at once if anything else is in flight. A Session caller may hand off only
+/// itself.
+fn dispatch_session_handoff(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let p = &req.params;
+    let asked = p.get("uid").or_else(|| p.get("session_uid")).and_then(serde_json::Value::as_str);
+    let now = p.get("now").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let (uid, origin) = match &req.caller {
+        Caller::Operator(_) => match asked {
+            Some(uid) => (uid.to_string(), crate::rotation::Origin::Operator),
+            None => return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session.handoff requires uid"),
+        },
+        Caller::Session(s) => {
+            if asked.is_some_and(|u| u != s.session_uid) {
+                return Response::err(req.id.clone(), ErrorCode::Unauthorized, "a session may hand off only itself");
+            }
+            if now {
+                return Response::err(req.id.clone(), ErrorCode::Unauthorized, "now is operator-only");
+            }
+            (s.session_uid.clone(), crate::rotation::Origin::Agent)
+        }
+    };
+    if p.get("status").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+        return Response::ok(
+            req.id.clone(),
+            serde_json::json!({ "session_uid": uid, "handoff": crate::handoff::status(&uid),
+                                "rotation": crate::rotation::status(&uid) }),
+        );
+    }
+    let wait = p.get("wait_secs").and_then(serde_json::Value::as_u64).map(std::time::Duration::from_secs);
+    match crate::handoff::request(state, &uid, handoff_request(p, origin, now), wait) {
+        Ok(v) => Response::ok(req.id.clone(), v),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `session.handoff_many {uids? | from_engine?, to_engine?, to_model?,
+/// to_effort?, reason?, wait_secs?}` (#25): Owner's bulk handoff,
+/// operator-only. Named `uids`, or every agent session on `from_engine`
+/// (never shells, continuous sessions or workflow participants). Each runs
+/// at its own boundary, one at a time.
+fn dispatch_session_handoff_many(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(response) = require_operator(req, "Bulk handoff is Operator-only") {
+        return response;
+    }
+    let p = &req.params;
+    let uids: Vec<String> = match p.get("uids").and_then(serde_json::Value::as_array) {
+        Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+        None => {
+            let from = p
+                .get("from_engine")
+                .and_then(serde_json::Value::as_str)
+                .map(|e| crate::handoff::engine_name(e).ok_or(e));
+            let from = match from {
+                Some(Ok(e)) => Some(e),
+                Some(Err(e)) => {
+                    return Response::err(req.id.clone(), ErrorCode::InvalidParams, format!("unknown engine '{e}'"))
+                }
+                None => None,
+            };
+            crate::handoff::select(&state.lock().unwrap_or_else(|p| p.into_inner()), from)
+        }
+    };
+    if uids.is_empty() {
+        return Response::err(req.id.clone(), ErrorCode::InvalidParams, "no sessions to hand off");
+    }
+    let wait = p.get("wait_secs").and_then(serde_json::Value::as_u64).map(std::time::Duration::from_secs);
+    let request = handoff_request(p, crate::rotation::Origin::Operator, false);
+    Response::ok(req.id.clone(), crate::handoff::request_many(state, &uids, &request, wait))
+}
+
 fn origin_label(origin: crate::rotation::Origin) -> &'static str {
     match origin {
         crate::rotation::Origin::Operator => "operator",
@@ -3428,6 +3518,70 @@ mod tests {
             caller: Caller::operator("op-default"),
             method: method.into(),
             params,
+        }
+    }
+
+    /// #25: who may hand off what. A session only itself and never `now`;
+    /// bulk is operator-only; shells and continuous sessions are refused.
+    #[test]
+    fn handoff_scope_and_refusals() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let spawn = |uid: &str, ty: &str| {
+            let mut sp = crate::session::SpawnParams::new(uid, "h", "/bin/sleep");
+            sp.args = vec!["30".into()];
+            sp.session_type = ty.into();
+            crate::session::DaemonSession::spawn(sp).unwrap()
+        };
+        {
+            let mut st = state.lock().unwrap();
+            st.sessions.insert("ts-ho-a".into(), spawn("ts-ho-a", "claude-code"));
+            st.sessions.insert("ts-ho-sh".into(), spawn("ts-ho-sh", "bash"));
+            let mut ct = spawn("ts-ho-ct", "claude-code");
+            ct.continuous_task_id = Some("ct-x".into());
+            st.sessions.insert("ts-ho-ct".into(), ct);
+        }
+        let other = dispatch_session_handoff(
+            &state,
+            &session_request("session.handoff", serde_json::json!({"uid": "ts-ho-sh", "to_engine": "codex"}), "ts-ho-a"),
+        );
+        assert!(!other.ok && other.error.unwrap().message.contains("only itself"));
+        let now = dispatch_session_handoff(
+            &state,
+            &session_request("session.handoff", serde_json::json!({"to_engine": "codex", "now": true}), "ts-ho-a"),
+        );
+        assert!(!now.ok && now.error.unwrap().message.contains("operator-only"));
+        let bulk = dispatch_session_handoff_many(
+            &state,
+            &session_request("session.handoff_many", serde_json::json!({"to_engine": "codex"}), "ts-ho-a"),
+        );
+        assert!(!bulk.ok, "bulk is operator-only");
+        let shell = dispatch_session_handoff(
+            &state,
+            &operator_request("session.handoff", serde_json::json!({"uid": "ts-ho-sh", "to_engine": "codex"})),
+        );
+        assert!(shell.error.unwrap().message.contains("never handed off"));
+        let ct = dispatch_session_handoff(
+            &state,
+            &operator_request("session.handoff", serde_json::json!({"uid": "ts-ho-ct", "to_engine": "codex"})),
+        );
+        assert!(ct.error.unwrap().message.contains("scheduler-owned"));
+        // A bulk selection never names shells or continuous sessions.
+        assert_eq!(crate::handoff::select(&state.lock().unwrap(), None), ["ts-ho-a"]);
+        // Its own handoff is queued for its next boundary (it never gets
+        // there in this test: a fresh process is not idle).
+        let own = dispatch_session_handoff(
+            &state,
+            &session_request("session.handoff", serde_json::json!({"to_engine": "codex", "to_model": "gpt-6-luna"}), "ts-ho-a"),
+        );
+        let v = own.result.expect("queued");
+        assert_eq!((v["queued"].as_bool(), v["handoff"]["kind"].as_str()), (Some(true), Some("switch")));
+        let status = dispatch_session_handoff(
+            &state,
+            &session_request("session.handoff", serde_json::json!({"status": true}), "ts-ho-a"),
+        );
+        assert_eq!(status.result.unwrap()["handoff"]["to_engine"], "codex");
+        for s in state.lock().unwrap().sessions.values_mut() {
+            let _ = s.kill();
         }
     }
 
