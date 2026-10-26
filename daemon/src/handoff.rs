@@ -181,7 +181,8 @@ impl Record {
 struct Registry {
     records: HashMap<String, Record>,
     queue: VecDeque<Queued>,
-    running: Option<String>,
+    /// Sessions being handed off now: any number at once, one per uid.
+    running: std::collections::HashSet<String>,
 }
 
 struct Queued {
@@ -211,14 +212,16 @@ pub fn status(uid: &str) -> Option<Value> {
     registry().lock().unwrap_or_else(|p| p.into_inner()).records.get(uid).map(Record::to_json)
 }
 
-/// Take the host's one handoff slot for `uid` unless a handoff or rotation
-/// holds it. Called with the state lock held (`_locked`), as rotation's
-/// `admit` is, so the two never both run.
+/// Claim `uid` for a handoff unless a handoff or rotation of that same
+/// session is running. Handoffs of different sessions run in parallel (Owner,
+/// 2026-10-26); only one session's old and new engine must never overlap.
+/// Called with the state lock held (`_locked`), as rotation's `admit` is, so
+/// the two never both get the same uid.
 fn take_slot(_locked: &DaemonState, reg: &mut Registry, uid: &str) -> bool {
-    if reg.running.is_some() || crate::rotation::running_any().is_some() {
+    if reg.running.contains(uid) || crate::rotation::in_progress(uid) {
         return false;
     }
-    reg.running = Some(uid.to_string());
+    reg.running.insert(uid.to_string());
     true
 }
 
@@ -230,14 +233,14 @@ pub(crate) fn test_drop_queued(uid: &str) {
     reg.records.remove(uid);
 }
 
-/// The session being handed off now, if any (one at a time per host).
+/// A session being handed off now, if any.
 pub fn running() -> Option<String> {
-    registry().lock().unwrap_or_else(|p| p.into_inner()).running.clone()
+    registry().lock().unwrap_or_else(|p| p.into_inner()).running.iter().next().cloned()
 }
 
 /// Whether `uid`'s process is being stopped and replaced right now.
 pub fn in_progress(uid: &str) -> bool {
-    registry().lock().unwrap_or_else(|p| p.into_inner()).running.as_deref() == Some(uid)
+    registry().lock().unwrap_or_else(|p| p.into_inner()).running.contains(uid)
 }
 
 /// A failed handoff: recorded, and Owner is alerted when it left the uid not
@@ -292,7 +295,7 @@ pub(crate) fn recover_live(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap:
     crate::rotation::hold(&state_arc.lock().unwrap_or_else(|p| p.into_inner()), &uid, crate::rotation::HoldOwner::Handoff);
     {
         let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
-        reg.running = Some(uid.clone());
+        reg.running.insert(uid.clone());
         reg.records.insert(uid.clone(), Record {
             phase: "confirming",
             kind: Kind::Switch,
@@ -313,14 +316,16 @@ pub(crate) fn recover_live(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap:
             requested_by: None,
         });
     }
+    let worker_uid = uid.clone();
     let spawned = std::thread::Builder::new().name(format!("cm-handoff-recover-{uid}")).spawn(move || {
+        let uid = worker_uid;
         let from = who(&snap.entry.session_type, snap.entry.model.as_deref());
         let to = who(&engine, None);
         confirm_takeover(&state, &uid, &snap, &file, &from, &to, &engine, "resumed after a daemon restart");
         crate::rotation::inflight_remove(&state.lock().unwrap_or_else(|p| p.into_inner()), &uid);
     });
     if spawned.is_err() {
-        registry().lock().unwrap_or_else(|p| p.into_inner()).running = None;
+        registry().lock().unwrap_or_else(|p| p.into_inner()).running.remove(&uid);
     }
     spawned.is_ok()
 }
@@ -334,9 +339,7 @@ fn finish(uid: &str, phase: &'static str, outcome: String) {
         r.outcome = Some(outcome);
         r.finished_at = Some(now());
     }
-    if reg.running.as_deref() == Some(uid) {
-        reg.running = None;
-    }
+    reg.running.remove(uid);
 }
 
 // ---- requests -----------------------------------------------------------------
@@ -371,7 +374,7 @@ pub fn request(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, req: Request, wai
         plan
     };
     let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
-    if reg.running.as_deref() == Some(uid) {
+    if reg.running.contains(uid) {
         return Err((ErrorCode::Conflict, "a handoff of this session is already running".into()));
     }
     reg.queue.retain(|q| q.uid != uid);
@@ -421,7 +424,7 @@ pub fn request(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, req: Request, wai
 }
 
 /// Queue a handoff for several sessions (Owner's bulk use). Each runs at its
-/// own boundary, one at a time. Returns what was queued and what was refused.
+/// own boundary, in parallel. Returns what was queued and what was refused.
 pub fn request_many(state_arc: &Arc<Mutex<DaemonState>>, uids: &[String], req: &Request, wait: Option<Duration>) -> Value {
     let mut queued = Vec::new();
     let mut refused = Vec::new();
@@ -454,29 +457,47 @@ pub fn select(state: &DaemonState, from_engine: Option<&str>) -> Vec<String> {
 
 fn boundary(state: &DaemonState, uid: &str, req: &Request) -> Result<(), String> {
     let c = &state.config.transcript_rotation;
-    let (idle, quiet) = if req.now {
-        (Duration::ZERO, Duration::ZERO)
-    } else {
-        (Duration::from_secs(c.idle_secs), Duration::from_secs(c.owner_quiet_secs))
-    };
     if crate::rotation::in_progress(uid) {
         return Err("a transcript rotation is running".into());
     }
-    crate::rotation::boundary_for(state, uid, idle, quiet, &["claude-code", "codex"])
+    // `now`, and an operator's (Owner's) request, skip the idle and
+    // Owner-quiet waits: Owner ordered it. An operator request still waits
+    // out a turn, a job and an unsent draft; `now` waives the draft too.
+    let (idle, quiet, draft) = if req.now {
+        (Duration::ZERO, Duration::ZERO, false)
+    } else if req.origin == Origin::Operator {
+        (Duration::ZERO, Duration::ZERO, true)
+    } else {
+        (Duration::from_secs(c.idle_secs), Duration::from_secs(c.owner_quiet_secs), true)
+    };
+    crate::rotation::boundary_checked(
+        state,
+        uid,
+        &["claude-code", "codex"],
+        crate::rotation::Checks { idle, owner_quiet: quiet, draft, at_turn_end: false },
+    )
 }
 
-/// Start the next queued handoff whose session is at a safe boundary, unless
-/// one is already running. Expired requests are dropped and recorded.
+/// Start every queued handoff whose session is at a safe boundary; they run
+/// in parallel. Expired requests are dropped and recorded.
 pub fn tick(state_arc: &Arc<Mutex<DaemonState>>) {
+    let budget = registry().lock().unwrap_or_else(|p| p.into_inner()).queue.len();
+    for _ in 0..budget {
+        if !tick_one(state_arc) {
+            break;
+        }
+    }
+}
+
+/// Start the first queued handoff at a safe boundary. Returns whether one
+/// was taken off the queue (started, or failed to start).
+fn tick_one(state_arc: &Arc<Mutex<DaemonState>>) -> bool {
     let next = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         // Take the queue out: the boundary check reads this registry
         // (`in_progress`), so it must not be held across it.
         let queue = {
             let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
-            if reg.running.is_some() || crate::rotation::running_any().is_some() {
-                return;
-            }
             std::mem::take(&mut reg.queue)
         };
         let mut chosen = None;
@@ -512,12 +533,6 @@ pub fn tick(state_arc: &Arc<Mutex<DaemonState>>) {
                 r.deferred = Some(why);
             }
         }
-        if reg.running.is_some() {
-            if let Some(q) = chosen {
-                reg.queue.push_front(q);
-            }
-            return;
-        }
         for (uid, why) in expired {
             if let Some(r) = reg.records.get_mut(&uid) {
                 r.phase = "dropped";
@@ -525,7 +540,7 @@ pub fn tick(state_arc: &Arc<Mutex<DaemonState>>) {
                 r.finished_at = Some(now());
             }
         }
-        let Some(q) = chosen else { return };
+        let Some(q) = chosen else { return false };
         let snap = match crate::rotation::snapshot(&state, &q.uid) {
             Ok(s) => Some(s),
             // A repick or a switch needs no transcript (a session that never
@@ -539,11 +554,11 @@ pub fn tick(state_arc: &Arc<Mutex<DaemonState>>) {
                 r.outcome = Some("the session has no transcript to hand off from".into());
                 r.finished_at = Some(now());
             }
-            return;
+            return true;
         };
         if q.plan.kind != Kind::Rotate && !take_slot(&state, &mut reg, &q.uid) {
             reg.queue.push_front(q);
-            return;
+            return false;
         }
         if q.plan.kind != Kind::Rotate {
             // Wakes wait for whatever runs at the uid once this is done, so
@@ -567,7 +582,7 @@ pub fn tick(state_arc: &Arc<Mutex<DaemonState>>) {
             Ok(_) => finish(&q.uid, "done", "same engine and model: rotated the transcript (see rotation status)".into()),
             Err((_, e)) => finish(&q.uid, "failed", format!("rotation refused: {e}")),
         }
-        return;
+        return true;
     }
     let state = Arc::clone(state_arc);
     let uid = q.uid.clone();
@@ -593,6 +608,7 @@ pub fn tick(state_arc: &Arc<Mutex<DaemonState>>) {
     if let Err(e) = spawned {
         finish(&uid, "failed", format!("handoff worker: {e}"));
     }
+    true
 }
 
 /// The snapshot of a session that never bound a transcript.
@@ -1145,7 +1161,7 @@ mod tests {
     /// under the state lock, as `rotation::start` and `tick` do) are never
     /// both running.
     #[test]
-    fn a_rotation_and_a_handoff_never_both_get_the_host() {
+    fn a_rotation_and_a_handoff_never_both_get_the_same_session() {
         let _serial = crate::rotation::test_registry_lock();
         let state = Arc::new(Mutex::new(DaemonState::new()));
         let both = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1157,7 +1173,7 @@ mod tests {
                     let admitted = {
                         let st = state.lock().unwrap();
                         let ok = crate::rotation::admit(&st, "ts-race-r", crate::rotation::test_rotation_record("ts-race-r")).is_ok();
-                        if ok && running().is_some() {
+                        if ok && in_progress("ts-race-r") {
                             both.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         }
                         ok
@@ -1177,8 +1193,8 @@ mod tests {
                     let admitted = {
                         let st = state.lock().unwrap();
                         let mut reg = registry().lock().unwrap();
-                        let ok = take_slot(&st, &mut reg, "ts-race-h");
-                        if ok && crate::rotation::running_any().is_some() {
+                        let ok = take_slot(&st, &mut reg, "ts-race-r");
+                        if ok && crate::rotation::in_progress("ts-race-r") {
                             both.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         }
                         ok
@@ -1186,7 +1202,7 @@ mod tests {
                     if admitted {
                         wins.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         std::thread::yield_now();
-                        registry().lock().unwrap().running = None;
+                        registry().lock().unwrap().running.remove("ts-race-r");
                     }
                 }
             })

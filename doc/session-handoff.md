@@ -106,7 +106,7 @@ as targets (to a caller with authority over them). The request waits for the
 target's own safe boundary (agents never get `now`). The record carries
 `requested_by` ("label (uid)"), and the target's notices say who asked.
 
-One handoff or rotation runs at a time per host. `list_sessions` rows and
+Handoffs run in parallel, any number per host (Owner, 2026-10-26); only one handoff or rotation runs per session. An operator's request (Owner's, `handoff_many`) skips the idle and Owner-quiet waits but still waits out a turn, a job or an unsent draft. Automatic transcript rotations stay one at a time per host. `list_sessions` rows and
 `resolve_authorized_session` carry the `handoff` record, and a `turn_end`
 monitor absorbs the turns CM's own prompts cause: two for a switch (the
 document and the takeover), one for a repick.

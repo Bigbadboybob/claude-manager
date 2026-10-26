@@ -921,8 +921,8 @@ fn pause_left() -> Option<Duration> {
 /// (`handoff::tick`), so the two cannot both get in (lock order state →
 /// handoff → rotation).
 pub(crate) fn admit(_locked: &DaemonState, uid: &str, rotation: Rotation) -> Result<(), String> {
-    if let Some(other) = crate::handoff::running() {
-        return Err(format!("a handoff is running ({other}); one at a time per host"));
+    if crate::handoff::in_progress(uid) {
+        return Err("a handoff of this session is running".into());
     }
     claim(uid, rotation)
 }
