@@ -98,6 +98,20 @@ class Queue:
         finally:
             os.close(fd)
 
+    # Delivery hold (#24): while CM is about to rotate or hand off this
+    # session (it is due, or mid-rotation), new wakes stay pending so they
+    # reach the NEW process instead of racing the restart. The daemon writes
+    # `hold` (not *.json: never parsed as an event) with an expiry, so a
+    # daemon that dies mid-rotation cannot hold delivery for good.
+    HOLD_EXEMPT = frozenset({"rotation", "handoff"})
+
+    def held(self, now: float | None = None) -> bool:
+        try:
+            until = json.loads((self.path / "hold").read_text()).get("until")
+        except (OSError, ValueError, AttributeError):
+            return False
+        return isinstance(until, (int, float)) and until > (time.time() if now is None else now)
+
     def event_path(self, event_id: str) -> Path:
         return self.path / (hashlib.sha256(event_id.encode()).hexdigest() + ".json")
 
@@ -444,6 +458,7 @@ async def consume(queue: Queue, adapter):
                     return handed_off
             # New wakes must not sit behind slow receipt checks for older input.
             events.sort(key=lambda event: event["status"] != "pending")
+            held = queue.held()
             for event in events:
                 if event["version"] != 1 or event["recipient"] != queue.uid:
                     continue  # Never deliver an unknown envelope or another identity.
@@ -459,6 +474,9 @@ async def consume(queue: Queue, adapter):
                 if event["status"] != "pending" or blocked:
                     # A client known to drop these events keeps them pending
                     # (retractable, never ambiguously submitted).
+                    continue
+                if held and event.get("source") not in Queue.HOLD_EXEMPT:
+                    # A rotation is due or running: the new process gets it.
                     continue
                 event = queue.change(
                     event["id"],

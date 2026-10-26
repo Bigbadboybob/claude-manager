@@ -3167,6 +3167,11 @@ pub fn session_agent_report(
     if applied.accepted && native_codex && applied.refresh_rollout {
         crate::transcript_detect::observe_codex_rollout_once(state_arc, &p.session_uid, &mut false);
     }
+    // #24: a due rotation starts right at the turn end, before the next
+    // wake (messages, a finished background job) starts another turn.
+    if applied.accepted && applied.ended && !continuing {
+        crate::rotation::on_turn_end(state_arc, &p.session_uid);
+    }
     Ok(json!({"ok": true, "applied": applied.accepted, "agent_state": agent_state}))
 }
 
@@ -3252,9 +3257,13 @@ pub fn session_turn_ended(
         session.stamp_turn_end();
     }
     let native_codex = session.session_type == "codex";
+    let ended = !p.continuing;
     rebind_reported_transcript(&mut state, &p.session_uid, p.transcript_path.as_deref());
     crate::agent_state::recompute_and_publish(&state, &p.session_uid);
     drop(state);
+    if ended {
+        crate::rotation::on_turn_end(state_arc, &p.session_uid);
+    }
     if native_codex {
         // The native launcher reports the selected thread immediately. The
         // existing /proc ownership check validates its exact rollout before

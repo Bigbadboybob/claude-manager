@@ -44,6 +44,33 @@ fn read(path: &Path) -> io::Result<Option<Value>> {
         Err(e) => Err(e),
     }
 }
+/// #24: hold `uid`'s new wakes (they stay pending) until `until` (unix
+/// seconds): CM is about to restart it for a rotation or handoff, so they
+/// go to the new process. Rotation/handoff notices are exempt (the
+/// consumer's `Queue.HOLD_EXEMPT`). `hold` is not `*.json`, so it is never
+/// read as an event.
+pub fn set_hold(root: &Path, uid: &str, until: f64) -> io::Result<()> {
+    let dir = directory(root, uid);
+    fs::create_dir_all(&dir)?;
+    let tmp = dir.join(".hold.tmp");
+    fs::write(&tmp, json!({ "until": until }).to_string())?;
+    fs::rename(tmp, dir.join("hold"))
+}
+
+/// Lift [`set_hold`]; the consumer then delivers what waited.
+pub fn clear_hold(root: &Path, uid: &str) {
+    let _ = fs::remove_file(directory(root, uid).join("hold"));
+}
+
+/// Whether `uid`'s wakes are held right now.
+pub fn held(root: &Path, uid: &str, now: f64) -> bool {
+    fs::read_to_string(directory(root, uid).join("hold"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v["until"].as_f64())
+        .is_some_and(|until| until > now)
+}
+
 pub fn get(root: &Path, uid: &str, id: &str) -> io::Result<Option<Value>> {
     let _guard = lock(root, uid)?;
     read(&path(root, uid, id))
@@ -175,6 +202,36 @@ pub fn retire_unconfirmable(root: &Path, uid: &str) -> io::Result<usize> {
     Ok(retired)
 }
 
+/// Retire ambiguous receipts (`submitted` / `uncertain`, never observed)
+/// older than `max_age` seconds (by `updated_at`, else `created_at`): they
+/// will never be confirmed, and must not hold anything back for good (#24:
+/// 8–17-day-old receipts blocked a rotation boundary). Marks them cancelled
+/// with `retired: "stale_receipt"`; returns how many.
+pub fn retire_stale(root: &Path, uid: &str, max_age: f64, now: f64) -> io::Result<usize> {
+    let dir = directory(root, uid);
+    if !dir.is_dir() {
+        return Ok(0);
+    }
+    let _guard = lock(root, uid)?;
+    let mut retired = 0;
+    for entry in fs::read_dir(&dir)? {
+        let path = entry?.path();
+        if path.extension().is_none_or(|x| x != "json") || path.file_name().is_some_and(|n| n == "transport.json") {
+            continue;
+        }
+        let Ok(Some(mut event)) = read(&path) else { continue };
+        let open = matches!(event["status"].as_str(), Some("submitted" | "uncertain"));
+        let at = event["updated_at"].as_f64().or_else(|| event["created_at"].as_f64()).unwrap_or(0.0);
+        if open && now - at > max_age {
+            event["status"] = json!("cancelled");
+            event["retired"] = json!("stale_receipt");
+            atomic_replace(&path, &event)?;
+            retired += 1;
+        }
+    }
+    Ok(retired)
+}
+
 /// Only unclaimed events can be rewritten or retracted. A submitted native
 /// frame cannot be recalled; leave the receipt state intact.
 pub fn update_pending(
@@ -265,6 +322,31 @@ mod tests {
         assert_eq!(retire_unconfirmable(root, "uid").unwrap(), 1);
         assert_eq!(retire_unconfirmable(root, "nobody").unwrap(), 0);
     }
+    #[test]
+    fn stale_ambiguous_receipts_are_retired_and_fresh_ones_kept() {
+        let _env = crate::test_support::env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for (id, status, age) in [("old-sub", "submitted", 9.0 * 86400.0), ("old-unc", "uncertain", 17.0 * 86400.0),
+                                  ("fresh", "submitted", 60.0), ("waiting", "pending", 9.0 * 86400.0)] {
+            let marker = format!("[m {id}]");
+            publish(root, "uid", id, "chat", &format!("{marker} x"), &marker).unwrap();
+            let mut e = get(root, "uid", id).unwrap().unwrap();
+            e["status"] = json!(status);
+            e["updated_at"] = json!(1_000_000.0 - age);
+            atomic_replace(&path(root, "uid", id), &e).unwrap();
+        }
+        assert_eq!(retire_stale(root, "uid", 86400.0, 1_000_000.0).unwrap(), 2);
+        assert_eq!(get(root, "uid", "old-sub").unwrap().unwrap()["retired"], "stale_receipt");
+        assert_eq!(get(root, "uid", "fresh").unwrap().unwrap()["status"], "submitted");
+        assert_eq!(get(root, "uid", "waiting").unwrap().unwrap()["status"], "pending", "a queued wake is not a receipt");
+        // Holds round-trip.
+        set_hold(root, "uid", 2e9).unwrap();
+        assert!(held(root, "uid", 1e9) && !held(root, "uid", 3e9));
+        clear_hold(root, "uid");
+        assert!(!held(root, "uid", 1e9));
+    }
+
     #[test]
     fn notifications_python_and_rust_share_queue_and_receipts() {
         let _env = crate::test_support::env_lock();

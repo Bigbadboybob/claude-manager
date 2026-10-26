@@ -123,6 +123,36 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.post()  # producer replay remains idempotent
         self.assertEqual(self.queue.get("one")["status"], "observed")
 
+    async def test_a_rotation_hold_keeps_wakes_pending_for_the_new_process(self):
+        # #24: while CM rotates this session, chat wakes stay pending (never
+        # submitted to the old process); the rotation's own notice still goes.
+        # Once the hold lifts, the next consumer delivers every one of them.
+        (self.queue.path / "hold").write_text(json.dumps({"until": time.time() + 60}))
+        old = Adapter()
+        task = self.start(old)
+        self.post("chat-1")
+        self.queue.publish("rot", "rotation", "[cm-rotation-notice x] heads-up", "[cm-rotation-notice x]")
+        await eventually(lambda: self.queue.get("rot")["status"] == "submitted")
+        self.post("chat-2")
+        await asyncio.sleep(0.2)
+        self.assertEqual([e["id"] for e in old.sent], ["rot"])
+        self.assertEqual({self.queue.get(i)["status"] for i in ("chat-1", "chat-2")}, {"pending"})
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        (self.queue.path / "hold").unlink()
+        new = Adapter()
+        self.start(new)
+        await eventually(lambda: len(new.sent) == 2)
+        self.assertEqual(sorted(e["id"] for e in new.sent), ["chat-1", "chat-2"], "nothing lost")
+
+    async def test_an_expired_hold_does_not_block_delivery(self):
+        (self.queue.path / "hold").write_text(json.dumps({"until": time.time() - 1}))
+        adapter = Adapter()
+        self.start(adapter)
+        self.post()
+        await eventually(lambda: self.queue.get("one")["status"] == "submitted")
+
     async def test_ambiguous_disconnect_is_retained_and_not_replayed_after_restart(
         self,
     ):

@@ -5021,12 +5021,12 @@ def rotate_transcript(reason: str = "", status: bool = False) -> dict:
     threshold; call this when you notice lag earlier, before a long new
     phase, or on Codex (which CM does not rotate on its own).
 
-    It is queued, not immediate: at your next safe idle point (a few minutes
-    idle, nothing running, nothing waiting to be delivered) CM restarts you at
-    the SAME CM session, with the same chat name, task, workspace and
-    permissions, continuing from your latest compaction summary in a new
-    transcript. Your first message afterwards says so. End your turn normally
-    after calling it. Anything a successor must not lose belongs in files,
+    It is armed for the end of your current turn: as soon as that turn ends
+    (with no tool or background job running) CM restarts you at the SAME CM
+    session, with the same chat name, task, workspace and permissions,
+    continuing from your latest compaction summary in a new transcript.
+    Messages that arrive meanwhile wait for the new transcript. Your first
+    message afterwards says so. End your turn normally after calling it. Anything a successor must not lose belongs in files,
     board items or notes, as always.
 
     Args:

@@ -182,6 +182,38 @@ pub fn boundary_for(
     owner_quiet: Duration,
     engines: &[&str],
 ) -> Result<(), String> {
+    boundary_checked(state, uid, engines, Checks { idle, owner_quiet, at_turn_end: false })
+}
+
+/// What a boundary check asks for.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Checks {
+    /// How long the agent must have been idle.
+    pub idle: Duration,
+    /// How long Owner must not have viewed or typed in it (and whether a
+    /// possible unsent draft blocks it): the automatic policy only.
+    pub owner_quiet: Duration,
+    /// Checked right at a turn end (or forced): queued wakes do not block
+    /// (they are held for the new process, `notifications::set_hold`), only
+    /// one being submitted to the old process right now does.
+    pub at_turn_end: bool,
+}
+
+/// How long a wake counts as "being submitted" to the old process.
+const IN_FLIGHT_SECS: f64 = 30.0;
+/// An unconfirmed receipt older than this does not block a boundary...
+const STALE_RECEIPT_SECS: f64 = 10.0 * 60.0;
+/// ...and one older than this is retired (`notifications::retire_stale`).
+const RETIRE_RECEIPT_SECS: f64 = 24.0 * 3600.0;
+
+/// Whether a background job's process is still there (a job whose process
+/// is gone has exited, even if the agent's last snapshot still lists it).
+fn job_alive(job: &crate::agent_state::Job) -> bool {
+    job.pid.is_none_or(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
+}
+
+pub(crate) fn boundary_checked(state: &DaemonState, uid: &str, engines: &[&str], checks: Checks) -> Result<(), String> {
+    let Checks { idle, owner_quiet, at_turn_end } = checks;
     let sess = state.sessions.get(uid).ok_or_else(|| format!("session '{uid}' is not live on this host"))?;
     if !engines.contains(&sess.session_type.as_str()) {
         return Err(format!("{} sessions cannot do this (only {})", sess.session_type, engines.join(", ")));
@@ -212,8 +244,9 @@ pub fn boundary_for(
     if idle_for < idle.as_secs_f64() {
         return Err(format!("idle {:.0}s of the {}s required", idle_for.max(0.0), idle.as_secs()));
     }
-    if !agent.background.jobs.is_empty() {
-        return Err(format!("{} background job(s) running", agent.background.jobs.len()));
+    let jobs = agent.background.jobs.iter().filter(|j| job_alive(j)).count();
+    if jobs > 0 {
+        return Err(format!("{jobs} background job(s) running"));
     }
     // A scheduled wakeup lives in the process: a restart would lose it (CM
     // does not carry session crons across a fork).
@@ -238,11 +271,25 @@ pub fn boundary_for(
             return Err("Owner typed in it since its last turn (a draft may be unsent)".into());
         }
     }
+    let t = now();
     let pending = crate::notifications::snapshot(&state.messaging_root, uid)
         .map(|(events, _)| {
             events
                 .iter()
-                .filter(|e| matches!(e["status"].as_str(), Some("pending" | "submitted" | "uncertain")))
+                .filter(|e| {
+                    let age = t - e["updated_at"].as_f64().or_else(|| e["created_at"].as_f64()).unwrap_or(0.0);
+                    match e["status"].as_str() {
+                        // Queued wakes wait for the new process (held) at a
+                        // turn end; on a poll they are still to come.
+                        Some("pending") => !at_turn_end,
+                        // One going into the old process right now.
+                        Some("submitting" | "submitted") if at_turn_end => age < IN_FLIGHT_SECS,
+                        // An ambiguous receipt that stayed unconfirmed this
+                        // long never will be: it does not block anything.
+                        Some("submitted" | "uncertain") => !at_turn_end && age < STALE_RECEIPT_SECS,
+                        _ => false,
+                    }
+                })
                 // The rotation's own before-notice never holds it back (a
                 // stuck consumer would otherwise block rotation forever).
                 .filter(|e| !matches!(e["source"].as_str(), Some("rotation" | "handoff")))
@@ -250,9 +297,28 @@ pub fn boundary_for(
         })
         .unwrap_or(0);
     if pending > 0 {
-        return Err(format!("{pending} notification(s) not yet delivered"));
+        return Err(if at_turn_end {
+            format!("{pending} notification(s) being delivered right now")
+        } else {
+            format!("{pending} notification(s) not yet delivered")
+        });
     }
     Ok(())
+}
+
+/// Whether a boundary refusal can never clear by waiting (anything else
+/// clears at a later turn end, so a forced request arms instead).
+fn permanent_refusal(why: &str) -> bool {
+    why.contains("is not live on this host")
+        || why.contains("sessions cannot do this")
+        || why.contains("has no bound transcript")
+        || why.contains("workflow participant")
+}
+
+/// Whether a refusal is about the next few seconds (the agent is mid-turn,
+/// jobs, a wake being delivered): worth holding new wakes for.
+fn hold_worthy(why: &str) -> bool {
+    why.starts_with("not idle") || why.contains("background job") || why.contains("being delivered")
 }
 
 /// What a rotation needs from the live session, captured under the lock.
@@ -302,20 +368,49 @@ pub fn start(
     origin: Origin,
     force: bool,
 ) -> MethodResult {
+    let checks = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let c = &state.config.transcript_rotation;
+        if force {
+            // `force` (an operator's explicit request) waives the idle and
+            // Owner-quiet waits and does not wait for queued wakes (held for
+            // the new process); a tool call, background job, a wake going in
+            // right now, a workflow transition or a continuous run still
+            // refuse, and then the request is ARMED for the next turn end.
+            Checks { idle: Duration::ZERO, owner_quiet: Duration::ZERO, at_turn_end: true }
+        } else {
+            Checks {
+                idle: Duration::from_secs(c.idle_secs),
+                owner_quiet: if origin == Origin::Policy { Duration::from_secs(c.owner_quiet_secs) } else { Duration::ZERO },
+                at_turn_end: false,
+            }
+        }
+    };
+    match start_with(state_arc, uid, reason, origin, checks) {
+        Err((ErrorCode::Conflict, why)) if force && !permanent_refusal(&why) => {
+            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            let mut v = arm(&state, uid, reason, origin, true)?;
+            v["deferred"] = json!(why);
+            Ok(v)
+        }
+        other => other,
+    }
+}
+
+/// [`start`] with explicit boundary checks.
+pub(crate) fn start_with(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    uid: &str,
+    reason: &str,
+    origin: Origin,
+    checks: Checks,
+) -> MethodResult {
     let (snap, record) = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-        let (idle, quiet) = {
-            let c = &state.config.transcript_rotation;
-            (Duration::from_secs(c.idle_secs), Duration::from_secs(c.owner_quiet_secs))
-        };
-        // `force` (an operator's explicit request) waives only the idle and
-        // Owner-quiet waits: a tool call, background job, undelivered notice,
-        // workflow transition or continuous run still refuses.
-        let (idle, quiet) = if force { (Duration::ZERO, Duration::ZERO) } else { (idle, quiet) };
         // #25: an explicit request may rotate Codex too (`codex fork`); the
         // automatic policy stays Claude-only.
         let engines: &[&str] = if origin == Origin::Policy { &["claude-code"] } else { &["claude-code", "codex"] };
-        boundary_for(&state, uid, idle, quiet, engines).map_err(|why| (ErrorCode::Conflict, format!("not at a safe boundary: {why}")))?;
+        boundary_checked(&state, uid, engines, checks).map_err(|why| (ErrorCode::Conflict, format!("not at a safe boundary: {why}")))?;
         if origin != Origin::Operator {
             if let Some(left) = pause_left() {
                 return Err((ErrorCode::Conflict, format!("pausing {}s after the last rotation", left.as_secs())));
@@ -337,6 +432,9 @@ pub fn start(
         };
         let record = rotation.to_json();
         admit(&state, uid, rotation).map_err(|why| (ErrorCode::Conflict, why))?;
+        // New wakes wait for the new process (lifted when this finishes).
+        hold(&state, uid);
+        arms().lock().unwrap_or_else(|p| p.into_inner()).remove(uid);
         (snap, record)
     };
     // A brain restart between the stop and the respawn must not leave the
@@ -435,6 +533,27 @@ fn fork_written(path: &Path) -> Option<u64> {
     (claude || codex).then_some(len)
 }
 
+/// Whether the fork at `path` is in use: the after-notice's marker is
+/// recorded, or any new turn is. A Claude fork's file is only written when
+/// its first message is recorded, whatever that message was (a wake that got
+/// in first still proves the fork took). A Codex fork's rollout starts with
+/// the copied history, so it needs a user row after `since` (its length when
+/// first bound).
+fn fork_took(path: &Path, marker: &str, claude: bool, since: u64) -> bool {
+    if tail_contains(path, marker) || claude {
+        return true;
+    }
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    if f.seek(SeekFrom::Start(since)).is_err() {
+        return false;
+    }
+    let mut buf = Vec::new();
+    let _ = f.take(4 * 1024 * 1024).read_to_end(&mut buf);
+    let text = String::from_utf8_lossy(&buf);
+    text.lines().any(|l| l.contains("\"role\":\"user\"") || l.contains("\"type\":\"user\""))
+}
+
 /// Whether the last `TAIL` bytes of `path` contain `marker` (the delivered
 /// notice was recorded in this transcript).
 pub(crate) fn tail_contains(path: &Path, marker: &str) -> bool {
@@ -512,6 +631,7 @@ fn deliver_with(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, text: String, fr
 
 fn finish(uid: &str, phase: &'static str, outcome: String) {
     eprintln!("cm-daemon: rotation of {uid}: {outcome}");
+    unhold(uid);
     update(uid, |r| {
         r.phase = phase;
         r.outcome = Some(outcome);
@@ -866,6 +986,8 @@ fn run(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: Snapshot) {
     update(uid, |r| r.phase = "verifying");
     let needle = format!("[cm-rotation{marker}]");
     let deadline = Instant::now() + verify_deadline(snap.from_bytes);
+    let claude = snap.entry.session_type == "claude-code";
+    let mut first_len: Option<(PathBuf, u64)> = None;
     while Instant::now() < deadline {
         let (live, to_path) = {
             let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
@@ -879,7 +1001,11 @@ fn run(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: Snapshot) {
         if let Some(to_path) = to_path.filter(|p| p != &snap.from_path) {
             let to_id = crate::session::transcript_id_from_path(&to_path.to_string_lossy());
             update(uid, |r| r.to_id = to_id.clone());
-            if let Some(bytes) = fork_written(&to_path).filter(|_| tail_contains(&to_path, &needle)) {
+            if first_len.as_ref().is_none_or(|(p, _)| p != &to_path) {
+                first_len = Some((to_path.clone(), std::fs::metadata(&to_path).map(|m| m.len()).unwrap_or(0)));
+            }
+            let since = first_len.as_ref().map_or(0, |(_, n)| *n);
+            if let Some(bytes) = fork_written(&to_path).filter(|_| fork_took(&to_path, &needle, claude, since)) {
                 update(uid, |r| r.to_bytes = Some(bytes));
                 if let Some(to) = to_id.as_deref() {
                     let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
@@ -995,27 +1121,69 @@ pub fn over_threshold(cfg: &crate::config::TranscriptRotationConfig, bytes: u64,
     None
 }
 
-fn before_notice(why: &str, quiet_secs: u64) -> String {
+fn before_notice(why: &str) -> String {
     format!(
         "[cm-rotation] Heads-up: your {why}. Claude Code slows down badly on transcripts this \
-         large, so CM will move this conversation to a fresh transcript at your next idle point \
-         ({} min with nothing running). You will continue from your latest compaction summary \
-         at the same CM session, name, task and workspace. Keep anything a successor would need \
-         in files, board items or notes, as usual; nothing to do otherwise.",
-        (quiet_secs + 59) / 60
+         large, so CM will move this conversation to a fresh transcript right after your next \
+         turn ends (with no tool or background job running). You will continue from your latest \
+         compaction summary at the same CM session, name, task and workspace; messages that \
+         arrive meanwhile wait for the new transcript. Keep anything a successor would need in \
+         files, board items or notes, as usual; nothing to do otherwise."
     )
 }
 
-/// Agents' own rotation requests (uid → reason), carried out by the policy
-/// at the session's next safe boundary (an agent asks mid-turn, so it is
-/// never at one when it asks).
-fn requests() -> &'static Mutex<HashMap<String, String>> {
-    static R: std::sync::OnceLock<Mutex<HashMap<String, String>>> = std::sync::OnceLock::new();
+/// A rotation asked for but not at a boundary yet: an agent's own request,
+/// or an operator's forced one that met a turn in progress. Carried out at
+/// the session's next turn end ([`on_turn_end`]), else by the policy pass.
+#[derive(Clone, Debug)]
+struct Arm {
+    reason: String,
+    origin: Origin,
+    armed_at: f64,
+}
+
+fn arms() -> &'static Mutex<HashMap<String, Arm>> {
+    static R: std::sync::OnceLock<Mutex<HashMap<String, Arm>>> = std::sync::OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Queue `uid`'s own request. Returns what it will wait for.
-pub fn request(state: &DaemonState, uid: &str, reason: &str) -> Result<Value, (ErrorCode, String)> {
+/// Whether a rotation of `uid` is armed (waits for its next turn end).
+pub fn armed(uid: &str) -> bool {
+    arms().lock().unwrap_or_else(|p| p.into_inner()).contains_key(uid)
+}
+
+/// An armed rotation that found no usable turn end in this long is dropped.
+const ARM_EXPIRY_SECS: f64 = 6.0 * 3600.0;
+
+/// How long the hold on new wakes lasts at most (a daemon that dies with a
+/// hold in place stops holding after this).
+const HOLD_SECS: f64 = 30.0 * 60.0;
+
+/// Where each held uid's queue lives, to lift it from `finish`.
+fn holds() -> &'static Mutex<HashMap<String, PathBuf>> {
+    static H: std::sync::OnceLock<Mutex<HashMap<String, PathBuf>>> = std::sync::OnceLock::new();
+    H.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Hold `uid`'s new wakes for the new process (`notifications::set_hold`).
+pub(crate) fn hold(state: &DaemonState, uid: &str) {
+    if let Err(e) = crate::notifications::set_hold(&state.messaging_root, uid, now() + HOLD_SECS) {
+        eprintln!("cm-daemon: rotation of {uid}: could not hold wakes: {e}");
+        return;
+    }
+    holds().lock().unwrap_or_else(|p| p.into_inner()).insert(uid.to_string(), state.messaging_root.clone());
+}
+
+/// Lift the hold: queued wakes go to whatever runs at the uid now.
+pub(crate) fn unhold(uid: &str) {
+    if let Some(root) = holds().lock().unwrap_or_else(|p| p.into_inner()).remove(uid) {
+        crate::notifications::clear_hold(&root, uid);
+    }
+}
+
+/// Arm a rotation of `uid` for its next turn end, holding new wakes so that
+/// turn end is not raced by one. Returns what it will wait for.
+pub fn arm(state: &DaemonState, uid: &str, reason: &str, origin: Origin, _forced: bool) -> Result<Value, (ErrorCode, String)> {
     match state.sessions.get(uid) {
         Some(s) if matches!(s.session_type.as_str(), "claude-code" | "codex") && s.transcript_path.is_some() => {}
         Some(s) if !matches!(s.session_type.as_str(), "claude-code" | "codex") => {
@@ -1024,18 +1192,181 @@ pub fn request(state: &DaemonState, uid: &str, reason: &str) -> Result<Value, (E
         Some(_) => return Err((ErrorCode::Conflict, "the session has no bound transcript yet".into())),
         None => return Err((ErrorCode::NotFound, format!("session '{uid}' is not live on this host"))),
     }
-    requests().lock().unwrap_or_else(|p| p.into_inner()).insert(uid.to_string(), reason.to_string());
-    let c = &state.config.transcript_rotation;
+    arms().lock().unwrap_or_else(|p| p.into_inner()).insert(
+        uid.to_string(),
+        Arm { reason: reason.to_string(), origin, armed_at: now() },
+    );
+    hold(state, uid);
     Ok(json!({
         "ok": true,
         "queued": true,
-        "note": format!(
-            "CM will move this conversation to a fresh transcript once you have been idle {} min \
-             with nothing running (checked every {} min). End your turn normally.",
-            (c.idle_secs + 59) / 60,
-            (c.check_secs + 59) / 60,
-        ),
+        "armed": true,
+        "session_uid": uid,
+        "note": "CM moves this conversation to a fresh transcript as soon as its current turn ends \
+                 (within a second or two). New wakes wait for the new transcript. End your turn normally.",
     }))
+}
+
+/// Queue `uid`'s own request (an agent asks mid-turn): armed for its next
+/// turn end.
+pub fn request(state: &DaemonState, uid: &str, reason: &str) -> Result<Value, (ErrorCode, String)> {
+    arm(state, uid, reason, Origin::Agent, false)
+}
+
+/// Called when `uid` reports a turn end (`session.turn_ended` /
+/// `session.agent_report`). A session that is due (armed, or over the size
+/// threshold) rotates right then, within about a second, before the next
+/// wake starts another turn. Runs on its own thread; returns at once.
+pub fn on_turn_end(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) {
+    let due = armed(uid) || {
+        let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        policy_due(&st, uid).is_some()
+    };
+    if !due {
+        return;
+    }
+    let state = Arc::clone(state_arc);
+    let uid = uid.to_string();
+    let _ = std::thread::Builder::new().name(format!("cm-rotate-turn-{uid}")).spawn(move || {
+        // The Stop report can reach the daemon before the agent's state
+        // source (presence, the relay) says idle; that observation lands a
+        // moment later, backdated. Start the moment it reads idle; if it
+        // never does in the window (a wake already started the next turn),
+        // try anyway: the refusal holds new wakes for the next turn end.
+        let deadline = Instant::now() + TURN_END_WINDOW;
+        loop {
+            std::thread::sleep(TURN_END_POLL);
+            let idle = {
+                let st = state.lock().unwrap_or_else(|p| p.into_inner());
+                st.sessions
+                    .get(&uid)
+                    .is_some_and(|s| crate::agent_state::current(s).state == crate::agent_state::State::Idle)
+            };
+            if idle || Instant::now() >= deadline {
+                break;
+            }
+        }
+        try_due(&state, &uid);
+    });
+}
+
+/// How long after a reported turn end the agent may take to read idle.
+const TURN_END_WINDOW: Duration = Duration::from_secs(5);
+const TURN_END_POLL: Duration = Duration::from_millis(100);
+
+/// Why the policy wants `uid` rotated now, if it does (over the size
+/// threshold, not backing off, a Claude session the boundary can accept).
+fn policy_due(state: &DaemonState, uid: &str) -> Option<String> {
+    let cfg = &state.config.transcript_rotation;
+    if !cfg.enabled || in_progress(uid) || recently_failed(uid) {
+        return None;
+    }
+    let s = state.sessions.get(uid)?;
+    if s.session_type != "claude-code" || s.workflow_run_id.is_some() {
+        return None;
+    }
+    let path = PathBuf::from(s.transcript_path.clone()?);
+    let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    if rotation_did_not_shrink(uid, &path, cfg.max_bytes) {
+        return None;
+    }
+    // Size only here (a stat); compaction counts are the policy pass's.
+    over_threshold(cfg, bytes, 0)
+}
+
+/// Whether `path` is the transcript `uid`'s last rotation produced and it is
+/// still over the threshold: rotating it again would not help (a fork keeps
+/// everything after the last compaction; under 5 MB Claude copies the whole
+/// file), so the policy leaves it until it has a new transcript.
+fn rotation_did_not_shrink(uid: &str, path: &Path, max_bytes: u64) -> bool {
+    let id = crate::session::transcript_id_from_path(&path.to_string_lossy());
+    registry().lock().unwrap_or_else(|p| p.into_inner()).get(uid).is_some_and(|r| {
+        r.phase == "done" && r.to_id.is_some() && r.to_id == id && r.to_bytes.is_some_and(|b| max_bytes > 0 && b >= max_bytes)
+    })
+}
+
+/// Retire `uid`'s receipts that will never be confirmed.
+fn retire_stale_receipts(state: &DaemonState, uid: &str) {
+    match crate::notifications::retire_stale(&state.messaging_root, uid, RETIRE_RECEIPT_SECS, now()) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("cm-daemon: retired {n} stale unconfirmed notification receipt(s) of {uid}"),
+        Err(e) => eprintln!("cm-daemon: retiring stale receipts of {uid}: {e}"),
+    }
+}
+
+/// The turn-end attempt for a due session.
+fn try_due(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) {
+    retire_stale_receipts(&state_arc.lock().unwrap_or_else(|p| p.into_inner()), uid);
+    let arm = arms().lock().unwrap_or_else(|p| p.into_inner()).get(uid).cloned();
+    let (reason, origin, checks) = match arm {
+        Some(a) => (a.reason, a.origin, Checks { idle: Duration::ZERO, owner_quiet: Duration::ZERO, at_turn_end: true }),
+        None => {
+            let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(why) = policy_due(&st, uid) else { return };
+            if notice_first(&st, uid, &why) {
+                // The notice's own turn ends next; rotate then.
+                return;
+            }
+            let quiet = Duration::from_secs(st.config.transcript_rotation.owner_quiet_secs);
+            (why, Origin::Policy, Checks { idle: Duration::ZERO, owner_quiet: quiet, at_turn_end: true })
+        }
+    };
+    match start_with(state_arc, uid, &reason, origin, checks) {
+        Ok(_) => eprintln!("cm-daemon: rotating {uid} at its turn end: {reason}"),
+        Err((_, why)) if permanent_refusal(&why) => {
+            eprintln!("cm-daemon: rotation of {uid} dropped: {why}");
+            arms().lock().unwrap_or_else(|p| p.into_inner()).remove(uid);
+            unhold(uid);
+        }
+        Err((_, why)) => {
+            eprintln!("cm-daemon: rotation of {uid} deferred at its turn end: {why}");
+            // A wake raced this turn end, or the agent went straight on:
+            // hold new wakes so the next turn end is clean. A lasting reason
+            // (Owner around, a scheduled wakeup) lets them flow meanwhile.
+            if hold_worthy(&why) {
+                let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                hold(&st, uid);
+            } else if !armed(uid) {
+                unhold(uid);
+            }
+        }
+    }
+}
+
+/// Publish the policy's before-notice for `uid`'s current transcript, once.
+/// Returns whether it went out now (the rotation then waits a turn).
+fn notice_first(state: &DaemonState, uid: &str, why: &str) -> bool {
+    let Some(path) = state.sessions.get(uid).and_then(|s| s.transcript_path.clone()) else { return false };
+    let id = crate::session::transcript_id_from_path(&path).unwrap_or_default();
+    let first = {
+        let mut n = noticed().lock().unwrap_or_else(|p| p.into_inner());
+        n.get(uid) != Some(&id) && {
+            n.insert(uid.to_string(), id.clone());
+            true
+        }
+    };
+    if first {
+        let marker = format!("[cm-rotation-notice {id}]");
+        let text = format!("{marker} {}", before_notice(why));
+        match crate::notifications::publish(
+            &state.messaging_root,
+            uid,
+            &format!("rotation-notice:{id}"),
+            "rotation",
+            &text,
+            &marker,
+        ) {
+            Ok(_) => {}
+            // This transcript was already noticed (by an earlier brain, with
+            // older wording): nothing more to say before rotating.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return false,
+            Err(e) => {
+                eprintln!("cm-daemon: rotation notice for {uid}: {e}");
+                return false;
+            }
+        }
+    }
+    first
 }
 
 /// After a failed rotation the policy leaves the session alone this long.
@@ -1076,20 +1407,18 @@ pub fn tick(state_arc: &Arc<Mutex<DaemonState>>) {
             .collect();
         (cfg, candidates)
     };
-    // Agents' own requests first: no threshold, no before-notice (they
-    // asked), only the boundary.
-    let asked: Vec<(String, String)> =
-        requests().lock().unwrap_or_else(|p| p.into_inner()).iter().map(|(u, r)| (u.clone(), r.clone())).collect();
-    for (uid, reason) in asked {
-        match start(state_arc, &uid, &format!("requested: {reason}"), Origin::Agent, false) {
-            Ok(_) => {
-                requests().lock().unwrap_or_else(|p| p.into_inner()).remove(&uid);
-            }
-            Err((ErrorCode::NotFound | ErrorCode::InvalidParams, _)) => {
-                requests().lock().unwrap_or_else(|p| p.into_inner()).remove(&uid);
-            }
-            Err((_, refusal)) => eprintln!("cm-daemon: requested rotation of {uid} deferred: {refusal}"),
+    // Armed requests first (a fallback: they normally run at the next turn
+    // end). No threshold, no before-notice (they asked), only the boundary.
+    let asked: Vec<(String, f64)> =
+        arms().lock().unwrap_or_else(|p| p.into_inner()).iter().map(|(u, a)| (u.clone(), a.armed_at)).collect();
+    for (uid, armed_at) in asked {
+        if now() - armed_at > ARM_EXPIRY_SECS {
+            eprintln!("cm-daemon: armed rotation of {uid} expired without a usable turn end");
+            arms().lock().unwrap_or_else(|p| p.into_inner()).remove(&uid);
+            unhold(&uid);
+            continue;
         }
+        try_due(state_arc, &uid);
     }
     // Sizes first (a stat each); compactions are counted only for files big
     // enough to matter, off a low-priority thread (the first pass after a
@@ -1108,7 +1437,10 @@ pub fn tick(state_arc: &Arc<Mutex<DaemonState>>) {
         .collect();
     let counted = count_compactions_quietly(scan);
     for (uid, path, bytes) in sized {
-        if requests().lock().unwrap_or_else(|p| p.into_inner()).contains_key(&uid) {
+        if armed(&uid) {
+            continue;
+        }
+        if rotation_did_not_shrink(&uid, &path, cfg.max_bytes) {
             continue;
         }
         let why = over_threshold(&cfg, bytes, counted.get(&path).copied().unwrap_or(0));
@@ -1116,29 +1448,10 @@ pub fn tick(state_arc: &Arc<Mutex<DaemonState>>) {
         if recently_failed(&uid) {
             continue;
         }
-        let id = crate::session::transcript_id_from_path(&path.to_string_lossy()).unwrap_or_default();
-        let first_notice = {
-            let mut n = noticed().lock().unwrap_or_else(|p| p.into_inner());
-            n.get(&uid) != Some(&id) && {
-                n.insert(uid.clone(), id.clone());
-                true
-            }
-        };
-        if first_notice {
-            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-            let marker = format!("[cm-rotation-notice {id}]");
-            let text = format!("{marker} {}", before_notice(&why, cfg.idle_secs));
-            if let Err(e) = crate::notifications::publish(
-                &state.messaging_root,
-                &uid,
-                &format!("rotation-notice:{id}"),
-                "rotation",
-                &text,
-                &marker,
-            ) {
-                eprintln!("cm-daemon: rotation notice for {uid}: {e}");
-            }
-            continue; // rotate on a later pass, after the notice settles
+        let _ = &path;
+        retire_stale_receipts(&state_arc.lock().unwrap_or_else(|p| p.into_inner()), &uid);
+        if notice_first(&state_arc.lock().unwrap_or_else(|p| p.into_inner()), &uid, &why) {
+            continue; // rotate at its next turn end, after the notice
         }
         match start(state_arc, &uid, &why, Origin::Policy, false) {
             Ok(_) => {
@@ -1287,6 +1600,142 @@ mod tests {
         }
     }
 
+    /// An idle claude-code session (a sleeping process) with a transcript.
+    fn idle_session(uid: &str, idle_secs: u64) -> crate::session::DaemonSession {
+        let mut sp = crate::session::SpawnParams::new(uid, "r", "/bin/sleep");
+        sp.args = vec!["30".into()];
+        sp.session_type = "claude-code".into();
+        let mut s = crate::session::DaemonSession::spawn(sp).unwrap();
+        s.transcript_path = Some("/tmp/never-read.jsonl".into());
+        let ago = |secs: u64| Instant::now().checked_sub(Duration::from_secs(secs));
+        *s.last_input_at.lock().unwrap() = ago(idle_secs + 100);
+        *s.last_activity_at.lock().unwrap() = ago(idle_secs);
+        *s.last_turn_end_at.lock().unwrap() = ago(idle_secs);
+        s
+    }
+
+    /// #24 (urgent): at a turn end, queued wakes and stale receipts do not
+    /// block (they are held for the new process); a wake being submitted
+    /// right now does. An exited background job does not count.
+    #[test]
+    fn turn_end_checks_ignore_queued_wakes_and_exited_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = DaemonState::new();
+        st.messaging_root = dir.path().to_path_buf();
+        st.sessions.insert("ts-te-0".into(), idle_session("ts-te-0", 3));
+        let at_end = Checks { idle: Duration::ZERO, owner_quiet: Duration::ZERO, at_turn_end: true };
+        let polled = Checks { idle: Duration::ZERO, owner_quiet: Duration::ZERO, at_turn_end: false };
+        let engines = ["claude-code"];
+        assert_eq!(boundary_checked(&st, "ts-te-0", &engines, at_end), Ok(()));
+        crate::notifications::publish(dir.path(), "ts-te-0", "chat-1", "chat", "[m1] hi", "[m1]").unwrap();
+        assert!(boundary_checked(&st, "ts-te-0", &engines, polled).unwrap_err().contains("not yet delivered"));
+        assert_eq!(boundary_checked(&st, "ts-te-0", &engines, at_end), Ok(()), "queued: held, not blocking");
+        // A stale receipt (submitted long ago, never observed) does not block.
+        let file = crate::notifications::directory(dir.path(), "ts-te-0");
+        let set_status = |status: &str, updated_at: f64| {
+            for e in std::fs::read_dir(&file).unwrap().flatten() {
+                let p = e.path();
+                if p.extension().is_some_and(|x| x == "json") && !p.ends_with("transport.json") {
+                    let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+                    v["status"] = json!(status);
+                    v["updated_at"] = json!(updated_at);
+                    std::fs::write(&p, v.to_string()).unwrap();
+                }
+            }
+        };
+        set_status("uncertain", now() - 3600.0);
+        assert_eq!(boundary_checked(&st, "ts-te-0", &engines, at_end), Ok(()));
+        assert_eq!(boundary_checked(&st, "ts-te-0", &engines, polled), Ok(()), "a stale receipt never blocks");
+        set_status("submitted", now());
+        assert!(boundary_checked(&st, "ts-te-0", &engines, at_end).unwrap_err().contains("being delivered"));
+        set_status("observed", now());
+        // A job whose process is gone has exited; a live one still blocks.
+        let job = |pid: u32| crate::agent_state::Job {
+            id: "bd3axlkpv".into(), kind: crate::agent_state::JobKind::Shell, label: "b".into(), pid: Some(pid), cpu: None, first_seen_at: 1.0, wakes_agent: true,
+        };
+        st.sessions["ts-te-0"].agent_state.lock().unwrap().inputs.background.jobs.push(job(u32::MAX - 7));
+        assert_eq!(boundary_checked(&st, "ts-te-0", &engines, at_end), Ok(()), "exited job ignored");
+        st.sessions["ts-te-0"].agent_state.lock().unwrap().inputs.background.jobs.push(job(std::process::id()));
+        assert!(boundary_checked(&st, "ts-te-0", &engines, at_end).unwrap_err().contains("background job"));
+        for s in st.sessions.values_mut() {
+            let _ = s.kill();
+        }
+    }
+
+    /// #24 (11:47Z SEJD): a wake recorded in the fork before the
+    /// after-notice still proves the fork took.
+    #[test]
+    fn a_fork_that_recorded_any_turn_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join("c.jsonl");
+        std::fs::write(&claude, "{\"type\":\"user\",\"parentUuid\":null,\"message\":{\"content\":\"chat wake\"}}\n").unwrap();
+        assert!(fork_took(&claude, "[cm-rotation abc]", true, 0), "a Claude fork's file means a turn was recorded");
+        let codex = dir.path().join("x.jsonl");
+        std::fs::write(&codex, "{\"type\":\"response_item\",\"payload\":{\"role\":\"user\"}}\n").unwrap();
+        let copied = std::fs::metadata(&codex).unwrap().len();
+        assert!(!fork_took(&codex, "[cm-rotation abc]", false, copied), "copied history alone is not a new turn");
+        use std::io::Write;
+        writeln!(std::fs::OpenOptions::new().append(true).open(&codex).unwrap(),
+                 "{{\"type\":\"response_item\",\"payload\":{{\"role\":\"user\",\"content\":\"chat wake\"}}}}").unwrap();
+        assert!(fork_took(&codex, "[cm-rotation abc]", false, copied));
+    }
+
+    /// A rotation whose fork is still over the threshold is not repeated.
+    #[test]
+    fn a_rotation_that_did_not_shrink_is_not_repeated() {
+        let _serial = test_registry_lock();
+        let mut r = test_rotation_record("old-x");
+        r.phase = "done";
+        r.to_id = Some("new-x".into());
+        r.to_bytes = Some(500_000);
+        r.finished_at = Some(now());
+        registry().lock().unwrap().insert("ts-shrink-0".into(), r);
+        assert!(rotation_did_not_shrink("ts-shrink-0", Path::new("/p/new-x.jsonl"), 300_000));
+        assert!(!rotation_did_not_shrink("ts-shrink-0", Path::new("/p/later-y.jsonl"), 300_000), "a newer transcript may rotate");
+        assert!(!rotation_did_not_shrink("ts-shrink-0", Path::new("/p/new-x.jsonl"), 800_000), "it did get under");
+        registry().lock().unwrap().remove("ts-shrink-0");
+    }
+
+    #[test]
+    fn refusals_are_classified() {
+        assert!(permanent_refusal("not at a safe boundary: workflow participant (its run drives it)"));
+        assert!(permanent_refusal("bash sessions cannot do this (only claude-code)"));
+        assert!(!permanent_refusal("not at a safe boundary: not idle (working)"));
+        assert!(hold_worthy("not idle (working)") && hold_worthy("1 notification(s) being delivered right now"));
+        assert!(!hold_worthy("Owner typed in it 3s ago") && !hold_worthy("1 scheduled wakeup(s) pending"));
+    }
+
+    /// A forced request that meets a turn in progress is armed for the next
+    /// turn end (and holds new wakes) instead of being refused.
+    #[test]
+    fn a_forced_rotation_mid_turn_is_armed_and_holds_wakes() {
+        let _serial = test_registry_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = DaemonState::new();
+        st.messaging_root = dir.path().to_path_buf();
+        let mut sp = crate::session::SpawnParams::new("ts-arm-0", "r", "/bin/sleep");
+        sp.args = vec!["30".into()];
+        sp.session_type = "claude-code".into();
+        let mut busy = crate::session::DaemonSession::spawn(sp).unwrap();
+        busy.transcript_path = Some("/tmp/never-read.jsonl".into());
+        st.sessions.insert("ts-arm-0".into(), busy);
+        let state = Arc::new(Mutex::new(st));
+        let v = start(&state, "ts-arm-0", "Owner asked", Origin::Operator, true).expect("armed, not refused");
+        assert_eq!(v["armed"], true, "{v}");
+        assert!(armed("ts-arm-0"));
+        assert!(crate::notifications::held(dir.path(), "ts-arm-0", now()), "wakes held for the new process");
+        assert!(start(&state, "ts-arm-0", "x", Origin::Operator, false).is_err(), "unforced still refuses");
+        // A permanent refusal is not armed.
+        state.lock().unwrap().sessions.get_mut("ts-arm-0").unwrap().workflow_run_id = Some("wf".into());
+        assert!(start(&state, "ts-arm-0", "x", Origin::Operator, true).is_err());
+        arms().lock().unwrap().remove("ts-arm-0");
+        unhold("ts-arm-0");
+        assert!(!crate::notifications::held(dir.path(), "ts-arm-0", now()));
+        for s in state.lock().unwrap().sessions.values_mut() {
+            let _ = s.kill();
+        }
+    }
+
     #[test]
     fn failure_counts_persist() {
         let dir = tempfile::tempdir().unwrap();
@@ -1363,6 +1812,6 @@ mod tests {
         assert!(after.contains("1670 MB") && after.contains("board items") && after.contains("standing rules"));
         assert_eq!(mb(323_505), "323 KB");
         assert_eq!(mb(9_121_310), "9.1 MB");
-        assert!(before_notice("transcript is 400 MB", 300).contains("5 min"));
+        assert!(before_notice("transcript is 400 MB").contains("next turn ends"));
     }
 }

@@ -248,7 +248,7 @@ fn fail(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, outcome: String) {
 /// confirmed: send its takeover notice again and confirm (or roll back to
 /// the old engine) exactly as the normal path does, on a worker thread.
 /// Returns whether that worker took the marker over.
-pub fn recover_live(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: crate::rotation::Snapshot, file: Option<&str>) -> bool {
+pub(crate) fn recover_live(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: crate::rotation::Snapshot, file: Option<&str>) -> bool {
     let (engine, done) = {
         let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         (
@@ -307,6 +307,7 @@ pub fn recover_live(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: crate:
 
 fn finish(uid: &str, phase: &'static str, outcome: String) {
     eprintln!("cm-daemon: handoff of {uid}: {outcome}");
+    crate::rotation::unhold(uid);
     let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
     if let Some(r) = reg.records.get_mut(uid) {
         r.phase = phase;
@@ -513,6 +514,11 @@ pub fn tick(state_arc: &Arc<Mutex<DaemonState>>) {
         if q.plan.kind != Kind::Rotate && !take_slot(&state, &mut reg, &q.uid) {
             reg.queue.push_front(q);
             return;
+        }
+        if q.plan.kind != Kind::Rotate {
+            // Wakes wait for whatever runs at the uid once this is done, so
+            // none gets in ahead of the handoff request or the takeover.
+            crate::rotation::hold(&state, &q.uid);
         }
         if let Some(r) = reg.records.get_mut(&q.uid) {
             r.phase = "starting";

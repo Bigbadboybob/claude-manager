@@ -6,6 +6,32 @@ therefore makes a session slow to start and laggy to drive. CM *rotates* such
 a session: it restarts it at the same CM uid in a fresh transcript that holds
 only the conversation after the latest compaction boundary.
 
+## When it runs: at a turn end
+
+An agent that is woken by messages and finished background jobs is idle for
+only a moment after each turn, so a rotation cannot wait for minutes of idle.
+CM starts a due rotation from the turn-end report itself (`session.turn_ended`
+/ `session.agent_report`), about 300 ms after the turn ends. A session is
+due when:
+- its transcript is over `max_bytes` (the policy; a before-notice goes out on
+  the first such turn end, and the rotation follows at the next one), or
+- a rotation is armed for it: an agent's `rotate_transcript`, or an
+  operator's forced one (Alt+T) that met a turn in progress. A forced
+  request that is refused for a reason that clears by itself (the agent is
+  mid-turn, a job is running, a wake is being delivered) returns
+  `armed: true` and runs at the next turn end. An arm that finds no usable
+  turn end in 6 h is dropped.
+
+The 5-minute policy pass stays as a fallback.
+
+**Wakes are held, not raced.** While a session is due and its turn-end
+attempt was refused by something short-lived, and while it rotates, CM holds
+its native wakes (chat messages, monitor fires): they stay `pending` in the
+durable queue (`notifications/<uid>/hold`, which expires after 30 minutes) and
+go to the new process once the rotation finishes, after its after-notice.
+Rotation and handoff notices are exempt. A handoff holds wakes the same way
+while it runs.
+
 ## How a rotation runs
 
 `daemon/src/rotation.rs`:
@@ -24,15 +50,23 @@ only the conversation after the latest compaction boundary.
    and standing rules from CM, and its first message is what writes the new
    file. A `turn_end` monitor absorbs the turn this notice causes; it does
    not fire it as the worker's completion.
-4. Confirm the rotation from the new transcript, not from keystrokes: the
-   fork's file must hold the conversation's message rows within 180 s plus
-   60 s per GB of source (fractional; at most 20 min).
+4. Confirm the rotation from the new transcript, not from keystrokes, within
+   180 s plus 60 s per GB of source (fractional; at most 20 min). The fork
+   took if it recorded the after-notice's marker or any new turn: a Claude
+   fork's file is only written when its first message is recorded, whatever
+   that message was; a Codex fork needs a new user row after its copied
+   history.
 5. If it is not (an API error, a rate-limit menu, an early exit), resume the
    old id unchanged and tell the agent. The policy then leaves the session
    alone for 6 h, doubling with each consecutive failure (at most a week;
    the counts persist in `~/.cm/rotation-failures.json` across restarts).
    Owner is alerted at once when a failed rotation leaves the session not
    running, and from the second consecutive failure otherwise.
+
+The restored session's own `--dangerously-load-development-channels`
+startup confirmation is accepted by CM for up to 3 minutes after launch, even
+when Claude first draws its banner (a large resume or fork does). Before
+this, a rotated fork could stop at that dialog until someone pressed Enter.
 
 A brain restart between the stop and the confirmation leaves the marker. The
 next brain resumes a session that is not live on its original transcript
@@ -76,14 +110,23 @@ the lineage (old id → new id) is kept in `~/.cm/daemon-resume-identities.json`
 
 ## Safe boundary
 
-A rotation is refused or deferred unless all of these hold:
+At a turn end (or when forced) the agent need not have been idle for
+`idle_secs`, and queued wakes do not block (they are held); only a wake being
+submitted to the old process in the last 30 s does. Owner-quiet and the
+unsent-draft check apply to the automatic policy only, not to an agent's or
+operator's request. Otherwise a rotation is refused or deferred unless all of
+these hold:
 
 - the session is live, Claude and not bash;
-- it is idle for `idle_secs`, with no tool call or background job in flight;
+- it is idle (for `idle_secs` on the fallback pass), with no tool call or
+  background job in flight. A job whose process is gone has exited and does
+  not count, even if the agent's last snapshot still lists it;
 - it has no pending scheduled wakeup (a session cron: CM does not carry
   crons across a fork, so a restart would lose it);
-- it has no pending, submitted or uncertain native notices (other than
-  rotation's own);
+- on the fallback pass, it has no queued or recently submitted native
+  notices (other than rotation's own). An unconfirmed receipt older than 10
+  minutes never blocks, and one older than 24 h is retired (`cancelled`,
+  `retired: "stale_receipt"`);
 - Owner has not viewed or typed in it for `owner_quiet_secs`, and has not
   typed in it since its last turn ended (an unsent draft may be in the
   composer; a forced rotation skips this);

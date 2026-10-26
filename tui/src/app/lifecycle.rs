@@ -2612,6 +2612,10 @@ impl App {
         self.run_in_background(Some(format!("rotate:{uid}")), move || {
             let result = crate::client_session::rpc_rotate_transcript(&socket, &token, &uid, true);
             Box::new(move |app: &mut App| match result {
+                Ok(v) if v["armed"] == true => app.set_status_msg(&format!(
+                    "Rotation armed: it starts as soon as the current turn ends ({}); new messages wait for it",
+                    v["deferred"].as_str().unwrap_or("busy")
+                )),
                 Ok(v) => {
                     let from = v.pointer("/rotation/from_bytes").and_then(|b| b.as_u64()).unwrap_or(0);
                     app.set_status_msg(&format!(
