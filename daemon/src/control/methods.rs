@@ -25164,7 +25164,7 @@ while True:
             s.sessions.get_mut(&uid).unwrap().session_type = "claude-code".to_string();
             s.sessions[&uid].agent_state.lock().unwrap().inputs.presence = Some(crate::agent_state::PresenceObs {
                 valid: true, status: crate::agent_state::PresenceStatus::Idle,
-                observed_at: now_unix_f64(), status_updated_at: now_unix_f64() - 60.0,
+                observed_at: now_unix_f64(), status_updated_at: Some(now_unix_f64() - 60.0), native_session_id: None,
                 engine_version: None, waiting_for: None, main_turn_open: None, transcript_error: None,
             });
         }
@@ -36619,7 +36619,7 @@ while True:
                         valid: true,
                         status: PresenceStatus::Idle,
                         observed_at: now,
-                        status_updated_at: now - 30.0,
+                        status_updated_at: Some(now - 30.0), native_session_id: None,
                         engine_version: None,
                         waiting_for: None,
                         main_turn_open: Some(false),
@@ -36691,7 +36691,7 @@ while True:
                     valid: false,
                     status: PresenceStatus::Unknown,
                     observed_at: now,
-                    status_updated_at: now,
+                    status_updated_at: Some(now), native_session_id: None,
                     engine_version: None,
                     waiting_for: None,
                     main_turn_open: None,
@@ -36833,7 +36833,7 @@ while True:
                         valid,
                         status,
                         observed_at: report.at_unix + 0.01,
-                        status_updated_at: report.at_unix + 0.01,
+                        status_updated_at: Some(report.at_unix + 0.01), native_session_id: None,
                         engine_version: None,
                         waiting_for: None,
                         main_turn_open: Some(true),
@@ -40443,7 +40443,7 @@ while True:
             *session.last_activity_at.lock().unwrap() = Some(std::time::Instant::now());
             session.agent_state.lock().unwrap().inputs.presence = Some(crate::agent_state::PresenceObs {
                 valid: true, status: crate::agent_state::PresenceStatus::Idle,
-                observed_at: now_unix_f64(), status_updated_at: now_unix_f64() - 60.0,
+                observed_at: now_unix_f64(), status_updated_at: Some(now_unix_f64() - 60.0), native_session_id: None,
                 engine_version: None, waiting_for: None, main_turn_open: None, transcript_error: None,
             });
         }
@@ -40711,7 +40711,7 @@ while True:
                 valid,
                 status,
                 observed_at: now,
-                status_updated_at: now,
+                status_updated_at: Some(now), native_session_id: None,
                 engine_version: None,
                 waiting_for: None,
                 main_turn_open: Some(true),

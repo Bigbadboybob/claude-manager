@@ -2316,7 +2316,7 @@ mod tests {
                 let mut cell = session.agent_state.lock().unwrap();
                 let now = crate::agent_state::unix_now();
                 cell.inputs.presence = Some(crate::agent_state::PresenceObs {
-                    valid: true, status, observed_at: now, status_updated_at: now,
+                    valid: true, status, observed_at: now, status_updated_at: Some(now), native_session_id: None,
                     engine_version: None, waiting_for: None, main_turn_open: Some(true),
                     transcript_error: None,
                 });

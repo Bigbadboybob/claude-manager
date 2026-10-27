@@ -268,7 +268,7 @@ impl Reader {
             valid: false,
             status: PresenceStatus::Unknown,
             observed_at: now,
-            status_updated_at: now,
+            status_updated_at: None, native_session_id: None,
             engine_version: None,
             waiting_for: None,
             main_turn_open: None,
@@ -328,6 +328,7 @@ impl Reader {
             return Some(invalid());
         }
         observation.observed_at = now;
+        observation.valid &= observation.matches_transcript(target.transcript.as_deref());
         if observation.valid
             && (observation.status == PresenceStatus::Idle
                 || (observation.status == PresenceStatus::Busy && target.needs_turn_probe))
@@ -408,13 +409,13 @@ fn parse(v: serde_json::Value, now: f64) -> Option<PresenceFile> {
         _ => PresenceStatus::Unknown,
     };
     let status_updated_at = match v.get("statusUpdatedAt") {
-        None => now,
+        None => None,
         Some(v) => {
             let seconds = v.as_f64()? / 1000.0;
             if !seconds.is_finite() || seconds < 0.0 || seconds > now + 5.0 {
                 return None;
             }
-            seconds
+            Some(seconds)
         }
     };
     Some(PresenceFile {
@@ -425,6 +426,10 @@ fn parse(v: serde_json::Value, now: f64) -> Option<PresenceFile> {
             status,
             observed_at: now,
             status_updated_at,
+            native_session_id: match v.get("sessionId") {
+                None => None,
+                Some(id) => Some(short(Some(id), 256).filter(|id| !id.is_empty())?),
+            },
             engine_version: short(v.get("version"), 256),
             waiting_for: short(v.get("waitingFor"), 4096),
             main_turn_open: None,
@@ -503,6 +508,71 @@ mod tests {
     }
 
     #[test]
+    fn native_conversation_mismatch_rechecks_cached_presence_after_rebinding() {
+        let mut f = Fixture::new();
+        f.install("idle");
+        let path = f.reader.root.join("1001.json");
+        let mut file: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let original = "11111111-1111-4111-8111-111111111111";
+        let replacement = "22222222-2222-4222-8222-222222222222";
+        file["sessionId"] = original.into();
+        std::fs::write(&path, file.to_string()).unwrap();
+        f.target.transcript = Some(f._dir.path().join(format!("{original}.jsonl")));
+        assert_eq!(f.state(), State::Idle);
+        let parses = f.reader.parses;
+        f.target.transcript = Some(f._dir.path().join(format!("{replacement}.jsonl")));
+        assert_eq!(f.state(), State::Unknown, "PID identity alone cannot validate another conversation");
+        assert_eq!(f.reader.parses, parses, "cached status must revalidate the current binding");
+        file["sessionId"] = replacement.into();
+        std::fs::write(&path, file.to_string()).unwrap();
+        assert_eq!(f.state(), State::Idle, "matching new conversation recovers");
+        file.as_object_mut().unwrap().remove("sessionId");
+        std::fs::write(&path, file.to_string()).unwrap();
+        assert_eq!(f.state(), State::Idle, "older engines may omit conversation identity");
+        f.process(1001, 1, 43, "S");
+        assert_eq!(f.state(), State::Unknown, "conversation match never bypasses process identity");
+    }
+
+    #[test]
+    fn missing_status_timestamp_rewrites_never_close_confirmed_hook_turn() {
+        let mut f = Fixture::new();
+        f.install("idle");
+        let path = f.reader.root.join("1001.json");
+        let mut file: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        file.as_object_mut().unwrap().remove("statusUpdatedAt");
+        let mut c = StateCell::new(0.0, Some(42));
+        c.apply(crate::agent_state::Report::Hook {
+            event: crate::agent_state::HookEvent::UserPromptSubmit,
+            payload: crate::agent_state::HookPayload { observed_at: Some(950.0), ..Default::default() },
+        }, 950.0).unwrap();
+        for status in ["idle", "waiting", "idle"] {
+            file["status"] = status.into();
+            std::fs::write(&path, file.to_string()).unwrap();
+            c.inputs.presence = f.sample();
+            assert_eq!(derive(&c.inputs, 1000.0).state, State::Working,
+                "a parse time or file rewrite is not an engine edge");
+        }
+    }
+
+    #[test]
+    fn wrapper_presence_must_match_bound_native_conversation() {
+        let mut f = Fixture::new();
+        f.process(2001, 1001, 84, "S");
+        let id = "11111111-1111-4111-8111-111111111111";
+        f.target.transcript = Some(f._dir.path().join(format!("{id}.jsonl")));
+        let path = f.reader.root.join("2001.json");
+        let mut file = serde_json::json!({
+            "pid": 2001, "procStart": "84", "kind": "interactive",
+            "status": "idle", "statusUpdatedAt": 990000, "sessionId": id,
+        });
+        std::fs::write(&path, file.to_string()).unwrap();
+        assert_eq!(f.state(), State::Idle);
+        file["sessionId"] = "22222222-2222-4222-8222-222222222222".into();
+        std::fs::write(&path, file.to_string()).unwrap();
+        assert_eq!(f.state(), State::Unknown);
+    }
+
+    #[test]
     fn fixtures_validate_identity_and_map_all_statuses() {
         for (name, expected) in [
             ("busy", State::Working),
@@ -528,7 +598,7 @@ mod tests {
             assert_eq!(f.state(), expected, "{name}");
             if name == "idle" {
                 let p = f.sample().unwrap();
-                assert_eq!(p.status_updated_at, 990.0, "milliseconds -> seconds");
+                assert_eq!(p.status_updated_at, Some(990.0), "milliseconds -> seconds");
                 assert_eq!(p.engine_version.as_deref(), Some("2.1.291"));
             }
         }

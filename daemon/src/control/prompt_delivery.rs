@@ -124,7 +124,7 @@ impl Baseline {
             relay_seq: input.relay.as_ref().map(|r| r.turn_seq),
             relay_start: input.relay.as_ref().and_then(|r| r.turn_started_at),
             hook_prompt: input.hooks.prompt_at,
-            presence_stamp: input.presence.as_ref().map(|p| p.status_updated_at),
+            presence_stamp: input.presence.as_ref().and_then(|p| p.status_updated_at),
         }
     }
     pub fn confirmed_by(&self, input: &Inputs) -> Option<&'static str> {
@@ -156,8 +156,8 @@ impl Baseline {
                 && p.status == PresenceStatus::Busy
                 && p.main_turn_open == Some(true)
                 && p.observed_at >= self.at
-                && p.status_updated_at >= self.at - 0.001
-                && Some(p.status_updated_at) != self.presence_stamp
+                && p.status_updated_at.is_some_and(|at| at >= self.at - 0.001)
+                && p.status_updated_at != self.presence_stamp
             {
                 return Some("presence");
             }
@@ -248,7 +248,7 @@ mod tests {
             valid: true,
             status: PresenceStatus::Busy,
             observed_at: 102.0,
-            status_updated_at: 101.0,
+            status_updated_at: Some(101.0), native_session_id: None,
             main_turn_open: Some(false),
             engine_version: None,
             waiting_for: None,
@@ -257,6 +257,9 @@ mod tests {
         assert_eq!(baseline.confirmed_by(&cell.inputs), None);
         cell.inputs.presence.as_mut().unwrap().main_turn_open = Some(true);
         assert_eq!(baseline.confirmed_by(&cell.inputs), Some("presence"));
+        cell.inputs.presence.as_mut().unwrap().status_updated_at = None;
+        assert_eq!(baseline.confirmed_by(&cell.inputs), None,
+            "a parse/poll without an engine timestamp cannot confirm delivery");
         cell.inputs.presence.as_mut().unwrap().valid = false;
         assert_eq!(baseline.confirmed_by(&cell.inputs), None);
         cell.inputs.hooks.prompt_at = Some(99.0);

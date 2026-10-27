@@ -98,6 +98,19 @@ It uses PTY activity plus `semantic_idle`, yielding `working`, `idle` or
 preserving the original idle time. A previously valid engine source becoming
 unreadable yields `unknown`, rather than falling back to a guessed idle.
 
+A Claude `UserPromptSubmit` hook newer than the last turn end and the presence
+status edge keeps the foreground `working` even if a stale file still says
+`idle` or `waiting`. Poll time, file rewrites, and a missing `statusUpdatedAt`
+are not status edges. A newer actual idle/wait status or Stop/StopFailure still
+takes effect; accepted PTY input without a confirmed start retains the bounded
+delivery/no-turn escape described above.
+
+When Claude supplies `sessionId`, presence must match the bound transcript's
+native conversation ID as well as the live PID/start identity. Mismatch yields
+`unknown`, including cached reads after a transcript rebind; it does not adopt
+another process or rebind the session. Older engines without `sessionId` retain
+the process identity checks. Native background-session recovery is separate.
+
 `stalled_since` overlays either working state after 15 minutes without transcript
 or subagent-directory growth. It does not replace the state. `since`, `turn_seq`,
 hook edges and background survive a brain restart in a daemon-side sidecar keyed

@@ -217,11 +217,22 @@ pub struct PresenceObs {
     pub valid: bool,
     pub status: PresenceStatus,
     pub observed_at: f64,
-    pub status_updated_at: f64,
+    /// Only an engine timestamp is a status edge; polling is not one.
+    pub status_updated_at: Option<f64>,
+    #[serde(default)]
+    pub native_session_id: Option<String>,
     pub engine_version: Option<String>,
     pub waiting_for: Option<String>,
     pub main_turn_open: Option<bool>,
     pub transcript_error: Option<String>,
+}
+impl PresenceObs {
+    pub(crate) fn matches_transcript(&self, transcript: Option<&std::path::Path>) -> bool {
+        match (self.native_session_id.as_deref(), transcript) {
+            (Some(id), Some(path)) => path.file_stem().and_then(|s| s.to_str()) == Some(id),
+            _ => true, // Older engines or a not-yet-bound transcript.
+        }
+    }
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -388,8 +399,16 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
     let presence_input_pending = presence.is_some_and(|p| {
         p.valid
             && p.status != PresenceStatus::Unknown
-            && start.is_some_and(|at| at > p.status_updated_at && now - at < 10.0)
+            && newer(start, p.status_updated_at)
+            && start.is_some_and(|at| now - at < 10.0)
     });
+    // Accepted PTY input (latest_start) can expire without starting a turn.
+    // An actual unmatched hook prompt cannot: an old idle/wait status stays
+    // older regardless of how often its file is reread or rewritten. A newer
+    // engine status edge still handles interruption without a Stop hook.
+    let presence_behind_hook = relay.is_none()
+        && newer(hooks.prompt_at, last_turn.ended_at)
+        && presence.is_some_and(|p| newer(hooks.prompt_at, p.status_updated_at));
     // A relay heartbeat is a receipt time, not evidence that queued PTY input
     // reached the engine. Hold until a real turn edge, with a bounded escape
     // for empty Enter, menu input, or a swallowed prompt.
@@ -442,7 +461,7 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
         if pending.is_some()
             || flag.is_some()
             || hook_wait
-            || presence.is_some_and(|p| p.status == PresenceStatus::Waiting)
+            || presence.is_some_and(|p| p.status == PresenceStatus::Waiting && !presence_behind_hook)
         {
             detail.waiting_for = pending
                 .map(|p| format!("{:?}", p.kind))
@@ -462,7 +481,7 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
             entered = pending
                 .map(|p| p.since)
                 .or(if hook_wait { hooks.waiting_at } else { None })
-                .or_else(|| presence.map(|p| p.status_updated_at))
+                .or_else(|| presence.and_then(|p| p.status_updated_at))
                 .unwrap_or(observed_at);
             State::WaitingOnHuman
         } else if (last_turn.status == Some(TurnStatus::Failed)
@@ -473,7 +492,7 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
             || presence.is_some_and(|p| {
                 p.status == PresenceStatus::Idle
                     && p.transcript_error.is_some()
-                    && !newer(start, Some(p.status_updated_at))
+                    && !newer(start, p.status_updated_at)
             })
         {
             detail.error_kind = relay
@@ -493,6 +512,8 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
             };
             let pending_input = relay.is_none() && !no_turn_candidate && newer(start, Some(observed_at));
             if pending_input
+                || (presence_behind_hook && presence.is_some_and(|p|
+                    matches!(p.status, PresenceStatus::Idle | PresenceStatus::Waiting)))
                 || relay.is_some_and(|r| r.foreground == RelayStatus::Active)
                 || presence.is_some_and(|p| p.status == PresenceStatus::Busy && open)
                 || (source == Source::Hooks && !no_turn_candidate && newer(start, last_turn.ended_at))
@@ -510,7 +531,7 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
                 State::WorkingBackground
             } else {
                 entered = presence
-                    .map(|p| p.status_updated_at)
+                    .and_then(|p| p.status_updated_at)
                     .or(last_turn.ended_at)
                     .unwrap_or(observed_at);
                 State::Idle
@@ -1009,7 +1030,15 @@ pub fn current(session: &DaemonSession) -> AgentState {
         .unwrap_or_else(|p| p.into_inner());
     cell.inputs.legacy = legacy;
     cell.inputs.exited = session.last_exit.kernel_set();
+    check_presence_binding(&mut cell.inputs, session.transcript_path.as_deref());
     cell.recompute(unix_now())
+}
+fn check_presence_binding(inputs: &mut Inputs, transcript: Option<&str>) {
+    if let Some(presence) = &mut inputs.presence {
+        if !presence.matches_transcript(transcript.map(std::path::Path::new)) {
+            presence.valid = false;
+        }
+    }
 }
 /// Read-only observation for operator previews: do not update debounce state,
 /// the publisher, or the persisted agent-state cache.
@@ -1017,6 +1046,7 @@ pub fn read_only(session: &DaemonSession) -> AgentState {
     let mut inputs = session.agent_state.lock().unwrap_or_else(|p| p.into_inner()).inputs.clone();
     inputs.legacy = legacy(session);
     inputs.exited = session.last_exit.kernel_set();
+    check_presence_binding(&mut inputs, session.transcript_path.as_deref());
     derive(&inputs, unix_now())
 }
 /// The tick is the only publisher. Reports coalesce a latest value per session;
@@ -1420,6 +1450,7 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>) -> std::io::Result<()> {
                         .map(PathBuf::from)
                         != transcript
                     {
+                        observation.valid = false;
                         observation.main_turn_open = None;
                         observation.transcript_error = None;
                     }
@@ -1470,7 +1501,7 @@ mod tests {
             valid: true,
             status,
             observed_at: 995.0,
-            status_updated_at: 990.0,
+            status_updated_at: Some(990.0), native_session_id: None,
             engine_version: Some("2.1.291".into()),
             waiting_for: None,
             main_turn_open: Some(true),
@@ -1787,6 +1818,95 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_hook_turn_outlives_stale_idle_presence_polls() {
+        let mut c = StateCell::new(0.0, Some(42));
+        c.inputs = presence(PresenceStatus::Idle);
+        c.inputs.legacy.pty_idle = true;
+        c.apply(hook(HookEvent::Stop, 900.0), 900.0).unwrap();
+        c.note_input(1000.0);
+        c.note_submitted(1000.0, 1000.0);
+        c.apply(hook(HookEvent::UserPromptSubmit, 1001.0), 1001.0).unwrap();
+        for now in [1016.0, 1040.0, 2000.0] {
+            c.inputs.presence.as_mut().unwrap().observed_at = now;
+            let state = c.recompute(now);
+            assert_eq!(state.state, State::Working, "a poll cannot close the confirmed turn");
+            assert_eq!(state.since, 1001.0);
+            assert_eq!(state.latest_start_at, Some(1001.0));
+            assert_eq!(state.last_turn.ended_at, Some(900.0));
+            assert_eq!(state.turn_seq, 1);
+            assert_eq!(state.detail.no_turn_at, None);
+            assert!(!state.compatibility_idle(true, true));
+        }
+        c.apply(hook(HookEvent::Stop, 2001.0), 2001.0).unwrap();
+        assert_eq!(c.recompute(2003.0).state, State::Idle);
+    }
+
+    #[test]
+    fn stale_presence_correction_preserves_synthetic_no_turn_escape() {
+        for old_prompt in [None, Some(800.0), Some(950.0)] {
+            let mut c = StateCell::new(0.0, Some(42));
+            c.inputs = presence(PresenceStatus::Idle);
+            c.inputs.legacy.pty_idle = true;
+            c.inputs.hooks.prompt_at = old_prompt;
+            c.inputs.hooks.stop_at = Some(900.0);
+            c.note_input(1000.0);
+            c.note_submitted(1000.0, 1000.0);
+            c.inputs.presence.as_mut().unwrap().observed_at = 1016.0;
+            let state = c.recompute(1016.0);
+            assert_eq!(state.state, State::Idle, "accepted input alone is not an engine start");
+            assert_eq!(state.detail.no_turn_at, Some(1015.0));
+            assert_eq!(state.latest_start_at, Some(1000.0));
+            // A later real hook revokes the escape even with the same idle file.
+            c.apply(hook(HookEvent::UserPromptSubmit, 1017.0), 1017.0).unwrap();
+            c.inputs.presence.as_mut().unwrap().observed_at = 1040.0;
+            let state = c.recompute(1040.0);
+            assert_eq!(state.state, State::Working);
+            assert_eq!(state.detail.no_turn_at, None);
+        }
+    }
+
+    #[test]
+    fn stale_presence_correction_retains_newer_idle_wait_error_and_background() {
+        let mut c = StateCell::new(0.0, Some(42));
+        c.inputs = presence(PresenceStatus::Idle);
+        c.apply(hook(HookEvent::Stop, 900.0), 900.0).unwrap();
+        c.apply(hook(HookEvent::UserPromptSubmit, 1001.0), 1001.0).unwrap();
+        c.inputs.presence.as_mut().unwrap().observed_at = 1040.0;
+        let original = c.inputs.clone();
+        for (status, expected) in [
+            (PresenceStatus::Shell, State::WorkingBackground),
+            (PresenceStatus::Unknown, State::Unknown),
+        ] {
+            let mut input = original.clone();
+            input.presence.as_mut().unwrap().status = status;
+            assert_eq!(derive(&input, 1040.0).state, expected);
+        }
+        let mut interrupted = original.clone();
+        interrupted.presence.as_mut().unwrap().status = PresenceStatus::Waiting;
+        assert_eq!(derive(&interrupted, 1040.0).state, State::Working,
+            "an old wait cannot hide a confirmed subsequent turn");
+        interrupted.presence.as_mut().unwrap().status_updated_at = Some(1002.0);
+        assert_eq!(derive(&interrupted, 1040.0).state, State::WaitingOnHuman);
+        interrupted.presence.as_mut().unwrap().status = PresenceStatus::Idle;
+        assert_eq!(derive(&interrupted, 1040.0).state, State::Idle,
+            "a newer idle edge still handles interruption without Stop");
+        interrupted.presence.as_mut().unwrap().transcript_error = Some("api_error".into());
+        assert_eq!(derive(&interrupted, 1040.0).state, State::Errored);
+        let mut stale_error = original.clone();
+        stale_error.presence.as_mut().unwrap().transcript_error = Some("api_error".into());
+        assert_eq!(derive(&stale_error, 1040.0).state, State::Working,
+            "an error attached to an older idle status cannot close a new turn");
+        c.apply(hook(HookEvent::PermissionRequest, 1020.0), 1020.0).unwrap();
+        assert_eq!(c.recompute(1040.0).state, State::WaitingOnHuman);
+        c.apply(hook(HookEvent::StopFailure, 1041.0), 1041.0).unwrap();
+        assert_eq!(c.recompute(1043.0).state, State::Errored);
+        c.inputs = original;
+        c.apply(hook(HookEvent::Stop, 1041.0), 1041.0).unwrap();
+        c.inputs.presence.as_mut().unwrap().status = PresenceStatus::Busy;
+        assert_eq!(c.recompute(1043.0).state, State::WorkingBackground);
+    }
+
+    #[test]
     fn presence_pending_input_uses_status_edge_has_bound_and_preserves_waiting() {
         for status in [
             PresenceStatus::Idle,
@@ -1814,7 +1934,7 @@ mod tests {
             };
             assert_eq!(derive(&i, 1010.0).state, expected, "pending is bounded");
             i.presence.as_mut().unwrap().status = PresenceStatus::Idle;
-            i.presence.as_mut().unwrap().status_updated_at = 1002.0;
+            i.presence.as_mut().unwrap().status_updated_at = Some(1002.0);
             i.previous = None;
             assert_eq!(
                 derive(&i, 1004.0).state,
@@ -2195,6 +2315,67 @@ mod tests {
         let mut state = DaemonState::new();
         state.sessions.insert(session.uid.clone(), session);
         state
+    }
+
+    #[test]
+    fn cached_native_identity_blocks_reads_before_presence_tick() {
+        let mut state = session_state();
+        let s = state.sessions.get_mut("ts-agent-state").unwrap();
+        let original = "11111111-1111-4111-8111-111111111111";
+        let replacement = "22222222-2222-4222-8222-222222222222";
+        s.transcript_path = Some(format!("/fixture/{original}.jsonl"));
+        let mut p = presence(PresenceStatus::Idle).presence.unwrap();
+        p.native_session_id = Some(original.into());
+        s.agent_state.lock().unwrap().inputs.presence = Some(p);
+        assert_eq!(read_only(s).state, State::Idle);
+        s.transcript_path = Some(format!("/fixture/{replacement}.jsonl"));
+        assert_eq!(read_only(s).state, State::Unknown);
+        assert!(s.agent_state.lock().unwrap().inputs.presence.as_ref().unwrap().valid,
+            "dry-run does not mutate the cached presence");
+        assert_eq!(current(s).state, State::Unknown);
+        let mut cell = s.agent_state.lock().unwrap();
+        let p = cell.inputs.presence.as_mut().unwrap();
+        p.native_session_id = Some(replacement.into());
+        p.valid = true; // Next matching reader sample.
+        drop(cell);
+        assert_eq!(current(s).state, State::Idle);
+    }
+
+    #[test]
+    fn confirmed_hook_stale_idle_blocks_rotation_and_publishes_working() {
+        let mut state = session_state();
+        let uid = "ts-agent-state";
+        state.sessions.get_mut(uid).unwrap().transcript_path = Some("/fixture/transcript.jsonl".into());
+        let now = unix_now();
+        {
+            let mut c = state.sessions[uid].agent_state.lock().unwrap();
+            c.inputs.presence = Some(PresenceObs {
+                valid: true, status: PresenceStatus::Idle,
+                observed_at: now, status_updated_at: Some(now - 3600.0), native_session_id: None,
+                engine_version: None, waiting_for: None,
+                main_turn_open: None, transcript_error: None,
+            });
+            c.apply(hook(HookEvent::Stop, now - 1800.0), now).unwrap();
+            c.apply(hook(HookEvent::UserPromptSubmit, now - 60.0), now).unwrap();
+        }
+        let preview = read_only(&state.sessions[uid]);
+        assert_eq!(preview.state, State::Working);
+        assert_eq!(current(&state.sessions[uid]).state, preview.state);
+        assert_eq!(crate::rotation::boundary(&state, uid, Duration::ZERO, Duration::ZERO),
+            Err("not idle (working)".into()));
+        let (rx, _guard) = state.manifest_watcher.subscribe();
+        let snapshot = snapshot(&state);
+        assert_eq!(snapshot[uid].state, State::Working);
+        {
+            let mut c = state.sessions[uid].agent_state.lock().unwrap();
+            c.apply(hook(HookEvent::Stop, now), now).unwrap();
+        }
+        recompute_and_publish(&state, uid);
+        flush_publishes(&state);
+        let ManifestDiff::Updated { entry, .. } = rx.try_recv().unwrap() else {
+            panic!("closed-turn state update");
+        };
+        assert_eq!(entry["agent_state"]["state"], "idle");
     }
 
     #[test]

@@ -362,7 +362,7 @@ mod tests {
             valid: false,
             status: PresenceStatus::Unknown,
             observed_at: 100.0,
-            status_updated_at: 100.0,
+            status_updated_at: Some(100.0), native_session_id: None,
             engine_version: None,
             waiting_for: None,
             main_turn_open: None,
