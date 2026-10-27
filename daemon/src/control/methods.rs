@@ -6538,14 +6538,6 @@ pub fn workflow_transition(
     caller: &Caller,
     params: &Value,
 ) -> MethodResult {
-    workflow_transition_guarded(state_arc, caller, params, None)
-}
-
-/// Internal poller proof; callers cannot inject it through wire parameters.
-pub(crate) fn workflow_transition_guarded(
-    state_arc: &Arc<Mutex<DaemonState>>, caller: &Caller, params: &Value,
-    proof: Option<&crate::continuous::completion::ConfirmedTurnProbe>,
-) -> MethodResult {
     let p: WorkflowTransitionParams = serde_json::from_value(params.clone())
         .map_err(|e| (
             ErrorCode::InvalidParams,
@@ -6762,21 +6754,6 @@ pub(crate) fn workflow_transition_guarded(
     let outcome = crate::workflow::run::try_modify(
         &p.run_id,
         move |run| -> Result<(), (ErrorCode, String)> {
-            // Never wait for registry/cell locks under the run flock: other
-            // writers may hold them in the opposite order. Contention retries
-            // on the next poll. Release before try_modify performs file IO.
-            let proof_state = proof.map(|_| state_arc.try_lock()
-                .map_err(|_| (ErrorCode::Conflict, "confirmed-turn registry busy; retry".into()))).transpose()?;
-            let proof_cell = proof.map(|p| p.cell.try_lock()
-                .map_err(|_| (ErrorCode::Conflict, "confirmed-turn state busy; retry".into()))).transpose()?;
-            if let Some(proof) = proof {
-                if !proof.matches(proof_state.as_ref().unwrap(), &proof_cell.as_ref().unwrap().inputs)
-                    || run.active_role.as_ref().and_then(|r| run.role_sessions.get(r))
-                        .and_then(|r| r.daemon_session_uid.as_deref()) != Some(proof.uid.as_str()) {
-                    return Err((ErrorCode::Conflict, "workflow_transition: stale confirmed-turn proof".into()));
-                }
-            }
-
             // P1 #3 auth: Session callers must be the
             // active-role's participant. Operators bypass.
             if is_session_caller {
@@ -15420,10 +15397,7 @@ pub(crate) fn capture_drain_sessions(
                             s.agent_state.lock().unwrap_or_else(|p| p.into_inner()).inputs.delivery
                                 .as_ref().is_some_and(|d| d.local_command))
                     } else { Some(end.is_some_and(|e| e >= report.at_instant)) };
-                    transcript_checks.push((uid.clone(), s.session_type.clone(), s.transcript_path.clone(), after, finished,
-                        agent.detail.confirmed_turn_open == Some(true),
-                        (agent.detail.confirmed_turn_open == Some(true)).then(||
-                            crate::continuous::completion::ConfirmedTurnProbe::capture(s, after)).flatten()));
+                    transcript_checks.push((uid.clone(), s.session_type.clone(), s.transcript_path.clone(), after, finished));
                 }
                 observations.push(SessionObservation {
                     session_uid: uid,
@@ -15452,27 +15426,13 @@ pub(crate) fn capture_drain_sessions(
         observations.sort_by(|a, b| a.session_uid.cmp(&b.session_uid));
         observations
     };
-    for (uid, engine, path, after, finished, confirmed_turn_open, proof) in &transcript_checks {
-        if let Some(session) = sessions.iter_mut().find(|s| s.session_uid == *uid) {
-            session.final_turn_ended = finished.unwrap_or_else(|| {
-                if *confirmed_turn_open {
-                    proof.as_ref().is_some_and(|proof| proof.finished(now_unix_f64(), true))
-                } else { path.as_ref().is_some_and(|path| {
-                    if engine == "claude-code" {
-                        crate::continuous::completion::claude_turn_finished_after(path, *after)
-                    } else { crate::continuous::completion::codex_turn_finished_after(path, *after) }
-                }) }
-            });
-        }
-    }
-    // All unlocked probes are finished. Revalidate together at the readback
-    // boundary so a later probe cannot invalidate an earlier true verdict.
-    let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-    for (uid, _, _, _, _, confirmed, proof) in &transcript_checks {
-        if *confirmed && !proof.as_ref().is_some_and(|proof| proof.still_current(&state)) {
-            if let Some(session) = sessions.iter_mut().find(|s| s.session_uid == *uid) {
-                session.final_turn_ended = false;
-            }
+    for (uid, engine, path, after, finished) in transcript_checks {
+        if let Some(session) = sessions.iter_mut().find(|s| s.session_uid == uid) {
+            session.final_turn_ended = finished.unwrap_or_else(|| path.is_some_and(|path| {
+                if engine == "claude-code" {
+                    crate::continuous::completion::claude_turn_finished_after(&path, after)
+                } else { crate::continuous::completion::codex_turn_finished_after(&path, after) }
+            }));
         }
     }
     sessions
@@ -36821,7 +36781,7 @@ while True:
                     ("confirmed-unknown", "2026-10-07T00:00:00Z", false, false),
                     ("foreign", "2026-10-07T00:00:00Z", true, false),
                     ("confirmed-unknown", "2026-10-06T00:00:00Z", true, false),
-                    ("confirmed-unknown", "2026-10-07T00:00:00Z", true, true),
+                    ("confirmed-unknown", "2026-10-07T00:00:00Z", true, false),
                 ] {
                     let mut transcript = format!("{assistant}\n");
                     if settled {
@@ -36832,54 +36792,35 @@ while True:
                         "valid={valid} sid={sid} settled={settled} stamp={stamp}");
                     assert_eq!(capture_drain_sessions(&state, &task)[0].final_turn_ended, expected);
                 }
-                // A current terminal error can release drain, unlike workflow
-                // advancement, which requires a successful settled turn.
+                // Production Reader ingestion, not a direct synthetic LastTurn:
+                // invalid process and native identity cannot authorize recovery.
+                for (native, process_valid, expected) in [
+                    ("foreign", true, false), ("confirmed-unknown", false, false),
+                    ("confirmed-unknown", true, true),
+                ] {
+                    let observed = crate::claude_presence::fixture_observation(&path, native, process_valid, now_unix_f64());
+                    state.lock().unwrap().sessions[&uid].agent_state.lock().unwrap().inputs.presence = Some(observed);
+                    assert_eq!(crate::control::continuous_drain::notice_ready(&state, &uid), expected);
+                    assert_eq!(capture_drain_sessions(&state, &task)[0].final_turn_ended, expected);
+                }
                 let mut failed = assistant.clone();
                 failed["isApiErrorMessage"] = json!(true);
                 failed["error"] = json!("api_error");
                 std::fs::write(&path, format!("{failed}\n")).unwrap();
+                let observed = crate::claude_presence::fixture_observation(&path, "confirmed-unknown", true, now_unix_f64());
+                state.lock().unwrap().sessions[&uid].agent_state.lock().unwrap().inputs.presence = Some(observed);
+                let resolved = resolve_authorized_session(&state, &json!({"session_uid":uid}), None).unwrap();
+                assert_eq!(resolved["agent_state"]["state"], "errored");
+                assert!(resolved["agent_state"]["detail"]["confirmed_turn_open"].is_null());
                 assert!(crate::control::continuous_drain::notice_ready(&state, &uid));
                 assert!(capture_drain_sessions(&state, &task)[0].final_turn_ended);
-                std::fs::write(&path, format!("{assistant}\n{}\n", json!({"type":"system", "subtype":"turn_duration",
-                    "sessionId":"confirmed-unknown", "timestamp":"2026-10-07T00:00:00Z"}))).unwrap();
-                for mutation in ["path", "generation", "start", "incarnation"] {
-                    for capture in [false, true] {
-                        let (old_path, old_generation, old_cell, old_inputs) = {
-                            let st = state.lock().unwrap();
-                            let session = &st.sessions[&uid];
-                            let inputs = session.agent_state.lock().unwrap().inputs.clone();
-                            (session.transcript_path.clone(), session.generation, session.agent_state.clone(), inputs)
-                        };
-                        let changed = state.clone();
-                        let changed_uid = uid.clone();
-                        crate::continuous::completion::after_confirmed_probe_for_test(move || {
-                            let mut st = changed.lock().unwrap();
-                            let session = st.sessions.get_mut(&changed_uid).unwrap();
-                            match mutation {
-                                "path" => session.transcript_path = Some("/fixture/rebound.jsonl".into()),
-                                "generation" => session.generation += 1,
-                                "start" => {
-                                    let mut cell = session.agent_state.lock().unwrap();
-                                    cell.inputs.latest_start = Some(ended + 1.0);
-                                    cell.inputs.hooks.prompt_at = Some(ended + 1.0);
-                                }
-                                "incarnation" => session.agent_state = std::sync::Arc::new(std::sync::Mutex::new(
-                                    crate::agent_state::StateCell::new(ended, None))),
-                                _ => unreachable!(),
-                            }
-                        });
-                        let ready = if capture { capture_drain_sessions(&state, &task)[0].final_turn_ended }
-                            else { crate::control::continuous_drain::notice_ready(&state, &uid) };
-                        assert!(!ready, "stale proof: valid={valid} mutation={mutation} capture={capture}");
-                        let mut st = state.lock().unwrap();
-                        let session = st.sessions.get_mut(&uid).unwrap();
-                        session.transcript_path = old_path;
-                        session.generation = old_generation;
-                        session.agent_state = old_cell;
-                        session.agent_state.lock().unwrap().inputs = old_inputs;
-                    }
+                {
+                    let st = state.lock().unwrap();
+                    let mut cell = st.sessions[&uid].agent_state.lock().unwrap();
+                    cell.inputs.presence.as_mut().unwrap().transcript_end = None;
+                    cell.inputs.presence.as_mut().unwrap().valid = valid;
+                    cell.inputs.hooks.stop_at = Some(ended);
                 }
-                state.lock().unwrap().sessions[&uid].agent_state.lock().unwrap().inputs.hooks.stop_at = Some(ended);
                 let resolved = resolve_authorized_session(&state, &json!({"session_uid":uid}), None).unwrap();
                 assert!(resolved["agent_state"]["detail"]["confirmed_turn_open"].is_null());
                 assert_eq!(resolved["idle"], true, "actual Stop releases the quiet fallback guard");

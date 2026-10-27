@@ -300,68 +300,6 @@ pub fn claude_turn_finished_after(path: &str, after: f64) -> bool {
     read() == Some(true)
 }
 
-/// Snapshot fence for the new Unknown/confirmed-hook transcript escape only.
-/// Arc identity distinguishes replacement instances even when UID is reused.
-#[derive(Clone, Debug)]
-pub(crate) struct ConfirmedTurnProbe {
-    pub uid: String,
-    pub cell: crate::agent_state::AgentStateCell,
-    generation: u64,
-    path: String,
-    after: f64,
-    latest_start: Option<f64>,
-    turn_seq: u64,
-    hooks: crate::agent_state::HookEdges,
-}
-impl ConfirmedTurnProbe {
-    pub fn capture(session: &crate::session::DaemonSession, after: f64) -> Option<Self> {
-        let inputs = &session.agent_state.lock().unwrap_or_else(|p| p.into_inner()).inputs;
-        Some(Self {
-            uid: session.uid.clone(), cell: session.agent_state.clone(),
-            generation: session.generation, path: session.transcript_path.clone()?,
-            after: after.max(inputs.latest_start.unwrap_or(0.0)).max(inputs.hooks.prompt_at.unwrap_or(0.0)),
-            latest_start: inputs.latest_start, turn_seq: inputs.turn_seq, hooks: inputs.hooks.clone(),
-        })
-    }
-    /// Caller holds DaemonState then this cell through the consuming mutation.
-    /// No transcript IO occurs while either lock is held.
-    pub fn matches(&self, state: &crate::state::DaemonState, inputs: &crate::agent_state::Inputs) -> bool {
-        state.sessions.get(&self.uid).is_some_and(|session|
-            std::sync::Arc::ptr_eq(&self.cell, &session.agent_state)
-            && session.generation == self.generation
-            && session.session_type == "claude-code"
-            && !session.last_exit.kernel_set()
-            && session.transcript_path.as_deref() == Some(self.path.as_str()))
-            && inputs.latest_start == self.latest_start && inputs.turn_seq == self.turn_seq && inputs.hooks == self.hooks
-            && crate::agent_state::derive(inputs, crate::agent_state::unix_now()).detail.confirmed_turn_open == Some(true)
-    }
-    pub fn still_current(&self, state: &crate::state::DaemonState) -> bool {
-        self.matches(state, &self.cell.lock().unwrap_or_else(|p| p.into_inner()).inputs)
-    }
-    pub fn finished(&self, now: f64, allow_failure: bool) -> bool {
-        let result = super::probe::probe_transcript_tail(std::path::Path::new(&self.path))
-            .is_some_and(|probe| self.after.is_finite() && !probe.claude_identity_mismatch
-                && probe.claude_end.as_ref().is_some_and(|end|
-                    (end.status == Some(crate::agent_state::TurnStatus::Completed)
-                        || (allow_failure && end.status == Some(crate::agent_state::TurnStatus::Failed)))
-                    && end.ended_at.is_some_and(|at| at >= self.after && at <= now + 5.0)));
-        #[cfg(test)]
-        AFTER_CONFIRMED_PROBE.with(|hook| {
-            let callback = hook.borrow_mut().take();
-            if let Some(callback) = callback { callback(); }
-        });
-        result
-    }
-}
-#[cfg(test)]
-thread_local! {
-    static AFTER_CONFIRMED_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = Default::default();
-}
-#[cfg(test)]
-pub(crate) fn after_confirmed_probe_for_test(callback: impl FnOnce() + 'static) {
-    AFTER_CONFIRMED_PROBE.with(|hook| *hook.borrow_mut() = Some(Box::new(callback)));
-}
-
 /// None permits a transcript check only after a continuous 90s source outage.
 /// Engine state stays Unknown on the public surfaces during this drain escape.
 pub fn claude_drain_state_finished_after(
@@ -371,6 +309,10 @@ pub fn claude_drain_state_finished_after(
     local_command: bool,
 ) -> Option<bool> {
     use crate::agent_state::State;
+    // Only normal bound-source reconciliation or a real terminal hook can
+    // resolve a confirmed turn. Do not create an independent transcript
+    // escape whose proof can go stale before persistence or prompt delivery.
+    if agent.detail.confirmed_turn_open == Some(true) { return Some(false); }
     if agent.state == State::Unknown && now - agent.since > 90.0 {
         return None;
     }

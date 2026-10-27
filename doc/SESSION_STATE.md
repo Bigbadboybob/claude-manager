@@ -127,15 +127,16 @@ error hints; invalid source identity still takes precedence as `unknown`.
 
 `detail.confirmed_turn_open=true` marks `unknown` with an unresolved actual
 Claude hook start. Quiet PTY output cannot make this compatible idle or complete
-an MCP idle wait. Workflow advancement and drain's post-90-second outage escape
-require a bound, timestamped settled transcript boundary after that start;
-workflow additionally requires successful completion (drain can accept failure).
-Assistant `end_turn` alone is insufficient. These probes run outside the daemon
-registry lock. The consuming verdict/mutation rechecks session UID, incarnation,
-generation, transcript path and start/hook evidence; a change discards the proof.
-Workflow locks under the run flock are nonblocking, so contention retries without
-introducing an inverse lock wait. A genuine Stop/StopFailure or verified settled boundary clears
-the guard. Ordinary unknown/legacy and synthetic-no-turn fallbacks remain.
+an MCP idle wait. Workflow and drain remain blocked, including after 90 seconds
+of source outage. A standalone transcript read cannot override that uncertainty.
+Normal valid, bound presence polling can ingest a timestamped settled boundary
+into `last_turn`; that or a real terminal hook clears the guard. A verified
+failed turn permits drain completion but cannot advance the workflow state gate.
+Ordinary unknown/legacy and synthetic-no-turn fallbacks remain unchanged.
+
+Availability limit: when presence is missing, invalid or mismatched, a confirmed
+unresolved turn stays `unknown` until the source recovers or a terminal hook
+arrives. The daemon does not infer safe idle from a transcript alone in this case.
 
 `stalled_since` overlays either working state after 15 minutes without transcript
 or subagent-directory growth. It does not replace the state. `since`, `turn_seq`,

@@ -37,7 +37,7 @@ impl Drop for PendingNotice {
 }
 
 pub(super) fn notice_ready(state: &Arc<Mutex<DaemonState>>, uid: &str) -> bool {
-    let (engine, idle, path, after, fallback, confirmed_turn_open, proof) = {
+    let (engine, idle, path, after, fallback) = {
         let state = state.lock().unwrap_or_else(|p| p.into_inner());
         if state.draining || crate::writer_gate::pause_requested() {
             return false;
@@ -83,17 +83,12 @@ pub(super) fn notice_ready(state: &Arc<Mutex<DaemonState>>, uid: &str) -> bool {
             session.transcript_path.clone(),
             after,
             agent.source.engine_reported(),
-            agent.detail.confirmed_turn_open == Some(true),
-            (agent.detail.confirmed_turn_open == Some(true))
-                .then(|| completion::ConfirmedTurnProbe::capture(session, after)).flatten(),
         )
     };
     match engine.as_str() {
-        "claude-code" if fallback && confirmed_turn_open => proof.is_some_and(|proof| {
-            if !proof.finished(super::methods::now_unix_f64(), true) { return false; }
-            proof.still_current(&state.lock().unwrap_or_else(|p| p.into_inner()))
-        }),
-        "claude-code" if fallback => path.is_some_and(|p| completion::claude_turn_finished_after(&p, after)),
+        "claude-code" if fallback => {
+            path.is_some_and(|p| completion::claude_turn_finished_after(&p, after))
+        }
         "claude-code" => idle == Some(true),
         "codex" => path.is_some_and(|p| completion::codex_turn_finished_after(&p, after)),
         _ => false,

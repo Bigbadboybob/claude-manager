@@ -445,6 +445,27 @@ fn parse(v: serde_json::Value, now: f64) -> Option<PresenceFile> {
     })
 }
 
+/// Test fixture using the production file/process/bound-transcript reader.
+#[cfg(test)]
+pub(crate) fn fixture_observation(transcript: &Path, native_id: &str, process_valid: bool, now: f64) -> PresenceObs {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sessions");
+    let proc_root = dir.path().join("proc");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(proc_root.join("1001")).unwrap();
+    let mut fields = vec!["0"; 20];
+    fields[0] = "S";
+    fields[1] = "1";
+    fields[19] = if process_valid { "42" } else { "43" };
+    std::fs::write(proc_root.join("1001/stat"), format!("1001 (claude) {}", fields.join(" "))).unwrap();
+    std::fs::write(root.join("1001.json"), serde_json::json!({"kind":"interactive", "pid":1001,
+        "procStart":"42", "status":"idle", "sessionId":native_id}).to_string()).unwrap();
+    Reader::new(root, proc_root).observe(&[Target {
+        uid: "fixture".into(), pid: 1001, child_start_time: Some(42), transcript: Some(transcript.to_path_buf()),
+        had_presence: true, needs_turn_probe: true,
+    }], now).pop().unwrap().unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

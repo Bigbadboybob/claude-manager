@@ -245,7 +245,7 @@ impl PresenceObs {
         }
     }
 }
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HookEdges {
     pub prompt_at: Option<f64>,
