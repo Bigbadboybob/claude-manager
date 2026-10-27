@@ -233,6 +233,32 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
         await eventually(lambda: adapter.sent == ["new"], timeout=8)
         self.assertEqual(self.queue.event_path("previous").read_bytes(), previous)
 
+    async def test_invalid_observation_arriving_after_healthy_heartbeat_blocks_claim(self):
+        adapter = Fixture("same")
+        healthy = asyncio.Event()
+        original_health = self.queue.health
+        def signal_health(*args, **kwargs):
+            result = original_health(*args, **kwargs)
+            if args[1] == "ready":
+                healthy.set()
+            return result
+        with mock.patch.object(self.queue, "health", side_effect=signal_health):
+            self.run_consumer(adapter)
+            await asyncio.wait_for(healthy.wait(), 3)
+            self.queue.publish("observation", "chat", "[observation] wake", "[observation]")
+            self.queue.change("observation", {"pending"}, status="observed")
+            observation = self.queue.get("observation")
+            observation["updated_at"] = time.time() + 3600
+            notifications.atomic_write(self.queue.event_path("observation"), observation)
+            self.queue.publish("new", "chat", "[new] wake", "[new]")
+            before = self.queue.event_path("new").read_bytes()
+            await asyncio.sleep(0.3)  # before the five-second next heartbeat
+            self.assertEqual(adapter.sent, [])
+            self.assertEqual(self.queue.event_path("new").read_bytes(), before)
+            observation["updated_at"] = time.time()
+            notifications.atomic_write(self.queue.event_path("observation"), observation)
+            await eventually(lambda: adapter.sent == ["new"], timeout=8)
+
     async def test_stale_holder_hands_off_to_live_waiter(self):
         old = Fixture("old", stale=["transcript_mismatch"])
         first = self.run_consumer(old, loop=False)

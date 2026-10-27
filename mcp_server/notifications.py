@@ -524,6 +524,9 @@ async def consume(queue: Queue, adapter):
                         adapter.cm_handed_off_at = time.monotonic()
                     return handed_off
             # New wakes must not sit behind slow receipt checks for older input.
+            # The heartbeat's block can be stale: a new invalid observation
+            # can arrive between diagnoses. Check this snapshot before claims.
+            census_unknown = delivery_health(events)["chronology_unknown"]
             events.sort(key=lambda event: event["status"] != "pending")
             held = queue.held()
             for event in events:
@@ -538,7 +541,7 @@ async def consume(queue: Queue, adapter):
                             event["id"], {"submitted", "uncertain"}, status="observed"
                         )
                     continue
-                if event["status"] != "pending" or blocked:
+                if event["status"] != "pending" or blocked or census_unknown:
                     # A client known to drop these events keeps them pending
                     # (retractable, never ambiguously submitted).
                     continue
