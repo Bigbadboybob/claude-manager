@@ -5,6 +5,11 @@
 //! only after a durable identity capture, a second identical probe, and a
 //! durable checkpoint immediately before each external effect.  Unknown or
 //! corrupt evidence is never treated as absence.
+//!
+//! These reservations serialize CM-controlled lifecycle and input only.
+//! Independently launched Claude clients do not hold them: an external change
+//! can still occur after the final probe and before `claude stop`. Immediate
+//! revalidation and post-stop proof expose but cannot eliminate that window.
 
 use crate::control::protocol::ErrorCode;
 use crate::state::DaemonState;
