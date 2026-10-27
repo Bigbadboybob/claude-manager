@@ -389,7 +389,7 @@ fn reconcile_task(
         .filter(|uid| task.current_session_uid.as_ref() == Some(uid))
     {
         let actor = store.participant_id(&uid);
-        store.bind_task_subscription(TaskBinding {
+        let subscription = TaskBinding {
             id: binding.subscription_id.clone(),
             task_id: task.task_id.clone(),
             channel_id: binding.channel_id.clone(),
@@ -397,7 +397,13 @@ fn reconcile_task(
             revision: binding.revision,
             active: true,
             acknowledged: BTreeSet::new(),
-        })?;
+            start_position: None,
+        };
+        if task.adoption_pending.is_some() {
+            store.bind_task_subscription_quiet(subscription)?;
+        } else {
+            store.bind_task_subscription(subscription)?;
+        }
         active.insert(binding.subscription_id.clone());
         report.bound = true;
         report.orchestrator = Some(actor.clone());

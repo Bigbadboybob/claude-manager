@@ -531,6 +531,7 @@ pub fn handle(
     method: &str,
     params: &Value,
 ) -> methods::MethodResult {
+    let _binding = super::adoption::binding_lock();
     let p: Params = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("{method}: {e}")))?;
     task::validate_task_id(&p.task_id).map_err(|e| (ErrorCode::InvalidParams, e.to_string()))?;
@@ -539,6 +540,7 @@ pub fn handle(
     }
     let _lifecycle = task::lock_lifecycle(&p.task_id).map_err(internal)?;
     let t = task::load_one(&p.task_id).ok_or_else(|| conflict("Task disappeared."))?;
+    super::adoption::ensure_available(&p.task_id)?;
     if method == "continuous.migrate_engine" {
         if let Some(previous) = t
             .engine_changes

@@ -297,6 +297,12 @@ pub struct ContinuousTask {
     // ----- runtime (Phase 2) -----
     #[serde(default)]
     pub current_session_uid: Option<String>,
+    /// An incomplete adoption is never admitted, even if another operator
+    /// attempts to resume it. Retry the original request to finish its receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adoption_pending: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adoption_receipt: Option<serde_json::Value>,
     #[serde(default)]
     pub run_count: u32,
     pub enabled: bool,
@@ -457,6 +463,8 @@ impl ContinuousTask {
             default_prompt,
             modes: BTreeMap::new(),
             current_session_uid: None,
+            adoption_pending: None,
+            adoption_receipt: None,
             run_count: 0,
             enabled: true,
             paused: false,
@@ -586,6 +594,22 @@ pub fn validate_task_id(id: &str) -> io::Result<()> {
     Ok(())
 }
 
+// Adopted records are durable activation/ownership commits, including later
+// scheduler writes. Keep the existing I/O policy for unrelated legacy tasks.
+fn write_state(tmp: &std::path::Path, path: &std::path::Path, bytes: &[u8], durable: bool) -> io::Result<()> {
+    use std::io::Write;
+    let mut file = fs::File::create(tmp)?;
+    file.write_all(bytes)?;
+    if durable { file.sync_all()?; }
+    fs::rename(tmp, path)?;
+    if durable {
+        let dir = path.parent().unwrap();
+        fs::File::open(dir)?.sync_all()?;
+        if let Some(parent) = dir.parent() { fs::File::open(parent)?.sync_all()?; }
+    }
+    Ok(())
+}
+
 /// Save atomically: write to state.json.tmp then rename.
 ///
 /// The write happens under an exclusive `flock(2)` on a dedicated lock file
@@ -602,8 +626,7 @@ pub fn save(task: &ContinuousTask) -> Result<(), PersistError> {
     let tmp = dir.join("state.json.tmp");
     let final_path = dir.join("state.json");
     let json = serde_json::to_string_pretty(task)?;
-    fs::write(&tmp, json)?;
-    fs::rename(&tmp, &final_path)?;
+    write_state(&tmp, &final_path, json.as_bytes(), task.adoption_pending.is_some() || task.adoption_receipt.is_some())?;
     Ok(())
 }
 
@@ -628,8 +651,7 @@ pub fn create(task: &ContinuousTask) -> Result<bool, PersistError> {
     }
     let tmp = dir.join("state.json.tmp");
     let json = serde_json::to_string_pretty(task)?;
-    fs::write(&tmp, json)?;
-    fs::rename(&tmp, &final_path)?;
+    write_state(&tmp, &final_path, json.as_bytes(), task.adoption_pending.is_some() || task.adoption_receipt.is_some())?;
     Ok(true)
 }
 
@@ -672,8 +694,7 @@ where
     mutate(&mut task);
     let tmp = dir.join("state.json.tmp");
     let json = serde_json::to_string_pretty(&task)?;
-    fs::write(&tmp, json)?;
-    fs::rename(&tmp, &path)?;
+    write_state(&tmp, &path, json.as_bytes(), task.adoption_pending.is_some() || task.adoption_receipt.is_some())?;
     Ok(task)
 }
 
@@ -726,10 +747,7 @@ where
         Ok(s) => s,
         Err(e) => return TryModifyOutcome::Persist(PersistError::Json(e)),
     };
-    if let Err(e) = fs::write(&tmp, json) {
-        return TryModifyOutcome::Persist(PersistError::Io(e));
-    }
-    if let Err(e) = fs::rename(&tmp, &path) {
+    if let Err(e) = write_state(&tmp, &path, json.as_bytes(), task.adoption_pending.is_some() || task.adoption_receipt.is_some()) {
         return TryModifyOutcome::Persist(PersistError::Io(e));
     }
     TryModifyOutcome::Ok(task)
@@ -749,7 +767,10 @@ struct LockGuard {
 /// Serializes operator pause/drain with scheduler interventions. Unlike the
 /// short state lock, this guard can span a spawn/kill/recovery operation. Never
 /// acquire it while holding DaemonState or the state-file lock. Lock order:
-/// lifecycle -> brief state-file / daemon locks (never both together).
+/// lifecycle -> brief state-file / daemon locks (normally never both together).
+/// Adoption activation is the narrow exception: it uses nonblocking
+/// `DaemonState::try_lock` inside try_modify, aborting on contention, and retains
+/// that guard through the write. It must never wait for DaemonState here.
 pub struct LifecycleGuard {
     _lock: LockGuard,
 }

@@ -27,6 +27,7 @@ from api.dispatch_daemon import dispatch_loop, warm_pool_loop
 from api.board_engine import board_loop
 from api.items import router as items_router
 from api.staffing import router as staffing_router
+from api.continuous_registration import router as continuous_registration_router
 from api.org import router as org_router
 from api.task_changes import ChangeBroker, change_log_maintenance_loop
 from dispatch import db, org_db, task_text
@@ -132,6 +133,7 @@ app = FastAPI(title="Claude Manager", lifespan=lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 app.include_router(items_router)
 app.include_router(staffing_router)
+app.include_router(continuous_registration_router)
 app.include_router(org_router)
 
 

@@ -241,6 +241,7 @@ fn p4_randomized_differential_intent_keys_and_order() {
                                 revision: if i == 2 { 2 } else { 1 },
                                 active: i != 3,
                                 acknowledged: ids.iter().step_by(3).cloned().collect(),
+                                start_position: None,
                             },
                         );
                     }
@@ -545,6 +546,7 @@ fn p4_boundaries_sticky_mutes_monitor_states_and_task_acknowledgments() {
             revision: 1,
             active: true,
             acknowledged: BTreeSet::from([late.clone()]),
+            start_position: None,
         },
     );
     // A mute cannot be undone by a later, equally specific unmuted follow.

@@ -3701,6 +3701,7 @@ pub fn set_workflow_context(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
 ) -> MethodResult {
+    let _binding = crate::continuous::adoption::binding_lock();
     let p: SetWorkflowContextParams = serde_json::from_value(params.clone())
         .map_err(|e| {
             (
@@ -3742,6 +3743,10 @@ pub fn set_workflow_context(
             }));
         }
     };
+    crate::continuous::adoption::session_available(&p.uid)?;
+    if session.continuous_task_id.is_some() && p.workflow_run_id.is_some() {
+        return Err((ErrorCode::Conflict, "session belongs to a continuous task".into()));
+    }
     // A top-level operator spawn may be tagged as a workflow participant
     // immediately after creation. Consume the pending Owner-placement intent
     // before the next heartbeat so a transient workflow tag can never turn
@@ -4828,6 +4833,7 @@ pub fn start_workflow(
     caller: &Caller,
     params: &Value,
 ) -> MethodResult {
+    let _binding = crate::continuous::adoption::binding_lock();
     use crate::workflow::run::{MessageBaseline, RoleBinding};
     use crate::workflow::toml_schema::Engine;
 
@@ -5108,6 +5114,10 @@ pub fn start_workflow(
                         ),
                     ));
                 };
+                crate::continuous::adoption::session_available(uid)?;
+                if session.continuous_task_id.is_some() {
+                    return Err((ErrorCode::Conflict, "session belongs to a continuous task".into()));
+                }
                 // (6) the bound session's engine matches the role's TOML engine.
                 if normalize_engine(&session.session_type)
                     != normalize_engine(role.engine.as_session_type())
@@ -5158,18 +5168,8 @@ pub fn start_workflow(
                 // run — either would let the OTHER run's poller keep driving
                 // this PTY after we overwrote its tags (two pollers, one agent).
                 //
-                // TOCTOU (deferred — out of Phase 1 scope): this check reads
-                // `all_runs` under the lock, but the bound session is tagged only
-                // AFTER `save` (the tag-after-save acceptance criterion releases
-                // the lock in between). Two concurrent `start_workflow` RPCs both
-                // binding the SAME uid could each pass this check before either
-                // tags, yielding two active runs whose `daemon_session_uid` point
-                // at one PTY. A reservation that closed the window would conflict
-                // with tag-after-save, and the realistic trigger (two
-                // simultaneous deliberate binds of one live session on a
-                // mostly-single-operator daemon) is narrow. The doc's Phase-1 bar
-                // is the rejection check itself (implemented + tested); closing
-                // the race is left to a follow-up.
+                // The shared binding mutex spans validation, durable run save,
+                // and session tagging; adoption cannot race this binding.
                 for run in all_runs.iter().filter(|r| r.is_active()) {
                     if run
                         .role_sessions
@@ -12558,7 +12558,7 @@ fn arm_continuous_fire(
     started_at: u64,
 ) -> crate::continuous::task::TryModifyOutcome<FireAbort> {
     crate::continuous::task::try_modify(&snapshot.task_id, |t| {
-        if t.paused || t.drain.is_some() {
+        if t.adoption_pending.is_some() || t.paused || t.drain.is_some() {
             return Err(FireAbort::Paused);
         }
         if t.recovery_hold.is_some() || t.account_blocked.is_some() || t.retirement.is_some() || t.recovery.is_some() { return Err(FireAbort::RecoveryHeld); }
@@ -12985,8 +12985,8 @@ pub fn trigger(
         format!("trigger: continuous task '{}' not found", p.task_id),
     ))?;
 
-    // A paused task doesn't fire — a clean skip, not an error.
-    if task.paused {
+    // A paused or incompletely adopted task cannot reach any executor.
+    if task.paused || task.adoption_pending.is_some() {
         return Ok(json!({ "fired": false, "reason": "paused" }));
     }
 
@@ -13801,12 +13801,14 @@ pub fn continuous_force_done(
     _state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
 ) -> MethodResult {
+    let _binding = crate::continuous::adoption::binding_lock();
     let p: ForceDoneParams = serde_json::from_value(params.clone()).map_err(|e| {
         (
             ErrorCode::InvalidParams,
             format!("continuous.force_done params: {}", e),
         )
     })?;
+    crate::continuous::adoption::ensure_available(&p.task_id)?;
     crate::continuous::task::validate_task_id(&p.task_id)
         .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.force_done: {}", e)))?;
     crate::continuous::task::load_one(&p.task_id).ok_or((
@@ -14694,8 +14696,10 @@ pub fn continuous_create(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
 ) -> MethodResult {
+    let _binding = crate::continuous::adoption::binding_lock();
     let p: ContinuousCreateParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.create params: {}", e)))?;
+    crate::continuous::adoption::ensure_available(&p.task_id)?;
 
     let messaging=crate::messaging::tasks::configuration(state_arc,p.messaging.as_ref().unwrap_or(&Value::Null))
         .map_err(|e|(ErrorCode::InvalidParams,e.to_string()))?;
@@ -15023,11 +15027,13 @@ pub fn continuous_update(
     _state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
 ) -> MethodResult {
+    let _binding = crate::continuous::adoption::binding_lock();
     if params.get("engine").is_some() {
         return Err((ErrorCode::InvalidParams, "Use continuous.migrate_engine to change engines after draining and retiring the old session.".into()));
     }
     let p: ContinuousUpdateParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.update params: {}", e)))?;
+    crate::continuous::adoption::ensure_available(&p.task_id)?;
     crate::continuous::task::validate_task_id(&p.task_id)
         .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.update: {}", e)))?;
     let Some(existing) = crate::continuous::task::load_one(&p.task_id) else {
@@ -15046,6 +15052,7 @@ pub fn continuous_update(
     };
     let _lifecycle = crate::continuous::task::lock_lifecycle(&p.task_id)
         .map_err(|e| (ErrorCode::Internal, format!("continuous.update lock: {e}")))?;
+    crate::continuous::adoption::ensure_available(&p.task_id)?;
     if let Some(dp) = &p.default_prompt {
         if dp.trim().is_empty() {
             return Err((
@@ -15271,6 +15278,8 @@ pub fn continuous_list(
                 // the exact seq/uid and when positive recovery proof must be
                 // newer than. `null` outside an account-block episode.
                 "account_blocked": t.account_blocked,
+                "adoption_pending": t.adoption_pending,
+                "adoption_receipt": t.adoption_receipt,
                 "recovery_hold": t.recovery_hold,
                 "recovery": t.recovery,
                 "retirement": t.retirement,
@@ -15443,12 +15452,14 @@ fn continuous_drain_status(
 /// Close admission and capture already-admitted work without input, a signal,
 /// a new queue claim or a session kill. Operator-only at dispatch.
 pub fn continuous_drain(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> MethodResult {
+    let _binding = crate::continuous::adoption::binding_lock();
     let p: ContinuousDrainParams = serde_json::from_value(params.clone()).map_err(|e| {
         (
             ErrorCode::InvalidParams,
             format!("continuous.drain params: {e}"),
         )
     })?;
+    crate::continuous::adoption::ensure_available(&p.task_id)?;
     crate::continuous::task::validate_task_id(&p.task_id)
         .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.drain: {e}")))?;
     if crate::continuous::task::load_one(&p.task_id).is_none() {
@@ -15459,6 +15470,7 @@ pub fn continuous_drain(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> 
     }
     let _lifecycle = crate::continuous::task::lock_lifecycle(&p.task_id)
         .map_err(|e| (ErrorCode::Internal, format!("continuous.drain lock: {e}")))?;
+    crate::continuous::adoption::ensure_available(&p.task_id)?;
     let updated = crate::continuous::task::modify(&p.task_id, |t| {
         crate::continuous::drain::request(t, crate::continuous::task::now_unix());
     })
@@ -15518,8 +15530,10 @@ pub fn continuous_pause(
     _state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
 ) -> MethodResult {
+    let _binding = crate::continuous::adoption::binding_lock();
     let p: ContinuousPauseParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.pause params: {}", e)))?;
+    crate::continuous::adoption::ensure_available(&p.task_id)?;
     crate::continuous::task::validate_task_id(&p.task_id)
         .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.pause: {}", e)))?;
     // Clean NotFound before the modify (which would otherwise surface a missing
@@ -15532,6 +15546,7 @@ pub fn continuous_pause(
     }
     let _lifecycle = crate::continuous::task::lock_lifecycle(&p.task_id)
         .map_err(|e| (ErrorCode::Internal, format!("continuous.pause lock: {e}")))?;
+    crate::continuous::adoption::ensure_available(&p.task_id)?;
     let updated = crate::continuous::task::try_modify::<_, ()>(&p.task_id, |t| {
         if !p.paused && t.reconciliation.as_ref().is_some_and(|r|r.items.values().any(|i|i.status != crate::continuous::migration::ItemStatus::Completed)) && t.account_blocked.is_none() && t.recovery_hold.is_none() && t.recovery.is_none() { return Err(()); }
         if !p.paused && t.retirement.is_some() && !(t.current_session_uid.is_none() && t.engine_changes.last().is_some_and(|c| c.target == t.engine && c.run_count == t.run_count)) { return Err(()); }
@@ -15617,8 +15632,10 @@ pub fn continuous_delete(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
 ) -> MethodResult {
+    let _binding = crate::continuous::adoption::binding_lock();
     let p: ContinuousDeleteParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.delete params: {}", e)))?;
+    crate::continuous::adoption::ensure_available(&p.task_id)?;
     crate::continuous::task::validate_task_id(&p.task_id)
         .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.delete: {}", e)))?;
     let task = crate::continuous::task::load_one(&p.task_id).ok_or((
@@ -15629,6 +15646,12 @@ pub fn continuous_delete(
         ),
     ))?;
 
+    let _lifecycle = crate::continuous::task::lock_lifecycle(&p.task_id)
+        .map_err(|e| (ErrorCode::Internal, e.to_string()))?;
+    crate::continuous::adoption::ensure_available(&p.task_id)?;
+    if p.gc && task.adoption_receipt.is_some() {
+        return Err((ErrorCode::Conflict, "adopted workspaces are retained; close the workspace separately".into()));
+    }
     // Optional worktree GC (default off). Resolve the repo LOCALLY (a delete
     // must never clone) and remove the worktree; any failure is logged, never
     // fatal — the record still retires below.
@@ -25880,6 +25903,8 @@ while True:
         }
         tmp
     }
+
+    include!("adoption_tests.rs");
 
     fn make_state_arc() -> Arc<Mutex<DaemonState>> {
         Arc::new(Mutex::new(DaemonState::new()))

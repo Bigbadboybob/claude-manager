@@ -984,6 +984,14 @@ pub fn dispatch_request(
         // arm that forwards the caller, because it re-dispatches to
         // `methods::trigger` with the (already operator-validated) caller.
         "trigger" => DispatchOutcome::Done(dispatch_trigger(state, req)),
+        "continuous.adopt_existing" => DispatchOutcome::Done(
+            match operator::require_strong_operator(&req.caller) {
+                Err((code, message)) => Response::err(req.id.clone(), code, message),
+                Ok(()) => match crate::continuous::adoption::handle(state, &req.params) {
+                    Ok(value) => Response::ok(req.id.clone(), value),
+                    Err((code, message)) => Response::err(req.id.clone(), code, message),
+                }
+            }),
         "continuous.create" => DispatchOutcome::Done(dispatch_continuous_create(state, req)),
         "continuous.update" => DispatchOutcome::Done(dispatch_continuous_update(state, req)),
         "continuous.list" => DispatchOutcome::Done(dispatch_continuous_list(state, req)),
@@ -12208,4 +12216,24 @@ mod tests {
             assert!(matches!(post.status, crate::workflow::run::RunStatus::Running));
         });
     }
+    #[test]
+    fn adoption_strong_operator_gate_precedes_params() {
+        let _g = crate::test_support::env_lock();
+        let state = make_state();
+        {
+            let _auth = crate::control::operator::test_override::set(None);
+            let r = dispatch_request(&state, &operator_request("continuous.adopt_existing", serde_json::json!({}))).into_response();
+            assert_eq!(r.error.unwrap().code, ErrorCode::Unauthorized);
+        }
+        let _auth = crate::control::operator::test_override::set(Some("strong-tok"));
+        let r = dispatch_request(&state, &session_request("continuous.adopt_existing", serde_json::json!({}), "ts-agent")).into_response();
+        assert_eq!(r.error.unwrap().code, ErrorCode::Unauthorized);
+        let mut req = operator_request("continuous.adopt_existing", serde_json::json!({}));
+        let r = dispatch_request(&state, &req).into_response();
+        assert_eq!(r.error.unwrap().code, ErrorCode::Unauthorized);
+        req.caller = Caller::operator("strong-tok");
+        let r = dispatch_request(&state, &req).into_response();
+        assert_eq!(r.error.unwrap().code, ErrorCode::InvalidParams);
+    }
+
 }

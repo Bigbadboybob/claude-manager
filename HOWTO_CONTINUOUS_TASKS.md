@@ -59,6 +59,10 @@ An agent's session-control MCP tools address its local daemon even when chat spa
 
 ---
 
+Already have the live agent and its planning workspace? Use the operator-only
+[adopt-existing procedure](doc/continuous-adopt-existing.md) instead of create:
+it preserves the process, registers ownership, and schedules only a future slot.
+
 ## 2. Create the planning task
 
 The orchestrator needs a real planning-task UUID as its parent so its subtasks nest under it on the board. Create it first and keep the `id`. Read API creds from the host's `~/.cm/daemon.toml` (`api_url`, `api_token`):

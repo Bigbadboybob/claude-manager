@@ -468,7 +468,7 @@ impl ContinuousScheduler {
         // Periodic-only + small N, so a plain Vec filter of the due set is
         // behaviorally identical to the design's BinaryHeap due-index (that
         // heap is an optimization deferred until load volume warrants it).
-        let tasks = task::load_all();
+        let tasks: Vec<_> = task::load_all().into_iter().filter(|t| t.adoption_pending.is_none()).collect();
 
         // Tasks already fired this tick (supervision), so the due check below
         // doesn't double-fire a Persistent+Periodic task.
@@ -2211,7 +2211,7 @@ impl ContinuousScheduler {
     /// in_flight-leak residual (a guard left set on an unclean fire path); an
     /// overdue on-disk guard from before a daemon restart clears here too.
     fn reconcile_orphans(&self, now: u64) {
-        for tk in task::load_all() {
+        for tk in task::load_all().into_iter().filter(|t| t.adoption_pending.is_none()) {
             if tk.recovery.is_some() || (tk.engine == task::Engine::Codex && (tk.account_blocked.is_some() || tk.recovery_hold.is_some())) { continue; }
             // A run can be stranded `Running` with no live reaper to finish it
             // when the daemon restarts / crashes / is SIGKILLed mid-run (systemd
@@ -2606,6 +2606,7 @@ fn active_account_block(tk: &ContinuousTask) -> Option<&AccountBlockRecord> {
 /// uid.
 fn should_supervise(tk: &ContinuousTask) -> bool {
     tk.run_mode == task::RunMode::Persistent
+        && tk.adoption_pending.is_none()
         && tk.supervise
         && tk.enabled
         && !tk.paused
@@ -2704,7 +2705,7 @@ fn collect_due(
     tasks
         .iter()
         .filter(|t| {
-            t.enabled && !t.paused && t.in_flight.is_none() && t.next_fire_at <= now
+            t.adoption_pending.is_none() && t.enabled && !t.paused && t.in_flight.is_none() && t.next_fire_at <= now
         })
         .filter(|t| match &t.schedule {
             Schedule::Periodic { .. } => true,

@@ -11,6 +11,10 @@ pub struct TaskBinding {
     pub active: bool,
     #[serde(default)]
     pub acknowledged: BTreeSet<String>,
+    /// Adoption begins at this durable checkpoint instead of replaying channel
+    /// history as an initial native wake. Retained across identical retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_position: Option<u64>,
 }
 impl Store {
     fn task_binding_path(&self, id: &str) -> Result<PathBuf> {
@@ -56,7 +60,17 @@ impl Store {
     }
     /// Only daemon scheduler code calls this. Channel/UID assertions from an
     /// agent tool are never used to transfer a subscription.
-    pub fn bind_task_subscription(&mut self, mut next: TaskBinding) -> Result<Value> {
+    pub fn bind_task_subscription(&mut self, next: TaskBinding) -> Result<Value> {
+        self.bind_task_subscription_inner(next, false)
+    }
+    pub(crate) fn bind_task_subscription_quiet(&mut self, next: TaskBinding) -> Result<Value> {
+        self.bind_task_subscription_inner(next, true)
+    }
+    fn bind_task_subscription_inner(
+        &mut self,
+        mut next: TaskBinding,
+        quiet: bool,
+    ) -> Result<Value> {
         self.task_binding_path(&next.id)?;
         if !self.channels.values().any(|id| id == &next.channel_id)
             || !next
@@ -67,6 +81,9 @@ impl Store {
                 "invalid_binding",
                 "Task subscription requires a known channel and a local scheduler session",
             ));
+        }
+        if quiet {
+            next.start_position = Some(self.position);
         }
         if let Some(old) = self.task_bindings.get(&next.id) {
             if old.task_id != next.task_id
@@ -80,6 +97,9 @@ impl Store {
                 ));
             }
             next.acknowledged.extend(old.acknowledged.iter().cloned());
+            if old.revision == next.revision {
+                next.start_position = old.start_position;
+            }
         }
         let monitor_id = format!("task-{}-{}", next.id, next.revision);
         // Persist the fencing revision before changing any private watch. A
@@ -90,12 +110,13 @@ impl Store {
         let stale = self
             .personal
             .iter()
-            .filter(|(actor, _)| *actor != &next.actor)
             .filter_map(|(_, p)| {
                 let mut p = p.clone();
                 let mut changed = false;
                 for m in p.monitors.values_mut().filter(|m| {
-                    m.task_subscription.as_ref() == Some(&next.id) && m.state != "cancelled"
+                    m.task_subscription.as_ref() == Some(&next.id)
+                        && m.id != monitor_id
+                        && m.state != "cancelled"
                 }) {
                     m.state = "cancelled".into();
                     m.closing_fence.get_or_insert(self.position);
@@ -109,6 +130,7 @@ impl Store {
         }
         let mut personal = self.personal_state(&next.actor);
         if !personal.monitors.contains_key(&monitor_id) {
+            let start = next.start_position.unwrap_or(0);
             let mut monitor = Monitor {
                 id: monitor_id.clone(),
                 task_subscription: Some(next.id.clone()),
@@ -122,11 +144,11 @@ impl Store {
                 created_at: now(),
                 expires_at: None,
                 state: "active".into(),
-                start: 0,
-                scanned: 0,
+                start,
+                scanned: start,
                 hit_high: 0,
                 hits: 0,
-                acknowledged: 0,
+                acknowledged: start,
                 closing_fence: None,
             };
             self.scan_monitor(&next.actor, &mut monitor, Utc::now())?;
@@ -256,6 +278,7 @@ mod tests {
             revision: 1,
             active: true,
             acknowledged: BTreeSet::new(),
+            start_position: None,
         };
         s.bind_task_subscription(bind.clone()).unwrap();
         let first = s
@@ -307,7 +330,10 @@ mod tests {
             .unwrap();
         assert_eq!(s.names[&new].name, "bug-triage-orchestrator");
         assert!(s.names[&old].released);
-        assert_eq!(s.names[&old].name, "bug-triage-orchestrator", "history keeps the old record");
+        assert_eq!(
+            s.names[&old].name, "bug-triage-orchestrator",
+            "history keeps the old record"
+        );
         assert!(!s.names[&worker].released, "unrelated names are untouched");
         // A DM addressed by name reaches the live holder, not the released one.
         let dm = s
@@ -334,8 +360,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut s = Store::open(tmp.path()).unwrap();
         let channel = s.channels["general"].clone();
-        let a = s.post_system_notice(&channel, "Run seq 7 held", "held:7").unwrap();
-        let b = s.post_system_notice(&channel, "Run seq 7 held", "held:7").unwrap();
+        let a = s
+            .post_system_notice(&channel, "Run seq 7 held", "held:7")
+            .unwrap();
+        let b = s
+            .post_system_notice(&channel, "Run seq 7 held", "held:7")
+            .unwrap();
         assert_eq!(a["event_id"], b["event_id"]);
         assert_eq!(a["event"]["actor"]["kind"], "system");
         assert_eq!(a["event"]["conversation_id"], channel);
@@ -382,6 +412,7 @@ mod tests {
             revision: 1,
             active: true,
             acknowledged: BTreeSet::new(),
+            start_position: None,
         };
         let initial = s.bind_task_subscription(bind.clone()).unwrap();
         let result = s
@@ -455,5 +486,115 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+    }
+    #[test]
+    fn adoption_quiet_subscription_retains_baseline_across_retry_and_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = Store::open(tmp.path()).unwrap();
+        let agent = s.participant_id("adopted");
+        let peer = s.participant_id("peer");
+        let people = [
+            person("adopted", agent.clone()),
+            person("peer", peer.clone()),
+        ];
+        s.enroll_participants(&people).unwrap();
+        let old = s
+            .send(
+                &peer,
+                "peer",
+                "agent",
+                &json!({"channel":"general","name":"Peer","body":"historical","request_id":"before"}),
+                &people,
+            )
+            .unwrap();
+        let binding = TaskBinding {
+            id: uuid(),
+            task_id: "adopted".into(),
+            channel_id: s.channels["general"].clone(),
+            actor: agent.clone(),
+            revision: 1,
+            active: true,
+            acknowledged: BTreeSet::new(),
+            start_position: None,
+        };
+        let private = s
+            .register_monitor(
+                &agent,
+                &json!({"scope":{"dms":true},"request_id":"unrelated"}),
+                &people,
+            )
+            .unwrap();
+        s.read("owner", &json!({"channel":"general"}), &people)
+            .unwrap();
+        let human_reads = serde_json::to_value(s.reads.get("owner")).unwrap();
+        let private_before = serde_json::to_value(
+            &s.personal_state(&agent).monitors[private["id"].as_str().unwrap()],
+        )
+        .unwrap();
+        let r = s.bind_task_subscription_quiet(binding.clone()).unwrap();
+        let baseline = s.task_bindings[&binding.id].start_position.unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                &s.personal_state(&agent).monitors[private["id"].as_str().unwrap()]
+            )
+            .unwrap(),
+            private_before
+        );
+        assert!(s
+            .monitors(
+                &agent,
+                &json!({"action":"get","monitor_id":r["monitor_id"]})
+            )
+            .unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        // Crash seam: durable binding exists but private monitor needs rebuilding.
+        let mut personal = s.personal_state(&agent);
+        personal.monitors.remove(r["monitor_id"].as_str().unwrap());
+        s.save_personal(personal).unwrap();
+        drop(s);
+        let mut s = Store::open(tmp.path()).unwrap();
+        let new = s
+            .send(
+                &peer,
+                "peer",
+                "agent",
+                &json!({"channel":"general","body":"after checkpoint","request_id":"after"}),
+                &people,
+            )
+            .unwrap();
+        let private_before = serde_json::to_value(
+            &s.personal_state(&agent).monitors[private["id"].as_str().unwrap()],
+        )
+        .unwrap();
+        s.bind_task_subscription_quiet(binding.clone()).unwrap();
+        s.bind_task_subscription(binding.clone()).unwrap();
+        assert_eq!(s.task_bindings[&binding.id].start_position, Some(baseline));
+        assert_eq!(
+            serde_json::to_value(s.reads.get("owner")).unwrap(),
+            human_reads
+        );
+        assert_eq!(
+            serde_json::to_value(
+                &s.personal_state(&agent).monitors[private["id"].as_str().unwrap()]
+            )
+            .unwrap(),
+            private_before
+        );
+        let result = s
+            .monitors(
+                &agent,
+                &json!({"action":"get","monitor_id":r["monitor_id"]}),
+            )
+            .unwrap();
+        assert_eq!(result["items"].as_array().unwrap().len(), 1, "{result}");
+        let items = result["items"].to_string();
+        assert!(items.contains(new["event_id"].as_str().unwrap()));
+        assert!(!items.contains(old["event_id"].as_str().unwrap()));
+        assert!(
+            s.events.iter().any(|e| e.event["id"] == old["event_id"]),
+            "history retained"
+        );
     }
 }

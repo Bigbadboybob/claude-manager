@@ -22,6 +22,7 @@
 //! fields are defined here but inert.
 
 pub mod dispatch_pending;
+pub mod adoption;
 pub mod completion;
 pub mod codex_probe;
 pub mod codex_account;

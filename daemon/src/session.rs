@@ -3598,6 +3598,16 @@ impl DaemonSession {
             .unwrap_or_else(|p| p.into_inner()) = Some(who.to_string());
     }
 
+    /// Non-consuming kernel liveness check for an operator adoption preview.
+    pub(crate) fn process_alive_read_only(&self) -> std::io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        let mut pfd = libc::pollfd { fd: self.pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: pfd is valid for one pollfd; timeout zero never waits.
+        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if rc < 0 { return Err(std::io::Error::last_os_error()); }
+        Ok(rc == 0)
+    }
+
     /// Non-blocking exit check. Returns `Some(DaemonExitStatus)`
     /// once the child has exited (the result is cached, so
     /// subsequent calls keep returning the same value), `None`

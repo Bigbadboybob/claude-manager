@@ -1011,6 +1011,14 @@ pub fn current(session: &DaemonSession) -> AgentState {
     cell.inputs.exited = session.last_exit.kernel_set();
     cell.recompute(unix_now())
 }
+/// Read-only observation for operator previews: do not update debounce state,
+/// the publisher, or the persisted agent-state cache.
+pub fn read_only(session: &DaemonSession) -> AgentState {
+    let mut inputs = session.agent_state.lock().unwrap_or_else(|p| p.into_inner()).inputs.clone();
+    inputs.legacy = legacy(session);
+    inputs.exited = session.last_exit.kernel_set();
+    derive(&inputs, unix_now())
+}
 /// The tick is the only publisher. Reports coalesce a latest value per session;
 /// the bounded drain leaves room for unrelated lifecycle diffs in the watcher.
 const MAX_STATE_DIFFS_PER_TICK: usize = crate::manifest::MANIFEST_WATCH_BUFFER / 4;
