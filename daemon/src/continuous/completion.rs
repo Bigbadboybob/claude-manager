@@ -300,6 +300,16 @@ pub fn claude_turn_finished_after(path: &str, after: f64) -> bool {
     read() == Some(true)
 }
 
+/// An unresolved real hook turn needs a settled boundary, not an assistant
+/// end_turn (Stop hooks may still block or continue). The bounded probe checks
+/// native identity and uses the boundary's own event time, never file mtime.
+pub fn claude_confirmed_turn_finished_after(path: &str, after: f64, now: f64) -> bool {
+    let Some(probe) = super::probe::probe_transcript_tail(std::path::Path::new(path)) else { return false; };
+    after.is_finite() && !probe.claude_identity_mismatch
+        && probe.claude_end.as_ref().is_some_and(|end|
+            end.ended_at.is_some_and(|at| at >= after && at <= now + 5.0))
+}
+
 /// None permits a transcript check only after a continuous 90s source outage.
 /// Engine state stays Unknown on the public surfaces during this drain escape.
 pub fn claude_drain_state_finished_after(

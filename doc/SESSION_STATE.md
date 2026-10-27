@@ -21,7 +21,7 @@ agent_state = {
          idle | starting | exited | unknown,
   since: unix_s,
   detail: {waiting_for?, error_kind?, resumes_at?, retrying?, open_tool?,
-           input_pending?, no_turn_at?},
+           input_pending?, no_turn_at?, confirmed_turn_open?},
   source: presence | hooks | relay | transcript | pty,
   observed_at: unix_s,
   engine_version?: string,
@@ -86,7 +86,7 @@ One pure `derive(inputs, now)` applies this precedence, highest first:
 | `starting` | No engine report or transcript yet, within 120 seconds of spawn. |
 | `unknown` | Previously valid engine source missing/invalid, PID identity mismatch, relay heartbeat older than 90 seconds, or relay backend disconnected. |
 | `waiting-on-human` | Claude waiting status or permission/notification edge newer than prompt-submit/Stop; Codex pending approval, user input or elicitation in its thread tree, or waiting flags. Tool calls and auth refresh alone do not count. |
-| `errored` | Claude StopFailure after the last prompt-submit, or idle presence plus synthetic transcript API error; Codex failed turn or system error. Cleared by the next turn start. |
+| `errored` | Claude StopFailure or timestamped synthetic transcript API failure after the last prompt-submit; Codex failed turn or system error. Cleared by the next turn start. |
 | `working` | Claude busy with its main turn open (hook edges, otherwise transcript); Codex foreground active, with `retrying` detail when applicable. |
 | `working-background` | Claude busy with its turn closed, or shell status; Codex foreground idle with active children or background terminals. |
 | `idle` | Engine idle; `since` comes from Claude `statusUpdatedAt`, Codex turn completion, or the fallback turn-end edge. |
@@ -121,6 +121,17 @@ conversation errors cannot supply that boundary. If an error accompanies stale
 presence but its event provenance is unavailable, state is `unknown` with
 `detail.error_kind=unverified_transcript_error`. Cached transcript evidence is
 bound to its sampled path and revalidated on reads and launch confirmation.
+A failure is dated by its own validated event, never by a later idle status or
+turn-duration record. Newer hook wait, Stop and StopFailure outrank unverifiable
+error hints; invalid source identity still takes precedence as `unknown`.
+
+`detail.confirmed_turn_open=true` marks `unknown` with an unresolved actual
+Claude hook start. Quiet PTY output cannot make this compatible idle or complete
+an MCP idle wait. Workflow advancement and drain's post-90-second outage escape
+require a bound, timestamped settled transcript boundary after that start;
+assistant `end_turn` alone is insufficient. These probes run outside the daemon
+registry lock. A genuine Stop/StopFailure or verified settled boundary clears
+the guard. Ordinary unknown/legacy and synthetic-no-turn fallbacks remain.
 
 `stalled_since` overlays either working state after 15 minutes without transcript
 or subagent-directory growth. It does not replace the state. `since`, `turn_seq`,

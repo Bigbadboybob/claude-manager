@@ -3855,6 +3855,7 @@ async def wait_for_session_idle(
         engine_done = engine_turn_complete(resolved)
         if engine_done is not None:
             if ((engine_state(resolved) or {}).get("state") == "unknown"
+                    and ((engine_state(resolved) or {}).get("detail") or {}).get("confirmed_turn_open") is not True
                     and resolved.get("pty_idle") is True):
                 return _with_outcome({
                     "idle": True, "timed_out": False, "state": state,

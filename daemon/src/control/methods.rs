@@ -15397,7 +15397,8 @@ pub(crate) fn capture_drain_sessions(
                             s.agent_state.lock().unwrap_or_else(|p| p.into_inner()).inputs.delivery
                                 .as_ref().is_some_and(|d| d.local_command))
                     } else { Some(end.is_some_and(|e| e >= report.at_instant)) };
-                    transcript_checks.push((uid.clone(), s.session_type.clone(), s.transcript_path.clone(), after, finished));
+                    transcript_checks.push((uid.clone(), s.session_type.clone(), s.transcript_path.clone(), after, finished,
+                        agent.detail.confirmed_turn_open == Some(true)));
                 }
                 observations.push(SessionObservation {
                     session_uid: uid,
@@ -15426,11 +15427,13 @@ pub(crate) fn capture_drain_sessions(
         observations.sort_by(|a, b| a.session_uid.cmp(&b.session_uid));
         observations
     };
-    for (uid, engine, path, after, finished) in transcript_checks {
+    for (uid, engine, path, after, finished, confirmed_turn_open) in transcript_checks {
         if let Some(session) = sessions.iter_mut().find(|s| s.session_uid == uid) {
             session.final_turn_ended = finished.unwrap_or_else(|| path.is_some_and(|path| {
                 if engine == "claude-code" {
-                    crate::continuous::completion::claude_turn_finished_after(&path, after)
+                    if confirmed_turn_open {
+                        crate::continuous::completion::claude_confirmed_turn_finished_after(&path, after, now_unix_f64())
+                    } else { crate::continuous::completion::claude_turn_finished_after(&path, after) }
                 } else { crate::continuous::completion::codex_turn_finished_after(&path, after) }
             }));
         }
@@ -36730,6 +36733,73 @@ while True:
                 !capture_drain_sessions(&state, &task)[0].final_turn_ended,
                 "fallback cannot reuse a transcript end from before the new input"
             );
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn state_core_unknown_confirmed_turn_blocks_quiet_reads_and_unsettled_drain() {
+        with_continuous_home(|home| {
+            use crate::agent_state::{PresenceObs, PresenceStatus};
+            let state = make_state_arc();
+            let uid = fresh_test_uid();
+            let mut task = fresh_task_running("confirmed-unknown", home, &uid);
+            crate::continuous::drain::request(&mut task, crate::continuous::task::now_unix());
+            insert_continuous_session(&state, &uid, &task.task_id);
+            let path = home.join("confirmed-unknown.jsonl");
+            let ended = crate::workflow::history::iso8601_to_ms("2026-10-07T00:00:00Z").unwrap() as f64 / 1000.0;
+            let assistant = json!({"type":"assistant", "sessionId":"confirmed-unknown",
+                "timestamp":"2026-10-07T00:00:00Z", "message":{"role":"assistant", "stop_reason":"end_turn"}});
+            for valid in [false, true] {
+                {
+                    let mut st = state.lock().unwrap();
+                    let session = st.sessions.get_mut(&uid).unwrap();
+                    session.transcript_path = Some(path.to_string_lossy().into_owned());
+                    session.stamp_reported_done(None);
+                    session.done_report.lock().unwrap().as_mut().unwrap().at_unix = ended - 1.0;
+                    *session.last_input_at.lock().unwrap() = None;
+                    *session.last_activity_at.lock().unwrap() = Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+                    let mut cell = session.agent_state.lock().unwrap();
+                    cell.inputs.latest_start = Some(ended - 2.0);
+                    cell.inputs.hooks.prompt_at = Some(ended - 2.0);
+                    cell.inputs.hooks.stop_at = Some(ended - 100.0);
+                    cell.inputs.previous = None;
+                    cell.inputs.presence = Some(PresenceObs {
+                        valid, status: PresenceStatus::Idle, observed_at: now_unix_f64() - 100.0,
+                        status_updated_at: None, native_session_id: None,
+                        engine_version: None, waiting_for: None, main_turn_open: None,
+                        transcript_error: Some("unverified".into()), transcript_end: None, transcript_evidence_path: None,
+                    });
+                }
+                let resolved = resolve_authorized_session(&state, &json!({"session_uid":uid}), None).unwrap();
+                let rows = list_sessions(&state, &json!({}), None).unwrap();
+                let row = rows.as_array().unwrap().iter().find(|r| r["session_uid"] == uid).unwrap();
+                for result in [&resolved, row] {
+                    assert_eq!(result["agent_state"]["state"], "unknown");
+                    assert_eq!(result["agent_state"]["detail"]["confirmed_turn_open"], true);
+                    assert_eq!(result["pty_idle"], true);
+                    assert_eq!(result["idle"], false);
+                }
+                for (sid, stamp, settled, expected) in [
+                    ("confirmed-unknown", "2026-10-07T00:00:00Z", false, false),
+                    ("foreign", "2026-10-07T00:00:00Z", true, false),
+                    ("confirmed-unknown", "2026-10-06T00:00:00Z", true, false),
+                    ("confirmed-unknown", "2026-10-07T00:00:00Z", true, true),
+                ] {
+                    let mut transcript = format!("{assistant}\n");
+                    if settled {
+                        transcript += &format!("{}\n", json!({"type":"system", "subtype":"turn_duration", "sessionId":sid, "timestamp":stamp}));
+                    }
+                    std::fs::write(&path, transcript).unwrap();
+                    assert_eq!(crate::control::continuous_drain::notice_ready(&state, &uid), expected,
+                        "valid={valid} sid={sid} settled={settled} stamp={stamp}");
+                    assert_eq!(capture_drain_sessions(&state, &task)[0].final_turn_ended, expected);
+                }
+                state.lock().unwrap().sessions[&uid].agent_state.lock().unwrap().inputs.hooks.stop_at = Some(ended);
+                let resolved = resolve_authorized_session(&state, &json!({"session_uid":uid}), None).unwrap();
+                assert!(resolved["agent_state"]["detail"]["confirmed_turn_open"].is_null());
+                assert_eq!(resolved["idle"], true, "actual Stop releases the quiet fallback guard");
+            }
             kill_all_sessions(&state);
         });
     }

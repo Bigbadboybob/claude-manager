@@ -232,6 +232,9 @@ struct TickSnapshot {
     /// session maps under the lock.
     active_session_daemon_owned: bool,
     engine_state_blocked: bool,
+    /// Unknown with a confirmed hook turn may escape only on a settled bound
+    /// transcript edge. Capture under the registry lock; probe outside it.
+    confirmed_turn_probe: Option<(String, f64)>,
     /// Snapshot of the workflow definition, if loaded. Cloned
     /// because the apply phase may run under a fresh state lock
     /// in [`fire_static_transition`] and we don't want to re-lookup
@@ -1034,7 +1037,8 @@ impl WorkflowPoller {
                 reason: SkipReason::NoHistoryEntry,
             };
         };
-        if snap.engine_state_blocked {
+        if snap.engine_state_blocked && !snap.confirmed_turn_probe.as_ref().is_some_and(|(path, after)|
+            crate::continuous::completion::claude_confirmed_turn_finished_after(path, *after, crate::agent_state::unix_now())) {
             return Decision::Skip { run_id: snap.run_id.clone(), reason: SkipReason::EngineStateBlocked };
         }
         let fire = crate::workflow::transcript::assistant_turn_completed_since(
@@ -1335,9 +1339,9 @@ impl WorkflowPoller {
     }
 }
 
-fn workflow_engine_blocks(state: &DaemonState, run: &WorkflowRun) -> bool {
+fn workflow_engine_gate(state: &DaemonState, run: &WorkflowRun) -> (bool, Option<(String, f64)>) {
     if !state.config.workflow_state_gate {
-        return false;
+        return (false, None);
     }
     let session = run
         .active_role
@@ -1345,15 +1349,20 @@ fn workflow_engine_blocks(state: &DaemonState, run: &WorkflowRun) -> bool {
         .and_then(|role| run.role_sessions.get(role))
         .and_then(|binding| binding.daemon_session_uid.as_ref())
         .and_then(|uid| state.sessions.get(uid));
-    session.is_some_and(|session| {
+    session.map_or((false, None), |session| {
         let agent = crate::agent_state::current(session);
-        agent.source.engine_reported()
-            && matches!(
+        let confirmed = agent.detail.confirmed_turn_open == Some(true);
+        let blocked = agent.source.engine_reported()
+            && (confirmed || matches!(
                 agent.state,
                 crate::agent_state::State::Working
                     | crate::agent_state::State::WorkingBackground
                     | crate::agent_state::State::WaitingOnHuman
-            )
+            ));
+        let probe = if confirmed && session.session_type == "claude-code" {
+            session.transcript_path.clone().zip(agent.latest_start_at)
+        } else { None };
+        (blocked, probe)
     })
 }
 
@@ -1420,7 +1429,7 @@ fn collect_snapshots(state: &DaemonState, runs: &[snapshots::Snapshot]) -> Vec<T
             // `resolve_role_session_context` (tag fallbacks) still serve engine
             // + worktree derivation below; only the FIRE gate is uid-based.
             let active_session_daemon_owned = daemon_owns_run(state, run);
-            let engine_state_blocked = workflow_engine_blocks(state, run);
+            let (engine_state_blocked, confirmed_turn_probe) = workflow_engine_gate(state, run);
 
             // Worktree resolution via session tags, NOT
             // `run.task_key`. The session bound to this run +
@@ -1465,6 +1474,7 @@ fn collect_snapshots(state: &DaemonState, runs: &[snapshots::Snapshot]) -> Vec<T
                 role_session_types,
                 active_session_daemon_owned,
                 engine_state_blocked,
+                confirmed_turn_probe,
                 workflow,
             }
         })
@@ -2324,6 +2334,40 @@ mod tests {
             let blocked = poller.poll_once();
             assert!(matches!(blocked.as_slice(), [Decision::Skip {
                 reason: SkipReason::EngineStateBlocked, .. }]), "{blocked:?}");
+        }
+        // Unknown without an actual hook keeps the legacy transcript gate.
+        // With a confirmed unresolved hook, end_turn alone cannot advance it.
+        let ended = crate::workflow::history::iso8601_to_ms("2026-10-07T00:00:00Z").unwrap() as f64 / 1000.0;
+        {
+            let mut st = state.lock().unwrap();
+            let session = st.sessions.get_mut("ts-worker").unwrap();
+            session.transcript_path = Some(proj.join("sid-worker.jsonl").to_string_lossy().into_owned());
+            let mut cell = session.agent_state.lock().unwrap();
+            cell.inputs.presence.as_mut().unwrap().valid = false;
+            cell.inputs.latest_start = Some(ended - 2.0);
+            cell.inputs.hooks.stop_at = Some(ended - 100.0);
+        }
+        assert!(matches!(poller.poll_once().as_slice(), [Decision::ActivateStatic { .. }]));
+        state.lock().unwrap().sessions["ts-worker"].agent_state.lock().unwrap().inputs.hooks.prompt_at = Some(ended - 2.0);
+        for (sid, stamp, settled, expected) in [
+            ("sid-worker", "2026-10-07T00:00:00Z", false, false),
+            ("foreign", "2026-10-07T00:00:00Z", true, false),
+            ("sid-worker", "2026-10-06T00:00:00Z", true, false),
+            ("sid-worker", "2026-10-07T00:00:00Z", true, true),
+        ] {
+            let assistant = serde_json::json!({"type":"assistant", "sessionId":"sid-worker", "timestamp":"2026-10-07T00:00:00Z",
+                "message":{"role":"assistant", "stop_reason":"end_turn", "content":[{"type":"text", "text":"done"}]}});
+            let mut transcript = format!("{assistant}\n");
+            if settled {
+                transcript += &format!("{}\n", serde_json::json!({"type":"system", "subtype":"turn_duration", "sessionId":sid, "timestamp":stamp}));
+            }
+            std::fs::write(proj.join("sid-worker.jsonl"), transcript).unwrap();
+            let decisions = poller.poll_once();
+            if expected {
+                assert!(matches!(decisions.as_slice(), [Decision::ActivateStatic { .. }]), "{decisions:?}");
+            } else {
+                assert!(matches!(decisions.as_slice(), [Decision::Skip { reason: SkipReason::EngineStateBlocked, .. }]), "{decisions:?}");
+            }
         }
         // Rollout flag off restores the underlying transcript predicate.
         state.lock().unwrap().config.workflow_state_gate = false;

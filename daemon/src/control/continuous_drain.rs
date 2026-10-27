@@ -37,7 +37,7 @@ impl Drop for PendingNotice {
 }
 
 pub(super) fn notice_ready(state: &Arc<Mutex<DaemonState>>, uid: &str) -> bool {
-    let (engine, idle, path, after, fallback) = {
+    let (engine, idle, path, after, fallback, confirmed_turn_open) = {
         let state = state.lock().unwrap_or_else(|p| p.into_inner());
         if state.draining || crate::writer_gate::pause_requested() {
             return false;
@@ -83,11 +83,14 @@ pub(super) fn notice_ready(state: &Arc<Mutex<DaemonState>>, uid: &str) -> bool {
             session.transcript_path.clone(),
             after,
             agent.source.engine_reported(),
+            agent.detail.confirmed_turn_open == Some(true),
         )
     };
     match engine.as_str() {
         "claude-code" if fallback => {
-            path.is_some_and(|p| completion::claude_turn_finished_after(&p, after))
+            path.is_some_and(|p| if confirmed_turn_open {
+                completion::claude_confirmed_turn_finished_after(&p, after, super::methods::now_unix_f64())
+            } else { completion::claude_turn_finished_after(&p, after) })
         }
         "claude-code" => idle == Some(true),
         "codex" => path.is_some_and(|p| completion::codex_turn_finished_after(&p, after)),

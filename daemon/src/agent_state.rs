@@ -57,6 +57,9 @@ pub struct Detail {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_turn_at: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Unknown must not become idle from PTY quiet while a real hook turn is open.
+    pub confirmed_turn_open: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_for: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<String>,
@@ -180,6 +183,7 @@ pub struct AgentState {
 }
 impl AgentState {
     pub fn compatibility_idle(&self, pty_idle: bool, presence_enabled: bool) -> bool {
+        if self.detail.confirmed_turn_open == Some(true) { return false; }
         if self.state == State::Unknown || (self.source == Source::Presence && !presence_enabled) {
             return pty_idle;
         }
@@ -424,7 +428,8 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
     let presence_behind_hook = relay.is_none()
         && newer(hooks.prompt_at, last_turn.ended_at)
         && presence.is_some_and(|p| newer(hooks.prompt_at, p.status_updated_at));
-    let unverified_error = presence_behind_hook && presence.is_some_and(|p|
+    let confirmed_hook_open = relay.is_none() && newer(hooks.prompt_at, last_turn.ended_at);
+    let unverified_error = confirmed_hook_open && presence.is_some_and(|p|
         p.status == PresenceStatus::Idle && p.transcript_error.is_some() && p.transcript_end.is_none());
     // A relay heartbeat is a receipt time, not evidence that queued PTY input
     // reached the engine. Hold until a real turn edge, with a bounded escape
@@ -449,11 +454,7 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
         State::Starting
     } else if presence.is_some_and(|p| !p.valid || p.status == PresenceStatus::Unknown)
         || relay.is_some_and(|r| !r.backend_connected || now - r.observed_at > 90.0)
-        || unverified_error
     {
-        if unverified_error {
-            detail.error_kind = Some("unverified_transcript_error".into());
-        }
         entered = relay
             .filter(|r| r.backend_connected)
             .map_or(observed_at, |r| r.observed_at + 90.0);
@@ -477,7 +478,7 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
         });
         let hook_wait = hooks.waiting_for.as_deref() != Some("idle_prompt") && newer(
             hooks.waiting_at,
-            max_time(start, max_time(hooks.stop_at, hooks.failure_at)),
+            max_time(start, last_turn.ended_at),
         );
         if pending.is_some()
             || flag.is_some()
@@ -514,16 +515,24 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
             || presence.is_some_and(|p| {
                 p.status == PresenceStatus::Idle
                     && p.transcript_error.is_some()
-                    && !newer(start, p.status_updated_at)
+                    // Legacy engines without any temporal lifecycle evidence
+                    // retain their error hint. Once edges exist, only the
+                    // merged, timestamped LastTurn can date a failure.
+                    && start.is_none() && last_turn.ended_at.is_none()
             })
         {
             detail.error_kind = relay
                 .and_then(|r| r.error_kind.clone())
+                .or_else(|| (hooks.failure_at.is_some() && hooks.failure_at == last_turn.ended_at)
+                    .then(|| hooks.error_kind.clone()).flatten())
                 .or_else(|| presence.and_then(|p| p.transcript_error.clone()))
                 .or_else(|| hooks.error_kind.clone());
             detail.resumes_at = hooks.resumes_at;
             entered = last_turn.ended_at.unwrap_or(observed_at);
             State::Errored
+        } else if unverified_error {
+            detail.error_kind = Some("unverified_transcript_error".into());
+            State::Unknown
         } else {
             let open = if hooks.prompt_at.is_some() {
                 newer(start, last_turn.ended_at)
@@ -598,6 +607,9 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
                 else { detail.input_pending = Some(true); }
             }
         }
+    }
+    if state == State::Unknown && confirmed_hook_open {
+        detail.confirmed_turn_open = Some(true);
     }
     AgentState {
         state,
@@ -1917,6 +1929,9 @@ mod tests {
         assert_eq!(derive(&interrupted, 1040.0).state, State::Idle,
             "a newer idle edge still handles interruption without Stop");
         interrupted.presence.as_mut().unwrap().transcript_error = Some("api_error".into());
+        interrupted.presence.as_mut().unwrap().transcript_end = Some(LastTurn {
+            ended_at: Some(1002.0), status: Some(TurnStatus::Failed),
+        });
         assert_eq!(derive(&interrupted, 1040.0).state, State::Errored);
         let mut stale_error = original.clone();
         stale_error.presence.as_mut().unwrap().transcript_error = Some("api_error".into());
@@ -1945,6 +1960,68 @@ mod tests {
         c.apply(hook(HookEvent::Stop, 1041.0), 1041.0).unwrap();
         c.inputs.presence.as_mut().unwrap().status = PresenceStatus::Busy;
         assert_eq!(c.recompute(1043.0).state, State::WorkingBackground);
+    }
+
+    #[test]
+    fn error_evidence_order_matrix_keeps_each_event_own_time() {
+        for actual in [false, true] {
+            for error_at in [Some(900.0), Some(1010.0), None] {
+                for event in ["none", "wait", "stop", "failure", "idle"] {
+                    let mut i = presence(PresenceStatus::Idle);
+                    i.latest_start = Some(1001.0);
+                    i.legacy.pty_idle = true;
+                    i.hooks.prompt_at = actual.then_some(1001.0);
+                    i.hooks.stop_at = Some(800.0);
+                    let p = i.presence.as_mut().unwrap();
+                    p.observed_at = 1040.0;
+                    p.transcript_error = Some("old_or_transcript_error".into());
+                    p.transcript_end = error_at.map(|at| LastTurn {
+                        ended_at: Some(at), status: Some(TurnStatus::Failed),
+                    });
+                    let expected = match event {
+                        "wait" => {
+                            i.hooks.waiting_at = Some(1012.0);
+                            i.hooks.waiting_for = Some("permission".into());
+                            State::WaitingOnHuman
+                        }
+                        "stop" => { i.hooks.stop_at = Some(1012.0); State::Idle }
+                        "failure" => {
+                            i.hooks.failure_at = Some(1012.0);
+                            i.hooks.error_kind = Some("new_hook_failure".into());
+                            State::Errored
+                        }
+                        _ => {
+                            if event == "idle" { p.status_updated_at = Some(1012.0); }
+                            if error_at == Some(1010.0) { State::Errored }
+                            else if actual && error_at.is_none() { State::Unknown }
+                            else if actual && event == "none" { State::Working }
+                            else { State::Idle }
+                        }
+                    };
+                    let result = derive(&i, 1040.0);
+                    assert_eq!(result.state, expected, "actual={actual} error={error_at:?} event={event}");
+                    if event == "failure" {
+                        assert_eq!(result.detail.error_kind.as_deref(), Some("new_hook_failure"));
+                    }
+                    assert_eq!(result.detail.confirmed_turn_open, (expected == State::Unknown).then_some(true));
+                    if expected == State::Unknown { assert!(!result.compatibility_idle(true, true)); }
+                }
+            }
+        }
+        let mut i = presence(PresenceStatus::Idle);
+        i.latest_start = Some(1001.0);
+        i.hooks.prompt_at = Some(1001.0);
+        i.hooks.waiting_at = Some(1005.0);
+        i.hooks.waiting_for = Some("elicitation".into());
+        i.presence.as_mut().unwrap().transcript_end = Some(LastTurn {
+            ended_at: Some(1010.0), status: Some(TurnStatus::Failed),
+        });
+        assert_eq!(derive(&i, 1040.0).state, State::Errored, "old wait cannot override current failure");
+        i.hooks.waiting_at = Some(1012.0);
+        assert_eq!(derive(&i, 1040.0).state, State::WaitingOnHuman);
+        i.presence.as_mut().unwrap().valid = false;
+        assert_eq!(derive(&i, 1040.0).state, State::Unknown, "invalid provenance stays fail closed");
+        assert_eq!(derive(&i, 1040.0).detail.confirmed_turn_open, Some(true));
     }
 
     #[test]

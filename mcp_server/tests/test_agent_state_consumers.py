@@ -511,6 +511,21 @@ class EngineWaitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(single["agent_state"]["state"], "unknown")
         self.assertTrue(many["timed_out"])
 
+    async def test_unknown_confirmed_turn_cannot_escape_on_quiet_pty(self):
+        value = observed("unknown", idle=True)
+        value["agent_state"]["detail"] = {"confirmed_turn_open": True}
+        value["agent_state"]["latest_start_at"] = 30.0
+        with patch.object(control_client, "call", return_value=value):
+            result = await server.wait_for_session_idle("ts-test", timeout_s=1)
+        self.assertFalse(result["idle"])
+        self.assertTrue(result["timed_out"])
+        # A genuine lifecycle end clears the guard and completes normally.
+        value["agent_state"].update(state="idle", detail={}, last_turn={"ended_at": 31.0, "status": "completed"})
+        with patch.object(control_client, "call", return_value=value):
+            result = await server.wait_for_session_idle("ts-test", timeout_s=1)
+        self.assertTrue(result["idle"])
+        self.assertFalse(result["timed_out"])
+
 
 if __name__ == "__main__":
     unittest.main()
