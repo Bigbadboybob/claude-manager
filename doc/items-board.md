@@ -457,8 +457,10 @@ item_resolve(n: int, action: "nudge"|"reassign"|"launch"|"block"|"drop"|"answer"
   already written stay written and the rest report `db_unavailable`. API:
   `PATCH /boards/{ref}/items` with `"each": true`.
 - MCP arguments left out are unchanged. An empty string clears `note`,
-  `group`, `blocked_on`, `check_back` or `eta`; `blocked_by=[]` clears
-  blockers; `holder="none"` hands the item back.
+  `group`, `blocked_on`, `check_back`, `eta` or `job`; explicit null also
+  clears `check_back`, `eta` or `job` when board rules permit it. `blocked_by=[]` clears
+  blockers; `holder="none"` hands the item back. A strict board refuses to
+  clear the check-back while a free-text block still requires one.
 - `board.read` also takes `since_version` (for the TUI's poll) and then may
   answer `{unchanged: true, version}`.
 - `board(view="slim")` returns one line per item, flags first, then by group:

@@ -403,7 +403,14 @@ fn item_fields(ctx: &Ctx, params: &Value, skip_title: bool) -> RpcResult<Map<Str
         if skip_title && *key == "title" {
             continue;
         }
-        let Some(mut value) = present(params, key) else { continue };
+        // Item updates distinguish omitted scheduling fields from explicit
+        // null; the API validates whether clearing each field is allowed.
+        let value = if matches!(*key, "check_back" | "eta" | "job") && !skip_title {
+            params.get(*key).cloned()
+        } else {
+            present(params, key)
+        };
+        let Some(mut value) = value else { continue };
         if CLEARABLE.contains(key) && value.as_str().is_some_and(|s| s.trim().is_empty()) {
             value = Value::Null;
         }
@@ -1569,6 +1576,38 @@ mod tests {
         let seen = seen.lock().unwrap();
         let (_, _, body) = seen.iter().find(|(m, _, _)| m == "PATCH").unwrap();
         assert_eq!(body["each"], true);
+    }
+
+    #[test]
+    fn item_set_preserves_scheduling_nulls_and_omissions_on_the_api_wire() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let (url, seen) = stub(|method, path, _| match (method, path) {
+            ("POST", "/boards/resolve") => (200, BOARD.into()),
+            ("PATCH", "/boards/sfd/items") => (200, r#"{"items":[],"unblocked":[],"warnings":[]}"#.into()),
+            _ => (500, "{}".into()),
+        });
+        let state = state_with_session(root.path(), &url);
+        for field in ["check_back", "eta", "job"] {
+            for value in [Value::Null, json!(""), json!("2h")] {
+                let mut params = json!({"n": 14, "note": "update"});
+                params[field] = value.clone();
+                let resp = call(&state, "me-uid", "item.set", params);
+                assert!(resp.ok, "{field}: {:?}", resp.error);
+                let log = seen.lock().unwrap();
+                let body = &log.iter().rev().find(|(m, _, _)| m == "PATCH").unwrap().2;
+                assert_eq!(body["set"].get(field), Some(if value == json!("") { &Value::Null } else { &value }));
+            }
+        }
+        let resp = call(&state, "me-uid", "item.set", json!({"n": 14, "note": "update"}));
+        assert!(resp.ok, "{:?}", resp.error);
+        let log = seen.lock().unwrap();
+        let body = &log.iter().rev().find(|(m, _, _)| m == "PATCH").unwrap().2;
+        for field in ["check_back", "eta", "job"] { assert!(body["set"].get(field).is_none()); }
+        // Other nullable fields retain their existing omission behavior.
+        let ctx = ctx_with(people());
+        let fields = item_fields(&ctx, &json!({"note": null}), false).unwrap();
+        assert!(!fields.contains_key("note"));
     }
 
     #[test]

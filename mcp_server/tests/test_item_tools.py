@@ -1,5 +1,6 @@
 """Item MCP tools route to the daemon with only the arguments given."""
 
+import asyncio
 import unittest
 from unittest import mock
 
@@ -31,6 +32,26 @@ class ItemToolsTests(unittest.TestCase):
         self.assertEqual(params, {"n": [14, 15], "blocked_by": []})
         _, params = self.call(server.item_set, [14, 15], "done", each=True)
         self.assertEqual(params, {"n": [14, 15], "status": "done", "each": True})
+
+    def test_item_set_scheduling_nulls_survive_real_mcp_validation(self):
+        # Exercise FastMCP's validated call, not only direct Python calls:
+        # an omitted default must differ from an explicitly supplied null.
+        for field in ("check_back", "eta", "job"):
+            for value in (None, "", "2h"):
+                with self.subTest(field=field, value=value):
+                    args = {"n": 14, "note": "update", field: value}
+                    with mock.patch.object(control_client, "call", return_value={"ok": 1}) as call:
+                        result = asyncio.run(server.mcp._tool_manager.call_tool("item_set", args))
+                    self.assertEqual(result, {"ok": 1})
+                    method, params = call.call_args.args
+                    self.assertEqual(method, "item.set")
+                    self.assertEqual(params, args)
+            with self.subTest(field=field, value="omitted"):
+                _, params = self.call(server.item_set, 14, note="update")
+                self.assertNotIn(field, params)
+        # Ordinary nullable fields retain the pre-existing omit-on-None contract.
+        _, params = self.call(server.item_set, 14, note=None, status="active")
+        self.assertNotIn("note", params)
 
     def test_gate_tools_route_to_the_daemon(self):
         method, params = self.call(server.gate_report, 14, [], "a" * 40, klass="py")
