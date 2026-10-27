@@ -20,10 +20,14 @@ impl Store {
     pub(crate) fn active_task_bindings(&self) -> Vec<TaskBinding> {
         self.task_bindings.values().filter(|b| b.active).cloned().collect()
     }
-    pub(crate) fn deferred_task_wake_prefixes(&self, actor: &str) -> Vec<String> {
+    /// A quiet adoption can replace the cached generation before activation.
+    /// Freeze this actor's queued prior generations too, until authority is
+    /// known. The subscription delimiter and generation ceiling are checked
+    /// by delivery; unrelated actors/subscriptions remain independent.
+    pub(crate) fn deferred_task_wake_generations(&self, actor: &str) -> Vec<(String, u64)> {
         self.task_bindings.values().filter(|b| b.active && b.actor == actor
             && self.task_authority.as_ref().is_some_and(|a| a.get(&b.id) == Some(&super::super::task_authority::Authority::Deferred)))
-            .map(|b| format!("monitor:task-{}-{}:", b.id, b.revision)).collect()
+            .map(|b| (format!("monitor:task-{}-", b.id), b.revision)).collect()
     }
     pub(super) fn task_monitor_current(&self, actor: &str, m: &Monitor) -> bool {
         m.task_subscription.as_ref().is_none_or(|id| {

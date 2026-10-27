@@ -160,6 +160,11 @@ leaves task hits and pending native work unconsumed for retry. Ordinary chat and
 personal monitors and their native wakes remain available. Only batches holding
 uncertain task keys wait; independent wakes bypass their latch. Never-published
 mixed batches are separated in one durable checkpoint before personal publication.
+During same-UID re-adoption, that retention covers queued prior generations of
+the exact subscription for the same actor: the channel checkpoint can advance
+the cached generation before activation. Obsolete generations reconcile only
+after authority becomes known; retention does not authorize reading or acking
+the old task monitor.
 Already-published or ambiguous batches keep their identities and receipts; they
 are not duplicated or retracted on unknown authority. The delivery path retains
 the guards through local publication, without blocking on session/store locks.

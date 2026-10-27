@@ -837,9 +837,13 @@ pub fn reconcile_session(cm_root: &Path, store: &Store, uid: &str) -> io::Result
 }
 
 fn defer_task_keys(store: &Store, uid: &str, q: &mut Queue) {
-    let prefixes = store.deferred_task_wake_prefixes(&store.participant_id(uid));
+    let generations = store.deferred_task_wake_generations(&store.participant_id(uid));
     q.deferred = q.batches.iter().flat_map(|b| &b.ids)
-        .filter(|id| prefixes.iter().any(|p| id.starts_with(p)))
+        .filter(|id| generations.iter().any(|(prefix, latest)| {
+            id.strip_prefix(prefix).and_then(|tail| tail.split_once(':'))
+                .is_some_and(|(revision, event)| !event.is_empty()
+                    && revision.parse::<u64>().is_ok_and(|n| n <= *latest && n.to_string() == revision))
+        }))
         .cloned().collect();
 }
 
@@ -1062,6 +1066,62 @@ mod tests {
         assert!(native_event(tmp.path(), &q.batches[0]).is_some());
         assert_eq!(native_event(tmp.path(), &q.batches[1]).unwrap(), personal);
         assert_eq!(q.batches.iter().flat_map(|b| b.ids.clone()).collect::<BTreeSet<_>>(), all_keys);
+    }
+
+    #[test]
+    fn deferred_task_generation_matching_is_exact_bounded_and_actor_scoped() {
+        let (_tmp, mut store, actor, people, sub, _) = mixed_task_queue();
+        let mut binding = store.task_binding_for("mixed-task").unwrap().clone();
+        binding.revision = 12;
+        store.bind_task_subscription_quiet(binding.clone()).unwrap();
+        let other_sub = uuid::Uuid::new_v4().to_string();
+        let mut other = binding.clone();
+        other.id = other_sub.clone();
+        other.task_id = "other-task".into();
+        store.bind_task_subscription(other).unwrap();
+        store.task_authority.as_mut().unwrap().insert(other_sub.clone(), super::super::task_authority::Authority::Current);
+
+        let prefix = format!("monitor:task-{sub}-");
+        let accepted: BTreeSet<_> = [0, 1, 11, 12].into_iter()
+            .map(|n| format!("{prefix}{n}:replica:event")).collect();
+        let rejected = [
+            format!("{prefix}13:event"), format!("{prefix}120:event"),
+            format!("{prefix}012:event"), format!("{prefix}+12:event"),
+            format!("{prefix}-1:event"), format!("{prefix}12x:event"),
+            format!("{prefix}18446744073709551616:event"), format!("{prefix}:event"),
+            format!("{prefix}12"), format!("{prefix}12:"),
+            format!("monitor:task-{sub}x-1:event"), format!("monitor:task-{sub}-extra-1:event"),
+            format!("monitor:task-{other_sub}-1:event"), format!("monitor:{sub}-1:event"),
+            format!("task-{sub}-1:event"), format!("replica:monitor:task-{sub}-1:event"),
+        ];
+        let mut q = Queue { batches: vec![Batch {
+            ids: accepted.iter().cloned().chain(rejected).collect(),
+            status: "pending".into(), ..Batch::default()
+        }], ..Queue::default() };
+        defer_task_keys(&store, "b", &mut q);
+        assert_eq!(q.deferred, accepted);
+        defer_task_keys(&store, "different-actor", &mut q);
+        assert!(q.deferred.is_empty(), "same subscription key must not freeze another actor's queue");
+        for authority in [super::super::task_authority::Authority::Current, super::super::task_authority::Authority::Stale] {
+            store.task_authority.as_mut().unwrap().insert(sub.clone(), authority);
+            defer_task_keys(&store, "b", &mut q);
+            assert!(q.deferred.is_empty(), "known authority permits obsolete generation reconciliation");
+        }
+        store.task_authority = None;
+        defer_task_keys(&store, "b", &mut q);
+        assert!(q.deferred.is_empty(), "Store-only contract has no authority projection");
+        store.task_authority = Some(BTreeMap::from([(sub, super::super::task_authority::Authority::Deferred)]));
+        binding.active = false;
+        store.bind_task_subscription(binding).unwrap();
+        defer_task_keys(&store, "b", &mut q);
+        assert!(q.deferred.is_empty(), "inactive binding must not freeze keys");
+
+        // The existing independent DM path remains available; no broad task
+        // prefix or another binding can swallow personal event identities.
+        let personal = dm(&mut store, &actor, &people, "generation-scope-personal");
+        q.batches[0].ids.push(personal);
+        defer_task_keys(&store, "b", &mut q);
+        assert!(q.deferred.is_empty());
     }
 
     #[test]

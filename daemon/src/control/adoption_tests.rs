@@ -1178,3 +1178,105 @@ fn adoption_reserved_name_control(stale: bool) {
 fn adoption_reserved_name_refuses_stale_authority() { adoption_reserved_name_control(true); }
 #[test]
 fn adoption_reserved_name_refuses_deferred_authority() { adoption_reserved_name_control(false); }
+
+fn adoption_channel_crash_retains_prior_generation(read_first: bool) {
+    with_temp_home(|| {
+        let (state, _stub, old, mut p) = adoption_monitor_fixture_with_params();
+        crate::messaging::delivery::tick(&state);
+        let (root, handle) = {
+            let s = state.lock().unwrap();
+            (s.messaging_root.clone(), s.messaging.clone())
+        };
+        let queue_dir = handle.lock().unwrap().as_ref().unwrap().root.join("_delivery");
+        let native_dir = crate::notifications::directory(&root, "ts-adopt");
+        let native_before = adoption_files(&native_dir);
+        let queue_before = adoption_files(&queue_dir);
+        let old_binding = handle.lock().unwrap().as_ref().unwrap().task_binding_for("adopt-40").unwrap().clone();
+        let old_native = native_before.values().filter_map(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+            .find(|event| event["text"].as_str().is_some_and(|t| t.contains(old["monitor_id"].as_str().unwrap()))).unwrap();
+        assert_eq!(old_native["status"], "pending");
+        continuous_pause(&state, &json!({"task_id":"adopt-40","paused":true})).unwrap();
+        p["request_id"] = json!("channel-generation-retry");
+        let retry = adoption_commit_request(&state, &p);
+        arm_continuous_spawn_spy_for_test();
+        arm_continuous_delivery_spy_for_test();
+        crate::continuous::adoption::inject_fault(Some("channel"));
+        assert!(crate::continuous::adoption::handle(&state, &retry).unwrap_err().1.contains("channel"));
+        crate::continuous::adoption::inject_fault(None);
+        let staged = handle.lock().unwrap().as_ref().unwrap().task_binding_for("adopt-40").unwrap().clone();
+        assert_eq!(staged.id, old_binding.id);
+        assert_eq!(staged.actor, old_binding.actor);
+        assert_eq!(staged.revision, old_binding.revision + 1);
+        assert!(crate::continuous::adoption::ensure_available("adopt-40").is_err());
+        let assert_unchanged = || {
+            let native = adoption_files(&native_dir);
+            for (name, bytes) in &native_before {
+                assert_eq!(native.get(name), Some(bytes), "old-generation native receipt changed before commit");
+            }
+            let queues = adoption_files(&queue_dir);
+            for (name, bytes) in &queue_before {
+                if !name.ends_with(".json") { continue; }
+                let before: Value = serde_json::from_slice(bytes).unwrap();
+                let after: Value = serde_json::from_slice(&queues[name]).unwrap();
+                for batch in before["batches"].as_array().unwrap() {
+                    assert!(after["batches"].as_array().unwrap().contains(batch), "old-generation batch changed before commit");
+                }
+            }
+            assert!(handle.lock().unwrap().as_ref().unwrap().task_binding_for("adopt-40").unwrap().acknowledged.is_empty());
+        };
+        assert_unchanged();
+        // Exercise both effects as the first consumer after the channel fault.
+        for read in [read_first, !read_first] {
+            if read {
+                let page = adoption_chat_call(&state, "ts-adopt", "read",
+                    json!({"conversation":old_binding.channel_id}));
+                assert!(page.ok, "{:?}", page.error);
+                assert!(page.result.unwrap()["items"].to_string().contains(old["event_id"].as_str().unwrap()));
+            } else {
+                crate::messaging::delivery::tick(&state);
+            }
+            assert_unchanged();
+        }
+        let sent = adoption_chat_call(&state, "ts-replacement", "send", json!({
+            "dm":staged.actor,"name":"generation-sender","body":"independent-channel-crash-dm","request_id":"channel-crash-personal"}));
+        assert!(sent.ok, "{:?}", sent.error);
+        crate::messaging::delivery::tick(&state);
+        let personal: Vec<_> = adoption_files(&native_dir).values()
+            .filter_map(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+            .filter(|e| e["text"].as_str().is_some_and(|t| t.contains("independent-channel-crash-dm"))).collect();
+        assert_eq!(personal.len(), 1, "independent personal wake blocked by old generation");
+        assert_unchanged();
+        let sender = handle.lock().unwrap().as_ref().unwrap().participant_id("ts-replacement");
+        assert!(adoption_chat_call(&state, "ts-adopt", "read", json!({"dm":sender})).ok);
+        crate::messaging::delivery::tick(&state);
+        assert_unchanged();
+        let count = adoption_native_events(&state, "ts-adopt");
+        let completed = crate::continuous::adoption::handle(&state, &retry).unwrap();
+        assert_eq!(completed["adopted"], true);
+        assert_eq!(completed["receipt"]["initial_fire"], false);
+        assert_eq!(completed["receipt"]["spawned"], false);
+        assert_eq!(crate::continuous::adoption::handle(&state, &retry).unwrap()["replayed"], true);
+        assert!(crate::continuous::adoption::ensure_available("adopt-40").is_ok());
+        crate::messaging::delivery::tick(&state);
+        let old_after = crate::notifications::get(&root, "ts-adopt", old_native["id"].as_str().unwrap()).unwrap().unwrap();
+        assert_eq!(old_after["status"], "cancelled", "obsolete receipt should reconcile after commit");
+        let queues = adoption_files(&queue_dir);
+        let reconciled = queues.values().filter_map(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+            .flat_map(|q| q["batches"].as_array().cloned().unwrap_or_default())
+            .find(|b| format!("chat:{}", b["wake_id"].as_str().unwrap()) == old_native["id"].as_str().unwrap()).unwrap();
+        assert_eq!(reconciled["released"], true);
+        assert_eq!(reconciled["status"], "cancelled");
+        assert_eq!(adoption_native_events(&state, "ts-adopt"), count, "retry must not publish an initial task wake or duplicate personal work");
+        assert!(take_continuous_spawn_spy_for_test().is_empty());
+        assert!(take_continuous_delivery_spy_for_test().is_empty());
+        kill_all_sessions(&state);
+    });
+}
+#[test]
+fn adoption_channel_crash_preserves_queued_generation_tick_first() {
+    adoption_channel_crash_retains_prior_generation(false);
+}
+#[test]
+fn adoption_channel_crash_preserves_queued_generation_read_first() {
+    adoption_channel_crash_retains_prior_generation(true);
+}
