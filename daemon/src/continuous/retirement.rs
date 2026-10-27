@@ -34,6 +34,9 @@ pub fn path(uid: &str) -> PathBuf {
 }
 
 pub fn ensure_open(uid: &str) -> io::Result<()> {
+    if let Some(reason) = crate::claude_recovery::admission_refusal(uid) {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, reason));
+    }
     match std::fs::symlink_metadata(path(uid)) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),

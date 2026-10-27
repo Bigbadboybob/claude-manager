@@ -524,27 +524,39 @@ fn roster(cwd: &Path) -> io::Result<Roster> {
     Ok(Roster { rows })
 }
 
+fn validated_roster(roster: &Roster) -> io::Result<Vec<(&str, &str, &str)>> {
+    let rows = roster
+        .rows
+        .as_array()
+        .ok_or_else(|| io::Error::other("invalid Claude roster"))?;
+    let mut validated = Vec::new();
+    for row in rows {
+        let kind = row.get("kind").and_then(Value::as_str);
+        if !matches!(kind, Some("background" | "interactive")) {
+            return Err(io::Error::other("Claude roster contains unknown or malformed kind"));
+        }
+        if kind == Some("interactive") && !row.get("pid").and_then(Value::as_u64).is_some_and(|pid| pid > 0) {
+            return Err(io::Error::other("Claude interactive roster PID is missing or invalid"));
+        }
+        let row_id = row.get("sessionId").and_then(Value::as_str)
+            .filter(|id| exact_session_id(id))
+            .ok_or_else(|| io::Error::other("Claude roster ID is missing or incomplete"))?;
+        let path = row.get("cwd").and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| io::Error::other("Claude roster cwd is missing"))?;
+        validated.push((kind.unwrap(), row_id, path));
+    }
+    Ok(validated)
+}
+
 fn roster_match(roster: &Roster, id: &str, cwd: &Path) -> io::Result<bool> {
     if !exact_session_id(id) {
         return Err(io::Error::other("invalid native session ID"));
     }
     let expected = canonical(cwd)?;
-    let rows = roster
-        .rows
-        .as_array()
-        .ok_or_else(|| io::Error::other("invalid Claude roster"))?;
     let mut found = 0;
-    for row in rows {
-        // Only the observed background schema is proof. An unfamiliar kind or
-        // truncated ID cannot establish that the target is absent.
-        if row.get("kind").and_then(Value::as_str) != Some("background") {
-            return Err(io::Error::other("Claude roster contains unknown or malformed kind"));
-        }
-        let row_id = row.get("sessionId").and_then(Value::as_str)
-            .filter(|id| exact_session_id(id))
-            .ok_or_else(|| io::Error::other("Claude roster background ID is missing or incomplete"))?;
-        let path = row.get("cwd").and_then(Value::as_str)
-            .ok_or_else(|| io::Error::other("Claude roster background cwd is missing"))?;
+    for (kind, row_id, path) in validated_roster(roster)? {
+        if kind != "background" { continue; }
         if row_id != id {
             continue;
         }
@@ -566,6 +578,25 @@ fn no_prior_native_identity(state: &DaemonState, uid: &str) -> Result<bool, Stri
         .map_err(|e| format!("resume identity archive unavailable: {e}"))?;
     Ok(record.is_some_and(|r| r.entry.generation == 0 && r.entry.transcript_id.is_none()
         && r.entry.transcript_path.is_none() && r.transcript_ids.is_empty()))
+}
+
+fn genuinely_fresh_live(state: &DaemonState, uid: &str, pid: u32) -> Result<bool, String> {
+    if state.recently_exited.iter().any(|t| t.session_uid == uid) || !no_prior_native_identity(state, uid)? {
+        return Ok(false);
+    }
+    let record = crate::resume_identity::lookup_uid(state, uid)
+        .map_err(|e| format!("resume identity archive unavailable: {e}"))?;
+    let Some(session) = state.sessions.get(uid) else { return Ok(false) };
+    let input_seen = session.last_input_at.lock().unwrap_or_else(|p| p.into_inner()).is_some()
+        || session.last_operator_input_at.lock().unwrap_or_else(|p| p.into_inner()).is_some();
+    Ok(!input_seen && record.is_some_and(|r| r.entry.last_exit.is_none()) && fresh_process(pid)?)
+}
+
+fn fresh_roster_clear(roster: &Roster, child_pid: u32) -> io::Result<bool> {
+    let rows = validated_roster(roster)?;
+    if rows.iter().any(|(kind, _, _)| *kind == "background") { return Ok(false); }
+    Ok(!roster.rows.as_array().unwrap().iter().any(|row|
+        row["kind"] == "interactive" && row["pid"].as_u64() == Some(child_pid as u64)))
 }
 
 fn snapshot(state: &DaemonState, uid: &str) -> Result<Snapshot, String> {
@@ -659,7 +690,7 @@ fn snapshot(state: &DaemonState, uid: &str) -> Result<Snapshot, String> {
     let native_session_id = match native_session_id {
         Some(id) => id,
         None if session.transcript_path.is_none() && session.generation == 0
-            && no_prior_native_identity(state, uid)? && fresh_process(session.pid as u32)? => String::new(),
+            && genuinely_fresh_live(state, uid, session.pid as u32)? => String::new(),
         _ => return Err("session has no unambiguous native transcript identity".into()),
     };
     let child_start_time = crate::adopt::proc_starttime(session.pid as libc::pid_t)
@@ -699,6 +730,24 @@ fn lifecycle_refusal(state: &DaemonState, uid: &str) -> Option<String> {
     }
     if let Err((_, reason)) = crate::continuous::adoption::session_available(uid) {
         return Some(reason);
+    }
+    let workflow_owns = |run: &crate::workflow::run::WorkflowRun| run.is_active()
+        && run.role_sessions.values().any(|binding| binding.daemon_session_uid.as_deref() == Some(uid));
+    if state.workflow_runs.values().any(workflow_owns) {
+        return Some("workflow participant owns this lifecycle".into());
+    }
+    match crate::workflow::run::load_all_strict() {
+        Ok(runs) if runs.iter().any(workflow_owns) => return Some("workflow participant owns this lifecycle".into()),
+        Err(error) => return Some(format!("workflow ownership unavailable: {error}")),
+        _ => {}
+    }
+    match crate::continuous::task::load_all_strict() {
+        Ok(tasks) if tasks.iter().any(|task| task.current_session_uid.as_deref() == Some(uid)
+            || task.investigator_uid.as_deref() == Some(uid)) => {
+            return Some("continuous-task scheduler owns this lifecycle".into());
+        }
+        Err(error) => return Some(format!("continuous ownership unavailable: {error}")),
+        _ => {}
     }
     if let Some(tomb) = state.recently_exited.iter().find(|t| t.session_uid == uid && !state.sessions.contains_key(uid)) {
         if tomb.workflow_run_id.is_some() || tomb.continuous_task_id.is_some() {
@@ -808,10 +857,9 @@ fn verify_no_native_background(identity: &Identity) -> Result<(), String> {
     let cwd = Path::new(&identity.canonical_cwd);
     let roster = roster(cwd).map_err(|e| format!("Claude roster unavailable: {e}"))?;
     if identity.native_session_id.is_empty() {
-        return match roster.rows.as_array() {
-            Some(rows) if rows.is_empty() => Ok(()),
-            _ => Err("native roster is not strictly empty for an unbound session".into()),
-        };
+        return if fresh_roster_clear(&roster, identity.child_pid).map_err(|e| format!("Claude roster unreadable: {e}"))? {
+            Ok(())
+        } else { Err("native roster contains background work or a bound interactive session".into()) };
     }
     match roster_match(&roster, &identity.native_session_id, cwd)
         .map_err(|e| format!("Claude roster unreadable: {e}"))?
@@ -847,8 +895,8 @@ pub(crate) fn preflight(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) -> Value
         if snap.identity.child_pid == 0 || !snap.background_complete || snap.background_jobs != 0 {
             return json!({"status":"unavailable","identity":Value::Null,"message":"fresh session needs a complete empty daemon background census"});
         }
-        if !roster.rows.as_array().is_some_and(Vec::is_empty) {
-            return json!({"status":"unavailable","identity":Value::Null,"message":"fresh session needs a strictly empty native roster"});
+        if !fresh_roster_clear(&roster, snap.identity.child_pid).unwrap_or(false) {
+            return json!({"status":"unavailable","identity":Value::Null,"message":"fresh session needs a valid native roster without background work"});
         }
         return json!({"status":"normal","identity":snap.identity,"message":"fresh session has no bound identity or background work; guarded restart"});
     }
@@ -909,6 +957,11 @@ pub(crate) fn confirm(
     let uid = identity.uid.clone();
     let recovery_gate = lifecycle_gate(&uid);
     let _recovery_write = recovery_gate.write().unwrap_or_else(|p| p.into_inner());
+    // Input handles and ordinary spawns already use this same per-UID gate.
+    // Take it before checking identity and retain it through the guarded
+    // revive; only the internal revive capability bypasses its own read.
+    let input_gate = crate::continuous::retirement::gate(&uid);
+    let _input_write = input_gate.write().unwrap_or_else(|p| p.into_inner());
     if let Some(receipt) = load_receipt(&uid)
         .map_err(|e| (ErrorCode::Conflict, format!("recovery receipt unavailable: {e}")))?
     {
@@ -1197,6 +1250,8 @@ mod tests {
         let id = "123e4567-e89b-12d3-a456-426614174000";
         let roster = Roster { rows: json!([{"kind":"background","sessionId":id,"cwd":cwd}]) };
         assert!(roster_match(&roster, id, &cwd).unwrap());
+        let interactive = Roster { rows: json!([{"kind":"interactive","sessionId":id,"cwd":cwd,"pid":123}]) };
+        assert!(!roster_match(&interactive, id, &cwd).unwrap());
         let other = dir.path().join("other");
         fs::create_dir_all(&other).unwrap();
         let roster = Roster { rows: json!([{"kind":"background","sessionId":id,"cwd":other}]) };
@@ -1232,6 +1287,10 @@ mod tests {
             roster:Roster { rows:json!([]) }, host:BackgroundHost { pid:1, start:1 },
             fail_phase:None, fail_stop:false, fail_proof:false, fail_revive:false, stops:0, revives:0,
         }));
+        assert!(verify_no_native_background(&identity).is_ok());
+        FAKE.with(|f| f.borrow_mut().as_mut().unwrap().roster.rows = json!([
+            {"kind":"interactive", "sessionId":"123e4567-e89b-12d3-a456-426614174000", "cwd":dir.path(), "pid":123}
+        ]));
         assert!(verify_no_native_background(&identity).is_ok());
         for rows in [json!([{}]), json!([{"kind":"unknown"}]),
             json!([{"kind":"background", "sessionId":"123e4567-e89b-12d3-a456-426614174000", "cwd":dir.path()}])] {
@@ -1272,6 +1331,14 @@ mod tests {
         let pre = preflight(&state, uid);
         assert_eq!(pre["status"], "normal");
         assert!(pre["identity"]["native_session_id"].is_null());
+        *state.lock().unwrap().sessions[uid].last_input_at.lock().unwrap() = Some(Instant::now());
+        assert_eq!(preflight(&state, uid)["status"], "unavailable");
+        *state.lock().unwrap().sessions[uid].last_input_at.lock().unwrap() = None;
+        FAKE.with(|f| f.borrow_mut().as_mut().unwrap().roster.rows = json!([
+            {"kind":"interactive", "sessionId":"123e4567-e89b-12d3-a456-426614174000",
+             "cwd":dir.path(), "pid":pre["identity"]["child_pid"]}
+        ]));
+        assert_eq!(preflight(&state, uid)["status"], "unavailable");
         FAKE.with(|f| f.borrow_mut().as_mut().unwrap().roster.rows = json!([{"kind":"unknown"}]));
         assert_eq!(preflight(&state, uid)["status"], "unavailable");
         state.lock().unwrap().sessions.get_mut(uid).unwrap().kill().unwrap();
@@ -1428,8 +1495,10 @@ mod tests {
         let identity = Identity { uid: uid.into(), task_id: None, workspace_id: "w".into(), canonical_cwd: "/tmp".into(), daemon_id: "d".into(), native_session_id: "123e4567-e89b-12d3-a456-426614174000".into(), transcript_generation: 0, holder_incarnation: None, holder_pid: None, holder_start_time: None, child_pid: 1, child_start_time: 1, background_pid: 2, background_start_time: 2 };
         save_receipt(uid, &Receipt { version: 1, identity, phase: "unknown".into(), updated_at: 1.0 }).unwrap();
         assert!(admission_blocked(uid));
+        assert!(crate::continuous::retirement::ensure_open(uid).is_err());
         fs::write(&path, b"not-json").unwrap();
         assert!(load_receipt(uid).is_err());
+        assert!(crate::continuous::retirement::ensure_open(uid).is_err());
         let _ = fs::remove_file(path);
     }
 

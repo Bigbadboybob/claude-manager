@@ -661,7 +661,9 @@ pub(crate) fn start_session_with_spawn_fn(
     fence_uids.sort_unstable();
     fence_uids.dedup();
     let fences: Vec<_> = fence_uids.iter().map(|uid| crate::continuous::retirement::gate(uid)).collect();
-    let _permits: Vec<_> = fences.iter().map(|g| g.read().unwrap_or_else(|p| p.into_inner())).collect();
+    let _permits: Vec<_> = fence_uids.iter().zip(&fences)
+        .filter(|(uid, _)| !(**uid == p.uid.as_str() && crate::claude_recovery::internal_active(&p.uid)))
+        .map(|(_, g)| g.read().unwrap_or_else(|p| p.into_inner())).collect();
     for uid in &fence_uids {
         crate::continuous::retirement::ensure_open(uid)
             .map_err(|e| (ErrorCode::Conflict, e.to_string()))?;
