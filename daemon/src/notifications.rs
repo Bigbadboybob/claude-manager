@@ -51,6 +51,8 @@ fn read(path: &Path) -> io::Result<Option<Value>> {
 
 fn valid_census_event(value: &Value) -> bool {
     let id_ok = value["id"].as_str().is_some_and(|id| !id.trim().is_empty());
+    let source_ok = value["source"].as_str().is_some_and(|source| !source.trim().is_empty());
+    let version_ok = value["version"] == 1;
     let status_ok = matches!(value["status"].as_str(), Some(
         "pending" | "submitting" | "submitted" | "uncertain" | "observed" | "cancelled"));
     // If updated_at exists it is authoritative: an invalid value cannot
@@ -59,7 +61,7 @@ fn valid_census_event(value: &Value) -> bool {
     let time_ok = at.as_f64().is_some_and(|t| t.is_finite() && t > 0.0);
     let text_ok = value["text"].as_str().is_some();
     let marker_ok = value.get("marker").is_none_or(|marker| marker.as_str().is_some());
-    id_ok && status_ok && time_ok && text_ok && marker_ok
+    id_ok && source_ok && version_ok && status_ok && time_ok && text_ok && marker_ok
 }
 /// #24: hold `uid`'s new wakes (they stay pending) until `until` (unix
 /// seconds): CM is about to restart it for a rotation or handoff, so they
@@ -214,10 +216,10 @@ fn snapshot_impl(root: &Path, uid: &str, strict: bool) -> io::Result<(Vec<Value>
         Err(e) => return Err(e),
     }
     let _guard = lock(root, uid)?;
-    snapshot_locked(&dir, strict)
+    snapshot_locked(&dir, uid, strict)
 }
 
-fn snapshot_locked(dir: &Path, strict: bool) -> io::Result<(Vec<Value>, Option<Value>)> {
+fn snapshot_locked(dir: &Path, uid: &str, strict: bool) -> io::Result<(Vec<Value>, Option<Value>)> {
     let mut events = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -226,7 +228,7 @@ fn snapshot_locked(dir: &Path, strict: bool) -> io::Result<(Vec<Value>, Option<V
         {
             match read(&entry.path()) {
                 Ok(Some(value)) => {
-                    if strict && !valid_census_event(&value) {
+                    if strict && (!valid_census_event(&value) || value["recipient"] != uid) {
                         return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid notification in census"));
                     }
                     events.push(value);
@@ -265,9 +267,9 @@ pub fn alarm_snapshot(root: &Path, uid: &str) -> io::Result<(Vec<Value>, Option<
         Err(e) => return Err(e),
     }
     let _guard = lock_with(root, uid, true)?;
-    snapshot_locked(&dir, true)?;
+    snapshot_locked(&dir, uid, true)?;
     retire_unconfirmable_locked(&dir)?;
-    snapshot_locked(&dir, true)
+    snapshot_locked(&dir, uid, true)
 }
 /// Retire this recipient's submitted/uncertain events whose text lacks their
 /// marker (published before `publish` enforced it): they were delivered but
@@ -387,6 +389,8 @@ mod tests {
         fs::write(&bad, corrupt_marker).unwrap();
         assert!(alarm_snapshot(root, "uid").is_err());
         assert_eq!(fs::read(&bad).unwrap(), corrupt_marker);
+        fs::write(&bad, br#"{"version":1,"id":"x","recipient":"other","source":"chat","status":"observed","created_at":1,"text":"wake"}"#).unwrap();
+        assert!(snapshot_strict(root, "uid").is_err());
         fs::remove_file(bad).unwrap();
         assert_eq!(snapshot_strict(root, "uid").unwrap().0.len(), 1);
         fs::write(dir.join("transport.json"), b"{").unwrap();

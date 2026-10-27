@@ -20,7 +20,7 @@ mod recovery_tests {
     fn recovery_offer_requires_exact_displayable_identity_and_space() {
         let mut offer = serde_json::json!({"status":"offer", "identity":{
             "uid":"ts-x", "native_session_id":"123e4567-e89b-12d3-a456-426614174000",
-            "background_pid":42, "background_start_time":77, "workspace_id":"ws", "canonical_cwd":"/workspace"
+            "background_pid":42, "background_start_time":77, "workspace_id":"ws", "canonical_cwd":"/workspace", "task_id":null
         }});
         assert!(valid_background_offer(&offer, "ts-x"));
         assert!(!valid_background_offer(&offer, "another"));
@@ -29,6 +29,12 @@ mod recovery_tests {
         offer["identity"]["native_session_id"] = serde_json::json!("123e4567-e89b-12d3-a456-426614174000");
         offer["identity"]["canonical_cwd"] = serde_json::json!("/work\nspace");
         assert!(!valid_background_offer(&offer, "ts-x"));
+        offer["identity"]["canonical_cwd"] = serde_json::json!("/workspace");
+        offer["identity"]["native_session_id"] = serde_json::Value::Null;
+        assert!(!valid_background_offer(&offer, "ts-x"));
+        assert!(valid_recovery_identity(&offer["identity"], "ts-x", true), "explicit fresh identity is valid for normal restart");
+        offer["identity"].as_object_mut().unwrap().remove("native_session_id");
+        assert!(!valid_recovery_identity(&offer["identity"], "ts-x", true), "missing is not proof of a fresh identity");
         assert!(!background_prompt_fits("details", (15, 8)));
         assert!(background_prompt_fits("Native ID: exact\nPID: 42\nWorkspace: /work", (100, 30)));
     }
@@ -98,26 +104,36 @@ pub(crate) fn classify_revive_refusal(error: &str, killed: bool) -> ReviveRefusa
 /// One remote revive: `(entry, workspace_id, worktree)`.
 type ReviveSpec = (ManifestEntry, String, String);
 
-fn valid_recovery_identity(id: &serde_json::Value, uid: &str) -> bool {
-    let native = id["native_session_id"].as_str().unwrap_or("");
-    let canonical = uuid::Uuid::parse_str(native).ok().is_some_and(|v| v.to_string() == native);
+fn valid_recovery_identity(id: &serde_json::Value, uid: &str, allow_fresh: bool) -> bool {
+    let canonical = match id.get("native_session_id") {
+        Some(serde_json::Value::Null) if allow_fresh => true,
+        Some(serde_json::Value::String(native)) => uuid::Uuid::parse_str(native).ok().is_some_and(|v| v.to_string() == *native),
+        _ => false,
+    };
     id["uid"] == uid && canonical
         && id["workspace_id"].as_str().is_some_and(|s| !s.is_empty())
         && id["canonical_cwd"].as_str().is_some_and(|s| !s.is_empty() && !s.chars().any(char::is_control))
-        && id["task_id"].as_str().is_none_or(|s| !s.chars().any(char::is_control))
+        && match id.get("task_id") {
+            Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::String(s)) => !s.chars().any(char::is_control),
+            _ => false,
+        }
 }
 
 fn valid_background_offer(offer: &serde_json::Value, uid: &str) -> bool {
     let id = &offer["identity"];
-    offer["status"] == "offer" && valid_recovery_identity(id, uid)
+    offer["status"] == "offer" && valid_recovery_identity(id, uid, false)
         && id["background_pid"].as_u64().is_some_and(|v| v > 0)
         && id["background_start_time"].as_u64().is_some_and(|v| v > 0)
 }
 
 fn valid_recovery_record(record: &serde_json::Value, uid: &str) -> bool {
     let id = &record["identity"];
-    valid_recovery_identity(id, uid) && matches!((id["background_pid"].as_u64(), id["background_start_time"].as_u64()),
-        (Some(0), Some(0)) | (Some(1..), Some(1..)))
+    match (id["background_pid"].as_u64(), id["background_start_time"].as_u64()) {
+        (Some(0), Some(0)) => valid_recovery_identity(id, uid, true),
+        (Some(1..), Some(1..)) => valid_recovery_identity(id, uid, false),
+        _ => false,
+    }
 }
 
 fn background_prompt_fits(prompt: &str, size: (u16, u16)) -> bool {
@@ -152,7 +168,7 @@ fn run_restart(
         match result {
             Ok(value) if value["status"] == "normal" => {
                 let identity = &value["identity"];
-                let valid = valid_recovery_identity(identity, uid)
+                let valid = valid_recovery_identity(identity, uid, true)
                     && identity["background_pid"].as_u64() == Some(0)
                     && identity["background_start_time"].as_u64() == Some(0);
                 if !valid {
@@ -669,12 +685,13 @@ impl App {
                 }
                 let identity = offer["identity"].clone();
                 let label = sanitize_for_display(&self.workspaces[wi].sessions[si].label);
-                let native = identity["native_session_id"].as_str().unwrap_or("");
+                let native = identity["native_session_id"].as_str().unwrap_or("not yet bound (fresh)");
                 let path = sanitize_for_display(identity["canonical_cwd"].as_str().unwrap_or(""));
                 let task = sanitize_for_display(identity["task_id"].as_str().unwrap_or("none"));
+                let workspace = sanitize_for_display(identity["workspace_id"].as_str().unwrap_or(""));
                 let pid = identity["background_pid"].as_u64().unwrap_or(0);
                 let start = identity["background_start_time"].as_u64().unwrap_or(0);
-                let prompt = format!("Stop Claude background work for {label} on `{}` and revive it? It may be active.\nNative ID: {native}\nBackground PID: {pid}; start: {start}\nTask: {task}\nWorkspace: {path}", flight.host_id.as_str());
+                let prompt = format!("Stop Claude background work for {label} on `{}` and revive it? It may be active.\nCM UID: {}\nNative ID: {native}\nBackground PID: {pid}; start: {start}\nTask: {task}\nWorkspace: {workspace} ({path})", sanitize_for_display(flight.host_id.as_str()), sanitize_for_display(&flight.uid));
                 if !background_prompt_fits(&prompt, self.last_term_size) {
                     self.set_status_msg("Terminal is too small to show the full recovery identity; enlarge it and press A-R again");
                     return;
@@ -706,13 +723,14 @@ impl App {
                 }
                 let identity = record["identity"].clone();
                 let label = sanitize_for_display(&self.workspaces[wi].sessions[si].label);
-                let native = identity["native_session_id"].as_str().unwrap_or("");
+                let native = identity["native_session_id"].as_str().unwrap_or("not yet bound (fresh)");
                 let path = sanitize_for_display(identity["canonical_cwd"].as_str().unwrap_or(""));
                 let task = sanitize_for_display(identity["task_id"].as_str().unwrap_or("none"));
+                let workspace = sanitize_for_display(identity["workspace_id"].as_str().unwrap_or(""));
                 let phase = sanitize_for_display(record["status"].as_str().unwrap_or("unknown"));
                 let pid = identity["background_pid"].as_u64().unwrap_or(0);
                 let start = identity["background_start_time"].as_u64().unwrap_or(0);
-                let prompt = format!("Reconcile interrupted recovery for {label} on `{}`? This checks whether background work stopped; it does not stop or revive it.\nPhase: {phase}\nNative ID: {native}\nBackground PID: {pid}; start: {start}\nTask: {task}\nWorkspace: {path}", flight.host_id.as_str());
+                let prompt = format!("Reconcile interrupted recovery for {label} on `{}`? This checks whether background work stopped; it does not stop or revive it.\nCM UID: {}\nPhase: {phase}\nNative ID: {native}\nBackground PID: {pid}; start: {start}\nTask: {task}\nWorkspace: {workspace} ({path})", sanitize_for_display(flight.host_id.as_str()), sanitize_for_display(&flight.uid));
                 if !background_prompt_fits(&prompt, self.last_term_size) {
                     self.set_status_msg("Terminal is too small to show the full recovery identity; enlarge it and press A-R again");
                     return;

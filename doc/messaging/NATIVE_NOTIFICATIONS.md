@@ -187,6 +187,12 @@ is not its background-host child; the roster alone does not prove process
 identity. A later observation can end a submission stall; older lost
 submissions remain as history.
 
+Board pushes use a per-push marker for receipt evidence. Older board pushes
+used a shared board marker; their retained submitted/uncertain receipts are
+ambiguous and are not re-sent or newly confirmed from that shared marker.
+Previously observed legacy board entries do not establish a later healthy
+delivery checkpoint.
+
 **Channels disabled.** A channel consumer inspects its parent Claude
 process's command line (directly, or through CM's launcher shell). If the
 client lacks the `server:claude-manager` development-channel flag, the

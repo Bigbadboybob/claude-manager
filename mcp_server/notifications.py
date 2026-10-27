@@ -31,6 +31,19 @@ TAKEOVER_FRESH_S = 15.0
 HANDOFF_MIN_HOLD_S = 30.0
 
 
+def receipt_evidence_allowed(event: dict) -> bool:
+    """A legacy board label is shared across pushes, so it proves no receipt."""
+    if not isinstance(event.get("source"), str) or not event["source"].strip():
+        return False
+    if event.get("source") != "board":
+        return True
+    event_id, marker = event.get("id"), event.get("marker")
+    if not isinstance(event_id, str) or not event_id.startswith("board-push:") or not isinstance(marker, str):
+        return False
+    suffix = event_id.removeprefix("board-push:")
+    return bool(suffix and marker.startswith("[cm-board ") and marker.endswith(f" push:{suffix}]"))
+
+
 def delivery_health(events, now: float | None = None, threshold: float | None = None):
     """Submitted/uncertain notices newer than the latest observation that are
     still unobserved past `threshold`. A later observation proves the path
@@ -39,7 +52,7 @@ def delivery_health(events, now: float | None = None, threshold: float | None = 
     threshold = UNOBSERVED_DEGRADED_S if threshold is None else threshold
     last_observed = max(
         (e.get("updated_at", e.get("created_at", 0)) for e in events
-         if e.get("status") == "observed"),
+         if e.get("status") == "observed" and receipt_evidence_allowed(e)),
         default=0,
     )
     stalled = [
@@ -496,7 +509,7 @@ async def consume(queue: Queue, adapter):
                     # Every poll: evidence is only searched in the window
                     # (TAIL_WINDOW), so a skipped poll can let it scroll out
                     # for good. _Tail makes each check an incremental read.
-                    if await adapter.observed(event):
+                    if receipt_evidence_allowed(event) and await adapter.observed(event):
                         queue.change(
                             event["id"], {"submitted", "uncertain"}, status="observed"
                         )

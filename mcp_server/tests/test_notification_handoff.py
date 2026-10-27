@@ -55,7 +55,7 @@ class Fixture:
 
 
 def ev(id, status, at):
-    return {"id": id, "status": status, "created_at": at, "updated_at": at, "marker": f"[m {id}]"}
+    return {"id": id, "source": "fixture", "status": status, "created_at": at, "updated_at": at, "marker": f"[m {id}]"}
 
 
 class DeliveryHealthTests(unittest.TestCase):
@@ -70,6 +70,38 @@ class DeliveryHealthTests(unittest.TestCase):
         self.assertEqual(recovered["unobserved"], 0)
         self.assertFalse(delivery_health([ev("x", "submitting", now - 299)], now)["stalled"])
         self.assertTrue(delivery_health([ev("x", "submitting", now - 301), ev("y", "observed", now - 1)], now)["stalled"])
+
+    def test_legacy_board_observation_cannot_mask_later_stall(self):
+        now = 10_000.0
+        legacy = dict(ev("board-push:1", "observed", now - 1), source="board", marker="[cm-board sfd]")
+        stuck = ev("later", "submitted", now - 400)
+        self.assertTrue(delivery_health([legacy, stuck], now)["stalled"])
+        legacy["marker"] = "[cm-board sfd push:1]"
+        self.assertFalse(delivery_health([legacy, stuck], now)["stalled"])
+
+    def test_persisted_legacy_observation_stays_untrusted_after_queue_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            q = Queue("s", root)
+            with mock.patch.object(notifications.time, "time", return_value=1000):
+                q.publish("later", "chat", "[later] wake", "[later]")
+                q.change("later", {"pending"}, status="submitted")
+            with mock.patch.object(notifications.time, "time", return_value=1900):
+                q.publish("board-push:1", "board", "[cm-board sfd] old", "[cm-board sfd]")
+                q.change("board-push:1", {"pending"}, status="observed")
+            saved = q.event_path("board-push:1").read_bytes()
+            with mock.patch.object(notifications.time, "time", return_value=2000):
+                q.health("claude-code", "ready")
+                self.assertEqual(q.snapshot()["health"]["status"], "degraded")
+                reopened = Queue("s", root)
+                self.assertEqual(reopened.snapshot()["health"]["status"], "degraded")
+            self.assertEqual(q.event_path("board-push:1").read_bytes(), saved)
+            with mock.patch.object(notifications.time, "time", return_value=2100):
+                marker = "[cm-board sfd push:2]"
+                q.publish("board-push:2", "board", f"new {marker}", marker)
+                q.change("board-push:2", {"pending"}, status="observed")
+                q.health("claude-code", "ready")
+                self.assertEqual(Queue("s", root).snapshot()["health"]["status"], "ready")
 
     def test_snapshot_reports_degraded_not_connected_while_submissions_vanish(self):
         with tempfile.TemporaryDirectory() as tmp:

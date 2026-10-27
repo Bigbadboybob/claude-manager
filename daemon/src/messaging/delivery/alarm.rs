@@ -53,6 +53,13 @@ fn transport_reason(transport: Option<&Value>) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn receipt_evidence_allowed(event: &Value) -> bool {
+    if event["source"] != "board" { return true; }
+    let Some(id) = event["id"].as_str().and_then(|s| s.strip_prefix("board-push:")) else { return false };
+    let Some(marker) = event["marker"].as_str() else { return false };
+    !id.is_empty() && marker.starts_with("[cm-board ") && marker.ends_with(&format!(" push:{id}]"))
+}
+
 /// Same rule as `mcp_server/notifications.py::delivery_health`: submissions
 /// newer than the latest observation, unobserved past the horizon. A later
 /// observation proves the path works again and ends the episode. A consumer
@@ -61,7 +68,7 @@ fn transport_reason(transport: Option<&Value>) -> Option<String> {
 pub fn assess(events: &[Value], transport: Option<&Value>, now: f64, threshold: u64) -> Option<Stall> {
     let last_observed = events
         .iter()
-        .filter(|e| e["status"] == "observed")
+        .filter(|e| e["status"] == "observed" && receipt_evidence_allowed(e))
         .map(at)
         .fold(0.0, f64::max);
     let reason = transport_reason(transport);
@@ -392,6 +399,11 @@ mod tests {
         let stall = assess(&[ev("a", "pending", now - 5000.0)], Some(&blocked), now, 900).unwrap();
         assert_eq!(stall.reason, "channels_disabled");
         assert!(message("worker", "uid-1", &stall).contains("A-R"));
+        let legacy = json!({"id":"board-push:1", "source":"board", "status":"observed", "marker":"[cm-board sfd]", "updated_at":now - 1.0});
+        assert!(assess(&[legacy.clone(), ev("later", "submitted", now - 1000.0)], None, now, 900).is_some());
+        let mut unique = legacy;
+        unique["marker"] = json!("[cm-board sfd push:1]");
+        assert!(assess(&[unique, ev("later", "submitted", now - 1000.0)], None, now, 900).is_none());
     }
 
     #[test]
@@ -636,6 +648,42 @@ mod tests {
         event["status"] = json!("observed"); event["updated_at"] = json!(2200.0);
         crate::messaging::atomic_replace(&file, &event).unwrap();
         pass(&state, root, std::slice::from_ref(&uid), 2300.0, 900);
+        assert!(load(root).is_empty());
+    }
+
+    #[test]
+    fn persisted_legacy_board_observation_does_not_clear_alarm_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let uid = "ts-persisted".to_string();
+        crate::notifications::publish(root, &uid, "later", "chat", "[later] wake", "[later]").unwrap();
+        crate::notifications::publish(root, &uid, "board-push:1", "board", "[cm-board sfd] old", "[cm-board sfd]").unwrap();
+        let queue = crate::notifications::directory(root, &uid);
+        use sha2::Digest;
+        let file = |id: &str| queue.join(format!("{:x}.json", sha2::Sha256::digest(id.as_bytes())));
+        let mut later: Value = serde_json::from_slice(&fs::read(file("later")).unwrap()).unwrap();
+        later["status"] = json!("submitted"); later["updated_at"] = json!(1000.0);
+        crate::messaging::atomic_replace(&file("later"), &later).unwrap();
+        let mut board: Value = serde_json::from_slice(&fs::read(file("board-push:1")).unwrap()).unwrap();
+        board["status"] = json!("observed"); board["updated_at"] = json!(1900.0);
+        crate::messaging::atomic_replace(&file("board-push:1"), &board).unwrap();
+        let original = fs::read(file("board-push:1")).unwrap();
+        let mkstate = || {
+            let mut daemon = DaemonState::new();
+            daemon.daemon_sessions_path = Some(root.join("daemon-sessions.json"));
+            Arc::new(Mutex::new(daemon))
+        };
+        pass(&mkstate(), root, std::slice::from_ref(&uid), 2000.0, 900);
+        assert!(load(root).contains_key(&uid));
+        pass(&mkstate(), root, std::slice::from_ref(&uid), 2050.0, 900);
+        assert!(load(root).contains_key(&uid));
+        assert_eq!(fs::read(file("board-push:1")).unwrap(), original);
+        let marker = "[cm-board sfd push:2]";
+        crate::notifications::publish(root, &uid, "board-push:2", "board", marker, marker).unwrap();
+        let mut fresh: Value = serde_json::from_slice(&fs::read(file("board-push:2")).unwrap()).unwrap();
+        fresh["status"] = json!("observed"); fresh["updated_at"] = json!(2100.0);
+        crate::messaging::atomic_replace(&file("board-push:2"), &fresh).unwrap();
+        pass(&mkstate(), root, std::slice::from_ref(&uid), 2200.0, 900);
         assert!(load(root).is_empty());
     }
 }

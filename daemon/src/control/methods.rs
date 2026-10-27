@@ -661,7 +661,9 @@ pub(crate) fn start_session_with_spawn_fn(
     fence_uids.sort_unstable();
     fence_uids.dedup();
     let fences: Vec<_> = fence_uids.iter().map(|uid| crate::continuous::retirement::gate(uid)).collect();
-    let _permits: Vec<_> = fences.iter().map(|g| g.read().unwrap_or_else(|p| p.into_inner())).collect();
+    let _permits: Vec<_> = fence_uids.iter().zip(&fences)
+        .filter(|(uid, _)| !(**uid == p.uid.as_str() && crate::claude_recovery::internal_active(&p.uid)))
+        .map(|(_, g)| g.read().unwrap_or_else(|p| p.into_inner())).collect();
     for uid in &fence_uids {
         crate::continuous::retirement::ensure_open(uid)
             .map_err(|e| (ErrorCode::Conflict, e.to_string()))?;
@@ -2005,6 +2007,16 @@ pub fn send_input(
             "submit=false is not yet supported (matches TUI parity)".into()));
     }
 
+    // Acquire outside DaemonState, and keep through queueing, so a recovery
+    // cannot report success while a newly accepted prompt is still pending.
+    let input_gate = crate::continuous::retirement::gate(&p.session_uid);
+    let _input_admission = input_gate.try_read().map_err(|_| (
+        ErrorCode::Conflict, "session input is reserved for recovery or retirement".into()
+    ))?;
+    crate::continuous::retirement::ensure_open(&p.session_uid)
+        .map_err(|e| (ErrorCode::Conflict, e.to_string()))?;
+    let _input_unit = crate::continuous::retirement::input_unit(&p.session_uid);
+
     // Sub-2a Finding #2 TOCTOU fix: auth + Arc clone happen in
     // ONE critical section so the target session can't be
     // removed (or replaced with an entry the caller wouldn't
@@ -2210,6 +2222,14 @@ pub fn kill_session(
     let p: KillSessionParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("kill_session params: {}", e)))?;
 
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.session_uid);
+    let _recovery_read = recovery_gate.try_read().map_err(|_| (
+        ErrorCode::Conflict, "session lifecycle is reserved for background recovery".into()
+    ))?;
+    if let Some(reason) = crate::claude_recovery::admission_refusal(&p.session_uid) {
+        return Err((ErrorCode::Conflict, reason));
+    }
+
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     // Sub-2a Finding #2 TOCTOU fix: auth + lookup happen in one
     // critical section so a non-descendant target can't slip in
@@ -2314,6 +2334,39 @@ pub(crate) fn kill_with_attribution(state_arc: &Arc<Mutex<DaemonState>>, uid: &s
     session.set_kill_attribution(who);
     let _ = session.kill();
     state.record_kill_request(uid, who, now_unix_f64());
+}
+
+/// Kill only the exact daemon incarnation captured by native background
+/// recovery. All identity and lifecycle checks happen under the same state
+/// mutex as the pidfd/holder signal, closing the rebind-before-kill window.
+pub(crate) fn kill_with_recovery_identity(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    identity: &crate::claude_recovery::Identity,
+    who: &str,
+) -> Result<(), String> {
+    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    crate::claude_recovery::validate_holder_effect(&state, identity)?;
+    let session = state.sessions.get_mut(&identity.uid).ok_or_else(|| "session exited before holder stop".to_string())?;
+    if session.workspace_id != identity.workspace_id
+        || session.task_id != identity.task_id
+        || session.generation != identity.transcript_generation
+        || session.holder_incarnation != identity.holder_incarnation
+        || session.pid as u32 != identity.child_pid
+        || session.workflow_run_id.is_some()
+        || session.continuous_task_id.is_some()
+    {
+        return Err("session identity or lifecycle changed before holder stop".into());
+    }
+    let start = crate::adopt::proc_starttime(session.pid as libc::pid_t)
+        .map_err(|e| format!("child identity unreadable before holder stop: {e}"))?;
+    if start != identity.child_start_time {
+        return Err("child PID/start changed before holder stop".into());
+    }
+    session.last_exit.mark_operator_kill_requested();
+    session.set_kill_attribution(who);
+    session.kill().map_err(|e| format!("holder signal outcome unknown: {e}"))?;
+    state.record_kill_request(&identity.uid, who, now_unix_f64());
+    Ok(())
 }
 
 /// Deliver `prompt` to an agent session as one submitted message, waiting
@@ -3239,6 +3292,8 @@ pub fn session_agent_report(
     if caller_uid.is_some_and(|uid| uid != p.session_uid) {
         return Err((ErrorCode::Unauthorized, "session.agent_report is self-only".into()));
     }
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.session_uid);
+    let _recovery_read = recovery_gate.read().unwrap_or_else(|p| p.into_inner());
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     if state.restarting {
         return Err((ErrorCode::Conflict, "brain restart in progress; retry the latest report".into()));
@@ -3326,6 +3381,8 @@ pub fn session_turn_ended(
                 format!("session.turn_ended params: {}", e),
             )
         })?;
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.session_uid);
+    let _recovery_read = recovery_gate.read().unwrap_or_else(|p| p.into_inner());
     let mut state = state_arc.lock().unwrap_or_else(|p2| p2.into_inner());
     if let Some(cuid) = caller_uid {
         let decision = crate::control::auth::check_session_caller(
@@ -3741,6 +3798,13 @@ pub fn set_workflow_context(
              workflow_role must both be set or both be null"
                 .into(),
         ));
+    }
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.uid);
+    let _recovery_read = recovery_gate.try_read().map_err(|_| (
+        ErrorCode::Conflict, "session is reserved for background recovery".into()
+    ))?;
+    if let Some(reason) = crate::claude_recovery::admission_refusal(&p.uid) {
+        return Err((ErrorCode::Conflict, reason));
     }
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     let session = match state.sessions.get_mut(&p.uid) {
@@ -5031,6 +5095,20 @@ pub fn start_workflow(
     // pre-save failure never orphans a tag on a pre-existing session.
     let role_sessions_param: std::collections::BTreeMap<String, String> =
         p.role_sessions.clone().unwrap_or_default();
+    // Retain reservations through validation, run persistence and tagging.
+    // Nonblocking acquisition avoids lock inversion with the binding mutex.
+    let bound_recovery_uids: std::collections::BTreeSet<_> = role_sessions_param.values().cloned().collect();
+    let bound_recovery_gates: Vec<_> = bound_recovery_uids.iter()
+        .map(|uid| crate::claude_recovery::lifecycle_gate(uid)).collect();
+    let mut _bound_recovery_reads = Vec::new();
+    for (uid, gate) in bound_recovery_uids.iter().zip(&bound_recovery_gates) {
+        _bound_recovery_reads.push(gate.try_read().map_err(|_| (
+            ErrorCode::Conflict, format!("session '{uid}' is reserved for background recovery")
+        ))?);
+        if let Some(reason) = crate::claude_recovery::admission_refusal(uid) {
+            return Err((ErrorCode::Conflict, reason));
+        }
+    }
     let mut bound_bindings: std::collections::BTreeMap<String, RoleBinding> =
         std::collections::BTreeMap::new();
     let mut bound_baselines: std::collections::BTreeMap<String, MessageBaseline> =
@@ -7892,6 +7970,82 @@ mod operator_quiet_tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn recovery_waits_for_complete_prompt_body_and_enter() {
+        let _serial = crate::writer_gate::TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let uid = format!("ts-{}-0", uuid::Uuid::new_v4().simple());
+        let (handle, writes) = InputHandle::test_handle_capturing();
+        let handle = handle.test_with_uid(&uid);
+        let fanout = std::sync::Arc::new(crate::session::PtyByteFanout::new(64));
+        let (body_tx, body_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let delivery_uid = uid.clone();
+        let delivery = std::thread::spawn(move || {
+            super::TEST_AFTER_AGENT_BODY.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                body_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })));
+            let mut launch = crate::control::prompt_delivery::LaunchWrite { written_at:None, enter:Vec::new() };
+            let ok = super::deliver_agent_body_inner(&handle, &fanout, &delivery_uid, "prompt", false,
+                "test", None, None, Some(&mut launch));
+            super::TEST_AFTER_AGENT_BODY.with(|hook| *hook.borrow_mut() = None);
+            ok
+        });
+        body_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let identity = crate::claude_recovery::Identity {
+            uid:uid.clone(), task_id:None, workspace_id:"w".into(), canonical_cwd:"/tmp".into(),
+            daemon_id:"d".into(), native_session_id:"123e4567-e89b-12d3-a456-426614174000".into(),
+            transcript_generation:0, holder_incarnation:None, holder_pid:None, holder_start_time:None,
+            child_pid:1, child_start_time:1, background_pid:2, background_start_time:2,
+        };
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let recovery = std::thread::spawn(move || {
+            let state = std::sync::Arc::new(std::sync::Mutex::new(crate::state::DaemonState::new()));
+            started_tx.send(()).unwrap();
+            let result = crate::claude_recovery::confirm(&state, &serde_json::to_value(identity).unwrap(), true);
+            done_tx.send(result).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(done_rx.recv_timeout(Duration::from_millis(150)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+        release_tx.send(()).unwrap();
+        assert!(delivery.join().unwrap());
+        assert!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
+        recovery.join().unwrap();
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 2);
+        assert!(writes[0].1.windows(6).any(|w| w == b"prompt"));
+        assert!(!writes[1].1.is_empty(), "Enter must land before the recovery gate releases");
+    }
+
+    #[test]
+    fn restart_door_does_not_hold_session_admission() {
+        let _serial = crate::writer_gate::TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let uid = format!("ts-{}-1", uuid::Uuid::new_v4().simple());
+        let pause = crate::writer_gate::request_pause();
+        let (handle, _) = InputHandle::test_handle_capturing();
+        let handle = handle.test_with_uid(&uid);
+        let fanout = std::sync::Arc::new(crate::session::PtyByteFanout::new(64));
+        let (at_door_tx, at_door_rx) = std::sync::mpsc::channel();
+        let delivery_uid = uid.clone();
+        let delivery = std::thread::spawn(move || {
+            super::TEST_BEFORE_INPUT_UNIT.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                at_door_tx.send(()).unwrap();
+            })));
+            let mut launch = crate::control::prompt_delivery::LaunchWrite { written_at:None, enter:Vec::new() };
+            let ok = super::deliver_agent_body_inner(&handle, &fanout, &delivery_uid, "prompt", false,
+                "test", None, None, Some(&mut launch));
+            super::TEST_BEFORE_INPUT_UNIT.with(|hook| *hook.borrow_mut() = None);
+            ok
+        });
+        at_door_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let gate = crate::continuous::retirement::gate(&uid);
+        let writer = gate.try_write().expect("restart-parked delivery must not hold UID gate");
+        drop(writer);
+        drop(pause);
+        assert!(delivery.join().unwrap());
+    }
+
+    #[test]
     fn launch_ignores_terminal_replies_but_defers_for_typing() {
         let _serial = crate::writer_gate::TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let (handle, writes) = InputHandle::test_handle_capturing();
@@ -8538,6 +8692,12 @@ fn deliver_agent_body_guarded(
     deliver_agent_body_inner(handle, fanout, session_uid, body_text, fresh_spawn, what, notice, before_write, None)
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_AFTER_AGENT_BODY: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+    static TEST_BEFORE_INPUT_UNIT: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+
 fn deliver_agent_body_inner(
     handle: &crate::session::InputHandle,
     fanout: &Arc<crate::session::PtyByteFanout>,
@@ -8674,7 +8834,18 @@ fn deliver_agent_body_inner(
         Some(guard)
     } else { None };
     if fanout.snapshot_since(None).closed { return false; }
+    // Reserve the UID for the complete body → Enter unit. The nested input
+    // writes reuse this thread-scoped permit, avoiding a recursive read lock
+    // when a recovery writer is already queued.
+    // Enter the restart unit first: a newly paused unit must not hold the
+    // UID read gate while parked at the global restart door.
+    #[cfg(test)]
+    TEST_BEFORE_INPUT_UNIT.with(|hook| { if let Some(hook) = hook.borrow_mut().as_mut() { hook(); } });
     let _unit = crate::writer_gate::unit_permit();
+    let input_gate = crate::continuous::retirement::gate(session_uid);
+    let _input_permit = input_gate.read().unwrap_or_else(|p| p.into_inner());
+    if crate::continuous::retirement::ensure_open(session_uid).is_err() { return false; }
+    let _input_unit = crate::continuous::retirement::input_unit(session_uid);
     if let Some(before_write) = before_write { before_write(); }
     let handle = handle.clone().prepare_agent_input(body);
     if let Some(launch) = launch.as_mut() { launch.written_at = Some(Instant::now()); }
@@ -8685,6 +8856,8 @@ fn deliver_agent_body_inner(
         );
         return false;
     }
+    #[cfg(test)]
+    TEST_AFTER_AGENT_BODY.with(|hook| { if let Some(hook) = hook.borrow_mut().as_mut() { hook(); } });
     // Step boundary: body landed. Under a restart pause, complete the
     // Enter promptly rather than park mid-prompt: the gap is drained in
     // short slices so a pause landing MID-gap is observed within one
@@ -11856,6 +12029,15 @@ fn restore_one_session_with(
 
 /// [`restore_one_session_with`] that can fork a Claude resume into a fresh
 /// transcript (#24 rotation): same uid, same identity, new file.
+#[cfg(test)]
+thread_local! {
+    static RECOVERY_TEST_RESTORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+pub(crate) fn recovery_test_restore_program(enabled: bool) {
+    RECOVERY_TEST_RESTORE.with(|value| value.set(enabled));
+}
+
 pub(crate) fn restore_one_session_launch(
     state_arc: &Arc<Mutex<DaemonState>>,
     workspace_id: &str,
@@ -11864,6 +12046,16 @@ pub(crate) fn restore_one_session_launch(
     task_models: Option<&TaskModelCache>,
     fork: bool,
 ) -> MethodResult {
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&e.uid);
+    let _recovery_read = (!crate::claude_recovery::internal_active(&e.uid)
+        && !crate::claude_recovery::read_context_active(&e.uid))
+        .then(|| recovery_gate.read().unwrap_or_else(|p| p.into_inner()));
+    let _recovery_context = if !crate::claude_recovery::read_context_active(&e.uid) {
+        Some(crate::claude_recovery::read_context(&e.uid))
+    } else { None };
+    if let Some(reason) = crate::claude_recovery::admission_refusal(&e.uid) {
+        return Err((ErrorCode::Conflict, reason));
+    }
     let resume = e.transcript_id.as_deref();
 
     // Snapshot existing transcript ids BEFORE the spawn so the detector armed
@@ -11886,6 +12078,12 @@ pub(crate) fn restore_one_session_launch(
     // report it, instead of spawning into a missing cwd.
     let worktree_report = ensure_ready_worktree(state_arc, workspace_id, worktree, e.task_id.as_deref())?;
     let params = compose_restore_params_launch(state_arc, workspace_id, worktree, e, task_models, fork)?;
+    #[cfg(test)]
+    let mut params = params;
+    #[cfg(test)]
+    if crate::claude_recovery::internal_active(&e.uid) && RECOVERY_TEST_RESTORE.with(|value| value.get()) {
+        params["argv"] = json!(["/bin/sleep", "60"]);
+    }
     {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         // Explicit Resume already checked the archive. Startup restore can
@@ -20641,15 +20839,20 @@ pub(crate) fn sweep_terminal_task_sessions(
         .collect();
     let swept_at = now_unix_f64();
     let attribution = format!("{} (terminal task)", killer);
+    let mut closed = Vec::new();
     for uid in &targets {
+        let gate = crate::claude_recovery::lifecycle_gate(uid);
+        let Ok(_permit) = gate.try_read() else { continue };
+        if crate::claude_recovery::admission_refusal(uid).is_some() { continue; }
         if let Some(sess) = state.sessions.get_mut(uid) {
             sess.last_exit.mark_operator_kill_requested();
             sess.set_kill_attribution(&attribution);
             let _ = sess.kill();
         }
         state.record_kill_request(uid, &attribution, swept_at);
+        closed.push(uid.clone());
     }
-    targets
+    closed
 }
 
 /// fast the children die.
@@ -20671,6 +20874,9 @@ pub(crate) fn sweep_task_sessions(state_arc: &Arc<Mutex<DaemonState>>, task_id: 
     let swept_at = now_unix_f64();
     let killer = format!("{} (mark_subtask_done)", killer);
     for uid in targets {
+        let gate = crate::claude_recovery::lifecycle_gate(&uid);
+        let Ok(_permit) = gate.try_read() else { continue };
+        if crate::claude_recovery::admission_refusal(&uid).is_some() { continue; }
         if let Some(sess) = state.sessions.get_mut(&uid) {
             sess.last_exit.mark_operator_kill_requested();
             // O4 routing: the verb-routed kill carries the sweep's
@@ -40746,6 +40952,26 @@ while True:
             ["ts-error", "ts-idle", "ts-unknown-quiet", "ts-wait"]
         );
         kill_all_sessions(&state);
+    }
+
+    #[test]
+    fn task_sweeps_do_not_signal_a_recovery_reserved_uid() {
+        let state = make_state_arc();
+        let uid = "ts-sweep-recovery";
+        let mut params = crate::session::SpawnParams::new(uid, "worker", "/bin/sleep");
+        params.args = vec!["60".into()];
+        params.session_type = "claude-code".into();
+        let mut session = crate::session::DaemonSession::spawn(params).unwrap();
+        session.task_id = Some("done-task".into());
+        *session.last_activity_at.lock().unwrap() = None;
+        state.lock().unwrap().sessions.insert(uid.into(), session);
+        let gate = crate::claude_recovery::lifecycle_gate(uid);
+        let _write = gate.write().unwrap();
+        assert!(sweep_terminal_task_sessions(&state, "done-task", "test", None, false).is_empty());
+        sweep_task_sessions(&state, "done-task", "test");
+        let mut state = state.lock().unwrap();
+        assert!(state.sessions.get_mut(uid).unwrap().try_wait().is_none());
+        let _ = state.sessions.get_mut(uid).unwrap().kill();
     }
 
     #[test]
