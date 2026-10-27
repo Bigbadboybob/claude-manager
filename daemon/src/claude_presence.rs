@@ -587,7 +587,7 @@ mod tests {
             ({ let mut v = error.clone(); v["timestamp"] = "1970-01-01T00:33:20.000Z".into(); v }, State::Unknown),
             ({ let mut v = error.clone(); v["isSidechain"] = true.into(); v }, State::Working),
             (serde_json::json!({"type":"assistant", "sessionId":id,
-                "timestamp":"1970-01-01T00:16:00.000Z", "message":{"stop_reason":"end_turn"}}), State::Idle),
+                "timestamp":"1970-01-01T00:16:00.000Z", "message":{"stop_reason":"end_turn"}}), State::Working),
             (serde_json::json!({"type":"system", "subtype":"turn_duration", "sessionId":id,
                 "timestamp":"1970-01-01T00:16:00.000Z"}), State::Idle),
         ] {
@@ -621,6 +621,20 @@ mod tests {
         std::fs::write(&path, format!("{error}\n{user}\n")).unwrap();
         c.inputs.presence = f.sample();
         assert_eq!(derive(&c.inputs, 1000.0).state, State::Working);
+        let assistant = serde_json::json!({"type":"assistant", "sessionId":id,
+            "timestamp":"1970-01-01T00:16:00.000Z", "message":{"stop_reason":"end_turn"}});
+        std::fs::write(&path, format!("{assistant}\n")).unwrap();
+        c.inputs.presence = f.sample();
+        assert_eq!(derive(&c.inputs, 1000.0).state, State::Working,
+            "end_turn while the Stop hook is pending is not a safe boundary");
+        c.apply(Report::Hook { event: HookEvent::Stop,
+            payload: HookPayload { observed_at: Some(970.0), continuing: true, ..Default::default() } }, 970.0).unwrap();
+        assert_eq!(derive(&c.inputs, 1000.0).state, State::Working,
+            "a blocked Stop continuing on inbox work retains foreground activity");
+        c.apply(Report::Hook { event: HookEvent::Stop,
+            payload: HookPayload { observed_at: Some(980.0), ..Default::default() } }, 980.0).unwrap();
+        assert_eq!(derive(&c.inputs, 1000.0).state, State::Idle,
+            "a later settled Stop still closes the turn");
     }
 
     #[test]

@@ -139,7 +139,9 @@ pub fn probe_transcript_tail(path: &Path) -> Option<TailProbe> {
         if substantive && v.get("sessionId").and_then(|v| v.as_str()).is_some_and(|id|
             path.file_stem().and_then(|s| s.to_str()) != Some(id)) {
             claude_identity_mismatch = true;
-            shape.get_or_insert(TailShape::MidTurn);
+            // Shared scheduler consumers also read shape without consulting
+            // the presence-only identity flag. Never retain a terminal verdict.
+            shape = Some(TailShape::MidTurn);
             break;
         }
         match v.get("type").and_then(|t| t.as_str()) {
@@ -226,8 +228,10 @@ fn claude_boundary(text: &str, path: &Path) -> Option<crate::agent_state::LastTu
                         && v.get("error").and_then(|v| v.as_str()).is_some())
                     || v.get("error").and_then(|v| v.as_str()) == Some("authentication_failed")
                     || is_usage_limit_banner(&assistant_text(&v));
-                if failed || completed.is_some() || matches!(
-                    v.pointer("/message/stop_reason").and_then(|v| v.as_str()), Some("end_turn" | "stop_sequence")) {
+                // Assistant end_turn precedes the Stop hook, which can block
+                // and continue on inbox work. Only settled turn_duration or a
+                // synthetic terminal failure supplies a transcript boundary.
+                if failed || completed.is_some() {
                     // An older error must not borrow a newer turn_duration's
                     // timestamp and look like a failure of a subsequent turn.
                     return Some(LastTurn { ended_at: Some(if failed { at } else { completed.unwrap_or(at) }),
@@ -289,7 +293,8 @@ fn read_tail(path: &Path) -> Option<String> {
     let start = len.saturating_sub(TAIL_READ_BYTES);
     f.seek(SeekFrom::Start(start)).ok()?;
     let mut buf = Vec::with_capacity((len - start) as usize);
-    f.read_to_end(&mut buf).ok()?;
+    f.take(TAIL_READ_BYTES + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > TAIL_READ_BYTES { return None; }
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
@@ -399,6 +404,32 @@ mod tests {
 
     /// The incident's exact wedge shape: user prompt → synthetic 401 assistant
     /// → turn_duration → snapshot. Turn complete AND auth error.
+    #[test]
+    fn foreign_history_cannot_leave_a_terminal_shape_for_shared_consumers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current.jsonl");
+        let foreign = serde_json::json!({"type":"assistant", "sessionId":"prior",
+            "timestamp":"1970-01-01T00:15:00Z", "isApiErrorMessage":true,
+            "error":"authentication_failed"});
+        let current = serde_json::json!({"type":"assistant", "sessionId":"current",
+            "timestamp":"1970-01-01T00:16:00Z", "message":{"stop_reason":"end_turn"}});
+        let duration = serde_json::json!({"type":"system", "subtype":"turn_duration", "sessionId":"current",
+            "timestamp":"1970-01-01T00:16:01Z"});
+        std::fs::write(&path, format!("{foreign}\n{duration}\n")).unwrap();
+        let probe = probe_transcript_tail(&path).unwrap();
+        assert!(probe.claude_identity_mismatch);
+        assert_eq!(probe.shape, TailShape::MidTurn,
+            "scheduler consumers must not wedge-close from a mixed-conversation tail");
+        assert!(probe.claude_end.is_none());
+        assert!(probe.auth_error.is_none());
+        std::fs::write(&path, format!("{foreign}\n{current}\n{duration}\n")).unwrap();
+        let probe = probe_transcript_tail(&path).unwrap();
+        assert!(!probe.claude_identity_mismatch, "copied history before a current turn remains supported");
+        assert_eq!(probe.shape, TailShape::TurnComplete);
+        assert_eq!(probe.claude_end.unwrap().ended_at, Some(961.0));
+        assert!(probe.auth_error.is_none());
+    }
+
     #[test]
     fn auth_error_turn_is_complete_with_auth_text() {
         let dir = tempfile::tempdir().unwrap();

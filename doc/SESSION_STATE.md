@@ -113,7 +113,9 @@ the process identity checks. Native background-session recovery is separate.
 
 The bounded Claude transcript probe can supply a missing turn boundary only
 from main-conversation records carrying the bound native `sessionId` and their
-own timestamps. A current API/auth failure can therefore yield `errored` even
+own timestamps. Normal completion requires settled `turn_duration`; an assistant
+`end_turn` alone can precede a blocked or continuing Stop hook and is insufficient.
+A current API/auth failure can therefore yield `errored` even
 without Stop or a presence timestamp; prior-turn, sidechain and foreign
 conversation errors cannot supply that boundary. If an error accompanies stale
 presence but its event provenance is unavailable, state is `unknown` with
