@@ -209,6 +209,30 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
         notifications.atomic_write(self.queue.takeover_path(os.getppid()),
                                    dict(claim, pid=os.getppid(), requested_at=time.time()))
 
+    async def test_unknown_chronology_holds_pending_until_census_is_trustworthy(self):
+        adapter = Fixture("old")
+        self.queue.publish("previous", "chat", "[previous] wake", "[previous]")
+        self.queue.change("previous", {"pending"}, status="uncertain")
+        previous = self.queue.event_path("previous").read_bytes()
+        self.queue.publish("observation", "chat", "[observation] wake", "[observation]")
+        self.queue.change("observation", {"pending"}, status="observed")
+        observation = self.queue.get("observation")
+        observation["updated_at"] = time.time() + 3600
+        notifications.atomic_write(self.queue.event_path("observation"), observation)
+        self.queue.publish("new", "chat", "[new] wake", "[new]")
+        pending = self.queue.event_path("new").read_bytes()
+        self.queue.health("claude-code", "degraded", reason="external_background", reasons=["external_background"])
+        self.run_consumer(adapter)
+        await eventually(lambda: "untrusted_notification_chronology" in self.queue.snapshot()["health"]["reasons"])
+        await asyncio.sleep(0.2)
+        self.assertEqual(adapter.sent, [])
+        self.assertEqual(self.queue.event_path("new").read_bytes(), pending)
+        self.assertEqual(self.queue.event_path("previous").read_bytes(), previous)
+        observation["updated_at"] = time.time()
+        notifications.atomic_write(self.queue.event_path("observation"), observation)
+        await eventually(lambda: adapter.sent == ["new"], timeout=8)
+        self.assertEqual(self.queue.event_path("previous").read_bytes(), previous)
+
     async def test_stale_holder_hands_off_to_live_waiter(self):
         old = Fixture("old", stale=["transcript_mismatch"])
         first = self.run_consumer(old, loop=False)
@@ -245,6 +269,7 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
         # change() supplies its own updated_at; seed the old receipt directly.
         event = self.queue.get("previous")
         event["updated_at"] = time.time() - 400
+        event["created_at"] = event["updated_at"]
         notifications.atomic_write(self.queue.event_path("previous"), event)
         self.queue.publish("new", "chat", "wake [cm-chat new]", "[cm-chat new]")
         self.run_consumer(old)

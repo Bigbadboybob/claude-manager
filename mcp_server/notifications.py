@@ -417,6 +417,8 @@ async def _diagnose(queue: Queue, adapter, events) -> dict:
     # healthy in-pane resume. Stop claiming new work even if no successor has
     # appeared; already-submitted/uncertain receipts remain untouched.
     blocked = diag.get("blocked")
+    if delivery["chronology_unknown"]:
+        blocked = blocked or "untrusted_notification_chronology"
     if "enqueued_unobserved" in stale and delivery["stalled"]:
         blocked = blocked or "stale_channel"
         reasons.append("stale_channel")
