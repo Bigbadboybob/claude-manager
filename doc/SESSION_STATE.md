@@ -131,7 +131,8 @@ an MCP idle wait. Workflow and drain remain blocked, including after 90 seconds
 of source outage. A standalone transcript read cannot override that uncertainty.
 Normal valid, bound presence polling can ingest a timestamped settled boundary
 into `last_turn`; that or a real terminal hook clears the guard. A verified
-failed turn permits drain completion but cannot advance the workflow state gate.
+failed turn permits drain completion. Existing ordinary workflow error semantics
+are unchanged.
 Ordinary unknown/legacy and synthetic-no-turn fallbacks remain unchanged.
 
 Availability limit: when presence is missing, invalid or mismatched, a confirmed

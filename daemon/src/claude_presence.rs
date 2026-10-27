@@ -462,7 +462,7 @@ pub(crate) fn fixture_observation(transcript: &Path, native_id: &str, process_va
         "procStart":"42", "status":"idle", "sessionId":native_id}).to_string()).unwrap();
     Reader::new(root, proc_root).observe(&[Target {
         uid: "fixture".into(), pid: 1001, child_start_time: Some(42), transcript: Some(transcript.to_path_buf()),
-        had_presence: true, needs_turn_probe: true,
+        had_presence: true, needs_turn_probe: false, // A real hook already supplies turn-open evidence.
     }], now).pop().unwrap().unwrap()
 }
 

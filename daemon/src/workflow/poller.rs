@@ -1349,8 +1349,6 @@ fn workflow_engine_blocks(state: &DaemonState, run: &WorkflowRun) -> bool {
         let agent = crate::agent_state::current(session);
         agent.source.engine_reported()
             && (agent.detail.confirmed_turn_open == Some(true)
-                || (agent.state == crate::agent_state::State::Errored
-                    && agent.last_turn.status == Some(crate::agent_state::TurnStatus::Failed))
                 || matches!(
                 agent.state,
                 crate::agent_state::State::Working
@@ -2379,8 +2377,8 @@ mod tests {
         let observed = crate::claude_presence::fixture_observation(&proj.join("sid-worker.jsonl"), "sid-worker", true,
             crate::agent_state::unix_now());
         state.lock().unwrap().sessions["ts-worker"].agent_state.lock().unwrap().inputs.presence = Some(observed);
-        assert!(matches!(poller.poll_once().as_slice(), [Decision::Skip { reason: SkipReason::EngineStateBlocked, .. }]),
-            "a verified failed turn can finish drain but cannot advance workflow");
+        assert!(matches!(poller.poll_once().as_slice(), [Decision::ActivateStatic { .. }]),
+            "ordinary errored workflow semantics are unchanged once bound evidence resolves Unknown");
         // Rollout flag off restores the underlying transcript predicate.
         state.lock().unwrap().config.workflow_state_gate = false;
         let decisions = poller.poll_once();
