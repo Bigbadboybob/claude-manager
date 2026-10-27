@@ -720,7 +720,7 @@ fn snapshot(state: &DaemonState, uid: &str) -> Result<Snapshot, String> {
     };
     Ok(Snapshot { identity, worktree: cwd,
         background_jobs: agent.background.jobs.len() + agent.background.crons.len(),
-        background_complete: agent.background.complete })
+        background_complete: agent.background.complete && agent.background.observed_at.is_some() })
 }
 
 fn lifecycle_refusal(state: &DaemonState, uid: &str) -> Option<String> {
@@ -1332,7 +1332,12 @@ mod tests {
             fail_phase:None, fail_stop:false, fail_proof:false, fail_revive:false, stops:0, revives:0,
         }));
         assert_eq!(preflight(&state, uid)["status"], "unavailable");
-        state.lock().unwrap().sessions[uid].agent_state.lock().unwrap().inputs.background.complete = true;
+        {
+            let state = state.lock().unwrap();
+            let mut agent = state.sessions[uid].agent_state.lock().unwrap();
+            agent.inputs.background.complete = true;
+            agent.inputs.background.observed_at = Some(crate::agent_state::unix_now());
+        }
         let pre = preflight(&state, uid);
         assert_eq!(pre["status"], "normal");
         assert!(pre["identity"]["native_session_id"].is_null());
@@ -1470,12 +1475,21 @@ mod tests {
     fn workflow_context_refuses_while_recovery_has_uid_reservation() {
         let uid = "ts-recovery-workflow-test";
         let gate = lifecycle_gate(uid);
-        let _write = gate.write().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _write = gate.write().unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        ready_rx.recv().unwrap();
         let state = Arc::new(Mutex::new(DaemonState::new()));
         let result = crate::control::methods::set_workflow_context(&state, &json!({
             "uid":uid, "workflow_run_id":"run", "workflow_role":"worker"
         }));
         assert!(matches!(result, Err((ErrorCode::Conflict, _))));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
     }
 
     #[test]
