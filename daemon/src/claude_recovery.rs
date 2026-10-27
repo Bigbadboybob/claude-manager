@@ -149,6 +149,28 @@ fn active() -> &'static Mutex<HashSet<String>> {
     ACTIVE.get_or_init(Default::default)
 }
 
+fn pending_inputs() -> &'static Mutex<std::collections::HashMap<String, usize>> {
+    static PENDING: OnceLock<Mutex<std::collections::HashMap<String, usize>>> = OnceLock::new();
+    PENDING.get_or_init(Default::default)
+}
+pub(crate) struct PendingInput(String);
+impl Drop for PendingInput {
+    fn drop(&mut self) {
+        let mut pending = pending_inputs().lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(count) = pending.get_mut(&self.0) {
+            *count -= 1;
+            if *count == 0 { pending.remove(&self.0); }
+        }
+    }
+}
+pub(crate) fn reserve_pending_input(uid: &str) -> PendingInput {
+    *pending_inputs().lock().unwrap_or_else(|p| p.into_inner()).entry(uid.to_string()).or_default() += 1;
+    PendingInput(uid.to_string())
+}
+pub(crate) fn has_pending_input(uid: &str) -> bool {
+    pending_inputs().lock().unwrap_or_else(|p| p.into_inner()).contains_key(uid)
+}
+
 fn gates() -> &'static Mutex<std::collections::HashMap<String, std::sync::Weak<RwLock<()>>>> {
     static GATES: OnceLock<Mutex<std::collections::HashMap<String, std::sync::Weak<RwLock<()>>>>> = OnceLock::new();
     GATES.get_or_init(Default::default)
@@ -724,6 +746,7 @@ fn snapshot(state: &DaemonState, uid: &str) -> Result<Snapshot, String> {
 }
 
 fn lifecycle_refusal(state: &DaemonState, uid: &str) -> Option<String> {
+    if has_pending_input(uid) { return Some("session has an accepted input still being delivered".into()); }
     if state.draining || state.restarting {
         return Some("daemon is draining or restarting".into());
     }
@@ -1588,7 +1611,10 @@ mod tests {
         let gate = crate::continuous::retirement::gate(uid);
         let write = gate.write().unwrap();
         assert!(handle.write_and_stamp_operator(b"command").is_err());
+        assert!(handle.write_and_stamp_operator(b"\x1b[A").is_err());
+        assert!(handle.write_and_stamp_operator(b"\x1b[<0;10;20M").is_err());
         handle.write_and_stamp_operator(b"\x1b[6;20;10t").unwrap();
+        handle.write_and_stamp_operator(b"\x1b[13;20R").unwrap();
         drop(write);
         handle.write_and_stamp_operator(b"normal").unwrap();
         let identity = Identity { uid:uid.into(), task_id:None, workspace_id:"w".into(), canonical_cwd:"/tmp".into(),
@@ -1597,8 +1623,9 @@ mod tests {
             child_pid:1, child_start_time:1, background_pid:2, background_start_time:2 };
         save_receipt(uid, &Receipt { version:1, identity, phase:"unknown".into(), updated_at:1.0 }).unwrap();
         assert!(handle.write_and_stamp_operator(b"after unknown").is_err());
+        assert!(handle.write_and_stamp_operator(b"\x1b[H").is_err());
         handle.write_and_stamp_operator(b"\x1b[6;20;10t").unwrap();
-        assert_eq!(writes.lock().unwrap().len(), 3);
+        assert_eq!(writes.lock().unwrap().len(), 4);
         let _ = fs::remove_file(path);
     }
 
@@ -1632,6 +1659,52 @@ mod tests {
         save_receipt(uid, &Receipt { version:1, identity, phase:"unknown".into(), updated_at:1.0 }).unwrap();
         assert!(crate::resume_identity::claim_uid(&state, uid).is_err());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn accepted_detached_send_blocks_actual_confirm_until_delivery_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(dir.path()).status().unwrap().success());
+        let uid = "ts-abc9-0";
+        let native = "123e4567-e89b-12d3-a456-426614174000";
+        let mut daemon = DaemonState::new();
+        daemon.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
+        let mut workspace = crate::manifest::ManifestWorkspace::default();
+        workspace.id = "w".into(); workspace.worktree_path = Some(dir.path().to_path_buf());
+        daemon.workspaces.insert("w".into(), workspace);
+        let state = Arc::new(Mutex::new(daemon));
+        crate::control::methods::start_session(&state, &json!({"uid":uid,"workspace_id":"w",
+            "label":"queued", "argv":["/bin/sleep","60"], "session_type":"claude-code",
+            "model":"test-model", "effort":"xhigh", "working_dir":dir.path(),
+            "transcript_path":dir.path().join(format!("{native}.jsonl"))})).unwrap();
+        FAKE.with(|f| *f.borrow_mut() = Some(FakeEffects {
+            roster:Roster { rows:json!([{"kind":"background","sessionId":native,"cwd":dir.path()}]) },
+            host:BackgroundHost { pid:123,start:456 }, fail_phase:None, fail_stop:false,
+            fail_proof:false, fail_revive:false, real_revive:false, stops:0, revives:0,
+        }));
+        let pre = preflight(&state, uid);
+        assert_eq!(pre["status"], "offer");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let latch = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let hook_latch = Arc::clone(&latch);
+        crate::control::methods::set_queued_input_test_hook(uid, Some(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            let (lock, cv) = &*hook_latch;
+            let mut release = lock.lock().unwrap();
+            while !*release { release = cv.wait(release).unwrap(); }
+        })));
+        assert!(crate::control::methods::send_input(&state, &json!({"session_uid":uid,"text":"queued"}), None).is_ok());
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(confirm(&state, &pre["identity"], true).is_err());
+        assert!(state.lock().unwrap().sessions.get_mut(uid).unwrap().try_wait().is_none());
+        FAKE.with(|f| assert_eq!(f.borrow().as_ref().unwrap().stops, 0));
+        crate::control::methods::set_queued_input_test_hook(uid, None);
+        { let (lock, cv) = &*latch; *lock.lock().unwrap() = true; cv.notify_all(); }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while has_pending_input(uid) && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(20)); }
+        assert!(!has_pending_input(uid));
+        let _ = state.lock().unwrap().sessions.get_mut(uid).unwrap().kill();
+        FAKE.with(|f| *f.borrow_mut() = None);
     }
 
     #[test]

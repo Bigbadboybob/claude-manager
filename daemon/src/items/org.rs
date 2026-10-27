@@ -432,11 +432,14 @@ fn close_assistant(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, mut p: Map<String
     // The central close changes attribution/holds before the local signal;
     // reserve the lifecycle across both halves so recovery cannot overlap it.
     let recovery_gate = crate::claude_recovery::lifecycle_gate(&uid);
-    let _recovery_read = recovery_gate.try_read().map_err(|_| (
+    let _recovery_read = recovery_gate.try_write().map_err(|_| (
         ErrorCode::Conflict, "session lifecycle is reserved for background recovery".into()
     ))?;
     if let Some(reason) = crate::claude_recovery::admission_refusal(&uid) {
         return Err((ErrorCode::Conflict, reason));
+    }
+    if crate::claude_recovery::has_pending_input(&uid) {
+        return Err((ErrorCode::Conflict, "session has accepted input still being delivered".into()));
     }
     let reason = take_str(&mut p, "reason")?.unwrap_or_else(|| "closed by its member".into());
     let member_id = assistant_of(state, &uid)?;
