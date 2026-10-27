@@ -36908,7 +36908,11 @@ while True:
                         waiting_for: None,
                         main_turn_open: Some(true),
                         transcript_error: failed.then(|| "auth".into()),
-                        transcript_end: None, transcript_evidence_path: None,
+                        // Error attribution needs its own boundary after Stop;
+                        // the presence status timestamp cannot date the hint.
+                        transcript_end: failed.then(|| LastTurn {
+                            ended_at: Some(report.at_unix + 0.02), status: Some(TurnStatus::Failed),
+                        }), transcript_evidence_path: None,
                     });
                     assert_eq!(
                         crate::agent_state::derive(&cell.inputs, now_unix_f64()).state,
