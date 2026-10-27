@@ -160,7 +160,7 @@ class ContinuousRegistrationTests(unittest.IsolatedAsyncioTestCase):
         body["binding"]["host"] = "cm-manager"
         self.assertEqual((await self.client.put(path, json=body)).status_code, 200)
 
-    async def test_corrupt_unreadable_or_missing_legacy_inventory_is_not_absence(self):
+    async def test_corrupt_inventory_fails_closed_but_missing_state_is_absent(self):
         tid, path, body, _ = await self.task()
         file = self.legacy_record(tid)
         for contents in ("{broken", "[]", '{"task_id":"planning","planning_task_id":12}'):
@@ -176,8 +176,46 @@ class ContinuousRegistrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.client.put(path, json=body)).status_code, 409)
         finally:
             file.chmod(0o600)
-        file.unlink()  # a present task directory without state is ambiguous
-        self.assertEqual((await self.client.get(path)).status_code, 409)
+        file.unlink()  # a lock/run-log-only directory establishes no owner
+        response = await self.client.get(path)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["api_host_owners"], [])
+        self.assertEqual(await self.pool.fetchval("SELECT count(*) FROM continuous_registrations"), 0)
+
+    async def test_lock_only_directory_is_absent_but_suspicious_state_entries_fail_closed(self):
+        tid, path, body, _ = await self.task()
+        lock_only = self.inventory / "cm-f1-cap-demo"
+        lock_only.mkdir(parents=True)
+        (lock_only / "state.json.lock").write_bytes(b"")
+        snapshot = await self.client.get(path)
+        self.assertEqual(snapshot.status_code, 200, snapshot.text)
+        self.assertEqual(snapshot.json()["api_host_owners"], [])
+        registered = await self.client.put(path, json=body)
+        self.assertEqual(registered.status_code, 200, registered.text)
+
+        # A dangling state symlink must not be mistaken for an absent file.
+        await self.pool.execute("DELETE FROM continuous_registrations")
+        await self.pool.execute("DELETE FROM continuous_registration_requests")
+        await self.pool.execute("UPDATE tasks SET kind='oneshot', metadata=NULL WHERE id=$1", tid)
+        dangling = self.inventory / "dangling"
+        dangling.mkdir()
+        (dangling / "state.json").symlink_to("gone.json")
+        response = await self.client.get(path)
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertIn("legacy_inventory_unavailable", response.text)
+
+        # A present symlink to a valid-looking record is still suspicious.
+        target = self.inventory / "target"
+        target.mkdir()
+        (target / "state.json").write_text(json.dumps({
+            "task_id": "target", "planning_task_id": str(tid), "workspace_id": "ws",
+            "worktree_path": "/existing", "engine": "codex",
+        }))
+        linked = self.inventory / "linked"
+        linked.symlink_to(target, target_is_directory=True)
+        response = await self.client.get(path)
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertIn("legacy_inventory_unavailable", response.text)
         self.assertEqual(await self.pool.fetchval("SELECT count(*) FROM continuous_registrations"), 0)
 
     async def test_receipt_replay_exposes_current_closure_without_reopening_task(self):

@@ -63,10 +63,30 @@ def legacy_owners(request: Request, task_id: UUID):
             return []  # a host with no continuous storage yet
         owners = []
         for entry in entries:
-            if not stat.S_ISDIR(entry.stat().st_mode):
+            entry_stat = entry.lstat()
+            if stat.S_ISLNK(entry_stat.st_mode):
+                raise ValueError(f"suspicious legacy inventory entry {entry}")
+            if not stat.S_ISDIR(entry_stat.st_mode):
                 continue
             location = entry / "state.json"
-            row = LegacyOwnership.model_validate(json.loads(location.read_text()))
+            try:
+                state_stat = location.lstat()
+            except FileNotFoundError:
+                # Scheduler run logs and lock files legitimately leave a task
+                # directory before its durable state exists. They establish no
+                # ownership record and are ignored.
+                continue
+            if stat.S_ISLNK(state_stat.st_mode) or not stat.S_ISREG(state_stat.st_mode):
+                raise ValueError(f"suspicious legacy state entry {location}")
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                fd = os.open(location, flags)
+            except FileNotFoundError:
+                # A state file removed after lstat is genuinely absent; do not
+                # broaden this to catch permission or parse errors.
+                continue
+            with os.fdopen(fd, "r", encoding="utf-8") as state:
+                row = LegacyOwnership.model_validate(json.loads(state.read()))
             if row.task_id != entry.name:
                 raise ValueError(f"state identity differs from directory {entry.name}")
             if row.planning_task_id == str(task_id) or row.task_id == str(task_id):

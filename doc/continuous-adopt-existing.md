@@ -47,8 +47,11 @@ planning mapping is retained. No session permissions are granted or widened.
 
 Ownership checks cover the target daemon's local records, a strict inventory of
 legacy records on the planning API host (normally manager), and central adoption
-claims. An unreadable/malformed API-host inventory fails closed; the API's
-best-effort `/continuous` display is not used to establish absence. This is **not
+claims. A task directory with no `state.json` is ignored because scheduler lock
+or run-log remnants do not establish ownership. A present `state.json` is opened
+without following symlinks; unreadable, malformed, non-regular, dangling or
+symlinked state entries fail closed. The API's best-effort `/continuous` display
+is not used to establish absence. This is **not
 global atomic exclusion** of legacy schedulers: an unregistered record on any
 other remote host, or a concurrent legacy `continuous.create` that bypasses the
 new claim route, still requires explicit operator reconciliation before use.
