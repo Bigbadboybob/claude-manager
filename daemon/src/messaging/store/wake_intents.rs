@@ -38,6 +38,7 @@ impl<'a> WakeRules<'a> {
             .flat_map(|p| p.monitors.values())
             .filter(|m| {
                 m.notify == "wake"
+                    && store.task_monitor_current(actor, m)
                     && !["cancelled", "dismissed"].contains(&m.state.as_str())
                     && m.hit_high > m.acknowledged
             })

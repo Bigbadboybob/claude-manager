@@ -672,6 +672,21 @@ pub fn load_one(task_id: &str) -> Option<ContinuousTask> {
     serde_json::from_str::<ContinuousTask>(&contents).ok()
 }
 
+/// Read authority without waiting behind a writer. Keep this guard through a
+/// local messaging effect so scheduler handover cannot race its generation
+/// check. Callers holding other locks must defer on contention, never wait.
+pub(crate) struct ReadGuard {
+    pub task: ContinuousTask,
+    _lock: LockGuard,
+}
+pub(crate) fn try_read_guard(task_id: &str) -> Result<ReadGuard, PersistError> {
+    validate_task_id(task_id)?;
+    let dir = task_dir(task_id);
+    let lock = LockGuard::acquire(&dir, libc::LOCK_SH | libc::LOCK_NB)?;
+    let task = serde_json::from_slice(&fs::read(dir.join("state.json"))?)?;
+    Ok(ReadGuard { task, _lock: lock })
+}
+
 /// Atomic load-modify-write under exclusive `flock(2)`. The closure receives a
 /// `&mut ContinuousTask` loaded from disk; on closure return, the task is saved
 /// back under the SAME lock the load took. This is the right shape for
@@ -779,6 +794,15 @@ pub fn lock_lifecycle(task_id: &str) -> std::io::Result<LifecycleGuard> {
     validate_task_id(task_id)?;
     Ok(LifecycleGuard {
         _lock: LockGuard::acquire_named(&task_dir(task_id), "lifecycle.lock", libc::LOCK_EX)?,
+    })
+}
+
+/// Nonblocking twin for messaging consumers. The lifecycle lock also fences
+/// adoption's intent-only window, before its first task-state write.
+pub(crate) fn try_lock_lifecycle(task_id: &str) -> std::io::Result<LifecycleGuard> {
+    validate_task_id(task_id)?;
+    Ok(LifecycleGuard {
+        _lock: LockGuard::acquire_named(&task_dir(task_id), "lifecycle.lock", libc::LOCK_EX | libc::LOCK_NB)?,
     })
 }
 

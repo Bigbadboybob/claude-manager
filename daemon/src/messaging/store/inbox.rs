@@ -80,7 +80,7 @@ impl Store {
         self.load_read(actor)?;
         let mut state = self.personal_state(actor);
         let mut advanced = 0;
-        for m in state.monitors.values_mut().filter(|m| m.state != "dismissed") {
+        for m in state.monitors.values_mut().filter(|m| m.state != "dismissed" && self.task_monitor_current(actor, m)) {
             let mut hits: Vec<&Published> = self.events_between(m.acknowledged,m.hit_high).iter()
                 .collect();
             hits.sort_by_key(|e| e.position);

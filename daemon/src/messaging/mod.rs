@@ -4,6 +4,7 @@ pub mod sync;
 pub mod rpc;
 pub mod startup;
 pub mod tasks;
+mod task_authority;
 mod store;
 pub use store::{atomic_replace, live_sessions, now, ChatError, LiveSession, Name, Person, Store, TaskBinding, WakeIntent, norms_diff};
 

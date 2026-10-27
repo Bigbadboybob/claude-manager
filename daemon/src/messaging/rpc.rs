@@ -198,7 +198,8 @@ fn execute(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, Chat
     if req.method == "messaging.sync" {
         return execute_sync_admin(state, req);
     }
-    // Fence stale task subscription owners before they can acknowledge hits.
+    // Opportunistic maintenance only. Deferred refresh is not an authority
+    // fence; task monitor effects below use a locked authoritative view.
     super::tasks::refresh(state)?;
     let mut result = execute_with_freshness(state, req, false)?;
     if matches!(req.caller, Caller::Operator(_)) && req.params["claim_bell"] == true {
@@ -404,11 +405,13 @@ fn execute_with_freshness(
             message: "This messaging host is not enrolled to serve Owner".into(),
         });
     }
-    if req.method == "messaging.counts" { return store.counts(&actor); }
+    if req.method == "messaging.counts" { return super::task_authority::View::new(store).counts(&actor); }
     if req.method == "messaging.attention" {
-        return store.attention(&actor,false).map(|attention|json!({"attention":attention}));
+        return super::task_authority::View::new(store).attention(&actor,false).map(|attention|json!({"attention":attention}));
     }
     if req.method == "messaging.mark_read" {
+        let mut authority = super::task_authority::View::new(store);
+        let store = &mut *authority;
         let result = store.mark_read(&actor,p,&people);
         if result.is_ok() && kind != "owner" {
             super::delivery::reconcile_session(&root,store,&uid).map_err(|e|ChatError {code:"outcome_unknown".into(),message:format!("Cursor saved; wake reconciliation needs retry: {e}")})?;
@@ -525,12 +528,28 @@ fn execute_with_freshness(
             return execute_with_freshness(state, req, true);
         }
     }
-    let result = match req.method.as_str() {
+    // These registry repairs may acquire DaemonState. Do them before taking
+    // task-file authority guards; no blocking state lock is allowed inside.
+    if req.method == "messaging.send" && kind != "owner" && !store.names.contains_key(&actor) {
+        repair_legacy_binding(state, &uid)?;
+    }
+    if req.method == "session.set_name" {
+        let target = p["uid"].as_str().unwrap_or(&uid);
+        if kind != "owner" && target != uid {
+            return Err(ChatError { code: "unauthorized".into(), message: "An agent can rename only itself".into() });
+        }
+        repair_legacy_binding(state, target)?;
+    }
+    // Display orientation loads task records. Do not reacquire task-file
+    // locks while the effect guards below are held (another task may be busy).
+    let continuous_orientation = (req.method == "messaging.open")
+        .then(|| super::tasks::orientation(store, &graph, &uid));
+    let result = {
+    let mut authority = super::task_authority::View::new(store);
+    let store = &mut *authority;
+    match req.method.as_str() {
         "messaging.react" => store.react(&actor,p),
         "messaging.send" => {
-            if kind != "owner" && !store.names.contains_key(&actor) {
-                repair_legacy_binding(state, &uid)?;
-            }
             store.acknowledge(&actor, &p["ack_receipt"])?;
             store.send(&actor, &uid, kind, p, &people)
         }
@@ -592,18 +611,11 @@ fn execute_with_freshness(
             query["newest_first"] = json!(true);
             let recent = store.read(&actor, &query, &people)?;
             Ok(
-                json!({"actor_id":actor,"daemon_id":store.daemon_id,"space_id":store.space_id,"name":store.names.get(&actor),"self":people.iter().find(|p|p.id==actor),"target":recent["target"],"norms":store.norms,"recent":recent,"dms":store.dms(&actor,true)?,"task_subscriptions":store.task_orientation(&actor),"continuous":super::tasks::orientation(store,&graph,&uid),"owner_availability":crate::owner_availability::exposure_at(&store.owner_availability, chrono::Utc::now()),"capabilities":["open","read","send","dms","people","channels","norms","monitor","monitors","follow","pins","react","mark_read","counts"],"features":["group_dms","channel_admins","pins","channel_membership","channel_mentions","channel_norms","channel_member_add","read_cursors","reactions"],"dm_max_members":32,"message_max_chars":3000}),
+                json!({"actor_id":actor,"daemon_id":store.daemon_id,"space_id":store.space_id,"name":store.names.get(&actor),"self":people.iter().find(|p|p.id==actor),"target":recent["target"],"norms":store.norms,"recent":recent,"dms":store.dms(&actor,true)?,"task_subscriptions":store.task_orientation(&actor),"continuous":continuous_orientation,"owner_availability":crate::owner_availability::exposure_at(&store.owner_availability, chrono::Utc::now()),"capabilities":["open","read","send","dms","people","channels","norms","monitor","monitors","follow","pins","react","mark_read","counts"],"features":["group_dms","channel_admins","pins","channel_membership","channel_mentions","channel_norms","channel_member_add","read_cursors","reactions"],"dm_max_members":32,"message_max_chars":3000}),
             )
         }
         "session.set_name" => {
             let target = p["uid"].as_str().unwrap_or(&uid);
-            if kind != "owner" && target != uid {
-                return Err(ChatError {
-                    code: "unauthorized".into(),
-                    message: "An agent can rename only itself".into(),
-                });
-            }
-            repair_legacy_binding(state, target)?;
             let target_actor = store.participant_id(target);
             let mut params = p.clone();
             params["_authenticated_actor"] = json!(actor);
@@ -613,6 +625,7 @@ fn execute_with_freshness(
             code: "unsupported_feature".into(),
             message: "Messaging method not implemented".into(),
         }),
+    }
     };
     if req.method == "messaging.read"
         && ["sender", "query"].iter().any(|key| p.get(key).is_some_and(|v| !v.is_null()))
@@ -628,6 +641,11 @@ fn execute_with_freshness(
         result => result,
     };
     project_names(state, store, true);
+    // Reacquire after the registry projection. Keep read/cancel boundaries and
+    // response monitor visibility under current authority too, without holding
+    // file guards over the state lock above or any remote forwarding earlier.
+    let mut authority = super::task_authority::View::new(store);
+    let store = &mut *authority;
     let mut retraction_note = None;
     // A bulk mark settles pending wakes for every message it marked, exactly
     // like supplying those messages in a page would.

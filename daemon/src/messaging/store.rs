@@ -311,6 +311,9 @@ pub struct Store {
     pub degraded: Option<String>,
     replication: replication::Replication,
     task_bindings: BTreeMap<String, TaskBinding>,
+    /// Ephemeral, effect-scoped daemon authority. Never persisted; standalone
+    /// Store users retain their store-only contract when no view is installed.
+    pub(super) task_authority: Option<BTreeMap<String, super::task_authority::Authority>>,
     /// Background deletion of superseded legacy coverage journal files.
     /// Declared before `_lock`: dropping the store stops it before the
     /// writer lock is released.
@@ -407,6 +410,7 @@ impl Store {
             generation: required(&meta, "generation")?,
             names: BTreeMap::new(),
             task_bindings: BTreeMap::new(),
+            task_authority: None,
             degraded: None,
             replication: replication::Replication::new(
                 &meta,

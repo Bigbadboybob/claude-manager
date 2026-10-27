@@ -152,6 +152,19 @@ intent-only crash before staging, preserving existing subscriptions. Deferred
 replica joins recheck the binding generation under that gate before forwarding.
 Only the adopting request can reconcile its own staged channel.
 
+A skipped refresh is reported as deferred, never as proof of subscription
+authority. Task-monitor reads, acknowledgments and native wakes independently
+validate the authoritative task owner, channel and subscription generation under
+nonblocking per-task lifecycle and state-file guards. Busy/unknown authority
+leaves task hits and pending native work unconsumed for retry. Ordinary chat and
+personal monitors remain available; native publication for a recipient whose
+task authority is busy waits for a later tick. The delivery path retains the
+guards through local publication, without blocking on session/store locks.
+
+The deferred-join gate covers the local send attempt. A timeout can leave the
+remote membership join outcome unknown; this does not introduce a remote lease
+or grant scheduler subscription ownership.
+
 The final planning read rejects observed drift; it is **not atomic** with local
 activation and does not introduce a distributed lease. Operators must serialize
 planning-close, ownership and continuous-metadata edits with adoption. A closed

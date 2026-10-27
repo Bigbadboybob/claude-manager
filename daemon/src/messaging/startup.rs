@@ -220,9 +220,8 @@ mod tests {
                     assert!(reply.ok, "{reply:?}");
                 }
             }
-            assert!(super::super::tasks::refresh(&probe_state)
-                .unwrap()
-                .is_empty());
+            assert!(matches!(super::super::tasks::refresh(&probe_state).unwrap(),
+                super::super::tasks::RefreshOutcome::Deferred));
             assert_eq!(
                 super::super::sync::Runtime::start(&probe_state)
                     .err()

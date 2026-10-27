@@ -606,7 +606,8 @@ fn adoption_refresh_snapshot_cannot_mutate_intent_only_crash() {
         });
         arm_continuous_spawn_spy_for_test();
         arm_continuous_delivery_spy_for_test();
-        assert!(crate::messaging::tasks::refresh(&state).unwrap().is_empty());
+        assert!(matches!(crate::messaging::tasks::refresh(&state).unwrap(),
+            crate::messaging::tasks::RefreshOutcome::Applied(joins) if joins.is_empty()));
         assert_eq!(before, serde_json::to_value(crate::continuous::task::load_one("adopt-40")).unwrap(),
             "stale refresh changed original_hash after durable intent");
         assert_eq!(*captured.borrow(), Some(adoption_files(&crate::path::dot_cm_dir())),
@@ -764,7 +765,8 @@ fn adoption_refresh_does_not_wait_or_reenter_the_binding_gate() {
         adoption_paused_record(&p);
         let before = adoption_files(&crate::path::dot_cm_dir());
         let guard = crate::continuous::adoption::binding_lock();
-        assert!(crate::messaging::tasks::refresh(&state).unwrap().is_empty());
+        assert!(matches!(crate::messaging::tasks::refresh(&state).unwrap(),
+            crate::messaging::tasks::RefreshOutcome::Deferred));
         assert_eq!(before, adoption_files(&crate::path::dot_cm_dir()));
         // create/adopt already own the gate; the internal entrypoint must not
         // reacquire it. The public normal entrypoint below also remains usable.
@@ -855,8 +857,160 @@ fn adoption_ensure_preserves_uninitialized_store_readiness() {
         let state = make_state_arc();
         let error = crate::messaging::tasks::ensure_for_task(&state, "adopt-40").unwrap_err();
         assert_eq!(error.code, "messaging_starting");
-        assert!(crate::messaging::tasks::refresh(&state).unwrap().is_empty());
+        assert!(matches!(crate::messaging::tasks::refresh(&state).unwrap(),
+            crate::messaging::tasks::RefreshOutcome::Deferred));
         let handle = state.lock().unwrap().messaging.clone();
         assert!(handle.lock().unwrap().is_none(), "ensure must not synchronously open a store");
+    });
+}
+
+fn adoption_chat_call(state: &Arc<Mutex<DaemonState>>, uid: &str, method: &str, params: Value) -> crate::control::protocol::Response {
+    crate::messaging::rpc::dispatch(state, &crate::control::protocol::Request {
+        id: "adoption-chat-test".into(), caller: Caller::session(uid),
+        method: format!("messaging.{method}"), params,
+    })
+}
+
+fn adoption_monitor_fixture() -> (Arc<Mutex<DaemonState>>, StubApi, Value) {
+    let (state, p, stub) = adoption_fixture();
+    let commit = adoption_commit_request(&state, &p);
+    crate::continuous::adoption::handle(&state, &commit).unwrap();
+    seed_mcp_spawn_fixture(&state, "ts-replacement", Some(ADOPT_TASK));
+    state.lock().unwrap().sessions.get_mut("ts-replacement").unwrap().session_type = "codex".into();
+    let binding = crate::continuous::task::load_one("adopt-40").unwrap().messaging.unwrap();
+    let handle = state.lock().unwrap().messaging.clone();
+    let message = handle.lock().unwrap().as_mut().unwrap()
+        .post_system_notice(&binding.channel_id, "Work intended for the current orchestrator", "authority-race").unwrap();
+    let id = format!("task-{}-{}", binding.subscription_id, binding.revision);
+    let read = adoption_chat_call(&state, "ts-adopt", "monitors", json!({"action":"get","monitor_id":id}));
+    assert!(read.ok, "{:?}", read.error);
+    let result = read.result.unwrap();
+    assert!(result["items"].to_string().contains(message["event_id"].as_str().unwrap()));
+    (state, stub, json!({"monitor_id":id,"receipt":result["receipt"],"event_id":message["event_id"]}))
+}
+
+fn adoption_change_authoritative_monitor_owner() {
+    // This is the scheduler handover shape, which does not take the global gate.
+    crate::continuous::task::modify("adopt-40", |t| {
+        t.current_session_uid = Some("ts-replacement".into());
+        t.messaging.as_mut().unwrap().handover("ts-replacement");
+    }).unwrap();
+}
+
+fn adoption_current_owner_can_read_and_ack(state: &Arc<Mutex<DaemonState>>, event: &Value) {
+    let binding = crate::continuous::task::load_one("adopt-40").unwrap().messaging.unwrap();
+    let id = format!("task-{}-{}", binding.subscription_id, binding.revision);
+    let read = adoption_chat_call(state, "ts-replacement", "monitors", json!({"action":"get","monitor_id":id}));
+    assert!(read.ok, "{:?}", read.error);
+    let result = read.result.unwrap();
+    assert!(result["items"].to_string().contains(event.as_str().unwrap()), "replacement lost unacknowledged work: {result}");
+    let ack = adoption_chat_call(state, "ts-replacement", "monitors", json!({"action":"ack","monitor_id":id,"receipt":result["receipt"],"request_id":"replacement-ack"}));
+    assert!(ack.ok, "{:?}", ack.error);
+}
+
+#[test]
+fn adoption_contended_refresh_refuses_stale_monitor_ack() {
+    with_temp_home(|| {
+        let (state, _stub, old) = adoption_monitor_fixture();
+        let guard = crate::continuous::adoption::binding_lock();
+        adoption_change_authoritative_monitor_owner();
+        let ack = adoption_chat_call(&state, "ts-adopt", "monitors", json!({"action":"ack","monitor_id":old["monitor_id"],"receipt":old["receipt"],"request_id":"stale-ack"}));
+        assert!(!ack.ok, "stale owner acknowledged replacement work while refresh was skipped");
+        let handle = state.lock().unwrap().messaging.clone();
+        assert!(handle.lock().unwrap().as_ref().unwrap().task_binding_for("adopt-40").unwrap().acknowledged.is_empty());
+        let ordinary = adoption_chat_call(&state, "ts-adopt", "send", json!({"channel":"general","body":"ordinary chat remains responsive","request_id":"ordinary-under-gate"}));
+        assert!(ordinary.ok, "{:?}", ordinary.error);
+        let personal = adoption_chat_call(&state, "ts-adopt", "monitor", json!({"scope":{"dms":true},"request_id":"personal-under-gate"}));
+        assert!(personal.ok, "{:?}", personal.error);
+        let personal_id = personal.result.unwrap()["id"].clone();
+        let page = adoption_chat_call(&state, "ts-adopt", "monitors", json!({"action":"get","monitor_id":personal_id}));
+        assert!(page.ok, "{:?}", page.error);
+        let ack = adoption_chat_call(&state, "ts-adopt", "monitors", json!({"action":"ack","monitor_id":personal_id,"receipt":page.result.unwrap()["receipt"],"request_id":"personal-ack-under-gate"}));
+        assert!(ack.ok, "{:?}", ack.error);
+        drop(guard);
+        adoption_current_owner_can_read_and_ack(&state, &old["event_id"]);
+        kill_all_sessions(&state);
+    });
+}
+
+#[test]
+fn adoption_contended_refresh_refuses_stale_monitor_get() {
+    with_temp_home(|| {
+        let (state, _stub, old) = adoption_monitor_fixture();
+        let guard = crate::continuous::adoption::binding_lock();
+        adoption_change_authoritative_monitor_owner();
+        let read = adoption_chat_call(&state, "ts-adopt", "monitors", json!({"action":"get","monitor_id":old["monitor_id"]}));
+        assert!(!read.ok, "stale owner received task-monitor results while refresh was skipped");
+        drop(guard);
+        adoption_current_owner_can_read_and_ack(&state, &old["event_id"]);
+        kill_all_sessions(&state);
+    });
+}
+
+fn adoption_native_events(state: &Arc<Mutex<DaemonState>>, uid: &str) -> usize {
+    let root = state.lock().unwrap().messaging_root.clone();
+    std::fs::read_dir(crate::notifications::directory(&root, uid)).into_iter().flatten().flatten()
+        .filter(|e| e.path().extension().is_some_and(|s| s == "json")).count()
+}
+
+#[test]
+fn adoption_contended_refresh_refuses_stale_native_task_wake() {
+    with_temp_home(|| {
+        let (state, _stub, _) = adoption_monitor_fixture();
+        let guard = crate::continuous::adoption::binding_lock();
+        adoption_change_authoritative_monitor_owner();
+        crate::messaging::delivery::tick(&state);
+        assert_eq!(adoption_native_events(&state, "ts-adopt"), 0, "native task wake published to stale owner");
+        drop(guard);
+        crate::messaging::tasks::refresh(&state).unwrap();
+        crate::messaging::delivery::tick(&state);
+        assert!(adoption_native_events(&state, "ts-replacement") > 0, "current owner must receive retained work");
+        kill_all_sessions(&state);
+    });
+}
+
+#[test]
+fn adoption_deferred_task_authority_retains_queue_and_correct_owner_retry() {
+    with_temp_home(|| {
+        let (state, _stub, old) = adoption_monitor_fixture();
+        crate::messaging::delivery::tick(&state);
+        assert!(adoption_native_events(&state, "ts-adopt") > 0);
+        let (root, handle) = {
+            let s = state.lock().unwrap();
+            (s.messaging_root.clone(), s.messaging.clone())
+        };
+        let queue_dir = handle.lock().unwrap().as_ref().unwrap().root.join("_delivery");
+        let native_dir = crate::notifications::directory(&root, "ts-adopt");
+        let queue_before = adoption_files(&queue_dir);
+        let native_before = adoption_files(&native_dir);
+        let personal = adoption_chat_call(&state, "ts-adopt", "monitor", json!({"scope":{"dms":true},"request_id":"busy-personal"}));
+        assert!(personal.ok);
+        let personal_id = personal.result.unwrap()["id"].clone();
+        // Model an overlapping local scheduler/adoption lifecycle operation.
+        // The current owner has not changed, but cannot yet be verified.
+        let lifecycle = crate::continuous::task::lock_lifecycle("adopt-40").unwrap();
+        let ack_params = json!({"action":"ack","monitor_id":old["monitor_id"],"receipt":old["receipt"],"request_id":"deferred-owner-ack"});
+        assert!(!adoption_chat_call(&state, "ts-adopt", "monitors", ack_params.clone()).ok);
+        assert!(!adoption_chat_call(&state, "ts-adopt", "monitors", json!({"action":"get","monitor_id":old["monitor_id"]})).ok);
+        let send = adoption_chat_call(&state, "ts-adopt", "send", json!({"channel":"general","body":"send while task authority is deferred","request_id":"busy-ordinary"}));
+        assert!(send.ok, "{:?}", send.error);
+        let page = adoption_chat_call(&state, "ts-adopt", "monitors", json!({"action":"get","monitor_id":personal_id}));
+        assert!(page.ok, "{:?}", page.error);
+        let personal_ack = adoption_chat_call(&state, "ts-adopt", "monitors", json!({"action":"ack","monitor_id":personal_id,"receipt":page.result.unwrap()["receipt"],"request_id":"busy-personal-ack"}));
+        assert!(personal_ack.ok, "{:?}", personal_ack.error);
+        crate::messaging::delivery::tick(&state);
+        assert_eq!(queue_before, adoption_files(&queue_dir), "Deferred must not settle/cancel queued work");
+        assert_eq!(native_before, adoption_files(&native_dir), "pending native receipt must be unchanged");
+        assert!(handle.lock().unwrap().as_ref().unwrap().task_binding_for("adopt-40").unwrap().acknowledged.is_empty());
+        drop(lifecycle);
+        let read = adoption_chat_call(&state, "ts-adopt", "monitors", json!({"action":"get","monitor_id":old["monitor_id"]}));
+        assert!(read.ok, "{:?}", read.error);
+        assert!(read.result.unwrap()["items"].to_string().contains(old["event_id"].as_str().unwrap()));
+        let ack = adoption_chat_call(&state, "ts-adopt", "monitors", ack_params.clone());
+        assert!(ack.ok, "{:?}", ack.error);
+        let replay = adoption_chat_call(&state, "ts-adopt", "monitors", ack_params);
+        assert!(replay.ok, "identical valid-owner retry remains idempotent");
+        assert!(handle.lock().unwrap().as_ref().unwrap().task_binding_for("adopt-40").unwrap().acknowledged.contains(old["event_id"].as_str().unwrap()));
+        kill_all_sessions(&state);
     });
 }

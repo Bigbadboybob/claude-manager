@@ -303,7 +303,11 @@ impl Recipient {
     fn current_binding(&self) -> Option<Binding> {
         if let Some((state, uid)) = &self.live {
             let state = state.upgrade()?;
-            let state = state.lock().unwrap_or_else(|p| p.into_inner());
+            let state = match state.try_lock() {
+                Ok(s) => s,
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return None,
+            };
             let s = state.sessions.get(uid)?;
             return marker::binding(s.transcript_path.as_deref(), s.generation);
         }
@@ -312,7 +316,13 @@ impl Recipient {
     fn still_current(&self) -> bool {
         self.live.as_ref().is_none_or(|(state, uid)| {
             state.upgrade().is_some_and(|state| {
-                let state = state.lock().unwrap_or_else(|p| p.into_inner());
+                // Publication may retain task authority guards. Never wait on
+                // the registry in that lock order; this tick can retry later.
+                let state = match state.try_lock() {
+                    Ok(s) => s,
+                    Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => return false,
+                };
                 state.sessions.get(uid).is_some_and(|s| {
                     Arc::ptr_eq(&s.fanout, &self.fanout)
                         && marker::binding(s.transcript_path.as_deref(), s.generation)
@@ -369,6 +379,8 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>) {
         let _guard = gate.lock().unwrap_or_else(|p| p.into_inner());
         let Ok(mut slot) = handle.try_lock() else { return; };
         let Some(store) = slot.as_mut() else { return; };
+        let mut authority = super::task_authority::View::new(store);
+        let store = &mut *authority;
         if store.degraded.is_some() || store.advance_monitors_at(chrono::Utc::now()).is_err() {
             return;
         }
@@ -404,16 +416,23 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>) {
                 let waiting = handle
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .as_ref()
-                    .map_or(0, |store| store.wake_intents_for_session(&uid).len());
+                    .as_mut()
+                    .map_or(0, |store| super::task_authority::View::new(store).wake_intents_for_session(&uid).len());
                 note_skip(&uid, Some(reason), waiting);
                 continue;
             }
         };
-        let (ids, store_root, mut queue) = {
+        let (ids, store_root, mut queue, _authority, previews) = {
             let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
             let Some(store) = slot.as_mut() else { return; };
             if store.degraded.is_some() { return; }
+            let mut authority = super::task_authority::View::new(store);
+            let store = &mut *authority;
+            if store.task_authority_deferred(&store.participant_id(&uid)) {
+                // Unknown is not absent: preserve queued task work unchanged.
+                // Other recipients and ordinary chat RPCs remain available.
+                continue;
+            }
             let ids = store.wake_intents_for_session(&uid);
             let queue = match reconcile_intents(&root, store, &uid, &ids) {
                 Ok(queue) => queue,
@@ -422,15 +441,16 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>) {
                     return;
                 }
             };
-            (ids, store.root.clone(), queue)
+            let previews: BTreeMap<_, _> = ids.iter().filter_map(|i| preview(store, &i.event_id)
+                .map(|p| (i.event_id.clone(), p))).collect();
+            let store_root = store.root.clone();
+            (ids, store_root, queue, authority.take_guards(), previews)
         };
         #[cfg(test)]
         if let Some(hook) = AFTER_RECONCILE.with(|hook| hook.borrow_mut().take()) { hook(); }
-        // Lock order matches the RPC path: delivery gate, then store.
-        let lookup = |id: &str| {
-            let slot = handle.lock().unwrap_or_else(|p| p.into_inner());
-            slot.as_ref().and_then(|store| preview(store, id))
-        };
+        // No blocking state/store reacquisition while task authority is held.
+        // Previews refer to the same immutable messages as this intent batch.
+        let lookup = |id: &str| previews.get(id).cloned();
         if let Err(e) = deliver_queue(
             &root,
             &store_root,
@@ -691,6 +711,7 @@ fn collect(q: &mut Queue, intents: &[WakeIntent]) -> bool {
 /// locks. Previews, status queries and invalid reads cannot consume wake work.
 /// Exact returned IDs preserve filtered/paginated reads and late arrivals.
 pub fn read_boundary(store: &Store, uid: &str, result: &Value) -> io::Result<()> {
+    if store.task_authority_deferred(&store.participant_id(uid)) { return Ok(()); }
     let ids: BTreeSet<_> = result["items"]
         .as_array()
         .into_iter()
@@ -810,6 +831,7 @@ pub fn reconcile(cm_root: &Path, store: &Store) -> io::Result<()> {
 /// Agent read receipts, follows and monitor changes affect only that actor.
 /// Keep offline actors' durable queues until they resume or explicitly cancel.
 pub fn reconcile_session(cm_root: &Path, store: &Store, uid: &str) -> io::Result<()> {
+    if store.task_authority_deferred(&store.participant_id(uid)) { return Ok(()); }
     reconcile_intents(cm_root, store, uid, &store.wake_intents_for_session(uid)).map(|_| ())
 }
 

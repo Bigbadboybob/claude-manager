@@ -213,6 +213,7 @@ impl Store {
         clock: DateTime<Utc>,
     ) -> Result<bool> {
         if monitor.state != "active"
+            || !self.task_monitor_current(actor, monitor)
             || actor == "owner" && self.sync_enabled() && !self.is_coordinator()
         {
             return Ok(false);
@@ -367,6 +368,13 @@ impl Store {
 
     pub fn monitors(&mut self, actor: &str, p: &Value) -> Result<Value> {
         let action = p["action"].as_str().unwrap_or("list");
+        // Check before receipts, replay, scans or acknowledgment writes. A
+        // task's cached subscription is not proof of current scheduler authority.
+        if let Some(m) = self.personal.get(actor).and_then(|s| s.monitors.get(strv(p, "monitor_id"))) {
+            if action != "cancel_all" && !self.task_monitor_current(actor, m) {
+                return Err(err("stale_binding", "Task subscription authority changed or is busy; retry after reconciliation"));
+            }
+        }
         let mutation = ["ack", "cancel", "cancel_all", "dismiss"].contains(&action);
         let op = if mutation {
             let op = self.personal_request(actor, p, &format!("monitors.{action}"))?;
@@ -384,6 +392,7 @@ impl Store {
                 .monitors
                 .values()
                 .filter(|m| m.state != "dismissed")
+                .filter(|m| self.task_monitor_current(actor, m))
                 .map(|m| self.monitor_summary(actor, m))
                 .collect();
             return self.directory_page(actor, p, items);
@@ -585,7 +594,7 @@ impl Store {
         let mut active = 0;
         let mut unacknowledged = 0u64;
         let mut badges = 0u64;
-        for m in state.monitors.values().filter(|m| m.state != "dismissed") {
+        for m in state.monitors.values().filter(|m| m.state != "dismissed" && self.task_monitor_current(actor, m)) {
             active += usize::from(m.state == "active");
             let unseen = self.monitor_unseen_count(actor, m) as u64;
             unacknowledged += unseen;
@@ -600,6 +609,7 @@ impl Store {
             .monitors
             .values()
             .filter(|m| m.state == "expired")
+            .filter(|m| self.task_monitor_current(actor, m))
             .filter_map(|m| {
                 let at = parse_time(m.expires_at.as_deref()?).ok()?;
                 (at >= horizon).then(|| (at, json!({"id":m.id,"scope":m.scope,"mode":m.mode,"expired_at":m.expires_at})))

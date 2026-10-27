@@ -494,14 +494,19 @@ fn reconcile_task(
 /// Refresh every task's fence, channel, name and membership synchronously.
 /// The background loop also runs this so a replacement doesn't need to
 /// discover chat first. Per-task failures are logged, not fatal.
-pub(crate) fn refresh(state: &Arc<Mutex<DaemonState>>) -> Result<Vec<DeferredJoin>, ChatError> {
+/// Applied means the maintenance pass ran, not an effect-time authority proof.
+pub(crate) enum RefreshOutcome {
+    Applied(Vec<DeferredJoin>),
+    Deferred,
+}
+pub(crate) fn refresh(state: &Arc<Mutex<DaemonState>>) -> Result<RefreshOutcome, ChatError> {
     // The old pass captured records here and used them after waiting on the
     // store. Keep the regression seam before the gate: ALL authoritative reads
     // and effects below, including the final active-set sweep, serialize with
     // adoption. A nested messaging RPC skips instead of waiting/reentering.
     #[cfg(test)]
     before_refresh_effects();
-    let Some(guard) = adoption::try_binding_lock() else { return Ok(Vec::new()); };
+    let Some(guard) = adoption::try_binding_lock() else { return Ok(RefreshOutcome::Deferred); };
     let (handle, graph) = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         (
@@ -526,9 +531,9 @@ pub(crate) fn refresh(state: &Arc<Mutex<DaemonState>>) -> Result<Vec<DeferredJoi
         }
     }
     let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(store) = slot.as_mut() else { return Ok(Vec::new()); };
+    let Some(store) = slot.as_mut() else { return Ok(RefreshOutcome::Deferred); };
     if store.messaging_frozen() {
-        return Ok(Vec::new());
+        return Ok(RefreshOutcome::Deferred);
     }
     let mut joins = Vec::new();
     let mut active = BTreeSet::new();
@@ -552,7 +557,7 @@ pub(crate) fn refresh(state: &Arc<Mutex<DaemonState>>) -> Result<Vec<DeferredJoi
         }
     }
     store.fence_task_subscriptions(&active)?;
-    Ok(joins)
+    Ok(RefreshOutcome::Applied(joins))
 }
 
 #[cfg(test)]
@@ -662,7 +667,8 @@ fn forward_joins_locked(
         if !graph.members(&task).contains(&join.uid) { continue; }
         // Keep only the binding gate across network I/O. The task-file read
         // and DaemonState guard above are gone; no store lock is held. Adoption
-        // cannot change this generation until the queued effect has returned.
+        // cannot change this generation during the send attempt. A timeout
+        // can leave the remote outcome unknown; this is not a receiver lease.
         send(&join.actor, &join.params);
     }
 }
@@ -785,7 +791,7 @@ pub fn spawn(state: &Arc<Mutex<DaemonState>>) {
             break;
         };
         match refresh(&state) {
-            Ok(joins) => {
+            Ok(RefreshOutcome::Applied(joins)) => {
                 let sync = state
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -797,6 +803,7 @@ pub fn spawn(state: &Arc<Mutex<DaemonState>>) {
                     });
                 }
             }
+            Ok(RefreshOutcome::Deferred) => {}
             Err(e) => eprintln!("cm task messaging: {e}"),
         }
         drop(state);

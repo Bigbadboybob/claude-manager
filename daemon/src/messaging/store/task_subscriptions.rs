@@ -17,6 +17,20 @@ pub struct TaskBinding {
     pub start_position: Option<u64>,
 }
 impl Store {
+    pub(crate) fn active_task_bindings(&self) -> Vec<TaskBinding> {
+        self.task_bindings.values().filter(|b| b.active).cloned().collect()
+    }
+    pub(crate) fn task_authority_deferred(&self, actor: &str) -> bool {
+        self.task_bindings.values().any(|b| b.active && b.actor == actor
+            && self.task_authority.as_ref().is_some_and(|a| a.get(&b.id) == Some(&super::super::task_authority::Authority::Deferred)))
+    }
+    pub(super) fn task_monitor_current(&self, actor: &str, m: &Monitor) -> bool {
+        m.task_subscription.as_ref().is_none_or(|id| {
+            self.task_authority.as_ref().is_none_or(|a| a.get(id) == Some(&super::super::task_authority::Authority::Current))
+                && self.task_bindings.get(id).is_some_and(|b| b.active && b.actor == actor
+                    && m.id == format!("task-{}-{}", b.id, b.revision))
+        })
+    }
     fn task_binding_path(&self, id: &str) -> Result<PathBuf> {
         Uuid::parse_str(id).map_err(|_| err("invalid_binding", "Invalid subscription identity"))?;
         Ok(self
@@ -201,10 +215,12 @@ impl Store {
         Ok(())
     }
     pub fn task_orientation(&self, actor: &str) -> Vec<Value> {
-        self.task_bindings.values().filter(|b|b.active && b.actor==actor).map(|b|json!({"subscription_id":b.id,"task_id":b.task_id,"channel_id":b.channel_id,"binding_revision":b.revision,"monitor_id":format!("task-{}-{}",b.id,b.revision),"acknowledged_messages":b.acknowledged.len(),"personal_dm_inheritance":false})).collect()
+        self.task_bindings.values().filter(|b| b.active && b.actor == actor
+            && self.task_authority.as_ref().is_none_or(|a| a.get(&b.id) == Some(&super::super::task_authority::Authority::Current)))
+            .map(|b|json!({"subscription_id":b.id,"task_id":b.task_id,"channel_id":b.channel_id,"binding_revision":b.revision,"monitor_id":format!("task-{}-{}",b.id,b.revision),"acknowledged_messages":b.acknowledged.len(),"personal_dm_inheritance":false})).collect()
     }
     pub(super) fn task_monitor_matches(&self, actor: &str, m: &Monitor, id: &str) -> bool {
-        m.task_subscription.as_ref().is_none_or(|task| {
+        self.task_monitor_current(actor, m) && m.task_subscription.as_ref().is_none_or(|task| {
             self.task_bindings.get(task).is_some_and(|b| {
                 b.active
                     && b.actor == actor
@@ -214,6 +230,9 @@ impl Store {
         })
     }
     pub(super) fn acknowledge_task_monitor(&mut self, actor: &str, m: &Monitor) -> Result<()> {
+        if !self.task_monitor_current(actor, m) {
+            return Err(err("stale_binding", "Task subscription authority changed or is busy; retry after reconciliation"));
+        }
         let Some(id) = &m.task_subscription else {
             return Ok(());
         };
