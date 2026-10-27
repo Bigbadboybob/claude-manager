@@ -59,6 +59,38 @@ def ev(id, status, at):
 
 
 class DeliveryHealthTests(unittest.TestCase):
+    def test_untrusted_chronology_degrades_both_surfaces_without_rewriting_receipts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            q = Queue("s", Path(tmp))
+            adapter = Fixture("same")
+            with mock.patch.object(notifications.time, "time", return_value=1000):
+                q.publish("one", "chat", "[one] wake", "[one]")
+                q.change("one", {"pending"}, status="observed")
+            path = q.event_path("one")
+            good = json.loads(path.read_text())
+            for created, updated in [(None, 2000), (2100, 2000), (1000, 3000)]:
+                event = dict(good, created_at=created, updated_at=updated)
+                notifications.atomic_write(path, event)
+                before = path.read_bytes()
+                with mock.patch.object(notifications.time, "time", return_value=2500):
+                    q.health("claude-code", "degraded", reason="channels_disabled", reasons=["channels_disabled"])
+                    health = q.snapshot()["health"]
+                    self.assertEqual(health["status"], "degraded")
+                    self.assertIsNone(health["unobserved"])
+                    self.assertIn("untrusted_notification_chronology", health["reasons"])
+                    diagnosis = asyncio.run(notifications._diagnose(q, adapter, [event]))
+                    self.assertEqual(diagnosis["status"], "degraded")
+                    self.assertIn("channels_disabled", diagnosis["extra"]["reasons"])
+                    self.assertIn("untrusted_notification_chronology", diagnosis["extra"]["reasons"])
+                self.assertEqual(path.read_bytes(), before)
+            for created, updated, now in [(1000, 1000, 2500), (1000, 3000, 3000)]:
+                event = dict(good, created_at=created, updated_at=updated)
+                notifications.atomic_write(path, event)
+                with mock.patch.object(notifications.time, "time", return_value=now):
+                    q.health("claude-code", "ready")
+                    self.assertEqual(q.snapshot()["health"]["status"], "ready")
+                    self.assertEqual(asyncio.run(notifications._diagnose(q, adapter, [event]))["status"], "ready")
+
     def test_stall_is_measured_from_the_latest_observation(self):
         now = 10_000.0
         self.assertFalse(delivery_health([ev("a", "submitted", now - 10)], now)["stalled"])

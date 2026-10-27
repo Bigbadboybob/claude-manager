@@ -11,6 +11,7 @@ import ctypes
 import fcntl
 import hashlib
 import json
+import math
 import os
 import tempfile
 import threading
@@ -50,6 +51,15 @@ def delivery_health(events, now: float | None = None, threshold: float | None = 
     works again, so older losses do not keep the session degraded forever."""
     now = time.time() if now is None else now
     threshold = UNOBSERVED_DEGRADED_S if threshold is None else threshold
+    def timestamp(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
+    for event in events:
+        created = event.get("created_at")
+        updated = event.get("updated_at", created)
+        if (not timestamp(created) or not timestamp(updated) or updated < created
+                or (event.get("status") == "observed" and updated > now)):
+            return {"unobserved": None, "oldest_unobserved_s": None,
+                    "stalled": False, "unobserved_markers": [], "chronology_unknown": True}
     last_observed = max(
         (e.get("updated_at", e.get("created_at", 0)) for e in events
          if e.get("status") == "observed" and receipt_evidence_allowed(e)),
@@ -68,6 +78,7 @@ def delivery_health(events, now: float | None = None, threshold: float | None = 
         "oldest_unobserved_s": None if age is None else round(age),
         "stalled": age is not None and age >= threshold,
         "unobserved_markers": [e.get("marker") for e in stalled],
+        "chronology_unknown": False,
     }
 
 
@@ -301,8 +312,10 @@ class Queue:
                 reasons.extend(transport.get("reasons") or [transport.get("reason") or "degraded"])
             if delivery["stalled"]:
                 reasons.append("unobserved_submissions")
+            if delivery["chronology_unknown"]:
+                reasons.append("untrusted_notification_chronology")
             # Never report a consumer as healthy while its submissions vanish.
-            if delivery["stalled"]:
+            if delivery["stalled"] or delivery["chronology_unknown"]:
                 transport["connected"] = False
             health = {
                 "status": ("degraded" if reasons else
@@ -316,7 +329,7 @@ class Queue:
                 # CM is rotating or handing off this session: pending wakes
                 # wait for the new process (until this time at most).
                 "hold": {"until": hold} if (hold := self.hold_until()) else None,
-                "notifications": sorted(events, key=lambda e: e["created_at"]),
+                "notifications": sorted(events, key=lambda e: e.get("created_at") if isinstance(e.get("created_at"), (int, float)) else 0),
             }
 
     def health(self, engine: str, state: str, **extra):
@@ -388,6 +401,15 @@ async def _diagnose(queue: Queue, adapter, events) -> dict:
             diag = {"diagnostics_error": type(exc).__name__}
     delivery = delivery_health(events)
     reasons = []
+    if delivery["chronology_unknown"]:
+        # A bad census cannot erase an existing degraded diagnosis.
+        try:
+            prior = json.loads((queue.path / "transport.json").read_text())
+            if prior.get("status") == "degraded":
+                reasons.extend(prior.get("reasons") or [prior.get("reason") or "degraded"])
+        except (OSError, ValueError, TypeError):
+            pass
+        reasons.append("untrusted_notification_chronology")
     if diag.get("blocked"):
         reasons.append(diag["blocked"])
     stale = list(diag.get("stale") or [])

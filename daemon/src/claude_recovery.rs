@@ -1676,8 +1676,7 @@ mod tests {
         let uid = "ts-abca-0";
         let id = "123e4567-e89b-12d3-a456-426614174000";
         let state = archived_fixture(uid, dir.path());
-        let path = crate::transcript_detect::claude_transcript_path(dir.path(), id).unwrap();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let path = dir.path().join(format!("{id}.jsonl"));
         fs::write(&path, b"").unwrap();
         FAKE.with(|f| *f.borrow_mut() = Some(FakeEffects {
             roster:Roster { rows:json!([{"kind":"background","sessionId":id,"cwd":dir.path()}]) },
@@ -1693,6 +1692,7 @@ mod tests {
         assert!(load_receipt(uid).unwrap().is_none());
         drop(claim);
         crate::control::methods::recovery_test_restore_program(true);
+        crate::control::methods::recovery_test_transcript(Some(path.clone()));
         let result = crate::control::methods::add_session(&state, &json!({
             "uid":"ts-abcb-0", "workspace_id":"workspace", "label":"resume", "engine":"claude-code", "resume_id":id,
             "model":"test-model", "effort":"xhigh"
@@ -1700,9 +1700,8 @@ mod tests {
         assert_eq!(result["session_uid"], uid);
         let _ = state.lock().unwrap().sessions.get_mut(uid).unwrap().kill();
         crate::control::methods::recovery_test_restore_program(false);
+        crate::control::methods::recovery_test_transcript(None);
         FAKE.with(|f| *f.borrow_mut() = None);
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_dir(path.parent().unwrap());
     }
 
     #[test]

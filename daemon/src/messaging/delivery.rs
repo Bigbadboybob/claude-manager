@@ -956,6 +956,7 @@ mod tests {
         let file = fs::read_dir(queue).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "json")).unwrap();
         let mut event: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
         event["status"] = json!("submitted");
+        event["created_at"] = json!(1.0);
         event["updated_at"] = json!(1.0);
         atomic_replace(&file, &event).unwrap();
         let _busy = store.lock().unwrap();
