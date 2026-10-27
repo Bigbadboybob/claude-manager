@@ -646,6 +646,9 @@ pub(crate) fn start_session_with_spawn_fn(
 ) -> MethodResult {
     let p: StartSessionParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
+    if let Some(reason) = crate::claude_recovery::admission_refusal(&p.uid) {
+        return Err((ErrorCode::Conflict, reason));
+    }
 
     // Serialize the entire spawn/registry insertion with retirement of both
     // this UID and its manager. A late child cannot appear after drain proof.
@@ -3557,6 +3560,9 @@ pub fn set_transcript_path(
             ErrorCode::InvalidParams,
             "transcript_path must be non-empty".into(),
         ));
+    }
+    if let Some(reason) = crate::claude_recovery::admission_refusal(&p.session_uid) {
+        return Err((ErrorCode::Conflict, reason));
     }
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     let session = state.sessions.get_mut(&p.session_uid).ok_or_else(|| {
@@ -12062,6 +12068,9 @@ pub fn revive_session(
 ) -> MethodResult {
     let p: ReviveSessionParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
+    if let Some(reason) = crate::claude_recovery::admission_refusal(&p.uid) {
+        return Err((ErrorCode::Conflict, reason));
+    }
 
     // H3: drain gate — a revive during drain would mint a child the
     // imminent restart immediately kills (and, pre-H1, could lose).

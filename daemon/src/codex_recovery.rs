@@ -139,6 +139,7 @@ pub(crate) fn tick(state: &Arc<Mutex<DaemonState>>) {
             if s.session_type != "codex" || s.last_exit.kernel_set()
                 || s.workflow_run_id.is_some() || s.continuous_task_id.is_some()
                 || crate::rotation::in_progress(uid) || crate::handoff::in_progress(uid)
+                || crate::claude_recovery::admission_blocked(uid)
                 || in_progress(uid)
             { return None; }
             let agent = crate::agent_state::current(s);

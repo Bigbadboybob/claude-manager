@@ -921,6 +921,9 @@ fn pause_left() -> Option<Duration> {
 /// (`handoff::tick`), so the two cannot both get in (lock order state →
 /// handoff → rotation).
 pub(crate) fn admit(_locked: &DaemonState, uid: &str, rotation: Rotation) -> Result<(), String> {
+    if crate::claude_recovery::admission_blocked(uid) {
+        return Err("Claude native background recovery is running or needs reconciliation".into());
+    }
     if crate::codex_recovery::in_progress(uid) {
         return Err("native Codex continuation recovery is running".into());
     }
