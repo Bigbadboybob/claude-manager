@@ -2325,9 +2325,7 @@ pub(crate) fn kill_with_recovery_identity(
     who: &str,
 ) -> Result<(), String> {
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-    if state.draining || state.restarting {
-        return Err("daemon is draining or restarting".into());
-    }
+    crate::claude_recovery::validate_holder_effect(&state, identity)?;
     let session = state.sessions.get_mut(&identity.uid).ok_or_else(|| "session exited before holder stop".to_string())?;
     if session.workspace_id != identity.workspace_id
         || session.task_id != identity.task_id
@@ -3781,6 +3779,13 @@ pub fn set_workflow_context(
                 .into(),
         ));
     }
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.uid);
+    let _recovery_read = recovery_gate.try_read().map_err(|_| (
+        ErrorCode::Conflict, "session is reserved for background recovery".into()
+    ))?;
+    if let Some(reason) = crate::claude_recovery::admission_refusal(&p.uid) {
+        return Err((ErrorCode::Conflict, reason));
+    }
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     let session = match state.sessions.get_mut(&p.uid) {
         Some(s) => s,
@@ -5070,6 +5075,20 @@ pub fn start_workflow(
     // pre-save failure never orphans a tag on a pre-existing session.
     let role_sessions_param: std::collections::BTreeMap<String, String> =
         p.role_sessions.clone().unwrap_or_default();
+    // Retain reservations through validation, run persistence and tagging.
+    // Nonblocking acquisition avoids lock inversion with the binding mutex.
+    let bound_recovery_uids: std::collections::BTreeSet<_> = role_sessions_param.values().cloned().collect();
+    let bound_recovery_gates: Vec<_> = bound_recovery_uids.iter()
+        .map(|uid| crate::claude_recovery::lifecycle_gate(uid)).collect();
+    let mut _bound_recovery_reads = Vec::new();
+    for (uid, gate) in bound_recovery_uids.iter().zip(&bound_recovery_gates) {
+        _bound_recovery_reads.push(gate.try_read().map_err(|_| (
+            ErrorCode::Conflict, format!("session '{uid}' is reserved for background recovery")
+        ))?);
+        if let Some(reason) = crate::claude_recovery::admission_refusal(uid) {
+            return Err((ErrorCode::Conflict, reason));
+        }
+    }
     let mut bound_bindings: std::collections::BTreeMap<String, RoleBinding> =
         std::collections::BTreeMap::new();
     let mut bound_baselines: std::collections::BTreeMap<String, MessageBaseline> =
@@ -11903,6 +11922,16 @@ pub(crate) fn restore_one_session_launch(
     task_models: Option<&TaskModelCache>,
     fork: bool,
 ) -> MethodResult {
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&e.uid);
+    let _recovery_read = (!crate::claude_recovery::internal_active(&e.uid)
+        && !crate::claude_recovery::read_context_active(&e.uid))
+        .then(|| recovery_gate.read().unwrap_or_else(|p| p.into_inner()));
+    let _recovery_context = if !crate::claude_recovery::read_context_active(&e.uid) {
+        Some(crate::claude_recovery::read_context(&e.uid))
+    } else { None };
+    if let Some(reason) = crate::claude_recovery::admission_refusal(&e.uid) {
+        return Err((ErrorCode::Conflict, reason));
+    }
     let resume = e.transcript_id.as_deref();
 
     // Snapshot existing transcript ids BEFORE the spawn so the detector armed

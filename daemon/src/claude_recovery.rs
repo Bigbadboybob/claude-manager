@@ -31,6 +31,7 @@ pub struct Identity {
     pub workspace_id: String,
     pub canonical_cwd: String,
     pub daemon_id: String,
+    #[serde(serialize_with = "serialize_native_id", deserialize_with = "deserialize_native_id")]
     pub native_session_id: String,
     pub transcript_generation: u64,
     pub holder_incarnation: Option<u64>,
@@ -40,6 +41,13 @@ pub struct Identity {
     pub child_start_time: u64,
     pub background_pid: u32,
     pub background_start_time: u64,
+}
+
+fn serialize_native_id<S: serde::Serializer>(id: &str, serializer: S) -> Result<S::Ok, S::Error> {
+    if id.is_empty() { serializer.serialize_none() } else { serializer.serialize_str(id) }
+}
+fn deserialize_native_id<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -55,6 +63,7 @@ struct Snapshot {
     identity: Identity,
     worktree: PathBuf,
     background_jobs: usize,
+    background_complete: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -358,6 +367,20 @@ fn proc_argv(pid: u32) -> io::Result<Vec<String>> {
         .collect()
 }
 
+fn fresh_argv(argv: &[String]) -> bool {
+    let Some(exe) = argv.first().and_then(|s| Path::new(s).file_name()).and_then(|s| s.to_str()) else { return false };
+    (exe == "claude" || exe.starts_with("claude-")) && !argv.iter().skip(1).any(|arg| {
+        matches!(arg.as_str(), "--resume" | "-r" | "--continue" | "-c")
+            || arg.starts_with("--resume=") || arg.starts_with("--continue=")
+    })
+}
+
+fn fresh_process(pid: u32) -> Result<bool, String> {
+    #[cfg(test)]
+    if tests::fake_fresh() { return Ok(true); }
+    proc_argv(pid).map(|argv| fresh_argv(&argv)).map_err(|e| format!("fresh process argv unavailable: {e}"))
+}
+
 fn host_argv_matches(argv: &[String], id: &str) -> bool {
     if !exact_session_id(id) || argv.len() < 3 {
         return false;
@@ -385,6 +408,8 @@ fn host_argv_matches(argv: &[String], id: &str) -> bool {
 }
 
 fn host_proof(id: &str, holder_pid: Option<u32>) -> io::Result<BackgroundHost> {
+    #[cfg(test)]
+    if let Some(host) = tests::fake_host() { return Ok(host); }
     if !exact_session_id(id) {
         return Err(io::Error::other("invalid native session ID"));
     }
@@ -444,27 +469,33 @@ fn host_proof(id: &str, holder_pid: Option<u32>) -> io::Result<BackgroundHost> {
 }
 
 fn run_command(cwd: &Path, args: &[&str]) -> io::Result<Vec<u8>> {
+    struct ChildGuard(std::process::Child, bool);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if !self.1 {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
     let mut file = tempfile::tempfile()?;
-    let mut child = Command::new("claude")
+    let mut child = ChildGuard(Command::new("claude")
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::from(file.try_clone()?))
         .stderr(Stdio::null())
-        .spawn()?;
+        .spawn()?, false);
     let deadline = Instant::now() + COMMAND_TIMEOUT;
     let status = loop {
         if file.metadata()?.len() > MAX_COMMAND_OUTPUT {
-            let _ = child.kill();
-            let _ = child.wait();
             return Err(io::Error::other("Claude command output too large"));
         }
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = child.0.try_wait()? {
+            child.1 = true;
             break status;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
             return Err(io::Error::new(io::ErrorKind::TimedOut, "Claude command timed out"));
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -482,6 +513,8 @@ fn run_command(cwd: &Path, args: &[&str]) -> io::Result<Vec<u8>> {
 }
 
 fn roster(cwd: &Path) -> io::Result<Roster> {
+    #[cfg(test)]
+    if let Some(roster) = tests::fake_roster() { return Ok(roster); }
     let bytes = run_command(cwd, &["agents", "--json"])?;
     let rows: Value = serde_json::from_slice(&bytes)
         .map_err(|e| io::Error::other(format!("invalid Claude roster: {e}")))?;
@@ -502,21 +535,19 @@ fn roster_match(roster: &Roster, id: &str, cwd: &Path) -> io::Result<bool> {
         .ok_or_else(|| io::Error::other("invalid Claude roster"))?;
     let mut found = 0;
     for row in rows {
-        if !row.is_object() || row.get("kind").and_then(Value::as_str).is_none() {
-            return Err(io::Error::other("Claude roster contains malformed row"));
+        // Only the observed background schema is proof. An unfamiliar kind or
+        // truncated ID cannot establish that the target is absent.
+        if row.get("kind").and_then(Value::as_str) != Some("background") {
+            return Err(io::Error::other("Claude roster contains unknown or malformed kind"));
         }
-        if row["kind"] != "background" || row["sessionId"] != id {
-            if row["kind"] == "background"
-                && (row.get("sessionId").and_then(Value::as_str).is_none()
-                    || row.get("cwd").and_then(Value::as_str).is_none())
-            {
-                return Err(io::Error::other("Claude roster background row is incomplete"));
-            }
+        let row_id = row.get("sessionId").and_then(Value::as_str)
+            .filter(|id| exact_session_id(id))
+            .ok_or_else(|| io::Error::other("Claude roster background ID is missing or incomplete"))?;
+        let path = row.get("cwd").and_then(Value::as_str)
+            .ok_or_else(|| io::Error::other("Claude roster background cwd is missing"))?;
+        if row_id != id {
             continue;
         }
-        let path = row["cwd"]
-            .as_str()
-            .ok_or_else(|| io::Error::other("background roster omitted cwd"))?;
         if canonical(Path::new(path))? == expected {
             found += 1;
         } else {
@@ -530,13 +561,48 @@ fn roster_match(roster: &Roster, id: &str, cwd: &Path) -> io::Result<bool> {
     }
 }
 
+fn no_prior_native_identity(state: &DaemonState, uid: &str) -> Result<bool, String> {
+    let record = crate::resume_identity::lookup_uid(state, uid)
+        .map_err(|e| format!("resume identity archive unavailable: {e}"))?;
+    Ok(record.is_some_and(|r| r.entry.generation == 0 && r.entry.transcript_id.is_none()
+        && r.entry.transcript_path.is_none() && r.transcript_ids.is_empty()))
+}
+
 fn snapshot(state: &DaemonState, uid: &str) -> Result<Snapshot, String> {
     let Some(session) = state.sessions.get(uid) else {
         let tomb = state
             .recently_exited
             .iter()
-            .find(|t| t.session_uid == uid)
-            .ok_or_else(|| format!("session '{uid}' is not known on this daemon"))?;
+            .find(|t| t.session_uid == uid);
+        let Some(tomb) = tomb else {
+            let record = crate::resume_identity::lookup_uid(state, uid)
+                .map_err(|e| format!("resume identity archive unavailable: {e}"))?
+                .ok_or_else(|| format!("session '{uid}' is not known on this daemon"))?;
+            let entry = record.entry;
+            if entry.session_type != "claude-code" {
+                return Err("background recovery is only supported for Claude sessions".into());
+            }
+            if entry.workflow_run_id.is_some() || entry.continuous_task_id.is_some() {
+                return Err("session lifecycle is owned by workflow/continuous supervision".into());
+            }
+            let cwd = canonical(&record.worktree_path).map_err(|e| format!("canonical cwd: {e}"))?;
+            let native_session_id = match entry.transcript_id.clone() {
+                Some(id) if exact_session_id(&id) => id,
+                None if no_prior_native_identity(state, uid)? => String::new(),
+                _ => return Err("archived session has no unambiguous native transcript identity".into()),
+            };
+            return Ok(Snapshot {
+                identity: Identity {
+                    uid: uid.to_string(), task_id: entry.task_id,
+                    workspace_id: record.workspace_id, canonical_cwd: cwd.to_string_lossy().into_owned(),
+                    daemon_id: daemon_identity()?, native_session_id,
+                    transcript_generation: entry.generation, holder_incarnation: None,
+                    holder_pid: None, holder_start_time: None, child_pid: 0, child_start_time: 0,
+                    background_pid: 0, background_start_time: 0,
+                },
+                worktree: cwd, background_jobs: 0, background_complete: false,
+            });
+        };
         if tomb.session_type != "claude-code" {
             return Err("background recovery is only supported for Claude sessions".into());
         }
@@ -549,8 +615,12 @@ fn snapshot(state: &DaemonState, uid: &str) -> Result<Snapshot, String> {
         let native_session_id = tomb
             .transcript_path
             .as_deref()
-            .and_then(crate::session::transcript_id_from_path)
-            .ok_or_else(|| "exited session has no bound native transcript identity".to_string())?;
+            .and_then(crate::session::transcript_id_from_path);
+        let native_session_id = match native_session_id {
+            Some(id) => id,
+            None if tomb.transcript_path.is_none() && no_prior_native_identity(state, uid)? => String::new(),
+            _ => return Err("exited session has no unambiguous native transcript identity".into()),
+        };
         return Ok(Snapshot {
             identity: Identity {
                 uid: uid.to_string(),
@@ -570,6 +640,7 @@ fn snapshot(state: &DaemonState, uid: &str) -> Result<Snapshot, String> {
             },
             worktree: cwd,
             background_jobs: 0,
+            background_complete: false,
         });
     };
     if session.session_type != "claude-code" {
@@ -584,8 +655,13 @@ fn snapshot(state: &DaemonState, uid: &str) -> Result<Snapshot, String> {
     let native_session_id = session
         .transcript_path
         .as_deref()
-        .and_then(crate::session::transcript_id_from_path)
-        .ok_or_else(|| "session has no bound native transcript identity".to_string())?;
+        .and_then(crate::session::transcript_id_from_path);
+    let native_session_id = match native_session_id {
+        Some(id) => id,
+        None if session.transcript_path.is_none() && session.generation == 0
+            && no_prior_native_identity(state, uid)? && fresh_process(session.pid as u32)? => String::new(),
+        _ => return Err("session has no unambiguous native transcript identity".into()),
+    };
     let child_start_time = crate::adopt::proc_starttime(session.pid as libc::pid_t)
         .map_err(|e| format!("child start time: {e}"))?;
     let (holder_pid, holder_start_time) = holder_identity();
@@ -606,7 +682,9 @@ fn snapshot(state: &DaemonState, uid: &str) -> Result<Snapshot, String> {
         background_pid: 0,
         background_start_time: 0,
     };
-    Ok(Snapshot { identity, worktree: cwd, background_jobs: agent.background.jobs.len() })
+    Ok(Snapshot { identity, worktree: cwd,
+        background_jobs: agent.background.jobs.len() + agent.background.crons.len(),
+        background_complete: agent.background.complete })
 }
 
 fn lifecycle_refusal(state: &DaemonState, uid: &str) -> Option<String> {
@@ -618,6 +696,14 @@ fn lifecycle_refusal(state: &DaemonState, uid: &str) -> Option<String> {
     }
     if crate::handoff::in_progress(uid) {
         return Some("session handoff is already running".into());
+    }
+    if let Err((_, reason)) = crate::continuous::adoption::session_available(uid) {
+        return Some(reason);
+    }
+    if let Some(tomb) = state.recently_exited.iter().find(|t| t.session_uid == uid && !state.sessions.contains_key(uid)) {
+        if tomb.workflow_run_id.is_some() || tomb.continuous_task_id.is_some() {
+            return Some("session lifecycle is owned by workflow/continuous supervision".into());
+        }
     }
     state.sessions.get(uid).and_then(|s| {
         if s.workflow_run_id.is_some() {
@@ -656,21 +742,22 @@ fn same_stable_identity(a: &Identity, b: &Identity) -> bool {
         && a.holder_incarnation == b.holder_incarnation
 }
 
+/// Called with the daemon state lock held through the holder signal.
+pub(crate) fn validate_holder_effect(state: &DaemonState, identity: &Identity) -> Result<(), String> {
+    if let Some(reason) = lifecycle_refusal(state, &identity.uid) {
+        return Err(reason);
+    }
+    let current = snapshot(state, &identity.uid)?;
+    if !same_bound_identity(&current.identity, identity) {
+        return Err("CM session identity changed before holder stop".into());
+    }
+    Ok(())
+}
+
 fn revalidate_bound(state_arc: &Arc<Mutex<DaemonState>>, identity: &Identity) -> Result<(), String> {
     let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-    if state.draining || state.restarting {
-        return Err("daemon is draining or restarting".into());
-    }
-    if crate::rotation::in_progress(&identity.uid) {
-        return Err("transcript rotation is running".into());
-    }
-    if crate::handoff::in_progress(&identity.uid) {
-        return Err("session handoff is running".into());
-    }
-    if let Some(session) = state.sessions.get(&identity.uid) {
-        if session.workflow_run_id.is_some() || session.continuous_task_id.is_some() {
-            return Err("session lifecycle is owned by workflow/continuous supervision".into());
-        }
+    if let Some(reason) = lifecycle_refusal(&state, &identity.uid) {
+        return Err(reason);
     }
     let current = snapshot(&state, &identity.uid)?;
     if !same_bound_identity(&current.identity, identity) {
@@ -681,14 +768,8 @@ fn revalidate_bound(state_arc: &Arc<Mutex<DaemonState>>, identity: &Identity) ->
 
 fn revalidate_stable_bound(state_arc: &Arc<Mutex<DaemonState>>, identity: &Identity) -> Result<(), String> {
     let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-    if state.draining || state.restarting {
-        return Err("daemon is draining or restarting".into());
-    }
-    if crate::rotation::in_progress(&identity.uid) {
-        return Err("transcript rotation is running".into());
-    }
-    if crate::handoff::in_progress(&identity.uid) {
-        return Err("session handoff is running".into());
+    if let Some(reason) = lifecycle_refusal(&state, &identity.uid) {
+        return Err(reason);
     }
     let current = snapshot(&state, &identity.uid)?;
     if !same_stable_identity(&current.identity, identity) {
@@ -707,6 +788,9 @@ fn process_gone(pid: u32, start: u64) -> Result<bool, String> {
 }
 
 fn verify_native_stopped(identity: &Identity) -> Result<(), String> {
+    if identity.native_session_id.is_empty() { return verify_no_native_background(identity); }
+    #[cfg(test)]
+    if let Some(result) = tests::fake_post_stop() { return result; }
     let cwd = Path::new(&identity.canonical_cwd);
     let roster = roster(cwd).map_err(|e| format!("Claude roster unavailable after stop: {e}"))?;
     match roster_match(&roster, &identity.native_session_id, cwd) {
@@ -723,6 +807,12 @@ fn verify_native_stopped(identity: &Identity) -> Result<(), String> {
 fn verify_no_native_background(identity: &Identity) -> Result<(), String> {
     let cwd = Path::new(&identity.canonical_cwd);
     let roster = roster(cwd).map_err(|e| format!("Claude roster unavailable: {e}"))?;
+    if identity.native_session_id.is_empty() {
+        return match roster.rows.as_array() {
+            Some(rows) if rows.is_empty() => Ok(()),
+            _ => Err("native roster is not strictly empty for an unbound session".into()),
+        };
+    }
     match roster_match(&roster, &identity.native_session_id, cwd)
         .map_err(|e| format!("Claude roster unreadable: {e}"))?
     {
@@ -741,14 +831,6 @@ pub(crate) fn preflight(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) -> Value
         if let Some(reason) = lifecycle_refusal(&state, uid) {
             return json!({"status":"unavailable","identity":Value::Null,"message":reason});
         }
-        if let Some(tomb) = state.recently_exited.iter().find(|t| t.session_uid == uid) {
-            if tomb.workflow_run_id.is_some() {
-                return json!({"status":"unavailable","identity":Value::Null,"message":"workflow participant owns this lifecycle"});
-            }
-            if tomb.continuous_task_id.is_some() {
-                return json!({"status":"unavailable","identity":Value::Null,"message":"continuous-task scheduler owns this lifecycle"});
-            }
-        }
         if admission_blocked(uid) {
             return json!({"status":"unavailable","identity":Value::Null,"message":"a recovery receipt is already pending or unknown; reconcile it first"});
         }
@@ -761,6 +843,15 @@ pub(crate) fn preflight(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) -> Value
         Ok(roster) => roster,
         Err(e) => return json!({"status":"unavailable","identity":Value::Null,"message":format!("Claude roster unavailable: {e}")}),
     };
+    if snap.identity.native_session_id.is_empty() {
+        if snap.identity.child_pid == 0 || !snap.background_complete || snap.background_jobs != 0 {
+            return json!({"status":"unavailable","identity":Value::Null,"message":"fresh session needs a complete empty daemon background census"});
+        }
+        if !roster.rows.as_array().is_some_and(Vec::is_empty) {
+            return json!({"status":"unavailable","identity":Value::Null,"message":"fresh session needs a strictly empty native roster"});
+        }
+        return json!({"status":"normal","identity":snap.identity,"message":"fresh session has no bound identity or background work; guarded restart"});
+    }
     let listed = match roster_match(&roster, &snap.identity.native_session_id, &snap.worktree) {
         Ok(value) => value,
         Err(e) => return json!({"status":"unavailable","identity":Value::Null,"message":format!("Claude roster evidence unavailable: {e}")}),
@@ -786,6 +877,8 @@ fn identity_from_value(value: &Value) -> Result<Identity, String> {
 }
 
 fn mark(uid: &str, identity: &Identity, phase: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if tests::fail_checkpoint(phase) { return Err(format!("injected checkpoint failure: {phase}")); }
     save_receipt(uid, &Receipt { version: 1, identity: identity.clone(), phase: phase.into(), updated_at: now() })
         .map_err(|e| format!("persist recovery checkpoint: {e}"))
 }
@@ -871,6 +964,13 @@ pub(crate) fn confirm(
             EffectStep::PreHolderRecheck => {
                 revalidate_bound(state_arc, &identity)?;
                 if normal_restart {
+                    if identity.native_session_id.is_empty() {
+                        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                        let snap = snapshot(&state, &uid)?;
+                        if !snap.background_complete || snap.background_jobs != 0 {
+                            return Err("fresh session background census is incomplete or nonempty".into());
+                        }
+                    }
                     return verify_no_native_background(&identity);
                 }
                 let host = host_proof(&identity.native_session_id, identity.holder_pid)
@@ -908,6 +1008,8 @@ pub(crate) fn confirm(
                 if normal_restart {
                     return Ok(());
                 }
+                #[cfg(test)]
+                if let Some(result) = tests::fake_stop() { return result; }
                 run_command(Path::new(&identity.canonical_cwd), &["stop", &identity.native_session_id])
                     .map(|_| ())
                     .map_err(|e| format!("native stop outcome is unknown: {e}"))
@@ -916,6 +1018,8 @@ pub(crate) fn confirm(
                 if normal_restart { Ok(()) } else { verify_native_stopped(&identity) }
             }
             EffectStep::Revive => {
+                #[cfg(test)]
+                if let Some(result) = tests::fake_revive() { return result; }
                 let _internal = internal(&uid);
                 let revive_params = json!({
                     "uid": uid,
@@ -923,7 +1027,7 @@ pub(crate) fn confirm(
                     "worktree_path": identity.canonical_cwd,
                     "session_type": "claude-code",
                     "task_id": identity.task_id,
-                    "transcript_id": identity.native_session_id,
+                    "transcript_id": if identity.native_session_id.is_empty() { Value::Null } else { json!(identity.native_session_id) },
                 });
                 crate::control::methods::revive_session(state_arc, &revive_params)
                     .map(|_| ())
@@ -997,12 +1101,92 @@ pub(crate) fn status(uid: &str) -> Result<Value, (ErrorCode, String)> {
 mod tests {
     use super::*;
 
+    struct FakeEffects {
+        roster: Roster,
+        host: BackgroundHost,
+        fail_phase: Option<&'static str>,
+        fail_stop: bool,
+        fail_proof: bool,
+        fail_revive: bool,
+        stops: usize,
+        revives: usize,
+    }
+    thread_local! { static FAKE: RefCell<Option<FakeEffects>> = const { RefCell::new(None) }; }
+    pub(super) fn fake_roster() -> Option<Roster> { FAKE.with(|f| f.borrow().as_ref().map(|f| f.roster.clone())) }
+    pub(super) fn fake_host() -> Option<BackgroundHost> { FAKE.with(|f| f.borrow().as_ref().map(|f| f.host.clone())) }
+    pub(super) fn fake_fresh() -> bool { FAKE.with(|f| f.borrow().is_some()) }
+    pub(super) fn fail_checkpoint(phase: &str) -> bool { FAKE.with(|f| f.borrow().as_ref().is_some_and(|f| f.fail_phase == Some(phase))) }
+    pub(super) fn fake_stop() -> Option<Result<(), String>> { FAKE.with(|f| f.borrow_mut().as_mut().map(|f| { f.stops += 1; if f.fail_stop { Err("injected timeout".into()) } else { Ok(()) } })) }
+    pub(super) fn fake_post_stop() -> Option<Result<(), String>> { FAKE.with(|f| f.borrow().as_ref().map(|f| if f.fail_proof { Err("injected unreadable roster".into()) } else { Ok(()) })) }
+    pub(super) fn fake_revive() -> Option<Result<(), String>> { FAKE.with(|f| f.borrow_mut().as_mut().map(|f| { f.revives += 1; if f.fail_revive { Err("injected revive failure".into()) } else { Ok(()) } })) }
+
+    fn archived_fixture(uid: &str, dir: &Path) -> Arc<Mutex<DaemonState>> {
+        let mut state = DaemonState::new();
+        state.daemon_sessions_path = Some(dir.join("daemon-sessions.json"));
+        let entry = serde_json::from_value(json!({"uid":uid, "label":"archive",
+            "session_type":"claude-code", "transcript_id":"123e4567-e89b-12d3-a456-426614174000",
+            "task_id":"task", "generation":7})).unwrap();
+        crate::resume_identity::remember(&state, crate::resume_identity::Record {
+            workspace_id:"workspace".into(), worktree_path:dir.to_path_buf(),
+            entry, transcript_ids:Default::default(),
+        }).unwrap();
+        crate::resume_identity::persist(&state).unwrap();
+        Arc::new(Mutex::new(state))
+    }
+
+    #[test]
+    fn confirm_restart_retries_and_effect_failures_keep_durable_fence() {
+        for (suffix, phase, stop_error, proof_error, revive_error, expected, receipt, stops, revives) in [
+            ("success", None, false, false, false, "revived", "revived", 1, 1),
+            ("holder_checkpoint", Some("holder_stopped"), false, false, false, "unknown", "confirmed", 0, 0),
+            ("native_checkpoint", Some("native_stop_ready"), false, false, false, "unknown", "holder_stopped", 0, 0),
+            ("stop_timeout", None, true, false, false, "unknown", "native_stop_ready", 1, 0),
+            ("proof_error", None, false, true, false, "unknown", "native_stop_ready", 1, 0),
+            ("crash_after_stop", Some("native_stopped"), false, false, false, "unknown", "native_stop_ready", 1, 0),
+            ("revive_error", None, false, false, true, "partial", "partial", 1, 1),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let uid = format!("ts-recovery-{suffix}");
+            let path = receipt_path(&uid).unwrap();
+            let _ = fs::remove_file(&path);
+            let state = archived_fixture(&uid, dir.path());
+            FAKE.with(|f| *f.borrow_mut() = Some(FakeEffects {
+                roster: Roster { rows: json!([{"kind":"background", "sessionId":"123e4567-e89b-12d3-a456-426614174000", "cwd":dir.path()}]) },
+                host: BackgroundHost { pid: 123, start: 456 }, fail_phase:phase,
+                fail_stop:stop_error, fail_proof:proof_error, fail_revive:revive_error, stops:0, revives:0,
+            }));
+            let pre = preflight(&state, &uid);
+            assert_eq!(pre["status"], "offer");
+            let identity = pre["identity"].clone();
+            let result = confirm(&state, &identity, true).unwrap();
+            assert_eq!(result["status"], expected, "{suffix}");
+            assert_eq!(load_receipt(&uid).unwrap().unwrap().phase, receipt);
+            let mut restarted = DaemonState::new();
+            restarted.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
+            let retry = confirm(&Arc::new(Mutex::new(restarted)), &identity, true);
+            if expected == "revived" { assert!(retry.is_ok()); } else { assert!(retry.is_err()); }
+            FAKE.with(|f| { let f = f.borrow(); let f = f.as_ref().unwrap(); assert_eq!(f.stops, stops); assert_eq!(f.revives, revives); });
+            if expected != "revived" {
+                assert!(admission_blocked(&uid));
+                FAKE.with(|f| { let mut f = f.borrow_mut(); let f = f.as_mut().unwrap(); f.fail_proof = false; f.fail_phase = None; });
+                assert_eq!(reconcile(&uid, &identity, "clear").unwrap()["status"], "cleared");
+                assert!(!admission_blocked(&uid));
+            }
+            FAKE.with(|f| *f.borrow_mut() = None);
+            let _ = fs::remove_file(path);
+        }
+    }
+
     #[test]
     fn host_argv_requires_exact_single_session_id() {
         let id = "123e4567-e89b-12d3-a456-426614174000";
         assert!(host_argv_matches(&vec!["claude".into(), "bg-pty-host".into(), "--session-id".into(), id.into()], id));
         assert!(!host_argv_matches(&vec!["claude".into(), "bg-pty-host".into(), "--session-id".into(), id.into(), "--session-id".into(), id.into()], id));
         assert!(!host_argv_matches(&vec!["claude".into(), "bg-pty-host".into(), "--session-id".into(), "other".into()], id));
+        assert!(fresh_argv(&["claude".into(), "--verbose".into()]));
+        assert!(!fresh_argv(&["claude".into(), "--resume".into(), id.into()]));
+        assert!(!fresh_argv(&["claude".into(), "--continue".into()]));
+        assert!(!fresh_argv(&["sh".into()]));
     }
 
     #[test]
@@ -1025,6 +1209,99 @@ mod tests {
         let id = "123e4567-e89b-12d3-a456-426614174000";
         let roster = Roster { rows: json!([{}]) };
         assert!(roster_match(&roster, id, dir.path()).is_err());
+        for row in [
+            json!({"kind":"unknown", "sessionId":id, "cwd":dir.path()}),
+            json!({"kind":"background", "sessionId":&id[..8], "cwd":dir.path()}),
+        ] {
+            assert!(roster_match(&Roster { rows: json!([row]) }, id, dir.path()).is_err());
+        }
+    }
+
+    #[test]
+    fn fresh_unbound_restart_requires_empty_native_roster_and_preserves_null_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = Identity { uid:"ts-fresh-proof".into(), task_id:None,
+            workspace_id:"w".into(), canonical_cwd:dir.path().to_string_lossy().into_owned(),
+            daemon_id:"d".into(), native_session_id:String::new(), transcript_generation:0,
+            holder_incarnation:None, holder_pid:None, holder_start_time:None,
+            child_pid:10, child_start_time:11, background_pid:0, background_start_time:0 };
+        let serialized = serde_json::to_value(&identity).unwrap();
+        assert!(serialized["native_session_id"].is_null());
+        assert_eq!(identity_from_value(&serialized).unwrap(), identity);
+        FAKE.with(|f| *f.borrow_mut() = Some(FakeEffects {
+            roster:Roster { rows:json!([]) }, host:BackgroundHost { pid:1, start:1 },
+            fail_phase:None, fail_stop:false, fail_proof:false, fail_revive:false, stops:0, revives:0,
+        }));
+        assert!(verify_no_native_background(&identity).is_ok());
+        for rows in [json!([{}]), json!([{"kind":"unknown"}]),
+            json!([{"kind":"background", "sessionId":"123e4567-e89b-12d3-a456-426614174000", "cwd":dir.path()}])] {
+            FAKE.with(|f| f.borrow_mut().as_mut().unwrap().roster.rows = rows);
+            assert!(verify_no_native_background(&identity).is_err());
+        }
+        FAKE.with(|f| *f.borrow_mut() = None);
+    }
+
+    #[test]
+    fn preflight_fresh_live_requires_complete_census_and_no_prior_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let uid = "ts-fresh-preflight-fixture";
+        let mut params = crate::session::SpawnParams::new(uid, "fresh", "/bin/sleep");
+        params.args = vec!["60".into()];
+        params.workspace_id = "w".into();
+        params.session_type = "claude-code".into();
+        let session = crate::session::PendingSession::spawn(params).unwrap().arm_reaper(None).unwrap();
+        let mut state = DaemonState::new();
+        state.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
+        let mut workspace = crate::manifest::ManifestWorkspace::default();
+        workspace.id = "w".into();
+        workspace.worktree_path = Some(dir.path().to_path_buf());
+        state.workspaces.insert("w".into(), workspace);
+        let entry = session.to_manifest_entry();
+        crate::resume_identity::remember(&state, crate::resume_identity::Record {
+            workspace_id:"w".into(), worktree_path:dir.path().to_path_buf(), entry,
+            transcript_ids:Default::default(),
+        }).unwrap();
+        state.sessions.insert(uid.into(), session);
+        let state = Arc::new(Mutex::new(state));
+        FAKE.with(|f| *f.borrow_mut() = Some(FakeEffects {
+            roster:Roster { rows:json!([]) }, host:BackgroundHost { pid:1, start:1 },
+            fail_phase:None, fail_stop:false, fail_proof:false, fail_revive:false, stops:0, revives:0,
+        }));
+        assert_eq!(preflight(&state, uid)["status"], "unavailable");
+        state.lock().unwrap().sessions[uid].agent_state.lock().unwrap().inputs.background.complete = true;
+        let pre = preflight(&state, uid);
+        assert_eq!(pre["status"], "normal");
+        assert!(pre["identity"]["native_session_id"].is_null());
+        FAKE.with(|f| f.borrow_mut().as_mut().unwrap().roster.rows = json!([{"kind":"unknown"}]));
+        assert_eq!(preflight(&state, uid)["status"], "unavailable");
+        state.lock().unwrap().sessions.get_mut(uid).unwrap().kill().unwrap();
+        FAKE.with(|f| *f.borrow_mut() = None);
+    }
+
+    #[test]
+    fn snapshot_uses_durable_archive_after_tombstone_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::new();
+        state.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
+        let uid = "ts-archive-recovery";
+        let id = "123e4567-e89b-12d3-a456-426614174000";
+        let entry = serde_json::from_value(json!({
+            "uid":uid, "label":"archive", "session_type":"claude-code",
+            "transcript_id":id, "task_id":"task", "generation":7
+        })).unwrap();
+        crate::resume_identity::remember(&state, crate::resume_identity::Record {
+            workspace_id:"workspace".into(), worktree_path:dir.path().to_path_buf(),
+            entry, transcript_ids:Default::default(),
+        }).unwrap();
+        crate::resume_identity::persist(&state).unwrap();
+        let mut restarted = DaemonState::new();
+        restarted.daemon_sessions_path = state.daemon_sessions_path.clone();
+        let snap = snapshot(&restarted, uid).unwrap();
+        assert_eq!(snap.identity.native_session_id, id);
+        assert_eq!(snap.identity.transcript_generation, 7);
+        assert_eq!(snap.identity.workspace_id, "workspace");
+        assert_eq!(snap.identity.task_id.as_deref(), Some("task"));
+        assert_eq!(snap.identity.child_pid, 0);
     }
 
     #[test]
@@ -1091,6 +1368,42 @@ mod tests {
         );
         assert!(matches!(outcome, EffectOutcome::Unknown(_)));
         assert!(!effects.contains(&EffectStep::NativeStop));
+    }
+
+    #[test]
+    fn production_effect_sequence_aborts_after_every_failed_effect() {
+        let steps = [EffectStep::PreHolderRecheck, EffectStep::HolderKill,
+            EffectStep::PreNativeRecheck, EffectStep::NativeStop,
+            EffectStep::PostStopProof, EffectStep::Revive];
+        for failed in steps {
+            let mut seen = Vec::new();
+            let mut saved = Vec::new();
+            let outcome = execute_effect_sequence(
+                |phase| { saved.push(phase.to_string()); Ok(()) },
+                |step| { seen.push(step); if step == failed { Err("injected failure".into()) } else { Ok(()) } },
+            );
+            assert_eq!(seen.last(), Some(&failed));
+            assert_eq!(seen, steps[..=steps.iter().position(|x| *x == failed).unwrap()]);
+            if failed == EffectStep::Revive {
+                assert!(matches!(outcome, EffectOutcome::Partial(_)));
+                assert_eq!(saved.last().map(String::as_str), Some("partial"));
+            } else {
+                assert!(matches!(outcome, EffectOutcome::Unknown(_)));
+                assert!(!saved.iter().any(|p| p == "revived"));
+            }
+        }
+    }
+
+    #[test]
+    fn workflow_context_refuses_while_recovery_has_uid_reservation() {
+        let uid = "ts-recovery-workflow-test";
+        let gate = lifecycle_gate(uid);
+        let _write = gate.write().unwrap();
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let result = crate::control::methods::set_workflow_context(&state, &json!({
+            "uid":uid, "workflow_run_id":"run", "workflow_role":"worker"
+        }));
+        assert!(matches!(result, Err((ErrorCode::Conflict, _))));
     }
 
     #[test]
