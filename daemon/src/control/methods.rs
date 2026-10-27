@@ -20856,7 +20856,7 @@ pub(crate) fn sweep_terminal_task_sessions(
 }
 
 /// fast the children die.
-pub(crate) fn sweep_task_sessions(state_arc: &Arc<Mutex<DaemonState>>, task_id: &str, killer: &str) {
+pub(crate) fn sweep_task_sessions(state_arc: &Arc<Mutex<DaemonState>>, task_id: &str, killer: &str) -> Vec<String> {
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     let targets: Vec<String> = state
         .sessions
@@ -20873,10 +20873,11 @@ pub(crate) fn sweep_task_sessions(state_arc: &Arc<Mutex<DaemonState>>, task_id: 
         .collect();
     let swept_at = now_unix_f64();
     let killer = format!("{} (mark_subtask_done)", killer);
+    let mut recovery_blocked = Vec::new();
     for uid in targets {
         let gate = crate::claude_recovery::lifecycle_gate(&uid);
-        let Ok(_permit) = gate.try_read() else { continue };
-        if crate::claude_recovery::admission_refusal(&uid).is_some() { continue; }
+        let Ok(_permit) = gate.try_read() else { recovery_blocked.push(uid); continue };
+        if crate::claude_recovery::admission_refusal(&uid).is_some() { recovery_blocked.push(uid); continue; }
         if let Some(sess) = state.sessions.get_mut(&uid) {
             sess.last_exit.mark_operator_kill_requested();
             // O4 routing: the verb-routed kill carries the sweep's
@@ -20886,6 +20887,7 @@ pub(crate) fn sweep_task_sessions(state_arc: &Arc<Mutex<DaemonState>>, task_id: 
         }
         state.record_kill_request(&uid, &killer, swept_at);
     }
+    recovery_blocked
 }
 
 fn teardown_subtask_done(
@@ -20983,7 +20985,13 @@ fn teardown_subtask_done(
     // regardless of worktree_mode / close_worktree (the daemon previously only
     // closed them inside the branch-mode + close_worktree path, stranding live
     // sessions on inherit / in-place / close_worktree=false done subtasks).
-    sweep_task_sessions(state_arc, &p.task_id, killer);
+    let recovery_blocked = sweep_task_sessions(state_arc, &p.task_id, killer);
+    if !recovery_blocked.is_empty() {
+        return Err((ErrorCode::Conflict, format!(
+            "task teardown deferred while background recovery is pending for: {}",
+            recovery_blocked.join(", ")
+        )));
+    }
     wait_for_task_sessions_gone(state_arc, &p.task_id, std::time::Duration::from_secs(2));
 
     // Phase 1/2 — cleanup BEFORE the API flip. Only branch mode owns a
@@ -40968,7 +40976,7 @@ while True:
         let gate = crate::claude_recovery::lifecycle_gate(uid);
         let _write = gate.write().unwrap();
         assert!(sweep_terminal_task_sessions(&state, "done-task", "test", None, false).is_empty());
-        sweep_task_sessions(&state, "done-task", "test");
+        assert_eq!(sweep_task_sessions(&state, "done-task", "test"), vec![uid.to_string()]);
         let mut state = state.lock().unwrap();
         assert!(state.sessions.get_mut(uid).unwrap().try_wait().is_none());
         let _ = state.sessions.get_mut(uid).unwrap().kill();
