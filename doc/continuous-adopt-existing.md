@@ -49,8 +49,9 @@ Ownership checks cover the target daemon's local records, a strict inventory of
 legacy records on the planning API host (normally manager), and central adoption
 claims. A task directory with no `state.json` is ignored because scheduler lock
 or run-log remnants do not establish ownership. A configured inventory root that
-is absent is also empty, while a dangling or symlinked root/ancestor is
-suspicious. A present `state.json` is opened with a nonblocking, no-follow file
+is absent is also empty; a resolved ancestor symlink is compatible with that
+empty storage, while a dangling root/ancestor is suspicious. A present
+`state.json` is opened with a nonblocking, no-follow file
 descriptor and checked with `fstat`; unreadable, malformed, replaced,
 non-regular, dangling or symlinked state entries fail closed. The API's
 best-effort `/continuous` display is not used to establish absence. This is **not

@@ -63,7 +63,17 @@ def _inventory_entries(root: Path):
             probe = parent
             continue
         if stat.S_ISLNK(root_stat.st_mode):
-            raise ValueError(f"suspicious legacy inventory root {probe}")
+            try:
+                resolved = probe.resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise ValueError(f"suspicious legacy inventory root {probe}") from exc
+            if not resolved.is_dir():
+                raise ValueError(f"legacy inventory root is not a directory {probe}")
+            if probe != root:
+                # A resolved symlink ancestor is a valid storage location; the
+                # configured child itself is still genuinely absent.
+                return []
+            return sorted(root.iterdir())
         if not stat.S_ISDIR(root_stat.st_mode):
             raise ValueError(f"legacy inventory root is not a directory {probe}")
         if probe != root:

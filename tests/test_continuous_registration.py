@@ -265,6 +265,22 @@ class ContinuousRegistrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("legacy_inventory_unavailable", response.text)
         self.assertEqual(await self.pool.fetchval("SELECT count(*) FROM continuous_registrations"), claims)
 
+        # A resolved ancestor symlink is compatible with an absent inventory
+        # child and must remain an empty, usable inventory.
+        self.app.state.continuous_registration_dir = self.root / "not-created" / "inventory"
+        tid, path, body, _ = await self.task()
+        resolved_target = self.root / "resolved-target"
+        resolved_target.mkdir()
+        resolved_parent = self.root / "resolved-parent"
+        resolved_parent.symlink_to(resolved_target, target_is_directory=True)
+        self.app.state.continuous_registration_dir = resolved_parent / "inventory"
+        response = await self.client.get(path)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["api_host_owners"], [])
+        self.assertEqual((await self.client.put(path, json=body)).status_code, 200)
+        claims += 1
+        self.assertEqual(await self.pool.fetchval("SELECT count(*) FROM continuous_registrations"), claims)
+
         self.app.state.continuous_registration_dir = self.root / "not-created" / "inventory"
         tid, path, body, _ = await self.task()
         dangling_root = self.root / "dangling-root"
