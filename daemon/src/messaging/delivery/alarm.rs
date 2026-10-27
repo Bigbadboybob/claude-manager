@@ -129,11 +129,19 @@ fn state_path(root: &Path) -> PathBuf {
     root.join("notifications").join("stall-alarms.state")
 }
 
+#[cfg(test)]
 fn load(root: &Path) -> BTreeMap<String, Episode> {
-    fs::read(state_path(root))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+    snapshot(root).unwrap_or_default()
+}
+
+/// Durable stall state used by the viewer. Corruption is unknown rather than
+/// an empty healthy snapshot; callers may keep their last known state.
+pub fn snapshot(root: &Path) -> io::Result<BTreeMap<String, Episode>> {
+    match fs::read(state_path(root)) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(e) => Err(e),
+    }
 }
 
 fn save(root: &Path, episodes: &BTreeMap<String, Episode>) -> io::Result<()> {
@@ -144,18 +152,28 @@ fn save(root: &Path, episodes: &BTreeMap<String, Episode>) -> io::Result<()> {
 /// One alarm pass over the given live native recipients. File reads run
 /// without the daemon lock; Owner-alert writes take it briefly.
 pub fn pass(state: &Arc<Mutex<DaemonState>>, root: &Path, uids: &[String], now: f64, threshold: u64) {
-    let mut episodes = load(root);
+    let mut episodes = match snapshot(root) {
+        Ok(episodes) => episodes,
+        Err(e) => { eprintln!("cm notifications: stall alarm state unavailable: {e}"); return; }
+    };
     let before = episodes.clone();
     for uid in uids {
-        // Legacy markerless records cannot be confirmed; retain the existing
-        // narrow retirement policy (it is not evidence of delivery).
-        match crate::notifications::retire_unconfirmable(root, uid) {
-            Ok(0) => {}
-            Ok(n) => eprintln!("cm notifications: retired {n} unconfirmable notice(s) for {uid}"),
-            Err(e) => eprintln!("cm notifications: retire unconfirmable for {uid}: {e}"),
-        }
-        let stall = match crate::notifications::snapshot_strict(root, uid) {
-            Ok((events, transport)) => assess(&events, transport.as_ref(), now, threshold),
+        // Legacy retirement remains narrow; the complete census and
+        // retirement share one nonblocking lock and never prove delivery.
+        let stall = match crate::notifications::alarm_snapshot(root, uid) {
+            Ok((events, transport)) => {
+                let assessed = assess(&events, transport.as_ref(), now, threshold);
+                // Pending work was held because the transport was known to
+                // drop it. A missing/changed heartbeat does not prove that
+                // those notices reached the recipient.
+                if assessed.is_none()
+                    && episodes.get(uid).is_some_and(|e| matches!(e.reason.as_str(), "channels_disabled" | "stale_channel" | "external_background"))
+                    && events.iter().any(|e| matches!(e["status"].as_str(), Some("pending" | "submitting")))
+                {
+                    continue;
+                }
+                assessed
+            }
             Err(_) => continue,
         };
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
@@ -171,19 +189,12 @@ pub fn pass(state: &Arc<Mutex<DaemonState>>, root: &Path, uids: &[String], now: 
                     alert_key: None,
                 });
                 let key = format!("notification-stall:{uid}");
-                // A legacy episode could be suppressed behind a session's
-                // unrelated alert, or already acknowledged. Migrate it once
-                // to the independent key without touching that other alert.
-                if episode.alert_key.as_deref() != Some(&key) {
-                    if episode.alert_key.is_none() {
-                        if let Some(id) = episode.alert_id.as_deref() {
-                            if let Err(e) = crate::owner_attention::clear_system(&s, uid, id) {
-                                eprintln!("cm notifications: migrate legacy stall alert for {uid}: {e}");
-                            }
-                        }
-                    }
-                    episode.alert_id = None;
-                    episode.alert_key = Some(key.clone());
+                // A legacy ID means this episode already alerted. Keep that
+                // ID/key even if it was acknowledged or replaced; moving it
+                // would re-alert an ongoing episode. Only a suppressed legacy
+                // episode (no ID) needs its independent key now.
+                if episode.alert_key.is_none() {
+                    episode.alert_key = Some(if episode.alert_id.is_some() { uid.clone() } else { key.clone() });
                 }
                 if episode.alert_id.is_none() {
                     let label = s
@@ -203,10 +214,22 @@ pub fn pass(state: &Arc<Mutex<DaemonState>>, root: &Path, uids: &[String], now: 
                             | crate::owner_attention::GateOutcome::Coalesced { alert_id: id }) => {
                             eprintln!("cm notifications: stall alert for {uid}: {} unobserved for {}s ({})", stall.unobserved, stall.oldest_secs, stall.reason);
                             episode.alert_id = Some(id);
-                            episode.reason = stall.reason;
+                            episode.reason = stall.reason.clone();
                         }
                         Err(e) => eprintln!("cm notifications: stall alert for {uid}: {e}"),
                     }
+                }
+                if episode.reason != stall.reason {
+                    if let Some(id) = episode.alert_id.as_deref() {
+                        let label = s.sessions.get(uid).map(|x| x.title.clone())
+                            .or_else(|| s.tui_sessions.get(uid).and_then(|x| x.label.clone()))
+                            .unwrap_or_else(|| uid.clone());
+                        let key = episode.alert_key.as_deref().unwrap_or(uid);
+                        if let Err(e) = crate::owner_attention::update_system_message(&s, key, id, &message(&label, uid, &stall)) {
+                            eprintln!("cm notifications: update stall alert for {uid}: {e}");
+                        }
+                    }
+                    episode.reason = stall.reason;
                 }
             }
             None => {
@@ -214,10 +237,10 @@ pub fn pass(state: &Arc<Mutex<DaemonState>>, root: &Path, uids: &[String], now: 
                     if let Some(id) = episode.alert_id {
                         // Old episodes used the session key; newer ones use a
                         // separate key so an agent's alert cannot mask this one.
-                        if let Err(e) = crate::owner_attention::withdraw(&s, &format!("notification-stall:{uid}"), &id) {
+                        let key = episode.alert_key.as_deref().unwrap_or(uid);
+                        if let Err(e) = crate::owner_attention::withdraw(&s, key, &id) {
                             eprintln!("cm notifications: clear stall alert for {uid}: {e}");
                         }
-                        let _ = crate::owner_attention::clear_system(&s, uid, &id);
                     }
                 }
             }
@@ -227,8 +250,20 @@ pub fn pass(state: &Arc<Mutex<DaemonState>>, root: &Path, uids: &[String], now: 
     // alerts: an exited row's alert stays for Owner to acknowledge.
     episodes.retain(|uid, _| uids.contains(uid));
     if episodes != before {
+        // Snapshot subscribers take the same state lock: save before
+        // broadcasting, so a reconnect cannot miss an episode transition.
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
         if let Err(e) = save(root, &episodes) {
             eprintln!("cm notifications: stall alarm state: {e}");
+        } else {
+            for uid in before.keys().chain(episodes.keys()).collect::<std::collections::BTreeSet<_>>() {
+                if before.get(uid) != episodes.get(uid) {
+                    s.manifest_watcher.broadcast(crate::manifest::ManifestDiff::Updated {
+                        uid: uid.clone(),
+                        entry: serde_json::json!({"notification_health": episodes.get(uid)}),
+                    });
+                }
+            }
         }
     }
 }
@@ -386,13 +421,32 @@ mod tests {
         let key = format!("notification-stall:{uid}");
         let first = alerts(&state)[&key].clone();
         assert!(first.message.contains("ts-stalled") && first.message.contains("16m"), "{}", first.message);
+        let transport = queue.join("transport.json");
+        crate::messaging::atomic_replace(&transport, &json!({"status":"degraded","reason":"external_background"})).unwrap();
+        pass(&state, root, &uids, 2_010.0, 900);
+        let refreshed = alerts(&state)[&key].clone();
+        assert_eq!(refreshed.id, first.id, "new evidence updates the same alert");
+        assert!(refreshed.message.contains("background"));
+        fs::remove_file(transport).unwrap();
         // A partial census cannot falsely resolve the episode.
         let bad = queue.join("corrupt.json");
+        event["status"] = json!("observed");
+        event["updated_at"] = json!(2_050.0);
+        crate::messaging::atomic_replace(&event_file("chat:one"), &event).unwrap();
         fs::write(&bad, b"{").unwrap();
         pass(&state, root, &uids, 2_100.0, 900);
         assert_eq!(alerts(&state)[&key].id, first.id);
         assert!(load(root).contains_key(&uid));
+        fs::write(&bad, br#"{"id":"bad","status":"bogus","created_at":1}"#).unwrap();
+        pass(&state, root, &uids, 2_100.0, 900);
+        assert_eq!(alerts(&state)[&key].id, first.id);
+        fs::write(&bad, br#"{"id":"bad","status":"submitted"}"#).unwrap();
+        pass(&state, root, &uids, 2_100.0, 900);
+        assert_eq!(alerts(&state)[&key].id, first.id);
         fs::remove_file(bad).unwrap();
+        event["status"] = json!("submitted");
+        event["updated_at"] = json!(1_000.0);
+        crate::messaging::atomic_replace(&event_file("chat:one"), &event).unwrap();
         // Owner acknowledges; the same episode never re-alerts.
         crate::owner_attention::withdraw(&state.lock().unwrap(), &key, &first.id).unwrap();
         pass(&state, root, &uids, 3_000.0, 900);
@@ -495,5 +549,93 @@ mod tests {
         let original = fs::read(&file).unwrap();
         pass(&state, root, &[uid], 2000.0, 900);
         assert_eq!(fs::read(file).unwrap(), original);
+    }
+
+    #[test]
+    fn legacy_episode_preserves_pending_and_acknowledged_alerts_and_migrates_suppression() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut daemon = DaemonState::new();
+        daemon.daemon_sessions_path = Some(root.join("daemon-sessions.json"));
+        let state = Arc::new(Mutex::new(daemon));
+        let uid = "ts-legacy".to_string();
+        crate::notifications::publish(root, &uid, "one", "chat", "[one] wake", "[one]").unwrap();
+        let queue = crate::notifications::directory(root, &uid);
+        let file = fs::read_dir(queue).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "json")).unwrap();
+        let mut event: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        event["status"] = json!("submitted"); event["updated_at"] = json!(1000.0);
+        crate::messaging::atomic_replace(&file, &event).unwrap();
+        let id = crate::owner_attention::raise_system(&state.lock().unwrap(), &uid, "legacy stall").unwrap().unwrap();
+        save(root, &[(uid.clone(), Episode { since: 1000, reason: "unobserved_submissions".into(), alert_id: Some(id.clone()), alert_key: None })].into_iter().collect()).unwrap();
+        pass(&state, root, std::slice::from_ref(&uid), 2000.0, 900);
+        let alerts = crate::owner_attention::snapshot(&state.lock().unwrap()).unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[&uid].id, id, "pending legacy alert is retained");
+        crate::owner_attention::clear_system(&state.lock().unwrap(), &uid, &id).unwrap();
+        let other = crate::owner_attention::raise_system(&state.lock().unwrap(), &uid, "new decision").unwrap().unwrap();
+        pass(&state, root, std::slice::from_ref(&uid), 2100.0, 900);
+        let alerts = crate::owner_attention::snapshot(&state.lock().unwrap()).unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[&uid].id, other, "acknowledged legacy episode does not re-alert or clear a replacement");
+        // A legacy episode suppressed by an unrelated alert had no ID.
+        save(root, &[(uid.clone(), Episode { since: 1000, reason: "unobserved_submissions".into(), alert_id: None, alert_key: None })].into_iter().collect()).unwrap();
+        pass(&state, root, std::slice::from_ref(&uid), 2200.0, 900);
+        let alerts = crate::owner_attention::snapshot(&state.lock().unwrap()).unwrap();
+        assert_eq!(alerts[&uid].id, other);
+        assert!(alerts.contains_key(&format!("notification-stall:{uid}")));
+    }
+
+    #[test]
+    fn locked_recipient_does_not_block_later_alarm() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut daemon = DaemonState::new();
+        daemon.daemon_sessions_path = Some(root.join("daemon-sessions.json"));
+        let state = Arc::new(Mutex::new(daemon));
+        for uid in ["first", "second"] {
+            crate::notifications::publish(root, uid, "one", "chat", "[one] wake", "[one]").unwrap();
+            let queue = crate::notifications::directory(root, uid);
+            let file = fs::read_dir(queue).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "json")).unwrap();
+            let mut event: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+            event["status"] = json!("submitted"); event["updated_at"] = json!(1000.0);
+            crate::messaging::atomic_replace(&file, &event).unwrap();
+        }
+        pass(&state, root, &["first".into()], 2000.0, 900);
+        let first_id = crate::owner_attention::snapshot(&state.lock().unwrap()).unwrap()["notification-stall:first"].id.clone();
+        let first = crate::notifications::directory(root, "first").join("queue.lock");
+        let lock = fs::OpenOptions::new().read(true).write(true).open(first).unwrap();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        pass(&state, root, &["first".into(), "second".into()], 2000.0, 900);
+        let alerts = crate::owner_attention::snapshot(&state.lock().unwrap()).unwrap();
+        assert_eq!(alerts["notification-stall:first"].id, first_id, "busy queue cannot clear its episode");
+        assert!(alerts.contains_key("notification-stall:second"));
+    }
+
+    #[test]
+    fn missing_transport_does_not_resolve_held_pending_notices() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut daemon = DaemonState::new();
+        daemon.daemon_sessions_path = Some(root.join("daemon-sessions.json"));
+        let state = Arc::new(Mutex::new(daemon));
+        let uid = "ts-held".to_string();
+        crate::notifications::publish(root, &uid, "one", "chat", "[one] wake", "[one]").unwrap();
+        let queue = crate::notifications::directory(root, &uid);
+        let file = fs::read_dir(&queue).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "json")).unwrap();
+        let mut event: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        event["created_at"] = json!(1000.0);
+        crate::messaging::atomic_replace(&file, &event).unwrap();
+        let transport = queue.join("transport.json");
+        crate::messaging::atomic_replace(&transport, &json!({"status":"degraded", "reason":"external_background"})).unwrap();
+        pass(&state, root, std::slice::from_ref(&uid), 2000.0, 900);
+        assert!(load(root).contains_key(&uid));
+        fs::remove_file(transport).unwrap();
+        pass(&state, root, std::slice::from_ref(&uid), 2100.0, 900);
+        assert!(load(root).contains_key(&uid));
+        event["status"] = json!("observed"); event["updated_at"] = json!(2200.0);
+        crate::messaging::atomic_replace(&file, &event).unwrap();
+        pass(&state, root, std::slice::from_ref(&uid), 2300.0, 900);
+        assert!(load(root).is_empty());
     }
 }

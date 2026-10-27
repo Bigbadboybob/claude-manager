@@ -353,6 +353,9 @@ pub enum ConfirmAction {
     RestoreTombstones { ws_id: String },
     /// Alt+T (#24): move this session's conversation to a fresh transcript.
     RotateTranscript { uid: String },
+    /// Explicit operator authorization for this exact background identity.
+    BackgroundRecovery { uid: String, host: crate::hosts::HostId, identity: serde_json::Value, prompt: String },
+    ReconcileBackground { uid: String, host: crate::hosts::HostId, identity: serde_json::Value, prompt: String },
 }
 
 /// Per-role slot in the launch modal. The user cycles through `options` with
@@ -487,6 +490,8 @@ pub(crate) enum SubmitAction {
     ForkSession,
     /// Alt+T confirmed: rotate `uid`'s transcript now.
     RotateTranscript { uid: String },
+    BackgroundRecovery { uid: String, host: crate::hosts::HostId, identity: serde_json::Value, prompt: String },
+    ReconcileBackground { uid: String, host: crate::hosts::HostId, identity: serde_json::Value, prompt: String },
     /// Alt+Shift+E form submitted (the form rides in the replaced mode).
     Handoff,
     /// Submit attempted but the inputs produced no work to do (e.g.
@@ -2473,6 +2478,11 @@ pub(crate) fn handle_confirm(
     let CrosstermEvent::Key(key) = event else {
         return InputOutcome::Consumed;
     };
+    // A background host can contain active work. Enter alone is not an
+    // authorization to stop it, even though older confirmation dialogs accept it.
+    if matches!(action, ConfirmAction::BackgroundRecovery { .. } | ConfirmAction::ReconcileBackground { .. }) && key.code == KeyCode::Enter {
+        return InputOutcome::Consumed;
+    }
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
             let submit = match action.clone() {
@@ -2486,6 +2496,8 @@ pub(crate) fn handle_confirm(
                     SubmitAction::RestoreTombstones { ws_id }
                 }
                 ConfirmAction::RotateTranscript { uid } => SubmitAction::RotateTranscript { uid },
+                ConfirmAction::BackgroundRecovery { uid, host, identity, prompt } => SubmitAction::BackgroundRecovery { uid, host, identity, prompt },
+                ConfirmAction::ReconcileBackground { uid, host, identity, prompt } => SubmitAction::ReconcileBackground { uid, host, identity, prompt },
             };
             InputOutcome::Submit(submit)
         }
@@ -4849,6 +4861,8 @@ impl App {
                 self.restore_tombstones_for_workspace(&ws_id);
             }
             SubmitAction::RotateTranscript { uid } => self.rotate_session(&uid),
+            SubmitAction::BackgroundRecovery { uid, host, identity, prompt } => self.start_background_recovery(uid, host, identity, prompt),
+            SubmitAction::ReconcileBackground { uid, host, identity, prompt } => self.start_background_reconcile(uid, host, identity, prompt),
             SubmitAction::PaletteJump { target } => {
                 self.apply_palette_jump(target);
             }
@@ -8710,6 +8724,26 @@ mod input_handler_tests {
     }
 
     // ── Confirm ───────────────────────────────────────────────────
+
+    #[test]
+    fn background_recovery_requires_explicit_y_and_preserves_identity() {
+        let host = crate::hosts::HostId::new("sessions");
+        let identity = serde_json::json!({"uid":"ts-x","native_id":"exact", "pid":42});
+        let action = ConfirmAction::BackgroundRecovery { uid: "ts-x".into(), host: host.clone(), identity: identity.clone(), prompt: "details".into() };
+        assert_consumed(&handle_confirm(&action, ctx_no_repos(), &key(KeyCode::Enter)));
+        assert_cancel(&handle_confirm(&action, ctx_no_repos(), &key(KeyCode::Esc)));
+        match handle_confirm(&action, ctx_no_repos(), &key(KeyCode::Char('y'))) {
+            InputOutcome::Submit(SubmitAction::BackgroundRecovery { uid, host: got_host, identity: got, .. }) => {
+                assert_eq!(uid, "ts-x");
+                assert_eq!(got_host, host);
+                assert_eq!(got, identity);
+            }
+            other => panic!("expected confirmed recovery, got {other:?}"),
+        }
+        let reconcile = ConfirmAction::ReconcileBackground { uid: "ts-x".into(), host, identity, prompt: "details".into() };
+        assert_consumed(&handle_confirm(&reconcile, ctx_no_repos(), &key(KeyCode::Enter)));
+        assert!(matches!(handle_confirm(&reconcile, ctx_no_repos(), &key(KeyCode::Char('y'))), InputOutcome::Submit(SubmitAction::ReconcileBackground { .. })));
+    }
 
     #[test]
     fn confirm_y_submits_mark_done() {

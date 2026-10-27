@@ -706,9 +706,10 @@ pub struct App {
     /// selects that session's row. See `tick_alerts` / `reap_and_clear_alerts`.
     alerts: HashMap<String, String>,
     owner_alerts: HashMap<(crate::hosts::HostId, String), cm_daemon::owner_attention::Alert>,
+    notification_health: HashMap<(crate::hosts::HostId, String), serde_json::Value>,
     /// Engine-reported `agent_state` per (host, uid); see `app/agent_state.rs`.
     agent_states: HashMap<(crate::hosts::HostId, String), agent_state::AgentStateView>,
-    owner_alert_rows: HashSet<String>,
+    owner_alert_rows: HashMap<(crate::hosts::HostId, String), String>,
     dismissed_owner_alerts: HashSet<(crate::hosts::HostId, String, String)>,
     /// When this viewer first saw each open alert (alert id, or `legacy:<uid>`
     /// for TUI-raised ones): the Messages "Open alerts" ages and order.
@@ -1153,8 +1154,9 @@ impl App {
             last_drawn_input_disc: None,
             alerts: HashMap::new(),
             owner_alerts: HashMap::new(),
+            notification_health: HashMap::new(),
             agent_states: HashMap::new(),
-            owner_alert_rows: HashSet::new(),
+            owner_alert_rows: HashMap::new(),
             dismissed_owner_alerts: HashSet::new(),
             owner_alert_since: HashMap::new(),
             last_alert_frame: 0,

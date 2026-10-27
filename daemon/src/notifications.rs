@@ -20,6 +20,9 @@ fn path(root: &Path, uid: &str, id: &str) -> PathBuf {
     directory(root, uid).join(format!("{}.json", digest(id)))
 }
 fn lock(root: &Path, uid: &str) -> io::Result<fs::File> {
+    lock_with(root, uid, false)
+}
+fn lock_with(root: &Path, uid: &str, nonblocking: bool) -> io::Result<fs::File> {
     let dir = directory(root, uid);
     fs::DirBuilder::new()
         .recursive(true)
@@ -32,7 +35,8 @@ fn lock(root: &Path, uid: &str) -> io::Result<fs::File> {
         .truncate(false)
         .mode(0o600)
         .open(dir.join("queue.lock"))?;
-    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+    let flags = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
+    if unsafe { libc::flock(f.as_raw_fd(), flags) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(f)
@@ -43,6 +47,19 @@ fn read(path: &Path) -> io::Result<Option<Value>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+fn valid_census_event(value: &Value) -> bool {
+    let id_ok = value["id"].as_str().is_some_and(|id| !id.trim().is_empty());
+    let status_ok = matches!(value["status"].as_str(), Some(
+        "pending" | "submitting" | "submitted" | "uncertain" | "observed" | "cancelled"));
+    // If updated_at exists it is authoritative: an invalid value cannot
+    // safely fall back to an older timestamp.
+    let at = value.get("updated_at").unwrap_or(&value["created_at"]);
+    let time_ok = at.as_f64().is_some_and(|t| t.is_finite() && t > 0.0);
+    let text_ok = value["text"].as_str().is_some();
+    let marker_ok = value.get("marker").is_none_or(|marker| marker.as_str().is_some());
+    id_ok && status_ok && time_ok && text_ok && marker_ok
 }
 /// #24: hold `uid`'s new wakes (they stay pending) until `until` (unix
 /// seconds): CM is about to restart it for a rotation or handoff, so they
@@ -197,15 +214,19 @@ fn snapshot_impl(root: &Path, uid: &str, strict: bool) -> io::Result<(Vec<Value>
         Err(e) => return Err(e),
     }
     let _guard = lock(root, uid)?;
+    snapshot_locked(&dir, strict)
+}
+
+fn snapshot_locked(dir: &Path, strict: bool) -> io::Result<(Vec<Value>, Option<Value>)> {
     let mut events = Vec::new();
-    for entry in fs::read_dir(&dir)? {
+    for entry in fs::read_dir(dir)? {
         let entry = entry?;
         if entry.path().extension().is_some_and(|x| x == "json")
             && entry.file_name() != "transport.json"
         {
             match read(&entry.path()) {
                 Ok(Some(value)) => {
-                    if strict && (value["id"].as_str().is_none() || value["status"].as_str().is_none()) {
+                    if strict && !valid_census_event(&value) {
                         return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid notification in census"));
                     }
                     events.push(value);
@@ -217,11 +238,36 @@ fn snapshot_impl(root: &Path, uid: &str, strict: bool) -> io::Result<(Vec<Value>
         }
     }
     let transport = if strict {
-        read(&dir.join("transport.json"))?
+        let transport = read(&dir.join("transport.json"))?;
+        if let Some(value) = &transport {
+            let status_ok = value.is_object() && value["status"].as_str().is_some_and(|s| !s.is_empty());
+            let reason_ok = value.get("reason").is_none_or(|v| v.is_null() || v.is_string());
+            let reasons_ok = value.get("reasons").is_none_or(|v| v.is_null() || v.as_array().is_some_and(|a| a.iter().all(Value::is_string)));
+            if !status_ok || !reason_ok || !reasons_ok {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid notification transport"));
+            }
+        }
+        transport
     } else {
         read(&dir.join("transport.json")).ok().flatten()
     };
     Ok((events, transport))
+}
+
+/// One complete alarm pass under a nonblocking queue lock. A busy or corrupt
+/// recipient is retried later and cannot delay another recipient's alarm.
+pub fn alarm_snapshot(root: &Path, uid: &str) -> io::Result<(Vec<Value>, Option<Value>)> {
+    let dir = directory(root, uid);
+    match fs::metadata(&dir) {
+        Ok(meta) if meta.is_dir() => {},
+        Ok(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "notification queue is not a directory")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), None)),
+        Err(e) => return Err(e),
+    }
+    let _guard = lock_with(root, uid, true)?;
+    snapshot_locked(&dir, true)?;
+    retire_unconfirmable_locked(&dir)?;
+    snapshot_locked(&dir, true)
 }
 /// Retire this recipient's submitted/uncertain events whose text lacks their
 /// marker (published before `publish` enforced it): they were delivered but
@@ -236,13 +282,18 @@ pub fn retire_unconfirmable(root: &Path, uid: &str) -> io::Result<usize> {
         return Ok(0);
     }
     let _guard = lock(root, uid)?;
+    retire_unconfirmable_locked(&dir)
+}
+
+fn retire_unconfirmable_locked(dir: &Path) -> io::Result<usize> {
     let mut retired = 0;
-    for entry in fs::read_dir(&dir)? {
+    for entry in fs::read_dir(dir)? {
         let path = entry?.path();
         if path.extension().is_none_or(|x| x != "json") || path.file_name().is_some_and(|n| n == "transport.json") {
             continue;
         }
         let Ok(Some(mut event)) = read(&path) else { continue };
+        if !valid_census_event(&event) { continue; }
         let open = matches!(event["status"].as_str(), Some("submitted" | "uncertain"));
         let marker = event["marker"].as_str().unwrap_or("");
         let confirmable = !marker.is_empty() && event["text"].as_str().is_some_and(|t| t.contains(marker));
@@ -328,9 +379,19 @@ mod tests {
         assert!(snapshot_strict(root, "uid").is_err());
         fs::write(&bad, b"{}").unwrap();
         assert!(snapshot_strict(root, "uid").is_err());
+        fs::write(&bad, br#"{"id":"x","status":"bogus","created_at":1}"#).unwrap();
+        assert!(snapshot_strict(root, "uid").is_err());
+        fs::write(&bad, br#"{"id":"x","status":"submitted"}"#).unwrap();
+        assert!(snapshot_strict(root, "uid").is_err());
+        let corrupt_marker = br#"{"id":"x","status":"submitted","created_at":1,"text":"wake","marker":42}"#;
+        fs::write(&bad, corrupt_marker).unwrap();
+        assert!(alarm_snapshot(root, "uid").is_err());
+        assert_eq!(fs::read(&bad).unwrap(), corrupt_marker);
         fs::remove_file(bad).unwrap();
         assert_eq!(snapshot_strict(root, "uid").unwrap().0.len(), 1);
         fs::write(dir.join("transport.json"), b"{").unwrap();
+        assert!(snapshot_strict(root, "uid").is_err());
+        fs::write(dir.join("transport.json"), b"[]").unwrap();
         assert!(snapshot_strict(root, "uid").is_err());
         assert_eq!(snapshot(root, "uid").unwrap().0.len(), 1);
         let other = directory(root, "file");

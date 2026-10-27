@@ -12,6 +12,28 @@ use cm_daemon::host_id::HostId;
 use cm_daemon::manifest::ManifestEntry;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn recovery_offer_requires_exact_displayable_identity_and_space() {
+        let mut offer = serde_json::json!({"status":"offer", "identity":{
+            "uid":"ts-x", "native_session_id":"123e4567-e89b-12d3-a456-426614174000",
+            "background_pid":42, "background_start_time":77, "workspace_id":"ws", "canonical_cwd":"/workspace"
+        }});
+        assert!(valid_background_offer(&offer, "ts-x"));
+        assert!(!valid_background_offer(&offer, "another"));
+        offer["identity"]["native_session_id"] = serde_json::json!("123e4567");
+        assert!(!valid_background_offer(&offer, "ts-x"));
+        offer["identity"]["native_session_id"] = serde_json::json!("123e4567-e89b-12d3-a456-426614174000");
+        offer["identity"]["canonical_cwd"] = serde_json::json!("/work\nspace");
+        assert!(!valid_background_offer(&offer, "ts-x"));
+        assert!(!background_prompt_fits("details", (15, 8)));
+        assert!(background_prompt_fits("Native ID: exact\nPID: 42\nWorkspace: /work", (100, 30)));
+    }
+}
+
 /// How long a forced restart waits for the killed child to leave the
 /// host's registry. Each poll is its own RPC.
 const REAP_WAIT: Duration = Duration::from_secs(20);
@@ -29,6 +51,14 @@ pub(super) enum RestartOutcome {
     ComingBack,
     /// Local live session killed and gone; the UI thread respawns it.
     Killed,
+    /// Read-only preflight found a specific external Claude background host.
+    BackgroundOffer(serde_json::Value),
+    RecoveryRecord(serde_json::Value),
+    RecoveryCleared(String),
+    /// Recovery was not attempted or its durable result needs inspection.
+    RecoveryNeedsAttention(String),
+    /// An effect may have stopped the holder; keep its row until reconciled.
+    RecoveryUncertain(String),
 }
 
 pub(super) struct RestartFlight {
@@ -68,17 +98,94 @@ pub(crate) fn classify_revive_refusal(error: &str, killed: bool) -> ReviveRefusa
 /// One remote revive: `(entry, workspace_id, worktree)`.
 type ReviveSpec = (ManifestEntry, String, String);
 
+fn valid_recovery_identity(id: &serde_json::Value, uid: &str) -> bool {
+    let native = id["native_session_id"].as_str().unwrap_or("");
+    let canonical = uuid::Uuid::parse_str(native).ok().is_some_and(|v| v.to_string() == native);
+    id["uid"] == uid && canonical
+        && id["workspace_id"].as_str().is_some_and(|s| !s.is_empty())
+        && id["canonical_cwd"].as_str().is_some_and(|s| !s.is_empty() && !s.chars().any(char::is_control))
+        && id["task_id"].as_str().is_none_or(|s| !s.chars().any(char::is_control))
+}
+
+fn valid_background_offer(offer: &serde_json::Value, uid: &str) -> bool {
+    let id = &offer["identity"];
+    offer["status"] == "offer" && valid_recovery_identity(id, uid)
+        && id["background_pid"].as_u64().is_some_and(|v| v > 0)
+        && id["background_start_time"].as_u64().is_some_and(|v| v > 0)
+}
+
+fn valid_recovery_record(record: &serde_json::Value, uid: &str) -> bool {
+    let id = &record["identity"];
+    valid_recovery_identity(id, uid) && matches!((id["background_pid"].as_u64(), id["background_start_time"].as_u64()),
+        (Some(0), Some(0)) | (Some(1..), Some(1..)))
+}
+
+fn background_prompt_fits(prompt: &str, size: (u16, u16)) -> bool {
+    let width = 100u16.min(size.0.saturating_sub(4)).saturating_sub(2) as usize;
+    if width < 20 { return false; }
+    // Reserve an extra row per logical line for word wrapping, plus borders
+    // and the confirmation instructions. If it cannot fit, refuse to offer
+    // a destructive action whose identifying details would be hidden.
+    let rows = prompt.lines().map(|s| 1 + unicode_width::UnicodeWidthStr::width(s).div_ceil(width)).sum::<usize>() + 6;
+    rows <= usize::from(size.1.saturating_sub(2))
+}
+
 fn run_restart(
     pool: &crate::host_pool::HostPool,
     host: &HostId,
     kill_uid: Option<&str>,
     revive: Option<&ReviveSpec>,
+    probe_background: bool,
 ) -> RestartOutcome {
     // Resolving the socket can warm a cold tunnel, so it happens here too.
     let Some(socket) = pool.for_host(host).ok().and_then(|h| h.socket_path()) else {
         return RestartOutcome::Unreachable;
     };
     let token = pool.operator_token_for(host);
+    if probe_background {
+        let uid = kill_uid.or_else(|| revive.map(|(entry, _, _)| entry.uid.as_str()));
+        let Some(uid) = uid else {
+            return RestartOutcome::RecoveryNeedsAttention("Cannot verify the session identity for background recovery".into());
+        };
+        let result = crate::client_session::rpc_messaging(
+            &socket, &token, "session.background_recovery_preflight", serde_json::json!({"uid": uid}));
+        match result {
+            Ok(value) if value["status"] == "normal" => {
+                let identity = &value["identity"];
+                let valid = valid_recovery_identity(identity, uid)
+                    && identity["background_pid"].as_u64() == Some(0)
+                    && identity["background_start_time"].as_u64() == Some(0);
+                if !valid {
+                    return RestartOutcome::RecoveryNeedsAttention("Normal restart identity was incomplete; no stop was attempted".into());
+                }
+                let result = crate::client_session::rpc_messaging_board(&socket, &token,
+                    "session.background_recovery_confirm", serde_json::json!({"identity":identity, "confirmed":true}));
+                return match result {
+                    Ok(reply) if reply["status"] == "revived" => RestartOutcome::Revived,
+                    Ok(reply) => RestartOutcome::RecoveryUncertain(format!("{}; inspect recovery status before retrying", reply["message"].as_str().unwrap_or("Restart did not complete"))),
+                    Err(e) => RestartOutcome::RecoveryUncertain(format!("Restart result is unknown: {e}; inspect recovery status before retrying")),
+                };
+            }
+            Ok(value) if valid_background_offer(&value, uid) => {
+                return RestartOutcome::BackgroundOffer(value);
+            }
+            Ok(value) => {
+                if value["status"] == "unavailable" {
+                    if let Ok(record) = crate::client_session::rpc_messaging(&socket, &token,
+                        "session.background_recovery_status", serde_json::json!({"uid":uid})) {
+                        if valid_recovery_record(&record, uid)
+                            && matches!(record["status"].as_str(), Some("confirmed" | "holder_stopped" | "native_stop_ready" | "native_stopped" | "unknown" | "partial")) {
+                            return RestartOutcome::RecoveryRecord(record);
+                        }
+                    }
+                }
+                return RestartOutcome::RecoveryNeedsAttention(
+                    value["message"].as_str().unwrap_or("Background-session identity is unavailable").into());
+            }
+            Err(e) => return RestartOutcome::RecoveryNeedsAttention(format!(
+                "Background preflight failed; session was not stopped: {e}")),
+        }
+    }
     if let Some(uid) = kill_uid {
         // A failed kill is not the last word: over a slow link the kill can
         // land with its reply lost, and a second A-R then finds the session
@@ -230,6 +337,104 @@ fn run_remote_add(pool: &crate::host_pool::HostPool, job: &RemoteAdd) -> AddOutc
 }
 
 impl App {
+    pub(super) fn start_background_reconcile(&mut self, uid: String, host: HostId, identity: serde_json::Value, prompt: String) {
+        if !background_prompt_fits(&prompt, self.last_term_size) {
+            self.set_status_msg("Terminal is too small to show the full recovery identity; enlarge it and press A-R again");
+            return;
+        }
+        if self.restart_in_flight(&uid) || !self.workspaces.iter().flat_map(|w| &w.sessions).any(|s| s.uid == uid && s.host_id == host) {
+            self.set_status_msg("Session or host changed; no reconciliation was attempted");
+            return;
+        }
+        let pool = std::sync::Arc::clone(&self.host_pool);
+        let job_host = host.clone();
+        let daemon_uid = identity["uid"].as_str().unwrap_or("").to_owned();
+        let (tx, result) = mpsc::channel();
+        let spawned = std::thread::Builder::new().name("cm-background-reconcile".into()).spawn(move || {
+            let outcome = (|| {
+                let socket = pool.for_host(&job_host).ok().and_then(|h| h.socket_path())
+                    .ok_or_else(|| "Host unreachable; reconciliation was not confirmed".to_string())?;
+                let token = pool.operator_token_for(&job_host);
+                let reply = crate::client_session::rpc_messaging_board(&socket, &token,
+                    "session.background_recovery_reconcile", serde_json::json!({"uid": daemon_uid, "identity": identity, "action":"clear"}))
+                    .map_err(|e| format!("Reconciliation result is unknown: {e}; inspect recovery status before retrying"))?;
+                if reply["status"] == "cleared" {
+                    Ok(reply["message"].as_str().unwrap_or("Recovery fence cleared").to_owned())
+                } else { Err(reply["message"].as_str().unwrap_or("Reconciliation did not complete").to_owned()) }
+            })();
+            let _ = tx.send(match outcome {
+                Ok(message) => RestartOutcome::RecoveryCleared(message),
+                Err(message) => RestartOutcome::RecoveryNeedsAttention(message),
+            });
+        });
+        if let Err(e) = spawned {
+            self.set_status_msg(&format!("Could not start reconciliation worker: {e}"));
+            return;
+        }
+        self.restarts.push(RestartFlight { uid, host_id: host, was_live: false, daemon_uid: None, result });
+        self.set_status_msg("Checking the interrupted recovery…");
+    }
+
+    /// Execute only the exact offer that the operator explicitly confirmed.
+    /// The daemon revalidates and journals before either stop effect.
+    pub(super) fn start_background_recovery(&mut self, uid: String, host: HostId, identity: serde_json::Value, prompt: String) {
+        if !background_prompt_fits(&prompt, self.last_term_size) {
+            self.set_status_msg("Terminal is too small to show the full recovery identity; enlarge it and press A-R again");
+            return;
+        }
+        if self.restart_in_flight(&uid) {
+            self.set_status_msg("A restart of this session is already in progress");
+            return;
+        }
+        let row = self.workspaces.iter().flat_map(|w| &w.sessions)
+            .find(|s| s.uid == uid && s.host_id == host);
+        let Some(row) = row else {
+            self.set_status_msg("The selected session or host changed; run A-R again");
+            return;
+        };
+        if row.workflow_run_id.is_some() || row.continuous_task_id.is_some() {
+            self.set_status_msg("This session's lifecycle is owned by a workflow or scheduler");
+            return;
+        }
+        let was_live = !row.session.exited;
+        let daemon_uid = was_live.then(|| row.session.daemon_session_uid.clone()).flatten();
+        if was_live && daemon_uid.is_none() {
+            self.set_status_msg("The holder identity is unavailable; no stop was attempted");
+            return;
+        }
+        if let Some(d) = &daemon_uid {
+            self.restart_suppressed_exit_uids.insert(d.clone());
+        }
+        let pool = std::sync::Arc::clone(&self.host_pool);
+        let job_host = host.clone();
+        let (tx, result) = mpsc::channel();
+        let spawned = std::thread::Builder::new().name("cm-background-recovery".into()).spawn(move || {
+            let outcome = (|| {
+                let socket = pool.for_host(&job_host).ok().and_then(|h| h.socket_path())
+                    .ok_or_else(|| "Host unreachable; recovery was not confirmed".to_string())?;
+                let token = pool.operator_token_for(&job_host);
+                let reply = crate::client_session::rpc_messaging_board(&socket, &token,
+                    "session.background_recovery_confirm", serde_json::json!({"identity": identity, "confirmed": true}))
+                    .map_err(|e| format!("Recovery result is unknown: {e}; inspect the durable recovery record before retrying"))?;
+                if reply["status"] == "revived" { Ok(()) } else {
+                    Err(format!("{}; inspect the durable recovery record before retrying",
+                        reply["message"].as_str().unwrap_or("Recovery did not complete")))
+                }
+            })();
+            let _ = tx.send(match outcome {
+                Ok(()) => RestartOutcome::Revived,
+                Err(e) => RestartOutcome::RecoveryUncertain(e),
+            });
+        });
+        if let Err(e) = spawned {
+            if let Some(d) = &daemon_uid { self.restart_suppressed_exit_uids.remove(d); }
+            self.set_status_msg(&format!("Could not start recovery worker: {e}"));
+            return;
+        }
+        self.restarts.push(RestartFlight { uid, host_id: host, was_live, daemon_uid, result });
+        self.set_status_msg("Checking and recovering the confirmed background session…");
+    }
+
     pub(super) fn restart_in_flight(&self, uid: &str) -> bool {
         self.restarts.iter().any(|f| f.uid == uid)
     }
@@ -269,7 +474,8 @@ impl App {
             None
         };
         let host_id = ts.host_id.clone();
-        let revive = (host_id != HostId::local()).then(|| {
+        let probe_background = matches!(ts.session_type.as_str(), "claude" | "claude-code");
+        let revive = (host_id != HostId::local() || (probe_background && !was_live)).then(|| {
             let mut entry = ts.to_manifest_entry();
             entry.last_exit = None;
             let worktree = ws
@@ -292,7 +498,7 @@ impl App {
         let spawned = std::thread::Builder::new()
             .name("cm-restart".into())
             .spawn(move || {
-                let _ = tx.send(run_restart(&pool, &job_host, job_kill.as_deref(), revive.as_ref()));
+                let _ = tx.send(run_restart(&pool, &job_host, job_kill.as_deref(), revive.as_ref(), probe_background));
             });
         if let Err(e) = spawned {
             if let Some(d) = &daemon_uid {
@@ -304,7 +510,7 @@ impl App {
         self.restarts.push(RestartFlight { uid, host_id, was_live, daemon_uid, result });
         self.set_status_msg(&format!(
             "{} {label}…",
-            if was_live { "Restarting" } else { "Reviving" }
+            if probe_background { "Checking" } else if was_live { "Restarting" } else { "Reviving" }
         ));
         self.needs_redraw = true;
     }
@@ -452,7 +658,69 @@ impl App {
             }
             RestartOutcome::Killed => {
                 let Some((wi, si)) = found else { return };
-                self.respawn_local_session(wi, si, true);
+                self.respawn_local_session(wi, si, flight.was_live);
+            }
+            RestartOutcome::BackgroundOffer(offer) => {
+                unmark(self);
+                let Some((wi, si)) = found else { return };
+                if !matches!(self.input_mode, InputMode::Normal) {
+                    self.set_status_msg("Background recovery needs confirmation; close the current dialog and press A-R again");
+                    return;
+                }
+                let identity = offer["identity"].clone();
+                let label = sanitize_for_display(&self.workspaces[wi].sessions[si].label);
+                let native = identity["native_session_id"].as_str().unwrap_or("");
+                let path = sanitize_for_display(identity["canonical_cwd"].as_str().unwrap_or(""));
+                let task = sanitize_for_display(identity["task_id"].as_str().unwrap_or("none"));
+                let pid = identity["background_pid"].as_u64().unwrap_or(0);
+                let start = identity["background_start_time"].as_u64().unwrap_or(0);
+                let prompt = format!("Stop Claude background work for {label} on `{}` and revive it? It may be active.\nNative ID: {native}\nBackground PID: {pid}; start: {start}\nTask: {task}\nWorkspace: {path}", flight.host_id.as_str());
+                if !background_prompt_fits(&prompt, self.last_term_size) {
+                    self.set_status_msg("Terminal is too small to show the full recovery identity; enlarge it and press A-R again");
+                    return;
+                }
+                self.input_mode = InputMode::Confirm {
+                    prompt: prompt.clone(),
+                    action: ConfirmAction::BackgroundRecovery { uid: flight.uid, host: flight.host_id, identity, prompt },
+                };
+            }
+            RestartOutcome::RecoveryNeedsAttention(message) => {
+                unmark(self);
+                self.set_status_msg(&format!("Recovery needs attention: {message}"));
+            }
+            RestartOutcome::RecoveryUncertain(message) => {
+                self.revive_failed.insert(flight.uid.clone(), message.clone());
+                unmark(self);
+                self.set_status_msg(&format!("Recovery needs attention: {message}"));
+            }
+            RestartOutcome::RecoveryCleared(message) => {
+                unmark(self);
+                self.set_status_msg(&format!("{message}; inspect the session before pressing A-R again"));
+            }
+            RestartOutcome::RecoveryRecord(record) => {
+                unmark(self);
+                let Some((wi, si)) = found else { return };
+                if !matches!(self.input_mode, InputMode::Normal) {
+                    self.set_status_msg("Recovery needs reconciliation; close the current dialog and press A-R again");
+                    return;
+                }
+                let identity = record["identity"].clone();
+                let label = sanitize_for_display(&self.workspaces[wi].sessions[si].label);
+                let native = identity["native_session_id"].as_str().unwrap_or("");
+                let path = sanitize_for_display(identity["canonical_cwd"].as_str().unwrap_or(""));
+                let task = sanitize_for_display(identity["task_id"].as_str().unwrap_or("none"));
+                let phase = sanitize_for_display(record["status"].as_str().unwrap_or("unknown"));
+                let pid = identity["background_pid"].as_u64().unwrap_or(0);
+                let start = identity["background_start_time"].as_u64().unwrap_or(0);
+                let prompt = format!("Reconcile interrupted recovery for {label} on `{}`? This checks whether background work stopped; it does not stop or revive it.\nPhase: {phase}\nNative ID: {native}\nBackground PID: {pid}; start: {start}\nTask: {task}\nWorkspace: {path}", flight.host_id.as_str());
+                if !background_prompt_fits(&prompt, self.last_term_size) {
+                    self.set_status_msg("Terminal is too small to show the full recovery identity; enlarge it and press A-R again");
+                    return;
+                }
+                self.input_mode = InputMode::Confirm {
+                    prompt: prompt.clone(),
+                    action: ConfirmAction::ReconcileBackground { uid: flight.uid, host: flight.host_id, identity, prompt },
+                };
             }
         }
     }

@@ -38,9 +38,11 @@ def background_match(rows, session_id, cwd):
     if not isinstance(rows, list) or not cwd:
         return None
     found = [r for r in rows if isinstance(r, dict) and r.get("kind") == "background"
-             and r.get("sessionId") == sid and isinstance(r.get("cwd"), str)
-             and os.path.realpath(r["cwd"]) == os.path.realpath(cwd)]
-    return found[0] if len(found) == 1 else None
+             and r.get("sessionId") == sid]
+    if (len(found) != 1 or not isinstance(found[0].get("cwd"), str)
+            or os.path.realpath(found[0]["cwd"]) != os.path.realpath(cwd)):
+        return None
+    return found[0]
 
 
 async def background_roster():
@@ -95,6 +97,13 @@ def _ppid(pid: int) -> int | None:
     try:
         return int(Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[1])
     except (OSError, IndexError, ValueError):
+        return None
+
+
+def _start(pid: int) -> str | None:
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
         return None
 
 
@@ -281,10 +290,29 @@ class ClaudeAdapter:
         # A live client with channels disabled still claims: holding the
         # queue it keeps notices pending and reports channels_disabled,
         # instead of a stale client submitting them into a void.
-        if self.live() is True:
-            return {"session_id": self.own_session_id(),
-                    "transcript_path": self.transcript_path}
+        # An inherited environment variable is useful diagnostics, but does
+        # not prove which client owns this MCP child after a native fork.
+        # Only the owning Claude process's explicit argv can authorize a
+        # channel takeover.
+        parent_id = argv_session_id(claude_parent_argv())
+        if parent_id and self.peer_start and self.live() is True and parent_id == self.own_session_id():
+            return {"session_id": parent_id,
+                    "transcript_path": self.transcript_path,
+                    "peer_start": self.peer_start}
         return None
+
+    def valid_takeover_request(self, claim):
+        """Recheck the waiting process, its parent and the current binding."""
+        pid = claim.get("pid")
+        if not isinstance(pid, int) or pid <= 0 or not self.transcript_path:
+            return False
+        sid = Path(self.transcript_path).stem
+        return (claim.get("session_id") == sid
+                and claim.get("transcript_path") == self.transcript_path
+                and claim.get("peer_start") is not None
+                and _start(pid) == claim["peer_start"]
+                and argv_session_id(claude_parent_argv(pid)) == sid
+                and _start(pid) == claim["peer_start"])
 
     @staticmethod
     def stale_evidence(own, markers):

@@ -17,7 +17,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
@@ -34,6 +34,8 @@ pub struct Identity {
     pub native_session_id: String,
     pub transcript_generation: u64,
     pub holder_incarnation: Option<u64>,
+    pub holder_pid: Option<u32>,
+    pub holder_start_time: Option<u64>,
     pub child_pid: u32,
     pub child_start_time: u64,
     pub background_pid: u32,
@@ -55,6 +57,68 @@ struct Snapshot {
     background_jobs: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EffectStep {
+    PreHolderRecheck,
+    HolderKill,
+    PreNativeRecheck,
+    NativeStop,
+    PostStopProof,
+    Revive,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum EffectOutcome {
+    Revived,
+    Partial(String),
+    Unknown(String),
+}
+
+fn execute_effect_sequence<C, E>(
+    mut checkpoint: C,
+    mut effect: E,
+) -> EffectOutcome
+where
+    C: FnMut(&str) -> Result<(), String>,
+    E: FnMut(EffectStep) -> Result<(), String>,
+{
+    if let Err(e) = checkpoint("confirmed") {
+        return EffectOutcome::Unknown(e);
+    }
+    if let Err(e) = effect(EffectStep::PreHolderRecheck) {
+        return EffectOutcome::Unknown(e);
+    }
+    if let Err(e) = effect(EffectStep::HolderKill) {
+        return EffectOutcome::Unknown(e);
+    }
+    if let Err(e) = checkpoint("holder_stopped") {
+        return EffectOutcome::Unknown(e);
+    }
+    if let Err(e) = checkpoint("native_stop_ready") {
+        return EffectOutcome::Unknown(e);
+    }
+    if let Err(e) = effect(EffectStep::PreNativeRecheck) {
+        return EffectOutcome::Unknown(e);
+    }
+    if let Err(e) = effect(EffectStep::NativeStop) {
+        return EffectOutcome::Unknown(e);
+    }
+    if let Err(e) = effect(EffectStep::PostStopProof) {
+        return EffectOutcome::Unknown(e);
+    }
+    if let Err(e) = checkpoint("native_stopped") {
+        return EffectOutcome::Unknown(e);
+    }
+    if let Err(e) = effect(EffectStep::Revive) {
+        let _ = checkpoint("partial");
+        return EffectOutcome::Partial(e);
+    }
+    if let Err(e) = checkpoint("revived") {
+        return EffectOutcome::Unknown(e);
+    }
+    EffectOutcome::Revived
+}
+
 #[derive(Clone, Debug)]
 struct BackgroundHost {
     pid: u32,
@@ -71,8 +135,25 @@ fn active() -> &'static Mutex<HashSet<String>> {
     ACTIVE.get_or_init(Default::default)
 }
 
+fn gates() -> &'static Mutex<std::collections::HashMap<String, std::sync::Weak<RwLock<()>>>> {
+    static GATES: OnceLock<Mutex<std::collections::HashMap<String, std::sync::Weak<RwLock<()>>>>> = OnceLock::new();
+    GATES.get_or_init(Default::default)
+}
+
+pub(crate) fn lifecycle_gate(uid: &str) -> Arc<RwLock<()>> {
+    let mut all = gates().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(existing) = all.get(uid).and_then(std::sync::Weak::upgrade) {
+        return existing;
+    }
+    all.retain(|_, value| value.strong_count() > 0);
+    let value = Arc::new(RwLock::new(()));
+    all.insert(uid.to_string(), Arc::downgrade(&value));
+    value
+}
+
 thread_local! {
     static INTERNAL: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    static READ_CONTEXT: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 }
 
 pub(crate) struct Reservation {
@@ -104,8 +185,31 @@ pub(crate) fn internal(uid: &str) -> InternalGuard {
     InternalGuard { uid: uid.to_string() }
 }
 
-fn internal_for(uid: &str) -> bool {
+pub(crate) fn internal_active(uid: &str) -> bool {
     INTERNAL.with(|set| set.borrow().contains(uid))
+}
+
+pub(crate) struct ReadContextGuard {
+    uid: String,
+}
+
+impl Drop for ReadContextGuard {
+    fn drop(&mut self) {
+        READ_CONTEXT.with(|set| {
+            set.borrow_mut().remove(&self.uid);
+        });
+    }
+}
+
+pub(crate) fn read_context(uid: &str) -> ReadContextGuard {
+    READ_CONTEXT.with(|set| {
+        set.borrow_mut().insert(uid.to_string());
+    });
+    ReadContextGuard { uid: uid.to_string() }
+}
+
+pub(crate) fn read_context_active(uid: &str) -> bool {
+    READ_CONTEXT.with(|set| set.borrow().contains(uid))
 }
 
 pub(crate) fn in_progress(uid: &str) -> bool {
@@ -119,14 +223,15 @@ pub(crate) fn admission_blocked(uid: &str) -> bool {
     if in_progress(uid) {
         return true;
     }
-    load_receipt(uid)
-        .ok()
-        .flatten()
-        .is_some_and(|r| !matches!(r.phase.as_str(), "revived" | "failed"))
+    match load_receipt(uid) {
+        Ok(Some(r)) => !matches!(r.phase.as_str(), "revived" | "failed"),
+        Ok(None) => false,
+        Err(_) => true,
+    }
 }
 
 pub(crate) fn admission_refusal(uid: &str) -> Option<String> {
-    if internal_for(uid) {
+    if internal_active(uid) {
         return None;
     }
     admission_blocked(uid).then(|| {
@@ -174,6 +279,41 @@ fn save_receipt(uid: &str, receipt: &Receipt) -> io::Result<()> {
 
 fn now() -> f64 {
     crate::control::methods::now_unix_f64()
+}
+
+fn daemon_identity() -> Result<String, String> {
+    let path = crate::path::dot_cm_dir().join("daemon-identity");
+    if let Ok(value) = fs::read_to_string(&path) {
+        let value = value.trim().to_string();
+        if !value.is_empty() {
+            return Ok(value);
+        }
+    }
+    fs::create_dir_all(path.parent().ok_or_else(|| "daemon identity has no parent".to_string())?)
+        .map_err(|e| format!("create daemon identity directory: {e}"))?;
+    let candidate = uuid::Uuid::new_v4().to_string();
+    match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            use std::io::Write;
+            file.write_all(candidate.as_bytes()).map_err(|e| format!("write daemon identity: {e}"))?;
+            file.sync_all().map_err(|e| format!("sync daemon identity: {e}"))?;
+            Ok(candidate)
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => fs::read_to_string(&path)
+            .map(|value| value.trim().to_string())
+            .map_err(|e| format!("read daemon identity after race: {e}")),
+        Err(e) => Err(format!("create daemon identity: {e}")),
+    }
+}
+
+fn holder_root_pid() -> Option<u32> {
+    crate::holder_mode::global().map(|_| unsafe { libc::getppid() as u32 })
+}
+
+fn holder_identity() -> (Option<u32>, Option<u64>) {
+    let pid = holder_root_pid();
+    let start = pid.and_then(|pid| proc_parts(pid).ok().map(|(_, start)| start));
+    (pid, start)
 }
 
 fn exact_session_id(id: &str) -> bool {
@@ -362,7 +502,16 @@ fn roster_match(roster: &Roster, id: &str, cwd: &Path) -> io::Result<bool> {
         .ok_or_else(|| io::Error::other("invalid Claude roster"))?;
     let mut found = 0;
     for row in rows {
+        if !row.is_object() || row.get("kind").and_then(Value::as_str).is_none() {
+            return Err(io::Error::other("Claude roster contains malformed row"));
+        }
         if row["kind"] != "background" || row["sessionId"] != id {
+            if row["kind"] == "background"
+                && (row.get("sessionId").and_then(Value::as_str).is_none()
+                    || row.get("cwd").and_then(Value::as_str).is_none())
+            {
+                return Err(io::Error::other("Claude roster background row is incomplete"));
+            }
             continue;
         }
         let path = row["cwd"]
@@ -408,10 +557,12 @@ fn snapshot(state: &DaemonState, uid: &str) -> Result<Snapshot, String> {
                 task_id: tomb.task_id.clone(),
                 workspace_id: tomb.workspace_id.clone(),
                 canonical_cwd: cwd.to_string_lossy().into_owned(),
-                daemon_id: crate::host_id::HostId::local().as_str().to_string(),
+                daemon_id: daemon_identity()?,
                 native_session_id,
                 transcript_generation: tomb.generation,
                 holder_incarnation: tomb.incarnation,
+                holder_pid: None,
+                holder_start_time: None,
                 child_pid: 0,
                 child_start_time: 0,
                 background_pid: 0,
@@ -437,16 +588,19 @@ fn snapshot(state: &DaemonState, uid: &str) -> Result<Snapshot, String> {
         .ok_or_else(|| "session has no bound native transcript identity".to_string())?;
     let child_start_time = crate::adopt::proc_starttime(session.pid as libc::pid_t)
         .map_err(|e| format!("child start time: {e}"))?;
+    let (holder_pid, holder_start_time) = holder_identity();
     let agent = crate::agent_state::current(session);
     let identity = Identity {
         uid: uid.to_string(),
         task_id: session.task_id.clone(),
         workspace_id: session.workspace_id.clone(),
         canonical_cwd: cwd.to_string_lossy().into_owned(),
-        daemon_id: crate::host_id::HostId::local().as_str().to_string(),
+        daemon_id: daemon_identity()?,
         native_session_id,
         transcript_generation: session.generation,
         holder_incarnation: session.holder_incarnation,
+        holder_pid,
+        holder_start_time,
         child_pid: session.pid as u32,
         child_start_time,
         background_pid: 0,
@@ -474,6 +628,107 @@ fn lifecycle_refusal(state: &DaemonState, uid: &str) -> Option<String> {
             None
         }
     })
+}
+
+fn same_bound_identity(a: &Identity, b: &Identity) -> bool {
+    a.uid == b.uid
+        && a.task_id == b.task_id
+        && a.workspace_id == b.workspace_id
+        && a.canonical_cwd == b.canonical_cwd
+        && a.daemon_id == b.daemon_id
+        && a.native_session_id == b.native_session_id
+        && a.transcript_generation == b.transcript_generation
+        && a.holder_incarnation == b.holder_incarnation
+        && a.holder_pid == b.holder_pid
+        && a.holder_start_time == b.holder_start_time
+        && a.child_pid == b.child_pid
+        && a.child_start_time == b.child_start_time
+}
+
+fn same_stable_identity(a: &Identity, b: &Identity) -> bool {
+    a.uid == b.uid
+        && a.task_id == b.task_id
+        && a.workspace_id == b.workspace_id
+        && a.canonical_cwd == b.canonical_cwd
+        && a.daemon_id == b.daemon_id
+        && a.native_session_id == b.native_session_id
+        && a.transcript_generation == b.transcript_generation
+        && a.holder_incarnation == b.holder_incarnation
+}
+
+fn revalidate_bound(state_arc: &Arc<Mutex<DaemonState>>, identity: &Identity) -> Result<(), String> {
+    let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    if state.draining || state.restarting {
+        return Err("daemon is draining or restarting".into());
+    }
+    if crate::rotation::in_progress(&identity.uid) {
+        return Err("transcript rotation is running".into());
+    }
+    if crate::handoff::in_progress(&identity.uid) {
+        return Err("session handoff is running".into());
+    }
+    if let Some(session) = state.sessions.get(&identity.uid) {
+        if session.workflow_run_id.is_some() || session.continuous_task_id.is_some() {
+            return Err("session lifecycle is owned by workflow/continuous supervision".into());
+        }
+    }
+    let current = snapshot(&state, &identity.uid)?;
+    if !same_bound_identity(&current.identity, identity) {
+        return Err("CM session identity changed during recovery".into());
+    }
+    Ok(())
+}
+
+fn revalidate_stable_bound(state_arc: &Arc<Mutex<DaemonState>>, identity: &Identity) -> Result<(), String> {
+    let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    if state.draining || state.restarting {
+        return Err("daemon is draining or restarting".into());
+    }
+    if crate::rotation::in_progress(&identity.uid) {
+        return Err("transcript rotation is running".into());
+    }
+    if crate::handoff::in_progress(&identity.uid) {
+        return Err("session handoff is running".into());
+    }
+    let current = snapshot(&state, &identity.uid)?;
+    if !same_stable_identity(&current.identity, identity) {
+        return Err("durable CM session identity changed during recovery".into());
+    }
+    Ok(())
+}
+
+fn process_gone(pid: u32, start: u64) -> Result<bool, String> {
+    match proc_parts(pid) {
+        Ok((_, current)) if current == start => Ok(false),
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(format!("background process identity unreadable: {e}")),
+    }
+}
+
+fn verify_native_stopped(identity: &Identity) -> Result<(), String> {
+    let cwd = Path::new(&identity.canonical_cwd);
+    let roster = roster(cwd).map_err(|e| format!("Claude roster unavailable after stop: {e}"))?;
+    match roster_match(&roster, &identity.native_session_id, cwd) {
+        Ok(false) => {}
+        Ok(true) => return Err("native background session is still listed after stop".into()),
+        Err(e) => return Err(format!("Claude roster unreadable after stop: {e}")),
+    }
+    if !process_gone(identity.background_pid, identity.background_start_time)? {
+        return Err("background host PID/start still exists after stop".into());
+    }
+    Ok(())
+}
+
+fn verify_no_native_background(identity: &Identity) -> Result<(), String> {
+    let cwd = Path::new(&identity.canonical_cwd);
+    let roster = roster(cwd).map_err(|e| format!("Claude roster unavailable: {e}"))?;
+    match roster_match(&roster, &identity.native_session_id, cwd)
+        .map_err(|e| format!("Claude roster unreadable: {e}"))?
+    {
+        true => Err("native background appeared during guarded normal restart".into()),
+        false => Ok(()),
+    }
 }
 
 pub(crate) fn preflight(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) -> Value {
@@ -514,22 +769,15 @@ pub(crate) fn preflight(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) -> Value
         if snap.background_jobs != 0 {
             return json!({"status":"unavailable","identity":Value::Null,"message":"daemon reports background work but Claude roster does not prove its identity"});
         }
-        return json!({"status":"normal","identity":Value::Null,"message":"no exact native background session is present"});
+        return json!({"status":"normal","identity":snap.identity,"message":"no exact native background session is present; captured identity is required for a guarded restart"});
     }
-    let host = match host_proof(
-        &snap.identity.native_session_id,
-        (snap.identity.child_pid != 0).then_some(snap.identity.child_pid),
-    ) {
+    let host = match host_proof(&snap.identity.native_session_id, snap.identity.holder_pid) {
         Ok(host) => host,
         Err(e) => return json!({"status":"unavailable","identity":Value::Null,"message":format!("background host evidence unavailable: {e}")}),
     };
     let mut identity = snap.identity;
     identity.background_pid = host.pid;
     identity.background_start_time = host.start;
-    let receipt = Receipt { version: 1, identity: identity.clone(), phase: "offered".into(), updated_at: now() };
-    if let Err(e) = save_receipt(uid, &receipt) {
-        return json!({"status":"unavailable","identity":Value::Null,"message":format!("could not persist recovery intent: {e}")});
-    }
     json!({"status":"offer","identity":identity,"message":"Claude native background work is active; explicit confirmation is required"})
 }
 
@@ -566,11 +814,23 @@ pub(crate) fn confirm(
     let identity = identity_from_value(identity_value)
         .map_err(|e| (ErrorCode::InvalidParams, e))?;
     let uid = identity.uid.clone();
-    let receipt = load_receipt(&uid)
+    let recovery_gate = lifecycle_gate(&uid);
+    let _recovery_write = recovery_gate.write().unwrap_or_else(|p| p.into_inner());
+    if let Some(receipt) = load_receipt(&uid)
         .map_err(|e| (ErrorCode::Conflict, format!("recovery receipt unavailable: {e}")))?
-        .ok_or_else(|| (ErrorCode::Conflict, "no durable recovery offer exists".into()))?;
-    if receipt.phase != "offered" || receipt.identity != identity {
-        return Err((ErrorCode::Conflict, "recovery identity is stale or already consumed".into()));
+    {
+        match receipt.phase.as_str() {
+            "revived" if receipt.identity == identity => {
+                return Ok(json!({"status":"revived","message":"recovery already completed"}));
+            }
+            "failed" if receipt.identity == identity => {
+                return Ok(json!({"status":"partial","message":"recovery was already reconciled as failed"}));
+            }
+            "revived" | "failed" => { /* a new identity starts a new episode */ }
+            phase => {
+                return Err((ErrorCode::Conflict, format!("recovery is already journaled in phase '{phase}'")));
+            }
+        }
     }
     let reservation = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
@@ -578,7 +838,7 @@ pub(crate) fn confirm(
             return Err((ErrorCode::Conflict, reason));
         }
         let snap = snapshot(&state, &uid).map_err(|e| (ErrorCode::Conflict, e))?;
-        if snap.identity != identity {
+        if !same_bound_identity(&snap.identity, &identity) {
             return Err((ErrorCode::Conflict, "session identity changed since preflight".into()));
         }
         if in_progress(&uid) {
@@ -588,55 +848,149 @@ pub(crate) fn confirm(
         Reservation { uid: uid.clone() }
     };
     let _reservation = reservation;
-    let roster = roster(Path::new(&identity.canonical_cwd))
-        .map_err(|e| (ErrorCode::Conflict, format!("Claude roster unavailable before effect: {e}")))?;
-    if !roster_match(&roster, &identity.native_session_id, Path::new(&identity.canonical_cwd))
-        .map_err(|e| (ErrorCode::Conflict, format!("native identity unavailable before effect: {e}")))?
-    {
-        return Err((ErrorCode::Conflict, "native background identity disappeared before effect".into()));
-    }
-    let host = host_proof(
-        &identity.native_session_id,
-        (identity.child_pid != 0).then_some(identity.child_pid),
-    )
-        .map_err(|e| (ErrorCode::Conflict, format!("background host changed before effect: {e}")))?;
-    if host.pid != identity.background_pid || host.start != identity.background_start_time {
-        return Err((ErrorCode::Conflict, "background host identity changed before effect".into()));
-    }
-    mark(&uid, &identity, "confirmed").map_err(|e| (ErrorCode::Conflict, e))?;
-    {
-        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-        if state.sessions.contains_key(&uid) {
-            drop(state);
-            crate::control::methods::kill_with_attribution(state_arc, &uid, "background-recovery");
-            wait_gone(state_arc, &uid).map_err(|e| (ErrorCode::Conflict, e))?;
+    let normal_restart = identity.background_pid == 0 && identity.background_start_time == 0;
+    if !normal_restart {
+        let roster_before = roster(Path::new(&identity.canonical_cwd))
+            .map_err(|e| (ErrorCode::Conflict, format!("Claude roster unavailable before effect: {e}")))?;
+        if !roster_match(&roster_before, &identity.native_session_id, Path::new(&identity.canonical_cwd))
+            .map_err(|e| (ErrorCode::Conflict, format!("native identity unavailable before effect: {e}")))?
+        {
+            return Err((ErrorCode::Conflict, "native background identity disappeared before effect".into()));
+        }
+        let host = host_proof(&identity.native_session_id, identity.holder_pid)
+            .map_err(|e| (ErrorCode::Conflict, format!("background host changed before effect: {e}")))?;
+        if host.pid != identity.background_pid || host.start != identity.background_start_time {
+            return Err((ErrorCode::Conflict, "background host identity changed before effect".into()));
         }
     }
-    mark(&uid, &identity, "holder_stopped").map_err(|e| (ErrorCode::Conflict, e))?;
-    if let Err(e) = run_command(Path::new(&identity.canonical_cwd), &["stop", &identity.native_session_id]) {
-        let _ = mark(&uid, &identity, "unknown");
-        return Ok(json!({"status":"unknown","message":format!("native stop outcome is unknown: {e}")}));
+    revalidate_bound(state_arc, &identity)
+        .map_err(|e| (ErrorCode::Conflict, e))?;
+    let outcome = execute_effect_sequence(
+        |phase| mark(&uid, &identity, phase),
+        |step| match step {
+            EffectStep::PreHolderRecheck => {
+                revalidate_bound(state_arc, &identity)?;
+                if normal_restart {
+                    return verify_no_native_background(&identity);
+                }
+                let host = host_proof(&identity.native_session_id, identity.holder_pid)
+                    .map_err(|e| e.to_string())?;
+                if host.pid != identity.background_pid || host.start != identity.background_start_time {
+                    return Err("holder/native identity changed before holder stop".into());
+                }
+                Ok(())
+            }
+            EffectStep::HolderKill => {
+                let live = state_arc.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(&uid);
+                if live {
+                    crate::control::methods::kill_with_attribution(state_arc, &uid, "background-recovery");
+                    wait_gone(state_arc, &uid)?;
+                }
+                Ok(())
+            }
+            EffectStep::PreNativeRecheck => {
+                if normal_restart {
+                    revalidate_stable_bound(state_arc, &identity)?;
+                    return verify_no_native_background(&identity);
+                }
+                let roster_after = roster(Path::new(&identity.canonical_cwd))
+                    .map_err(|e| format!("native identity unreadable after holder stop: {e}"))?;
+                let listed_after = roster_match(&roster_after, &identity.native_session_id, Path::new(&identity.canonical_cwd))
+                    .map_err(|e| e.to_string())?;
+                let host_after = host_proof(&identity.native_session_id, identity.holder_pid)
+                    .map_err(|e| e.to_string())?;
+                if !listed_after || host_after.pid != identity.background_pid || host_after.start != identity.background_start_time {
+                    return Err("native identity changed after holder stop".into());
+                }
+                revalidate_stable_bound(state_arc, &identity)
+            }
+            EffectStep::NativeStop => {
+                if normal_restart {
+                    return Ok(());
+                }
+                run_command(Path::new(&identity.canonical_cwd), &["stop", &identity.native_session_id])
+                    .map(|_| ())
+                    .map_err(|e| format!("native stop outcome is unknown: {e}"))
+            }
+            EffectStep::PostStopProof => {
+                if normal_restart { Ok(()) } else { verify_native_stopped(&identity) }
+            }
+            EffectStep::Revive => {
+                let _internal = internal(&uid);
+                let revive_params = json!({
+                    "uid": uid,
+                    "workspace_id": identity.workspace_id,
+                    "worktree_path": identity.canonical_cwd,
+                    "session_type": "claude-code",
+                    "task_id": identity.task_id,
+                    "transcript_id": identity.native_session_id,
+                });
+                crate::control::methods::revive_session(state_arc, &revive_params)
+                    .map(|_| ())
+                    .map_err(|(_, e)| e)
+            }
+        },
+    );
+    Ok(match outcome {
+        EffectOutcome::Revived if normal_restart => json!({"status":"revived","message":"session restarted under the captured CM identity"}),
+        EffectOutcome::Revived => json!({"status":"revived","message":"native background stopped and session revived"}),
+        EffectOutcome::Partial(message) if normal_restart => json!({"status":"partial","message":format!("guarded session restart failed to revive: {message}")}),
+        EffectOutcome::Partial(message) => json!({"status":"partial","message":format!("native background stopped but revive failed: {message}")}),
+        EffectOutcome::Unknown(message) => json!({"status":"unknown","message":message}),
+    })
+}
+
+/// Explicit operator reconciliation.  Preflight is intentionally stateless;
+/// only an unknown/partial effect can be cleared here, after fresh negative
+/// roster and PID/start evidence. An unreadable source stays fenced for a
+/// later operator investigation.
+pub(crate) fn reconcile(
+    uid: &str,
+    identity_value: &Value,
+    action: &str,
+) -> Result<Value, (ErrorCode, String)> {
+    if action != "clear" {
+        return Err((ErrorCode::InvalidParams, "action must be clear".into()));
     }
-    mark(&uid, &identity, "native_stopped").map_err(|e| (ErrorCode::Conflict, e))?;
-    let _internal = internal(&uid);
-    let revive_params = json!({
-        "uid": uid,
-        "workspace_id": identity.workspace_id,
-        "worktree_path": identity.canonical_cwd,
-        "session_type": "claude-code",
-        "task_id": identity.task_id,
-        "transcript_id": identity.native_session_id,
-    });
-    match crate::control::methods::revive_session(state_arc, &revive_params) {
-        Ok(_) => {
-            mark(&identity.uid, &identity, "revived").map_err(|e| (ErrorCode::Conflict, e))?;
-            Ok(json!({"status":"revived","message":"native background stopped and session revived"}))
-        }
-        Err((_, e)) => {
-            let _ = mark(&identity.uid, &identity, "partial");
-            Ok(json!({"status":"partial","message":format!("native background stopped but revive failed: {e}")}))
-        }
+    let identity = identity_from_value(identity_value)
+        .map_err(|e| (ErrorCode::InvalidParams, e))?;
+    let recovery_gate = lifecycle_gate(uid);
+    let _recovery_write = recovery_gate.write().unwrap_or_else(|p| p.into_inner());
+    if in_progress(uid) {
+        return Err((ErrorCode::Conflict, "recovery effect is still running".into()));
     }
+    if identity.uid != uid {
+        return Err((ErrorCode::Conflict, "identity uid does not match request uid".into()));
+    }
+    let receipt = load_receipt(uid)
+        .map_err(|e| (ErrorCode::Conflict, format!("recovery receipt unavailable: {e}")))?
+        .ok_or_else(|| (ErrorCode::NotFound, "no recovery receipt exists".into()))?;
+    if receipt.identity != identity {
+        return Err((ErrorCode::Conflict, "recovery identity is stale".into()));
+    }
+    match (action, receipt.phase.as_str()) {
+        ("clear", "confirmed" | "holder_stopped" | "native_stop_ready" | "native_stopped" | "unknown" | "partial") => {
+            verify_native_stopped(&identity)
+                .map_err(|e| (ErrorCode::Conflict, format!("fresh reconciliation evidence unavailable: {e}")))?;
+            mark(uid, &identity, "failed").map_err(|e| (ErrorCode::Conflict, e))?;
+            let message = if identity.background_pid == 0 {
+                "operator reconciliation proved no matching native background session"
+            } else {
+                "operator reconciliation proved native work stopped"
+            };
+            Ok(json!({"status":"cleared","message":message}))
+        }
+        _ => Err((ErrorCode::Conflict, "receipt phase cannot be reconciled with this action".into())),
+    }
+}
+
+pub(crate) fn status(uid: &str) -> Result<Value, (ErrorCode, String)> {
+    let receipt = load_receipt(uid)
+        .map_err(|e| (ErrorCode::Conflict, format!("recovery receipt unavailable: {e}")))?;
+    Ok(match receipt {
+        Some(receipt) => json!({"status": receipt.phase, "identity": receipt.identity, "message":"durable recovery receipt"}),
+        None => json!({"status":"none", "identity":Value::Null, "message":"no durable recovery receipt"}),
+    })
 }
 
 #[cfg(test)]
@@ -666,15 +1020,115 @@ mod tests {
     }
 
     #[test]
+    fn malformed_roster_cannot_prove_negative_background_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "123e4567-e89b-12d3-a456-426614174000";
+        let roster = Roster { rows: json!([{}]) };
+        assert!(roster_match(&roster, id, dir.path()).is_err());
+    }
+
+    #[test]
+    fn lifecycle_writer_excludes_ordinary_admission() {
+        let uid = "ts-recovery-gate-test";
+        let gate = lifecycle_gate(uid);
+        let read = gate.read().unwrap();
+        assert!(gate.try_write().is_err(), "effect writer must fence a lifecycle reader");
+        drop(read);
+        let write = gate.write().unwrap();
+        assert!(gate.try_read().is_err(), "effect writer must fence new readers");
+        drop(write);
+        assert!(gate.try_read().is_ok());
+    }
+
+    #[test]
+    fn injected_effect_success_has_one_stop_and_one_revive() {
+        let mut checkpoints = Vec::new();
+        let mut effects = Vec::new();
+        let outcome = execute_effect_sequence(
+            |phase| { checkpoints.push(phase.to_string()); Ok(()) },
+            |step| { effects.push(step); Ok(()) },
+        );
+        assert_eq!(outcome, EffectOutcome::Revived);
+        assert_eq!(checkpoints, ["confirmed", "holder_stopped", "native_stop_ready", "native_stopped", "revived"]);
+        assert_eq!(effects, [EffectStep::PreHolderRecheck, EffectStep::HolderKill, EffectStep::PreNativeRecheck, EffectStep::NativeStop, EffectStep::PostStopProof, EffectStep::Revive]);
+    }
+
+    #[test]
+    fn injected_effect_crash_checkpoints_never_replay_stop() {
+        for phase in ["confirmed", "holder_stopped", "native_stop_ready", "native_stopped"] {
+            let mut checkpoints = Vec::new();
+            let mut stop_calls = 0;
+            let outcome = execute_effect_sequence(
+                |checkpoint| {
+                    checkpoints.push(checkpoint.to_string());
+                    if checkpoint == phase { Err("crash".into()) } else { Ok(()) }
+                },
+                |step| {
+                    if step == EffectStep::NativeStop { stop_calls += 1; }
+                    Ok(())
+                },
+            );
+            assert!(matches!(outcome, EffectOutcome::Unknown(_)), "crash at {phase}");
+            assert!(stop_calls <= 1);
+        }
+    }
+
+    #[test]
+    fn injected_effect_stop_success_revive_failure_is_partial() {
+        let outcome = execute_effect_sequence(
+            |_| Ok(()),
+            |step| if step == EffectStep::Revive { Err("revive failed".into()) } else { Ok(()) },
+        );
+        assert!(matches!(outcome, EffectOutcome::Partial(_)));
+    }
+
+    #[test]
+    fn native_stop_checkpoint_failure_never_invokes_native_stop() {
+        let mut effects = Vec::new();
+        let outcome = execute_effect_sequence(
+            |phase| if phase == "native_stop_ready" { Err("fsync failed".into()) } else { Ok(()) },
+            |step| { effects.push(step); Ok(()) },
+        );
+        assert!(matches!(outcome, EffectOutcome::Unknown(_)));
+        assert!(!effects.contains(&EffectStep::NativeStop));
+    }
+
+    #[test]
+    fn confirm_rejects_persisted_interrupted_checkpoint_without_replaying_stop() {
+        let uid = "ts-recovery-interrupted-confirm";
+        let path = receipt_path(uid).unwrap();
+        let _ = fs::remove_file(&path);
+        let identity = Identity { uid: uid.into(), task_id: None, workspace_id: "w".into(), canonical_cwd: "/tmp".into(), daemon_id: "d".into(), native_session_id: "123e4567-e89b-12d3-a456-426614174000".into(), transcript_generation: 1, holder_incarnation: None, holder_pid: None, holder_start_time: None, child_pid: 0, child_start_time: 0, background_pid: 2, background_start_time: 2 };
+        save_receipt(uid, &Receipt { version: 1, identity: identity.clone(), phase: "native_stop_ready".into(), updated_at: 1.0 }).unwrap();
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        let result = confirm(&state, &serde_json::to_value(identity).unwrap(), true);
+        assert!(result.is_err());
+        assert_eq!(load_receipt(uid).unwrap().unwrap().phase, "native_stop_ready");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn corrupt_or_pending_receipt_blocks_admission() {
         let uid = "ts-recovery-receipt-test";
         let path = receipt_path(uid).unwrap();
         let _ = fs::remove_file(&path);
-        let identity = Identity { uid: uid.into(), task_id: None, workspace_id: "w".into(), canonical_cwd: "/tmp".into(), daemon_id: "d".into(), native_session_id: "123e4567-e89b-12d3-a456-426614174000".into(), transcript_generation: 0, holder_incarnation: None, child_pid: 1, child_start_time: 1, background_pid: 2, background_start_time: 2 };
+        let identity = Identity { uid: uid.into(), task_id: None, workspace_id: "w".into(), canonical_cwd: "/tmp".into(), daemon_id: "d".into(), native_session_id: "123e4567-e89b-12d3-a456-426614174000".into(), transcript_generation: 0, holder_incarnation: None, holder_pid: None, holder_start_time: None, child_pid: 1, child_start_time: 1, background_pid: 2, background_start_time: 2 };
         save_receipt(uid, &Receipt { version: 1, identity, phase: "unknown".into(), updated_at: 1.0 }).unwrap();
         assert!(admission_blocked(uid));
         fs::write(&path, b"not-json").unwrap();
         assert!(load_receipt(uid).is_err());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn offer_identity_recheck_ignores_only_the_effect_specific_host_pid() {
+        let mut a = Identity { uid: "u".into(), task_id: Some("t".into()), workspace_id: "w".into(), canonical_cwd: "/tmp".into(), daemon_id: "d".into(), native_session_id: "123e4567-e89b-12d3-a456-426614174000".into(), transcript_generation: 2, holder_incarnation: Some(4), holder_pid: Some(5), holder_start_time: Some(6), child_pid: 10, child_start_time: 11, background_pid: 20, background_start_time: 21 };
+        let b = a.clone();
+        assert!(same_bound_identity(&a, &b));
+        a.background_pid = 99;
+        a.background_start_time = 100;
+        assert!(same_bound_identity(&a, &b));
+        a.child_start_time = 12;
+        assert!(!same_bound_identity(&a, &b));
     }
 }

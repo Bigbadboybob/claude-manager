@@ -221,6 +221,8 @@ fn take_slot(_locked: &DaemonState, reg: &mut Registry, uid: &str) -> bool {
     if reg.running.contains(uid)
         || crate::rotation::in_progress(uid)
         || crate::codex_recovery::in_progress(uid)
+        || crate::claude_recovery::internal_active(uid)
+        || crate::claude_recovery::lifecycle_gate(uid).try_read().is_err()
         || crate::claude_recovery::admission_blocked(uid)
     {
         return false;

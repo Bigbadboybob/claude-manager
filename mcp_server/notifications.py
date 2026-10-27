@@ -177,8 +177,15 @@ class Queue:
                 claim = json.loads(path.read_text())
             except (OSError, ValueError):
                 continue
+            if not isinstance(claim, dict):
+                continue
             pid = claim.get("pid")
             if pid == os.getpid() or not isinstance(pid, int):
+                continue
+            requested_at = claim.get("requested_at")
+            if not isinstance(requested_at, (int, float)) or not 0 <= now - requested_at <= TAKEOVER_FRESH_S:
+                with suppress(OSError):
+                    path.unlink(missing_ok=True)
                 continue
             alive = True
             try:
@@ -187,7 +194,7 @@ class Queue:
                 alive = False
             except PermissionError:
                 pass
-            if not alive or now - claim.get("requested_at", 0) > TAKEOVER_FRESH_S:
+            if not alive:
                 with suppress(OSError):
                     path.unlink(missing_ok=True)
                 continue
@@ -437,12 +444,15 @@ async def _wait_for_lock(queue: Queue, adapter, fd: int):
         queue.withdraw_takeover()
 
 
-def _handoff_reason(queue: Queue, assessment: dict, held_for: float):
+def _handoff_reason(queue: Queue, adapter, assessment: dict, held_for: float):
     """Release only with this holder's own positive staleness evidence AND a
     fresh request from a consumer attached to the daemon-bound transcript."""
     if held_for < HANDOFF_MIN_HOLD_S or not assessment["stale"]:
         return None
-    if not queue.takeover_requests():
+    claims = queue.takeover_requests()
+    if hasattr(adapter, "valid_takeover_request"):
+        claims = [claim for claim in claims if adapter.valid_takeover_request(claim)]
+    if not claims:
         return None
     return assessment["stale"][0]
 
@@ -471,7 +481,7 @@ async def consume(queue: Queue, adapter):
                 queue.health(adapter.engine, assessment["status"],
                              **adapter.identity(), **assessment["extra"])
                 heartbeat = time.monotonic() + 5
-                handed_off = _handoff_reason(queue, assessment, time.monotonic() - acquired)
+                handed_off = _handoff_reason(queue, adapter, assessment, time.monotonic() - acquired)
                 if handed_off:
                     with suppress(AttributeError):
                         adapter.cm_handed_off_at = time.monotonic()

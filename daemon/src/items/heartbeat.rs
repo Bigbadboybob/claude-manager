@@ -225,8 +225,14 @@ pub(crate) fn plan(push: &Value, engine_of: impl Fn(&str) -> Option<String>) -> 
         Some("claude-code" | "codex") => Plan::Publish {
             uid,
             id: format!("board-push:{id}"),
-            text,
-            marker: format!("[cm-board {board}]"),
+            // Board names are shared by every push. Give each native receipt
+            // its own marker so an old inbound board notice cannot confirm a
+            // later event that merely has the same board label.
+            text: {
+                let marker = format!("[cm-board {board} push:{id}]");
+                if text.contains(&marker) { text } else { format!("{text} {marker}") }
+            },
+            marker: format!("[cm-board {board} push:{id}]"),
         },
         Some(engine) => Plan::Drop { reason: format!("{engine} session cannot receive pushes") },
         None => Plan::Drop { reason: "session is not live on this daemon".into() },
@@ -456,8 +462,8 @@ mod tests {
         assert_eq!(planned, Plan::Publish {
             uid: "u1".into(),
             id: "board-push:7".into(),
-            text: "[cm-board sfd] hi".into(),
-            marker: "[cm-board sfd]".into(),
+            text: "[cm-board sfd] hi [cm-board sfd push:7]".into(),
+            marker: "[cm-board sfd push:7]".into(),
         });
     }
 
@@ -606,7 +612,7 @@ mod tests {
         // Org model S2: the reply's member map feeds `ping`'s member.
         assert_eq!(super::super::org::cached_member("me-uid")["handle"], "ep");
         let delivered = crate::notifications::get(root.path(), "me-uid", "board-push:41").unwrap().unwrap();
-        assert_eq!(delivered["text"], "[cm-board sfd] assigned");
+        assert_eq!(delivered["text"], "[cm-board sfd] assigned [cm-board sfd push:41]");
         assert_eq!(delivered["source"], "board");
         beat.run(&state);
         assert!(beat.acks.is_empty());

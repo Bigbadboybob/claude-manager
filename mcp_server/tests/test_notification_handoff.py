@@ -205,6 +205,20 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ClaudeEvidenceTests(unittest.IsolatedAsyncioTestCase):
+    def test_takeover_request_rechecks_peer_process_and_parent_binding(self):
+        adapter = ClaudeAdapter("uid")
+        adapter.transcript_path = "/tmp/bound.jsonl"
+        claim = {"pid": 123, "session_id": "bound", "transcript_path": adapter.transcript_path, "peer_start": "42"}
+        with mock.patch("mcp_server.native_claude._start", return_value="42"), \
+             mock.patch("mcp_server.native_claude.claude_parent_argv", return_value=["claude", "--resume", "bound"]):
+            self.assertTrue(adapter.valid_takeover_request(claim))
+            self.assertFalse(adapter.valid_takeover_request(dict(claim, peer_start="old")))
+            self.assertFalse(adapter.valid_takeover_request(dict(claim, session_id="other")))
+            self.assertFalse(adapter.valid_takeover_request(dict(claim, transcript_path="/tmp/other.jsonl")))
+        with mock.patch("mcp_server.native_claude._start", return_value="42"), \
+             mock.patch("mcp_server.native_claude.claude_parent_argv", return_value=None):
+            self.assertFalse(adapter.valid_takeover_request(claim))
+
     def test_background_roster_requires_exact_native_id_and_workspace(self):
         sid = "650fb958-1e42-4428-b4aa-33e4f7061ba5"
         rows = [{"kind": "background", "sessionId": sid, "cwd": "/tmp/work", "state": "busy"}]
@@ -212,6 +226,7 @@ class ClaudeEvidenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(background_match(rows, sid[:8], "/tmp/work"))
         self.assertIsNone(background_match(rows, sid, "/tmp/other"))
         self.assertIsNone(background_match(rows + rows, sid, "/tmp/work"))
+        self.assertIsNone(background_match(rows + [{"kind":"background", "sessionId":sid, "cwd":"/tmp/other"}], sid, "/tmp/work"))
         self.assertIsNone(background_match(None, sid, "/tmp/work"))
 
     async def test_old_channel_with_inherited_bound_id_is_detected_and_pending_held(self):
@@ -304,10 +319,16 @@ class ClaudeEvidenceTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsNone(await old.takeover_claim())
                 self.assertTrue(diag["transcript_mismatch"])
                 self.assertEqual(diag["stale"], ["transcript_mismatch", "continued_in"])
-                with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "new"}):
+                with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "new"}), \
+                     mock.patch("mcp_server.native_claude.claude_parent_argv", return_value=["claude", "--resume", "new"]):
                     new = ClaudeAdapter("uid")
                     self.assertEqual((await new.diagnostics([]))["stale"], [])
                     self.assertEqual((await new.takeover_claim())["session_id"], "new")
+
+                with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "new"}), \
+                     mock.patch("mcp_server.native_claude.claude_parent_argv", return_value=None):
+                    unknown = ClaudeAdapter("uid")
+                    self.assertIsNone(await unknown.takeover_claim(), "inherited ID alone cannot authorize handoff")
 
     async def test_channels_disabled_client_keeps_notices_pending_and_reports_degraded(self):
         for argv, blocked in ((["claude", "bg-pty-host", "--session-id", "x"], True),

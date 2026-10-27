@@ -646,6 +646,10 @@ pub(crate) fn start_session_with_spawn_fn(
 ) -> MethodResult {
     let p: StartSessionParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.uid);
+    let _recovery_read = (!crate::claude_recovery::internal_active(&p.uid)
+        && !crate::claude_recovery::read_context_active(&p.uid))
+        .then(|| recovery_gate.read().unwrap_or_else(|p| p.into_inner()));
     if let Some(reason) = crate::claude_recovery::admission_refusal(&p.uid) {
         return Err((ErrorCode::Conflict, reason));
     }
@@ -3561,6 +3565,9 @@ pub fn set_transcript_path(
             "transcript_path must be non-empty".into(),
         ));
     }
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.session_uid);
+    let _recovery_read = (!crate::claude_recovery::internal_active(&p.session_uid))
+        .then(|| recovery_gate.read().unwrap_or_else(|p| p.into_inner()));
     if let Some(reason) = crate::claude_recovery::admission_refusal(&p.session_uid) {
         return Err((ErrorCode::Conflict, reason));
     }
@@ -12068,6 +12075,10 @@ pub fn revive_session(
 ) -> MethodResult {
     let p: ReviveSessionParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.uid);
+    let _recovery_read = (!crate::claude_recovery::internal_active(&p.uid))
+        .then(|| recovery_gate.read().unwrap_or_else(|p| p.into_inner()));
+    let _recovery_context = crate::claude_recovery::read_context(&p.uid);
     if let Some(reason) = crate::claude_recovery::admission_refusal(&p.uid) {
         return Err((ErrorCode::Conflict, reason));
     }
