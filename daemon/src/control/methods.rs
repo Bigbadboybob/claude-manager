@@ -20839,15 +20839,20 @@ pub(crate) fn sweep_terminal_task_sessions(
         .collect();
     let swept_at = now_unix_f64();
     let attribution = format!("{} (terminal task)", killer);
+    let mut closed = Vec::new();
     for uid in &targets {
+        let gate = crate::claude_recovery::lifecycle_gate(uid);
+        let Ok(_permit) = gate.try_read() else { continue };
+        if crate::claude_recovery::admission_refusal(uid).is_some() { continue; }
         if let Some(sess) = state.sessions.get_mut(uid) {
             sess.last_exit.mark_operator_kill_requested();
             sess.set_kill_attribution(&attribution);
             let _ = sess.kill();
         }
         state.record_kill_request(uid, &attribution, swept_at);
+        closed.push(uid.clone());
     }
-    targets
+    closed
 }
 
 /// fast the children die.
@@ -20869,6 +20874,9 @@ pub(crate) fn sweep_task_sessions(state_arc: &Arc<Mutex<DaemonState>>, task_id: 
     let swept_at = now_unix_f64();
     let killer = format!("{} (mark_subtask_done)", killer);
     for uid in targets {
+        let gate = crate::claude_recovery::lifecycle_gate(&uid);
+        let Ok(_permit) = gate.try_read() else { continue };
+        if crate::claude_recovery::admission_refusal(&uid).is_some() { continue; }
         if let Some(sess) = state.sessions.get_mut(&uid) {
             sess.last_exit.mark_operator_kill_requested();
             // O4 routing: the verb-routed kill carries the sweep's
@@ -40944,6 +40952,26 @@ while True:
             ["ts-error", "ts-idle", "ts-unknown-quiet", "ts-wait"]
         );
         kill_all_sessions(&state);
+    }
+
+    #[test]
+    fn task_sweeps_do_not_signal_a_recovery_reserved_uid() {
+        let state = make_state_arc();
+        let uid = "ts-sweep-recovery";
+        let mut params = crate::session::SpawnParams::new(uid, "worker", "/bin/sleep");
+        params.args = vec!["60".into()];
+        params.session_type = "claude-code".into();
+        let mut session = crate::session::DaemonSession::spawn(params).unwrap();
+        session.task_id = Some("done-task".into());
+        *session.last_activity_at.lock().unwrap() = None;
+        state.lock().unwrap().sessions.insert(uid.into(), session);
+        let gate = crate::claude_recovery::lifecycle_gate(uid);
+        let _write = gate.write().unwrap();
+        assert!(sweep_terminal_task_sessions(&state, "done-task", "test", None, false).is_empty());
+        sweep_task_sessions(&state, "done-task", "test");
+        let mut state = state.lock().unwrap();
+        assert!(state.sessions.get_mut(uid).unwrap().try_wait().is_none());
+        let _ = state.sessions.get_mut(uid).unwrap().kill();
     }
 
     #[test]
