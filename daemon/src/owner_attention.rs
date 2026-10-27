@@ -260,6 +260,19 @@ pub fn withdraw(state: &DaemonState, key: &str, alert_id: &str) -> Result<bool, 
     Ok(false)
 }
 
+/// Refresh a pending system alert without creating a new alert or reviving an
+/// acknowledged one. Compare the ID so unrelated replacements are untouched.
+pub fn update_system_message(state: &DaemonState, key: &str, alert_id: &str, message: &str) -> Result<bool, String> {
+    let mut alerts = snapshot(state)?;
+    let Some(alert) = alerts.get_mut(key).filter(|a| a.id == alert_id) else { return Ok(false) };
+    if alert.message == message { return Ok(true); }
+    alert.message = truncate(message);
+    let updated = alert.clone();
+    save(state, &alerts)?;
+    broadcast(state, key, Some(&updated));
+    Ok(true)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NotifyParams {

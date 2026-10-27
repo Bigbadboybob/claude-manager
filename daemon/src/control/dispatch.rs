@@ -712,6 +712,18 @@ pub fn dispatch_request(
         "session.set_transcript_path" => {
             DispatchOutcome::Done(dispatch_set_transcript_path(state, req))
         }
+        "session.background_recovery_preflight" => {
+            DispatchOutcome::Done(dispatch_background_recovery_preflight(state, req))
+        }
+        "session.background_recovery_confirm" => {
+            DispatchOutcome::Done(dispatch_background_recovery_confirm(state, req))
+        }
+        "session.background_recovery_reconcile" => {
+            DispatchOutcome::Done(dispatch_background_recovery_reconcile(state, req))
+        }
+        "session.background_recovery_status" => {
+            DispatchOutcome::Done(dispatch_background_recovery_status(state, req))
+        }
 
         // 10d-2c-1 review round-5 (F1): after-the-fact tagging
         // of an already-spawned daemon session with workflow
@@ -2386,6 +2398,74 @@ fn dispatch_session_revive(
     }
 }
 
+fn dispatch_background_recovery_preflight(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "session.background_recovery_preflight is Operator-callable only — native background recovery may stop active work",
+    ) {
+        return resp;
+    }
+    let uid = req.params.get("uid").and_then(Value::as_str).unwrap_or_default();
+    Response::ok(req.id.clone(), crate::claude_recovery::preflight(state, uid))
+}
+
+fn dispatch_background_recovery_confirm(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "session.background_recovery_confirm is Operator-callable only — it requires explicit confirmation before stopping native work",
+    ) {
+        return resp;
+    }
+    let identity = req.params.get("identity").cloned().unwrap_or(Value::Null);
+    let confirmed = req.params.get("confirmed").and_then(Value::as_bool).unwrap_or(false);
+    match crate::claude_recovery::confirm(state, &identity, confirmed) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_background_recovery_reconcile(
+    _state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "session.background_recovery_reconcile is Operator-callable only — reconciliation clears a durable recovery fence",
+    ) {
+        return resp;
+    }
+    let uid = req.params.get("uid").and_then(Value::as_str).unwrap_or_default();
+    let identity = req.params.get("identity").cloned().unwrap_or(Value::Null);
+    let action = req.params.get("action").and_then(Value::as_str).unwrap_or_default();
+    match crate::claude_recovery::reconcile(uid, &identity, action) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_background_recovery_status(
+    _state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "session.background_recovery_status is Operator-callable only",
+    ) {
+        return resp;
+    }
+    let uid = req.params.get("uid").and_then(Value::as_str).unwrap_or_default();
+    match crate::claude_recovery::status(uid) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
 /// `task.update_tree` — TUI-pushed task-tree snapshot
 /// (slice 10d-mcp-surface-2a). Operator-only.
 fn dispatch_task_update_tree(
@@ -3324,6 +3404,9 @@ fn dispatch_manifest_watch(state: &mut DaemonState, req: &Request) -> DispatchOu
             eprintln!("cm-daemon: {e}; sidebar requests unavailable in snapshot");
         }).ok(),
         "owner_attention": owner_attention,
+        "notification_health": crate::messaging::delivery::alarm::snapshot(&state.messaging_root)
+            .map_err(|e| eprintln!("cm-daemon: notification health snapshot unavailable: {e}"))
+            .ok(),
         "agent_states": crate::agent_state::snapshot(state),
         "workspaces": state.workspaces,
         "bindings": state.bindings,

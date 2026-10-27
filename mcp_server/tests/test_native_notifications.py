@@ -123,6 +123,21 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.post()  # producer replay remains idempotent
         self.assertEqual(self.queue.get("one")["status"], "observed")
 
+    async def test_legacy_shared_board_marker_cannot_confirm_later_push(self):
+        for event_id in ("board-push:1", "board-push:2"):
+            self.queue.publish(event_id, "board", "[cm-board sfd] notice", "[cm-board sfd]")
+            self.queue.change(event_id, {"pending"}, status="submitted")
+        unique = "[cm-board sfd push:3]"
+        self.queue.publish("board-push:3", "board", f"notice {unique}", unique)
+        self.queue.change("board-push:3", {"pending"}, status="submitted")
+        adapter = Adapter()
+        adapter.seen.update({"board-push:1", "board-push:2", "board-push:3"})
+        self.start(adapter)
+        await eventually(lambda: self.queue.get("board-push:3")["status"] == "observed")
+        self.assertEqual(self.queue.get("board-push:1")["status"], "submitted")
+        self.assertEqual(self.queue.get("board-push:2")["status"], "submitted")
+        self.assertEqual(adapter.sent, [], "ambiguous receipts are never republished")
+
     async def test_a_rotation_hold_keeps_wakes_pending_for_the_new_process(self):
         # #24: while CM rotates this session, chat wakes stay pending (never
         # submitted to the old process); the rotation's own notice still goes.

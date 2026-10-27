@@ -450,8 +450,8 @@ impl App {
                 InputMode::TaskPeek { lines, scroll, .. } => {
                     peek_max = Some(self.draw_task_peek(frame, area, lines, *scroll));
                 }
-                InputMode::Confirm { prompt, .. } => {
-                    self.draw_confirm(frame, area, prompt);
+                InputMode::Confirm { prompt, action } => {
+                    self.draw_confirm(frame, area, prompt, matches!(action, ConfirmAction::BackgroundRecovery { .. } | ConfirmAction::ReconcileBackground { .. }));
                 }
                 InputMode::Normal => {}
             }
@@ -634,9 +634,13 @@ impl App {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
-    fn draw_confirm(&self, frame: &mut Frame, area: Rect, prompt: &str) {
-        let width = 70u16.min(area.width.saturating_sub(4));
-        let height = 5u16;
+    fn draw_confirm(&self, frame: &mut Frame, area: Rect, prompt: &str, background: bool) {
+        let width = if background { 100 } else { 70 }.min(area.width.saturating_sub(4));
+        let height = if background {
+            let inner = usize::from(width.saturating_sub(2)).max(1);
+            let lines = prompt.lines().map(|line| 1 + unicode_width::UnicodeWidthStr::width(line).div_ceil(inner)).sum::<usize>();
+            u16::try_from(lines.saturating_add(6)).unwrap_or(u16::MAX).min(area.height.saturating_sub(2))
+        } else { 5 };
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -652,11 +656,10 @@ impl App {
 
         let dim = Style::default().fg(theme::DIM);
         let white = Style::default().fg(theme::TEXT);
-        let lines = vec![
-            Line::from(Span::styled(prompt.to_string(), white)),
-            Line::from(""),
-            Line::from(Span::styled("y/Enter confirm \u{00b7} n/Esc cancel", dim)),
-        ];
+        let mut lines: Vec<Line<'_>> = prompt.lines()
+            .map(|line| Line::from(Span::styled(line.to_owned(), white))).collect();
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(if background { "y confirm \u{00b7} n/Esc cancel" } else { "y/Enter confirm \u{00b7} n/Esc cancel" }, dim)));
         frame.render_widget(Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }), inner);
     }
 
@@ -1254,6 +1257,20 @@ impl App {
             .border_style(Style::default().fg(border_color))
             .title(Span::styled(self.active_title(), title_style));
 
+        if let Some((_, ts)) = self.active_session() {
+            if let Some(health) = self.notification_health.get(&(ts.host_id.clone(), ts.uid.clone())) {
+                let warning = if health["reason"] == "external_background" {
+                    " Claude background session: notifications stalled · A-R to inspect "
+                } else {
+                    " Notifications stalled · A-R to inspect "
+                };
+                block = block.title_bottom(Line::from(Span::styled(
+                    warning,
+                    Style::default().fg(theme::ATTN),
+                )));
+            }
+        }
+
         // Scrollback cue: when the active session's viewport is scrolled up
         // (not showing the live tail), surface a right-aligned ATTN tag in
         // the top border. Reading the offset per-frame means it vanishes the
@@ -1519,7 +1536,7 @@ impl App {
                     }
                 }
             };
-            let (indicator, indicator_style) = if self.session_has_alert(&ts.uid) {
+            let (indicator, indicator_style) = if self.session_has_alert(&ts.uid, &ts.host_id) {
                 self.alert_indicator()
             } else if self.owner_blocked_session(&ts.uid) {
                 self.owner_indicator()
@@ -1581,7 +1598,7 @@ impl App {
             } else if let Some(stage) = stage {
                 Style::default().fg(stage.color())
             } else if matches!(idle_bucket, Some(IdleAgeBucket::Stale))
-                && !self.session_has_alert(&ts.uid)
+                && !self.session_has_alert(&ts.uid, &ts.host_id)
                 && !self.owner_blocked_session(&ts.uid)
                 && !self.reconnecting_sessions.contains(&ts.uid)
             {
@@ -2137,7 +2154,7 @@ impl App {
                     // Below a pending alert: work blocked on an Owner decision.
                     let owner_blocked = self.owner_blocked_session(&ts.uid);
                     let revive_failed = self.revive_failed.contains_key(&ts.uid);
-                    let (indicator, indicator_style) = if self.session_has_alert(&ts.uid) {
+                    let (indicator, indicator_style) = if self.session_has_alert(&ts.uid, &ts.host_id) {
                         self.alert_indicator()
                     } else if revive_failed {
                         ("\u{2717}", Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD))
@@ -2283,7 +2300,7 @@ impl App {
                             .fg(theme::TEXT)
                             .add_modifier(Modifier::BOLD)
                     } else if matches!(idle_bucket, Some(IdleAgeBucket::Stale))
-                        && !self.session_has_alert(&ts.uid)
+                        && !self.session_has_alert(&ts.uid, &ts.host_id)
                         && !owner_blocked
                         && !self.reconnecting_sessions.contains(&ts.uid)
                     {
@@ -2331,7 +2348,7 @@ impl App {
                     // when the group reads as one unit).
                     let agg_alerting = ws.sessions.iter().any(|ts| {
                         ts.workflow_run_id.as_deref() == Some(run_id.as_str())
-                            && self.session_has_alert(&ts.uid)
+                            && self.session_has_alert(&ts.uid, &ts.host_id)
                     });
                     let (agg_indicator, agg_style) = if agg_alerting {
                         self.alert_indicator()
@@ -2699,7 +2716,7 @@ impl App {
         let now = Instant::now();
         for ws in self.workspaces.iter().filter(|w| !w.is_closed) {
             for ts in &ws.sessions {
-                if self.session_has_alert(&ts.uid) {
+                if self.session_has_alert(&ts.uid, &ts.host_id) {
                     // An alerting session counts ONLY as an alert — it's
                     // already asking for a human, whatever its status.
                     n_alert += 1;

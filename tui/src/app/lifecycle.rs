@@ -2685,7 +2685,8 @@ impl App {
             let uid = ts.uid.clone();
             self.pending_remote_reattach.retain(|p| p.entry.uid != uid);
         }
-        if was_live || ts.host_id != cm_daemon::host_id::HostId::local() {
+        if was_live || ts.host_id != cm_daemon::host_id::HostId::local()
+            || matches!(ts.session_type.as_str(), "claude" | "claude-code") {
             self.start_restart(wi, si, was_live);
             return;
         }

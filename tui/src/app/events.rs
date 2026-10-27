@@ -1959,6 +1959,13 @@ impl App {
         if let Some(alerts) = &snapshot.owner_attention {
             self.apply_owner_attention_snapshot(&snapshot.host, alerts);
         }
+        if let Some(health) = &snapshot.notification_health {
+            self.notification_health.retain(|(host, uid), _| host != &snapshot.host || health.contains_key(uid));
+            for (uid, value) in health {
+                self.notification_health.insert((snapshot.host.clone(), uid.clone()), value.clone());
+            }
+            self.needs_redraw = true;
+        }
         if let Some(states) = &snapshot.agent_states {
             self.apply_agent_state_snapshot(&snapshot.host, states);
         }
@@ -2363,6 +2370,12 @@ impl App {
             } else if let Ok(alert) = serde_json::from_value(value.clone()) {
                 self.apply_owner_attention(&host, &uid, Some(alert));
             }
+        }
+        if let Some(value) = entry.get("notification_health") {
+            let key = (host.clone(), uid.clone());
+            if value.is_null() { self.notification_health.remove(&key); }
+            else { self.notification_health.insert(key, value.clone()); }
+            self.needs_redraw = true;
         }
         if let Some(value) = entry.get("agent_state") {
             self.apply_agent_state(&host, &uid, value);
@@ -3302,18 +3315,111 @@ mod apply_manifest_diff_tests {
             app.apply_manifest_diff_from_host(host.clone(), ManifestDiff::Updated {
                 uid: "self".into(), entry: serde_json::json!({"owner_attention": alert}),
             });
-            assert!(app.session_has_alert("self"));
+            assert!(app.session_has_alert("self", &host));
             app.needs_redraw = false;
             app.sync_owner_alert_indicators();
             assert!(!app.needs_redraw, "pending alerts must not busy-redraw");
-            app.acknowledge_owner_alerts_for_row("self");
+            app.acknowledge_owner_alerts_for_row("self", &host);
             app.alerts.remove("self");
             assert!(app.owner_alerts.is_empty());
             app.apply_owner_attention(&host, "self", Some(alert));
-            assert!(!app.session_has_alert("self"), "old snapshot cannot resurrect a focused alert");
+            assert!(!app.session_has_alert("self", &host), "old snapshot cannot resurrect a focused alert");
             app.apply_owner_attention(&host, "self", Some(owner_test_alert("new", "self")));
-            assert!(app.session_has_alert("self"));
+            assert!(app.session_has_alert("self", &host));
         }
+    }
+
+    #[test]
+    fn owner_attention_independent_key_is_visible_on_affected_row() {
+        let host = crate::hosts::HostId::new("sessions");
+        let mut app = build_app_with_session("self");
+        app.push_worker.shutdown();
+        app.workspaces[0].sessions[0].host_id = host.clone();
+        app.apply_owner_attention(&host, "self", Some(owner_test_alert("decision", "self")));
+        app.apply_manifest_diff_from_host(host.clone(), ManifestDiff::Updated {
+            uid: "notification-stall:self".into(),
+            entry: serde_json::json!({"owner_attention": owner_test_alert("stall", "self")}),
+        });
+        assert_eq!(app.owner_alerts.len(), 2);
+        assert!(app.session_has_alert("self", &host));
+        assert_eq!(app.open_owner_alerts().iter().filter(|a| a.uid == "self").count(), 2);
+        // A stale menu selection cannot acknowledge the current alert.
+        app.jump_to_owner_alert("self", &host, Some("notification-stall:self"), Some("old"));
+        assert_eq!(app.owner_alerts.len(), 2);
+        app.jump_to_owner_alert("self", &host, Some("notification-stall:self"), Some("stall"));
+        assert_eq!(app.owner_alerts.len(), 1);
+        assert!(app.owner_alerts.contains_key(&(host.clone(), "self".into())));
+        assert!(app.session_has_alert("self", &host));
+        let other_host = crate::hosts::HostId::new("other-host");
+        app.apply_owner_attention(&other_host, "notification-stall:self", Some(owner_test_alert("stall", "self")));
+        assert!(app.owner_alerts.contains_key(&(other_host.clone(), "notification-stall:self".into())));
+        app.acknowledge_owner_alerts_for_row("self", &host);
+        assert_eq!(app.owner_alerts.len(), 1, "focusing one host cannot acknowledge another");
+    }
+
+    #[test]
+    fn owner_attention_same_uid_on_two_hosts_and_missing_row_ack() {
+        let a = crate::hosts::HostId::new("host-a");
+        let b = crate::hosts::HostId::new("host-b");
+        let mut app = build_app_with_session("same");
+        app.push_worker.shutdown();
+        app.workspaces[0].sessions[0].host_id = a.clone();
+        let session = crate::session::Session::new("/bin/true", &[], 80, 24, None,
+            std::collections::HashMap::new(), None).expect("test PTY");
+        let mut second = make_simple_session_with_uid("same".into(), "second", "claude", session, None);
+        second.host_id = b.clone();
+        app.workspaces[0].sessions.push(second);
+        app.apply_owner_attention(&a, "same", Some(owner_test_alert("a", "same")));
+        app.apply_owner_attention(&b, "same", Some(owner_test_alert("b", "same")));
+        assert!(app.session_has_alert("same", &a));
+        assert!(app.session_has_alert("same", &b));
+        app.cursor = Cursor::Session(0, 1);
+        app.reap_and_clear_alerts();
+        assert!(app.session_has_alert("same", &a));
+        assert!(!app.session_has_alert("same", &b));
+        app.apply_owner_attention(&b, "host-wide", Some(owner_test_alert("host", "no-row")));
+        app.jump_to_owner_alert("no-row", &b, Some("host-wide"), Some("stale"));
+        assert!(app.owner_alerts.contains_key(&(b.clone(), "host-wide".into())));
+        app.jump_to_owner_alert("no-row", &b, Some("host-wide"), Some("host"));
+        assert!(!app.owner_alerts.contains_key(&(b, "host-wide".into())));
+        assert!(app.owner_alerts.contains_key(&(a, "same".into())));
+    }
+
+    #[test]
+    fn notification_health_survives_alert_ack_until_recovery() {
+        let host = crate::hosts::HostId::new("sessions");
+        let mut app = build_app_with_session("self");
+        app.push_worker.shutdown();
+        app.workspaces[0].sessions[0].host_id = host.clone();
+        app.apply_manifest_diff_from_host(host.clone(), ManifestDiff::Updated {
+            uid: "self".into(), entry: serde_json::json!({"notification_health":{"reason":"external_background","since":100}}),
+        });
+        app.apply_owner_attention(&host, "notification-stall:self", Some(owner_test_alert("stall", "self")));
+        app.acknowledge_owner_alerts_for_row("self", &host);
+        assert!(app.notification_health.contains_key(&(host.clone(), "self".into())));
+        app.apply_manifest_diff_from_host(host.clone(), ManifestDiff::Updated {
+            uid: "self".into(), entry: serde_json::json!({"notification_health":null}),
+        });
+        assert!(!app.notification_health.contains_key(&(host, "self".into())));
+    }
+
+    #[test]
+    fn notification_health_reconnect_snapshot_preserves_unknown_and_clears_confirmed_recovery() {
+        let host = crate::hosts::HostId::new("sessions");
+        let mut app = build_app_with_session("self");
+        app.push_worker.shutdown();
+        app.workspaces[0].sessions[0].host_id = host.clone();
+        let mut snap = snapshot_payload(host.clone(), &["self"], &[]);
+        snap.notification_health = Some([("self".into(), serde_json::json!({"reason":"external_background"}))].into());
+        app.apply_manifest_snapshot(snap);
+        assert!(app.notification_health.contains_key(&(host.clone(), "self".into())));
+        let unknown = snapshot_payload(host.clone(), &["self"], &[]);
+        app.apply_manifest_snapshot(unknown);
+        assert!(app.notification_health.contains_key(&(host.clone(), "self".into())), "unknown must not clear prior evidence");
+        let mut recovered = snapshot_payload(host.clone(), &["self"], &[]);
+        recovered.notification_health = Some(Default::default());
+        app.apply_manifest_snapshot(recovered);
+        assert!(!app.notification_health.contains_key(&(host, "self".into())));
     }
 
     #[test]
@@ -3323,14 +3429,14 @@ mod apply_manifest_diff_tests {
         let host = crate::hosts::HostId::new("sessions");
         app.workspaces[0].sessions[0].host_id = host.clone();
         app.apply_owner_attention(&host, "self", Some(owner_test_alert("a", "self")));
-        assert!(!app.session_has_alert("self"));
+        assert!(!app.session_has_alert("self", &host));
         app.workspaces[0].sessions[0].uid = "self".into();
         app.sync_owner_alert_indicators();
-        assert!(app.session_has_alert("self"));
+        assert!(app.session_has_alert("self", &host));
         app.apply_owner_attention_snapshot(&crate::hosts::HostId::local(), &Default::default());
-        assert!(app.session_has_alert("self"));
+        assert!(app.session_has_alert("self", &host));
         app.apply_owner_attention_snapshot(&host, &Default::default());
-        assert!(!app.session_has_alert("self"));
+        assert!(!app.session_has_alert("self", &host));
     }
 
     #[test]
@@ -3343,8 +3449,8 @@ mod apply_manifest_diff_tests {
         let mut alert = owner_test_alert("a", "previous-tick");
         alert.continuous_task_id = Some("continuous".into());
         app.apply_owner_attention(&host, "previous-tick", Some(alert));
-        assert!(app.session_has_alert("new-tick"));
-        app.acknowledge_owner_alerts_for_row("new-tick");
+        assert!(app.session_has_alert("new-tick", &host));
+        app.acknowledge_owner_alerts_for_row("new-tick", &host);
         assert!(app.owner_alerts.is_empty());
     }
 
@@ -3767,6 +3873,7 @@ mod apply_manifest_diff_tests {
             host,
             session_transcripts: Vec::new(),
             owner_attention: None,
+            notification_health: None,
             agent_states: None,
             sidebar_assignments: None,
             listed_uids: listed.iter().map(|u| u.to_string()).collect(),
@@ -4514,6 +4621,7 @@ mod apply_manifest_diff_tests {
             session_last_exits: Vec::new(),
             session_transcripts: vec![("ts-snap-resume".into(), "current".into())],
             owner_attention: None,
+            notification_health: None,
             agent_states: None,
             sidebar_assignments: None,
             received_at: std::time::Instant::now(),
@@ -4547,6 +4655,7 @@ mod apply_manifest_diff_tests {
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
             owner_attention: None,
+            notification_health: None,
             agent_states: None,
             sidebar_assignments: None,
             received_at: std::time::Instant::now(),
@@ -4594,6 +4703,7 @@ mod apply_manifest_diff_tests {
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
             owner_attention: None,
+            notification_health: None,
             agent_states: None,
             sidebar_assignments: None,
             received_at: std::time::Instant::now(),
@@ -4759,6 +4869,7 @@ mod apply_manifest_diff_tests {
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
             owner_attention: None,
+            notification_health: None,
             agent_states: None,
             sidebar_assignments: None,
             received_at: std::time::Instant::now(),
@@ -4804,6 +4915,7 @@ mod apply_manifest_diff_tests {
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
             owner_attention: None,
+            notification_health: None,
             agent_states: None,
             sidebar_assignments: None,
             received_at: std::time::Instant::now(),

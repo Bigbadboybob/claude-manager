@@ -503,6 +503,14 @@ pub fn handle(state: &Arc<Mutex<DaemonState>>, params: &Value) -> Result<Value> 
     }
     check_native(&p)?;
     let _binding = binding_lock();
+    // Keep the target fenced through intent, registration and manifest
+    // binding; recovery must not kill a newly adopted orchestrator.
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.expected.session_uid);
+    let _recovery_read = recovery_gate.try_read()
+        .map_err(|_| conflict("session is reserved for background recovery"))?;
+    if let Some(reason) = crate::claude_recovery::admission_refusal(&p.expected.session_uid) {
+        return Err(conflict(reason));
+    }
     let mut canonical = serde_json::to_value(&p).map_err(internal)?;
     canonical["dry_run"] = json!(false);
     let old = read_intent(&p.request_id)?;

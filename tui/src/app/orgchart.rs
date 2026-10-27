@@ -949,7 +949,7 @@ impl App {
         if ts.session.exited {
             return ("\u{00d7}", Style::default().fg(theme::DIM));
         }
-        if self.session_has_alert(&ts.uid) {
+        if self.session_has_alert(&ts.uid, &ts.host_id) {
             return self.alert_indicator();
         }
         if self.revive_failed.contains_key(&ts.uid) {

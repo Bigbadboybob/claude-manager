@@ -465,8 +465,9 @@ pub(super) fn cursor_selected_session_uid<'a>(
 
 impl App {
     /// True iff the session with this uid has a pending `notify_user` alert.
-    pub(crate) fn session_has_alert(&self, uid: &str) -> bool {
-        self.alerts.contains_key(uid)
+    pub(crate) fn session_has_alert(&self, uid: &str, host: &crate::hosts::HostId) -> bool {
+        self.owner_alert_rows.contains_key(&(host.clone(), uid.to_string()))
+            || (*host == crate::hosts::HostId::local() && self.alerts.contains_key(uid))
     }
 
     /// Record an attention alert for `uid` and fire the desktop notification.
@@ -483,7 +484,7 @@ impl App {
     /// idle. Cheap no-op when `alerts` is empty (the common case). Called once
     /// per main-loop iteration.
     pub fn tick_alerts(&mut self) {
-        if self.alerts.is_empty() {
+        if self.alerts.is_empty() && self.owner_alert_rows.is_empty() {
             return;
         }
         let frame = self.alert_frame();
@@ -543,18 +544,21 @@ impl App {
         self.apply_pending_sidebar_assignments();
         // Bind delayed adoption and replacement continuous ticks to retained alerts.
         if !self.owner_alerts.is_empty() { self.sync_owner_alert_indicators(); }
-        if self.alerts.is_empty() {
+        if self.alerts.is_empty() && self.owner_alerts.is_empty() {
             return;
         }
         // Clear-on-focus: the chosen semantics are "selecting the session's
         // sidebar row counts as focusing it" (attach selects first, so it's
         // covered too). Resolve the uid first and drop the workspaces borrow
         // before mutating `alerts`.
-        let selected = cursor_selected_session_uid(&self.cursor, &self.workspaces)
-            .map(str::to_string);
-        if let Some(uid) = selected {
-            self.acknowledge_owner_alerts_for_row(&uid);
-            if self.alerts.remove(&uid).is_some() {
+        let selected = match self.cursor {
+            Cursor::Session(wi, si) => self.workspaces.get(wi).and_then(|w| w.sessions.get(si))
+                .map(|s| (s.uid.clone(), s.host_id.clone())),
+            _ => None,
+        };
+        if let Some((uid, host)) = selected {
+            self.acknowledge_owner_alerts_for_row(&uid, &host);
+            if host == crate::hosts::HostId::local() && self.alerts.remove(&uid).is_some() {
                 self.needs_redraw = true;
             }
         }
@@ -1602,7 +1606,7 @@ impl App {
             .map(|(wi, si, _)| {
                 let ts = &self.workspaces[*wi].sessions[*si];
                 super::agent_state::attention_tier(
-                    self.session_has_alert(&ts.uid),
+                    self.session_has_alert(&ts.uid, &ts.host_id),
                     ts.hidden,
                     (!ts.session.exited).then(|| self.agent_activity(ts)).flatten(),
                     ts.status == SessionStatus::Idle && !ts.session.exited,

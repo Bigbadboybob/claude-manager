@@ -25,11 +25,8 @@ impl App {
     fn record_owner_attention(&mut self, host: &HostId, uid: &str, alert: Option<Alert>) {
         let key = (host.clone(), uid.to_string());
         if let Some(alert) = alert {
-            if alert.session_uid != uid {
-                return;
-            }
-            if self.dismissed_owner_alerts.contains(&alert.id) {
-                self.push_worker.ack_owner_alert(host.clone(), alert);
+            if self.dismissed_owner_alerts.contains(&(host.clone(), uid.to_string(), alert.id.clone())) {
+                self.push_worker.ack_owner_alert(host.clone(), uid.to_string(), alert);
                 return;
             }
             // The worker deduplicates successful desktop submissions, including
@@ -61,24 +58,11 @@ impl App {
                 })
             });
             if let Some(row) = row {
-                next.insert(row.uid.clone(), alert.message.clone());
+                next.insert((host.clone(), row.uid.clone()), alert.message.clone());
             }
         }
-        let changed = self
-            .owner_alert_rows
-            .iter()
-            .any(|uid| !next.contains_key(uid))
-            || next
-                .iter()
-                .any(|(uid, msg)| !self.owner_alert_rows.contains(uid) || self.alerts.get(uid) != Some(msg));
-        if changed {
-            for uid in self.owner_alert_rows.drain() {
-                self.alerts.remove(&uid);
-            }
-            for (uid, message) in next {
-                self.owner_alert_rows.insert(uid.clone());
-                self.alerts.insert(uid, message);
-            }
+        if self.owner_alert_rows != next {
+            self.owner_alert_rows = next;
             self.needs_redraw = true;
         }
     }
@@ -95,9 +79,12 @@ impl App {
                 .map(|s| s.label.clone())
         };
         let mut out = Vec::new();
-        for ((host, uid), alert) in &self.owner_alerts {
+        for ((host, key), alert) in &self.owner_alerts {
+            let uid = &alert.session_uid;
             out.push(super::messages::OpenAlert {
                 uid: uid.clone(),
+                key: key.clone(),
+                id: Some(alert.id.clone()),
                 host: host.clone(),
                 label: label_of(self, host, uid).unwrap_or_else(|| alert.label.clone()),
                 reason: alert.message.lines().next().unwrap_or("").to_owned(),
@@ -116,7 +103,6 @@ impl App {
         let legacy: Vec<(String, String)> = self
             .alerts
             .iter()
-            .filter(|(uid, _)| !self.owner_alert_rows.contains(*uid))
             .map(|(u, m)| (u.clone(), m.clone()))
             .collect();
         for (uid, message) in legacy {
@@ -126,6 +112,8 @@ impl App {
                 label: label_of(self, &host, &uid).unwrap_or_else(|| uid.clone()),
                 reason: message.lines().next().unwrap_or("").to_owned(),
                 uid,
+                key: String::new(),
+                id: None,
                 host,
                 since,
             });
@@ -136,13 +124,30 @@ impl App {
 
     /// Enter on an "Open alerts" row: go to that session (as A-g does) and
     /// mark its alert seen.
-    pub(crate) fn jump_to_owner_alert(&mut self, uid: &str, host: &HostId) {
+    pub(crate) fn jump_to_owner_alert(&mut self, uid: &str, host: &HostId, key: Option<&str>, id: Option<&str>) {
+        if let (Some(key), Some(id)) = (key, id) {
+            let map_key = (host.clone(), key.to_owned());
+            if !self.owner_alerts.get(&map_key).is_some_and(|a| a.id == id && a.session_uid == uid) {
+                self.messages.error = "That alert changed; select the current alert".into();
+                return;
+            }
+            if let Some(alert) = self.owner_alerts.remove(&map_key) {
+                self.dismissed_owner_alerts.insert((host.clone(), key.to_owned(), alert.id.clone()));
+                self.push_worker.ack_owner_alert(host.clone(), key.to_owned(), alert);
+            }
+            self.sync_owner_alert_indicators();
+        } else {
+            self.alerts.remove(uid);
+        }
+        self.owner_alert_since.remove(&format!("legacy:{uid}"));
         let target = self.workspaces.iter().enumerate().find_map(|(wi, w)| {
             (!w.is_closed).then(|| w.sessions.iter().position(|s| s.uid == uid && &s.host_id == host)).flatten()
                 .map(|si| (wi, si))
         });
         let Some((wi, si)) = target else {
-            self.messages.error = format!("That session is not in the sidebar ({} on `{}`)", uid, host.as_str());
+            self.messages.visible = false;
+            self.set_status_msg(&format!("Alert dismissed here; acknowledgement queued. Session {} is not in the sidebar on `{}`", uid, host.as_str()));
+            self.needs_redraw = true;
             return;
         };
         let continuous = self.continuous_members().contains(&(wi, si));
@@ -153,19 +158,16 @@ impl App {
         self.cursor_column = if continuous { SidebarColumn::Continuous } else { SidebarColumn::Main };
         self.cursor = Cursor::Session(wi, si);
         self.reveal_cursor();
-        self.acknowledge_owner_alerts_for_row(uid);
-        self.alerts.remove(uid);
-        self.owner_alert_since.remove(&format!("legacy:{uid}"));
         self.messages.visible = false;
         self.needs_redraw = true;
     }
 
-    pub(crate) fn acknowledge_owner_alerts_for_row(&mut self, uid: &str) {
+    pub(crate) fn acknowledge_owner_alerts_for_row(&mut self, uid: &str, host: &HostId) {
         let row = self
             .workspaces
             .iter()
             .flat_map(|w| &w.sessions)
-            .find(|s| s.uid == uid);
+            .find(|s| s.uid == uid && &s.host_id == host);
         let Some(row) = row else {
             return;
         };
@@ -182,10 +184,10 @@ impl App {
             .collect();
         for key in keys {
             if let Some(alert) = self.owner_alerts.remove(&key) {
-                self.dismissed_owner_alerts.insert(alert.id.clone());
-                self.push_worker.ack_owner_alert(key.0, alert);
+                self.dismissed_owner_alerts.insert((key.0.clone(), key.1.clone(), alert.id.clone()));
+                self.push_worker.ack_owner_alert(key.0, key.1, alert);
             }
         }
-        self.owner_alert_rows.remove(uid);
+        self.sync_owner_alert_indicators();
     }
 }

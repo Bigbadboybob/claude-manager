@@ -271,6 +271,16 @@ pub fn status(root: &Path, uid: &str, event: &str) -> Value {
     json!({"recipient":uid,"status":state})
 }
 pub fn spawn(state: &Arc<Mutex<DaemonState>>) {
+    // Delivery may be blocked on the store or on one recipient. The Owner
+    // alarm must keep running even when that worker cannot make progress.
+    let alarm_state = Arc::downgrade(state);
+    thread::spawn(move || loop {
+        let Some(state) = alarm_state.upgrade() else { break };
+        let root = state.lock().unwrap_or_else(|p| p.into_inner()).messaging_root.clone();
+        alarm_tick(&state, &root);
+        drop(state);
+        thread::sleep(Duration::from_secs(alarm::ALARM_INTERVAL_SECS));
+    });
     let weak = Arc::downgrade(state);
     let wake = state
         .lock()
@@ -466,30 +476,20 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>) {
             eprintln!("cm messaging: wake for {uid} pending: {e}");
         }
     }
-    alarm_tick(state, &root);
 }
 
-/// Throttled stall alarm over live native-capable sessions.
+/// Stall alarm over live native-capable sessions. The dedicated worker
+/// controls its cadence; this pass does not require the delivery store.
 fn alarm_tick(state: &Arc<Mutex<DaemonState>>, root: &Path) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static LAST: AtomicU64 = AtomicU64::new(0);
-    let now = crate::continuous::task::now_unix();
-    let last = LAST.load(Ordering::Relaxed);
-    if now.saturating_sub(last) < alarm::ALARM_INTERVAL_SECS
-        || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err()
-    {
-        return;
-    }
     let uids: Vec<String> = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         if s.draining {
             return;
         }
-        s.sessions
-            .iter()
-            .filter(|(_, x)| ["claude-code", "codex"].contains(&x.session_type.as_str()))
-            .filter(|(_, x)| !x.fanout.snapshot_since(None).closed)
-            .map(|(uid, _)| uid.clone())
+        super::store::live_sessions(&s)
+            .into_iter()
+            .filter(|x| matches!(x.engine.as_deref(), Some("claude-code" | "codex")))
+            .map(|x| x.uid)
             .collect()
     };
     let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
@@ -941,6 +941,28 @@ fn reconcile_intents(cm_root: &Path, store: &Store, uid: &str, intents: &[WakeIn
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn alarm_pass_runs_while_delivery_store_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut daemon = DaemonState::new();
+        daemon.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
+        daemon.tui_sessions.insert("ts-stalled".into(), serde_json::from_value(json!({
+            "uid":"ts-stalled", "type":"claude", "label":"worker"
+        })).unwrap());
+        let store = Arc::clone(&daemon.messaging);
+        let state = Arc::new(Mutex::new(daemon));
+        crate::notifications::publish(dir.path(), "ts-stalled", "one", "chat", "[one] wake", "[one]").unwrap();
+        let queue = crate::notifications::directory(dir.path(), "ts-stalled");
+        let file = fs::read_dir(queue).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "json")).unwrap();
+        let mut event: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        event["status"] = json!("submitted");
+        event["created_at"] = json!(1.0);
+        event["updated_at"] = json!(1.0);
+        atomic_replace(&file, &event).unwrap();
+        let _busy = store.lock().unwrap();
+        alarm_tick(&state, dir.path());
+        assert!(crate::owner_attention::snapshot(&state.lock().unwrap()).unwrap().contains_key("notification-stall:ts-stalled"));
+    }
     fn recipient(engine: &str) -> Recipient {
         Recipient {
             engine: engine.into(),

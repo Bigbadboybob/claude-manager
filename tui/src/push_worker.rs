@@ -93,8 +93,8 @@ impl PushWorker {
     pub fn present_owner_alert(&self, alert: cm_daemon::owner_attention::Alert) {
         let _ = self.cmd_tx.send(PushCommand::OwnerAttention(crate::owner_notification::Command::Present(alert)));
     }
-    pub fn ack_owner_alert(&self, host: HostId, alert: cm_daemon::owner_attention::Alert) {
-        let _ = self.cmd_tx.send(PushCommand::OwnerAttention(crate::owner_notification::Command::Acknowledge(host, alert)));
+    pub fn ack_owner_alert(&self, host: HostId, key: String, alert: cm_daemon::owner_attention::Alert) {
+        let _ = self.cmd_tx.send(PushCommand::OwnerAttention(crate::owner_notification::Command::Acknowledge(host, key, alert)));
     }
 
     pub fn spawn(host_pool: Arc<HostPool>) -> Self {

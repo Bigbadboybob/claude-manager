@@ -11,6 +11,7 @@ import ctypes
 import fcntl
 import hashlib
 import json
+import math
 import os
 import tempfile
 import threading
@@ -31,21 +32,44 @@ TAKEOVER_FRESH_S = 15.0
 HANDOFF_MIN_HOLD_S = 30.0
 
 
+def receipt_evidence_allowed(event: dict) -> bool:
+    """A legacy board label is shared across pushes, so it proves no receipt."""
+    if not isinstance(event.get("source"), str) or not event["source"].strip():
+        return False
+    if event.get("source") != "board":
+        return True
+    event_id, marker = event.get("id"), event.get("marker")
+    if not isinstance(event_id, str) or not event_id.startswith("board-push:") or not isinstance(marker, str):
+        return False
+    suffix = event_id.removeprefix("board-push:")
+    return bool(suffix and marker.startswith("[cm-board ") and marker.endswith(f" push:{suffix}]"))
+
+
 def delivery_health(events, now: float | None = None, threshold: float | None = None):
     """Submitted/uncertain notices newer than the latest observation that are
     still unobserved past `threshold`. A later observation proves the path
     works again, so older losses do not keep the session degraded forever."""
     now = time.time() if now is None else now
     threshold = UNOBSERVED_DEGRADED_S if threshold is None else threshold
+    def timestamp(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
+    for event in events:
+        created = event.get("created_at")
+        updated = event.get("updated_at", created)
+        if (not timestamp(created) or not timestamp(updated) or updated < created
+                or (event.get("status") == "observed" and updated > now)):
+            return {"unobserved": None, "oldest_unobserved_s": None,
+                    "stalled": False, "unobserved_markers": [], "chronology_unknown": True}
     last_observed = max(
         (e.get("updated_at", e.get("created_at", 0)) for e in events
-         if e.get("status") == "observed"),
+         if e.get("status") == "observed" and receipt_evidence_allowed(e)),
         default=0,
     )
     stalled = [
         e for e in events
-        if e.get("status") in {"submitted", "uncertain"}
-        and e.get("updated_at", e.get("created_at", 0)) > last_observed
+        if (e.get("status") == "submitting"
+            or (e.get("status") in {"submitted", "uncertain"}
+                and e.get("updated_at", e.get("created_at", 0)) > last_observed))
     ]
     oldest = min((e.get("updated_at", e.get("created_at", now)) for e in stalled), default=None)
     age = None if oldest is None else max(0.0, now - oldest)
@@ -54,6 +78,7 @@ def delivery_health(events, now: float | None = None, threshold: float | None = 
         "oldest_unobserved_s": None if age is None else round(age),
         "stalled": age is not None and age >= threshold,
         "unobserved_markers": [e.get("marker") for e in stalled],
+        "chronology_unknown": False,
     }
 
 
@@ -176,8 +201,15 @@ class Queue:
                 claim = json.loads(path.read_text())
             except (OSError, ValueError):
                 continue
+            if not isinstance(claim, dict):
+                continue
             pid = claim.get("pid")
             if pid == os.getpid() or not isinstance(pid, int):
+                continue
+            requested_at = claim.get("requested_at")
+            if not isinstance(requested_at, (int, float)) or not 0 <= now - requested_at <= TAKEOVER_FRESH_S:
+                with suppress(OSError):
+                    path.unlink(missing_ok=True)
                 continue
             alive = True
             try:
@@ -186,7 +218,7 @@ class Queue:
                 alive = False
             except PermissionError:
                 pass
-            if not alive or now - claim.get("requested_at", 0) > TAKEOVER_FRESH_S:
+            if not alive:
                 with suppress(OSError):
                     path.unlink(missing_ok=True)
                 continue
@@ -280,8 +312,10 @@ class Queue:
                 reasons.extend(transport.get("reasons") or [transport.get("reason") or "degraded"])
             if delivery["stalled"]:
                 reasons.append("unobserved_submissions")
+            if delivery["chronology_unknown"]:
+                reasons.append("untrusted_notification_chronology")
             # Never report a consumer as healthy while its submissions vanish.
-            if delivery["stalled"]:
+            if delivery["stalled"] or delivery["chronology_unknown"]:
                 transport["connected"] = False
             health = {
                 "status": ("degraded" if reasons else
@@ -295,7 +329,7 @@ class Queue:
                 # CM is rotating or handing off this session: pending wakes
                 # wait for the new process (until this time at most).
                 "hold": {"until": hold} if (hold := self.hold_until()) else None,
-                "notifications": sorted(events, key=lambda e: e["created_at"]),
+                "notifications": sorted(events, key=lambda e: e.get("created_at") if isinstance(e.get("created_at"), (int, float)) else 0),
             }
 
     def health(self, engine: str, state: str, **extra):
@@ -367,9 +401,27 @@ async def _diagnose(queue: Queue, adapter, events) -> dict:
             diag = {"diagnostics_error": type(exc).__name__}
     delivery = delivery_health(events)
     reasons = []
+    if delivery["chronology_unknown"]:
+        # A bad census cannot erase an existing degraded diagnosis.
+        try:
+            prior = json.loads((queue.path / "transport.json").read_text())
+            if prior.get("status") == "degraded":
+                reasons.extend(prior.get("reasons") or [prior.get("reason") or "degraded"])
+        except (OSError, ValueError, TypeError):
+            pass
+        reasons.append("untrusted_notification_chronology")
     if diag.get("blocked"):
         reasons.append(diag["blocked"])
     stale = list(diag.get("stale") or [])
+    # A positive record that this client only enqueues our notices is not a
+    # healthy in-pane resume. Stop claiming new work even if no successor has
+    # appeared; already-submitted/uncertain receipts remain untouched.
+    blocked = diag.get("blocked")
+    if delivery["chronology_unknown"]:
+        blocked = blocked or "untrusted_notification_chronology"
+    if "enqueued_unobserved" in stale and delivery["stalled"]:
+        blocked = blocked or "stale_channel"
+        reasons.append("stale_channel")
     # An in-pane resume or clear legitimately moves the bound transcript
     # away from this client's launch id while delivery keeps working, so a
     # mismatch alone is informational; with stalled work or other evidence
@@ -389,9 +441,9 @@ async def _diagnose(queue: Queue, adapter, events) -> dict:
         if delivery["unobserved"]:
             extra["unobserved"] = delivery["unobserved"]
             extra["oldest_unobserved_s"] = delivery["oldest_unobserved_s"]
-    degraded = diag.get("blocked") or (reasons and base == "ready")
+    degraded = blocked or (reasons and base == "ready")
     return {"status": "degraded" if degraded else base,
-            "extra": extra, "stale": stale, "blocked": diag.get("blocked")}
+            "extra": extra, "stale": stale, "blocked": blocked}
 
 
 async def _wait_for_lock(queue: Queue, adapter, fd: int):
@@ -429,12 +481,15 @@ async def _wait_for_lock(queue: Queue, adapter, fd: int):
         queue.withdraw_takeover()
 
 
-def _handoff_reason(queue: Queue, assessment: dict, held_for: float):
+def _handoff_reason(queue: Queue, adapter, assessment: dict, held_for: float):
     """Release only with this holder's own positive staleness evidence AND a
     fresh request from a consumer attached to the daemon-bound transcript."""
     if held_for < HANDOFF_MIN_HOLD_S or not assessment["stale"]:
         return None
-    if not queue.takeover_requests():
+    claims = queue.takeover_requests()
+    if hasattr(adapter, "valid_takeover_request"):
+        claims = [claim for claim in claims if adapter.valid_takeover_request(claim)]
+    if not claims:
         return None
     return assessment["stale"][0]
 
@@ -463,12 +518,15 @@ async def consume(queue: Queue, adapter):
                 queue.health(adapter.engine, assessment["status"],
                              **adapter.identity(), **assessment["extra"])
                 heartbeat = time.monotonic() + 5
-                handed_off = _handoff_reason(queue, assessment, time.monotonic() - acquired)
+                handed_off = _handoff_reason(queue, adapter, assessment, time.monotonic() - acquired)
                 if handed_off:
                     with suppress(AttributeError):
                         adapter.cm_handed_off_at = time.monotonic()
                     return handed_off
             # New wakes must not sit behind slow receipt checks for older input.
+            # The heartbeat's block can be stale: a new invalid observation
+            # can arrive between diagnoses. Check this snapshot before claims.
+            census_unknown = delivery_health(events)["chronology_unknown"]
             events.sort(key=lambda event: event["status"] != "pending")
             held = queue.held()
             for event in events:
@@ -478,12 +536,12 @@ async def consume(queue: Queue, adapter):
                     # Every poll: evidence is only searched in the window
                     # (TAIL_WINDOW), so a skipped poll can let it scroll out
                     # for good. _Tail makes each check an incremental read.
-                    if await adapter.observed(event):
+                    if receipt_evidence_allowed(event) and await adapter.observed(event):
                         queue.change(
                             event["id"], {"submitted", "uncertain"}, status="observed"
                         )
                     continue
-                if event["status"] != "pending" or blocked:
+                if event["status"] != "pending" or blocked or census_unknown:
                     # A client known to drop these events keeps them pending
                     # (retractable, never ambiguously submitted).
                     continue

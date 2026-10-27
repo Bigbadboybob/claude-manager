@@ -429,6 +429,18 @@ fn member(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, p: &Map<String, Value>) ->
 /// session may close it, and holds stay where they are.
 fn close_assistant(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, mut p: Map<String, Value>) -> RpcResult {
     let uid = take_str(&mut p, "session_uid")?.ok_or_else(|| bad("org.close_assistant needs session_uid"))?;
+    // The central close changes attribution/holds before the local signal;
+    // reserve the lifecycle across both halves so recovery cannot overlap it.
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&uid);
+    let _recovery_read = recovery_gate.try_write().map_err(|_| (
+        ErrorCode::Conflict, "session lifecycle is reserved for background recovery".into()
+    ))?;
+    if let Some(reason) = crate::claude_recovery::admission_refusal(&uid) {
+        return Err((ErrorCode::Conflict, reason));
+    }
+    if crate::claude_recovery::has_pending_input(&uid) {
+        return Err((ErrorCode::Conflict, "session has accepted input still being delivered".into()));
+    }
     let reason = take_str(&mut p, "reason")?.unwrap_or_else(|| "closed by its member".into());
     let member_id = assistant_of(state, &uid)?;
     let pid = format!("agent:{}:{uid}", ctx.daemon_id);
@@ -1061,6 +1073,25 @@ mod tests {
 
     fn call(state: &Arc<Mutex<DaemonState>>, caller: Caller, method: &str, params: Value) -> Response {
         dispatch(state, &Request { id: "t".into(), caller, method: method.into(), params })
+    }
+
+    #[test]
+    fn close_assistant_refuses_recovery_before_central_effect() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let (url, seen) = test_stub(|_, _, _| (500, "{}".into()));
+        let state = state(root.path(), &url);
+        let uid = "ts-abc5-0";
+        let gate = crate::claude_recovery::lifecycle_gate(uid);
+        let _write = gate.write().unwrap();
+        let ctx = Ctx {
+            pid:"operator".into(), name:"operator".into(), uid:None, task_id:None,
+            owner:true, global:true, engine:None, daemon_owned:false,
+            daemon_id:"test".into(), people:Vec::new(), api:crate::items::api::Api::from_config(&url, "tok").unwrap(),
+        };
+        let params = json!({"session_uid":uid}).as_object().unwrap().clone();
+        assert!(matches!(close_assistant(&state, &ctx, params), Err((ErrorCode::Conflict, _))));
+        assert!(seen.lock().unwrap().is_empty(), "central close must not run");
     }
 
     #[test]

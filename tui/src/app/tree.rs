@@ -544,7 +544,7 @@ impl App {
         let (mut n, mut running, mut idle, mut alerting) = (0, 0, 0, 0);
         for ts in sessions {
             n += 1;
-            if self.session_has_alert(&ts.uid) {
+            if self.session_has_alert(&ts.uid, &ts.host_id) {
                 alerting += 1;
             }
             if ts.session.exited {
