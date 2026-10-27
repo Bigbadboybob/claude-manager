@@ -646,6 +646,13 @@ pub(crate) fn start_session_with_spawn_fn(
 ) -> MethodResult {
     let p: StartSessionParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.uid);
+    let _recovery_read = (!crate::claude_recovery::internal_active(&p.uid)
+        && !crate::claude_recovery::read_context_active(&p.uid))
+        .then(|| recovery_gate.read().unwrap_or_else(|p| p.into_inner()));
+    if let Some(reason) = crate::claude_recovery::admission_refusal(&p.uid) {
+        return Err((ErrorCode::Conflict, reason));
+    }
 
     // Serialize the entire spawn/registry insertion with retirement of both
     // this UID and its manager. A late child cannot appear after drain proof.
@@ -2309,6 +2316,41 @@ pub(crate) fn kill_with_attribution(state_arc: &Arc<Mutex<DaemonState>>, uid: &s
     state.record_kill_request(uid, who, now_unix_f64());
 }
 
+/// Kill only the exact daemon incarnation captured by native background
+/// recovery. All identity and lifecycle checks happen under the same state
+/// mutex as the pidfd/holder signal, closing the rebind-before-kill window.
+pub(crate) fn kill_with_recovery_identity(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    identity: &crate::claude_recovery::Identity,
+    who: &str,
+) -> Result<(), String> {
+    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    if state.draining || state.restarting {
+        return Err("daemon is draining or restarting".into());
+    }
+    let session = state.sessions.get_mut(&identity.uid).ok_or_else(|| "session exited before holder stop".to_string())?;
+    if session.workspace_id != identity.workspace_id
+        || session.task_id != identity.task_id
+        || session.generation != identity.transcript_generation
+        || session.holder_incarnation != identity.holder_incarnation
+        || session.pid as u32 != identity.child_pid
+        || session.workflow_run_id.is_some()
+        || session.continuous_task_id.is_some()
+    {
+        return Err("session identity or lifecycle changed before holder stop".into());
+    }
+    let start = crate::adopt::proc_starttime(session.pid as libc::pid_t)
+        .map_err(|e| format!("child identity unreadable before holder stop: {e}"))?;
+    if start != identity.child_start_time {
+        return Err("child PID/start changed before holder stop".into());
+    }
+    session.last_exit.mark_operator_kill_requested();
+    session.set_kill_attribution(who);
+    let _ = session.kill();
+    state.record_kill_request(&identity.uid, who, now_unix_f64());
+    Ok(())
+}
+
 /// Deliver `prompt` to an agent session as one submitted message, waiting
 /// for a fresh spawn's startup first (`fresh_spawn`), with delivery
 /// confirmation. The daemon's own sends (rotation notices) use it.
@@ -3232,6 +3274,8 @@ pub fn session_agent_report(
     if caller_uid.is_some_and(|uid| uid != p.session_uid) {
         return Err((ErrorCode::Unauthorized, "session.agent_report is self-only".into()));
     }
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.session_uid);
+    let _recovery_read = recovery_gate.read().unwrap_or_else(|p| p.into_inner());
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     if state.restarting {
         return Err((ErrorCode::Conflict, "brain restart in progress; retry the latest report".into()));
@@ -3319,6 +3363,8 @@ pub fn session_turn_ended(
                 format!("session.turn_ended params: {}", e),
             )
         })?;
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.session_uid);
+    let _recovery_read = recovery_gate.read().unwrap_or_else(|p| p.into_inner());
     let mut state = state_arc.lock().unwrap_or_else(|p2| p2.into_inner());
     if let Some(cuid) = caller_uid {
         let decision = crate::control::auth::check_session_caller(
@@ -3557,6 +3603,12 @@ pub fn set_transcript_path(
             ErrorCode::InvalidParams,
             "transcript_path must be non-empty".into(),
         ));
+    }
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.session_uid);
+    let _recovery_read = (!crate::claude_recovery::internal_active(&p.session_uid))
+        .then(|| recovery_gate.read().unwrap_or_else(|p| p.into_inner()));
+    if let Some(reason) = crate::claude_recovery::admission_refusal(&p.session_uid) {
+        return Err((ErrorCode::Conflict, reason));
     }
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     let session = state.sessions.get_mut(&p.session_uid).ok_or_else(|| {
@@ -12062,6 +12114,13 @@ pub fn revive_session(
 ) -> MethodResult {
     let p: ReviveSessionParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.uid);
+    let _recovery_read = (!crate::claude_recovery::internal_active(&p.uid))
+        .then(|| recovery_gate.read().unwrap_or_else(|p| p.into_inner()));
+    let _recovery_context = crate::claude_recovery::read_context(&p.uid);
+    if let Some(reason) = crate::claude_recovery::admission_refusal(&p.uid) {
+        return Err((ErrorCode::Conflict, reason));
+    }
 
     // H3: drain gate — a revive during drain would mint a child the
     // imminent restart immediately kills (and, pre-H1, could lose).
