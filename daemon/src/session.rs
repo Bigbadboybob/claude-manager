@@ -3052,6 +3052,9 @@ fn terminal_response_input(mut bytes: &[u8]) -> bool {
 }
 
 impl InputHandle {
+    pub(crate) fn belongs_to(&self, session: &DaemonSession) -> bool {
+        Arc::ptr_eq(&self.writer, &session.writer)
+    }
     /// Write `bytes` to the PTY then stamp activity. Stamp is
     /// AFTER the write so a failed write doesn't lie about
     /// "session was active." Lock order: writer-gate permit first

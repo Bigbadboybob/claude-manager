@@ -8400,6 +8400,20 @@ fn agent_paste_payload(body: &str) -> Vec<u8> {
     }
 }
 
+fn reserve_detached_delivery(
+    state: &Arc<Mutex<DaemonState>>, handle: &crate::session::InputHandle, uid: &str,
+) -> Result<crate::claude_recovery::PendingInput, String> {
+    let gate = crate::claude_recovery::lifecycle_gate(uid);
+    let _guard = gate.try_write().map_err(|_| "session lifecycle is reserved".to_string())?;
+    if let Some(reason) = crate::claude_recovery::admission_refusal(uid) { return Err(reason); }
+    let state = state.lock().unwrap_or_else(|p| p.into_inner());
+    let session = state.sessions.get(uid).ok_or_else(|| "session disappeared".to_string())?;
+    if !handle.belongs_to(session) || session.last_exit.kernel_set() {
+        return Err("session was replaced or exited".into());
+    }
+    Ok(crate::claude_recovery::reserve_pending_input(uid))
+}
+
 /// Deliver a prompt to a kitty-TUI agent (codex or claude-code) on a
 /// detached thread: mode-await, write the body, gap, write Enter, verify.
 /// Async so callers return promptly (stays under the Python MCP 30s call
@@ -8430,10 +8444,20 @@ fn spawn_agent_prompt_delivery(
     fresh_spawn: bool,
     confirm_state: Option<Arc<Mutex<DaemonState>>>,
 ) {
+    let pending = match confirm_state.as_ref() {
+        Some(state) => match reserve_detached_delivery(state, &handle, &session_uid) {
+            Ok(pending) => Some(pending),
+            Err(reason) => { eprintln!("cm-daemon: prompt for {session_uid} not queued: {reason}"); return; }
+        },
+        None => None,
+    };
     let handle = handle.prepare_agent_input(&prompt);
     let _ = std::thread::Builder::new()
         .name(format!("cm-daemon-agent-prompt-{}", session_uid))
         .spawn(move || {
+            let _pending = pending;
+            #[cfg(test)]
+            test_pause_queued_input(&session_uid);
             if let Some(state) = confirm_state {
                 deliver_agent_body_confirmed(&state, &handle, &fanout, &session_uid, &prompt, fresh_spawn, "prompt");
             } else {
@@ -8451,10 +8475,17 @@ fn spawn_initial_prompt_delivery(
     ticket: super::prompt_delivery::Ticket,
 ) {
     use super::prompt_delivery::{self as delivery, Baseline, Check, LaunchWrite};
+    let pending = match reserve_detached_delivery(&state, &handle, &uid) {
+        Ok(pending) => pending,
+        Err(reason) => { delivery::finish(&ticket, Err("session_unavailable")); eprintln!("cm-daemon: initial prompt for {uid} not queued: {reason}"); return; }
+    };
     let result_ticket = Arc::clone(&ticket);
     let spawned = std::thread::Builder::new()
         .name(format!("cm-launch-confirm-{uid}"))
         .spawn(move || {
+            let _pending = pending;
+            #[cfg(test)]
+            test_pause_queued_input(&uid);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut launch = LaunchWrite {
                     written_at: None,
@@ -8577,6 +8608,20 @@ fn spawn_initial_prompt_delivery(
     if spawned.is_err() {
         delivery::finish(&result_ticket, Err("confirmation_worker_unavailable"));
     }
+}
+
+#[cfg(test)]
+pub(crate) fn recovery_test_queue_initial(
+    state: Arc<Mutex<DaemonState>>, uid: &str,
+) -> super::prompt_delivery::Ticket {
+    let (handle, fanout) = {
+        let state = state.lock().unwrap();
+        let session = &state.sessions[uid];
+        (session.input_handle(), Arc::clone(&session.fanout))
+    };
+    let ticket = super::prompt_delivery::Receipt::pending();
+    spawn_initial_prompt_delivery(state, handle, fanout, uid.to_string(), "initial".into(), Arc::clone(&ticket));
+    ticket
 }
 
 /// Confirmation runs for fresh/resumed launches, persistent fires and
@@ -9076,10 +9121,17 @@ fn spawn_persistent_prompt_delivery(
     compact: bool,
     state: Arc<Mutex<DaemonState>>,
 ) {
+    let pending = match reserve_detached_delivery(&state, &handle, &session_uid) {
+        Ok(pending) => pending,
+        Err(reason) => { eprintln!("cm-daemon: persistent prompt for {session_uid} not queued: {reason}"); return; }
+    };
     let handle = handle.prepare_agent_input(if compact { "/compact" } else { &prompt });
     let _ = std::thread::Builder::new()
         .name(format!("cm-daemon-persistent-prompt-{}", session_uid))
         .spawn(move || {
+            let _pending = pending;
+            #[cfg(test)]
+            test_pause_queued_input(&session_uid);
             if compact {
                 // Auto-compact: `/compact` SUMMARIZES the conversation and
                 // continues on the condensed context — bounding unbounded

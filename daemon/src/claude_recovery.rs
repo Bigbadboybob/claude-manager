@@ -1752,6 +1752,51 @@ mod tests {
     }
 
     #[test]
+    fn initial_launch_delivery_blocks_actual_confirm_until_worker_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let uid = "ts-abcd-1";
+        let native = "123e4567-e89b-12d3-a456-426614174000";
+        let mut daemon = DaemonState::new();
+        daemon.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
+        let mut workspace = crate::manifest::ManifestWorkspace::default();
+        workspace.id = "w".into(); workspace.worktree_path = Some(dir.path().to_path_buf());
+        daemon.workspaces.insert("w".into(), workspace);
+        let state = Arc::new(Mutex::new(daemon));
+        crate::control::methods::start_session(&state, &json!({"uid":uid,"workspace_id":"w",
+            "label":"initial", "argv":["/bin/sleep","60"], "session_type":"claude-code",
+            "model":"test-model", "effort":"xhigh", "working_dir":dir.path(),
+            "transcript_path":dir.path().join(format!("{native}.jsonl"))})).unwrap();
+        FAKE.with(|f| *f.borrow_mut() = Some(FakeEffects {
+            roster:Roster { rows:json!([{"kind":"background","sessionId":native,"cwd":dir.path()}]) },
+            host:BackgroundHost { pid:123,start:456 }, fail_phase:None, fail_stop:false,
+            fail_proof:false, fail_revive:false, real_revive:false, stops:0, revives:0,
+        }));
+        let pre = preflight(&state, uid);
+        assert_eq!(pre["status"], "offer");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let latch = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let hook_latch = Arc::clone(&latch);
+        crate::control::methods::set_queued_input_test_hook(uid, Some(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            let (lock, cv) = &*hook_latch;
+            let mut release = lock.lock().unwrap();
+            while !*release { release = cv.wait(release).unwrap(); }
+        })));
+        let _ticket = crate::control::methods::recovery_test_queue_initial(Arc::clone(&state), uid);
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(confirm(&state, &pre["identity"], true).is_err());
+        assert!(state.lock().unwrap().sessions.get_mut(uid).unwrap().try_wait().is_none());
+        FAKE.with(|f| assert_eq!(f.borrow().as_ref().unwrap().stops, 0));
+        crate::control::methods::set_queued_input_test_hook(uid, None);
+        let _ = state.lock().unwrap().sessions.get_mut(uid).unwrap().kill();
+        { let (lock, cv) = &*latch; *lock.lock().unwrap() = true; cv.notify_all(); }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while has_pending_input(uid) && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(20)); }
+        assert!(!has_pending_input(uid));
+        FAKE.with(|f| *f.borrow_mut() = None);
+    }
+
+    #[test]
     fn confirm_rejects_persisted_interrupted_checkpoint_without_replaying_stop() {
         let uid = "ts-recovery-interrupted-confirm";
         let path = receipt_path(uid).unwrap();
