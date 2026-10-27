@@ -178,6 +178,15 @@ impl Store {
             .map(|b| b.task_id.clone())
             .collect()
     }
+    /// A pending adoption freezes existing subscriptions, including an intent
+    /// written before the task record was staged. A refresh must not fence them
+    /// merely because it intentionally skipped that task's reconciliation.
+    pub(crate) fn active_task_subscription_ids(&self, task_id: &str) -> Vec<String> {
+        self.task_bindings.values()
+            .filter(|b| b.active && b.task_id == task_id)
+            .map(|b| b.id.clone())
+            .collect()
+    }
     pub fn fence_task_subscriptions(&mut self, active: &BTreeSet<String>) -> Result<()> {
         let old = self
             .task_bindings

@@ -17,6 +17,12 @@ fn adoption_fixture_remote() -> (Arc<Mutex<DaemonState>>, Value, StubApi, Arc<Mu
     let stub = spawn_routed_stub(move |method, _, body| {
         let mut current = remote.lock().unwrap();
         if method == "GET" {
+            if current["inject_initial"] == "remove" {
+                let mut s = local_state.lock().unwrap();
+                if let Some(mut session) = s.sessions.remove("ts-adopt") {
+                    let _ = session.kill();
+                }
+            }
             if !current["binding"].is_null() {
                 if let Some(change) = current["inject_local"].as_str() {
                     let mut s = local_state.lock().unwrap();
@@ -40,6 +46,7 @@ fn adoption_fixture_remote() -> (Arc<Mutex<DaemonState>>, Value, StubApi, Arc<Mu
             }
             let mut reply = current.clone();
             reply.as_object_mut().unwrap().remove("inject_local");
+            reply.as_object_mut().unwrap().remove("inject_initial");
             return (200, reply.to_string());
         }
         let p: Value = serde_json::from_str(body).unwrap();
@@ -561,5 +568,295 @@ fn adoption_requires_the_old_native_cron_owners_verified_removal() {
             "neither agent replaced or killed"
         );
         kill_all_sessions(&state);
+    });
+}
+
+fn adoption_paused_record(p: &Value) {
+    let mut t = crate::continuous::task::ContinuousTask::new(
+        "adopt-40".into(), "Existing".into(), "ws-1".into(),
+        p["expected"]["worktree_path"].as_str().unwrap().into(),
+        crate::continuous::task::Engine::Codex,
+        crate::continuous::task::RunMode::Persistent,
+        crate::continuous::task::Schedule::Periodic { every_secs: 60 },
+        "Existing prompt".into(),
+    );
+    t.planning_task_id = Some(ADOPT_TASK.into());
+    t.paused = true;
+    t.current_session_uid = Some("ts-adopt".into());
+    crate::continuous::task::save(&t).unwrap();
+}
+
+#[test]
+fn adoption_refresh_snapshot_cannot_mutate_intent_only_crash() {
+    with_temp_home(|| {
+        let (state, p, _) = adoption_fixture();
+        adoption_paused_record(&p);
+        let commit = adoption_commit_request(&state, &p);
+        let before = serde_json::to_value(crate::continuous::task::load_one("adopt-40")).unwrap();
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let after_crash = captured.clone();
+        let race_state = state.clone();
+        let race_commit = commit.clone();
+        crate::messaging::tasks::before_refresh_effects_for_test(move || {
+            crate::continuous::adoption::inject_fault(Some("intent"));
+            let e = crate::continuous::adoption::handle(&race_state, &race_commit).unwrap_err();
+            crate::continuous::adoption::inject_fault(None);
+            assert!(e.1.contains("intent"), "{e:?}");
+            *after_crash.borrow_mut() = Some(adoption_files(&crate::path::dot_cm_dir()));
+        });
+        arm_continuous_spawn_spy_for_test();
+        arm_continuous_delivery_spy_for_test();
+        assert!(crate::messaging::tasks::refresh(&state).unwrap().is_empty());
+        assert_eq!(before, serde_json::to_value(crate::continuous::task::load_one("adopt-40")).unwrap(),
+            "stale refresh changed original_hash after durable intent");
+        assert_eq!(*captured.borrow(), Some(adoption_files(&crate::path::dot_cm_dir())),
+            "intent-only fence must cover channel/name/subscription/join effects too");
+        let r = crate::continuous::adoption::handle(&state, &commit).unwrap();
+        assert_eq!(r["adopted"], true);
+        assert!(take_continuous_spawn_spy_for_test().is_empty());
+        assert!(take_continuous_delivery_spy_for_test().is_empty());
+        kill_all_sessions(&state);
+    });
+}
+
+#[test]
+fn adoption_refresh_snapshot_cannot_replace_same_uid_generation() {
+    with_temp_home(|| {
+        let (state, p, _) = adoption_fixture();
+        let first = adoption_commit_request(&state, &p);
+        crate::continuous::adoption::handle(&state, &first).unwrap();
+        continuous_pause(&state, &json!({"task_id":"adopt-40","paused":true})).unwrap();
+        // Legacy path backfill makes the stale pass try to persist its old binding.
+        crate::continuous::task::modify("adopt-40", |t| t.messaging.as_mut().unwrap().path = None).unwrap();
+        let old = crate::continuous::task::load_one("adopt-40").unwrap();
+        let mut p = p.clone();
+        p["request_id"] = json!("same-uid-race");
+        let commit = adoption_commit_request(&state, &p);
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let after_adopt = captured.clone();
+        let race_state = state.clone();
+        crate::messaging::tasks::before_refresh_effects_for_test(move || {
+            let r = crate::continuous::adoption::handle(&race_state, &commit).unwrap();
+            assert_eq!(r["adopted"], true);
+            *after_adopt.borrow_mut() = Some(r["current"]["messaging"].clone());
+        });
+        arm_continuous_spawn_spy_for_test();
+        arm_continuous_delivery_spy_for_test();
+        crate::messaging::tasks::refresh(&state).unwrap();
+        let current = crate::continuous::task::load_one("adopt-40").unwrap();
+        assert_eq!(serde_json::to_value(&current.messaging).unwrap(), captured.borrow().as_ref().unwrap().clone());
+        let binding = current.messaging.unwrap();
+        assert_eq!(binding.revision, old.messaging.unwrap().revision + 1);
+        let handle = state.lock().unwrap().messaging.clone();
+        let mut slot = handle.lock().unwrap();
+        let store = slot.as_mut().unwrap();
+        let subscription = store.task_binding_for("adopt-40").expect("refresh must not fence the new generation").clone();
+        assert_eq!(subscription.revision, binding.revision);
+        assert_eq!(subscription.actor, store.participant_id("ts-adopt"));
+        assert!(subscription.start_position.is_some());
+        let hits = store.monitors(&subscription.actor, &json!({"action":"get",
+            "monitor_id":format!("task-{}-{}", subscription.id, subscription.revision)})).unwrap();
+        assert!(hits["items"].as_array().unwrap().is_empty(), "{hits}");
+        drop(slot);
+        assert!(take_continuous_spawn_spy_for_test().is_empty());
+        assert!(take_continuous_delivery_spy_for_test().is_empty());
+        kill_all_sessions(&state);
+    });
+}
+
+#[test]
+fn adoption_refresh_snapshot_cannot_fence_a_new_task() {
+    with_temp_home(|| {
+        let (state, p, _) = adoption_fixture();
+        let commit = adoption_commit_request(&state, &p);
+        let race_state = state.clone();
+        crate::messaging::tasks::before_refresh_effects_for_test(move || {
+            assert_eq!(crate::continuous::adoption::handle(&race_state, &commit).unwrap()["adopted"], true);
+        });
+        crate::messaging::tasks::refresh(&state).unwrap();
+        let handle = state.lock().unwrap().messaging.clone();
+        let slot = handle.lock().unwrap();
+        assert!(slot.as_ref().unwrap().task_binding_for("adopt-40").is_some(),
+            "stale active set disabled the newly adopted subscription");
+        drop(slot);
+        kill_all_sessions(&state);
+    });
+}
+
+#[test]
+fn adoption_pending_refresh_and_explicit_ensure_preserve_all_effects() {
+    for stage in ["intent", "staged", "channel"] {
+        with_temp_home(|| {
+            let (state, p, _) = adoption_fixture();
+            let first = adoption_commit_request(&state, &p);
+            crate::continuous::adoption::handle(&state, &first).unwrap();
+            continuous_pause(&state, &json!({"task_id":"adopt-40","paused":true})).unwrap();
+            let mut next = p.clone();
+            next["request_id"] = json!(format!("pending-{stage}"));
+            let commit = adoption_commit_request(&state, &next);
+            crate::continuous::adoption::inject_fault(Some(stage));
+            assert!(crate::continuous::adoption::handle(&state, &commit).unwrap_err().1.contains(stage));
+            crate::continuous::adoption::inject_fault(None);
+            let before = adoption_files(&crate::path::dot_cm_dir());
+            crate::messaging::tasks::refresh(&state).unwrap();
+            let report = crate::messaging::tasks::ensure_for_task(&state, "adopt-40").unwrap();
+            assert!(!report.bound && !report.deferred.is_empty());
+            assert_eq!(before, adoption_files(&crate::path::dot_cm_dir()), "{stage}");
+            let handle = state.lock().unwrap().messaging.clone();
+            assert!(handle.lock().unwrap().as_ref().unwrap().task_binding_for("adopt-40").is_some(), "{stage}");
+            assert_eq!(crate::continuous::adoption::handle(&state, &commit).unwrap()["adopted"], true);
+            kill_all_sessions(&state);
+        });
+    }
+}
+
+fn adoption_deferred_join(state: &Arc<Mutex<DaemonState>>) -> crate::messaging::tasks::DeferredJoin {
+    let t = crate::continuous::task::load_one("adopt-40").unwrap();
+    let handle = state.lock().unwrap().messaging.clone();
+    let actor = handle.lock().unwrap().as_ref().unwrap().participant_id("ts-adopt");
+    crate::messaging::tasks::DeferredJoin {
+        task_id: t.task_id,
+        binding: t.messaging.unwrap(),
+        uid: "ts-adopt".into(),
+        actor,
+        params: json!({"action":"join","request_id":"deferred-test"}),
+    }
+}
+
+#[test]
+fn adoption_deferred_join_requires_current_generation_and_no_pending_intent() {
+    with_temp_home(|| {
+        let (state, p, _) = adoption_fixture();
+        let first = adoption_commit_request(&state, &p);
+        crate::continuous::adoption::handle(&state, &first).unwrap();
+        let old = adoption_deferred_join(&state);
+        let mut sent = 0;
+        crate::messaging::tasks::forward_joins(&state, vec![old.clone()], |_, _| {
+            let handle = state.try_lock().expect("no state lock across network").messaging.clone();
+            assert!(handle.try_lock().is_ok(), "no store lock across network");
+            assert!(crate::continuous::adoption::try_binding_lock().is_none(), "hold generation gate across effect");
+            crate::continuous::task::modify("adopt-40", |_| {}).unwrap(); // No task-file lock held.
+            sent += 1;
+        });
+        assert_eq!(sent, 1, "current generation forwards");
+        continuous_pause(&state, &json!({"task_id":"adopt-40","paused":true})).unwrap();
+        let mut next = p.clone();
+        next["request_id"] = json!("deferred-second");
+        let second = adoption_commit_request(&state, &next);
+        crate::continuous::adoption::handle(&state, &second).unwrap();
+        crate::messaging::tasks::forward_joins(&state, vec![old], |_, _| panic!("stale same-UID join sent"));
+        let current = adoption_deferred_join(&state);
+        continuous_pause(&state, &json!({"task_id":"adopt-40","paused":true})).unwrap();
+        next["request_id"] = json!("deferred-intent");
+        let third = adoption_commit_request(&state, &next);
+        crate::continuous::adoption::inject_fault(Some("intent"));
+        assert!(crate::continuous::adoption::handle(&state, &third).is_err());
+        crate::continuous::adoption::inject_fault(None);
+        crate::messaging::tasks::forward_joins(&state, vec![current], |_, _| panic!("pending intent join sent"));
+        kill_all_sessions(&state);
+    });
+}
+
+#[test]
+fn adoption_refresh_does_not_wait_or_reenter_the_binding_gate() {
+    with_temp_home(|| {
+        let (state, p, _) = adoption_fixture();
+        adoption_paused_record(&p);
+        let before = adoption_files(&crate::path::dot_cm_dir());
+        let guard = crate::continuous::adoption::binding_lock();
+        assert!(crate::messaging::tasks::refresh(&state).unwrap().is_empty());
+        assert_eq!(before, adoption_files(&crate::path::dot_cm_dir()));
+        // create/adopt already own the gate; the internal entrypoint must not
+        // reacquire it. The public normal entrypoint below also remains usable.
+        assert!(crate::messaging::tasks::ensure_for_task_locked(&state, "adopt-40", &guard, None).unwrap().bound);
+        drop(guard);
+        assert!(crate::messaging::tasks::ensure_for_task(&state, "adopt-40").unwrap().bound);
+        kill_all_sessions(&state);
+    });
+}
+
+#[test]
+fn adoption_session_removed_during_planning_get_is_a_conflict_without_intent() {
+    for preview in [false, true] {
+        with_temp_home(|| {
+            let (state, p, _, remote) = adoption_fixture_remote();
+            let commit = adoption_commit_request(&state, &p);
+            let before = adoption_files(&crate::path::dot_cm_dir());
+            remote.lock().unwrap()["inject_initial"] = json!("remove");
+            let error = crate::continuous::adoption::handle(&state, if preview { &p } else { &commit }).unwrap_err();
+            assert!(matches!(error.0, ErrorCode::Conflict), "{error:?}");
+            assert!(error.1.contains("not live"), "{error:?}");
+            assert_eq!(before, adoption_files(&crate::path::dot_cm_dir()));
+            assert!(state.lock().unwrap().sessions.is_empty());
+        });
+    }
+}
+
+#[test]
+fn adoption_validates_durable_and_guarded_workspace_bindings() {
+    for case in ["volatile_conflict", "durable_conflict", "guarded_missing", "guarded_inferred", "epoch_changed"] {
+        with_temp_home(|| {
+            let (state, p, _) = adoption_fixture();
+            let commit = adoption_commit_request(&state, &p);
+            {
+                let mut s = state.lock().unwrap();
+                match case {
+                    "volatile_conflict" => { s.task_workspaces.insert(ADOPT_TASK.into(), "elsewhere".into()); }
+                    "durable_conflict" => { s.bindings.insert(ADOPT_TASK.into(), "elsewhere".into()); }
+                    _ => {
+                        cm_holder_proto::org::set(&mut s.workspaces.get_mut("ws-1").unwrap().org, "binding_epoch", json!(4));
+                        if case != "guarded_missing" { s.bindings.insert(ADOPT_TASK.into(), "ws-1".into()); }
+                        if case == "guarded_inferred" { s.inferred_bindings.push((ADOPT_TASK.into(), "ws-1".into())); }
+                    }
+                }
+            }
+            let before = adoption_files(&crate::path::dot_cm_dir());
+            let error = crate::continuous::adoption::handle(&state, &commit).unwrap_err();
+            assert!(matches!(error.0, ErrorCode::Conflict), "{case}: {error:?}");
+            assert_eq!(before, adoption_files(&crate::path::dot_cm_dir()), "{case}");
+            kill_all_sessions(&state);
+        });
+    }
+}
+
+#[test]
+fn adoption_persists_workspace_binding_across_guarded_and_plain_restart() {
+    for guarded in [false, true] {
+        with_temp_home(|| {
+            let (state, p, _) = adoption_fixture();
+            if guarded {
+                let mut s = state.lock().unwrap();
+                cm_holder_proto::org::set(&mut s.workspaces.get_mut("ws-1").unwrap().org, "binding_epoch", json!(7));
+                s.bindings.insert(ADOPT_TASK.into(), "ws-1".into());
+            }
+            let commit = adoption_commit_request(&state, &p);
+            assert_eq!(commit["expected"]["workspace_binding_epoch"], if guarded { json!(7) } else { Value::Null });
+            crate::continuous::adoption::handle(&state, &commit).unwrap();
+            let path = state.lock().unwrap().daemon_sessions_path.clone().unwrap();
+            let disk: crate::manifest::Manifest = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(disk.bindings.get(ADOPT_TASK).map(String::as_str), Some("ws-1"));
+            let mut restored = DaemonState::new();
+            restored.load_manifest_from_disk(&path).unwrap();
+            assert_eq!(restored.bindings.get(ADOPT_TASK).map(String::as_str), Some("ws-1"));
+            assert!(restored.inferred_bindings.is_empty(), "binding must be recorded, not reconstructed");
+            assert_eq!(cm_holder_proto::org::binding_epoch(restored.workspaces["ws-1"].org.as_ref()), guarded.then_some(7));
+            let headless = make_state_arc();
+            headless.lock().unwrap().daemon_sessions_path = Some(path);
+            rehydrate_derived_state(&headless);
+            assert_eq!(headless.lock().unwrap().bindings.get(ADOPT_TASK).map(String::as_str), Some("ws-1"));
+            kill_all_sessions(&state);
+        });
+    }
+}
+
+#[test]
+fn adoption_ensure_preserves_uninitialized_store_readiness() {
+    with_temp_home(|| {
+        let state = make_state_arc();
+        let error = crate::messaging::tasks::ensure_for_task(&state, "adopt-40").unwrap_err();
+        assert_eq!(error.code, "messaging_starting");
+        assert!(crate::messaging::tasks::refresh(&state).unwrap().is_empty());
+        let handle = state.lock().unwrap().messaging.clone();
+        assert!(handle.lock().unwrap().is_none(), "ensure must not synchronously open a store");
     });
 }

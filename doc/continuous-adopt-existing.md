@@ -20,6 +20,12 @@ planning mapping is retained. No session permissions are granted or widened.
   idle with a complete background census, no active jobs or pending input. PTY
   silence and `unknown` are insufficient. Shells and workflow participants are
   refused, including active workflow records whose session tag was lost.
+- Existing entries in the current task/workspace map and durable manifest
+  binding must agree with the requested workspace. A workspace guarded by `binding_epoch`
+  must already have an explicit matching durable binding; the agent's task ID
+  alone cannot create one. Preview reports `workspace_binding_epoch` and commit
+  must echo it. Adoption preserves the epoch and persists the verified binding,
+  including for headless restart.
 - No other continuous record owns the session or planning task. An existing
   continuous record must be on this host, paused, settled, and free of admission,
   drain, reconciliation, retirement and recovery holds. Its engine, planning
@@ -107,8 +113,9 @@ After reviewing an `ok: true` preview, copy its `result.expected`,
 `result.expected_state_hash` and `result.expected_registration` into the request,
 set `dry_run` to false, and save the exact resulting JSON as `commit.json`.
 The commit must echo all process fields, including PID, kernel process start
-time and holder incarnation. Keep the same ID and **identical payload** for all
-retries. Changed identities require a new preview before any intent exists.
+time, holder incarnation and workspace binding epoch. Keep the same ID and
+**identical payload** for all retries. Changed identities require a new preview
+before any intent exists.
 
 ```bash
 scripts/cm-op --ssh cm-sessions continuous.adopt_existing "$(cat commit.json)" > adoption-reply.json
@@ -137,6 +144,19 @@ the session binding, reconciles the channel, rechecks current planning ownership
 kind, status and scheduler/engine metadata, and finally fsyncs activation.
 An old API receipt never overrides a task closure or changed planning metadata.
 No startup recovery automatically resumes an incomplete adoption.
+
+Task-channel reconciliation uses the same local binding gate as adoption before
+reading task/session state and through channel, naming, membership, subscription
+and fencing effects. Background refresh skips pending intents, even an
+intent-only crash before staging, preserving existing subscriptions. Deferred
+replica joins recheck the binding generation under that gate before forwarding.
+Only the adopting request can reconcile its own staged channel.
+
+The final planning read rejects observed drift; it is **not atomic** with local
+activation and does not introduce a distributed lease. Operators must serialize
+planning-close, ownership and continuous-metadata edits with adoption. A closed
+planning row alone does not revoke the local scheduler: use the owning daemon's
+pause/drain controls to stop scheduler admission.
 
 A channel prerequisite returns `adopted: false, pending: true`. Other errors
 (including uncertain API responses) can also leave a durable pending intent;

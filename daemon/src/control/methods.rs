@@ -14908,7 +14908,7 @@ pub fn continuous_create(
     // Task channel: create/attach + bind now when the messaging coordinator is
     // reachable; otherwise the refresh loop converges on it. Never fatal — the
     // record is already durable.
-    let channel = match crate::messaging::tasks::ensure_for_task(state_arc, &p.task_id) {
+    let channel = match crate::messaging::tasks::ensure_for_task_locked(state_arc, &p.task_id, &_binding, None) {
         Ok(report) => json!({
             "channel_id": report.channel_id,
             "path": report.path,

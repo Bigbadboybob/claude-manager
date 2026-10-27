@@ -24,11 +24,23 @@ fn invalid(e: impl std::fmt::Display) -> (ErrorCode, String) {
     (ErrorCode::InvalidParams, e.to_string())
 }
 
-// Serializes adoption with workflow existing-session binding and creation. Must
-// be acquired before a lifecycle or DaemonState lock; never from a callback.
+// Serializes adoption, workflow binding, operator edits and task messaging.
+// Acquire before lifecycle, DaemonState, messaging-store or task-file locks;
+// never wait for this gate from their callbacks. Messaging RPC refresh uses
+// try_binding_lock so nested calls/contended adoption cannot reverse that order.
 static BINDING: Mutex<()> = Mutex::new(());
-pub(crate) fn binding_lock() -> MutexGuard<'static, ()> {
-    BINDING.lock().unwrap_or_else(|p| p.into_inner())
+pub(crate) struct BindingGuard {
+    _guard: MutexGuard<'static, ()>,
+}
+pub(crate) fn binding_lock() -> BindingGuard {
+    BindingGuard { _guard: BINDING.lock().unwrap_or_else(|p| p.into_inner()) }
+}
+pub(crate) fn try_binding_lock() -> Option<BindingGuard> {
+    match BINDING.try_lock() {
+        Ok(guard) => Some(BindingGuard { _guard: guard }),
+        Err(std::sync::TryLockError::Poisoned(p)) => Some(BindingGuard { _guard: p.into_inner() }),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -43,6 +55,10 @@ pub struct Identity {
     pub workspace_id: String,
     pub worktree_path: String,
     pub engine: task::Engine,
+    /// Centrally guarded workspaces may only retain their explicit binding.
+    /// Preview reports the epoch; commit must echo it, including on retry.
+    #[serde(default)]
+    pub workspace_binding_epoch: Option<u64>,
     // Omit process fields for a preview; the commit must echo its full identity.
     #[serde(default)]
     pub pid: i32,
@@ -223,12 +239,16 @@ fn observe(state: &DaemonState, p: &Params, daemon_id: &str) -> Result<Identity>
             "session already belongs to another continuous owner",
         ));
     }
-    if state
-        .task_workspaces
-        .get(&e.planning_task_id)
-        .is_some_and(|id| id != &s.workspace_id)
+    for (source, bindings) in [("task_workspaces", &state.task_workspaces), ("bindings", &state.bindings)] {
+        if bindings.get(&e.planning_task_id).is_some_and(|id| id != &s.workspace_id) {
+            return Err(conflict(format!("planning task workspace mapping conflicts in {source}")));
+        }
+    }
+    if crate::state::binding_guarded(ws)
+        && (state.bindings.get(&e.planning_task_id) != Some(&s.workspace_id)
+            || state.inferred_bindings.iter().any(|(task_id, ws_id)| task_id == &e.planning_task_id && ws_id == &s.workspace_id))
     {
-        return Err(conflict("planning task workspace mapping conflicts"));
+        return Err(conflict("guarded workspace requires an explicit matching durable planning binding; session task identity is not binding authority"));
     }
     if crate::workflow::run::load_all_strict()
         .map_err(internal)?
@@ -285,12 +305,16 @@ fn observe(state: &DaemonState, p: &Params, daemon_id: &str) -> Result<Identity>
         workspace_id: s.workspace_id.clone(),
         worktree_path: path.to_string_lossy().into_owned(),
         engine,
+        workspace_binding_epoch: cm_holder_proto::org::binding_epoch(ws.org.as_ref()),
         pid: s.pid,
         child_start_time: cell.child_start_time,
         holder_incarnation: s.holder_incarnation,
     };
     let mut expected = e.clone();
     if p.dry_run {
+        if expected.workspace_binding_epoch.is_none() {
+            expected.workspace_binding_epoch = got.workspace_binding_epoch;
+        }
         if expected.daemon_id.is_empty() {
             expected.daemon_id = got.daemon_id.clone();
         }
@@ -588,6 +612,14 @@ pub fn handle(state: &Arc<Mutex<DaemonState>>, params: &Value) -> Result<Value> 
         checked.expected = observed.clone();
         validate_registration(&registration, &checked, existing.is_some())?;
     }
+    // The planning read can block while the local process exits, is removed,
+    // or changes identity. Reject before even previewing/staging a stale agent.
+    {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        if observe(&s, &p, &daemon_id)? != observed {
+            return Err(conflict("identity_changed during planning registration read"));
+        }
+    }
     let hash = existing.map(migration::state_hash);
     if p.dry_run {
         return Ok(
@@ -620,7 +652,9 @@ pub fn handle(state: &Arc<Mutex<DaemonState>>, params: &Value) -> Result<Value> 
         });
         if existing.is_none() {
             let s = state.lock().unwrap_or_else(|p| p.into_inner());
-            let session = &s.sessions[&p.expected.session_uid];
+            observe(&s, &p, &daemon_id)?;
+            let session = s.sessions.get(&p.expected.session_uid)
+                .ok_or_else(|| conflict("session disappeared before staging"))?;
             t.model = session.model.clone();
             t.effort = session.effort.clone();
             t.host_id = observed.host.clone();
@@ -697,6 +731,11 @@ pub fn handle(state: &Arc<Mutex<DaemonState>>, params: &Value) -> Result<Value> 
             p.expected.planning_task_id.clone(),
             p.expected.workspace_id.clone(),
         );
+        // task_workspaces is a TUI snapshot and is not persisted. Record the
+        // explicit durable resolver too, just as task.register_agent_subtask
+        // does, after observe validated both maps and the workspace epoch.
+        s.bindings.insert(p.expected.planning_task_id.clone(), p.expected.workspace_id.clone());
+        s.inferred_bindings.retain(|(task_id, _)| task_id != &p.expected.planning_task_id);
         s.save_daemon_sessions_checked(s.daemon_sessions_path.as_ref().unwrap())
             .map_err(internal)?;
         let entry = s.sessions[&p.expected.session_uid].to_manifest_entry();
@@ -708,7 +747,9 @@ pub fn handle(state: &Arc<Mutex<DaemonState>>, params: &Value) -> Result<Value> 
     }
     fault("session")?;
     task::modify(&p.task_id, |t| t.enabled = true).map_err(internal)?;
-    let channel = crate::messaging::tasks::ensure_for_task(state, &p.task_id).map_err(internal)?;
+    let channel = crate::messaging::tasks::ensure_for_task_locked(
+        state, &p.task_id, &_binding, Some(&p.request_id),
+    ).map_err(internal)?;
     let channel_ready = {
         let slot = handle.lock().unwrap_or_else(|p| p.into_inner());
         slot.as_ref().is_some_and(|store| {

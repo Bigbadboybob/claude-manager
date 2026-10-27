@@ -9,7 +9,7 @@
 //! so a replacement session, a restarted brain, or a newly spawned worker
 //! converges without any agent-side registration.
 use super::{ChatError, Store, TaskBinding};
-use crate::{continuous::task, state::DaemonState};
+use crate::{continuous::{adoption, task}, state::DaemonState};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskChannel {
     pub subscription_id: String,
     pub space_id: String,
@@ -326,18 +326,40 @@ pub fn ensure_channel(
 /// RPCs and replica sync for minutes (2026-09-14).
 const JOINS_PER_PASS: usize = 6;
 
+/// A replica join is an effect of a particular scheduler binding, not a naked
+/// (actor, params) request that can outlive adoption and join the old owner.
+#[derive(Clone, Debug)]
+pub(crate) struct DeferredJoin {
+    pub task_id: String,
+    pub binding: TaskChannel,
+    pub uid: String,
+    pub actor: String,
+    pub params: Value,
+}
+
 fn reconcile_task(
     store: &mut Store,
     graph: &SessionGraph,
     mut task: task::ContinuousTask,
     active: &mut BTreeSet<String>,
-    joins: &mut Vec<(String, Value)>,
+    joins: &mut Vec<DeferredJoin>,
     budget: &mut usize,
+    _guard: &adoption::BindingGuard,
+    adoption_request: Option<&str>,
 ) -> Result<TaskReport, ChatError> {
     let mut report = TaskReport {
         task_id: task.task_id.clone(),
         ..TaskReport::default()
     };
+    if let Some(request) = adoption_request {
+        if task.adoption_pending.as_deref() != Some(request) {
+            return Err(ChatError { code: "adoption_pending".into(), message: "adoption request no longer owns the staged task".into() });
+        }
+    } else if let Err((_, reason)) = adoption::ensure_available(&task.task_id) {
+        active.extend(store.active_task_subscription_ids(&task.task_id));
+        report.deferred.push(reason);
+        return Ok(report);
+    }
     if !task.enabled {
         return Ok(report);
     }
@@ -413,7 +435,7 @@ fn reconcile_task(
                 store.channel_action(&actor, &params, &[])?;
                 report.joined.push(actor.clone());
             } else {
-                joins.push((actor.clone(), params));
+                joins.push(DeferredJoin { task_id: task.task_id.clone(), binding: binding.clone(), uid: uid.clone(), actor: actor.clone(), params });
                 report.deferred.push(format!("join {actor}"));
             }
         }
@@ -462,7 +484,7 @@ fn reconcile_task(
                 Err(e) => report.deferred.push(format!("join {actor}: {}", e.message)),
             }
         } else {
-            joins.push((actor.clone(), params));
+            joins.push(DeferredJoin { task_id: task.task_id.clone(), binding: binding.clone(), uid: uid.clone(), actor: actor.clone(), params });
             report.deferred.push(format!("join {actor}"));
         }
     }
@@ -472,7 +494,14 @@ fn reconcile_task(
 /// Refresh every task's fence, channel, name and membership synchronously.
 /// The background loop also runs this so a replacement doesn't need to
 /// discover chat first. Per-task failures are logged, not fatal.
-pub fn refresh(state: &Arc<Mutex<DaemonState>>) -> Result<Vec<(String, Value)>, ChatError> {
+pub(crate) fn refresh(state: &Arc<Mutex<DaemonState>>) -> Result<Vec<DeferredJoin>, ChatError> {
+    // The old pass captured records here and used them after waiting on the
+    // store. Keep the regression seam before the gate: ALL authoritative reads
+    // and effects below, including the final active-set sweep, serialize with
+    // adoption. A nested messaging RPC skips instead of waiting/reentering.
+    #[cfg(test)]
+    before_refresh_effects();
+    let Some(guard) = adoption::try_binding_lock() else { return Ok(Vec::new()); };
     let (handle, graph) = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         (
@@ -506,7 +535,7 @@ pub fn refresh(state: &Arc<Mutex<DaemonState>>) -> Result<Vec<(String, Value)>, 
     let mut budget = JOINS_PER_PASS;
     for (_, task) in records {
         let id = task.task_id.clone();
-        match reconcile_task(store, &graph, task, &mut active, &mut joins, &mut budget) {
+        match reconcile_task(store, &graph, task, &mut active, &mut joins, &mut budget, &guard, None) {
             Ok(report) => {
                 if report.created || report.named || !report.joined.is_empty() {
                     eprintln!(
@@ -526,11 +555,49 @@ pub fn refresh(state: &Arc<Mutex<DaemonState>>) -> Result<Vec<(String, Value)>, 
     Ok(joins)
 }
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_REFRESH_EFFECTS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+#[cfg(test)]
+pub(crate) fn before_refresh_effects_for_test(f: impl FnOnce() + 'static) {
+    BEFORE_REFRESH_EFFECTS.with(|slot| *slot.borrow_mut() = Some(Box::new(f)));
+}
+#[cfg(test)]
+fn before_refresh_effects() {
+    let callback = BEFORE_REFRESH_EFFECTS.with(|slot| slot.borrow_mut().take());
+    if let Some(callback) = callback {
+        callback();
+    }
+}
+
 /// Reconcile ONE task now (continuous.create / continuous.ensure_channel).
 pub fn ensure_for_task(
     state: &Arc<Mutex<DaemonState>>,
     task_id: &str,
 ) -> Result<TaskReport, ChatError> {
+    let guard = adoption::binding_lock();
+    ensure_for_task_locked(state, task_id, &guard, None)
+}
+
+/// Callers already holding the gate (create/adopt) must pass it through instead
+/// of reacquiring. Only adoption may reconcile its own durable pending request.
+pub(crate) fn ensure_for_task_locked(
+    state: &Arc<Mutex<DaemonState>>,
+    task_id: &str,
+    guard: &adoption::BindingGuard,
+    adoption_request: Option<&str>,
+) -> Result<TaskReport, ChatError> {
+    if adoption_request.is_none() {
+        if let Err((_, reason)) = adoption::ensure_available(task_id) {
+            return Ok(TaskReport { task_id: task_id.into(), deferred: vec![reason], ..TaskReport::default() });
+        }
+    }
+    // Retain ordinary ensure/create readiness and name projection semantics.
+    // initialize only projects the already-open store (no lazy open/refresh),
+    // so it does not reacquire our binding gate. Pending unrelated requests
+    // return above before this or any other reconciliation effect.
     super::rpc::initialize(state)?;
     let (handle, graph, sync) = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
@@ -554,15 +621,50 @@ pub fn ensure_for_task(
         let mut active: BTreeSet<String> = store.configured_task_ids().into_iter().collect();
         // An explicit ensure is allowed to do all of its joins at once.
         let mut budget = usize::MAX;
-        let report = reconcile_task(store, &graph, task, &mut active, &mut joins, &mut budget)?;
+        let report = reconcile_task(store, &graph, task, &mut active, &mut joins, &mut budget, guard, adoption_request)?;
         report
     };
     if let Some(sync) = sync {
-        for (actor, params) in joins {
-            let _ = sync.request(&actor, "messaging.channels", &params);
-        }
+        forward_joins_locked(state, joins, guard, adoption_request, |actor, params| {
+            let _ = sync.request(actor, "messaging.channels", params);
+        });
     }
     Ok(report)
+}
+
+pub(crate) fn forward_joins(
+    state: &Arc<Mutex<DaemonState>>,
+    joins: Vec<DeferredJoin>,
+    send: impl FnMut(&str, &Value),
+) {
+    let Some(guard) = adoption::try_binding_lock() else { return; };
+    forward_joins_locked(state, joins, &guard, None, send);
+}
+
+fn forward_joins_locked(
+    state: &Arc<Mutex<DaemonState>>,
+    joins: Vec<DeferredJoin>,
+    _guard: &adoption::BindingGuard,
+    adoption_request: Option<&str>,
+    mut send: impl FnMut(&str, &Value),
+) {
+    for join in joins {
+        let Some(task) = task::load_one(&join.task_id) else { continue; };
+        let allowed = match adoption_request {
+            Some(request) => task.adoption_pending.as_deref() == Some(request),
+            None => adoption::ensure_available(&join.task_id).is_ok(),
+        };
+        if !allowed || !task.enabled || task.messaging.as_ref() != Some(&join.binding)
+            || task.current_session_uid != join.binding.session_uid {
+            continue;
+        }
+        let graph = SessionGraph::capture(&state.lock().unwrap_or_else(|p| p.into_inner()));
+        if !graph.members(&task).contains(&join.uid) { continue; }
+        // Keep only the binding gate across network I/O. The task-file read
+        // and DaemonState guard above are gone; no store lock is held. Adoption
+        // cannot change this generation until the queued effect has returned.
+        send(&join.actor, &join.params);
+    }
 }
 
 /// Orientation for `chat_open`: the task channel(s) a session belongs to and
@@ -690,9 +792,9 @@ pub fn spawn(state: &Arc<Mutex<DaemonState>>) {
                     .messaging_sync
                     .clone();
                 if let Some(sync) = sync {
-                    for (actor, params) in joins {
-                        let _ = sync.request(&actor, "messaging.channels", &params);
-                    }
+                    forward_joins(&state, joins, |actor, params| {
+                        let _ = sync.request(actor, "messaging.channels", params);
+                    });
                 }
             }
             Err(e) => eprintln!("cm task messaging: {e}"),
