@@ -759,6 +759,14 @@ fn lifecycle_refusal(state: &DaemonState, uid: &str) -> Option<String> {
     if !internal_active(uid) && state.resume_claims.contains(&("uid".to_string(), uid.to_string())) {
         return Some("session is already being resumed".into());
     }
+    if !internal_active(uid) {
+        if let Ok(snap) = snapshot(state, uid) {
+            if !snap.identity.native_session_id.is_empty()
+                && state.resume_claims.contains(&("claude-code".into(), snap.identity.native_session_id)) {
+                return Some("native conversation is already being resumed".into());
+            }
+        }
+    }
     if let Err((_, reason)) = crate::continuous::adoption::session_available(uid) {
         return Some(reason);
     }
@@ -1659,6 +1667,42 @@ mod tests {
         save_receipt(uid, &Receipt { version:1, identity, phase:"unknown".into(), updated_at:1.0 }).unwrap();
         assert!(crate::resume_identity::claim_uid(&state, uid).is_err());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn conversation_resume_claim_refuses_actual_confirm_before_effect_and_resume_then_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git").args(["init", "-q"]).current_dir(dir.path()).status().unwrap().success());
+        let uid = "ts-abca-0";
+        let id = "123e4567-e89b-12d3-a456-426614174000";
+        let state = archived_fixture(uid, dir.path());
+        let path = crate::transcript_detect::claude_transcript_path(dir.path(), id).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"").unwrap();
+        FAKE.with(|f| *f.borrow_mut() = Some(FakeEffects {
+            roster:Roster { rows:json!([{"kind":"background","sessionId":id,"cwd":dir.path()}]) },
+            host:BackgroundHost { pid:123,start:456 }, fail_phase:None, fail_stop:false,
+            fail_proof:false, fail_revive:false, real_revive:false, stops:0, revives:0,
+        }));
+        let pre = preflight(&state, uid);
+        assert_eq!(pre["status"], "offer");
+        let (claim, saved) = crate::resume_identity::resolve_and_claim(&state, "claude-code", id).unwrap();
+        assert_eq!(saved.unwrap().entry.uid, uid);
+        assert!(confirm(&state, &pre["identity"], true).is_err());
+        FAKE.with(|f| assert_eq!(f.borrow().as_ref().unwrap().stops, 0));
+        assert!(load_receipt(uid).unwrap().is_none());
+        drop(claim);
+        crate::control::methods::recovery_test_restore_program(true);
+        let result = crate::control::methods::add_session(&state, &json!({
+            "uid":"ts-abcb-0", "workspace_id":"workspace", "label":"resume", "engine":"claude-code", "resume_id":id,
+            "model":"test-model", "effort":"xhigh"
+        })).unwrap();
+        assert_eq!(result["session_uid"], uid);
+        let _ = state.lock().unwrap().sessions.get_mut(uid).unwrap().kill();
+        crate::control::methods::recovery_test_restore_program(false);
+        FAKE.with(|f| *f.borrow_mut() = None);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(path.parent().unwrap());
     }
 
     #[test]

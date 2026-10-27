@@ -429,6 +429,9 @@ pub fn resolve_and_claim(
     }
     let record = candidates.into_values().next();
     if let Some(r) = &record {
+        if let Some(reason) = crate::claude_recovery::admission_refusal(&r.entry.uid) {
+            return Err((ErrorCode::Conflict, reason));
+        }
         if s.sessions.contains_key(&r.entry.uid) {
             return Err((
                 ErrorCode::Conflict,

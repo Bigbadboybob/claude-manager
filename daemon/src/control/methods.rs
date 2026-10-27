@@ -12123,7 +12123,7 @@ pub(crate) fn restore_one_session_launch(
     #[cfg(test)]
     let mut params = params;
     #[cfg(test)]
-    if crate::claude_recovery::internal_active(&e.uid) && RECOVERY_TEST_RESTORE.with(|value| value.get()) {
+    if RECOVERY_TEST_RESTORE.with(|value| value.get()) {
         params["argv"] = json!(["/bin/sleep", "60"]);
     }
     {
