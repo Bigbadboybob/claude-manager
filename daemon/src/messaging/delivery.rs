@@ -94,6 +94,10 @@ struct Queue {
     // In-memory checkpoint state, including migrations applied during load.
     #[serde(skip)]
     dirty: bool,
+    // Effect-scoped keys whose task authority is unknown. Never persisted:
+    // every caller rebuilds this projection while holding authority guards.
+    #[serde(skip)]
+    deferred: BTreeSet<String>,
 }
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -123,6 +127,9 @@ struct Batch {
     delivered_at: u64,
 }
 impl Batch {
+    fn deferred(&self, keys: &BTreeSet<String>) -> bool {
+        self.ids.iter().any(|id| keys.contains(id))
+    }
     fn settled_history(&self) -> bool {
         self.released && matches!(self.status.as_str(), "confirmed" | "cancelled")
     }
@@ -145,7 +152,7 @@ fn delivered(status: &str) -> bool {
 fn expire_latches(q: &mut Queue, now: u64) -> bool {
     let mut changed = false;
     for batch in &mut q.batches {
-        if batch.released || !delivered(&batch.status) {
+        if batch.deferred(&q.deferred) || batch.released || !delivered(&batch.status) {
             continue;
         }
         if batch.delivered_at == 0 {
@@ -428,11 +435,6 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>) {
             if store.degraded.is_some() { return; }
             let mut authority = super::task_authority::View::new(store);
             let store = &mut *authority;
-            if store.task_authority_deferred(&store.participant_id(&uid)) {
-                // Unknown is not absent: preserve queued task work unchanged.
-                // Other recipients and ordinary chat RPCs remain available.
-                continue;
-            }
             let ids = store.wake_intents_for_session(&uid);
             let queue = match reconcile_intents(&root, store, &uid, &ids) {
                 Ok(queue) => queue,
@@ -570,12 +572,12 @@ fn deliver_queue(
     let first = q
         .batches
         .iter()
-        .position(|b| !b.released && b.status != "cancelled");
+        .position(|b| !b.deferred(&q.deferred) && !b.released && b.status != "cancelled");
     for index in 0..q.batches.len() {
         let batch = &mut q.batches[index];
         // Released ambiguous submissions still need late native/transcript
         // confirmation. Only final receipts are safe to leave as history.
-        if batch.settled_history() {
+        if batch.deferred(&q.deferred) || batch.settled_history() {
             continue;
         }
         let id = format!("chat:{}", batch.wake_id);
@@ -658,7 +660,7 @@ fn settle(q: &mut Queue, intents: &[WakeIntent]) -> bool {
     let eligible: BTreeSet<_> = intents.iter().map(|i| &i.key).collect();
     let mut changed = false;
     for batch in &mut q.batches {
-        if !batch.released
+        if !batch.deferred(&q.deferred) && !batch.released
             && batch
                 .ids
                 .iter()
@@ -688,7 +690,7 @@ fn collect(q: &mut Queue, intents: &[WakeIntent]) -> bool {
         if let Some(batch) = q
             .batches
             .iter_mut()
-            .find(|b| !b.released && !b.sealed && b.status != "cancelled")
+            .find(|b| !b.deferred(&q.deferred) && !b.released && !b.sealed && b.status != "cancelled")
         {
             if !pending(&batch.status) {
                 batch.coalesced.extend(new.iter().cloned());
@@ -711,7 +713,6 @@ fn collect(q: &mut Queue, intents: &[WakeIntent]) -> bool {
 /// locks. Previews, status queries and invalid reads cannot consume wake work.
 /// Exact returned IDs preserve filtered/paginated reads and late arrivals.
 pub fn read_boundary(store: &Store, uid: &str, result: &Value) -> io::Result<()> {
-    if store.task_authority_deferred(&store.participant_id(uid)) { return Ok(()); }
     let ids: BTreeSet<_> = result["items"]
         .as_array()
         .into_iter()
@@ -725,6 +726,7 @@ pub fn read_boundary(store: &Store, uid: &str, result: &Value) -> io::Result<()>
     let path = queue_path(&store.root, uid);
     let mut q = load(&path)?;
     // Include arrivals not yet visited by the delivery worker before sealing.
+    defer_task_keys(store, uid, &mut q);
     q.dirty |= collect(&mut q, &intents);
     let checked: BTreeSet<_> = intents
         .iter()
@@ -831,17 +833,57 @@ pub fn reconcile(cm_root: &Path, store: &Store) -> io::Result<()> {
 /// Agent read receipts, follows and monitor changes affect only that actor.
 /// Keep offline actors' durable queues until they resume or explicitly cancel.
 pub fn reconcile_session(cm_root: &Path, store: &Store, uid: &str) -> io::Result<()> {
-    if store.task_authority_deferred(&store.participant_id(uid)) { return Ok(()); }
     reconcile_intents(cm_root, store, uid, &store.wake_intents_for_session(uid)).map(|_| ())
+}
+
+fn defer_task_keys(store: &Store, uid: &str, q: &mut Queue) {
+    let prefixes = store.deferred_task_wake_prefixes(&store.participant_id(uid));
+    q.deferred = q.batches.iter().flat_map(|b| &b.ids)
+        .filter(|id| prefixes.iter().any(|p| id.starts_with(p)))
+        .cloned().collect();
+}
+
+/// Move eligible personal work out of a never-published mixed batch. An
+/// existing native receipt (even pending), or any legacy/ambiguous attempt,
+/// keeps its identity and dedup keys intact. Independent new arrivals can
+/// bypass that frozen batch, but already submitted work is never replayed.
+fn split_unpublished(cm_root: &Path, uid: &str, q: &mut Queue, intents: &[WakeIntent]) -> io::Result<()> {
+    let eligible: BTreeSet<_> = intents.iter().map(|i| i.key.as_str()).collect();
+    let mut split = Vec::new();
+    for batch in &mut q.batches {
+        if !batch.deferred(&q.deferred) || batch.released || !pending(&batch.status)
+            || batch.attempts != 0 || batch.attempted_at != 0 || batch.original.is_some()
+            || crate::notifications::get(cm_root, uid, &format!("chat:{}", batch.wake_id))?.is_some() {
+            continue;
+        }
+        let ids: Vec<_> = batch.ids.iter()
+            .filter(|id| !q.deferred.contains(*id) && !batch.checked.contains(*id) && eligible.contains(id.as_str()))
+            .cloned().collect();
+        if ids.is_empty() { continue; }
+        let moved: BTreeSet<_> = ids.iter().cloned().collect();
+        batch.ids.retain(|id| !moved.contains(id));
+        batch.coalesced.retain(|id| !moved.contains(id));
+        split.push(Batch { wake_id: uuid::Uuid::new_v4().to_string(), ids, status: "pending".into(), ..Batch::default() });
+    }
+    if !split.is_empty() {
+        q.batches.extend(split);
+        q.dirty = true;
+    }
+    Ok(())
 }
 
 fn reconcile_intents(cm_root: &Path, store: &Store, uid: &str, intents: &[WakeIntent]) -> io::Result<Queue> {
     let path = queue_path(&store.root, uid);
     let mut q = load(&path)?;
+    defer_task_keys(store, uid, &mut q);
+    split_unpublished(cm_root, uid, &mut q, intents)?;
+    // The separation is one durable write before any native queue effect.
+    // Reload/retry sees the same personal wake identity and all retained keys.
+    checkpoint(&path, &mut q)?;
     q.dirty |= settle(&mut q, intents);
     let eligible: BTreeSet<_> = intents.iter().map(|i| i.key.as_str()).collect();
     for batch in &mut q.batches {
-        if batch.settled_history() {
+        if batch.deferred(&q.deferred) || batch.settled_history() {
             continue;
         }
         let active = batch
@@ -962,6 +1004,94 @@ mod tests {
         QUEUE_SAVE_CALLS.with(|count| count.get())
     }
 
+    fn mixed_task_queue() -> (tempfile::TempDir, Store, String, Vec<super::super::Person>, String, Vec<WakeIntent>) {
+        let (tmp, mut store, actor, people) = fixture();
+        let sub = uuid::Uuid::new_v4().to_string();
+        let channel = store.channel_id_at_path("general").unwrap().to_string();
+        store.bind_task_subscription(super::super::TaskBinding {
+            id: sub.clone(), task_id: "mixed-task".into(), channel_id: channel.clone(), actor: actor.clone(),
+            revision: 1, active: true, acknowledged: BTreeSet::new(), start_position: None,
+        }).unwrap();
+        store.post_system_notice(&channel, "task work", "mixed-task-notice").unwrap();
+        dm(&mut store, &actor, &people, "old-personal");
+        let all = store.wake_intents_for_session("b");
+        assert!(all.iter().any(|i| i.monitor.is_some()) && all.iter().any(|i| i.monitor.is_none()));
+        let mut q = Queue::default();
+        q.dirty |= collect(&mut q, &all);
+        checkpoint(&queue_path(&store.root, "b"), &mut q).unwrap();
+        store.task_authority = Some(BTreeMap::from([(sub.clone(), super::super::task_authority::Authority::Deferred)]));
+        (tmp, store, actor, people, sub, all)
+    }
+
+    #[test]
+    fn deferred_mixed_split_is_durable_before_publication_and_retry_keeps_keys() {
+        let (tmp, mut store, _, _, sub, all) = mixed_task_queue();
+        let path = queue_path(&store.root, "b");
+        let original = fs::read(&path).unwrap();
+        let eligible = store.wake_intents_for_session("b");
+        assert!(eligible.iter().all(|i| i.monitor.is_none()));
+        FAIL_QUEUE_SAVE_AT.with(|at| at.set(Some(save_calls() + 1)));
+        assert!(reconcile_intents(tmp.path(), &store, "b", &eligible).is_err());
+        FAIL_QUEUE_SAVE_AT.with(|at| at.set(None));
+        assert_eq!(original, fs::read(&path).unwrap(), "failed split must preserve original ledger");
+        let old = load(&path).unwrap();
+        assert!(native_event(tmp.path(), &old.batches[0]).is_none());
+
+        let q = reconcile_intents(tmp.path(), &store, "b", &eligible).unwrap();
+        assert_eq!(q.batches.len(), 2);
+        let split_id = q.batches[1].wake_id.clone();
+        let all_keys: BTreeSet<_> = all.iter().map(|i| i.key.clone()).collect();
+        assert_eq!(q.batches.iter().flat_map(|b| b.ids.clone()).collect::<BTreeSet<_>>(), all_keys);
+        assert!(q.batches[0].deferred(&q.deferred));
+        assert!(native_event(tmp.path(), &q.batches[1]).is_none());
+        // Crash/reload after the single split checkpoint, before publication.
+        drop(q);
+        let mut q = reconcile_intents(tmp.path(), &store, "b", &eligible).unwrap();
+        assert_eq!(q.batches.len(), 2);
+        assert_eq!(q.batches[1].wake_id, split_id);
+        deliver_queue(tmp.path(), &store.root, "b", &eligible, &recipient("codex"), 1, &|id| preview(&store, id), &mut q).unwrap();
+        assert!(native_event(tmp.path(), &q.batches[0]).is_none());
+        let personal = native_event(tmp.path(), &q.batches[1]).unwrap();
+        assert!(!personal["text"].as_str().unwrap().contains(&sub));
+        let mut q = reconcile_intents(tmp.path(), &store, "b", &eligible).unwrap();
+        deliver_queue(tmp.path(), &store.root, "b", &eligible, &recipient("codex"), 2, &|id| preview(&store, id), &mut q).unwrap();
+        assert_eq!(native_event(tmp.path(), &q.batches[1]).unwrap(), personal);
+        store.task_authority = None; // Existing Store-only/scheduler contract.
+        let mut q = reconcile_intents(tmp.path(), &store, "b", &all).unwrap();
+        deliver_queue(tmp.path(), &store.root, "b", &all, &recipient("codex"), 3, &|id| preview(&store, id), &mut q).unwrap();
+        assert!(native_event(tmp.path(), &q.batches[0]).is_some());
+        assert_eq!(native_event(tmp.path(), &q.batches[1]).unwrap(), personal);
+        assert_eq!(q.batches.iter().flat_map(|b| b.ids.clone()).collect::<BTreeSet<_>>(), all_keys);
+    }
+
+    #[test]
+    fn deferred_mixed_native_receipts_keep_identity_while_new_personal_work_bypasses() {
+        for status in ["pending", "submitting", "observed"] {
+            let (tmp, mut store, actor, people, _, all) = mixed_task_queue();
+            let path = queue_path(&store.root, "b");
+            let mut original = load(&path).unwrap();
+            // Native publication won a crash race before its ledger checkpoint.
+            let b = &original.batches[0];
+            crate::notifications::publish(tmp.path(), "b", &format!("chat:{}", b.wake_id), "chat",
+                &wake_text(b, &all, &no_preview), &format!("[cm-chat {}]", b.wake_id)).unwrap();
+            set_native_status(tmp.path(), b, status);
+            let receipt = native_event(tmp.path(), b).unwrap();
+            let batch = serde_json::to_value(b).unwrap();
+            dm(&mut store, &actor, &people, "new-independent");
+            let eligible = store.wake_intents_for_session("b");
+            original = reconcile_intents(tmp.path(), &store, "b", &eligible).unwrap();
+            deliver_queue(tmp.path(), &store.root, "b", &eligible, &recipient("codex"), 1, &|id| preview(&store, id), &mut original).unwrap();
+            assert_eq!(original.batches.len(), 2);
+            assert_eq!(serde_json::to_value(&original.batches[0]).unwrap(), batch);
+            assert_eq!(native_event(tmp.path(), &original.batches[0]).unwrap(), receipt);
+            assert_eq!(original.batches[1].ids.len(), 1, "already published personal key must not be replayed");
+            let fresh = native_event(tmp.path(), &original.batches[1]).unwrap();
+            let mut q = reconcile_intents(tmp.path(), &store, "b", &eligible).unwrap();
+            deliver_queue(tmp.path(), &store.root, "b", &eligible, &recipient("codex"), 2, &|id| preview(&store, id), &mut q).unwrap();
+            assert_eq!(q.batches.len(), 2);
+            assert_eq!(native_event(tmp.path(), &q.batches[1]).unwrap(), fresh);
+        }
+    }
     #[test]
     fn messaging_unchanged_live_tick_loads_once_and_writes_zero_queues() {
         let _env = crate::test_support::env_lock();

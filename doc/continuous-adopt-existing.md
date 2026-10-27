@@ -157,9 +157,19 @@ authority. Task-monitor reads, acknowledgments and native wakes independently
 validate the authoritative task owner, channel and subscription generation under
 nonblocking per-task lifecycle and state-file guards. Busy/unknown authority
 leaves task hits and pending native work unconsumed for retry. Ordinary chat and
-personal monitors remain available; native publication for a recipient whose
-task authority is busy waits for a later tick. The delivery path retains the
-guards through local publication, without blocking on session/store locks.
+personal monitors and their native wakes remain available. Only batches holding
+uncertain task keys wait; independent wakes bypass their latch. Never-published
+mixed batches are separated in one durable checkpoint before personal publication.
+Already-published or ambiguous batches keep their identities and receipts; they
+are not duplicated or retracted on unknown authority. The delivery path retains
+the guards through local publication, without blocking on session/store locks.
+The reserved `-orchestrator` suffix requires current authority when an agent
+claims a name; this does not revoke an already-published name globally.
+
+`chat_open().continuous` is an orientation snapshot loaded before the effect
+guards, not proof of current ownership. It can briefly show an orchestrator
+while `task_subscriptions` is empty during pending adoption or handover; use the
+guarded subscription result and owning-daemon readback for authority.
 
 The deferred-join gate covers the local send attempt. A timeout can leave the
 remote membership join outcome unknown; this does not introduce a remote lease

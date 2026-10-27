@@ -20,9 +20,10 @@ impl Store {
     pub(crate) fn active_task_bindings(&self) -> Vec<TaskBinding> {
         self.task_bindings.values().filter(|b| b.active).cloned().collect()
     }
-    pub(crate) fn task_authority_deferred(&self, actor: &str) -> bool {
-        self.task_bindings.values().any(|b| b.active && b.actor == actor
+    pub(crate) fn deferred_task_wake_prefixes(&self, actor: &str) -> Vec<String> {
+        self.task_bindings.values().filter(|b| b.active && b.actor == actor
             && self.task_authority.as_ref().is_some_and(|a| a.get(&b.id) == Some(&super::super::task_authority::Authority::Deferred)))
+            .map(|b| format!("monitor:task-{}-{}:", b.id, b.revision)).collect()
     }
     pub(super) fn task_monitor_current(&self, actor: &str, m: &Monitor) -> bool {
         m.task_subscription.as_ref().is_none_or(|id| {
@@ -178,7 +179,8 @@ impl Store {
     pub fn is_task_subscription_actor(&self, actor: &str) -> bool {
         self.task_bindings
             .values()
-            .any(|b| b.active && b.actor == actor)
+            .any(|b| b.active && b.actor == actor
+                && self.task_authority.as_ref().is_none_or(|a| a.get(&b.id) == Some(&super::super::task_authority::Authority::Current)))
     }
     /// The channel a task subscription points at, for orientation blocks.
     pub fn task_binding_for(&self, task_id: &str) -> Option<&TaskBinding> {
