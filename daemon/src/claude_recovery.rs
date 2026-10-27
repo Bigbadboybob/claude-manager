@@ -1251,6 +1251,8 @@ mod tests {
         for (uid, mutation) in [("ts-abc1-0", "none"), ("ts-abc2-0", "rebind"),
             ("ts-abc3-0", "workflow"), ("ts-abc4-0", "tomb_rebind")] {
             let dir = tempfile::tempdir().unwrap();
+            assert!(std::process::Command::new("git").args(["init", "-q"])
+                .current_dir(dir.path()).status().unwrap().success());
             let receipt = receipt_path(uid).unwrap();
             let _ = fs::remove_file(&receipt);
             let mut daemon = DaemonState::new();
