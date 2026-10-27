@@ -10,6 +10,9 @@ import socket
 import sys
 import time
 import uuid
+from typing import Annotated, cast
+
+from pydantic import Field
 
 # Optional: full JSON-Schema validation for the `schema=` structured-output
 # option on the spawn-and-run / send-and-wait tools. Absent on the lean
@@ -300,8 +303,23 @@ _ITEMS_LAUNCH_TIMEOUT_S = 180.0
 _GATE_REPORT_TIMEOUT_S = 900
 
 
-def _items_call(method: str, params: dict, timeout: float = _ITEMS_TIMEOUT_S) -> dict:
-    params = {key: value for key, value in params.items() if value is not None}
+# FastMCP validates arguments before calling the function. This distinct default
+# survives validation while an explicitly supplied JSON null becomes None.
+class _OmittedScheduleField(str):
+    pass
+
+
+_OMITTED_SCHEDULE_FIELD = _OmittedScheduleField("__cm_omitted_schedule_field__")
+
+
+def _hide_omitted_schedule_default(schema: dict) -> None:
+    # The sentinel is an implementation detail, not a value clients should send.
+    schema.pop("default", None)
+
+
+def _items_call(method: str, params: dict, timeout: float = _ITEMS_TIMEOUT_S,
+                *, keep_null: frozenset[str] = frozenset()) -> dict:
+    params = {key: value for key, value in params.items() if value is not None or key in keep_null}
     try:
         return control_client.call(method, params, timeout=timeout)
     except control_client.TransportError as exc:
@@ -377,9 +395,9 @@ def item_set(
     group: str | None = None,
     blocked_by: list[int] | None = None,
     blocked_on: str | None = None,
-    check_back: str | None = None,
-    eta: str | None = None,
-    job: str | None = None,
+    check_back: Annotated[str | None, Field(json_schema_extra=_hide_omitted_schedule_default)] = cast(str | None, _OMITTED_SCHEDULE_FIELD),
+    eta: Annotated[str | None, Field(json_schema_extra=_hide_omitted_schedule_default)] = cast(str | None, _OMITTED_SCHEDULE_FIELD),
+    job: Annotated[str | None, Field(json_schema_extra=_hide_omitted_schedule_default)] = cast(str | None, _OMITTED_SCHEDULE_FIELD),
     title: str | None = None,
     links: list[str] | None = None,
     reason: str | None = None,
@@ -416,7 +434,8 @@ def item_set(
 
     holder replaces the holders ("none" hands the item back); add_holder /
     remove_holder adjust them. An empty string clears note, group or
-    blocked_on; blocked_by=[] clears blockers. head / mf / ruling move the
+    blocked_on; check_back, eta and job accept null or "" to clear them when
+    board rules permit it; blocked_by=[] clears blockers. head / mf / ruling move the
     item's gate bindings (full SHAs, a ruling id; "" clears) and make older
     gate receipts STALE; gate_class picks its gate profile. With a list of n,
     the change is all-or-nothing; each=True writes every item on its own and
@@ -444,11 +463,14 @@ def item_set(
     Returns {board, items, unblocked?, warnings?}.
     """
     params = dict(locals())
+    for key in ("check_back", "eta", "job"):
+        if params[key] is _OMITTED_SCHEDULE_FIELD:
+            params.pop(key)
     if not each:
         params.pop("each")
     if not reopen:
         params.pop("reopen")
-    return _items_call("item.set", params)
+    return _items_call("item.set", params, keep_null=frozenset({"check_back", "eta", "job"}))
 
 
 @mcp.tool()

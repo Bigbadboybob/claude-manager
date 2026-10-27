@@ -513,6 +513,58 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
         # never capacity (doc/strict-boards.md §4.2).
         self.assertEqual(board["free_capacity"], [])
 
+    async def test_explicit_scheduling_nulls_obey_strict_rules_and_are_atomic(self):
+        r = await self.http.patch(f"/boards/{self.ref}", json={
+            "actor": {"pid": "owner"}, "backlog_allowed": False})
+        self.assertEqual(r.status_code, 200, r.text)
+        await self.create({"title": "blocked", "holders": [LANE]},
+                          {"title": "job", "holders": [LANE]})
+        await self.patch(1, actor=LANE, status="blocked", blocked_on="await review", check_back="2h")
+        await self.patch(2, actor=LANE, status="active", job="batch", eta="2h")
+
+        before = {i["n"]: i for i in (await self.read())["items"]}
+        await self.patch(1, actor=LANE, note="omitted check-back")
+        await self.patch(2, actor=LANE, note="omitted job and eta")
+        current = {i["n"]: i for i in (await self.read())["items"]}
+        self.assertEqual(current[1]["check_back_at"], before[1]["check_back_at"])
+        self.assertEqual((current[2]["eta_at"], current[2]["job"]),
+                         (before[2]["eta_at"], before[2]["job"]))
+
+        for n, field, code in ((1, "check_back", "check_back_required"),
+                               (2, "eta", "eta_required")):
+            r = await self.patch(n, actor=LANE, ok=False, note="must roll back", **{field: None})
+            self.assertEqual((r.status_code, r.json()["detail"]["code"]), (422, code), r.text)
+        current = {i["n"]: i for i in (await self.read())["items"]}
+        self.assertEqual((current[1]["check_back_at"], current[1]["note"]),
+                         (before[1]["check_back_at"], "omitted check-back"))
+        self.assertEqual((current[2]["eta_at"], current[2]["job"], current[2]["note"]),
+                         (before[2]["eta_at"], "batch", "omitted job and eta"))
+
+        # An atomic bulk call must not commit its earlier successful item.
+        r = await self.patch([2, 1], actor=LANE, ok=False, note="bulk must roll back", check_back=None)
+        self.assertEqual((r.status_code, r.json()["detail"]["code"]), (422, "check_back_required"), r.text)
+        current = {i["n"]: i for i in (await self.read())["items"]}
+        self.assertEqual(current[2]["note"], "omitted job and eta")
+
+        await self.patch(1, actor=LANE, status="active", check_back=None)
+        await self.patch(2, actor=LANE, job=None)
+        current = {i["n"]: i for i in (await self.read())["items"]}
+        self.assertIsNone(current[1]["check_back_at"])
+        self.assertEqual((current[2]["eta_at"], current[2]["job"]), (before[2]["eta_at"], None))
+        await self.patch(2, actor=LANE, eta=None)
+        current = {i["n"]: i for i in (await self.read())["items"]}
+        self.assertEqual((current[2]["eta_at"], current[2]["job"]), (None, None))
+
+        # A permissive board allows clearing the check-back while still blocked.
+        r = await self.http.patch(f"/boards/{self.ref}", json={
+            "actor": {"pid": "owner"}, "backlog_allowed": True})
+        self.assertEqual(r.status_code, 200, r.text)
+        await self.patch(1, actor=LANE, status="blocked", blocked_on="await review", check_back="2h")
+        await self.patch(1, actor=LANE, check_back=None)
+        item = next(i for i in (await self.read())["items"] if i["n"] == 1)
+        self.assertEqual((item["status"], item["blocked_on"], item["check_back_at"]),
+                         ("blocked", "await review", None))
+
     async def test_strict_board_setting_refusals_job_and_capacity(self):
         now = datetime.now(timezone.utc)
 
