@@ -9,6 +9,24 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
+thread_local! {
+    static INPUT_UNITS: std::cell::RefCell<std::collections::HashSet<String>> = Default::default();
+}
+
+/// A prompt unit holds the UID gate from body through Enter. Its individual
+/// writes must not recursively take a read lock behind a queued writer.
+pub(crate) struct InputUnit(String);
+impl Drop for InputUnit {
+    fn drop(&mut self) { INPUT_UNITS.with(|units| { units.borrow_mut().remove(&self.0); }); }
+}
+pub(crate) fn input_unit(uid: &str) -> InputUnit {
+    INPUT_UNITS.with(|units| { units.borrow_mut().insert(uid.to_string()); });
+    InputUnit(uid.to_string())
+}
+pub(crate) fn input_unit_active(uid: &str) -> bool {
+    INPUT_UNITS.with(|units| units.borrow().contains(uid))
+}
+
 pub fn gate(uid: &str) -> Arc<RwLock<()>> {
     static GATES: OnceLock<Mutex<HashMap<PathBuf, Weak<RwLock<()>>>>> = OnceLock::new();
     let mut gates = GATES

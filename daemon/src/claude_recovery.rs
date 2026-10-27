@@ -1166,17 +1166,25 @@ mod tests {
         fail_stop: bool,
         fail_proof: bool,
         fail_revive: bool,
+        real_revive: bool,
         stops: usize,
         revives: usize,
     }
-    thread_local! { static FAKE: RefCell<Option<FakeEffects>> = const { RefCell::new(None) }; }
+    thread_local! {
+        static FAKE: RefCell<Option<FakeEffects>> = const { RefCell::new(None) };
+        static HOST_HOOK: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+    }
     pub(super) fn fake_roster() -> Option<Roster> { FAKE.with(|f| f.borrow().as_ref().map(|f| f.roster.clone())) }
-    pub(super) fn fake_host() -> Option<BackgroundHost> { FAKE.with(|f| f.borrow().as_ref().map(|f| f.host.clone())) }
+    pub(super) fn fake_host() -> Option<BackgroundHost> {
+        let host = FAKE.with(|f| f.borrow().as_ref().map(|f| f.host.clone()));
+        if host.is_some() { HOST_HOOK.with(|hook| { if let Some(hook) = hook.borrow_mut().as_mut() { hook(); } }); }
+        host
+    }
     pub(super) fn fake_fresh() -> bool { FAKE.with(|f| f.borrow().is_some()) }
     pub(super) fn fail_checkpoint(phase: &str) -> bool { FAKE.with(|f| f.borrow().as_ref().is_some_and(|f| f.fail_phase == Some(phase))) }
     pub(super) fn fake_stop() -> Option<Result<(), String>> { FAKE.with(|f| f.borrow_mut().as_mut().map(|f| { f.stops += 1; if f.fail_stop { Err("injected timeout".into()) } else { Ok(()) } })) }
     pub(super) fn fake_post_stop() -> Option<Result<(), String>> { FAKE.with(|f| f.borrow().as_ref().map(|f| if f.fail_proof { Err("injected unreadable roster".into()) } else { Ok(()) })) }
-    pub(super) fn fake_revive() -> Option<Result<(), String>> { FAKE.with(|f| f.borrow_mut().as_mut().map(|f| { f.revives += 1; if f.fail_revive { Err("injected revive failure".into()) } else { Ok(()) } })) }
+    pub(super) fn fake_revive() -> Option<Result<(), String>> { FAKE.with(|f| f.borrow_mut().as_mut().and_then(|f| { f.revives += 1; if f.real_revive { None } else if f.fail_revive { Some(Err("injected revive failure".into())) } else { Some(Ok(())) } })) }
 
     fn archived_fixture(uid: &str, dir: &Path) -> Arc<Mutex<DaemonState>> {
         let mut state = DaemonState::new();
@@ -1211,7 +1219,7 @@ mod tests {
             FAKE.with(|f| *f.borrow_mut() = Some(FakeEffects {
                 roster: Roster { rows: json!([{"kind":"background", "sessionId":"123e4567-e89b-12d3-a456-426614174000", "cwd":dir.path()}]) },
                 host: BackgroundHost { pid: 123, start: 456 }, fail_phase:phase,
-                fail_stop:stop_error, fail_proof:proof_error, fail_revive:revive_error, stops:0, revives:0,
+                fail_stop:stop_error, fail_proof:proof_error, fail_revive:revive_error, real_revive:false, stops:0, revives:0,
             }));
             let pre = preflight(&state, &uid);
             assert_eq!(pre["status"], "offer");
@@ -1232,6 +1240,79 @@ mod tests {
             }
             FAKE.with(|f| *f.borrow_mut() = None);
             let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn live_confirm_signals_only_captured_holder_and_really_revives() {
+        for (uid, mutation) in [("ts-abc1-0", "none"), ("ts-abc2-0", "rebind"),
+            ("ts-abc3-0", "workflow"), ("ts-abc4-0", "tomb_rebind")] {
+            let dir = tempfile::tempdir().unwrap();
+            let receipt = receipt_path(uid).unwrap();
+            let _ = fs::remove_file(&receipt);
+            let mut daemon = DaemonState::new();
+            daemon.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
+            let mut workspace = crate::manifest::ManifestWorkspace::default();
+            workspace.id = "w".into();
+            workspace.worktree_path = Some(dir.path().to_path_buf());
+            daemon.workspaces.insert("w".into(), workspace);
+            let state = Arc::new(Mutex::new(daemon));
+            let native_id = "123e4567-e89b-12d3-a456-426614174000";
+            let transcript = dir.path().join(format!("{native_id}.jsonl"));
+            crate::control::methods::start_session(&state, &json!({
+                "uid":uid, "workspace_id":"w", "label":"recovery test",
+                "argv":["/bin/sleep", "60"], "session_type":"claude-code",
+                "model":"test-model", "effort":"xhigh", "working_dir":dir.path(),
+                "transcript_path":transcript,
+            })).unwrap();
+            let old_pid = state.lock().unwrap().sessions[uid].pid;
+            FAKE.with(|f| *f.borrow_mut() = Some(FakeEffects {
+                roster:Roster { rows:json!([{"kind":"background", "sessionId":native_id, "cwd":dir.path()}]) },
+                host:BackgroundHost { pid:123, start:456 }, fail_phase:None, fail_stop:false,
+                fail_proof:false, fail_revive:false, real_revive:true, stops:0, revives:0,
+            }));
+            crate::control::methods::recovery_test_restore_program(true);
+            let pre = preflight(&state, uid);
+            assert_eq!(pre["status"], "offer", "{mutation}: {pre}");
+            if mutation != "none" {
+                let state_for_hook = Arc::clone(&state);
+                let uid_for_hook = uid.to_string();
+                let calls = std::cell::Cell::new(1usize); // preflight already probed once
+                HOST_HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                    let n = calls.get() + 1;
+                    calls.set(n);
+                    let mut state = state_for_hook.lock().unwrap();
+                    if n == 3 && mutation == "rebind" {
+                        let session = state.sessions.get_mut(&uid_for_hook).unwrap();
+                        session.transcript_path = Some("/tmp/changed-transcript.jsonl".into());
+                        session.generation += 1;
+                    } else if n == 3 && mutation == "workflow" {
+                        state.sessions.get_mut(&uid_for_hook).unwrap().workflow_run_id = Some("new-owner".into());
+                    } else if n == 4 && mutation == "tomb_rebind" {
+                        state.recently_exited.iter_mut().find(|t| t.session_uid == uid_for_hook).unwrap().generation += 1;
+                    }
+                })));
+            }
+            let result = confirm(&state, &pre["identity"], true).unwrap();
+            HOST_HOOK.with(|hook| *hook.borrow_mut() = None);
+            if mutation == "none" {
+                assert_eq!(result["status"], "revived", "{result}");
+                let state = state.lock().unwrap();
+                let session = &state.sessions[uid];
+                assert_ne!(session.pid, old_pid);
+                assert_eq!(session.workspace_id, "w");
+                assert_eq!(session.transcript_path.as_deref().and_then(crate::session::transcript_id_from_path).as_deref(), Some(native_id));
+            } else {
+                assert_eq!(result["status"], "unknown", "{mutation}: {result}");
+                FAKE.with(|f| assert_eq!(f.borrow().as_ref().unwrap().stops, 0));
+                if mutation != "tomb_rebind" {
+                    assert_eq!(state.lock().unwrap().sessions[uid].pid, old_pid);
+                }
+            }
+            crate::control::methods::recovery_test_restore_program(false);
+            if let Some(session) = state.lock().unwrap().sessions.get_mut(uid) { let _ = session.kill(); }
+            FAKE.with(|f| *f.borrow_mut() = None);
+            let _ = fs::remove_file(receipt);
         }
     }
 
@@ -1290,7 +1371,7 @@ mod tests {
         assert_eq!(identity_from_value(&serialized).unwrap(), identity);
         FAKE.with(|f| *f.borrow_mut() = Some(FakeEffects {
             roster:Roster { rows:json!([]) }, host:BackgroundHost { pid:1, start:1 },
-            fail_phase:None, fail_stop:false, fail_proof:false, fail_revive:false, stops:0, revives:0,
+            fail_phase:None, fail_stop:false, fail_proof:false, fail_revive:false, real_revive:false, stops:0, revives:0,
         }));
         assert!(verify_no_native_background(&identity).is_ok());
         FAKE.with(|f| f.borrow_mut().as_mut().unwrap().roster.rows = json!([
@@ -1329,15 +1410,15 @@ mod tests {
         let state = Arc::new(Mutex::new(state));
         FAKE.with(|f| *f.borrow_mut() = Some(FakeEffects {
             roster:Roster { rows:json!([]) }, host:BackgroundHost { pid:1, start:1 },
-            fail_phase:None, fail_stop:false, fail_proof:false, fail_revive:false, stops:0, revives:0,
+            fail_phase:None, fail_stop:false, fail_proof:false, fail_revive:false, real_revive:false, stops:0, revives:0,
         }));
         assert_eq!(preflight(&state, uid)["status"], "unavailable");
-        {
-            let state = state.lock().unwrap();
-            let mut agent = state.sessions[uid].agent_state.lock().unwrap();
-            agent.inputs.background.complete = true;
-            agent.inputs.background.observed_at = Some(crate::agent_state::unix_now());
-        }
+        let observed_at = crate::agent_state::unix_now();
+        crate::control::methods::session_agent_report(&state, &json!({
+            "session_uid":uid, "kind":"hook", "event":"Stop",
+            "payload":{"observed_at":observed_at,
+                "background":{"complete":true, "observed_at":observed_at, "jobs":[], "crons":[]}}
+        }), Some(uid)).unwrap();
         let pre = preflight(&state, uid);
         assert_eq!(pre["status"], "normal");
         assert!(pre["identity"]["native_session_id"].is_null());
@@ -1490,6 +1571,44 @@ mod tests {
         assert!(matches!(result, Err((ErrorCode::Conflict, _))));
         release_tx.send(()).unwrap();
         holder.join().unwrap();
+    }
+
+    #[test]
+    fn attached_operator_input_refuses_reservation_and_unknown_receipt_but_passive_replies_flow() {
+        let uid = "ts-recovery-attached-input";
+        let path = receipt_path(uid).unwrap();
+        let _ = fs::remove_file(&path);
+        let (handle, writes) = crate::session::InputHandle::test_handle_capturing();
+        let handle = handle.test_with_uid(uid);
+        let gate = crate::continuous::retirement::gate(uid);
+        let write = gate.write().unwrap();
+        assert!(handle.write_and_stamp_operator(b"command").is_err());
+        handle.write_and_stamp_operator(b"\x1b[6;20;10t").unwrap();
+        drop(write);
+        handle.write_and_stamp_operator(b"normal").unwrap();
+        let identity = Identity { uid:uid.into(), task_id:None, workspace_id:"w".into(), canonical_cwd:"/tmp".into(),
+            daemon_id:"d".into(), native_session_id:"123e4567-e89b-12d3-a456-426614174000".into(),
+            transcript_generation:0, holder_incarnation:None, holder_pid:None, holder_start_time:None,
+            child_pid:1, child_start_time:1, background_pid:2, background_start_time:2 };
+        save_receipt(uid, &Receipt { version:1, identity, phase:"unknown".into(), updated_at:1.0 }).unwrap();
+        assert!(handle.write_and_stamp_operator(b"after unknown").is_err());
+        handle.write_and_stamp_operator(b"\x1b[6;20;10t").unwrap();
+        assert_eq!(writes.lock().unwrap().len(), 3);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn ordinary_send_and_kill_refuse_reserved_uid() {
+        let uid = "ts-recovery-ordinary-methods";
+        let gate = lifecycle_gate(uid);
+        let _write = gate.write().unwrap();
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        assert!(matches!(crate::control::methods::kill_session(&state, &json!({"session_uid":uid}), None),
+            Err((ErrorCode::Conflict, _))));
+        let input_gate = crate::continuous::retirement::gate(uid);
+        let _input_write = input_gate.write().unwrap();
+        assert!(matches!(crate::control::methods::send_input(&state, &json!({"session_uid":uid,"text":"test"}), None),
+            Err((ErrorCode::Conflict, _))));
     }
 
     #[test]

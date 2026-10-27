@@ -3047,11 +3047,12 @@ impl InputHandle {
     /// deadlock the exec sequence's post-freeze state-lock holds),
     /// not just for RPC latency.
     pub fn write_and_stamp(&self, bytes: &[u8]) -> std::io::Result<()> {
-        let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
+        let _permit = crate::writer_gate::write_permit();
+        let gate = self.session_uid.as_deref().filter(|uid| !crate::continuous::retirement::input_unit_active(uid))
+            .map(crate::continuous::retirement::gate);
         let _fence = gate.as_ref().map(|g| g.read().unwrap_or_else(|p| p.into_inner()));
         if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
         {
-            let _permit = crate::writer_gate::write_permit();
             let mut w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
             w.write_all(bytes)?;
             w.flush()?;
@@ -3061,28 +3062,31 @@ impl InputHandle {
         Ok(())
     }
 
-    /// Write one `send_key` key. Same gate, permit and writer as
-    /// [`write_and_stamp`](Self::write_and_stamp), but it stamps nothing:
-    /// a key is not new work, so it neither supersedes the agent's done
-    /// report (`last_input_at`) nor re-arms watches, nor counts as typing.
+    /// Write one `send_key` key. A key does not supersede the done report,
+    /// but it records operator activity for fresh-recovery proof because it
+    /// can affect the terminal or submit a command.
     pub fn write_key(&self, bytes: &[u8]) -> std::io::Result<()> {
+        let _permit = crate::writer_gate::write_permit();
         let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
         let _fence = gate.as_ref().map(|g| g.read().unwrap_or_else(|p| p.into_inner()));
         if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
-        let _permit = crate::writer_gate::write_permit();
         let mut w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         w.write_all(bytes)?;
-        w.flush()
+        w.flush()?;
+        // A key can execute a command (Enter/escape/etc.) even though it does
+        // not count as a new agent turn; fresh-recovery proof must see it.
+        stamp_now(&self.last_operator_input_at);
+        Ok(())
     }
 
     /// A recovery Enter must not touch a draft typed since the agent paste.
     /// Check under the same writer lock used to stamp human input, closing
     /// the race between checking operator activity and writing the retry.
     pub(crate) fn write_recovery_enter(&self, bytes: &[u8], since: Instant) -> std::io::Result<bool> {
+        let _permit = crate::writer_gate::write_permit();
         let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
         let _fence = gate.as_ref().map(|g| g.read().unwrap_or_else(|p| p.into_inner()));
         if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
-        let _permit = crate::writer_gate::write_permit();
         let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         if self.last_operator_input_at.lock().unwrap_or_else(|p| p.into_inner())
             .is_some_and(|at| at >= since) {
@@ -3098,10 +3102,10 @@ impl InputHandle {
     /// CM's own channel onboarding only. Any operator input since process
     /// creation cancels automation, including input racing the screen check.
     pub(crate) fn write_startup_confirmation(&self, bytes: &[u8]) -> std::io::Result<bool> {
+        let _permit = crate::writer_gate::write_permit();
         let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
         let _fence = gate.as_ref().map(|g| g.read().unwrap_or_else(|p| p.into_inner()));
         if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
-        let _permit = crate::writer_gate::write_permit();
         let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         if self.last_operator_input_at.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
             return Ok(false);
@@ -3125,10 +3129,10 @@ impl InputHandle {
         enter: &[u8],
         screen_unchanged: impl FnOnce() -> bool,
     ) -> std::io::Result<bool> {
+        let _unit = crate::writer_gate::unit_permit();
         let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
         let _fence = gate.as_ref().map(|g| g.read().unwrap_or_else(|p| p.into_inner()));
         if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
-        let _unit = crate::writer_gate::unit_permit();
         let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         let typed = *self.last_operator_input_at.lock().unwrap_or_else(|p| p.into_inner());
         let input = *self.last_input_at.lock().unwrap_or_else(|p| p.into_inner());
@@ -3191,7 +3195,8 @@ impl InputHandle {
     /// cannot mark a newer queued prompt submitted. Commands do not start turns.
     pub(crate) fn prepare_agent_input(mut self, body: &str) -> Self {
         if self.delivery_token.is_some() { return self; }
-        let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
+        let gate = self.session_uid.as_deref().filter(|uid| !crate::continuous::retirement::input_unit_active(uid))
+            .map(crate::continuous::retirement::gate);
         let _fence = match gate.as_ref().map(|g| g.try_read()) {
             Some(Ok(guard)) => Some(guard),
             Some(Err(_)) => return self,
@@ -3232,6 +3237,20 @@ impl InputHandle {
     /// preserve semantic idle and the agent's done report.
     pub fn write_and_stamp_operator(&self, bytes: &[u8]) -> std::io::Result<()> {
         let _permit = crate::writer_gate::write_permit();
+        // Terminal protocol replies/navigation must still flow while recovery
+        // is fenced. Bytes that can alter the composer take the same UID gate
+        // as agent delivery and are refused during/after an ambiguous effect.
+        let gate = if passive_viewer_input(bytes) { None } else {
+            self.session_uid.as_deref().map(crate::continuous::retirement::gate)
+        };
+        let _fence = match gate.as_ref() {
+            Some(gate) => Some(gate.try_read().map_err(|_| std::io::Error::new(
+                std::io::ErrorKind::WouldBlock, "session input is reserved for recovery or retirement"))?),
+            None => None,
+        };
+        if gate.is_some() {
+            if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
+        }
         let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         // Stamp while holding the same writer lock as explicit prompt delivery.
         // Even a partial/failed human write means the composer may contain text.
@@ -3291,6 +3310,12 @@ impl InputHandle {
     #[cfg(test)]
     pub(crate) fn test_agent_state(&self) -> crate::agent_state::AgentStateCell {
         Arc::clone(&self.agent_state)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_uid(mut self, uid: &str) -> Self {
+        self.session_uid = Some(uid.to_string());
+        self
     }
 
     /// Test-only handle whose writes are captured per-call (one
