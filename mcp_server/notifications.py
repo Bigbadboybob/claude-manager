@@ -44,8 +44,9 @@ def delivery_health(events, now: float | None = None, threshold: float | None = 
     )
     stalled = [
         e for e in events
-        if e.get("status") in {"submitted", "uncertain"}
-        and e.get("updated_at", e.get("created_at", 0)) > last_observed
+        if (e.get("status") == "submitting"
+            or (e.get("status") in {"submitted", "uncertain"}
+                and e.get("updated_at", e.get("created_at", 0)) > last_observed))
     ]
     oldest = min((e.get("updated_at", e.get("created_at", now)) for e in stalled), default=None)
     age = None if oldest is None else max(0.0, now - oldest)
@@ -370,6 +371,13 @@ async def _diagnose(queue: Queue, adapter, events) -> dict:
     if diag.get("blocked"):
         reasons.append(diag["blocked"])
     stale = list(diag.get("stale") or [])
+    # A positive record that this client only enqueues our notices is not a
+    # healthy in-pane resume. Stop claiming new work even if no successor has
+    # appeared; already-submitted/uncertain receipts remain untouched.
+    blocked = diag.get("blocked")
+    if "enqueued_unobserved" in stale and delivery["stalled"]:
+        blocked = blocked or "stale_channel"
+        reasons.append("stale_channel")
     # An in-pane resume or clear legitimately moves the bound transcript
     # away from this client's launch id while delivery keeps working, so a
     # mismatch alone is informational; with stalled work or other evidence
@@ -389,9 +397,9 @@ async def _diagnose(queue: Queue, adapter, events) -> dict:
         if delivery["unobserved"]:
             extra["unobserved"] = delivery["unobserved"]
             extra["oldest_unobserved_s"] = delivery["oldest_unobserved_s"]
-    degraded = diag.get("blocked") or (reasons and base == "ready")
+    degraded = blocked or (reasons and base == "ready")
     return {"status": "degraded" if degraded else base,
-            "extra": extra, "stale": stale, "blocked": diag.get("blocked")}
+            "extra": extra, "stale": stale, "blocked": blocked}
 
 
 async def _wait_for_lock(queue: Queue, adapter, fd: int):

@@ -709,7 +709,7 @@ pub struct App {
     /// Engine-reported `agent_state` per (host, uid); see `app/agent_state.rs`.
     agent_states: HashMap<(crate::hosts::HostId, String), agent_state::AgentStateView>,
     owner_alert_rows: HashSet<String>,
-    dismissed_owner_alerts: HashSet<String>,
+    dismissed_owner_alerts: HashSet<(crate::hosts::HostId, String, String)>,
     /// When this viewer first saw each open alert (alert id, or `legacy:<uid>`
     /// for TUI-raised ones): the Messages "Open alerts" ages and order.
     owner_alert_since: HashMap<String, SystemTime>,

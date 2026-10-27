@@ -17,7 +17,7 @@ use std::{
 
 /// Default stall horizon; `CM_NOTIFY_STALL_ALERT_SECS` overrides it.
 pub const DEFAULT_STALL_ALERT_SECS: u64 = 900;
-/// How often the delivery worker evaluates the alarm (its tick is 2 s).
+/// How often the independent alarm worker evaluates the queue.
 pub const ALARM_INTERVAL_SECS: u64 = 30;
 
 pub fn threshold_secs() -> u64 {
@@ -65,12 +65,13 @@ pub fn assess(events: &[Value], transport: Option<&Value>, now: f64, threshold: 
         .map(at)
         .fold(0.0, f64::max);
     let reason = transport_reason(transport);
-    let blocked = reason.as_deref() == Some("channels_disabled");
+    let blocked = matches!(reason.as_deref(), Some("channels_disabled" | "stale_channel" | "external_background"));
     let stalled: Vec<f64> = events
         .iter()
         .filter(|e| {
             let status = e["status"].as_str().unwrap_or("");
-            (matches!(status, "submitted" | "uncertain") && at(e) > last_observed)
+            status == "submitting"
+                || (matches!(status, "submitted" | "uncertain") && at(e) > last_observed)
                 || (blocked && status == "pending")
         })
         .map(at)
@@ -96,10 +97,12 @@ fn human(secs: u64) -> String {
 }
 
 pub fn message(label: &str, uid: &str, stall: &Stall) -> String {
-    let recovery = if stall.reason == "channels_disabled" {
+    let recovery = if stall.reason == "external_background" {
+        "Claude lists the bound conversation as background while this notification channel is not its background-host child; inspect the exact native ID, host process, and active work before an operator decides whether to stop that specific session and revive it"
+    } else if stall.reason == "channels_disabled" {
         "its Claude client was relaunched without the claude-manager channel (e.g. a bg/fork hand-off); restart/resume it in place with A-R"
     } else {
-        "check notification_status in that session; if its client was replaced, reconnect MCP or restart/resume it in place with A-R"
+        "inspect the session and notification_status; reconnect MCP only if the live client still owns the channel, otherwise restart/resume it in place with A-R"
     };
     format!(
         "CM notifications are not reaching {label} ({uid}): {} notice(s) unobserved for {} (reason: {}). Recovery: {recovery}.",
@@ -116,6 +119,8 @@ pub struct Episode {
     pub reason: String,
     /// Set once the Owner alert was raised; never re-raised in this episode.
     pub alert_id: Option<String>,
+    /// Absent in pre-independent-key journals.
+    pub alert_key: Option<String>,
 }
 
 fn state_path(root: &Path) -> PathBuf {
@@ -142,14 +147,14 @@ pub fn pass(state: &Arc<Mutex<DaemonState>>, root: &Path, uids: &[String], now: 
     let mut episodes = load(root);
     let before = episodes.clone();
     for uid in uids {
-        // Notices that can never be confirmed (text without its marker,
-        // written before publish enforced it) must not hold an episode open.
+        // Legacy markerless records cannot be confirmed; retain the existing
+        // narrow retirement policy (it is not evidence of delivery).
         match crate::notifications::retire_unconfirmable(root, uid) {
             Ok(0) => {}
             Ok(n) => eprintln!("cm notifications: retired {n} unconfirmable notice(s) for {uid}"),
             Err(e) => eprintln!("cm notifications: retire unconfirmable for {uid}: {e}"),
         }
-        let stall = match crate::notifications::snapshot(root, uid) {
+        let stall = match crate::notifications::snapshot_strict(root, uid) {
             Ok((events, transport)) => assess(&events, transport.as_ref(), now, threshold),
             Err(_) => continue,
         };
@@ -163,7 +168,23 @@ pub fn pass(state: &Arc<Mutex<DaemonState>>, root: &Path, uids: &[String], now: 
                     since: now as u64,
                     reason: stall.reason.clone(),
                     alert_id: None,
+                    alert_key: None,
                 });
+                let key = format!("notification-stall:{uid}");
+                // A legacy episode could be suppressed behind a session's
+                // unrelated alert, or already acknowledged. Migrate it once
+                // to the independent key without touching that other alert.
+                if episode.alert_key.as_deref() != Some(&key) {
+                    if episode.alert_key.is_none() {
+                        if let Some(id) = episode.alert_id.as_deref() {
+                            if let Err(e) = crate::owner_attention::clear_system(&s, uid, id) {
+                                eprintln!("cm notifications: migrate legacy stall alert for {uid}: {e}");
+                            }
+                        }
+                    }
+                    episode.alert_id = None;
+                    episode.alert_key = Some(key.clone());
+                }
                 if episode.alert_id.is_none() {
                     let label = s
                         .sessions
@@ -171,14 +192,19 @@ pub fn pass(state: &Arc<Mutex<DaemonState>>, root: &Path, uids: &[String], now: 
                         .map(|x| x.title.clone())
                         .or_else(|| s.tui_sessions.get(uid).and_then(|x| x.label.clone()))
                         .unwrap_or_else(|| uid.clone());
-                    match crate::owner_attention::raise_system(&s, uid, &message(&label, uid, &stall)) {
-                        Ok(Some(id)) => {
+                    let escalation = crate::owner_attention::Escalation {
+                        source: key.clone(), dedupe_key: key,
+                        urgency: crate::owner_availability::Urgency::Blocking,
+                        summary: message(&label, uid, &stall),
+                        session_uid: Some(uid.clone()), task_id: None,
+                    };
+                    match crate::owner_attention::escalate(&s, escalation) {
+                        Ok(crate::owner_attention::GateOutcome::Delivered { alert_id: id }
+                            | crate::owner_attention::GateOutcome::Coalesced { alert_id: id }) => {
                             eprintln!("cm notifications: stall alert for {uid}: {} unobserved for {}s ({})", stall.unobserved, stall.oldest_secs, stall.reason);
                             episode.alert_id = Some(id);
                             episode.reason = stall.reason;
                         }
-                        // Another alert is pending for this session; retry later.
-                        Ok(None) => {}
                         Err(e) => eprintln!("cm notifications: stall alert for {uid}: {e}"),
                     }
                 }
@@ -186,9 +212,12 @@ pub fn pass(state: &Arc<Mutex<DaemonState>>, root: &Path, uids: &[String], now: 
             None => {
                 if let Some(episode) = episodes.remove(uid) {
                     if let Some(id) = episode.alert_id {
-                        if let Err(e) = crate::owner_attention::clear_system(&s, uid, &id) {
+                        // Old episodes used the session key; newer ones use a
+                        // separate key so an agent's alert cannot mask this one.
+                        if let Err(e) = crate::owner_attention::withdraw(&s, &format!("notification-stall:{uid}"), &id) {
                             eprintln!("cm notifications: clear stall alert for {uid}: {e}");
                         }
+                        let _ = crate::owner_attention::clear_system(&s, uid, &id);
                     }
                 }
             }
@@ -249,6 +278,7 @@ pub fn outbox_pass(
             since: crate::continuous::task::now_unix(),
             reason: "pending_sync".into(),
             alert_id: None,
+            alert_key: None,
         });
         if ep.alert_id.is_none() {
             let oldest = stalled.iter().filter_map(|(_, o)| o["oldest_age_s"].as_i64()).max().unwrap_or(0).max(0) as u64;
@@ -321,6 +351,8 @@ mod tests {
         assert_eq!(assess(&[ev("a", "submitted", now - 1000.0)], Some(&t), now, 900).unwrap().reason, "transcript_mismatch");
         // Pending only counts when the consumer reports its client drops events.
         assert_eq!(assess(&[ev("a", "pending", now - 5000.0)], None, now, 900), None);
+        assert_eq!(assess(&[ev("a", "submitting", now - 899.0)], None, now, 900), None);
+        assert!(assess(&[ev("a", "submitting", now - 901.0), ev("b", "observed", now - 1.0)], None, now, 900).is_some());
         let blocked = json!({"status":"degraded","reason":"channels_disabled"});
         let stall = assess(&[ev("a", "pending", now - 5000.0)], Some(&blocked), now, 900).unwrap();
         assert_eq!(stall.reason, "channels_disabled");
@@ -351,10 +383,18 @@ mod tests {
         pass(&state, root, &uids, 1_100.0, 900);
         assert!(alerts(&state).is_empty(), "inside the horizon");
         pass(&state, root, &uids, 2_000.0, 900);
-        let first = alerts(&state)[&uid].clone();
+        let key = format!("notification-stall:{uid}");
+        let first = alerts(&state)[&key].clone();
         assert!(first.message.contains("ts-stalled") && first.message.contains("16m"), "{}", first.message);
+        // A partial census cannot falsely resolve the episode.
+        let bad = queue.join("corrupt.json");
+        fs::write(&bad, b"{").unwrap();
+        pass(&state, root, &uids, 2_100.0, 900);
+        assert_eq!(alerts(&state)[&key].id, first.id);
+        assert!(load(root).contains_key(&uid));
+        fs::remove_file(bad).unwrap();
         // Owner acknowledges; the same episode never re-alerts.
-        crate::owner_attention::clear_system(&state.lock().unwrap(), &uid, &first.id).unwrap();
+        crate::owner_attention::withdraw(&state.lock().unwrap(), &key, &first.id).unwrap();
         pass(&state, root, &uids, 3_000.0, 900);
         assert!(alerts(&state).is_empty());
         // Observation clears the episode; a new stall raises a new alert.
@@ -369,7 +409,7 @@ mod tests {
         two["updated_at"] = json!(3_300.0);
         crate::messaging::atomic_replace(&event_file("chat:two"), &two).unwrap();
         pass(&state, root, &uids, 4_300.0, 900);
-        let second = alerts(&state)[&uid].clone();
+        let second = alerts(&state)[&key].clone();
         assert_ne!(second.id, first.id);
         // Recovery withdraws exactly the alarm's own alert.
         two["status"] = json!("observed");
@@ -416,7 +456,7 @@ mod tests {
         assert!(alerts(&state).is_empty());
     }
     #[test]
-    fn notifications_stall_alarm_never_displaces_an_agent_alert() {
+    fn notifications_stall_alarm_is_independent_of_an_agent_alert() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let mut daemon = DaemonState::new();
@@ -425,11 +465,35 @@ mod tests {
         let uid = "ts-busy".to_string();
         let existing = crate::owner_attention::raise_system(&state.lock().unwrap(), &uid, "Decision needed").unwrap().unwrap();
         crate::notifications::publish(root, &uid, "chat:one", "chat", "[cm-chat one] wake", "[cm-chat one]").unwrap();
-        let mut snapshot = crate::notifications::snapshot(root, &uid).unwrap().0;
-        snapshot[0]["status"] = json!("submitted");
-        assert!(assess(&snapshot, None, snapshot[0]["created_at"].as_f64().unwrap() + 1000.0, 900).is_some());
-        // (File left pending: only the displacement rule is exercised here.)
-        assert_eq!(crate::owner_attention::raise_system(&state.lock().unwrap(), &uid, "stall").unwrap(), None);
-        assert_eq!(crate::owner_attention::snapshot(&state.lock().unwrap()).unwrap()[&uid].id, existing);
+        let queue = crate::notifications::directory(root, &uid);
+        let file = fs::read_dir(queue).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "json")).unwrap();
+        let mut event: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        event["status"] = json!("submitted");
+        event["updated_at"] = json!(1000.0);
+        crate::messaging::atomic_replace(&file, &event).unwrap();
+        pass(&state, root, std::slice::from_ref(&uid), 2000.0, 900);
+        let alerts = crate::owner_attention::snapshot(&state.lock().unwrap()).unwrap();
+        assert_eq!(alerts[&uid].id, existing);
+        assert_eq!(alerts[&format!("notification-stall:{uid}")].session_uid, uid);
+    }
+
+    #[test]
+    fn alarm_preserves_an_ambiguous_confirmable_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut daemon = DaemonState::new();
+        daemon.daemon_sessions_path = Some(root.join("daemon-sessions.json"));
+        let state = Arc::new(Mutex::new(daemon));
+        let uid = "ts-ambiguous".to_string();
+        crate::notifications::publish(root, &uid, "one", "chat", "[one] wake", "[one]").unwrap();
+        let queue = crate::notifications::directory(root, &uid);
+        let file = fs::read_dir(queue).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "json")).unwrap();
+        let mut event: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        event["status"] = json!("uncertain");
+        event["updated_at"] = json!(1000.0);
+        crate::messaging::atomic_replace(&file, &event).unwrap();
+        let original = fs::read(&file).unwrap();
+        pass(&state, root, &[uid], 2000.0, 900);
+        assert_eq!(fs::read(file).unwrap(), original);
     }
 }

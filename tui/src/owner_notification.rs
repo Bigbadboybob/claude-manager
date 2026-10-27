@@ -9,7 +9,7 @@ use std::{
 
 pub enum Command {
     Present(Alert),
-    Acknowledge(HostId, Alert),
+    Acknowledge(HostId, String, Alert),
 }
 
 #[cfg(test)]
@@ -115,7 +115,7 @@ const RELEASE_DIGEST_WINDOW: Duration = Duration::from_secs(3);
 pub struct Delivery {
     seen: VecDeque<String>,
     path: PathBuf,
-    acknowledgements: Vec<(HostId, Alert)>,
+    acknowledgements: Vec<(HostId, String, Alert)>,
     retry_at: Instant,
     released: Vec<(Alert, Instant)>,
 }
@@ -148,13 +148,13 @@ impl Delivery {
             Command::Present(alert) => self.present(&alert, |a| {
                 crate::app::show_user_alert(&a.label, &a.message)
             }),
-            Command::Acknowledge(host, alert) => {
+            Command::Acknowledge(host, key, alert) => {
                 if !self
                     .acknowledgements
                     .iter()
-                    .any(|(h, a)| h == &host && a.id == alert.id)
+                    .any(|(h, k, a)| h == &host && k == &key && a.id == alert.id)
                 {
-                    self.acknowledgements.push((host, alert));
+                    self.acknowledgements.push((host, key, alert));
                 }
             }
         }
@@ -234,7 +234,7 @@ impl Delivery {
             return;
         }
         self.retry_at = Instant::now() + Duration::from_secs(5);
-        self.acknowledgements.retain(|(host, alert)| {
+        self.acknowledgements.retain(|(host, key, alert)| {
             let result = (|| -> anyhow::Result<()> {
                 let socket = pool
                     .for_host(host)?
@@ -244,7 +244,7 @@ impl Delivery {
                     &socket,
                     &pool.operator_token_for(host),
                     "owner_attention.ack",
-                    serde_json::json!({"session_uid": alert.session_uid, "alert_id": alert.id}),
+                    serde_json::json!({"session_uid": key, "alert_id": alert.id}),
                 )?;
                 Ok(())
             })();

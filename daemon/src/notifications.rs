@@ -176,9 +176,25 @@ pub fn publish(
 /// All retained events plus the consumer's `transport.json` heartbeat, read
 /// under the queue lock. A missing queue directory is an empty queue.
 pub fn snapshot(root: &Path, uid: &str) -> io::Result<(Vec<Value>, Option<Value>)> {
-    let dir = directory(root, uid);
-    if !dir.is_dir() {
+    if !directory(root, uid).is_dir() {
         return Ok((Vec::new(), None));
+    }
+    snapshot_impl(root, uid, false)
+}
+
+/// A complete census for decisions that would otherwise treat a partial
+/// queue as empty. Diagnostic callers may continue using `snapshot`.
+pub fn snapshot_strict(root: &Path, uid: &str) -> io::Result<(Vec<Value>, Option<Value>)> {
+    snapshot_impl(root, uid, true)
+}
+
+fn snapshot_impl(root: &Path, uid: &str, strict: bool) -> io::Result<(Vec<Value>, Option<Value>)> {
+    let dir = directory(root, uid);
+    match fs::metadata(&dir) {
+        Ok(meta) if meta.is_dir() => {},
+        Ok(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "notification queue is not a directory")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), None)),
+        Err(e) => return Err(e),
     }
     let _guard = lock(root, uid)?;
     let mut events = Vec::new();
@@ -187,12 +203,24 @@ pub fn snapshot(root: &Path, uid: &str) -> io::Result<(Vec<Value>, Option<Value>
         if entry.path().extension().is_some_and(|x| x == "json")
             && entry.file_name() != "transport.json"
         {
-            if let Ok(Some(value)) = read(&entry.path()) {
-                events.push(value);
+            match read(&entry.path()) {
+                Ok(Some(value)) => {
+                    if strict && (value["id"].as_str().is_none() || value["status"].as_str().is_none()) {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid notification in census"));
+                    }
+                    events.push(value);
+                }
+                Ok(None) if strict => return Err(io::Error::new(io::ErrorKind::NotFound, "notification disappeared during census")),
+                Err(e) if strict => return Err(e),
+                _ => {},
             }
         }
     }
-    let transport = read(&dir.join("transport.json")).ok().flatten();
+    let transport = if strict {
+        read(&dir.join("transport.json"))?
+    } else {
+        read(&dir.join("transport.json")).ok().flatten()
+    };
     Ok((events, transport))
 }
 /// Retire this recipient's submitted/uncertain events whose text lacks their
@@ -288,6 +316,27 @@ pub fn update_pending(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn strict_census_rejects_corrupt_entries_and_non_directory_queue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        publish(root, "uid", "good", "chat", "[ok] wake", "[ok]").unwrap();
+        let dir = directory(root, "uid");
+        let bad = dir.join("broken.json");
+        fs::write(&bad, b"{").unwrap();
+        assert_eq!(snapshot(root, "uid").unwrap().0.len(), 1);
+        assert!(snapshot_strict(root, "uid").is_err());
+        fs::write(&bad, b"{}").unwrap();
+        assert!(snapshot_strict(root, "uid").is_err());
+        fs::remove_file(bad).unwrap();
+        assert_eq!(snapshot_strict(root, "uid").unwrap().0.len(), 1);
+        fs::write(dir.join("transport.json"), b"{").unwrap();
+        assert!(snapshot_strict(root, "uid").is_err());
+        assert_eq!(snapshot(root, "uid").unwrap().0.len(), 1);
+        let other = directory(root, "file");
+        fs::write(&other, b"not a directory").unwrap();
+        assert!(snapshot_strict(root, "file").is_err());
+    }
     #[test]
     fn notifications_idempotency_cancellation_and_no_retraction_after_claim() {
         let _env = crate::test_support::env_lock();

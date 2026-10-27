@@ -3317,6 +3317,34 @@ mod apply_manifest_diff_tests {
     }
 
     #[test]
+    fn owner_attention_independent_key_is_visible_on_affected_row() {
+        let host = crate::hosts::HostId::new("sessions");
+        let mut app = build_app_with_session("self");
+        app.push_worker.shutdown();
+        app.workspaces[0].sessions[0].host_id = host.clone();
+        app.apply_owner_attention(&host, "self", Some(owner_test_alert("decision", "self")));
+        app.apply_manifest_diff_from_host(host.clone(), ManifestDiff::Updated {
+            uid: "notification-stall:self".into(),
+            entry: serde_json::json!({"owner_attention": owner_test_alert("stall", "self")}),
+        });
+        assert_eq!(app.owner_alerts.len(), 2);
+        assert!(app.session_has_alert("self"));
+        assert_eq!(app.open_owner_alerts().iter().filter(|a| a.uid == "self").count(), 2);
+        // A stale menu selection cannot acknowledge the current alert.
+        app.jump_to_owner_alert("self", &host, Some("notification-stall:self"), Some("old"));
+        assert_eq!(app.owner_alerts.len(), 2);
+        app.jump_to_owner_alert("self", &host, Some("notification-stall:self"), Some("stall"));
+        assert_eq!(app.owner_alerts.len(), 1);
+        assert!(app.owner_alerts.contains_key(&(host.clone(), "self".into())));
+        assert!(app.session_has_alert("self"));
+        let other_host = crate::hosts::HostId::new("other-host");
+        app.apply_owner_attention(&other_host, "notification-stall:self", Some(owner_test_alert("stall", "self")));
+        assert!(app.owner_alerts.contains_key(&(other_host.clone(), "notification-stall:self".into())));
+        app.acknowledge_owner_alerts_for_row("self");
+        assert_eq!(app.owner_alerts.len(), 1, "focusing one host cannot acknowledge another");
+    }
+
+    #[test]
     fn owner_attention_snapshot_clears_only_its_host_and_survives_delayed_adoption() {
         let mut app = build_app_with_session("other");
         app.push_worker.shutdown();

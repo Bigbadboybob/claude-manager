@@ -14,6 +14,7 @@ from mcp_server.claude_channel import CHAT_CONTENT_MAX, ClaudeChannel, channel_c
 from mcp_server.native_claude import (
     ClaudeAdapter,
     argv_session_id,
+    background_match,
     channel_flag_present,
 )
 from mcp_server.notifications import Queue, consume, delivery_health
@@ -67,6 +68,8 @@ class DeliveryHealthTests(unittest.TestCase):
         recovered = delivery_health([ev("a", "submitted", now - 400), ev("b", "observed", now - 5)], now)
         self.assertFalse(recovered["stalled"])
         self.assertEqual(recovered["unobserved"], 0)
+        self.assertFalse(delivery_health([ev("x", "submitting", now - 299)], now)["stalled"])
+        self.assertTrue(delivery_health([ev("x", "submitting", now - 301), ev("y", "observed", now - 1)], now)["stalled"])
 
     def test_snapshot_reports_degraded_not_connected_while_submissions_vanish(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -171,6 +174,21 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(5.5)
         self.assertFalse(second.done(), "evidence alone is not a successor")
 
+    async def test_stale_holder_with_no_successor_holds_new_pending_without_replay(self):
+        old = Fixture("old", stale=["enqueued_unobserved"])
+        self.queue.publish("previous", "chat", "wake [cm-chat previous]", "[cm-chat previous]")
+        self.queue.change("previous", {"pending"}, status="submitted")
+        # change() supplies its own updated_at; seed the old receipt directly.
+        event = self.queue.get("previous")
+        event["updated_at"] = time.time() - 400
+        notifications.atomic_write(self.queue.event_path("previous"), event)
+        self.queue.publish("new", "chat", "wake [cm-chat new]", "[cm-chat new]")
+        self.run_consumer(old)
+        await asyncio.sleep(.2)
+        self.assertEqual(old.sent, [])
+        self.assertEqual(self.queue.get("previous")["status"], "submitted")
+        self.assertEqual(self.queue.get("new")["status"], "pending")
+
     async def test_handed_off_consumer_does_not_reclaim_without_its_own_claim(self):
         old = Fixture("old", stale=["transcript_mismatch"])
         self.run_consumer(old)
@@ -187,6 +205,60 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ClaudeEvidenceTests(unittest.IsolatedAsyncioTestCase):
+    def test_background_roster_requires_exact_native_id_and_workspace(self):
+        sid = "650fb958-1e42-4428-b4aa-33e4f7061ba5"
+        rows = [{"kind": "background", "sessionId": sid, "cwd": "/tmp/work", "state": "busy"}]
+        self.assertEqual(background_match(rows, sid, "/tmp/work"), rows[0])
+        self.assertIsNone(background_match(rows, sid[:8], "/tmp/work"))
+        self.assertIsNone(background_match(rows, sid, "/tmp/other"))
+        self.assertIsNone(background_match(rows + rows, sid, "/tmp/work"))
+        self.assertIsNone(background_match(None, sid, "/tmp/work"))
+
+    async def test_old_channel_with_inherited_bound_id_is_detected_and_pending_held(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = "1cd328c6-b3cf-4f72-a4e4-13cf2a505443"
+            new = "650fb958-1e42-4428-b4aa-33e4f7061ba5"
+            project = Path(tmp)
+            markers = [f"[cm-chat {i}]" for i in range(3)]
+            (project / f"{old}.jsonl").write_text("".join(json.dumps(x) + "\n" for x in [
+                {"type": "continued-in", "continuedInSessionId": new},
+                *[{"type": "queue-operation", "operation": "enqueue", "content": m} for m in markers],
+            ]))
+            (project / f"{new}.jsonl").write_text("")
+            events = [ev(str(i), "submitted", time.time() - 400) for i in range(3)]
+            for event, marker in zip(events, markers): event["marker"] = marker
+            roster = [{"kind": "background", "sessionId": new, "cwd": os.getcwd(), "state": "busy"}]
+            with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": new}), \
+                 mock.patch("mcp_server.native_claude.claude_parent_argv", return_value=["claude", "--resume", old]), \
+                 mock.patch("mcp_server.native_claude.background_roster", new=mock.AsyncMock(return_value=roster)), \
+                 mock.patch.object(control_client, "call", return_value={"transcript_path": str(project / f"{new}.jsonl")}):
+                adapter = ClaudeAdapter("uid")
+                diag = await adapter.diagnostics(events)
+                self.assertEqual(diag["own_session_id"], old)
+                self.assertEqual(diag["blocked"], "external_background")
+                self.assertIn("enqueued_unobserved", diag["stale"])
+                with tempfile.TemporaryDirectory() as root:
+                    result = await notifications._diagnose(Queue("uid", Path(root)), adapter, events)
+                self.assertEqual(result["status"], "degraded")
+                self.assertEqual(result["blocked"], "external_background")
+
+    async def test_background_probe_cache_follows_binding(self):
+        first = "650fb958-1e42-4428-b4aa-33e4f7061ba5"
+        second = "1cd328c6-b3cf-4f72-a4e4-13cf2a505443"
+        roster = [{"kind": "background", "sessionId": first, "cwd": os.getcwd()}]
+        events = [ev("one", "submitted", time.time() - 400)]
+        with mock.patch("mcp_server.native_claude.claude_parent_argv", return_value=["claude"]), \
+             mock.patch("mcp_server.native_claude.background_roster", new=mock.AsyncMock(return_value=roster)) as probe, \
+             mock.patch.object(control_client, "call", side_effect=[
+                 {"transcript_path": f"/tmp/{first}.jsonl"},
+                 {"transcript_path": f"/tmp/{second}.jsonl"},
+             ]):
+            adapter = ClaudeAdapter("uid")
+            self.assertEqual((await adapter.diagnostics(events))["blocked"], "external_background")
+            adapter.resolve_after = 0
+            self.assertNotIn("blocked", await adapter.diagnostics(events))
+            self.assertEqual(probe.await_count, 2)
+
     def test_argv_parsing(self):
         self.assertEqual(argv_session_id(["claude", "--session-id", "abc"]), "abc")
         self.assertEqual(argv_session_id(["claude", "bg-pty-host", "--session-id", "new",

@@ -30,6 +30,8 @@ pub struct Draft {
 #[derive(Clone, Debug)]
 pub struct OpenAlert {
     pub uid: String,
+    pub key: String,
+    pub id: Option<String>,
     pub host: cm_daemon::host_id::HostId,
     pub label: String,
     pub reason: String,
@@ -363,7 +365,7 @@ impl Messages {
                 out.push((
                     // Age first (like the count column), so it survives truncation.
                     format!("  {:>3} {}{host} \u{00b7} {}", short_age(a.since), a.label, a.reason),
-                    json!({"alert": a.uid, "alert_host": a.host.as_str()}),
+                    json!({"alert": a.uid, "alert_host": a.host.as_str(), "alert_key": a.key, "alert_id": a.id}),
                 ));
             }
         }
@@ -1441,7 +1443,7 @@ impl App {
                         }
                         if let Some(uid) = target["alert"].as_str() {
                             let host = cm_daemon::host_id::HostId::new(target["alert_host"].as_str().unwrap_or("local"));
-                            self.jump_to_owner_alert(uid, &host);
+                            self.jump_to_owner_alert(uid, &host, target["alert_key"].as_str(), target["alert_id"].as_str());
                             return true;
                         }
                         if target["dm_section"] == true {
