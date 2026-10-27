@@ -733,6 +733,9 @@ fn lifecycle_refusal(state: &DaemonState, uid: &str) -> Option<String> {
     if crate::handoff::in_progress(uid) {
         return Some("session handoff is already running".into());
     }
+    if !internal_active(uid) && state.resume_claims.contains(&("uid".to_string(), uid.to_string())) {
+        return Some("session is already being resumed".into());
+    }
     if let Err((_, reason)) = crate::continuous::adoption::session_available(uid) {
         return Some(reason);
     }
@@ -1609,6 +1612,24 @@ mod tests {
         let _input_write = input_gate.write().unwrap();
         assert!(matches!(crate::control::methods::send_input(&state, &json!({"session_uid":uid,"text":"test"}), None),
             Err((ErrorCode::Conflict, _))));
+    }
+
+    #[test]
+    fn existing_uid_resume_claim_refuses_recovery_and_pending_receipt_refuses_claim() {
+        let uid = "ts-recovery-resume-claim";
+        let path = receipt_path(uid).unwrap();
+        let _ = fs::remove_file(&path);
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let claim = crate::resume_identity::claim_uid(&state, uid).unwrap();
+        assert!(lifecycle_refusal(&state.lock().unwrap(), uid).unwrap().contains("resumed"));
+        drop(claim);
+        let identity = Identity { uid:uid.into(), task_id:None, workspace_id:"w".into(), canonical_cwd:"/tmp".into(),
+            daemon_id:"d".into(), native_session_id:"123e4567-e89b-12d3-a456-426614174000".into(),
+            transcript_generation:0, holder_incarnation:None, holder_pid:None, holder_start_time:None,
+            child_pid:0, child_start_time:0, background_pid:2, background_start_time:2 };
+        save_receipt(uid, &Receipt { version:1, identity, phase:"unknown".into(), updated_at:1.0 }).unwrap();
+        assert!(crate::resume_identity::claim_uid(&state, uid).is_err());
+        let _ = fs::remove_file(path);
     }
 
     #[test]

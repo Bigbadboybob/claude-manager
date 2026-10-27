@@ -454,6 +454,9 @@ pub fn resolve_and_claim(
 
 pub fn claim_uid(state: &Arc<Mutex<DaemonState>>, uid: &str) -> Result<Claim, Failure> {
     let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(reason) = crate::claude_recovery::admission_refusal(uid) {
+        return Err((ErrorCode::Conflict, reason));
+    }
     let key = ("uid".into(), uid.to_string());
     if s.sessions.contains_key(uid) || !s.resume_claims.insert(key.clone()) {
         return Err((
