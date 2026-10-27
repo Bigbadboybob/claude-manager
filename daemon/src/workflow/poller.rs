@@ -234,7 +234,7 @@ struct TickSnapshot {
     engine_state_blocked: bool,
     /// Unknown with a confirmed hook turn may escape only on a settled bound
     /// transcript edge. Capture under the registry lock; probe outside it.
-    confirmed_turn_probe: Option<(String, f64)>,
+    confirmed_turn_probe: Option<crate::continuous::completion::ConfirmedTurnProbe>,
     /// Snapshot of the workflow definition, if loaded. Cloned
     /// because the apply phase may run under a fresh state lock
     /// in [`fire_static_transition`] and we don't want to re-lookup
@@ -526,7 +526,7 @@ impl WorkflowPoller {
         // were PRODUCED, not which applied). 2c-2-2-c's race tests
         // assert the apply outcome separately via state inspection.
         if !self.disable_apply_for_test.load(Ordering::SeqCst) {
-            for d in &decisions {
+            for (d, snapshot) in decisions.iter().zip(&snapshots) {
                 match d {
                     Decision::ActivateStatic {
                         run_id,
@@ -539,11 +539,12 @@ impl WorkflowPoller {
                         // poll-time `rendered_prompt` (kept on the Decision for
                         // observability/tests only).
                         let _ = rendered_prompt;
-                        if let Err(e) = self.fire_static_transition(
+                        if let Err(e) = self.fire_static_transition_guarded(
                             run_id,
                             from_role,
                             to_role,
                             "",
+                            snapshot.confirmed_turn_probe.as_ref(),
                         ) {
                             eprintln!(
                                 "cm-daemon: workflow poller failed to fire static \
@@ -564,7 +565,7 @@ impl WorkflowPoller {
                         // duplicate self-re-activations). Skip the fire if
                         // the marker didn't stick.
                         if let Err(e) =
-                            self.persist_nudge_guard(run_id, *guard_count)
+                            self.persist_nudge_guard(run_id, *guard_count, snapshot.confirmed_turn_probe.as_ref())
                         {
                             eprintln!(
                                 "cm-daemon: workflow poller failed to persist \
@@ -575,11 +576,12 @@ impl WorkflowPoller {
                             continue;
                         }
                         // Self-targeted re-activation: from == to == role.
-                        if let Err(e) = self.fire_static_transition(
+                        if let Err(e) = self.fire_static_transition_guarded(
                             run_id,
                             role,
                             role,
                             rendered_prompt,
+                            snapshot.confirmed_turn_probe.as_ref(),
                         ) {
                             eprintln!(
                                 "cm-daemon: workflow poller failed to fire idle \
@@ -1037,8 +1039,8 @@ impl WorkflowPoller {
                 reason: SkipReason::NoHistoryEntry,
             };
         };
-        if snap.engine_state_blocked && !snap.confirmed_turn_probe.as_ref().is_some_and(|(path, after)|
-            crate::continuous::completion::claude_confirmed_turn_finished_after(path, *after, crate::agent_state::unix_now())) {
+        if snap.engine_state_blocked && !snap.confirmed_turn_probe.as_ref().is_some_and(|proof|
+            proof.finished(crate::agent_state::unix_now(), false)) {
             return Decision::Skip { run_id: snap.run_id.clone(), reason: SkipReason::EngineStateBlocked };
         }
         let fire = crate::workflow::transcript::assistant_turn_completed_since(
@@ -1201,6 +1203,13 @@ impl WorkflowPoller {
         // instead of silently re-showing the role its normal prompt.
         prompt: &str,
     ) -> Result<(), String> {
+        self.fire_static_transition_guarded(run_id, from_role, to_role, prompt, None)
+    }
+
+    fn fire_static_transition_guarded(
+        &self, run_id: &str, from_role: &str, to_role: &str, prompt: &str,
+        proof: Option<&crate::continuous::completion::ConfirmedTurnProbe>,
+    ) -> Result<(), String> {
         // 10d-2c-2-2-b F2 + F3:
         // - `expected_from`: snapshot's active_role. If state.json
         //   changed between snapshot and apply (concurrent MCP
@@ -1231,10 +1240,11 @@ impl WorkflowPoller {
             "trigger": "static_idle",
         });
         let caller = Caller::operator("daemon-poller");
-        match crate::control::methods::workflow_transition(
+        match crate::control::methods::workflow_transition_guarded(
             &self.state,
             &caller,
             &params,
+            proof,
         ) {
             Ok(_) => Ok(()),
             Err((code, msg)) => Err(format!("{:?}: {}", code, msg)),
@@ -1247,19 +1257,29 @@ impl WorkflowPoller {
     /// `workflow_transition`) so the next poll tick sees the marker even
     /// if it runs before the async history-append for this nudge lands —
     /// without it, the stale start-count baseline would re-fire the nudge
-    /// every tick until the append caught up. The closure never aborts,
-    /// so `Aborted` is uninhabited.
-    fn persist_nudge_guard(&self, run_id: &str, guard_count: usize) -> Result<(), String> {
-        let outcome = crate::workflow::run::try_modify::<_, std::convert::Infallible>(
+    /// every tick until the append caught up. A stale confirmed-turn proof
+    /// aborts before even this debounce side effect.
+    fn persist_nudge_guard(&self, run_id: &str, guard_count: usize,
+        proof: Option<&crate::continuous::completion::ConfirmedTurnProbe>) -> Result<(), String> {
+        let outcome = crate::workflow::run::try_modify::<_, String>(
             run_id,
             move |run| {
+                let state = proof.map(|_| self.state.try_lock().map_err(|_| "confirmed-turn registry busy; retry".to_string())).transpose()?;
+                let cell = proof.map(|p| p.cell.try_lock().map_err(|_| "confirmed-turn state busy; retry".to_string())).transpose()?;
+                if let Some(proof) = proof {
+                    if !proof.matches(state.as_ref().unwrap(), &cell.as_ref().unwrap().inputs)
+                        || run.active_role.as_ref().and_then(|r| run.role_sessions.get(r))
+                            .and_then(|r| r.daemon_session_uid.as_deref()) != Some(proof.uid.as_str()) {
+                        return Err("stale confirmed-turn proof".into());
+                    }
+                }
                 run.nudge_assistant_count = Some(guard_count);
                 Ok(())
             },
         );
         match outcome {
             crate::workflow::run::TryModifyOutcome::Ok(_) => Ok(()),
-            crate::workflow::run::TryModifyOutcome::Aborted(never) => match never {},
+            crate::workflow::run::TryModifyOutcome::Aborted(error) => Err(error),
             crate::workflow::run::TryModifyOutcome::Persist(e) => {
                 Err(format!("persist nudge guard: {:?}", e))
             }
@@ -1339,7 +1359,7 @@ impl WorkflowPoller {
     }
 }
 
-fn workflow_engine_gate(state: &DaemonState, run: &WorkflowRun) -> (bool, Option<(String, f64)>) {
+fn workflow_engine_gate(state: &DaemonState, run: &WorkflowRun) -> (bool, Option<crate::continuous::completion::ConfirmedTurnProbe>) {
     if !state.config.workflow_state_gate {
         return (false, None);
     }
@@ -1360,7 +1380,7 @@ fn workflow_engine_gate(state: &DaemonState, run: &WorkflowRun) -> (bool, Option
                     | crate::agent_state::State::WaitingOnHuman
             ));
         let probe = if confirmed && session.session_type == "claude-code" {
-            session.transcript_path.clone().zip(agent.latest_start_at)
+            crate::continuous::completion::ConfirmedTurnProbe::capture(session, agent.latest_start_at.unwrap_or(0.0))
         } else { None };
         (blocked, probe)
     })
@@ -2369,6 +2389,52 @@ mod tests {
                 assert!(matches!(decisions.as_slice(), [Decision::Skip { reason: SkipReason::EngineStateBlocked, .. }]), "{decisions:?}");
             }
         }
+        let healthy = std::fs::read_to_string(proj.join("sid-worker.jsonl")).unwrap();
+        std::fs::write(proj.join("sid-worker.jsonl"), serde_json::json!({"type":"assistant", "sessionId":"sid-worker",
+            "timestamp":"2026-10-07T00:00:00Z", "isApiErrorMessage":true, "error":"api_error",
+            "message":{"role":"assistant", "stop_reason":"end_turn", "content":[]}}).to_string()).unwrap();
+        assert!(matches!(poller.poll_once().as_slice(), [Decision::Skip { reason: SkipReason::EngineStateBlocked, .. }]),
+            "a terminal failure can finish drain but cannot justify this workflow escape");
+        std::fs::write(proj.join("sid-worker.jsonl"), healthy).unwrap();
+        // Pause after evaluation, then mutate identity/start before the actual
+        // try_modify effect. The decision may exist; history must not advance.
+        poller.set_disable_apply_for_test(false);
+        for mutation in ["path", "generation", "start", "incarnation"] {
+            let (old_path, old_generation, old_cell, old_inputs) = {
+                let st = state.lock().unwrap();
+                let session = &st.sessions["ts-worker"];
+                let inputs = session.agent_state.lock().unwrap().inputs.clone();
+                (session.transcript_path.clone(), session.generation, session.agent_state.clone(), inputs)
+            };
+            poller.set_pre_apply_hook_for_test(move |state| {
+                let session = state.sessions.get_mut("ts-worker").unwrap();
+                match mutation {
+                    "path" => session.transcript_path = Some("/fixture/rebound.jsonl".into()),
+                    "generation" => session.generation += 1,
+                    "start" => {
+                        let mut cell = session.agent_state.lock().unwrap();
+                        cell.inputs.latest_start = Some(ended + 1.0);
+                        cell.inputs.hooks.prompt_at = Some(ended + 1.0);
+                    }
+                    "incarnation" => session.agent_state = Arc::new(Mutex::new(crate::agent_state::StateCell::new(ended, None))),
+                    _ => unreachable!(),
+                }
+            });
+            let before = crate::workflow::run::load_one("r1").unwrap();
+            assert!(matches!(poller.poll_once().as_slice(), [Decision::ActivateStatic { .. }]));
+            let after = crate::workflow::run::load_one("r1").unwrap();
+            assert_eq!(after.iteration, before.iteration, "{mutation}");
+            assert_eq!(after.active_role, before.active_role, "{mutation}");
+            assert_eq!(serde_json::to_value(after.pending_activation).unwrap(), serde_json::to_value(before.pending_activation).unwrap(), "{mutation}");
+            let mut st = state.lock().unwrap();
+            let session = st.sessions.get_mut("ts-worker").unwrap();
+            session.transcript_path = old_path;
+            session.generation = old_generation;
+            session.agent_state = old_cell;
+            session.agent_state.lock().unwrap().inputs = old_inputs;
+        }
+        *poller.pre_apply_hook.lock().unwrap() = None;
+        poller.set_disable_apply_for_test(true);
         // Rollout flag off restores the underlying transcript predicate.
         state.lock().unwrap().config.workflow_state_gate = false;
         let decisions = poller.poll_once();

@@ -245,7 +245,7 @@ impl PresenceObs {
         }
     }
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HookEdges {
     pub prompt_at: Option<f64>,
@@ -521,13 +521,14 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
                     && start.is_none() && last_turn.ended_at.is_none()
             })
         {
-            detail.error_kind = relay
-                .and_then(|r| r.error_kind.clone())
-                .or_else(|| (hooks.failure_at.is_some() && hooks.failure_at == last_turn.ended_at)
-                    .then(|| hooks.error_kind.clone()).flatten())
-                .or_else(|| presence.and_then(|p| p.transcript_error.clone()))
-                .or_else(|| hooks.error_kind.clone());
-            detail.resumes_at = hooks.resumes_at;
+            if let Some(relay) = relay {
+                detail.error_kind = relay.error_kind.clone();
+            } else if hooks.failure_at.is_some() && hooks.failure_at == last_turn.ended_at {
+                detail.error_kind = hooks.error_kind.clone();
+                detail.resumes_at = hooks.resumes_at;
+            } else {
+                detail.error_kind = presence.and_then(|p| p.transcript_error.clone());
+            }
             entered = last_turn.ended_at.unwrap_or(observed_at);
             State::Errored
         } else if unverified_error {
@@ -2022,6 +2023,13 @@ mod tests {
         i.presence.as_mut().unwrap().valid = false;
         assert_eq!(derive(&i, 1040.0).state, State::Unknown, "invalid provenance stays fail closed");
         assert_eq!(derive(&i, 1040.0).detail.confirmed_turn_open, Some(true));
+        i.presence.as_mut().unwrap().valid = true;
+        i.presence.as_mut().unwrap().transcript_error = Some("old_error".into());
+        i.hooks.failure_at = Some(1013.0);
+        i.hooks.error_kind = None;
+        assert_eq!(derive(&i, 1040.0).state, State::Errored);
+        assert_eq!(derive(&i, 1040.0).detail.error_kind, None, "kind-less new failure cannot inherit an old error label");
+
     }
 
     #[test]

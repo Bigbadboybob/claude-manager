@@ -129,8 +129,12 @@ error hints; invalid source identity still takes precedence as `unknown`.
 Claude hook start. Quiet PTY output cannot make this compatible idle or complete
 an MCP idle wait. Workflow advancement and drain's post-90-second outage escape
 require a bound, timestamped settled transcript boundary after that start;
-assistant `end_turn` alone is insufficient. These probes run outside the daemon
-registry lock. A genuine Stop/StopFailure or verified settled boundary clears
+workflow additionally requires successful completion (drain can accept failure).
+Assistant `end_turn` alone is insufficient. These probes run outside the daemon
+registry lock. The consuming verdict/mutation rechecks session UID, incarnation,
+generation, transcript path and start/hook evidence; a change discards the proof.
+Workflow locks under the run flock are nonblocking, so contention retries without
+introducing an inverse lock wait. A genuine Stop/StopFailure or verified settled boundary clears
 the guard. Ordinary unknown/legacy and synthetic-no-turn fallbacks remain.
 
 `stalled_since` overlays either working state after 15 minutes without transcript
