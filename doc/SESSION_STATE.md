@@ -1,5 +1,7 @@
 # Session state wire contract
 
+Codex's exact missing-continuation error has [bounded native-fork recovery](codex-continuation-recovery.md), owned by the daemon and independent of the viewer.
+
 Contract for the staged reliable-session-state rollout. The daemon owns one
 `agent_state` per session; consumers use it instead of deriving engine activity
 from terminal repainting. Old daemons may omit it. Ignore unknown object keys;

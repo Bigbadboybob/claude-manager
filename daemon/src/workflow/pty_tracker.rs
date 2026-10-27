@@ -231,6 +231,20 @@ impl PtyModeTracker {
         self.term.grid().display_iter().map(|cell| cell.c).collect()
     }
 
+    /// Codex's empty composer at its input cursor. Accept its observed ghost
+    /// placeholder, never arbitrary text/history that happens to contain `›`.
+    pub(crate) fn codex_recovery_composer_ready(&self) -> bool {
+        use alacritty_terminal::index::Column;
+        let grid = self.term.grid();
+        let cursor = grid.cursor.point;
+        if cursor.line.0 < 0 || cursor.column.0 > 5
+            || !self.term.mode().contains(TermMode::SHOW_CURSOR)
+        { return false; }
+        let row: String = (0..grid.columns()).map(|c| grid[cursor.line][Column(c)].c).collect();
+        matches!(row.trim(), "›" | "› Ask Codex to do anything")
+            && row.chars().take(cursor.column.0).collect::<String>().trim() == "›"
+    }
+
     /// Enter encoding for the current mode (see [`enter_bytes_for_mode`]).
     pub fn enter_bytes(&self) -> &'static [u8] {
         enter_bytes_for_mode(self.term_mode())

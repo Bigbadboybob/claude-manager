@@ -921,6 +921,9 @@ fn pause_left() -> Option<Duration> {
 /// (`handoff::tick`), so the two cannot both get in (lock order state →
 /// handoff → rotation).
 pub(crate) fn admit(_locked: &DaemonState, uid: &str, rotation: Rotation) -> Result<(), String> {
+    if crate::codex_recovery::in_progress(uid) {
+        return Err("native Codex continuation recovery is running".into());
+    }
     if crate::handoff::in_progress(uid) {
         return Err("a handoff of this session is running".into());
     }
@@ -1452,6 +1455,8 @@ pub(crate) enum HoldOwner {
     Rotation,
     /// A handoff that is running.
     Handoff,
+    /// Native Codex continuation recovery in the existing process.
+    CodexRecovery,
 }
 
 struct Hold {

@@ -26,6 +26,27 @@ def turn(state, method, status, at, uid="t1"):
 
 
 class ModelTests(unittest.TestCase):
+    def test_missing_continuation_is_specific_even_when_wrapped_as_overload(self):
+        for info in ["other", "serverOverloaded", {"httpConnectionFailed": {"httpStatusCode": 400}}]:
+            state = selected()
+            turn(state, "turn/started", "inProgress", 101)
+            event(state, "turn/completed", {"turn": {"id": "t1", "status": "failed",
+                "error": {"codexErrorInfo": info, "message":
+                    "Previous response was not found; retry without previous_response_id"}}}, 103)
+            self.assertEqual(state.snapshot()["error_kind"], "previous_response_not_found")
+            turn(state, "turn/started", "inProgress", 104, "t2")
+            self.assertIsNone(state.snapshot()["error_kind"])
+
+    def test_conversation_mentions_and_other_engine_errors_are_not_recovery_signals(self):
+        state = selected()
+        event(state, "item/agentMessage/delta", {"delta": "previous_response_not_found"})
+        self.assertIsNone(state.snapshot()["error_kind"])
+        for message in ["server overloaded", "rate limit", "previous_response_id is invalid",
+                        "not_previous_response_not_found_suffix"]:
+            event(state, "turn/completed", {"turn": {"id": "t1", "status": "failed",
+                "error": {"codexErrorInfo": "other", "message": message}}}, 103)
+            self.assertEqual(state.snapshot()["error_kind"], "other")
+
     def test_recorded_0160_notification_sequence(self):
         state = CodexState()
         state.connection(True)

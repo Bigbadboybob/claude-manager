@@ -218,7 +218,7 @@ pub fn status(uid: &str) -> Option<Value> {
 /// Called with the state lock held (`_locked`), as rotation's `admit` is, so
 /// the two never both get the same uid.
 fn take_slot(_locked: &DaemonState, reg: &mut Registry, uid: &str) -> bool {
-    if reg.running.contains(uid) || crate::rotation::in_progress(uid) {
+    if reg.running.contains(uid) || crate::rotation::in_progress(uid) || crate::codex_recovery::in_progress(uid) {
         return false;
     }
     reg.running.insert(uid.to_string());

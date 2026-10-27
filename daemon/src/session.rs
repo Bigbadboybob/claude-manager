@@ -3113,6 +3113,59 @@ impl InputHandle {
         Ok(true)
     }
 
+    /// One native recovery command, serialized against human/agent PTY input.
+    /// Never clear a composer or retry Enter. The caller has checked the live
+    /// screen; recheck its cursor and the failed turn immediately before typing.
+    pub(crate) fn write_codex_recovery_fork(
+        &self,
+        captured: Instant,
+        turn_seq: u64,
+        ended_at: Option<f64>,
+        error_kind: Option<&str>,
+        enter: &[u8],
+        screen_unchanged: impl FnOnce() -> bool,
+    ) -> std::io::Result<bool> {
+        let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
+        let _fence = gate.as_ref().map(|g| g.read().unwrap_or_else(|p| p.into_inner()));
+        if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
+        let _unit = crate::writer_gate::unit_permit();
+        let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        let typed = *self.last_operator_input_at.lock().unwrap_or_else(|p| p.into_inner());
+        let input = *self.last_input_at.lock().unwrap_or_else(|p| p.into_inner());
+        if typed.is_some_and(|t| t >= captured || input.is_none_or(|i| t > i))
+            || input.is_some_and(|t| t >= captured)
+            || !screen_unchanged()
+        {
+            return Ok(false);
+        }
+        let token = crate::agent_state::unix_now();
+        {
+            let mut cell = self.agent_state.lock().unwrap_or_else(|p| p.into_inner());
+            let state = cell.recompute(token);
+            if !crate::codex_recovery::failed_boundary(&state)
+                || state.turn_seq != turn_seq || state.last_turn.ended_at != ended_at
+                || !matches!((error_kind, state.detail.error_kind.as_deref()),
+                    (Some("other" | "serverOverloaded" | "previous_response_not_found"),
+                     Some("other" | "serverOverloaded" | "previous_response_not_found")))
+            {
+                return Ok(false);
+            }
+            cell.note_command(token);
+        }
+        // No state/cell lock across PTY writes or the Codex paste-settle gap.
+        // Keep the writer until Enter so a draft cannot slip between the two.
+        writer.write_all(b"/fork")?;
+        writer.flush()?;
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        writer.write_all(enter)?;
+        writer.flush()?;
+        stamp_now(&self.last_activity_at);
+        stamp_now(&self.last_input_at);
+        self.agent_state.lock().unwrap_or_else(|p| p.into_inner())
+            .note_submitted(token, crate::agent_state::unix_now());
+        Ok(true)
+    }
+
     /// Bump the activity clock WITHOUT writing to the PTY. The agent
     /// `send_input` path hands the actual PTY write to a detached delivery
     /// thread (settle → bracketed body → gap → kitty-Enter), but the caller
@@ -3233,6 +3286,11 @@ impl InputHandle {
             last_operator_input_at: Arc::new(Mutex::new(None)),
             last_input_at: Arc::new(Mutex::new(None)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_agent_state(&self) -> crate::agent_state::AgentStateCell {
+        Arc::clone(&self.agent_state)
     }
 
     /// Test-only handle whose writes are captured per-call (one

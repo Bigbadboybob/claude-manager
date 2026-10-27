@@ -62,6 +62,25 @@ pub fn clear_hold(root: &Path, uid: &str) {
     let _ = fs::remove_file(directory(root, uid).join("hold"));
 }
 
+/// Serialize a recovery command against native event claims. An event already
+/// being submitted (or ambiguously submitted after this failure) makes the
+/// recovery unsafe. Keep this guard only for the short command delivery, never
+/// while awaiting the relay's fork binding (its health reports use this lock).
+pub(crate) fn recovery_input_guard(root: &Path, uid: &str, failed_at: f64) -> io::Result<Option<fs::File>> {
+    let guard = lock(root, uid)?;
+    for entry in fs::read_dir(directory(root, uid))? {
+        let path = entry?.path();
+        if path.extension().is_none_or(|x| x != "json") || path.file_name().is_some_and(|n| n == "transport.json") { continue; }
+        let Some(event) = read(&path)? else { continue; };
+        let status = event["status"].as_str();
+        let at = event["updated_at"].as_f64().or_else(|| event["created_at"].as_f64()).unwrap_or(f64::INFINITY);
+        if status == Some("submitting")
+            || (matches!(status, Some("submitted" | "uncertain")) && at >= failed_at)
+        { return Ok(None); }
+    }
+    Ok(Some(guard))
+}
+
 /// Remove every hold under `root` (brain start: no hold outlives the brain
 /// that set it). Returns how many.
 pub fn clear_all_holds(root: &Path) -> usize {

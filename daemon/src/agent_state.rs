@@ -1423,6 +1423,7 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>) -> std::io::Result<()> {
     }
     flush_publishes(&st);
     drop(st);
+    crate::codex_recovery::tick(state);
     persist_with(state, false, Instant::now(), |path, json| {
         crate::state::write_json_atomic(path, json, true)
     })

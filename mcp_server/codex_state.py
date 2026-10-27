@@ -28,6 +28,28 @@ def short(value, size=256):
     return str(value or "").encode("utf-8")[:size].decode("utf-8", "ignore")
 
 
+def error_kind(error):
+    """Classify only engine errors, never conversation/tool output.
+
+    The app-server wraps a missing continuation in ``other`` or
+    ``serverOverloaded``. Preserve the precise cause without publishing raw
+    provider messages (which can contain request IDs and other private data).
+    """
+    if not isinstance(error, dict):
+        return None
+    info = error.get("codexErrorInfo")
+    kind = short(next(iter(info), "unknown") if isinstance(info, dict) else info) or None
+    message = error.get("message")
+    if isinstance(message, str):
+        message = message[:16384].lower()
+        if (
+            re.search(r"\bprevious_response_not_found\b", message)
+            or "previous response was not found" in message
+        ):
+            return "previous_response_not_found"
+    return kind
+
+
 def timestamp(value, now):
     return (
         value
@@ -164,12 +186,7 @@ class CodexState:
             thread.turn_id = turn["id"]
             thread.last_status = turn["status"]
             thread.retrying = False
-            error = turn.get("error") or {}
-            info = error.get("codexErrorInfo")
-            thread.error_kind = (
-                short(next(iter(info), "unknown") if isinstance(info, dict) else info)
-                or None
-            )
+            thread.error_kind = error_kind(turn.get("error"))
         if not thread.status_seen:
             if active:
                 thread.status = "active"
