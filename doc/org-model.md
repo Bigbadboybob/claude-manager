@@ -966,7 +966,7 @@ clients working. Permission changes run in shadow before they enforce.
 | **S5 profiles, discovery, shadow scope** | `profile_set`, `org(view=member/team/directory)`, `who` over items, epics, receipts, `report_done`, commits and tags; staleness display; manager-chain scope and new board-edit rule computed and logged beside the old rules (observational) | end of v1 |
 | **S6 members become real** | occupancy rows and generations on spawn, revive and Fresh fires, fencing at the API (`occupancy_v1`); spawn defaults and `hire` (§4.2); `@handle` → main session; qualified body mentions; holds by member with every consumer updated together (holder checks, flags, capacity, pushes retargeted, orchestrator/steward, gate grantor and editor allowlists); handover checklist; offline standby; member workspace records and `cm-ws/` branches; `start_session(item=…)`; models resolve member before task; bootstrap allow rules (§6.3) | consumers roll before inherited holds turn on |
 | **S7 scope cutover** | per host, after a week of shadow logs with only expected differences: manager-chain scope and the new board-edit rule authoritative | rollback = shadow with bootstrap rules (§6.3) |
-| **S8 cleanup** | retire `agent_task_edges` and task bindings for scope (irreversible, announced); Task sub-view becomes a filter; decide full convergence (§16) | |
+| **S8 cleanup** | retire `agent_task_edges` and task bindings for scope (irreversible, announced); Task sub-view becomes a filter; full convergence of tasks into items (O6, §16.1 preconditions) | |
 
 ### 13.1 v1 cut line
 
@@ -1184,6 +1184,16 @@ viewers never poll.
   belong to no member. Cost: idle assistants and their checkouts stay
   resident, so reuse comes before spawning, and the board's free capacity
   lists idle assistants.
+- **O6. Full convergence: a task is a board item — decided (Owner,
+  2026-10-27).** O3's link-first stays the v1 path, but it is no longer the end
+  state. Sessions are reused across work, so binding work to a session is the
+  wrong shape: a task becomes a board item, and it is not coupled to a session.
+  Launching a session records its work as a board item (S6,
+  `start_session(item=…)`), and S8 merges the two kinds of row, with §16.1's
+  preconditions as its checklist. The planning API stays as the surface for
+  that work. Trigger: on 2026-10-27 an org-chart move (QRM-DeepDecay under
+  Joint-Decision) did not reach the sidebar, which still nested by
+  `parent_task_id`.
 
 ### 15.2 Design decisions (override any)
 
@@ -1208,7 +1218,7 @@ viewers never poll.
 
 ## 16. Open questions
 
-1. **Full convergence** (after O3). Preconditions: one canonical work id
+1. **Full convergence** — decided by O6 (2026-10-27); what remains open is how. Preconditions: one canonical work id
    everywhere; the single status authority already in place (link-first gives
    this); cross-board `blocked_by` by stable id; receipt and grant provenance
    independent of the item's current board; moves that refuse to cross live
