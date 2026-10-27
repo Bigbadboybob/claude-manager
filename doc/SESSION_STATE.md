@@ -100,7 +100,7 @@ unreadable yields `unknown`, rather than falling back to a guessed idle.
 
 A Claude `UserPromptSubmit` hook newer than the last turn end and the presence
 status edge keeps the foreground `working` even if a stale file still says
-`idle` or `waiting`. Poll time, file rewrites, and a missing `statusUpdatedAt`
+`idle`, `waiting` or `shell`. Poll time, file rewrites, and a missing `statusUpdatedAt`
 are not status edges. A newer actual idle/wait status or Stop/StopFailure still
 takes effect; accepted PTY input without a confirmed start retains the bounded
 delivery/no-turn escape described above.
@@ -110,6 +110,15 @@ native conversation ID as well as the live PID/start identity. Mismatch yields
 `unknown`, including cached reads after a transcript rebind; it does not adopt
 another process or rebind the session. Older engines without `sessionId` retain
 the process identity checks. Native background-session recovery is separate.
+
+The bounded Claude transcript probe can supply a missing turn boundary only
+from main-conversation records carrying the bound native `sessionId` and their
+own timestamps. A current API/auth failure can therefore yield `errored` even
+without Stop or a presence timestamp; prior-turn, sidechain and foreign
+conversation errors cannot supply that boundary. If an error accompanies stale
+presence but its event provenance is unavailable, state is `unknown` with
+`detail.error_kind=unverified_transcript_error`. Cached transcript evidence is
+bound to its sampled path and revalidated on reads and launch confirmation.
 
 `stalled_since` overlays either working state after 15 minutes without transcript
 or subagent-directory growth. It does not replace the state. `since`, `turn_seq`,

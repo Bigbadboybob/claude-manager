@@ -75,6 +75,10 @@ pub enum TailShape {
 #[derive(Debug, Clone)]
 pub struct TailProbe {
     pub shape: TailShape,
+    /// Timestamped main-conversation boundary, independently validated against
+    /// the bound filename. Legacy shape/error hints alone are not turn edges.
+    pub claude_end: Option<crate::agent_state::LastTurn>,
+    pub claude_identity_mismatch: bool,
     /// Machine-readable tag on the latest synthetic API-error assistant.
     /// Presence consumers apply this only while the engine itself says idle.
     pub api_error: Option<String>,
@@ -118,6 +122,7 @@ pub fn probe_transcript_tail(path: &Path) -> Option<TailProbe> {
     let mut auth_error: Option<String> = None;
     let mut usage_limit: Option<String> = None;
     let mut api_error: Option<String> = None;
+    let mut claude_identity_mismatch = false;
     for line in text.lines().rev().take(MAX_SCAN_LINES) {
         let line = line.trim();
         if line.is_empty() {
@@ -127,6 +132,16 @@ pub fn probe_transcript_tail(path: &Path) -> Option<TailProbe> {
             // A truncated first-line-of-tail or a corrupt record — skip.
             continue;
         };
+        if v.get("isSidechain").and_then(|v| v.as_bool()) == Some(true) { continue; }
+        let substantive = matches!(v.get("type").and_then(|v| v.as_str()), Some("assistant" | "user"))
+            || (v.get("type").and_then(|v| v.as_str()) == Some("system")
+                && v.get("subtype").and_then(|v| v.as_str()) == Some("turn_duration"));
+        if substantive && v.get("sessionId").and_then(|v| v.as_str()).is_some_and(|id|
+            path.file_stem().and_then(|s| s.to_str()) != Some(id)) {
+            claude_identity_mismatch = true;
+            shape.get_or_insert(TailShape::MidTurn);
+            break;
+        }
         match v.get("type").and_then(|t| t.as_str()) {
             Some("system") => {
                 if v.get("subtype").and_then(|s| s.as_str()) == Some("turn_duration")
@@ -170,6 +185,8 @@ pub fn probe_transcript_tail(path: &Path) -> Option<TailProbe> {
     }
     shape.map(|shape| TailProbe {
         shape,
+        claude_end: claude_boundary(&text, path),
+        claude_identity_mismatch,
         api_error,
         auth_error,
         usage_limit,
@@ -177,6 +194,52 @@ pub fn probe_transcript_tail(path: &Path) -> Option<TailProbe> {
         pool_transient: false,
         pool_capacity: false,
     })
+}
+
+fn claude_boundary(text: &str, path: &Path) -> Option<crate::agent_state::LastTurn> {
+    use crate::agent_state::{LastTurn, TurnStatus};
+    let native_id = path.file_stem()?.to_str()?;
+    let mut completed = None;
+    for line in text.lines().rev().filter(|line| !line.trim().is_empty()).take(MAX_SCAN_LINES) {
+        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        if v.get("isSidechain").and_then(|v| v.as_bool()) == Some(true) { continue; }
+        let kind = v.get("type")?.as_str()?;
+        match kind {
+            "file-history-snapshot" | "last-prompt" | "summary" | "attachment" | "progress" => continue,
+            "system" if v.get("subtype").and_then(|v| v.as_str()) == Some("stop_hook_summary") => continue,
+            "system" | "assistant" | "user" => {},
+            _ => return None,
+        }
+        if v.get("sessionId").and_then(|v| v.as_str()) != Some(native_id) { return None; }
+        let stamp = v.get("timestamp")?.as_str()?;
+        if !stamp.ends_with('Z') { return None; }
+        let at = crate::workflow::history::iso8601_to_ms(stamp)? as f64 / 1000.0;
+        if at < 0.0 || completed.is_some_and(|end| at > end) { return None; }
+        match kind {
+            "system" if v.get("subtype").and_then(|v| v.as_str()) == Some("turn_duration") => {
+                if completed.is_some() { return None; }
+                completed = Some(at);
+            }
+            "assistant" => {
+                let failed = v.get("isApiErrorMessage").and_then(|v| v.as_bool()) == Some(true)
+                    || (v.pointer("/message/model").and_then(|v| v.as_str()) == Some("<synthetic>")
+                        && v.get("error").and_then(|v| v.as_str()).is_some())
+                    || v.get("error").and_then(|v| v.as_str()) == Some("authentication_failed")
+                    || is_usage_limit_banner(&assistant_text(&v));
+                if failed || completed.is_some() || matches!(
+                    v.pointer("/message/stop_reason").and_then(|v| v.as_str()), Some("end_turn" | "stop_sequence")) {
+                    // An older error must not borrow a newer turn_duration's
+                    // timestamp and look like a failure of a subsequent turn.
+                    return Some(LastTurn { ended_at: Some(if failed { at } else { completed.unwrap_or(at) }),
+                        status: Some(if failed { TurnStatus::Failed } else { TurnStatus::Completed }) });
+                }
+                return None;
+            }
+            "user" => break,
+            _ => return None,
+        }
+    }
+    completed.map(|at| LastTurn { ended_at: Some(at), status: Some(TurnStatus::Completed) })
 }
 
 /// Match only Claude's first-person limit turn-enders. A loose search for

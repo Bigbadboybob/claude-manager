@@ -225,9 +225,16 @@ pub struct PresenceObs {
     pub waiting_for: Option<String>,
     pub main_turn_open: Option<bool>,
     pub transcript_error: Option<String>,
+    #[serde(default)]
+    pub transcript_end: Option<LastTurn>,
+    #[serde(default)]
+    pub transcript_evidence_path: Option<PathBuf>,
 }
 impl PresenceObs {
     pub(crate) fn matches_transcript(&self, transcript: Option<&std::path::Path>) -> bool {
+        if self.transcript_evidence_path.as_deref().is_some_and(|path| Some(path) != transcript) {
+            return false;
+        }
         match (self.native_session_id.as_deref(), transcript) {
             (Some(id), Some(path)) => path.file_stem().and_then(|s| s.to_str()) == Some(id),
             _ => true, // Older engines or a not-yet-bound transcript.
@@ -373,7 +380,7 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
     } else {
         max_time(input.latest_start, input.legacy.input_at)
     };
-    let last_turn = if let Some(r) = relay {
+    let mut last_turn = if let Some(r) = relay {
         r.last_turn.clone()
     } else if newer(hooks.failure_at, hooks.stop_at) {
         LastTurn {
@@ -391,6 +398,13 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
             status: input.legacy.turn_ended_at.map(|_| TurnStatus::Completed),
         }
     };
+    if source == Source::Presence {
+        if let Some(end) = presence.filter(|p| p.valid).and_then(|p| p.transcript_end.as_ref()) {
+            if newer(end.ended_at, last_turn.ended_at) {
+                last_turn = end.clone();
+            }
+        }
+    }
     let mut detail = Detail::default();
     let mut entered = observed_at;
     // A cached presence file predates a submitted prompt even when we just
@@ -400,6 +414,7 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
         p.valid
             && p.status != PresenceStatus::Unknown
             && newer(start, p.status_updated_at)
+            && newer(input.latest_start.or(start), max_time(hooks.prompt_at, last_turn.ended_at))
             && start.is_some_and(|at| now - at < 10.0)
     });
     // Accepted PTY input (latest_start) can expire without starting a turn.
@@ -409,6 +424,8 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
     let presence_behind_hook = relay.is_none()
         && newer(hooks.prompt_at, last_turn.ended_at)
         && presence.is_some_and(|p| newer(hooks.prompt_at, p.status_updated_at));
+    let unverified_error = presence_behind_hook && presence.is_some_and(|p|
+        p.status == PresenceStatus::Idle && p.transcript_error.is_some() && p.transcript_end.is_none());
     // A relay heartbeat is a receipt time, not evidence that queued PTY input
     // reached the engine. Hold until a real turn edge, with a bounded escape
     // for empty Enter, menu input, or a swallowed prompt.
@@ -432,7 +449,11 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
         State::Starting
     } else if presence.is_some_and(|p| !p.valid || p.status == PresenceStatus::Unknown)
         || relay.is_some_and(|r| !r.backend_connected || now - r.observed_at > 90.0)
+        || unverified_error
     {
+        if unverified_error {
+            detail.error_kind = Some("unverified_transcript_error".into());
+        }
         entered = relay
             .filter(|r| r.backend_connected)
             .map_or(observed_at, |r| r.observed_at + 90.0);
@@ -461,7 +482,8 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
         if pending.is_some()
             || flag.is_some()
             || hook_wait
-            || presence.is_some_and(|p| p.status == PresenceStatus::Waiting && !presence_behind_hook)
+            || presence.is_some_and(|p| p.status == PresenceStatus::Waiting
+                && !newer(max_time(hooks.prompt_at, last_turn.ended_at), p.status_updated_at))
         {
             detail.waiting_for = pending
                 .map(|p| format!("{:?}", p.kind))
@@ -513,7 +535,7 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
             let pending_input = relay.is_none() && !no_turn_candidate && newer(start, Some(observed_at));
             if pending_input
                 || (presence_behind_hook && presence.is_some_and(|p|
-                    matches!(p.status, PresenceStatus::Idle | PresenceStatus::Waiting)))
+                    matches!(p.status, PresenceStatus::Idle | PresenceStatus::Waiting | PresenceStatus::Shell)))
                 || relay.is_some_and(|r| r.foreground == RelayStatus::Active)
                 || presence.is_some_and(|p| p.status == PresenceStatus::Busy && open)
                 || (source == Source::Hooks && !no_turn_candidate && newer(start, last_turn.ended_at))
@@ -1033,10 +1055,11 @@ pub fn current(session: &DaemonSession) -> AgentState {
     check_presence_binding(&mut cell.inputs, session.transcript_path.as_deref());
     cell.recompute(unix_now())
 }
-fn check_presence_binding(inputs: &mut Inputs, transcript: Option<&str>) {
+pub(crate) fn check_presence_binding(inputs: &mut Inputs, transcript: Option<&str>) {
     if let Some(presence) = &mut inputs.presence {
-        if !presence.matches_transcript(transcript.map(std::path::Path::new)) {
+        if presence.valid && !presence.matches_transcript(transcript.map(std::path::Path::new)) {
             presence.valid = false;
+            presence.observed_at = unix_now();
         }
     }
 }
@@ -1453,6 +1476,7 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>) -> std::io::Result<()> {
                         observation.valid = false;
                         observation.main_turn_open = None;
                         observation.transcript_error = None;
+                        observation.transcript_end = None;
                     }
                     cell.inputs.presence = Some(observation);
                 }
@@ -1505,7 +1529,7 @@ mod tests {
             engine_version: Some("2.1.291".into()),
             waiting_for: None,
             main_turn_open: Some(true),
-            transcript_error: None,
+            transcript_error: None, transcript_end: None, transcript_evidence_path: None,
         });
         i
     }
@@ -1874,7 +1898,7 @@ mod tests {
         c.inputs.presence.as_mut().unwrap().observed_at = 1040.0;
         let original = c.inputs.clone();
         for (status, expected) in [
-            (PresenceStatus::Shell, State::WorkingBackground),
+            (PresenceStatus::Shell, State::Working),
             (PresenceStatus::Unknown, State::Unknown),
         ] {
             let mut input = original.clone();
@@ -1887,6 +1911,8 @@ mod tests {
             "an old wait cannot hide a confirmed subsequent turn");
         interrupted.presence.as_mut().unwrap().status_updated_at = Some(1002.0);
         assert_eq!(derive(&interrupted, 1040.0).state, State::WaitingOnHuman);
+        interrupted.presence.as_mut().unwrap().status = PresenceStatus::Shell;
+        assert_eq!(derive(&interrupted, 1040.0).state, State::WorkingBackground);
         interrupted.presence.as_mut().unwrap().status = PresenceStatus::Idle;
         assert_eq!(derive(&interrupted, 1040.0).state, State::Idle,
             "a newer idle edge still handles interruption without Stop");
@@ -1894,8 +1920,23 @@ mod tests {
         assert_eq!(derive(&interrupted, 1040.0).state, State::Errored);
         let mut stale_error = original.clone();
         stale_error.presence.as_mut().unwrap().transcript_error = Some("api_error".into());
+        stale_error.presence.as_mut().unwrap().transcript_end = Some(LastTurn {
+            ended_at: Some(900.0), status: Some(TurnStatus::Failed),
+        });
         assert_eq!(derive(&stale_error, 1040.0).state, State::Working,
             "an error attached to an older idle status cannot close a new turn");
+        for (event, expected) in [
+            (HookEvent::PermissionRequest, State::WaitingOnHuman),
+            (HookEvent::Stop, State::Idle),
+            (HookEvent::StopFailure, State::Errored),
+        ] {
+            let mut immediate = StateCell::new(0.0, None);
+            immediate.inputs = original.clone();
+            immediate.inputs.presence.as_mut().unwrap().status = PresenceStatus::Waiting;
+            immediate.apply(hook(event, 1002.0), 1002.0).unwrap();
+            assert_eq!(immediate.recompute(1003.0).state, expected,
+                "a confirmed lifecycle event is not a synthetic delivery gap");
+        }
         c.apply(hook(HookEvent::PermissionRequest, 1020.0), 1020.0).unwrap();
         assert_eq!(c.recompute(1040.0).state, State::WaitingOnHuman);
         c.apply(hook(HookEvent::StopFailure, 1041.0), 1041.0).unwrap();
@@ -2332,13 +2373,26 @@ mod tests {
         assert_eq!(read_only(s).state, State::Unknown);
         assert!(s.agent_state.lock().unwrap().inputs.presence.as_ref().unwrap().valid,
             "dry-run does not mutate the cached presence");
-        assert_eq!(current(s).state, State::Unknown);
+        let unknown = current(s);
+        assert_eq!(unknown.state, State::Unknown);
+        assert!(unix_now() - unknown.since < 1.0, "binding loss starts a fresh source outage");
         let mut cell = s.agent_state.lock().unwrap();
         let p = cell.inputs.presence.as_mut().unwrap();
         p.native_session_id = Some(replacement.into());
         p.valid = true; // Next matching reader sample.
         drop(cell);
         assert_eq!(current(s).state, State::Idle);
+        // Even old engines without a presence sessionId must not carry
+        // timestamped transcript evidence across a rebind before the next tick.
+        {
+            let mut cell = s.agent_state.lock().unwrap();
+            let p = cell.inputs.presence.as_mut().unwrap();
+            p.native_session_id = None;
+            p.transcript_evidence_path = s.transcript_path.as_ref().map(PathBuf::from);
+            p.transcript_end = Some(LastTurn { ended_at: Some(1000.0), status: Some(TurnStatus::Completed) });
+        }
+        s.transcript_path = Some(format!("/fixture/{original}.jsonl"));
+        assert_eq!(read_only(s).state, State::Unknown);
     }
 
     #[test]
@@ -2353,7 +2407,7 @@ mod tests {
                 valid: true, status: PresenceStatus::Idle,
                 observed_at: now, status_updated_at: Some(now - 3600.0), native_session_id: None,
                 engine_version: None, waiting_for: None,
-                main_turn_open: None, transcript_error: None,
+                main_turn_open: None, transcript_error: None, transcript_end: None, transcript_evidence_path: None,
             });
             c.apply(hook(HookEvent::Stop, now - 1800.0), now).unwrap();
             c.apply(hook(HookEvent::UserPromptSubmit, now - 60.0), now).unwrap();

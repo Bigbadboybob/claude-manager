@@ -2318,7 +2318,7 @@ mod tests {
                 cell.inputs.presence = Some(crate::agent_state::PresenceObs {
                     valid: true, status, observed_at: now, status_updated_at: Some(now), native_session_id: None,
                     engine_version: None, waiting_for: None, main_turn_open: Some(true),
-                    transcript_error: None,
+                    transcript_error: None, transcript_end: None, transcript_evidence_path: None,
                 });
             }
             let blocked = poller.poll_once();

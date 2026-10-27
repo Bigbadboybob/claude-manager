@@ -127,7 +127,11 @@ impl Baseline {
             presence_stamp: input.presence.as_ref().and_then(|p| p.status_updated_at),
         }
     }
-    pub fn confirmed_by(&self, input: &Inputs) -> Option<&'static str> {
+    pub fn confirmed_for(&self, input: &mut Inputs, transcript: Option<&str>) -> Option<&'static str> {
+        crate::agent_state::check_presence_binding(input, transcript);
+        self.confirmed_by(input)
+    }
+    fn confirmed_by(&self, input: &Inputs) -> Option<&'static str> {
         // CM stamps this counter itself. It is necessary, but alone cannot
         // prove that an engine consumed the prompt (nor can PTY repaint).
         if input.turn_seq <= self.turn_seq {
@@ -240,6 +244,26 @@ mod tests {
     }
 
     #[test]
+    fn launch_confirmation_revalidates_cached_busy_at_effect_time() {
+        let mut cell = StateCell::new(1.0, None);
+        let baseline = Baseline::capture(&cell.inputs, 100.0);
+        cell.note_input(101.0);
+        cell.inputs.presence = Some(crate::agent_state::PresenceObs {
+            valid: true, status: PresenceStatus::Busy, observed_at: 102.0,
+            status_updated_at: Some(101.0), native_session_id: Some("original".into()),
+            main_turn_open: Some(true), engine_version: None, waiting_for: None,
+            transcript_error: None, transcript_end: None, transcript_evidence_path: None,
+        });
+        assert_eq!(baseline.confirmed_for(&mut cell.inputs, Some("/fixture/original.jsonl")), Some("presence"));
+        assert_eq!(baseline.confirmed_for(&mut cell.inputs, Some("/fixture/rebound.jsonl")), None,
+            "after generation deferral, an old busy snapshot still cannot confirm a new conversation");
+        let p = cell.inputs.presence.as_mut().unwrap();
+        p.native_session_id = Some("rebound".into());
+        p.valid = true;
+        assert_eq!(baseline.confirmed_for(&mut cell.inputs, Some("/fixture/rebound.jsonl")), Some("presence"));
+    }
+
+    #[test]
     fn fresh_presence_and_hook_edges_confirm_but_background_busy_does_not() {
         let mut cell = StateCell::new(1.0, None);
         let baseline = Baseline::capture(&cell.inputs, 100.0);
@@ -252,7 +276,7 @@ mod tests {
             main_turn_open: Some(false),
             engine_version: None,
             waiting_for: None,
-            transcript_error: None,
+            transcript_error: None, transcript_end: None, transcript_evidence_path: None,
         });
         assert_eq!(baseline.confirmed_by(&cell.inputs), None);
         cell.inputs.presence.as_mut().unwrap().main_turn_open = Some(true);

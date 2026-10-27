@@ -272,7 +272,7 @@ impl Reader {
             engine_version: None,
             waiting_for: None,
             main_turn_open: None,
-            transcript_error: None,
+            transcript_error: None, transcript_end: None, transcript_evidence_path: None,
         };
         let root_valid = self
             .process(target.pid)
@@ -334,6 +334,11 @@ impl Reader {
                 || (observation.status == PresenceStatus::Busy && target.needs_turn_probe))
         {
             let tail = self.tail(target);
+            observation.transcript_evidence_path = target.transcript.clone();
+            if tail.as_ref().is_some_and(|p| p.claude_identity_mismatch) {
+                observation.valid = false;
+                return Some(observation);
+            }
             if observation.status == PresenceStatus::Busy {
                 // Missing/unreadable transcripts cannot prove a closed turn.
                 observation.main_turn_open = Some(
@@ -341,6 +346,8 @@ impl Reader {
                         .is_none_or(|p| p.shape != TailShape::TurnComplete),
                 );
             } else {
+                observation.transcript_end = tail.as_ref().and_then(|p| p.claude_end.clone())
+                    .filter(|end| end.ended_at.is_some_and(|at| at <= now + 5.0));
                 observation.transcript_error = tail.and_then(|p| {
                     p.api_error
                         .or_else(|| p.auth_error.map(|_| "authentication_failed".into()))
@@ -433,7 +440,7 @@ fn parse(v: serde_json::Value, now: f64) -> Option<PresenceFile> {
             engine_version: short(v.get("version"), 256),
             waiting_for: short(v.get("waitingFor"), 4096),
             main_turn_open: None,
-            transcript_error: None,
+            transcript_error: None, transcript_end: None, transcript_evidence_path: None,
         },
     })
 }
@@ -552,6 +559,68 @@ mod tests {
             assert_eq!(derive(&c.inputs, 1000.0).state, State::Working,
                 "a parse time or file rewrite is not an engine edge");
         }
+    }
+
+    #[test]
+    fn timestamped_current_transcript_boundaries_resolve_stale_presence_without_stop() {
+        use crate::agent_state::{HookEvent, HookPayload, Report, TurnStatus};
+        let mut f = Fixture::new();
+        f.install("idle");
+        let presence_path = f.reader.root.join("1001.json");
+        let mut file: serde_json::Value = serde_json::from_slice(&std::fs::read(&presence_path).unwrap()).unwrap();
+        file.as_object_mut().unwrap().remove("statusUpdatedAt");
+        std::fs::write(&presence_path, file.to_string()).unwrap();
+        let id = "11111111-1111-4111-8111-111111111111";
+        let path = f._dir.path().join(format!("{id}.jsonl"));
+        f.target.transcript = Some(path.clone());
+        let mut c = StateCell::new(0.0, Some(42));
+        c.apply(Report::Hook { event: HookEvent::UserPromptSubmit,
+            payload: HookPayload { observed_at: Some(950.0), ..Default::default() } }, 950.0).unwrap();
+        let error = serde_json::json!({"type":"assistant", "sessionId":id,
+            "timestamp":"1970-01-01T00:16:00.000Z", "isApiErrorMessage":true,
+            "error":"authentication_failed"});
+        for (record, expected) in [
+            (error.clone(), State::Errored),
+            ({ let mut v = error.clone(); v["timestamp"] = "1970-01-01T00:15:00.000Z".into(); v }, State::Working),
+            ({ let mut v = error.clone(); v.as_object_mut().unwrap().remove("timestamp"); v }, State::Unknown),
+            ({ let mut v = error.clone(); v["sessionId"] = "22222222-2222-4222-8222-222222222222".into(); v }, State::Unknown),
+            ({ let mut v = error.clone(); v["timestamp"] = "1970-01-01T00:33:20.000Z".into(); v }, State::Unknown),
+            ({ let mut v = error.clone(); v["isSidechain"] = true.into(); v }, State::Working),
+            (serde_json::json!({"type":"assistant", "sessionId":id,
+                "timestamp":"1970-01-01T00:16:00.000Z", "message":{"stop_reason":"end_turn"}}), State::Idle),
+            (serde_json::json!({"type":"system", "subtype":"turn_duration", "sessionId":id,
+                "timestamp":"1970-01-01T00:16:00.000Z"}), State::Idle),
+        ] {
+            std::fs::write(&path, format!("{record}\n")).unwrap();
+            c.inputs.presence = f.sample();
+            let state = derive(&c.inputs, 1000.0);
+            assert_eq!(state.state, expected, "{record}");
+            if expected == State::Errored {
+                assert_eq!(state.last_turn.ended_at, Some(960.0));
+                assert_eq!(state.last_turn.status, Some(TurnStatus::Failed));
+                assert_eq!(state.detail.error_kind.as_deref(), Some("authentication_failed"));
+            } else if expected == State::Idle {
+                assert_eq!(state.last_turn.ended_at, Some(960.0));
+                assert_eq!(state.last_turn.status, Some(TurnStatus::Completed));
+            }
+        }
+        let mut prior_error = error.clone();
+        prior_error["timestamp"] = "1970-01-01T00:15:00.000Z".into();
+        let duration = serde_json::json!({"type":"system", "subtype":"turn_duration", "sessionId":id,
+            "timestamp":"1970-01-01T00:16:01.000Z"});
+        for (assistant, expected) in [(&prior_error, State::Working), (&error, State::Errored)] {
+            std::fs::write(&path, format!("{assistant}\n{duration}\n")).unwrap();
+            c.inputs.presence = f.sample();
+            assert_eq!(derive(&c.inputs, 1000.0).state, expected,
+                "an error must use its own event time, never borrow a later completion");
+        }
+        // A current user row blocks old completion/error proof even if appending
+        // it merely changes the mtime of the same bound file.
+        let user = serde_json::json!({"type":"user", "sessionId":id,
+            "timestamp":"1970-01-01T00:16:01.000Z"});
+        std::fs::write(&path, format!("{error}\n{user}\n")).unwrap();
+        c.inputs.presence = f.sample();
+        assert_eq!(derive(&c.inputs, 1000.0).state, State::Working);
     }
 
     #[test]

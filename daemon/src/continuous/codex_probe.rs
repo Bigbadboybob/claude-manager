@@ -120,6 +120,8 @@ pub fn probe(path: &Path, after: f64) -> Option<TailProbe> {
         }
         let mut result = TailProbe {
             shape: TailShape::MidTurn,
+            claude_end: None,
+            claude_identity_mismatch: false,
             api_error: None,
             auth_error: None,
             usage_limit: None,

@@ -8315,8 +8315,8 @@ fn spawn_initial_prompt_delivery(
                             generation.set(s.generation);
                             return Check::Deferred;
                         }
-                        let cell = s.agent_state.lock().unwrap_or_else(|p| p.into_inner());
-                        if let Some(source) = baseline.confirmed_by(&cell.inputs) {
+                        let mut cell = s.agent_state.lock().unwrap_or_else(|p| p.into_inner());
+                        if let Some(source) = baseline.confirmed_for(&mut cell.inputs, s.transcript_path.as_deref()) {
                             return Check::Confirmed(source);
                         }
                     }
@@ -25165,7 +25165,7 @@ while True:
             s.sessions[&uid].agent_state.lock().unwrap().inputs.presence = Some(crate::agent_state::PresenceObs {
                 valid: true, status: crate::agent_state::PresenceStatus::Idle,
                 observed_at: now_unix_f64(), status_updated_at: Some(now_unix_f64() - 60.0), native_session_id: None,
-                engine_version: None, waiting_for: None, main_turn_open: None, transcript_error: None,
+                engine_version: None, waiting_for: None, main_turn_open: None, transcript_error: None, transcript_end: None, transcript_evidence_path: None,
             });
         }
         let params = json!({ "session_uid": &uid, "text": "implement the fix" });
@@ -36623,7 +36623,7 @@ while True:
                         engine_version: None,
                         waiting_for: None,
                         main_turn_open: Some(false),
-                        transcript_error: None,
+                        transcript_error: None, transcript_end: None, transcript_evidence_path: None,
                     });
                     cell.inputs.hooks.stop_at = Some(now - 30.0);
                 }
@@ -36695,7 +36695,7 @@ while True:
                     engine_version: None,
                     waiting_for: None,
                     main_turn_open: None,
-                    transcript_error: None,
+                    transcript_error: None, transcript_end: None, transcript_evidence_path: None,
                 });
             }
             assert!(!crate::control::continuous_drain::notice_ready(
@@ -36838,6 +36838,7 @@ while True:
                         waiting_for: None,
                         main_turn_open: Some(true),
                         transcript_error: failed.then(|| "auth".into()),
+                        transcript_end: None, transcript_evidence_path: None,
                     });
                     assert_eq!(
                         crate::agent_state::derive(&cell.inputs, now_unix_f64()).state,
@@ -40444,7 +40445,7 @@ while True:
             session.agent_state.lock().unwrap().inputs.presence = Some(crate::agent_state::PresenceObs {
                 valid: true, status: crate::agent_state::PresenceStatus::Idle,
                 observed_at: now_unix_f64(), status_updated_at: Some(now_unix_f64() - 60.0), native_session_id: None,
-                engine_version: None, waiting_for: None, main_turn_open: None, transcript_error: None,
+                engine_version: None, waiting_for: None, main_turn_open: None, transcript_error: None, transcript_end: None, transcript_evidence_path: None,
             });
         }
         let reads = |expected_state: &str, expected_idle: bool| {
@@ -40716,6 +40717,7 @@ while True:
                 waiting_for: None,
                 main_turn_open: Some(true),
                 transcript_error: (uid == "ts-error").then(|| "auth".into()),
+                transcript_end: None, transcript_evidence_path: None,
             });
             state.lock().unwrap().sessions.insert(uid.into(), session);
         }
