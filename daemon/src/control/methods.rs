@@ -653,6 +653,9 @@ pub(crate) fn start_session_with_spawn_fn(
     if let Some(reason) = crate::claude_recovery::admission_refusal(&p.uid) {
         return Err((ErrorCode::Conflict, reason));
     }
+    if !crate::claude_recovery::internal_active(&p.uid) && crate::claude_recovery::has_pending_input(&p.uid) {
+        return Err((ErrorCode::Conflict, "session has accepted input still being delivered".into()));
+    }
 
     // Serialize the entire spawn/registry insertion with retirement of both
     // this UID and its manager. A late child cannot appear after drain proof.
@@ -2009,6 +2012,10 @@ pub fn send_input(
 
     // Acquire outside DaemonState, and keep through queueing, so a recovery
     // cannot report success while a newly accepted prompt is still pending.
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.session_uid);
+    let _recovery_read = recovery_gate.try_write().map_err(|_| (
+        ErrorCode::Conflict, "session lifecycle is reserved for background recovery".into()
+    ))?;
     let input_gate = crate::continuous::retirement::gate(&p.session_uid);
     let _input_admission = input_gate.try_read().map_err(|_| (
         ErrorCode::Conflict, "session input is reserved for recovery or retirement".into()
@@ -2031,7 +2038,7 @@ pub fn send_input(
     // invariant in one place so future input paths can't skip
     // it. Also read the session_type so we can pick the right
     // SUBMIT encoding below (see the agent/bash branch).
-    let (handle, fanout, is_agent) = {
+    let (handle, fanout, is_agent, accepted_pid, accepted_incarnation, pending) = {
         let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         // Session-caller auth: under the same lock that does
         // the target lookup. Operator callers (`caller_uid:
@@ -2065,7 +2072,8 @@ pub fn send_input(
         }
         // claude-code / codex run a kitty-keyboard TUI; bash is a raw shell.
         let is_agent = session.session_type != "bash";
-        (session.input_handle(), session.fanout.clone(), is_agent)
+        let pending = is_agent.then(|| crate::claude_recovery::reserve_pending_input(&p.session_uid));
+        (session.input_handle(), session.fanout.clone(), is_agent, session.pid, session.holder_incarnation, pending)
     };
     // The target's checkout vanished (an agent removed its own worktree):
     // re-create it before delivering, so the turn's tools have a cwd again.
@@ -2094,7 +2102,19 @@ pub fn send_input(
         // Input was delivered NOW — flip idle false synchronously even though
         // the PTY write is deferred to the delivery thread (which stamps too).
         let handle = handle.prepare_agent_input(&p.text);
-        spawn_agent_prompt_delivery(handle, fanout, p.session_uid.clone(), p.text, false, Some(Arc::clone(state_arc)));
+        let state = Arc::clone(state_arc);
+        let uid = p.session_uid.clone();
+        let text = p.text;
+        std::thread::Builder::new().name(format!("cm-daemon-agent-prompt-{uid}"))
+            .spawn(move || {
+                let _pending = pending;
+                #[cfg(test)]
+                test_pause_queued_input(&uid);
+                let current = state.lock().unwrap_or_else(|p| p.into_inner()).sessions.get(&uid)
+                    .is_some_and(|s| s.pid == accepted_pid && s.holder_incarnation == accepted_incarnation && !s.last_exit.kernel_set());
+                if !current { return; }
+                deliver_agent_body_confirmed(&state, &handle, &fanout, &uid, &text, false, "prompt");
+            }).map_err(|e| (ErrorCode::Internal, format!("could not queue agent prompt: {e}")))?;
         Ok(with_heal(json!({ "ok": true, "delivery": "agent-kitty-async" })))
     } else {
         let mut payload = p.text.into_bytes();
@@ -2107,6 +2127,22 @@ pub fn send_input(
         })?;
         Ok(with_heal(json!({ "ok": true, "kind": "shell", "submitted": p.submit })))
     }
+}
+
+#[cfg(test)]
+fn queued_input_test_hooks() -> &'static Mutex<std::collections::HashMap<String, Arc<dyn Fn() + Send + Sync>>> {
+    static HOOKS: std::sync::OnceLock<Mutex<std::collections::HashMap<String, Arc<dyn Fn() + Send + Sync>>>> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn set_queued_input_test_hook(uid: &str, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+    let mut hooks = queued_input_test_hooks().lock().unwrap();
+    if let Some(hook) = hook { hooks.insert(uid.into(), hook); } else { hooks.remove(uid); }
+}
+#[cfg(test)]
+fn test_pause_queued_input(uid: &str) {
+    let hook = queued_input_test_hooks().lock().unwrap().get(uid).cloned();
+    if let Some(hook) = hook { hook(); }
 }
 
 /// A live session's workspace checkout is missing on disk (typically an
@@ -2223,14 +2259,20 @@ pub fn kill_session(
         .map_err(|e| (ErrorCode::InvalidParams, format!("kill_session params: {}", e)))?;
 
     let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.session_uid);
-    let _recovery_read = recovery_gate.try_read().map_err(|_| (
+    let _recovery_read = recovery_gate.try_write().map_err(|_| (
         ErrorCode::Conflict, "session lifecycle is reserved for background recovery".into()
     ))?;
     if let Some(reason) = crate::claude_recovery::admission_refusal(&p.session_uid) {
         return Err((ErrorCode::Conflict, reason));
     }
+    if crate::claude_recovery::has_pending_input(&p.session_uid) {
+        return Err((ErrorCode::Conflict, "session has accepted input still being delivered".into()));
+    }
 
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    if crate::claude_recovery::has_pending_input(&p.session_uid) {
+        return Err((ErrorCode::Conflict, "session has accepted input still being delivered".into()));
+    }
     // Sub-2a Finding #2 TOCTOU fix: auth + lookup happen in one
     // critical section so a non-descendant target can't slip in
     // (or out) between authorize-time and signal-time.
@@ -8358,6 +8400,20 @@ fn agent_paste_payload(body: &str) -> Vec<u8> {
     }
 }
 
+fn reserve_detached_delivery(
+    state: &Arc<Mutex<DaemonState>>, handle: &crate::session::InputHandle, uid: &str,
+) -> Result<crate::claude_recovery::PendingInput, String> {
+    let gate = crate::claude_recovery::lifecycle_gate(uid);
+    let _guard = gate.try_write().map_err(|_| "session lifecycle is reserved".to_string())?;
+    if let Some(reason) = crate::claude_recovery::admission_refusal(uid) { return Err(reason); }
+    let state = state.lock().unwrap_or_else(|p| p.into_inner());
+    let session = state.sessions.get(uid).ok_or_else(|| "session disappeared".to_string())?;
+    if !handle.belongs_to(session) || session.last_exit.kernel_set() {
+        return Err("session was replaced or exited".into());
+    }
+    Ok(crate::claude_recovery::reserve_pending_input(uid))
+}
+
 /// Deliver a prompt to a kitty-TUI agent (codex or claude-code) on a
 /// detached thread: mode-await, write the body, gap, write Enter, verify.
 /// Async so callers return promptly (stays under the Python MCP 30s call
@@ -8388,10 +8444,20 @@ fn spawn_agent_prompt_delivery(
     fresh_spawn: bool,
     confirm_state: Option<Arc<Mutex<DaemonState>>>,
 ) {
+    let pending = match confirm_state.as_ref() {
+        Some(state) => match reserve_detached_delivery(state, &handle, &session_uid) {
+            Ok(pending) => Some(pending),
+            Err(reason) => { eprintln!("cm-daemon: prompt for {session_uid} not queued: {reason}"); return; }
+        },
+        None => None,
+    };
     let handle = handle.prepare_agent_input(&prompt);
     let _ = std::thread::Builder::new()
         .name(format!("cm-daemon-agent-prompt-{}", session_uid))
         .spawn(move || {
+            let _pending = pending;
+            #[cfg(test)]
+            test_pause_queued_input(&session_uid);
             if let Some(state) = confirm_state {
                 deliver_agent_body_confirmed(&state, &handle, &fanout, &session_uid, &prompt, fresh_spawn, "prompt");
             } else {
@@ -8409,10 +8475,17 @@ fn spawn_initial_prompt_delivery(
     ticket: super::prompt_delivery::Ticket,
 ) {
     use super::prompt_delivery::{self as delivery, Baseline, Check, LaunchWrite};
+    let pending = match reserve_detached_delivery(&state, &handle, &uid) {
+        Ok(pending) => pending,
+        Err(reason) => { delivery::finish(&ticket, Err("session_unavailable")); eprintln!("cm-daemon: initial prompt for {uid} not queued: {reason}"); return; }
+    };
     let result_ticket = Arc::clone(&ticket);
     let spawned = std::thread::Builder::new()
         .name(format!("cm-launch-confirm-{uid}"))
         .spawn(move || {
+            let _pending = pending;
+            #[cfg(test)]
+            test_pause_queued_input(&uid);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut launch = LaunchWrite {
                     written_at: None,
@@ -8535,6 +8608,20 @@ fn spawn_initial_prompt_delivery(
     if spawned.is_err() {
         delivery::finish(&result_ticket, Err("confirmation_worker_unavailable"));
     }
+}
+
+#[cfg(test)]
+pub(crate) fn recovery_test_queue_initial(
+    state: Arc<Mutex<DaemonState>>, uid: &str,
+) -> super::prompt_delivery::Ticket {
+    let (handle, fanout) = {
+        let state = state.lock().unwrap();
+        let session = &state.sessions[uid];
+        (session.input_handle(), Arc::clone(&session.fanout))
+    };
+    let ticket = super::prompt_delivery::Receipt::pending();
+    spawn_initial_prompt_delivery(state, handle, fanout, uid.to_string(), "initial".into(), Arc::clone(&ticket));
+    ticket
 }
 
 /// Confirmation runs for fresh/resumed launches, persistent fires and
@@ -9034,10 +9121,17 @@ fn spawn_persistent_prompt_delivery(
     compact: bool,
     state: Arc<Mutex<DaemonState>>,
 ) {
+    let pending = match reserve_detached_delivery(&state, &handle, &session_uid) {
+        Ok(pending) => pending,
+        Err(reason) => { eprintln!("cm-daemon: persistent prompt for {session_uid} not queued: {reason}"); return; }
+    };
     let handle = handle.prepare_agent_input(if compact { "/compact" } else { &prompt });
     let _ = std::thread::Builder::new()
         .name(format!("cm-daemon-persistent-prompt-{}", session_uid))
         .spawn(move || {
+            let _pending = pending;
+            #[cfg(test)]
+            test_pause_queued_input(&session_uid);
             if compact {
                 // Auto-compact: `/compact` SUMMARIZES the conversation and
                 // continues on the condensed context — bounding unbounded
@@ -12081,7 +12175,7 @@ pub(crate) fn restore_one_session_launch(
     #[cfg(test)]
     let mut params = params;
     #[cfg(test)]
-    if crate::claude_recovery::internal_active(&e.uid) && RECOVERY_TEST_RESTORE.with(|value| value.get()) {
+    if RECOVERY_TEST_RESTORE.with(|value| value.get()) {
         params["argv"] = json!(["/bin/sleep", "60"]);
     }
     {
@@ -12279,6 +12373,9 @@ pub fn revive_session(
     let _recovery_context = crate::claude_recovery::read_context(&p.uid);
     if let Some(reason) = crate::claude_recovery::admission_refusal(&p.uid) {
         return Err((ErrorCode::Conflict, reason));
+    }
+    if !crate::claude_recovery::internal_active(&p.uid) && crate::claude_recovery::has_pending_input(&p.uid) {
+        return Err((ErrorCode::Conflict, "session has accepted input still being delivered".into()));
     }
 
     // H3: drain gate — a revive during drain would mint a child the
@@ -20842,8 +20939,8 @@ pub(crate) fn sweep_terminal_task_sessions(
     let mut closed = Vec::new();
     for uid in &targets {
         let gate = crate::claude_recovery::lifecycle_gate(uid);
-        let Ok(_permit) = gate.try_read() else { continue };
-        if crate::claude_recovery::admission_refusal(uid).is_some() { continue; }
+        let Ok(_permit) = gate.try_write() else { continue };
+        if crate::claude_recovery::admission_refusal(uid).is_some() || crate::claude_recovery::has_pending_input(uid) { continue; }
         if let Some(sess) = state.sessions.get_mut(uid) {
             sess.last_exit.mark_operator_kill_requested();
             sess.set_kill_attribution(&attribution);
@@ -20856,7 +20953,7 @@ pub(crate) fn sweep_terminal_task_sessions(
 }
 
 /// fast the children die.
-pub(crate) fn sweep_task_sessions(state_arc: &Arc<Mutex<DaemonState>>, task_id: &str, killer: &str) {
+pub(crate) fn sweep_task_sessions(state_arc: &Arc<Mutex<DaemonState>>, task_id: &str, killer: &str) -> Vec<String> {
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     let targets: Vec<String> = state
         .sessions
@@ -20873,10 +20970,11 @@ pub(crate) fn sweep_task_sessions(state_arc: &Arc<Mutex<DaemonState>>, task_id: 
         .collect();
     let swept_at = now_unix_f64();
     let killer = format!("{} (mark_subtask_done)", killer);
+    let mut recovery_blocked = Vec::new();
     for uid in targets {
         let gate = crate::claude_recovery::lifecycle_gate(&uid);
-        let Ok(_permit) = gate.try_read() else { continue };
-        if crate::claude_recovery::admission_refusal(&uid).is_some() { continue; }
+        let Ok(_permit) = gate.try_write() else { recovery_blocked.push(uid); continue };
+        if crate::claude_recovery::admission_refusal(&uid).is_some() || crate::claude_recovery::has_pending_input(&uid) { recovery_blocked.push(uid); continue; }
         if let Some(sess) = state.sessions.get_mut(&uid) {
             sess.last_exit.mark_operator_kill_requested();
             // O4 routing: the verb-routed kill carries the sweep's
@@ -20886,6 +20984,7 @@ pub(crate) fn sweep_task_sessions(state_arc: &Arc<Mutex<DaemonState>>, task_id: 
         }
         state.record_kill_request(&uid, &killer, swept_at);
     }
+    recovery_blocked
 }
 
 fn teardown_subtask_done(
@@ -20983,7 +21082,13 @@ fn teardown_subtask_done(
     // regardless of worktree_mode / close_worktree (the daemon previously only
     // closed them inside the branch-mode + close_worktree path, stranding live
     // sessions on inherit / in-place / close_worktree=false done subtasks).
-    sweep_task_sessions(state_arc, &p.task_id, killer);
+    let recovery_blocked = sweep_task_sessions(state_arc, &p.task_id, killer);
+    if !recovery_blocked.is_empty() {
+        return Err((ErrorCode::Conflict, format!(
+            "task teardown deferred while background recovery is pending for: {}",
+            recovery_blocked.join(", ")
+        )));
+    }
     wait_for_task_sessions_gone(state_arc, &p.task_id, std::time::Duration::from_secs(2));
 
     // Phase 1/2 — cleanup BEFORE the API flip. Only branch mode owns a
@@ -40968,7 +41073,7 @@ while True:
         let gate = crate::claude_recovery::lifecycle_gate(uid);
         let _write = gate.write().unwrap();
         assert!(sweep_terminal_task_sessions(&state, "done-task", "test", None, false).is_empty());
-        sweep_task_sessions(&state, "done-task", "test");
+        assert_eq!(sweep_task_sessions(&state, "done-task", "test"), vec![uid.to_string()]);
         let mut state = state.lock().unwrap();
         assert!(state.sessions.get_mut(uid).unwrap().try_wait().is_none());
         let _ = state.sessions.get_mut(uid).unwrap().kill();

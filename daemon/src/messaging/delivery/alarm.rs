@@ -167,7 +167,7 @@ pub fn pass(state: &Arc<Mutex<DaemonState>>, root: &Path, uids: &[String], now: 
     for uid in uids {
         // Legacy retirement remains narrow; the complete census and
         // retirement share one nonblocking lock and never prove delivery.
-        let stall = match crate::notifications::alarm_snapshot(root, uid) {
+        let stall = match crate::notifications::alarm_snapshot(root, uid, now) {
             Ok((events, transport)) => {
                 let assessed = assess(&events, transport.as_ref(), now, threshold);
                 // Pending work was held because the transport was known to
@@ -421,6 +421,7 @@ mod tests {
             queue.join(format!("{:x}.json", sha2::Sha256::digest(id.as_bytes())))
         };
         let mut event: Value = serde_json::from_slice(&fs::read(event_file("chat:one")).unwrap()).unwrap();
+        event["created_at"] = json!(1.0);
         event["status"] = json!("submitted");
         event["updated_at"] = json!(1_000.0);
         crate::messaging::atomic_replace(&event_file("chat:one"), &event).unwrap();
@@ -471,6 +472,7 @@ mod tests {
         assert!(load(root).is_empty());
         crate::notifications::publish(root, &uid, "chat:two", "chat", "[cm-chat two] wake", "[cm-chat two]").unwrap();
         let mut two: Value = serde_json::from_slice(&fs::read(event_file("chat:two")).unwrap()).unwrap();
+        two["created_at"] = json!(1.0);
         two["status"] = json!("submitted");
         two["updated_at"] = json!(3_300.0);
         crate::messaging::atomic_replace(&event_file("chat:two"), &two).unwrap();
@@ -534,6 +536,7 @@ mod tests {
         let queue = crate::notifications::directory(root, &uid);
         let file = fs::read_dir(queue).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "json")).unwrap();
         let mut event: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        event["created_at"] = json!(1.0);
         event["status"] = json!("submitted");
         event["updated_at"] = json!(1000.0);
         crate::messaging::atomic_replace(&file, &event).unwrap();
@@ -555,6 +558,7 @@ mod tests {
         let queue = crate::notifications::directory(root, &uid);
         let file = fs::read_dir(queue).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "json")).unwrap();
         let mut event: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        event["created_at"] = json!(1.0);
         event["status"] = json!("uncertain");
         event["updated_at"] = json!(1000.0);
         crate::messaging::atomic_replace(&file, &event).unwrap();
@@ -575,6 +579,7 @@ mod tests {
         let queue = crate::notifications::directory(root, &uid);
         let file = fs::read_dir(queue).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "json")).unwrap();
         let mut event: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        event["created_at"] = json!(1.0);
         event["status"] = json!("submitted"); event["updated_at"] = json!(1000.0);
         crate::messaging::atomic_replace(&file, &event).unwrap();
         let id = crate::owner_attention::raise_system(&state.lock().unwrap(), &uid, "legacy stall").unwrap().unwrap();
@@ -610,6 +615,7 @@ mod tests {
             let queue = crate::notifications::directory(root, uid);
             let file = fs::read_dir(queue).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "json")).unwrap();
             let mut event: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        event["created_at"] = json!(1.0);
             event["status"] = json!("submitted"); event["updated_at"] = json!(1000.0);
             crate::messaging::atomic_replace(&file, &event).unwrap();
         }
@@ -636,6 +642,7 @@ mod tests {
         let queue = crate::notifications::directory(root, &uid);
         let file = fs::read_dir(&queue).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "json")).unwrap();
         let mut event: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        event["created_at"] = json!(1.0);
         event["created_at"] = json!(1000.0);
         crate::messaging::atomic_replace(&file, &event).unwrap();
         let transport = queue.join("transport.json");
@@ -662,9 +669,11 @@ mod tests {
         use sha2::Digest;
         let file = |id: &str| queue.join(format!("{:x}.json", sha2::Sha256::digest(id.as_bytes())));
         let mut later: Value = serde_json::from_slice(&fs::read(file("later")).unwrap()).unwrap();
+        later["created_at"] = json!(1.0);
         later["status"] = json!("submitted"); later["updated_at"] = json!(1000.0);
         crate::messaging::atomic_replace(&file("later"), &later).unwrap();
         let mut board: Value = serde_json::from_slice(&fs::read(file("board-push:1")).unwrap()).unwrap();
+        board["created_at"] = json!(1.0);
         board["status"] = json!("observed"); board["updated_at"] = json!(1900.0);
         crate::messaging::atomic_replace(&file("board-push:1"), &board).unwrap();
         let original = fs::read(file("board-push:1")).unwrap();
@@ -681,9 +690,53 @@ mod tests {
         let marker = "[cm-board sfd push:2]";
         crate::notifications::publish(root, &uid, "board-push:2", "board", marker, marker).unwrap();
         let mut fresh: Value = serde_json::from_slice(&fs::read(file("board-push:2")).unwrap()).unwrap();
+        fresh["created_at"] = json!(1.0);
         fresh["status"] = json!("observed"); fresh["updated_at"] = json!(2100.0);
         crate::messaging::atomic_replace(&file("board-push:2"), &fresh).unwrap();
         pass(&mkstate(), root, std::slice::from_ref(&uid), 2200.0, 900);
+        assert!(load(root).is_empty());
+    }
+
+    #[test]
+    fn untrusted_chronology_neither_clears_episode_nor_retires_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let uid = "ts-clock".to_string();
+        let mut daemon = DaemonState::new();
+        daemon.daemon_sessions_path = Some(root.join("daemon-sessions.json"));
+        let state = Arc::new(Mutex::new(daemon));
+        crate::notifications::publish(root, &uid, "one", "chat", "[one] wake", "[one]").unwrap();
+        let queue = crate::notifications::directory(root, &uid);
+        let file = fs::read_dir(&queue).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "json")).unwrap();
+        let mut event: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        event["created_at"] = json!(1000.0);
+        event["updated_at"] = json!(1000.0);
+        event["status"] = json!("submitted");
+        crate::messaging::atomic_replace(&file, &event).unwrap();
+        pass(&state, root, std::slice::from_ref(&uid), 2000.0, 900);
+        let episode = load(root)[&uid].clone();
+        let key = format!("notification-stall:{uid}");
+        let alert = crate::owner_attention::snapshot(&state.lock().unwrap()).unwrap()[&key].id.clone();
+        // A separate legacy receipt would be retired by a successful census.
+        crate::notifications::publish(root, &uid, "old", "chat", "[old] wake", "[old]").unwrap();
+        use sha2::Digest;
+        let old_file = queue.join(format!("{:x}.json", sha2::Sha256::digest(b"old")));
+        let mut old: Value = serde_json::from_slice(&fs::read(&old_file).unwrap()).unwrap();
+        old["created_at"] = json!(1000.0); old["updated_at"] = json!(1000.0);
+        old["status"] = json!("uncertain"); old["marker"] = json!("absent");
+        crate::messaging::atomic_replace(&old_file, &old).unwrap();
+        let original = fs::read(&old_file).unwrap();
+        for (created, updated) in [(json!(null), json!(2100.0)), (json!(2100.0), json!(2000.0)), (json!(1000.0), json!(3000.0))] {
+            event["created_at"] = created; event["updated_at"] = updated; event["status"] = json!("observed");
+            crate::messaging::atomic_replace(&file, &event).unwrap();
+            pass(&state, root, std::slice::from_ref(&uid), 2500.0, 900);
+            assert_eq!(load(root)[&uid], episode);
+            assert_eq!(crate::owner_attention::snapshot(&state.lock().unwrap()).unwrap()[&key].id, alert);
+            assert_eq!(fs::read(&old_file).unwrap(), original);
+        }
+        // Once wall time catches up, the forward observation is credible.
+        fs::remove_file(old_file).unwrap();
+        pass(&state, root, std::slice::from_ref(&uid), 3000.0, 900);
         assert!(load(root).is_empty());
     }
 }

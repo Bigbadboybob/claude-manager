@@ -3026,7 +3026,35 @@ fn passive_viewer_input(mut bytes: &[u8]) -> bool {
     true
 }
 
+/// Recognize only terminal-generated response frames for recovery bypass.
+/// Navigation and mouse events are actions even when they do not type text.
+fn terminal_response_input(mut bytes: &[u8]) -> bool {
+    if bytes.is_empty() { return false; }
+    while !bytes.is_empty() {
+        if let Some(csi) = bytes.strip_prefix(b"\x1b[") {
+            let Some(end) = csi.iter().position(|b| (0x40..=0x7e).contains(b)) else { return false };
+            let params = &csi[..end];
+            let final_byte = csi[end];
+            if !(matches!(final_byte, b'R' | b'c' | b't' | b'y')
+                || (final_byte == b'u' && params.starts_with(b"?"))) { return false; }
+            bytes = &csi[end + 1..];
+        } else if bytes.starts_with(b"\x1bP>|") || bytes.starts_with(b"\x1b_G") {
+            let Some(end) = bytes.windows(2).position(|p| p == b"\x1b\\") else { return false };
+            bytes = &bytes[end + 2..];
+        } else if let Some(osc) = bytes.strip_prefix(b"\x1b]") {
+            if !osc.starts_with(b"10;") && !osc.starts_with(b"11;") { return false; }
+            if let Some(end) = osc.iter().position(|b| *b == 7) { bytes = &osc[end + 1..]; }
+            else if let Some(end) = osc.windows(2).position(|p| p == b"\x1b\\") { bytes = &osc[end + 2..]; }
+            else { return false; }
+        } else { return false; }
+    }
+    true
+}
+
 impl InputHandle {
+    pub(crate) fn belongs_to(&self, session: &DaemonSession) -> bool {
+        Arc::ptr_eq(&self.writer, &session.writer)
+    }
     /// Write `bytes` to the PTY then stamp activity. Stamp is
     /// AFTER the write so a failed write doesn't lie about
     /// "session was active." Lock order: writer-gate permit first
@@ -3240,7 +3268,7 @@ impl InputHandle {
         // Terminal protocol replies/navigation must still flow while recovery
         // is fenced. Bytes that can alter the composer take the same UID gate
         // as agent delivery and are refused during/after an ambiguous effect.
-        let gate = if passive_viewer_input(bytes) { None } else {
+        let gate = if terminal_response_input(bytes) { None } else {
             self.session_uid.as_deref().map(crate::continuous::retirement::gate)
         };
         let _fence = match gate.as_ref() {

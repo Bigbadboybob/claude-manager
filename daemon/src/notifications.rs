@@ -258,7 +258,7 @@ fn snapshot_locked(dir: &Path, uid: &str, strict: bool) -> io::Result<(Vec<Value
 
 /// One complete alarm pass under a nonblocking queue lock. A busy or corrupt
 /// recipient is retried later and cannot delay another recipient's alarm.
-pub fn alarm_snapshot(root: &Path, uid: &str) -> io::Result<(Vec<Value>, Option<Value>)> {
+pub fn alarm_snapshot(root: &Path, uid: &str, now: f64) -> io::Result<(Vec<Value>, Option<Value>)> {
     let dir = directory(root, uid);
     match fs::metadata(&dir) {
         Ok(meta) if meta.is_dir() => {},
@@ -267,7 +267,19 @@ pub fn alarm_snapshot(root: &Path, uid: &str) -> io::Result<(Vec<Value>, Option<
         Err(e) => return Err(e),
     }
     let _guard = lock_with(root, uid, true)?;
-    snapshot_locked(&dir, uid, true)?;
+    let (events, _) = snapshot_locked(&dir, uid, true)?;
+    for event in &events {
+        let created = event["created_at"].as_f64().filter(|t| t.is_finite() && *t > 0.0);
+        let updated = event.get("updated_at").map(|v| v.as_f64().filter(|t| t.is_finite() && *t > 0.0));
+        let valid = created.is_some_and(|created| match updated {
+            None => event["status"] != "observed" || created <= now,
+            Some(Some(updated)) => updated >= created && (event["status"] != "observed" || updated <= now),
+            Some(None) => false,
+        });
+        if !valid {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "untrusted notification chronology"));
+        }
+    }
     retire_unconfirmable_locked(&dir)?;
     snapshot_locked(&dir, uid, true)
 }
@@ -387,7 +399,7 @@ mod tests {
         assert!(snapshot_strict(root, "uid").is_err());
         let corrupt_marker = br#"{"id":"x","status":"submitted","created_at":1,"text":"wake","marker":42}"#;
         fs::write(&bad, corrupt_marker).unwrap();
-        assert!(alarm_snapshot(root, "uid").is_err());
+        assert!(alarm_snapshot(root, "uid", f64::MAX).is_err());
         assert_eq!(fs::read(&bad).unwrap(), corrupt_marker);
         fs::write(&bad, br#"{"version":1,"id":"x","recipient":"other","source":"chat","status":"observed","created_at":1,"text":"wake"}"#).unwrap();
         assert!(snapshot_strict(root, "uid").is_err());
