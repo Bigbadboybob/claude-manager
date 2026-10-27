@@ -50,6 +50,60 @@ class LegacyOwnership(BaseModel):
     engine: Literal["claude", "codex", "bash"]
 
 
+def _inventory_entries(root: Path):
+    """Return inventory entries, distinguishing absent storage from dangling paths."""
+    probe = root
+    while True:
+        try:
+            root_stat = probe.lstat()
+        except FileNotFoundError:
+            parent = probe.parent
+            if parent == probe:
+                return []
+            probe = parent
+            continue
+        if stat.S_ISLNK(root_stat.st_mode):
+            raise ValueError(f"suspicious legacy inventory root {probe}")
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise ValueError(f"legacy inventory root is not a directory {probe}")
+        if probe != root:
+            # The configured root itself is absent, but its nearest existing
+            # ancestor is sound. Missing storage is an empty inventory.
+            return []
+        return sorted(root.iterdir())
+
+
+def _read_state_file(location: Path) -> str | None:
+    try:
+        state_stat = location.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(state_stat.st_mode) or not stat.S_ISREG(state_stat.st_mode):
+        raise ValueError(f"suspicious legacy state entry {location}")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        fd = os.open(location, flags)
+    except FileNotFoundError:
+        # A state file removed after lstat is genuinely absent; do not broaden
+        # this to catch permission or parse errors.
+        return None
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (state_stat.st_dev, state_stat.st_ino):
+            raise ValueError(f"suspicious legacy state replacement {location}")
+        with os.fdopen(fd, "r", encoding="utf-8") as state:
+            fd = -1
+            return state.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def legacy_owners(request: Request, task_id: UUID):
     root = Path(getattr(request.app.state, "continuous_registration_dir",
                         os.path.expanduser(os.environ.get("CM_CONTINUOUS_TASKS_DIR", "~/.cm/continuous-tasks"))))
@@ -57,10 +111,7 @@ def legacy_owners(request: Request, task_id: UUID):
                    os.environ.get("HOSTNAME") or socket.gethostname()).strip().split(".")[0]
     location = root
     try:
-        try:
-            entries = sorted(root.iterdir())
-        except FileNotFoundError:
-            return []  # a host with no continuous storage yet
+        entries = _inventory_entries(root)
         owners = []
         for entry in entries:
             entry_stat = entry.lstat()
@@ -69,24 +120,13 @@ def legacy_owners(request: Request, task_id: UUID):
             if not stat.S_ISDIR(entry_stat.st_mode):
                 continue
             location = entry / "state.json"
-            try:
-                state_stat = location.lstat()
-            except FileNotFoundError:
+            contents = _read_state_file(location)
+            if contents is None:
                 # Scheduler run logs and lock files legitimately leave a task
                 # directory before its durable state exists. They establish no
                 # ownership record and are ignored.
                 continue
-            if stat.S_ISLNK(state_stat.st_mode) or not stat.S_ISREG(state_stat.st_mode):
-                raise ValueError(f"suspicious legacy state entry {location}")
-            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-            try:
-                fd = os.open(location, flags)
-            except FileNotFoundError:
-                # A state file removed after lstat is genuinely absent; do not
-                # broaden this to catch permission or parse errors.
-                continue
-            with os.fdopen(fd, "r", encoding="utf-8") as state:
-                row = LegacyOwnership.model_validate(json.loads(state.read()))
+            row = LegacyOwnership.model_validate(json.loads(contents))
             if row.task_id != entry.name:
                 raise ValueError(f"state identity differs from directory {entry.name}")
             if row.planning_task_id == str(task_id) or row.task_id == str(task_id):

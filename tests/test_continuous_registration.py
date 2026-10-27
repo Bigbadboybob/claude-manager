@@ -61,6 +61,7 @@ class ContinuousRegistrationTests(unittest.IsolatedAsyncioTestCase):
         app = FastAPI()
         app.include_router(router)
         app.state.pool = self.pool
+        self.app = app
         self.inventory = self.root / (self.schema + "-inventory")
         app.state.continuous_registration_dir = self.inventory
         app.state.continuous_registration_host = "cm-manager"
@@ -200,9 +201,16 @@ class ContinuousRegistrationTests(unittest.IsolatedAsyncioTestCase):
         dangling = self.inventory / "dangling"
         dangling.mkdir()
         (dangling / "state.json").symlink_to("gone.json")
-        response = await self.client.get(path)
-        self.assertEqual(response.status_code, 409, response.text)
-        self.assertIn("legacy_inventory_unavailable", response.text)
+        async def reject_inventory():
+            response = await self.client.get(path)
+            self.assertEqual(response.status_code, 409, response.text)
+            self.assertIn("legacy_inventory_unavailable", response.text)
+            response = await self.client.put(path, json=body)
+            self.assertEqual(response.status_code, 409, response.text)
+            self.assertEqual(await self.pool.fetchval("SELECT count(*) FROM continuous_registrations"), 0)
+        await reject_inventory()
+        (dangling / "state.json").unlink()
+        dangling.rmdir()
 
         # A present symlink to a valid-looking record is still suspicious.
         target = self.inventory / "target"
@@ -213,10 +221,60 @@ class ContinuousRegistrationTests(unittest.IsolatedAsyncioTestCase):
         }))
         linked = self.inventory / "linked"
         linked.symlink_to(target, target_is_directory=True)
+        await reject_inventory()
+        linked.unlink()
+        (target / "state.json").unlink()
+        target.rmdir()
+
+        # A present directory at state.json is non-regular and must fail.
+        nonregular = self.inventory / "nonregular"
+        nonregular.mkdir()
+        (nonregular / "state.json").mkdir()
+        await reject_inventory()
+        (nonregular / "state.json").rmdir()
+        nonregular.rmdir()
+
+        # Directory permission failures are errors, not an empty inventory.
+        unreadable = self.inventory / "unreadable"
+        unreadable.mkdir()
+        unreadable.chmod(0)
+        try:
+            await reject_inventory()
+        finally:
+            unreadable.chmod(0o700)
+            unreadable.rmdir()
+
+    async def test_absent_inventory_root_is_empty_but_dangling_root_fails_closed(self):
+        tid, path, body, _ = await self.task()
+        self.inventory = self.root / "not-created" / "inventory"
+        self.app.state.continuous_registration_dir = self.inventory
         response = await self.client.get(path)
-        self.assertEqual(response.status_code, 409, response.text)
-        self.assertIn("legacy_inventory_unavailable", response.text)
-        self.assertEqual(await self.pool.fetchval("SELECT count(*) FROM continuous_registrations"), 0)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["api_host_owners"], [])
+        self.assertEqual((await self.client.put(path, json=body)).status_code, 200)
+        claims = await self.pool.fetchval("SELECT count(*) FROM continuous_registrations")
+        self.assertEqual(claims, 1)
+
+        tid, path, body, _ = await self.task()
+        dangling_parent = self.root / "dangling-parent"
+        dangling_parent.symlink_to("missing-parent")
+        self.app.state.continuous_registration_dir = dangling_parent / "inventory"
+        for method in ("get", "put"):
+            response = await self.client.put(path, json=body) if method == "put" else await self.client.get(path)
+            self.assertEqual(response.status_code, 409, response.text)
+            self.assertIn("legacy_inventory_unavailable", response.text)
+        self.assertEqual(await self.pool.fetchval("SELECT count(*) FROM continuous_registrations"), claims)
+
+        self.app.state.continuous_registration_dir = self.root / "not-created" / "inventory"
+        tid, path, body, _ = await self.task()
+        dangling_root = self.root / "dangling-root"
+        dangling_root.symlink_to("missing-root")
+        self.app.state.continuous_registration_dir = dangling_root
+        for method in ("get", "put"):
+            response = await self.client.put(path, json=body) if method == "put" else await self.client.get(path)
+            self.assertEqual(response.status_code, 409, response.text)
+            self.assertIn("legacy_inventory_unavailable", response.text)
+        self.assertEqual(await self.pool.fetchval("SELECT count(*) FROM continuous_registrations"), claims)
 
     async def test_receipt_replay_exposes_current_closure_without_reopening_task(self):
         tid, path, body, _ = await self.task()
