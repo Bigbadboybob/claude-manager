@@ -4481,6 +4481,7 @@ mod remote_reconnect_tests {
                 daemon_socket: sock,
                 operator_token_id: crate::daemon_launch::operator_token(),
                 uid,
+                auto_place_owner: false,
                 workspace_id: "ws-l",
                 label: "reexec-e2e",
                 session_type: "bash",

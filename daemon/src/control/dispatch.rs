@@ -2059,7 +2059,7 @@ fn note_owner_spawn(state: &Arc<Mutex<DaemonState>>, req: &Request, result: &ser
         // rejected; fresh snapshot clones remain eligible. The daemon-side
         // eligibility check also excludes shells, continuous sessions,
         // workflows and existing attribution.
-        if operator_spawn_is_fresh(&guard, req, uid)
+        if operator_spawn_is_fresh(req)
             && crate::assistants::mark_owner_placement(&mut guard, uid)
         {
             guard.persist_sessions_best_effort();
@@ -2072,7 +2072,7 @@ fn note_owner_spawn(state: &Arc<Mutex<DaemonState>>, req: &Request, result: &ser
 /// Startup restore/A-R and transcript resume reuse the same spawn machinery,
 /// so their resume identity must be rejected before the placement marker is
 /// written.
-fn operator_spawn_is_fresh(state: &DaemonState, req: &Request, uid: &str) -> bool {
+fn operator_spawn_is_fresh(req: &Request) -> bool {
     if !matches!(req.caller, Caller::Operator(_)) {
         return false;
     }
@@ -2080,35 +2080,9 @@ fn operator_spawn_is_fresh(state: &DaemonState, req: &Request, uid: &str) -> boo
         "create_session" => true,
         "add_session" => req.params.get("resume_id").and_then(Value::as_str)
             .is_none_or(|id| id.trim().is_empty()),
-        "start_session" => {
-            if req.params.get("transcript_path").and_then(Value::as_str)
-                .is_some_and(|path| !path.trim().is_empty())
-                || req.params.get("org").is_some_and(|org| !org.is_null())
-            {
-                return false;
-            }
-            let resume_argv = req.params.get("argv").and_then(Value::as_array).is_some_and(|argv| {
-                argv.iter().filter_map(Value::as_str).any(|arg| {
-                    matches!(arg, "resume" | "fork" | "--resume" | "--continue" | "--fork-session")
-                        || arg.starts_with("--resume=")
-                })
-            });
-            // A fresh snapshot clone can legitimately carry resume argv. An
-            // existing manifest/tombstone/archive identity means restore/A-R
-            // instead, including old sessions that were never org-seated.
-            !(resume_argv && state_has_persisted_identity(state, uid))
-        }
+        "start_session" => req.params.get("auto_place_owner").and_then(Value::as_bool) == Some(true),
         _ => false,
     }
-}
-
-fn state_has_persisted_identity(state: &DaemonState, uid: &str) -> bool {
-    state.exited_tombstone(uid).is_some()
-        || state.workspaces.values().any(|ws| ws.sessions.iter().any(|entry| entry.uid == uid))
-        || crate::resume_identity::lookup_uid(state, uid)
-            .ok()
-            .flatten()
-            .is_some()
 }
 
 /// `session.viewed {uid}` — the TUI reports the session it is showing (on
@@ -4247,46 +4221,28 @@ mod tests {
         );
         note_owner_spawn(
             &state,
-            &operator_request("start_session", serde_json::json!({"uid": "ts-auto"})),
+            &operator_request("start_session", serde_json::json!({
+                "uid": "ts-auto",
+                "auto_place_owner": true,
+            })),
             &serde_json::json!({"session_uid": "ts-auto"}),
         );
         assert!(crate::assistants::wants_owner_placement(
             state.lock().unwrap().sessions["ts-auto"].org.as_ref()
         ));
         state.lock().unwrap().sessions.get_mut("ts-auto").unwrap().org = None;
-        {
-            let guard = state.lock().unwrap();
-            assert!(operator_spawn_is_fresh(&guard, &operator_request(
-                "start_session",
-                serde_json::json!({"uid": "ts-auto", "argv": ["claude", "--resume", "old"]}),
-            ), "ts-auto"));
-            assert!(!operator_spawn_is_fresh(&guard, &operator_request(
-                "start_session",
-                serde_json::json!({"uid": "ts-auto", "transcript_path": "/tmp/old.jsonl", "argv": ["claude"]}),
-            ), "ts-auto"));
-            assert!(!operator_spawn_is_fresh(&guard, &operator_request(
-                "add_session",
-                serde_json::json!({"uid": "ts-auto", "resume_id": "old"}),
-            ), "ts-auto"));
-        }
-        state.lock().unwrap().workspaces.insert(
-            "ws-old".into(),
-            crate::manifest::ManifestWorkspace {
-                id: "ws-old".into(),
-                sessions: vec![serde_json::from_value(serde_json::json!({
-                    "uid": "ts-auto", "label": "old", "session_type": "claude-code",
-                    "transcript_id": "old",
-                })).unwrap()],
-                ..Default::default()
-            },
-        );
-        {
-            let guard = state.lock().unwrap();
-            assert!(!operator_spawn_is_fresh(&guard, &operator_request(
-                "start_session",
-                serde_json::json!({"uid": "ts-auto", "argv": ["claude", "--resume", "old"]}),
-            ), "ts-auto"), "persisted unseated UID is restore, not a new hire");
-        }
+        assert!(operator_spawn_is_fresh(&operator_request(
+            "start_session",
+            serde_json::json!({"uid": "ts-auto", "auto_place_owner": true}),
+        )));
+        assert!(!operator_spawn_is_fresh(&operator_request(
+            "start_session",
+            serde_json::json!({"uid": "ts-auto", "transcript_path": "/tmp/old.jsonl", "argv": ["claude"]}),
+        )));
+        assert!(!operator_spawn_is_fresh(&operator_request(
+            "add_session",
+            serde_json::json!({"uid": "ts-auto", "resume_id": "old"}),
+        )));
         note_owner_spawn(
             &state,
             &operator_request("session.revive", serde_json::json!({"uid": "ts-auto"})),

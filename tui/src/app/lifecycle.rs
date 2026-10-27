@@ -181,6 +181,7 @@ pub(crate) fn attach_via_daemon(
         daemon_socket: &daemon_socket,
         operator_token_id: &operator_token_id,
         uid: session_uid,
+        auto_place_owner: false,
         workspace_id,
         label,
         session_type: wire_session_type,
@@ -358,6 +359,7 @@ pub(crate) fn try_spawn_via_daemon_with_deps(
     // the daemon's `resolve_authorized_session` flips ready
     // immediately and MCP `read_session_output` can serve.
     transcript_path: Option<&str>,
+    auto_place_owner: bool,
     // Global-permissions grant applied at spawn — see
     // `ClientSessionConfig::global_perms` for the contract and the
     // respawn-at-same-uid incident it closes.
@@ -509,6 +511,7 @@ pub(crate) fn try_spawn_via_daemon_with_deps(
         daemon_socket: &daemon_socket,
         operator_token_id: &operator_token_id,
         uid: session_uid,
+        auto_place_owner,
         workspace_id,
         label,
         session_type: wire_session_type,
@@ -700,6 +703,7 @@ impl App {
         // path for resume/restore flows. Fresh A-n / A-s
         // spawns pass `None`.
         transcript_path: Option<&str>,
+        auto_place_owner: bool,
         // Global-permissions grant applied AT SPAWN (see
         // `ClientSessionConfig::global_perms`). Restore / revive
         // pass the manifest entry's grant so a respawn-at-same-uid
@@ -741,6 +745,7 @@ impl App {
             workflow_role,
             host_id,
             transcript_path,
+            auto_place_owner,
             global_perms,
             model,
             model_source,
@@ -1131,6 +1136,7 @@ impl App {
                         None,
                         &active_host,
                         pre_spawn_transcript.as_deref(),
+                        false, // restore/revive is not a fresh owner placement
                         false, // global_perms
                         tomb.entry.as_ref().and_then(|e| e.model.as_deref()),
                         tomb.entry.as_ref().and_then(|e| e.effort.as_deref()),
@@ -1368,6 +1374,7 @@ impl App {
                 None,
                 &active_host,
                 pre_spawn_transcript.as_deref(),
+                false, // transcript resume is not a fresh owner placement
                 false, // global_perms
                 tomb_model.as_deref(),
                 tomb_effort.as_deref(),
@@ -2365,6 +2372,7 @@ impl App {
             None,
             &active_host,
             pre_spawn_transcript.as_deref(),
+            true, // fresh A-n, including a seeded snapshot clone
             false, // global_perms
             model,
             effort,
@@ -2860,6 +2868,7 @@ impl App {
                     // attach_active is a fresh spawn — post-spawn
                     // detector will discover the transcript path.
                     None,
+                    true, // fresh attach-active agent spawn
                     false, // global_perms
                     None,
                     None,
@@ -3233,6 +3242,7 @@ impl App {
             None,
             &spawn_host,
             pre_spawn_transcript.as_deref(),
+            true, // fresh A-s agent spawn, including a seeded clone
             false, // global_perms
             model,
             effort,
@@ -3960,6 +3970,7 @@ impl App {
             // launch_from_plan is a fresh spawn — post-spawn
             // detector will discover the transcript path.
             None,
+            true, // fresh plan-launched agent
             false, // global_perms
             model,
             effort,
@@ -4334,6 +4345,7 @@ impl App {
             // launch_into_workspace is a fresh spawn — post-
             // spawn detector handles the transcript path.
             None,
+            true, // fresh plan-launched agent
             false, // global_perms
             model,
             effort,

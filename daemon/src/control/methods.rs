@@ -3753,6 +3753,10 @@ pub fn set_workflow_context(
     }
     session.workflow_run_id = p.workflow_run_id;
     session.workflow_role = p.workflow_role;
+    // Persist both the workflow tag and the consumed placement intent while
+    // the same state lock is held. A crash before the next heartbeat must not
+    // revive a workflow participant as a fresh Owner hire.
+    state.persist_sessions_best_effort();
     Ok(json!({
         "ok": true,
         "daemon_owned": true,
@@ -5584,6 +5588,7 @@ pub fn start_workflow(
         let mut diffs: Vec<crate::manifest::ManifestDiff> = Vec::new();
         for (uid, role) in &bound_uid_roles {
             if let Some(s) = state.sessions.get_mut(uid) {
+                s.org.as_mut().map(|org| org.remove(crate::assistants::AUTO_PLACE_OWNER));
                 s.workflow_run_id = Some(run_id.clone());
                 s.workflow_role = Some(role.clone());
                 diffs.push(crate::manifest::ManifestDiff::Updated {
@@ -5598,6 +5603,9 @@ pub fn start_workflow(
                     }),
                 });
             }
+        }
+        if !bound_uid_roles.is_empty() {
+            state.persist_sessions_best_effort();
         }
         (
             state.workflow_event_watcher.clone(),
@@ -29232,6 +29240,58 @@ while True:
             )
             .expect("post-set must pass auth");
             assert_eq!(post["ok"], json!(true));
+        });
+    }
+
+    #[test]
+    fn set_workflow_context_persists_consumed_owner_placement_intent() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let path = std::env::temp_dir().join(format!(
+                "cm-owner-placement-workflow-{}.json",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            {
+                let mut s = state.lock().unwrap();
+                s.daemon_sessions_path = Some(path.clone());
+                let mut p = crate::session::SpawnParams::new(
+                    "ts-workflow-placement",
+                    "workflow",
+                    "/bin/sleep",
+                );
+                p.args = vec!["3".to_string()];
+                p.workspace_id = "ws-workflow-placement".to_string();
+                let session = crate::session::DaemonSession::spawn(p).expect("spawn");
+                s.sessions.insert("ts-workflow-placement".to_string(), session);
+                assert!(crate::assistants::mark_owner_placement(
+                    &mut s,
+                    "ts-workflow-placement"
+                ));
+            }
+            set_workflow_context(
+                &state,
+                &json!({
+                    "uid": "ts-workflow-placement",
+                    "workflow_run_id": "wf-placement",
+                    "workflow_role": "worker",
+                }),
+            )
+            .expect("set_workflow_context ok");
+            assert!(!crate::assistants::wants_owner_placement(
+                state
+                    .lock()
+                    .unwrap()
+                    .sessions
+                    .get("ts-workflow-placement")
+                    .and_then(|s| s.org.as_ref())
+            ));
+            let persisted = std::fs::read_to_string(&path).expect("persisted sessions");
+            assert!(
+                !persisted.contains("auto_place_owner"),
+                "workflow tagging must persist the consumed placement marker"
+            );
+            let _ = std::fs::remove_file(path);
         });
     }
 

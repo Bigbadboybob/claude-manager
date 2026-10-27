@@ -1577,6 +1577,7 @@ impl App {
                         entry.workflow_role.as_deref(),
                         &entry.host_id,
                         pre_spawn_transcript.as_deref(),
+                        false, // restore/attach is not a fresh owner placement
                         entry.global_perms, // global_perms
                         entry.model.as_deref(),
                         entry.effort.as_deref(),
@@ -1609,6 +1610,7 @@ impl App {
                         entry.workflow_role.as_deref(),
                         &entry.host_id,
                         pre_spawn_transcript.as_deref(),
+                        false, // restore/attach is not a fresh owner placement
                         entry.global_perms, // global_perms
                         entry.model.as_deref(),
                         entry.effort.as_deref(),

@@ -235,5 +235,7 @@ and refuse shells clearly. This distinction does not
 close, kill, restart or move shell sessions.
 Fresh top-level agent sessions started by the TUI or operator are auto-placed
 as agent members reporting to Owner on the next org heartbeat, so Owner can
-move them afterward. This excludes shell, continuous-task, workflow, restore,
-and resume sessions.
+move them afterward. The TUI sends this as explicit fresh-spawn intent; it is
+never inferred from transcript paths or argv, so snapshot clones remain fresh
+while restore/resume paths stay in their existing scope. This excludes shell,
+continuous-task, workflow, restore, and resume sessions.

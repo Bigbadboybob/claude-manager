@@ -249,6 +249,7 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
         Some(role),
         &ts.host_id,
         pre_spawn_transcript.as_deref(),
+        false, // workflow respawn is explicitly excluded
         false, // global_perms
         ts.model.as_deref().or(task_model),
         if ts.model.is_some() { ts.model_source.as_deref() } else { task_model.map(|_| "task") },

@@ -1571,6 +1571,7 @@ impl App {
             // MCP-driven spawn is always fresh — post-spawn
             // detector handles transcript path discovery.
             None,
+            false, // MCP/managed spawn is not a TUI operator spawn
             // Grant at spawn time (escalation-checked upstream in
             // `control::methods::start_session`) — no window where
             // the child runs ungranted, no second RPC to lose.
@@ -2635,6 +2636,7 @@ impl App {
             daemon_socket: &socket,
             operator_token_id: &op_token,
             uid,
+            auto_place_owner: false,
             workspace_id: &ws_id,
             label: &label,
             session_type: &session_type,
@@ -5856,6 +5858,7 @@ pub(super) mod pending_workflow_events_tests {
             daemon_socket: &sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
+            auto_place_owner: false,
             workspace_id: "ws-e2e",
             label: "reviewer",
             session_type: "claude-code",
@@ -6334,6 +6337,7 @@ pub(super) mod pending_workflow_events_tests {
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
+            auto_place_owner: false,
             workspace_id: "ws-mgr",
             label: "claude-code",
             session_type: "claude-code",
@@ -6517,6 +6521,7 @@ pub(super) mod pending_workflow_events_tests {
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
+            auto_place_owner: false,
             workspace_id: "ws-r",
             label: "claude-code",
             session_type: "claude-code",
@@ -6746,6 +6751,7 @@ pub(super) mod pending_workflow_events_tests {
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
+            auto_place_owner: false,
             workspace_id: "ws-r",
             label: "claude-code",
             session_type: "claude-code",
@@ -6972,6 +6978,7 @@ pub(super) mod pending_workflow_events_tests {
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid_live,
+            auto_place_owner: false,
             workspace_id: "ws-r",
             label: "claude-code",
             session_type: "claude-code",
@@ -7589,6 +7596,7 @@ pub(super) mod pending_workflow_events_tests {
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
+            auto_place_owner: false,
             workspace_id: "ws-c",
             label: "claude-code",
             session_type: "claude-code",

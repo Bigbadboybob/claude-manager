@@ -871,7 +871,7 @@ async def _auto_place_home(conn, session: dict | None) -> dict | None:
         return None
     if path and await conn.fetchval(
             """SELECT 1 FROM org_workspace_marks
-                WHERE daemon_id = $1 AND kind = 'home' AND path = $2
+                WHERE daemon_id = $1 AND path = $2 AND member_id IS NOT NULL
                 LIMIT 1""", daemon_id, path):
         return None
     if await conn.fetchval(
@@ -1925,10 +1925,25 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
             # a lifecycle tag that can cancel one), take the same lock before
             # the heartbeat upsert so row-lock → advisory-lock inversion is
             # impossible. Idle beats stay lock-free.
+            if not requires_org_lock and acked_mark_ids:
+                requires_org_lock = bool(await conn.fetchval(
+                    """SELECT EXISTS (SELECT 1 FROM org_workspace_marks
+                                       WHERE daemon_id = $1 AND id = ANY($2::bigint[])
+                                         AND state <> 'confirmed')""",
+                    daemon_id, [int(i) for i in acked_mark_ids]))
             if not requires_org_lock:
                 requires_org_lock = bool(await conn.fetchval(
-                    """SELECT EXISTS (SELECT 1 FROM org_session_facts
-                                       WHERE daemon_id = $1 AND auto_place_owner)""", daemon_id))
+                    """SELECT EXISTS (
+                               SELECT 1 FROM org_session_facts
+                                WHERE daemon_id = $1 AND auto_place_owner
+                                  AND member_id IS NULL
+                                  AND managed_by_uid IS NULL
+                                  AND continuous_task_id IS NULL
+                                  AND workflow_run_id IS NULL)""", daemon_id))
+            if not requires_org_lock:
+                requires_org_lock = bool(await conn.fetchval(
+                    """SELECT EXISTS (SELECT 1 FROM org_workspace_marks
+                                       WHERE daemon_id = $1 AND state <> 'confirmed')""", daemon_id))
             if requires_org_lock:
                 await _lock(conn)
             for f in facts:
@@ -1954,6 +1969,8 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
                            workflow_run_id = EXCLUDED.workflow_run_id,
                            spawned_at = coalesce(org_session_facts.spawned_at, EXCLUDED.spawned_at),
                            auto_place_owner = CASE
+                               WHEN org_session_facts.member_id IS NOT NULL
+                               THEN FALSE
                                WHEN EXCLUDED.workflow_run_id IS NOT NULL
                                  OR EXCLUDED.continuous_task_id IS NOT NULL
                                  OR EXCLUDED.managed_by_uid IS NOT NULL
@@ -1983,11 +2000,13 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
             # placement intent takes the feed lock, then it rechecks the
             # candidates under that lock before creating members.
             candidates = await conn.fetch(candidate_sql, daemon_id, sorted(AGENT_ENGINES))
-            if candidates:
-                if not requires_org_lock:
-                    await _lock(conn)
-                    requires_org_lock = True
+            if candidates and requires_org_lock:
                 candidates = await conn.fetch(candidate_sql, daemon_id, sorted(AGENT_ENGINES))
+            elif candidates:
+                # A concurrent placement/adoption may have committed after
+                # the lock-free preflight. Never acquire the advisory lock
+                # after fact row writes; retry placement on the next beat.
+                candidates = []
             if candidates:
                 taken = {r["alias"] for r in await conn.fetch(
                     "SELECT alias FROM member_aliases WHERE org_id = $1", ORG)}
@@ -2003,7 +2022,7 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
                         request_id=f"auto-place:{row['pid']}")
                     await conn.execute(
                         """UPDATE org_session_facts
-                              SET member_id = $2, acting_as = 'main'
+                              SET member_id = $2, acting_as = 'main', auto_place_owner = FALSE
                             WHERE pid = $1 AND member_id IS NULL""",
                         row["pid"], member_id)
                     auto_placed.append({"pid": row["pid"], "member_id": member_id,

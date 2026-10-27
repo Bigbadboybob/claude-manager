@@ -102,6 +102,10 @@ pub struct ClientSessionConfig<'a> {
     /// validation + collision check); a daemon-minted alternative
     /// would silently desync every downstream consumer.
     pub uid: &'a str,
+    /// Explicit intent to place a fresh operator/TUI agent under Owner.
+    /// Restore, resume, workflow, continuous-task and shell callers leave
+    /// this false; it is never inferred from argv or transcript metadata.
+    pub auto_place_owner: bool,
     /// Workspace id for sidebar binding. Must already be in the
     /// daemon's manifest snapshot, OR `worktree_path` must be set
     /// (auto-register fallback — see [`Self::worktree_path`]).
@@ -921,6 +925,9 @@ pub(crate) fn rpc_start_session_full(
     // returns `state: "pending"` and the Python tool polls.
     if let Some(tp) = config.transcript_path {
         params["transcript_path"] = serde_json::Value::String(tp.to_string());
+    }
+    if config.auto_place_owner {
+        params["auto_place_owner"] = serde_json::Value::Bool(true);
     }
     // 10d-2c-1 review round-5 (F1): workflow context for daemon-side
     // `lookup_session_any` → `workflow_transition` / `workflow_done`
@@ -2837,6 +2844,7 @@ pub(crate) mod tests {
             daemon_socket: socket,
             operator_token_id: token,
             uid,
+            auto_place_owner: false,
             workspace_id,
             label,
             // Tests default to "bash" (the bare-shell helper);
@@ -2923,6 +2931,7 @@ time.sleep(60)
             daemon_socket: &socket,
             operator_token_id: "op-graphics",
             uid: &uid,
+            auto_place_owner: false,
             workspace_id: "ws-graphics-e2e",
             label: "graphics-e2e",
             session_type: "bash",
@@ -5181,7 +5190,7 @@ while True:
     /// ungranted spawn leaves the key OFF the wire — byte-for-byte
     /// the pre-fix request shape.
     #[test]
-    fn start_session_wire_carries_global_perms_only_when_granted() {
+    fn start_session_wire_carries_operator_flags_only_when_set() {
         use cm_daemon::control::wire as wire_local;
         use std::os::unix::net::UnixListener;
 
@@ -5218,6 +5227,7 @@ while True:
                 daemon_socket: &socket_path,
                 operator_token_id: "op-gp",
                 uid: &uid,
+                auto_place_owner: granted,
                 workspace_id: "ws-gp",
                 label: "planning",
                 session_type: "claude-code",
@@ -5253,6 +5263,18 @@ while True:
                     "an ungranted spawn keeps the pre-fix wire shape (no key); \
                      observed: {:?}",
                     req.params["global_perms"],
+                );
+            }
+            if granted {
+                assert_eq!(
+                    req.params["auto_place_owner"],
+                    serde_json::json!(true),
+                    "fresh operator intent must be explicit on the wire",
+                );
+            } else {
+                assert!(
+                    req.params.get("auto_place_owner").is_none(),
+                    "restore/resume callers keep placement intent off the wire",
                 );
             }
         }
@@ -5370,6 +5392,7 @@ while True:
             daemon_socket: &socket_path,
             operator_token_id: "op-memcap",
             uid: &uid,
+            auto_place_owner: false,
             workspace_id: "ws-memcap",
             label: "memcap",
             session_type: "bash",
@@ -5463,6 +5486,7 @@ while True:
             daemon_socket: &socket,
             operator_token_id: "op-chunk",
             uid: &uid_pre,
+            auto_place_owner: false,
             workspace_id: "ws-chunking-e2e",
             label: "chunking-e2e",
             session_type: "bash",
