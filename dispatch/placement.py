@@ -51,6 +51,46 @@ def placement_json(board: dict, it, **extra) -> dict:
     return out
 
 
+async def item_rule_team(pool, ref: str, n: int) -> dict:
+    """Resolve §7.2's item → nearest epic → board owning-team default.
+
+    This is only a delivery source, never an authority check. An explicit
+    item team wins; headings do not themselves invent a team.
+    """
+    async with pool.acquire() as conn:
+        board = await items_db._board_by_ref(conn, ref)
+        item = await conn.fetchrow(
+            "SELECT team_id, group_id FROM items WHERE board_id=$1 AND number=$2 AND link_archived_at IS NULL",
+            uuid.UUID(board["id"]), n)
+        if item is None:
+            raise ItemsError(404, "not_found", f"no item #{n} on board {ref}")
+        team_id = item["team_id"]
+        if team_id is None and item["group_id"] is not None:
+            team_id = await conn.fetchval(
+                """WITH RECURSIVE parents AS (
+                       SELECT id, parent_group_id, kind, team_id, 0 AS depth, ARRAY[id] AS seen
+                         FROM groups WHERE id=$1 AND board_id=$2
+                       UNION ALL
+                       SELECT g.id, g.parent_group_id, g.kind, g.team_id, p.depth+1, p.seen || g.id
+                         FROM groups g JOIN parents p ON g.id=p.parent_group_id
+                        WHERE g.board_id=$2 AND NOT g.id = ANY(p.seen))
+                   SELECT team_id FROM parents WHERE kind='epic' AND team_id IS NOT NULL
+                    ORDER BY depth LIMIT 1""", item["group_id"], uuid.UUID(board["id"]))
+        if team_id is None:
+            team_id = items_db._uuid_or_none(board.get("initiative_id"))
+        if team_id is None and board.get("root_task_id"):
+            team_id = await conn.fetchval(
+                "SELECT id FROM initiatives WHERE coordinator_task_id=$1",
+                uuid.UUID(board["root_task_id"]))
+        if team_id is None:
+            return {"team": None}
+        team = await conn.fetchrow("SELECT id, slug, standing_rules FROM initiatives WHERE id=$1", team_id)
+        if team is None:
+            raise ItemsError(409, "unknown_team", "the item's owning team is unavailable")
+        return {"team": {"id": str(team["id"]), "slug": team["slug"],
+                         "rules": team["standing_rules"] or []}}
+
+
 # A daemon counts toward the gate while its last heartbeat is this fresh.
 GATE_FRESH_S = 120
 
@@ -674,9 +714,11 @@ async def set_group(pool, ref: str, actor: dict, group_id: str, changes: dict, *
 
 async def _group_event(conn, board, actor, type_, prev, new, now) -> None:
     await conn.execute(
-        """INSERT INTO item_events (board_id, actor_pid, actor_name, type, prev, new, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)""",
-        uuid.UUID(board["id"]), actor["pid"], actor.get("name"), type_, prev, new, now)
+        """INSERT INTO item_events (board_id, actor_pid, actor_name, type, prev, new, created_at,
+                                    actor_member_id, actor_acting_as)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
+        uuid.UUID(board["id"]), actor["pid"], actor.get("name"), type_, prev, new, now,
+        actor.get("member_id"), actor.get("acting_as"))
 
 
 async def _team_leads(conn, team_ids: list) -> dict:

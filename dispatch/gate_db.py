@@ -42,6 +42,7 @@ def _row_receipt(row, slug: str, n: int) -> dict:
         "verdict": row["verdict"], "stale_at": row["stale_at"],
         "stale_reason": row["stale_reason"], "checked_at": row["checked_at"],
         "poster_pid": row["poster_pid"], "poster_daemon_id": row["poster_daemon_id"],
+        "poster_member_id": row.get("poster_member_id"), "poster_acting_as": row.get("poster_acting_as"),
         "posted_at": row["posted_at"],
     }
 
@@ -50,6 +51,7 @@ def _row_grant(row, slug: str, n: int) -> dict:
     return {
         "id": row["id"], "label": gr.grant_label(slug, n, row["seq"]), "seq": row["seq"],
         "kind": row["kind"], "gate": row["gate"], "grantor_pid": row["grantor_pid"],
+        "grantor_member_id": row.get("grantor_member_id"), "grantor_acting_as": row.get("grantor_acting_as"),
         "head_sha": row["head_sha"], "base_sha": row["base_sha"], "step": row["step"],
         "nodes": list(row["nodes"]) if row["nodes"] is not None else None,
         "cmd_digest": row["cmd_digest"], "reason": row["reason"], "risk": row["risk"],
@@ -248,6 +250,7 @@ def _public(rec: dict, now: datetime, *, steps: bool = True) -> dict:
         "ruling": rec["ruling_id"], "base": rec["base"], "attestation": rec["attestation"],
         "inputs": rec["inputs"], "waivers": rec["waivers"],
         "posted_at": iso(rec["posted_at"]), "poster": rec["poster_pid"],
+        "poster_member_id": rec.get("poster_member_id"), "poster_acting_as": rec.get("poster_acting_as"),
         "computed": (rec.get("computed") or {}).get("verdict"),
         "checked_at": iso(rec.get("checked_at")),
         "profile_version": rec.get("profile_version"),
@@ -309,9 +312,10 @@ async def post_receipt(pool, ref: str, actor: dict, n: int, raw: dict, *,
                 """INSERT INTO item_receipts (board_id, item_id, seq, gate, class, profile_version,
                        head_sha, mf_sha, runner, ruling_id, base, closure, worktree, inputs, steps,
                        waivers, repo, branch, log_path, attestation, computed, verdict,
-                       poster_pid, poster_daemon_id, request_id, posted_at, brief)
+                       poster_pid, poster_daemon_id, request_id, posted_at, brief,
+                       poster_member_id, poster_acting_as)
                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-                           $21,$21,$22,$23,$24,$25,$26) RETURNING id""",
+                           $21,$21,$22,$23,$24,$25,$26,$27,$28) RETURNING id""",
                 _bid(board), row["id"], seq, receipt["gate"], klass,
                 (profile or {}).get("version"), receipt["head_sha"], receipt["mf_sha"],
                 receipt["runner"], receipt["ruling_id"], receipt["base"], receipt["closure"],
@@ -319,7 +323,8 @@ async def post_receipt(pool, ref: str, actor: dict, n: int, raw: dict, *,
                                       for i in receipt["inputs"]],
                 receipt["steps"], receipt["waivers"], receipt["repo"], receipt["branch"],
                 receipt["log_path"], receipt["attestation"], verdict, actor["pid"],
-                actor.get("daemon_id"), request_id, now, brief(receipt["steps"]))
+                actor.get("daemon_id"), request_id, now, brief(receipt["steps"]),
+                actor.get("member_id"), actor.get("acting_as"))
             for inp in receipt["inputs"]:
                 await conn.execute(
                     """INSERT INTO item_receipt_inputs (receipt_id, name, locator, content_id, state,
@@ -470,6 +475,7 @@ def _grant_public(grant: dict) -> dict:
     return {
         "id": grant["label"], "kind": grant["kind"], "gate": grant["gate"],
         "grantor": grant["grantor_pid"], "head": grant["head_sha"], "base": grant["base_sha"],
+        "grantor_member_id": grant["grantor_member_id"], "grantor_acting_as": grant["grantor_acting_as"],
         "step": grant["step"], "nodes": grant["nodes"], "cmd_digest": grant["cmd_digest"],
         "reason": grant["reason"], "risk": grant["risk"], "message_id": grant["message_id"],
         "verified": not grant.get("problems"), "problems": grant.get("problems") or [],
@@ -544,10 +550,10 @@ async def attach_grant(pool, ref: str, actor: dict, n: int, body: dict) -> dict:
             await conn.execute(
                 """INSERT INTO item_grants (board_id, item_id, seq, kind, gate, grantor_pid, head_sha,
                        base_sha, step, nodes, cmd_digest, reason, risk, message_id, message_check,
-                       created_at)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)""",
+                       created_at, grantor_member_id, grantor_acting_as)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)""",
                 _bid(board), row["id"], seq, kind, gate, actor["pid"], head, base, step, nodes,
-                cmd, reason, risk, message_id, check, now)
+                cmd, reason, risk, message_id, check, now, actor.get("member_id"), actor.get("acting_as"))
             label = gr.grant_label(board["slug"], n, seq)
             tx._event(it, "grant_attached", new={"grant": label, "kind": kind, "step": step,
                                                  "head": gr.short(head), "verified": not problems,

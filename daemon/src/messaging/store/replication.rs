@@ -1079,6 +1079,14 @@ impl Store {
         method: &str,
         p: &Value,
     ) -> Result<Value> {
+        self.coordinate_attributed(host, actor, method, p, &Value::Null)
+    }
+
+    /// Attribution travels in the authenticated peer frame, not in agent
+    /// request parameters. Old peers omit it and keep legacy semantics.
+    pub(crate) fn coordinate_attributed(
+        &mut self, host: &str, actor: &str, method: &str, p: &Value, attribution: &Value,
+    ) -> Result<Value> {
         self.shared_mutation_allowed()?;
         if !self.host_authorized(host, Some(actor)) {
             return Err(err(
@@ -1117,7 +1125,14 @@ impl Store {
             };
         }
         self.replication.operation_origin = Some(host.into());
-        let result = (|| match method {
+        self.operation_attribution = if actor != "owner" {
+            match (attribution["member_id"].as_str(), attribution["acting_as"].as_str()) {
+                (Some(member), Some(role @ ("main" | "assistant" | "worker"))) if !member.is_empty() =>
+                    Some((actor.to_owned(), member.to_owned(), role.to_owned())),
+                _ => None,
+            }
+        } else { None };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match method {
             "messaging.send" => self.send(
                 actor,
                 uid,
@@ -1173,8 +1188,10 @@ impl Store {
                 "unsupported_feature",
                 "This is not a coordinated messaging operation",
             )),
-        })();
+        }));
         self.replication.operation_origin = None;
+        self.operation_attribution = None;
+        let result = match result { Ok(result) => result, Err(panic) => std::panic::resume_unwind(panic) };
         result.map(|mut v| {
             if actor == "owner" && v.is_object() {
                 v["execution_host"] = json!(self.coordinator_id());

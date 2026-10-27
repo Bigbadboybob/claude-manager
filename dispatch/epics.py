@@ -185,6 +185,7 @@ async def set_poc(pool, ref: str, actor: dict, group_id: str, member: str, *,
                     WHERE member_id = $1 AND role = 'main' AND ended_at IS NULL""", member_id)
             if main_pid and await board_members.add(
                     conn, board, main_pid, added_by=actor["pid"], group_id=g.id,
+                    added_by_member_id=actor.get("member_id"), added_by_acting_as=actor.get("acting_as"),
                     reason=f"PoC of epic {g.name}"):
                 joined.append(main_pid)
             offers = await _staffing_offers(conn, board, groups, g, chosen)

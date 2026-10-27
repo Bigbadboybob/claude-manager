@@ -10,7 +10,8 @@ use crate::messaging::Person;
 use crate::state::DaemonState;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub const METHODS: &[&str] = &[
     "item.create", "item.set", "item.resolve", "board.read", "board.settings", "board.owner_blocked",
@@ -68,13 +69,14 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
 /// session's participant id and name, so a translated legacy status write on
 /// a placed task is the session's, not the daemon's API token. None when the
 /// messaging store is not open (no participant identity) or the uid is
-/// unknown. Takes the state lock, releases it, then the store slot (the
-/// usual order).
+/// unknown. Takes the state lock, releases it, then the store slot; the
+/// optional wire-support probe runs after both locks have been released.
 pub fn session_actor(state: &Arc<Mutex<DaemonState>>, uid: &str) -> Option<Value> {
-    let (handle, title, task_id) = {
+    let (handle, title, task_id, membership, api_url, api_token) = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         let sess = s.sessions.get(uid)?;
-        (s.messaging.clone(), sess.title.clone(), sess.task_id.clone())
+        (s.messaging.clone(), sess.title.clone(), sess.task_id.clone(),
+         crate::assistants::attribution(sess), s.config.api_url.clone(), s.config.api_token.clone())
     };
     let slot = handle.lock().unwrap_or_else(|p| p.into_inner());
     let store = slot.as_ref()?;
@@ -83,13 +85,21 @@ pub fn session_actor(state: &Arc<Mutex<DaemonState>>, uid: &str) -> Option<Value
         .get(&store.participant_id(uid))
         .map(|n| n.name.clone())
         .unwrap_or(title);
-    Some(json!({
+    let mut actor = json!({
         "pid": format!("agent:{}:{uid}", store.daemon_id),
         "name": name,
         "session_uid": uid,
         "daemon_id": store.daemon_id,
         "task_id": task_id,
-    }))
+    });
+    drop(slot);
+    if let Some(m) = membership {
+        if Api::from_config(&api_url, &api_token).ok().is_some_and(|api| api.attribution_wire()) {
+            actor["member_id"] = json!(m.member_id);
+            actor["acting_as"] = json!(m.acting_as);
+        }
+    }
+    Some(actor)
 }
 
 /// Who is calling, resolved on this daemon.
@@ -107,6 +117,9 @@ pub(crate) struct Ctx {
     /// Every known participant: `{id, name, session_uid, aliases?, released?, present}`.
     pub people: Vec<Value>,
     pub api: Api,
+    pub attribution_wire: OnceLock<bool>,
+    /// Local daemon registry evidence, keyed by uid; never caller parameters.
+    pub attribution: HashMap<String, crate::assistants::Membership>,
 }
 
 impl Ctx {
@@ -118,7 +131,7 @@ impl Ctx {
         if !req.params.is_object() && !req.params.is_null() {
             return Err(bad("expected object parameters"));
         }
-        let (me, live, handle, api_url, api_token) = {
+        let (me, live, handle, api_url, api_token, attribution) = {
             let s = state.lock().unwrap_or_else(|p| p.into_inner());
             let me = match &req.caller {
                 Caller::Operator(_) => None,
@@ -139,7 +152,18 @@ impl Ctx {
                 }
             };
             let live = crate::messaging::live_sessions(&s);
-            (me, live, s.messaging.clone(), s.config.api_url.clone(), s.config.api_token.clone())
+            let mut attribution: HashMap<_, _> = s.sessions.iter().filter_map(|(uid, session)|
+                crate::assistants::attribution(session).map(|m| (uid.clone(), m))).collect();
+            for (uid, session) in &s.tui_sessions {
+                if !s.sessions.contains_key(uid) && session.session_type.as_deref().is_some_and(|t| t != "bash") {
+                    if let Some(member_id) = crate::assistants::main_member(uid) {
+                        attribution.insert(uid.clone(), crate::assistants::Membership {
+                            member_id, acting_as: crate::assistants::MAIN,
+                        });
+                    }
+                }
+            }
+            (me, live, s.messaging.clone(), s.config.api_url.clone(), s.config.api_token.clone(), attribution)
         };
         if me.as_ref().is_some_and(|(_, _, _, _, engine, _)| engine.as_deref() == Some("bash")) {
             return Err(bad("agent_only: item and org tools require an agent; bash is a shell"));
@@ -180,6 +204,8 @@ impl Ctx {
                 daemon_id,
                 people,
                 api,
+                attribution_wire: OnceLock::new(),
+                attribution,
             },
             Some((uid, title, task_id, global, engine, daemon_owned)) => Ctx {
                 pid: format!("agent:{daemon_id}:{uid}"),
@@ -193,22 +219,61 @@ impl Ctx {
                 daemon_id,
                 people,
                 api,
+                attribution_wire: OnceLock::new(),
+                attribution,
             },
         })
     }
 
     pub(crate) fn actor(&self) -> Value {
-        json!({
+        let mut actor = json!({
             "pid": self.pid,
             "name": self.name,
             "session_uid": self.uid,
             "daemon_id": if self.owner { Value::Null } else { json!(self.daemon_id) },
             "task_id": self.task_id,
-        })
+        });
+        if let Some(m) = self.uid.as_ref().and_then(|uid| self.attribution.get(uid)) {
+            if self.supports_attribution() {
+                actor["member_id"] = json!(m.member_id);
+                actor["acting_as"] = json!(m.acting_as);
+            }
+        }
+        actor
+    }
+
+    fn supports_attribution(&self) -> bool {
+        *self.attribution_wire.get_or_init(|| self.api.attribution_wire())
     }
 
     fn me(&self) -> Value {
-        holder_value(&self.pid, Some(&self.name))
+        self.holder(&self.pid, Some(&self.name))
+    }
+
+    fn holder(&self, pid: &str, name: Option<&str>) -> Value {
+        let mut holder = holder_value(pid, name);
+        let local = holder["daemon_id"].as_str() == Some(self.daemon_id.as_str());
+        if let Some(m) = local.then(|| holder["session_uid"].as_str())
+                .flatten().and_then(|uid| self.attribution.get(uid)) {
+            if self.supports_attribution() {
+                holder["member_id"] = json!(m.member_id);
+                holder["acting_as"] = json!(m.acting_as);
+            }
+        } else if !local && pid.starts_with("agent:") && self.supports_attribution() {
+                // Other daemons own their own session stamps. The API's
+                // last reported binding can attribute that exact PID; a
+                // missing/error response remains unknown, never the signer.
+                if let Ok(value) = self.api.get("/org/members/by-pid", &[("pid", pid.to_owned())]) {
+                    let role = value["acting_as"].as_str();
+                    if value["pid"] == pid && matches!(role, Some("main" | "assistant" | "worker")) {
+                        if let Some(member) = value["member"]["id"].as_str().filter(|v| !v.is_empty()) {
+                            holder["member_id"] = json!(member);
+                            holder["acting_as"] = json!(role);
+                        }
+                    }
+                }
+        }
+        holder
     }
 }
 
@@ -244,7 +309,7 @@ pub(crate) fn resolve_holder(ctx: &Ctx, reference: &str) -> RpcResult {
         return Ok(ctx.me());
     }
     if r.eq_ignore_ascii_case("owner") {
-        return Ok(holder_value("owner", Some("Owner")));
+        return Ok(ctx.holder("owner", Some("Owner")));
     }
     let name_of = |p: &Value| p["name"].as_str().map(str::to_string);
     if r.starts_with("agent:") {
@@ -252,10 +317,10 @@ pub(crate) fn resolve_holder(ctx: &Ctx, reference: &str) -> RpcResult {
             return Err(bad(format!("malformed participant id {r}")));
         }
         let name = ctx.people.iter().find(|p| p["id"] == r).and_then(name_of);
-        return Ok(holder_value(r, name.as_deref()));
+        return Ok(ctx.holder(r, name.as_deref()));
     }
     if let Some(p) = ctx.people.iter().find(|p| p["session_uid"] == r && p["id"].as_str().is_some()) {
-        return Ok(holder_value(p["id"].as_str().unwrap(), name_of(p).as_deref()));
+        return Ok(ctx.holder(p["id"].as_str().unwrap(), name_of(p).as_deref()));
     }
     let key = r.to_lowercase();
     let matches_name = |p: &&Value| {
@@ -284,7 +349,7 @@ pub(crate) fn resolve_holder(ctx: &Ctx, reference: &str) -> RpcResult {
     }
     found.dedup_by(|a, b| a["id"] == b["id"]);
     match found.as_slice() {
-        [one] => Ok(holder_value(one["id"].as_str().unwrap_or_default(), name_of(one).as_deref())),
+        [one] => Ok(ctx.holder(one["id"].as_str().unwrap_or_default(), name_of(one).as_deref())),
         [] => Err((
             ErrorCode::NotFound,
             format!("no session named {r}: use a chat name, session uid or participant id (chat_people lists them)"),
@@ -589,7 +654,19 @@ fn item_resolve(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, params: &Value) -> R
     if action == "launch" {
         launched = launch(state, ctx, params, &slug, n)?;
         body["action"] = json!("reassign");
-        body["holders"] = json!([holder_value(launched["pid"].as_str().unwrap_or_default(), Some(&format!("item-{n}")))]);
+        let mut holder = ctx.holder(launched["pid"].as_str().unwrap_or_default(), Some(&format!("item-{n}")));
+        if ctx.supports_attribution() {
+            let current = {
+                let state = state.lock().unwrap_or_else(|p| p.into_inner());
+                launched["uid"].as_str().and_then(|uid| state.sessions.get(uid))
+                    .and_then(crate::assistants::attribution)
+            };
+            if let Some(m) = current {
+                holder["member_id"] = json!(m.member_id);
+                holder["acting_as"] = json!(m.acting_as);
+            }
+        }
+        body["holders"] = json!([holder]);
     }
     let reply = ctx.api.post(&format!("/boards/{slug}/items/{n}/resolve"), &body).map_err(|(code, message)| {
         if launched.is_null() {
@@ -675,13 +752,27 @@ fn launch(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, params: &Value, slug: &str
         "\n\nYou hold this item. Keep it current with item_set({n}, ..., board=\"{slug}\"), \
          mark it waiting with an eta for long jobs, and close it with item_set({n}, \"done\", board=\"{slug}\")."
     ));
+    // A work item's owning team may differ from the member's primary team.
+    // Keep that source explicit and include it once; do not infer policy
+    // precedence between the two teams.
+    let member = ctx.attribution.get(uid).map(|m| m.member_id.as_str());
+    // Board IDs are safe path components even for legacy slugs with special characters.
+    let board_ref = read["board"]["id"].as_str().unwrap_or(slug);
+    let mut included_work_team = None;
+    if let Some(snapshot) = super::org::work_team_rules(&ctx.api, board_ref, item, member)? {
+        included_work_team = snapshot["sources"]["work_team"]["id"].as_str().map(str::to_owned);
+        let root = state.lock().unwrap_or_else(|p| p.into_inner()).messaging_root.clone();
+        prompt = super::org::compose_rules(&root, Some(&snapshot), &prompt)
+            .map_err(|e| (ErrorCode::InvalidParams, format!("cannot deliver item team rules: {e}")))?;
+    }
     // Without task_id the worker joins the caller's task and checkout, as
     // start_session does; a task_id gives it that task's own worktree.
     let mut spawn_params = json!({"type": engine, "label": format!("item-{n}"), "prompt": prompt});
     if let Some(task_id) = params.get("task_id").and_then(Value::as_str).filter(|t| !t.trim().is_empty()) {
         spawn_params["task_id"] = json!(task_id.trim());
     }
-    let spawn = crate::control::methods::mcp_start_session(state, &spawn_params, Some(uid))?;
+    let spawn = crate::control::methods::mcp_start_session_for_item(
+        state, &spawn_params, Some(uid), included_work_team.as_deref())?;
     let new_uid = spawn["uid"]
         .as_str()
         .or_else(|| spawn["session_uid"].as_str())
@@ -1223,6 +1314,8 @@ mod tests {
             daemon_id: "d1".into(),
             people,
             api: Api::from_config("http://127.0.0.1:9", "tok").unwrap(),
+            attribution_wire: OnceLock::from(false),
+            attribution: HashMap::new(),
         }
     }
 
@@ -1450,6 +1543,54 @@ mod tests {
     }
 
     const BOARD: &str = r#"{"id":"b-1","slug":"sfd","name":"Swarm"}"#;
+
+    #[test]
+    fn negotiated_actor_and_holder_stamps_use_registry_not_caller_fields() {
+        let _env = crate::test_support::env_lock();
+        crate::items::org::reset_cache_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let (url, seen) = stub(|method, path, _| match (method, path) {
+            ("GET", "/org/attribution-wire") => (200, r#"{"contract":"cm-attribution-wire-v1","actor":true,"holder":true}"#.into()),
+            ("POST", "/boards/resolve") => (200, BOARD.into()),
+            ("PATCH", "/boards/sfd/items") => (200, r#"{"items":[],"unblocked":[],"warnings":[]}"#.into()),
+            _ => (404, "{}".into()),
+        });
+        let state = state_with_session(root.path(), &url);
+        crate::items::org::absorb_reply(&json!({"org": {"members": {
+            "me-uid": {"id":"mem_real", "acting_as":"main"},
+            "rl-uid": {"id":"mem_target", "acting_as":"main"}}}}), 1.0);
+        let result = call(&state, "me-uid", "item.set", json!({"n": 1, "note":"done",
+            "actor":{"pid":"owner", "member_id":"mem_forged", "acting_as":"main"}, "holder":"rl-uid"}));
+        assert!(result.ok, "{:?}", result.error);
+        let seen = seen.lock().unwrap();
+        let body = &seen.iter().find(|(m,p,_)| m == "PATCH" && p == "/boards/sfd/items").unwrap().2;
+        assert_eq!(body["actor"]["member_id"], "mem_real");
+        assert_eq!(body["actor"]["acting_as"], "main");
+        assert_eq!(body["set"]["holders"][0]["member_id"], "mem_target");
+        assert_ne!(body["actor"]["pid"], "owner");
+        crate::items::org::reset_cache_for_test();
+    }
+
+    #[test]
+    fn old_api_receives_legacy_wire_without_a_write_retry() {
+        let _env = crate::test_support::env_lock();
+        crate::items::org::reset_cache_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let (url, seen) = stub(|method, path, _| match (method, path) {
+            ("POST", "/boards/resolve") => (200, BOARD.into()),
+            ("PATCH", "/boards/sfd/items") => (200, r#"{"items":[],"unblocked":[],"warnings":[]}"#.into()),
+            _ => (404, "{}".into()),
+        });
+        let state = state_with_session(root.path(), &url);
+        crate::items::org::absorb_reply(&json!({"org": {"members": {
+            "me-uid": {"id":"mem_real", "acting_as":"main"}}}}), 1.0);
+        assert!(call(&state, "me-uid", "item.set", json!({"n":1, "note":"legacy"})).ok);
+        let seen = seen.lock().unwrap();
+        let patches = seen.iter().filter(|(m,p,_)| m == "PATCH" && p == "/boards/sfd/items").collect::<Vec<_>>();
+        assert_eq!(patches.len(), 1);
+        assert!(patches[0].2["actor"].get("member_id").is_none());
+        crate::items::org::reset_cache_for_test();
+    }
 
     fn call_gate(state: &Arc<Mutex<DaemonState>>, uid: &str, method: &str, params: Value) -> Response {
         crate::items::gate::dispatch(state, &Request {
@@ -1752,8 +1893,9 @@ mod tests {
         assert_eq!(result["board"], "sfd");
         assert_eq!(result["items"][0]["holders"], json!(["rl"]));
         let seen = seen.lock().unwrap();
-        assert_eq!(seen[0].2, json!({"task_id":"task-a"}));
-        let body = &seen[1].2;
+        assert_eq!(seen.iter().find(|(m, p, _)| m == "POST" && p == "/boards/resolve").unwrap().2,
+                   json!({"task_id":"task-a"}));
+        let body = &seen.iter().find(|(m, p, _)| m == "POST" && p == "/boards/sfd/items").unwrap().2;
         assert_eq!(body["actor"]["pid"], format!("agent:{d}:me-uid"));
         assert_eq!(body["actor"]["daemon_id"], d);
         assert_eq!(body["actor"]["task_id"], "task-a");
@@ -1804,7 +1946,7 @@ mod tests {
         state.lock().unwrap().tui_sessions.get_mut("me-uid").unwrap().global_perms = true;
         let resp = call(&state, "me-uid", "item.set", json!({"n":1,"status":"done","board":"other"}));
         assert!(resp.ok, "{:?}", resp.error);
-        assert!(!seen.lock().unwrap().iter().any(|(m, ..)| m == "GET"));
+        assert!(!seen.lock().unwrap().iter().any(|(m, p, _)| m == "GET" && p != "/org/attribution-wire"));
     }
 
     #[test]
@@ -1860,7 +2002,8 @@ mod tests {
         let state = state_with_session(root.path(), &url);
         let resp = call(&state, "me-uid", "item.create", json!({"title":"a","request_id":"rq-9"}));
         assert_eq!(resp.result.unwrap()["replayed"], true);
-        assert_eq!(seen.lock().unwrap()[1].2["request_id"], "rq-9");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.iter().find(|(m, p, _)| m == "POST" && p == "/boards/sfd/items").unwrap().2["request_id"], "rq-9");
     }
 
     #[test]

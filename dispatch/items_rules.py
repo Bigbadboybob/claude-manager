@@ -200,7 +200,8 @@ class Item:
             "title": self.title,
             "status": self.status,
             "holders": [
-                {k: h.get(k) for k in ("pid", "name", "session_uid", "daemon_id", "role")}
+                {**{k: h.get(k) for k in ("pid", "name", "session_uid", "daemon_id", "role")},
+                 **{k: h[k] for k in ("member_id", "acting_as") if h.get(k) is not None}}
                 for h in self.holders
             ],
             "group_id": self.group_id,
@@ -342,6 +343,9 @@ def _holder(value) -> dict:
         "session_uid": value.get("session_uid"),
         "daemon_id": value.get("daemon_id"),
     }
+    for key in ("member_id", "acting_as"):
+        if value.get(key) is not None:
+            out[key] = value[key]
     if role is not None:
         out["role"] = role
     if value.get("added_at") is not None:

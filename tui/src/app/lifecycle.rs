@@ -4048,13 +4048,7 @@ impl App {
             ts.effort = effort;
         }
         if !prompt.trim().is_empty() {
-            ts.pending_prompt = Some(PendingWrite::wait_for_quiet(
-                prompt.to_string(),
-                false,
-                Duration::from_secs(1),
-                Duration::from_secs(2),
-                Duration::from_secs(60),
-            ));
+            ts.pending_prompt = Some(self.plan_pending_brief(&active_host, &ts.uid, task_id, prompt));
         }
 
         let ws = Workspace {
@@ -4374,13 +4368,7 @@ impl App {
         ts.task_id = Some(task_id.to_string());
         ts.host_id = active_host.clone();
         if !prompt.trim().is_empty() {
-            ts.pending_prompt = Some(PendingWrite::wait_for_quiet(
-                prompt.to_string(),
-                false,
-                Duration::from_secs(1),
-                Duration::from_secs(2),
-                Duration::from_secs(60),
-            ));
+            ts.pending_prompt = Some(self.plan_pending_brief(&active_host, &ts.uid, task_id, prompt));
         }
         let si = self.workspaces[wi].sessions.len();
         self.workspaces[wi].sessions.push(ts);

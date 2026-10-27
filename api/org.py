@@ -177,6 +177,12 @@ async def _call(coro):
         raise HTTPException(status_code=exc.status, detail=exc.detail()) from None
 
 
+@router.get("/attribution-wire")
+async def attribution_wire():
+    """Typed actor/holder fields are accepted; this is not org_stamp_v1."""
+    return {"contract": "cm-attribution-wire-v1", "actor": True, "holder": True}
+
+
 @router.get("/snapshot")
 async def snapshot(request: Request,
                    since_version: int | None = Query(None, ge=0, le=2**63 - 1)):

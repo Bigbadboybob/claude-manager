@@ -115,10 +115,14 @@ pub struct SessionGraph {
     /// uid → (managed_by_uid, continuous_task_id) for recent tombstones
     pub exited: BTreeMap<String, (Option<String>, Option<String>)>,
     pub task_tree: HashMap<String, Option<String>>,
+    /// Daemon-resolved attribution for scheduler-owned agent events.
+    pub attribution: BTreeMap<String, crate::assistants::Membership>,
 }
 impl SessionGraph {
     pub fn capture(s: &DaemonState) -> Self {
         SessionGraph {
+            attribution: s.sessions.iter().filter_map(|(uid, session)|
+                crate::assistants::attribution(session).map(|m| (uid.clone(), m))).collect(),
             live: s
                 .sessions
                 .values()
@@ -432,7 +436,8 @@ fn reconcile_task(
         if !store.is_member(&binding.channel_id, &actor) {
             let params = json!({"action":"join","conversation":binding.channel_id,"request_id":format!("task-join:{}:{}",binding.subscription_id,binding.revision)});
             if store.is_coordinator() {
-                store.channel_action(&actor, &params, &[])?;
+                store.with_operation_attribution(&actor, graph.attribution.get(&uid),
+                    |store| store.channel_action(&actor, &params, &[]))?;
                 report.joined.push(actor.clone());
             } else {
                 joins.push(DeferredJoin { task_id: task.task_id.clone(), binding: binding.clone(), uid: uid.clone(), actor: actor.clone(), params });
@@ -447,13 +452,13 @@ fn reconcile_task(
                 .filter(|(id, _)| **id != actor)
                 .map(|(id, _)| id.clone())
                 .collect();
-            match store.assign_task_name(
+            match store.with_operation_attribution(&actor, graph.attribution.get(&uid), |store| store.assign_task_name(
                 &actor,
                 &uid,
                 &name,
                 &release,
                 &format!("task-name:{}:{}", binding.subscription_id, binding.revision),
-            ) {
+            )) {
                 Ok(Some(_)) => report.named = true,
                 Ok(None) => {}
                 Err(e) => report.deferred.push(format!("name: {}", e.message)),
@@ -479,7 +484,8 @@ fn reconcile_task(
                 continue;
             }
             *budget -= 1;
-            match store.channel_action(&actor, &params, &[]) {
+            match store.with_operation_attribution(&actor, graph.attribution.get(uid),
+                |store| store.channel_action(&actor, &params, &[])) {
                 Ok(_) => report.joined.push(actor),
                 Err(e) => report.deferred.push(format!("join {actor}: {}", e.message)),
             }
@@ -630,8 +636,8 @@ pub(crate) fn ensure_for_task_locked(
         report
     };
     if let Some(sync) = sync {
-        forward_joins_locked(state, joins, guard, adoption_request, |actor, params| {
-            let _ = sync.request(actor, "messaging.channels", params);
+        forward_joins_locked(state, joins, guard, adoption_request, |actor, params, attribution| {
+            let _ = sync.request_with_attribution(actor, "messaging.channels", params, attribution);
         });
     }
     Ok(report)
@@ -640,7 +646,7 @@ pub(crate) fn ensure_for_task_locked(
 pub(crate) fn forward_joins(
     state: &Arc<Mutex<DaemonState>>,
     joins: Vec<DeferredJoin>,
-    send: impl FnMut(&str, &Value),
+    send: impl FnMut(&str, &Value, Option<Value>),
 ) {
     let Some(guard) = adoption::try_binding_lock() else { return; };
     forward_joins_locked(state, joins, &guard, None, send);
@@ -651,7 +657,7 @@ fn forward_joins_locked(
     joins: Vec<DeferredJoin>,
     _guard: &adoption::BindingGuard,
     adoption_request: Option<&str>,
-    mut send: impl FnMut(&str, &Value),
+    mut send: impl FnMut(&str, &Value, Option<Value>),
 ) {
     for join in joins {
         let Some(task) = task::load_one(&join.task_id) else { continue; };
@@ -669,7 +675,9 @@ fn forward_joins_locked(
         // and DaemonState guard above are gone; no store lock is held. Adoption
         // cannot change this generation during the send attempt. A timeout
         // can leave the remote outcome unknown; this is not a receiver lease.
-        send(&join.actor, &join.params);
+        let attribution = graph.attribution.get(&join.uid)
+            .map(|m| json!({"member_id":m.member_id, "acting_as":m.acting_as}));
+        send(&join.actor, &join.params, attribution);
     }
 }
 
@@ -798,8 +806,8 @@ pub fn spawn(state: &Arc<Mutex<DaemonState>>) {
                     .messaging_sync
                     .clone();
                 if let Some(sync) = sync {
-                    forward_joins(&state, joins, |actor, params| {
-                        let _ = sync.request(actor, "messaging.channels", params);
+                    forward_joins(&state, joins, |actor, params, attribution| {
+                        let _ = sync.request_with_attribution(actor, "messaging.channels", params, attribution);
                     });
                 }
             }

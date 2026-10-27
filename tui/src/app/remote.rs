@@ -3295,6 +3295,7 @@ mod remote_reconnect_tests {
             session_with_injected_exit("uid-remote", manager_host(), true);
         ts.pending_prompt = Some(PendingWrite {
             text: "review the unstaged diff".into(),
+            prepare: None,
             submit: true,
             earliest_deliver_at: Instant::now() - Duration::from_secs(1),
             require_quiet: Duration::from_millis(0),
@@ -3340,6 +3341,38 @@ mod remote_reconnect_tests {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
             None => unsafe { std::env::remove_var("HOME") },
         }
+    }
+
+    #[test]
+    fn planning_brief_waits_for_preparation_and_reports_failure_without_delivery() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_manager_host(&tmp.path().join("daemon.sock"));
+        let (mut ts, _events, _) = session_with_injected_exit("brief", manager_host(), false);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut pending = PendingWrite::wait_for_quiet("original".into(), false,
+            Duration::from_secs(600), Duration::ZERO, Duration::from_secs(600));
+        pending.prepare = Some(rx);
+        ts.pending_prompt = Some(pending);
+        app.workspaces.push(workspace_with(ts));
+        app.sessions_restored = false;
+        app.drain_terminal_events();
+        let pending = app.workspaces[0].sessions[0].pending_prompt.as_ref().unwrap();
+        assert!(pending.prepare.is_some());
+        assert_eq!(pending.text, "original");
+        tx.send(Ok(("[rules] original".into(), None))).unwrap();
+        app.drain_terminal_events();
+        let pending = app.workspaces[0].sessions[0].pending_prompt.as_ref().unwrap();
+        assert!(pending.prepare.is_none());
+        assert_eq!(pending.text, "[rules] original");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pending = app.workspaces[0].sessions[0].pending_prompt.as_mut().unwrap();
+        pending.prepare = Some(rx);
+        tx.send(Err("API unavailable".into())).unwrap();
+        app.drain_terminal_events();
+        assert!(app.workspaces[0].sessions[0].pending_prompt.is_none());
+        assert!(app.status_msg.as_ref().is_some_and(|m| m.0.contains("API unavailable")));
     }
 
     /// Closing a session during the offline window must cancel its reconnect

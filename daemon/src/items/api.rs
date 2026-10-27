@@ -59,6 +59,14 @@ impl Api {
         finish(request.call(), path)
     }
 
+    /// Negotiate before a write: an old strict API rejects the extra actor
+    /// fields. An absent or malformed endpoint disables them. Never retry a
+    /// potentially committed write after a failed request.
+    pub fn attribution_wire(&self) -> bool {
+        self.get("/org/attribution-wire", &[]).ok().is_some_and(|v|
+            v["contract"] == "cm-attribution-wire-v1" && v["actor"] == true && v["holder"] == true)
+    }
+
     pub fn post(&self, path: &str, body: &Value) -> ApiResult {
         finish(
             self.agent()

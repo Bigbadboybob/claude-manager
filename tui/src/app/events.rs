@@ -846,8 +846,28 @@ impl App {
                     && ts.pending_enter.is_none()
                     && !session_reconnecting
                 {
+                    if let Some(prompt) = &mut ts.pending_prompt {
+                        if let Some(rx) = &prompt.prepare {
+                            match rx.try_recv() {
+                                Ok(Ok((body, warning))) => {
+                                    prompt.text = body;
+                                    prompt.prepare = None;
+                                    if let Some(warning) = warning { write_failure_notes.push(warning); }
+                                }
+                                Ok(Err(error)) => {
+                                    write_failure_notes.push(format!("brief for {} not delivered: {}", ts.label, error));
+                                    ts.pending_prompt = None;
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    write_failure_notes.push(format!("brief for {} not delivered: preparation stopped", ts.label));
+                                    ts.pending_prompt = None;
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                            }
+                        }
+                    }
                     if let Some(prompt) = &ts.pending_prompt {
-                        if Self::ready_for_write(&ts.session, prompt, now) {
+                        if prompt.prepare.is_none() && Self::ready_for_write(&ts.session, prompt, now) {
                             let pw = ts.pending_prompt.take().unwrap();
                             if let Err(e) =
                                 Self::deliver_pending_write(ts, &pw, "pending_prompt")
@@ -5021,6 +5041,7 @@ mod ready_tests {
         (
             PendingWrite {
                 text: "hi".into(),
+                prepare: None,
                 submit: true,
                 earliest_deliver_at: now + Duration::from_secs(floor_secs),
                 require_quiet: Duration::from_secs(quiet_secs),
@@ -5397,6 +5418,7 @@ mod pty_tracker_parity {
     fn neutral_pw(base: Instant, window: Duration) -> PendingWrite {
         PendingWrite {
             text: String::new(),
+            prepare: None,
             submit: false,
             earliest_deliver_at: base,
             require_quiet: window,

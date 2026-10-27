@@ -41,6 +41,11 @@ router = APIRouter(dependencies=[Depends(verify_token)])
 logger = logging.getLogger("cm.api.items")
 
 
+@router.get("/boards/{ref}/items/{n}/rule-team")
+async def item_rule_team(ref: str, n: int, request: Request):
+    return await _call(placement.item_rule_team(_pool(request), ref, n))
+
+
 def _pool(request: Request):
     return request.app.state.pool
 

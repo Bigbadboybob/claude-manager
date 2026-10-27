@@ -120,6 +120,28 @@ impl Drop for Network {
     }
 }
 #[test]
+fn coordinated_message_uses_daemon_attribution_and_ignores_agent_claims() {
+    let _env = crate::test_support::env_lock();
+    crate::items::org::reset_cache_for_test();
+    let n = Network::new();
+    let client = &n.clients[0];
+    client.lock().unwrap().tui_sessions.get_mut("client-0").unwrap().session_type = Some("codex".into());
+    crate::items::org::absorb_reply(&json!({"org": {"members": {
+        "client-0": {"id":"mem_real", "acting_as":"main"}}}}), 1.0);
+    // A new DM must be coordinated by the hub. Identity-shaped input in
+    // the request is never trusted as the peer-frame attribution.
+    let out = call(client, "client-0", "send", json!({"dm":"owner", "body":"attributed",
+        "request_id":"attr-peer", "attribution":{"member_id":"mem_forged", "acting_as":"worker"}}));
+    assert_eq!(out["event"]["actor"]["member_id"], "mem_real");
+    assert_eq!(out["event"]["actor"]["acting_as"], "main");
+    let id = out["event_id"].as_str().unwrap();
+    let retained = with_store(&n.hub, |s| s.wire_event(id).unwrap());
+    let event: Value = serde_json::from_str(retained["event"].as_str().unwrap()).unwrap();
+    assert_eq!(event["actor"]["member_id"], "mem_real");
+    crate::items::org::reset_cache_for_test();
+}
+
+#[test]
 fn messaging_sync_admin_adds_agent_on_another_host_through_normal_rpc() {
     let n = Network::new();
     let a = &n.clients[0];

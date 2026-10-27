@@ -2067,9 +2067,44 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
             members = await conn.fetch(
                 f"""{_MEMBER_SELECT}
                      WHERE inc.daemon_id = $1 AND left(inc.pid, length($2)) = $2""", daemon_id, prefix)
+            # Include rules for both mains and locally reported assistants and
+            # workers. A member's main may be on another daemon; the session
+            # facts are how this host identifies the rules its children need.
+            # This is a read-only snapshot, not an occupancy claim.
+            rule_rows = await conn.fetch(
+                """SELECT m.id, m.handle, m.standing_rules AS member_rules,
+                          t.id AS team_id, t.slug AS team_slug,
+                          t.standing_rules AS team_rules
+                     FROM members m
+                     LEFT JOIN initiatives t ON t.id = m.primary_team_id
+                    WHERE m.id IN (
+                        SELECT i.member_id FROM incarnations i
+                         WHERE i.daemon_id = $1 AND i.role = 'main' AND i.ended_at IS NULL
+                        UNION
+                        SELECT f.member_id FROM org_session_facts f
+                         WHERE f.daemon_id = $1 AND f.acting_as IN ('assistant', 'worker')
+                           AND f.member_id IS NOT NULL
+                        UNION
+                        SELECT s.attribution_member_id FROM session_states s
+                         WHERE s.daemon_id = $1 AND s.state <> 'exited'
+                           AND s.attribution_member_id IS NOT NULL
+                        UNION
+                        SELECT cm.member_id FROM continuous_members cm WHERE cm.daemon_id = $1
+                    )""", daemon_id)
+            continuous = await conn.fetch(
+                "SELECT continuous_id, member_id FROM continuous_members WHERE daemon_id = $1", daemon_id)
     return {
         "members": {r["main_session_uid"]: {**member_summary(_shape_member(r)), "acting_as": "main"}
                     for r in members},
+        "rules_by_member": {
+            r["id"]: {
+                "member": {"id": r["id"], "handle": r["handle"],
+                           "rules": r["member_rules"] or []},
+                "team": ({"id": str(r["team_id"]), "slug": r["team_slug"],
+                          "rules": r["team_rules"] or []} if r["team_id"] else None),
+            } for r in rule_rows
+        },
+        "continuous_members": {r["continuous_id"]: r["member_id"] for r in continuous},
         "workspace_marks": marks,
         "auto_placed": auto_placed,
         "capable": bool(capable),

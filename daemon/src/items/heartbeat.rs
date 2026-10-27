@@ -317,6 +317,7 @@ impl Beat {
         super::org::absorb_reply(&reply, crate::agent_state::unix_now());
         if reply["org"]["members"].is_object() {
             super::org::save_cache(&snap.root);
+            super::org::deliver_rule_notices(state, &snap.root);
         }
         let applied = {
             let mut s = state.lock().unwrap_or_else(|p| p.into_inner());

@@ -49,7 +49,8 @@ async def on_board(conn, board: dict, pid: str) -> bool:
 
 
 async def add(conn, board: dict, pid: str, *, added_by: str, name: str | None = None,
-              group_id: str | None = None, reason: str | None = None) -> bool:
+              group_id: str | None = None, reason: str | None = None,
+              added_by_member_id: str | None = None, added_by_acting_as: str | None = None) -> bool:
     """Add `pid` to `board` unless it is already on it; True when it joined
     now. A repeated join may move its group."""
     if not isinstance(pid, str) or not pid or len(pid) > 300:
@@ -62,12 +63,13 @@ async def add(conn, board: dict, pid: str, *, added_by: str, name: str | None = 
         raise invalid("invalid_group", f"no group {group_id} on this board", field="group_id")
     await conn.execute(
         """INSERT INTO board_members (board_id, pid, name, session_uid, daemon_id, group_id,
-                                      added_by, reason)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                                      added_by, reason, added_by_member_id, added_by_acting_as)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
            ON CONFLICT (board_id, pid) DO UPDATE SET
                name = coalesce(EXCLUDED.name, board_members.name),
                group_id = coalesce(EXCLUDED.group_id, board_members.group_id)""",
-        uuid.UUID(board["id"]), pid, name, uid, daemon_id, gid, added_by, reason)
+        uuid.UUID(board["id"]), pid, name, uid, daemon_id, gid, added_by, reason,
+        added_by_member_id, added_by_acting_as)
     return not already
 
 
@@ -86,7 +88,9 @@ async def join(pool, ref: str, actor: dict, *, pid: str, name: str | None = None
                 if group_id is None:
                     raise invalid("invalid_group", f"no group {group!r} on this board", field="group")
             joined = await add(conn, board, pid, added_by=actor.get("pid") or "?", name=name,
-                               group_id=group_id, reason=reason)
+                               group_id=group_id, reason=reason,
+                               added_by_member_id=actor.get("member_id"),
+                               added_by_acting_as=actor.get("acting_as"))
             return {"board": board["slug"], "pid": pid, "joined": joined, "group_id": group_id}
 
 
@@ -145,6 +149,7 @@ async def members(pool, ref: str, *, pid: str | None = None) -> dict:
         board = await items_db._board_by_ref(conn, ref)
         rows = await conn.fetch(
             """SELECT pid, name, session_uid, daemon_id, group_id::text AS group_id, added_by,
+                      added_by_member_id, added_by_acting_as,
                       reason, added_at
                  FROM board_members WHERE board_id = $1 AND ($2::text IS NULL OR pid = $2)
                 ORDER BY added_at, pid""", uuid.UUID(board["id"]), pid)

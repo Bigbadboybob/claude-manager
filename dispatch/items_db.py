@@ -226,6 +226,9 @@ async def _load_items(conn, board_id: str, extra_ns=(), *, archived: bool = Fals
         }
         if h.get("role") is not None:
             holder["role"] = h["role"]
+        for key in ("member_id", "acting_as", "via_member_id"):
+            if h.get(key) is not None:
+                holder[key] = h[key]
         by_id[h["item_id"]].holders.append(holder)
     for d in await conn.fetch(
         "SELECT item_id, blocker_id FROM item_deps WHERE item_id = ANY($1::bigint[])", ids
@@ -329,10 +332,11 @@ async def _apply(conn, tx: BoardTx, *, mirror: bool = False) -> None:
         for h in it.holders:
             await conn.execute(
                 """INSERT INTO item_holders (item_id, pid, session_uid, daemon_id, name, added_at,
-                                             role)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+                                             role, member_id, acting_as, via_member_id)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)""",
                 it.id, h["pid"], h.get("session_uid"), h.get("daemon_id"), h.get("name"),
-                h.get("added_at") or now, h.get("role"),
+                h.get("added_at") or now, h.get("role"), h.get("member_id"), h.get("acting_as"),
+                h.get("via_member_id"),
             )
     for n in sorted(tx.deps_changed):
         it = tx.items[n]
@@ -366,11 +370,12 @@ async def _apply(conn, tx: BoardTx, *, mirror: bool = False) -> None:
     for e in tx.events:
         await conn.execute(
             """INSERT INTO item_events (board_id, item_id, item_number, actor_pid,
-                                        actor_name, type, prev, new, reason, created_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)""",
+                                        actor_name, type, prev, new, reason, created_at,
+                                        actor_member_id, actor_acting_as)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)""",
             board_id, tx.items[e["n"]].id if e.get("n") else None, e.get("n"),
             tx.actor["pid"], tx.actor.get("name"), e["type"], e["prev"], e["new"],
-            e["reason"], now,
+            e["reason"], now, tx.actor.get("member_id"), tx.actor.get("acting_as"),
         )
     for p in tx.pushes:
         await conn.execute(
@@ -745,10 +750,11 @@ async def patch_board(pool, ref: str, actor: dict, changes: dict) -> dict:
                 )
                 await conn.execute(
                     """INSERT INTO item_events (board_id, actor_pid, actor_name, type,
-                                                prev, new, created_at)
-                       VALUES ($1, $2, $3, 'board_updated', $4, $5, $6)""",
+                                                prev, new, created_at, actor_member_id, actor_acting_as)
+                       VALUES ($1, $2, $3, 'board_updated', $4, $5, $6, $7, $8)""",
                     uuid.UUID(board["id"]), actor["pid"], actor.get("name"),
                     {k: prev[k] for k in changed}, changed, now,
+                    actor.get("member_id"), actor.get("acting_as"),
                 )
                 board.update(changed)
                 if "gate_default_class" in changed:
@@ -1006,6 +1012,7 @@ async def read_board(pool, ref: str, *, since_version: int | None = None,
                 events.setdefault(e["item_number"], []).append({
                     "id": e["id"], "type": e["type"], "actor": e["actor_name"] or e["actor_pid"],
                     "actor_pid": e["actor_pid"], "prev": e["prev"], "new": e["new"],
+                    "actor_member_id": e["actor_member_id"], "actor_acting_as": e["actor_acting_as"],
                     "reason": e["reason"], "at": iso(e["created_at"]),
                 })
         needle = q.lower() if q else None
@@ -1158,6 +1165,13 @@ def _session_row(raw, prefix: str) -> tuple[dict | None, str | None]:
     for key in ("state_age_s", "idle_for_s", "age_s"):
         row[key] = _seconds(raw.get(key))
     row["reported_done"] = raw.get("reported_done") is True
+    member = raw.get("attribution_member_id")
+    acting = raw.get("attribution_acting_as")
+    if (row.get("engine") in ("claude-code", "codex") and isinstance(member, str)
+            and member and len(member) <= 200 and acting in ("main", "assistant", "worker")):
+        row["attribution_member_id"], row["attribution_acting_as"] = member, acting
+    else:
+        row["attribution_member_id"], row["attribution_acting_as"] = None, None
     agent_state = raw.get("agent_state")
     row["agent_state"] = agent_state if isinstance(agent_state, dict) else None
     return row, None
@@ -1230,9 +1244,10 @@ async def heartbeat(pool, daemon_id: str, *, host_label: str | None, sessions: l
                     """INSERT INTO session_states (pid, daemon_id, session_uid, host_label, task_id,
                                                    name, engine, state, state_since, idle_since,
                                                    reported_done, killed_by, agent_state,
-                                                   started_at, exited_at, reported_at)
+                                                   started_at, exited_at, reported_at,
+                                                   attribution_member_id, attribution_acting_as)
                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                               CASE WHEN $15 THEN $16::timestamptz END, $16)
+                               CASE WHEN $15 THEN $16::timestamptz END, $16, $17, $18)
                        ON CONFLICT (pid) DO UPDATE SET
                            daemon_id = EXCLUDED.daemon_id, session_uid = EXCLUDED.session_uid,
                            host_label = EXCLUDED.host_label, task_id = EXCLUDED.task_id,
@@ -1240,6 +1255,8 @@ async def heartbeat(pool, daemon_id: str, *, host_label: str | None, sessions: l
                            state_since = EXCLUDED.state_since, idle_since = EXCLUDED.idle_since,
                            reported_done = EXCLUDED.reported_done, killed_by = EXCLUDED.killed_by,
                            agent_state = EXCLUDED.agent_state,
+                           attribution_member_id = EXCLUDED.attribution_member_id,
+                           attribution_acting_as = EXCLUDED.attribution_acting_as,
                            started_at = COALESCE(EXCLUDED.started_at, session_states.started_at),
                            exited_at = CASE WHEN $15
                                             THEN COALESCE(session_states.exited_at, $16::timestamptz)
@@ -1250,6 +1267,7 @@ async def heartbeat(pool, daemon_id: str, *, host_label: str | None, sessions: l
                     ago(s.get("state_age_s")), ago(s.get("idle_for_s")),
                     bool(s.get("reported_done")), s.get("killed_by"), s.get("agent_state"),
                     ago(s.get("age_s")), gone, now,
+                    s.get("attribution_member_id"), s.get("attribution_acting_as"),
                 )
             live = [s["pid"] for s in sessions if s["state"] != "exited"]
             await conn.execute(

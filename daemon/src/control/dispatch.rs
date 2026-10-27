@@ -565,6 +565,13 @@ pub fn dispatch_request(
         // own locking inside `methods::*`; the dispatcher just
         // does the Caller-authorization shape check.
         "send_input" => DispatchOutcome::Done(dispatch_send_input(state, req)),
+        "session.prepare_org_brief" => DispatchOutcome::Done(if let Err(response) =
+            require_operator(req, "Preparing a TUI brief is Operator-only") { response } else {
+            match methods::prepare_org_brief(state, &req.params) {
+                Ok(value) => Response::ok(req.id.clone(), value),
+                Err((code, message)) => Response::err(req.id.clone(), code, message),
+            }
+        }),
         // One key (no body, no Enter) to one or more sessions; per-target
         // results. `send_key` is the MCP tool's name for it (TUI-routed on
         // a laptop, like send_input; a headless host's daemon serves it).
@@ -1095,13 +1102,42 @@ fn dispatch_start_session(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Res
             );
         }
     }
-    match methods::start_session(state, &req.params) {
+    let params = trusted_operator_spawn_params(state, &req.params);
+    match methods::start_session(state, &params) {
         Ok(value) => {
             note_owner_spawn(state, req, &value);
             Response::ok(req.id.clone(), value)
         }
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
+}
+
+/// A viewer can round-trip opaque org data, but it cannot select the daemon's
+/// identity or lifecycle stamp. Preserve those keys only from the daemon's
+/// own persisted record. Internal fork/workflow/continuous paths do not use
+/// this RPC boundary; they construct their provenance inside the daemon.
+fn trusted_operator_spawn_params(state: &Arc<Mutex<DaemonState>>, params: &serde_json::Value) -> serde_json::Value {
+    const TRUSTED: &[&str] = &["member_id", "acting_as", "member_via", "assistant_closed_at",
+        "attribution_member_id", "attribution_acting_as", "occupancy_id", "occupancy_generation",
+        "binding_epoch", "workspace_kind", "auto_place_owner"];
+    let mut out = params.clone();
+    let Some(obj) = out.as_object_mut() else { return out };
+    let uid = obj.get("uid").and_then(serde_json::Value::as_str);
+    let persisted = uid.and_then(|uid| {
+        let guard = state.lock().unwrap_or_else(|p| p.into_inner());
+        methods::persisted_org(&guard, uid)
+    });
+    let mut org = obj.remove("org").and_then(|v| v.as_object().cloned()).unwrap_or_default();
+    for key in TRUSTED { org.remove(*key); }
+    if let Some(saved) = persisted {
+        for (key, value) in saved {
+            if TRUSTED.contains(&key.as_str()) || !org.contains_key(&key) {
+                org.insert(key, value);
+            }
+        }
+    }
+    if !org.is_empty() { obj.insert("org".into(), serde_json::Value::Object(org)); }
+    out
 }
 
 /// `list_sessions` — enumerate the daemon's live session
@@ -3668,6 +3704,10 @@ fn dispatch_ping(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
             // pongs, with `global_perms=false` and null scope.
             let st = state.lock().unwrap_or_else(|p| p.into_inner());
             let messaging_root = st.messaging_root.clone();
+            let rules = st.sessions.get(&s.session_uid)
+                .filter(|sess| !crate::assistants::is_shell(&sess.session_type))
+                .and_then(crate::assistants::attribution)
+                .and_then(|m| crate::items::org::cached_rules(&m.member_id));
             let (
                 global_perms,
                 task_id,
@@ -3721,6 +3761,7 @@ fn dispatch_ping(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
                     "worktree_path": worktree_path,
                     "owner_availability": owner_availability,
                     "staffing": staffing,
+                    "standing_rules": rules,
                     // The member this session works as (org model S2),
                     // from the last heartbeat reply; null when it is an
                     // assistant or the planning API predates S2.
@@ -3742,6 +3783,39 @@ fn dispatch_ping(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operator_spawn_cannot_supply_identity_but_restores_daemon_provenance() {
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        let forged = serde_json::json!({"uid":"fresh", "org": {
+            "member_id":"mem_forged", "acting_as":"assistant",
+            "attribution_member_id":"mem_forged", "attribution_acting_as":"main",
+            "future_opaque":"preserved"}});
+        let fresh = trusted_operator_spawn_params(&state, &forged);
+        assert!(fresh["org"].get("member_id").is_none());
+        assert!(fresh["org"].get("attribution_member_id").is_none());
+        assert_eq!(fresh["org"]["future_opaque"], "preserved");
+        let entry: crate::manifest::ManifestEntry = serde_json::from_value(serde_json::json!({
+            "uid":"fresh", "label":"x", "session_type":"codex", "transcript_id":null,
+            "org":{"member_id":"mem_real", "acting_as":"assistant", "member_via":"spawn:p",
+                   "future_saved":"kept"}})).unwrap();
+        let mut ws = crate::manifest::ManifestWorkspace { id:"ws".into(), ..Default::default() };
+        ws.sessions.push(entry);
+        state.lock().unwrap().workspaces.insert("ws".into(), ws);
+        let restored = trusted_operator_spawn_params(&state, &forged);
+        assert_eq!(restored["org"]["member_id"], "mem_real");
+        assert_eq!(restored["org"]["acting_as"], "assistant");
+        assert_eq!(restored["org"]["future_saved"], "kept");
+        assert_eq!(restored["org"]["future_opaque"], "preserved");
+    }
+
+    #[test]
+    fn preparing_operator_brief_does_not_grant_a_session_rpc() {
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        let req = session_request("session.prepare_org_brief", serde_json::json!({}), "caller");
+        let response = dispatch_request(&state, &req).into_response();
+        assert_eq!(response.error.unwrap().code, ErrorCode::Unauthorized);
+    }
 
     fn session_request(method: &str, params: serde_json::Value, uid: &str) -> Request {
         Request {

@@ -127,7 +127,113 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
         async with self.pool.acquire() as conn:
             return await conn.fetch(sql, *args)
 
+    async def test_rule_team_resolves_item_nearest_epic_board_and_absence(self):
+        await self.create("work")
+        board_id = uuid.UUID(self.board["id"])
+        async with self.pool.acquire() as conn:
+            teams = []
+            for label in ("board", "outer", "inner", "explicit"):
+                teams.append(await conn.fetchval(
+                    "INSERT INTO initiatives (slug, name, standing_rules, kind) VALUES ($1,$1,$2,'team') RETURNING id",
+                    f"team-{label}", [{"text": f"{label} rule", "source": "Owner"}]))
+            board_team, outer_team, inner_team, explicit_team = teams
+            await conn.execute("UPDATE boards SET initiative_id=$1 WHERE id=$2", board_team, board_id)
+            outer = await conn.fetchval(
+                "INSERT INTO groups (board_id,name,kind,team_id) VALUES ($1,'outer','epic',$2) RETURNING id",
+                board_id, outer_team)
+            inner = await conn.fetchval(
+                "INSERT INTO groups (board_id,name,kind,team_id,parent_group_id) "
+                "VALUES ($1,'inner','epic',$2,$3) RETURNING id", board_id, inner_team, outer)
+            heading = await conn.fetchval(
+                "INSERT INTO groups (board_id,name,kind,parent_group_id) "
+                "VALUES ($1,'heading','heading',$2) RETURNING id", board_id, inner)
+            await conn.execute("UPDATE items SET group_id=$1, team_id=$2 WHERE board_id=$3 AND number=1",
+                               heading, explicit_team, board_id)
+        async def resolved():
+            response = await self.http.get(f"/boards/{board_id}/items/1/rule-team")
+            self.assertEqual(response.status_code, 200, response.text)
+            return response.json()["team"]
+        self.assertEqual((await resolved())["id"], str(explicit_team))
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE items SET team_id=NULL WHERE board_id=$1 AND number=1", board_id)
+        team = await resolved()
+        self.assertEqual(team["id"], str(inner_team))
+        self.assertEqual(team["rules"], [{"text": "inner rule", "source": "Owner"}])
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE groups SET team_id=NULL WHERE id=$1", inner)
+        self.assertEqual((await resolved())["id"], str(outer_team))
+        async with self.pool.acquire() as conn:
+            parent = outer
+            for depth in range(70):
+                parent = await conn.fetchval(
+                    "INSERT INTO groups (board_id,name,kind,parent_group_id) "
+                    "VALUES ($1,$2,'heading',$3) RETURNING id", board_id, f"deep-{depth}", parent)
+            await conn.execute("UPDATE items SET group_id=$1 WHERE board_id=$2 AND number=1", parent, board_id)
+        self.assertEqual((await resolved())["id"], str(outer_team))
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE items SET group_id=NULL WHERE board_id=$1 AND number=1", board_id)
+        self.assertEqual((await resolved())["id"], str(board_team))
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE boards SET initiative_id=NULL WHERE id=$1", board_id)
+        self.assertIsNone(await resolved())
+        self.assertEqual((await self.http.get(f"/boards/{board_id}/items/999/rule-team")).status_code, 404)
+
     # ---- reopen guard (2026-10-24, sejd #1665 / #1643 / #1505) ----------
+    async def test_attribution_roundtrips_without_changing_pid_or_holder_identity(self):
+        signer = {**ORCH, "member_id": "mem_signer", "acting_as": "main"}
+        target = {**LANE, "member_id": "mem_target", "acting_as": "worker"}
+        await self.create({"title": "attributed", "holders": [target]}, actor=signer)
+        item = (await self.read(history=10))["items"][0]
+        holder = item["holders"][0]
+        self.assertEqual((holder["pid"], holder["member_id"], holder["acting_as"]),
+                         (LANE["pid"], "mem_target", "worker"))
+        await self.patch(1, actor=signer, note="updated")
+        # A later rewrite of holders must not discard the original stamp.
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE item_holders SET via_member_id='mem_via' WHERE pid=$1", LANE["pid"])
+        await self.patch(1, actor=signer, add_holders=[ORCH])
+        holder = next(h for h in (await self.read())["items"][0]["holders"] if h["pid"] == LANE["pid"])
+        self.assertEqual((holder["member_id"], holder["acting_as"]), ("mem_target", "worker"))
+        via = await self.fetch("SELECT via_member_id FROM item_holders WHERE pid=$1", LANE["pid"])
+        self.assertEqual(via[0]["via_member_id"], "mem_via")
+        events = await self.fetch("SELECT actor_pid, actor_member_id, actor_acting_as FROM item_events "
+                                  "WHERE item_number=1 ORDER BY id")
+        self.assertTrue(events)
+        self.assertTrue(all((e["actor_pid"], e["actor_member_id"], e["actor_acting_as"]) ==
+                            (ORCH["pid"], "mem_signer", "main") for e in events))
+
+    async def test_board_join_keeps_signer_attribution_and_original_pid_authority(self):
+        signer = {**ORCH, "member_id": "mem_signer", "acting_as": "assistant"}
+        response = await self.post(f"/boards/{self.ref}/members", {"actor": signer, "pid": LANE["pid"]})
+        self.assertEqual(response.status_code, 200, response.text)
+        row = (await self.fetch("SELECT * FROM board_members WHERE pid=$1", LANE["pid"]))[0]
+        self.assertEqual((row["added_by"], row["added_by_member_id"], row["added_by_acting_as"]),
+                         (ORCH["pid"], "mem_signer", "assistant"))
+        # A legacy repeat is idempotent and does not replace the original adder evidence.
+        response = await self.post(f"/boards/{self.ref}/members", {"actor": ORCH, "pid": LANE["pid"]})
+        self.assertEqual(response.status_code, 200, response.text)
+        row = (await self.fetch("SELECT * FROM board_members WHERE pid=$1", LANE["pid"]))[0]
+        self.assertEqual((row["added_by_member_id"], row["added_by_acting_as"]), ("mem_signer", "assistant"))
+
+    async def test_heartbeat_attribution_is_evidence_and_old_or_shell_rows_clear_it(self):
+        path = "/hosts/d1/heartbeat"
+        row = {"pid": "agent:d1:owned", "session_uid": "owned", "state": "idle",
+               "engine": "codex", "attribution_member_id": "mem_worker",
+               "attribution_acting_as": "worker"}
+        r = await self.post(path, {"sessions": [row]})
+        self.assertEqual(r.status_code, 200, r.text)
+        states = await self.fetch("SELECT attribution_member_id, attribution_acting_as "
+                                  "FROM session_states WHERE pid=$1", row["pid"])
+        self.assertEqual(tuple(states[0]), ("mem_worker", "worker"))
+        # An older daemon or a shell with this UID must not retain stale evidence.
+        for replacement in ({k: v for k, v in row.items() if not k.startswith("attribution_")},
+                            {**row, "engine": "bash"}):
+            r = await self.post(path, {"sessions": [replacement]})
+            self.assertEqual(r.status_code, 200, r.text)
+            states = await self.fetch("SELECT attribution_member_id, attribution_acting_as "
+                                      "FROM session_states WHERE pid=$1", row["pid"])
+            self.assertEqual(tuple(states[0]), (None, None))
+
     async def test_a_done_item_reopens_only_on_purpose_on_every_write_route(self):
         await self.create({"title": "gate", "holders": [LANE]}, {"title": "other", "holders": [LANE]})
         await self.patch(1, actor=LANE, status="done")

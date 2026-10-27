@@ -73,6 +73,69 @@ fn kind(ws: &ManifestWorkspace) -> lifecycle_guard::WorkspaceKind {
 }
 
 #[test]
+fn lifecycle_owned_attribution_does_not_make_an_assistant_or_main() {
+    let _env = crate::test_support::env_lock();
+    crate::items::org::reset_cache_for_test();
+    let mut role = session("wf-attributed", None, None, "ws");
+    role.workflow_run_id = Some("wf".into());
+    bridge::set(&mut role.org, ATTRIBUTION_MEMBER_ID, json!("mem_owner_of_work"));
+    bridge::set(&mut role.org, ATTRIBUTION_ACTING_AS, json!("assistant"));
+    assert_eq!(attribution(&role), Some(Membership {
+        member_id: "mem_owner_of_work".into(), acting_as: ASSISTANT,
+    }));
+    assert!(of_session(&role).is_none());
+    assert!(!is_assistant(&role) && !is_member_session(&role));
+    role.session_type = "bash".into();
+    assert!(attribution(&role).is_none());
+    let _ = role.kill();
+    crate::items::org::reset_cache_for_test();
+}
+
+#[test]
+fn lifecycle_owned_spawn_and_fork_inherit_evidence_without_lifecycle_claims() {
+    let _env = crate::test_support::env_lock();
+    crate::items::org::reset_cache_for_test();
+    let mut state = DaemonState::default();
+    for (uid, continuous, role, expected) in [
+        ("wf", false, ASSISTANT, ASSISTANT), ("fresh", true, MAIN, WORKER),
+    ] {
+        let mut parent = session(uid, None, None, "ws");
+        if continuous { parent.continuous_task_id = Some("ct".into()); }
+        else { parent.workflow_run_id = Some("wf".into()); }
+        bridge::set(&mut parent.org, ATTRIBUTION_MEMBER_ID, json!("mem_x"));
+        bridge::set(&mut parent.org, ATTRIBUTION_ACTING_AS, json!(role));
+        state.sessions.insert(uid.into(), parent);
+        let mut org = None;
+        assert_eq!(stamp_spawn(&state, "child", Some(uid), "codex", &mut org), None);
+        assert_eq!(org.as_ref().unwrap()[ATTRIBUTION_ACTING_AS], expected);
+        assert!(stamped(org.as_ref()).is_none());
+        let fork = fork_org(&state, uid, "codex").unwrap();
+        assert_eq!(fork[ATTRIBUTION_MEMBER_ID], "mem_x");
+        assert_eq!(fork[ATTRIBUTION_ACTING_AS], expected);
+        assert!(stamped(Some(&fork)).is_none());
+        assert!(fork_org(&state, uid, "bash").is_none());
+    }
+    kill_st(&mut state);
+    crate::items::org::reset_cache_for_test();
+}
+
+#[test]
+fn workflow_attribution_does_not_prevent_normal_task_teardown() {
+    let _env = crate::test_support::env_lock();
+    crate::items::org::reset_cache_for_test();
+    let state = Arc::new(Mutex::new(DaemonState::default()));
+    let mut role = session("wf-role", Some("wf-task"), None, "wf-ws");
+    role.workflow_run_id = Some("wf-run".into());
+    bridge::set(&mut role.org, ATTRIBUTION_MEMBER_ID, json!("mem_work"));
+    bridge::set(&mut role.org, ATTRIBUTION_ACTING_AS, json!("assistant"));
+    state.lock().unwrap().sessions.insert("wf-role".into(), role);
+    crate::control::methods::sweep_task_sessions(&state, "wf-task", "operator");
+    assert!(state.lock().unwrap().sessions["wf-role"].last_exit.operator_kill_requested());
+    kill_all(&state);
+    crate::items::org::reset_cache_for_test();
+}
+
+#[test]
 fn owner_placement_marker_only_marks_fresh_top_level_agents() {
     let _env = crate::test_support::env_lock();
     crate::items::org::reset_cache_for_test();
@@ -782,7 +845,8 @@ fn an_assistant_in_its_members_home_is_promoted_without_taking_that_home() {
     assert_eq!(main_member("ca-twin").as_deref(), Some("mem_new"));
     drop(st);
     let seen = seen.lock().unwrap();
-    assert_eq!(seen[0].2["home_refused"], "shared_checkout");
+    let post = seen.iter().find(|(m, p, _)| m == "POST" && p == "/org/assistants/promote").unwrap();
+    assert_eq!(post.2["home_refused"], "shared_checkout");
     drop(seen);
     kill_all(&state);
     crate::items::org::reset_cache_for_test();
@@ -807,7 +871,7 @@ fn a_retried_promote_reaches_the_apis_replay_and_a_bare_one_does_not() {
     assert!(again.ok, "{:?}", again.error);
     let again = again.result.unwrap();
     assert_eq!((again["member"]["id"].as_str(), again["was_assistant_of"].as_str()), (Some("mem_new"), Some("mem_ep")));
-    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert_eq!(seen.lock().unwrap().iter().filter(|(m, p, _)| m == "POST" && p == "/org/assistants/promote").count(), 2);
     {
         let st = state.lock().unwrap();
         let ws = st.workspaces["ws-asst"].org.clone().unwrap();
@@ -819,7 +883,7 @@ fn a_retried_promote_reaches_the_apis_replay_and_a_bare_one_does_not() {
         params: json!({"action": "promote", "session": "ca-asst", "handle": "x", "reason": "r"}),
     });
     assert!(bare.error.unwrap().message.starts_with("already_member"));
-    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert_eq!(seen.lock().unwrap().iter().filter(|(m, p, _)| m == "POST" && p == "/org/assistants/promote").count(), 2);
     kill_all(&state);
     crate::items::org::reset_cache_for_test();
 }

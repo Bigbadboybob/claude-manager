@@ -769,6 +769,13 @@ pub(crate) fn session_facts(state: &DaemonState, sess: &DaemonSession, now: f64)
     facts.insert("continuous_task_id".into(), json!(sess.continuous_task_id));
     facts.insert("managed_by_uid".into(), json!(sess.managed_by_uid));
     facts.insert("workflow_run_id".into(), json!(sess.workflow_run_id));
+    // This pair is evidence only; org_session_facts remains the separate
+    // lifecycle/control source and is not populated from attribution-only
+    // workflow or continuous records.
+    if let Some(m) = crate::assistants::attribution(sess) {
+        facts.insert("attribution_member_id".into(), json!(m.member_id));
+        facts.insert("attribution_acting_as".into(), json!(m.acting_as));
+    }
     // O5: whom an assistant or worker works for (the API learns mains from
     // incarnations).
     if let Some((member, role)) = crate::assistants::stamped(sess.org.as_ref()) {
@@ -801,6 +808,11 @@ pub(crate) fn spawned_age_s(uid: &str, now: f64) -> Option<f64> {
 struct MemberCache {
     /// session uid → member summary (`acting_as: main`), from the last reply.
     by_uid: HashMap<String, Value>,
+    /// Rules keyed by member, including members whose main is on another host.
+    rules_by_member: HashMap<String, Value>,
+    continuous_members: HashMap<String, String>,
+    rule_notice_seq: u64,
+    pending_rule_notices: Vec<Value>,
     at: Option<f64>,
 }
 
@@ -815,6 +827,25 @@ pub(crate) fn absorb_reply(reply: &Value, now: f64) {
     let Some(members) = reply["org"]["members"].as_object() else { return };
     let mut c = cache().lock().unwrap_or_else(|p| p.into_inner());
     c.by_uid = members.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    // An older API does not send this key; keep the last known snapshot.
+    if let Some(rules) = reply["org"]["rules_by_member"].as_object() {
+        // A missing old value is bootstrap, not a change notice. Keep a
+        // durable queue of changes, including A→B→A, rather than relying on
+        // a digest alone as the notification ID.
+        for (member, next) in rules {
+            if c.by_uid.values().any(|m| m["id"].as_str() == Some(member.as_str()) && m["acting_as"] == "main")
+                && c.rules_by_member.get(member).is_some_and(|old| old != next) {
+                c.rule_notice_seq = c.rule_notice_seq.saturating_add(1);
+                let seq = c.rule_notice_seq;
+                c.pending_rule_notices.push(json!({"member_id": member, "seq": seq}));
+            }
+        }
+        c.rules_by_member = rules.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    }
+    if let Some(mappings) = reply["org"]["continuous_members"].as_object() {
+        c.continuous_members = mappings.iter().filter_map(|(k, v)|
+            v.as_str().map(|member| (k.clone(), member.to_owned()))).collect();
+    }
     c.at = Some(now);
 }
 
@@ -826,17 +857,26 @@ fn cache_path(root: &std::path::Path) -> std::path::PathBuf {
 /// to spare members' main sessions (lifecycle_guard_v1), so after a brain
 /// restart it must not start empty and let `mark_subtask_done` close a
 /// member before the first beat (review of 6522623).
-pub(crate) fn save_cache(root: &std::path::Path) {
+pub(crate) fn save_cache(root: &std::path::Path) -> bool {
+    use std::io::Write;
+    static SAVE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _save = SAVE_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|p| p.into_inner());
     let snapshot = {
         let c = cache().lock().unwrap_or_else(|p| p.into_inner());
-        json!({"at": c.at, "members": c.by_uid})
+        json!({"at": c.at, "members": c.by_uid, "rules_by_member": c.rules_by_member,
+               "continuous_members": c.continuous_members, "rule_notice_seq": c.rule_notice_seq,
+               "pending_rule_notices": c.pending_rule_notices})
     };
     let tmp = cache_path(root).with_extension("json.tmp");
-    if let Ok(bytes) = serde_json::to_vec(&snapshot) {
-        if std::fs::write(&tmp, bytes).is_ok() {
-            let _ = std::fs::rename(&tmp, cache_path(root));
-        }
-    }
+    let result = (|| -> std::io::Result<()> {
+        let bytes = serde_json::to_vec(&snapshot).map_err(std::io::Error::other)?;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, cache_path(root))?;
+        std::fs::File::open(root)?.sync_all()
+    })();
+    result.is_ok()
 }
 
 /// Load the persisted cache at brain start, unless a beat already filled it.
@@ -850,7 +890,174 @@ pub(crate) fn load_cache(root: &std::path::Path) {
     if let Some(members) = saved["members"].as_object() {
         c.by_uid = members.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         c.at = saved["at"].as_f64();
+        if let Some(rules) = saved["rules_by_member"].as_object() {
+            c.rules_by_member = rules.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        }
+        if let Some(mappings) = saved["continuous_members"].as_object() {
+            c.continuous_members = mappings.iter().filter_map(|(k, v)|
+                v.as_str().map(|member| (k.clone(), member.to_owned()))).collect();
+        }
+        c.rule_notice_seq = saved["rule_notice_seq"].as_u64().unwrap_or(0);
+        c.pending_rule_notices = saved["pending_rule_notices"].as_array().cloned().unwrap_or_default();
     }
+}
+
+/// Publish persisted notices to each member's current live main. The queue is
+/// retained on any publication failure and replay uses the same notification
+/// id. No state lock is held during filesystem or notification operations.
+pub(crate) fn deliver_rule_notices(state: &Arc<Mutex<DaemonState>>, root: &std::path::Path) {
+    if !save_cache(root) { return; }
+    let pending = {
+        let c = cache().lock().unwrap_or_else(|p| p.into_inner());
+        c.pending_rule_notices.iter().filter_map(|notice| {
+            let member = notice["member_id"].as_str()?;
+            let seq = notice["seq"].as_u64()?;
+            let uid = c.by_uid.iter().find_map(|(uid, m)|
+                (m["id"] == member && m["acting_as"] == "main").then(|| uid.clone()))?;
+            Some((member.to_owned(), seq, uid))
+        }).collect::<Vec<_>>()
+    };
+    for (member, seq, uid) in pending {
+        let live = {
+            let state = state.lock().unwrap_or_else(|p| p.into_inner());
+            state.sessions.get(&uid).is_some_and(|s| !crate::assistants::is_shell(&s.session_type)
+                && crate::assistants::of_session(s).is_some_and(|m| m.member_id == member && m.acting_as == "main"))
+        };
+        if !live { continue; }
+        let id = format!("org-rules-change:{member}:{seq}");
+        let marker = format!("[cm-org-rules change:{seq}]");
+        let text = format!("{marker} Standing rules changed; read ping().standing_rules.");
+        if crate::notifications::publish(root, &uid, &id, "cm", &text, &marker).is_ok() {
+            cache().lock().unwrap_or_else(|p| p.into_inner()).pending_rule_notices
+                .retain(|n| !(n["member_id"] == member && n["seq"] == seq));
+            save_cache(root);
+        }
+    }
+}
+
+/// A last-known host-local mapping, for attribution only, not a claim.
+pub(crate) fn cached_continuous_member(continuous_id: &str) -> Option<String> {
+    cache().lock().unwrap_or_else(|p| p.into_inner())
+        .continuous_members.get(continuous_id).cloned()
+}
+
+/// Cached source-labelled rules, never an authorization grant. Returns none
+/// for an unbound session or an API that has not provided a rules snapshot.
+pub(crate) fn cached_rules(member_id: &str) -> Option<Value> {
+    let rules = cache().lock().unwrap_or_else(|p| p.into_inner())
+        .rules_by_member.get(member_id).cloned()?;
+    rules_snapshot(rules)
+}
+
+pub(crate) fn rules_snapshot(sources: Value) -> Option<Value> {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(&sources).ok()?;
+    let digest = Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect::<String>();
+    Some(json!({"sha256": digest, "sources": sources}))
+}
+
+/// The work item's owning team is a separate source when it is not already
+/// the member's primary team. The item and team come from the planning API.
+pub(crate) fn work_team_rules(api: &super::api::Api, board: &str, item: &Value,
+                              member: Option<&str>) -> RpcResult<Option<Value>> {
+    if board.is_empty() || !board.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err(bad("invalid item board slug"));
+    }
+    let n = item["n"].as_i64().filter(|n| *n > 0).ok_or_else(|| bad("item number is missing"))?;
+    let team = match api.get(&format!("/boards/{board}/items/{n}/rule-team"), &[]) {
+        Ok(reply) if reply["team"].is_null() => return Ok(None),
+        Ok(reply) if reply["team"].is_object() => reply["team"].clone(),
+        Ok(_) => return Err((ErrorCode::Internal, "item owning-team rules response is malformed".into())),
+        Err((ErrorCode::NotFound, _)) => {
+            // Older APIs cannot resolve inherited teams. An explicit team can
+            // still be read there; otherwise no source is known.
+            let Some(id) = item["team_id"].as_str().filter(|s| !s.is_empty()) else {
+                return rules_snapshot(json!({"work_team_unresolved":
+                    "This API cannot resolve inherited epic or board team rules."}))
+                    .map(Some).ok_or_else(|| (ErrorCode::Internal, "could not encode work-team status".into()));
+            };
+            let id = uuid::Uuid::parse_str(id).map_err(|_| bad("item contains an invalid owning team id"))?;
+            let team = api.get(&format!("/org/teams/{id}"), &[])?;
+            json!({"id":team["id"], "slug":team["slug"], "rules":team["standing_rules"]})
+        }
+        Err(e) => return Err(e),
+    };
+    let team_id = team["id"].as_str().ok_or_else(|| bad("item owning team id is missing"))?;
+    let team_id = uuid::Uuid::parse_str(team_id).map_err(|_| bad("item contains an invalid owning team id"))?;
+    if !team["rules"].is_array() {
+        return Err((ErrorCode::Internal, "item owning-team rules unavailable or malformed".into()));
+    }
+    let primary = member.and_then(cached_rules)
+        .and_then(|rules| rules["sources"]["team"]["id"].as_str().map(str::to_owned));
+    if primary.as_deref() == Some(team_id.to_string().as_str()) { return Ok(None); }
+    rules_snapshot(json!({"work_team": team}))
+        .map(Some).ok_or_else(|| (ErrorCode::Internal, "could not encode work-team rules".into()))
+}
+
+/// Snapshot a live agent's rules under the registry lock. Shells and unknown
+/// sessions do not acquire a member identity from a workspace or caller.
+pub(crate) fn rules_for_session(state: &Arc<Mutex<DaemonState>>, uid: &str) -> Option<Value> {
+    let member = {
+        let state = state.lock().unwrap_or_else(|p| p.into_inner());
+        let session = state.sessions.get(uid)?;
+        if crate::assistants::is_shell(&session.session_type) { return None; }
+        crate::assistants::attribution(session)?.member_id
+    };
+    cached_rules(&member)
+}
+
+/// Keep source fields and all stored values intact; a runbook path is data,
+/// never opened or executed here. The same snapshot is returned by `ping`.
+pub(crate) fn prepend_rules(rules: Option<&Value>, prompt: &str) -> String {
+    let Some(rules) = rules else { return prompt.to_owned() };
+    let Some(digest) = rules["sha256"].as_str() else { return prompt.to_owned() };
+    let sources = serde_json::to_string_pretty(&rules["sources"]).unwrap_or_default();
+    format!("[cm-org-rules sha256:{digest}]\n{sources}\n\n{prompt}")
+}
+
+/// Compose within the existing input limit. A too-large inline rules list is
+/// replaced by a content-addressed, complete local snapshot, never truncated.
+/// If even the reference and the original prompt cannot fit, return an
+/// explicit error without sending either. Existing snapshots are verified.
+pub(crate) fn compose_rules(root: &std::path::Path, rules: Option<&Value>, prompt: &str)
+    -> std::io::Result<String>
+{
+    use std::io::{Error, ErrorKind, Write};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    let inline = prepend_rules(rules, prompt);
+    if inline.len() <= crate::control::methods::MAX_SEND_INPUT_BYTES { return Ok(inline); }
+    let rules = rules.ok_or_else(|| Error::new(ErrorKind::InvalidInput, "prompt exceeds agent input limit"))?;
+    let digest = rules["sha256"].as_str().filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "invalid rule snapshot digest"))?;
+    let dir = root.join("org-rule-snapshots");
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
+    let path = dir.join(format!("{digest}.json"));
+    let bytes = serde_json::to_vec_pretty(rules).map_err(Error::other)?;
+    if !path.exists() {
+        let tmp = dir.join(format!(".{}-{}.tmp", digest, uuid::Uuid::new_v4()));
+        let result = (|| -> std::io::Result<()> {
+            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+            f.write_all(&bytes)?;
+            f.set_permissions(std::fs::Permissions::from_mode(0o400))?;
+            f.sync_all()?;
+            match std::fs::hard_link(&tmp, &path) {
+                Ok(()) => std::fs::File::open(&dir)?.sync_all()?,
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => (),
+                Err(e) => return Err(e),
+            }
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        result?;
+    }
+    if std::fs::read(&path)? != bytes {
+        return Err(Error::new(ErrorKind::InvalidData, "rule snapshot digest collision or corruption"));
+    }
+    let reference = format!("[cm-org-rules sha256:{digest}] Full immutable snapshot: {}\n\n{prompt}", path.display());
+    if reference.len() > crate::control::methods::MAX_SEND_INPUT_BYTES {
+        return Err(Error::new(ErrorKind::InvalidInput, "prompt and standing-rule reference exceed agent input limit"));
+    }
+    Ok(reference)
 }
 
 /// Apply the home/stream workspace marks a heartbeat reply hands this
@@ -993,17 +1200,229 @@ pub(crate) fn test_stub(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn operator_brief_uses_recipient_and_work_team_and_rejects_wrong_task() {
+        let _env = crate::test_support::env_lock();
+        reset_cache_for_test();
+        let task = "11111111-1111-4111-8111-111111111111";
+        let board = "22222222-2222-4222-8222-222222222222";
+        let team = "33333333-3333-4333-8333-333333333333";
+        let root = tempfile::tempdir().unwrap();
+        let (url, _) = test_stub(move |method, path, _| {
+            if method == "GET" && path == format!("/tasks/{task}") {
+                (200, json!({"placement":{"board_id":board,"n":1}}).to_string())
+            } else if method == "GET" && path == format!("/boards/{board}") {
+                (200, json!({"items":[{"n":1}]}).to_string())
+            } else if method == "GET" && path == format!("/boards/{board}/items/1/rule-team") {
+                (200, json!({"team":{"id":team,"slug":"work","rules":[{"text":"work-rule","source":"lead"}]}}).to_string())
+            } else { (404, "{}".into()) }
+        });
+        let state = state(root.path(), &url);
+        let mut session = crate::session::DaemonSession::spawn({
+            let mut p = crate::session::SpawnParams::new("me-uid", "me", "/bin/sleep");
+            p.args = vec!["30".into()]; p.session_type = "codex".into(); p
+        }).unwrap();
+        session.task_id = Some(task.into());
+        state.lock().unwrap().sessions.insert("me-uid".into(), session);
+        absorb_reply(&json!({"org":{"members":{"me-uid":{"id":"mem_p","acting_as":"main"}},
+            "rules_by_member":{"mem_p":{"member":{"rules":[{"text":"member-rule","source":"Owner"}]},"team":null}}}}), 1.0);
+        let result = crate::control::methods::prepare_org_brief(&state, &json!({"uid":"me-uid","task_id":task,"prompt":"task brief"})).unwrap();
+        let body = result["prompt"].as_str().unwrap();
+        assert!(body.contains("member-rule") && body.contains("work-rule") && body.contains("task brief"));
+        assert_eq!(result["identity_known"], true);
+        assert!(crate::control::methods::prepare_org_brief(&state, &json!({"uid":"me-uid",
+            "task_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","prompt":"wrong"})).is_err());
+        let _ = state.lock().unwrap().sessions.get_mut("me-uid").unwrap().kill();
+        reset_cache_for_test();
+    }
+
+    #[test]
+    fn operator_brief_refuses_retagged_recipient_during_api_lookup() {
+        let _env = crate::test_support::env_lock();
+        reset_cache_for_test();
+        let task = "11111111-1111-4111-8111-111111111111";
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let resume_rx = std::sync::Mutex::new(resume_rx);
+        let (url, _) = test_stub(move |method, path, _| {
+            if method == "GET" && path == format!("/tasks/{task}") {
+                entered_tx.send(()).unwrap();
+                resume_rx.lock().unwrap().recv().unwrap();
+                (200, json!({"placement":null}).to_string())
+            } else { (404, "{}".into()) }
+        });
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path(), &url);
+        let mut session = crate::session::DaemonSession::spawn({
+            let mut p = crate::session::SpawnParams::new("me-uid", "me", "/bin/sleep");
+            p.args = vec!["30".into()]; p.session_type = "codex".into(); p
+        }).unwrap();
+        session.task_id = Some(task.into());
+        crate::org_bridge::set(&mut session.org, crate::assistants::ATTRIBUTION_MEMBER_ID, json!("mem_old"));
+        crate::org_bridge::set(&mut session.org, crate::assistants::ATTRIBUTION_ACTING_AS, json!("assistant"));
+        state.lock().unwrap().sessions.insert("me-uid".into(), session);
+        let worker_state = state.clone();
+        let worker = std::thread::spawn(move || crate::control::methods::prepare_org_brief(&worker_state,
+            &json!({"uid":"me-uid","task_id":task,"prompt":"brief"})));
+        entered_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+        {
+            let mut s = state.lock().unwrap();
+            let session = s.sessions.get_mut("me-uid").unwrap();
+            crate::org_bridge::set(&mut session.org, crate::assistants::ATTRIBUTION_MEMBER_ID, json!("mem_new"));
+        }
+        resume_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err());
+        let _ = state.lock().unwrap().sessions.get_mut("me-uid").unwrap().kill();
+        reset_cache_for_test();
+    }
+
+    #[test]
+    fn work_team_rules_are_included_once_and_keep_sources() {
+        let _env = crate::test_support::env_lock();
+        reset_cache_for_test();
+        let primary = "11111111-1111-4111-8111-111111111111";
+        let other = "22222222-2222-4222-8222-222222222222";
+        absorb_reply(&json!({"org":{"members":{}, "rules_by_member":{
+            "mem_p":{"member":{"rules":[]}, "team":{"id":primary, "rules":[{"text":"primary", "source":"Owner"}]}}}}}), 1.0);
+        let (url, seen) = test_stub(move |method, path, _| {
+            let id = if path == "/boards/b/items/1/rule-team" { primary } else { other };
+            if method == "GET" {
+                (200, json!({"team":{"id":id,"slug":"work","rules":[{"text":"work rule", "source":"lead"}]}}).to_string())
+            } else { (404, "{}".into()) }
+        });
+        let api = super::super::api::Api::from_config(&url, "tok").unwrap();
+        assert!(work_team_rules(&api, "b", &json!({"n":1}), Some("mem_p")).unwrap().is_none());
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        let rules = work_team_rules(&api, "b", &json!({"n":2}), Some("mem_p")).unwrap().unwrap();
+        assert_eq!(rules["sources"]["work_team"]["rules"][0]["source"], "lead");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        reset_cache_for_test();
+    }
+
+    #[test]
+    fn work_team_old_api_fallback_preserves_explicit_team_and_fails_on_bad_data() {
+        let id = "22222222-2222-4222-8222-222222222222";
+        let (url, _) = test_stub(move |method, path, _| match (method, path) {
+            ("GET", "/boards/b/items/1/rule-team") => (404, "{}".into()),
+            ("GET", "/boards/b/items/2/rule-team") => (404, "{}".into()),
+            ("GET", "/boards/b/items/3/rule-team") => (200, r#"{"team":{"id":"broken"}}"#.into()),
+            ("GET", "/org/teams/22222222-2222-4222-8222-222222222222") =>
+                (200, json!({"id": id, "slug": "work", "standing_rules": [{"text":"full", "source":"Owner"}]}).to_string()),
+            _ => (500, "{}".into()),
+        });
+        let api = super::super::api::Api::from_config(&url, "tok").unwrap();
+        let rules = work_team_rules(&api, "b", &json!({"n":1, "team_id":id}), None).unwrap().unwrap();
+        assert_eq!(rules["sources"]["work_team"]["rules"][0]["text"], "full");
+        // An old server cannot resolve inherited team rules. The brief must
+        // say so, rather than implying that there are no such rules.
+        let unresolved = work_team_rules(&api, "b", &json!({"n":2}), None).unwrap().unwrap();
+        assert!(unresolved["sources"]["work_team_unresolved"].as_str().unwrap().contains("cannot resolve"));
+        assert!(work_team_rules(&api, "b", &json!({"n":3}), None).is_err());
+    }
+
+    #[test]
+    fn rule_change_notices_survive_restart_and_do_not_repeat_unchanged_rules() {
+        let _env = crate::test_support::env_lock();
+        reset_cache_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path(), "http://127.0.0.1:1");
+        {
+            let mut st = state.lock().unwrap();
+            let mut p = crate::session::SpawnParams::new("me-uid", "me", "/bin/sleep");
+            p.args = vec!["30".into()];
+            p.session_type = "codex".into();
+            st.sessions.insert("me-uid".into(), crate::session::DaemonSession::spawn(p).unwrap());
+        }
+        let reply = |text| json!({"org": {
+            "members": {"me-uid": {"id": "mem_test", "acting_as": "main"}},
+            "rules_by_member": {"mem_test": {"member": {"rules": [{"text": text, "source": "Owner"}]}}}}});
+        absorb_reply(&reply("a"), 1.0);
+        absorb_reply(&reply("b"), 2.0);
+        assert!(save_cache(root.path()));
+        reset_cache_for_test();
+        load_cache(root.path());
+        deliver_rule_notices(&state, root.path());
+        assert_eq!(crate::notifications::snapshot(root.path(), "me-uid").unwrap().0.len(), 1);
+        absorb_reply(&reply("b"), 3.0);
+        deliver_rule_notices(&state, root.path());
+        assert_eq!(crate::notifications::snapshot(root.path(), "me-uid").unwrap().0.len(), 1);
+        absorb_reply(&reply("a"), 4.0);
+        deliver_rule_notices(&state, root.path());
+        assert_eq!(crate::notifications::snapshot(root.path(), "me-uid").unwrap().0.len(), 2);
+        let _ = state.lock().unwrap().sessions.get_mut("me-uid").unwrap().kill();
+        reset_cache_for_test();
+    }
+
+    #[test]
+    fn remote_worker_rules_do_not_queue_notices_on_the_wrong_host() {
+        let _env = crate::test_support::env_lock();
+        reset_cache_for_test();
+        for value in ["a", "b", "a"] {
+            absorb_reply(&json!({"org":{"members":{},"rules_by_member":{
+                "mem_remote":{"member":{"rules":[{"text":value,"source":"Owner"}]}}}}}), 1.0);
+        }
+        assert!(cache().lock().unwrap().pending_rule_notices.is_empty());
+        reset_cache_for_test();
+    }
+
+    #[test]
+    fn oversized_rules_are_retrievable_without_bypassing_input_limit() {
+        let _env = crate::test_support::env_lock();
+        reset_cache_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let rules = json!({"member": {"id": "mem_large", "rules": [
+            {"text": "x".repeat(70000), "source": "Owner"}]}, "team": null});
+        absorb_reply(&json!({"org": {"members": {}, "rules_by_member": {"mem_large": rules}}}), 1.0);
+        let snapshot = cached_rules("mem_large").unwrap();
+        let rendered = compose_rules(root.path(), Some(&snapshot), "do work").unwrap();
+        assert!(rendered.contains("Full immutable snapshot:"));
+        assert!(rendered.len() <= crate::control::methods::MAX_SEND_INPUT_BYTES);
+        let path = root.path().join("org-rule-snapshots").join(format!("{}.json", snapshot["sha256"].as_str().unwrap()));
+        let restored: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(restored, snapshot);
+        let too_full = "p".repeat(crate::control::methods::MAX_SEND_INPUT_BYTES);
+        assert!(compose_rules(root.path(), Some(&snapshot), &too_full).is_err());
+        let small = rules_snapshot(json!({"member":{"rules":[{"text":"brief","source":"Owner"}]}})).unwrap();
+        let prefix_len = prepend_rules(Some(&small), "").len();
+        let near = "p".repeat(crate::control::methods::MAX_SEND_INPUT_BYTES - prefix_len);
+        let rendered = compose_rules(root.path(), Some(&small), &near).unwrap();
+        assert_eq!(rendered.len(), crate::control::methods::MAX_SEND_INPUT_BYTES);
+        assert!(rendered.contains("brief") && !rendered.contains("Full immutable snapshot:"));
+        let over = format!("{near}p");
+        if let Ok(rendered) = compose_rules(root.path(), Some(&small), &over) {
+            assert!(rendered.contains("Full immutable snapshot:"));
+            assert!(rendered.len() <= crate::control::methods::MAX_SEND_INPUT_BYTES);
+        }
+        reset_cache_for_test();
+    }
+
+    #[test]
     fn the_member_cache_survives_a_brain_restart() {
         // The cache is process-global: every test that writes it holds the lock.
         let _env = crate::test_support::env_lock();
         let root = tempfile::tempdir().unwrap();
-        absorb_reply(&json!({"org": {"members": {"persist-uid": {"id": "mem_p", "acting_as": "main"}}}}),
+        let rules = json!({"member": {"id": "mem_p", "rules": [
+            {"text": "keep evidence", "source": "Owner"}]},
+            "team": {"id": "team_1", "rules": [{"text": "test", "source": "lead"}]}});
+        absorb_reply(&json!({"org": {"members": {"persist-uid": {"id": "mem_p", "acting_as": "main"}},
+                                      "rules_by_member": {"mem_p": rules},
+                                      "continuous_members": {"ct-p": "mem_p"}}}),
                      1_700_000_000.0);
+        let initial = cached_rules("mem_p").unwrap();
+        let rendered = prepend_rules(Some(&initial), "work");
+        assert!(rendered.starts_with("[cm-org-rules sha256:"));
+        assert!(rendered.contains("keep evidence") && rendered.contains("Owner"));
+        assert!(rendered.contains("lead") && rendered.ends_with("\n\nwork"));
+        assert_eq!(prepend_rules(None, "work"), "work");
         save_cache(root.path());
         reset_cache_for_test();
         assert!(cached_member("persist-uid").is_null(), "a fresh brain starts empty");
         load_cache(root.path());
         assert_eq!(cached_member("persist-uid")["acting_as"], "main");
+        assert_eq!(cached_continuous_member("ct-p").as_deref(), Some("mem_p"));
+        assert_eq!(cached_rules("mem_p"), Some(initial.clone()));
+        absorb_reply(&json!({"org": {"members": {"persist-uid": {"id": "mem_p", "acting_as": "main"}}}}),
+                     1_700_000_001.0); // an older API cannot erase rules
+        assert_eq!(cached_rules("mem_p"), Some(initial));
         reset_cache_for_test();
     }
 
@@ -1088,6 +1507,7 @@ mod tests {
             pid:"operator".into(), name:"operator".into(), uid:None, task_id:None,
             owner:true, global:true, engine:None, daemon_owned:false,
             daemon_id:"test".into(), people:Vec::new(), api:crate::items::api::Api::from_config(&url, "tok").unwrap(),
+            attribution_wire: std::sync::OnceLock::from(false), attribution: HashMap::new(),
         };
         let params = json!({"session_uid":uid}).as_object().unwrap().clone();
         assert!(matches!(close_assistant(&state, &ctx, params), Err((ErrorCode::Conflict, _))));

@@ -5542,6 +5542,23 @@ pub fn start_workflow(
         insert_pick(&mut full, &role_model, &role_effort);
         full.insert("workflow_run_id".into(), Value::String(run_id.clone()));
         full.insert("workflow_role".into(), Value::String(role_name.clone()));
+        // Workflow roles keep their scheduler-owned lifecycle. Carry the
+        // authenticated creator's attribution in separate keys, never as an
+        // assistant lifecycle/control grant. Operator launches without a
+        // creator remain unknown rather than guessing from co-tenancy.
+        if let Some(cuid) = caller_uid.as_deref() {
+            let member = {
+                let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                crate::assistants::member_for_spawn(&state, cuid)
+                    .or_else(|| crate::assistants::attribution_only_child(&state, cuid))
+            };
+            if let Some((member_id, acting_as)) = member {
+                full.insert("org".into(), json!({
+                    "attribution_member_id": member_id,
+                    "attribution_acting_as": acting_as,
+                }));
+            }
+        }
         if let Some(tid) = task_id.clone() {
             full.insert("task_id".into(), Value::String(tid));
         }
@@ -8444,6 +8461,21 @@ fn spawn_agent_prompt_delivery(
     fresh_spawn: bool,
     confirm_state: Option<Arc<Mutex<DaemonState>>>,
 ) {
+    let prompt = if fresh_spawn {
+        let rules = confirm_state.as_ref()
+            .and_then(|state| crate::items::org::rules_for_session(state, &session_uid));
+        if let Some(state) = confirm_state.as_ref() {
+            let root = state.lock().unwrap_or_else(|p| p.into_inner()).messaging_root.clone();
+            match crate::items::org::compose_rules(&root, rules.as_ref(), &prompt) {
+                Ok(body) => body,
+                Err(e) => { eprintln!("cm-daemon: prompt for {session_uid} not delivered: {e}"); return; }
+            }
+        } else { prompt }
+    } else { prompt };
+    if fresh_spawn && prompt.len() > MAX_SEND_INPUT_BYTES {
+        eprintln!("cm-daemon: prompt with standing rules for {session_uid} exceeds the input limit; not delivered");
+        return;
+    }
     let pending = match confirm_state.as_ref() {
         Some(state) => match reserve_detached_delivery(state, &handle, &session_uid) {
             Ok(pending) => Some(pending),
@@ -8475,6 +8507,13 @@ fn spawn_initial_prompt_delivery(
     ticket: super::prompt_delivery::Ticket,
 ) {
     use super::prompt_delivery::{self as delivery, Baseline, Check, LaunchWrite};
+    let rules = crate::items::org::rules_for_session(&state, &uid);
+    let root = state.lock().unwrap_or_else(|p| p.into_inner()).messaging_root.clone();
+    let body = match crate::items::org::compose_rules(&root, rules.as_ref(), &body) {
+        Ok(body) => body,
+        Err(e) => { delivery::finish(&ticket, Err("prompt_with_rules_unavailable"));
+                    eprintln!("cm-daemon: initial prompt for {uid} not delivered: {e}"); return; }
+    };
     let pending = match reserve_detached_delivery(&state, &handle, &uid) {
         Ok(pending) => pending,
         Err(reason) => { delivery::finish(&ticket, Err("session_unavailable")); eprintln!("cm-daemon: initial prompt for {uid} not queued: {reason}"); return; }
@@ -9764,13 +9803,81 @@ pub fn mcp_start_session(
     params: &Value,
     caller_uid: Option<&str>,
 ) -> MethodResult {
-    with_cap_hint(state_arc, caller_uid, mcp_start_session_inner(state_arc, params, caller_uid))
+    with_cap_hint(state_arc, caller_uid, mcp_start_session_inner(state_arc, params, caller_uid, None))
+}
+
+/// Prepare a TUI planning brief on the target's daemon, off the UI thread.
+/// No terminal input is performed here. The caller keeps the existing PTY
+/// readiness/delivery contract. An unknown recipient stays unknown.
+pub(crate) fn prepare_org_brief(state: &Arc<Mutex<DaemonState>>, params: &Value) -> MethodResult {
+    let uid = params["uid"].as_str().filter(|s| !s.is_empty())
+        .ok_or_else(|| (ErrorCode::InvalidParams, "brief needs uid".into()))?;
+    let task = params["task_id"].as_str().and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .ok_or_else(|| (ErrorCode::InvalidParams, "brief needs a task UUID".into()))?.to_string();
+    let prompt = params["prompt"].as_str()
+        .ok_or_else(|| (ErrorCode::InvalidParams, "brief needs prompt".into()))?;
+    let (pid, incarnation, fanout, member, url, token, root) = {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        let session = s.sessions.get(uid).ok_or_else(|| (ErrorCode::NotFound, "brief session unavailable".into()))?;
+        if session.task_id.as_deref() != Some(task.as_str()) || crate::assistants::is_shell(&session.session_type) {
+            return Err((ErrorCode::Conflict, "brief session task or engine changed".into()));
+        }
+        (session.pid, session.holder_incarnation, Arc::clone(&session.fanout), crate::assistants::attribution(session),
+         s.config.api_url.clone(), s.config.api_token.clone(), s.messaging_root.clone())
+    };
+    let creds = planning_creds(state)?;
+    let row = api_get_task(&creds, &task).map_err(|e| e.to_method_err())?;
+    let mut body = prompt.to_owned();
+    if let Some(place) = row.get("placement").filter(|p| p.is_object()) {
+        if let (Some(board), Some(n)) = (place["board_id"].as_str(), place["n"].as_i64()) {
+            let board = uuid::Uuid::parse_str(board).map_err(|_| (ErrorCode::InvalidParams,
+                "task placement has invalid board id".into()))?.to_string();
+            let api = crate::items::api::Api::from_config(&url, &token)?;
+            let board_value = api.get(&format!("/boards/{board}"), &[])?;
+            let item = board_value["items"].as_array().and_then(|rows| rows.iter().find(|i| i["n"] == n))
+                .ok_or_else(|| (ErrorCode::NotFound, "placed item is not available for its brief".into()))?;
+            if let Some(rules) = crate::items::org::work_team_rules(&api, &board, item,
+                member.as_ref().map(|m| m.member_id.as_str()))? {
+                body = crate::items::org::compose_rules(&root, Some(&rules), &body)
+                    .map_err(|e| (ErrorCode::InvalidParams, format!("cannot deliver item team rules: {e}")))?;
+            }
+        }
+    }
+    {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        let current = s.sessions.get(uid).ok_or_else(|| (ErrorCode::Conflict, "brief session changed".into()))?;
+        if current.pid != pid || current.holder_incarnation != incarnation || !Arc::ptr_eq(&current.fanout, &fanout)
+            || current.task_id.as_deref() != Some(task.as_str())
+            || crate::assistants::attribution(current) != member {
+            return Err((ErrorCode::Conflict, "brief session identity changed; retry preparation".into()));
+        }
+    }
+    let rules = member.as_ref().and_then(|m| crate::items::org::cached_rules(&m.member_id));
+    body = crate::items::org::compose_rules(&root, rules.as_ref(), &body)
+        .map_err(|e| (ErrorCode::InvalidParams, format!("cannot deliver standing rules: {e}")))?;
+    {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        let current = s.sessions.get(uid).ok_or_else(|| (ErrorCode::Conflict, "brief session changed".into()))?;
+        if !Arc::ptr_eq(&current.fanout, &fanout) || current.task_id.as_deref() != Some(task.as_str())
+            || crate::assistants::attribution(current) != member {
+            return Err((ErrorCode::Conflict, "brief session identity changed; retry preparation".into()));
+        }
+    }
+    Ok(json!({"prompt": body, "identity_known": member.is_some()}))
+}
+
+/// The item launch has already included this team source in its trusted brief.
+pub(crate) fn mcp_start_session_for_item(
+    state_arc: &Arc<Mutex<DaemonState>>, params: &Value, caller_uid: Option<&str>, team: Option<&str>,
+) -> MethodResult {
+    with_cap_hint(state_arc, caller_uid, mcp_start_session_inner(state_arc, params, caller_uid, team))
 }
 
 fn mcp_start_session_inner(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
     caller_uid: Option<&str>,
+    included_work_team: Option<&str>,
 ) -> MethodResult {
     let mut p: McpStartSessionParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("mcp_start_session params: {}", e)))?;
@@ -10185,7 +10292,7 @@ fn mcp_start_session_inner(
     // task. Auto-delivery is for the propose-then-launch flow, where
     // the caller names the task it wants run.
     let autodelivery_eligible = matches!(p.type_.as_str(), "claude-code" | "codex");
-    let (effective_prompt, prompt_source): (Option<String>, &'static str) = match caller_prompt {
+    let (mut effective_prompt, prompt_source): (Option<String>, &'static str) = match caller_prompt {
         Some(text) => (Some(text), "caller"),
         None => match p.task_id.as_deref().filter(|_| autodelivery_eligible) {
             // ux-1a: a minted spawn already read this exact row to learn
@@ -10208,6 +10315,61 @@ fn mcp_start_session_inner(
             None => (None, "none"),
         },
     };
+
+    // Placed tasks carry a board/item link. Include the work team's rules in
+    // the task brief as well as the child's member and primary-team rules.
+    // APIs before placement simply return a task without this field.
+    if autodelivery_eligible && effective_prompt.is_some() {
+        if let Some(task_id) = p.task_id.as_deref() {
+            let row = match minted_task_row.clone() {
+                Some(row) => Some(row),
+                None => match planning_creds(state_arc).and_then(|creds|
+                    api_get_task(&creds, task_id).map_err(|e| e.to_method_err())) {
+                    Ok(row) => Some(row),
+                    Err(_) => {
+                        let prompt = effective_prompt.as_deref().unwrap_or_default();
+                        effective_prompt = Some(format!("[cm-org-rules] Work-team rules could not be resolved; check the item when the planning API is available.\n\n{prompt}"));
+                        None
+                    }
+                },
+            };
+            if let Some(place) = row.as_ref().and_then(|r| r.get("placement")).filter(|p| p.is_object()) {
+                if let (Some(board), Some(n)) = (place["board_id"].as_str(), place["n"].as_i64()) {
+                    let board = uuid::Uuid::parse_str(board).map_err(|_| (ErrorCode::InvalidParams,
+                        "task placement has invalid board id".into()))?.to_string();
+                    let (url, token, root, member) = {
+                        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                        let member = caller_uid.and_then(|uid| state.sessions.get(uid))
+                            .and_then(crate::assistants::attribution).map(|m| m.member_id);
+                        (state.config.api_url.clone(), state.config.api_token.clone(), state.messaging_root.clone(), member)
+                    };
+                    let api = crate::items::api::Api::from_config(&url, &token)?;
+                    let board_value = api.get(&format!("/boards/{board}"), &[])?;
+                    let item = board_value["items"].as_array().and_then(|rows| rows.iter().find(|i| i["n"] == n))
+                        .ok_or_else(|| (ErrorCode::NotFound, "placed item is not available for its brief".into()))?;
+                    if let Some(rules) = crate::items::org::work_team_rules(&api, &board, item, member.as_deref())?
+                        .filter(|r| !r["sources"]["work_team"]["id"].as_str()
+                            .is_some_and(|id| Some(id) == included_work_team)) {
+                        let prompt = effective_prompt.as_deref().unwrap_or_default();
+                        effective_prompt = Some(crate::items::org::compose_rules(&root, Some(&rules), prompt)
+                            .map_err(|e| (ErrorCode::InvalidParams, format!("cannot deliver item team rules: {e}")))?);
+                    }
+                }
+            }
+        }
+    }
+
+    // For a known creator, validate the complete inherited rules and prompt
+    // before spawning. Recheck the child's actual snapshot at delivery too,
+    // since membership or rules can change while the spawn is in flight.
+    if autodelivery_eligible {
+        if let (Some(uid), Some(prompt)) = (caller_uid, effective_prompt.as_deref()) {
+            let rules = crate::items::org::rules_for_session(state_arc, uid);
+            let root = state_arc.lock().unwrap_or_else(|p| p.into_inner()).messaging_root.clone();
+            crate::items::org::compose_rules(&root, rules.as_ref(), prompt)
+                .map_err(|e| (ErrorCode::InvalidParams, format!("cannot deliver prompt with standing rules: {e}")))?;
+        }
+    }
 
     // Explicit model → task default → staffing rule → config default.
     // Effort keeps its existing resolution order. Like the
@@ -13600,7 +13762,18 @@ pub fn trigger(
             let (cols, rows) = caller_size.unwrap_or((80, 24));
             let working_dir = PathBuf::from(&task.worktree_path);
 
-            let full = match compose_continuous_spawn_params(
+            if !crate::assistants::is_shell(engine) {
+                if let Err(e) = validate_continuous_rules_prompt(state_arc, &session_uid, &task.task_id, &resolved_prompt) {
+                    if let Some(b) = &consumer_batch {
+                        release_consumer_batch(state_arc, &b.queue, &b.ids, &p.task_id);
+                    }
+                    continuous_clear_in_flight_after_failure(&p.task_id, seq, &fire_token,
+                        &session_uid, run_mode_label, &trigger_source, &e.1);
+                    return Err(e);
+                }
+            }
+
+            let mut full = match compose_continuous_spawn_params(
                 state_arc,
                 &session_uid,
                 &task.workspace_id,
@@ -13635,6 +13808,7 @@ pub fn trigger(
                 }
             };
 
+            stamp_continuous_attribution(&mut full, &task.task_id, engine, crate::assistants::MAIN);
             if let Err(e) = continuous_fresh_spawn(state_arc, &full) {
                 if let Some(b) = &consumer_batch {
                     release_consumer_batch(state_arc, &b.queue, &b.ids, &p.task_id);
@@ -14772,6 +14946,24 @@ fn investigator_prompt(
 /// OWN runtime bound is enforced by the watchdog via `[scheduler]
 /// default_investigator_runtime_secs`; `compose_continuous_spawn_params` carries
 /// no per-session deadline, so the spawn itself is unbounded.)
+fn stamp_continuous_attribution(full: &mut Value, id: &str, engine: &str, role: &str) {
+    if crate::assistants::is_shell(engine) { return; }
+    if let Some(member) = crate::items::org::cached_continuous_member(id) {
+        full["org"] = json!({"attribution_member_id": member, "attribution_acting_as": role});
+    }
+}
+
+fn validate_continuous_rules_prompt(state: &Arc<Mutex<DaemonState>>, uid: &str, id: &str,
+    prompt: &str) -> Result<(), (ErrorCode, String)> {
+    let member = crate::assistants::main_member(uid)
+        .or_else(|| crate::items::org::cached_continuous_member(id));
+    let rules = member.as_deref().and_then(crate::items::org::cached_rules);
+    let root = state.lock().unwrap_or_else(|p| p.into_inner()).messaging_root.clone();
+    crate::items::org::compose_rules(&root, rules.as_ref(), prompt)
+        .map(|_| ())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("cannot deliver continuous prompt with standing rules: {e}")))
+}
+
 pub(crate) fn spawn_investigator(
     state_arc: &Arc<Mutex<DaemonState>>,
     task: &crate::continuous::task::ContinuousTask,
@@ -14786,10 +14978,12 @@ pub(crate) fn spawn_investigator(
         _ => crate::continuous::task::Engine::Claude,
     }.as_session_type();
     let working_dir = PathBuf::from(&task.worktree_path);
+    let prompt = investigator_prompt(task, seq, snapshot_dir);
+    validate_continuous_rules_prompt(state_arc, &uid, &task.task_id, &prompt)?;
 
     // Compose via the continuous spawn choke point (tags continuous_task_id +
     // memory-caps + pins the worktree).
-    let full = compose_continuous_spawn_params(
+    let mut full = compose_continuous_spawn_params(
         state_arc,
         &uid,
         &task.workspace_id,
@@ -14803,6 +14997,7 @@ pub(crate) fn spawn_investigator(
         24,
     )?;
 
+    stamp_continuous_attribution(&mut full, &task.task_id, engine, crate::assistants::WORKER);
     // Spawn through the start_session choke point (spied in tests → no real
     // claude). Propagate a spawn error BEFORE recording the investigation.
     continuous_fresh_spawn(state_arc, &full)?;
@@ -14811,7 +15006,6 @@ pub(crate) fn spawn_investigator(
     // a BRIEF state lock, drop it, THEN hand off to the detached delivery thread.
     // A vanished session (fast-exit reaper removed the entry) skips delivery
     // best-effort — the investigation is already recorded below.
-    let prompt = investigator_prompt(task, seq, snapshot_dir);
     let handle_opt = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         state
@@ -30266,6 +30460,40 @@ while True:
         });
     }
 
+    #[test]
+    fn task_launch_resolves_work_team_and_rejects_unfit_brief_before_spawn() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_mcp_spawn_fixture(&state, "ts-caller", Some("task-1"));
+            let board = "22222222-2222-4222-8222-222222222222";
+            let team = "33333333-3333-4333-8333-333333333333";
+            let stub = spawn_routed_stub(move |method, path, _| {
+                if method == "GET" && path == "/tasks/task-1" {
+                    (200, json!({"id":"task-1","status":"running",
+                        "placement":{"board_id":board,"n":1}}).to_string())
+                } else if method == "GET" && path == format!("/boards/{board}") {
+                    (200, json!({"items":[{"n":1}]}).to_string())
+                } else if method == "GET" && path == format!("/boards/{board}/items/1/rule-team") {
+                    (200, json!({"team":{"id":team,"slug":"work",
+                        "rules":[{"text":"x".repeat(70000),"source":"Owner"}]}}).to_string())
+                } else { (404, "{}".into()) }
+            });
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".into();
+            }
+            let before = state.lock().unwrap().sessions.len();
+            let result = mcp_start_session(&state, &json!({"type":"codex","label":"child",
+                "task_id":"task-1","prompt":"p".repeat(MAX_SEND_INPUT_BYTES)}), Some("ts-caller"));
+            assert!(result.unwrap_err().1.contains("cannot deliver item team rules"));
+            assert_eq!(state.lock().unwrap().sessions.len(), before);
+            assert!(stub.requests.lock().unwrap().iter().any(|r|
+                r.path == format!("/boards/{board}/items/1/rule-team")));
+            kill_all_sessions(&state);
+        });
+    }
+
     /// ux-5c scope guard: auto-delivery requires an EXPLICIT `task_id`
     /// param. A child spawned without one still INHERITS the caller's
     /// binding (grouping), but that binding must not trigger delivery —
@@ -34956,6 +35184,9 @@ while True:
     #[test]
     fn trigger_fresh_composes_params_tagged_with_continuous_task_id() {
         with_continuous_home(|home| {
+            crate::items::org::reset_cache_for_test();
+            crate::items::org::absorb_reply(&json!({"org":{"members":{},
+                "continuous_members":{"ct-fresh":"mem_continuous"}}}), 1.0);
             let wt = home.join("wt");
             std::fs::create_dir_all(&wt).unwrap();
             let task = continuous_task(
@@ -34987,6 +35218,9 @@ while True:
             assert_eq!(captured.len(), 1, "exactly one spawn per fire");
             let full = &captured[0];
             assert_eq!(full["continuous_task_id"], json!("ct-fresh"));
+            assert_eq!(full["org"]["attribution_member_id"], "mem_continuous");
+            assert_eq!(full["org"]["attribution_acting_as"], "main");
+            assert!(full["org"].get("member_id").is_none(), "attribution must not claim membership");
             assert_eq!(full["task_id"], json!("ct-fresh"));
             assert_eq!(full["session_type"], json!("claude-code"));
             assert_eq!(
@@ -35014,8 +35248,35 @@ while True:
             let line: crate::continuous::runlog::RunLogLine =
                 serde_json::from_str(runs.lines().next().expect("one line")).unwrap();
             assert_eq!(line.event, "fired");
+            crate::items::org::reset_cache_for_test();
             assert_eq!(line.run_mode.as_deref(), Some("fresh"));
             assert_eq!(line.session_uid.as_deref(), Some(session_uid));
+        });
+    }
+
+    #[test]
+    fn trigger_fresh_rejects_oversized_composed_rules_before_spawn() {
+        with_continuous_home(|home| {
+            crate::items::org::reset_cache_for_test();
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let task = continuous_task("ct-too-big", crate::continuous::task::Engine::Codex,
+                crate::continuous::task::RunMode::Fresh, &wt);
+            crate::continuous::task::save(&task).unwrap();
+            crate::items::org::absorb_reply(&json!({"org":{"members":{},
+                "continuous_members":{"ct-too-big":"mem_ct"},
+                "rules_by_member":{"mem_ct":{"member":{"rules":[{"text":"x".repeat(70000),"source":"Owner"}]}}}}}), 1.0);
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            state.lock().unwrap().messaging_root = home.into();
+            arm_continuous_spawn_spy_for_test();
+            let error = trigger(&state, &Caller::operator("op-token"),
+                &json!({"task_id":"ct-too-big", "prompt":"p".repeat(MAX_SEND_INPUT_BYTES)})).unwrap_err();
+            assert!(error.1.contains("cannot deliver continuous prompt"));
+            assert!(take_continuous_spawn_spy_for_test().is_empty());
+            let saved = crate::continuous::task::load_one("ct-too-big").unwrap();
+            assert!(saved.in_flight.is_none());
+            assert_eq!(saved.run_count, 0);
+            crate::items::org::reset_cache_for_test();
         });
     }
 

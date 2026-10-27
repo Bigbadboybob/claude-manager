@@ -695,6 +695,27 @@ fn rpc_round_trip(daemon_socket: &Path, req: &Request) -> anyhow::Result<Respons
     rpc_round_trip_with_read_timeout(daemon_socket, req, DEFAULT_RPC_READ_TIMEOUT)
 }
 
+/// Runs on the planning brief worker. Old daemons explicitly fall back to
+/// the legacy brief; other failures are surfaced instead of dropping rules.
+pub(crate) fn rpc_prepare_org_brief(socket: &Path, token: &str, uid: &str, task: &str,
+    prompt: &str) -> anyhow::Result<(String, Option<String>)> {
+    let request = Request { id: next_request_id(), caller: Caller::operator(token),
+        method: "session.prepare_org_brief".into(),
+        params: serde_json::json!({"uid":uid, "task_id":task, "prompt":prompt}) };
+    let response = match rpc_round_trip_with_read_timeout(socket, &request, START_WORKFLOW_RPC_READ_TIMEOUT) {
+        Ok(response) => response,
+        Err(e) if e.downcast_ref::<DaemonRpcError>().is_some_and(|e| e.code == ErrorCode::UnknownMethod) => {
+            anyhow::ensure!(prompt.len() <= cm_daemon::control::methods::MAX_SEND_INPUT_BYTES,
+                "brief exceeds agent input limit");
+            return Ok((prompt.to_owned(), Some("Old daemon: standing rules unavailable for this brief".into())));
+        }
+        Err(e) => return Err(e),
+    };
+    let body = response.result.context("brief preparation returned no result")?;
+    let text = body["prompt"].as_str().context("brief preparation returned no prompt")?.to_owned();
+    Ok((text, None))
+}
+
 pub(crate) fn rpc_continuous_control(daemon_socket: &Path, token: &str, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
     anyhow::ensure!(matches!(method, "continuous.list" | "continuous.drain" | "continuous.pause"), "unsupported continuous control");
     let request = Request { id: next_request_id(), caller: Caller::operator(token), method: method.into(), params };
@@ -2472,6 +2493,30 @@ pub(crate) mod tests {
     use tempfile::TempDir;
 
     // --- attach failure classification (cm/fix-frozen-remote-session) --------
+
+    #[test]
+    fn old_daemon_brief_fallback_is_explicit_and_other_errors_are_not_retried() {
+        for (code, size) in [(ErrorCode::UnknownMethod, 8), (ErrorCode::Unauthorized, 8),
+                             (ErrorCode::UnknownMethod, cm_daemon::control::methods::MAX_SEND_INPUT_BYTES + 1)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("daemon.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = wire::read_request(&mut stream).unwrap().unwrap();
+                assert_eq!(req.method, "session.prepare_org_brief");
+                wire::write_response(&mut stream, &Response::err(req.id, code, "test")).unwrap();
+            });
+            let prompt = "x".repeat(size);
+            let result = rpc_prepare_org_brief(&path, "op", "uid", "task", &prompt);
+            if code == ErrorCode::UnknownMethod && size == 8 {
+                let (body, warning) = result.unwrap();
+                assert_eq!(body, prompt);
+                assert!(warning.unwrap().contains("Old daemon"));
+            } else { assert!(result.is_err()); }
+            server.join().unwrap();
+        }
+    }
 
     #[test]
     fn attach_failure_notfound_is_session_gone() {

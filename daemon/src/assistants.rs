@@ -48,6 +48,11 @@ pub const CAPABILITY: &str = "assistant_guard_v1";
 pub const MEMBER_ID: &str = "member_id";
 pub const ACTING_AS: &str = "acting_as";
 pub const MEMBER_VIA: &str = "member_via";
+/// Attribution-only provenance for lifecycle-owned sessions. These keys are
+/// deliberately distinct from `member_id`/`acting_as`: the latter participate
+/// in existing assistant lifecycle and control checks.
+pub const ATTRIBUTION_MEMBER_ID: &str = "attribution_member_id";
+pub const ATTRIBUTION_ACTING_AS: &str = "attribution_acting_as";
 /// Set on a fresh top-level agent session created by the TUI/operator. The
 /// org heartbeat consumes this durable intent and seats the session under
 /// Owner; it is never set for restores, assistants, shells, continuous runs,
@@ -124,6 +129,22 @@ pub fn membership(uid: &str, org: Option<&OrgObject>) -> Option<Membership> {
 
 pub fn of_session(sess: &DaemonSession) -> Option<Membership> {
     membership(&sess.uid, sess.org.as_ref())
+}
+
+/// Attribution for display and evidence only; never use for lifecycle,
+/// authorization or occupancy. Ordinary membership takes precedence.
+pub fn attribution(sess: &DaemonSession) -> Option<Membership> {
+    if is_shell(&sess.session_type) { return None; }
+    if let Some(m) = of_session(sess) { return Some(m); }
+    let org = sess.org.as_ref()?;
+    let member_id = org.get(ATTRIBUTION_MEMBER_ID)?.as_str().filter(|s| !s.is_empty())?;
+    let acting_as = match org.get(ATTRIBUTION_ACTING_AS)?.as_str()? {
+        MAIN => MAIN,
+        ASSISTANT => ASSISTANT,
+        WORKER => WORKER,
+        _ => return None,
+    };
+    Some(Membership { member_id: member_id.to_owned(), acting_as })
 }
 
 /// A member's main session or one of its (durable) assistants: never closed
@@ -226,13 +247,30 @@ pub fn stamp_spawn(
     session_type: &str,
     org: &mut Option<OrgObject>,
 ) -> Option<&'static str> {
-    if has_member_key(org.as_ref()) || main_member(uid).is_some() || is_shell(session_type) {
+    if has_member_key(org.as_ref()) || org.as_ref().is_some_and(|o| o.contains_key(ATTRIBUTION_MEMBER_ID))
+        || main_member(uid).is_some() || is_shell(session_type) {
         return None;
     }
     let spawner = spawner_uid.filter(|s| *s != uid)?;
-    let (member_id, role) = member_for_spawn(state, spawner)?;
+    let Some((member_id, role)) = member_for_spawn(state, spawner) else {
+        if let Some((member_id, role)) = attribution_only_child(state, spawner) {
+            bridge::set(org, ATTRIBUTION_MEMBER_ID, json!(member_id));
+            bridge::set(org, ATTRIBUTION_ACTING_AS, json!(role));
+        }
+        return None;
+    };
     stamp(org, &member_id, role, &format!("spawn:{spawner}"));
     Some(role)
+}
+
+// Propagate known evidence from a lifecycle-owned workflow/continuous parent
+// without creating an assistant, stream workspace, or main-session grant.
+pub(crate) fn attribution_only_child(state: &DaemonState, uid: &str) -> Option<(String, &'static str)> {
+    let parent = state.sessions.get(uid)?;
+    if of_session(parent).is_some() { return None; }
+    let member = attribution(parent)?;
+    let role = if parent.continuous_task_id.is_some() { WORKER } else { child_role(&member) };
+    Some((member.member_id, role))
 }
 
 /// A fork's stamp (design: the fork works for the SOURCE's member, not the
@@ -241,7 +279,16 @@ pub fn fork_org(state: &DaemonState, source_uid: &str, session_type: &str) -> Op
     if is_shell(session_type) {
         return None;
     }
-    let (member_id, role) = member_for_spawn(state, source_uid)?;
+    let (member_id, role) = match member_for_spawn(state, source_uid) {
+        Some(m) => m,
+        None => {
+            let (member_id, role) = attribution_only_child(state, source_uid)?;
+            let mut org = None;
+            bridge::set(&mut org, ATTRIBUTION_MEMBER_ID, json!(member_id));
+            bridge::set(&mut org, ATTRIBUTION_ACTING_AS, json!(role));
+            return org;
+        }
+    };
     let mut org = None;
     stamp(&mut org, &member_id, role, &format!("fork:{source_uid}"));
     org

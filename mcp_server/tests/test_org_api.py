@@ -161,6 +161,9 @@ class OrgApiDb(unittest.IsolatedAsyncioTestCase):
              "task_id": s.get("task_id"), "workspace_id": s.get("ws"),
              "worktree_path": s.get("path"), "continuous_task_id": s.get("continuous"),
              "managed_by_uid": s.get("managed_by"), "workflow_run_id": s.get("workflow"),
+             "member_id": s.get("member_id"), "acting_as": s.get("acting_as"),
+             "attribution_member_id": s.get("attribution_member_id"),
+             "attribution_acting_as": s.get("attribution_acting_as"),
              "auto_place_owner": s.get("auto_place_owner", False),
              "spawned_age_s": s.get("age_s", 3 * 86400)}
             for s in sessions], **extra}
@@ -470,6 +473,42 @@ class OrgApiDb(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(wren["primary_team_id"], team["id"])
 
     # ---- adoption, heartbeat, reads --------------------------------------------
+
+    async def test_heartbeat_rules_include_remote_members_for_local_workers(self):
+        main = uid_at(0.1, 71)
+        await self.beat(D1, [{"uid": main, "name": "Rules Main"}])
+        adopted = await self.http.post("/org/adopt", json={
+            "actor": OWNER, "pid": pid(main), "handle": "rules-main", "request_id": "rules-adopt"})
+        self.assertEqual(adopted.status_code, 200, adopted.text)
+        member = adopted.json()["member"]["id"]
+        team = (await self.http.post("/org/teams", json={
+            "actor": OWNER, "name": "Rules Team", "slug": "rules-team"})).json()["id"]
+        member_rules = [{"text": f"member rule {i}", "source": "Owner"} for i in range(12)]
+        team_rules = [{"text": "team rule", "source": "lead"}]
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE members SET standing_rules=$2, primary_team_id=$3 WHERE id=$1",
+                               member, member_rules, uuid.UUID(team))
+            await conn.execute("UPDATE initiatives SET standing_rules=$2 WHERE id=$1",
+                               uuid.UUID(team), team_rules)
+        local = await self.beat(D1, [{"uid": main, "name": "Rules Main"}])
+        snapshot = local["org"]["rules_by_member"][member]
+        self.assertEqual(snapshot["member"]["rules"], member_rules)
+        self.assertEqual(snapshot["team"]["rules"], team_rules)
+        worker = uid_at(0.01, 72)
+        remote = await self.beat(D2, [{"uid": worker, "name": "worker", "member_id": member,
+                                       "acting_as": "worker", "managed_by": "remote-main"}])
+        self.assertEqual(remote["org"]["rules_by_member"][member], snapshot)
+        workflow = uid_at(0.01, 74)
+        lifecycle_owned = await self.beat("d4", [{"uid": workflow, "name": "workflow", "workflow": "wf",
+                                                   "attribution_member_id": member,
+                                                   "attribution_acting_as": "assistant"}])
+        self.assertEqual(lifecycle_owned["org"]["rules_by_member"][member], snapshot)
+        async with self.pool.acquire() as conn:
+            fact = await conn.fetchrow("SELECT member_id, acting_as FROM org_session_facts WHERE pid=$1",
+                                       pid(workflow, "d4"))
+        self.assertTrue(fact is None or (fact["member_id"] is None and fact["acting_as"] is None))
+        unrelated = await self.beat("d3", [{"uid": uid_at(0.01, 73), "name": "unbound"}])
+        self.assertNotIn(member, unrelated["org"]["rules_by_member"])
 
     async def test_fresh_top_level_agents_auto_place_under_owner_and_exclusions_stay_unplaced(self):
         uid = uid_at(0.01)

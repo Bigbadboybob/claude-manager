@@ -730,9 +730,16 @@ fn adoption_deferred_join_requires_current_generation_and_no_pending_intent() {
         let (state, p, _) = adoption_fixture();
         let first = adoption_commit_request(&state, &p);
         crate::continuous::adoption::handle(&state, &first).unwrap();
+        {
+            let mut s = state.lock().unwrap();
+            let session = s.sessions.get_mut("ts-adopt").unwrap();
+            crate::org_bridge::set(&mut session.org, crate::assistants::ATTRIBUTION_MEMBER_ID, json!("mem_scheduler"));
+            crate::org_bridge::set(&mut session.org, crate::assistants::ATTRIBUTION_ACTING_AS, json!("worker"));
+        }
         let old = adoption_deferred_join(&state);
         let mut sent = 0;
-        crate::messaging::tasks::forward_joins(&state, vec![old.clone()], |_, _| {
+        crate::messaging::tasks::forward_joins(&state, vec![old.clone()], |_, _, attribution| {
+            assert_eq!(attribution, Some(json!({"member_id":"mem_scheduler","acting_as":"worker"})));
             let handle = state.try_lock().expect("no state lock across network").messaging.clone();
             assert!(handle.try_lock().is_ok(), "no store lock across network");
             assert!(crate::continuous::adoption::try_binding_lock().is_none(), "hold generation gate across effect");
@@ -745,7 +752,7 @@ fn adoption_deferred_join_requires_current_generation_and_no_pending_intent() {
         next["request_id"] = json!("deferred-second");
         let second = adoption_commit_request(&state, &next);
         crate::continuous::adoption::handle(&state, &second).unwrap();
-        crate::messaging::tasks::forward_joins(&state, vec![old], |_, _| panic!("stale same-UID join sent"));
+        crate::messaging::tasks::forward_joins(&state, vec![old], |_, _, _| panic!("stale same-UID join sent"));
         let current = adoption_deferred_join(&state);
         continuous_pause(&state, &json!({"task_id":"adopt-40","paused":true})).unwrap();
         next["request_id"] = json!("deferred-intent");
@@ -753,7 +760,7 @@ fn adoption_deferred_join_requires_current_generation_and_no_pending_intent() {
         crate::continuous::adoption::inject_fault(Some("intent"));
         assert!(crate::continuous::adoption::handle(&state, &third).is_err());
         crate::continuous::adoption::inject_fault(None);
-        crate::messaging::tasks::forward_joins(&state, vec![current], |_, _| panic!("pending intent join sent"));
+        crate::messaging::tasks::forward_joins(&state, vec![current], |_, _, _| panic!("pending intent join sent"));
         kill_all_sessions(&state);
     });
 }

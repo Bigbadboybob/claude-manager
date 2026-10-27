@@ -222,6 +222,18 @@ class GateApiDb(unittest.IsolatedAsyncioTestCase):
         self.assertIn("receipt_stale", await self.flags())
 
     # ---- posting and reading ------------------------------------------------
+    async def test_receipt_and_grant_preserve_signer_attribution_without_changing_authority(self):
+        poster = {**LANE, "member_id": "mem_poster", "acting_as": "assistant"}
+        rec = await self.post(wire(), actor=poster)
+        self.assertEqual((rec["poster"], rec["poster_member_id"], rec["poster_acting_as"]),
+                         (LANE["pid"], "mem_poster", "assistant"))
+        denied = await self.grant(actor=poster, ok=False)
+        self.assertEqual(denied.status_code, 403)
+        grantor = {**EP, "member_id": "mem_grantor", "acting_as": "main"}
+        grant = await self.grant(actor=grantor)
+        self.assertEqual((grant["grantor"], grant["grantor_member_id"], grant["grantor_acting_as"]),
+                         (EP["pid"], "mem_grantor", "main"))
+
     async def test_a_receipt_renders_on_the_board_and_moves_the_version(self):
         before = (await self.board())["board"]["version"]
         rec = await self.post(wire())

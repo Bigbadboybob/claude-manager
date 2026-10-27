@@ -66,6 +66,10 @@ pub struct FinalizeCtx<'a> {
     /// Canonical ID read from the live role process's open Codex rollout.
     /// Never inferred from the newest file in a shared worktree.
     pub codex_rollout_id: Option<String>,
+    /// The recipient's daemon-resolved standing rules, if known. Frozen with
+    /// the rendered prompt before any input effect so retries remain exact.
+    pub standing_rules: Option<serde_json::Value>,
+    pub rules_root: &'a Path,
     pub now_ms: u64,
     pub now_instant: Instant,
     pub gap_ms: u64,
@@ -152,6 +156,11 @@ where
         ActivationPhase::Queued => {
             // Step 1: render from the PRE-reset, PRE-append snapshot and freeze.
             let rendered = render_activation(ctx, &run, &pa);
+            let first = pa.is_initial || !run.history.iter().any(|h| h.role == pa.target_role);
+            let rendered = if first {
+                crate::items::org::compose_rules(ctx.rules_root, ctx.standing_rules.as_ref(), &rendered)
+                    .map_err(PersistError::Io)?
+            } else { rendered };
             run::modify(ctx.run_id, |r| {
                 if let Some(pa) = r.pending_activation.as_mut() {
                     pa.rendered_prompt = Some(rendered.clone());
@@ -715,6 +724,8 @@ to = "manager"
             worktree: wt,
             role_engines: role_engines(),
             codex_rollout_id: None,
+            standing_rules: None,
+            rules_root: wt,
             now_ms,
             now_instant: Instant::now(),
             gap_ms,

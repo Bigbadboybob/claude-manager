@@ -290,6 +290,8 @@ pub(super) const CODEX_RESUME_REBIND_WINDOW: Duration = Duration::from_secs(120)
 /// (encoded for the session's current mode) at delivery time.
 pub struct PendingWrite {
     pub text: String,
+    /// An optional off-thread rule preparation; no text is written before it succeeds.
+    pub prepare: Option<std::sync::mpsc::Receiver<Result<(String, Option<String>), String>>>,
     pub submit: bool,
     pub earliest_deliver_at: Instant,
     pub require_quiet: Duration,
@@ -304,6 +306,7 @@ impl PendingWrite {
         let now = Instant::now();
         PendingWrite {
             text,
+            prepare: None,
             submit,
             earliest_deliver_at: now + floor,
             require_quiet: quiet,

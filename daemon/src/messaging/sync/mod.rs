@@ -74,6 +74,7 @@ struct Command {
     actor: String,
     method: String,
     params: Value,
+    attribution: Option<Value>,
 }
 struct Pending {
     reply: mpsc::SyncSender<Result<Value>>,
@@ -382,6 +383,10 @@ impl Runtime {
     pub fn request(&self, actor: &str, method: &str, params: &Value) -> Result<Value> {
         self.request_scoped(actor, method, params, None)
     }
+    pub(crate) fn request_with_attribution(&self, actor: &str, method: &str, params: &Value,
+                                           attribution: Option<Value>) -> Result<Value> {
+        self.request_scoped_inner(actor, method, params, None, attribution)
+    }
     /// True when the hub connection negotiated per-scope backfill.
     pub fn scoped(&self) -> bool {
         self.scoped.load(Ordering::Acquire)
@@ -395,6 +400,12 @@ impl Runtime {
         method: &str,
         params: &Value,
         history: Option<(Vec<String>, Duration)>,
+    ) -> Result<Value> {
+        self.request_scoped_inner(actor, method, params, history, None)
+    }
+    fn request_scoped_inner(
+        &self, actor: &str, method: &str, params: &Value,
+        history: Option<(Vec<String>, Duration)>, attribution: Option<Value>,
     ) -> Result<Value> {
         if !self.connected.load(Ordering::Acquire) {
             return Err(error(
@@ -427,6 +438,7 @@ impl Runtime {
                 actor: actor.into(),
                 method: method.into(),
                 params: params.clone(),
+                attribution,
             })
             .is_err()
         {

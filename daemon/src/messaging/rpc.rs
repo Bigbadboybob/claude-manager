@@ -297,7 +297,7 @@ fn execute_with_freshness(
             message: e.into(),
         })?;
     }
-    let (handle, root, uid, kind, live, draining, graph, search_budget) = {
+    let (handle, root, uid, kind, live, draining, graph, search_budget, attribution) = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         let (uid, kind) = match &req.caller {
             Caller::Operator(_) => (String::new(), "owner"),
@@ -320,6 +320,14 @@ fn execute_with_freshness(
             }
         };
         let live = super::live_sessions(&s);
+        let attribution = if kind == "agent" {
+            s.sessions.get(&uid).and_then(crate::assistants::attribution).or_else(|| {
+                s.tui_sessions.get(&uid)
+                    .filter(|t| t.session_type.as_deref().is_some_and(|e| e != "bash"))
+                    .and_then(|_| crate::assistants::main_member(&uid))
+                    .map(|member_id| crate::assistants::Membership { member_id, acting_as: crate::assistants::MAIN })
+            })
+        } else { None };
         (
             s.messaging.clone(),
             s.messaging_root.clone(),
@@ -329,6 +337,7 @@ fn execute_with_freshness(
             s.draining,
             super::tasks::SessionGraph::capture(&s),
             s.config.chat_search_budget_bytes,
+            attribution,
         )
     };
     if draining {
@@ -498,7 +507,8 @@ fn execute_with_freshness(
             drop(_delivery_guard);
             if forward {
                 let submitted_at = chrono::Utc::now();
-                let mut result = sync.request(&actor, &req.method, &forwarded)?;
+                let attribution = attribution.as_ref().map(|m| json!({"member_id":m.member_id, "acting_as":m.acting_as}));
+                let mut result = sync.request_with_attribution(&actor, &req.method, &forwarded, attribution)?;
                 let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
                 let store = slot.as_mut().unwrap();
                 if req.method == "messaging.send" {
@@ -544,7 +554,9 @@ fn execute_with_freshness(
     // locks while the effect guards below are held (another task may be busy).
     let continuous_orientation = (req.method == "messaging.open")
         .then(|| super::tasks::orientation(store, &graph, &uid));
-    let result = {
+    store.operation_attribution = attribution.as_ref()
+        .map(|m| (actor.clone(), m.member_id.clone(), m.acting_as.to_owned()));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
     let mut authority = super::task_authority::View::new(store);
     let store = &mut *authority;
     match req.method.as_str() {
@@ -626,7 +638,9 @@ fn execute_with_freshness(
             message: "Messaging method not implemented".into(),
         }),
     }
-    };
+    }));
+    store.operation_attribution = None;
+    let result = match result { Ok(result) => result, Err(panic) => std::panic::resume_unwind(panic) };
     if req.method == "messaging.read"
         && ["sender", "query"].iter().any(|key| p.get(key).is_some_and(|v| !v.is_null()))
     {

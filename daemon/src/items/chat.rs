@@ -146,6 +146,7 @@ pub(crate) fn post_suggestion(body: &str, ns: &[i64], is_reply: bool) -> Option<
 struct Job {
     api: Api,
     actor: Value,
+    attribution: Option<crate::assistants::Membership>,
     ns: Vec<i64>,
     channel: Option<String>,
     message_id: Option<String>,
@@ -169,19 +170,24 @@ fn worker() -> &'static SyncSender<Job> {
 /// One call: the API resolves boards and applies the sender rules. An API
 /// that predates it (404) gets the holder-only touches below.
 fn run(job: &Job) {
-    let mut body = json!({"actor": job.actor, "ns": job.ns, "channel": job.channel, "source": "chat",
+    let mut actor = job.actor.clone();
+    if let Some(m) = job.attribution.as_ref().filter(|_| job.api.attribution_wire()) {
+        actor["member_id"] = json!(m.member_id);
+        actor["acting_as"] = json!(m.acting_as);
+    }
+    let mut body = json!({"actor": actor, "ns": job.ns, "channel": job.channel, "source": "chat",
                           "message_id": job.message_id, "excerpt": job.excerpt});
     if let Some((keyword, status)) = job.suggest {
         body["suggest"] = json!({"keyword": keyword, "status": status});
     }
     if let Err((crate::control::protocol::ErrorCode::NotFound, _)) = job.api.post("/items/chat-touch", &body) {
-        run_holder_only(job);
+        run_holder_only(job, &actor);
     }
 }
 
 /// Pre-2026-10-20 API: touch, on every board where the sender holds one of
 /// the named items, the items it holds there. Timeouts are skipped silently.
-fn run_holder_only(job: &Job) {
+fn run_holder_only(job: &Job, actor: &Value) {
     let pid = job.actor["pid"].as_str().unwrap_or_default();
     let Ok(held) = job.api.get("/items", &[("holder_pid", pid.to_owned()), ("open", "true".into())]) else {
         return;
@@ -196,7 +202,7 @@ fn run_holder_only(job: &Job) {
     for (board, ns) in by_board {
         let _ = job.api.post(
             &format!("/boards/{board}/items/touch"),
-            &json!({"actor": job.actor, "ns": ns, "source": "chat",
+            &json!({"actor": actor, "ns": ns, "source": "chat",
                     "message_id": job.message_id, "excerpt": job.excerpt}),
         );
     }
@@ -238,12 +244,16 @@ pub fn on_send(state: &Arc<Mutex<DaemonState>>, uid: &str, params: &Value, reply
     if ns.is_empty() {
         return;
     }
+    // The immutable sent event captures the signer at the send boundary. A
+    // same-UID revival after that boundary must not retag its later touch.
+    let attribution = event_attribution(reply, &format!("agent:{daemon_id}:{uid}"));
     let Ok(api) = Api::from_config(&api_url, &api_token) else { return };
     let suggest = post_suggestion(body, &ns, thread_root.is_some());
     let job = Job {
         api: api.with_timeout(TIMEOUT),
         actor: json!({"pid": format!("agent:{daemon_id}:{uid}"), "name": name.unwrap_or(title),
                       "session_uid": uid, "daemon_id": daemon_id, "task_id": task_id}),
+        attribution,
         ns,
         channel,
         message_id: reply["event_id"].as_str().or_else(|| reply["event"]["id"].as_str()).map(str::to_owned),
@@ -257,9 +267,31 @@ pub fn on_send(state: &Arc<Mutex<DaemonState>>, uid: &str, params: &Value, reply
     }
 }
 
+fn event_attribution(reply: &Value, pid: &str) -> Option<crate::assistants::Membership> {
+    let actor = &reply["event"]["actor"];
+    if actor["id"] != pid || actor["kind"] != "agent" { return None; }
+    let member_id = actor["member_id"].as_str().filter(|s| !s.is_empty())?.to_owned();
+    let acting_as = match actor["acting_as"].as_str()? {
+        "main" => crate::assistants::MAIN,
+        "assistant" => crate::assistants::ASSISTANT,
+        "worker" => crate::assistants::WORKER,
+        _ => return None,
+    };
+    Some(crate::assistants::Membership { member_id, acting_as })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_touch_attribution_comes_from_the_sent_event() {
+        let event = json!({"event":{"actor":{"id":"agent:d:u","kind":"agent",
+            "member_id":"mem_original","acting_as":"worker"}}});
+        assert_eq!(event_attribution(&event, "agent:d:u").unwrap().member_id, "mem_original");
+        assert!(event_attribution(&event, "agent:d:replacement").is_none());
+        assert!(event_attribution(&json!({"event":{"actor":{"id":"agent:d:u","kind":"agent"}}}), "agent:d:u").is_none());
+    }
 
     #[test]
     fn keywords_suggest_a_status_only_when_unambiguous() {
@@ -330,6 +362,8 @@ mod tests {
                 let parts: Vec<String> = first.split_whitespace().map(str::to_owned).collect();
                 let (status, reply) = if parts[1] == "/items/chat-touch" {
                     (chat_touch, r#"{"touched":{"sfd":[7]},"skipped":[]}"#)
+                } else if parts[1] == "/org/attribution-wire" {
+                    (200, r#"{"contract":"cm-attribution-wire-v1","actor":true,"holder":true}"#)
                 } else if parts[0] == "GET" {
                     // Holds #7 on two boards, and #8 elsewhere (not named).
                     (200, r#"[{"board":"sfd","n":7},{"board":"other","n":7},{"board":"sfd","n":8}]"#)
@@ -392,6 +426,22 @@ mod tests {
         assert_eq!(body["message_id"], "reply-1");
         assert_eq!(body["source"], "chat");
         assert!(body["actor"]["pid"].as_str().unwrap().ends_with(":me-uid"));
+    }
+
+    #[test]
+    fn chat_touch_keeps_the_sent_signer_when_registry_no_longer_has_its_member() {
+        let _env = crate::test_support::env_lock();
+        let (url, seen) = fake_api(200);
+        let (state, _root_id, _dir) = thread_fixture(url);
+        let handle = state.lock().unwrap().messaging.clone();
+        let pid = handle.lock().unwrap().as_ref().unwrap().participant_id("me-uid");
+        on_send(&state, "me-uid", &json!({"channel":"general","body":"#7 update",
+            "member_id":"mem_forged"}), &json!({"event_id":"sent",
+            "event":{"actor":{"id":pid,"kind":"agent","member_id":"mem_original","acting_as":"worker"}}}));
+        let seen = wait_for(&seen, 2);
+        let post = seen.iter().find(|(m, p, _)| m == "POST" && p == "/items/chat-touch").unwrap();
+        assert_eq!(post.2["actor"]["member_id"], "mem_original");
+        assert_eq!(post.2["actor"]["acting_as"], "worker");
     }
 
     /// An API without /items/chat-touch gets the old holder-only touches.

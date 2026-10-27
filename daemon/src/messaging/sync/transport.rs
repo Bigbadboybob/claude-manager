@@ -804,7 +804,7 @@ fn serve_peer(runtime: &Arc<Runtime>, stream: UnixStream) -> Result<()> {
                             sub.interests.extend(requested);
                             Ok(json!({"caught_up":true}))
                         } else {
-                            store.coordinate(&host, actor, method, &frame["params"])
+                            store.coordinate_attributed(&host, actor, method, &frame["params"], &frame["attribution"])
                         };
                         if actor == "owner" {
                             if let Ok(v) = &mut result {
@@ -1498,7 +1498,7 @@ fn client_connection(runtime: &Arc<Runtime>) -> Result<()> {
                 }
                 write_frame(
                     &connection.writer,
-                    &json!({"kind":"call","id":command.id,"actor":command.actor,"method":command.method,"params":command.params,"people":runtime.local_people()}),
+                    &json!({"kind":"call","id":command.id,"actor":command.actor,"method":command.method,"params":command.params,"people":runtime.local_people(),"attribution":command.attribution}),
                 )?;
             }
             let uploads = runtime

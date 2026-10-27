@@ -314,6 +314,9 @@ pub struct Store {
     /// Ephemeral, effect-scoped daemon authority. Never persisted; standalone
     /// Store users retain their store-only contract when no view is installed.
     pub(super) task_authority: Option<BTreeMap<String, super::task_authority::Authority>>,
+    /// Authenticated operation attribution, installed only for the duration
+    /// of a local call or authenticated peer call. Never read from params.
+    pub(super) operation_attribution: Option<(String, String, String)>,
     /// Background deletion of superseded legacy coverage journal files.
     /// Declared before `_lock`: dropping the store stops it before the
     /// writer lock is released.
@@ -347,6 +350,16 @@ pub struct Store {
     owner_identity_revision: String,
 }
 impl Store {
+    /// Temporarily attribute an internally initiated operation to the
+    /// daemon-resolved session. Restore any outer context even on unwind.
+    pub(crate) fn with_operation_attribution<T>(&mut self, actor: &str,
+        member: Option<&crate::assistants::Membership>, f: impl FnOnce(&mut Self) -> T) -> T {
+        let prior = std::mem::replace(&mut self.operation_attribution,
+            member.map(|m| (actor.to_owned(), m.member_id.clone(), m.acting_as.to_owned())));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.operation_attribution = prior;
+        match result { Ok(value) => value, Err(panic) => std::panic::resume_unwind(panic) }
+    }
     pub fn open(cm_root: &Path) -> Result<Self> {
         mkdir(cm_root)?;
         let lock = OpenOptions::new()
@@ -411,6 +424,7 @@ impl Store {
             names: BTreeMap::new(),
             task_bindings: BTreeMap::new(),
             task_authority: None,
+            operation_attribution: None,
             degraded: None,
             replication: replication::Replication::new(
                 &meta,
@@ -885,9 +899,14 @@ impl Store {
             .clock
             .checked_add(1)
             .ok_or_else(|| err("clock_overflow", "Logical clock exhausted"))?;
-        Ok(
-            json!({"protocol":1,"space_id":self.space_id,"id":format!("{}:{}",self.daemon_id,uuid()),"origin_daemon_id":self.daemon_id,"logical_time":self.clock.to_string(),"type":ty,"created_at":now(),"actor":{"id":actor,"name":name,"kind":kind},"conversation_id":conv,"body":body,"data":data,"extensions":{},"request":{"key":key,"sha256":digest,"origin_daemon_id":if actor == "system" {&self.daemon_id} else {self.operation_origin()}}}),
-        )
+        let mut event = json!({"protocol":1,"space_id":self.space_id,"id":format!("{}:{}",self.daemon_id,uuid()),"origin_daemon_id":self.daemon_id,"logical_time":self.clock.to_string(),"type":ty,"created_at":now(),"actor":{"id":actor,"name":name,"kind":kind},"conversation_id":conv,"body":body,"data":data,"extensions":{},"request":{"key":key,"sha256":digest,"origin_daemon_id":if actor == "system" {&self.daemon_id} else {self.operation_origin()}}});
+        if kind == "agent" {
+            if let Some((_, member, role)) = self.operation_attribution.as_ref().filter(|(id, _, _)| id == actor) {
+                event["actor"]["member_id"] = json!(member);
+                event["actor"]["acting_as"] = json!(role);
+            }
+        }
+        Ok(event)
     }
     fn commit(&mut self, event: Value) -> Result<Value> {
         let bytes = serde_json::to_vec_pretty(&event)?;
@@ -2247,6 +2266,23 @@ mod tests {
             &[p.clone()],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn scheduler_membership_event_uses_scoped_attribution_and_restores_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = Store::open(tmp.path()).unwrap();
+        s.create_channel("owner", &json!({"action":"create","path":"ct/test","request_id":"create"})).unwrap();
+        let actor = s.participant_id("worker");
+        let member = crate::assistants::Membership { member_id: "mem_test".into(),
+            acting_as: crate::assistants::WORKER };
+        let result = s.with_operation_attribution(&actor, Some(&member), |s| s.channel_action(&actor,
+            &json!({"action":"join","path":"ct/test","request_id":"join"}), &[])).unwrap();
+        assert_eq!(result["event"]["actor"]["member_id"], "mem_test");
+        assert_eq!(result["event"]["actor"]["acting_as"], "worker");
+        assert!(s.operation_attribution.is_none());
+        let later = s.channel_action(&actor, &json!({"action":"leave","path":"ct/test","request_id":"leave"}), &[]).unwrap();
+        assert!(later["event"]["actor"].get("member_id").is_none());
     }
     #[test]
     fn names_collide_on_unicode_case_and_retries_survive_rebuild() {

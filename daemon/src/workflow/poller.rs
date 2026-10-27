@@ -853,6 +853,7 @@ impl WorkflowPoller {
         let quiet_ms = self.finalize_quiet_ms.load(Ordering::SeqCst);
 
         for w in work {
+            let rules_root = self.state.lock().unwrap_or_else(|p| p.into_inner()).messaging_root.clone();
             // Clone the input handle + fanout out of state, drop the state lock
             // before any PTY write (the lock contract from `DaemonSession`).
             let handle_fanout = {
@@ -877,6 +878,8 @@ impl WorkflowPoller {
                     codex_rollout_id: if session_type == "codex" {
                         crate::transcript_detect::detect_live_codex_id(pid, &w.worktree).map(|(id, _)| id)
                     } else { None },
+                    standing_rules: crate::items::org::rules_for_session(&self.state, &w.uid),
+                    rules_root: &rules_root,
                     now_ms: now_unix_ms(),
                     now_instant: Instant::now(),
                     gap_ms,

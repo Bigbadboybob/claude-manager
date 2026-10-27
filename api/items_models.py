@@ -27,6 +27,8 @@ class Actor(_Strict):
     session_uid: Short | None = None
     daemon_id: Short | None = None
     task_id: Short | None = None
+    member_id: Short | None = None
+    acting_as: Short | None = None
 
 
 class Holder(_Strict):
@@ -36,6 +38,8 @@ class Holder(_Strict):
     daemon_id: Short | None = None
     # owner | contributor | reviewer | approver (doc/org-model.md §7.2)
     role: Short | None = None
+    member_id: Short | None = None
+    acting_as: Short | None = None
 
 
 class ItemFields(_Strict):

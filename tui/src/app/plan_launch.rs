@@ -38,6 +38,33 @@ pub(super) struct PlanLaunchFlight {
 }
 
 impl App {
+    /// Prepare the brief on the owning daemon without blocking input. The
+    /// pending write waits for this result and surfaces failures to the user.
+    pub(super) fn plan_pending_brief(&self, host: &cm_daemon::host_id::HostId,
+        uid: &str, task: &str, prompt: &str) -> PendingWrite {
+        let mut pending = PendingWrite::wait_for_quiet(prompt.to_owned(), false,
+            Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(60));
+        let (tx, rx) = mpsc::channel();
+        let socket = self.host_pool.live_socket_path(host);
+        let pool = std::sync::Arc::clone(&self.host_pool);
+        let host = host.clone();
+        let uid = uid.to_owned();
+        let task = task.to_owned();
+        let text = prompt.to_owned();
+        let start = std::thread::Builder::new().name("cm-plan-brief".into()).spawn(move || {
+            let result = socket.ok_or_else(|| "owning daemon is unavailable".to_owned())
+                .and_then(|socket| crate::client_session::rpc_prepare_org_brief(
+                    &socket, &pool.operator_token_for(&host), &uid, &task, &text)
+                    .map_err(|e| e.to_string()));
+            let _ = tx.send(result);
+        });
+        // If thread creation fails, dropping tx disconnects the receiver and
+        // the pending write reports the error without sending an unprepared brief.
+        if let Err(error) = start { eprintln!("cm-plan-brief: {error}"); }
+        pending.prepare = Some(rx);
+        pending
+    }
+
     pub(super) fn start_remote_plan_launch(&mut self, spec: PlanLaunchSpec) {
         if self
             .plan_launches
