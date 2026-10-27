@@ -12126,10 +12126,15 @@ fn restore_one_session_with(
 #[cfg(test)]
 thread_local! {
     static RECOVERY_TEST_RESTORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static RECOVERY_TEST_TRANSCRIPT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 #[cfg(test)]
 pub(crate) fn recovery_test_restore_program(enabled: bool) {
     RECOVERY_TEST_RESTORE.with(|value| value.set(enabled));
+}
+#[cfg(test)]
+pub(crate) fn recovery_test_transcript(path: Option<PathBuf>) {
+    RECOVERY_TEST_TRANSCRIPT.with(|value| *value.borrow_mut() = path);
 }
 
 pub(crate) fn restore_one_session_launch(
@@ -16547,7 +16552,10 @@ fn resume_picked_session(state_arc: &Arc<Mutex<DaemonState>>, p: &AddSessionPara
         "claude-code" => crate::transcript_detect::claude_transcript_path(&record.worktree_path, id),
         "codex" => crate::transcript_detect::codex_transcript_path(id),
         _ => None,
-    }.filter(|p| p.is_file()).ok_or((ErrorCode::NotFound, "Requested transcript no longer exists on this host".into()))?;
+    };
+    #[cfg(test)]
+    let path = RECOVERY_TEST_TRANSCRIPT.with(|value| value.borrow().clone()).or(path);
+    let path = path.filter(|p| p.is_file()).ok_or((ErrorCode::NotFound, "Requested transcript no longer exists on this host".into()))?;
     record.entry.session_type = p.engine.clone();
     // An explicit choice replaces the recorded one; the rest are reused.
     use crate::models::{ModelSource, Setting};
