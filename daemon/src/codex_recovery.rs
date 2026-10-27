@@ -217,9 +217,14 @@ fn step(mut target: Target) -> std::io::Result<()> {
     }
     let snapshot = target.fanout.snapshot_since(None);
     if snapshot.closed { return Ok(()); }
+    // Startup keyboard escapes can be older than the retained replay ring.
+    // The fanout tracks their live state independently and restores it across
+    // brain adoption. A later output change still cancels the guarded write.
+    let keyboard = target.fanout.keyboard().0;
     let mut screen = PtyModeTracker::with_size(target.cols.max(1) as usize, target.rows.max(1) as usize);
     screen.feed(&snapshot.bytes, Instant::now());
-    if !screen.composer_ready() || !screen.codex_recovery_composer_ready()
+    let mode = keyboard.or_else(|| screen.composer_ready().then(|| screen.term_mode()));
+    if mode.is_none() || !screen.codex_recovery_composer_ready()
         || (!recoverable(&target.agent)
             && !(matches!(target.agent.detail.error_kind.as_deref(), Some("other" | "serverOverloaded"))
                 && legacy_error_screen(&screen.visible_text())))
@@ -245,7 +250,7 @@ fn step(mut target: Target) -> std::io::Result<()> {
     save(&target.receipt, &receipt)?;
     let path = target.receipt.clone();
     let uid = target.uid.clone();
-    let enter = screen.enter_bytes().to_vec();
+    let enter = crate::workflow::pty_tracker::enter_bytes_for_mode(mode.unwrap()).to_vec();
     let spawn_path = path.clone();
     let mut spawn_failure = receipt.clone();
     let spawned = std::thread::Builder::new().name(format!("cm-codex-recovery-{uid}")).spawn(move || {
@@ -402,6 +407,50 @@ mod tests {
         assert_eq!(r.target_transcript.as_deref(), Some(fresh.to_str().unwrap()));
         let (events, _) = crate::notifications::snapshot(d.path(), "test-1").unwrap();
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn evicted_keyboard_startup_survives_brain_adoption() {
+        for adopted in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let (mut target, writes) = fixture(d.path());
+            target.uid = format!("evicted-keyboard-{adopted}");
+            let screen = b"\x1b[2J\x1b[H\x1b[?25h\xe2\x96\xa0 Previous response was not found; retry without previous_response_id.\r\n\xe2\x80\xba Ask Codex to do anything\x1b[2;3H";
+            target.fanout.push(&vec![b' '; 4096]);
+            target.fanout.push(screen);
+            let ring = target.fanout.snapshot_since(None).bytes;
+            let mut replay = PtyModeTracker::with_size(160, 24);
+            replay.feed(&ring, Instant::now());
+            assert!(!replay.composer_ready(), "startup mode was evicted");
+            assert!(replay.codex_recovery_composer_ready());
+            if adopted {
+                let (_, keyboard) = target.fanout.keyboard();
+                target.fanout = Arc::new(crate::session::PtyByteFanout::new(4096));
+                target.fanout.seed_adopted(Some(&ring), Some(keyboard));
+            }
+            step(target).unwrap();
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            while load(&d.path().join("receipt.json")).unwrap().unwrap().phase == "claimed" {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let got: Vec<u8> = writes.lock().unwrap().iter().flat_map(|(_, b)| b.clone()).collect();
+            assert_eq!(got, b"/fork\x1b[13u");
+        }
+    }
+
+    #[test]
+    fn unknown_keyboard_without_startup_evidence_is_skipped() {
+        let d = tempfile::tempdir().unwrap();
+        let (mut target, writes) = fixture(d.path());
+        target.uid = "unknown-keyboard".into();
+        let ring = target.fanout.snapshot_since(None).bytes;
+        target.fanout = Arc::new(crate::session::PtyByteFanout::new(4096));
+        target.fanout.seed_adopted(Some(&ring[b"\x1b[>1u".len()..]), None);
+        assert!(target.fanout.keyboard().0.is_none());
+        step(target).unwrap();
+        assert!(writes.lock().unwrap().is_empty());
+        assert!(!d.path().join("receipt.json").exists());
     }
 
     #[test]
