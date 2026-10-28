@@ -90,7 +90,7 @@ snapshot/revalidation state; do not hold it across I/O.
 | Gate report/waive/profile: `items/gate.rs:92`, `:109`, `:476`, `:511` | `api/items.py:145`, `:159`, `:166`, `:181` → `gate_db.py:274`, `:499`, `:525`, `:562`, `:623`, `:650`; report explicitly uses daemon board edit; grant/profile have their own grantor/message/content/editor checks and may bypass that generic check. Rechecking a message while reading receipts (`gate.rs:431`) can PATCH a grant: tag this system/read-derived effect and don't treat it as a user-issued waiver. Approver contact is not a grant. |
 | Chat touch and internal effects | `api/items.py:114`, `:121` → `items_db.py:578`, `:589`, `:599` and `items_rules.py:1050`: per-item holder/steward and ambiguity rules; `placement.py:186` launch-grant transfer; `epics.py:219` staffing; `gate_db.py` refresh. System/daemon-origin operations have no session actor unless proven and must not be assigned one. |
 | Legacy task writes: `control/methods.rs:19482`, `:19547`; `api/main.py:935`, `:945` | Placed-task status and description PATCH can enter `placement.py:457`, `:549` through the legacy adapter; task scope, board/status mirror and side effects are separate components. A direct legacy API write may have no verified daemon correlation; do not pretend it traversed `items/rpc.rs:350`. |
-| Direct API / TUI paths | `api/items.py:40` router uses `api/auth.py:7` shared bearer. It trusts supplied actor fields by design; possession of that bearer or a claimed daemon ID does **not** prove a particular actor/host. Direct API, TUI/operator, retry and internal calls must have an explicit origin class. If no authenticated daemon-side correlation exists, store `unverified_origin`, observe central result separately and leave end-to-end candidate/coverage unknown. Do not join on actor/body/time alone. `api/items.py:90` delete has no actor in this API: record as a separate bearer-auth operation, not an attributed member decision. |
+| Direct API / TUI paths | `api/items.py:40` router uses `api/auth.py:7` shared bearer. It trusts supplied actor fields by design; possession of that bearer or a claimed daemon ID does **not** prove a particular actor/host. Direct API, TUI/operator, retry and internal calls must have an explicit origin class. For independent API-side telemetry without authenticated producer correlation, store `unverified_origin` and do not join on actor/body/time. A trusted daemon can still record the effective result from the response to its own call where that response is decisive; candidate facts and independent API producer identity are separate questions. `api/items.py:90` delete has no actor in this API: record as a separate bearer-auth operation, not an attributed member decision. |
 
 A `gate_profile` read, a board read or an internal background refresh is not a
 user board-edit attempt merely because it shares dispatch code. Conversely,
@@ -180,24 +180,51 @@ observation. API-generated direct attempts use their own trusted process
 lineage and ID and cannot claim to be daemon-origin solely from a header.
 An optional correlation header must be negotiated outside strict request
 bodies and authenticated/bound by a future compatible transport; until then it
-is **untrusted hint only**, so API and daemon records stay unjoined/unknown.
-Never attach labels or match by time/PID/body as proof. This is a present
-coverage limitation: old/direct calls cannot yield an authenticated joined
-end-to-end result from existing wires. The safe initial choice is separately
-recorded components with `unverified_origin` / `unknown`; a later versioned,
-authenticated correlation transport can improve coverage without changing
-authorization. Neither a caller-supplied ID nor a shared bearer solves it.
+is an **untrusted hint only** for joining an independently produced API event
+to a daemon event. Never match by time/PID/body as proof, and never treat a
+shared bearer or caller-supplied ID as proof of an independent producer. A
+later authenticated correlation transport can improve independent component
+coverage without changing authorization; it is not required to observe the
+response of the daemon's own existing outbound call.
+
+The daemon already holds its own request span across `items/api.rs:54`–`:89`
+(`get`, `post`, `patch`, `put`) and its directly returned response is linked to
+that very call by control flow. `finish` at `:93`–`:113` reads HTTP status and
+body; `map_error` at `:117` maps 403 to `Unauthorized`, 404/409/422 to other
+codes and flattens structured detail into a message. The observer can capture
+a bounded, typed status/detail code **before** flattening and without changing
+the returned error, while preserving the existing synchronous HTTP call and
+never adding a telemetry wait. Its local span therefore supports these results:
+
+| Existing response and scope | Effective authorization observation | Execution / coverage |
+|---|---|---|
+| Daemon precheck denies before making API request | Known daemon denial with its actual reason; API check `not_evaluated`. | No API execution; retain the original response unchanged. |
+| Daemon precheck passes and its exact API call returns a parsed successful response for an operation whose relevant checks were executed | Known effective authorization **allow** for that operation/child; no separate independently authenticated API record is needed. | Record actual result separately; `each`/bulk, idempotent replay, no-op or asynchronous acceptance require per-child/phase interpretation. Success does not prove downstream delivery or processing, or that a skipped check was evaluated. |
+| Exact API response carries a validated structured authorization denial from the relevant endpoint | Known effective **deny** with its typed source/reason, following any daemon precheck. | No inference from raw text; retain original mapped error. An independently emitted API event remains separately unverified unless its origin is bound. |
+| Timeout, lost/invalid reply, 401 shared-token authentication failure, 404/409/422, unclassified 403/5xx, ambiguous bulk result or unknown check order | `unknown` or `not_evaluated` as the captured phase warrants; never reinterpret an ambiguous error as policy deny. | Execution/commit may be unknown after timeout; do not blindly reissue. |
+| Direct API/TUI/system request with no trusted daemon span | API-side record can report what that API endpoint observed, tagged `unverified_origin` for asserted actor/host. | No authenticated daemon span is invented; candidate provenance and cross-producer join remain unknown. |
+
+This classification is per operation, not a blanket rule that every 2xx proves
+a particular intermediate check, or every 403 is an authorization decision.
+Capture preconditions, retries and item-level responses where the actual path
+provides them; an early validation/no-op/replay can leave a component
+`not_evaluated`. Missing or stale member facts can leave the **candidate**
+unknown even when the daemon-observed actual final result is known. The old
+policy is never recomputed. No new credential system is needed for a daemon to
+observe its own call's outcome; independent API telemetry origin and joining
+still require verified transport.
 
 The authoritative path remains fully functional with old daemons, direct API
 clients and rollbacks. Parent spans have per-component states
-`pending | allow | deny | error | not_evaluated | unknown`; a final joins only
-when all required components are observed with verified correlation. A daemon
-may finish a response after an API write whose outcome is unknown; do not
-reissue or invent final status. Define denominators as `(logical attempt,
-target)` exactly once; raw component events and delivery retries have separate
-counts. Atomic/mixed batch partial results remain individually visible. A
-startup manifest lists all expected sites and coverage; uninstrumented sites,
-unknown origins and pending final join are counted separately, not successes.
+`pending | allow | deny | error | not_evaluated | unknown`; the daemon span
+can establish a final from its own decisive result, while a join to an
+independent API-produced event requires verified correlation. A daemon may
+finish with an API write outcome unknown; do not reissue or invent final status.
+Define denominators as `(logical attempt, target)` exactly once; raw component
+events and delivery retries have separate counts. Atomic/mixed batch partial
+results remain individually visible. A startup manifest lists all expected
+sites and coverage; uninstrumented sites, unverified origins and unresolved
+final results are counted separately, not successes.
 
 ## Durability, access, feed and bounded operation
 
@@ -310,7 +337,7 @@ or blocked worker can fill it sooner than spool capacity.
 Retention rule: keep every event, interval, gap and pending/classified S7
 review evidence through the Owner-directed roughly one-week observation and
 until its review is explicitly complete; no implicit deletion at seven days.
-A preexisting review/legal hold wins. Only after review and acknowledged
+A pending S7 review hold wins. Only after review and acknowledged
 consumer cursors may an operator-approved retention policy prune; publish the
 pruned boundary and force old cursors to resnapshot. If quota/headroom is
 exhausted before then, stop accepting observer records, retain existing data,
@@ -319,16 +346,29 @@ request capacity/review; do not evict held data, block user work or call S7
 clean. Epoch-wide unknown after unclean crash can outlive the quota interval.
 No invented automatic timer or discard policy is authorized by this document.
 
-Smallest later measurement: one reserved, finite, isolated **fixture-based**
-probe, not a scheduled/live collector: serialize synthetic worst-case bounded
-records and replay representative existing sanitized authorization fixtures
-under a private labelled target; measure encoded bytes, enqueue throughput,
-quota/overflow and fsync cost with the future component implementation. Then,
-a separately coordinated opt-in bounded counter-only canary on each relevant
-host can measure actual eligible decisions/bursts and DB physical/WAL growth
-without storing content. Its duration, resource reservation and reviewed
-privacy/retention protocol must be explicit; until then rates remain unknown.
-No probe, canary or collector is authorized or run here.
+The smallest later measurements are separate, finite steps, none authorized or
+run here:
+
+1. In a reserved, labelled isolated fixture, serialize synthetic worst-case
+   bounded records and replay sanitized authorization fixtures; measure encoded
+   bytes, enqueue throughput, quota/overflow and spool fsync cost.
+2. In a separately reserved **isolated scratch database**, ingest a finite
+   representative mix of full-size and smaller records, indexes, replay and
+   updates; measure physical table/index growth and WAL/backup headroom under
+   the proposed schema. Report fixture mix, before/after allocated bytes and
+   peak WAL; do not extrapolate unmeasured production distributions as fact.
+3. Only after a separately coordinated opt-in, a bounded counter-only live
+   canary on each relevant host may measure actual eligible decision counts
+   and burst rates without storing full events. It cannot measure full-event
+   database, index or WAL costs. Specify duration, resource reservation,
+   privacy/retention protocol and coverage beforehand.
+
+Combine the separately measured rate/burst envelope and isolated per-record
+physical/WAL costs with actual central-mount free-space and headroom to choose
+and review quota. Until then rates, full-event production costs and safe quota
+remain unknown, and the proposed ceilings remain inactive and unmeasured. No
+scheduled collector, canary, database fixture or production work is authorized
+or run by this design.
 
 ## S4 and rollout prerequisites
 
