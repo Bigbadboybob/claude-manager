@@ -8,7 +8,7 @@
 //! producer. `&mut self` requires exclusive ownership: it never acquires a
 //! lock, waits for a consumer, or changes the separately supplied decision.
 
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::mem::size_of;
@@ -48,6 +48,22 @@ impl Id {
     }
 }
 
+impl<'de> Deserialize<'de> for Id {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct IdVisitor;
+        impl<'de> serde::de::Visitor<'de> for IdVisitor {
+            type Value = Id;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a nonempty bounded UTF-8 identifier")
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Id, E> {
+                Id::new(value).map_err(|_| E::custom("invalid identifier length"))
+            }
+        }
+        deserializer.deserialize_str(IdVisitor)
+    }
+}
+
 impl Serialize for Id {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(self.as_str())
@@ -83,14 +99,15 @@ wire_enum!(Family { SessionControl, BoardEdit });
 /// explicit even when a current registry later gains more information. A
 /// `Known` value with `Legacy` or `Unverified` source records a claim, not
 /// trusted proof; the future adapter/evaluator must reject it as authority.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Knowledge<T> {
     Known { value: T, source: FactSource, revision: Option<u64> },
     Unknown { reason: UnknownReason },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EventId {
     pub producer: Id,
     /// Opaque caller-provided boot UUID bytes, not a PID or transcript epoch.
@@ -100,7 +117,8 @@ pub struct EventId {
     pub component: Component,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActorSnapshot {
     pub origin: Origin,
     pub pid: Knowledge<Id>,
@@ -114,7 +132,8 @@ pub struct ActorSnapshot {
     pub global_perms: Knowledge<Truth>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TargetSnapshot {
     pub pid: Knowledge<Id>,
     pub uid: Knowledge<Id>,
@@ -132,7 +151,8 @@ pub struct TargetSnapshot {
 }
 
 /// Facts are a bounded snapshot, not a graph or a display-derived identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Relations {
     pub is_self: Knowledge<Truth>,
     pub own_assistant: Knowledge<Truth>,
@@ -151,7 +171,8 @@ pub struct Relations {
     pub gate_grantor: Knowledge<Truth>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Draft {
     pub family: Family,
     pub board_operation: Option<BoardOperation>,
@@ -180,7 +201,8 @@ pub struct Draft {
     pub component: Component,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Envelope {
     pub id: EventId,
     pub facts: Draft,
