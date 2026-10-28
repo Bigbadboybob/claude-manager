@@ -644,6 +644,15 @@ pub(crate) fn start_session_with_spawn_fn(
     params: &Value,
     watcher_spawn_fn: crate::session_watch::WatcherSpawnFn,
 ) -> MethodResult {
+    start_session_with_origin(state_arc, params, watcher_spawn_fn, false)
+}
+
+fn start_session_with_origin(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    watcher_spawn_fn: crate::session_watch::WatcherSpawnFn,
+    local_mcp_spawn: bool,
+) -> MethodResult {
     let p: StartSessionParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
     let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.uid);
@@ -1371,6 +1380,11 @@ pub(crate) fn start_session_with_spawn_fn(
     let mut session = pending
         .arm(Some(on_exit), pre_ack)
         .map_err(|e| (ErrorCode::Internal, format!("arm reaper: {}", e)))?;
+    if local_mcp_spawn && p.managed_by_uid.is_some() && p.workflow_run_id.is_none()
+        && p.continuous_task_id.is_none() && matches!(p.session_type.as_str(), "codex" | "claude-code")
+    {
+        session.s4_spawn_origin = Some((session.pid, session.holder_incarnation, session.generation, session.org.clone()));
+    }
     // Slice 10d watcher-fix: stash the watcher handle on the
     // registry-resident session at the same instant we insert
     // it. The drop-on-detach contract documented on the field
@@ -10475,7 +10489,8 @@ fn mcp_start_session_inner(
         );
     }
 
-    let start_result = start_session(state_arc, &Value::Object(full_params))?;
+    let start_result = start_session_with_origin(state_arc, &Value::Object(full_params),
+        crate::session_watch::default_watcher_spawn_fn(), caller_uid.is_some())?;
 
     // #28: the creator's name for the child lands before the child has a
     // prompt to act on, so its own first chat_send can never claim the same
@@ -30089,6 +30104,60 @@ while True:
             .expect("arm");
         state.lock().unwrap().sessions.insert(caller_uid.to_string(), sess);
         wt
+    }
+
+    #[test]
+    fn s4_mcp_spawn_records_local_origin_without_changing_shell_lifecycle() {
+        let _tmp = with_temp_home(|| {
+            crate::items::s4_attribution::reset_for_test();
+            let state = make_state_arc();
+            seed_mcp_spawn_fixture(&state, "ts-caller", None);
+            set_spawn_program_override_for_test(Some(("/bin/sleep".into(), vec!["120".into()])));
+            let child = mcp_start_session(&state, &json!({"type":"codex", "label":"s4 child"}), Some("ts-caller")).unwrap();
+            let shell = mcp_start_session(&state, &json!({"type":"bash", "label":"shell"}), Some("ts-caller")).unwrap();
+            set_spawn_program_override_for_test(None);
+            {
+                let st = state.lock().unwrap();
+                assert!(st.sessions[child["session_uid"].as_str().unwrap()].s4_spawn_origin.is_some());
+                assert!(st.sessions[shell["session_uid"].as_str().unwrap()].s4_spawn_origin.is_none());
+            }
+            let uid = child["session_uid"].as_str().unwrap();
+            crate::items::s4_attribution::absorb_snapshot("d", &json!({"version":7, "s4_min_wire":true,
+                "members":[{"id":"mem_new", "main":{"pid":format!("agent:d:{uid}"),
+                    "daemon_id":"d", "session_uid":uid, "occupancy_generation":1}}]}));
+            assert_eq!(crate::items::s4_attribution::capture(&state).0[uid]["member_id"], "mem_new");
+            assert!(crate::items::s4_attribution::capture(&state).0.get(shell["session_uid"].as_str().unwrap()).is_none());
+            crate::items::s4_attribution::reset_for_test();
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn s4_dispatch_spawn_progresses_after_queued_retirement_writer() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_mcp_spawn_fixture(&state, "ts-caller", None);
+            let gate = crate::continuous::retirement::gate("ts-caller");
+            let writer = gate.write().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker_state = state.clone();
+            let worker = std::thread::spawn(move || {
+                set_spawn_program_override_for_test(Some(("/bin/sleep".into(), vec!["120".into()])));
+                let req = crate::control::protocol::Request {
+                    id:"s4-writer".into(), caller: crate::control::protocol::Caller::session("ts-caller"),
+                    method:"mcp_start_session".into(), params:json!({"type":"codex", "label":"s4 child"}),
+                };
+                let result = crate::control::dispatch::dispatch_request(&worker_state, &req);
+                set_spawn_program_override_for_test(None);
+                let ok = matches!(result, crate::control::dispatch::DispatchOutcome::Done(response) if response.ok);
+                tx.send(ok).unwrap();
+            });
+            assert!(rx.recv_timeout(std::time::Duration::from_millis(100)).is_err());
+            drop(writer);
+            assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).expect("spawn must not deadlock"));
+            worker.join().unwrap();
+            kill_all_sessions(&state);
+        });
     }
 
     /// ux-1c: every `mcp_start_session` success carries

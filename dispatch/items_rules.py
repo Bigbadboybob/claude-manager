@@ -200,7 +200,8 @@ class Item:
             "title": self.title,
             "status": self.status,
             "holders": [
-                {k: h.get(k) for k in ("pid", "name", "session_uid", "daemon_id", "role")}
+                {**{k: h.get(k) for k in ("pid", "name", "session_uid", "daemon_id", "role")},
+                 **({"attribution": h["attribution"]} if h.get("attribution") is not None else {})}
                 for h in self.holders
             ],
             "group_id": self.group_id,
@@ -342,6 +343,8 @@ def _holder(value) -> dict:
         "session_uid": value.get("session_uid"),
         "daemon_id": value.get("daemon_id"),
     }
+    if value.get("attribution") is not None:
+        out["attribution"] = value["attribution"]
     if role is not None:
         out["role"] = role
     if value.get("added_at") is not None:
@@ -352,7 +355,9 @@ def _holder(value) -> dict:
 def _dedupe_holders(holders) -> list:
     seen: dict[str, dict] = {}
     for h in holders:
-        seen.setdefault(h["pid"], h)
+        prior = seen.setdefault(h["pid"], h)
+        if prior.get("attribution") is None and h.get("attribution") is not None:
+            prior["attribution"] = h["attribution"]
     return list(seen.values())
 
 
@@ -761,7 +766,16 @@ class BoardTx:
                 if h.get("role") in ("owner", "holder", None):
                     h["role"] = "contributor"
             existing = next((h for h in it.holders if h["pid"] == owner["pid"]), None)
-            new_holders.insert(0, {**(existing or owner), "role": "owner"})
+            new_holders.insert(0, {**(existing or {}), **owner, "role": "owner"})
+        previous = {h["pid"]: h for h in it.holders}
+        for h in new_holders:
+            old = previous.get(h["pid"])
+            if old is not None:
+                # Old daemon full replacements omit these fields. Never copy
+                # them to a different PID or accept caller-supplied via.
+                for key in ("member_id", "via_member_id", "attribution"):
+                    if h.get(key) is None and old.get(key) is not None:
+                        h[key] = old[key]
         new_holders = self._assign_roles(new_holders, set(prev_pids), replaced=holders is not None)
         # The owner left and one holder remains: the successor is not in
         # doubt (today's add-then-remove hand-off keeps working). With
@@ -772,7 +786,9 @@ class BoardTx:
             new_holders[0]["role"] = "owner"
         holders_changed = (creating or [h["pid"] for h in new_holders] != prev_pids
                            or [h.get("role") for h in new_holders]
-                           != [h.get("role") for h in it.holders])
+                           != [h.get("role") for h in it.holders]
+                           or [h.get("attribution") for h in new_holders]
+                           != [h.get("attribution") for h in it.holders])
         if holders_changed:
             it.holders = new_holders
             self.holders_changed.add(n)

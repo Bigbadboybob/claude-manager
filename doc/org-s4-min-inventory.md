@@ -31,7 +31,9 @@ The daemon's `items/org.rs:MemberCache` stores heartbeat `by_uid` summaries and
 an observation time; `heartbeat_extras` returns neither the org version nor
 open-incarnation fields. `org.snapshot` is an on-demand RPC, not an existing
 daemon-maintained freshness snapshot. No daemon latest-seen org version for
-this cache was found. A separate version must not be invented from local time
+this cache was found. S4-min adds a separate in-memory snapshot refreshed by
+the existing heartbeat and a monotonic latest-observed feed version; it does
+not replace the lifecycle cache. A version must not be invented from local time
 or member revision; a verified claim needs a coherent source snapshot and
 explicit tracking of newer observed org changes. The independently observed
 frontier is only what this daemon has seen, not global freshness.
@@ -44,9 +46,13 @@ without a version-bound process association. A locally spawned then promoted
 main could be a positive subject only after a coherent versioned central
 snapshot and a separately established matching local spawn/process origin are
 available. This does not establish a positive for ordinary local assistants.
-Whether that narrower positive is an acceptable first slice or additional
-central assistant-incarnation work is needed is escalated to CM; do not call
-an all-unknown implementation complete.
+CM ruling `e3634390` accepts this narrower positive: only a locally spawned,
+subsequently open main may be verified from a coherent snapshot and local
+origin binding. It does not add assistant incarnations. Assistants and workers
+retain their spawn-time O5 member and role as `o5-spawn-stamp`, explicitly
+unverified and as-of spawn; this is separate from current main evidence. A
+missing/stale main snapshot cannot establish a verified claim. Do not call an
+all-unknown implementation complete.
 
 ## Producer and consumer boundaries
 
@@ -70,3 +76,11 @@ replacement on isolated storage. Review the whole diff for no provenance gate,
 new authority, backfill, timer, rules/notice change or cross-host assertion.
 The #56 driver reservation has not been transferred; no test/build is performed
 by this inventory.
+
+S4-min writing is off unless the daemon starts with `CM_S4_MIN_WRITE=1`.
+Rollback requires stopping these writes on every participating daemon before
+rolling the API back; the last capability snapshot is as-of and cannot protect
+an uncoordinated API downgrade before its next refresh. No data migration back
+is needed. This is a release constraint, not authorization to deploy. Snapshot
+refresh uses the existing heartbeat thread and adds no timer; process-origin
+evidence is intentionally lost on brain restart/adoption.

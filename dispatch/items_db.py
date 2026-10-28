@@ -226,6 +226,9 @@ async def _load_items(conn, board_id: str, extra_ns=(), *, archived: bool = Fals
         }
         if h.get("role") is not None:
             holder["role"] = h["role"]
+        for key in ("member_id", "via_member_id", "attribution"):
+            if h.get(key) is not None:
+                holder[key] = h[key]
         by_id[h["item_id"]].holders.append(holder)
     for d in await conn.fetch(
         "SELECT item_id, blocker_id FROM item_deps WHERE item_id = ANY($1::bigint[])", ids
@@ -329,10 +332,11 @@ async def _apply(conn, tx: BoardTx, *, mirror: bool = False) -> None:
         for h in it.holders:
             await conn.execute(
                 """INSERT INTO item_holders (item_id, pid, session_uid, daemon_id, name, added_at,
-                                             role)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+                                             role, member_id, via_member_id, attribution)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)""",
                 it.id, h["pid"], h.get("session_uid"), h.get("daemon_id"), h.get("name"),
-                h.get("added_at") or now, h.get("role"),
+                h.get("added_at") or now, h.get("role"), h.get("member_id"),
+                h.get("via_member_id"), h.get("attribution"),
             )
     for n in sorted(tx.deps_changed):
         it = tx.items[n]
@@ -366,11 +370,11 @@ async def _apply(conn, tx: BoardTx, *, mirror: bool = False) -> None:
     for e in tx.events:
         await conn.execute(
             """INSERT INTO item_events (board_id, item_id, item_number, actor_pid,
-                                        actor_name, type, prev, new, reason, created_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)""",
+                                        actor_name, type, prev, new, reason, created_at, actor_attribution)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)""",
             board_id, tx.items[e["n"]].id if e.get("n") else None, e.get("n"),
             tx.actor["pid"], tx.actor.get("name"), e["type"], e["prev"], e["new"],
-            e["reason"], now,
+            e["reason"], now, tx.actor.get("attribution"),
         )
     for p in tx.pushes:
         await conn.execute(
@@ -1006,6 +1010,7 @@ async def read_board(pool, ref: str, *, since_version: int | None = None,
                 events.setdefault(e["item_number"], []).append({
                     "id": e["id"], "type": e["type"], "actor": e["actor_name"] or e["actor_pid"],
                     "actor_pid": e["actor_pid"], "prev": e["prev"], "new": e["new"],
+                    "actor_attribution": e["actor_attribution"],
                     "reason": e["reason"], "at": iso(e["created_at"]),
                 })
         needle = q.lower() if q else None

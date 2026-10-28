@@ -239,3 +239,11 @@ move them afterward. The TUI sends this as explicit fresh-spawn intent; it is
 never inferred from transcript paths or argv, so snapshot clones remain fresh
 while restore/resume paths stay in their existing scope. This excludes shell,
 continuous-task, workflow, restore, and resume sessions.
+
+# S4-min attribution
+
+When enabled, item and local chat evidence can include an `attribution` or
+`actor_attribution` record. `central-open-main` is a trusted daemon's as-of
+org snapshot, not a permission or a guarantee of current membership;
+`o5-spawn-stamp` is an unverified spawn-time O5 label. Missing attribution
+means unknown. Existing session control and item authorization do not change.

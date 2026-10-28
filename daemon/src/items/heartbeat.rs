@@ -387,6 +387,13 @@ impl Beat {
         if !self.acks.is_empty() || !self.mark_acks.is_empty() {
             poke(); // ack promptly rather than in 30 s
         }
+        // Existing background heartbeat supplies an as-of S4 snapshot. No
+        // operation path waits for this lookup or takes a provenance permit.
+        if std::env::var_os("CM_S4_MIN_WRITE").is_some_and(|v| v == "1") {
+            if let Ok(snapshot) = api.get("/org/snapshot", &[]) {
+                super::s4_attribution::absorb_snapshot(&snap.daemon_id, &snapshot);
+            }
+        }
     }
 
     /// True when the push is settled (delivered, escalated or dropped).

@@ -1384,6 +1384,13 @@ impl Store {
         p: &Value,
         people: &[Person],
     ) -> Result<Value> {
+        self.send_with_attribution(actor, uid, kind, p, people, None)
+    }
+
+    pub(crate) fn send_with_attribution(
+        &mut self, actor: &str, uid: &str, kind: &str, p: &Value,
+        people: &[Person], attribution: Option<&Value>,
+    ) -> Result<Value> {
         let (key, digest, prior) = self.request(actor, p, "message.create")?;
         if let Some(e) = prior {
             let mut result = self.send_response(&e);
@@ -1536,6 +1543,7 @@ impl Store {
             .map(|(path, id)| self.channel_info(path, id)["revision"].clone())
             .unwrap_or(json!(conv));
         let mut data = json!({"reply_to":reply,"thread_root":root,"mentions":mentions,"tags":p.get("tags").cloned().unwrap_or(json!([])),"links":links,"norms_seen":p.get("norms_seen").cloned().unwrap_or(json!({})),"metadata_seen":{"identity":identity_revision,"conversation":conversation_revision,"enrollment":enrollment_revision}});
+        if let Some(claim) = attribution { data["actor_attribution"] = claim.clone(); }
         data["metadata_seen"]["membership"] = json!(self.membership_revisions.get(&conv));
         data["mention_here"] = json!(mention_here);
         data["mention_recipients"] = json!(recipients);
@@ -1559,7 +1567,7 @@ impl Store {
             )?;
             data["identity_attestation"] = json!(serde_json::to_string(&att)?);
         }
-        let e = self.publish(
+        let mut e = self.event(
             "message.create",
             Some(&conv),
             &body,
@@ -1570,6 +1578,12 @@ impl Store {
             &key,
             &digest,
         )?;
+        // Provenance must not make an otherwise valid message exceed the
+        // existing event limit. Drop only the optional evidence before commit.
+        if attribution.is_some() && serde_json::to_vec_pretty(&e).map_or(true, |b| b.len() > 65536) {
+            if let Some(data) = e["data"].as_object_mut() { data.remove("actor_attribution"); }
+        }
+        let e = self.commit(e)?;
         let repair = self.repair_attestations().and_then(|_| self.project());
         let mut result = self.send_response(&e);
         if let Err(e) = repair {
@@ -2247,6 +2261,19 @@ mod tests {
             &[p.clone()],
         )
         .unwrap()
+    }
+    #[test]
+    fn s4_attribution_is_not_part_of_chat_request_digest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = Store::open(tmp.path()).unwrap();
+        let p = person(&s, "a");
+        let params = json!({"channel":"general", "body":"Ready", "request_id":"same", "name":"Scout"});
+        let a = json!({"member_id":"mem_a", "acting_as":"main", "provenance":"central-open-main", "org_version":1});
+        let b = json!({"member_id":"mem_b", "acting_as":"main", "provenance":"central-open-main", "org_version":2});
+        let first = s.send_with_attribution(&p.id, "a", "agent", &params, &[p.clone()], Some(&a)).unwrap();
+        let retry = s.send_with_attribution(&p.id, "a", "agent", &params, &[p], Some(&b)).unwrap();
+        assert_eq!(first["event_id"], retry["event_id"]);
+        assert_eq!(retry["event"]["data"]["actor_attribution"], a);
     }
     #[test]
     fn names_collide_on_unicode_case_and_retries_survive_rebuild() {

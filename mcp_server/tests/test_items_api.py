@@ -338,6 +338,36 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(row["closed_at"])
         self.assertEqual(row["status"], "active")
 
+    async def test_s4_old_holder_replacement_preserves_existing_evidence(self):
+        attribution = {"member_id": "mem_a", "acting_as": "assistant",
+                       "provenance": "o5-spawn-stamp", "verified": False}
+        await self.create({"title": "a", "holders": [LANE]})
+        await self.patch(1, add_holders=[{**LANE, "attribution": attribution}])
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE item_holders SET member_id='mem_a', via_member_id='mem_v'")
+        # Old clients omit attribution; replacement/reorder cannot erase it.
+        await self.patch(1, holders=[LANE, ORCH])
+        await self.patch(1, holders=[ORCH, LANE])
+        await self.patch(1, holders=[{**ORCH, "role":"owner"}, {**LANE, "role":"contributor"}])
+        rows = await self.fetch("SELECT pid,member_id,via_member_id,attribution FROM item_holders ORDER BY pid")
+        by_pid = {r["pid"]: r for r in rows}
+        self.assertEqual(by_pid[LANE["pid"]]["member_id"], "mem_a")
+        self.assertEqual(by_pid[LANE["pid"]]["via_member_id"], "mem_v")
+        self.assertEqual(by_pid[LANE["pid"]]["attribution"]["provenance"], "o5-spawn-stamp")
+        self.assertIsNone(by_pid[ORCH["pid"]]["attribution"])
+        await self.patch(1, holders=[ORCH])
+        rows = await self.fetch("SELECT pid,attribution FROM item_holders")
+        self.assertEqual([r["pid"] for r in rows], [ORCH["pid"]])
+
+    async def test_s4_item_actor_attribution_is_event_evidence(self):
+        await self.create("a")
+        claim = {"member_id":"mem_a", "acting_as":"main", "provenance":"central-open-main",
+                 "org_version": 7, "daemon_id":"d1", "verified":True}
+        await self.patch(1, actor={**ORCH, "attribution":claim}, note="evidence")
+        rows = await self.fetch("SELECT actor_pid,actor_attribution FROM item_events WHERE type='updated'")
+        self.assertTrue(any(r["actor_pid"] == ORCH["pid"] and r["actor_attribution"]
+                            and r["actor_attribution"]["member_id"] == "mem_a" for r in rows))
+
     async def test_nudge_resolve_snoozes_and_pushes(self):
         await self.create({"title": "a", "holders": [LANE]})
         async with self.pool.acquire() as conn:

@@ -13,6 +13,7 @@ pub mod heartbeat;
 pub mod held;
 pub mod org;
 pub mod rpc;
+pub(crate) mod s4_attribution;
 
 /// Start the items background work (the holder-state heartbeat and the
 /// gate-receipt refresh, doc/gate-receipts.md §8).

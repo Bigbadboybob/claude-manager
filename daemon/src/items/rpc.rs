@@ -94,6 +94,8 @@ pub fn session_actor(state: &Arc<Mutex<DaemonState>>, uid: &str) -> Option<Value
 
 /// Who is calling, resolved on this daemon.
 pub(crate) struct Ctx {
+    pub(crate) s4: std::collections::HashMap<String, Value>,
+    pub(crate) s4_wire: bool,
     pub pid: String,
     pub name: String,
     pub uid: Option<String>,
@@ -167,8 +169,10 @@ impl Ctx {
             (store.daemon_id.clone(), people, my_name)
         };
         let api = Api::from_config(&api_url, &api_token)?;
+        let (s4, s4_wire) = super::s4_attribution::current();
         Ok(match me {
             None => Ctx {
+                s4, s4_wire,
                 pid: "owner".into(),
                 name: "Owner".into(),
                 uid: None,
@@ -182,6 +186,7 @@ impl Ctx {
                 api,
             },
             Some((uid, title, task_id, global, engine, daemon_owned)) => Ctx {
+                s4, s4_wire,
                 pid: format!("agent:{daemon_id}:{uid}"),
                 name: my_name.unwrap_or(title),
                 uid: Some(uid),
@@ -198,17 +203,33 @@ impl Ctx {
     }
 
     pub(crate) fn actor(&self) -> Value {
-        json!({
+        let mut actor = json!({
             "pid": self.pid,
             "name": self.name,
             "session_uid": self.uid,
             "daemon_id": if self.owner { Value::Null } else { json!(self.daemon_id) },
             "task_id": self.task_id,
-        })
+        });
+        if self.s4_wire {
+            if let Some(claim) = self.uid.as_ref().and_then(|u| self.s4.get(u)) {
+                actor["attribution"] = claim.clone();
+            }
+        }
+        actor
     }
 
     fn me(&self) -> Value {
-        holder_value(&self.pid, Some(&self.name))
+        self.holder(&self.pid, Some(&self.name))
+    }
+
+    fn holder(&self, pid: &str, name: Option<&str>) -> Value {
+        let mut value = holder_value(pid, name);
+        if self.s4_wire && value["daemon_id"].as_str() == Some(self.daemon_id.as_str()) {
+            if let Some(claim) = value["session_uid"].as_str().and_then(|u| self.s4.get(u)) {
+                value["attribution"] = claim.clone();
+            }
+        }
+        value
     }
 }
 
@@ -252,10 +273,10 @@ pub(crate) fn resolve_holder(ctx: &Ctx, reference: &str) -> RpcResult {
             return Err(bad(format!("malformed participant id {r}")));
         }
         let name = ctx.people.iter().find(|p| p["id"] == r).and_then(name_of);
-        return Ok(holder_value(r, name.as_deref()));
+        return Ok(ctx.holder(r, name.as_deref()));
     }
     if let Some(p) = ctx.people.iter().find(|p| p["session_uid"] == r && p["id"].as_str().is_some()) {
-        return Ok(holder_value(p["id"].as_str().unwrap(), name_of(p).as_deref()));
+        return Ok(ctx.holder(p["id"].as_str().unwrap(), name_of(p).as_deref()));
     }
     let key = r.to_lowercase();
     let matches_name = |p: &&Value| {
@@ -284,7 +305,7 @@ pub(crate) fn resolve_holder(ctx: &Ctx, reference: &str) -> RpcResult {
     }
     found.dedup_by(|a, b| a["id"] == b["id"]);
     match found.as_slice() {
-        [one] => Ok(holder_value(one["id"].as_str().unwrap_or_default(), name_of(one).as_deref())),
+        [one] => Ok(ctx.holder(one["id"].as_str().unwrap_or_default(), name_of(one).as_deref())),
         [] => Err((
             ErrorCode::NotFound,
             format!("no session named {r}: use a chat name, session uid or participant id (chat_people lists them)"),
@@ -1212,6 +1233,7 @@ mod tests {
 
     fn ctx_with(people: Vec<Value>) -> Ctx {
         Ctx {
+            s4: Default::default(), s4_wire: false,
             pid: "agent:d1:me-uid".into(),
             name: "lane".into(),
             uid: Some("me-uid".into()),
@@ -1224,6 +1246,21 @@ mod tests {
             people,
             api: Api::from_config("http://127.0.0.1:9", "tok").unwrap(),
         }
+    }
+
+    #[test]
+    fn s4_actor_and_target_are_independent_and_old_api_shape_is_unchanged() {
+        let mut ctx = ctx_with(people());
+        let actor = json!({"member_id":"mem_a", "acting_as":"main", "provenance":"central-open-main", "org_version":7});
+        let target = json!({"member_id":"mem_b", "acting_as":"assistant", "provenance":"o5-spawn-stamp", "verified":false});
+        ctx.s4.insert("me-uid".into(), actor.clone());
+        ctx.s4.insert("old-uid".into(), target.clone());
+        assert!(ctx.actor().get("attribution").is_none());
+        assert!(ctx.holder("agent:d1:old-uid", None).get("attribution").is_none());
+        ctx.s4_wire = true;
+        assert_eq!(ctx.actor()["attribution"], actor);
+        assert_eq!(ctx.holder("agent:d1:old-uid", None)["attribution"], target);
+        assert!(ctx.holder("agent:d2:old-uid", None).get("attribution").is_none());
     }
 
     fn people() -> Vec<Value> {

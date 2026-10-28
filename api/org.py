@@ -180,7 +180,9 @@ async def _call(coro):
 @router.get("/snapshot")
 async def snapshot(request: Request,
                    since_version: int | None = Query(None, ge=0, le=2**63 - 1)):
-    return await _call(org_db.snapshot(_pool(request), since_version))
+    result = await _call(org_db.snapshot(_pool(request), since_version))
+    result["s4_min_wire"] = True
+    return result
 
 
 @router.get("/changes")

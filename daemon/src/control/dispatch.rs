@@ -396,6 +396,10 @@ pub fn dispatch_request(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
 ) -> DispatchOutcome {
+    // Snapshot provenance before any operation or lifecycle gate. Failure to
+    // take either short try-lock is merely unknown and never changes the RPC.
+    let _s4 = crate::items::s4_attribution::begin(state, matches!(req.method.as_str(),
+        "mcp_start_session" | "item.set" | "item.resolve" | "messaging.send"));
     // Reserved board credentials never fall through legacy fail-open Operator
     // auth. Delegate only this service's fixed method/action capability.
     let delegated = match super::board_token::authorize(state, req) {

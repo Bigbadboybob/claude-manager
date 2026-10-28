@@ -1079,6 +1079,8 @@ impl LastExitProbe {
 
 pub struct DaemonSession {
     pub uid: String,
+    /// Ephemeral S4-min spawn evidence; never restored from a manifest.
+    pub(crate) s4_spawn_origin: Option<(libc::pid_t, Option<u64>, u64, Option<cm_holder_proto::org::OrgObject>)>,
     pub title: String,
     pub agent_state: crate::agent_state::AgentStateCell,
     /// Initial MCP launch prompt receipt; absence after adoption is unknown.
@@ -2120,6 +2122,7 @@ impl PendingSession {
 
         Ok(DaemonSession {
             agent_state: crate::agent_state::StateCell::for_process(pid),
+            s4_spawn_origin: None,
             prompt_delivery: None,
             holder_incarnation: None,
             uid,
@@ -2692,6 +2695,7 @@ impl AdoptedSessionBuild {
 
         Ok(DaemonSession {
             agent_state: crate::agent_state::StateCell::for_process(pid),
+            s4_spawn_origin: None,
             prompt_delivery: None,
             holder_incarnation: None,
             title: meta.title,

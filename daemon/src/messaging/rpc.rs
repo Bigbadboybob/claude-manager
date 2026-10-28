@@ -291,6 +291,11 @@ fn execute_with_freshness(
     req: &Request,
     caught_up: bool,
 ) -> Result<Value, ChatError> {
+    let s4 = match &req.caller {
+        Caller::Session(c) if req.method == "messaging.send" =>
+            crate::items::s4_attribution::current().0.get(&c.session_uid).cloned(),
+        _ => None,
+    };
     if matches!(req.caller, Caller::Operator(_)) {
         crate::control::operator::validate_operator(&req.caller).map_err(|e| ChatError {
             code: "unauthorized".into(),
@@ -551,7 +556,7 @@ fn execute_with_freshness(
         "messaging.react" => store.react(&actor,p),
         "messaging.send" => {
             store.acknowledge(&actor, &p["ack_receipt"])?;
-            store.send(&actor, &uid, kind, p, &people)
+            store.send_with_attribution(&actor, &uid, kind, p, &people, s4.as_ref())
         }
         "messaging.read" => {
             // A proactive read may beat the maintenance scan. Include watch
