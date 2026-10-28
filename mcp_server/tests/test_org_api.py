@@ -424,7 +424,8 @@ class OrgApiDb(unittest.IsolatedAsyncioTestCase):
                          {k: v for k, v in result.items() if k != "version"})
         snap = await self.snapshot()
         self.assertGreater(snap["version"], before)
-        self.assertEqual(await self.snapshot(snap["version"]), {"unchanged": True, "version": snap["version"]})
+        self.assertEqual(await self.snapshot(snap["version"]),
+                         {"unchanged": True, "version": snap["version"], "s4_min_wire": True})
         by = {m["handle"]: m for m in snap["members"]}
         coord, lane = by["swarm-coord"], by["org-lane"]
         self.assertEqual(lane["manager_member_id"], coord["id"])
