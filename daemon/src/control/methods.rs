@@ -8026,6 +8026,47 @@ mod operator_quiet_tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn s4_existing_input_unit_finishes_enter_with_queued_writer() {
+        let _serial = crate::writer_gate::TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let uid = format!("ts-{}-0", uuid::Uuid::new_v4().simple());
+        let gate = crate::continuous::retirement::gate(&uid);
+        let (handle, writes) = InputHandle::test_handle_capturing();
+        let handle = handle.test_with_uid(&uid);
+        let fanout = std::sync::Arc::new(crate::session::PtyByteFanout::new(64));
+        let (body_tx, body_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let delivery_uid = uid.clone();
+        let delivery = std::thread::spawn(move || {
+            super::TEST_AFTER_AGENT_BODY.with(|h| *h.borrow_mut() = Some(Box::new(move || {
+                body_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            })));
+            let ok = super::deliver_agent_body_inner(&handle, &fanout, &delivery_uid, "prompt", false,
+                "test", None, None, None);
+            super::TEST_AFTER_AGENT_BODY.with(|h| *h.borrow_mut() = None);
+            ok
+        });
+        body_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let write_gate = gate.clone();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _guard = write_gate.write().unwrap();
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while gate.try_read().is_ok() && Instant::now() < deadline { std::thread::yield_now(); }
+        assert!(gate.try_read().is_err(), "writer must be queued behind the delivery unit");
+        resume_tx.send(()).unwrap();
+        assert!(delivery.join().unwrap());
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        writer.join().unwrap();
+        assert!(writes.lock().unwrap().len() >= 2, "body and Enter both reached the writer");
+    }
+
+    #[test]
     fn recovery_waits_for_complete_prompt_body_and_enter() {
         let _serial = crate::writer_gate::TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let uid = format!("ts-{}-0", uuid::Uuid::new_v4().simple());
@@ -10123,7 +10164,9 @@ fn mcp_start_session_inner(
             caller.last_cols,
             caller.last_rows,
             granted,
-            caller.workflow_run_id.is_none() && caller.continuous_task_id.is_none(),
+            // A normal MCP spawn by a continuous member is an O5 worker;
+            // scheduler/Fresh launches use their separate internal path.
+            caller.workflow_run_id.is_none(),
         )
     };
 
@@ -30128,6 +30171,36 @@ while True:
                     "daemon_id":"d", "session_uid":uid, "occupancy_generation":1}}]}));
             assert_eq!(crate::items::s4_attribution::capture(&state).0[uid].claim["member_id"], "mem_new");
             assert!(crate::items::s4_attribution::capture(&state).0.get(shell["session_uid"].as_str().unwrap()).is_none());
+            let previous = std::env::var_os("CM_S4_MIN_WRITE");
+            std::env::set_var("CM_S4_MIN_WRITE", "1");
+            crate::items::org::absorb_reply(&json!({"org":{"members":{
+                "ts-caller":{"id":"mem_cont", "kind":"continuous", "acting_as":"main"}}}}), 1.0);
+            {
+                let mut st = state.lock().unwrap();
+                st.sessions.get_mut("ts-caller").unwrap().continuous_task_id = Some("ct".into());
+                st.config.api_url = "http://127.0.0.1:9".into();
+                st.config.api_token = "tok".into();
+            }
+            crate::messaging::startup::open_for_test(&state).unwrap();
+            let worker = mcp_start_session(&state, &json!({"type":"codex", "label":"worker"}), Some("ts-caller")).unwrap();
+            let worker_uid = worker["session_uid"].as_str().unwrap();
+            let req = crate::control::protocol::Request { id:"item".into(), caller:crate::control::protocol::Caller::session(worker_uid),
+                method:"item.set".into(), params:json!({"n":1,"status":"active"}) };
+            {
+                let _scope = crate::items::s4_attribution::begin(&state, &req);
+                let ctx = crate::items::rpc::Ctx::capture(&state, &req).unwrap();
+                assert_eq!(ctx.actor()["attribution"]["acting_as"], "worker");
+                assert_eq!(ctx.actor()["attribution"]["provenance"], "o5-spawn-stamp");
+            }
+            let chat = crate::control::protocol::Request { id:"chat".into(), caller:crate::control::protocol::Caller::session(worker_uid),
+                method:"messaging.send".into(), params:json!({"channel":"general", "name":"worker", "body":"ready", "request_id":"worker-chat"}) };
+            let result = crate::control::dispatch::dispatch_request(&state, &chat);
+            let crate::control::dispatch::DispatchOutcome::Done(response) = result else { panic!("chat must complete") };
+            assert!(response.ok, "{:?}", response.error);
+            assert_eq!(response.result.unwrap()["event"]["data"]["actor_attribution"]["acting_as"], "worker");
+            if let Some(value) = previous { std::env::set_var("CM_S4_MIN_WRITE", value); }
+            else { std::env::remove_var("CM_S4_MIN_WRITE"); }
+            crate::items::org::reset_cache_for_test();
             state.lock().unwrap().sessions.get_mut("ts-caller").unwrap().workflow_run_id = Some("workflow".into());
             let workflow_child = mcp_start_session(&state, &json!({"type":"codex", "label":"workflow child"}), Some("ts-caller")).unwrap();
             assert!(state.lock().unwrap().sessions[workflow_child["session_uid"].as_str().unwrap()].s4_spawn_origin.is_none());
@@ -30190,6 +30263,45 @@ while True:
             worker.join().unwrap();
             writer.join().unwrap();
             crate::items::s4_attribution::reset_for_test();
+            if let Some(value) = previous { std::env::set_var("CM_S4_MIN_WRITE", value); }
+            else { std::env::remove_var("CM_S4_MIN_WRITE"); }
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn s4_dispatch_holds_no_outer_gate_after_snapshot() {
+        let _tmp = with_temp_home(|| {
+            let previous = std::env::var_os("CM_S4_MIN_WRITE");
+            std::env::set_var("CM_S4_MIN_WRITE", "1");
+            let state = make_state_arc();
+            seed_mcp_spawn_fixture(&state, "ts-caller", None);
+            let gate = crate::continuous::retirement::gate("ts-caller");
+            let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker_state = state.clone();
+            let worker = std::thread::spawn(move || {
+                set_spawn_program_override_for_test(Some(("/bin/sleep".into(), vec!["120".into()])));
+                crate::control::dispatch::test_after_s4(Some(Box::new(move || {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+                })));
+                let req = crate::control::protocol::Request { id:"seam".into(),
+                    caller:crate::control::protocol::Caller::session("ts-caller"), method:"mcp_start_session".into(),
+                    params:json!({"type":"codex", "label":"child"}) };
+                let result = crate::control::dispatch::dispatch_request(&worker_state, &req);
+                crate::control::dispatch::test_after_s4(None);
+                set_spawn_program_override_for_test(None);
+                done_tx.send(matches!(result, crate::control::dispatch::DispatchOutcome::Done(response) if response.ok)).unwrap();
+            });
+            paused_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            let writer = gate.try_write().expect("S4 snapshot must hold no outer retirement read");
+            resume_tx.send(()).unwrap();
+            assert!(done_rx.recv_timeout(std::time::Duration::from_millis(100)).is_err());
+            drop(writer);
+            assert!(done_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
+            worker.join().unwrap();
             if let Some(value) = previous { std::env::set_var("CM_S4_MIN_WRITE", value); }
             else { std::env::remove_var("CM_S4_MIN_WRITE"); }
             kill_all_sessions(&state);

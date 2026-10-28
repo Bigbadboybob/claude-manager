@@ -821,10 +821,10 @@ class BoardTx:
             new_holders[0]["role"] = "owner"
         holders_changed = (creating or [h["pid"] for h in new_holders] != prev_pids
                            or [h.get("role") for h in new_holders]
-                           != [h.get("role") for h in it.holders]
-                           or [h.get("attribution") for h in new_holders]
-                           != [h.get("attribution") for h in it.holders])
-        if holders_changed:
+                           != [h.get("role") for h in it.holders])
+        evidence_changed = ([h.get("attribution") for h in new_holders]
+                            != [h.get("attribution") for h in it.holders])
+        if holders_changed or evidence_changed:
             it.holders = new_holders
             self.holders_changed.add(n)
 

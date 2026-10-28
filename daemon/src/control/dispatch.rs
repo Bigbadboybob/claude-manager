@@ -392,6 +392,11 @@ pub(crate) fn method_counts_as_restart_mutation(method: &str) -> bool {
 /// Route `req` to the appropriate method handler. Returns
 /// `UnknownMethod` for everything that depends on App state that
 /// hasn't migrated; see the module doc for the cutoff.
+#[cfg(test)]
+thread_local! { static TEST_AFTER_S4: std::cell::RefCell<Option<Box<dyn FnMut()>>> = std::cell::RefCell::new(None); }
+#[cfg(test)]
+pub(crate) fn test_after_s4(hook: Option<Box<dyn FnMut()>>) { TEST_AFTER_S4.with(|h| *h.borrow_mut() = hook); }
+
 pub fn dispatch_request(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
@@ -399,6 +404,8 @@ pub fn dispatch_request(
     // Snapshot provenance before any operation or lifecycle gate. Failure to
     // take either short try-lock is merely unknown and never changes the RPC.
     let _s4 = crate::items::s4_attribution::begin(state, req);
+    #[cfg(test)]
+    TEST_AFTER_S4.with(|h| { if let Some(hook) = h.borrow_mut().as_mut() { hook(); } });
     // Reserved board credentials never fall through legacy fail-open Operator
     // auth. Delegate only this service's fixed method/action capability.
     let delegated = match super::board_token::authorize(state, req) {

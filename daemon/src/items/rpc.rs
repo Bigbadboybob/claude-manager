@@ -614,7 +614,7 @@ fn item_resolve(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, params: &Value) -> R
     if action == "launch" {
         launched = launch(state, ctx, params, &slug, n)?;
         body["action"] = json!("reassign");
-        body["holders"] = json!([holder_value(launched["pid"].as_str().unwrap_or_default(), Some(&format!("item-{n}")))]);
+        body["holders"] = json!([ctx.holder(launched["pid"].as_str().unwrap_or_default(), Some(&format!("item-{n}")))]);
     }
     let reply = ctx.api.post(&format!("/boards/{slug}/items/{n}/resolve"), &body).map_err(|(code, message)| {
         if launched.is_null() {

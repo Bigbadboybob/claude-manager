@@ -403,6 +403,19 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((rows[0]["name"], rows[0]["session_uid"], rows[0]["daemon_id"]),
                          (ORCH["name"], ORCH["session_uid"], ORCH["daemon_id"]))
 
+    async def test_s4_evidence_only_does_not_change_status_or_actionable_clock(self):
+        await self.create({"title":"a", "holders":[LANE]})
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE items SET status='open', actionable_at='2020-01-01T00:00:00Z'")
+        before = (await self.fetch("SELECT status,actionable_at FROM items"))[0]
+        claim = {"member_id":"mem_a", "acting_as":"assistant", "provenance":"o5-spawn-stamp",
+                 "as_of":"spawn", "verified":False}
+        await self.patch(1, holders=[{**LANE, "attribution":claim}])
+        after = (await self.fetch("SELECT status,actionable_at FROM items"))[0]
+        self.assertEqual((after["status"], after["actionable_at"]), (before["status"], before["actionable_at"]))
+        await self.patch(1, add_holders=[ORCH])
+        self.assertEqual((await self.fetch("SELECT status FROM items"))[0]["status"], "active")
+
     async def test_nudge_resolve_snoozes_and_pushes(self):
         await self.create({"title": "a", "holders": [LANE]})
         async with self.pool.acquire() as conn:
