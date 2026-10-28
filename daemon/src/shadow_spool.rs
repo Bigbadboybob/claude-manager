@@ -52,7 +52,7 @@ pub struct Counts {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Health { Unopened, Clean, Incomplete, UncleanSuffix, PartialTail, Corrupt, IoUncertain }
+pub enum Health { Unopened, Open, Clean, Incomplete, UncleanSuffix, PartialTail, Corrupt, IoUncertain }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Append { Stored, Duplicate }
 
@@ -80,7 +80,7 @@ struct EventMeta { id: EventId, digest: [u8; 32], ack: Option<Id> }
 #[derive(Clone, Copy)]
 struct Epoch {
     producer: Id, boot: [u8; 16], checkpoint: Option<(u64, Counts)>,
-    closed: bool, event_count: u64,
+    closed: bool, event_count: u64, last_sequence: u64,
 }
 struct State {
     epochs: Vec<Epoch>, events: Vec<EventMeta>, used: u64, event_bytes: u64,
@@ -96,7 +96,11 @@ impl State {
 
 /// The lock is held for the handle's lifetime. Dropping the handle does not
 /// imply clean close. `journal` and `lock` are the only files this creates.
-pub struct Spool { _directory: File, _lock: File, journal: File, limits: Limits, state: State, unrecorded_loss: bool, restart_uncertain: bool }
+pub struct Spool {
+    _directory: File, _lock: File, journal: File, limits: Limits, state: State,
+    unrecorded_loss: bool, restart_uncertain: bool,
+    #[cfg(test)] fail_next_sync: bool,
+}
 
 fn digest(data: &[u8]) -> [u8; 32] { Sha256::digest(data).into() }
 fn checked_event(envelope: &Envelope) -> Result<Vec<u8>, Error> {
@@ -156,6 +160,12 @@ fn open_or_create(dir: &File, name: &str) -> Result<(File, bool), Error> {
         Err(e) => Err(e),
     }
 }
+fn validate_lock(lock: &File) -> Result<(), Error> {
+    let m = lock.metadata()?;
+    if m.len() != 0 || m.blocks() != 0 || m.nlink() != 1 || !m.is_file()
+        || m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o7777 != 0o600 { return Err(Error::Bounds); }
+    Ok(())
+}
 fn valid_limits(l: Limits) -> bool {
     l.capacity >= BLOCK * 4 && l.capacity <= MAX_CAPACITY && l.capacity % BLOCK == 0
         && l.control_reserve >= BLOCK && l.control_reserve < l.capacity - HEADER
@@ -175,14 +185,15 @@ impl State {
                     return Err(Error::Conflict);
                 }
                 if self.active().is_some() { self.unknown_suffix = true; }
-                self.epochs.push(Epoch { producer: *producer, boot: *boot, checkpoint: None, closed: false, event_count: 0 });
+                self.epochs.push(Epoch { producer: *producer, boot: *boot, checkpoint: None, closed: false, event_count: 0, last_sequence: 0 });
             }
             Record::Event { envelope } => {
                 if self.events.len() >= MAX_RECORDS - RESERVED_CONTROL_RECORDS { return Err(Error::Full); }
                 let payload = checked_event(envelope)?;
                 let id = envelope.id;
                 let epoch = self.epochs.last_mut().filter(|e| !e.closed).ok_or(Error::NoOpen)?;
-                if id.producer != epoch.producer || id.boot != epoch.boot { return Err(Error::Invalid); }
+                if id.producer != epoch.producer || id.boot != epoch.boot || id.sequence <= epoch.last_sequence
+                    || epoch.checkpoint.is_some_and(|(next, _)| id.sequence < next) { return Err(Error::Invalid); }
                 let d = digest(&payload);
                 if self.events.iter().any(|e| e.id.producer == id.producer && e.id.boot == id.boot
                     && e.id.sequence == id.sequence && e.id != id) { return Err(Error::Conflict); }
@@ -194,14 +205,16 @@ impl State {
                 self.events.push(EventMeta { id, digest: d, ack: None });
                 self.event_bytes = event_bytes;
                 epoch.event_count = epoch.event_count.checked_add(1).ok_or(Error::Bounds)?;
+                epoch.last_sequence = id.sequence;
             }
             Record::Checkpoint { producer, boot, next_sequence, counts } => {
                 if self.events.iter().any(|e| e.id.producer == *producer && e.id.boot == *boot && e.id.sequence >= *next_sequence) { return Err(Error::Invalid); }
                 let epoch = self.epochs.last_mut().filter(|e| !e.closed && e.producer == *producer && e.boot == *boot).ok_or(Error::NoOpen)?;
-                if *next_sequence == 0 || counts.admitted.checked_add(counts.loss) != Some(counts.attempted)
+                if counts.attempted.checked_add(1) != Some(*next_sequence)
+                    || counts.admitted.checked_add(counts.loss) != Some(counts.attempted)
                     || counts.oversize > counts.loss || counts.invalid > counts.loss
                     || counts.oversize.checked_add(counts.invalid).is_none_or(|v| v > counts.loss)
-                    || counts.admitted < epoch.event_count { return Err(Error::Invalid); }
+                    || counts.admitted != epoch.event_count { return Err(Error::Invalid); }
                 if let Some((old_seq, old)) = epoch.checkpoint {
                     if *next_sequence < old_seq || counts.attempted < old.attempted || counts.admitted < old.admitted
                         || counts.loss < old.loss || counts.oversize < old.oversize || counts.invalid < old.invalid {
@@ -260,15 +273,20 @@ impl Spool {
     /// No fallback from failed preallocation. The directory is fixture/operator
     /// supplied and must be private; existing files are never replaced.
     pub fn open(path: &Path, limits: Limits) -> Result<Self, Error> {
+        Self::open_internal(path, limits, false, false)
+    }
+    fn open_internal(path: &Path, limits: Limits, inject_recovery_sync_failure: bool, inject_directory_sync_failure: bool) -> Result<Self, Error> {
+        #[cfg(not(test))] let _ = (inject_recovery_sync_failure, inject_directory_sync_failure);
         if !valid_limits(limits) { return Err(Error::Bounds); }
         let directory = open_directory(path)?;
-        let (lock, lock_created) = open_or_create(&directory, "lock")?;
+        let (lock, _lock_created) = open_or_create(&directory, "lock")?;
         let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
             let e = io::Error::last_os_error();
             return if e.kind() == io::ErrorKind::WouldBlock { Err(Error::Busy) } else { Err(Error::Io(e)) };
         }
-        if lock_created { lock.sync_all()?; directory.sync_all()?; }
+        validate_lock(&lock)?;
+        lock.sync_all()?;
         let (mut journal, created) = open_or_create(&directory, "journal")?;
         if created {
             // KEEP_SIZE reserves all journal blocks without making unwritten
@@ -280,7 +298,6 @@ impl Spool {
             journal.write_all(&limits.capacity.to_be_bytes())?;
             journal.write_all(&limits.control_reserve.to_be_bytes())?;
             journal.sync_all()?;
-            directory.sync_all()?;
         }
         if allocated(&journal)? != limits.capacity || journal.metadata()?.len() > limits.capacity { return Err(Error::Bounds); }
         let mut head = [0u8; HEADER as usize];
@@ -288,7 +305,14 @@ impl Spool {
         journal.read_exact(&mut head)?;
         if &head[..8] != MAGIC || u64::from_be_bytes(head[8..16].try_into().unwrap()) != limits.capacity
             || u64::from_be_bytes(head[16..24].try_into().unwrap()) != limits.control_reserve { return Err(Error::Invalid); }
-        let mut spool = Self { _directory: directory, _lock: lock, journal, limits, state: State::new(), unrecorded_loss: false, restart_uncertain: false };
+        // Sync the parent even when adopting visible entries from an earlier
+        // interrupted initialization; visibility alone is not durable naming.
+        #[cfg(test)]
+        if inject_directory_sync_failure { return Err(Error::Io(io::Error::other("injected directory fsync failure"))); }
+        directory.sync_all()?;
+        let mut spool = Self { _directory: directory, _lock: lock, journal, limits, state: State::new(),
+            unrecorded_loss: false, restart_uncertain: false,
+            #[cfg(test)] fail_next_sync: inject_recovery_sync_failure };
         spool.recover()?;
         Ok(spool)
     }
@@ -315,6 +339,11 @@ impl Spool {
                 self.state.health = Health::Corrupt; self.state.unknown_suffix = true; break;
             }
         }
+        // A complete close visible after a failed fsync is not yet durable.
+        // Re-sync the validated complete prefix before exposing clean status.
+        if self.state.health == Health::Clean && self.sync_journal().is_err() {
+            self.state.health = Health::IoUncertain; self.state.unknown_suffix = true;
+        }
         if self.state.epochs.is_empty() && self.state.health == Health::Clean { self.state.health = Health::Unopened; }
         if self.state.active().is_some() { self.state.unknown_suffix = true; self.restart_uncertain = true; }
         if self.state.health == Health::Clean && self.state.unknown_suffix { self.state.health = Health::UncleanSuffix; }
@@ -325,6 +354,7 @@ impl Spool {
     pub fn health(&self) -> Health {
         if self.state.health == Health::Clean && self.state.unknown_suffix { Health::UncleanSuffix }
         else if self.state.health == Health::Clean && self.known_loss_lower_bound() > 0 { Health::Incomplete }
+        else if self.state.health == Health::Clean && self.state.active().is_some() { Health::Open }
         else { self.state.health }
     }
     pub fn unknown_suffix(&self) -> bool { self.state.unknown_suffix || self.state.epochs.is_empty() }
@@ -333,16 +363,26 @@ impl Spool {
             .fold(0u64, u64::saturating_add);
         checkpoints.max(self.state.known_loss)
     }
-    pub fn allocated_data_bytes(&self) -> Result<u64, Error> { allocated(&self.journal) }
+    pub fn allocated_data_bytes(&self) -> Result<u64, Error> { validate_lock(&self._lock)?; allocated(&self.journal) }
     pub fn logical_bytes(&self) -> u64 { self.state.used }
+
+    fn sync_journal(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_next_sync {
+            self.fail_next_sync = false;
+            return Err(io::Error::other("injected journal fsync failure"));
+        }
+        self.journal.sync_all()
+    }
 
     // A complete frame may have survived a failed fsync. Re-sync before an
     // idempotent success, so a retry never mistakes visibility for durability.
     fn sync_existing(&mut self) -> Result<(), Error> {
         if matches!(self.state.health, Health::PartialTail | Health::Corrupt | Health::IoUncertain) { return Err(Error::Quarantined); }
         let check = (|| -> Result<(), Error> {
+            validate_lock(&self._lock)?;
             if allocated(&self.journal)? != self.limits.capacity || self.journal.metadata()?.len() != self.state.used { return Err(Error::Bounds); }
-            self.journal.sync_all()?;
+            self.sync_journal()?;
             Ok(())
         })();
         if check.is_err() { self.state.health = Health::IoUncertain; self.state.unknown_suffix = true; }
@@ -354,10 +394,12 @@ impl Spool {
         let bytes = frame(&record)?;
         let mut next = self.state.clone();
         next.apply(&record, bytes.len() as u64, self.limits)?;
-        if allocated(&self.journal)? != self.limits.capacity || self.journal.metadata()?.len() != self.state.used {
+        if validate_lock(&self._lock).is_err() || allocated(&self.journal)? != self.limits.capacity || self.journal.metadata()?.len() != self.state.used {
             self.state.health = Health::IoUncertain; self.state.unknown_suffix = true; return Err(Error::Bounds);
         }
-        if let Err(e) = self.journal.seek(SeekFrom::End(0)).and_then(|_| self.journal.write_all(&bytes)).and_then(|_| self.journal.sync_all()) {
+        let written = self.journal.seek(SeekFrom::End(0)).and_then(|_| self.journal.write_all(&bytes));
+        let persisted = written.and_then(|_| self.sync_journal());
+        if let Err(e) = persisted {
             self.state.health = Health::IoUncertain;
             self.state.unknown_suffix = true;
             return Err(Error::Io(e));
@@ -409,7 +451,7 @@ impl Spool {
     }
     /// `known_loss` is a cumulative journal-wide lower bound, not a delta.
     pub fn record_gap(&mut self, known_loss: u64, unknown_suffix: bool) -> Result<(), Error> {
-        if self.unrecorded_loss && known_loss == 0 && !unknown_suffix { return Err(Error::Invalid); }
+        if self.unrecorded_loss && !unknown_suffix { return Err(Error::Invalid); }
         let e = *self.state.active().ok_or(Error::NoOpen)?;
         let result = self.append(Record::Gap { producer: e.producer, boot: e.boot, known_loss, unknown_suffix });
         // Failure to persist the gap must itself make coverage unknown.
@@ -496,6 +538,11 @@ mod tests {
     use crate::shadow_observation::{Authorization, Execution};
     use std::os::unix::fs::{symlink, PermissionsExt};
 
+    fn fixture_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
     fn limits() -> Limits { Limits { capacity: 128 * 1024, control_reserve: 32 * 1024 } }
     fn id(s: &str) -> Id { Id::new(s).unwrap() }
     fn envelope(n: u64) -> Envelope {
@@ -511,12 +558,13 @@ mod tests {
 
     #[test]
     fn durable_roundtrip_dedupe_receipt_and_close() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let mut s = Spool::open(dir.path(), limits()).unwrap();
         assert_eq!(s.health(), Health::Unopened);
         assert!(s.unknown_suffix());
         assert_eq!(s.allocated_data_bytes().unwrap(), limits().capacity);
         s.begin(id("producer"), [1; 16]).unwrap();
+        assert_eq!(s.health(), Health::Open);
         let e = envelope(1);
         let original = e;
         let d = Spool::event_digest(&e).unwrap();
@@ -541,7 +589,7 @@ mod tests {
 
     #[test]
     fn conflicting_event_cannot_become_clean_coverage() {
-        let dir = tempfile::tempdir().unwrap(); let mut s = opened(dir.path());
+        let dir = fixture_dir(); let mut s = opened(dir.path());
         let e = envelope(1); s.append_event(&e).unwrap();
         let mut changed = e; changed.facts.actual_authorization = Authorization::Deny;
         assert!(matches!(s.append_event(&changed), Err(Error::Conflict)));
@@ -555,7 +603,7 @@ mod tests {
 
     #[test]
     fn unclean_boot_replay_and_stable_receipt() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let mut s = opened(dir.path());
         let e = envelope(1); let d = Spool::event_digest(&e).unwrap();
         s.append_event(&e).unwrap(); s.checkpoint(2, counts(1)).unwrap();
@@ -579,7 +627,7 @@ mod tests {
 
     #[test]
     fn partial_tail_and_middle_corruption_quarantine_prefix() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let mut s = opened(dir.path()); let e = envelope(1);
         s.append_event(&e).unwrap(); let prefix = s.logical_bytes(); drop(s);
         let path = dir.path().join("journal");
@@ -602,7 +650,7 @@ mod tests {
 
     #[test]
     fn capacity_gap_and_control_exhaustion_are_never_clean() {
-        let dir = tempfile::tempdir().unwrap(); let small = Limits { capacity: 16 * 1024, control_reserve: 4096 };
+        let dir = fixture_dir(); let small = Limits { capacity: 16 * 1024, control_reserve: 4096 };
         let mut s = Spool::open(dir.path(), small).unwrap(); s.begin(id("producer"), [1; 16]).unwrap();
         let mut n = 1;
         loop {
@@ -623,8 +671,94 @@ mod tests {
     }
 
     #[test]
+    fn sequences_require_accounted_holes_and_no_late_events() {
+        let dir = fixture_dir(); let mut s = opened(dir.path());
+        assert_eq!(s.health(), Health::Open);
+        let e = envelope(2); s.append_event(&e).unwrap();
+        assert!(matches!(s.checkpoint(3, counts(1)), Err(Error::Invalid)));
+        // Two claimed admissions with only one flushed record are unsupported.
+        assert!(matches!(s.checkpoint(3, counts(2)), Err(Error::Invalid)));
+        let c = Counts { attempted: 2, admitted: 1, loss: 1, ..Counts::default() };
+        s.checkpoint(3, c).unwrap();
+        assert_eq!(s.health(), Health::Incomplete);
+        s.acknowledge(e.id, Spool::event_digest(&e).unwrap(), id("receipt")).unwrap();
+        s.close(3).unwrap(); drop(s);
+        let s = Spool::open(dir.path(), limits()).unwrap();
+        assert_eq!(s.health(), Health::Incomplete);
+
+        let dir2 = fixture_dir(); let mut s = opened(dir2.path());
+        s.append_event(&e).unwrap(); s.checkpoint(3, c).unwrap();
+        assert!(matches!(s.append_event(&envelope(1)), Err(Error::Invalid)));
+        assert!(s.unknown_suffix());
+        assert!(matches!(s.close(3), Err(Error::Uncheckpointed)));
+        s.record_gap(1, true).unwrap();
+    }
+
+    #[test]
+    fn repeated_loss_bound_cannot_clear_new_failures() {
+        let dir = fixture_dir(); let mut s = opened(dir.path());
+        let e = envelope(1); s.append_event(&e).unwrap();
+        s.record_gap(1, false).unwrap();
+        let mut conflict = e; conflict.facts.actual_authorization = Authorization::Deny;
+        assert!(matches!(s.append_event(&conflict), Err(Error::Conflict)));
+        assert!(matches!(s.append_event(&conflict), Err(Error::Conflict)));
+        assert!(matches!(s.record_gap(1, false), Err(Error::Invalid)));
+        assert!(matches!(s.close(2), Err(Error::Uncheckpointed)));
+        s.record_gap(1, true).unwrap();
+        // A repeated/lost-response marker is a lower bound, never additive.
+        s.record_gap(1, true).unwrap(); assert_eq!(s.known_loss_lower_bound(), 1);
+        s.checkpoint(2, counts(1)).unwrap();
+        s.acknowledge(e.id, Spool::event_digest(&e).unwrap(), id("receipt")).unwrap();
+        s.close(2).unwrap(); drop(s);
+        let s = Spool::open(dir.path(), limits()).unwrap(); assert!(s.unknown_suffix());
+    }
+
+    #[test]
+    fn close_sync_failure_and_failed_recovery_sync_remain_uncertain() {
+        let dir = fixture_dir(); let mut s = opened(dir.path());
+        let e = envelope(1); s.append_event(&e).unwrap(); s.checkpoint(2, counts(1)).unwrap();
+        s.acknowledge(e.id, Spool::event_digest(&e).unwrap(), id("receipt")).unwrap();
+        s.fail_next_sync = true;
+        assert!(matches!(s.close(2), Err(Error::Io(_))));
+        assert_eq!(s.health(), Health::IoUncertain); drop(s);
+        let mut s = Spool::open_internal(dir.path(), limits(), true, false).unwrap();
+        assert_eq!(s.health(), Health::IoUncertain); assert!(s.unknown_suffix());
+        assert!(matches!(s.begin(id("producer"), [2; 16]), Err(Error::Quarantined)));
+        let mut seen = 0; s.replay(|_, _, _| seen += 1).unwrap(); assert_eq!(seen, 1);
+        drop(s);
+        // A successful recovery fsync establishes durable visible close bytes.
+        let s = Spool::open(dir.path(), limits()).unwrap(); assert_eq!(s.health(), Health::Clean);
+    }
+
+    #[test]
+    fn interrupted_directory_sync_is_retried_on_adoption() {
+        let dir = fixture_dir();
+        assert!(matches!(Spool::open_internal(dir.path(), limits(), false, true), Err(Error::Io(_))));
+        let len = std::fs::metadata(dir.path().join("journal")).unwrap().len();
+        assert_eq!(len, HEADER);
+        assert!(matches!(Spool::open_internal(dir.path(), limits(), false, true), Err(Error::Io(_))));
+        assert_eq!(std::fs::metadata(dir.path().join("journal")).unwrap().len(), len);
+        let mut s = Spool::open(dir.path(), limits()).unwrap();
+        assert_eq!(s.health(), Health::Unopened); s.begin(id("producer"), [1; 16]).unwrap();
+        assert_eq!(s.health(), Health::Open);
+    }
+
+    #[test]
+    fn refuses_allocated_or_sparse_lock_without_overwriting() {
+        for sparse in [false, true] {
+            let dir = fixture_dir(); let path = dir.path().join("lock");
+            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            if sparse { f.set_len(4096).unwrap(); } else { f.write_all(&[42]).unwrap(); }
+            f.sync_all().unwrap(); let before = f.metadata().unwrap().len(); drop(f);
+            assert!(matches!(Spool::open(dir.path(), limits()), Err(Error::Bounds)));
+            assert_eq!(std::fs::metadata(path).unwrap().len(), before);
+        }
+    }
+
+    #[test]
     fn receipt_ranges_preserve_holes_and_held_events() {
-        let dir = tempfile::tempdir().unwrap(); let mut s = opened(dir.path());
+        let dir = fixture_dir(); let mut s = opened(dir.path());
         let events = [envelope(1), envelope(2), envelope(3)];
         for e in &events { s.append_event(e).unwrap(); }
         for e in [&events[0], &events[2]] {
@@ -642,7 +776,7 @@ mod tests {
 
     #[test]
     fn persisted_known_loss_cannot_appear_clean() {
-        let dir = tempfile::tempdir().unwrap(); let mut s = opened(dir.path());
+        let dir = fixture_dir(); let mut s = opened(dir.path());
         let e = envelope(1); s.append_event(&e).unwrap();
         let c = Counts { attempted: 2, admitted: 1, loss: 1, oversize: 1, invalid: 0 };
         s.checkpoint(3, c).unwrap();
@@ -655,7 +789,7 @@ mod tests {
 
     #[test]
     fn unsynced_receipt_frame_is_never_a_clean_interval() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let mut s = opened(dir.path()); let e = envelope(1);
         s.append_event(&e).unwrap(); s.checkpoint(2, counts(1)).unwrap(); drop(s);
         let d = Spool::event_digest(&e).unwrap();
@@ -684,15 +818,15 @@ mod tests {
 
     #[test]
     fn rejects_symlinks_bad_modes_and_concurrent_owners() {
-        let dir = tempfile::tempdir().unwrap(); let s = opened(dir.path());
+        let dir = fixture_dir(); let s = opened(dir.path());
         assert!(matches!(Spool::open(dir.path(), limits()), Err(Error::Busy)));
         drop(s);
-        let parent = tempfile::tempdir().unwrap(); let link = parent.path().join("link");
+        let parent = fixture_dir(); let link = parent.path().join("link");
         symlink(dir.path(), &link).unwrap();
         assert!(Spool::open(&link, limits()).is_err());
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(matches!(Spool::open(dir.path(), limits()), Err(Error::Invalid)));
-        let other = tempfile::tempdir().unwrap();
+        let other = fixture_dir();
         symlink("/dev/null", other.path().join("journal")).unwrap();
         assert!(Spool::open(other.path(), limits()).is_err());
     }

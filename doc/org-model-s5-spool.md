@@ -11,11 +11,13 @@ S4 wire type is changed.
 
 ## Disk and state machine
 
-The caller supplies an existing absolute private (owner, mode 0700) directory.
+The caller supplies an existing absolute private (owner, mode 0700) directory
+whose own creation and parent directory entry have already been made durable.
 The implementation opens each path component using `openat`/`O_NOFOLLOW` and
 never uses a caller-supplied filename. Its only owned files are `lock` and
 `journal`: regular, single-link, caller-owned mode 0600 files, opened without
-following a final symlink. A nonblocking exclusive `flock` is held for the
+following a final symlink. The lock must have zero length and zero allocated
+blocks, including on adoption; otherwise it is refused without modification. A nonblocking exclusive `flock` is held for the
 handle's lifetime. This protects cooperating writers, not an adversarial process
 with the same OS UID or a filesystem that violates POSIX locking. Deployment
 must place the directory on a verified local filesystem with appropriate mount,
@@ -24,7 +26,8 @@ ACL and ownership controls; this library cannot authenticate a filesystem.
 Creation uses `O_EXCL`, never overwrites an existing file, and reserves the
 whole configurable, block-aligned data budget with Linux `fallocate(KEEP_SIZE)`
 before enabling writes. Unsupported reservation or unexpected `st_blocks`
-disables the spool. It syncs the file and then directory after creating entries.
+disables the spool. It syncs the lock and parent directory on both creation and adoption, so a
+previous interrupted initialization cannot leave only a visible, unsynced name.
 The journal is one immutable-header append-only file: capacity and control
 reserve in its header, then bounded frames `(u32 length, 32-byte SHA-256,
 canonical typed JSON)`. Every append validates the entire transition first,
@@ -51,8 +54,12 @@ event/checkpoint/close writes to that boot. A fresh boot marker is required;
 opening it never clears the old uncertainty. Existing receipts and duplicate
 retries can still be reconciled. An empty journal is `Unopened`, not evidence
 of a clean zero. A system-level manifest is still required to detect a boot on
-which this library was never opened. Checkpoints validate monotonic counts and
-sequence and are lower bounds; a clean close requires a matching final checkpoint,
+which this library was never opened. Events are accepted in strictly increasing sequence order; a checkpoint is
+allowed only after all admitted events through its boundary have been flushed.
+Its `attempted` must equal `next_sequence - 1`, its `admitted` must equal the
+number of stored events, and `attempted = admitted + loss`. Consequently holes
+cannot be clean; a later event below a checkpoint is refused. Checkpoints are
+lower bounds; a clean close requires a matching final checkpoint,
 all its admitted events present and individually acknowledged, and the caller's
 assertion that its queue has drained. A recorded gap reports a cumulative journal-wide known loss lower
 bound and/or an unknown suffix; retries do not add the same loss twice; overlapping checkpoint and gap counts are not
@@ -62,7 +69,8 @@ rejects further writes. Restart sees the unclosed epoch as unknown even if no
 marker survived. No elapsed time turns uncertainty into agreement or readiness.
 
 A failed event admission is returned to the caller and marks an unrecorded loss;
-close cannot succeed until a nonzero loss or explicit unknown gap is persisted.
+close cannot succeed until an explicit unknown-suffix gap is persisted; a
+previously recorded cumulative loss bound cannot clear a new failure.
 No logic claims that an event was never offered elsewhere or reissues an action.
 A successful write can be followed by a lost response: after restart the caller
 retries the same ID/digest; the scan identifies a duplicate and re-syncs before
@@ -75,7 +83,10 @@ receipt.
 
 Recovery verifies header, record length, checksum, strict typed decoding,
 canonical representation, identity/digest uniqueness and transition rules.
-It replays only the verified prefix and never fabricates endpoint, actual,
+Before reporting a complete recovered prefix or clean close, it successfully
+syncs the journal again. Failed recovery sync yields an uncertain,
+write-quarantined handle. Active epochs report open rather than clean, with
+loss and unknown taking precedence. It replays only the verified prefix and never fabricates endpoint, actual,
 execution or provenance. A short final header/payload is classified as a
 **possible partial tail**, not proof of a clean prior disk or a power-loss
 model; an impossible length, invalid checksum, malformed/noncanonical record
