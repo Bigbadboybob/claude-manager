@@ -30208,6 +30208,36 @@ while True:
                 assert!(std::time::Instant::now() < deadline, "worker item evidence never became available");
                 std::thread::yield_now();
             }
+            // Force the state try-lock to fail at the production dispatch
+            // snapshot, then release it before normal authorization/delivery.
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+            let locked_state = state.clone();
+            let holder = std::thread::spawn(move || {
+                let guard = locked_state.lock().unwrap();
+                held_tx.send(()).unwrap();
+                release_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+                drop(guard);
+                dropped_tx.send(()).unwrap();
+            });
+            held_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+            crate::items::s4_attribution::take_test_trace();
+            crate::control::dispatch::test_after_s4(Some(Box::new(move || {
+                assert!(crate::items::s4_attribution::take_test_trace().contains(&"state-busy"));
+                assert!(crate::items::s4_attribution::current().0.is_empty());
+                release_tx.send(()).unwrap();
+                dropped_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+            })));
+            let contended = crate::control::protocol::Request { id:"contended-chat".into(), caller:crate::control::protocol::Caller::session(worker_uid),
+                method:"messaging.send".into(), params:json!({"channel":"general", "name":"worker", "body":"contended", "request_id":"contended-chat"}) };
+            let result = crate::control::dispatch::dispatch_request(&state, &contended);
+            crate::control::dispatch::test_after_s4(None);
+            holder.join().unwrap();
+            let crate::control::dispatch::DispatchOutcome::Done(response) = result else { panic!("contended chat must complete") };
+            assert!(response.ok, "{:?}", response.error);
+            assert!(response.result.unwrap()["event"]["data"]["actor_attribution"].is_null());
+            eprintln!("forced state-busy snapshot: unknown attribution, successful chat");
             // Each attempt is a separate successful write; a busy nonblocking
             // snapshot may legitimately omit evidence on any one attempt.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -30216,14 +30246,26 @@ while True:
                 attempt += 1;
                 let chat = crate::control::protocol::Request { id:format!("chat-{attempt}"), caller:crate::control::protocol::Caller::session(worker_uid),
                     method:"messaging.send".into(), params:json!({"channel":"general", "name":"worker", "body":"ready", "request_id":format!("worker-chat-{attempt}")}) };
+                crate::items::s4_attribution::take_test_trace();
+                let captured = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let observed = captured.clone();
+                let observed_uid = worker_uid.to_owned();
+                crate::control::dispatch::test_after_s4(Some(Box::new(move || {
+                    observed.store(crate::items::s4_attribution::current().0.contains_key(&observed_uid), std::sync::atomic::Ordering::SeqCst);
+                })));
                 let result = crate::control::dispatch::dispatch_request(&state, &chat);
+                crate::control::dispatch::test_after_s4(None);
                 let crate::control::dispatch::DispatchOutcome::Done(response) = result else { panic!("chat must complete") };
                 assert!(response.ok, "{:?}", response.error);
                 let attribution = response.result.unwrap()["event"]["data"]["actor_attribution"].clone();
                 if attribution["acting_as"] == "worker" {
+                    assert!(captured.load(std::sync::atomic::Ordering::SeqCst), "positive chat needs its own captured subject");
                     assert_eq!(attribution["provenance"], "o5-spawn-stamp");
+                    eprintln!("worker positive capture and chat claim at attempt {attempt}");
                     break;
                 }
+                eprintln!("worker chat attempt {attempt} unknown (captured={}): {:?}",
+                    captured.load(std::sync::atomic::Ordering::SeqCst), crate::items::s4_attribution::take_test_trace());
                 assert!(attribution.is_null() || attribution["provenance"] == "unknown", "{attribution}");
                 assert!(std::time::Instant::now() < deadline, "worker chat evidence never became available");
                 std::thread::yield_now();

@@ -6,6 +6,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::os::fd::{AsRawFd, OwnedFd};
 
+#[cfg(test)]
+thread_local! { static TEST_TRACE: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) }; }
+#[cfg(test)]
+fn trace(reason: &'static str) { TEST_TRACE.with(|t| t.borrow_mut().push(reason)); }
+#[cfg(test)]
+pub(crate) fn take_test_trace() -> Vec<&'static str> { TEST_TRACE.with(|t| std::mem::take(&mut *t.borrow_mut())) }
+
 #[derive(Clone)]
 pub(crate) struct Subject {
     pid: libc::pid_t, incarnation: Option<u64>, generation: u64,
@@ -29,11 +36,24 @@ impl Subject {
 pub(crate) struct Evidence { pub(crate) claim: Value, subject: Subject, pidfd: Arc<OwnedFd> }
 impl Evidence {
     fn matches(&self, current: &Subject) -> bool {
-        if !self.subject.same(current) || current.exit.try_kernel_set() != Some(false) { return false; }
+        if !self.subject.same(current) {
+            #[cfg(test)] trace("subject-changed");
+            return false;
+        }
+        match current.exit.try_kernel_set() {
+            Some(false) => {},
+            other => {
+                #[cfg(test)] trace(if other.is_none() { "exit-probe-busy" } else { "subject-exited" });
+                let _ = other;
+                return false;
+            }
+        }
         let mut descriptor = libc::pollfd { fd: self.pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
         // pidfd is bound by the kernel to the original process; timeout zero
         // neither waits nor depends on a reusable numerical PID.
-        unsafe { libc::poll(&mut descriptor, 1, 0) == 0 }
+        let live = unsafe { libc::poll(&mut descriptor, 1, 0) == 0 };
+        #[cfg(test)] if !live { trace("pidfd-not-live"); }
+        live
     }
 }
 
@@ -131,7 +151,10 @@ pub(crate) fn capture(state: &Arc<Mutex<DaemonState>>) -> (HashMap<String, Evide
     capture_for(state, None)
 }
 fn capture_for(state: &Arc<Mutex<DaemonState>>, refs: Option<&[String]>) -> (HashMap<String, Evidence>, bool) {
-    if INVALID.load(Ordering::SeqCst) { return (HashMap::new(), WIRE.load(Ordering::SeqCst)); }
+    if INVALID.load(Ordering::SeqCst) {
+        #[cfg(test)] trace("snapshot-invalid");
+        return (HashMap::new(), WIRE.load(Ordering::SeqCst));
+    }
     let locals = match state.try_lock() {
         Ok(s) => s.sessions.iter().filter(|(uid, session)| refs.is_none_or(|refs| refs.iter().any(|r| {
             uid.to_lowercase() == *r || r.rsplit(':').next() == Some(uid.as_str())
@@ -143,18 +166,34 @@ fn capture_for(state: &Arc<Mutex<DaemonState>>, refs: Option<&[String]>) -> (Has
             session.continuous_task_id.is_some(), session.org.clone(), Subject::from_session(session),
             Arc::new(session.s4_pidfd()?),
         ))).collect::<Vec<_>>(),
-        Err(_) => return (HashMap::new(), WIRE.load(Ordering::SeqCst)),
+        Err(_) => {
+            #[cfg(test)] trace("state-busy");
+            return (HashMap::new(), WIRE.load(Ordering::SeqCst));
+        },
     };
     let central = match cache().try_lock() {
         Ok(c) => c.clone(),
-        Err(_) => return (HashMap::new(), WIRE.load(Ordering::SeqCst)),
+        Err(_) => {
+            #[cfg(test)] trace("cache-busy");
+            return (HashMap::new(), WIRE.load(Ordering::SeqCst));
+        },
     };
     let wire = central.as_ref().is_some_and(|c| c.wire);
-    if INVALID.load(Ordering::SeqCst) { return (HashMap::new(), wire); }
+    if INVALID.load(Ordering::SeqCst) {
+        #[cfg(test)] trace("snapshot-invalid-after-capture");
+        return (HashMap::new(), wire);
+    }
     let mut claims = HashMap::new();
     for (uid, origin, pid, incarnation, generation, workflow, continuous, org, subject, pidfd) in locals {
         if origin.0 != pid || origin.1 != incarnation || origin.2 != generation || workflow || continuous { continue; }
-        if subject.exit.try_kernel_set() != Some(false) { continue; }
+        match subject.exit.try_kernel_set() {
+            Some(false) => {},
+            other => {
+                #[cfg(test)] trace(if other.is_none() { "capture-exit-probe-busy" } else { "capture-subject-exited" });
+                let _ = other;
+                continue;
+            }
+        }
         if central.as_ref().is_some_and(|c| c.ambiguous.contains(&uid)) { continue; }
         let legacy = crate::assistants::stamped(origin.3.as_ref()).map(|(m, r)| (m, r.to_string()));
         let current_stamp = crate::assistants::stamped(org.as_ref()).map(|(m, r)| (m, r.to_string()));
@@ -171,6 +210,7 @@ fn capture_for(state: &Arc<Mutex<DaemonState>>, refs: Option<&[String]>) -> (Has
             if ev.matches(&ev.subject) { claims.insert(uid, ev); }
         }
     }
+    #[cfg(test)] if claims.is_empty() { trace("capture-no-claim"); }
     (claims, wire)
 }
 
