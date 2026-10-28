@@ -2271,7 +2271,7 @@ mod tests {
         let a = json!({"member_id":"mem_a", "acting_as":"main", "provenance":"central-open-main", "org_version":1});
         let b = json!({"member_id":"mem_b", "acting_as":"main", "provenance":"central-open-main", "org_version":2});
         let first = s.send_with_attribution(&p.id, "a", "agent", &params, &[p.clone()], Some(&a)).unwrap();
-        let retry = s.send_with_attribution(&p.id, "a", "agent", &params, &[p], Some(&b)).unwrap();
+        let retry = s.send_with_attribution(&p.id, "a", "agent", &params, &[p.clone()], Some(&b)).unwrap();
         assert_eq!(first["event_id"], retry["event_id"]);
         assert_eq!(retry["event"]["data"]["actor_attribution"], a);
     }

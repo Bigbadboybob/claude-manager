@@ -64,6 +64,11 @@ all-unknown implementation complete.
 | `messaging/rpc.rs` → `messaging/store.rs:request/send` | The existing request digest hashes caller params before publication. Adding a variable snapshot to those params changes retry identity. Any daemon-only evidence must preserve the old request digest and receipt behavior. Forwarded/remote origin is unknown, and must not inherit a local sender claim. |
 | `items/heartbeat.rs` → `org_db.py:heartbeat_extras` | Existing heartbeat is best-effort and cannot block ordinary operations. Any additive central snapshot or support announcement must be coherent and independently versioned, compatible with older peers, and not create a new operation-path network call or timer. |
 
+CM ruling `a863d518` accepts that the initial `item.resolve(action=launch)`
+holder is unknown: that child did not exist at the pre-gate snapshot. Later
+supported writes can carry the child's own O5 label. The launch must not copy
+the actor's member or take a post-spawn provenance gate.
+
 ## Verification after explicit driver transfer
 
 Use isolated positive and negative fixtures for the real source/version,
