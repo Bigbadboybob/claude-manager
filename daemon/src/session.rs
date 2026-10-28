@@ -322,6 +322,11 @@ impl PtyByteFanout {
         for tx in inner.output_subscribers.drain(..) { tx.close(); }
     }
 
+    /// Read producer closure without copying the replay buffer.
+    pub fn is_closed(&self) -> bool {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).closed
+    }
+
     /// Append `bytes` to the ring (FIFO-evicting if needed) and
     /// broadcast a copy to every live subscriber.
     pub fn push(&self, bytes: &[u8]) {
@@ -4082,6 +4087,33 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn alloc56_closed_check_preserves_replay_and_allocates_nothing() {
+        use crate::test_support::allocations::measure;
+        let fanout = PtyByteFanout::new(1024 * 1024);
+        fanout.push(&vec![b'x'; 1024 * 1024]);
+        for closed in [false, true] {
+            if closed { fanout.close(); }
+            let (old, before) = measure(|| fanout.snapshot_since(None).closed);
+            let (new, after) = measure(|| fanout.is_closed());
+            assert_eq!((old, new), (closed, closed));
+            assert_eq!(before.bytes, 1024 * 1024);
+            assert_eq!(after.bytes, 0);
+            assert_eq!(after.calls, 0);
+            println!("ALLOC56 closed={closed} old_requested_bytes={} new_requested_bytes={}", before.bytes, after.bytes);
+            let snapshot = fanout.snapshot_since(None);
+            assert_eq!(snapshot.bytes, vec![b'x'; 1024 * 1024]);
+            assert_eq!(snapshot.cursor, 1024 * 1024);
+        }
+        // Keep the accessor's existing poisoned-mutex recovery behavior.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = fanout.inner.lock().unwrap();
+            panic!("poison fixture");
+        }));
+        assert!(fanout.is_closed());
+        assert!(fanout.snapshot_since(None).closed);
+    }
 
     /// Wait briefly for an mpsc receiver to surface a value; helps
     /// the few multi-thread tests not flake.

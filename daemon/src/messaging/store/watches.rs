@@ -257,13 +257,18 @@ impl Store {
     pub fn advance_monitors_at(&mut self, clock: DateTime<Utc>) -> Result<()> {
         let owners: Vec<_> = self.personal.keys().cloned().collect();
         for actor in owners {
-            let mut state = self.personal_state(&actor);
-            let mut changed = false;
-            for monitor in state.monitors.values_mut() {
-                changed |= self.scan_monitor(&actor, monitor, clock)?;
+            let mut updates = BTreeMap::new();
+            for (id, monitor) in &self.personal[&actor].monitors {
+                if monitor.state != "active" {
+                    continue;
+                }
+                let mut candidate = monitor.clone();
+                if self.scan_monitor(&actor, &mut candidate, clock)? {
+                    updates.insert(id.clone(), candidate);
+                }
             }
-            if changed {
-                self.save_personal(state)?;
+            if !updates.is_empty() {
+                self.save_monitor_updates(&actor, updates)?;
             }
         }
         Ok(())

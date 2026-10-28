@@ -2802,6 +2802,29 @@ impl Store {
     }
 }
 
+/// Encode exactly the newest retained checkpoint marks, overlaying a staged
+/// insertion/replacement without copying the unbounded in-memory history.
+pub(super) fn recent_marks(marks: &BTreeMap<u64, Value>, pending: Option<&(u64, Value)>) -> Vec<Value> {
+    let mut old = marks.iter().rev().peekable();
+    let mut pending = pending;
+    let mut recent = Vec::new();
+    while recent.len() < RETAINED_MARKS {
+        if let Some((key, value)) = pending {
+            if old.peek().is_none_or(|(old_key, _)| key >= *old_key) {
+                if old.peek().is_some_and(|(old_key, _)| key == *old_key) {
+                    old.next();
+                }
+                recent.push(json!([key, value]));
+                pending = None;
+                continue;
+            }
+        }
+        let Some((key, value)) = old.next() else { break; };
+        recent.push(json!([key, value]));
+    }
+    recent
+}
+
 /// Coverage checkpoints. A checkpoint claims "this replica holds everything
 /// through hub position N" for a scope, so it is written only after the
 /// records it covers are durable, and losing it (or falling back to an older
@@ -2834,7 +2857,7 @@ impl Store {
                 .get_or_insert_with(|| self.replication.coverage.clone())
                 .insert((*scope).to_owned(), data);
         }
-        let mut marks = None;
+        let mut pending_mark = None;
         if let Some((cursor, revision, subscribed)) = transport {
             let data = json!({"scope":"transport","coordinator_id":self.coordinator_id(),"generation":generation,"cursor":cursor,"revision":revision,"scopes":subscribed,"complete":false});
             coverage
@@ -2842,18 +2865,17 @@ impl Store {
                 .insert("transport".into(), data.clone());
             // Known to position tokens minted after the next local arrival
             // (a token at the current position may predate this checkpoint).
-            let mut m = self.replication.marks.clone();
-            m.insert(self.position.saturating_add(1), transport_mark(&data));
-            marks = Some(m);
+            pending_mark = Some((self.position.saturating_add(1), transport_mark(&data)));
         }
         let Some(coverage) = coverage else {
             return Ok(());
         };
-        let marks = marks.unwrap_or_else(|| self.replication.marks.clone());
         let recorded_at = now();
-        self.save_coverage(&coverage, &marks, &recorded_at)?;
+        self.save_coverage(&coverage, pending_mark.as_ref(), &recorded_at)?;
         self.replication.coverage = coverage;
-        self.replication.marks = marks;
+        if let Some((position, mark)) = pending_mark {
+            self.replication.marks.insert(position, mark);
+        }
         self.replication.last_reconciled = Some(recorded_at);
         self.replication.signal.signal();
         Ok(())
@@ -2861,7 +2883,7 @@ impl Store {
     fn save_coverage(
         &mut self,
         coverage: &BTreeMap<String, Value>,
-        marks: &BTreeMap<u64, Value>,
+        pending_mark: Option<&(u64, Value)>,
         recorded_at: &str,
     ) -> Result<()> {
         // Claims are persisted only once everything ingested is durable.
@@ -2869,12 +2891,7 @@ impl Store {
         if let Some(reason) = &self.degraded {
             return Err(err("store_read_only", reason.clone()));
         }
-        let recent: Vec<_> = marks
-            .iter()
-            .rev()
-            .take(RETAINED_MARKS)
-            .map(|(k, v)| json!([k, v]))
-            .collect();
+        let recent = recent_marks(&self.replication.marks, pending_mark);
         atomic_replace(
             &self.root.join(COVERAGE_FILE),
             &json!({"version":1,"replica_id":self.daemon_id,"generation":self.generation,
@@ -2956,7 +2973,6 @@ impl Store {
                 .clone()
                 .unwrap_or_else(now);
             let coverage = self.replication.coverage.clone();
-            let marks = self.replication.marks.clone();
             let mut kept: BTreeSet<u64> = index.map(|i| i.kept).unwrap_or_default();
             kept.extend(scan.kept);
             // Legacy marks are immutable history; recent new-style marks
@@ -2967,7 +2983,7 @@ impl Store {
                 .range(..=floor)
                 .map(|(k, v)| json!([k, v]))
                 .collect();
-            let written = self.save_coverage(&coverage, &marks, &recorded_at).and_then(|_| {
+            let written = self.save_coverage(&coverage, None, &recorded_at).and_then(|_| {
                 atomic_replace(
                     &self.root.join(JOURNAL_INDEX_FILE),
                     &json!({"version":1,"replica_id":self.daemon_id,"generation":self.generation,

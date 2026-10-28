@@ -8800,7 +8800,7 @@ fn deliver_agent_body_inner(
     // receiver until the session exits, so a chatty orchestrator's
     // repeated `send_input`s would strand one thread per call. Dropping
     // `rx` on return lets the fanout's next push reap the slot.
-    if fanout.snapshot_since(None).closed { return false; }
+    if fanout.is_closed() { return false; }
     let rx = fanout.subscribe();
     let mut tracker = crate::workflow::pty_tracker::PtyModeTracker::with_size(80, 24);
     // Drain PTY bytes into the tracker for `dur`, so both the observed
@@ -8920,7 +8920,7 @@ fn deliver_agent_body_inner(
         if handle.operator_quiet_for().is_some_and(|quiet| quiet < OPERATOR_QUIET_WINDOW) { return false; }
         Some(guard)
     } else { None };
-    if fanout.snapshot_since(None).closed { return false; }
+    if fanout.is_closed() { return false; }
     // Reserve the UID for the complete body → Enter unit. The nested input
     // writes reuse this thread-scoped permit, avoiding a recursive read lock
     // when a recovery writer is already queued.

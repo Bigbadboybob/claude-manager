@@ -102,6 +102,40 @@ impl Store {
         Ok(())
     }
 
+    /// Monitor scans stage only changed monitors. Borrow the other potentially
+    /// large histories for encoding; never mutate committed state before the
+    /// durable write, including when rename succeeds but directory fsync fails.
+    pub(super) fn save_monitor_updates(
+        &mut self,
+        actor: &str,
+        updates: BTreeMap<String, super::watches::Monitor>,
+    ) -> Result<()> {
+        self.ensure_messaging_writable()?;
+        if let Some(reason) = &self.degraded {
+            return Err(err("store_read_only", reason.clone()));
+        }
+        let state = &self.personal[actor];
+        let revision = state
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| err("counter_overflow", "Personal state revision exhausted"))?;
+        let bytes = serde_json::to_vec_pretty(&state.monitor_checkpoint(revision, &updates))?;
+        if let Err(e) = write_file(&self.personal_path(actor), &bytes, true) {
+            self.degraded = Some(format!(
+                "Personal-state outcome requires reconciliation: {e}"
+            ));
+            return Err(err("outcome_unknown", self.degraded.clone().unwrap()));
+        }
+        let state = self
+            .personal
+            .get_mut(actor)
+            .expect("monitor owner remains present");
+        state.revision = revision;
+        state.monitors.extend(updates);
+        self.replication.signal.signal();
+        Ok(())
+    }
+
     pub(super) fn personal_request(
         &self,
         actor: &str,
@@ -173,11 +207,84 @@ fn global_scope() -> String {
     "global".into()
 }
 impl Personal {
+    fn monitor_checkpoint<'a>(
+        &'a self,
+        revision: u64,
+        updates: &'a BTreeMap<String, super::watches::Monitor>,
+    ) -> impl Serialize + 'a {
+        #[derive(Serialize)]
+        struct Checkpoint<'a> {
+            actor: &'a str,
+            revision: u64,
+            bell_position: u64,
+            bell_monitors: &'a BTreeMap<String, u64>,
+            norms_ack: &'a Option<String>,
+            channel_norms_ack: &'a BTreeMap<String, String>,
+            norms_supplied: &'a BTreeSet<String>,
+            norms_offered: &'a BTreeSet<String>,
+            norm_pages: &'a BTreeMap<String, NormPage>,
+            operations: &'a BTreeMap<String, Operation>,
+            monitor_receipts: &'a BTreeSet<String>,
+            monitors: MonitorUpdates<'a>,
+            preferences: &'a super::preferences::Preferences,
+        }
+        // Exhaustive destructuring makes any new Personal field a compile-time
+        // obligation here, rather than silently dropping it from checkpoints.
+        let Personal {
+            actor,
+            revision: _,
+            bell_position,
+            bell_monitors,
+            norms_ack,
+            channel_norms_ack,
+            norms_supplied,
+            norms_offered,
+            norm_pages,
+            operations,
+            monitor_receipts,
+            monitors,
+            preferences,
+        } = self;
+        Checkpoint {
+            actor,
+            revision,
+            bell_position: *bell_position,
+            bell_monitors,
+            norms_ack,
+            channel_norms_ack,
+            norms_supplied,
+            norms_offered,
+            norm_pages,
+            operations,
+            monitor_receipts,
+            monitors: MonitorUpdates { monitors, updates },
+            preferences,
+        }
+    }
+
     pub(super) fn norms_ack_for(&self, scope: &str) -> Option<&str> {
         if scope == "global" {
             self.norms_ack.as_deref()
         } else {
             self.channel_norms_ack.get(scope).map(String::as_str)
         }
+    }
+}
+
+struct MonitorUpdates<'a> {
+    monitors: &'a BTreeMap<String, super::watches::Monitor>,
+    updates: &'a BTreeMap<String, super::watches::Monitor>,
+}
+impl Serialize for MonitorUpdates<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.monitors.len()))?;
+        for (id, old) in self.monitors {
+            map.serialize_entry(id, self.updates.get(id).unwrap_or(old))?;
+        }
+        map.end()
     }
 }
