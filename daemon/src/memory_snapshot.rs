@@ -2,7 +2,8 @@
 //!
 //! mallinfo2 takes glibc arena locks internally. There is NO hard total-time
 //! bound and a disconnected/timed-out caller cannot cancel the C call. Keep
-//! one process-wide admission permit on the SAME handler until it returns.
+//! one process-wide permit on the SAME handler through aggregate Value
+//! construction. Ordinary wire encoding and socket writes follow its release.
 use crate::{
     control::{
         operator,
@@ -117,6 +118,18 @@ fn capture(
     budget: Duration,
     allocator_read: impl FnOnce() -> Section<Allocator>,
 ) -> serde_json::Value {
+    capture_with_value(state, in_flight, budget, allocator_read, |out| {
+        serde_json::to_value(out).expect("memory snapshot contains serializable scalars")
+    })
+}
+
+fn capture_with_value(
+    state: &Arc<Mutex<DaemonState>>,
+    in_flight: &AtomicBool,
+    budget: Duration,
+    allocator_read: impl FnOnce() -> Section<Allocator>,
+    construct_value: impl FnOnce(&Snapshot) -> serde_json::Value,
+) -> serde_json::Value {
     let began = Instant::now();
     let deadline = began + budget;
     let admission = Admission::enter(in_flight);
@@ -166,9 +179,12 @@ fn capture(
     out.finished_at = crate::messaging::now();
     out.elapsed_us = began.elapsed().as_micros() as u64;
     // All state/store guards have gone out of scope before JSON allocation.
-    let wire = serde_json::to_value(&out).expect("memory snapshot contains serializable scalars");
-    drop(admission); // Also held through serialization, including after a client timeout.
-    wire
+    let value = construct_value(&out);
+    // Admission covers Value construction, including after a client timeout.
+    // Ordinary response wire encoding and socket writes happen after this
+    // returns and may overlap another capture; they have no diagnostic permit.
+    drop(admission);
+    value
 }
 
 fn collect_messaging(state: &Arc<Mutex<DaemonState>>, deadline: Instant, out: &mut Snapshot) {
@@ -375,11 +391,72 @@ mod tests {
     fn memory_snapshot_admission_releases_on_unwind() {
         let gate = AtomicBool::new(false);
         let result = std::panic::catch_unwind(|| {
-            let _guard = Admission::enter(&gate).unwrap();
-            panic!("fixture");
+            capture_with_value(&state(), &gate, Duration::from_secs(1), fake, |_| {
+                assert!(gate.load(Ordering::Acquire));
+                panic!("Value construction fixture");
+            });
         });
         assert!(result.is_err());
         assert!(Admission::enter(&gate).is_some());
+    }
+
+    #[test]
+    fn memory_snapshot_admission_covers_value_construction_but_not_wire_io() {
+        let state = state();
+        let gate = Arc::new(AtomicBool::new(false));
+        let (entered, receive) = std::sync::mpsc::sync_channel(1);
+        let (release, wait) = std::sync::mpsc::sync_channel(1);
+        let worker_state = state.clone();
+        let worker_gate = gate.clone();
+        let worker = std::thread::spawn(move || {
+            capture_with_value(
+                &worker_state,
+                &worker_gate,
+                Duration::from_secs(1),
+                fake,
+                |out| {
+                    let handle = worker_state.try_lock().unwrap().messaging.clone();
+                    assert!(
+                        handle.try_lock().is_ok(),
+                        "no CM locks during Value construction"
+                    );
+                    entered.send(()).unwrap();
+                    wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                    serde_json::to_value(out).unwrap()
+                },
+            )
+        });
+        receive.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            capture(&state, &gate, Duration::from_secs(1), || panic!(
+                "second allocator"
+            ))["status"],
+            "busy"
+        );
+        release.send(()).unwrap();
+        let response = Response::ok("snapshot".into(), worker.join().unwrap());
+        assert!(
+            !gate.load(Ordering::Acquire),
+            "released before ordinary wire encoding"
+        );
+        // A disconnected writer cannot retain or resurrect diagnostic admission.
+        struct Disconnected<'a>(&'a AtomicBool);
+        impl std::io::Write for Disconnected<'_> {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                assert!(!self.0.load(Ordering::Acquire));
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let err =
+            crate::control::wire::write_response(&mut Disconnected(&gate), &response).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_ne!(
+            capture(&state, &gate, Duration::from_secs(1), fake)["status"],
+            "busy"
+        );
     }
 
     #[test]
@@ -423,6 +500,78 @@ mod tests {
         let text = result.to_string();
         assert!(!text.contains("transcript"));
         assert!(!text.contains("event_id"));
+        // The capture schema contains no per-event/participant arrays or strings.
+        // Even maximum scalar counters remain small; this excludes the RPC ID.
+        fn maximize_scalars(value: &mut serde_json::Value) -> usize {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    fields.values_mut().map(maximize_scalars).sum()
+                }
+                serde_json::Value::Array(_) => panic!("variable-length diagnostic array"),
+                serde_json::Value::String(s) => {
+                    assert!(s.len() <= 512);
+                    1
+                }
+                serde_json::Value::Number(_) => {
+                    *value = u64::MAX.into();
+                    1
+                }
+                _ => 1,
+            }
+        }
+        let mut largest = result;
+        assert!(maximize_scalars(&mut largest) <= 80);
+        assert!(serde_json::to_vec(&largest).unwrap().len() < 8192);
+    }
+
+    #[test]
+    fn memory_snapshot_caller_id_uses_ordinary_frame_limits() {
+        use crate::control::wire;
+        let result = capture(
+            &state(),
+            &AtomicBool::new(false),
+            Duration::from_secs(1),
+            fake,
+        );
+        let mut req = Request {
+            id: "i".repeat(1024 * 1024),
+            caller: Caller::operator("fixture"),
+            method: "daemon.memory_snapshot".into(),
+            params: serde_json::json!({}),
+        };
+        let mut request_wire = Vec::new();
+        wire::write_request(&mut request_wire, &req).unwrap();
+        let parsed = wire::read_request(&mut request_wire.as_slice())
+            .unwrap()
+            .unwrap();
+        let mut response = Response::ok(parsed.id, result);
+        let mut response_wire = Vec::new();
+        wire::write_response(&mut response_wire, &response).unwrap();
+        let decoded = wire::read_response(&mut response_wire.as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.id, req.id);
+
+        // A legal request can still produce an over-cap response due to its ID.
+        response.id.clear();
+        let overhead = serde_json::to_vec(&response).unwrap().len();
+        req.id = "i".repeat(wire::MAX_REQUEST_BYTES as usize - overhead + 1);
+        request_wire.clear();
+        wire::write_request(&mut request_wire, &req).unwrap();
+        let parsed = wire::read_request(&mut request_wire.as_slice())
+            .unwrap()
+            .unwrap();
+        response.id = parsed.id;
+        response_wire.clear();
+        let error = wire::write_response(&mut response_wire, &response).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(response_wire.is_empty(), "cap refusal precedes writes");
+        wire::write_response_or_error(&mut response_wire, &response).unwrap();
+        let fallback = wire::read_response(&mut response_wire.as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(fallback.id, req.id);
+        assert_eq!(fallback.error.unwrap().code, ErrorCode::Internal);
     }
 
     #[test]

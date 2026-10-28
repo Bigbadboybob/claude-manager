@@ -30,13 +30,16 @@ targets report `unsupported` with null data. No trimming is performed.
 **There is no hard total-time bound.** `mallinfo2` can wait for internal glibc
 arena locks and has no cancellation API. It executes on the existing RPC
 handler, never on a detached diagnostic worker. A process-wide admission flag
-remains held through the C call, collection and serialization, even if cm-op
-times out or disconnects. Concurrent retries return `status=busy`,
+remains held through the C call, collection and JSON Value construction, even if
+cm-op times out or disconnects. Concurrent retries return `status=busy`,
 `reason=snapshot_in_flight`, with unavailable data. A stuck call can occupy that
 one handler indefinitely; later requests cannot spawn additional allocator
-workers. Ordinary methods do not acquire this diagnostic flag. All allocation,
-including JSON serialization, also remains subject to normal allocator/OS
-scheduling; response delivery is not guaranteed within the client timeout.
+workers. Ordinary methods do not acquire this diagnostic flag. Ordinary wire
+encoding of the response and socket writes occur **after admission release** and
+may overlap another capture. There is no global wire/response exclusion or
+deadline. All allocation, including Value construction and wire encoding,
+remains subject to normal allocator/OS scheduling; response delivery is not
+guaranteed within the client timeout.
 
 The cooperative collection budget is 20 ms from capture entry, including time
 spent in the allocator call. If it is exhausted, subsequent sections are
@@ -44,7 +47,12 @@ unavailable/partial. Registry and Store acquisition use `try_lock`, never wait,
 and never overlap each other or the C call. Poisoned locks are unavailable.
 Participant iteration checks the deadline before every entry and visits at most
 4,096 entries. Preemption and the allocator call can exceed the budget; this is
-not a real-time deadline. All locks are released before JSON serialization.
+not a real-time deadline. All locks are released before JSON Value construction.
+Capture data has a fixed set of scalar fields and bounded identity/static
+strings, independent of payload or participant count. The outer RPC request ID
+is caller-supplied, so the entire response is not fixed-size; ordinary request
+and response frame caps (4 MiB) still apply. Those caps are not an allocation or
+time bound on wire encoding.
 
 Messaging reports O(1) event length/capacity, shared request, replication
 receipt/rejection and coverage scope/mark counts. It visits only participant
