@@ -13,7 +13,7 @@ grant member authority, change legacy operations, or authorize rollout.
 
 | Present source at baseline | What it establishes and its limit |
 |---|---|
-| `daemon/src/control/protocol.rs:Request` and `CallerSession`; `control/operator.rs` | A session caller supplies a UID on the same-user 0600 control socket. Operator validation is a separate path. A UID in an envelope, environment or `/proc` alone does not authenticate the actual originating agent process. Same OS UID is a trust boundary, not isolation against a malicious local peer. |
+| `daemon/src/control/protocol.rs:Request` and `CallerSession`; `control/operator.rs` | A session caller supplies a UID on the same-user 0600 control socket. `validate_operator` accepts any Operator-shaped caller when the token is unset; only the separate strong gate requires a configured, matching token. A UID in an envelope, environment or `/proc` alone does not authenticate the actual originating agent process. Same OS UID is a trust boundary, not isolation against a malicious local peer. |
 | `daemon/src/session.rs:DaemonSession`, `holder_mode.rs`, `holder-proto/src/holder_manifest.rs`; `adopt.rs:proc_starttime` | Registry, holder incarnation and process start information can help identify a live child. Holder incarnation has a lineage high-water mark; transcript generation, process start, holder incarnation, brain epoch and S6 occupancy generation are distinct. None alone proves who sent an RPC. |
 | `assistants.rs:stamp_spawn`, `member_for_spawn`, `fork_org`, `backfill`; `control/methods.rs:start_session` | O5 supplies existing local lifecycle stamps and assistant/worker behavior. Main-cache, persisted stamp, ancestor/task fallback and workspace are not independently process-bound evidence. Preserve their current lifecycle semantics; do not retroactively certify them. |
 | `items/org.rs:session_facts`, `items/heartbeat.rs`, `dispatch/org_db.py` | Heartbeats carry assistant facts; central `org_session_facts` coalesces omitted member/role with old values. Omission cannot clear a historical stamp or prove it is current. A cache, timestamp, checksum or heartbeat alone is not this contract's proof. |
@@ -56,8 +56,13 @@ authorized session channel within the stated same-user trust boundary; it does
 not identify which descendant composed the request or resist a same-UID
 credential thief. Existing UID-only calls continue under existing behavior,
 but have `unverified_origin` for this evidence contract. Operator and internal
-scheduler actions have distinct validated origin classes, not a fabricated
-agent signer. A missing authenticated channel must never be upgraded from a
+scheduler actions have separate origin classes, not a fabricated agent signer.
+An Operator-shaped request accepted by the compatibility path with token
+validation disabled is `unverified_origin`. A configured, matching token may
+establish the operator channel within the stated same-user threat boundary;
+an invalid token is not validated. Classification is independent of whether
+the existing endpoint allows or denies the operation, and does not change that
+authorization. A missing authenticated channel must never be upgraded from a
 matching UID or an authenticated daemon-to-API connection.
 
 A separate **member claim** `M` says member ID, role (`main`, `assistant`,
@@ -74,13 +79,22 @@ negative. A pending placement is unknown, not unbound. An unresolved source
 must not fall through to the caller, ancestor, task or workspace to create a
 known claim. Separately preserve legacy lifecycle stamps and protections.
 
-Every record distinguishes initiating actor `A` (session, validated operator,
-or system), executing session `P`, trusted issuer/custodian, `M` if known,
-operation and object, and the actual authorization decision and policy version.
+Every record has separate evidence slots: **initiator** `A` origin and its own
+binding and member claim or unknown; **executor** session binding and its own
+member claim or unknown; and **target**, when applicable, its own binding and
+member claim or unknown. Each claim has its own source, revision and as-of;
+each binding identifies the subject it describes. Operator/system initiators
+have their own validated or unknown origin and do not acquire an invented
+session or member. Record a causal edge and operation ID from initiator to
+executor and any target, plus trusted issuer/custodian, operation and object,
+and the actual authorization decision and policy version.
 For a delegated or asynchronous effect, retain `A` and the causal operation;
-the executor is not silently rewritten as the author. A holder target's claim
-is derived for that target, never copied from the signer. Current member
-status is distinct from an event-time claim; old records keep their original
+the executor is not silently rewritten as the author. Never fill one slot's
+member, role or binding from another slot merely because a causal edge exists:
+an explicitly established inheritance is a separate evidence-bearing
+transition. A holder target's claim is derived for that target, never copied
+from the signer. Current member status is distinct from an event-time claim;
+old records keep their original
 evidence, including unknown, and a correction is a linked, auditable event.
 Do not reveal credentials, raw prompts or private transcripts in evidence.
 
@@ -99,8 +113,9 @@ Do not reveal credentials, raw prompts or private transcripts in evidence.
    errors remain unchanged during evidence-only adoption.
 3. For a central write, propose a mutually authenticated, enrolled daemon
    issuer and a versioned integrity-protected envelope bound to destination,
-   method, operation ID, payload digest, `P`, `A`, and `M` or unknown. The API
-   verifies issuer entitlement, binding/custody, signature or equivalent
+   method, operation ID, payload digest and the separate initiator, executor
+   and target bindings and claims or unknown. The API verifies issuer
+   entitlement, binding/custody, signature or equivalent
    authenticated channel, request binding, source version and replay before
    accepting it as *issuer-attested as-of evidence*. The present shared bearer
    cannot do that. Verification failures produce unknown or refusal on the new
@@ -122,13 +137,33 @@ Do not reveal credentials, raw prompts or private transcripts in evidence.
 local lifecycle/identity permit; pass an unforgeable in-process guard/context
 to nested spawn or input helpers rather than reacquiring its `RwLock`. Never
 block on a nested read behind a queued writer. Acquire multiple UID permits in
-a documented global order or fail promptly and release; no external I/O while
-holding them. Heartbeat transition takes an exclusive unit only after releasing
-registry/cache locks, then rechecks exact binding/version; no lock upgrade.
-Capture, release for I/O, and revalidate before effect where an exclusive unit
-cannot be held. Timeouts, permit failure and asynchronous effects stay explicit
-unknown rather than silently authorizing. This is a proposed synchronization
-invariant, not a claim that the rejected gate implementation satisfies it.
+a documented global order or fail promptly and release. Do not hold global
+daemon, registry or cache locks across network, disk, subprocess or PTY I/O.
+Heartbeat transition takes an exclusive unit only after releasing those locks,
+then rechecks exact binding/version; no lock upgrade.
+
+The per-UID unit may cover a specifically bounded, reviewed **local effect**:
+for example, revalidate the exact live target binding and input state, then
+write the accepted PTY body and Enter as one unit before releasing it. The
+target cannot be rebound or retired through cooperating CM paths during that
+unit. Define actual write/timeout bounds and partial-body, failed Enter and
+restart behavior before implementation; a partial or uncertain effect remains
+unknown and is not replayed automatically. Spawn needs its own reviewed
+bounded local admission/effect boundary, including actual child binding and
+failure cleanup; it cannot rely solely on a pre-spawn check.
+
+Network, arbitrary or unbounded I/O is not held inside the per-UID unit. If an
+effect must cross that boundary, release the unit, retain durable operation
+intent and captured binding/claim versions, perform the effect with a recipient
+that checks the applicable expected generation at its own effect boundary,
+then reacquire and revalidate before any dependent local effect. If the
+recipient cannot enforce that fence, a post-call check cannot undo a possibly
+committed effect: classify the outcome and attribution as unknown, preserve
+evidence and reconcile explicitly. A timeout, changed binding, permit failure
+or ambiguous remote receipt never implies no effect. The local unit cannot
+serialize independent external native clients. These are proposed invariants,
+not a claim that the rejected gate implementation satisfies them; the rules
+snapshot remains as-of, not distributed current-at-write.
 
 ## Lifecycle matrix
 
@@ -146,9 +181,25 @@ invariant, not a claim that the rejected gate implementation satisfies it.
 ## Persistence, compatibility and boundaries
 
 Persist immutable evidence and an operation/payload-bound receipt atomically
-with each central write where supported. A same-key, same-digest replay returns
-its original receipt; a changed payload conflicts. For external effects, retain
-durable intent before effect, then an outcome/receipt; crash or lost response
+with each central write where supported. The replay scope binds issuer and
+authenticated principal, original binding epoch, audience, method and operation
+ID; the stored canonical digest also binds the complete effect-bearing request
+and evidence. Admission of a new operation consumes its nonce/sequence and
+reserves the scoped key atomically with the outcome or durable unknown intent.
+An authenticated exact retry with the same scope and digest retrieves the
+original pending/outcome/receipt without re-executing or rebinding; changed
+payload, principal or binding conflicts. A different issuer cannot claim the
+same operation's receipt by presenting its ID. Unknown, expired or missing
+replay state cannot authorize fresh execution of that operation.
+
+After the original process/channel is gone, an independently authenticated and
+authorized reconciliation principal may inspect that exact historical key and
+digest and resolve its recorded outcome; it is not the original signer and
+cannot use the old credential to initiate a new effect. Require a bounded,
+durable replay/receipt retention floor covering retries, crash recovery and
+reconciliation before activation. Exhaustion or uncertain retention yields
+explicit unknown/refusal rather than pretending a key is unused. For external
+effects, retain durable intent before effect, then an outcome/receipt; crash or lost response
 is unknown until independently reconciled by exact operation, source and
 binding. Never automatically replay an uncertain input or write under a new
 identity, retire receipts to manufacture a safe queue, or convert a failed
@@ -195,14 +246,27 @@ here; without a proven source/version and a reviewed bound, claim unknown.
 S6's proposed five-minute refresh is not an S4 decision. Owner's existing O5
 assistant durability and existing scope rules are not reopened.
 
-Before any implementation is advertised as verified: prove channel binding
-against forged UID, stolen/replayed/expired credential within the stated
-threat model; actual child PID/start and incarnation through spawn, fork,
+Before any implementation is advertised as verified: exercise configured and
+matching, configured and invalid, and unconfigured compatibility Operator
+paths, distinguishing the existing endpoint decision from origin evidence;
+prove forged UIDs and wrong, expired or revoked credentials, and a replayed
+nonce presented as a new operation, cannot establish a new binding or effect;
+an authenticated exact retry follows the receipt rule above. Verify that known
+compromise/revocation prevents later
+verified claims subject to the documented remote window. Undetected theft of a
+valid credential is outside this threat model and cannot establish actual
+process/model authorship. Verify actual child PID/start and incarnation through
+spawn, fork,
 revive, rebind, restart and holder rehello; caller and target replacement and
 promotion races; queued-writer nested spawn/input with timeout and lock-order
-checks; workflow and Fresh origin/executor/run distinctions; remote issuer,
+checks; workflow and Fresh origin/executor/run distinctions, including an
+initiator from member A, executor from member B and a remote target/handback
+with independently unknown or known claims, plus scheduler/operator cases with
+no fabricated executor member; remote issuer,
 forward/handback replay, revocation and unavailable-source cases; crash seams
-before/after local and central effects with exact-receipt reconciliation; and
+before/after local and central effects with exact-receipt reconciliation,
+concurrent duplicate calls, lost reply, restart, cross-issuer collision and
+expired/unknown retention; and
 old/new API, old daemon and rollback holder-preservation cases on isolated
 fixtures. Check central transaction fencing separately before any S6 authority
 use. Show unknown rather than inferred attribution in every missing, ambiguous
