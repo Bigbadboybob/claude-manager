@@ -83,6 +83,7 @@ pub mod worktree_watch;
 pub mod maintenance;
 pub mod manifest;
 pub mod messaging;
+mod memory_snapshot;
 pub mod mcp_config;
 pub mod migrate;
 pub mod models;
