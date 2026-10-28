@@ -4,7 +4,7 @@ import unittest
 
 from dispatch.shadow_policy import (
     Actor, BoardFacts, BoardOperation as Op, Comparison, Endpoint, Identity,
-    OriginalDecision, POLICY_VERSION, Result, Role, SessionFacts, Truth,
+    OriginalDecision, POLICY_VERSION, Result, Role, SessionFacts, SettingsKind, Truth,
     board_edit, compare, session_control,
 )
 
@@ -25,10 +25,10 @@ def session(role=Role.MAIN, **changes):
 
 
 def board(op=Op.EDIT_ITEM, role=Role.MAIN, **changes):
-    facts = BoardFacts(actor(role), READY, op, snapshot_identity=VERIFIED,
+    facts = BoardFacts(actor(role), READY, op, settings_kind=SettingsKind.GENERAL, snapshot_identity=VERIFIED,
                        team_member=N, own_item_holder=N, delegated_item=N,
                        board_team_lead=N, steward=N, orchestrator=N,
-                       gate_editor=N, gate_grantor=N)
+                       gate_editor=N, gate_grantor=N, poc_chain=N, poc_chain_valid=Y)
     return replace(facts, **changes)
 
 
@@ -99,7 +99,20 @@ class BoardCandidateTests(unittest.TestCase):
             (board(Op.SETTINGS, steward=Y), Result.ALLOW, "steward"),
             (board(Op.SETTINGS, team_member=Y), Result.DENY, "no_settings_scope"),
             (board(Op.SET_POC, board_team_lead=Y), Result.ALLOW, "board_team_lead"),
-            (board(Op.SET_POC, steward=Y), Result.DENY, "not_board_team_lead"),
+            (board(Op.SET_POC, steward=Y), Result.ALLOW, "steward"),
+            (board(Op.SET_POC, Role.ASSISTANT, steward=Y), Result.ALLOW, "steward"),
+            (board(Op.SET_POC, Role.ASSISTANT, poc_chain=Y), Result.DENY, "no_poc_scope"),
+            (board(Op.SET_POC, orchestrator=Y), Result.ALLOW, "orchestrator"),
+            (board(Op.SET_POC, poc_chain=Y), Result.ALLOW, "current_epic_poc_chain"),
+            (board(Op.SET_POC), Result.DENY, "no_poc_scope"),
+            (board(Op.CLOSE_EPIC, orchestrator=Y), Result.ALLOW, "orchestrator"),
+            (board(Op.CLOSE_EPIC, Role.ASSISTANT, orchestrator=Y), Result.ALLOW, "orchestrator"),
+            (board(Op.CLOSE_EPIC, steward=Y, poc_chain=Y), Result.DENY, "no_epic_close_scope"),
+            (board(Op.SETTINGS, settings_kind=SettingsKind.GOVERNED, steward=Y), Result.DENY, "governed_setting_owner_or_orchestrator"),
+            (board(Op.SETTINGS, settings_kind=SettingsKind.GOVERNED, orchestrator=Y), Result.ALLOW, "settings_scope_and_field_authorized"),
+            (board(Op.SETTINGS, settings_kind=SettingsKind.GATE_DEFAULT, board_team_lead=Y), Result.DENY, "not_gate_editor"),
+            (board(Op.SETTINGS, settings_kind=SettingsKind.GATE_DEFAULT, board_team_lead=Y, gate_editor=Y), Result.ALLOW, "settings_scope_and_field_authorized"),
+            (board(Op.SETTINGS, settings_kind=SettingsKind.GATE_ALLOWLIST, board_team_lead=Y, gate_editor=Y), Result.DENY, "owner_only_gate_allowlist"),
             (board(Op.GATE_PROFILE, gate_editor=Y), Result.ALLOW, "gate_editor"),
             (board(Op.GATE_PROFILE, steward=Y), Result.DENY, "not_gate_editor"),
             (board(Op.GATE_GRANT, gate_grantor=Y), Result.ALLOW, "gate_grantor"),
@@ -117,6 +130,10 @@ class BoardCandidateTests(unittest.TestCase):
         cases = [
             (board(team_member=U), "relation_unknown"),  # guest eligibility unverified
             (board(Op.GATE_GRANT, gate_grantor=U), "relation_unknown"),
+            (board(Op.SET_POC, poc_chain=U), "relation_unknown"),
+            (board(Op.SET_POC, poc_chain=Y, poc_chain_valid=N), "relation_unknown"),
+            (board(Op.SETTINGS, settings_kind=SettingsKind.UNSPECIFIED, orchestrator=Y), "settings_specialization_required"),
+            (board(Op.SETTINGS, settings_kind=SettingsKind.GATE_DEFAULT, board_team_lead=Y, gate_editor=U), "settings_restriction_unknown"),
             (board(Op.GATE_GRANT, Role.ASSISTANT, gate_grantor=Y), "assistant_independent_gate_authority_unspecified"),
             (board(role=Role.WORKER), "actor_role_policy_unspecified"),
             (board(role=Role.WORKFLOW), "actor_role_policy_unspecified"),
@@ -154,6 +171,15 @@ class ObservationTests(unittest.TestCase):
         self.assertEqual(original.reason, "existing_task_tree")
         with self.assertRaises(FrozenInstanceError):
             original.outcome = "deny"
+
+    def test_generic_settings_cannot_claim_effective_agreement(self):
+        original = OriginalDecision("allow", "old_board_editor")
+        generic = board_edit(board(Op.SETTINGS, settings_kind=SettingsKind.UNSPECIFIED,
+                                   orchestrator=Y))
+        self.assertEqual(compare(original, generic).comparison, Comparison.UNKNOWN)
+        restricted = board_edit(board(Op.SETTINGS, settings_kind=SettingsKind.GATE_ALLOWLIST,
+                                      orchestrator=Y))
+        self.assertEqual(compare(original, restricted).comparison, Comparison.DISAGREEMENT)
 
     def test_bootstrap_input_does_not_enforce_or_change_decision(self):
         for evaluator, facts in ((session_control, session()), (board_edit, board())):

@@ -4,11 +4,14 @@ Facts must be captured from trusted, versioned sources by a future observer;
 this module performs no IO and does not compute or replace the old decision.
 Unknown facts do not imply denial. Endpoint preconditions are reported
 separately from the candidate rule, so a missing target cannot become an allow.
+For settings, the observer must supply the exact field category; mixed or
+unclassified patches are UNSPECIFIED, not a general-settings grant. READY is
+an independently established endpoint condition, never inferred from scope.
 """
 from dataclasses import dataclass
 from enum import Enum
 
-POLICY_VERSION = "s5-candidate-v1"
+POLICY_VERSION = "s5-candidate-v2"
 
 
 class Truth(Enum):
@@ -41,6 +44,8 @@ class Role(Enum):
 
 
 class Endpoint(Enum):
+    # READY is an observer-supplied assertion that all applicable endpoint
+    # preconditions were checked; it is not inferred from policy scope.
     READY = "ready"
     MISSING_TARGET = "missing_target"
     EXITED_TARGET = "exited_target"
@@ -53,9 +58,19 @@ class BoardOperation(Enum):
     PLACE = "place"
     SETTINGS = "settings"
     SET_POC = "set_poc"
+    CLOSE_EPIC = "close_epic"
     GATE_PROFILE = "gate_profile"
     GATE_GRANT = "gate_grant"
     GATE_ALLOWLIST = "gate_allowlist"
+
+
+class SettingsKind(Enum):
+    # One concrete field category, not an aggregate mixed-field patch.
+    GENERAL = "general"
+    GOVERNED = "governed"
+    GATE_DEFAULT = "gate_default"
+    GATE_ALLOWLIST = "gate_allowlist"
+    UNSPECIFIED = "unspecified"
 
 
 @dataclass(frozen=True)
@@ -101,6 +116,7 @@ class BoardFacts:
     actor: Actor
     endpoint: Endpoint
     operation: BoardOperation
+    settings_kind: SettingsKind = SettingsKind.UNSPECIFIED
     snapshot_identity: Identity = Identity.MISSING
     # YES means confirmed eligibility on this board; guest status alone is
     # not evidence of eligibility. Incomplete membership is UNKNOWN.
@@ -110,6 +126,9 @@ class BoardFacts:
     board_team_lead: Truth = Truth.UNKNOWN
     steward: Truth = Truth.UNKNOWN
     orchestrator: Truth = Truth.UNKNOWN
+    # Exact epic current PoC or its manager chain, not a board-wide role.
+    poc_chain: Truth = Truth.UNKNOWN
+    poc_chain_valid: Truth = Truth.UNKNOWN
     # Independently checked current gate permission, not a contact/approver.
     gate_editor: Truth = Truth.UNKNOWN
     gate_grantor: Truth = Truth.UNKNOWN
@@ -192,16 +211,19 @@ def _board_edit(facts: BoardFacts) -> Candidate:
     if (not isinstance(actor, Actor) or not isinstance(actor.identity, Identity)
             or not isinstance(actor.same_org, Truth) or not isinstance(actor.global_perms, Truth)
             or not isinstance(actor.role, Role) or not isinstance(op, BoardOperation)
+            or not isinstance(facts.settings_kind, SettingsKind)
             or not isinstance(facts.snapshot_identity, Identity)
             or any(not isinstance(v, Truth) for v in (facts.team_member, facts.own_item_holder,
                 facts.delegated_item, facts.board_team_lead, facts.steward, facts.orchestrator,
-                facts.gate_editor, facts.gate_grantor))):
+                facts.gate_editor, facts.gate_grantor, facts.poc_chain, facts.poc_chain_valid))):
         return _candidate(endpoint, Result.UNKNOWN, "malformed_facts")
     if endpoint is Endpoint.READY and facts.snapshot_identity is not Identity.VERIFIED:
         return _candidate(endpoint, Result.UNKNOWN, "board_snapshot_unverified")
     base = _base(actor, endpoint)
     if base:
         return base
+    if op is BoardOperation.SETTINGS and facts.settings_kind is SettingsKind.UNSPECIFIED:
+        return _candidate(endpoint, Result.UNKNOWN, "settings_specialization_required")
     if actor.role is Role.OWNER:
         return _candidate(endpoint, Result.ALLOW, "owner")
     # A global bit is not itself an approval or a specialized board grant.
@@ -211,6 +233,13 @@ def _board_edit(facts: BoardFacts) -> Candidate:
     if op is BoardOperation.GATE_ALLOWLIST:
         return _candidate(endpoint, Result.DENY, "owner_only_gate_allowlist")
     if actor.role is Role.ASSISTANT:
+        if op is BoardOperation.SET_POC:
+            # Shipped steward/orchestrator checks are explicit PID roles;
+            # they do not turn an assistant into its member's PoC.
+            return _any_relation(endpoint, ((facts.steward, "steward"),
+                                            (facts.orchestrator, "orchestrator")), "no_poc_scope")
+        if op is BoardOperation.CLOSE_EPIC:
+            return _any_relation(endpoint, ((facts.orchestrator, "orchestrator"),), "no_epic_close_scope")
         if op is BoardOperation.EDIT_ITEM:
             return _any_relation(endpoint, ((facts.delegated_item, "delegated_item"),), "not_delegated")
         if op in (BoardOperation.GATE_PROFILE, BoardOperation.GATE_GRANT):
@@ -230,11 +259,37 @@ def _board_edit(facts: BoardFacts) -> Candidate:
                                         (facts.steward, "steward"),
                                         (facts.orchestrator, "orchestrator")), "no_item_scope")
     if op is BoardOperation.SETTINGS:
-        return _any_relation(endpoint, ((facts.board_team_lead, "board_team_lead"),
-                                        (facts.steward, "steward"),
-                                        (facts.orchestrator, "orchestrator")), "no_settings_scope")
+        scope = _any_relation(endpoint, ((facts.board_team_lead, "board_team_lead"),
+                                         (facts.steward, "steward"),
+                                         (facts.orchestrator, "orchestrator")), "no_settings_scope")
+        if facts.settings_kind is SettingsKind.GATE_ALLOWLIST:
+            return _candidate(endpoint, Result.DENY, "owner_only_gate_allowlist")
+        if facts.settings_kind is SettingsKind.GENERAL:
+            return scope
+        if facts.settings_kind is SettingsKind.GOVERNED:
+            restriction = _any_relation(endpoint, ((facts.orchestrator, "orchestrator"),), "governed_setting_owner_or_orchestrator")
+        else:  # gate_default has a distinct, independently verified gate check
+            restriction = _any_relation(endpoint, ((facts.gate_editor, "gate_editor"),
+                                                    (facts.orchestrator, "orchestrator")), "not_gate_editor")
+        if scope.decision.result is Result.DENY or restriction.decision.result is Result.DENY:
+            return scope if scope.decision.result is Result.DENY else restriction
+        if scope.decision.result is Result.UNKNOWN or restriction.decision.result is Result.UNKNOWN:
+            return _candidate(endpoint, Result.UNKNOWN, "settings_restriction_unknown")
+        return _candidate(endpoint, Result.ALLOW, "settings_scope_and_field_authorized")
     if op is BoardOperation.SET_POC:
-        return _any_relation(endpoint, ((facts.board_team_lead, "board_team_lead"),), "not_board_team_lead")
+        # #28's documented per-epic exception survives the older §6.4 table.
+        direct = _any_relation(endpoint, ((facts.board_team_lead, "board_team_lead"),
+                                           (facts.steward, "steward"),
+                                           (facts.orchestrator, "orchestrator")), "no_board_poc_scope")
+        if direct.decision.result is Result.ALLOW:
+            return direct
+        chain = (facts.poc_chain if facts.poc_chain_valid is Truth.YES else Truth.UNKNOWN)
+        return _any_relation(endpoint, ((Truth.UNKNOWN if direct.decision.result is Result.UNKNOWN else Truth.NO, "board_poc_scope"),
+                                         (chain, "current_epic_poc_chain")), "no_poc_scope")
+    if op is BoardOperation.CLOSE_EPIC:
+        # The #28 steward and current-PoC-chain exceptions are for set_poc.
+        return _any_relation(endpoint, ((facts.board_team_lead, "board_team_lead"),
+                                        (facts.orchestrator, "orchestrator")), "no_epic_close_scope")
     if op is BoardOperation.GATE_PROFILE:
         return _any_relation(endpoint, ((facts.gate_editor, "gate_editor"),
                                         (facts.orchestrator, "orchestrator")), "not_gate_editor")
@@ -248,7 +303,7 @@ def board_edit(facts: BoardFacts) -> Candidate:
     result = _board_edit(facts)
     if (result.decision.result is Result.DENY
             and result.decision.reason != "cross_org"
-            and facts.operation is not BoardOperation.GATE_ALLOWLIST
+            and result.decision.reason != "owner_only_gate_allowlist"
             and facts.actor.global_perms is not Truth.NO):
         return _candidate(result.precondition, Result.UNKNOWN, "board_global_policy_unspecified")
     return result
