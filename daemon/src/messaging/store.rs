@@ -34,6 +34,8 @@ mod memory;
 pub(crate) use memory::StoreMemorySnapshot;
 #[cfg(test)]
 mod tests_b;
+#[cfg(test)]
+mod tests_alloc56;
 mod wake_intents;
 pub use wake_intents::WakeIntent;
 mod norms;
@@ -136,8 +138,12 @@ fn write_file_synced(path: &Path, bytes: &[u8], replace: bool, sync_dir: bool) -
             .open(&temp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
+        #[cfg(test)]
+        tests_alloc56::write_fault(path, "before_rename")?;
         if replace {
             fs::rename(&temp, path)?;
+            #[cfg(test)]
+            tests_alloc56::write_fault(path, "after_rename")?;
         } else {
             fs::hard_link(&temp, path)?;
             fs::remove_file(&temp)?;

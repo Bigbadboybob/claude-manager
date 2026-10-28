@@ -410,7 +410,7 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>) {
             let s = state.lock().unwrap_or_else(|p| p.into_inner());
             if s.draining { return; }
             let Some(s) = s.sessions.get(&uid) else { continue; };
-            if s.fanout.snapshot_since(None).closed {
+            if s.fanout.is_closed() {
                 Err(SKIP_OUTPUT_CLOSED)
             } else {
                 Ok(Recipient {
@@ -1229,7 +1229,7 @@ mod tests {
         params.session_type = "claude-code".into();
         let session = crate::session::DaemonSession::spawn(params).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !session.fanout.snapshot_since(None).closed {
+        while !session.fanout.is_closed() {
             assert!(std::time::Instant::now() < deadline, "the child's output never ended");
             thread::sleep(Duration::from_millis(20));
         }
