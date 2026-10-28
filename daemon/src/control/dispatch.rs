@@ -11348,6 +11348,7 @@ mod tests {
         {
             let mut st = state.lock().unwrap();
             st.config = crate::config::DaemonConfig {
+                s4_min_write: false,
                 transcript_rotation: Default::default(),
                 chat_search_budget_bytes: 512 * 1024 * 1024,
                 presence_idle_enabled: true,
@@ -11455,6 +11456,7 @@ mod tests {
     fn set_stub_api_config(state: &Arc<Mutex<DaemonState>>, port: u16) {
         let mut st = state.lock().unwrap();
         st.config = crate::config::DaemonConfig {
+            s4_min_write: false,
             transcript_rotation: Default::default(),
             chat_search_budget_bytes: 512 * 1024 * 1024,
             presence_idle_enabled: true,

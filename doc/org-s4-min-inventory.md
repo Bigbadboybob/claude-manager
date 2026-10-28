@@ -82,11 +82,20 @@ new authority, backfill, timer, rules/notice change or cross-host assertion.
 The #56 driver reservation has not been transferred; no test/build is performed
 by this inventory.
 
-S4-min writing is off unless the daemon starts with `CM_S4_MIN_WRITE=1`.
-Rollback requires stopping these writes on every participating daemon before
-rolling the API back; the last capability snapshot is as-of and cannot protect
-an uncoordinated API downgrade before its next refresh. No data migration back
-is needed. An older API can delete and reinsert holder rows without preserving
+S4-min writing defaults off. `s4_min_write = true` in `daemon.toml` enables it
+at startup or through the operator-only `daemon.reload_config`; `daemon.health`
+reports the applied value. Each toggle or API URL/token change invalidates the
+previous snapshot and wire capability, including delayed responses. The
+monotonic latest-seen version is not reset on an API change, so a new source
+with a lower version remains unknown until it catches up or the brain restarts.
+A newly enabled daemon uses the old item wire shape until a fresh supported snapshot
+arrives via the existing heartbeat. The configuration switch does not gate or
+wait for ordinary operations. Reloading off does not cancel a write that already
+captured evidence; rollback requires stopping writes on every participating
+daemon and completing or draining earlier operations before rolling the API
+back. The last capability snapshot is as-of and cannot protect an uncoordinated
+API downgrade before its next refresh. No data migration back is needed. An
+older API can delete and reinsert holder rows without preserving
 their current metadata, even after new daemon writes stop. The new API also
 records holder evidence in additive item-event fields, so historical evidence
 survives that old writer; current holder attribution is unknown after such a

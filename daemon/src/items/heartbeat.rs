@@ -77,6 +77,7 @@ pub(crate) struct Snapshot {
     pub sessions: Vec<Value>,
     pub api: Option<Api>,
     pub root: PathBuf,
+    s4_epoch: Option<u64>,
 }
 
 /// At most `limit` characters (the API clips too; this keeps rows small).
@@ -172,6 +173,7 @@ fn capture(state: &Arc<Mutex<DaemonState>>) -> Option<Snapshot> {
         sessions,
         api,
         root: s.messaging_root.clone(),
+        s4_epoch: s.config.s4_min_write.then(super::s4_attribution::config_epoch),
     })
 }
 
@@ -389,9 +391,9 @@ impl Beat {
         }
         // Existing background heartbeat supplies an as-of S4 snapshot. No
         // operation path waits for this lookup or takes a provenance permit.
-        if std::env::var_os("CM_S4_MIN_WRITE").is_some_and(|v| v == "1") {
+        if let Some(epoch) = snap.s4_epoch {
             if let Ok(snapshot) = api.get("/org/snapshot", &[]) {
-                super::s4_attribution::absorb_snapshot(&snap.daemon_id, &snapshot);
+                super::s4_attribution::absorb_snapshot(&snap.daemon_id, &snapshot, epoch);
             }
         }
     }
@@ -520,6 +522,34 @@ mod tests {
         assert!(row["idle_for_s"].is_null());
         assert_eq!(row["name"].as_str().unwrap().chars().count(), 200);
         assert_eq!(row["engine"].as_str().unwrap().chars().count(), 40);
+    }
+
+    #[test]
+    fn s4_config_controls_snapshot_fetch_without_suppressing_heartbeat() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let (url, seen) = super::super::org::test_stub(|_, path, _| {
+            let body = if path == "/org/snapshot" {
+                json!({"version":1, "s4_min_wire":true, "members":[]})
+            } else { json!({"pushes":[]}) };
+            (200, body.to_string())
+        });
+        let mut st = DaemonState::default();
+        st.messaging_root = root.path().into();
+        st.config.api_url = url;
+        st.config.api_token = "tok".into();
+        let state = Arc::new(Mutex::new(st));
+        crate::messaging::startup::open_for_test(&state).unwrap();
+        let mut beat = Beat::default();
+        beat.run(&state);
+        state.lock().unwrap().config.s4_min_write = true;
+        beat.run(&state);
+        state.lock().unwrap().config.s4_min_write = false;
+        beat.run(&state);
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.iter().filter(|(_, p, _)| p.starts_with("/hosts/")).count(), 3);
+        assert_eq!(calls.iter().filter(|(_, p, _)| p == "/org/snapshot").count(), 1);
+        super::super::s4_attribution::reset_for_test();
     }
 
     /// Org model S2's home push: a beat applies the reply's workspace marks

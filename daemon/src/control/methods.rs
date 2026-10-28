@@ -4495,6 +4495,7 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         "previous_pin": previous_pin,
         // doc/org-model.md §12: each role's list and their intersection.
         "capabilities": capabilities,
+        "s4_min_write": state.config.s4_min_write,
         "holder_status_error": holder_status_err,
         "mcp_ok": mcp_ok,
         "mcp_detail": mcp_detail,
@@ -4597,10 +4598,18 @@ pub fn reload_config(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
             applied.tls = st.config.tls.clone();
             crate::mcp_config::set_codex_inline_scrollback(applied.codex_inline_scrollback);
             crate::models::set_models(applied.models.clone());
+            if st.config.s4_min_write != applied.s4_min_write
+                || st.config.api_url != applied.api_url || st.config.api_token != applied.api_token {
+                crate::items::s4_attribution::invalidate_config_epoch();
+            }
             st.config = applied;
         }
         (changed, requires_restart)
     };
+
+    if changed.iter().any(|k| matches!(k.as_str(), "s4_min_write" | "api_url" | "api_token")) {
+        crate::items::heartbeat::poke();
+    }
 
     // Re-derive the startup artifacts whose inputs moved. IO happens
     // outside the state lock; results are assigned under it.
@@ -23769,6 +23778,7 @@ mod tests {
                 },
             );
             s.config = crate::config::DaemonConfig {
+                s4_min_write: false,
                 transcript_rotation: Default::default(),
                 chat_search_budget_bytes: 512 * 1024 * 1024,
                 presence_idle_enabled: true,
@@ -26374,6 +26384,82 @@ while True:
                 crate::config::AuthMode::SshTrust,
                 "auth mode must NOT hot-swap",
             );
+        });
+    }
+
+    #[test]
+    fn s4_config_reload_invalidates_pre_toggle_capability_and_delayed_snapshot() {
+        with_temp_home(|| {
+            crate::items::s4_attribution::reset_for_test();
+            let state = make_state_arc();
+            seed_mcp_spawn_fixture(&state, "ts-caller", None);
+            {
+                let mut st = state.lock().unwrap();
+                st.config.api_url = "http://127.0.0.1:9".into();
+                st.config.api_token = "tok".into();
+                let caller = st.sessions.get_mut("ts-caller").unwrap();
+                caller.s4_spawn_origin = Some((caller.pid, caller.holder_incarnation, caller.generation, caller.org.clone()));
+            }
+            crate::messaging::startup::open_for_test(&state).unwrap();
+            let req = crate::control::protocol::Request { id:"config".into(),
+                caller:crate::control::protocol::Caller::session("ts-caller"),
+                method:"item.set".into(), params:json!({"n":1, "status":"active"}) };
+            let old_epoch = crate::items::s4_attribution::config_epoch();
+            let snapshot = json!({"version": 7, "s4_min_wire":true,
+                "members":[{"id":"mem_a", "main":{"pid":"agent:d:ts-caller", "daemon_id":"d",
+                    "session_uid":"ts-caller", "occupancy_generation":1}}]});
+            crate::items::s4_attribution::absorb_snapshot("d", &snapshot, old_epoch);
+            let check = |want_wire: bool, want_claim: bool| {
+                let _scope = crate::items::s4_attribution::begin(&state, &req);
+                let (claims, wire) = crate::items::s4_attribution::current();
+                assert_eq!(wire, want_wire);
+                assert_eq!(claims.contains_key("ts-caller"), want_claim);
+                let ctx = crate::items::rpc::Ctx::capture(&state, &req).unwrap();
+                assert_eq!(ctx.actor().get("attribution").is_some(), want_wire);
+            };
+            check(false, false); // default-off, even with a populated cache
+            assert_eq!(daemon_health(&state).unwrap()["s4_min_write"], false);
+            let cm = std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cm");
+            std::fs::create_dir_all(&cm).unwrap();
+            let path = cm.join("daemon.toml");
+            let write_config = |enabled| {
+                std::fs::write(&path, format!("s4_min_write = {enabled}\napi_url = \"http://127.0.0.1:9\"\napi_token = \"tok\"\n")).unwrap();
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            };
+            write_config(true);
+            let reply = reload_config(&state).unwrap();
+            assert!(reply["changed"].as_array().unwrap().contains(&json!("s4_min_write")));
+            assert_eq!(daemon_health(&state).unwrap()["s4_min_write"], true);
+            check(false, false); // pre-enable capability invalidated
+            crate::items::s4_attribution::absorb_snapshot("d", &snapshot, old_epoch); // delayed old beat
+            check(false, false);
+            let enabled_epoch = crate::items::s4_attribution::config_epoch();
+            crate::items::s4_attribution::absorb_snapshot("d", &snapshot, enabled_epoch);
+            check(true, true);
+            std::fs::write(&path, "s4_min_write = true\napi_url = \"http://127.0.0.1:10\"\napi_token = \"tok\"\n").unwrap();
+            reload_config(&state).unwrap();
+            check(false, false); // switching API cannot reuse its predecessor's capability
+            write_config(true);
+            reload_config(&state).unwrap();
+            crate::items::s4_attribution::absorb_snapshot("d", &snapshot, enabled_epoch);
+            check(false, false);
+            let second_epoch = crate::items::s4_attribution::config_epoch();
+            crate::items::s4_attribution::absorb_snapshot("d", &snapshot, second_epoch);
+            check(true, true);
+            write_config(false);
+            reload_config(&state).unwrap();
+            assert_eq!(daemon_health(&state).unwrap()["s4_min_write"], false);
+            check(false, false);
+            write_config(true);
+            reload_config(&state).unwrap();
+            crate::items::s4_attribution::absorb_snapshot("d", &snapshot, enabled_epoch);
+            check(false, false);
+            let current_epoch = crate::items::s4_attribution::config_epoch();
+            crate::items::s4_attribution::absorb_snapshot("d", &json!({"version":7,"members":[]}), current_epoch);
+            check(false, false); // old API: no new request shape
+            crate::items::s4_attribution::reset_for_test();
+            kill_all_sessions(&state);
         });
     }
 
@@ -30168,11 +30254,10 @@ while True:
             let uid = child["session_uid"].as_str().unwrap();
             crate::items::s4_attribution::absorb_snapshot("d", &json!({"version":7, "s4_min_wire":true,
                 "members":[{"id":"mem_new", "main":{"pid":format!("agent:d:{uid}"),
-                    "daemon_id":"d", "session_uid":uid, "occupancy_generation":1}}]}));
+                    "daemon_id":"d", "session_uid":uid, "occupancy_generation":1}}]}), crate::items::s4_attribution::config_epoch());
             assert_eq!(crate::items::s4_attribution::capture(&state).0[uid].claim["member_id"], "mem_new");
             assert!(crate::items::s4_attribution::capture(&state).0.get(shell["session_uid"].as_str().unwrap()).is_none());
-            let previous = std::env::var_os("CM_S4_MIN_WRITE");
-            std::env::set_var("CM_S4_MIN_WRITE", "1");
+            state.lock().unwrap().config.s4_min_write = true;
             crate::items::org::absorb_reply(&json!({"org":{"members":{
                 "ts-caller":{"id":"mem_cont", "kind":"continuous", "acting_as":"main"}}}}), 1.0);
             {
@@ -30270,8 +30355,6 @@ while True:
                 assert!(std::time::Instant::now() < deadline, "worker chat evidence never became available");
                 std::thread::yield_now();
             }
-            if let Some(value) = previous { std::env::set_var("CM_S4_MIN_WRITE", value); }
-            else { std::env::remove_var("CM_S4_MIN_WRITE"); }
             crate::items::org::reset_cache_for_test();
             state.lock().unwrap().sessions.get_mut("ts-caller").unwrap().workflow_run_id = Some("workflow".into());
             next_worktree("wt-workflow");
@@ -30286,10 +30369,9 @@ while True:
     #[test]
     fn s4_dispatch_spawn_progresses_after_queued_retirement_writer() {
         let _tmp = with_temp_home(|| {
-            let previous = std::env::var_os("CM_S4_MIN_WRITE");
-            std::env::set_var("CM_S4_MIN_WRITE", "1");
             crate::items::s4_attribution::reset_for_test();
             let state = make_state_arc();
+            state.lock().unwrap().config.s4_min_write = true;
             seed_mcp_spawn_fixture(&state, "ts-caller", None);
             {
                 let mut st = state.lock().unwrap();
@@ -30298,7 +30380,7 @@ while True:
             }
             crate::items::s4_attribution::absorb_snapshot("d", &json!({"version":9, "s4_min_wire":true,
                 "members":[{"id":"mem_a", "main":{"pid":"agent:d:ts-caller", "daemon_id":"d",
-                    "session_uid":"ts-caller", "occupancy_generation":1}}]}));
+                    "session_uid":"ts-caller", "occupancy_generation":1}}]}), crate::items::s4_attribution::config_epoch());
             let gate = crate::continuous::retirement::gate("ts-caller");
             let reader = gate.read().unwrap();
             let (writer_started_tx, writer_started_rx) = std::sync::mpsc::channel();
@@ -30336,8 +30418,6 @@ while True:
             worker.join().unwrap();
             writer.join().unwrap();
             crate::items::s4_attribution::reset_for_test();
-            if let Some(value) = previous { std::env::set_var("CM_S4_MIN_WRITE", value); }
-            else { std::env::remove_var("CM_S4_MIN_WRITE"); }
             kill_all_sessions(&state);
         });
     }
@@ -30345,9 +30425,8 @@ while True:
     #[test]
     fn s4_dispatch_holds_no_outer_gate_after_snapshot() {
         let _tmp = with_temp_home(|| {
-            let previous = std::env::var_os("CM_S4_MIN_WRITE");
-            std::env::set_var("CM_S4_MIN_WRITE", "1");
             let state = make_state_arc();
+            state.lock().unwrap().config.s4_min_write = true;
             seed_mcp_spawn_fixture(&state, "ts-caller", None);
             let gate = crate::continuous::retirement::gate("ts-caller");
             let (paused_tx, paused_rx) = std::sync::mpsc::channel();
@@ -30375,8 +30454,6 @@ while True:
             drop(writer);
             assert!(done_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
             worker.join().unwrap();
-            if let Some(value) = previous { std::env::set_var("CM_S4_MIN_WRITE", value); }
-            else { std::env::remove_var("CM_S4_MIN_WRITE"); }
             kill_all_sessions(&state);
         });
     }

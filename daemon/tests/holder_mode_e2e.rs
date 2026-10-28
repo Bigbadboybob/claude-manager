@@ -215,7 +215,7 @@ fn launch_sandbox_with_api(tag: &str, api: Option<&str>) -> Sandbox {
         std::fs::create_dir_all(&cm).unwrap();
         let config = cm.join("daemon.toml");
         let mcp = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("mcp_server/server.py");
-        std::fs::write(&config, format!("api_url = \"{api}\"\napi_token = \"stub\"\nmcp_server_path = \"{}\"\n", mcp.display())).unwrap();
+        std::fs::write(&config, format!("s4_min_write = true\napi_url = \"{api}\"\napi_token = \"stub\"\nmcp_server_path = \"{}\"\n", mcp.display())).unwrap();
         std::fs::set_permissions(config, std::fs::Permissions::from_mode(0o600)).unwrap();
         let bin = home.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -244,7 +244,6 @@ fn launch_sandbox_with_api(tag: &str, api: Option<&str>) -> Sandbox {
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_for_stderr));
-    if api.is_some() { holder_command.env("CM_S4_MIN_WRITE", "1"); }
     let holder = holder_command.spawn()
         .expect("spawn sandbox cm-holder");
     let holder_pid = holder.id() as i32;

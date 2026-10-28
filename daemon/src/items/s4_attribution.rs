@@ -3,7 +3,7 @@ use crate::state::DaemonState;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::os::fd::{AsRawFd, OwnedFd};
 
 #[cfg(test)]
@@ -58,20 +58,23 @@ impl Evidence {
 }
 
 #[derive(Default, Clone)]
-struct Central { version: i64, daemon: String, mains: HashMap<String, String>, ambiguous: std::collections::HashSet<String>, wire: bool }
+struct Central { version: i64, daemon: String, mains: HashMap<String, String>, ambiguous: std::collections::HashSet<String>, wire: bool, epoch: u64 }
 fn cache() -> &'static Mutex<Option<Arc<Central>>> {
     static CACHE: OnceLock<Mutex<Option<Arc<Central>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
 }
 static LATEST: AtomicI64 = AtomicI64::new(-1);
-static INVALID: AtomicBool = AtomicBool::new(false);
-static WIRE: AtomicBool = AtomicBool::new(false);
+static INVALID_EPOCH: AtomicU64 = AtomicU64::new(0);
+static CONFIG_EPOCH: AtomicU64 = AtomicU64::new(1);
+/// Called while swapping the config, without acquiring the cache lock. An
+/// older heartbeat reply cannot authorize a new wire shape after a toggle.
+pub(crate) fn invalidate_config_epoch() { CONFIG_EPOCH.fetch_add(1, Ordering::SeqCst); }
+pub(crate) fn config_epoch() -> u64 { CONFIG_EPOCH.load(Ordering::SeqCst) }
 thread_local! { static CURRENT: std::cell::RefCell<(HashMap<String, Evidence>, bool)> = Default::default(); }
 pub(crate) struct Scope((HashMap<String, Evidence>, bool));
 impl Drop for Scope { fn drop(&mut self) { CURRENT.with(|c| *c.borrow_mut() = std::mem::take(&mut self.0)); } }
 pub(crate) fn begin(state: &Arc<Mutex<DaemonState>>, req: &crate::control::protocol::Request) -> Scope {
     let enabled = matches!(req.method.as_str(), "mcp_start_session" | "item.set" | "item.resolve" | "messaging.send");
-    let switched_on = std::env::var_os("CM_S4_MIN_WRITE").is_some_and(|v| v == "1");
     let mut refs = Vec::new();
     if let Some(uid) = req.caller.session_uid() { refs.push(uid.to_lowercase()); }
     if matches!(req.method.as_str(), "item.set" | "item.resolve") {
@@ -84,7 +87,7 @@ pub(crate) fn begin(state: &Arc<Mutex<DaemonState>>, req: &crate::control::proto
             }
         }
     }
-    let fresh = if enabled && switched_on { capture_for(state, Some(&refs)) } else { Default::default() };
+    let fresh = if enabled { capture_for(state, Some(&refs), true) } else { Default::default() };
     Scope(CURRENT.with(|c| std::mem::replace(&mut *c.borrow_mut(), fresh)))
 }
 pub(crate) fn current() -> (HashMap<String, Evidence>, bool) { CURRENT.with(|c| c.borrow().clone()) }
@@ -98,8 +101,7 @@ pub(crate) fn matching(evidence: HashMap<String, Evidence>, subjects: &HashMap<S
 pub(crate) fn reset_for_test() {
     *cache().lock().unwrap() = None;
     LATEST.store(-1, Ordering::Relaxed);
-    INVALID.store(false, Ordering::SeqCst);
-    WIRE.store(false, Ordering::SeqCst);
+    INVALID_EPOCH.store(0, Ordering::SeqCst);
 }
 
 pub(crate) fn observe_version(v: &Value) {
@@ -109,8 +111,9 @@ pub(crate) fn observe_version(v: &Value) {
 }
 
 /// Called by the existing background heartbeat, never by a write path.
-pub(crate) fn absorb_snapshot(daemon: &str, value: &Value) {
-    INVALID.store(true, Ordering::SeqCst);
+pub(crate) fn absorb_snapshot(daemon: &str, value: &Value, epoch: u64) {
+    if epoch != config_epoch() { return; }
+    INVALID_EPOCH.fetch_max(epoch, Ordering::SeqCst);
     let Some(version) = value["version"].as_i64().filter(|v| *v >= 0) else { return };
     let Some(members) = value["members"].as_array() else { return };
     let mut mains = HashMap::new();
@@ -135,12 +138,12 @@ pub(crate) fn absorb_snapshot(daemon: &str, value: &Value) {
     }
     observe_version(value);
     if let Ok(mut guard) = cache().try_lock() {
-        if guard.as_ref().is_none_or(|old| version >= old.version) {
+        if epoch != config_epoch() { return; }
+        if guard.as_ref().is_none_or(|old| old.epoch != epoch || version >= old.version) {
             *guard = Some(Arc::new(Central { version, daemon: daemon.to_owned(), mains, ambiguous,
-                wire: value["s4_min_wire"] == true }));
-            WIRE.store(value["s4_min_wire"] == true, Ordering::SeqCst);
+                wire: value["s4_min_wire"] == true, epoch }));
         }
-        INVALID.store(false, Ordering::SeqCst);
+        let _ = INVALID_EPOCH.compare_exchange(epoch, 0, Ordering::SeqCst, Ordering::SeqCst);
     }
 }
 
@@ -148,15 +151,14 @@ pub(crate) fn absorb_snapshot(daemon: &str, value: &Value) {
 /// poisoned source is unknown; this never changes operation admission.
 #[cfg(test)]
 pub(crate) fn capture(state: &Arc<Mutex<DaemonState>>) -> (HashMap<String, Evidence>, bool) {
-    capture_for(state, None)
+    capture_for(state, None, false)
 }
-fn capture_for(state: &Arc<Mutex<DaemonState>>, refs: Option<&[String]>) -> (HashMap<String, Evidence>, bool) {
-    if INVALID.load(Ordering::SeqCst) {
-        #[cfg(test)] trace("snapshot-invalid");
-        return (HashMap::new(), WIRE.load(Ordering::SeqCst));
-    }
+fn capture_for(state: &Arc<Mutex<DaemonState>>, refs: Option<&[String]>, require_enabled: bool) -> (HashMap<String, Evidence>, bool) {
     let locals = match state.try_lock() {
-        Ok(s) => s.sessions.iter().filter(|(uid, session)| refs.is_none_or(|refs| refs.iter().any(|r| {
+        Ok(s) => {
+            if require_enabled && !s.config.s4_min_write { return (HashMap::new(), false); }
+            let epoch = config_epoch();
+            let locals = s.sessions.iter().filter(|(uid, session)| refs.is_none_or(|refs| refs.iter().any(|r| {
             uid.to_lowercase() == *r || r.rsplit(':').next() == Some(uid.as_str())
                 || session.title.to_lowercase() == *r || s.messaging_names.get(*uid).is_some_and(|name|
                     name.name.to_lowercase() == *r || name.aliases.iter().any(|a| a.to_lowercase() == *r))
@@ -165,23 +167,31 @@ fn capture_for(state: &Arc<Mutex<DaemonState>>, refs: Option<&[String]>) -> (Has
             session.holder_incarnation, session.generation, session.workflow_run_id.is_some(),
             session.continuous_task_id.is_some(), session.org.clone(), Subject::from_session(session),
             Arc::new(session.s4_pidfd()?),
-        ))).collect::<Vec<_>>(),
+            ))).collect::<Vec<_>>();
+            (epoch, locals)
+        },
         Err(_) => {
             #[cfg(test)] trace("state-busy");
-            return (HashMap::new(), WIRE.load(Ordering::SeqCst));
+            return (HashMap::new(), false);
         },
     };
+    let (epoch, locals) = locals;
+    if INVALID_EPOCH.load(Ordering::SeqCst) == epoch {
+        #[cfg(test)] trace("snapshot-invalid");
+        return (HashMap::new(), false);
+    }
     let central = match cache().try_lock() {
         Ok(c) => c.clone(),
         Err(_) => {
             #[cfg(test)] trace("cache-busy");
-            return (HashMap::new(), WIRE.load(Ordering::SeqCst));
+            return (HashMap::new(), false);
         },
     };
+    let central = central.filter(|c| c.epoch == epoch && epoch == config_epoch());
     let wire = central.as_ref().is_some_and(|c| c.wire);
-    if INVALID.load(Ordering::SeqCst) {
+    if INVALID_EPOCH.load(Ordering::SeqCst) == epoch {
         #[cfg(test)] trace("snapshot-invalid-after-capture");
-        return (HashMap::new(), wire);
+        return (HashMap::new(), false);
     }
     let mut claims = HashMap::new();
     for (uid, origin, pid, incarnation, generation, workflow, continuous, org, subject, pidfd) in locals {
@@ -235,7 +245,7 @@ mod tests {
         let snapshot = json!({"version": 10, "s4_min_wire": true, "members": [
             {"id":"mem_main", "main":{"pid":"agent:d:ts-a1-1", "daemon_id":"d",
              "session_uid":"ts-a1-1", "occupancy_generation":1}}]});
-        absorb_snapshot("d", &snapshot);
+        absorb_snapshot("d", &snapshot, config_epoch());
         let (claims, wire) = capture(&state);
         assert!(wire);
         assert_eq!(claims["ts-a1-1"].claim["member_id"], "mem_main");
@@ -273,9 +283,9 @@ mod tests {
             crate::assistants::stamp(&mut session.org, "mem_main", "main", "promote:test");
         }
         assert!(capture(&state).0.is_empty(), "stale promoted main is unknown");
-        absorb_snapshot("d", &json!({"version": 12, "s4_min_wire":true, "members":[]}));
+        absorb_snapshot("d", &json!({"version": 12, "s4_min_wire":true, "members":[]}), config_epoch());
         assert!(capture(&state).0.is_empty(), "missing main cannot borrow old stamp");
-        absorb_snapshot("d", &json!({"version":13, "members":[{"id":"mem_x", "main":{}}]}));
+        absorb_snapshot("d", &json!({"version":13, "members":[{"id":"mem_x", "main":{}}]}), config_epoch());
         assert!(capture(&state).0.is_empty(), "malformed snapshot cannot retain a stale claim");
         state.lock().unwrap().sessions.remove("ts-a1-1");
         reset_for_test();
