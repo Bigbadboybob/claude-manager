@@ -91,6 +91,7 @@ pub mod org;
 pub mod owner_attention;
 pub mod owner_availability;
 pub mod sidebar;
+pub mod shadow_observation;
 pub mod path;
 pub mod planning_client;
 pub mod pty_input;
