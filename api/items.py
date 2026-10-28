@@ -104,11 +104,11 @@ async def update_items(ref: str, body: ItemsPatchBody, request: Request):
     fields = body.set.model_dump(exclude_unset=True)
     write = items_db.update_items_each if body.each else items_db.update_items
     return await _call(write(
-        _pool(request), ref, body.actor.model_dump(), body.ns, fields,
-        add_holders=[h.model_dump() for h in body.add_holders or []],
+        _pool(request), ref, body.actor.model_dump(exclude_unset=True), body.ns, fields,
+        add_holders=[h.model_dump(exclude_unset=True) for h in body.add_holders or []],
         remove_holders=body.remove_holders, reason=body.reason,
         reopen=body.reopen, expect_status=body.expect_status,
-        owner=body.owner.model_dump() if body.owner else None, role=body.role))
+        owner=body.owner.model_dump(exclude_unset=True) if body.owner else None, role=body.role))
 
 
 @router.post("/boards/{ref}/items/touch")
@@ -130,9 +130,9 @@ async def chat_touch(body: ItemsChatTouchBody, request: Request):
 async def resolve_item(ref: str, body: ItemResolveBody, request: Request,
                        n: int = Path(ge=1, le=2**31 - 1)):
     return await _call(items_db.resolve_item(
-        _pool(request), ref, body.actor.model_dump(), n, body.action,
+        _pool(request), ref, body.actor.model_dump(exclude_unset=True), n, body.action,
         kind=body.kind,
-        holders=[h.model_dump() for h in body.holders] if body.holders is not None else None,
+        holders=[h.model_dump(exclude_unset=True) for h in body.holders] if body.holders is not None else None,
         blocked_by=body.blocked_by, blocked_on=body.blocked_on,
         check_back=body.check_back, reason=body.reason, message=body.message, to=body.to))
 

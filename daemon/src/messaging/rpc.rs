@@ -291,7 +291,7 @@ fn execute_with_freshness(
     req: &Request,
     caught_up: bool,
 ) -> Result<Value, ChatError> {
-    let s4 = match &req.caller {
+    let s4_snapshot = match &req.caller {
         Caller::Session(c) if req.method == "messaging.send" =>
             crate::items::s4_attribution::current().0.get(&c.session_uid).cloned(),
         _ => None,
@@ -302,7 +302,7 @@ fn execute_with_freshness(
             message: e.into(),
         })?;
     }
-    let (handle, root, uid, kind, live, draining, graph, search_budget) = {
+    let (handle, root, uid, kind, live, draining, graph, search_budget, s4_subject) = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         let (uid, kind) = match &req.caller {
             Caller::Operator(_) => (String::new(), "owner"),
@@ -325,6 +325,7 @@ fn execute_with_freshness(
             }
         };
         let live = super::live_sessions(&s);
+        let s4_subject = s.sessions.get(&uid).map(crate::items::s4_attribution::Subject::from_session);
         (
             s.messaging.clone(),
             s.messaging_root.clone(),
@@ -334,7 +335,16 @@ fn execute_with_freshness(
             s.draining,
             super::tasks::SessionGraph::capture(&s),
             s.config.chat_search_budget_bytes,
+            s4_subject,
         )
+    };
+    let s4 = match (s4_snapshot, s4_subject) {
+        (Some(evidence), Some(subject)) => {
+            let claims = std::collections::HashMap::from([(uid.clone(), evidence)]);
+            let subjects = std::collections::HashMap::from([(uid.clone(), subject)]);
+            crate::items::s4_attribution::matching(claims, &subjects).remove(&uid)
+        }
+        _ => None,
     };
     if draining {
         return Err(ChatError {

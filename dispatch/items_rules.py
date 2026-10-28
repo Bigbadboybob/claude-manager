@@ -331,6 +331,34 @@ def _links(value) -> list:
     return links
 
 
+def _attribution(value, subject) -> dict | None:
+    """Optional display evidence; malformed/unknown never rejects the write."""
+    if not isinstance(value, dict):
+        return None
+    if set(value) - {"member_id", "acting_as", "provenance", "verified", "org_version", "daemon_id", "as_of"}:
+        return None
+    member, daemon, uid = value.get("member_id"), subject.get("daemon_id"), subject.get("session_uid")
+    if (not isinstance(member, str) or not member.strip() or len(member) > 200
+            or not isinstance(daemon, str) or not daemon or ":" in daemon
+            or not isinstance(uid, str) or not uid or ":" in uid
+            or subject.get("pid") != f"agent:{daemon}:{uid}"):
+        return None
+    if value.get("provenance") == "central-open-main":
+        version = value.get("org_version")
+        if (value.get("acting_as") != "main" or value.get("verified") is not True
+                or type(version) is not int or version < 0 or version > 2**63 - 1
+                or value.get("daemon_id") != daemon or value.get("as_of") is not None):
+            return None
+    elif value.get("provenance") == "o5-spawn-stamp":
+        if (value.get("acting_as") not in ("assistant", "worker") or value.get("verified") is not False
+                or value.get("as_of") != "spawn" or value.get("daemon_id") is not None
+                or value.get("org_version") is not None):
+            return None
+    else:
+        return None
+    return dict(value)
+
+
 def _holder(value) -> dict:
     if not isinstance(value, dict) or not isinstance(value.get("pid"), str) or not value["pid"]:
         raise invalid("invalid_field", "each holder needs a pid", field="holders")
@@ -343,8 +371,8 @@ def _holder(value) -> dict:
         "session_uid": value.get("session_uid"),
         "daemon_id": value.get("daemon_id"),
     }
-    if value.get("attribution") is not None:
-        out["attribution"] = value["attribution"]
+    if "attribution" in value:
+        out["attribution"] = _attribution(value["attribution"], out)
     if role is not None:
         out["role"] = role
     if value.get("added_at") is not None:
@@ -356,7 +384,7 @@ def _dedupe_holders(holders) -> list:
     seen: dict[str, dict] = {}
     for h in holders:
         prior = seen.setdefault(h["pid"], h)
-        if prior.get("attribution") is None and h.get("attribution") is not None:
+        if prior is not h and "attribution" in h:
             prior["attribution"] = h["attribution"]
     return list(seen.values())
 
@@ -379,7 +407,9 @@ class BoardTx:
         # (n, previous owner pid | None, new owner holder | None): the
         # launch grants to move (§7.4).
         self.owner_changes: list[tuple[int, str | None, dict | None]] = []
-        self.actor = actor
+        self.actor = dict(actor)
+        if "attribution" in actor:
+            self.actor["attribution"] = _attribution(actor["attribution"], actor)
         self.now = now
         self.created: list[int] = []
         self.dirty: set[int] = set()
@@ -418,6 +448,8 @@ class BoardTx:
     def _event(self, it: Item, type_: str, prev=None, new=None, reason=None):
         self.events.append({
             "n": it.n, "type": type_, "prev": prev, "new": new, "reason": reason,
+            "holder_attributions": [{"pid": h["pid"], "attribution": dict(h["attribution"])}
+                                    for h in it.holders if h.get("attribution") is not None],
         })
 
     def _push(self, it: Item, holder: dict, kind: str, text: str):
@@ -766,7 +798,10 @@ class BoardTx:
                 if h.get("role") in ("owner", "holder", None):
                     h["role"] = "contributor"
             existing = next((h for h in it.holders if h["pid"] == owner["pid"]), None)
-            new_holders.insert(0, {**(existing or {}), **owner, "role": "owner"})
+            promoted = {**(existing or owner), "role": "owner"}
+            if "attribution" in owner:
+                promoted["attribution"] = owner["attribution"]
+            new_holders.insert(0, promoted)
         previous = {h["pid"]: h for h in it.holders}
         for h in new_holders:
             old = previous.get(h["pid"])
@@ -774,7 +809,7 @@ class BoardTx:
                 # Old daemon full replacements omit these fields. Never copy
                 # them to a different PID or accept caller-supplied via.
                 for key in ("member_id", "via_member_id", "attribution"):
-                    if h.get(key) is None and old.get(key) is not None:
+                    if key not in h and old.get(key) is not None:
                         h[key] = old[key]
         new_holders = self._assign_roles(new_holders, set(prev_pids), replaced=holders is not None)
         # The owner left and one holder remains: the successor is not in

@@ -370,11 +370,12 @@ async def _apply(conn, tx: BoardTx, *, mirror: bool = False) -> None:
     for e in tx.events:
         await conn.execute(
             """INSERT INTO item_events (board_id, item_id, item_number, actor_pid,
-                                        actor_name, type, prev, new, reason, created_at, actor_attribution)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)""",
+                                        actor_name, type, prev, new, reason, created_at, actor_attribution,
+                                        holder_attributions)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)""",
             board_id, tx.items[e["n"]].id if e.get("n") else None, e.get("n"),
             tx.actor["pid"], tx.actor.get("name"), e["type"], e["prev"], e["new"],
-            e["reason"], now, tx.actor.get("attribution"),
+            e["reason"], now, tx.actor.get("attribution"), e.get("holder_attributions") or None,
         )
     for p in tx.pushes:
         await conn.execute(
@@ -1011,6 +1012,7 @@ async def read_board(pool, ref: str, *, since_version: int | None = None,
                     "id": e["id"], "type": e["type"], "actor": e["actor_name"] or e["actor_pid"],
                     "actor_pid": e["actor_pid"], "prev": e["prev"], "new": e["new"],
                     "actor_attribution": e["actor_attribution"],
+                    "holder_attributions": e["holder_attributions"],
                     "reason": e["reason"], "at": iso(e["created_at"]),
                 })
         needle = q.lower() if q else None

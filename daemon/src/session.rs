@@ -985,6 +985,11 @@ impl LastExitProbe {
             .is_some()
     }
 
+    /// Nonblocking exit observation for display evidence; contention is unknown.
+    pub(crate) fn try_kernel_set(&self) -> Option<bool> {
+        self.kernel.try_lock().ok().map(|status| status.is_some())
+    }
+
     /// Snapshot the End-frame payload's `(exit_code, memory_cap_kill)`.
     /// Reads kernel exit from the cached slot; scans the kill log
     /// AT THIS MOMENT for `memory_cap_kill` — that's the lazy
@@ -1467,6 +1472,10 @@ pub fn codex_rollout_uuid_from_stem(stem: &str) -> Option<String> {
 }
 
 impl DaemonSession {
+    /// Duplicate the spawn-bound pidfd for nonblocking provenance observation.
+    pub(crate) fn s4_pidfd(&self) -> Option<std::os::fd::OwnedFd> {
+        self.pidfd.try_clone().ok()
+    }
     /// Project this live session into a persistable
     /// [`ManifestEntry`](crate::manifest::ManifestEntry) for the
     /// daemon's own durable registry (P0 session durability, S1).

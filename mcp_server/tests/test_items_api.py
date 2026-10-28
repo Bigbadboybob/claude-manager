@@ -340,7 +340,7 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
 
     async def test_s4_old_holder_replacement_preserves_existing_evidence(self):
         attribution = {"member_id": "mem_a", "acting_as": "assistant",
-                       "provenance": "o5-spawn-stamp", "verified": False}
+                       "provenance": "o5-spawn-stamp", "as_of":"spawn", "verified": False}
         await self.create({"title": "a", "holders": [LANE]})
         await self.patch(1, add_holders=[{**LANE, "attribution": attribution}])
         async with self.pool.acquire() as conn:
@@ -358,6 +358,9 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
         await self.patch(1, holders=[ORCH])
         rows = await self.fetch("SELECT pid,attribution FROM item_holders")
         self.assertEqual([r["pid"] for r in rows], [ORCH["pid"]])
+        events = await self.fetch("SELECT holder_attributions FROM item_events WHERE holder_attributions IS NOT NULL")
+        self.assertTrue(any(any(h["pid"] == LANE["pid"] and h["attribution"]["member_id"] == "mem_a"
+                                for h in row["holder_attributions"]) for row in events))
 
     async def test_s4_item_actor_attribution_is_event_evidence(self):
         await self.create("a")
@@ -367,6 +370,38 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
         rows = await self.fetch("SELECT actor_pid,actor_attribution FROM item_events WHERE type='updated'")
         self.assertTrue(any(r["actor_pid"] == ORCH["pid"] and r["actor_attribution"]
                             and r["actor_attribution"]["member_id"] == "mem_a" for r in rows))
+
+    async def test_s4_bad_optional_evidence_is_unknown_without_rejecting_write(self):
+        await self.create({"title":"a", "holders":[LANE]})
+        good = {"member_id":"mem_a", "acting_as":"assistant", "provenance":"o5-spawn-stamp",
+                "as_of":"spawn", "verified":False}
+        await self.patch(1, add_holders=[{**LANE, "attribution":good}])
+        # An old writer omits the field: preserve existing evidence.
+        await self.patch(1, holders=[LANE])
+        self.assertIsNotNone((await self.fetch("SELECT attribution FROM item_holders"))[0]["attribution"])
+        bad = ["malformed", {"provenance":"unknown"},
+               {"member_id":"", "acting_as":"assistant", "provenance":"central-open-main", "verified":True},
+               {"member_id":"mem_a", "acting_as":"assistant", "provenance":"o5-spawn-stamp", "as_of":"spawn", "verified":True},
+               {"member_id":"mem_a", "acting_as":"main", "provenance":"central-open-main", "verified":True,
+                "daemon_id":"wrong", "org_version":7}]
+        for claim in bad:
+            await self.patch(1, holders=[{**LANE, "attribution":claim}], note="kept working")
+            self.assertIsNone((await self.fetch("SELECT attribution FROM item_holders"))[0]["attribution"])
+
+    async def test_s4_old_minimal_owner_transfer_preserves_existing_identity(self):
+        await self.create("a")
+        await self.patch(1, add_holders=[LANE])
+        url = f"/boards/{self.ref}/items"
+        r = await self.http.patch(url, json={"actor":ORCH, "ns":[1], "set":{}, "owner":{"pid":LANE["pid"]}})
+        self.assertEqual(r.status_code, 200, r.text)
+        rows = await self.fetch("SELECT pid,name,session_uid,daemon_id FROM item_holders WHERE pid=$1", LANE["pid"])
+        self.assertEqual((rows[0]["name"], rows[0]["session_uid"], rows[0]["daemon_id"]),
+                         (LANE["name"], LANE["session_uid"], LANE["daemon_id"]))
+        r = await self.http.patch(url, json={"actor":ORCH, "ns":[1], "set":{}, "owner":ORCH})
+        self.assertEqual(r.status_code, 200, r.text)
+        rows = await self.fetch("SELECT name,session_uid,daemon_id FROM item_holders WHERE pid=$1", ORCH["pid"])
+        self.assertEqual((rows[0]["name"], rows[0]["session_uid"], rows[0]["daemon_id"]),
+                         (ORCH["name"], ORCH["session_uid"], ORCH["daemon_id"]))
 
     async def test_nudge_resolve_snoozes_and_pushes(self):
         await self.create({"title": "a", "holders": [LANE]})

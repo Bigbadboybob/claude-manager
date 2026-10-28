@@ -9877,6 +9877,7 @@ fn mcp_start_session_inner(
         caller_cols,
         caller_rows,
         launch_grant,
+        s4_supported_caller,
     ) = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         let cuid = caller_uid.ok_or((
@@ -10122,6 +10123,7 @@ fn mcp_start_session_inner(
             caller.last_cols,
             caller.last_rows,
             granted,
+            caller.workflow_run_id.is_none() && caller.continuous_task_id.is_none(),
         )
     };
 
@@ -10490,7 +10492,7 @@ fn mcp_start_session_inner(
     }
 
     let start_result = start_session_with_origin(state_arc, &Value::Object(full_params),
-        crate::session_watch::default_watcher_spawn_fn(), caller_uid.is_some())?;
+        crate::session_watch::default_watcher_spawn_fn(), s4_supported_caller)?;
 
     // #28: the creator's name for the child lands before the child has a
     // prompt to act on, so its own first chat_send can never claim the same
@@ -30115,7 +30117,6 @@ while True:
             set_spawn_program_override_for_test(Some(("/bin/sleep".into(), vec!["120".into()])));
             let child = mcp_start_session(&state, &json!({"type":"codex", "label":"s4 child"}), Some("ts-caller")).unwrap();
             let shell = mcp_start_session(&state, &json!({"type":"bash", "label":"shell"}), Some("ts-caller")).unwrap();
-            set_spawn_program_override_for_test(None);
             {
                 let st = state.lock().unwrap();
                 assert!(st.sessions[child["session_uid"].as_str().unwrap()].s4_spawn_origin.is_some());
@@ -30125,8 +30126,12 @@ while True:
             crate::items::s4_attribution::absorb_snapshot("d", &json!({"version":7, "s4_min_wire":true,
                 "members":[{"id":"mem_new", "main":{"pid":format!("agent:d:{uid}"),
                     "daemon_id":"d", "session_uid":uid, "occupancy_generation":1}}]}));
-            assert_eq!(crate::items::s4_attribution::capture(&state).0[uid]["member_id"], "mem_new");
+            assert_eq!(crate::items::s4_attribution::capture(&state).0[uid].claim["member_id"], "mem_new");
             assert!(crate::items::s4_attribution::capture(&state).0.get(shell["session_uid"].as_str().unwrap()).is_none());
+            state.lock().unwrap().sessions.get_mut("ts-caller").unwrap().workflow_run_id = Some("workflow".into());
+            let workflow_child = mcp_start_session(&state, &json!({"type":"codex", "label":"workflow child"}), Some("ts-caller")).unwrap();
+            assert!(state.lock().unwrap().sessions[workflow_child["session_uid"].as_str().unwrap()].s4_spawn_origin.is_none());
+            set_spawn_program_override_for_test(None);
             crate::items::s4_attribution::reset_for_test();
             kill_all_sessions(&state);
         });
@@ -30135,10 +30140,35 @@ while True:
     #[test]
     fn s4_dispatch_spawn_progresses_after_queued_retirement_writer() {
         let _tmp = with_temp_home(|| {
+            let previous = std::env::var_os("CM_S4_MIN_WRITE");
+            std::env::set_var("CM_S4_MIN_WRITE", "1");
+            crate::items::s4_attribution::reset_for_test();
             let state = make_state_arc();
             seed_mcp_spawn_fixture(&state, "ts-caller", None);
+            {
+                let mut st = state.lock().unwrap();
+                let caller = st.sessions.get_mut("ts-caller").unwrap();
+                caller.s4_spawn_origin = Some((caller.pid, caller.holder_incarnation, caller.generation, caller.org.clone()));
+            }
+            crate::items::s4_attribution::absorb_snapshot("d", &json!({"version":9, "s4_min_wire":true,
+                "members":[{"id":"mem_a", "main":{"pid":"agent:d:ts-caller", "daemon_id":"d",
+                    "session_uid":"ts-caller", "occupancy_generation":1}}]}));
             let gate = crate::continuous::retirement::gate("ts-caller");
-            let writer = gate.write().unwrap();
+            let reader = gate.read().unwrap();
+            let (writer_started_tx, writer_started_rx) = std::sync::mpsc::channel();
+            let (writer_acquired_tx, writer_acquired_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let writer_gate = gate.clone();
+            let writer = std::thread::spawn(move || {
+                writer_started_tx.send(()).unwrap();
+                let _guard = writer_gate.write().unwrap();
+                writer_acquired_tx.send(()).unwrap();
+                release_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+            });
+            writer_started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while gate.try_read().is_ok() && std::time::Instant::now() < deadline { std::thread::yield_now(); }
+            assert!(gate.try_read().is_err(), "writer must be queued behind the existing reader");
             let (tx, rx) = std::sync::mpsc::channel();
             let worker_state = state.clone();
             let worker = std::thread::spawn(move || {
@@ -30153,9 +30183,15 @@ while True:
                 tx.send(ok).unwrap();
             });
             assert!(rx.recv_timeout(std::time::Duration::from_millis(100)).is_err());
-            drop(writer);
+            drop(reader);
+            writer_acquired_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            release_tx.send(()).unwrap();
             assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).expect("spawn must not deadlock"));
             worker.join().unwrap();
+            writer.join().unwrap();
+            crate::items::s4_attribution::reset_for_test();
+            if let Some(value) = previous { std::env::set_var("CM_S4_MIN_WRITE", value); }
+            else { std::env::remove_var("CM_S4_MIN_WRITE"); }
             kill_all_sessions(&state);
         });
     }

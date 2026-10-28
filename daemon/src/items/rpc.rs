@@ -120,8 +120,12 @@ impl Ctx {
         if !req.params.is_object() && !req.params.is_null() {
             return Err(bad("expected object parameters"));
         }
-        let (me, live, handle, api_url, api_token) = {
+        let (s4_snapshot, s4_wire) = super::s4_attribution::current();
+        let (me, live, handle, api_url, api_token, subjects) = {
             let s = state.lock().unwrap_or_else(|p| p.into_inner());
+            let subjects = s4_snapshot.keys().filter_map(|uid| s.sessions.get(uid)
+                .map(|session| (uid.clone(), super::s4_attribution::Subject::from_session(session))))
+                .collect::<std::collections::HashMap<_, _>>();
             let me = match &req.caller {
                 Caller::Operator(_) => None,
                 Caller::Session(c) => {
@@ -141,7 +145,7 @@ impl Ctx {
                 }
             };
             let live = crate::messaging::live_sessions(&s);
-            (me, live, s.messaging.clone(), s.config.api_url.clone(), s.config.api_token.clone())
+            (me, live, s.messaging.clone(), s.config.api_url.clone(), s.config.api_token.clone(), subjects)
         };
         if me.as_ref().is_some_and(|(_, _, _, _, engine, _)| engine.as_deref() == Some("bash")) {
             return Err(bad("agent_only: item and org tools require an agent; bash is a shell"));
@@ -169,7 +173,7 @@ impl Ctx {
             (store.daemon_id.clone(), people, my_name)
         };
         let api = Api::from_config(&api_url, &api_token)?;
-        let (s4, s4_wire) = super::s4_attribution::current();
+        let s4 = super::s4_attribution::matching(s4_snapshot, &subjects);
         Ok(match me {
             None => Ctx {
                 s4, s4_wire,
@@ -211,8 +215,8 @@ impl Ctx {
             "task_id": self.task_id,
         });
         if self.s4_wire {
-            if let Some(claim) = self.uid.as_ref().and_then(|u| self.s4.get(u)) {
-                actor["attribution"] = claim.clone();
+            if let Some(uid) = self.uid.as_ref() {
+                actor["attribution"] = self.s4.get(uid).cloned().unwrap_or(json!({"provenance":"unknown"}));
             }
         }
         actor
@@ -224,10 +228,10 @@ impl Ctx {
 
     fn holder(&self, pid: &str, name: Option<&str>) -> Value {
         let mut value = holder_value(pid, name);
-        if self.s4_wire && value["daemon_id"].as_str() == Some(self.daemon_id.as_str()) {
-            if let Some(claim) = value["session_uid"].as_str().and_then(|u| self.s4.get(u)) {
-                value["attribution"] = claim.clone();
-            }
+        if self.s4_wire && value["session_uid"].is_string() {
+            let claim = (value["daemon_id"].as_str() == Some(self.daemon_id.as_str()))
+                .then(|| value["session_uid"].as_str().and_then(|u| self.s4.get(u))).flatten();
+            value["attribution"] = claim.cloned().unwrap_or(json!({"provenance":"unknown"}));
         }
         value
     }
@@ -1260,7 +1264,7 @@ mod tests {
         ctx.s4_wire = true;
         assert_eq!(ctx.actor()["attribution"], actor);
         assert_eq!(ctx.holder("agent:d1:old-uid", None)["attribution"], target);
-        assert!(ctx.holder("agent:d2:old-uid", None).get("attribution").is_none());
+        assert_eq!(ctx.holder("agent:d2:old-uid", None)["attribution"]["provenance"], "unknown");
     }
 
     fn people() -> Vec<Value> {

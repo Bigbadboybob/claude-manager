@@ -81,6 +81,11 @@ S4-min writing is off unless the daemon starts with `CM_S4_MIN_WRITE=1`.
 Rollback requires stopping these writes on every participating daemon before
 rolling the API back; the last capability snapshot is as-of and cannot protect
 an uncoordinated API downgrade before its next refresh. No data migration back
-is needed. This is a release constraint, not authorization to deploy. Snapshot
+is needed. An older API can delete and reinsert holder rows without preserving
+their current metadata, even after new daemon writes stop. The new API also
+records holder evidence in additive item-event fields, so historical evidence
+survives that old writer; current holder attribution is unknown after such a
+rollback unless preservation is independently established. This is a release
+constraint, not authorization to deploy. Snapshot
 refresh uses the existing heartbeat thread and adds no timer; process-origin
 evidence is intentionally lost on brain restart/adoption.

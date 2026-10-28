@@ -5,7 +5,7 @@ rules in `dispatch.items_rules` do the semantic validation, so these models
 only fix the wire shape.
 """
 
-from typing import Annotated, Literal
+from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -21,16 +21,6 @@ class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class Attribution(_Strict):
-    member_id: Short
-    acting_as: Literal["main", "assistant", "worker"]
-    provenance: Literal["central-open-main", "o5-spawn-stamp"]
-    as_of: Literal["spawn"] | None = None
-    org_version: int | None = None
-    daemon_id: Short | None = None
-    verified: bool | None = None
-
-
 class Actor(_Strict):
     pid: str = Field(min_length=1, max_length=200)
     name: Short | None = None
@@ -40,7 +30,7 @@ class Actor(_Strict):
 
 
 class AttributedActor(Actor):
-    attribution: Attribution | None = None
+    attribution: Any = None
 
 
 class Holder(_Strict):
@@ -53,7 +43,7 @@ class Holder(_Strict):
 
 
 class AttributedHolder(Holder):
-    attribution: Attribution | None = None
+    attribution: Any = None
 
 
 class ItemFields(_Strict):
