@@ -30195,18 +30195,39 @@ while True:
             let worker_uid = worker["session_uid"].as_str().unwrap();
             let req = crate::control::protocol::Request { id:"item".into(), caller:crate::control::protocol::Caller::session(worker_uid),
                 method:"item.set".into(), params:json!({"n":1,"status":"active"}) };
-            {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
                 let _scope = crate::items::s4_attribution::begin(&state, &req);
                 let ctx = crate::items::rpc::Ctx::capture(&state, &req).unwrap();
-                assert_eq!(ctx.actor()["attribution"]["acting_as"], "worker");
-                assert_eq!(ctx.actor()["attribution"]["provenance"], "o5-spawn-stamp");
+                let attribution = ctx.actor()["attribution"].clone();
+                if attribution["acting_as"] == "worker" {
+                    assert_eq!(attribution["provenance"], "o5-spawn-stamp");
+                    break;
+                }
+                assert!(attribution.is_null() || attribution["provenance"] == "unknown", "{attribution}");
+                assert!(std::time::Instant::now() < deadline, "worker item evidence never became available");
+                std::thread::yield_now();
             }
-            let chat = crate::control::protocol::Request { id:"chat".into(), caller:crate::control::protocol::Caller::session(worker_uid),
-                method:"messaging.send".into(), params:json!({"channel":"general", "name":"worker", "body":"ready", "request_id":"worker-chat"}) };
-            let result = crate::control::dispatch::dispatch_request(&state, &chat);
-            let crate::control::dispatch::DispatchOutcome::Done(response) = result else { panic!("chat must complete") };
-            assert!(response.ok, "{:?}", response.error);
-            assert_eq!(response.result.unwrap()["event"]["data"]["actor_attribution"]["acting_as"], "worker");
+            // Each attempt is a separate successful write; a busy nonblocking
+            // snapshot may legitimately omit evidence on any one attempt.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                let chat = crate::control::protocol::Request { id:format!("chat-{attempt}"), caller:crate::control::protocol::Caller::session(worker_uid),
+                    method:"messaging.send".into(), params:json!({"channel":"general", "name":"worker", "body":"ready", "request_id":format!("worker-chat-{attempt}")}) };
+                let result = crate::control::dispatch::dispatch_request(&state, &chat);
+                let crate::control::dispatch::DispatchOutcome::Done(response) = result else { panic!("chat must complete") };
+                assert!(response.ok, "{:?}", response.error);
+                let attribution = response.result.unwrap()["event"]["data"]["actor_attribution"].clone();
+                if attribution["acting_as"] == "worker" {
+                    assert_eq!(attribution["provenance"], "o5-spawn-stamp");
+                    break;
+                }
+                assert!(attribution.is_null() || attribution["provenance"] == "unknown", "{attribution}");
+                assert!(std::time::Instant::now() < deadline, "worker chat evidence never became available");
+                std::thread::yield_now();
+            }
             if let Some(value) = previous { std::env::set_var("CM_S4_MIN_WRITE", value); }
             else { std::env::remove_var("CM_S4_MIN_WRITE"); }
             crate::items::org::reset_cache_for_test();
