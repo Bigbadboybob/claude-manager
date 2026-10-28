@@ -191,15 +191,15 @@ impl State {
                 if self.events.len() >= MAX_RECORDS - RESERVED_CONTROL_RECORDS { return Err(Error::Full); }
                 let payload = checked_event(envelope)?;
                 let id = envelope.id;
-                let epoch = self.epochs.last_mut().filter(|e| !e.closed).ok_or(Error::NoOpen)?;
-                if id.producer != epoch.producer || id.boot != epoch.boot || id.sequence <= epoch.last_sequence
-                    || epoch.checkpoint.is_some_and(|(next, _)| id.sequence < next) { return Err(Error::Invalid); }
                 let d = digest(&payload);
                 if self.events.iter().any(|e| e.id.producer == id.producer && e.id.boot == id.boot
                     && e.id.sequence == id.sequence && e.id != id) { return Err(Error::Conflict); }
                 if let Some(previous) = self.events.iter().find(|e| e.id == id) {
                     return Err(if previous.digest == d { Error::Invalid } else { Error::Conflict });
                 }
+                let epoch = self.epochs.last_mut().filter(|e| !e.closed).ok_or(Error::NoOpen)?;
+                if id.producer != epoch.producer || id.boot != epoch.boot || id.sequence <= epoch.last_sequence
+                    || epoch.checkpoint.is_some_and(|(next, _)| id.sequence < next) { return Err(Error::Invalid); }
                 let event_bytes = self.event_bytes.checked_add(frame_bytes).ok_or(Error::Bounds)?;
                 if event_bytes > limits.capacity - limits.control_reserve - HEADER { return Err(Error::Full); }
                 self.events.push(EventMeta { id, digest: d, ack: None });
@@ -434,6 +434,12 @@ impl Spool {
             if self.state.health == Health::Clean { self.state.health = Health::UncleanSuffix; }
             return Err(Error::Conflict);
         }
+        if self.state.events.iter().any(|e| e.id.producer == envelope.id.producer && e.id.boot == envelope.id.boot
+            && e.id.sequence == envelope.id.sequence && e.id != envelope.id) {
+            self.unrecorded_loss = true; self.state.unknown_suffix = true;
+            if self.state.health == Health::Clean { self.state.health = Health::UncleanSuffix; }
+            return Err(Error::Conflict);
+        }
         if self.restart_uncertain { return Err(Error::NoOpen); }
         match self.append(Record::Event { envelope: *envelope }) {
             Ok(()) => Ok(Append::Stored),
@@ -599,6 +605,20 @@ mod tests {
         s.acknowledge(e.id, Spool::event_digest(&e).unwrap(), id("receipt")).unwrap();
         s.close(2).unwrap(); drop(s);
         let s = Spool::open(dir.path(), limits()).unwrap(); assert!(s.unknown_suffix());
+    }
+
+    #[test]
+    fn reused_sequence_with_different_id_is_conflict_before_and_after_restart() {
+        let dir = fixture_dir(); let mut s = opened(dir.path());
+        let e = envelope(1); s.append_event(&e).unwrap(); s.checkpoint(2, counts(1)).unwrap();
+        let mut changed = e; changed.id.child = 1; changed.facts.child = 1;
+        assert!(matches!(s.append_event(&changed), Err(Error::Conflict)));
+        s.record_gap(0, true).unwrap(); drop(s);
+        let mut s = Spool::open(dir.path(), limits()).unwrap();
+        changed.id.component = crate::shadow_observation::Component::ApiResponse;
+        changed.facts.component = crate::shadow_observation::Component::ApiResponse;
+        assert!(matches!(s.append_event(&changed), Err(Error::Conflict)));
+        assert!(s.unknown_suffix());
     }
 
     #[test]
