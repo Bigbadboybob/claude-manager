@@ -1,7 +1,11 @@
 # Process-bound provenance for S4: proposed contract
 
-Status: **specification for independent review**, not an implemented or
-approved protocol. Baseline is `origin/main` `0c2fcd8d5e84279e16c1572ad3e1a6cf6998a63d`.
+Status: **reviewed proposal with binding CM engineering decisions below**.
+The proposal through “Proposed decisions and minimum future verification” was
+independently reviewed at `597b97be` on 2026-10-28. The final **Decided** section
+supersedes that proposal for S4-min, including its credentials, admission gates,
+new receipts and remote-work requirements. No runtime implementation is claimed.
+Baseline is `origin/main` `0c2fcd8d5e84279e16c1572ad3e1a6cf6998a63d`.
 O1, O4–O6 and the signer/attribution/authorization separation in
 `doc/org-model.md` remain in force. The local S5 observation and spool contracts
 and S6 occupancy plan are planning inputs, not deployed guarantees. Rejected S4
@@ -273,3 +277,107 @@ use. Show unknown rather than inferred attribution in every missing, ambiguous
 and stale case, preserve rule/brief boundaries and existing O5 lifecycle, and
 obtain independent review of actual implementation and release compatibility.
 These are future verification gates, not tests performed for this spec.
+
+## Decided (CM 2026-10-28)
+
+Authority: Swarm-Coord's engineering decision
+`8c9334f8-112f-457a-be52-95fe1328d987`, created
+`2026-10-28T15:43:16.588Z`. CM explicitly owns these engineering choices under
+Owner's altitude rule; they are not requests for another Owner approval. This
+section is the implementation contract for **S4-min**. The stronger historical
+proposal above is context, not additional requirements to implement now.
+
+1. **Purpose and trust.** S4 is attribution for display and routing, not a
+   security mechanism. Assume one owner, cooperating trusted hosts and the
+   same OS user, with no adversary. The existing operator token, SSH tunnel and
+   0600 socket are the trust boundary. Add no per-binding credentials, key
+   provisioning or signing. A `verified` attribution means a trusted daemon's
+   supported as-of claim under this model; it does not authenticate model
+   authorship, resist a malicious same-user process, grant authority, or prove
+   that membership remained current when a later effect happened. Legacy
+   lifecycle and endpoint authorization behavior remain unchanged.
+2. **Issuer and transport.** The daemon issues the attribution on the existing
+   daemon-to-API path, using the API token plus daemon ID. Use existing
+   request-ID/receipt idempotency. Add no replay or retention store, new nonce
+   protocol, new signing path, or historical reconciliation service.
+3. **Member source and freshness.** Use the central org record—member plus
+   open incarnation—as recorded at spawn, adoption or promotion, cached by the
+   daemon with its org version. If the version is unknown or older than the
+   latest org event the daemon has seen, record `unknown`. There is no TTL.
+   Missing, contradictory or unsupported subject/source evidence is unknown;
+   do not derive a verified member from an ancestor, workspace, task, legacy
+   O5 stamp or caller-supplied member. The actual source and version fields
+   must be identified and covered by the implementation's proof; an invented
+   local revision is not a substitute for the central org version.
+4. **No provenance gate.** Never block or delay a write or spawn for
+   provenance. Compute the claim from an already obtained snapshot, outside
+   all locks and before acquiring an existing operation gate. Any contention
+   or timeout yields unknown and leaves the existing operation path alone.
+   Snapshot acquisition itself must be nonblocking; release any successful
+   short try-lock before computing the claim. Add no new admission permit,
+   retirement gate, lock upgrade, nested acquisition or wait for a heartbeat,
+   member lookup, network call or disk operation. Do not convert uncertainty
+   into a provenance-induced refusal or automatic retry. The claim is as-of
+   its snapshot, with no new claim of effect-time fencing.
+5. **Storage and rollback.** Use additive nullable columns or JSON fields;
+   old readers ignore the additions. Rollback means stop writing attribution,
+   with no migration back. Validate the actual reader/writer compatibility:
+   existing strict API schemas require compatible parsing and old endpoints
+   must receive the old request shape. Preserve existing write semantics and
+   historical attribution without adding a new receipt system or activating
+   the rejected broad S4 migration. No production rollback or backfill is
+   implied by this docs change.
+6. **First implementation slice.** Cover daemon-originated writes for locally
+   spawned sessions: spawn, item set/resolve and chat send, plus distinguish
+   existing O5 stamps as `legacy` from supported `verified` claims. Everything
+   else—remote origin/forwarding/handback, workflows, Fresh, TUI/API-direct and
+   unsupported restored/adopted paths—remains unknown for S4-min. Recording a
+   central member source during adoption does not by itself admit adoption
+   to the supported first slice. These paths remain S6 follow-ups. Use one
+   existing implementation lane and a deadlock-focused independent review;
+   no cross-host implementation work. S6 waits on accepted S4-min.
+
+S4-min retains separate initiating actor, executor and target meanings where
+the existing operation exposes them; never copy one subject's member into
+another subject's attribution. It does not add a general causal-event system.
+Known pending placement remains unknown rather than falsely unbound, and old
+records are not certified from current membership. Scope and authorization
+checks continue to use their existing sources. Standing-rule delivery and the
+rejected S4 gate/notice changes remain outside this slice.
+
+### Assumptions register for S4-min
+
+This register applies the assumption audit to the reviewed proposal after
+CM's six decisions. `CARRIED (CM)` means an explicit delegated engineering
+decision from the receipt above, not an invented Owner ruling. `CONSEQUENCE`
+records an observable limit of those choices. Unselected proposal mechanisms
+are overridden, not implementation prerequisites. No new numeric defaults
+or Owner decisions are introduced here.
+
+| # | Assumption / value | Provenance | Scope | Blast radius and cheapest verification | Status |
+|---|---|---|---|---|---|
+| 1 | Single-owner, trusted cooperating hosts, same-user, no adversary | CARRIED (CM 1) | Trust | Attribution cannot establish hostile-process identity; assert this meaning in docs and output tests | approved by CM |
+| 2 | Existing token/SSH/0600 socket; no per-binding credentials or signing | CARRIED (CM 1) | Transport | Possession or daemon assertion is not model authorship; exclude credential/issuer infrastructure from diff | approved by CM; overrides proposal |
+| 3 | Attribution for display/routing never grants authority | CARRIED (CM 1; existing org-model separation) | Consumers | Reusing a label in permissions would change control; review consumers and unchanged authorization fixtures | approved |
+| 4 | Daemon issuer, existing API token plus daemon ID | CARRIED (CM 2) | Writes | Direct/client-provided fields could be mislabelled; fixture supported daemon path versus unknown direct path | approved by CM |
+| 5 | Existing request-ID receipts only; no new replay/retention store | CARRIED (CM 2) | Idempotency | New retention semantics could alter writes; keep existing duplicate behavior and audit storage diff | approved by CM; overrides proposal |
+| 6 | Central member plus open incarnation cached at spawn/adopt/promote with org version | CARRIED (CM 3) | Member source | Wrong subject/version would produce a plausible wrong label; identify actual fields and fixture one positive supported local case | implementation evidence gate |
+| 7 | Unknown version or version older than latest observed org event yields unknown; no TTL | CARRIED (CM 3) | Freshness | Missing events can leave an as-of claim older than central state; test seen-version invalidation and disclose observation boundary | approved by CM |
+| 8 | Snapshot claims do not prove globally current or effect-time membership | CONSEQUENCE (3, 4) | Meaning | A membership change after snapshot can precede the effect; race fixture must preserve operation and as-of label | accepted scope limit |
+| 9 | Nonblocking snapshot; computation outside locks before existing gates | CARRIED (CM 4) | Locking | A hidden acquisition can reproduce spawn/heartbeat deadlock; contention/queued-writer fixtures plus lock-path review | implementation evidence gate |
+| 10 | Unknown on contention/timeout; no provenance refusal, wait or retry | CARRIED (CM 4) | Failure behavior | Unavailable attribution must not prevent work; test contended/missing source alongside ordinary operation success | approved by CM |
+| 11 | No new lifecycle permit, credentials, receipt reconciliation or distributed fence | CONSEQUENCE (1, 2, 4) | Exclusions | Importing the historical proposal reopens the rejected broad migration; inspect complete diff | overrides proposal |
+| 12 | Additive nullable storage; rollback stops writes, no migration back | CARRIED (CM 5) | Persistence | An old parser or whole-row rewrite can lose fields or reject writes; targeted new/old schema and writer fixtures | implementation evidence gate |
+| 13 | Old strict endpoints receive old wire shape; no mutation retry after ambiguous response | CARRIED (existing API behavior); CONSEQUENCE (5) | Compatibility | Unknown JSON fields can reject live operations; capability/unsupported fixture before new-field use | implementation evidence gate |
+| 14 | Local spawn, item set/resolve and chat send only | CARRIED (CM 6) | Coverage | Uncovered origin must not appear verified; explicit supported-path inventory and positive/negative fixtures | approved by CM |
+| 15 | Remote/handback/workflow/Fresh/TUI/API-direct/unsupported adoption remain unknown | CARRIED (CM 6); CONSEQUENCE (coverage) | Exclusions | Reusing a cached O5 stamp could falsely certify excluded paths; origin-matrix fixtures | approved by CM |
+| 16 | Legacy O5 stamps retained and labelled legacy; no lifecycle change | CARRIED (CM 6; existing O5) | Lifecycle | Dropping stamps or changing teardown alters assistants/workers; existing lifecycle controls remain | approved |
+| 17 | Initiator, executor and target claims cannot fill one another | CARRIED (reviewed spec; existing subject meanings) | Subjects | Cross-member writes can gain the wrong label; fixture distinct subjects and independently unknown claims | approved scope invariant |
+| 18 | No retroactive certification or changes to rules/notice delivery | CONSEQUENCE (first slice); CARRIED (deferred S4) | History/rules | Old records or unsent work could be silently changed; no backfill/delivery code in diff | excluded |
+| 19 | One implementation lane, independent deadlock review; S6 waits | CARRIED (CM 6) | Sequencing | Premature S6 use could treat incomplete coverage as authority; release receipt names actual accepted coverage | approved by CM |
+
+The implementation evidence gates are engineering checks, not requests for
+Owner permission. If an existing source cannot support a positive local claim
+without new protocol or cross-host work, report that to CM and keep the claim
+unknown; do not broaden the slice or claim S4-min complete with no supported
+positive path.
