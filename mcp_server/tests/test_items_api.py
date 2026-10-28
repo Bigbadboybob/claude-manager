@@ -407,6 +407,30 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
             await self.patch(1, holders=[{**LANE, "attribution":claim}], note="kept working")
             self.assertIsNone((await self.fetch("SELECT attribution FROM item_holders"))[0]["attribution"])
 
+    @unittest.skipUnless(os.environ.get("CM_S4_HOLDER_PROOF"), "requires isolated Rust wire fixture")
+    async def test_s4_contended_holder_wire_clears_persisted_evidence(self):
+        import json
+        fixtures = json.loads(Path(os.environ["CM_S4_HOLDER_PROOF"]).read_text())
+        self.assertEqual(len(fixtures), 3)
+        state_busy, cache_busy, old_wire = fixtures
+        self.assertEqual(state_busy["pid"], cache_busy["pid"])
+        self.assertEqual(state_busy["pid"], old_wire["pid"])
+        self.assertNotIn("attribution", old_wire)
+        good = {"member_id":"mem_a", "acting_as":"assistant", "provenance":"o5-spawn-stamp",
+                "as_of":"spawn", "verified":False}
+        await self.create({"title":"a", "holders":[old_wire]})
+        for holder in (state_busy, cache_busy):
+            await self.patch(1, add_holders=[{**old_wire, "attribution":good}])
+            before = (await self.fetch("SELECT attribution FROM item_holders"))[0]["attribution"]
+            self.assertEqual(before["member_id"], "mem_a")
+            self.assertEqual(holder["attribution"], {"provenance":"unknown"})
+            await self.patch(1, holders=[holder])
+            self.assertIsNone((await self.fetch("SELECT attribution FROM item_holders"))[0]["attribution"])
+        # A genuine old-wire writer is different: absence preserves evidence.
+        await self.patch(1, add_holders=[{**old_wire, "attribution":good}])
+        await self.patch(1, holders=[old_wire])
+        self.assertEqual((await self.fetch("SELECT attribution FROM item_holders"))[0]["attribution"]["member_id"], "mem_a")
+
     async def test_s4_old_minimal_owner_transfer_preserves_existing_identity(self):
         await self.create("a")
         await self.patch(1, add_holders=[LANE])

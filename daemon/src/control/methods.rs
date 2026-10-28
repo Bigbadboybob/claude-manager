@@ -26437,6 +26437,28 @@ while True:
             let enabled_epoch = crate::items::s4_attribution::config_epoch();
             crate::items::s4_attribution::absorb_snapshot("d", &snapshot, enabled_epoch);
             check(true, true);
+            // A modern writer that cannot resolve the subject must send an
+            // explicit unknown for the retained holder, not omit the field
+            // like an old writer (which preserves prior stored evidence).
+            let observed_holders = std::cell::RefCell::new(Vec::<Value>::new());
+            let assert_unknown_holder = || {
+                let ctx = crate::items::rpc::Ctx::capture(&state, &req).unwrap();
+                let pid = format!("agent:{}:ts-caller", ctx.daemon_id);
+                let holder = ctx.test_holder(&pid);
+                assert_eq!(holder["attribution"]["provenance"], "unknown");
+                observed_holders.borrow_mut().push(holder);
+            };
+            {
+                let state_lock = state.lock().unwrap();
+                let scope = crate::items::s4_attribution::begin(&state, &req);
+                drop(state_lock);
+                assert_unknown_holder();
+                drop(scope);
+            }
+            crate::items::s4_attribution::with_busy_cache(|| {
+                let _scope = crate::items::s4_attribution::begin(&state, &req);
+                assert_unknown_holder();
+            });
             std::fs::write(&path, "s4_min_write = true\napi_url = \"http://127.0.0.1:10\"\napi_token = \"tok\"\n").unwrap();
             reload_config(&state).unwrap();
             check(false, false); // switching API cannot reuse its predecessor's capability
@@ -26458,6 +26480,22 @@ while True:
             let current_epoch = crate::items::s4_attribution::config_epoch();
             crate::items::s4_attribution::absorb_snapshot("d", &json!({"version":7,"members":[]}), current_epoch);
             check(false, false); // old API: no new request shape
+            {
+                let state_lock = state.lock().unwrap();
+                let scope = crate::items::s4_attribution::begin(&state, &req);
+                drop(state_lock);
+                let ctx = crate::items::rpc::Ctx::capture(&state, &req).unwrap();
+                let pid = format!("agent:{}:ts-caller", ctx.daemon_id);
+                let holder = ctx.test_holder(&pid);
+                assert!(holder.get("attribution").is_none());
+                observed_holders.borrow_mut().push(holder);
+                drop(scope);
+            }
+            // The isolated cross-language proof feeds these exact generated
+            // wire objects to the private Postgres-backed API fixture.
+            if let Some(path) = std::env::var_os("CM_S4_HOLDER_PROOF") {
+                std::fs::write(path, serde_json::to_vec(&*observed_holders.borrow()).unwrap()).unwrap();
+            }
             crate::items::s4_attribution::reset_for_test();
             kill_all_sessions(&state);
         });

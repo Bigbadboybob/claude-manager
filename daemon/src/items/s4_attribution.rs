@@ -58,7 +58,7 @@ impl Evidence {
 }
 
 #[derive(Default, Clone)]
-struct Central { version: i64, daemon: String, mains: HashMap<String, String>, ambiguous: std::collections::HashSet<String>, wire: bool, epoch: u64 }
+struct Central { version: i64, daemon: String, mains: HashMap<String, String>, ambiguous: std::collections::HashSet<String>, epoch: u64 }
 fn cache() -> &'static Mutex<Option<Arc<Central>>> {
     static CACHE: OnceLock<Mutex<Option<Arc<Central>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
@@ -66,10 +66,28 @@ fn cache() -> &'static Mutex<Option<Arc<Central>>> {
 static LATEST: AtomicI64 = AtomicI64::new(-1);
 static INVALID_EPOCH: AtomicU64 = AtomicU64::new(0);
 static CONFIG_EPOCH: AtomicU64 = AtomicU64::new(1);
+// The low bit is the last successfully negotiated wire capability; upper
+// bits bind it to the rollout epoch. A busy evidence lock can then still send
+// explicit unknown without mistaking a pre-toggle API for the current one.
+static WIRE_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// Called while swapping the config, without acquiring the cache lock. An
 /// older heartbeat reply cannot authorize a new wire shape after a toggle.
 pub(crate) fn invalidate_config_epoch() { CONFIG_EPOCH.fetch_add(1, Ordering::SeqCst); }
 pub(crate) fn config_epoch() -> u64 { CONFIG_EPOCH.load(Ordering::SeqCst) }
+fn wire_for(epoch: u64) -> bool {
+    let wire = WIRE_EPOCH.load(Ordering::SeqCst);
+    wire >> 1 == epoch && wire & 1 == 1 && epoch == config_epoch()
+}
+fn note_wire(epoch: u64, supported: bool) {
+    let next = (epoch << 1) | u64::from(supported);
+    let mut old = WIRE_EPOCH.load(Ordering::SeqCst);
+    while old >> 1 <= epoch {
+        match WIRE_EPOCH.compare_exchange_weak(old, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return,
+            Err(now) => old = now,
+        }
+    }
+}
 thread_local! { static CURRENT: std::cell::RefCell<(HashMap<String, Evidence>, bool)> = Default::default(); }
 pub(crate) struct Scope((HashMap<String, Evidence>, bool));
 impl Drop for Scope { fn drop(&mut self) { CURRENT.with(|c| *c.borrow_mut() = std::mem::take(&mut self.0)); } }
@@ -102,6 +120,12 @@ pub(crate) fn reset_for_test() {
     *cache().lock().unwrap() = None;
     LATEST.store(-1, Ordering::Relaxed);
     INVALID_EPOCH.store(0, Ordering::SeqCst);
+    WIRE_EPOCH.store(0, Ordering::SeqCst);
+}
+#[cfg(test)]
+pub(crate) fn with_busy_cache(f: impl FnOnce()) {
+    let _guard = cache().lock().unwrap();
+    f();
 }
 
 pub(crate) fn observe_version(v: &Value) {
@@ -139,9 +163,10 @@ pub(crate) fn absorb_snapshot(daemon: &str, value: &Value, epoch: u64) {
     observe_version(value);
     if let Ok(mut guard) = cache().try_lock() {
         if epoch != config_epoch() { return; }
+        note_wire(epoch, value["s4_min_wire"] == true);
         if guard.as_ref().is_none_or(|old| old.epoch != epoch || version >= old.version) {
             *guard = Some(Arc::new(Central { version, daemon: daemon.to_owned(), mains, ambiguous,
-                wire: value["s4_min_wire"] == true, epoch }));
+                epoch }));
         }
         let _ = INVALID_EPOCH.compare_exchange(epoch, 0, Ordering::SeqCst, Ordering::SeqCst);
     }
@@ -172,26 +197,26 @@ fn capture_for(state: &Arc<Mutex<DaemonState>>, refs: Option<&[String]>, require
         },
         Err(_) => {
             #[cfg(test)] trace("state-busy");
-            return (HashMap::new(), false);
+            return (HashMap::new(), wire_for(config_epoch()));
         },
     };
     let (epoch, locals) = locals;
     if INVALID_EPOCH.load(Ordering::SeqCst) == epoch {
         #[cfg(test)] trace("snapshot-invalid");
-        return (HashMap::new(), false);
+        return (HashMap::new(), wire_for(epoch));
     }
     let central = match cache().try_lock() {
         Ok(c) => c.clone(),
         Err(_) => {
             #[cfg(test)] trace("cache-busy");
-            return (HashMap::new(), false);
+            return (HashMap::new(), wire_for(epoch));
         },
     };
     let central = central.filter(|c| c.epoch == epoch && epoch == config_epoch());
-    let wire = central.as_ref().is_some_and(|c| c.wire);
+    let wire = wire_for(epoch);
     if INVALID_EPOCH.load(Ordering::SeqCst) == epoch {
         #[cfg(test)] trace("snapshot-invalid-after-capture");
-        return (HashMap::new(), false);
+        return (HashMap::new(), wire_for(epoch));
     }
     let mut claims = HashMap::new();
     for (uid, origin, pid, incarnation, generation, workflow, continuous, org, subject, pidfd) in locals {

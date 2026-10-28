@@ -235,6 +235,9 @@ impl Ctx {
         }
         value
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_holder(&self, pid: &str) -> Value { self.holder(pid, None) }
 }
 
 /// `{pid, name, session_uid, daemon_id}` for a participant id.
