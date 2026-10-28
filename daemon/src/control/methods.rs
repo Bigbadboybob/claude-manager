@@ -644,6 +644,15 @@ pub(crate) fn start_session_with_spawn_fn(
     params: &Value,
     watcher_spawn_fn: crate::session_watch::WatcherSpawnFn,
 ) -> MethodResult {
+    start_session_with_origin(state_arc, params, watcher_spawn_fn, false)
+}
+
+fn start_session_with_origin(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    watcher_spawn_fn: crate::session_watch::WatcherSpawnFn,
+    local_mcp_spawn: bool,
+) -> MethodResult {
     let p: StartSessionParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
     let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.uid);
@@ -1371,6 +1380,11 @@ pub(crate) fn start_session_with_spawn_fn(
     let mut session = pending
         .arm(Some(on_exit), pre_ack)
         .map_err(|e| (ErrorCode::Internal, format!("arm reaper: {}", e)))?;
+    if local_mcp_spawn && p.managed_by_uid.is_some() && p.workflow_run_id.is_none()
+        && p.continuous_task_id.is_none() && matches!(p.session_type.as_str(), "codex" | "claude-code")
+    {
+        session.s4_spawn_origin = Some((session.pid, session.holder_incarnation, session.generation, session.org.clone()));
+    }
     // Slice 10d watcher-fix: stash the watcher handle on the
     // registry-resident session at the same instant we insert
     // it. The drop-on-detach contract documented on the field
@@ -4481,6 +4495,7 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         "previous_pin": previous_pin,
         // doc/org-model.md §12: each role's list and their intersection.
         "capabilities": capabilities,
+        "s4_min_write": state.config.s4_min_write,
         "holder_status_error": holder_status_err,
         "mcp_ok": mcp_ok,
         "mcp_detail": mcp_detail,
@@ -4583,10 +4598,18 @@ pub fn reload_config(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
             applied.tls = st.config.tls.clone();
             crate::mcp_config::set_codex_inline_scrollback(applied.codex_inline_scrollback);
             crate::models::set_models(applied.models.clone());
+            if st.config.s4_min_write != applied.s4_min_write
+                || st.config.api_url != applied.api_url || st.config.api_token != applied.api_token {
+                crate::items::s4_attribution::invalidate_config_epoch();
+            }
             st.config = applied;
         }
         (changed, requires_restart)
     };
+
+    if changed.iter().any(|k| matches!(k.as_str(), "s4_min_write" | "api_url" | "api_token")) {
+        crate::items::heartbeat::poke();
+    }
 
     // Re-derive the startup artifacts whose inputs moved. IO happens
     // outside the state lock; results are assigned under it.
@@ -8012,6 +8035,47 @@ mod operator_quiet_tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn s4_existing_input_unit_finishes_enter_with_queued_writer() {
+        let _serial = crate::writer_gate::TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let uid = format!("ts-{}-0", uuid::Uuid::new_v4().simple());
+        let gate = crate::continuous::retirement::gate(&uid);
+        let (handle, writes) = InputHandle::test_handle_capturing();
+        let handle = handle.test_with_uid(&uid);
+        let fanout = std::sync::Arc::new(crate::session::PtyByteFanout::new(64));
+        let (body_tx, body_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let delivery_uid = uid.clone();
+        let delivery = std::thread::spawn(move || {
+            super::TEST_AFTER_AGENT_BODY.with(|h| *h.borrow_mut() = Some(Box::new(move || {
+                body_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            })));
+            let ok = super::deliver_agent_body_inner(&handle, &fanout, &delivery_uid, "prompt", false,
+                "test", None, None, None);
+            super::TEST_AFTER_AGENT_BODY.with(|h| *h.borrow_mut() = None);
+            ok
+        });
+        body_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let write_gate = gate.clone();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _guard = write_gate.write().unwrap();
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while gate.try_read().is_ok() && Instant::now() < deadline { std::thread::yield_now(); }
+        assert!(gate.try_read().is_err(), "writer must be queued behind the delivery unit");
+        resume_tx.send(()).unwrap();
+        assert!(delivery.join().unwrap());
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        writer.join().unwrap();
+        assert!(writes.lock().unwrap().len() >= 2, "body and Enter both reached the writer");
+    }
+
+    #[test]
     fn recovery_waits_for_complete_prompt_body_and_enter() {
         let _serial = crate::writer_gate::TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let uid = format!("ts-{}-0", uuid::Uuid::new_v4().simple());
@@ -9863,6 +9927,7 @@ fn mcp_start_session_inner(
         caller_cols,
         caller_rows,
         launch_grant,
+        s4_supported_caller,
     ) = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         let cuid = caller_uid.ok_or((
@@ -10108,6 +10173,9 @@ fn mcp_start_session_inner(
             caller.last_cols,
             caller.last_rows,
             granted,
+            // A normal MCP spawn by a continuous member is an O5 worker;
+            // scheduler/Fresh launches use their separate internal path.
+            caller.workflow_run_id.is_none(),
         )
     };
 
@@ -10475,7 +10543,8 @@ fn mcp_start_session_inner(
         );
     }
 
-    let start_result = start_session(state_arc, &Value::Object(full_params))?;
+    let start_result = start_session_with_origin(state_arc, &Value::Object(full_params),
+        crate::session_watch::default_watcher_spawn_fn(), s4_supported_caller)?;
 
     // #28: the creator's name for the child lands before the child has a
     // prompt to act on, so its own first chat_send can never claim the same
@@ -23709,6 +23778,7 @@ mod tests {
                 },
             );
             s.config = crate::config::DaemonConfig {
+                s4_min_write: false,
                 transcript_rotation: Default::default(),
                 chat_search_budget_bytes: 512 * 1024 * 1024,
                 presence_idle_enabled: true,
@@ -26314,6 +26384,120 @@ while True:
                 crate::config::AuthMode::SshTrust,
                 "auth mode must NOT hot-swap",
             );
+        });
+    }
+
+    #[test]
+    fn s4_config_reload_invalidates_pre_toggle_capability_and_delayed_snapshot() {
+        with_temp_home(|| {
+            crate::items::s4_attribution::reset_for_test();
+            let state = make_state_arc();
+            seed_mcp_spawn_fixture(&state, "ts-caller", None);
+            {
+                let mut st = state.lock().unwrap();
+                st.config.api_url = "http://127.0.0.1:9".into();
+                st.config.api_token = "tok".into();
+                let caller = st.sessions.get_mut("ts-caller").unwrap();
+                caller.s4_spawn_origin = Some((caller.pid, caller.holder_incarnation, caller.generation, caller.org.clone()));
+            }
+            crate::messaging::startup::open_for_test(&state).unwrap();
+            let req = crate::control::protocol::Request { id:"config".into(),
+                caller:crate::control::protocol::Caller::session("ts-caller"),
+                method:"item.set".into(), params:json!({"n":1, "status":"active"}) };
+            let old_epoch = crate::items::s4_attribution::config_epoch();
+            let snapshot = json!({"version": 7, "s4_min_wire":true,
+                "members":[{"id":"mem_a", "main":{"pid":"agent:d:ts-caller", "daemon_id":"d",
+                    "session_uid":"ts-caller", "occupancy_generation":1}}]});
+            crate::items::s4_attribution::absorb_snapshot("d", &snapshot, old_epoch);
+            let check = |want_wire: bool, want_claim: bool| {
+                let _scope = crate::items::s4_attribution::begin(&state, &req);
+                let (claims, wire) = crate::items::s4_attribution::current();
+                assert_eq!(wire, want_wire);
+                assert_eq!(claims.contains_key("ts-caller"), want_claim);
+                let ctx = crate::items::rpc::Ctx::capture(&state, &req).unwrap();
+                assert_eq!(ctx.actor().get("attribution").is_some(), want_wire);
+            };
+            check(false, false); // default-off, even with a populated cache
+            assert_eq!(daemon_health(&state).unwrap()["s4_min_write"], false);
+            let cm = std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cm");
+            std::fs::create_dir_all(&cm).unwrap();
+            let path = cm.join("daemon.toml");
+            let write_config = |enabled| {
+                std::fs::write(&path, format!("s4_min_write = {enabled}\napi_url = \"http://127.0.0.1:9\"\napi_token = \"tok\"\n")).unwrap();
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            };
+            write_config(true);
+            let reply = reload_config(&state).unwrap();
+            assert!(reply["changed"].as_array().unwrap().contains(&json!("s4_min_write")));
+            assert_eq!(daemon_health(&state).unwrap()["s4_min_write"], true);
+            check(false, false); // pre-enable capability invalidated
+            crate::items::s4_attribution::absorb_snapshot("d", &snapshot, old_epoch); // delayed old beat
+            check(false, false);
+            let enabled_epoch = crate::items::s4_attribution::config_epoch();
+            crate::items::s4_attribution::absorb_snapshot("d", &snapshot, enabled_epoch);
+            check(true, true);
+            // A modern writer that cannot resolve the subject must send an
+            // explicit unknown for the retained holder, not omit the field
+            // like an old writer (which preserves prior stored evidence).
+            let observed_holders = std::cell::RefCell::new(Vec::<Value>::new());
+            let assert_unknown_holder = || {
+                let ctx = crate::items::rpc::Ctx::capture(&state, &req).unwrap();
+                let pid = format!("agent:{}:ts-caller", ctx.daemon_id);
+                let holder = ctx.test_holder(&pid);
+                assert_eq!(holder["attribution"]["provenance"], "unknown");
+                observed_holders.borrow_mut().push(holder);
+            };
+            {
+                let state_lock = state.lock().unwrap();
+                let scope = crate::items::s4_attribution::begin(&state, &req);
+                drop(state_lock);
+                assert_unknown_holder();
+                drop(scope);
+            }
+            crate::items::s4_attribution::with_busy_cache(|| {
+                let _scope = crate::items::s4_attribution::begin(&state, &req);
+                assert_unknown_holder();
+            });
+            std::fs::write(&path, "s4_min_write = true\napi_url = \"http://127.0.0.1:10\"\napi_token = \"tok\"\n").unwrap();
+            reload_config(&state).unwrap();
+            check(false, false); // switching API cannot reuse its predecessor's capability
+            write_config(true);
+            reload_config(&state).unwrap();
+            crate::items::s4_attribution::absorb_snapshot("d", &snapshot, enabled_epoch);
+            check(false, false);
+            let second_epoch = crate::items::s4_attribution::config_epoch();
+            crate::items::s4_attribution::absorb_snapshot("d", &snapshot, second_epoch);
+            check(true, true);
+            write_config(false);
+            reload_config(&state).unwrap();
+            assert_eq!(daemon_health(&state).unwrap()["s4_min_write"], false);
+            check(false, false);
+            write_config(true);
+            reload_config(&state).unwrap();
+            crate::items::s4_attribution::absorb_snapshot("d", &snapshot, enabled_epoch);
+            check(false, false);
+            let current_epoch = crate::items::s4_attribution::config_epoch();
+            crate::items::s4_attribution::absorb_snapshot("d", &json!({"version":7,"members":[]}), current_epoch);
+            check(false, false); // old API: no new request shape
+            {
+                let state_lock = state.lock().unwrap();
+                let scope = crate::items::s4_attribution::begin(&state, &req);
+                drop(state_lock);
+                let ctx = crate::items::rpc::Ctx::capture(&state, &req).unwrap();
+                let pid = format!("agent:{}:ts-caller", ctx.daemon_id);
+                let holder = ctx.test_holder(&pid);
+                assert!(holder.get("attribution").is_none());
+                observed_holders.borrow_mut().push(holder);
+                drop(scope);
+            }
+            // The isolated cross-language proof feeds these exact generated
+            // wire objects to the private Postgres-backed API fixture.
+            if let Some(path) = std::env::var_os("CM_S4_HOLDER_PROOF") {
+                std::fs::write(path, serde_json::to_vec(&*observed_holders.borrow()).unwrap()).unwrap();
+            }
+            crate::items::s4_attribution::reset_for_test();
+            kill_all_sessions(&state);
         });
     }
 
@@ -30089,6 +30273,227 @@ while True:
             .expect("arm");
         state.lock().unwrap().sessions.insert(caller_uid.to_string(), sess);
         wt
+    }
+
+    #[test]
+    fn s4_mcp_spawn_records_local_origin_without_changing_shell_lifecycle() {
+        let _tmp = with_temp_home(|| {
+            crate::items::s4_attribution::reset_for_test();
+            let state = make_state_arc();
+            seed_mcp_spawn_fixture(&state, "ts-caller", None);
+            set_spawn_program_override_for_test(Some(("/bin/sleep".into(), vec!["120".into()])));
+            let child = mcp_start_session(&state, &json!({"type":"codex", "label":"s4 child"}), Some("ts-caller")).unwrap();
+            let shell = mcp_start_session(&state, &json!({"type":"bash", "label":"shell"}), Some("ts-caller")).unwrap();
+            {
+                let st = state.lock().unwrap();
+                assert!(st.sessions[child["session_uid"].as_str().unwrap()].s4_spawn_origin.is_some());
+                assert!(st.sessions[shell["session_uid"].as_str().unwrap()].s4_spawn_origin.is_none());
+            }
+            let uid = child["session_uid"].as_str().unwrap();
+            crate::items::s4_attribution::absorb_snapshot("d", &json!({"version":7, "s4_min_wire":true,
+                "members":[{"id":"mem_new", "main":{"pid":format!("agent:d:{uid}"),
+                    "daemon_id":"d", "session_uid":uid, "occupancy_generation":1}}]}), crate::items::s4_attribution::config_epoch());
+            assert_eq!(crate::items::s4_attribution::capture(&state).0[uid].claim["member_id"], "mem_new");
+            assert!(crate::items::s4_attribution::capture(&state).0.get(shell["session_uid"].as_str().unwrap()).is_none());
+            state.lock().unwrap().config.s4_min_write = true;
+            crate::items::org::absorb_reply(&json!({"org":{"members":{
+                "ts-caller":{"id":"mem_cont", "kind":"continuous", "acting_as":"main"}}}}), 1.0);
+            {
+                let mut st = state.lock().unwrap();
+                st.sessions.get_mut("ts-caller").unwrap().continuous_task_id = Some("ct".into());
+                st.config.api_url = "http://127.0.0.1:9".into();
+                st.config.api_token = "tok".into();
+            }
+            crate::messaging::startup::open_for_test(&state).unwrap();
+            // The fake engine never creates a transcript, so its detector retains
+            // the per-worktree slot. Give each subsequent agent its own worktree
+            // rather than bypassing the real spawn admission queue.
+            let next_worktree = |name: &str| {
+                let path = std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(name);
+                std::fs::create_dir_all(&path).unwrap();
+                state.lock().unwrap().workspaces.get_mut("ws-1").unwrap().worktree_path = Some(path);
+            };
+            next_worktree("wt-worker");
+            let worker = mcp_start_session(&state, &json!({"type":"codex", "label":"worker"}), Some("ts-caller")).unwrap();
+            let worker_uid = worker["session_uid"].as_str().unwrap();
+            let req = crate::control::protocol::Request { id:"item".into(), caller:crate::control::protocol::Caller::session(worker_uid),
+                method:"item.set".into(), params:json!({"n":1,"status":"active"}) };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                let _scope = crate::items::s4_attribution::begin(&state, &req);
+                let ctx = crate::items::rpc::Ctx::capture(&state, &req).unwrap();
+                let attribution = ctx.actor()["attribution"].clone();
+                if attribution["acting_as"] == "worker" {
+                    assert_eq!(attribution["provenance"], "o5-spawn-stamp");
+                    break;
+                }
+                assert!(attribution.is_null() || attribution["provenance"] == "unknown", "{attribution}");
+                assert!(std::time::Instant::now() < deadline, "worker item evidence never became available");
+                std::thread::yield_now();
+            }
+            // Force the state try-lock to fail at the production dispatch
+            // snapshot, then release it before normal authorization/delivery.
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+            let locked_state = state.clone();
+            let holder = std::thread::spawn(move || {
+                let guard = locked_state.lock().unwrap();
+                held_tx.send(()).unwrap();
+                release_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+                drop(guard);
+                dropped_tx.send(()).unwrap();
+            });
+            held_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+            crate::items::s4_attribution::take_test_trace();
+            crate::control::dispatch::test_after_s4(Some(Box::new(move || {
+                assert!(crate::items::s4_attribution::take_test_trace().contains(&"state-busy"));
+                assert!(crate::items::s4_attribution::current().0.is_empty());
+                release_tx.send(()).unwrap();
+                dropped_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+            })));
+            let contended = crate::control::protocol::Request { id:"contended-chat".into(), caller:crate::control::protocol::Caller::session(worker_uid),
+                method:"messaging.send".into(), params:json!({"channel":"general", "name":"worker", "body":"contended", "request_id":"contended-chat"}) };
+            let result = crate::control::dispatch::dispatch_request(&state, &contended);
+            crate::control::dispatch::test_after_s4(None);
+            holder.join().unwrap();
+            let crate::control::dispatch::DispatchOutcome::Done(response) = result else { panic!("contended chat must complete") };
+            assert!(response.ok, "{:?}", response.error);
+            assert!(response.result.unwrap()["event"]["data"]["actor_attribution"].is_null());
+            eprintln!("forced state-busy snapshot: unknown attribution, successful chat");
+            // Each attempt is a separate successful write; a busy nonblocking
+            // snapshot may legitimately omit evidence on any one attempt.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                let chat = crate::control::protocol::Request { id:format!("chat-{attempt}"), caller:crate::control::protocol::Caller::session(worker_uid),
+                    method:"messaging.send".into(), params:json!({"channel":"general", "name":"worker", "body":"ready", "request_id":format!("worker-chat-{attempt}")}) };
+                crate::items::s4_attribution::take_test_trace();
+                let captured = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let observed = captured.clone();
+                let observed_uid = worker_uid.to_owned();
+                crate::control::dispatch::test_after_s4(Some(Box::new(move || {
+                    observed.store(crate::items::s4_attribution::current().0.contains_key(&observed_uid), std::sync::atomic::Ordering::SeqCst);
+                })));
+                let result = crate::control::dispatch::dispatch_request(&state, &chat);
+                crate::control::dispatch::test_after_s4(None);
+                let crate::control::dispatch::DispatchOutcome::Done(response) = result else { panic!("chat must complete") };
+                assert!(response.ok, "{:?}", response.error);
+                let attribution = response.result.unwrap()["event"]["data"]["actor_attribution"].clone();
+                if attribution["acting_as"] == "worker" {
+                    assert!(captured.load(std::sync::atomic::Ordering::SeqCst), "positive chat needs its own captured subject");
+                    assert_eq!(attribution["provenance"], "o5-spawn-stamp");
+                    eprintln!("worker positive capture and chat claim at attempt {attempt}");
+                    break;
+                }
+                eprintln!("worker chat attempt {attempt} unknown (captured={}): {:?}",
+                    captured.load(std::sync::atomic::Ordering::SeqCst), crate::items::s4_attribution::take_test_trace());
+                assert!(attribution.is_null() || attribution["provenance"] == "unknown", "{attribution}");
+                assert!(std::time::Instant::now() < deadline, "worker chat evidence never became available");
+                std::thread::yield_now();
+            }
+            crate::items::org::reset_cache_for_test();
+            state.lock().unwrap().sessions.get_mut("ts-caller").unwrap().workflow_run_id = Some("workflow".into());
+            next_worktree("wt-workflow");
+            let workflow_child = mcp_start_session(&state, &json!({"type":"codex", "label":"workflow child"}), Some("ts-caller")).unwrap();
+            assert!(state.lock().unwrap().sessions[workflow_child["session_uid"].as_str().unwrap()].s4_spawn_origin.is_none());
+            set_spawn_program_override_for_test(None);
+            crate::items::s4_attribution::reset_for_test();
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn s4_dispatch_spawn_progresses_after_queued_retirement_writer() {
+        let _tmp = with_temp_home(|| {
+            crate::items::s4_attribution::reset_for_test();
+            let state = make_state_arc();
+            state.lock().unwrap().config.s4_min_write = true;
+            seed_mcp_spawn_fixture(&state, "ts-caller", None);
+            {
+                let mut st = state.lock().unwrap();
+                let caller = st.sessions.get_mut("ts-caller").unwrap();
+                caller.s4_spawn_origin = Some((caller.pid, caller.holder_incarnation, caller.generation, caller.org.clone()));
+            }
+            crate::items::s4_attribution::absorb_snapshot("d", &json!({"version":9, "s4_min_wire":true,
+                "members":[{"id":"mem_a", "main":{"pid":"agent:d:ts-caller", "daemon_id":"d",
+                    "session_uid":"ts-caller", "occupancy_generation":1}}]}), crate::items::s4_attribution::config_epoch());
+            let gate = crate::continuous::retirement::gate("ts-caller");
+            let reader = gate.read().unwrap();
+            let (writer_started_tx, writer_started_rx) = std::sync::mpsc::channel();
+            let (writer_acquired_tx, writer_acquired_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let writer_gate = gate.clone();
+            let writer = std::thread::spawn(move || {
+                writer_started_tx.send(()).unwrap();
+                let _guard = writer_gate.write().unwrap();
+                writer_acquired_tx.send(()).unwrap();
+                release_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+            });
+            writer_started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while gate.try_read().is_ok() && std::time::Instant::now() < deadline { std::thread::yield_now(); }
+            assert!(gate.try_read().is_err(), "writer must be queued behind the existing reader");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker_state = state.clone();
+            let worker = std::thread::spawn(move || {
+                set_spawn_program_override_for_test(Some(("/bin/sleep".into(), vec!["120".into()])));
+                let req = crate::control::protocol::Request {
+                    id:"s4-writer".into(), caller: crate::control::protocol::Caller::session("ts-caller"),
+                    method:"mcp_start_session".into(), params:json!({"type":"codex", "label":"s4 child"}),
+                };
+                let result = crate::control::dispatch::dispatch_request(&worker_state, &req);
+                set_spawn_program_override_for_test(None);
+                let ok = matches!(result, crate::control::dispatch::DispatchOutcome::Done(response) if response.ok);
+                tx.send(ok).unwrap();
+            });
+            assert!(rx.recv_timeout(std::time::Duration::from_millis(100)).is_err());
+            drop(reader);
+            writer_acquired_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            release_tx.send(()).unwrap();
+            assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).expect("spawn must not deadlock"));
+            worker.join().unwrap();
+            writer.join().unwrap();
+            crate::items::s4_attribution::reset_for_test();
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn s4_dispatch_holds_no_outer_gate_after_snapshot() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            state.lock().unwrap().config.s4_min_write = true;
+            seed_mcp_spawn_fixture(&state, "ts-caller", None);
+            let gate = crate::continuous::retirement::gate("ts-caller");
+            let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker_state = state.clone();
+            let worker = std::thread::spawn(move || {
+                set_spawn_program_override_for_test(Some(("/bin/sleep".into(), vec!["120".into()])));
+                crate::control::dispatch::test_after_s4(Some(Box::new(move || {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+                })));
+                let req = crate::control::protocol::Request { id:"seam".into(),
+                    caller:crate::control::protocol::Caller::session("ts-caller"), method:"mcp_start_session".into(),
+                    params:json!({"type":"codex", "label":"child"}) };
+                let result = crate::control::dispatch::dispatch_request(&worker_state, &req);
+                crate::control::dispatch::test_after_s4(None);
+                set_spawn_program_override_for_test(None);
+                done_tx.send(matches!(result, crate::control::dispatch::DispatchOutcome::Done(response) if response.ok)).unwrap();
+            });
+            paused_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            let writer = gate.try_write().expect("S4 snapshot must hold no outer retirement read");
+            resume_tx.send(()).unwrap();
+            assert!(done_rx.recv_timeout(std::time::Duration::from_millis(100)).is_err());
+            drop(writer);
+            assert!(done_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
+            worker.join().unwrap();
+            kill_all_sessions(&state);
+        });
     }
 
     /// ux-1c: every `mcp_start_session` success carries

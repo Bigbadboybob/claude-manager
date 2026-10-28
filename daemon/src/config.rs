@@ -406,6 +406,10 @@ impl Default for SchedulerConfig {
 /// Parsed `daemon.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DaemonConfig {
+    /// Opt-in S4 display evidence on supported daemon writes. Hot reloadable;
+    /// disabling does not cancel writes that already captured evidence.
+    #[serde(default)]
+    pub s4_min_write: bool,
     /// Accounted search-cache bytes, including an in-progress build. Zero
     /// disables search. Applied on the next messaging RPC after config reload.
     #[serde(default = "default_chat_search_budget_bytes")]
@@ -587,6 +591,7 @@ impl DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            s4_min_write: false,
             chat_search_budget_bytes: default_chat_search_budget_bytes(),
             presence_idle_enabled: default_presence_idle_enabled(),
             workflow_state_gate: false,
@@ -782,6 +787,7 @@ mode = "ssh-trust"
         let tmp = tempfile::tempdir().expect("tempdir");
         let missing = tmp.path().join("does-not-exist.toml");
         let cfg = load_or_default(&missing).expect("missing file is OK");
+        assert!(!cfg.s4_min_write, "S4 evidence defaults off");
         assert_eq!(cfg.mcp_server_path, "");
         assert_eq!(cfg.api_url, "");
         assert_eq!(cfg.api_token, "");
@@ -884,6 +890,7 @@ mode = "ssh-trust"
     #[test]
     fn serde_round_trip() {
         let original = DaemonConfig {
+            s4_min_write: true,
             transcript_rotation: Default::default(),
             chat_search_budget_bytes: 128 * 1024 * 1024,
             presence_idle_enabled: false,
@@ -911,6 +918,7 @@ mode = "ssh-trust"
         let toml_text = toml::to_string(&original).expect("ser");
         let reparsed: DaemonConfig =
             toml::from_str(&toml_text).expect("de");
+        assert!(reparsed.s4_min_write);
         assert_eq!(reparsed.mcp_server_path, original.mcp_server_path);
         assert_eq!(reparsed.presence_idle_enabled, original.presence_idle_enabled);
         assert_eq!(reparsed.workflow_state_gate, original.workflow_state_gate);

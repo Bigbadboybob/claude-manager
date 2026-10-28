@@ -199,18 +199,38 @@ struct Sandbox {
 }
 
 fn launch_sandbox(tag: &str) -> Sandbox {
+    launch_sandbox_with_api(tag, None)
+}
+
+fn launch_sandbox_with_api(tag: &str, api: Option<&str>) -> Sandbox {
     let daemon_bin = env!("CARGO_BIN_EXE_cm-daemon");
     let holder_bin = locate_cm_holder();
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path().join("home");
     std::fs::create_dir_all(&home).expect("mk sandbox HOME");
+    let mut test_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into());
+    if let Some(api) = api {
+        use std::os::unix::fs::PermissionsExt;
+        let cm = home.join(".cm");
+        std::fs::create_dir_all(&cm).unwrap();
+        let config = cm.join("daemon.toml");
+        let mcp = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("mcp_server/server.py");
+        std::fs::write(&config, format!("s4_min_write = true\napi_url = \"{api}\"\napi_token = \"stub\"\nmcp_server_path = \"{}\"\n", mcp.display())).unwrap();
+        std::fs::set_permissions(config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let claude = bin.join("claude");
+        std::fs::write(&claude, "#!/bin/sh\nexec /bin/sleep 120\n").unwrap();
+        std::fs::set_permissions(claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        test_path = format!("{}:{test_path}", bin.display());
+    }
     let socket = dir.path().join("daemon.sock");
     let log_path = dir.path().join("split.log");
     let token = format!("holder-e2e-{tag}-{}", std::process::id());
     let log_file = std::fs::File::create(&log_path).expect("create log");
     let log_for_stderr = log_file.try_clone().expect("clone log handle");
-    let holder = Command::new(&holder_bin)
-        .arg("--brain")
+    let mut holder_command = Command::new(&holder_bin);
+    holder_command.arg("--brain")
         .arg(daemon_bin)
         .env_clear()
         .env("HOME", &home)
@@ -219,15 +239,12 @@ fn launch_sandbox(tag: &str) -> Sandbox {
         // The S1 canary: present in the HOLDER's environ (and thus
         // the brain's), and must never reach a session child.
         .env("CLAUDE_CODE_SESSION_ID", "64b95f94-e2e-leak-canary")
-        .env(
-            "PATH",
-            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
-        )
+        .env("PATH", test_path)
         .current_dir(&home)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(log_for_stderr))
-        .spawn()
+        .stderr(Stdio::from(log_for_stderr));
+    let holder = holder_command.spawn()
         .expect("spawn sandbox cm-holder");
     let holder_pid = holder.id() as i32;
     let guard = SandboxGuard {
@@ -335,6 +352,97 @@ impl Sandbox {
         .filter(|r| r.ok)?;
         r.result?.get("sessions").and_then(|v| v.as_u64())
     }
+}
+
+/// Real split spawn -> versioned heartbeat snapshot -> chat attribution. The
+/// only network peer is this test's stub in the isolated network namespace.
+#[test]
+fn s4_split_holder_local_spawn_produces_verified_main_attribution() {
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let target = Arc::new(Mutex::new(None::<String>));
+    let ready = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (target2, ready2, stop2) = (target.clone(), ready.clone(), stop.clone());
+    let server = std::thread::spawn(move || {
+        let mut daemon = String::new();
+        while !stop2.load(Ordering::Relaxed) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(v) => v,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10)); continue;
+                }
+                Err(e) => panic!("stub accept: {e}"),
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+                }
+                if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..end]);
+                    let len = headers.lines().find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().ok()).flatten()
+                    }).unwrap_or(0);
+                    if bytes.len() >= end + 4 + len { break; }
+                }
+            }
+            let request = String::from_utf8_lossy(&bytes);
+            let path = request.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("");
+            if let Some(d) = path.strip_prefix("/hosts/").and_then(|p| p.strip_suffix("/heartbeat")) {
+                daemon = d.to_owned();
+            }
+            let body = if path == "/org/snapshot" {
+                if let Some(uid) = target2.lock().unwrap().clone().filter(|_| !daemon.is_empty()) {
+                    ready2.fetch_add(1, Ordering::SeqCst);
+                    serde_json::json!({"version":7,"s4_min_wire":true,"members":[{"id":"mem_split",
+                        "main":{"pid":format!("agent:{daemon}:{uid}"),"daemon_id":daemon,
+                                "session_uid":uid,"occupancy_generation":1}}]})
+                } else { serde_json::json!({"version":7,"s4_min_wire":true,"members":[]}) }
+            } else { serde_json::json!({}) };
+            let body = body.to_string();
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+        }
+    });
+    struct StopServer(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>);
+    impl Drop for StopServer {
+        fn drop(&mut self) { self.0.store(true, Ordering::Relaxed); if let Some(t) = self.1.take() { let _ = t.join(); } }
+    }
+    let _server = StopServer(stop, Some(server));
+    let mut sb = launch_sandbox_with_api("s4-split", Some(&format!("http://{addr}")));
+    sb.spawn_typed_bash("ts-54aa-1", serde_json::json!({}), "claude-code");
+    let spawn = round_trip(&sb.socket, &Request { id:"s4-spawn".into(),
+        caller:Caller::session("ts-54aa-1"), method:"mcp_start_session".into(),
+        params:serde_json::json!({"type":"claude-code", "label":"s4-split-child"}) }).unwrap();
+    assert!(spawn.ok, "{:?}\n{}", spawn.error, sb.guard.log_tail());
+    let uid = spawn.result.unwrap()["session_uid"].as_str().unwrap().to_owned();
+    let child_pid = find_child_by_comm(sb.holder_pid, "sleep", Instant::now() + Duration::from_secs(10))
+        .unwrap_or_else(|| panic!("fake engine did not stay live\n{}", sb.guard.log_tail()));
+    sb.guard.bash.push((child_pid, proc_starttime(child_pid).unwrap()));
+    *target.lock().unwrap() = Some(uid.clone());
+    wait_for(Instant::now() + Duration::from_secs(45), "snapshot for spawned child", &sb.guard,
+        || (ready.load(Ordering::SeqCst) > 0).then_some(()));
+    let mut attempt = 0;
+    let attribution = wait_for(Instant::now() + Duration::from_secs(10), "verified chat attribution", &sb.guard, || {
+        attempt += 1;
+        let response = round_trip(&sb.socket, &Request { id:format!("s4-chat-{attempt}"),
+            caller:Caller::session(&uid), method:"messaging.send".into(),
+            params:serde_json::json!({"channel":"general", "name":"split-child", "body":"fixture",
+                                      "request_id":format!("s4-chat-{attempt}")}) }).ok()?;
+        let value = response.result?["event"]["data"]["actor_attribution"].clone();
+        (value["provenance"] == "central-open-main").then_some(value)
+    });
+    assert_eq!(attribution["member_id"], "mem_split");
+    assert_eq!(attribution["verified"], true);
+    assert_eq!(attribution["org_version"], 7);
 }
 
 #[test]

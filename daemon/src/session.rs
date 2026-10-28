@@ -990,6 +990,11 @@ impl LastExitProbe {
             .is_some()
     }
 
+    /// Nonblocking exit observation for display evidence; contention is unknown.
+    pub(crate) fn try_kernel_set(&self) -> Option<bool> {
+        self.kernel.try_lock().ok().map(|status| status.is_some())
+    }
+
     /// Snapshot the End-frame payload's `(exit_code, memory_cap_kill)`.
     /// Reads kernel exit from the cached slot; scans the kill log
     /// AT THIS MOMENT for `memory_cap_kill` — that's the lazy
@@ -1084,6 +1089,8 @@ impl LastExitProbe {
 
 pub struct DaemonSession {
     pub uid: String,
+    /// Ephemeral S4-min spawn evidence; never restored from a manifest.
+    pub(crate) s4_spawn_origin: Option<(libc::pid_t, Option<u64>, u64, Option<cm_holder_proto::org::OrgObject>)>,
     pub title: String,
     pub agent_state: crate::agent_state::AgentStateCell,
     /// Initial MCP launch prompt receipt; absence after adoption is unknown.
@@ -1470,6 +1477,10 @@ pub fn codex_rollout_uuid_from_stem(stem: &str) -> Option<String> {
 }
 
 impl DaemonSession {
+    /// Duplicate the spawn-bound pidfd for nonblocking provenance observation.
+    pub(crate) fn s4_pidfd(&self) -> Option<std::os::fd::OwnedFd> {
+        self.pidfd.try_clone().ok()
+    }
     /// Project this live session into a persistable
     /// [`ManifestEntry`](crate::manifest::ManifestEntry) for the
     /// daemon's own durable registry (P0 session durability, S1).
@@ -2125,6 +2136,7 @@ impl PendingSession {
 
         Ok(DaemonSession {
             agent_state: crate::agent_state::StateCell::for_process(pid),
+            s4_spawn_origin: None,
             prompt_delivery: None,
             holder_incarnation: None,
             uid,
@@ -2697,6 +2709,7 @@ impl AdoptedSessionBuild {
 
         Ok(DaemonSession {
             agent_state: crate::agent_state::StateCell::for_process(pid),
+            s4_spawn_origin: None,
             prompt_delivery: None,
             holder_incarnation: None,
             title: meta.title,

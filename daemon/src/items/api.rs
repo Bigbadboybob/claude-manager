@@ -105,8 +105,12 @@ fn finish(
         (ErrorCode::Internal, format!("planning_api_unavailable: {path}: reading reply: {e}"))
     })?;
     if (200..300).contains(&status) {
-        return serde_json::from_str(&body)
-            .map_err(|e| (ErrorCode::Internal, format!("planning API reply for {path}: {e}")));
+        let value: Value = serde_json::from_str(&body)
+            .map_err(|e| (ErrorCode::Internal, format!("planning API reply for {path}: {e}")))?;
+        if path.starts_with("/org/") {
+            super::s4_attribution::observe_version(&value);
+        }
+        return Ok(value);
     }
     Err(map_error(status, &body))
 }

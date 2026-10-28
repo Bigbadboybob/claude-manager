@@ -5,7 +5,7 @@ rules in `dispatch.items_rules` do the semantic validation, so these models
 only fix the wire shape.
 """
 
-from typing import Annotated
+from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -29,6 +29,10 @@ class Actor(_Strict):
     task_id: Short | None = None
 
 
+class AttributedActor(Actor):
+    attribution: Any = None
+
+
 class Holder(_Strict):
     pid: str = Field(min_length=1, max_length=200)
     name: Short | None = None
@@ -36,6 +40,10 @@ class Holder(_Strict):
     daemon_id: Short | None = None
     # owner | contributor | reviewer | approver (doc/org-model.md §7.2)
     role: Short | None = None
+
+
+class AttributedHolder(Holder):
+    attribution: Any = None
 
 
 class ItemFields(_Strict):
@@ -60,6 +68,10 @@ class ItemFields(_Strict):
     mf: Short | None = None
     ruling: Short | None = None
     gate_class: Short | None = None
+
+
+class AttributedItemFields(ItemFields):
+    holders: list[AttributedHolder] | None = Field(default=None, max_length=50)
 
 
 class ItemSpec(ItemFields):
@@ -102,10 +114,10 @@ class ItemsCreateBody(_Strict):
 
 
 class ItemsPatchBody(_Strict):
-    actor: Actor
+    actor: AttributedActor
     ns: list[ItemNumber] = Field(min_length=1, max_length=50)
-    set: ItemFields = Field(default_factory=ItemFields)
-    add_holders: list[Holder] | None = Field(default=None, max_length=50)
+    set: AttributedItemFields = Field(default_factory=AttributedItemFields)
+    add_holders: list[AttributedHolder] | None = Field(default=None, max_length=50)
     remove_holders: list[Short] | None = Field(default=None, max_length=50)
     reason: Reason | None = None
     # Per-item results: each item is written on its own (bulk edits).
@@ -115,7 +127,7 @@ class ItemsPatchBody(_Strict):
     # Compare-and-set: refused (409 status_changed) unless the item's status is this.
     expect_status: Short | None = None
     # Transfer ownership (one atomic write), and the role for add_holders.
-    owner: Holder | None = None
+    owner: AttributedHolder | None = None
     role: Short | None = None
 
 
@@ -228,10 +240,10 @@ class ItemsChatTouchBody(_Strict):
 
 
 class ItemResolveBody(_Strict):
-    actor: Actor
+    actor: AttributedActor
     action: str = Field(max_length=32)
     kind: str | None = Field(default=None, max_length=64)
-    holders: list[Holder] | None = Field(default=None, max_length=50)
+    holders: list[AttributedHolder] | None = Field(default=None, max_length=50)
     blocked_by: list[ItemNumber] | None = Field(default=None, max_length=50)
     blocked_on: str | None = None
     check_back: When | None = None

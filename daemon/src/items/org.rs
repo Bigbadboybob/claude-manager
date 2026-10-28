@@ -82,7 +82,10 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
         }
     });
     match result {
-        Ok(value) => Response::ok(req.id.clone(), value),
+        Ok(value) => {
+            super::s4_attribution::observe_version(&value);
+            Response::ok(req.id.clone(), value)
+        },
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
 }
@@ -1085,6 +1088,7 @@ mod tests {
         let gate = crate::claude_recovery::lifecycle_gate(uid);
         let _write = gate.write().unwrap();
         let ctx = Ctx {
+            s4: Default::default(), s4_wire: false,
             pid:"operator".into(), name:"operator".into(), uid:None, task_id:None,
             owner:true, global:true, engine:None, daemon_owned:false,
             daemon_id:"test".into(), people:Vec::new(), api:crate::items::api::Api::from_config(&url, "tok").unwrap(),

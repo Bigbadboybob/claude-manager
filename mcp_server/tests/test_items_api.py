@@ -338,6 +338,127 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(row["closed_at"])
         self.assertEqual(row["status"], "active")
 
+    async def test_s4_old_holder_replacement_preserves_existing_evidence(self):
+        attribution = {"member_id": "mem_a", "acting_as": "assistant",
+                       "provenance": "o5-spawn-stamp", "as_of":"spawn", "verified": False}
+        await self.create({"title": "a", "holders": [LANE]})
+        await self.patch(1, add_holders=[{**LANE, "attribution": attribution}])
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE item_holders SET member_id='mem_a', via_member_id='mem_v'")
+        # Old clients omit attribution; replacement/reorder cannot erase it.
+        await self.patch(1, holders=[LANE, ORCH])
+        await self.patch(1, holders=[ORCH, LANE])
+        await self.patch(1, holders=[{**ORCH, "role":"owner"}, {**LANE, "role":"contributor"}])
+        rows = await self.fetch("SELECT pid,member_id,via_member_id,attribution FROM item_holders ORDER BY pid")
+        by_pid = {r["pid"]: r for r in rows}
+        self.assertEqual(by_pid[LANE["pid"]]["member_id"], "mem_a")
+        self.assertEqual(by_pid[LANE["pid"]]["via_member_id"], "mem_v")
+        self.assertEqual(by_pid[LANE["pid"]]["attribution"]["provenance"], "o5-spawn-stamp")
+        self.assertIsNone(by_pid[ORCH["pid"]]["attribution"])
+        await self.patch(1, holders=[ORCH])
+        rows = await self.fetch("SELECT pid,attribution FROM item_holders")
+        self.assertEqual([r["pid"] for r in rows], [ORCH["pid"]])
+        events = await self.fetch("SELECT holder_attributions FROM item_events WHERE holder_attributions IS NOT NULL")
+        self.assertTrue(any(any(h["pid"] == LANE["pid"] and h["attribution"]["member_id"] == "mem_a"
+                                for h in row["holder_attributions"]) for row in events))
+
+    async def test_s4_item_actor_attribution_is_event_evidence(self):
+        await self.create("a")
+        claim = {"member_id":"mem_a", "acting_as":"main", "provenance":"central-open-main",
+                 "org_version": 7, "daemon_id":"d1", "verified":True}
+        await self.patch(1, actor={**ORCH, "attribution":claim}, note="evidence")
+        rows = await self.fetch("SELECT actor_pid,actor_attribution FROM item_events WHERE type='updated'")
+        self.assertTrue(any(r["actor_pid"] == ORCH["pid"] and r["actor_attribution"]
+                            and r["actor_attribution"]["member_id"] == "mem_a" for r in rows))
+
+    async def test_s4_rollback_old_writer_loses_current_but_not_event_evidence(self):
+        claim = {"member_id":"mem_a", "acting_as":"assistant", "provenance":"o5-spawn-stamp",
+                 "as_of":"spawn", "verified":False}
+        await self.create({"title":"a", "holders":[LANE]})
+        await self.patch(1, add_holders=[{**LANE, "attribution":claim}])
+        # Reproduce a2029aba's holder rewrite, which knows only these columns.
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                rows = await conn.fetch("SELECT item_id,pid,session_uid,daemon_id,name,added_at,role FROM item_holders")
+                await conn.execute("DELETE FROM item_holders")
+                for row in rows:
+                    await conn.execute("""INSERT INTO item_holders
+                        (item_id,pid,session_uid,daemon_id,name,added_at,role)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7)""", *row.values())
+        self.assertIsNone((await self.fetch("SELECT attribution FROM item_holders"))[0]["attribution"])
+        events = await self.fetch("SELECT holder_attributions FROM item_events WHERE holder_attributions IS NOT NULL")
+        self.assertTrue(any(any(h["pid"] == LANE["pid"] and h["attribution"]["member_id"] == "mem_a"
+                                for h in row["holder_attributions"]) for row in events))
+
+    async def test_s4_bad_optional_evidence_is_unknown_without_rejecting_write(self):
+        await self.create({"title":"a", "holders":[LANE]})
+        good = {"member_id":"mem_a", "acting_as":"assistant", "provenance":"o5-spawn-stamp",
+                "as_of":"spawn", "verified":False}
+        await self.patch(1, add_holders=[{**LANE, "attribution":good}])
+        # An old writer omits the field: preserve existing evidence.
+        await self.patch(1, holders=[LANE])
+        self.assertIsNotNone((await self.fetch("SELECT attribution FROM item_holders"))[0]["attribution"])
+        bad = ["malformed", {"provenance":"unknown"},
+               {"member_id":"", "acting_as":"assistant", "provenance":"central-open-main", "verified":True},
+               {"member_id":"mem_a", "acting_as":"assistant", "provenance":"o5-spawn-stamp", "as_of":"spawn", "verified":True},
+               {"member_id":"mem_a", "acting_as":"main", "provenance":"central-open-main", "verified":True,
+                "daemon_id":"wrong", "org_version":7}]
+        for claim in bad:
+            await self.patch(1, holders=[{**LANE, "attribution":claim}], note="kept working")
+            self.assertIsNone((await self.fetch("SELECT attribution FROM item_holders"))[0]["attribution"])
+
+    @unittest.skipUnless(os.environ.get("CM_S4_HOLDER_PROOF"), "requires isolated Rust wire fixture")
+    async def test_s4_contended_holder_wire_clears_persisted_evidence(self):
+        import json
+        fixtures = json.loads(Path(os.environ["CM_S4_HOLDER_PROOF"]).read_text())
+        self.assertEqual(len(fixtures), 3)
+        state_busy, cache_busy, old_wire = fixtures
+        self.assertEqual(state_busy["pid"], cache_busy["pid"])
+        self.assertEqual(state_busy["pid"], old_wire["pid"])
+        self.assertNotIn("attribution", old_wire)
+        good = {"member_id":"mem_a", "acting_as":"assistant", "provenance":"o5-spawn-stamp",
+                "as_of":"spawn", "verified":False}
+        await self.create({"title":"a", "holders":[old_wire]})
+        for holder in (state_busy, cache_busy):
+            await self.patch(1, add_holders=[{**old_wire, "attribution":good}])
+            before = (await self.fetch("SELECT attribution FROM item_holders"))[0]["attribution"]
+            self.assertEqual(before["member_id"], "mem_a")
+            self.assertEqual(holder["attribution"], {"provenance":"unknown"})
+            await self.patch(1, holders=[holder])
+            self.assertIsNone((await self.fetch("SELECT attribution FROM item_holders"))[0]["attribution"])
+        # A genuine old-wire writer is different: absence preserves evidence.
+        await self.patch(1, add_holders=[{**old_wire, "attribution":good}])
+        await self.patch(1, holders=[old_wire])
+        self.assertEqual((await self.fetch("SELECT attribution FROM item_holders"))[0]["attribution"]["member_id"], "mem_a")
+
+    async def test_s4_old_minimal_owner_transfer_preserves_existing_identity(self):
+        await self.create("a")
+        await self.patch(1, add_holders=[LANE])
+        url = f"/boards/{self.ref}/items"
+        r = await self.http.patch(url, json={"actor":ORCH, "ns":[1], "set":{}, "owner":{"pid":LANE["pid"]}})
+        self.assertEqual(r.status_code, 200, r.text)
+        rows = await self.fetch("SELECT pid,name,session_uid,daemon_id FROM item_holders WHERE pid=$1", LANE["pid"])
+        self.assertEqual((rows[0]["name"], rows[0]["session_uid"], rows[0]["daemon_id"]),
+                         (LANE["name"], LANE["session_uid"], LANE["daemon_id"]))
+        r = await self.http.patch(url, json={"actor":ORCH, "ns":[1], "set":{}, "owner":ORCH})
+        self.assertEqual(r.status_code, 200, r.text)
+        rows = await self.fetch("SELECT name,session_uid,daemon_id FROM item_holders WHERE pid=$1", ORCH["pid"])
+        self.assertEqual((rows[0]["name"], rows[0]["session_uid"], rows[0]["daemon_id"]),
+                         (ORCH["name"], ORCH["session_uid"], ORCH["daemon_id"]))
+
+    async def test_s4_evidence_only_does_not_change_status_or_actionable_clock(self):
+        await self.create({"title":"a", "holders":[LANE]})
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE items SET status='open', actionable_at='2020-01-01T00:00:00Z'")
+        before = (await self.fetch("SELECT status,actionable_at FROM items"))[0]
+        claim = {"member_id":"mem_a", "acting_as":"assistant", "provenance":"o5-spawn-stamp",
+                 "as_of":"spawn", "verified":False}
+        await self.patch(1, holders=[{**LANE, "attribution":claim}])
+        after = (await self.fetch("SELECT status,actionable_at FROM items"))[0]
+        self.assertEqual((after["status"], after["actionable_at"]), (before["status"], before["actionable_at"]))
+        await self.patch(1, add_holders=[ORCH])
+        self.assertEqual((await self.fetch("SELECT status FROM items"))[0]["status"], "active")
+
     async def test_nudge_resolve_snoozes_and_pushes(self):
         await self.create({"title": "a", "holders": [LANE]})
         async with self.pool.acquire() as conn:
