@@ -31,13 +31,16 @@ Pick the model too. Every spawn names one: the `model=` you pass, else the
 task's default (`metadata.models`, inherited by subtasks), else the compatible
 work-rule model, else the host's
 `[models]` engine default (Claude `claude-opus-5-5`, Codex `gpt-6.1-terra`, the best performance per dollar).
-**Busywork and low-intelligence work goes to Codex Luna** (Owner, 2026-10-25:
-Luna is very cheap): `start_session(type="codex", model="gpt-6-luna")`, or
-`work_kind="busywork"` with a configured Luna rule (task defaults still win). That
-covers mechanical edits, renames and reformatting, running and triaging known
-tests or scripts, collecting logs or data, filling templates, checklist
-verification, and simple well-specified fixes. Keep the default model for
-design, debugging unknowns, review verdicts and anything judgement-heavy.
+**Claude Opus for most work; Codex Luna for simple work and wide fan-outs**
+(Owner, 2026-10-28, staffing policy v5). Design, architecture, coding,
+debugging unknowns, review verdicts and anything judgement-heavy go to Claude
+(`claude-opus-5-5`), the policy default. Luna is the cost-effective choice for
+simple work and whenever you want many agents at once:
+`start_session(type="codex", model="gpt-6-luna")`, or `work_kind="busywork"` /
+`work_kind="fanout"`, whose rules select Luna (task defaults still win). Simple
+work covers mechanical edits, renames and reformatting, running and triaging
+known tests or scripts, collecting logs or data, filling templates, checklist
+verification, and simple well-specified fixes.
 Set a task default with `create_subtask(model=...)` so a whole subtree
 inherits it. Effort works the same way (`effort=`, default `xhigh`; levels
 low/medium/high/xhigh, plus max on Claude): lower it for mechanical work.
