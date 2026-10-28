@@ -331,6 +331,7 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "boards.on_boards",
     "gate.receipts",
     "usage.read",
+    "daemon.memory_snapshot",
     "continuous.list",
     "continuous.context",
     "continuous.dispatch_pending",
@@ -600,6 +601,7 @@ pub fn dispatch_request(
         // fix-loud-preflight: post-restart health probe. Operator-only —
         // it reports host-environment diagnosis, not per-session state.
         "daemon.health" => DispatchOutcome::Done(dispatch_daemon_health(state, req)),
+        "daemon.memory_snapshot" => DispatchOutcome::Done(crate::memory_snapshot::dispatch(state, req)),
         "daemon.reload_config" => {
             DispatchOutcome::Done(dispatch_reload_config(state, req))
         }

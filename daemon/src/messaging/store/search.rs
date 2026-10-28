@@ -149,6 +149,11 @@ impl ConversationSearch {
     }
 }
 impl SearchIndex {
+    /// O(1) accounting only. The mpsc disposer queue has no depth accessor.
+    pub(super) fn memory_counts(&self) -> (usize, usize, usize, usize) {
+        (self.total_bytes, self.building_bytes, self.conversations.len(), self.retired.len())
+    }
+
     pub(super) fn index(&mut self, e: &Published, index: usize) {
         // Cold at startup: no keys, body tokenization, postings or extra replay.
         if self.conversations.is_empty() {

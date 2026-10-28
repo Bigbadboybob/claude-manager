@@ -30,6 +30,8 @@ mod task_subscriptions;
 pub use replication::ChangeSignal;
 pub use task_subscriptions::TaskBinding;
 mod personal;
+mod memory;
+pub(crate) use memory::StoreMemorySnapshot;
 #[cfg(test)]
 mod tests_b;
 mod wake_intents;
