@@ -118,7 +118,7 @@ mod tests {
         a.monitors.insert(
             "monitor".into(),
             serde_json::from_value(serde_json::json!({
-                "id":"monitor", "scope":{}, "mode":"once", "notify":"wake",
+                "id":"monitor", "scope":{"dms":false,"include_children":false}, "mode":"once", "notify":"wake",
                 "include_self":false, "created_at":"2026-10-28T00:00:00Z",
                 "state":"active", "start":0, "scanned":0, "hit_high":0,
                 "hits":0, "acknowledged":0
