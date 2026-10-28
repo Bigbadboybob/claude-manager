@@ -30182,6 +30182,15 @@ while True:
                 st.config.api_token = "tok".into();
             }
             crate::messaging::startup::open_for_test(&state).unwrap();
+            // The fake engine never creates a transcript, so its detector retains
+            // the per-worktree slot. Give each subsequent agent its own worktree
+            // rather than bypassing the real spawn admission queue.
+            let next_worktree = |name: &str| {
+                let path = std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(name);
+                std::fs::create_dir_all(&path).unwrap();
+                state.lock().unwrap().workspaces.get_mut("ws-1").unwrap().worktree_path = Some(path);
+            };
+            next_worktree("wt-worker");
             let worker = mcp_start_session(&state, &json!({"type":"codex", "label":"worker"}), Some("ts-caller")).unwrap();
             let worker_uid = worker["session_uid"].as_str().unwrap();
             let req = crate::control::protocol::Request { id:"item".into(), caller:crate::control::protocol::Caller::session(worker_uid),
@@ -30202,6 +30211,7 @@ while True:
             else { std::env::remove_var("CM_S4_MIN_WRITE"); }
             crate::items::org::reset_cache_for_test();
             state.lock().unwrap().sessions.get_mut("ts-caller").unwrap().workflow_run_id = Some("workflow".into());
+            next_worktree("wt-workflow");
             let workflow_child = mcp_start_session(&state, &json!({"type":"codex", "label":"workflow child"}), Some("ts-caller")).unwrap();
             assert!(state.lock().unwrap().sessions[workflow_child["session_uid"].as_str().unwrap()].s4_spawn_origin.is_none());
             set_spawn_program_override_for_test(None);

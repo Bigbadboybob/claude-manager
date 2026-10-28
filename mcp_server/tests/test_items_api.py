@@ -371,6 +371,25 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(r["actor_pid"] == ORCH["pid"] and r["actor_attribution"]
                             and r["actor_attribution"]["member_id"] == "mem_a" for r in rows))
 
+    async def test_s4_rollback_old_writer_loses_current_but_not_event_evidence(self):
+        claim = {"member_id":"mem_a", "acting_as":"assistant", "provenance":"o5-spawn-stamp",
+                 "as_of":"spawn", "verified":False}
+        await self.create({"title":"a", "holders":[LANE]})
+        await self.patch(1, add_holders=[{**LANE, "attribution":claim}])
+        # Reproduce a2029aba's holder rewrite, which knows only these columns.
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                rows = await conn.fetch("SELECT item_id,pid,session_uid,daemon_id,name,added_at,role FROM item_holders")
+                await conn.execute("DELETE FROM item_holders")
+                for row in rows:
+                    await conn.execute("""INSERT INTO item_holders
+                        (item_id,pid,session_uid,daemon_id,name,added_at,role)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7)""", *row.values())
+        self.assertIsNone((await self.fetch("SELECT attribution FROM item_holders"))[0]["attribution"])
+        events = await self.fetch("SELECT holder_attributions FROM item_events WHERE holder_attributions IS NOT NULL")
+        self.assertTrue(any(any(h["pid"] == LANE["pid"] and h["attribution"]["member_id"] == "mem_a"
+                                for h in row["holder_attributions"]) for row in events))
+
     async def test_s4_bad_optional_evidence_is_unknown_without_rejecting_write(self):
         await self.create({"title":"a", "holders":[LANE]})
         good = {"member_id":"mem_a", "acting_as":"assistant", "provenance":"o5-spawn-stamp",
