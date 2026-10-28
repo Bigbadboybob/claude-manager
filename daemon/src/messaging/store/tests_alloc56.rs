@@ -116,7 +116,7 @@ fn copy_tree(from: &Path, to: &Path) {
 fn pair(mode: &str, operations: usize) -> (tempfile::TempDir, Store, Store) {
     let tmp = tempfile::tempdir().unwrap();
     let old = fixture(&tmp.path().join("old"), mode, operations);
-    copy_tree(&old.root, &tmp.path().join("new"));
+    copy_tree(&tmp.path().join("old"), &tmp.path().join("new"));
     let new = Store::open(&tmp.path().join("new")).unwrap();
     (tmp, old, new)
 }
@@ -139,7 +139,7 @@ fn states(s: &Store) -> Value {
     serde_json::to_value(&s.personal).unwrap()
 }
 fn assert_same(old: &Store, new: &Store) {
-    assert_eq!(states(old), states(new));
+    assert!(states(old) == states(new), "participant state mismatch");
     assert_eq!(old.position, new.position);
     for actor in old.personal.keys() {
         assert_eq!(
@@ -201,7 +201,7 @@ fn alloc56_monitor_behavior_and_requested_allocations() {
         new.advance_monitors_at(clock()).unwrap();
         assert_same(&old, &new);
         let expected = states(&new);
-        let root = new.root.clone();
+        let root = new.root.parent().unwrap().parent().unwrap().to_path_buf();
         drop(new);
         let reopened = Store::open(&root).unwrap();
         assert_eq!(states(&reopened), expected);
@@ -282,7 +282,7 @@ fn alloc56_monitor_persistence_failures_keep_committed_ram_and_uncertainty() {
         }
         assert_same(&old, &new);
         let expected = load(&new.personal_path("owner")).unwrap();
-        let root = new.root.clone();
+        let root = new.root.parent().unwrap().parent().unwrap().to_path_buf();
         drop(new);
         let reopened = Store::open(&root).unwrap();
         assert_eq!(
