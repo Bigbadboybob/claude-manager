@@ -376,6 +376,32 @@ or Owner decisions are introduced here.
 | 18 | No retroactive certification or changes to rules/notice delivery | CONSEQUENCE (first slice); CARRIED (deferred S4) | History/rules | Old records or unsent work could be silently changed; no backfill/delivery code in diff | excluded |
 | 19 | One implementation lane, independent deadlock review; S6 waits | CARRIED (CM 6) | Sequencing | Premature S6 use could treat incomplete coverage as authority; release receipt names actual accepted coverage | approved by CM |
 
+### Source-feasibility ruling (CM 2026-10-28)
+
+CM receipt `e3634390-a12b-4ce1-86c9-a544efbe8b2c`, created
+`2026-10-28T15:52:26.290Z`, resolves the source feasibility gate above:
+
+- A main-only positive path satisfies S4-min. Use an asynchronous producer of
+  the existing, consistent versioned `/org/snapshot`, outside operation locks,
+  together with an exact local origin binding. Missing or stale version is
+  unknown. Add no assistant-specific central incarnation or broader central
+  data contract.
+- Assistants and workers retain their existing O5 spawn-time member and role
+  with the distinct provenance label `o5-spawn-stamp`: as-of spawn and
+  unverified. Do not erase that legacy attribution to bare unknown. Existing
+  `member_id` and `acting_as` role meanings remain intact; the provenance label
+  is separate. Readers distinguish it from a supported verified main claim;
+  neither label claims current-at-effect membership.
+- Daemon-internal chat metadata must preserve the existing request digest.
+  Item capability negotiation is permitted, and old endpoints keep their old
+  request shape. The actual preserving-reader/writer checks still apply.
+
+Assumptions 6, 14–16 are thus narrowed by explicit CM ruling: the supported
+positive central-source path is local mains; O5 legacy attribution for
+assistants/workers remains visible and unverified. No unsupported origin is
+promoted to verified. The diagnostic work in #56 keeps the shared test/build
+driver priority; S4-min source work may proceed in its one existing lane.
+
 The implementation evidence gates are engineering checks, not requests for
 Owner permission. If an existing source cannot support a positive local claim
 without new protocol or cross-host work, report that to CM and keep the claim
