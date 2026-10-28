@@ -122,6 +122,8 @@ pub struct TargetSnapshot {
     pub task: Knowledge<Id>,
     pub workspace: Knowledge<Id>,
     pub board: Knowledge<Id>,
+    /// Board snapshot identity is independent of the target session identity.
+    pub board_snapshot_identity: Knowledge<Identity>,
     pub item: Knowledge<Id>,
     pub identity: Knowledge<Identity>,
     pub binding_epoch: Knowledge<u64>,
@@ -412,7 +414,9 @@ mod tests {
     }
     fn draft(case: &Value) -> Draft {
         let role = known(parse(&case["role"]));
-        let identity = known(parse(case.get("identity").unwrap_or(&json!("verified"))));
+        let identity_value = parse(case.get("identity").unwrap_or(&json!("verified")));
+        let identity = Knowledge::Known { value: identity_value,
+            source: parse(case.get("identity_source").unwrap_or(&json!("org_snapshot"))), revision: Some(7) };
         let target_identity = known(parse(case.get("target_identity").unwrap_or(&json!("verified"))));
         Draft {
             family: parse(&case["family"]),
@@ -425,7 +429,11 @@ mod tests {
                 same_org: known(parse(case.get("same_org").unwrap_or(&json!("yes")))),
                 global_perms: known(parse(case.get("global_perms").unwrap_or(&json!("no")))) },
             target: TargetSnapshot { pid: known(id("target")), uid: unknown(), member: unknown(),
-                task: unknown(), workspace: unknown(), board: unknown(), item: unknown(),
+                task: unknown(), workspace: unknown(), board: unknown(),
+                board_snapshot_identity: if case["family"] != "board_edit" || case["board_identity"] == "unknown" { unknown() } else {
+                    Knowledge::Known { value: parse(case.get("board_identity").unwrap_or(&json!("verified"))),
+                        source: parse(case.get("board_identity_source").unwrap_or(&json!("org_snapshot"))), revision: Some(7) }
+                }, item: unknown(),
                 identity: target_identity, binding_epoch: known(1), occupancy_generation: known(2),
                 holder_incarnation: unknown() },
             relations: Relations { is_self: fact(case, "is_self"), own_assistant: fact(case, "own_assistant"),
@@ -439,12 +447,12 @@ mod tests {
                 poc_chain: fact(case, "poc_chain"), poc_chain_valid: fact(case, "poc_chain_valid"),
                 gate_editor: fact(case, "gate_editor"), gate_grantor: fact(case, "gate_grantor") },
             endpoint: parse(case.get("endpoint").unwrap_or(&json!("ready"))),
-            actual_authorization: Authorization::Error, actual_reason: id("original_error"),
-            execution: Execution::Unknown, policy_version: id("s5-candidate-v2"),
+            actual_authorization: parse(case.get("actual").unwrap_or(&json!("error"))), actual_reason: id("original_reason"),
+            execution: parse(case.get("execution").unwrap_or(&json!("unknown"))), policy_version: id("s5-candidate-v2"),
             actual_policy_version: unknown(), bootstrap_version: unknown(), source_site: id("fixture"),
-            org_snapshot_version: known(7), task_snapshot_version: unknown(), board_snapshot_version: unknown(), brain_epoch: known(3),
+            org_snapshot_version: known(7), task_snapshot_version: unknown(), board_snapshot_version: if case["family"] == "board_edit" && case["board_identity"] != "unknown" { known(7) } else { unknown() }, brain_epoch: known(3),
             monotonic_tick: known(10), wall_time_ms: unknown(), parent: None, child: 0,
-            component: Component::SessionScope,
+            component: if case["family"] == "board_edit" { Component::BoardScope } else { Component::SessionScope },
         }
     }
     fn cases() -> Vec<Value> {
@@ -466,11 +474,12 @@ mod tests {
             let out = q.pop().unwrap();
             assert_eq!(out.facts, input);
             let wire = serde_json::to_value(out).unwrap();
+            assert_eq!(wire, case["wire"], "{}", case["name"]);
             assert_eq!(wire["facts"]["family"], case["family"]);
             assert_eq!(wire["facts"]["actor"]["role"]["value"], case["role"]);
             assert_eq!(wire["facts"]["endpoint"], case.get("endpoint").cloned().unwrap_or(json!("ready")));
-            assert_eq!(wire["facts"]["actual_authorization"], "error");
-            assert_eq!(wire["facts"]["execution"], "unknown");
+            assert_eq!(wire["facts"]["actual_authorization"], case.get("actual").cloned().unwrap_or(json!("error")));
+            assert_eq!(wire["facts"]["execution"], case.get("execution").cloned().unwrap_or(json!("unknown")));
             assert_eq!(wire["facts"]["policy_version"], "s5-candidate-v2");
             if case["chain_reason"] == "cyclic" {
                 assert_eq!(wire["facts"]["relations"]["manager_chain_valid"],
