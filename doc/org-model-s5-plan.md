@@ -125,15 +125,30 @@ not make discovery itself grant permission. No new grants registry is created.
 | Current work: board holder/role, team lead/PoC, declared item links/job | Query live state as of labelled snapshot; this is a current claim, not history or approval. Parse path safely and filter visibility first. `OWNER.md`/VM scanner is later, not implied by an item link. |
 | Owner rulings, member mail, message/mention evidence | Rulings are external prerequisite; member mail, OWNER.md/VM scanner and mention ingestion are later. Never count private DMs, even if the caller is a DM participant, in this discovery index. |
 
-Each evidence record is idempotent by `(source kind, immutable source key,
-attribution role)` and carries source revision, event time, actor/signer,
-trusted attribution when present, confidence/provenance, visibility scope and
-correction/supersession links. A correction appends a source-keyed event; it
-never silently edits history. A cursor/watermark is per source and records
-holes, reset, replay, ingestion failure and earliest coverage; old sources and
-old clients without S4 fields remain `unknown`. Require exact idempotent
-replay, event ordering and rebuild equivalence; preserve original board/item
-receipt and grant keys through S6's many-alias migration.
+Each evidence record has immutable per-subject identity `(source kind,
+immutable source key, attribution role, credited subject)`; §14's proposed
+`UNIQUE(source_key, role, member_id)` captures the member-backed case when
+source keys are namespaced. One source can credit multiple reviewers or
+contributors in the same role, so they must remain separate. A verified
+member ID is a subject only when the event-time record supports it. Preserve
+a legacy PID as a typed PID subject with unknown member provenance; if even a
+stable subject reference is missing, retain an explicit unresolved source
+occurrence rather than collapsing it into a shared null identity or inventing
+someone. A later binding does not retroactively relabel an old PID/unknown
+record: any evidence-backed attribution correction is a new auditable event,
+linked to the exact prior record and any newly credited subject, with source
+and justification. Never silently infer membership from a current binding.
+
+Carry source revision, event time, actor/signer, trusted attribution when
+present, confidence/provenance, visibility scope and correction/supersession
+links. Deduplicate identical per-subject replay, while distinct subjects and
+roles remain distinct. Corrections target the exact immutable record, append
+idempotently and preserve the prior history. A cursor/watermark is per source
+and records holes, reset, replay, ingestion failure and earliest coverage; old
+sources and old clients without S4 fields remain `unknown`. Rebuild from
+source plus corrections must yield the same records and attribution, including
+legacy PID and unresolved occurrences; preserve original board/item receipt
+and grant keys through S6's many-alias migration.
 
 **Privacy before computation:** authenticate the caller; derive readable
 boards/public channels and its joined channels using the authoritative current
@@ -295,7 +310,11 @@ coverage counts. Slice 2 adds permission matrix, spoofed member, stale revision,
 concurrent writes, duplicate/reused request ID, omitted/null, unknown legacy
 values, event/feed atomicity and no unauthorized reads. Slice 3 adds ACL
 filter-before-count/rank, inaccessible evidence/DM leakage, historical signer
-vs live authority, correction/idempotency and untrusted text. Slice 4 checks
+vs live authority, correction/idempotency and untrusted text. Include one
+source with multiple same-role subjects, repeated ingestion, distinct roles,
+legacy PID, unresolved subject, later member binding and an explicit
+per-record correction; assert no collapsed credits, retroactive relabel or
+replay/rebuild divergence. Slice 4 checks
 actual rendered Team rows before/after a move and cache/reconnect behavior.
 Run targeted suites and relevant workspace checks only after implementation is
 approved and resource lane assigned; no jobs are authorized by this plan. A
@@ -315,7 +334,7 @@ choice is identified and routed by coordinator.
 | Register / provenance | Risk and recommendation; cheapest evidence | Disposition |
 |---|---|---|
 | C11: title 60, mandate 400, focus 120, tags 8, redirects 5, availability 80, note 7 days; INVENTED | Existing values may be rejected, truncated or disappear. First preserve full legacy values and existing validation, no new expiry/caps; inspect sanitized existing shapes and boundary fixtures, then propose explicit validation and user-visible expiry. | Engineering compatibility gate; material expiry/limits choice if evidence shows a behavioral change |
-| C12: source + role, owner vs clicker, author vs lander; CONSEQUENCE/CARRIED | Incorrect credit affects routing. Reconstruct only proven event-time roles; inspect actual `item_events`, closed/reopen specimens and hook coverage; unknown otherwise. | Engineering provenance gate |
+| C12: source + role + credited subject, owner vs clicker, author vs lander; CONSEQUENCE/CARRIED | Incorrect credit affects routing. Reconstruct only proven event-time roles; inspect actual `item_events`, closed/reopen specimens and hook coverage; unknown otherwise. | Engineering provenance gate |
 | C13: weights 5/3/2/2/2, short-close half credit, team routing cap and unspecified branch cap; INVENTED | Ranking misroutes or rewards gaming; no numerical score or automatic routing in first discovery slice. Compare labelled, readable interview/source specimens and evaluate deterministic evidence categories first. | Engineering evaluation gate; adopt weights/caps only after evidence and policy review if material |
 | C14: token overlap and no model on read path; CARRIED | Poor relevance or cost surprise. Recommend deterministic whole-word matching on eligible visible sources; compare small representative queries and measured latency. | Engineering quality gate, preserve no-model direction |
 | C15: mandate drift 60d, nudge once/2wk; INVENTED | Spam or missed drift. No automatic drift nudge/timer initially; surface explicit evidence timestamps and unknowns. Assess real drift specimens first. | Engineering evidence gate; user-visible automation policy if introduced |
