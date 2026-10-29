@@ -66,6 +66,7 @@ pub mod claude_trust;
 pub mod claude_channels;
 pub mod claude_presence;
 pub mod claude_recovery;
+pub mod claude_account_recovery;
 pub mod codex_trust;
 pub mod codex_recovery;
 pub mod config;

@@ -406,6 +406,10 @@ impl Default for SchedulerConfig {
 /// Parsed `daemon.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DaemonConfig {
+    /// Automatically resume a Claude session once after a proven subscription
+    /// limit clears. Set false and reload config to disable new attempts.
+    #[serde(default = "default_claude_limit_recovery")]
+    pub claude_limit_recovery: bool,
     /// Reloadable allocator maintenance. Interval zero disables periodic runs.
     #[serde(default)]
     pub memory: MemoryConfig,
@@ -609,6 +613,7 @@ impl DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            claude_limit_recovery: true,
             memory: MemoryConfig::default(),
             s4_min_write: false,
             chat_search_budget_bytes: default_chat_search_budget_bytes(),
@@ -632,6 +637,8 @@ impl Default for DaemonConfig {
         }
     }
 }
+
+fn default_claude_limit_recovery() -> bool { true }
 
 /// Errors surfaced by `DaemonConfig::load_or_default`.
 #[derive(Debug)]

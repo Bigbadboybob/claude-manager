@@ -3216,6 +3216,43 @@ impl InputHandle {
         Ok(true)
     }
 
+    /// A single guarded resume. `commit` revalidates transcript evidence
+    /// and durably records the attempt while this writer is exclusively held;
+    /// neither an ambiguous write nor a crash may trigger a second attempt.
+    pub(crate) fn write_claude_limit_resume(
+        &self, captured: Instant, turn_seq: u64, ended_at: Option<f64>,
+        enter: &[u8], commit: impl FnOnce() -> std::io::Result<bool>,
+    ) -> std::io::Result<bool> {
+        let _unit = crate::writer_gate::unit_permit();
+        let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
+        let _fence = gate.as_ref().map(|g| g.read().unwrap_or_else(|p| p.into_inner()));
+        if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
+        let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        let typed = *self.last_operator_input_at.lock().unwrap_or_else(|p| p.into_inner());
+        let input = *self.last_input_at.lock().unwrap_or_else(|p| p.into_inner());
+        if typed.is_some_and(|t| t >= captured || input.is_none_or(|i| t > i))
+            || input.is_some_and(|t| t >= captured) { return Ok(false); }
+        let token = crate::agent_state::unix_now();
+        {
+            let mut cell = self.agent_state.lock().unwrap_or_else(|p| p.into_inner());
+            let state = cell.recompute(token);
+            if !crate::claude_account_recovery::failed_boundary(&state)
+                || state.turn_seq != turn_seq || state.last_turn.ended_at != ended_at { return Ok(false); }
+        }
+        if !commit()? { return Ok(false); }
+        self.agent_state.lock().unwrap_or_else(|p| p.into_inner()).note_input(token);
+        writer.write_all(b"\x1b[200~The usage limit is cleared. Continue where you stopped.\x1b[201~")?;
+        writer.flush()?;
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        writer.write_all(enter)?;
+        writer.flush()?;
+        stamp_now(&self.last_activity_at);
+        stamp_now(&self.last_input_at);
+        self.agent_state.lock().unwrap_or_else(|p| p.into_inner())
+            .note_submitted(token, crate::agent_state::unix_now());
+        Ok(true)
+    }
+
     /// Bump the activity clock WITHOUT writing to the PTY. The agent
     /// `send_input` path hands the actual PTY write to a detached delivery
     /// thread (settle → bracketed body → gap → kitty-Enter), but the caller

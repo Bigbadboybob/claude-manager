@@ -1465,6 +1465,8 @@ pub(crate) enum HoldOwner {
     Handoff,
     /// Native Codex continuation recovery in the existing process.
     CodexRecovery,
+    /// A guarded ordinary Claude limit-recovery prompt.
+    ClaudeAccountRecovery,
 }
 
 struct Hold {
