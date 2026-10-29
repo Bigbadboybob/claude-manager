@@ -35,6 +35,9 @@ Recovery notices use a version-2 envelope, which older MCP consumers leave
 pending. After ten minutes, an unclaimed version-2 notice is reported as
 `pending (delivery unconfirmed — consumer may need MCP reconnect)`; the new
 consumer rechecks the session and record when it claims the notice.
+If an older consumer takes over after a version-2 notice was already marked
+`submitting`, its startup recovery marks that receipt `uncertain`; it does not
+send or replay the notice. The manager digest reports the uncertain outcome.
 
 An unreadable recovery journal is quarantined and recovery remains disabled
 until a clean journal is supplied. Quarantined data is retained; records dated
