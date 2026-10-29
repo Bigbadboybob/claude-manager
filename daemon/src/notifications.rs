@@ -271,6 +271,33 @@ pub(crate) fn cancel_recovery_pending(root: &Path, uid: &str, id: &str, reason: 
     atomic_replace(&path, &event)?;
     Ok(true)
 }
+
+/// A quarantined journal cannot identify its old pending claims. Cancel every
+/// still-retractable recovery envelope before a clean journal is enabled;
+/// submitted and uncertain envelopes are left untouched.
+pub(crate) fn cancel_all_recovery_pending(root: &Path) -> io::Result<()> {
+    let dir = root.join("notifications");
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let queue = entry?.path();
+        if !queue.is_dir() { continue; }
+        for entry in fs::read_dir(queue)? {
+            let path = entry?.path();
+            if path.extension().is_none_or(|ext| ext != "json")
+                || path.file_name().is_some_and(|name| name == "transport.json") { continue; }
+            let Some(event) = read(&path)? else { continue; };
+            if event["source"] != "claude-limit-recovery" || event["status"] != "pending" { continue; }
+            let uid = event["recipient"].as_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "recovery recipient missing"))?;
+            let id = event["id"].as_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "recovery id missing"))?;
+            cancel_recovery_pending(root, uid, id, "recovery_disabled")?;
+        }
+    }
+    Ok(())
+}
 /// All retained events plus the consumer's `transport.json` heartbeat, read
 /// under the queue lock. A missing queue directory is an empty queue.
 pub fn snapshot(root: &Path, uid: &str) -> io::Result<(Vec<Value>, Option<Value>)> {

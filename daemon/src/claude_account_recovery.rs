@@ -365,7 +365,12 @@ pub(crate) fn configure(state: &Arc<Mutex<crate::state::DaemonState>>, enabled: 
             }
         }
     }
-    if enabled && !was_enabled { crate::notifications::set_recovery_enabled(&root, true)?; }
+    if enabled && !was_enabled {
+        if path.with_extension("quarantined").exists() {
+            crate::notifications::cancel_all_recovery_pending(&root)?;
+        }
+        crate::notifications::set_recovery_enabled(&root, true)?;
+    }
     Ok(())
 }
 
@@ -784,7 +789,9 @@ fn pass(state: &Arc<Mutex<crate::state::DaemonState>>, observation: &mut Account
         }
         let result = attempt(state, target, &record, &profile, &mut journal, &journal_path, &root, observation);
         let episode = journal.episodes.get_mut(&key).unwrap();
-        let admitted = matches!(&result, Ok(true));
+        // A durable pre-effect claim counts even if publication or a partial
+        // PTY write fails: the outcome may be uncertain and consumes this pass.
+        let admitted = episode.attempted;
         if episode.attempted {
             episode.digest = None;
             episode.outcome = match (&episode.native_event, result) {
@@ -1072,6 +1079,7 @@ mod tests {
             let damaged = b"{broken journal";
             std::fs::write(&path, damaged).unwrap();
             crate::notifications::set_recovery_enabled(dir.path(), true).unwrap();
+            crate::notifications::publish(dir.path(), "worker", "old-pending", "claude-limit-recovery", "[old] wake", "[old]").unwrap();
             let mut daemon = crate::state::DaemonState::new();
             daemon.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
             daemon.messaging_root = dir.path().into();
@@ -1086,6 +1094,9 @@ mod tests {
             assert!(Journal::load(&path).is_err());
             assert!(configure(&state, true).is_err());
             assert!(!crate::notifications::recovery_enabled(dir.path()));
+            Journal::new().save(&path).unwrap();
+            configure(&state, true).unwrap();
+            assert_eq!(crate::notifications::get(dir.path(), "worker", "old-pending").unwrap().unwrap()["status"], "cancelled");
         }
     }
     #[test]
