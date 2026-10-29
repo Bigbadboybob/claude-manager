@@ -9288,6 +9288,8 @@ enum WorkspaceResolution {
 /// Everything `mint_task_workspace` needs that lives behind the state
 /// lock, snapshotted so the mint itself runs unlocked.
 struct MintContext {
+    /// Strong-operator launch: use this exact local repository, never search or clone.
+    explicit_repo: Option<PathBuf>,
     /// A retained binding must recover its prior branch, never mint empty work.
     recover_existing: bool,
     /// The caller's (or fork source's) checkout paths: its main repo and
@@ -9435,7 +9437,9 @@ fn mint_task_workspace(
     };
     // The task's repo: its row, else its project's. Never the caller's
     // checkout, which may be another repo entirely.
-    let repo_url = match field("repo_url") {
+    let repo_url = if let Some(repo) = &ctx.explicit_repo {
+        crate::worktree::origin_url(repo).unwrap_or_else(|| repo.to_string_lossy().into_owned())
+    } else { match field("repo_url") {
         Some(url) => url,
         None => field("project")
             .and_then(|pj| {
@@ -9452,7 +9456,7 @@ fn mint_task_workspace(
                     override_hint()
                 ),
             ))?,
-    };
+    }};
     let task_name = field("name").unwrap_or_else(|| task_id.to_string());
 
     // Main repo: a local clone of the TASK's repo, verified by origin. The
@@ -9466,7 +9470,7 @@ fn mint_task_workspace(
         .iter()
         .map(|(n, u)| crate::worktree::RepoAllow { name: n, url: u })
         .collect();
-    let main_repo = crate::worktree::locate_repo_clone(
+    let main_repo = if let Some(repo) = &ctx.explicit_repo { repo.clone() } else { crate::worktree::locate_repo_clone(
         &repo_url,
         &candidates,
         &ctx.repos_dir,
@@ -9483,7 +9487,7 @@ fn mint_task_workspace(
                 override_hint()
             ),
         )
-    })?;
+    })? };
     // A cut point from the caller's checkout (fork base=source) only means
     // something in that same repo; in another one the cut is its trunk.
     let base = ctx.base.as_deref().filter(|_| caller_main.as_deref() == Some(main_repo.as_path()));
@@ -9544,7 +9548,16 @@ fn mint_task_workspace(
             .or_else(|| state.bindings.get(task_id))
             .cloned()
         {
-            if state.workspaces.contains_key(&existing) {
+            if let Some(workspace) = state.workspaces.get(&existing) {
+                // The operator supplies an exact local repository. Another
+                // launch may have bound this task while our git/API work ran;
+                // never pair its workspace ID with our different checkout.
+                if ctx.explicit_repo.is_some()
+                    && workspace.worktree_path.as_ref() != Some(&minted.worktree_path)
+                {
+                    return Err((ErrorCode::Conflict,
+                        "task workspace changed during operator mint; inspect the binding before a new request".into()));
+                }
                 eprintln!(
                     "cm-daemon: mcp_start_session mint for task {} raced another \
                      mint; adopting workspace {}",
@@ -9863,6 +9876,60 @@ fn mcp_start_session_inner(
     params: &Value,
     caller_uid: Option<&str>,
 ) -> MethodResult {
+    start_agent_with_context(state_arc, params, caller_uid, None)
+}
+
+/// Only the strong-operator session.launch entry point supplies this context.
+/// It bypasses Session context resolution, not the common spawn/prompt funnel.
+pub(crate) struct OperatorLaunchContext {
+    pub uid: String,
+    pub repo_path: PathBuf,
+    pub base: Option<String>,
+    pub managed_by_uid: Option<String>,
+}
+
+pub(crate) fn operator_launch_agent(
+    state: &Arc<Mutex<DaemonState>>, params: &Value, context: &OperatorLaunchContext,
+) -> MethodResult {
+    start_agent_with_context(state, params, None, Some(context))
+}
+
+fn operator_workspace_resolution(
+    state: &Arc<Mutex<DaemonState>>, task_id: &str, context: &OperatorLaunchContext,
+) -> Result<WorkspaceResolution, (ErrorCode, String)> {
+    let (bound, config, recover_existing) = {
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+        let id = st.task_workspaces.get(task_id).or_else(|| st.bindings.get(task_id));
+        let bound = id.and_then(|id| st.workspaces.get(id).map(|ws| (id.clone(), ws.clone())));
+        let recover = id.is_some() && bound.is_none();
+        (bound, st.config.clone(), recover)
+    };
+    if let Some((id, workspace)) = bound {
+        let path = workspace.worktree_path.ok_or((ErrorCode::Conflict, "bound workspace has no worktree path".into()))?;
+        let repo = crate::worktree::main_checkout_of(&path)
+            .or_else(|| workspace.main_repo_path.and_then(|p| crate::worktree::main_checkout_of(&p)))
+            .and_then(|p| std::fs::canonicalize(p).ok());
+        if repo.as_ref() != Some(&context.repo_path) {
+            return Err((ErrorCode::Conflict, "task's bound workspace does not belong to repo_path; reconcile the binding first".into()));
+        }
+        // A stale local binding must not let an invalid task bypass validation.
+        let creds = PlanningApiCreds::from_config(&config.api_url, &config.api_token)
+            .map_err(|e| (ErrorCode::Conflict, format!("planning API required: {e:?}")))?;
+        api_get_task(&creds, task_id).map_err(|e| e.to_method_err())?;
+        return Ok(WorkspaceResolution::Ready { workspace_id: id, working_dir: path, shared_with_caller: false });
+    }
+    Ok(WorkspaceResolution::Mint { task_id: task_id.into(), ctx: MintContext {
+        explicit_repo: Some(context.repo_path.clone()), recover_existing,
+        caller_paths: vec![context.repo_path.clone()], workspace_paths: Vec::new(),
+        repos_dir: config.repos_dir_or_default(), allow_clone: false, allow_entries: Vec::new(),
+        api_url: config.api_url, api_token: config.api_token, base: context.base.clone(),
+    }})
+}
+
+fn start_agent_with_context(
+    state_arc: &Arc<Mutex<DaemonState>>, params: &Value, caller_uid: Option<&str>,
+    operator_launch: Option<&OperatorLaunchContext>,
+) -> MethodResult {
     let mut p: McpStartSessionParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("mcp_start_session params: {}", e)))?;
     let staffing = {
@@ -9955,7 +10022,10 @@ fn mcp_start_session_inner(
         caller_rows,
         launch_grant,
         s4_supported_caller,
-    ) = {
+    ) = if let Some(context) = operator_launch {
+        let task_id = p.task_id.as_deref().ok_or((ErrorCode::InvalidParams, "operator launch requires task_id".into()))?;
+        (operator_workspace_resolution(state_arc, task_id, context)?, None, None, 80u16, 24u16, None, false)
+    } else {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         let cuid = caller_uid.ok_or((
             ErrorCode::Unauthorized,
@@ -10121,6 +10191,7 @@ fn mcp_start_session_inner(
                 WorkspaceResolution::Mint {
                     task_id: req_task.to_string(),
                     ctx: MintContext {
+                        explicit_repo: None,
                         recover_existing,
                         caller_paths: caller_ws.map(workspace_paths_of).unwrap_or_default(),
                         workspace_paths: state.workspaces.values().flat_map(workspace_paths_of).collect(),
@@ -10434,7 +10505,7 @@ fn mcp_start_session_inner(
     // Generate a fresh uid in the TUI format. Same generator
     // shape as `tui/src/app.rs::new_session_uid` —
     // `ts-<nanos>-<counter>`.
-    let session_uid = new_daemon_minted_session_uid();
+    let session_uid = operator_launch.map(|c| c.uid.clone()).unwrap_or_else(new_daemon_minted_session_uid);
 
     // Build raw argv via the daemon-local mcp_config helper.
     // Writes the per-session claude.json (claude) or builds
@@ -10532,7 +10603,7 @@ fn mcp_start_session_inner(
     // 80×24 serde fallback.
     full_params.insert("cols".into(), Value::Number(caller_cols.into()));
     full_params.insert("rows".into(), Value::Number(caller_rows.into()));
-    if let Some(cuid) = caller_uid {
+    if let Some(cuid) = operator_launch.and_then(|c| c.managed_by_uid.as_deref()).or(caller_uid) {
         full_params.insert("managed_by_uid".into(), Value::String(cuid.to_string()));
     }
     if let Some(tid) = task_id_for_spawn.as_deref() {
@@ -17046,7 +17117,7 @@ fn test_detector_spawn_fn() -> crate::transcript_detect::DetectorSpawnFn {
     })
 }
 
-fn new_daemon_minted_session_uid() -> String {
+pub(crate) fn new_daemon_minted_session_uid() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -19002,6 +19073,7 @@ fn session_fork_once(
                 // A never-run task: mint its checkout via the start_session
                 // path, cut at the requested base.
                 let ctx = MintContext {
+                    explicit_repo: None,
                     recover_existing,
                     caller_paths: source_ws.as_ref().map(workspace_paths_of).unwrap_or_default(),
                     workspace_paths: Vec::new(),
@@ -39437,6 +39509,76 @@ while True:
         }
         seed_tasked_caller(state, "ts-orch", "ws-parent", "task-parent");
         repo.to_path_buf()
+    }
+
+    #[test]
+    fn session_launch_operator_mints_binds_replays_and_composes_both_engines() {
+        with_home_and_repo("launch72repo", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            run_git(&repo, &["branch", "-M", "main"]);
+            let base = git_sha(&repo, "HEAD");
+            std::fs::write(repo.join("newer.txt"), "newer trunk").unwrap();
+            run_git(&repo, &["add", "."]); run_git(&repo, &["commit", "-qm", "newer"]);
+            let state = make_state_arc();
+            let stub = spawn_routed_stub(|method, path, _| match (method, path) {
+                ("GET", p) if p.starts_with("/tasks/") => (200, json!({"id":p.trim_start_matches("/tasks/"), "name":"Operator worker", "status":"backlog"}).to_string()),
+                ("PATCH", _) => (200, "{}".into()),
+                _ => (404, "{}".into()),
+            });
+            {
+                let mut st = state.lock().unwrap();
+                st.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                st.config.api_token = "fixture".into();
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".into(), vec!["120".into()])));
+            for (engine, model, task, global) in [("codex","gpt-6.1-terra","task-a-72",false), ("claude","claude-opus-4-6","task-b-72",true)] {
+                let params = json!({"request_id":task,"task_id":task,"engine":engine,"model":model,
+                    "effort":"xhigh","prompt":"explicit launch prompt", "label":"operator worker",
+                    "repo_path":repo,"base":base,"managed_by_uid":"ts-parent-72","global_perms":global});
+                let response = crate::control::session_launch::launch(&state, &params).expect("operator launch without a Session caller");
+                let uid = response["uid"].as_str().unwrap();
+                assert_eq!(response["session_uid"], uid);
+                assert_eq!(response["task_id"], task);
+                assert_eq!(response["prompt_source"], "caller");
+                assert!(response["prompt_delivery"].is_object(), "normal asynchronous receipt");
+                let path = PathBuf::from(response["worktree_path"].as_str().unwrap());
+                assert_eq!(crate::worktree::worktree_head_sha(&path).as_deref(), Some(base.as_str()));
+                assert!(crate::worktree::worktree_current_branch(&path).unwrap().starts_with("cm-sub/operator-worker-"));
+                let count = {
+                    let st = state.lock().unwrap();
+                    let session = &st.sessions[uid];
+                    assert_eq!(session.model.as_deref(), Some(model));
+                    assert_eq!(session.managed_by_uid.as_deref(), Some("ts-parent-72"));
+                    assert_eq!(session.global_perms, global);
+                    assert_eq!(st.task_workspaces.get(task), st.bindings.get(task));
+                    assert_eq!(st.workspaces[&session.workspace_id].main_repo_path.as_deref(), Some(repo.as_path()));
+                    st.sessions.len()
+                };
+                assert_eq!(crate::control::session_launch::launch(&state, &params).unwrap(), response);
+                assert_eq!(state.lock().unwrap().sessions.len(), count, "retry creates no child or prompt");
+                std::fs::write(path.join("keep.txt"), "uncommitted work").unwrap();
+                let context = OperatorLaunchContext { uid:"unused".into(), repo_path:repo.clone(), base:None, managed_by_uid:None };
+                assert!(matches!(operator_workspace_resolution(&state,task,&context).unwrap(), WorkspaceResolution::Ready { working_dir, .. } if working_dir == path));
+                assert_eq!(std::fs::read_to_string(path.join("keep.txt")).unwrap(), "uncommitted work");
+                let other = seed_other_clone(home, &format!("other-{engine}"), "fixture-other");
+                let context = OperatorLaunchContext { repo_path:other.clone(), ..context };
+                assert_eq!(operator_workspace_resolution(&state,task,&context).err().unwrap().0, ErrorCode::Conflict);
+                // Simulate the mint plan taken before a competing registration:
+                // the registration check must reject a different winning path.
+                let config = state.lock().unwrap().config.clone();
+                let stale = MintContext { explicit_repo:Some(other.clone()), recover_existing:false,
+                    caller_paths:vec![other], workspace_paths:vec![], repos_dir:home.join("repos"),
+                    allow_clone:false, allow_entries:vec![], api_url:config.api_url,
+                    api_token:config.api_token, base:None };
+                let error = mint_task_workspace(&state,task,&stale).err().unwrap();
+                assert_eq!(error.0, ErrorCode::Conflict);
+                assert!(error.1.contains("changed during operator mint"));
+                assert_eq!(state.lock().unwrap().sessions.len(), count);
+            }
+            set_spawn_program_override_for_test(None);
+            assert_eq!(state.lock().unwrap().sessions.len(), 2);
+            kill_all_sessions(&state);
+        });
     }
 
     /// ux-1a, the headline: `start_session(task_id=<workspace-less task>)`

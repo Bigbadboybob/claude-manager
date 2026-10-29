@@ -274,6 +274,43 @@ On cm-manager itself, omit `--ssh cm-manager`; a deployed copy of the helper is 
 
 The helper is an Operator route for the work Owner authorized. Do not substitute the local session UID as a remote caller or copy tokens into prompts. No extra approval is needed merely to use this route for an already-approved dispatch. A successful `send_input` response means delivery was accepted; verify actual processing from the bound transcript. It does not register an MCP completion monitor. Prefer a task-channel post mentioning the worker or parent when native delivery is available; retain parent reconciliation for legacy workers. After an uncertain send, inspect delivery evidence before retrying—the input RPC has no chat-style request-ID deduplication.
 
+To launch a new task-bound agent on the chosen host, use the strong-operator
+`session.launch` RPC. It requires that host's configured operator token; Session
+callers, board tokens and tokenless operator mode cannot launch through it:
+
+```bash
+scripts/cm-op --ssh f-sessions session.launch '{"request_id":"f-build-001","task_id":"<task-id>","engine":"codex","model":"gpt-6.1-terra","effort":"xhigh","label":"F build","repo_path":"/home/lucas/code/project","prompt":"<authorized task>"}'
+```
+
+Required fields are `request_id`, `task_id`, `engine` (`claude` or `codex`),
+`model`, `label` and absolute `repo_path` **on that host**. Optional fields are
+`effort`, `prompt`, `base`, `managed_by_uid` and `global_perms` (default false).
+The planning API must resolve the task. CM mints or reattaches its normal
+`cm-sub/<task-slug>-<task7>` worktree, registers the workspace/task binding, and
+composes the engine argv, MCP configuration, environment and prompt just as for
+an in-host MCP launch. `base` selects the starting commit/ref of a new branch;
+existing work/history is preserved. A bound workspace in another repository
+is refused. An omitted/blank prompt uses the stored task brief, if present.
+
+The result includes `uid` (also `session_uid`), `worktree_path`, `task_id` and
+normal prompt-delivery metadata. Acceptance or a pending prompt receipt does
+not prove the engine started a turn. `managed_by_uid` is attribution and monitor
+routing metadata only: control still follows existing task/global scope. A lead
+whose task tree contains the child's task can control it on the same daemon;
+this RPC adds no cross-host MCP routing or new authorization edge.
+
+Retry an uncertain response with **identical fields and the same request_id on
+the same host**. CM durably saves an intent before effects and retains completed
+results and terminal errors across brain restarts in
+`~/.cm/session-launch-requests/` (request hash, reserved UID and result/error;
+no prompt or argv). Exact retries return the saved result without spawning or
+delivering again; changed fields conflict. A concurrent launch returns busy
+without consuming the ID. An interrupted intent reports **outcome unknown**
+with its reserved UID and refuses automatic relaunch. Inspect that UID, task
+binding and prompt evidence before any deliberate new request; even an error
+may follow a partial launch. Receipts have no automatic expiry. A retry returns
+the original launch receipt, not a fresh liveness or delivery-status read.
+
 For routine coordination, post in the task channel (`chat_open().continuous.channel`) mentioning the current parent or worker. Native wake availability is a separate question from SSH/control reachability. Do not spawn a duplicate worker or move its implementation to a different host solely because a local session-control lookup failed.
 
 Use `notification_status()` to inspect your native connection and delivery receipts. Claude uses its own-session socket; new CM Codex sessions use an owned app-server. The connection starts automatically, so there is no per-notification arming call. A submitted notice is distinct from an observed receipt, and neither marks its chat messages read. Pending or uncertain notices do not fall back to terminal typing. See [native notifications and upgrade steps](messaging/NATIVE_NOTIFICATIONS.md).

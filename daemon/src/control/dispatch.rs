@@ -539,6 +539,7 @@ pub fn dispatch_request(
         // review fix #2 for the race-safety argument; the Arc
         // serializes the insert against the callback's remove.
         "start_session" => DispatchOutcome::Done(dispatch_start_session(state, req)),
+        "session.launch" => DispatchOutcome::Done(super::session_launch::dispatch(state, req)),
 
         // Read-mostly methods lock for the duration of the dispatch
         // arm. Brief critical sections — no daemon-state-blocking
