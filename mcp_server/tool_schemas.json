@@ -43,6 +43,9 @@
     "board": {
      "type": "string"
     },
+    "flags_only": {
+     "type": "boolean"
+    },
     "group": {
      "type": "string"
     },

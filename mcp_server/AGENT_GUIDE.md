@@ -120,7 +120,9 @@ everyone who holds what, with each holder's live state, so nobody has to ask.
   `item_set(14, holder="rl-scale-out")` (chat name, session uid or participant
   id).
 - `board()` shows flags first, then items by group, recently closed items and
-  who is free; `board(mine=True)` shows yours. Any session may read any board.
+  who is free; `board(mine=True)` filters items, while flags remain board-wide.
+  `board(flags_only=True)` lists all open flags with item title, holders and
+  block/check-back context, without item bodies. Any session may read any board.
 - Any item on a board can be edited by sessions whose task belongs to that
   board, by anyone holding an item there, by `global_perms` sessions and by
   Owner; every session can read every board. History is kept, so give a short

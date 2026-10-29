@@ -74,6 +74,16 @@ class ItemToolsTests(unittest.TestCase):
         self.assertEqual(params, {"view": "slim", "mine": False, "include_closed": True,
                                   "archived": False})
 
+    def test_board_flags_only_routes_through_real_mcp_validation(self):
+        with mock.patch.object(control_client, "call", return_value={"ok": 1}) as call:
+            result = asyncio.run(server.mcp._tool_manager.call_tool(
+                "board", {"board": "sejd", "flags_only": True, "query": "ignored"}))
+        self.assertEqual(result, {"ok": 1})
+        method, params = call.call_args.args
+        self.assertEqual(method, "board.read")
+        self.assertTrue(params["flags_only"])
+        self.assertEqual(params["query"], "ignored")
+
     def test_place_unplace_and_roles_route_to_the_daemon(self):
         method, params = self.call(server.place, "t-1", group="Latent", holder="me")
         self.assertEqual(method, "item.place")
