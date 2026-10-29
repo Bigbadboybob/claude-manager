@@ -1831,7 +1831,8 @@ pub(crate) fn dispatch_org(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Re
     // may close it.
     // `org(action="promote", session, handle, title?, team?, manager?, reason)`
     // (§4.2) likewise: the API decides who may promote whose assistant.
-    if let Some(verb @ ("close_assistant" | "promote")) = req.params["action"].as_str() {
+    // `rebind_main` likewise forwards the member and target to the API.
+    if let Some(verb @ ("close_assistant" | "promote" | "rebind_main")) = req.params["action"].as_str() {
         let mut fwd = req.clone();
         fwd.method = format!("org.{verb}");
         if let Some(obj) = fwd.params.as_object_mut() {

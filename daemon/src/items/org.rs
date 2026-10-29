@@ -1260,6 +1260,48 @@ mod tests {
     }
 
     #[test]
+    fn org_tool_rebind_main_routes_to_the_api_as_the_caller() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let (url, seen) = test_stub(|method, path, _| match (method, path) {
+            ("POST", "/org/members/main/ep/rebind_main") => (200, json!({
+                "member": {"id": "mem_ep", "handle": "ep", "manager_handle": "owner"},
+                "old_main": {"pid": "agent:old:old-uid", "session_uid": "old-uid"},
+                "new_main": {"session_uid": "new-uid"}, "holds": {}
+            }).to_string()),
+            _ => (500, "{}".into()),
+        });
+        let state = state(root.path(), &url);
+        let daemon = daemon_id(&state);
+        let caller = Caller::session("me-uid");
+        let request = Request { id: "rebind".into(), caller: caller.clone(), method: "org".into(),
+            params: json!({"action": "rebind_main", "member": "main/ep", "session_uid": "new-uid",
+                           "reason": "handoff", "request_id": "rebind-1"}) };
+        let response = crate::control::dispatch::dispatch_org(&state, &request);
+        assert!(response.ok, "{:?}", response.error);
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            let (method, path, body) = &seen[0];
+            assert_eq!((method.as_str(), path.as_str()), ("POST", "/org/members/main/ep/rebind_main"));
+            assert_eq!(body["pid"], format!("agent:{daemon}:new-uid"));
+            assert_eq!(body["actor"]["pid"], format!("agent:{daemon}:me-uid"));
+            assert_eq!(body["actor"]["session_uid"], "me-uid");
+            assert_eq!(body["actor"]["task_id"], "t-1");
+            assert_eq!((body["reason"].as_str(), body["request_id"].as_str()),
+                       (Some("handoff"), Some("rebind-1")));
+            assert!(body.get("action").is_none() && body.get("member").is_none());
+        }
+        let unknown = crate::control::dispatch::dispatch_org(&state, &Request {
+            id: "unknown".into(), caller, method: "org".into(), params: json!({"action": "unknown-action"})
+        });
+        let error = unknown.error.expect("unknown action must be rejected");
+        assert!(matches!(error.code, ErrorCode::InvalidParams));
+        assert!(error.message.contains("unknown action"), "{}", error.message);
+        assert_eq!(seen.lock().unwrap().len(), 1, "unknown action must not reach the API");
+    }
+
+    #[test]
     fn path_segments_are_encoded_but_qualified_handles_keep_their_slash() {
         assert_eq!(encode("main/ep"), "main/ep");
         assert_eq!(encode("a b?c"), "a%20b%3Fc");
