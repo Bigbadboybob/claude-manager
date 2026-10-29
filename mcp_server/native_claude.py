@@ -23,6 +23,52 @@ TAIL_BYTES = 2 * 1024 * 1024
 BG_PROBE_INTERVAL = 30.0
 
 
+def recovery_record_state(path, session_id, record_id):
+    """Confirm the exact failed main turn, or fail closed on an unclear tail."""
+    try:
+        if str(uuid.UUID(session_id)) != session_id or str(uuid.UUID(record_id)) != record_id:
+            return "unknown"
+        path = Path(path)
+        if path.stem != session_id:
+            return "superseded"
+        with path.open("rb") as stream:
+            size = os.fstat(stream.fileno()).st_size
+            start = max(0, size - TAIL_BYTES)
+            stream.seek(start)
+            data = stream.read(TAIL_BYTES + 1)
+        if len(data) > TAIL_BYTES or not data.endswith(b"\n"):
+            return "unknown"
+        if start:
+            _, sep, data = data.partition(b"\n")
+            if not sep:
+                return "unknown"
+        queue_activity = False
+        for line in reversed(data.splitlines()):
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                return "unknown"
+            if row.get("isSidechain") is True:
+                continue
+            kind = row.get("type")
+            if kind == "user":
+                return "superseded"
+            if kind == "assistant":
+                if row.get("sessionId") != session_id:
+                    return "unknown"
+                if (row.get("uuid") != record_id or row.get("error") != "rate_limit"
+                        or row.get("isApiErrorMessage") is not True
+                        or (row.get("message") or {}).get("model") != "<synthetic>"):
+                    return "superseded"
+                return "superseded" if queue_activity else "ready"
+            if kind in {"queue-operation", "attachment"}:
+                queue_activity = True
+            elif kind not in {"system", "progress", "file-history-snapshot", "last-prompt", "summary"}:
+                return "unknown"
+        return "unknown" if start else "superseded"
+    except (OSError, ValueError, TypeError, AttributeError):
+        return "unknown"
+
+
 def background_match(rows, session_id, cwd):
     """Only an exact native ID and workspace from Claude's own roster count.
 
@@ -403,6 +449,21 @@ class ClaudeAdapter:
             event["marker"],
             event.get("binding"),
         )
+
+    async def recovery_check(self, event):
+        parts = event.get("id", "").split(":")
+        if len(parts) != 3 or parts[0] != "claude-limit":
+            return "unknown"
+        # A cached binding is not sufficient at the effect boundary.
+        self.resolve_after = 0.0
+        await self._resolve()
+        if self.live() is False:
+            return "superseded"
+        if self.live() is not True or not self.transcript_path:
+            return "unknown"
+        if Path(self.transcript_path).stem != parts[1]:
+            return "superseded"
+        return await asyncio.to_thread(recovery_record_state, self.transcript_path, parts[1], parts[2])
 
 
 class ClaudeSocket(ClaudeAdapter):

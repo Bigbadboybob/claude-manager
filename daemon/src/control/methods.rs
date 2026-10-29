@@ -4575,6 +4575,8 @@ pub fn reload_config(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
     // Admission holds the matching read side through a recovery write. A
     // completed disable therefore cannot race a later automatic prompt.
     let _recovery_config = crate::claude_account_recovery::config_gate().write().unwrap_or_else(|p| p.into_inner());
+    crate::claude_account_recovery::configure(state_arc, new_cfg.claude_limit_recovery)
+        .map_err(|e| (ErrorCode::Internal, format!("could not fence Claude recovery configuration: {e}")))?;
 
     const RESTART_ONLY: &[&str] = &["auth", "tls"];
 

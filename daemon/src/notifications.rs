@@ -128,6 +128,12 @@ pub fn publish(
     text: &str,
     marker: &str,
 ) -> io::Result<Value> {
+    validate_notice(text, marker)?;
+    let _guard = lock(root, uid)?;
+    publish_locked(root, uid, id, source, text, marker)
+}
+
+fn validate_notice(text: &str, marker: &str) -> io::Result<()> {
     if text.is_empty() || text.len() > 65536 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -143,7 +149,10 @@ pub fn publish(
             "notification text must contain its marker",
         ));
     }
-    let _guard = lock(root, uid)?;
+    Ok(())
+}
+
+fn publish_locked(root: &Path, uid: &str, id: &str, source: &str, text: &str, marker: &str) -> io::Result<Value> {
     let path = path(root, uid, id);
     if let Some(old) = read(&path)? {
         if old["text"] != text || old["source"] != source || old["marker"] != marker {
@@ -191,6 +200,74 @@ pub fn publish(
         return Err(e);
     }
     Ok(event)
+}
+
+/// Admit one recovery event under the recipient queue lock. The callback
+/// rechecks the failure and durably claims its attempt before publication.
+pub(crate) fn publish_recovery_if(
+    root: &Path, uid: &str, id: &str, text: &str, marker: &str, native_id: &str,
+    failed_at: f64, now: f64, commit: impl FnOnce() -> io::Result<bool>, final_check: impl FnOnce() -> bool,
+) -> io::Result<Option<Value>> {
+    validate_notice(text, marker)?;
+    let started = std::time::Instant::now();
+    let _guard = lock(root, uid)?;
+    if !recovery_enabled(root) || held(root, uid, now) { return Ok(None); }
+    let (events, transport) = snapshot_locked(&directory(root, uid), uid, true)?;
+    if !recovery_transport_ready(transport.as_ref(), native_id, now) { return Ok(None); }
+    if events.iter().any(|e| {
+        let status = e["status"].as_str();
+        let at = e["updated_at"].as_f64().or_else(|| e["created_at"].as_f64()).unwrap_or(f64::INFINITY);
+        matches!(status, Some("pending" | "submitting"))
+            || (matches!(status, Some("submitted" | "uncertain")) && at >= failed_at)
+    }) { return Ok(None); }
+    if !commit()? { return Ok(None); }
+    // Heartbeats are written independently of the queue lock. Re-read after
+    // the durable claim, then perform the in-memory boundary check last.
+    let current = read(&directory(root, uid).join("transport.json"))?;
+    let now = now + started.elapsed().as_secs_f64();
+    if !recovery_enabled(root) || held(root, uid, now)
+        || !recovery_transport_ready(current.as_ref(), native_id, now) { return Ok(None); }
+    if !final_check() { return Ok(None); }
+    publish_locked(root, uid, id, "claude-limit-recovery", text, marker).map(Some)
+}
+
+pub(crate) fn recovery_transport_ready(transport: Option<&Value>, native_id: &str, now: f64) -> bool {
+    let Some(t) = transport else { return false; };
+    let recent = t["updated_at"].as_f64().is_some_and(|at| at <= now && now - at < 15.0);
+    t["status"] == "ready" && t["engine"] == "claude-code" && recent
+        && t["own_session_id"] == native_id && t["bound_session_id"] == native_id
+}
+
+/// Missing, stale or mismatched health is unknown and cannot authorize a PTY
+/// fallback: the native consumer might still be delivering independently.
+pub(crate) fn recovery_transport_definitely_unready(transport: Option<&Value>, native_id: &str, now: f64) -> bool {
+    let Some(t) = transport else { return false; };
+    let recent = t["updated_at"].as_f64().is_some_and(|at| at <= now && now - at < 15.0);
+    matches!(t["status"].as_str(), Some("degraded" | "disconnected" | "stopped"))
+        && t["engine"] == "claude-code" && recent
+        && t["own_session_id"] == native_id && t["bound_session_id"] == native_id
+}
+
+pub(crate) fn recovery_enabled(root: &Path) -> bool {
+    let path = root.join("notifications").join("claude-limit-recovery-state");
+    if !std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() <= 4096) { return false; }
+    read(&path).ok().flatten().is_some_and(|v| v["version"] == 1 && v["enabled"] == true)
+}
+
+pub(crate) fn set_recovery_enabled(root: &Path, enabled: bool) -> io::Result<()> {
+    let path = root.join("notifications").join("claude-limit-recovery-state");
+    crate::state::write_json_atomic(&path, &json!({"version":1,"enabled":enabled}).to_string(), true)
+}
+
+pub(crate) fn cancel_recovery_pending(root: &Path, uid: &str, id: &str, reason: &str) -> io::Result<bool> {
+    let _guard = lock(root, uid)?;
+    let path = path(root, uid, id);
+    let Some(mut event) = read(&path)? else { return Ok(false); };
+    if event["source"] != "claude-limit-recovery" || event["status"] != "pending" { return Ok(false); }
+    event["status"] = json!("cancelled"); event["cancel_reason"] = json!(reason);
+    event["updated_at"] = json!(chrono::Utc::now().timestamp_millis() as f64 / 1000.0);
+    atomic_replace(&path, &event)?;
+    Ok(true)
 }
 /// All retained events plus the consumer's `transport.json` heartbeat, read
 /// under the queue lock. A missing queue directory is an empty queue.
@@ -381,6 +458,22 @@ pub fn update_pending(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_publication_requires_fresh_owned_transport_and_never_duplicates() {
+        let tmp = tempfile::tempdir().unwrap(); let root = tmp.path(); let uid = "uid";
+        let native = "93686392-56ae-455c-803d-6ce59cc55e29";
+        set_recovery_enabled(root, true).unwrap();
+        let dir = directory(root, uid); std::fs::create_dir_all(&dir).unwrap();
+        let heartbeat = |at: f64, own: &str| json!({"status":"ready", "engine":"claude-code", "updated_at":at, "own_session_id":own, "bound_session_id":native});
+        crate::messaging::atomic_replace(&dir.join("transport.json"), &heartbeat(1000.0, "wrong")).unwrap();
+        assert!(publish_recovery_if(root, uid, "event", "[m] resume", "[m]", native, 900.0, 1001.0, || panic!("must not commit"), || true).unwrap().is_none());
+        crate::messaging::atomic_replace(&dir.join("transport.json"), &heartbeat(1000.0, native)).unwrap();
+        assert!(publish_recovery_if(root, uid, "event", "[m] resume", "[m]", native, 900.0, 1016.0, || panic!("stale health"), || true).unwrap().is_none());
+        let event = publish_recovery_if(root, uid, "event", "[m] resume", "[m]", native, 900.0, 1001.0, || Ok(true), || true).unwrap().unwrap();
+        assert_eq!(event["source"], "claude-limit-recovery");
+        assert!(publish_recovery_if(root, uid, "event", "[m] resume", "[m]", native, 900.0, 1001.0, || panic!("pending event"), || true).unwrap().is_none());
+        assert_eq!(snapshot(root, uid).unwrap().0.len(), 1);
+    }
     #[test]
     fn strict_census_rejects_corrupt_entries_and_non_directory_queue() {
         let tmp = tempfile::tempdir().unwrap();

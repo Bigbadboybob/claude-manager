@@ -27,8 +27,20 @@ pub(crate) fn failed_boundary(agent: &crate::agent_state::AgentState) -> bool {
         && agent.last_turn.status == Some(TurnStatus::Failed)
         && agent.detail.error_kind.as_deref() == Some("rate_limit")
         && agent.detail.input_pending != Some(true)
-        && agent.background.complete && agent.background.jobs.is_empty()
-        && agent.background.crons.is_empty()
+        && agent.background.complete
+}
+
+/// Compare stable identities, not sampled CPU or observation timestamps.
+/// A newly started/ended background job invalidates the captured boundary.
+pub(crate) fn same_background(a: &crate::agent_state::Background, b: &crate::agent_state::Background) -> bool {
+    fn signature(b: &crate::agent_state::Background) -> Vec<String> {
+        let mut rows = Vec::new();
+        rows.extend(b.jobs.iter().map(|j| format!("job:{:?}:{}:{}", j.kind, j.id, j.wakes_agent)));
+        rows.extend(b.crons.iter().map(|c| format!("cron:{}:{}:{}", c.id, c.schedule, c.recurring)));
+        rows.extend(b.ended.iter().map(|e| format!("ended:{}:{}", e.id, e.ended_at)));
+        rows.sort(); rows
+    }
+    a.complete && b.complete && signature(a) == signature(b)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,7 +51,7 @@ pub(crate) struct LimitRecord {
     pub reset_at: Option<i64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 struct Episode {
     uid: String,
     record_id: String,
@@ -59,6 +71,16 @@ struct Episode {
     digest: Option<String>,
     #[serde(default)]
     unmanaged_logged: bool,
+    #[serde(default)]
+    native_event: Option<String>,
+    #[serde(default)]
+    queued_at: Option<f64>,
+    #[serde(default)]
+    deferred: bool,
+    #[serde(default)]
+    deferred_account: Option<String>,
+    #[serde(default)]
+    deferred_reset_due: bool,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -69,10 +91,16 @@ struct Journal {
     digests: BTreeMap<String, DigestNotice>,
     #[serde(default)]
     last_account: Option<String>,
+    #[serde(default)]
+    pending_unchecked: BTreeMap<String, Vec<String>>,
     #[serde(skip)]
     unstaged: bool,
     #[serde(skip)]
     unsent: bool,
+    #[serde(skip)]
+    native_pending: bool,
+    #[serde(skip)]
+    next_digest_at: Option<f64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -99,22 +127,68 @@ fn flush_digests(journal: &mut Journal, journal_path: &Path, root: &Path) -> io:
     Ok(())
 }
 
+fn refresh_native_receipts(journal: &mut Journal, journal_path: &Path, root: &Path) -> io::Result<()> {
+    if !journal.native_pending { return Ok(()); }
+    let pending: Vec<_> = journal.episodes.iter().filter_map(|(key, e)| {
+        (e.attempted && e.outcome.is_none()).then(|| e.native_event.as_ref().map(|id| (key.clone(), e.uid.clone(), id.clone()))).flatten()
+    }).collect();
+    let mut changed = false;
+    for (key, uid, id) in pending {
+        let event = crate::notifications::get(root, &uid, &id)?;
+        let outcome = match event.as_ref().and_then(|e| e["status"].as_str()) {
+            Some("pending" | "submitting") => continue,
+            Some("submitted") => "native event submitted; turn unconfirmed",
+            Some("observed") => "native event observed; turn unconfirmed",
+            Some("uncertain") => "native event outcome uncertain; no automatic retry",
+            Some("cancelled") if event.as_ref().is_some_and(|e| e["cancel_reason"] == "superseded") => "not resumed: superseded by newer input",
+            Some("cancelled") if event.as_ref().is_some_and(|e| e["cancel_reason"] == "recovery_disabled") => "not resumed: recovery disabled",
+            Some("cancelled") => "not resumed: native event cancelled",
+            _ => "native publication outcome unknown; no automatic retry",
+        };
+        journal.episodes.get_mut(&key).unwrap().outcome = Some(outcome.into());
+        journal.unstaged = true;
+        changed = true;
+    }
+    if changed { journal.refresh_pending(); journal.save(journal_path)?; }
+    Ok(())
+}
+
 fn stage_digests(journal: &mut Journal, journal_path: &Path,
     unchecked: BTreeMap<String, Vec<String>>, account_changed: bool) -> io::Result<()> {
-    if !journal.unstaged && unchecked.is_empty() && !account_changed { return Ok(()); }
+    let now = crate::agent_state::unix_now();
+    let overdue = journal.next_digest_at.is_some_and(|at| now >= at);
+    if !journal.unstaged && !overdue && unchecked.is_empty() && !account_changed && journal.pending_unchecked.is_empty() { return Ok(()); }
     let mut groups: BTreeMap<String, Vec<(Option<String>, String)>> = BTreeMap::new();
     let mut dirty = account_changed;
-    for (key, episode) in &journal.episodes {
-        if !episode.attempted || episode.digest.is_some() { continue; }
+    let mut first_pending: BTreeMap<String, f64> = BTreeMap::new();
+    for episode in journal.episodes.values().filter(|e| e.digest.is_none() && e.native_event.is_some() && e.outcome.is_none()) {
         if let Some(manager) = &episode.manager {
-            let outcome = episode.outcome.as_deref().unwrap_or("attempt outcome unknown");
+            let at = episode.queued_at.unwrap_or(0.0);
+            first_pending.entry(manager.clone()).and_modify(|old| *old = old.min(at)).or_insert(at);
+        }
+    }
+    let waiting: std::collections::BTreeSet<_> = first_pending.iter()
+        .filter(|(_, at)| now - **at < 600.0).map(|(manager, _)| manager.clone()).collect();
+    for (key, episode) in &journal.episodes {
+        let timed_out_pending = episode.digest.is_none() && episode.native_event.is_some() && episode.outcome.is_none()
+            && episode.manager.as_ref().is_some_and(|m| first_pending.get(m).is_some_and(|at| now - *at >= 600.0));
+        if (!notice_ready(episode) && !timed_out_pending) || episode.manager.as_ref().is_some_and(|m| waiting.contains(m)) { continue; }
+        if let Some(manager) = &episode.manager {
+            let outcome = episode.outcome.as_deref().unwrap_or(if timed_out_pending { "pending (delivery unconfirmed)" } else { "attempt outcome unknown" });
             groups.entry(manager.clone()).or_default().push((Some(key.clone()), format!("{} ({}): {outcome}", episode.label, episode.uid)));
         } else {
             eprintln!("cm-daemon: Claude account recovery {}: {}", episode.uid, episode.outcome.as_deref().unwrap_or("attempt outcome unknown"));
         }
     }
     for (manager, rows) in unchecked {
+        let pending = journal.pending_unchecked.entry(manager).or_default();
+        for row in rows { if !pending.contains(&row) { pending.push(row); dirty = true; } }
+    }
+    let ready_managers: Vec<_> = journal.pending_unchecked.keys().filter(|m| !waiting.contains(*m)).cloned().collect();
+    for manager in ready_managers {
+        let rows = journal.pending_unchecked.remove(&manager).unwrap();
         groups.entry(manager).or_default().extend(rows.into_iter().map(|row| (None, format!("{row}: could not check"))));
+        dirty = true;
     }
     for (manager, rows) in groups {
         let mut hasher = Sha256::new();
@@ -135,19 +209,32 @@ fn stage_digests(journal: &mut Journal, journal_path: &Path,
         dirty = true;
     }
     if dirty { journal.save(journal_path)?; }
-    journal.unstaged = false;
+    journal.unstaged = journal.episodes.values().any(notice_ready);
+    journal.refresh_pending();
     Ok(())
 }
 
 impl Journal {
-    fn new() -> Self { Self { version: 1, episodes: BTreeMap::new(), digests: BTreeMap::new(), last_account: None, unstaged: false, unsent: false } }
+    fn new() -> Self { Self { version: 1, episodes: BTreeMap::new(), digests: BTreeMap::new(), last_account: None,
+        pending_unchecked: BTreeMap::new(), unstaged: false, unsent: false, native_pending: false, next_digest_at: None } }
+    fn refresh_pending(&mut self) {
+        self.native_pending = false; self.next_digest_at = None;
+        for e in self.episodes.values().filter(|e| e.native_event.is_some() && e.outcome.is_none()) {
+            self.native_pending = true;
+            if e.digest.is_none() {
+                let deadline = e.queued_at.unwrap_or(0.0) + 600.0;
+                self.next_digest_at = Some(self.next_digest_at.map_or(deadline, |old| old.min(deadline)));
+            }
+        }
+    }
     fn load(path: &Path) -> io::Result<Self> {
         match std::fs::read(path) {
             Ok(bytes) => {
                 let mut journal: Self = serde_json::from_slice(&bytes)?;
                 if journal.version != 1 { return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown account recovery journal")); }
-                journal.unstaged = journal.episodes.values().any(|e| e.attempted && e.digest.is_none());
+                journal.unstaged = journal.episodes.values().any(notice_ready);
                 journal.unsent = journal.digests.values().any(|n| !n.sent);
+                journal.refresh_pending();
                 Ok(journal)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::new()),
@@ -166,15 +253,26 @@ impl Journal {
             baseline_account: account.map(str::to_owned), reset_at: record.reset_at, attempted: false,
             manager: None, label: uid.into(), outcome: None, digest: None,
             unmanaged_logged: false,
+            native_event: None, queued_at: None,
+            deferred: false, deferred_account: None, deferred_reset_due: false,
         })
     }
 }
 
 impl Episode {
     fn armed(&self, account: Option<&str>, now: i64) -> bool {
-        !self.attempted && (self.reset_at.is_some_and(|reset| now >= reset)
-            || self.baseline_account.as_deref().zip(account).is_some_and(|(old, new)| old != new))
+        if self.attempted { return false; }
+        let reset_due = self.reset_at.is_some_and(|reset| now >= reset);
+        if self.deferred {
+            let new_switch = self.deferred_account.as_deref().zip(account).is_some_and(|(old, new)| old != new);
+            return new_switch || (reset_due && !self.deferred_reset_due);
+        }
+        reset_due || self.baseline_account.as_deref().zip(account).is_some_and(|(old, new)| old != new)
     }
+}
+
+fn notice_ready(e: &Episode) -> bool {
+    e.digest.is_none() && (e.outcome.is_some() || (e.attempted && e.native_event.is_none()))
 }
 
 /// Return a one-way, stable account identity, never a token or e-mail address.
@@ -197,6 +295,29 @@ fn profile_path() -> Option<PathBuf> {
     } else {
         Some(PathBuf::from(std::env::var_os("HOME")?).join(".claude.json"))
     }
+}
+
+/// Called under the configuration write gate during reload, and before the
+/// worker starts. A disabled marker stops consumers before pending events are
+/// cancelled; submitted/uncertain receipts are never retracted or replayed.
+pub(crate) fn configure(state: &Arc<Mutex<crate::state::DaemonState>>, enabled: bool) -> io::Result<()> {
+    let (root, path) = {
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(base) = &st.daemon_sessions_path else { return Ok(()); };
+        (st.messaging_root.clone(), base.with_file_name("daemon-claude-account-recovery.json"))
+    };
+    let was_enabled = crate::notifications::recovery_enabled(&root);
+    if !enabled { crate::notifications::set_recovery_enabled(&root, false)?; }
+    if !enabled || !was_enabled {
+        let journal = Journal::load(&path)?;
+        for episode in journal.episodes.values() {
+            if let Some(id) = &episode.native_event {
+                crate::notifications::cancel_recovery_pending(&root, &episode.uid, id, "recovery_disabled")?;
+            }
+        }
+    }
+    if enabled && !was_enabled { crate::notifications::set_recovery_enabled(&root, true)?; }
+    Ok(())
 }
 
 /// A session can override HOME or CLAUDE_CONFIG_DIR at launch. Never use the
@@ -238,7 +359,7 @@ struct AccountObservation {
     profile: Option<(PathBuf, FileStamp, String)>,
     journal: Option<(PathBuf, FileStamp, Journal)>,
     tails: BTreeMap<PathBuf, (FileStamp, String, Result<Option<LimitRecord>, String>)>,
-    screens: BTreeMap<String, (libc::pid_t, u64, u64, u16, u16)>,
+    screens: BTreeMap<String, (libc::pid_t, u64, u64, u64, u16, u16)>,
     #[cfg(test)] profile_reads: usize,
     #[cfg(test)] journal_reads: usize,
     #[cfg(test)] tail_reads: usize,
@@ -384,6 +505,17 @@ fn bind_fallback(state: &Arc<Mutex<crate::state::DaemonState>>, target: &Target,
     Ok(true)
 }
 
+fn session_still_eligible(st: &crate::state::DaemonState, target: &Target) -> bool {
+    let Some(session) = st.sessions.get(&target.uid) else { return false; };
+    !st.restarting && !st.draining && st.config.claude_limit_recovery
+        && session.pid == target.pid && session.holder_incarnation == target.incarnation
+        && session.generation == target.generation && target.input.belongs_to(session)
+        && !session.last_exit.kernel_set() && session.workflow_run_id.is_none() && session.continuous_task_id.is_none()
+        && session.managed_by_uid.is_some() && session.managed_by_uid == target.manager
+        && !crate::rotation::in_progress(&target.uid) && !crate::handoff::in_progress(&target.uid)
+        && failed_boundary(&crate::agent_state::current(session))
+}
+
 fn attempt(state: &Arc<Mutex<crate::state::DaemonState>>, target: &Target, record: &LimitRecord,
     profile: &Path, journal: &mut Journal, journal_path: &Path, messaging_root: &Path,
     observation: &mut AccountObservation) -> io::Result<bool> {
@@ -392,13 +524,53 @@ fn attempt(state: &Arc<Mutex<crate::state::DaemonState>>, target: &Target, recor
     let Ok(_lifecycle) = lifecycle.try_write() else { return Ok(false); };
     if crate::claude_recovery::admission_blocked(&target.uid)
         || crate::claude_recovery::has_pending_input(&target.uid) { return Ok(false); }
+    if !crate::notifications::recovery_enabled(messaging_root) { return Ok(false); }
+    let (_, transport) = crate::notifications::snapshot_strict(messaging_root, &target.uid)?;
+    let native = crate::notifications::recovery_transport_ready(transport.as_ref(), &target.native_id, crate::agent_state::unix_now());
+    if native {
+        let _config = config_gate().read().unwrap_or_else(|p| p.into_inner());
+        {
+            let st = state.lock().unwrap_or_else(|p| p.into_inner());
+            if !session_still_eligible(&st, target) { return Ok(false); }
+        }
+        let Some(path) = target.path.as_ref() else { return Ok(false); };
+        let key = format!("{}:{}", target.uid, record.id);
+        let id = format!("claude-limit:{}:{}", target.native_id, record.id);
+        let marker = format!("[cm-recovery {id}]");
+        let text = format!("{marker} Your last turn stopped on a usage limit. Capacity may be available now; continue where you stopped. If it fails again, stop and wait.");
+        return target.input.admit_claude_limit_notice(target.captured, target.agent.turn_seq,
+            target.agent.last_turn.ended_at, &target.agent.background, || {
+                crate::notifications::publish_recovery_if(messaging_root, &target.uid, &id, &text, &marker,
+                    &target.native_id, record.at as f64, crate::agent_state::unix_now(), || {
+                        if latest_limit(path, &target.native_id)?.as_ref() != Some(record) { return Ok(false); }
+                        if let Some(cwd) = &target.fallback_cwd { if !fallback_cwd_matches(path, record, cwd)? { return Ok(false); } }
+                        let account = if process_uses_profile(target.pid, profile).unwrap_or(false) { account_fingerprint(profile).ok() } else { None };
+                        let Some(episode) = journal.episodes.get_mut(&key) else { return Ok(false); };
+                        if !episode.armed(account.as_deref(), chrono::Utc::now().timestamp()) { return Ok(false); }
+                        episode.attempted = true; episode.native_event = Some(id.clone()); episode.queued_at = Some(crate::agent_state::unix_now());
+                        journal.refresh_pending();
+                        if let Err(e) = journal.save(journal_path) {
+                            let episode = journal.episodes.get_mut(&key).unwrap(); episode.attempted = false; episode.native_event = None; episode.queued_at = None;
+                            journal.refresh_pending();
+                            return Err(e);
+                        }
+                        Ok(true)
+                    }, || target.input.claude_limit_boundary_matches(target.agent.turn_seq,
+                        target.agent.last_turn.ended_at, &target.agent.background)).map(|event| event.is_some())
+            });
+    }
+    if !crate::notifications::recovery_transport_definitely_unready(transport.as_ref(), &target.native_id, crate::agent_state::unix_now()) { return Ok(false); }
+    // The PTY fallback has a paste/submit gap. Never use it while Claude has
+    // live background work that can enqueue another turn during that gap.
+    if !target.agent.background.jobs.is_empty() || !target.agent.background.crons.is_empty() { return Ok(false); }
+    let geometry_version = *target.fanout.geometry_read();
     let cursor = target.fanout.snapshot_since(Some(u64::MAX));
     if cursor.closed { return Ok(false); }
-    let screen_key = (target.pid, target.generation, cursor.cursor, target.cols, target.rows);
+    let screen_key = (target.pid, target.generation, cursor.cursor, geometry_version, target.cols, target.rows);
     if observation.screens.get(&target.uid) == Some(&screen_key) { return Ok(false); }
     let snapshot = target.fanout.snapshot_since(None);
     if snapshot.closed { return Ok(false); }
-    let screen_key = (target.pid, target.generation, snapshot.cursor, target.cols, target.rows);
+    let screen_key = (target.pid, target.generation, snapshot.cursor, geometry_version, target.cols, target.rows);
     let mut screen = crate::workflow::pty_tracker::PtyModeTracker::with_size(target.cols.max(1) as usize, target.rows.max(1) as usize);
     screen.feed(&snapshot.bytes, Instant::now());
     let mode = target.fanout.keyboard().0.or_else(|| screen.composer_ready().then(|| screen.term_mode()));
@@ -411,22 +583,20 @@ fn attempt(state: &Arc<Mutex<crate::state::DaemonState>>, target: &Target, recor
     let _config = config_gate().read().unwrap_or_else(|p| p.into_inner());
     {
         let st = state.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(session) = st.sessions.get(&target.uid) else { return Ok(false); };
-        if st.restarting || st.draining || !st.config.claude_limit_recovery
-            || session.pid != target.pid || session.holder_incarnation != target.incarnation
-            || session.generation != target.generation || !target.input.belongs_to(session)
-            || session.last_exit.kernel_set() || session.workflow_run_id.is_some() || session.continuous_task_id.is_some()
-            || session.managed_by_uid.is_none() || session.managed_by_uid != target.manager
-            || crate::rotation::in_progress(&target.uid) || crate::handoff::in_progress(&target.uid)
-            || !failed_boundary(&crate::agent_state::current(session)) { return Ok(false); }
+        if !session_still_eligible(&st, target) { return Ok(false); }
+        if st.sessions.get(&target.uid).is_none_or(|s| s.last_cols != target.cols || s.last_rows != target.rows) { return Ok(false); }
         if !crate::rotation::hold(&st, &target.uid, crate::rotation::HoldOwner::ClaudeAccountRecovery) { return Ok(false); }
     }
     let _hold = WakeHold(target.uid.clone());
+    let geometry = target.fanout.geometry_read();
+    if *geometry != geometry_version { return Ok(false); }
     let Some(_native) = crate::notifications::recovery_input_guard(messaging_root, &target.uid, record.at as f64)? else { return Ok(false); };
     let Some(path) = target.path.as_ref() else { return Ok(false); };
     let key = format!("{}:{}", target.uid, record.id);
     let enter = crate::workflow::pty_tracker::enter_bytes_for_mode(mode.unwrap());
-    target.input.write_claude_limit_resume(target.captured, target.agent.turn_seq, target.agent.last_turn.ended_at, enter, || {
+    let committed_stamp = std::cell::RefCell::new(None);
+    target.input.write_claude_limit_resume(target.captured, target.agent.turn_seq, target.agent.last_turn.ended_at,
+        &target.agent.background, enter, || {
         let fresh = target.fanout.snapshot_since(Some(snapshot.cursor));
         if fresh.closed || fresh.cursor != snapshot.cursor || latest_limit(path, &target.native_id)?.as_ref() != Some(record) { return Ok(false); }
         if let Some(cwd) = &target.fallback_cwd { if !fallback_cwd_matches(path, record, cwd)? { return Ok(false); } }
@@ -435,6 +605,7 @@ fn attempt(state: &Arc<Mutex<crate::state::DaemonState>>, target: &Target, recor
         } else { None };
         let Some(episode) = journal.episodes.get_mut(&key) else { return Ok(false); };
         if !episode.armed(account.as_deref(), chrono::Utc::now().timestamp()) { return Ok(false); }
+        *committed_stamp.borrow_mut() = Some(FileStamp::read(path)?);
         episode.attempted = true;
         let was_unstaged = journal.unstaged;
         journal.unstaged = true;
@@ -445,6 +616,11 @@ fn attempt(state: &Arc<Mutex<crate::state::DaemonState>>, target: &Target, recor
             return Err(e);
         }
         Ok(true)
+    }, || Ok(committed_stamp.borrow().as_ref() == Some(&FileStamp::read(path)?)), || {
+        let fresh = target.fanout.snapshot_since(Some(snapshot.cursor));
+        !fresh.closed && fresh.cursor == snapshot.cursor
+    }, || {
+        Ok(latest_limit(path, &target.native_id)?.as_ref() == Some(record))
     })
 }
 
@@ -457,8 +633,13 @@ fn pass(state: &Arc<Mutex<crate::state::DaemonState>>, observation: &mut Account
             if st.config.claude_limit_recovery && !st.restarting && !st.draining { targets(&st) } else { Vec::new() })
     };
     let mut journal = observation.read_journal(&journal_path)?;
+    refresh_native_receipts(&mut journal, &journal_path, &root)?;
     flush_digests(&mut journal, &journal_path, &root)?;
-    if !enabled { observation.cache_journal(&journal_path, journal); return Ok(()); }
+    if !enabled {
+        stage_digests(&mut journal, &journal_path, BTreeMap::new(), false)?;
+        flush_digests(&mut journal, &journal_path, &root)?;
+        observation.cache_journal(&journal_path, journal); return Ok(());
+    }
     let Some(profile) = profile_path() else { observation.cache_journal(&journal_path, journal); return Ok(()); };
     let account = observation.fingerprint(&profile).ok();
     let observed_at = chrono::Utc::now().timestamp();
@@ -527,14 +708,28 @@ fn pass(state: &Arc<Mutex<crate::state::DaemonState>>, observation: &mut Account
         let result = attempt(state, target, &record, &profile, &mut journal, &journal_path, &root, observation);
         let episode = journal.episodes.get_mut(&key).unwrap();
         if episode.attempted {
-            episode.outcome = Some(match result {
-                Ok(true) => "resume input written; turn not yet confirmed".into(),
-                Ok(false) => "attempt outcome unknown".into(),
-                Err(_) => "input outcome unknown; no automatic retry".into(),
-            });
+            episode.digest = None;
+            episode.outcome = match (&episode.native_event, result) {
+                (Some(_), Ok(true)) => None,
+                (Some(_), Ok(false)) => Some("not resumed: final safety check changed; no event published".into()),
+                (Some(_), Err(_)) => Some("native publication outcome unknown; no automatic retry".into()),
+                (None, Ok(true)) => Some("resume input written; turn not yet confirmed".into()),
+                (None, Ok(false)) => Some("not resumed: final safety check changed".into()),
+                (None, Err(_)) => Some("input outcome unknown; no automatic retry".into()),
+            };
+            journal.unstaged = journal.episodes.values().any(notice_ready);
             journal.save(&journal_path)?;
-        } else if let Err(e) = result {
-            eprintln!("cm-daemon: Claude account recovery {} deferred: {e}", target.uid);
+        } else {
+            // An unsafe/busy composer or changed evidence gets one immediate
+            // notice and no more attempts until a new switch or reset edge.
+            episode.deferred = true;
+            episode.deferred_account = target_account.map(str::to_owned);
+            episode.deferred_reset_due = episode.reset_at.is_some_and(|at| chrono::Utc::now().timestamp() >= at);
+            episode.outcome = Some("not resumed: composer busy/draft or safety check; resume by hand".into());
+            episode.digest = None;
+            journal.unstaged = true;
+            if let Err(e) = result { eprintln!("cm-daemon: Claude account recovery {} not submitted: {e}", target.uid); }
+            journal.save(&journal_path)?;
         }
     }
     // Freeze each system notice before publishing so a crash cannot create a
@@ -551,6 +746,8 @@ fn pass(state: &Arc<Mutex<crate::state::DaemonState>>, observation: &mut Account
 /// hold the global state lock. Processing attempts sequentially naturally
 /// staggers sends (each paste/submit is serialized through its settle gap).
 pub(crate) fn start(state: &Arc<Mutex<crate::state::DaemonState>>) -> io::Result<()> {
+    let enabled = state.lock().unwrap_or_else(|p| p.into_inner()).config.claude_limit_recovery;
+    configure(state, enabled)?;
     let weak = Arc::downgrade(state);
     std::thread::Builder::new().name("cm-claude-account-recovery".into()).spawn(move || {
       let mut observation = AccountObservation::default();
@@ -597,6 +794,7 @@ pub(crate) fn latest_limit(path: &Path, native_id: &str) -> io::Result<Option<Li
         &bytes[cut + 1..]
     } else { &bytes[..] };
     let mut lines: Vec<&[u8]> = bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()).collect();
+    let mut later_queue_activity = false;
     while let Some(line) = lines.pop() {
         let v: Value = serde_json::from_slice(line).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid transcript record"))?;
         if v["isSidechain"] == true { continue; }
@@ -610,6 +808,9 @@ pub(crate) fn latest_limit(path: &Path, native_id: &str) -> io::Result<Option<Li
                     || v["isApiErrorMessage"] != true || v["message"]["model"] != "<synthetic>" {
                     return Ok(None);
                 }
+                if later_queue_activity {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "queue activity after the failure"));
+                }
                 let id = v["uuid"].as_str().filter(|s| uuid::Uuid::parse_str(s).is_ok())
                     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing limit record identity"))?;
                 let at = v["timestamp"].as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
@@ -618,7 +819,8 @@ pub(crate) fn latest_limit(path: &Path, native_id: &str) -> io::Result<Option<Li
                 let reset_at = v["quotaLimits"]["resetsAt"].as_i64().filter(|reset| *reset >= at);
                 return Ok(Some(LimitRecord { id: id.to_owned(), session_id: native_id.to_owned(), at, reset_at }));
             }
-            Some("system" | "progress" | "file-history-snapshot" | "last-prompt" | "summary" | "queue-operation" | "attachment") => continue,
+            Some("queue-operation" | "attachment") => { later_queue_activity = true; continue; },
+            Some("system" | "progress" | "file-history-snapshot" | "last-prompt" | "summary") => continue,
             _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown transcript record")),
         }
     }
@@ -646,6 +848,8 @@ mod tests {
         assert_eq!(latest_limit(&path, SESSION).unwrap(), None);
         let mut ordinary = fixture(); ordinary["isApiErrorMessage"] = json!(false);
         write(&path, &[ordinary]); assert_eq!(latest_limit(&path, SESSION).unwrap(), None);
+        write(&path, &[fixture(), json!({"type":"queue-operation","operation":"enqueue"})]);
+        assert!(latest_limit(&path, SESSION).is_err());
         write(&path, &[fixture(), json!({"type":"assistant","sessionId":SESSION,"message":{"model":"claude"}})]);
         assert_eq!(latest_limit(&path, SESSION).unwrap(), None);
     }
@@ -674,6 +878,17 @@ mod tests {
         let mut restored = Journal::load(&path).unwrap();
         assert!(!restored.observe("worker", &record, Some("different-account")).armed(Some("different-account"), 3000));
         std::fs::write(&path, "{").unwrap(); assert!(Journal::load(&path).is_err());
+    }
+    #[test]
+    fn deferred_record_waits_for_a_new_switch_or_reset_edge() {
+        let record = LimitRecord { id: RECORD.into(), session_id: SESSION.into(), at: 1000, reset_at: Some(2000) };
+        let mut journal = Journal::new(); let episode = journal.observe("worker", &record, Some("old"));
+        assert!(episode.armed(Some("new"), 1500));
+        episode.deferred = true; episode.deferred_account = Some("new".into()); episode.deferred_reset_due = false;
+        assert!(!episode.armed(Some("new"), 1500));
+        assert!(episode.armed(Some("next"), 1500));
+        assert!(episode.armed(Some("new"), 2000));
+        episode.attempted = true; assert!(!episode.armed(Some("next"), 3000));
     }
     #[test]
     fn unknown_baseline_does_not_prove_a_switch() {
@@ -728,6 +943,67 @@ mod tests {
         assert_eq!(crate::notifications::snapshot(dir.path(), "manager").unwrap().0.len(), 1);
     }
     #[test]
+    fn pending_native_digest_waits_for_receipt_or_ten_minutes() {
+        let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("journal.json");
+        let record = LimitRecord { id: RECORD.into(), session_id: SESSION.into(), at: 1000, reset_at: Some(2000) };
+        let mut journal = Journal::new(); let episode = journal.observe("worker", &record, Some("a"));
+        episode.manager = Some("manager".into()); episode.attempted = true;
+        episode.native_event = Some("native-id".into()); episode.queued_at = Some(crate::agent_state::unix_now());
+        journal.refresh_pending();
+        stage_digests(&mut journal, &path, [("manager".into(), vec!["unbound".into()])].into_iter().collect(), false).unwrap();
+        assert!(journal.digests.is_empty());
+        journal.episodes.values_mut().next().unwrap().queued_at = Some(crate::agent_state::unix_now() - 601.0);
+        journal.refresh_pending();
+        stage_digests(&mut journal, &path, BTreeMap::new(), false).unwrap();
+        let digest = journal.digests.values().next().unwrap();
+        assert!(digest.text.contains("pending (delivery unconfirmed)"));
+        assert!(digest.text.contains("unbound: could not check"));
+    }
+    #[test]
+    fn disable_cancels_only_pending_native_events() {
+        let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("daemon-claude-account-recovery.json");
+        let mut daemon = crate::state::DaemonState::new(); daemon.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
+        daemon.messaging_root = dir.path().into(); let state = Arc::new(Mutex::new(daemon));
+        crate::notifications::set_recovery_enabled(dir.path(), true).unwrap();
+        let mut journal = Journal::new();
+        for (uid, id, status) in [("one", "id-one", "pending"), ("two", "id-two", "submitted")] {
+            let mut record = LimitRecord { id: RECORD.into(), session_id: SESSION.into(), at: 1000, reset_at: None };
+            if uid == "two" { record.id = "123e4567-e89b-12d3-a456-426614174000".into(); }
+            let episode = journal.observe(uid, &record, Some("account")); episode.attempted = true; episode.native_event = Some(id.into());
+            crate::notifications::publish(dir.path(), uid, id, "claude-limit-recovery", "[x] wake", "[x]").unwrap();
+            if status == "submitted" {
+                let queue = crate::notifications::directory(dir.path(), uid);
+                let event_file = std::fs::read_dir(queue).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == "json")).unwrap();
+                let mut event: Value = serde_json::from_slice(&std::fs::read(&event_file).unwrap()).unwrap();
+                event["status"] = json!("submitted"); crate::messaging::atomic_replace(&event_file, &event).unwrap();
+            }
+        }
+        journal.save(&path).unwrap(); configure(&state, false).unwrap();
+        assert!(!crate::notifications::recovery_enabled(dir.path()));
+        assert_eq!(crate::notifications::get(dir.path(), "one", "id-one").unwrap().unwrap()["status"], "cancelled");
+        assert_eq!(crate::notifications::get(dir.path(), "two", "id-two").unwrap().unwrap()["status"], "submitted");
+        configure(&state, true).unwrap();
+        assert!(crate::notifications::recovery_enabled(dir.path()));
+        assert_eq!(crate::notifications::get(dir.path(), "one", "id-one").unwrap().unwrap()["status"], "cancelled");
+    }
+    #[test]
+    fn native_receipt_supersession_reaches_the_single_manager_digest() {
+        let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("journal.json");
+        let record = LimitRecord { id: RECORD.into(), session_id: SESSION.into(), at: 1000, reset_at: None };
+        let mut journal = Journal::new(); let e = journal.observe("worker", &record, Some("a"));
+        e.manager = Some("manager".into()); e.attempted = true; e.native_event = Some("native-id".into());
+        e.queued_at = Some(crate::agent_state::unix_now()); journal.refresh_pending();
+        crate::notifications::publish(dir.path(), "worker", "native-id", "claude-limit-recovery", "[x] resume", "[x]").unwrap();
+        refresh_native_receipts(&mut journal, &path, dir.path()).unwrap();
+        assert!(journal.episodes.values().next().unwrap().outcome.is_none());
+        crate::notifications::cancel_recovery_pending(dir.path(), "worker", "native-id", "superseded").unwrap();
+        refresh_native_receipts(&mut journal, &path, dir.path()).unwrap();
+        stage_digests(&mut journal, &path, BTreeMap::new(), false).unwrap();
+        assert!(journal.digests.values().next().unwrap().text.contains("superseded by newer input"));
+        flush_digests(&mut journal, &path, dir.path()).unwrap();
+        assert_eq!(crate::notifications::snapshot(dir.path(), "manager").unwrap().0.len(), 1);
+    }
+    #[test]
     fn claude_composer_requires_empty_current_input_row() {
         for (row, col, expected) in [("❯ ", 3, true), ("❯ draft", 3, false), ("❯ ", 7, false)] {
             let mut screen = crate::workflow::pty_tracker::PtyModeTracker::with_size(80, 24);
@@ -755,12 +1031,31 @@ mod tests {
         }
         let agent = cell.lock().unwrap().recompute(now);
         assert!(failed_boundary(&agent), "{agent:?}");
+        let mut with_job = agent.clone();
+        with_job.background.jobs.push(serde_json::from_value(json!({"id":"active-job","kind":"shell","first_seen_at":1.0,"wakes_agent":true})).unwrap());
+        assert!(failed_boundary(&with_job), "active background jobs do not erase the failed foreground");
+        assert!(!same_background(&agent.background, &with_job.background));
         let captured = Instant::now();
-        assert!(!input.write_claude_limit_resume(captured, agent.turn_seq, agent.last_turn.ended_at, b"\r", || Ok(false)).unwrap());
+        assert!(!input.write_claude_limit_resume(captured, agent.turn_seq, agent.last_turn.ended_at, &agent.background, b"\r", || Ok(false), || Ok(true), || true, || Ok(true)).unwrap());
         assert!(writes.lock().unwrap().is_empty());
+        let captured_cell = Arc::clone(&cell);
+        assert!(!input.write_claude_limit_resume(captured, agent.turn_seq, agent.last_turn.ended_at, &agent.background, b"\r", || {
+            let job: crate::agent_state::Job = serde_json::from_value(json!({"id":"finished-job","kind":"shell","first_seen_at":1.0,"wakes_agent":true})).unwrap();
+            captured_cell.lock().unwrap().inputs.background.jobs.push(job); Ok(true)
+        }, || Ok(true), || true, || Ok(true)).unwrap());
+        assert!(writes.lock().unwrap().is_empty(), "background change after commit must refuse before bytes");
+        cell.lock().unwrap().inputs.background.jobs.clear();
         input.stamp_operator_input_at(Instant::now());
-        assert!(!input.write_claude_limit_resume(captured, agent.turn_seq, agent.last_turn.ended_at, b"\r", || panic!("must not commit after human input")).unwrap());
+        assert!(!input.write_claude_limit_resume(captured, agent.turn_seq, agent.last_turn.ended_at, &agent.background, b"\r", || panic!("must not commit after human input"), || Ok(true), || true, || Ok(true)).unwrap());
         assert!(writes.lock().unwrap().is_empty());
+        let (other, other_writes) = crate::session::InputHandle::test_handle_capturing();
+        other.test_agent_state().lock().unwrap().inputs = cell.lock().unwrap().inputs.clone();
+        let fresh = other.test_agent_state().lock().unwrap().recompute(crate::agent_state::unix_now());
+        let err = other.write_claude_limit_resume(Instant::now(), fresh.turn_seq, fresh.last_turn.ended_at,
+            &fresh.background, b"\r", || Ok(true), || Ok(true), || true, || Ok(false)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        let written = other_writes.lock().unwrap();
+        assert_eq!(written.len(), 1, "a late completion withholds Enter after the paste");
     }
     #[test]
     fn actual_attempt_rechecks_manager_disable_and_new_user_before_writing() {
@@ -795,6 +1090,10 @@ mod tests {
         let mut daemon = crate::state::DaemonState::new(); daemon.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
         daemon.messaging_root = dir.path().into(); daemon.sessions.insert(uid.clone(), session);
         let state = Arc::new(Mutex::new(daemon));
+        crate::notifications::set_recovery_enabled(dir.path(), true).unwrap();
+        let queue = crate::notifications::directory(dir.path(), &uid);
+        std::fs::create_dir_all(&queue).unwrap();
+        crate::messaging::atomic_replace(&queue.join("transport.json"), &json!({"status":"degraded", "engine":"claude-code", "updated_at":crate::agent_state::unix_now(), "own_session_id":SESSION, "bound_session_id":SESSION})).unwrap();
         let target = targets(&state.lock().unwrap()).pop().expect("failed managed candidate");
         let journal_path = dir.path().join("recovery.json"); let mut journal = Journal::new();
         journal.observe(&uid, &record, None).manager = Some("manager".into()); journal.save(&journal_path).unwrap();
@@ -814,6 +1113,51 @@ mod tests {
         assert!(attempt(&state, &target, &record, &profile, &mut journal, &journal_path, dir.path(), &mut runtime).unwrap());
         assert!(Journal::load(&journal_path).unwrap().episodes.values().next().unwrap().attempted);
         assert!(!attempt(&state, &target, &record, &profile, &mut journal, &journal_path, dir.path(), &mut runtime).unwrap());
+        let _ = state.lock().unwrap().sessions.get_mut(&uid).unwrap().kill();
+    }
+    #[test]
+    fn active_background_uses_owned_native_queue_without_pty_write() {
+        let dir = tempfile::tempdir().unwrap(); let uid = format!("ts-native-test-{}", uuid::Uuid::new_v4());
+        let transcript = dir.path().join(format!("{SESSION}.jsonl")); let profile = dir.path().join("profile.json");
+        std::fs::write(&profile, json!({"oauthAccount":{"accountUuid":"123e4567-e89b-12d3-a456-426614174000"}}).to_string()).unwrap();
+        let now = chrono::Utc::now().timestamp(); let mut failure = fixture();
+        failure["timestamp"] = json!(chrono::DateTime::from_timestamp(now - 120, 0).unwrap().to_rfc3339());
+        failure["quotaLimits"]["resetsAt"] = json!(now - 60);
+        write(&transcript, &[failure, json!({"type":"system","subtype":"turn_duration"})]);
+        let record = latest_limit(&transcript, SESSION).unwrap().unwrap();
+        let mut params = crate::session::SpawnParams::new(&uid, "worker", "/bin/sleep");
+        params.args = vec!["60".into()]; params.session_type = "claude-code".into(); params.workspace_id = "w".into();
+        params.managed_by_uid = Some("manager".into()); params.transcript_path = Some(transcript.to_string_lossy().into());
+        let session = crate::session::PendingSession::spawn(params).unwrap().arm_reaper(None).unwrap();
+        let at = crate::agent_state::unix_now();
+        {
+            let mut cell = session.agent_state.lock().unwrap();
+            cell.inputs.presence = Some(crate::agent_state::PresenceObs { valid:true,
+                status:crate::agent_state::PresenceStatus::Idle, observed_at:at, status_updated_at:Some(at - 1.0),
+                native_session_id:Some(SESSION.into()), engine_version:Some("2.1.312".into()), waiting_for:None,
+                main_turn_open:None, transcript_error:Some("rate_limit".into()),
+                transcript_end:Some(crate::agent_state::LastTurn { ended_at:Some((now - 120) as f64), status:Some(crate::agent_state::TurnStatus::Failed) }),
+                transcript_evidence_path:Some(transcript.clone()) });
+            cell.inputs.latest_start = Some((now - 180) as f64); cell.inputs.background.complete = true;
+            cell.inputs.background.jobs.push(serde_json::from_value(json!({"id":"bg","kind":"shell","first_seen_at":1.0,"wakes_agent":true})).unwrap());
+        }
+        let mut daemon = crate::state::DaemonState::new(); daemon.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
+        daemon.messaging_root = dir.path().into(); daemon.sessions.insert(uid.clone(), session);
+        let state = Arc::new(Mutex::new(daemon)); crate::notifications::set_recovery_enabled(dir.path(), true).unwrap();
+        let queue = crate::notifications::directory(dir.path(), &uid); std::fs::create_dir_all(&queue).unwrap();
+        crate::messaging::atomic_replace(&queue.join("transport.json"), &json!({"status":"ready","engine":"claude-code",
+            "updated_at":crate::agent_state::unix_now(),"own_session_id":SESSION,"bound_session_id":SESSION})).unwrap();
+        let target = targets(&state.lock().unwrap()).pop().expect("failed foreground with background job");
+        let before = target.input.last_activity(); let journal_path = dir.path().join("journal.json");
+        let mut journal = Journal::new(); journal.observe(&uid, &record, None).manager = Some("manager".into()); journal.save(&journal_path).unwrap();
+        let mut runtime = AccountObservation::default();
+        assert!(attempt(&state, &target, &record, &profile, &mut journal, &journal_path, dir.path(), &mut runtime).unwrap());
+        assert_eq!(target.input.last_activity(), before, "native recovery must not write to the PTY");
+        let episode = journal.episodes.values().next().unwrap(); assert!(episode.attempted && episode.native_event.is_some());
+        let events = crate::notifications::snapshot(dir.path(), &uid).unwrap().0;
+        assert_eq!(events.len(), 1); assert_eq!(events[0]["status"], "pending");
+        assert!(!attempt(&state, &target, &record, &profile, &mut journal, &journal_path, dir.path(), &mut runtime).unwrap());
+        assert_eq!(crate::notifications::snapshot(dir.path(), &uid).unwrap().0.len(), 1);
         let _ = state.lock().unwrap().sessions.get_mut(&uid).unwrap().kill();
     }
 }
