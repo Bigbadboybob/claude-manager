@@ -374,6 +374,8 @@ mod tests {
         let mut child = make_session_tasked("ts-child", "ws-child", Some("task-child"));
         child.managed_by_uid = Some("ts-parent".into());
         let mut state = state_with(vec![parent, child]);
+        state.task_tree.insert("task-parent".into(), None);
+        state.task_tree.insert("task-child".into(), None);
         assert_eq!(check_session_caller(&state, "ts-parent", "ts-child"), AuthDecision::OutOfScope);
         state.task_tree.insert("task-child".into(), Some("task-parent".into()));
         assert_eq!(check_session_caller(&state, "ts-parent", "ts-child"), AuthDecision::Allow);

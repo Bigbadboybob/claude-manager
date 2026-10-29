@@ -538,6 +538,41 @@ pub fn mint_task_worktree_at(
     wip_branch_hint: Option<&str>,
     base: Option<&str>,
 ) -> anyhow::Result<MintedTaskWorktree> {
+    mint_task_worktree_at_impl(main_repo, task_id, task_name, wip_branch_hint, base, false)
+}
+
+/// Operator launch requires the resulting checkout to belong to its explicit
+/// local repository, including a reused deterministic path. Verify before setup
+/// can run scripts in that path. Legacy MCP mint semantics are unchanged.
+pub fn mint_task_worktree_at_verified(
+    main_repo: &Path,
+    task_id: &str,
+    task_name: &str,
+    wip_branch_hint: Option<&str>,
+    base: Option<&str>,
+) -> anyhow::Result<MintedTaskWorktree> {
+    let minted = mint_task_worktree_at_impl(main_repo, task_id, task_name, wip_branch_hint, base, true)?;
+    verify_task_worktree_repo(main_repo, &minted.worktree_path)?;
+    Ok(minted)
+}
+
+pub(crate) fn verify_task_worktree_repo(main_repo: &Path, path: &Path) -> anyhow::Result<()> {
+    let expected = std::fs::canonicalize(main_repo)?;
+    let actual = main_checkout_of(path).and_then(|p| std::fs::canonicalize(p).ok());
+    if actual.as_ref() != Some(&expected) {
+        anyhow::bail!("task worktree {} does not belong to repo_path {}", path.display(), main_repo.display());
+    }
+    Ok(())
+}
+
+fn mint_task_worktree_at_impl(
+    main_repo: &Path,
+    task_id: &str,
+    task_name: &str,
+    wip_branch_hint: Option<&str>,
+    base: Option<&str>,
+    verify_repo: bool,
+) -> anyhow::Result<MintedTaskWorktree> {
     let branch = task_worktree_branch(task_id, task_name);
 
     // (1) The task already has a branch on record → re-attach it.
@@ -562,6 +597,9 @@ pub fn mint_task_worktree_at(
         None => resolve_project_main(main_repo)?,
     };
     let worktree_path = create_subtask_worktree(main_repo, &branch, SubtaskStart::Base(&trunk_sha))?;
+    if verify_repo {
+        verify_task_worktree_repo(main_repo, &worktree_path)?;
+    }
     setup_worktree(main_repo, &worktree_path);
     let base_sha = worktree_head_sha(&worktree_path).unwrap_or(trunk_sha);
     Ok(MintedTaskWorktree {

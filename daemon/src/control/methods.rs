@@ -9511,13 +9511,12 @@ fn mint_task_workspace(
             "Task '{}' retains a workspace binding but its prior local branch could not be verified; reconcile the existing checkout before relaunching.", task_id
         )));
     }
-    let minted = crate::worktree::mint_task_worktree_at(
-        &main_repo,
-        task_id,
-        &task_name,
-        wip_branch_hint.as_deref(),
-        base,
-    )
+    let mint = if ctx.explicit_repo.is_some() {
+        crate::worktree::mint_task_worktree_at_verified
+    } else {
+        crate::worktree::mint_task_worktree_at
+    };
+    let minted = mint(&main_repo, task_id, &task_name, wip_branch_hint.as_deref(), base)
         .map_err(|e| {
             (
                 ErrorCode::Conflict,
@@ -9906,9 +9905,14 @@ fn operator_workspace_resolution(
     };
     if let Some((id, workspace)) = bound {
         let path = workspace.worktree_path.ok_or((ErrorCode::Conflict, "bound workspace has no worktree path".into()))?;
-        let repo = crate::worktree::main_checkout_of(&path)
-            .or_else(|| workspace.main_repo_path.and_then(|p| crate::worktree::main_checkout_of(&p)))
-            .and_then(|p| std::fs::canonicalize(p).ok());
+        // Only a genuinely missing checkout may use the retained main repo
+        // for recovery. A present unmanaged/dangling/wrong-repo path fails closed.
+        let repo = match std::fs::symlink_metadata(&path) {
+            Ok(_) => crate::worktree::main_checkout_of(&path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
+                workspace.main_repo_path.and_then(|p| crate::worktree::main_checkout_of(&p)),
+            Err(_) => None,
+        }.and_then(|p| std::fs::canonicalize(p).ok());
         if repo.as_ref() != Some(&context.repo_path) {
             return Err((ErrorCode::Conflict, "task's bound workspace does not belong to repo_path; reconcile the binding first".into()));
         }
@@ -10312,6 +10316,11 @@ fn start_agent_with_context(
                 )
             }
         };
+
+    if let Some(context) = operator_launch {
+        crate::worktree::verify_task_worktree_repo(&context.repo_path, &working_dir)
+            .map_err(|e| (ErrorCode::Conflict, e.to_string()))?;
+    }
 
     // ux-5c: resolve the task binding BEFORE the spawn so the
     // auto-delivery lookup and the response can both use it.
@@ -39561,18 +39570,33 @@ while True:
                 assert!(matches!(operator_workspace_resolution(&state,task,&context).unwrap(), WorkspaceResolution::Ready { working_dir, .. } if working_dir == path));
                 assert_eq!(std::fs::read_to_string(path.join("keep.txt")).unwrap(), "uncommitted work");
                 let other = seed_other_clone(home, &format!("other-{engine}"), "fixture-other");
+                std::fs::write(other.join("setup_worktree.sh"),
+                    r#"#!/bin/sh
+printf ran > "$MAIN_REPO/setup-ran"
+"#).unwrap();
                 let context = OperatorLaunchContext { repo_path:other.clone(), ..context };
                 assert_eq!(operator_workspace_resolution(&state,task,&context).err().unwrap().0, ErrorCode::Conflict);
                 // Simulate the mint plan taken before a competing registration:
                 // the registration check must reject a different winning path.
                 let config = state.lock().unwrap().config.clone();
-                let stale = MintContext { explicit_repo:Some(other.clone()), recover_existing:false,
-                    caller_paths:vec![other], workspace_paths:vec![], repos_dir:home.join("repos"),
+                let mut stale = MintContext { explicit_repo:Some(other.clone()), recover_existing:false,
+                    caller_paths:vec![other.clone()], workspace_paths:vec![], repos_dir:home.join("repos"),
                     allow_clone:false, allow_entries:vec![], api_url:config.api_url,
                     api_token:config.api_token, base:None };
                 let error = mint_task_workspace(&state,task,&stale).err().unwrap();
                 assert_eq!(error.0, ErrorCode::Conflict);
-                assert!(error.1.contains("changed during operator mint"));
+                assert!(error.1.contains("does not belong to repo_path"), "{}", error.1);
+                assert!(!other.join("setup-ran").exists(), "foreign setup must not run in this checkout");
+                assert_eq!(std::fs::read_to_string(path.join("keep.txt")).unwrap(), "uncommitted work");
+                // A different registration path in the same repo must also
+                // refuse; matching only repository identity is insufficient.
+                let wsid = state.lock().unwrap().task_workspaces[task].clone();
+                state.lock().unwrap().workspaces.get_mut(&wsid).unwrap().worktree_path = Some(repo.clone());
+                stale.explicit_repo = Some(repo.clone());
+                stale.caller_paths = vec![repo.clone()];
+                let error = mint_task_workspace(&state,task,&stale).err().unwrap();
+                assert!(error.1.contains("changed during operator mint"), "{}", error.1);
+                state.lock().unwrap().workspaces.get_mut(&wsid).unwrap().worktree_path = Some(path);
                 assert_eq!(state.lock().unwrap().sessions.len(), count);
             }
             set_spawn_program_override_for_test(None);
