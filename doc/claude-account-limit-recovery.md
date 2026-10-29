@@ -38,6 +38,21 @@ cannot be trusted. A recovery configuration failure leaves recovery disabled
 while other hot settings still apply; reload returns a warning, including when
 it cannot confirm that the disabled marker was written.
 
+To restore recovery after quarantine, first disable it in the config and reload;
+confirm the disabled marker in the reload result. Preserve the quarantined
+journal and inspect any unreadable notification event: one unreadable event can
+prevent cancellation and re-enablement. If an event must be moved aside for
+repair, keep its contents and receipt for inspection. Supply a clean journal
+named `daemon-claude-account-recovery.json` beside `daemon-sessions.json`, with
+contents `{"version":1,"episodes":{}}`, then enable recovery and reload again.
+Do not delete `daemon-claude-account-recovery.quarantined`: it preserves the
+cutoff and causes old pending recovery events to be cancelled before recovery
+is enabled. Records at or before that cutoff cannot be retried automatically.
+
+If the journal is corrupt and the disabled marker cannot be written at startup,
+a previously pending event can still make its first delivery. No duplicate is
+created, but the operator should inspect retained receipts before recovery.
+
 PTY delivery is a fallback only when a fresh, identity-matched transport report
 proves the native channel is unavailable and there are no live background jobs
 or crons. It requires an empty composer and holds the writer, lifecycle and
@@ -57,3 +72,7 @@ The empty-composer check deliberately fails closed when terminal evidence is
 missing. A fixture from the deployed Claude limit screen has not yet been
 captured; isolated synthetic screen tests do not prove that all deployed CLI
 versions render an accepted composer.
+
+The explicit one-admission-per-pass cap applies to both delivery routes. The
+worker's older source comment about staggering through the PTY settle gap
+predates that cap; it does not describe native delivery's pacing.
