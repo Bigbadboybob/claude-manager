@@ -602,6 +602,7 @@ def board(
     membership: str | None = None,
     session: str | None = None,
     reason: str | None = None,
+    flags_only: bool = False,
 ) -> dict:
     """Read your board: flags first, then items by group, recently closed
     items (24 h), free capacity (idle sessions on the board holding no
@@ -613,8 +614,11 @@ def board(
 
     view="full" returns item dicts with their last 5 history events.
     mine=True keeps only your items; group filters by heading; archived=True
-    adds archived items; query searches titles, notes and groups. Any
-    session may read any board by slug.
+    adds archived items; query searches titles, notes and groups. The flag
+    list remains board-wide even when items are filtered. flags_only=True
+    returns every open flag with its item title, holders and block/check-back
+    context, without item bodies; item filters do not restrict that list.
+    Any session may read any board by slug.
 
     settings={...} changes the board's settings first (board members only),
     e.g. {"stale_s": 9000}. Owner or the board's orchestrator only:
@@ -636,6 +640,8 @@ def board(
             raise ValueError("membership must be join, leave or remove")
         return _items_call(verb, {"board": board, "session": session, "group": group, "reason": reason})
     params = dict(locals())
+    if not flags_only:
+        params.pop("flags_only", None)
     for key in ("membership", "session", "reason"):
         params.pop(key, None)
     if params.pop("settings", None):

@@ -449,15 +449,33 @@ def compose(slug: str, flag_parts: list[str], closed: dict[str, list[int]],
     text = f"{head} {' · '.join(sections)}.{tail}"
     if len(text) <= limit:
         return text
-    # Keep whole flag entries; say how many were left out.
-    kept = list(flag_parts)
-    while kept and len(text) > limit:
-        kept.pop()
-        rest = len(flag_parts) - len(kept)
-        sections[0] = (f"{len(flag_parts)} flags: " + "; ".join(kept)
-                       + f"; +{rest} more")
-        text = f"{head} {' · '.join(sections)}.{tail}"
-    return text[:limit]
+    if not flag_parts:
+        return text[:limit]
+    # Keep whole flag entries and reserve the complete recovery instruction.
+    # The compact board read is board-wide even when item filters are in use.
+    digest = " · ".join(sections[1:])
+    for keep_digest in (True, False) if digest else (False,):
+        for count in range(len(flag_parts) - 1, -1, -1):
+            omitted = len(flag_parts) - count
+            shown = "; ".join(flag_parts[:count])
+            noun = "flag" if len(flag_parts) == 1 else "flags"
+            prefix = f"{head} {len(flag_parts)} {noun}" + (f": {shown}" if shown else "")
+            if keep_digest:
+                prefix += f" · {digest}"
+            separator = " · " if keep_digest else "; " if shown else ": "
+            suffix = f'+{omitted} more: board(board="{slug}", flags_only=true)'
+            candidate = prefix + separator + suffix
+            if len(candidate) <= limit:
+                return candidate
+    # With a tiny limit the board-specific command may not fit. Never point
+    # to a different board: retain its name if possible, otherwise the count.
+    fallback = f'+{len(flag_parts)} more: board(board="{slug}", flags_only=true)'
+    if len(fallback) <= limit:
+        return fallback
+    fallback = f"+{len(flag_parts)} more (board: {slug})"
+    if len(fallback) <= limit:
+        return fallback
+    return f"+{len(flag_parts)} more"[:limit]
 
 
 # ---- one board, one tick ---------------------------------------------------

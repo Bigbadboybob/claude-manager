@@ -919,6 +919,23 @@ pub fn launch_line(launch: &Value, now: DateTime<Utc>) -> Option<String> {
 
 /// Shape a `GET /boards/{ref}` reply for `board()`; pure, for tests.
 pub(crate) fn shape_board(read: &Value, pid: &str, params: &Value, now: DateTime<Utc>) -> Value {
+    if params["flags_only"] == true {
+        // The API read is unfiltered in this mode, so every flag can be
+        // joined to its item without exposing the item body or history.
+        let items = read["items"].as_array().into_iter().flatten()
+            .chain(read["recently_closed"].as_array().into_iter().flatten());
+        let by_number: std::collections::HashMap<i64, &Value> = items
+            .filter_map(|i| i["n"].as_i64().map(|n| (n, i))).collect();
+        let flags: Vec<Value> = read["flags"].as_array().into_iter().flatten().map(|f| {
+            let item = f["n"].as_i64().and_then(|n| by_number.get(&n).copied());
+            let holders: Vec<&str> = item.and_then(|i| i["holders"].as_array())
+                .into_iter().flatten().filter_map(|h| h["name"].as_str().or_else(|| h["pid"].as_str())).collect();
+            json!({"n": f["n"], "title": item.map(|i| &i["title"]), "kind": f["kind"],
+                "holders": holders, "blocked_on": item.map(|i| &i["blocked_on"]),
+                "check_back_at": item.map(|i| &i["check_back_at"]), "age_s": f["age_s"]})
+        }).collect();
+        return json!({"board": board_header(&read["board"]), "flags": flags});
+    }
     let mine = params["mine"] == true;
     let group = params["group"].as_str().map(str::to_lowercase);
     let full = params["view"] == "full";
@@ -929,11 +946,9 @@ pub(crate) fn shape_board(read: &Value, pid: &str, params: &Value, now: DateTime
     let mut items: Vec<&Value> = read["items"].as_array().map(|v| v.iter().filter(keep).collect()).unwrap_or_default();
     // Flagged first (the API already orders by group, then number).
     items.sort_by_key(|i| i["flags"].as_array().is_none_or(Vec::is_empty));
-    let kept: std::collections::BTreeSet<i64> = items.iter().filter_map(|i| i["n"].as_i64()).collect();
-    let flags: Vec<&Value> = read["flags"]
-        .as_array()
-        .map(|v| v.iter().filter(|f| f["n"].as_i64().is_some_and(|n| kept.contains(&n))).collect())
-        .unwrap_or_default();
+    // Board-level flag health must not disappear when item rows are filtered.
+    let flags: Vec<&Value> = read["flags"].as_array()
+        .map(|v| v.iter().collect()).unwrap_or_default();
     let closed: Vec<&Value> = if params["include_closed"] == false {
         vec![]
     } else {
@@ -1213,17 +1228,19 @@ fn board_read(ctx: &Ctx, params: &Value) -> RpcResult {
     let board = resolve_board(ctx, params)?;
     let slug = slug(&board)?;
     let mut query: Vec<(&str, String)> = vec![];
-    if params["archived"] == true {
-        query.push(("archived", "true".into()));
-    }
-    if let Some(q) = params["query"].as_str().filter(|q| !q.trim().is_empty()) {
-        query.push(("q", q.trim().into()));
-    }
-    if params["view"] == "full" {
-        query.push(("history", "5".into()));
-    }
-    if let Some(v) = params["since_version"].as_i64() {
-        query.push(("since_version", v.to_string()));
+    if params["flags_only"] != true {
+        if params["archived"] == true {
+            query.push(("archived", "true".into()));
+        }
+        if let Some(q) = params["query"].as_str().filter(|q| !q.trim().is_empty()) {
+            query.push(("q", q.trim().into()));
+        }
+        if params["view"] == "full" {
+            query.push(("history", "5".into()));
+        }
+        if let Some(v) = params["since_version"].as_i64() {
+            query.push(("since_version", v.to_string()));
+        }
     }
     let read = ctx.api.get(&format!("/boards/{slug}"), &query)?;
     if read["unchanged"] == true {
@@ -1407,11 +1424,38 @@ mod tests {
         let now = Utc::now();
         let out = shape_board(&sample_read(), "agent:d1:me-uid", &json!({"mine":true,"include_closed":false}), now);
         assert_eq!(out["items"].as_array().unwrap().len(), 1);
-        assert_eq!(out["flags"], json!([]));
+        assert_eq!(out["flags"], json!(["#14 holder_idle 10m"]));
         assert_eq!(out["recently_closed"], json!([]));
         let out = shape_board(&sample_read(), "x", &json!({"group":"rl","view":"full"}), now);
         assert_eq!(out["items"].as_array().unwrap().len(), 2);
         assert_eq!(out["items"][0]["n"], 14);
+    }
+
+    #[test]
+    fn flags_only_returns_every_flag_with_compact_item_context() {
+        let mut read = sample_read();
+        read["items"][2]["blocked_on"] = json!("approval");
+        read["items"][2]["check_back_at"] = json!("2026-10-06T13:00:00Z");
+        read["flags"].as_array_mut().unwrap().push(json!({"n":15,"kind":"check_back","age_s":4}));
+        let out = shape_board(&read, "agent:d1:me-uid",
+            &json!({"flags_only":true,"mine":true,"query":"absent","group":"other","view":"full"}), Utc::now());
+        assert_eq!(out["flags"], json!([
+            {"n":14,"title":"fuse SEJD","kind":"holder_idle","holders":["rl-scale-out"],"blocked_on":null,"check_back_at":null,"age_s":600},
+            {"n":15,"title":"bench","kind":"check_back","holders":[],"blocked_on":"approval","check_back_at":"2026-10-06T13:00:00Z","age_s":4}
+        ]));
+        assert!(out.get("items").is_none());
+        assert!(out.get("recently_closed").is_none());
+        assert!(out.get("free_capacity").is_none());
+    }
+
+    #[test]
+    fn board_flags_survive_a_query_filtered_api_reply() {
+        let mut read = sample_read();
+        let matched = read["items"][0].clone();
+        read["items"] = json!([matched]);
+        let out = shape_board(&read, "agent:d1:me-uid", &json!({"query":"C2"}), Utc::now());
+        assert_eq!(out["items"].as_array().unwrap().len(), 1);
+        assert_eq!(out["flags"], json!(["#14 holder_idle 10m"]));
     }
 
     // ---- against a stub planning API ----------------------------------------
@@ -1816,6 +1860,23 @@ mod tests {
             ("PATCH", "/boards/other/items") => (200, r#"{"items":[]}"#.into()),
             _ => (200, "{}".into()),
         }
+    }
+
+    #[test]
+    fn flags_only_fetches_an_unfiltered_board_even_with_item_filters() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let (url, seen) = stub(|method, path, _| match (method, path) {
+            ("POST", "/boards/resolve") => (200, BOARD.into()),
+            ("GET", "/boards/sfd") => (200, sample_read().to_string()),
+            _ => (500, "{}".into()),
+        });
+        let state = state_with_session(root.path(), &url);
+        let resp = call(&state, "me-uid", "board.read", json!({"flags_only":true,
+            "query":"absent","mine":true,"view":"full","archived":true,"since_version":12}));
+        assert!(resp.ok, "{:?}", resp.error);
+        assert_eq!(resp.result.unwrap()["flags"][0]["title"], "fuse SEJD");
+        assert!(seen.lock().unwrap().iter().any(|(m, p, _)| m == "GET" && p == "/boards/sfd"));
     }
 
     #[test]
