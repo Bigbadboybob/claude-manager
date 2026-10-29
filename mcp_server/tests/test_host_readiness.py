@@ -156,10 +156,27 @@ class HostReadinessTests(unittest.TestCase):
                 out = cm_op.host_readiness({"required_repos":["missing"]}, home=home, meminfo=mem)
             checks = {row["name"]:row for row in out["checks"]}
             for name in ("daemon", "replica_sync", "repositories", "claude_onboarding", "claude_worktree_trust",
-                         "claude_notification_channel", "codex_worktree_trust", "codex_lb", "mcp_stamp", "static_external_ip"):
+                         "claude_notification_channel", "codex_worktree_trust", "codex_lb", "codex_provider_auth", "mcp_stamp", "static_external_ip"):
                 self.assertEqual(checks[name]["status"], "FAIL", checks[name])
                 self.assertTrue(checks[name]["hint"])
             self.assertIsNone(checks["laptop_hosts_entry"]["detail"]["suggested_block"])
+
+    def test_local_pool_auth_does_not_require_unrelated_direct_login(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp); codex = home / ".codex"; codex.mkdir()
+            (codex / "config.toml").write_text('model_provider="local_pool"\n[model_providers.local_pool]\nbase_url="http://127.0.0.1:2455"\n[model_providers.local_pool.auth]\ncommand="~/bin/pool-token"\n')
+            helper = home / "bin" / "pool-token"; helper.parent.mkdir(); helper.write_text("# fixture\n"); helper.chmod(0o700)
+            key = home / ".config" / "cm-codex-lb" / "proxy.key"; key.parent.mkdir(parents=True); key.write_text("SECRET_KEY")
+            mem = home / "meminfo"; mem.write_text("MemTotal: 1 kB\nMemAvailable: 1 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n")
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(cm_op, "rpc", side_effect=OSError()), \
+                 mock.patch.object(cm_op, "_daemon_environment", return_value={"HOME":str(home), "PATH":"/holder/bin"}), \
+                 mock.patch.object(cm_op, "_version", return_value=None), mock.patch.object(cm_op, "_service_active", return_value=False), \
+                 mock.patch.object(cm_op, "_external_ip_status", return_value=(None, False)):
+                out = cm_op.host_readiness({}, home=home, meminfo=mem)
+            checks = {row["name"]:row for row in out["checks"]}
+            self.assertEqual(checks["codex_auth"]["status"], "PASS")
+            self.assertEqual(checks["codex_provider_auth"]["status"], "PASS")
+            self.assertNotIn("SECRET_KEY", json.dumps(out))
 
     def test_missing_or_busy_sync_is_unknown_without_calling_mutating_rpc(self):
         with tempfile.TemporaryDirectory() as tmp:
