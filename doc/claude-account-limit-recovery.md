@@ -34,7 +34,9 @@ reported as pending and delivery unconfirmed.
 An unreadable recovery journal is quarantined and recovery remains disabled
 until a clean journal is supplied. Quarantined data is retained; records dated
 at or before quarantine remain ineligible because their old one-shot fences
-cannot be trusted.
+cannot be trusted. A recovery configuration failure leaves recovery disabled
+while other hot settings still apply; reload returns a warning, including when
+it cannot confirm that the disabled marker was written.
 
 PTY delivery is a fallback only when a fresh, identity-matched transport report
 proves the native channel is unavailable and there are no live background jobs

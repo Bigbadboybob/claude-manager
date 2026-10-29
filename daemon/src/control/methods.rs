@@ -4573,7 +4573,7 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
 
 pub fn reload_config(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
     let path = crate::config::default_config_path();
-    let new_cfg = crate::config::load_or_default(&path).map_err(|e| {
+    let mut new_cfg = crate::config::load_or_default(&path).map_err(|e| {
         (
             ErrorCode::Internal,
             format!("daemon.reload_config: {}", e),
@@ -4583,8 +4583,16 @@ pub fn reload_config(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
     // Admission holds the matching read side through a recovery write. A
     // completed disable therefore cannot race a later automatic prompt.
     let _recovery_config = crate::claude_account_recovery::config_gate().write().unwrap_or_else(|p| p.into_inner());
-    crate::claude_account_recovery::configure(state_arc, new_cfg.claude_limit_recovery)
-        .map_err(|e| (ErrorCode::Internal, format!("could not fence Claude recovery configuration: {e}")))?;
+    let mut warnings = Vec::new();
+    if let Err(e) = crate::claude_account_recovery::configure(state_arc, new_cfg.claude_limit_recovery) {
+        let root = state_arc.lock().unwrap_or_else(|p| p.into_inner()).messaging_root.clone();
+        let marker_confirmed = crate::notifications::recovery_disabled_confirmed(&root);
+        new_cfg.claude_limit_recovery = false;
+        let warning = format!("Claude recovery disabled after configuration failure: {e}; disabled marker {}",
+            if marker_confirmed { "confirmed" } else { "could not be confirmed" });
+        eprintln!("cm-daemon: reload_config: {warning}");
+        warnings.push(warning);
+    }
 
     const RESTART_ONLY: &[&str] = &["auth", "tls"];
 
@@ -4695,6 +4703,7 @@ pub fn reload_config(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         "requires_restart": requires_restart,
         "mcp_preflight": mcp_preflight,
         "workflow_definitions_reloaded": workflow_defs_reloaded,
+        "warnings": warnings,
     }))
 }
 
@@ -26344,6 +26353,59 @@ while True:
     /// names them in `requires_restart`, and re-runs the MCP preflight
     /// when `mcp_server_path` moved (failing loudly here, since the
     /// test's new path is fake).
+    #[test]
+    fn recovery_journal_failure_does_not_block_other_reload_keys() {
+        with_temp_home(|| {
+            let state = make_state_arc();
+            let root = tempfile::tempdir().unwrap();
+            let journal = root.path().join("daemon-claude-account-recovery.json");
+            std::fs::write(&journal, b"{broken").unwrap();
+            crate::notifications::set_recovery_enabled(root.path(), true).unwrap();
+            {
+                let mut st = state.lock().unwrap();
+                st.daemon_sessions_path = Some(root.path().join("daemon-sessions.json"));
+                st.messaging_root = root.path().into();
+            }
+            let path = crate::config::default_config_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "[memory]\ntrim_interval_secs=2\n").unwrap();
+            let result = reload_config(&state).unwrap();
+            assert!(result["changed"].as_array().unwrap().iter().any(|v| v == "memory"));
+            assert!(result["warnings"][0].as_str().unwrap().contains("disabled marker confirmed"));
+            assert_eq!(state.lock().unwrap().config.memory.trim_interval_secs, 2);
+            assert!(!state.lock().unwrap().config.claude_limit_recovery);
+            assert!(crate::notifications::recovery_disabled_confirmed(root.path()));
+            assert!(!journal.exists());
+            std::fs::write(&path, "[memory]\ntrim_interval_secs=3\n").unwrap();
+            let second = reload_config(&state).unwrap();
+            assert!(!second["warnings"].as_array().unwrap().is_empty());
+            assert_eq!(state.lock().unwrap().config.memory.trim_interval_secs, 3);
+            assert!(!state.lock().unwrap().config.claude_limit_recovery);
+        });
+    }
+
+    #[test]
+    fn reload_reports_when_recovery_disable_marker_cannot_be_confirmed() {
+        with_temp_home(|| {
+            let state = make_state_arc();
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("daemon-claude-account-recovery.json"), b"{broken").unwrap();
+            std::fs::write(root.path().join("notifications"), b"not a directory").unwrap();
+            {
+                let mut st = state.lock().unwrap();
+                st.daemon_sessions_path = Some(root.path().join("daemon-sessions.json"));
+                st.messaging_root = root.path().into();
+            }
+            let path = crate::config::default_config_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "[memory]\ntrim_interval_secs=4\n").unwrap();
+            let result = reload_config(&state).unwrap();
+            assert!(result["warnings"][0].as_str().unwrap().contains("disabled marker could not be confirmed"));
+            assert_eq!(state.lock().unwrap().config.memory.trim_interval_secs, 4);
+            assert!(!state.lock().unwrap().config.claude_limit_recovery);
+        });
+    }
+
     #[test]
     fn memory_trim_reload_config_is_hot_and_zero_disables_periodic() {
         with_temp_home(|| {

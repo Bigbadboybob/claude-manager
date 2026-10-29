@@ -256,6 +256,12 @@ pub(crate) fn recovery_enabled(root: &Path) -> bool {
     read(&path).ok().flatten().is_some_and(|v| v["version"] == 1 && v["enabled"] == true)
 }
 
+pub(crate) fn recovery_disabled_confirmed(root: &Path) -> bool {
+    let path = root.join("notifications").join("claude-limit-recovery-state");
+    std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() <= 4096)
+        && read(&path).ok().flatten().is_some_and(|v| v["version"] == 1 && v["enabled"] == false)
+}
+
 pub(crate) fn set_recovery_enabled(root: &Path, enabled: bool) -> io::Result<()> {
     let path = root.join("notifications").join("claude-limit-recovery-state");
     crate::state::write_json_atomic(&path, &json!({"version":1,"enabled":enabled}).to_string(), true)
