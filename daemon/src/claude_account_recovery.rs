@@ -2,7 +2,7 @@
 //!
 //! Only main-conversation synthetic failures can authorize a retry. A bounded
 //! tail that cannot be read or classified is unknown, never an empty history.
-use serde_json::Value;
+use serde_json::{json, Value};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -140,7 +140,7 @@ fn refresh_native_receipts(journal: &mut Journal, journal_path: &Path, root: &Pa
             Some("submitted") => "native event submitted; turn unconfirmed",
             Some("observed") => "native event observed; turn unconfirmed",
             Some("uncertain") => "native event outcome uncertain; no automatic retry",
-            Some("cancelled") if event.as_ref().is_some_and(|e| e["cancel_reason"] == "superseded") => "not resumed: superseded by newer input",
+            Some("cancelled") if event.as_ref().is_some_and(|e| e["cancel_reason"] == "superseded") => "not resumed: superseded by newer input or changed session scope",
             Some("cancelled") if event.as_ref().is_some_and(|e| e["cancel_reason"] == "recovery_disabled") => "not resumed: recovery disabled",
             Some("cancelled") => "not resumed: native event cancelled",
             _ => "native publication outcome unknown; no automatic retry",
