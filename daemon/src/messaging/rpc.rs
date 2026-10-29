@@ -237,6 +237,15 @@ fn execute_sync_admin(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<
         code: "unauthorized".into(),
         message: e.into(),
     })?;
+    // Status is an observation only. `initialize` projects chat names into
+    // the session registry and can broadcast/persist, so use the already-open
+    // store directly without projecting names or taking the delivery gate.
+    if req.params["action"].as_str().unwrap_or("status") == "status" {
+        let handle = state.lock().unwrap_or_else(|p| p.into_inner()).messaging.clone();
+        let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+        let store = slot.as_mut().ok_or_else(super::startup::starting)?;
+        return store.sync_admin(&req.params, &[]);
+    }
     initialize(state)?;
     let restart = matches!(
         req.params["action"].as_str(),
@@ -870,6 +879,40 @@ mod tests {
         let r = dispatch(state, &Request { id: "rpc-test".into(), caller, method: format!("messaging.{method}"), params: p });
         assert!(r.ok, "{method}: {:?}", r.error);
         r.result.unwrap()
+    }
+
+    #[test]
+    fn sync_status_is_read_only_and_never_projects_names() {
+        let root = tempfile::tempdir().unwrap();
+        let state = setup(root.path());
+        call(&state, "a", "send", json!({"channel":"general", "name":"Named Scout", "body":"Ready", "request_id":"status-name"})).unwrap();
+        let manifest = root.path().join("daemon-sessions.json");
+        std::fs::write(&manifest, b"unchanged manifest sentinel").unwrap();
+        let (rx, _guard, delivery) = {
+            let mut st = state.lock().unwrap();
+            st.messaging_names.remove("a");
+            st.tui_sessions.get_mut("a").unwrap().label = Some("old label".into());
+            st.daemon_sessions_path = Some(manifest.clone());
+            st.messaging_registry_restored = true;
+            let (rx, guard) = st.manifest_watcher.subscribe();
+            (rx, guard, st.messaging_delivery.clone())
+        };
+        let delivery_guard = delivery.lock().unwrap();
+        let req = |params| Request { id:"status".into(), caller:Caller::operator("t"), method:"messaging.sync".into(), params };
+        for params in [json!({}), json!({"action":"status"})] {
+            let result = execute_sync_admin(&state, &req(params)).unwrap();
+            assert!(result["sync"]["role"].is_string());
+            assert!(result["descriptor"].is_object());
+        }
+        drop(delivery_guard);
+        let st = state.lock().unwrap();
+        assert!(!st.messaging_names.contains_key("a"));
+        assert_eq!(st.tui_sessions["a"].label.as_deref(), Some("old label"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(std::fs::read(&manifest).unwrap(), b"unchanged manifest sentinel");
+        drop(st);
+        let denied = execute_sync_admin(&state, &Request { id:"denied".into(), caller:Caller::session("a"), method:"messaging.sync".into(), params:json!({}) });
+        assert_eq!(denied.unwrap_err().code, "unauthorized");
     }
 
     /// A maintenance notice rides on every agent chat response while it is
