@@ -3,7 +3,9 @@
 Status: design for coordinator/Trim-Review, based on `7d47b88`; no implementation,
 new permissions, deployment, live database query or session control. Coordinator
 rulings in CM message `1897f4a7` approve the surface, scope, freshness and limits
-below; test fixtures and independent review precede implementation. The aim is
+below. Trim-Review passed the initial spec conditionally on C1/C2 and N1–N7;
+coordinator message `585b05b6` rules C1/C2. Clarifications below are part of the
+build contract, not a new policy choice. The aim is
 one read-only view for a lead coordinating work across hosts, including about
 75 sessions on one host. It must show partial/stale evidence honestly, and must
 not infer a session's work or authority from a shared checkout or display name.
@@ -26,8 +28,11 @@ caller daemon, without treating equal workspace strings on different hosts as
 proof of shared scope. Owner and daemon-verified global-permissions callers see all rows. Filters narrow
 this scope, never widen it. Default excludes shells;
 `include_shells` can be a later explicit option, not an assumption that a shell
-is an agent. A compact row contains stable `(daemon_id, session_uid, pid)`, host
-label, name/engine/recorded model/kind, task ID and task name, member/role and
+is an agent. A known `bash`/`shell` engine is excluded; an absent/unclassified
+engine cannot prove an agent, so it is excluded by default and counted only
+within already-authorized scope as `unknown_kind_omitted` with partial coverage.
+A TUI-only row with known non-shell engine is included with unknown activity. A compact row contains stable `(daemon_id, session_uid, pid)`, host
+label, name/engine/`recorded_model`/kind, task ID and task name, member/role and
 manager with provenance, held open items `(board slug, number, title, status, holder role)`, activity
 state and its source/time, and separately reported limit/recovery observations.
 Nullable/unknown is explicit. Return `as_of` for the database read, per-host beat
@@ -38,8 +43,11 @@ identifiers, tokens, recovery journal contents or terminal text.
 Recommend a single bounded page sized to cover the observed ~75-session use case
 (e.g. 100 rows as an engineering starting point, not a measured maximum), with
 keyset order `(daemon_id, session_uid, pid)` and `more`/`next`. Apply visibility
-and filters **before** counting, sorting or paging. Each page uses one read-only
-repeatable-read transaction; separate page requests are not the same snapshot.
+and filters **before** counting, sorting or paging. A cursor is opaque, bounded and integrity protected; it binds the verified
+caller PID/incarnation, exact normalized filters, scope basis and last key. A
+mismatched caller, filter or basis is refused, never silently reused. Each page
+uses one read-only repeatable-read transaction; separate page requests are not
+the same snapshot.
 Say so in the response: a pagination walk is not a consistent census if rows or
 permissions change, and a refresh is required to reconcile it. Do not use the
 org/task feed version as a heartbeat watermark: heartbeats do not enter that
@@ -55,8 +63,9 @@ snapshot/token design separately; do not silently keep a DB transaction open.
   not currently in the heartbeat: `DaemonSession.model`/`model_source` are
   recorded launch/resume settings (`daemon/src/session.rs:661`–`:668`), not
   proof of an engine's active model. Export them as bounded optional fields and
-  persist nullable values; old/absent data stays unknown, never inferred from
-  the engine. The API limits a heartbeat to 2,000 session rows (`api/items_models.py:256`–`:267`).
+  persist nullable `recorded_model` and `recorded_model_source` values in the
+  same heartbeat upsert. A missing field overwrites the previous value with
+  null; old/absent data stays unknown, never inferred from the engine. The API limits a heartbeat to 2,000 session rows (`api/items_models.py:256`–`:267`).
   `dispatch/items_db.py:1154`–`:1170`, `:1193`–`:1266` validates and stores
   per-PID `session_states` (`sql/017_items.sql:115`–`:136`). A missing PID in
   a successfully processed full beat is marked exited; dropped invalid rows
@@ -74,8 +83,11 @@ snapshot/token design separately; do not silently keep a DB transaction open.
   `org_session_facts.member_id/acting_as` stamp (`sql/031_org_assistants.sql:1`–`:8`).
   Main rebind changes incarnation and hands back holds in one org transaction
   (`dispatch/org_db.py:1296`–`:1355`); a stale old session is not the new main.
-  Closed/promoted, stale, absent or conflicting stamps need explicit
-  unknown/conflict rather than a guessed membership. Show member status and
+  Main identity comes from the open canonical incarnation and does not depend
+  on freshness of `org_session_facts`; it is a current seat, not proof of a
+  running process. For assistant/worker stamps use their independent 90s
+  `reported_at` freshness; closed/promoted, stale, absent or conflicting
+  stamps need explicit unknown/conflict rather than guessed membership. Show member status and
   incarnation/generation where available; membership is a roster fact, not a
   grant to control that session.
 * Join `session_states.task_id` to `tasks.id` and display `tasks.name`; missing
@@ -103,8 +115,11 @@ snapshot/token design separately; do not silently keep a DB transaction open.
 `AgentState` has state/since, observation time, source, last turn status/end,
 latest accepted input/engine start and limited `detail` (`daemon/src/agent_state.rs:
 13`–`:72`, `:166`–`:183`). None is a universal last-activity timestamp:
-`observed_at`/`reported_at` is observation/heartbeat, `since` is state entry,
-and `last_turn.ended_at` is a turn boundary. Label these individually; a quiet
+`agent_state.observed_at` is host-clock observation, `agent_state.since` is
+host-clock state entry, and `last_turn.ended_at` is a host-clock turn boundary.
+`session_states.reported_at` and reconstructed `state_since` are API-clock
+values. Label clocks and use only API `reported_at` for the 90s freshness rule;
+never compare host clocks across machines to establish ordering. Label these individually; a quiet
 PTY, heartbeat or `reported_done` does not prove work succeeded. Unsupported,
 legacy, TUI-only, stale and malformed data stay unknown. Never scan transcripts
 or infer identity from co-tenancy to fill gaps.
@@ -154,10 +169,37 @@ caller daemon authenticates its own local session/operator and stamps the
 request from its registry. The API enforces the org manager-chain and task-tree
 visibility filter **server-side before pagination**, using its own current
 member/incarnation, task and stamped session records, rather than treating an
-actor-supplied member or claimed ancestry as the result. The daemon stamps its
-validated global/Owner condition; ordinary caller parameters cannot request
-that exemption. Snapshot and revalidate the caller incarnation after the API
-call; stale/rebound callers fail rather than receive a widened result. A local
+actor-supplied member or claimed ancestry as the result. The server-side task
+closure starts at the validated task root and repeatedly includes both
+`tasks.parent_task_id` descendants and rows whose `metadata.filer.task_id` is
+already in the closure. This is the central planning-row creator edge for
+`propose_task`; daemon-local `agent_task_edges` are not consulted. Missing,
+malformed or cyclic links cannot create reachability.
+
+The daemon stamps its validated global/Owner condition; ordinary caller
+parameters cannot request that exemption. Before the call it confirms that a
+claimed main/assistant is still the locally registered caller, capturing its
+member/role, task, workspace, process/generation and global state. The API
+returns `scope_basis` containing the member ID/revision and incarnation (when
+applicable), global/Owner basis, task roots and snapshot `as_of`. Afterward the
+daemon confirms the same local caller/task/global/process generation and that
+current member and revision match the basis; mismatch returns `scope_changed`
+and retries the whole read once, then returns the error. For taskless/unbound
+callers, null membership is explicit and only independently established scope
+can grant rows. A privileged operator is validated through the existing strong
+operator path, rather than fabricating a member.
+
+Current `org_db.member_summary` omits revision (`dispatch/org_db.py:299`–`:305`)
+and the daemon cache holds only local mains (`dispatch/org_db.py:2139`–`:2144`),
+while assistant stamps carry no revision (`daemon/src/assistants.rs:72`–`:83`).
+A local heartbeat cache alone therefore cannot perform this current-version
+comparison. The proposed implementation uses one O(1) central caller-PID
+recheck after the roster query (the existing `member_for_pid` resolves main or
+stamped assistant and returns member detail/revision), followed by local caller
+revalidation. It is one batched roster query plus one verification request,
+never N+1; when that recheck is unavailable or inconsistent, fail closed.
+The coordinator approved this concrete mechanism in message `7fcea50a`. A
+recheck must not assert cross-table atomicity beyond the actual transaction. A local
 API outage returns an explicit unavailable/partial result and never silently
 falls back to a broad remote listing.
 
@@ -174,11 +216,11 @@ not a prerequisite invented by this spec or a session-control grant.
 
 Each row's `as_of` is `session_states.reported_at`; org attribution carries its
 own `org_as_of` and is unknown if absent, stale or conflicting. The API also
-returns its database-snapshot `as_of`, coverage and continuation. Illustrative
+returns its database-snapshot `as_of`, scope basis, coverage and continuation. Illustrative
 content-free row (the actual wire uses structured timestamps, no transcript):
 
 ```json
-{"session":{"pid":"agent:d2:u2","uid":"u2","name":"worker","engine":"codex","model":"configured-model","model_source":"explicit"},"host":{"daemon_id":"d2","label":"host-b"},"task":{"id":"t2","name":"task"},"member":{"id":"mem_child","acting_as":"assistant","manager":"mem_lead","org_as_of":"2026-01-01T00:00:00Z"},"items":[{"board":"b","n":7,"title":"work","status":"active","role":"owner"}],"activity":{"state":"working","state_since":"2026-01-01T00:00:00Z","observed_at":"2026-01-01T00:00:01Z","source":"relay"},"limit":{"error_kind":null,"resumes_at":null,"recovery":"not_exported"},"as_of":"2026-01-01T00:00:02Z","freshness":"fresh"}
+{"session":{"pid":"agent:d2:u2","uid":"u2","name":"worker","engine":"codex","recorded_model":"configured-model","recorded_model_source":"explicit"},"host":{"daemon_id":"d2","label":"host-b"},"task":{"id":"t2","name":"task"},"member":{"id":"mem_child","acting_as":"assistant","manager":"mem_lead","org_as_of":"2026-01-01T00:00:00Z"},"items":[{"board":"b","n":7,"title":"work","status":"active","role":"owner"}],"activity":{"state":"working","state_since":"2026-01-01T00:00:00Z","observed_at":"2026-01-01T00:00:01Z","source":"relay"},"limit":{"error_kind":null,"resumes_at":null,"recovery":"not_exported"},"as_of":"2026-01-01T00:00:02Z","freshness":"fresh"}
 ```
 
 | Fixture | Expected result |
@@ -193,8 +235,10 @@ content-free row (the actual wire uses structured timestamps, no transcript):
 | `state_since`, `observed_at`, `reported_at`, turn end all differ | Preserve and label each; do not substitute any for universal last activity. |
 | Claude reports `rate_limit` with `resumes_at`; Codex reports `previous_response_not_found`; old writer has neither | Show the reported kinds with their source/time and recovery `not_exported`; do not call either a successful recovery or claim no limit. |
 | New host sends optional recorded model/source; old host or TUI-only row omits it | New API reads known values with source; old/absent is unknown. Old API ignores nested fields; old writers/new API and rollback do not reject the heartbeat or preserve a stale model as current. |
-| Caller rebound or permissions change while read is in flight | Revalidate exact caller identity; do not return old scope. Authority/API unavailable is explicit unavailable or safely limited, never a broadened fallback. |
-| More rows than page cap, scope changes between pages | Stable key order and honest `more`/cursor for each page; scope before counts. Separate-page snapshot is explicitly non-atomic and requires refresh for a consistent census. |
+| Parent task, a direct filer edge and a filer-of-filer edge | Central closure includes all descendants and filer edges to a fixed point; a forged/unrelated root and daemon-only creator edge do not widen it. |
+| Caller rebound, member revision or task/global state changes while read is in flight | API returns scope_basis; central version and local caller revalidation must match, otherwise `scope_changed` and one whole-read retry. Authority/API unavailable is explicit unavailable or safely limited, never a broadened fallback. |
+| Same workspace string on two daemons, TUI-only with unknown engine, continuous worker | Local taskless workspace scope does not cross daemon boundary; unclassified engine is omitted and counted after scope; a stamped continuous worker is not promoted to main. |
+| More rows than page cap, changed caller/filter, scope changes between pages | Cursor binds caller, normalized filters and scope basis; mismatches are refused. Stable key order and honest `more`/cursor for each page; scope before counts. Separate-page snapshot is explicitly non-atomic and requires refresh for a consistent census. |
 
 ## Small implementation route and checks, after design disposition
 
@@ -204,13 +248,16 @@ content-free row (the actual wire uses structured timestamps, no transcript):
    columns, and leave absent/older writers unknown. Do not call `held_items`
    or `authority-batch` once per row. Return explicit source timestamps and
    `recovery: not_exported`. Proposed boundaries: `sql/<next>_session_roster.sql`,
-   `dispatch/items_db.py` (heartbeat persistence) plus new
+   `dispatch/items_db.py` (heartbeat persistence, same-upsert nulling) plus new
    `dispatch/session_roster.py` (scoped query), `api/items.py` (+ request
    models), `daemon/src/items/heartbeat.rs`, `daemon/src/items/rpc.rs` or new
    `daemon/src/items/roster.rs`, `mcp_server/server.py`,
    `mcp_server/tool_schemas.json`, `mcp_server/AGENT_GUIDE.md`; focused tests
-   beside those modules. Avoid session lifecycle, terminal input, org writes
-   and recovery workers.
+   beside those modules. Add the read method to
+   `RESTART_BARRIER_READ_ONLY_METHODS` and `mcp_server/control_client.py`'s
+   `DAEMON_METHODS`, never to the board-token method list; include the optional
+   MCP schema and guide. Document global as fleet-wide **read-only** visibility.
+   Avoid session lifecycle, terminal input, org writes and recovery workers.
 2. Separately specify and implement a safe owner-daemon recovery summary only
    when its semantics, authorization, strict-wire/rollback and capacity are
    reviewed. This is out of scope for the approved first slice; current
@@ -219,7 +266,7 @@ content-free row (the actual wire uses structured timestamps, no transcript):
 3. Test at least two daemons with colliding host labels, ~75 synthetic sessions,
    multiple holds/boards and taskless/zero-hold sessions; main rebind versus
    stale assistant stamp; stale/missing/partial heartbeat and dropped row;
-   org subtree plus task-tree union, manager/host/member/state filters, spoofed
+   org subtree plus parent/filer task-tree union, manager/host/member/state filters, spoofed
    member/global input, caller rebind mid-read, global/Owner callers and an
    unavailable authority API; filter before pagination/counts; state-since vs
    heartbeat observation time; legacy/no recovery, Claude and Codex distinct
