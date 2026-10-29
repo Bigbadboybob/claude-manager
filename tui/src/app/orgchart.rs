@@ -191,6 +191,8 @@ pub(super) struct ChartNode {
 pub(super) struct OrgCard {
     pub member_id: Option<String>,
     pub team_id: Option<String>,
+    /// A reporting reference opens this actual team box on Enter.
+    pub link_to: Option<String>,
     /// Lines above the sessions (a team box: its lead's handle and title).
     pub top: Vec<(String, Style)>,
     /// Lines under the sessions (a team's epic chips).
@@ -1166,7 +1168,13 @@ impl App {
                     hit = true;
                 }
             }
-            if !hit && node.title.to_lowercase().contains(&q) {
+            // A team lead is displayed inside its team card, not in the
+            // node title. Search the handle even if its main is on a host
+            // whose sessions the viewer has not loaded.
+            let member_handle = node.card.as_ref().and_then(|c| c.member_id.as_deref())
+                .and_then(|id| self.org_live()?.member(id))
+                .is_some_and(|member| member.handle.to_lowercase().contains(&q));
+            if !hit && (node.title.to_lowercase().contains(&q) || member_handle) {
                 out.push((i, 0));
             }
         }
@@ -1286,6 +1294,14 @@ impl App {
                 self.orgchart.follow.set(true);
             }
             (_, KeyCode::F(6) | KeyCode::Esc | KeyCode::Char('q')) => self.orgchart_jump(&model, false),
+            (_, KeyCode::Enter) if model.nodes[focus].card.as_ref().and_then(|c| c.link_to.as_ref()).is_some() => {
+                let target = model.nodes[focus].card.as_ref().and_then(|c| c.link_to.as_deref())
+                    .and_then(|key| model.find(key));
+                if let Some(target) = target {
+                    self.orgchart_reveal(&model, target);
+                    self.orgchart_set_focus(&model, target);
+                }
+            }
             (_, KeyCode::Enter) => self.orgchart_jump(&model, true),
             (_, KeyCode::Char('t')) if alt => self.orgchart_jump(&model, true),
             (_, KeyCode::Char(c @ ('g' | 'z'))) => self.orgchart.pending = Some(c),

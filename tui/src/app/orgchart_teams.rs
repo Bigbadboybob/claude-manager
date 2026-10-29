@@ -290,6 +290,29 @@ impl App {
             }
         }
 
+        // A lead may have a manager in a different team. Keep the team
+        // hierarchy intact and place a navigable reference under the manager
+        // so the reporting line is visible from both sides.
+        for x in &people {
+            let Some(&target) = lead_home.get(x.id.as_str()) else { continue };
+            let Some(manager) = x.manager_member_id.as_deref() else { continue };
+            let manager_box = lead_home.get(manager).copied()
+                .or_else(|| member_node.get(manager).copied());
+            let Some(parent) = manager_box else { continue };
+            if parent == target || m.nodes[target].parent == Some(parent) { continue; }
+            let team = m.nodes[target].title.clone();
+            let target_key = m.nodes[target].key.clone();
+            let i = m.push(Some(parent), format!("report-link:{}", x.id), NodeKind::Member,
+                format!("↪ {}", x.handle), None, 4);
+            m.nodes[i].card = Some(OrgCard {
+                member_id: Some(x.id.clone()),
+                top: vec![(format!("in {team} · Enter opens"), muted)],
+                link_to: Some(target_key),
+                keep: true,
+                ..OrgCard::default()
+            });
+        }
+
         // Guests: an empty box in each team they visit.
         for t in &order {
             for g in t.members.iter().filter(|g| g.role == "guest") {
@@ -922,6 +945,65 @@ mod tests {
         assert_eq!(node(&m, "task:loose").sessions[0].uid, "ts-90-0");
         assert_eq!(node(&m, OWNER_SESSIONS_KEY).title, OWNER_SESSIONS_LABEL);
         assert!(m.find(UNASSIGNED_KEY).is_none());
+    }
+
+    /// Real v556 shape: sibling teams led by a manager and report, with
+    /// the report's own reports running on a second daemon/host.
+    #[test]
+    fn cross_host_team_lead_and_reports_are_drawn_and_searchable() {
+        let mut app = test_app();
+        app.workspaces = vec![ws("old"), ws("f")];
+        app.workspaces[1].host_id = HostId("f".into());
+        session(&mut app, 0, 0x10, "F-Plan-Lead", Some("shared"));
+        let mut people = vec![
+            owner(),
+            member("ep", "execution-policy", Some("mem-owner"), Some("ep-team"), None),
+            member("rp", "relperf-lead", Some("ep"), None, None),
+            member("fl", "f-lead", Some("rp"), None, Some("ts-10-0")),
+        ];
+        for i in 0..11u32 {
+            let uid = format!("ts-{:x}-0", 0x20 + i);
+            session(&mut app, 1, 0x20 + i, &format!("F-worker-{i}"), Some("shared"));
+            app.workspaces[1].sessions[i as usize].host_id = HostId("f".into());
+            let mut m = member(&format!("child-{i}"), &format!("cf-{i}"), Some("fl"), None, Some(&uid));
+            m["main"]["daemon_id"] = json!("f-daemon");
+            people.push(m);
+        }
+        app.org.accept(snapshot(556, people, vec![
+            team("ep-team", "Execution Pipeline", None, Some("ep"), &[]),
+            team("reliability", "Prod Reliability & Perf", Some("ep-team"), Some("rp"), &[]),
+            team("f-team", "Trader event loop & data plane", Some("ep-team"), Some("fl"), &[]),
+        ]));
+        let chart = app.org_model(false);
+        let f = chart.find("team:f-team").unwrap();
+        assert_eq!(chart.nodes[f].parent, chart.find("team:ep-team"));
+        let reference = chart.find("report-link:fl").unwrap();
+        assert_eq!(chart.nodes[reference].parent, chart.find("team:reliability"));
+        assert_eq!(chart.nodes[reference].card.as_ref().unwrap().link_to.as_deref(), Some("team:f-team"));
+        assert_eq!(chart.nodes[f].sessions[0].uid, "ts-10-0");
+        for i in 0..11u32 {
+            let child = chart.find(&format!("member:child-{i}")).unwrap();
+            assert_eq!(chart.nodes[child].parent, Some(f));
+            assert_eq!(chart.nodes[child].sessions[0].uid, format!("ts-{:x}-0", 0x20+i));
+        }
+        app.handle_event(&key(KeyCode::F(6)));
+        app.orgchart.focus = Some("report-link:fl".into());
+        app.handle_event(&key(KeyCode::Enter));
+        let chart = app.org_model(false);
+        assert_eq!(chart.nodes[app.orgchart_focus(&chart)].key, "team:f-team");
+        app.handle_event(&key(KeyCode::Char('/')));
+        for c in "f-lead".chars() { app.handle_event(&key(KeyCode::Char(c))); }
+        app.handle_event(&key(KeyCode::Enter));
+        let chart = app.org_model(false);
+        let found = &chart.nodes[app.orgchart_focus(&chart)];
+        assert!(found.key == "team:f-team" || found.key == "report-link:fl");
+        // Even when the remote host's workspaces have not arrived, the org
+        // snapshot itself retains every member box and its reporting line.
+        app.workspaces.pop();
+        let chart = app.org_model(false);
+        for i in 0..11u32 {
+            assert!(chart.find(&format!("member:child-{i}")).is_some());
+        }
     }
 
     #[test]

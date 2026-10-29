@@ -79,7 +79,8 @@ setting. The snapshot is polled only while something shows it (see
   team lead hangs from the team box, and one managed by another member hangs
   from that member. A manager line that crosses teams (manager outside the
   member's team) is a **matrix** case and carries `⋯` with the manager's
-  handle.
+  handle. When a lead has a manager in another team, a `↪ handle` reference
+  appears under the manager; Enter opens the lead's actual team box.
 - A member who is a **guest** in another team also appears there, as a
   second box marked `⊹`.
 - **Assistants** are every other session that reaches a member (doc/org-model.md
@@ -132,7 +133,7 @@ items it holds. (The four S5 facts replace mandate and focus when they land.)
 | `j` / `k` | down to the report last focused under this box (else the first; a stack comes first) / up to the boss. Inside a stack, `j`/`k` move down and up the list; `k` on its first item goes to the leader, and the last item is the bottom of the branch. Each box also remembers its last-focused session, so `k` then `j` lands where you were |
 | `gg` / `G` | Owner / last box |
 | `Tab` / `S-Tab` | next / previous session in the box |
-| `/` `n` `N` | search session labels and box names, then step through matches; the search unfolds a match's ancestors |
+| `/` `n` `N` | search session labels, box names and member handles, then step through matches; the search unfolds a match's ancestors |
 | Space or `za`, `zc`, `zo` | toggle, fold, unfold the box's subtree; a folded box shows how many sessions it hides |
 | `zM` / `zR` | fold every project, split and division / unfold everything |
 | `?` | show or hide the symbol legend above the help line |
@@ -142,7 +143,7 @@ items it holds. (The four S5 facts replace mandate and focus when they land.)
 | `i` | show or hide the info pane |
 | `a` | team mode: expand or fold the focused member's assistants |
 | `R` | team mode: open the roster |
-| Enter (or `A-t`) | open the Sessions view with that session focused; folded sidebar headers above it unfold. Enter on a box with no session stays in the chart |
+| Enter (or `A-t`) | open the Sessions view with that session focused; folded sidebar headers above it unfold. Enter on a reporting reference opens its team; on another box with no session it stays in the chart |
 | F6, Esc, `q` | the same, except that with no session selected (a box without one, or a header the chart opened on and you haven't moved from) the sidebar cursor goes back exactly where it was when the chart opened |
 
 The chart opens fully unfolded (folds last only while it is open), on the

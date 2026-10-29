@@ -2395,7 +2395,7 @@ impl App {
                         .map(|t| t.name.clone())
                         .unwrap_or_else(|| "task".into());
                     let initiative_marker = self.planning.task_initiative_marker(task_id);
-                    let node = super::tree::Node::Task(task_id.clone());
+                    let node = super::tree::Node::Task(*ws_idx, task_id.clone());
                     let folded = self.tree_folded(&node);
                     let has_reports = tree.as_ref().is_some_and(|t| t.org.has_reports(task_id));
                     let tail = fold_tail(&node);
