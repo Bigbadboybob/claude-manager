@@ -357,6 +357,9 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
 /// `daemon.restart` call would wait on a counter it is itself
 /// inflating.
 pub(crate) const RESTART_BARRIER_EXEMPT_METHODS: &[&str] = &[
+    // Allocator-only maintenance does not alter session/persisted state; an
+    // uncancellable allocator call must not pin restart quiescence.
+    "daemon.memory_trim",
     // Leaf feed recovery may quarantine a corrupt checkpoint. No registry,
     // child or session state is touched; a 25s wait must not pin quiescence.
     "owner.notifications.next",
@@ -612,6 +615,7 @@ pub fn dispatch_request(
         // it reports host-environment diagnosis, not per-session state.
         "daemon.health" => DispatchOutcome::Done(dispatch_daemon_health(state, req)),
         "daemon.memory_snapshot" => DispatchOutcome::Done(crate::memory_snapshot::dispatch(state, req)),
+        "daemon.memory_trim" => DispatchOutcome::Done(crate::memory_trim::dispatch(req)),
         "daemon.reload_config" => {
             DispatchOutcome::Done(dispatch_reload_config(state, req))
         }
@@ -11350,6 +11354,7 @@ mod tests {
         {
             let mut st = state.lock().unwrap();
             st.config = crate::config::DaemonConfig {
+                memory: Default::default(),
                 s4_min_write: false,
                 transcript_rotation: Default::default(),
                 chat_search_budget_bytes: 512 * 1024 * 1024,
@@ -11424,6 +11429,7 @@ mod tests {
         {
             let mut st = state.lock().unwrap();
             st.config = crate::config::DaemonConfig {
+                memory: Default::default(),
                 api_url: format!("http://127.0.0.1:{}", port),
                 api_token: "tok".into(),
                 ..Default::default()
@@ -11458,6 +11464,7 @@ mod tests {
     fn set_stub_api_config(state: &Arc<Mutex<DaemonState>>, port: u16) {
         let mut st = state.lock().unwrap();
         st.config = crate::config::DaemonConfig {
+                memory: Default::default(),
             s4_min_write: false,
             transcript_rotation: Default::default(),
             chat_search_budget_bytes: 512 * 1024 * 1024,
