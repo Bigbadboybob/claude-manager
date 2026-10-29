@@ -56,8 +56,8 @@ class RosterDb(unittest.IsolatedAsyncioTestCase):
             await conn.execute("""INSERT INTO org_session_facts(pid,daemon_id,session_uid,member_id,acting_as,reported_at)
                 VALUES ('agent:d2:assistant','d2','assistant','mem_child','assistant',now())""")
             await conn.execute("""INSERT INTO session_states
-                (pid,daemon_id,session_uid,host_label,name,engine,state,reported_at,roster_stamp_member,roster_stamp_role)
-                VALUES ('agent:d2:assistant','d2','assistant','same','assistant','codex','working',now(),'mem_child','assistant')""")
+                (pid,daemon_id,session_uid,host_label,name,engine,state,reported_at,roster_stamp_member,roster_stamp_role,roster_stamp_as_of)
+                VALUES ('agent:d2:assistant','d2','assistant','same','assistant','codex','working',now(),'mem_child','assistant',now())""")
 
     async def asyncTearDown(self):
         await self.pool.close()
@@ -115,6 +115,14 @@ class RosterDb(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(row["member"]["id"])
         self.assertEqual(row["member"]["source"], "unknown")
 
+    async def test_old_api_beat_does_not_refresh_the_retained_roster_stamp(self):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""UPDATE session_states SET task_id=$1, reported_at=now(),
+                roster_stamp_as_of=now()-interval '1 second' WHERE pid='agent:d2:assistant'""", self.root)
+        out = await self.query()
+        row = next(r for r in out["rows"] if r["session"]["uid"] == "assistant")
+        self.assertIsNone(row["member"]["id"])
+
     async def test_rebinding_exposes_only_the_open_main_seat(self):
         async with self.pool.acquire() as conn:
             await conn.execute("UPDATE incarnations SET ended_at=now() WHERE member_id='mem_child' AND ended_at IS NULL")
@@ -148,6 +156,17 @@ class RosterDb(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["items"], [{"board": "fixture-board", "board_id": str(board),
                          "board_slug_omitted": False, "n": 1, "title": "held",
                          "title_truncated": False, "status": "active", "role": "reviewer"}])
+
+    async def test_old_exit_remains_filterable_and_labels_stale_heartbeat(self):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""UPDATE session_states SET state='exited',
+                exited_at=now()-interval '5 minutes', reported_at=now()-interval '5 minutes'
+                WHERE pid='agent:d2:child'""")
+        out = await self.query(f=filters(include_exited=True, state="exited"))
+        row = next(r for r in out["rows"] if r["session"]["uid"] == "child")
+        self.assertEqual(row["activity"]["state"], "stale")
+        self.assertEqual(row["activity"]["last_known_state"], "exited")
+        self.assertIsNotNone(row["exited_at_api_clock"])
 
     async def test_seventy_five_rows_fit_one_page_and_unknown_scope_is_not_counted(self):
         async with self.pool.acquire() as conn:

@@ -534,16 +534,18 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
     async def test_recorded_model_is_bounded_and_old_writer_clears_it(self):
         await self.beat([self.row("lane", recorded_model="m" * 250,
                                   recorded_model_source="explicit", member_id="mem_child", acting_as="assistant")])
-        row = (await self.fetch("SELECT recorded_model, recorded_model_source, roster_stamp_member, roster_stamp_role FROM session_states"))[0]
+        row = (await self.fetch("SELECT recorded_model, recorded_model_source, roster_stamp_member, roster_stamp_role, roster_stamp_as_of, reported_at FROM session_states"))[0]
         self.assertEqual(row["recorded_model"], "m" * 200)
         self.assertEqual(row["recorded_model_source"], "explicit")
         self.assertEqual((row["roster_stamp_member"], row["roster_stamp_role"]), ("mem_child", "assistant"))
+        self.assertEqual(row["roster_stamp_as_of"], row["reported_at"])
         await self.beat([self.row("lane")])
-        row = (await self.fetch("SELECT recorded_model, recorded_model_source, roster_stamp_member, roster_stamp_role FROM session_states"))[0]
+        row = (await self.fetch("SELECT recorded_model, recorded_model_source, roster_stamp_member, roster_stamp_role, roster_stamp_as_of FROM session_states"))[0]
         self.assertIsNone(row["recorded_model"])
         self.assertIsNone(row["recorded_model_source"])
         self.assertIsNone(row["roster_stamp_member"])
         self.assertIsNone(row["roster_stamp_role"])
+        self.assertIsNone(row["roster_stamp_as_of"])
 
     async def test_missing_from_snapshot_is_exited_and_revival_clears_it(self):
         await self.beat([self.row("lane"), self.row("orch")])

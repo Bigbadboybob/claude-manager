@@ -1245,9 +1245,10 @@ async def heartbeat(pool, daemon_id: str, *, host_label: str | None, sessions: l
                                                    reported_done, killed_by, agent_state,
                                                    started_at, exited_at, reported_at,
                                                    recorded_model, recorded_model_source,
-                                                   roster_stamp_member, roster_stamp_role)
+                                                   roster_stamp_member, roster_stamp_role, roster_stamp_as_of)
                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                               CASE WHEN $15 THEN $16::timestamptz END, $16, $17, $18, $19, $20)
+                               CASE WHEN $15 THEN $16::timestamptz END, $16, $17, $18, $19, $20,
+                               CASE WHEN $19::text IS NOT NULL THEN $16::timestamptz END)
                        ON CONFLICT (pid) DO UPDATE SET
                            daemon_id = EXCLUDED.daemon_id, session_uid = EXCLUDED.session_uid,
                            host_label = EXCLUDED.host_label, task_id = EXCLUDED.task_id,
@@ -1263,7 +1264,8 @@ async def heartbeat(pool, daemon_id: str, *, host_label: str | None, sessions: l
                            recorded_model = EXCLUDED.recorded_model,
                            recorded_model_source = EXCLUDED.recorded_model_source,
                            roster_stamp_member = EXCLUDED.roster_stamp_member,
-                           roster_stamp_role = EXCLUDED.roster_stamp_role""",
+                           roster_stamp_role = EXCLUDED.roster_stamp_role,
+                           roster_stamp_as_of = EXCLUDED.roster_stamp_as_of""",
                     s["pid"], daemon_id, s["session_uid"], host_label,
                     _uuid_or_none(s.get("task_id")), s.get("name"), s.get("engine"), s["state"],
                     ago(s.get("state_age_s")), ago(s.get("idle_for_s")),

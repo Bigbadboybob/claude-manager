@@ -95,7 +95,13 @@ measurement before rollout.
   omits it while still refreshing `reported_at`; that timestamp alone cannot
   prove the stamp was reaffirmed. Persist a roster-only member/role observation
   from the session beat, clearing it on omission, and require the fresh session
-  and org observations to agree for assistant/worker attribution. Old writers
+  and org observations to agree for assistant/worker attribution. Its own
+  API-clock timestamp must equal the session beat timestamp: an older API
+  updating the session row during rollback normally cannot refresh a retained
+  stamp. Exact repeated API-clock timestamps across such a write are not a
+  durable beat identity; the rollout must treat clock discontinuity or an
+  uncertain rollback window as partial until a new-writer beat is observed.
+  Old writers
   without that observation stay unknown. Closed/promoted, stale, absent or conflicting
   stamps need explicit unknown/conflict rather than guessed membership. Show member status and
   incarnation/generation where available; membership is a roster fact, not a
@@ -185,6 +191,10 @@ closure starts at the validated task root and repeatedly includes both
 already in the closure. This is the central planning-row creator edge for
 `propose_task`; daemon-local `agent_task_edges` are not consulted. Missing,
 malformed or cyclic links cannot create reachability.
+
+The subtree read applies to a stamped assistant or worker caller as well as a
+main, as ruled for this roster. It is read-only and does not change the
+main-only widening used by existing session-control or other reads.
 
 Reviewer note N8: task metadata is a writable bag and `metadata.filer.task_id`
 is not currently guarded by `update_task`; a permitted writer can change that

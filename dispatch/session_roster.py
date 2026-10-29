@@ -65,12 +65,14 @@ facts AS MATERIALIZED (
            CASE WHEN i.id IS NOT NULL THEN i.member_id
                 WHEN f.reported_at >= now() - interval '90 seconds'
                  AND s.reported_at >= now() - interval '90 seconds'
+                 AND s.roster_stamp_as_of = s.reported_at
                  AND f.acting_as IN ('assistant','worker') AND fm.id IS NOT NULL
                  AND f.member_id = s.roster_stamp_member AND f.acting_as = s.roster_stamp_role
                 THEN f.member_id END AS resolved_member,
            CASE WHEN i.id IS NOT NULL THEN 'main'
                 WHEN f.reported_at >= now() - interval '90 seconds'
                  AND s.reported_at >= now() - interval '90 seconds'
+                 AND s.roster_stamp_as_of = s.reported_at
                  AND f.acting_as IN ('assistant','worker') AND fm.id IS NOT NULL
                  AND f.member_id = s.roster_stamp_member AND f.acting_as = s.roster_stamp_role
                 THEN f.acting_as END AS resolved_role,
@@ -121,6 +123,7 @@ async def _caller(conn, pid):
              AND f.acting_as IN ('assistant','worker')
           LEFT JOIN session_states s ON s.pid = p.pid
              AND s.reported_at >= now() - interval '90 seconds'
+             AND s.roster_stamp_as_of = s.reported_at
              AND s.roster_stamp_member = f.member_id AND s.roster_stamp_role = f.acting_as
           LEFT JOIN members fm ON fm.id = f.member_id
         """, pid)
@@ -228,7 +231,9 @@ async def read(pool, caller, filters, secret):
                 WHERE ($8::text IS NULL OR daemon_id = $8)
                   AND ($9::text IS NULL OR resolved_member = $9 OR member_handle = $9)
                   AND ($10::text IS NULL OR manager_member_id = $10 OR manager_handle = $10)
-                  AND ($11::text IS NULL OR visible_state = $11)
+                  AND ($11::text IS NULL OR
+                       CASE WHEN $11 = 'exited' THEN exited_at IS NOT NULL
+                            ELSE visible_state = $11 END)
                   AND ($12::text IS NULL OR task_id::text = $12)
             """
             unknown = await conn.fetchval(_SCOPED + "SELECT count(*) FROM scoped " + where +
@@ -301,7 +306,7 @@ async def read(pool, caller, filters, secret):
                                "title": h["title"], "title_truncated": h["title_truncated"],
                                "status": h["status"], "role": h["role"]} for h in items],
                     "items_more": bool(items and items[0]["total"] > len(items)),
-                    "as_of": row["reported_at"], **activity})
+                    "as_of": row["reported_at"], "exited_at_api_clock": row["exited_at"], **activity})
             next_cursor = None
             if len(page) > limit and selected:
                 last = selected[-1]

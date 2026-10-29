@@ -6,3 +6,4 @@ ALTER TABLE session_states ADD COLUMN IF NOT EXISTS recorded_model_source TEXT;
 -- org_session_facts' intentionally retained values, omission clears them.
 ALTER TABLE session_states ADD COLUMN IF NOT EXISTS roster_stamp_member TEXT;
 ALTER TABLE session_states ADD COLUMN IF NOT EXISTS roster_stamp_role TEXT;
+ALTER TABLE session_states ADD COLUMN IF NOT EXISTS roster_stamp_as_of TIMESTAMPTZ;

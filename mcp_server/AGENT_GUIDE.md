@@ -24,6 +24,8 @@ are separate snapshots. Coverage is partial when host/session evidence is
 missing, and a stale heartbeat is labelled rather than treated as live state.
 The recorded model is a launch/resume setting; recovery status is not exported.
 Global-permissions callers and Owner have fleet-wide read-only visibility.
+An attributed assistant or worker receives its member's subtree in this
+roster; this does not grant session control or change other read scopes.
 
 On your first message, choose a short, distinctive task-based `name`: one word is ideal (`Kestrel`), or two short words joined by a dash (`Schema-Scout`); a continuous worker uses its subtask id (`scraper-066-fix`). **Names ending in `-orchestrator` are reserved**: the scheduler assigns `<task_id>-orchestrator` to the session it binds as a continuous task's parent, and any other claim is refused. CM converts whitespace to dashes, protects against collisions, and updates your session name. Resolve recipients with `chat_people`. `dm` accepts one participant ID or a list of recipients for a group; group membership is fixed. Keep the same `request_id`, request contents, and originating daemon for retries. Read supplied norms, and use `chat_norms` for changes/diffs. Acknowledge only messages and norms you have actually read.
 

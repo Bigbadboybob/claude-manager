@@ -2216,7 +2216,8 @@ def session_roster(
     """Read a bounded cross-host roster of visible sessions and their holds.
 
     Scope is your org subtree plus task tree, or your local workspace when
-    taskless. Owner and global-permissions callers have fleet-wide read-only
+    taskless. Assistants and workers receive their member's subtree for this
+    read. Owner and global-permissions callers have fleet-wide read-only
     visibility. Filters narrow that scope. Host is an exact daemon ID or an
     unambiguous visible host label. Shells and unknown session kinds are
     omitted; coverage says when the result is incomplete. Each page is a
