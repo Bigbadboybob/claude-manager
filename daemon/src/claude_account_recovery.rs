@@ -296,6 +296,15 @@ impl Episode {
         }
         reset_due || self.baseline_account.as_deref().zip(account).is_some_and(|(old, new)| old != new)
     }
+
+    fn start_new_edge(&mut self) {
+        self.deferred = false;
+        self.deferred_account = None;
+        self.deferred_reset_due = false;
+        self.outcome = None;
+        self.digest = None;
+        self.queued_at = None;
+    }
 }
 
 fn notice_ready(e: &Episode) -> bool {
@@ -399,7 +408,8 @@ struct AccountObservation {
     profile: Option<(PathBuf, FileStamp, String)>,
     journal: Option<(PathBuf, FileStamp, Journal)>,
     tails: BTreeMap<PathBuf, (FileStamp, String, Result<Option<LimitRecord>, String>)>,
-    screens: BTreeMap<String, (libc::pid_t, u64, u64, u64, u16, u16)>,
+    screens: BTreeMap<String, ((libc::pid_t, u64, u64, u64, u16, u16), bool)>,
+    composer_busy: bool,
     #[cfg(test)] profile_reads: usize,
     #[cfg(test)] journal_reads: usize,
     #[cfg(test)] tail_reads: usize,
@@ -559,6 +569,7 @@ fn session_still_eligible(st: &crate::state::DaemonState, target: &Target) -> bo
 fn attempt(state: &Arc<Mutex<crate::state::DaemonState>>, target: &Target, record: &LimitRecord,
     profile: &Path, journal: &mut Journal, journal_path: &Path, messaging_root: &Path,
     observation: &mut AccountObservation) -> io::Result<bool> {
+    observation.composer_busy = false;
     if target.manager.is_none() { return Ok(false); }
     let lifecycle = crate::claude_recovery::lifecycle_gate(&target.uid);
     let Ok(_lifecycle) = lifecycle.try_write() else { return Ok(false); };
@@ -608,7 +619,9 @@ fn attempt(state: &Arc<Mutex<crate::state::DaemonState>>, target: &Target, recor
     let cursor = target.fanout.snapshot_since(Some(u64::MAX));
     if cursor.closed { return Ok(false); }
     let screen_key = (target.pid, target.generation, cursor.cursor, geometry_version, target.cols, target.rows);
-    if observation.screens.get(&target.uid) == Some(&screen_key) { return Ok(false); }
+    if let Some((key, draft)) = observation.screens.get(&target.uid) {
+        if *key == screen_key { observation.composer_busy = *draft; return Ok(false); }
+    }
     let snapshot = target.fanout.snapshot_since(None);
     if snapshot.closed { return Ok(false); }
     let screen_key = (target.pid, target.generation, snapshot.cursor, geometry_version, target.cols, target.rows);
@@ -617,7 +630,8 @@ fn attempt(state: &Arc<Mutex<crate::state::DaemonState>>, target: &Target, recor
     let mode = target.fanout.keyboard().0.or_else(|| screen.composer_ready().then(|| screen.term_mode()));
     if mode.is_none() || !screen.claude_recovery_composer_ready() {
         if observation.screens.len() >= 512 { observation.screens.clear(); }
-        observation.screens.insert(target.uid.clone(), screen_key);
+        observation.composer_busy = screen.claude_recovery_composer_has_draft();
+        observation.screens.insert(target.uid.clone(), (screen_key, observation.composer_busy));
         return Ok(false);
     }
     observation.screens.remove(&target.uid);
@@ -736,6 +750,11 @@ fn pass(state: &Arc<Mutex<crate::state::DaemonState>>, observation: &mut Account
             }
         }
         if !armed { continue; }
+        if journal.episodes[&key].deferred {
+            journal.episodes.get_mut(&key).unwrap().start_new_edge();
+            journal.refresh_pending();
+            journal.save(&journal_path)?;
+        }
         if target.manager.is_none() {
             let episode = journal.episodes.get_mut(&key).unwrap();
             if !episode.unmanaged_logged {
@@ -756,7 +775,13 @@ fn pass(state: &Arc<Mutex<crate::state::DaemonState>>, observation: &mut Account
             continue;
         }
         // Still observe later failures and preserve their pre-switch baseline.
-        if admitted_this_pass { continue; }
+        if admitted_this_pass {
+            let episode = journal.episodes.get_mut(&key).unwrap();
+            let changed = note_transient_refusal(episode, target_account, crate::agent_state::unix_now());
+            if episode.outcome.is_some() { journal.unstaged = true; }
+            if changed { journal.refresh_pending(); journal.save(&journal_path)?; }
+            continue;
+        }
         let result = attempt(state, target, &record, &profile, &mut journal, &journal_path, &root, observation);
         let episode = journal.episodes.get_mut(&key).unwrap();
         let admitted = matches!(&result, Ok(true));
@@ -772,7 +797,7 @@ fn pass(state: &Arc<Mutex<crate::state::DaemonState>>, observation: &mut Account
             };
             journal.unstaged = journal.episodes.values().any(notice_ready);
             journal.save(&journal_path)?;
-        } else if observation.screens.contains_key(&target.uid) {
+        } else if observation.composer_busy {
             // An unsafe/busy composer or changed evidence gets one immediate
             // notice and no more attempts until a new switch or reset edge.
             episode.deferred = true;
@@ -1015,6 +1040,12 @@ mod tests {
         assert!(note_transient_refusal(episode, Some("new"), 1800.0));
         assert!(episode.deferred);
         assert_eq!(episode.outcome.as_deref(), Some("pending (delivery unconfirmed)"));
+        assert!(!episode.armed(Some("new"), 1801));
+        assert!(episode.armed(Some("another"), 1801));
+        episode.start_new_edge();
+        assert!(episode.queued_at.is_none());
+        assert!(note_transient_refusal(episode, Some("another"), 1801.0));
+        assert!(!episode.deferred && episode.outcome.is_none());
     }
     #[test]
     fn pending_native_digest_waits_for_receipt_or_ten_minutes() {
@@ -1107,6 +1138,7 @@ mod tests {
             let mut screen = crate::workflow::pty_tracker::PtyModeTracker::with_size(80, 24);
             screen.feed(format!("\x1b[?25h\x1b[H{row}\x1b[1;{col}H").as_bytes(), Instant::now());
             assert_eq!(screen.claude_recovery_composer_ready(), expected, "{row} {col}");
+            assert_eq!(screen.claude_recovery_composer_has_draft(), row == "❯ draft", "{row} {col}");
         }
     }
     #[test]
