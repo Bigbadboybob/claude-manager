@@ -211,15 +211,15 @@ class HostReadinessTests(unittest.TestCase):
             self.assertIn("sessions launched before the fix require a restart", channel["hint"])
 
     def test_command_routes_readiness_locally_without_generic_rpc(self):
-        with mock.patch.object(cm_op, "host_readiness", return_value={"ok":False, "checks":[]}) as readiness, \
+        with mock.patch.object(cm_op, "host_readiness", return_value={"ok":False, "checks":[], "_account_identity":None}) as readiness, \
              mock.patch.object(cm_op, "rpc") as rpc, contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(cm_op.main(["host.readiness", '{"required_repos":["x"]}']), 0)
             readiness.assert_called_once()
             rpc.assert_not_called()
-            self.assertEqual(json.loads(out.getvalue())["checks"], [])
+            self.assertEqual(json.loads(out.getvalue())["checks"][0]["status"], "WARN")
 
     def test_ssh_routing_streams_same_read_only_helper(self):
-        remote = types.SimpleNamespace(stdout='{"ok":false,"checks":[]}', stderr="", returncode=0)
+        remote = types.SimpleNamespace(stdout='{"ok":false,"checks":[],"_account_identity":null}', stderr="", returncode=0)
         with mock.patch.object(cm_op.subprocess, "run", return_value=remote) as run, \
              contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(cm_op.main(["--ssh", "f-sessions", "host.readiness", '{"required_repos":["x"]}']), 0)
@@ -227,7 +227,40 @@ class HostReadinessTests(unittest.TestCase):
         self.assertEqual(args[0][:4], ["ssh", "-o", "ConnectTimeout=15", "f-sessions"])
         self.assertIn("host.readiness", args[0][4])
         self.assertIn("def host_readiness", kwargs["input"])
-        self.assertEqual(json.loads(out.getvalue())["checks"], [])
+        self.assertEqual(json.loads(out.getvalue())["checks"][0]["status"], "WARN")
+
+    def test_account_comparison_warns_on_absence_or_unreachable_and_fails_on_match(self):
+        account = "a" * 64; other = "b" * 64
+        target = {"fingerprint":account, "machine":"x", "hostname":"target"}
+        cases = [
+            ({}, {}, "WARN", "unverified (no peers given)"),
+            ({"peer_hosts":["peer"]}, {"peer":(None, "SSH timed out")}, "WARN", None),
+            ({"peer_hosts":["peer"]}, {"peer":({"fingerprint":account,"machine":"y","hostname":"peer"}, None)}, "FAIL", None),
+            ({"peer_hosts":["peer"]}, {"peer":({"fingerprint":other,"machine":"y","hostname":"peer"}, None)}, "PASS", None),
+        ]
+        for params, answers, expected, reason in cases:
+            with mock.patch.object(cm_op, "_peer_account_probe", side_effect=lambda peer, timeout: answers[peer]):
+                out = cm_op._account_comparison({"ok":True, "checks":[]}, target, params)
+            check = out["checks"][0]
+            self.assertEqual(check["status"], expected)
+            self.assertEqual(check["detail"]["reason"], reason)
+            self.assertNotIn(account, json.dumps(out))
+            self.assertNotIn(other, json.dumps(out))
+            if expected == "FAIL": self.assertEqual(check["detail"]["matching"], ["peer"])
+            if answers.get("peer", (None, None))[1] == "SSH timed out":
+                self.assertEqual(check["detail"]["unavailable"]["peer"], "SSH timed out")
+
+    def test_account_identity_hashes_uuid_and_same_host_is_not_collision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            machine = Path(tmp) / "machine-id"; machine.write_text("fixture-machine")
+            raw = "123e4567-e89b-12d3-a456-426614174000"
+            with mock.patch.object(cm_op.socket, "gethostname", return_value="host-a"):
+                target = cm_op._account_identity({"oauthAccount":{"accountUuid":raw}}, machine)
+            self.assertNotIn(raw, json.dumps(target))
+            with mock.patch.object(cm_op, "_peer_account_probe", return_value=(target, None)):
+                out = cm_op._account_comparison({"ok":True,"checks":[]}, target, {"peer_hosts":["alias"]})
+            self.assertEqual(out["checks"][0]["status"], "WARN")
+            self.assertEqual(out["checks"][0]["detail"]["same_host_skipped"], ["alias"])
 
 
 if __name__ == "__main__":

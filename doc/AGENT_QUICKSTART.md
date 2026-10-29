@@ -277,7 +277,7 @@ The helper is an Operator route for the work Owner authorized. Do not substitute
 Before using a new session host, run the read-only preflight from a checkout:
 
 ```sh
-scripts/cm-op --ssh f-sessions host.readiness '{"required_repos":["claude-manager","predictionTrading"]}'
+scripts/cm-op --ssh f-sessions host.readiness '{"required_repos":["claude-manager","predictionTrading"],"peer_hosts":["cm-manager","cm-sessions","f-sessions"]}'
 ```
 
 The report gives individual PASS/FAIL checks and repair hints for daemon and
@@ -296,6 +296,11 @@ reports `unknown (busy)`. The pool check accepts either the local service or
 the forward-only tunnel and checks loopback `/health`; it checks that the
 configured auth command resolves and the proxy key exists without executing
 the helper or displaying the key. Do not clone a pool's refresh tokens.
+The explicit `peer_hosts` list compares one-way hashes of Claude account UUIDs
+without printing the UUIDs or hashes. Matching accounts fail the check;
+unreachable peers or an absent list are WARN and leave coverage unverified.
+Never copy `.credentials.json` between live hosts: rotating refresh tokens can
+invalidate the other host's login.
 
 For routine coordination, post in the task channel (`chat_open().continuous.channel`) mentioning the current parent or worker. Native wake availability is a separate question from SSH/control reachability. Do not spawn a duplicate worker or move its implementation to a different host solely because a local session-control lookup failed.
 

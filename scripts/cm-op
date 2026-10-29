@@ -39,6 +39,7 @@ import re
 import shutil
 import urllib.parse
 import urllib.request
+import uuid
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.10 hosts can still report other checks.
@@ -194,6 +195,24 @@ def _external_ip_status():
         return external, reserved
     except (OSError, ValueError, KeyError, TypeError, AttributeError, UnicodeError):
         return external, False
+
+
+def _account_identity(profile, machine_id=pathlib.Path("/etc/machine-id")):
+    """Return one-way account/machine fingerprints, never the raw IDs."""
+    try:
+        account = profile.get("oauthAccount")
+        if not isinstance(account, dict):
+            return None
+        canonical = str(uuid.UUID(account.get("accountUuid")))
+        digest = hashlib.sha256(b"cm-host-claude-account-v1\0" + canonical.encode()).hexdigest()
+        try:
+            machine = machine_id.read_bytes().strip()
+            machine_hash = hashlib.sha256(b"cm-host-machine-v1\0" + machine).hexdigest() if machine else None
+        except OSError:
+            machine_hash = None
+        return {"fingerprint": digest, "machine": machine_hash, "hostname": socket.gethostname()}
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 
 def host_readiness(params, timeout=5, home=None, meminfo=pathlib.Path("/proc/meminfo")):
@@ -397,9 +416,78 @@ def host_readiness(params, timeout=5, home=None, meminfo=pathlib.Path("/proc/mem
                  + f"remote_socket = {json.dumps(str(home / '.cm' / 'daemon.sock'))}\n")
     add("laptop_hosts_entry", False, {"checked": False, "suggested_block": block},
         "The laptop was not inspected. Verify its ~/.cm/hosts.toml and SSH access; add the suggested block if absent.")
-    return {"ok": all(check["status"] == "PASS" for check in checks), "checks": checks,
+    result = {"ok": all(check["status"] == "PASS" for check in checks), "checks": checks,
             "note": "Credentials are presence-only; resource checks report measurements, not workload capacity thresholds.",
             "launch_environment": "holder/daemon" if daemon_env is not None else "SSH environment (holder environment unavailable)"}
+    if params.get("__internal_account_probe") is True:
+        result["_account_identity"] = _account_identity(claude_json) if daemon_env is not None else None
+    return result
+
+
+def _local_account_probe(timeout=5):
+    try:
+        response = rpc("daemon.health", {}, timeout=timeout, strict=True)
+        health = response.get("result") if response.get("ok") is True else None
+        env = _daemon_environment(health) if isinstance(health, dict) else None
+        if not env or not env.get("HOME"):
+            return None
+        home = pathlib.Path(env["HOME"])
+        profile = (pathlib.Path(env["CLAUDE_CONFIG_DIR"]) / ".claude.json"
+                   if env.get("CLAUDE_CONFIG_DIR") else home / ".claude.json")
+        return _account_identity(_read_json(profile) or {})
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+def _peer_account_probe(host, timeout=5):
+    try:
+        source = pathlib.Path(__file__).read_text()
+        result = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host,
+                                 "python3 - host.account_fingerprint"],
+                                input=source, capture_output=True, text=True, timeout=timeout + 5)
+        if result.returncode != 0:
+            return None, "SSH or remote probe failed"
+        value = json.loads(result.stdout)
+        return (value, None) if isinstance(value, dict) else (None, "account identity unavailable")
+    except subprocess.TimeoutExpired:
+        return None, "SSH timed out"
+    except (OSError, ValueError):
+        return None, "SSH unavailable or invalid response"
+
+
+def _account_comparison(result, target, params, target_host=None, timeout=5):
+    peers = params.get("peer_hosts", [])
+    if (not isinstance(peers, list) or len(peers) > 20 or not all(isinstance(p, str)
+            and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.@:-]*", p) for p in peers)):
+        raise ValueError("peer_hosts must be at most 20 SSH host names")
+    peers_supplied = bool(peers)
+    peers = list(dict.fromkeys(p for p in peers if p != target_host))
+    matched, unavailable, compared, same_host = [], {}, [], []
+    target_valid = isinstance(target, dict) and isinstance(target.get("fingerprint"), str) and re.fullmatch(r"[0-9a-f]{64}", target["fingerprint"]) is not None
+    if target_valid:
+        for peer in peers:
+            other, reason = _peer_account_probe(peer, timeout)
+            if not isinstance(other, dict) or not isinstance(other.get("fingerprint"), str) or re.fullmatch(r"[0-9a-f]{64}", other["fingerprint"]) is None:
+                unavailable[peer] = reason or "account identity unavailable"
+                continue
+            if (target.get("machine") and target.get("machine") == other.get("machine")
+                    and target.get("hostname") == other.get("hostname")):
+                same_host.append(peer)
+                continue
+            compared.append(peer)
+            if target["fingerprint"] == other["fingerprint"]:
+                matched.append(peer)
+    else:
+        unavailable.update({peer:"target account identity unavailable" for peer in peers})
+    status = "FAIL" if matched else "WARN" if not target_valid or not compared or unavailable else "PASS"
+    detail = {"compared": compared, "matching": matched, "unavailable": unavailable,
+              "same_host_skipped": same_host, "target_account_available": target_valid,
+              "reason": "unverified (no peers given)" if not peers_supplied else "unverified (no other peers)" if not peers else None}
+    result["checks"].append({"name":"claude_account_collision", "status":status, "detail":detail,
+        "hint":None if status == "PASS" else 'Use distinct Claude logins; never copy .credentials.json between live hosts. Supply peer_hosts=["cm-manager","cm-sessions","f-sessions"] and retry unreachable peers.'})
+    result["ok"] = result.get("ok") is True and status != "FAIL"
+    result["warnings"] = sum(check.get("status") == "WARN" for check in result["checks"])
+    return result
 
 def rpc(method, params, timeout=120, strict=False):
     """One framed call. `strict` (batch mode) raises on a dead or silent
@@ -455,11 +543,34 @@ def main(argv):
     if ssh_host:
         # Run THIS script remotely (the token and socket are host-local).
         me = pathlib.Path(__file__).read_text()
-        remote_args = (["--timeout", str(timeout)] if timeout is not None else []) + [args[0], args[1] if len(args) > 1 else "{}"]
-        remote = subprocess.run(
-            ["ssh", "-o", "ConnectTimeout=15", ssh_host,
-             "python3 - " + shlex.join(remote_args)],
-            input=me, capture_output=True, text=True)
+        readiness = args[0] == "host.readiness"
+        params = json.loads(args[1]) if len(args) > 1 else {}
+        if readiness and not isinstance(params, dict):
+            raise ValueError("host.readiness parameters must be an object")
+        remote_params = dict(params, __internal_account_probe=True) if readiness else params
+        remote_args = (["--timeout", str(timeout)] if timeout is not None else []) + [args[0], json.dumps(remote_params)]
+        try:
+            remote = subprocess.run(
+                ["ssh", "-o", "ConnectTimeout=15", ssh_host,
+                 "python3 - " + shlex.join(remote_args)],
+                input=me, capture_output=True, text=True, timeout=45 if readiness else None)
+        except subprocess.TimeoutExpired:
+            print(json.dumps({"ok":False, "error":"remote readiness timed out"}))
+            return 1
+        if readiness:
+            if remote.returncode != 0:
+                print(json.dumps({"ok":False, "error":"remote readiness unavailable"}))
+                return remote.returncode
+            try:
+                result = json.loads(remote.stdout)
+                target = result.pop("_account_identity", None)
+                result = _account_comparison(result, target, params, target_host=ssh_host,
+                                             timeout=min(max(timeout or 5, 0.1), 5))
+            except (ValueError, TypeError, AttributeError):
+                print(json.dumps({"ok":False, "error":"invalid readiness response or peer inventory"}))
+                return 1
+            print(json.dumps(result, indent=1))
+            return 0
         sys.stdout.write(remote.stdout)
         sys.stderr.write(remote.stderr)
         return remote.returncode
@@ -474,7 +585,14 @@ def main(argv):
     if method == "host.readiness":
         if not isinstance(params, dict):
             raise ValueError("host.readiness parameters must be an object")
-        print(json.dumps(host_readiness(params, timeout=min(max(timeout or 5, 0.1), 5)), indent=1))
+        result = host_readiness(dict(params, __internal_account_probe=True), timeout=min(max(timeout or 5, 0.1), 5))
+        if params.get("__internal_account_probe") is not True:
+            target = result.pop("_account_identity", None)
+            result = _account_comparison(result, target, params, timeout=min(max(timeout or 5, 0.1), 5))
+        print(json.dumps(result, indent=1))
+        return 0
+    if method == "host.account_fingerprint":
+        print(json.dumps(_local_account_probe(timeout=min(max(timeout or 5, 0.1), 5))))
         return 0
     print(json.dumps(rpc(method, params, 120 if timeout is None else timeout), indent=1))
     return 0
