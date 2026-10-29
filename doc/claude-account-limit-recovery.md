@@ -5,9 +5,9 @@ The daemon can resume an ordinary managed Claude session after a synthetic
 `quotaLimits.resetsAt` has passed. It checks the current native session and
 transcript and requires no later user input. A ready, identity-matched native
 channel receives one durable continuation event per session and error-record
-UUID. The consumer checks the same error and later input immediately before
-claiming it; a superseded event is cancelled. Sessions are processed
-sequentially. Codex, workflow participants, continuous-task runs,
+UUID. The consumer checks the error, later input, manager, scope and binding at
+claim; a superseded event is cancelled. At most one event or PTY write is
+admitted per two-second polling pass. Codex, workflow participants, continuous-task runs,
 and sessions with no manager are excluded; the continuous scheduler owns its
 own recovery. Unmanaged sessions are logged for the operator.
 
@@ -26,13 +26,21 @@ minutes, when remaining events are labelled pending and unconfirmed. It never
 claims that the agent started a new turn. Transcript identity ambiguity is
 reported as `could not check`. Retained record IDs prevent duplicate attempts
 and have no time-based expiry. Disabling recovery retracts pending native
-events; submitted and uncertain receipts are retained.
+events; submitted and uncertain receipts are retained. A native send past its
+final consumer check may complete after disable returns; its receipt is retained.
+Transient admission refusals retry until the ten-minute notice bound, then are
+reported as pending and delivery unconfirmed.
+
+An unreadable recovery journal is quarantined and recovery remains disabled
+until a clean journal is supplied. Quarantined data is retained; records dated
+at or before quarantine remain ineligible because their old one-shot fences
+cannot be trusted.
 
 PTY delivery is a fallback only when a fresh, identity-matched transport report
 proves the native channel is unavailable and there are no live background jobs
-or crons. It requires an empty composer and holds the writer, geometry,
-lifecycle and native notification guards through the paste and 1.5-second
-submit gap. A newly observed background event during that gap withholds Enter;
+or crons. It requires an empty composer and holds the writer, lifecycle and
+native notification guards through the paste and 1.5-second
+submit gap. A resize or newly observed background event during that gap withholds Enter;
 the partial input is uncertain and is never replayed. A busy composer or failed
 safety check is reported to the manager for manual recovery and is not tried
 again until another account switch or reset edge.

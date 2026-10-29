@@ -239,6 +239,25 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.queue.get("recover")["cancel_reason"], "superseded")
         self.assertEqual(adapter.sent, [])
 
+    async def test_real_adapter_rechecks_live_scope_before_claim(self):
+        sid = "93686392-56ae-455c-803d-6ce59cc55e29"
+        rid = "e3c16692-eddd-4ec9-9fd5-282de7a3de11"
+        path = Path(self.tmp.name) / f"{sid}.jsonl"
+        path.write_text(json.dumps({"type":"assistant", "sessionId":sid, "uuid":rid,
+                                    "error":"rate_limit", "isApiErrorMessage":True,
+                                    "message":{"model":"<synthetic>"}}) + "\n")
+        event = {"id":f"claude-limit:{sid}:{rid}", "recovery_scope":{"manager":"manager", "generation":7}}
+        base = {"transcript_path":str(path), "claude_recovery_eligible":True, "managed_by_uid":"manager",
+                "generation":7, "workflow_run_id":None, "continuous_task_id":None}
+        adapter = ClaudeAdapter(self.queue.uid)
+        with mock.patch.object(adapter, "live", return_value=True), mock.patch.object(control_client, "call", return_value=base) as call:
+            self.assertEqual(await adapter.recovery_check(event), "ready")
+            for changed in ({"managed_by_uid":None}, {"managed_by_uid":"other"},
+                            {"workflow_run_id":"run"}, {"continuous_task_id":"ct"},
+                            {"generation":8}, {"claude_recovery_eligible":False}):
+                call.return_value = dict(base, **changed)
+                self.assertEqual(await adapter.recovery_check(event), "superseded", changed)
+
     async def test_recovery_disable_cancels_pending_without_send(self):
         notifications.atomic_write(self.queue.path.parent / "claude-limit-recovery-state", {"version":1, "enabled":False})
         self.queue.publish("recover", "claude-limit-recovery", "[recover] continue", "[recover]")

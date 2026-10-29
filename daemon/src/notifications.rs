@@ -130,7 +130,7 @@ pub fn publish(
 ) -> io::Result<Value> {
     validate_notice(text, marker)?;
     let _guard = lock(root, uid)?;
-    publish_locked(root, uid, id, source, text, marker)
+    publish_locked(root, uid, id, source, text, marker, None)
 }
 
 fn validate_notice(text: &str, marker: &str) -> io::Result<()> {
@@ -152,10 +152,11 @@ fn validate_notice(text: &str, marker: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn publish_locked(root: &Path, uid: &str, id: &str, source: &str, text: &str, marker: &str) -> io::Result<Value> {
+fn publish_locked(root: &Path, uid: &str, id: &str, source: &str, text: &str, marker: &str, recovery_scope: Option<&Value>) -> io::Result<Value> {
     let path = path(root, uid, id);
     if let Some(old) = read(&path)? {
-        if old["text"] != text || old["source"] != source || old["marker"] != marker {
+        if old["text"] != text || old["source"] != source || old["marker"] != marker
+            || recovery_scope.is_some_and(|scope| old["recovery_scope"] != *scope) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "notification ID content conflict",
@@ -192,8 +193,9 @@ fn publish_locked(root: &Path, uid: &str, id: &str, source: &str, text: &str, ma
             ));
         }
     }
-    let event = json!({"version":1,"id":id,"recipient":uid,"source":source,"text":text,"marker":marker,
+    let mut event = json!({"version":1,"id":id,"recipient":uid,"source":source,"text":text,"marker":marker,
         "status":"pending","created_at":chrono::Utc::now().timestamp_millis() as f64 / 1000.0});
+    if let Some(scope) = recovery_scope { event["recovery_scope"] = scope.clone(); }
     if let Err(e) = atomic_replace(&path, &event) {
         // Still under the queue lock: failed publication cannot be consumed.
         let _ = fs::remove_file(&path);
@@ -206,7 +208,7 @@ fn publish_locked(root: &Path, uid: &str, id: &str, source: &str, text: &str, ma
 /// rechecks the failure and durably claims its attempt before publication.
 pub(crate) fn publish_recovery_if(
     root: &Path, uid: &str, id: &str, text: &str, marker: &str, native_id: &str,
-    failed_at: f64, now: f64, commit: impl FnOnce() -> io::Result<bool>, final_check: impl FnOnce() -> bool,
+    failed_at: f64, now: f64, scope: &Value, commit: impl FnOnce() -> io::Result<bool>, final_check: impl FnOnce() -> bool,
 ) -> io::Result<Option<Value>> {
     validate_notice(text, marker)?;
     let started = std::time::Instant::now();
@@ -228,7 +230,7 @@ pub(crate) fn publish_recovery_if(
     if !recovery_enabled(root) || held(root, uid, now)
         || !recovery_transport_ready(current.as_ref(), native_id, now) { return Ok(None); }
     if !final_check() { return Ok(None); }
-    publish_locked(root, uid, id, "claude-limit-recovery", text, marker).map(Some)
+    publish_locked(root, uid, id, "claude-limit-recovery", text, marker, Some(scope)).map(Some)
 }
 
 pub(crate) fn recovery_transport_ready(transport: Option<&Value>, native_id: &str, now: f64) -> bool {
@@ -466,12 +468,12 @@ mod tests {
         let dir = directory(root, uid); std::fs::create_dir_all(&dir).unwrap();
         let heartbeat = |at: f64, own: &str| json!({"status":"ready", "engine":"claude-code", "updated_at":at, "own_session_id":own, "bound_session_id":native});
         crate::messaging::atomic_replace(&dir.join("transport.json"), &heartbeat(1000.0, "wrong")).unwrap();
-        assert!(publish_recovery_if(root, uid, "event", "[m] resume", "[m]", native, 900.0, 1001.0, || panic!("must not commit"), || true).unwrap().is_none());
+        assert!(publish_recovery_if(root, uid, "event", "[m] resume", "[m]", native, 900.0, 1001.0, &json!({}), || panic!("must not commit"), || true).unwrap().is_none());
         crate::messaging::atomic_replace(&dir.join("transport.json"), &heartbeat(1000.0, native)).unwrap();
-        assert!(publish_recovery_if(root, uid, "event", "[m] resume", "[m]", native, 900.0, 1016.0, || panic!("stale health"), || true).unwrap().is_none());
-        let event = publish_recovery_if(root, uid, "event", "[m] resume", "[m]", native, 900.0, 1001.0, || Ok(true), || true).unwrap().unwrap();
+        assert!(publish_recovery_if(root, uid, "event", "[m] resume", "[m]", native, 900.0, 1016.0, &json!({}), || panic!("stale health"), || true).unwrap().is_none());
+        let event = publish_recovery_if(root, uid, "event", "[m] resume", "[m]", native, 900.0, 1001.0, &json!({}), || Ok(true), || true).unwrap().unwrap();
         assert_eq!(event["source"], "claude-limit-recovery");
-        assert!(publish_recovery_if(root, uid, "event", "[m] resume", "[m]", native, 900.0, 1001.0, || panic!("pending event"), || true).unwrap().is_none());
+        assert!(publish_recovery_if(root, uid, "event", "[m] resume", "[m]", native, 900.0, 1001.0, &json!({}), || panic!("pending event"), || true).unwrap().is_none());
         assert_eq!(snapshot(root, uid).unwrap().0.len(), 1);
     }
     #[test]

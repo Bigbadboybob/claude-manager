@@ -115,7 +115,7 @@ pub struct FanoutSnapshot {
 
 pub struct PtyByteFanout {
     inner: Mutex<FanoutInner>,
-    geometry: std::sync::RwLock<u64>,
+    geometry: std::sync::atomic::AtomicU64,
     /// Sub-2b-1 review-r#2 #1: shared activity timestamp.
     /// `None` for fanouts constructed via the unit-test
     /// `PtyByteFanout::new` shortcut (idle isn't observable
@@ -242,13 +242,13 @@ impl PtyByteFanout {
                 stream_id: new_stream_id(),
                 keyboard: crate::keys::KeyboardTracker::fresh(),
             }),
-            geometry: std::sync::RwLock::new(0),
+            geometry: std::sync::atomic::AtomicU64::new(0),
             last_activity_at,
         }
     }
 
-    pub(crate) fn geometry_read(&self) -> std::sync::RwLockReadGuard<'_, u64> {
-        self.geometry.read().unwrap_or_else(|p| p.into_inner())
+    pub(crate) fn geometry_version(&self) -> u64 {
+        self.geometry.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Seed an adopted session's fanout: its keyboard mode, then its replay
@@ -3678,8 +3678,7 @@ impl DaemonSession {
         rows: u16,
         cell_pixels: Option<(u16, u16)>,
     ) -> std::io::Result<()> {
-        let mut geometry = self.fanout.geometry.write().unwrap_or_else(|p| p.into_inner());
-        *geometry = geometry.wrapping_add(1);
+        self.fanout.geometry.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         use portable_pty::PtySize;
         if let Some((w, h)) = cell_pixels.filter(|&(w, h)| w > 0 && h > 0) {
             self.last_cell_pixels = Some((w, h));

@@ -251,6 +251,7 @@ class ClaudeAdapter:
         except (OSError, IndexError):
             self.peer_start = None
         self.transcript_path = None
+        self.resolved_session = None
         self.resolve_after = 0.0
         self.initial_bound = None
         self._own_session_id = None
@@ -280,8 +281,10 @@ class ClaudeAdapter:
                     timeout=2,
                 )
                 self.transcript_path = resolved.get("transcript_path")
+                self.resolved_session = resolved
             except (control_client.ControlError, control_client.TransportError):
                 self.transcript_path = None
+                self.resolved_session = None
             if self.initial_bound is None and self.transcript_path:
                 self.initial_bound = self.transcript_path
             self.resolve_after = time.monotonic() + 1
@@ -457,6 +460,19 @@ class ClaudeAdapter:
         # A cached binding is not sufficient at the effect boundary.
         self.resolve_after = 0.0
         await self._resolve()
+        resolved = self.resolved_session
+        scope = event.get("recovery_scope")
+        if not isinstance(resolved, dict) or not isinstance(scope, dict):
+            return "unknown"
+        if (not isinstance(scope.get("manager"), str) or not scope["manager"]
+                or not isinstance(scope.get("generation"), int)):
+            return "unknown"
+        if (resolved.get("claude_recovery_eligible") is not True
+                or resolved.get("managed_by_uid") != scope["manager"]
+                or resolved.get("generation") != scope["generation"]
+                or resolved.get("workflow_run_id") is not None
+                or resolved.get("continuous_task_id") is not None):
+            return "superseded"
         if self.live() is False:
             return "superseded"
         if self.live() is not True or not self.transcript_path:

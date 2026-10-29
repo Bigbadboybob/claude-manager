@@ -3266,6 +3266,14 @@ pub fn resolve_authorized_session(
             "kind": if session.session_type == "bash" { "shell" } else { "agent" },
             "transcript_path": session.transcript_path.clone(),
             "generation": session.generation,
+            "managed_by_uid": session.managed_by_uid,
+            "workflow_run_id": session.workflow_run_id,
+            "continuous_task_id": session.continuous_task_id,
+            "claude_recovery_eligible": engine_str(&session.session_type) == "claude-code"
+                && session.managed_by_uid.is_some() && session.workflow_run_id.is_none()
+                && session.continuous_task_id.is_none() && !session.last_exit.kernel_set()
+                && !state.restarting && !state.draining && state.config.claude_limit_recovery
+                && !crate::rotation::in_progress(&p.session_uid) && !crate::handoff::in_progress(&p.session_uid),
             "idle": idle,
             "pty_idle": pty_idle,
             "agent_state": agent_state,

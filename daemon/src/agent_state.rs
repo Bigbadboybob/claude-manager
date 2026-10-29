@@ -1506,7 +1506,9 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>) -> std::io::Result<()> {
 }
 
 pub fn start(state: &Arc<Mutex<DaemonState>>) -> std::io::Result<()> {
-    crate::claude_account_recovery::start(state)?;
+    if let Err(e) = crate::claude_account_recovery::start(state) {
+        eprintln!("cm-daemon: Claude account recovery unavailable at startup: {e}");
+    }
     let weak = Arc::downgrade(state);
     std::thread::Builder::new()
         .name("cm-agent-state".into())
