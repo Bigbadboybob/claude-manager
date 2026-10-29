@@ -1032,7 +1032,7 @@ mod tests {
         let agent = cell.lock().unwrap().recompute(now);
         assert!(failed_boundary(&agent), "{agent:?}");
         let mut with_job = agent.clone();
-        with_job.background.jobs.push(serde_json::from_value(json!({"id":"active-job","kind":"shell","first_seen_at":1.0,"wakes_agent":true})).unwrap());
+        with_job.background.jobs.push(serde_json::from_value(json!({"id":"active-job","label":"active-job","kind":"shell","first_seen_at":1.0,"wakes_agent":true})).unwrap());
         assert!(failed_boundary(&with_job), "active background jobs do not erase the failed foreground");
         assert!(!same_background(&agent.background, &with_job.background));
         let captured = Instant::now();
@@ -1040,7 +1040,7 @@ mod tests {
         assert!(writes.lock().unwrap().is_empty());
         let captured_cell = Arc::clone(&cell);
         assert!(!input.write_claude_limit_resume(captured, agent.turn_seq, agent.last_turn.ended_at, &agent.background, b"\r", || {
-            let job: crate::agent_state::Job = serde_json::from_value(json!({"id":"finished-job","kind":"shell","first_seen_at":1.0,"wakes_agent":true})).unwrap();
+            let job: crate::agent_state::Job = serde_json::from_value(json!({"id":"finished-job","label":"finished-job","kind":"shell","first_seen_at":1.0,"wakes_agent":true})).unwrap();
             captured_cell.lock().unwrap().inputs.background.jobs.push(job); Ok(true)
         }, || Ok(true), || true, || Ok(true)).unwrap());
         assert!(writes.lock().unwrap().is_empty(), "background change after commit must refuse before bytes");
@@ -1139,7 +1139,7 @@ mod tests {
                 transcript_end:Some(crate::agent_state::LastTurn { ended_at:Some((now - 120) as f64), status:Some(crate::agent_state::TurnStatus::Failed) }),
                 transcript_evidence_path:Some(transcript.clone()) });
             cell.inputs.latest_start = Some((now - 180) as f64); cell.inputs.background.complete = true;
-            cell.inputs.background.jobs.push(serde_json::from_value(json!({"id":"bg","kind":"shell","first_seen_at":1.0,"wakes_agent":true})).unwrap());
+            cell.inputs.background.jobs.push(serde_json::from_value(json!({"id":"bg","label":"bg","kind":"shell","first_seen_at":1.0,"wakes_agent":true})).unwrap());
         }
         let mut daemon = crate::state::DaemonState::new(); daemon.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
         daemon.messaging_root = dir.path().into(); daemon.sessions.insert(uid.clone(), session);

@@ -585,7 +585,8 @@ class SlimReadTests(unittest.TestCase):
             self.assertNotIn("view", call.call_args.args[1])
             self.assertEqual(call.call_args.args[1], {"inbox": True, "unread_only": True,
                                                       "time_basis": "created", "freshness": "cached",
-                                                      "limit": 50, "dms": False, "newest_first": True})
+                                                      "limit": 50, "dms": False, "newest_first": True,
+                                                      "mark_read": True, "mentions_only": False})
             self.assertEqual(slim["view"], "slim")
             full = server.chat_read(inbox=True, unread_only=True, view="full", newest_first=False)
             self.assertIn("norms", full)
