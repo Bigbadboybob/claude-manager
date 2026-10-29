@@ -1293,6 +1293,78 @@ async def authority_batch(pool, actor: dict, targets: list[dict], *, self_ok: bo
     return {"allowed": allowed}
 
 
+async def rebind_main(pool, actor: dict, ref: str, *, session: str,
+                      reason: str, request_id: str | None = None) -> dict:
+    """Move a member seat to another live agent session.
+
+    The member identity and manager chain stay put; only its open main
+    incarnation, local O5 fact and board holds move.  The operation is one
+    advisory-locked transaction and is idempotent by request_id.
+    """
+    if not reason or not str(reason).strip():
+        raise _err(422, "invalid_field", "rebinding a main needs a reason")
+
+    async def body(conn):
+        member_id = await _resolve_member_id(conn, ref)
+        if not member_id or member_id == OWNER_ID:
+            raise _err(404, "not_found", f"no rebindable member {ref!r}")
+        member = await conn.fetchrow("SELECT * FROM members WHERE id = $1", member_id)
+        if member["status"] != "active":
+            raise _err(409, "retired", f"{member['handle']} is not active")
+        await _require_chain(conn, actor, member_id, "rebind the main of")
+        target = await conn.fetchrow(
+            """SELECT s.pid, s.daemon_id, s.session_uid, s.engine, s.exited_at,
+                      f.workspace_id, f.worktree_path
+                 FROM session_states s LEFT JOIN org_session_facts f ON f.pid = s.pid
+                WHERE s.pid = $1 AND s.exited_at IS NULL AND s.state <> 'exited'""", session)
+        if target is None:
+            raise _err(404, "not_found", f"{session} is not a live session")
+        if target["engine"] in ("bash", "shell"):
+            raise _err(422, "agent_only", "a main must be an agent session; shells are excluded")
+        if await conn.fetchval("SELECT 1 FROM incarnations WHERE pid = $1 AND ended_at IS NULL", session):
+            raise _err(409, "already_member", f"{session} is already an active member session")
+        old = await conn.fetchrow(
+            """SELECT * FROM incarnations WHERE member_id = $1 AND role = 'main' AND ended_at IS NULL
+                FOR UPDATE""", member_id)
+        if old is None:
+            raise _err(409, "no_main", f"{member['handle']} has no open main incarnation")
+        if old["pid"] == session:
+            return await _detail(conn, member_id)
+        generation = int(member["occupancy_generation"] or 0) + 1
+        holds = await hand_back_holds(conn, actor, old["pid"], session,
+                                      reason=f"main rebound: {reason}")
+        await conn.execute(
+            """UPDATE incarnations SET ended_at = now(), end_reason = $2
+                WHERE id = $1""", old["id"], f"rebound:{reason[:180]}")
+        incarnation = await conn.fetchval(
+            """INSERT INTO incarnations (member_id, role, occupancy_generation, pid, daemon_id,
+                                         session_uid, workspace_id, predecessor)
+               VALUES ($1, 'main', $2, $3, $4, $5, $6, $7) RETURNING id""",
+            member_id, generation, target["pid"], target["daemon_id"], target["session_uid"],
+            target["workspace_id"], old["id"])
+        await conn.execute("UPDATE members SET occupancy_generation = $2, revision = revision + 1, updated_at = now() WHERE id = $1",
+                           member_id, generation)
+        await conn.execute("UPDATE org_session_facts SET acting_as = 'closed' WHERE pid = $1", old["pid"])
+        await conn.execute(
+            """UPDATE org_session_facts SET member_id = $2, acting_as = 'main'
+                WHERE pid = $1""", target["pid"], member_id)
+        await _event(conn, "member", member_id, "main_rebound", actor,
+                     prev={"pid": old["pid"], "session_uid": old["session_uid"], "incarnation": old["id"]},
+                     new={"pid": target["pid"], "session_uid": target["session_uid"], "incarnation": incarnation,
+                          "occupancy_generation": generation, "holds": holds},
+                     reason=reason, request_id=request_id)
+        detail = await _detail(conn, member_id)
+        return {"member": detail["member"], "old_main": {"pid": old["pid"], "session_uid": old["session_uid"]},
+                "new_main": {"pid": target["pid"], "session_uid": target["session_uid"], "daemon_id": target["daemon_id"]},
+                "holds": holds,
+                "notices": [{"session_uid": old["session_uid"], "kind": "main_rebound"},
+                            {"session_uid": target["session_uid"], "kind": "main_rebound"}]}
+
+    response = await _member_write(pool, actor, request_id, "rebind_main", body)
+    async with pool.acquire() as conn:
+        return {**response, "version": await version(conn)}
+
+
 async def _require_destination(conn, actor_member: str | None, manager_id: str, what: str) -> None:
     """A non-Owner may place a member only under itself or a member of its
     own reporting subtree; anywhere else (another lead's branch, Owner) is

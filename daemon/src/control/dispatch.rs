@@ -939,7 +939,7 @@ pub fn dispatch_request(
         // adoption, proxied like items. Roster and adoption are Owner's.
         "org.snapshot" | "org.member" | "org.team" | "org.roster" | "org.roster_apply"
         | "org.adopt" | "org.team_create" | "org.team_update" | "org.move" | "org.retire"
-        | "org.reinstate" | "org.close_assistant" | "org.promote" => {
+        | "org.reinstate" | "org.close_assistant" | "org.promote" | "org.rebind_main" => {
             DispatchOutcome::Done(crate::items::org::dispatch(state, req))
         }
         // Gate receipts (doc/gate-receipts.md §9): same proxy shape as items.

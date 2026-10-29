@@ -1688,6 +1688,12 @@ def org(
         (`already_member`), continuous orchestrators (`continuous`) and
         non-assistants (`not_an_assistant`); a taken handle is
         `handle_taken`. The session must be on this host.
+      - `action="rebind_main", member=..., session_uid=..., reason=...`:
+        hand an existing member's main seat and board holds to a live agent
+        session, including a session on another daemon host. The member's
+        handle, manager chain and teams remain unchanged; the old main is
+        closed and both local sessions receive a `[cm-org]` notice when
+        present on this host. Allowed for Owner or the member's manager chain.
       - `action="setup", session_uid=..., name=, channels=, board=, group=,
         epic=, items=, poc_of=, hire=`: set up a session you spawned, the
         same steps as `start_session`'s spawn-time setup (see there), with
@@ -1706,7 +1712,7 @@ def org(
             "items": items, "poc_of": poc_of, "hire": hire,
         }.items() if value not in (None, "", [])}
         return {"session_uid": session_uid, "setup": _setup_session(session_uid, spec)}
-    if action in ("move", "retire", "reinstate", "close_assistant", "promote") and request_id is None:
+    if action in ("move", "retire", "reinstate", "close_assistant", "promote", "rebind_main") and request_id is None:
         request_id = f"org-{action}-{uuid.uuid4()}"
     params = {key: value for key, value in {
         "view": view, "action": action, "task_id": task_id,

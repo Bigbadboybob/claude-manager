@@ -31,6 +31,7 @@ pub const METHODS: &[&str] = &[
     "org.reinstate",
     "org.close_assistant",
     "org.promote",
+    "org.rebind_main",
 ];
 
 /// The read-only ones (restart-barrier classification).
@@ -78,6 +79,7 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
             }
             "org.close_assistant" => close_assistant(state, &ctx, p),
             "org.promote" => promote(state, &ctx, p),
+            "org.rebind_main" => rebind_main(state, &ctx, p),
             other => Err((ErrorCode::UnknownMethod, format!("unknown org method {other}"))),
         }
     });
@@ -539,6 +541,60 @@ pub(crate) fn hand_back_after_kill(state: &Arc<Mutex<DaemonState>>, req: &Reques
             eprintln!("cm org: holds of killed assistant {uid} not handed back: {e}");
         }
     });
+}
+
+/// Hand an existing member's main role to a live agent session. The planning
+/// API performs the atomic occupancy/hold move; this daemon updates local
+/// cache/stamps and writes native notices for sessions hosted here.
+fn rebind_main(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, mut p: Map<String, Value>) -> RpcResult {
+    let member = match take_str(&mut p, "member")? {
+        Some(v) => v,
+        None => take_str(&mut p, "ref")?.ok_or_else(|| bad("org.rebind_main needs member"))?,
+    };
+    let uid = match take_str(&mut p, "session_uid")? {
+        Some(v) => v,
+        None => take_str(&mut p, "session")?.ok_or_else(|| bad("org.rebind_main needs session"))?,
+    };
+    let reason = take_str(&mut p, "reason")?.ok_or_else(|| bad("org.rebind_main needs reason"))?;
+    let pid = if uid.starts_with("agent:") { uid.clone() } else { format!("agent:{}:{uid}", ctx.daemon_id) };
+    let mut body = Map::new();
+    body.insert("pid".into(), json!(pid));
+    body.insert("reason".into(), json!(reason));
+    if let Some(v) = p.get("request_id").filter(|v| v.is_string()) { body.insert("request_id".into(), v.clone()); }
+    let path = format!("/org/members/{}/rebind_main", encode(&member));
+    let reply = api(ctx.api.post(&path, &with_actor(ctx, body)))?;
+    let member_obj = reply["member"].clone();
+    let new_uid = reply["new_main"]["session_uid"].as_str().unwrap_or(&uid).to_string();
+    let old_uid = reply["old_main"]["session_uid"].as_str().unwrap_or("").to_string();
+    let root = {
+        let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(sess) = s.sessions.get_mut(&old_uid) {
+            if let Some(org) = sess.org.as_mut() { org.remove(crate::assistants::MEMBER_ID); org.remove(crate::assistants::ACTING_AS); }
+        }
+        note_main(&new_uid, &member_obj);
+        if let Some(sess) = s.sessions.get_mut(&new_uid) {
+            let member_id = member_obj["id"].as_str().unwrap_or_default();
+            crate::assistants::stamp(&mut sess.org, member_id, crate::assistants::MAIN, "rebind:operator");
+        }
+        s.persist_sessions_best_effort();
+        s.messaging_root.clone()
+    };
+    let handle = member_obj["handle"].as_str().unwrap_or(member.as_str());
+    let manager = member_obj["manager_handle"].as_str().unwrap_or("Owner");
+    let marker = "[cm-org]";
+    let text = format!("{marker} Main session changed to {handle}; reporting to {manager}. The member seat and board holds moved with it.");
+    let mut noticed = Map::new();
+    for target in [old_uid.as_str(), new_uid.as_str()] {
+        if !target.is_empty() {
+            let id = format!("org-rebind-main:{}:{}", member_obj["id"], target);
+            let ok = crate::notifications::publish(&root, target, &id, "cm", &text, marker).is_ok();
+            noticed.insert(target.to_string(), json!(ok));
+        }
+    }
+    let mut out = reply;
+    out["session_uid"] = json!(new_uid);
+    out["noticed"] = Value::Object(noticed);
+    Ok(out)
 }
 
 /// `org.promote` (doc/org-model.md §4.2): one of a member's assistants on
