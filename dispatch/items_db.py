@@ -1133,7 +1133,8 @@ MAX_PUSHES_PER_BEAT = 100
 # with a reason) so it cannot starve newer ones (~5 min at 30 s beats).
 MAX_PUSH_ATTEMPTS = 10
 _TEXT_LIMITS = {"session_uid": 200, "task_id": 200, "name": 200, "engine": 40,
-                "state": 40, "killed_by": 200}
+                "state": 40, "killed_by": 200,
+                "recorded_model": 200, "recorded_model_source": 64}
 
 
 def _clip(value, limit: int):
@@ -1165,6 +1166,11 @@ def _session_row(raw, prefix: str) -> tuple[dict | None, str | None]:
     for key in ("state_age_s", "idle_for_s", "age_s"):
         row[key] = _seconds(raw.get(key))
     row["reported_done"] = raw.get("reported_done") is True
+    member, role = raw.get("member_id"), raw.get("acting_as")
+    if isinstance(member, str) and 0 < len(member) <= 64 and role in ("assistant", "worker"):
+        row["roster_stamp_member"], row["roster_stamp_role"] = member, role
+    else:
+        row["roster_stamp_member"], row["roster_stamp_role"] = None, None
     agent_state = raw.get("agent_state")
     row["agent_state"] = agent_state if isinstance(agent_state, dict) else None
     return row, None
@@ -1237,9 +1243,11 @@ async def heartbeat(pool, daemon_id: str, *, host_label: str | None, sessions: l
                     """INSERT INTO session_states (pid, daemon_id, session_uid, host_label, task_id,
                                                    name, engine, state, state_since, idle_since,
                                                    reported_done, killed_by, agent_state,
-                                                   started_at, exited_at, reported_at)
+                                                   started_at, exited_at, reported_at,
+                                                   recorded_model, recorded_model_source,
+                                                   roster_stamp_member, roster_stamp_role)
                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                               CASE WHEN $15 THEN $16::timestamptz END, $16)
+                               CASE WHEN $15 THEN $16::timestamptz END, $16, $17, $18, $19, $20)
                        ON CONFLICT (pid) DO UPDATE SET
                            daemon_id = EXCLUDED.daemon_id, session_uid = EXCLUDED.session_uid,
                            host_label = EXCLUDED.host_label, task_id = EXCLUDED.task_id,
@@ -1251,12 +1259,18 @@ async def heartbeat(pool, daemon_id: str, *, host_label: str | None, sessions: l
                            exited_at = CASE WHEN $15
                                             THEN COALESCE(session_states.exited_at, $16::timestamptz)
                                        END,
-                           reported_at = EXCLUDED.reported_at""",
+                           reported_at = EXCLUDED.reported_at,
+                           recorded_model = EXCLUDED.recorded_model,
+                           recorded_model_source = EXCLUDED.recorded_model_source,
+                           roster_stamp_member = EXCLUDED.roster_stamp_member,
+                           roster_stamp_role = EXCLUDED.roster_stamp_role""",
                     s["pid"], daemon_id, s["session_uid"], host_label,
                     _uuid_or_none(s.get("task_id")), s.get("name"), s.get("engine"), s["state"],
                     ago(s.get("state_age_s")), ago(s.get("idle_for_s")),
                     bool(s.get("reported_done")), s.get("killed_by"), s.get("agent_state"),
                     ago(s.get("age_s")), gone, now,
+                    s.get("recorded_model"), s.get("recorded_model_source"),
+                    s.get("roster_stamp_member"), s.get("roster_stamp_role"),
                 )
             live = [s["pid"] for s in sessions if s["state"] != "exited"]
             await conn.execute(

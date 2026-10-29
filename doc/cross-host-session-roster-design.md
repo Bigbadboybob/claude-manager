@@ -53,6 +53,12 @@ permissions change, and a refresh is required to reconcile it. Do not use the
 org/task feed version as a heartbeat watermark: heartbeats do not enter that
 feed. If a consistent multi-page census becomes necessary, review a bounded
 snapshot/token design separately; do not silently keep a DB transaction open.
+The initial implementation caps a row at 50 holds and marks `items_more`;
+it does not claim the truncated hold list is complete. A visible host summary
+is capped at 100 and marks `hosts_more`. A task scope above 10,000 nodes or
+containing a cycle fails closed with an explicit error; these are engineering
+bounds, not measured fleet limits. Large-scope performance requires isolated
+measurement before rollout.
 
 ## Existing facts and exact joins
 
@@ -85,8 +91,12 @@ snapshot/token design separately; do not silently keep a DB transaction open.
   (`dispatch/org_db.py:1296`–`:1355`); a stale old session is not the new main.
   Main identity comes from the open canonical incarnation and does not depend
   on freshness of `org_session_facts`; it is a current seat, not proof of a
-  running process. For assistant/worker stamps use their independent 90s
-  `reported_at` freshness; closed/promoted, stale, absent or conflicting
+  running process. The org upsert retains a previous member stamp when a beat
+  omits it while still refreshing `reported_at`; that timestamp alone cannot
+  prove the stamp was reaffirmed. Persist a roster-only member/role observation
+  from the session beat, clearing it on omission, and require the fresh session
+  and org observations to agree for assistant/worker attribution. Old writers
+  without that observation stay unknown. Closed/promoted, stale, absent or conflicting
   stamps need explicit unknown/conflict rather than guessed membership. Show member status and
   incarnation/generation where available; membership is a roster fact, not a
   grant to control that session.
@@ -176,6 +186,12 @@ already in the closure. This is the central planning-row creator edge for
 `propose_task`; daemon-local `agent_task_edges` are not consulted. Missing,
 malformed or cyclic links cannot create reachability.
 
+Reviewer note N8: task metadata is a writable bag and `metadata.filer.task_id`
+is not currently guarded by `update_task`; a permitted writer can change that
+edge. This is part of the approved trusted-host scope and has a similar
+implication to the existing writable parent-task edge. It is not evidence that
+the edge is tamper-proof; guarding task metadata is separate work.
+
 The daemon stamps its validated global/Owner condition; ordinary caller
 parameters cannot request that exemption. Before the call it confirms that a
 claimed main/assistant is still the locally registered caller, capturing its
@@ -202,6 +218,12 @@ The coordinator approved this concrete mechanism in message `7fcea50a`. A
 recheck must not assert cross-table atomicity beyond the actual transaction. A local
 API outage returns an explicit unavailable/partial result and never silently
 falls back to a broad remote listing.
+
+For a taskless caller the daemon also supplies its bounded, sorted snapshot of
+session UIDs currently in the caller's local workspace, and revalidates that set
+after the read. The API intersects it with the caller daemon ID. A heartbeat's
+workspace label alone is not a current authorization proof. If the local set
+exceeds the request bound, refuse rather than return an unlabelled truncation.
 
 The existing service boundary is important to state accurately: `api/auth.py:
 7`–`:10` authenticates a shared bearer and `api/items.py:1`–`:4` trusts

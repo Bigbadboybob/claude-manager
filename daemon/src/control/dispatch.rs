@@ -312,6 +312,7 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "ping",
     "staffing.get",
     "list_sessions",
+    "session.roster",
     "read_session_output",
     "resolve_authorized_session",
     "session.list_transcripts",
@@ -598,6 +599,7 @@ pub fn dispatch_request(
         // see only their own workspace; Operator callers see the
         // full registry.
         "list_sessions" => DispatchOutcome::Done(dispatch_list_sessions(state, req)),
+        "session.roster" => DispatchOutcome::Done(crate::items::roster::dispatch(state, req)),
 
         // Slice 10d-mcp-surface-2a: TUI-pushed task-tree
         // snapshot. Operator-only — Session callers can't

@@ -267,6 +267,37 @@ class HeartbeatBody(_Strict):
     acked_mark_ids: list[Annotated[int, Field(ge=1)]] = Field(default_factory=list, max_length=1000)
 
 
+class RosterCaller(_Strict):
+    # Internal daemon-stamped identity; shared bearer authenticates the host,
+    # not the individual actor. Never forward fields from tool arguments.
+    pid: str = Field(min_length=1, max_length=300)
+    daemon_id: str = Field(min_length=1, max_length=200)
+    session_uid: str | None = Field(default=None, max_length=200)
+    task_id: str | None = Field(default=None, max_length=200)
+    workspace_id: str | None = Field(default=None, max_length=200)
+    workspace_uids: list[Annotated[str, Field(min_length=1, max_length=200)]] = Field(default_factory=list, max_length=2000)
+    generation: int | None = Field(default=None, ge=0)
+    process_identity: int | None = Field(default=None, ge=0)
+    global_: bool = Field(default=False, alias="global")
+    owner: bool = False
+
+
+class RosterFilters(_Strict):
+    host: str | None = Field(default=None, min_length=1, max_length=200)
+    member: str | None = Field(default=None, min_length=1, max_length=200)
+    manager: str | None = Field(default=None, min_length=1, max_length=200)
+    state: str | None = Field(default=None, min_length=1, max_length=40)
+    task: str | None = Field(default=None, min_length=1, max_length=200)
+    include_exited: bool = False
+    limit: int = Field(default=100, ge=1, le=100)
+    cursor: str | None = Field(default=None, min_length=1, max_length=4096)
+
+
+class RosterBody(_Strict):
+    caller: RosterCaller
+    filters: RosterFilters
+
+
 # ---- gate receipts (doc/gate-receipts.md §9) -----------------------------------
 
 class ReceiptBody(_Strict):

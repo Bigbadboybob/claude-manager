@@ -1831,6 +1831,35 @@
     "session_uids"
    ]
   },
+  "session_roster": {
+   "params": {
+    "cursor": {
+     "type": "string"
+    },
+    "host": {
+     "type": "string"
+    },
+    "include_exited": {
+     "type": "boolean"
+    },
+    "limit": {
+     "type": "integer"
+    },
+    "manager": {
+     "type": "string"
+    },
+    "member": {
+     "type": "string"
+    },
+    "state": {
+     "type": "string"
+    },
+    "task": {
+     "type": "string"
+    }
+   },
+   "required": []
+  },
   "set_session_section": {
    "params": {
     "section": {

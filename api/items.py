@@ -26,6 +26,7 @@ from api.items_models import (
     RefreshBody,
     ItemsChatTouchBody,
     HeartbeatBody,
+    RosterBody,
     BoardResolveBody,
     ItemResolveBody,
     ItemsCreateBody,
@@ -34,11 +35,26 @@ from api.items_models import (
 )
 import logging
 
-from dispatch import epics, gate_db, items_db, org_db, placement
+from dispatch import epics, gate_db, items_db, org_db, placement, session_roster
 from dispatch.items_rules import ItemsError
 
 router = APIRouter(dependencies=[Depends(verify_token)])
 logger = logging.getLogger("cm.api.items")
+
+
+@router.post("/session-roster")
+async def session_roster_read(body: RosterBody, request: Request):
+    # Within the approved shared-bearer trusted-host boundary the daemon is
+    # responsible for stamping these fields and revalidating its caller.
+    caller = body.caller.model_dump(by_alias=True)
+    if caller["owner"]:
+        if caller["pid"] != "owner" or caller["session_uid"] is not None:
+            raise HTTPException(status_code=422, detail="invalid operator stamp")
+    elif not caller["session_uid"] or caller["pid"] != f"agent:{caller['daemon_id']}:{caller['session_uid']}":
+        raise HTTPException(status_code=422, detail="invalid session stamp")
+    from dispatch.config import API_TOKEN
+    return await _call(session_roster.read(_pool(request), caller, body.filters.model_dump(),
+                                          API_TOKEN.encode() if API_TOKEN else b""))
 
 
 def _pool(request: Request):
