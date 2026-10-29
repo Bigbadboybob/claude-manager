@@ -52,7 +52,8 @@ fn read(path: &Path) -> io::Result<Option<Value>> {
 fn valid_census_event(value: &Value) -> bool {
     let id_ok = value["id"].as_str().is_some_and(|id| !id.trim().is_empty());
     let source_ok = value["source"].as_str().is_some_and(|source| !source.trim().is_empty());
-    let version_ok = value["version"] == 1;
+    let version_ok = value["version"] == 1
+        || (value["version"] == 2 && value["source"] == "claude-limit-recovery");
     let status_ok = matches!(value["status"].as_str(), Some(
         "pending" | "submitting" | "submitted" | "uncertain" | "observed" | "cancelled"));
     // If updated_at exists it is authoritative: an invalid value cannot
@@ -156,6 +157,7 @@ fn publish_locked(root: &Path, uid: &str, id: &str, source: &str, text: &str, ma
     let path = path(root, uid, id);
     if let Some(old) = read(&path)? {
         if old["text"] != text || old["source"] != source || old["marker"] != marker
+            || (recovery_scope.is_some() && old["version"] != 2)
             || recovery_scope.is_some_and(|scope| old["recovery_scope"] != *scope) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -193,7 +195,8 @@ fn publish_locked(root: &Path, uid: &str, id: &str, source: &str, text: &str, ma
             ));
         }
     }
-    let mut event = json!({"version":1,"id":id,"recipient":uid,"source":source,"text":text,"marker":marker,
+    let version = if recovery_scope.is_some() { 2 } else { 1 };
+    let mut event = json!({"version":version,"id":id,"recipient":uid,"source":source,"text":text,"marker":marker,
         "status":"pending","created_at":chrono::Utc::now().timestamp_millis() as f64 / 1000.0});
     if let Some(scope) = recovery_scope { event["recovery_scope"] = scope.clone(); }
     if let Err(e) = atomic_replace(&path, &event) {
@@ -506,6 +509,15 @@ mod tests {
         assert!(publish_recovery_if(root, uid, "event", "[m] resume", "[m]", native, 900.0, 1016.0, &json!({}), || panic!("stale health"), || true).unwrap().is_none());
         let event = publish_recovery_if(root, uid, "event", "[m] resume", "[m]", native, 900.0, 1001.0, &json!({}), || Ok(true), || true).unwrap().unwrap();
         assert_eq!(event["source"], "claude-limit-recovery");
+        assert_eq!(event["version"], 2);
+        assert_eq!(snapshot_strict(root, uid).unwrap().0.len(), 1);
+        assert_eq!(alarm_snapshot(root, uid, 1001.0).unwrap().0.len(), 1);
+        let event_file = path(root, uid, "event");
+        let mut wrong = event.clone(); wrong["source"] = json!("chat");
+        crate::messaging::atomic_replace(&event_file, &wrong).unwrap();
+        assert!(snapshot_strict(root, uid).is_err());
+        assert!(alarm_snapshot(root, uid, 1001.0).is_err());
+        crate::messaging::atomic_replace(&event_file, &event).unwrap();
         assert!(publish_recovery_if(root, uid, "event", "[m] resume", "[m]", native, 900.0, 1001.0, &json!({}), || panic!("pending event"), || true).unwrap().is_none());
         assert_eq!(snapshot(root, uid).unwrap().0.len(), 1);
     }

@@ -560,7 +560,8 @@ async def consume(queue: Queue, adapter):
             events.sort(key=lambda event: event["status"] != "pending")
             held = queue.held()
             for event in events:
-                if event["version"] != 1 or event["recipient"] != queue.uid:
+                if (event.get("version") != 1 and not (event.get("version") == 2
+                        and event.get("source") == "claude-limit-recovery")) or event["recipient"] != queue.uid:
                     continue  # Never deliver an unknown envelope or another identity.
                 if event["status"] in {"submitted", "uncertain"}:
                     # Every poll: evidence is only searched in the window

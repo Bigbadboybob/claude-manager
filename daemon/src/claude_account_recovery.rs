@@ -75,6 +75,8 @@ struct Episode {
     native_event: Option<String>,
     #[serde(default)]
     queued_at: Option<f64>,
+    #[serde(skip)]
+    unclaimed_v2: bool,
     #[serde(default)]
     deferred: bool,
     #[serde(default)]
@@ -135,6 +137,8 @@ fn refresh_native_receipts(journal: &mut Journal, journal_path: &Path, root: &Pa
     let mut changed = false;
     for (key, uid, id) in pending {
         let event = crate::notifications::get(root, &uid, &id)?;
+        journal.episodes.get_mut(&key).unwrap().unclaimed_v2 = event.as_ref().is_some_and(|e|
+            e["version"] == 2 && e["source"] == "claude-limit-recovery" && e["status"] == "pending");
         let outcome = match event.as_ref().and_then(|e| e["status"].as_str()) {
             Some("pending" | "submitting") => continue,
             Some("submitted") => "native event submitted; turn unconfirmed",
@@ -187,7 +191,9 @@ fn stage_digests(journal: &mut Journal, journal_path: &Path,
             && episode.manager.as_ref().is_some_and(|m| first_pending.get(m).is_some_and(|at| now - *at >= 600.0));
         if (!notice_ready(episode) && !timed_out_pending) || episode.manager.as_ref().is_some_and(|m| waiting.contains(m)) { continue; }
         if let Some(manager) = &episode.manager {
-            let outcome = episode.outcome.as_deref().unwrap_or(if timed_out_pending { "pending (delivery unconfirmed)" } else { "attempt outcome unknown" });
+            let outcome = episode.outcome.as_deref().unwrap_or(if timed_out_pending && episode.unclaimed_v2 {
+                "pending (delivery unconfirmed — consumer may need MCP reconnect)"
+            } else if timed_out_pending { "pending (delivery unconfirmed)" } else { "attempt outcome unknown" });
             groups.entry(manager.clone()).or_default().push((Some(key.clone()), format!("{} ({}): {outcome}", episode.label, episode.uid)));
         } else {
             eprintln!("cm-daemon: Claude account recovery {}: {}", episode.uid, episode.outcome.as_deref().unwrap_or("attempt outcome unknown"));
@@ -280,7 +286,7 @@ impl Journal {
             baseline_account: account.map(str::to_owned), reset_at: record.reset_at, attempted: false,
             manager: None, label: uid.into(), outcome: None, digest: None,
             unmanaged_logged: false,
-            native_event: None, queued_at: None,
+            native_event: None, queued_at: None, unclaimed_v2: false,
             deferred: false, deferred_account: None, deferred_reset_due: false,
         })
     }
@@ -304,6 +310,7 @@ impl Episode {
         self.outcome = None;
         self.digest = None;
         self.queued_at = None;
+        self.unclaimed_v2 = false;
     }
 }
 
@@ -1070,6 +1077,24 @@ mod tests {
         let digest = journal.digests.values().next().unwrap();
         assert!(digest.text.contains("pending (delivery unconfirmed)"));
         assert!(digest.text.contains("unbound: could not check"));
+    }
+    #[test]
+    fn unclaimed_v2_digest_suggests_reconnect_without_republishing() {
+        let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("journal.json");
+        let record = LimitRecord { id: RECORD.into(), session_id: SESSION.into(), at: 1000, reset_at: None };
+        let mut journal = Journal::new(); let episode = journal.observe("worker", &record, Some("a"));
+        episode.manager = Some("manager".into()); episode.attempted = true;
+        episode.native_event = Some("v2-id".into()); episode.queued_at = Some(crate::agent_state::unix_now() - 601.0);
+        journal.refresh_pending();
+        let mut event = crate::notifications::publish(dir.path(), "worker", "v2-id", "claude-limit-recovery", "[v2] wake", "[v2]").unwrap();
+        event["version"] = json!(2);
+        let event_file = std::fs::read_dir(crate::notifications::directory(dir.path(), "worker")).unwrap()
+            .flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == "json")).unwrap();
+        crate::messaging::atomic_replace(&event_file, &event).unwrap();
+        refresh_native_receipts(&mut journal, &path, dir.path()).unwrap();
+        stage_digests(&mut journal, &path, BTreeMap::new(), false).unwrap();
+        assert!(journal.digests.values().next().unwrap().text.contains("pending (delivery unconfirmed — consumer may need MCP reconnect)"));
+        assert_eq!(crate::notifications::get(dir.path(), "worker", "v2-id").unwrap().unwrap()["status"], "pending");
     }
     #[test]
     fn corrupt_journal_disables_recovery_without_blocking_agent_state_start() {

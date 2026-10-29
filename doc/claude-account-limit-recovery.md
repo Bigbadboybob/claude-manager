@@ -31,6 +31,11 @@ final consumer check may complete after disable returns; its receipt is retained
 Transient admission refusals retry until the ten-minute notice bound, then are
 reported as pending and delivery unconfirmed.
 
+Recovery notices use a version-2 envelope, which older MCP consumers leave
+pending. After ten minutes, an unclaimed version-2 notice is reported as
+`pending (delivery unconfirmed — consumer may need MCP reconnect)`; the new
+consumer rechecks the session and record when it claims the notice.
+
 An unreadable recovery journal is quarantined and recovery remains disabled
 until a clean journal is supplied. Quarantined data is retained; records dated
 at or before quarantine remain ineligible because their old one-shot fences
@@ -76,3 +81,20 @@ versions render an accepted composer.
 The explicit one-admission-per-pass cap applies to both delivery routes. The
 worker's older source comment about staggering through the PTY settle gap
 predates that cap; it does not describe native delivery's pacing.
+
+## Rollback
+
+Before rolling back to a brain that predates version-2 recovery envelopes,
+set `claude_limit_recovery = false` and reload. Confirm the disabled marker and
+keep recovery disabled throughout the sweep. Run `scripts/cm-recovery-rollback-sweep`
+first without `--apply` to list affected files. Then run it with `--apply
+--backup <directory>` to move version-2 recovery events into a labelled backup
+outside the notification tree; use the same filesystem as the queues. The
+helper takes each queue lock, skips `submitting` events, and exits nonzero if
+any file is skipped or cannot be moved. Wait for in-flight submissions to
+settle and repeat until the sweep succeeds before rolling back. Keep the backup
+and its receipts for review.
+
+On a later roll-forward, do not restore those files into the live queues. A
+journal that references a moved event reports `native publication outcome
+unknown; no automatic retry`, preserving the one-shot fence.

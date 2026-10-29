@@ -277,6 +277,46 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
         await eventually(lambda: self.queue.get("recover")["status"] == "submitted")
         self.assertEqual(adapter.sent, ["recover"])
 
+    async def test_v1_consumer_skips_v2_then_upgraded_consumer_claims_it(self):
+        notifications.atomic_write(self.queue.path.parent / "claude-limit-recovery-state", {"version":1, "enabled":True})
+        self.queue.publish("recover-v2", "claude-limit-recovery", "[recover] continue", "[recover]")
+        event = self.queue.get("recover-v2")
+        event["version"] = 2
+        notifications.atomic_write(self.queue.event_path("recover-v2"), event)
+        self.queue.publish("ordinary", "chat", "[ordinary] wake", "[ordinary]")
+        old = Fixture("old")
+        # The old v1 loop's version guard and generic claim, copied from 2921a6e.
+        for event in self.queue.snapshot()["notifications"]:
+            if event["version"] != 1 or event["recipient"] != self.queue.uid:
+                continue
+            if event["status"] != "pending":
+                continue
+            claimed = self.queue.change(event["id"], {"pending"}, status="submitting", binding=old.identity())
+            receipt = await old.send(claimed)
+            self.queue.change(event["id"], {"submitting"}, status="submitted", receipt=receipt)
+        self.assertEqual(old.sent, ["ordinary"])
+        self.assertEqual(self.queue.get("recover-v2")["status"], "pending")
+        self.assertFalse(notifications.delivery_health(self.queue.snapshot()["notifications"])["chronology_unknown"])
+        new = Fixture("upgraded")
+        new.recovery_check = mock.AsyncMock(return_value="ready")
+        self.run_consumer(new)
+        await eventually(lambda: self.queue.get("recover-v2")["status"] == "submitted")
+        self.assertEqual(new.sent, ["recover-v2"])
+
+    async def test_upgraded_consumer_rejects_v2_other_sources_and_preserves_crash_receipt(self):
+        self.queue.publish("other", "chat", "[other] wake", "[other]")
+        other = self.queue.get("other"); other["version"] = 2
+        notifications.atomic_write(self.queue.event_path("other"), other)
+        self.queue.publish("crashed", "claude-limit-recovery", "[crashed] wake", "[crashed]")
+        crashed = self.queue.get("crashed"); crashed["version"] = 2; crashed["status"] = "submitting"
+        notifications.atomic_write(self.queue.event_path("crashed"), crashed)
+        adapter = Fixture("upgraded")
+        adapter.recovery_check = mock.AsyncMock(return_value="ready")
+        self.run_consumer(adapter)
+        await eventually(lambda: self.queue.get("crashed")["status"] == "uncertain")
+        self.assertEqual(self.queue.get("other")["status"], "pending")
+        self.assertEqual(adapter.sent, [])
+
     async def test_unknown_chronology_holds_pending_until_census_is_trustworthy(self):
         adapter = Fixture("old")
         self.queue.publish("previous", "chat", "[previous] wake", "[previous]")
