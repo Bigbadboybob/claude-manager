@@ -102,6 +102,14 @@ impl<'a> Service<'a> {
     }
 
     fn request(&self, params: Params) -> Result<serde_json::Value, (ErrorCode, &'static str)> {
+        // Monolith execveat can preserve PID/start and reset generation after
+        // terminal fallback, while discarding the receipt. Fail closed before
+        // any lock/admission: this tuple cannot fence a different process image.
+        if self.identity.holder_epoch.is_none() {
+            return Ok(
+                serde_json::json!({"status":"unavailable", "reason":"process_image_binding_unavailable", "accepted":false}),
+            );
+        }
         if self.identity.process_start_ticks.is_none() {
             return Ok(
                 serde_json::json!({"status":"unavailable", "reason":"process_identity_unavailable"}),

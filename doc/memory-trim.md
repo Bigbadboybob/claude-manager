@@ -71,9 +71,14 @@ readback (`daemon.memory_snapshot`); then deliberately bind the attempt:
 scripts/cm-op --timeout 5 daemon.memory_trim '{"request_id":"maintenance-1","brain_pid":123,"process_start_ticks":456,"holder_epoch":7}'
 ```
 
-Those are illustrative identities; do not copy them for a live call. In
-monolith mode explicitly supply `"holder_epoch":null`. Unknown fields are
-refused. `request_id` is 1–128 ASCII letters/digits or `-_:.`.
+Those are illustrative identities; do not copy them for a live call. Manual
+trim requires split mode and a holder epoch. Monolith mode returns
+`unavailable/process_image_binding_unavailable` before taking admission or
+consuming an attempt. Its in-place re-exec can retain PID/start while losing
+the receipt, so those fields alone cannot safely bind a retry to one process
+image. A separate health/snapshot precheck does not close that race. Periodic
+trimming remains supported in monolith mode. Unknown fields are refused.
+`request_id` is 1–128 ASCII letters/digits or `-_:.`.
 The frame ID is independent. Explicit requests bypass the periodic threshold
 and remain available with interval 0. An already accepted manual job still runs
 exactly once if periodic work is then disabled.

@@ -526,8 +526,42 @@ fn memory_trim_monolith_and_unavailable_identity() {
     let service = Service::new(MemoryConfig::default(), id, &gate, Instant::now());
     let mut p = params();
     p.holder_epoch = None;
-    assert_eq!(service.request(p).unwrap()["attempt"]["status"], "pending");
+    {
+        let locked = service.control.lock().unwrap();
+        let refused = service.request(p.clone()).unwrap();
+        assert_eq!(refused["reason"], "process_image_binding_unavailable");
+        assert_eq!(refused["accepted"], false);
+        assert!(locked.receipt.is_none());
+        assert!(locked.pending.is_none());
+        assert!(!gate.load(Ordering::Acquire));
+    }
+    // Same PID/start/None in a replacement monolith image cannot re-admit an
+    // uncertain manual request. No health precheck is assumed to be a fence.
     drop(service);
+    let mut id = identity();
+    id.holder_epoch = None;
+    let now = Instant::now();
+    let replacement = Service::new(MemoryConfig::default(), id, &gate, now);
+    assert_eq!(
+        replacement.request(p).unwrap()["reason"],
+        "process_image_binding_unavailable"
+    );
+    let work = take(&replacement, now + Duration::from_secs(600))
+        .expect("monolith periodic remains supported");
+    let calls = AtomicUsize::new(0);
+    let result = run(
+        &replacement.identity,
+        &work,
+        || sample(1 << 30),
+        || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some(1)
+        },
+    );
+    replacement.finish(work, &Ok(result), now + Duration::from_secs(601));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(replacement.control.lock().unwrap().receipt.is_none());
+    drop(replacement);
     assert!(!gate.load(Ordering::Acquire));
     let mut id = identity();
     id.process_start_ticks = None;
