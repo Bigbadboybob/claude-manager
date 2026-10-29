@@ -9,10 +9,17 @@ use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 const MAX_TAIL: u64 = 2 * 1024 * 1024;
+
+/// Reload and effect admission share this lock: disabling the feature waits
+/// for an already admitted write, and prevents all later admissions.
+pub(crate) fn config_gate() -> &'static RwLock<()> {
+    static GATE: OnceLock<RwLock<()>> = OnceLock::new();
+    GATE.get_or_init(|| RwLock::new(()))
+}
 
 pub(crate) fn failed_boundary(agent: &crate::agent_state::AgentState) -> bool {
     use crate::agent_state::{Source, State, TurnStatus};
@@ -50,6 +57,8 @@ struct Episode {
     outcome: Option<String>,
     #[serde(default)]
     digest: Option<String>,
+    #[serde(default)]
+    unmanaged_logged: bool,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -60,6 +69,10 @@ struct Journal {
     digests: BTreeMap<String, DigestNotice>,
     #[serde(default)]
     last_account: Option<String>,
+    #[serde(skip)]
+    unstaged: bool,
+    #[serde(skip)]
+    unsent: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -71,51 +84,70 @@ struct DigestNotice {
 }
 
 fn flush_digests(journal: &mut Journal, journal_path: &Path, root: &Path) -> io::Result<()> {
+    if !journal.unsent { return Ok(()); }
     let pending: Vec<_> = journal.digests.iter().filter(|(_, n)| !n.sent)
         .map(|(id, n)| (id.clone(), n.clone())).collect();
     for (id, notice) in pending {
-        crate::notifications::publish(root, &notice.manager, &id, "cm-recovery", &notice.text, &notice.marker)?;
+        if let Err(e) = crate::notifications::publish(root, &notice.manager, &id, "cm-recovery", &notice.text, &notice.marker) {
+            eprintln!("cm-daemon: Claude recovery notice to {} deferred: {e}", notice.manager);
+            continue;
+        }
         journal.digests.get_mut(&id).unwrap().sent = true;
         journal.save(journal_path)?;
     }
+    journal.unsent = journal.digests.values().any(|n| !n.sent);
     Ok(())
 }
 
-fn stage_digests(journal: &mut Journal, journal_path: &Path) -> io::Result<()> {
-    let mut groups: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+fn stage_digests(journal: &mut Journal, journal_path: &Path,
+    unchecked: BTreeMap<String, Vec<String>>, account_changed: bool) -> io::Result<()> {
+    if !journal.unstaged && unchecked.is_empty() && !account_changed { return Ok(()); }
+    let mut groups: BTreeMap<String, Vec<(Option<String>, String)>> = BTreeMap::new();
+    let mut dirty = account_changed;
     for (key, episode) in &journal.episodes {
         if !episode.attempted || episode.digest.is_some() { continue; }
         if let Some(manager) = &episode.manager {
             let outcome = episode.outcome.as_deref().unwrap_or("attempt outcome unknown");
-            groups.entry(manager.clone()).or_default().push((key.clone(), format!("{} ({}): {outcome}", episode.label, episode.uid)));
+            groups.entry(manager.clone()).or_default().push((Some(key.clone()), format!("{} ({}): {outcome}", episode.label, episode.uid)));
         } else {
             eprintln!("cm-daemon: Claude account recovery {}: {}", episode.uid, episode.outcome.as_deref().unwrap_or("attempt outcome unknown"));
         }
     }
+    for (manager, rows) in unchecked {
+        groups.entry(manager).or_default().extend(rows.into_iter().map(|row| (None, format!("{row}: could not check"))));
+    }
     for (manager, rows) in groups {
         let mut hasher = Sha256::new();
         hasher.update(manager.as_bytes());
-        for (key, _) in &rows { hasher.update(key.as_bytes()); }
+        hasher.update(journal.last_account.as_deref().unwrap_or("").as_bytes());
+        for (key, line) in &rows { hasher.update(key.as_deref().unwrap_or(line).as_bytes()); }
         let id = format!("claude-account-recovery:{:x}", hasher.finalize());
         let marker = format!("[cm-recovery {id}]");
         let text = format!("{marker} Claude account recovery:\n{}", rows.iter().map(|(_, line)| line.as_str()).collect::<Vec<_>>().join("\n"));
-        for (key, _) in &rows { journal.episodes.get_mut(key).unwrap().digest = Some(id.clone()); }
+        for (key, _) in &rows { if let Some(key) = key { journal.episodes.get_mut(key).unwrap().digest = Some(id.clone()); } }
         journal.digests.entry(id).or_insert(DigestNotice { manager, text, marker, sent: false });
+        journal.unsent = true;
+        dirty = true;
     }
     // No-manager outcomes have no notification target and are logged once.
     for episode in journal.episodes.values_mut().filter(|e| e.attempted && e.manager.is_none() && e.digest.is_none()) {
         episode.digest = Some("logged".into());
+        dirty = true;
     }
-    journal.save(journal_path)
+    if dirty { journal.save(journal_path)?; }
+    journal.unstaged = false;
+    Ok(())
 }
 
 impl Journal {
-    fn new() -> Self { Self { version: 1, episodes: BTreeMap::new(), digests: BTreeMap::new(), last_account: None } }
+    fn new() -> Self { Self { version: 1, episodes: BTreeMap::new(), digests: BTreeMap::new(), last_account: None, unstaged: false, unsent: false } }
     fn load(path: &Path) -> io::Result<Self> {
         match std::fs::read(path) {
             Ok(bytes) => {
-                let journal: Self = serde_json::from_slice(&bytes)?;
+                let mut journal: Self = serde_json::from_slice(&bytes)?;
                 if journal.version != 1 { return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown account recovery journal")); }
+                journal.unstaged = journal.episodes.values().any(|e| e.attempted && e.digest.is_none());
+                journal.unsent = journal.digests.values().any(|n| !n.sent);
                 Ok(journal)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::new()),
@@ -133,6 +165,7 @@ impl Journal {
             uid: uid.into(), record_id: record.id.clone(), native_id: record.session_id.clone(),
             baseline_account: account.map(str::to_owned), reset_at: record.reset_at, attempted: false,
             manager: None, label: uid.into(), outcome: None, digest: None,
+            unmanaged_logged: false,
         })
     }
 }
@@ -166,6 +199,95 @@ fn profile_path() -> Option<PathBuf> {
     }
 }
 
+/// A session can override HOME or CLAUDE_CONFIG_DIR at launch. Never use the
+/// host account change as evidence for an independently configured client.
+fn process_uses_profile(pid: libc::pid_t, profile: &Path) -> io::Result<bool> {
+    use std::os::unix::ffi::OsStringExt;
+    if pid <= 0 { return Ok(false); }
+    let file = std::fs::File::open(format!("/proc/{pid}/environ"))?;
+    let mut bytes = Vec::new(); file.take(8 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 8 * 1024 * 1024 { return Err(io::Error::new(io::ErrorKind::InvalidData, "process environment too large")); }
+    let mut home = None; let mut config = None;
+    for entry in bytes.split(|b| *b == 0) {
+        if let Some(value) = entry.strip_prefix(b"HOME=") { home = Some(PathBuf::from(std::ffi::OsString::from_vec(value.to_vec()))); }
+        if let Some(value) = entry.strip_prefix(b"CLAUDE_CONFIG_DIR=") {
+            if !value.is_empty() { config = Some(PathBuf::from(std::ffi::OsString::from_vec(value.to_vec()))); }
+        }
+    }
+    let expected = if let Some(dir) = config { dir.join(".claude.json") }
+        else if let Some(home) = home { home.join(".claude.json") }
+        else { return Ok(false); };
+    Ok(std::fs::canonicalize(expected)? == std::fs::canonicalize(profile)?)
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct FileStamp { inode: u64, len: u64, mtime: (i64, i64), ctime: (i64, i64) }
+impl FileStamp {
+    fn read(path: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(path)?;
+        if !m.is_file() { return Err(io::Error::new(io::ErrorKind::InvalidData, "not a regular file")); }
+        Ok(Self { inode: m.ino(), len: m.len(), mtime: (m.mtime(), m.mtime_nsec()), ctime: (m.ctime(), m.ctime_nsec()) })
+    }
+}
+
+#[derive(Default)]
+struct AccountObservation {
+    account: Option<String>,
+    seen_at: i64,
+    profile: Option<(PathBuf, FileStamp, String)>,
+    journal: Option<(PathBuf, FileStamp, Journal)>,
+    tails: BTreeMap<PathBuf, (FileStamp, String, Result<Option<LimitRecord>, String>)>,
+    screens: BTreeMap<String, (libc::pid_t, u64, u64, u16, u16)>,
+    #[cfg(test)] profile_reads: usize,
+    #[cfg(test)] journal_reads: usize,
+    #[cfg(test)] tail_reads: usize,
+}
+impl AccountObservation {
+    fn fingerprint(&mut self, path: &Path) -> io::Result<String> {
+        let stamp = FileStamp::read(path)?;
+        if let Some((p, s, value)) = &self.profile {
+            if p == path && *s == stamp { return Ok(value.clone()); }
+        }
+        #[cfg(test)] { self.profile_reads += 1; }
+        let value = account_fingerprint(path)?;
+        self.profile = Some((path.to_owned(), stamp, value.clone()));
+        Ok(value)
+    }
+    fn read_journal(&mut self, path: &Path) -> io::Result<Journal> {
+        if let Ok(stamp) = FileStamp::read(path) {
+            if let Some((p, s, journal)) = self.journal.take() {
+                if p == path && s == stamp { return Ok(journal); }
+            }
+        }
+        #[cfg(test)] { self.journal_reads += 1; }
+        Journal::load(path)
+    }
+    fn cache_journal(&mut self, path: &Path, journal: Journal) {
+        self.journal = FileStamp::read(path).ok().map(|stamp| (path.to_owned(), stamp, journal));
+    }
+    fn limit(&mut self, path: &Path, native_id: &str) -> io::Result<Option<LimitRecord>> {
+        let stamp = FileStamp::read(path)?;
+        if let Some((s, id, result)) = self.tails.get(path) {
+            if *s == stamp && id == native_id {
+                return result.clone().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+            }
+        }
+        #[cfg(test)] { self.tail_reads += 1; }
+        let result = latest_limit(path, native_id).map_err(|e| e.to_string());
+        if self.tails.len() >= 512 { self.tails.clear(); }
+        self.tails.insert(path.to_owned(), (stamp, native_id.to_owned(), result.clone()));
+        result.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+}
+
+fn baseline_for_record<'a>(prior: &'a AccountObservation, current: Option<&'a str>, failed_at: i64) -> Option<&'a str> {
+    match (prior.account.as_deref(), current) {
+        (Some(old), Some(new)) if old != new && prior.seen_at > failed_at => Some(old),
+        (_, current) => current,
+    }
+}
+
 struct Target {
     uid: String,
     label: String,
@@ -192,15 +314,17 @@ fn targets(state: &crate::state::DaemonState) -> Vec<Target> {
             || crate::rotation::in_progress(uid) || crate::handoff::in_progress(uid)
             || crate::codex_recovery::in_progress(uid) || crate::claude_recovery::admission_blocked(uid) { continue; }
         let agent = crate::agent_state::current(session);
-        if !failed_boundary(&agent) { continue; }
         let presence = session.agent_state.lock().unwrap_or_else(|p| p.into_inner()).inputs.presence.clone();
         let Some(presence) = presence.filter(|p| p.valid && p.status == crate::agent_state::PresenceStatus::Idle) else { continue; };
-        let Some(native_id) = presence.native_session_id.filter(|id| uuid::Uuid::parse_str(id).is_ok()) else { continue; };
+        // A not-yet-bound idle Claude needs a chance to establish its exact
+        // transcript before the agent-state reader can classify its error.
+        if !failed_boundary(&agent) && session.transcript_path.is_some() { continue; }
+        let native_id = presence.native_session_id.filter(|id| uuid::Uuid::parse_str(id).is_ok()).unwrap_or_default();
         let fallback_cwd = if session.transcript_path.is_none() {
             state.workspaces.get(&session.workspace_id).and_then(|w| w.worktree_path.clone())
         } else { None };
         let path = session.transcript_path.as_ref().map(PathBuf::from).or_else(|| {
-            fallback_cwd.as_ref().and_then(|cwd| crate::transcript_detect::claude_transcript_path(cwd, &native_id))
+            (!native_id.is_empty()).then(|| fallback_cwd.as_ref().and_then(|cwd| crate::transcript_detect::claude_transcript_path(cwd, &native_id))).flatten()
         });
         result.push(Target { uid: uid.clone(), label: session.title.clone(), manager: session.managed_by_uid.clone(),
             native_id, path, fallback_cwd, generation: session.generation, pid: session.pid,
@@ -233,18 +357,58 @@ fn fallback_cwd_matches(path: &Path, record: &LimitRecord, cwd: &Path) -> io::Re
     Ok(false)
 }
 
+/// Bind only the previously absent path, using the same lifecycle exclusion as
+/// ordinary transcript updates. A concurrent resume/rebind always wins.
+fn bind_fallback(state: &Arc<Mutex<crate::state::DaemonState>>, target: &Target,
+    record: &LimitRecord, path: &Path, cwd: &Path) -> io::Result<bool> {
+    let gate = crate::claude_recovery::lifecycle_gate(&target.uid);
+    let Ok(_guard) = gate.try_write() else { return Ok(false); };
+    if latest_limit(path, &target.native_id)?.as_ref() != Some(record)
+        || !fallback_cwd_matches(path, record, cwd)? { return Ok(false); }
+    let mut st = state.lock().unwrap_or_else(|p| p.into_inner());
+    if st.restarting || st.draining || !st.config.claude_limit_recovery || target.manager.is_none() { return Ok(false); }
+    let Some(session) = st.sessions.get_mut(&target.uid) else { return Ok(false); };
+    let presence = session.agent_state.lock().unwrap_or_else(|p| p.into_inner()).inputs.presence.clone();
+    if session.pid != target.pid || session.holder_incarnation != target.incarnation
+        || session.generation != target.generation || session.transcript_path.is_some()
+        || !target.input.belongs_to(session) || session.last_exit.kernel_set()
+        || session.managed_by_uid != target.manager || session.workflow_run_id.is_some() || session.continuous_task_id.is_some()
+        || !presence.is_some_and(|p| p.valid && p.status == crate::agent_state::PresenceStatus::Idle
+            && p.native_session_id.as_deref() == Some(target.native_id.as_str())) { return Ok(false); }
+    let Some(path) = path.to_str() else { return Ok(false); };
+    session.transcript_path = Some(path.to_owned());
+    session.generation = session.generation.saturating_add(1);
+    let entry = crate::control::methods::transcript_updated_entry(session);
+    st.persist_sessions_best_effort();
+    crate::control::methods::broadcast_transcript_updated(&st, &target.uid, entry);
+    Ok(true)
+}
+
 fn attempt(state: &Arc<Mutex<crate::state::DaemonState>>, target: &Target, record: &LimitRecord,
-    profile: &Path, journal: &mut Journal, journal_path: &Path, messaging_root: &Path) -> io::Result<bool> {
+    profile: &Path, journal: &mut Journal, journal_path: &Path, messaging_root: &Path,
+    observation: &mut AccountObservation) -> io::Result<bool> {
+    if target.manager.is_none() { return Ok(false); }
     let lifecycle = crate::claude_recovery::lifecycle_gate(&target.uid);
     let Ok(_lifecycle) = lifecycle.try_write() else { return Ok(false); };
     if crate::claude_recovery::admission_blocked(&target.uid)
         || crate::claude_recovery::has_pending_input(&target.uid) { return Ok(false); }
+    let cursor = target.fanout.snapshot_since(Some(u64::MAX));
+    if cursor.closed { return Ok(false); }
+    let screen_key = (target.pid, target.generation, cursor.cursor, target.cols, target.rows);
+    if observation.screens.get(&target.uid) == Some(&screen_key) { return Ok(false); }
     let snapshot = target.fanout.snapshot_since(None);
     if snapshot.closed { return Ok(false); }
+    let screen_key = (target.pid, target.generation, snapshot.cursor, target.cols, target.rows);
     let mut screen = crate::workflow::pty_tracker::PtyModeTracker::with_size(target.cols.max(1) as usize, target.rows.max(1) as usize);
     screen.feed(&snapshot.bytes, Instant::now());
     let mode = target.fanout.keyboard().0.or_else(|| screen.composer_ready().then(|| screen.term_mode()));
-    if mode.is_none() || !screen.claude_recovery_composer_ready() { return Ok(false); }
+    if mode.is_none() || !screen.claude_recovery_composer_ready() {
+        if observation.screens.len() >= 512 { observation.screens.clear(); }
+        observation.screens.insert(target.uid.clone(), screen_key);
+        return Ok(false);
+    }
+    observation.screens.remove(&target.uid);
+    let _config = config_gate().read().unwrap_or_else(|p| p.into_inner());
     {
         let st = state.lock().unwrap_or_else(|p| p.into_inner());
         let Some(session) = st.sessions.get(&target.uid) else { return Ok(false); };
@@ -252,6 +416,7 @@ fn attempt(state: &Arc<Mutex<crate::state::DaemonState>>, target: &Target, recor
             || session.pid != target.pid || session.holder_incarnation != target.incarnation
             || session.generation != target.generation || !target.input.belongs_to(session)
             || session.last_exit.kernel_set() || session.workflow_run_id.is_some() || session.continuous_task_id.is_some()
+            || session.managed_by_uid.is_none() || session.managed_by_uid != target.manager
             || crate::rotation::in_progress(&target.uid) || crate::handoff::in_progress(&target.uid)
             || !failed_boundary(&crate::agent_state::current(session)) { return Ok(false); }
         if !crate::rotation::hold(&st, &target.uid, crate::rotation::HoldOwner::ClaudeAccountRecovery) { return Ok(false); }
@@ -265,16 +430,25 @@ fn attempt(state: &Arc<Mutex<crate::state::DaemonState>>, target: &Target, recor
         let fresh = target.fanout.snapshot_since(Some(snapshot.cursor));
         if fresh.closed || fresh.cursor != snapshot.cursor || latest_limit(path, &target.native_id)?.as_ref() != Some(record) { return Ok(false); }
         if let Some(cwd) = &target.fallback_cwd { if !fallback_cwd_matches(path, record, cwd)? { return Ok(false); } }
-        let account = account_fingerprint(profile).ok();
+        let account = if process_uses_profile(target.pid, profile).unwrap_or(false) {
+            account_fingerprint(profile).ok()
+        } else { None };
         let Some(episode) = journal.episodes.get_mut(&key) else { return Ok(false); };
         if !episode.armed(account.as_deref(), chrono::Utc::now().timestamp()) { return Ok(false); }
         episode.attempted = true;
-        journal.save(journal_path)?;
+        let was_unstaged = journal.unstaged;
+        journal.unstaged = true;
+        if let Err(e) = journal.save(journal_path) {
+            // No terminal byte has been written when persistence fails.
+            journal.episodes.get_mut(&key).unwrap().attempted = false;
+            journal.unstaged = was_unstaged;
+            return Err(e);
+        }
         Ok(true)
     })
 }
 
-fn pass(state: &Arc<Mutex<crate::state::DaemonState>>) -> io::Result<()> {
+fn pass(state: &Arc<Mutex<crate::state::DaemonState>>, observation: &mut AccountObservation) -> io::Result<()> {
     let (journal_path, root, enabled, candidates) = {
         let st = state.lock().unwrap_or_else(|p| p.into_inner());
         let Some(base) = st.daemon_sessions_path.as_ref() else { return Ok(()); };
@@ -282,17 +456,18 @@ fn pass(state: &Arc<Mutex<crate::state::DaemonState>>) -> io::Result<()> {
             st.config.claude_limit_recovery && !st.restarting && !st.draining,
             if st.config.claude_limit_recovery && !st.restarting && !st.draining { targets(&st) } else { Vec::new() })
     };
-    let mut journal = Journal::load(&journal_path)?;
+    let mut journal = observation.read_journal(&journal_path)?;
     flush_digests(&mut journal, &journal_path, &root)?;
-    if !enabled { return Ok(()); }
-    let Some(profile) = profile_path() else { return Ok(()); };
-    let account = account_fingerprint(&profile).ok();
+    if !enabled { observation.cache_journal(&journal_path, journal); return Ok(()); }
+    let Some(profile) = profile_path() else { observation.cache_journal(&journal_path, journal); return Ok(()); };
+    let account = observation.fingerprint(&profile).ok();
+    let observed_at = chrono::Utc::now().timestamp();
     // Only a successfully read, changed account identity can indicate a switch.
     let switched = journal.last_account.as_deref().zip(account.as_deref()).is_some_and(|(a, b)| a != b);
-    if let Some(account) = &account { journal.last_account = Some(account.clone()); }
+    let account_changed = account.is_some() && journal.last_account != account;
     let mut could_not_check: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for target in &candidates {
-        let record = target.path.as_deref().map(|path| latest_limit(path, &target.native_id));
+        let record = target.path.as_deref().map(|path| observation.limit(path, &target.native_id));
         let record = match record {
             Some(Ok(Some(record))) => record,
             Some(Ok(None)) => continue,
@@ -317,15 +492,43 @@ fn pass(state: &Arc<Mutex<crate::state::DaemonState>>) -> io::Result<()> {
         }
         let key = format!("{}:{}", target.uid, record.id);
         let new = !journal.episodes.contains_key(&key);
-        let episode = journal.observe(&target.uid, &record, account.as_deref());
-        if new { episode.manager = target.manager.clone(); episode.label = target.label.clone(); journal.save(&journal_path)?; }
-        let armed = journal.episodes[&key].armed(account.as_deref(), chrono::Utc::now().timestamp());
+        let matching_profile = process_uses_profile(target.pid, &profile).unwrap_or(false);
+        let target_account = if matching_profile { account.as_deref() } else { None };
+        let baseline = baseline_for_record(observation, target_account, record.at);
+        let episode = journal.observe(&target.uid, &record, baseline);
+        let metadata_changed = episode.manager != target.manager || episode.label != target.label;
+        if new || metadata_changed { episode.manager = target.manager.clone(); episode.label = target.label.clone(); journal.save(&journal_path)?; }
+        let armed = journal.episodes[&key].armed(target_account, chrono::Utc::now().timestamp());
+        if switched && !matching_profile {
+            if let Some(manager) = &target.manager {
+                could_not_check.entry(manager.clone()).or_default().push(format!("{} ({})", target.label, target.uid));
+            }
+        }
         if !armed { continue; }
-        let result = attempt(state, target, &record, &profile, &mut journal, &journal_path, &root);
+        if target.manager.is_none() {
+            let episode = journal.episodes.get_mut(&key).unwrap();
+            if !episode.unmanaged_logged {
+                eprintln!("cm-daemon: Claude account recovery {}: unmanaged session requires operator resume", target.uid);
+                episode.unmanaged_logged = true;
+                journal.save(&journal_path)?;
+            }
+            continue;
+        }
+        if let (Some(path), Some(cwd)) = (&target.path, &target.fallback_cwd) {
+            // The normal presence reader needs the binding before it can
+            // classify the error. Its next tick will supply the safe edge.
+            if !bind_fallback(state, target, &record, path, cwd).unwrap_or(false) && switched {
+                if let Some(manager) = &target.manager {
+                    could_not_check.entry(manager.clone()).or_default().push(format!("{} ({})", target.label, target.uid));
+                }
+            }
+            continue;
+        }
+        let result = attempt(state, target, &record, &profile, &mut journal, &journal_path, &root, observation);
         let episode = journal.episodes.get_mut(&key).unwrap();
         if episode.attempted {
             episode.outcome = Some(match result {
-                Ok(true) => "resume submitted".into(),
+                Ok(true) => "resume input written; turn not yet confirmed".into(),
                 Ok(false) => "attempt outcome unknown".into(),
                 Err(_) => "input outcome unknown; no automatic retry".into(),
             });
@@ -336,17 +539,12 @@ fn pass(state: &Arc<Mutex<crate::state::DaemonState>>) -> io::Result<()> {
     }
     // Freeze each system notice before publishing so a crash cannot create a
     // different digest or repeat an accepted notice on the next pass.
-    for (manager, rows) in could_not_check {
-        let mut hasher = Sha256::new(); hasher.update(manager.as_bytes());
-        hasher.update(account.as_deref().unwrap_or("").as_bytes());
-        for row in &rows { hasher.update(row.as_bytes()); }
-        let id = format!("claude-account-unchecked:{:x}", hasher.finalize());
-        let marker = format!("[cm-recovery {id}]");
-        journal.digests.entry(id).or_insert(DigestNotice { manager,
-            text: format!("{marker} Claude account recovery could not check:\n{}", rows.join("\n")), marker, sent: false });
-    }
-    stage_digests(&mut journal, &journal_path)?;
-    flush_digests(&mut journal, &journal_path, &root)
+    if let Some(account) = &account { journal.last_account = Some(account.clone()); }
+    stage_digests(&mut journal, &journal_path, could_not_check, account_changed)?;
+    flush_digests(&mut journal, &journal_path, &root)?;
+    observation.cache_journal(&journal_path, journal);
+    if let Some(account) = account { observation.account = Some(account); observation.seen_at = observed_at; }
+    Ok(())
 }
 
 /// Runs independently of the agent-state ticker; filesystem and PTY I/O never
@@ -354,10 +552,25 @@ fn pass(state: &Arc<Mutex<crate::state::DaemonState>>) -> io::Result<()> {
 /// staggers sends (each paste/submit is serialized through its settle gap).
 pub(crate) fn start(state: &Arc<Mutex<crate::state::DaemonState>>) -> io::Result<()> {
     let weak = Arc::downgrade(state);
-    std::thread::Builder::new().name("cm-claude-account-recovery".into()).spawn(move || loop {
+    std::thread::Builder::new().name("cm-claude-account-recovery".into()).spawn(move || {
+      let mut observation = AccountObservation::default();
+      loop {
         std::thread::sleep(Duration::from_secs(2));
         let Some(state) = weak.upgrade() else { break; };
-        if let Err(e) = pass(&state) { eprintln!("cm-daemon: Claude account recovery: {e}"); }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pass(&state, &mut observation))) {
+            Ok(Ok(())) => {},
+            Ok(Err(e)) => {
+                eprintln!("cm-daemon: Claude account recovery unavailable: {e}");
+                observation = AccountObservation::default();
+                std::thread::sleep(Duration::from_secs(30));
+            }
+            Err(_) => {
+                eprintln!("cm-daemon: Claude account recovery panicked; retrying with fresh evidence");
+                observation = AccountObservation::default();
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        }
+      }
     })?;
     Ok(())
 }
@@ -390,7 +603,10 @@ pub(crate) fn latest_limit(path: &Path, native_id: &str) -> io::Result<Option<Li
         match v["type"].as_str() {
             Some("user") => return Ok(None),
             Some("assistant") => {
-                if v["sessionId"] != native_id || v["error"] != "rate_limit"
+                if v["sessionId"] != native_id {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "transcript session identity mismatch"));
+                }
+                if v["error"] != "rate_limit"
                     || v["isApiErrorMessage"] != true || v["message"]["model"] != "<synthetic>" {
                     return Ok(None);
                 }
@@ -430,7 +646,7 @@ mod tests {
         assert_eq!(latest_limit(&path, SESSION).unwrap(), None);
         let mut ordinary = fixture(); ordinary["isApiErrorMessage"] = json!(false);
         write(&path, &[ordinary]); assert_eq!(latest_limit(&path, SESSION).unwrap(), None);
-        write(&path, &[fixture(), json!({"type":"assistant","message":{"model":"claude"}})]);
+        write(&path, &[fixture(), json!({"type":"assistant","sessionId":SESSION,"message":{"model":"claude"}})]);
         assert_eq!(latest_limit(&path, SESSION).unwrap(), None);
     }
     #[test]
@@ -440,7 +656,7 @@ mod tests {
         std::fs::write(&path, format!("{}", fixture())).unwrap(); assert!(latest_limit(&path, SESSION).is_err());
         write(&path, &[fixture()]); assert!(latest_limit(&path, "not-a-uuid").is_err());
         let mut other = fixture(); other["sessionId"] = json!("different"); write(&path, &[other]);
-        assert_eq!(latest_limit(&path, SESSION).unwrap(), None);
+        assert!(latest_limit(&path, SESSION).is_err());
     }
     #[test]
     fn one_attempt_per_record_survives_restart_and_account_refresh() {
@@ -464,5 +680,140 @@ mod tests {
         let record = LimitRecord { id: RECORD.into(), session_id: SESSION.into(), at: 1000, reset_at: None };
         let mut journal = Journal::new();
         assert!(!journal.observe("worker", &record, None).armed(Some("new-account"), 3000));
+        let prior = AccountObservation { account: Some("old".into()), seen_at: 1001, ..Default::default() };
+        assert_eq!(baseline_for_record(&prior, Some("new"), 1000), Some("old"));
+        assert_eq!(baseline_for_record(&prior, Some("new"), 1001), Some("new"));
+        assert_eq!(baseline_for_record(&prior, None, 1000), None);
+    }
+    #[test]
+    fn unchanged_passes_reuse_parses_and_do_not_rewrite_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile.json");
+        std::fs::write(&profile, json!({"oauthAccount":{"accountUuid":"123e4567-e89b-12d3-a456-426614174000"}}).to_string()).unwrap();
+        let transcript = dir.path().join(format!("{SESSION}.jsonl")); write(&transcript, &[fixture()]);
+        let path = dir.path().join("journal.json"); Journal::new().save(&path).unwrap();
+        let before = FileStamp::read(&path).unwrap();
+        let mut runtime = AccountObservation::default();
+        for _ in 0..20 {
+            runtime.fingerprint(&profile).unwrap();
+            runtime.limit(&transcript, SESSION).unwrap();
+            let mut journal = runtime.read_journal(&path).unwrap();
+            stage_digests(&mut journal, &path, BTreeMap::new(), false).unwrap();
+            runtime.cache_journal(&path, journal);
+        }
+        assert_eq!((runtime.profile_reads, runtime.tail_reads, runtime.journal_reads), (1, 1, 1));
+        assert!(before == FileStamp::read(&path).unwrap(), "idle pass rewrote the journal");
+        write(&transcript, &[fixture(), json!({"type":"user"})]);
+        assert_eq!(runtime.limit(&transcript, SESSION).unwrap(), None);
+        assert_eq!(runtime.tail_reads, 2);
+    }
+    #[test]
+    fn notice_batch_combines_attempts_and_unknowns_and_survives_restart() {
+        let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("journal.json");
+        let record = LimitRecord { id: RECORD.into(), session_id: SESSION.into(), at: 1000, reset_at: Some(2000) };
+        let mut journal = Journal::new(); let episode = journal.observe("worker", &record, Some("a"));
+        episode.manager = Some("manager".into()); episode.label = "Worker".into();
+        episode.attempted = true; episode.outcome = Some("resume submitted".into());
+        let unchecked = [("manager".into(), vec!["Other (other-uid)".into()])].into_iter().collect();
+        stage_digests(&mut journal, &path, unchecked, false).unwrap();
+        assert_eq!(journal.digests.len(), 1);
+        flush_digests(&mut journal, &path, dir.path()).unwrap();
+        let (events, _) = crate::notifications::snapshot(dir.path(), "manager").unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0]["text"].as_str().unwrap().contains("resume submitted"));
+        assert!(events[0]["text"].as_str().unwrap().contains("could not check"));
+        let mut recovered = Journal::load(&path).unwrap();
+        stage_digests(&mut recovered, &path, BTreeMap::new(), false).unwrap();
+        flush_digests(&mut recovered, &path, dir.path()).unwrap();
+        assert_eq!(crate::notifications::snapshot(dir.path(), "manager").unwrap().0.len(), 1);
+    }
+    #[test]
+    fn claude_composer_requires_empty_current_input_row() {
+        for (row, col, expected) in [("❯ ", 3, true), ("❯ draft", 3, false), ("❯ ", 7, false)] {
+            let mut screen = crate::workflow::pty_tracker::PtyModeTracker::with_size(80, 24);
+            screen.feed(format!("\x1b[?25h\x1b[H{row}\x1b[1;{col}H").as_bytes(), Instant::now());
+            assert_eq!(screen.claude_recovery_composer_ready(), expected, "{row} {col}");
+        }
+    }
+    #[test]
+    fn write_guard_refuses_new_input_and_failed_commit_before_bytes() {
+        let (input, writes) = crate::session::InputHandle::test_handle_capturing();
+        let now = crate::agent_state::unix_now();
+        let cell = input.test_agent_state();
+        {
+            let mut cell = cell.lock().unwrap();
+            cell.inputs.presence = Some(crate::agent_state::PresenceObs {
+                valid: true, status: crate::agent_state::PresenceStatus::Idle,
+                observed_at: now, status_updated_at: Some(now - 1.0),
+                native_session_id: Some(SESSION.into()), engine_version: Some("2.1.312".into()),
+                waiting_for: None, main_turn_open: None, transcript_error: Some("rate_limit".into()),
+                transcript_end: Some(crate::agent_state::LastTurn { ended_at: Some(now - 1.0), status: Some(crate::agent_state::TurnStatus::Failed) }),
+                transcript_evidence_path: None,
+            });
+            cell.inputs.latest_start = Some(now - 10.0);
+            cell.inputs.background.complete = true;
+        }
+        let agent = cell.lock().unwrap().recompute(now);
+        assert!(failed_boundary(&agent), "{agent:?}");
+        let captured = Instant::now();
+        assert!(!input.write_claude_limit_resume(captured, agent.turn_seq, agent.last_turn.ended_at, b"\r", || Ok(false)).unwrap());
+        assert!(writes.lock().unwrap().is_empty());
+        input.stamp_operator_input_at(Instant::now());
+        assert!(!input.write_claude_limit_resume(captured, agent.turn_seq, agent.last_turn.ended_at, b"\r", || panic!("must not commit after human input")).unwrap());
+        assert!(writes.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn actual_attempt_rechecks_manager_disable_and_new_user_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let uid = format!("ts-limit-test-{}", uuid::Uuid::new_v4());
+        let transcript = dir.path().join(format!("{SESSION}.jsonl"));
+        let profile = dir.path().join("profile.json");
+        std::fs::write(&profile, json!({"oauthAccount":{"accountUuid":"123e4567-e89b-12d3-a456-426614174000"}}).to_string()).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let mut failure = fixture();
+        failure["timestamp"] = json!(chrono::DateTime::from_timestamp(now - 120, 0).unwrap().to_rfc3339());
+        failure["quotaLimits"]["resetsAt"] = json!(now - 60);
+        write(&transcript, &[failure.clone(), json!({"type":"system","subtype":"turn_duration"})]);
+        let record = latest_limit(&transcript, SESSION).unwrap().unwrap();
+        let mut params = crate::session::SpawnParams::new(&uid, "worker", "/bin/sleep");
+        params.args = vec!["60".into()]; params.session_type = "claude-code".into();
+        params.workspace_id = "workspace".into(); params.managed_by_uid = Some("manager".into());
+        params.transcript_path = Some(transcript.to_string_lossy().into());
+        let mut session = crate::session::PendingSession::spawn(params).unwrap().arm_reaper(None).unwrap();
+        let at = crate::agent_state::unix_now();
+        {
+            let mut cell = session.agent_state.lock().unwrap();
+            cell.inputs.presence = Some(crate::agent_state::PresenceObs { valid:true,
+                status:crate::agent_state::PresenceStatus::Idle, observed_at:at, status_updated_at:Some(at - 1.0),
+                native_session_id:Some(SESSION.into()), engine_version:Some("2.1.312".into()),
+                waiting_for:None, main_turn_open:None, transcript_error:Some("rate_limit".into()),
+                transcript_end:Some(crate::agent_state::LastTurn { ended_at:Some((now - 120) as f64), status:Some(crate::agent_state::TurnStatus::Failed) }),
+                transcript_evidence_path:Some(transcript.clone()) });
+            cell.inputs.latest_start = Some((now - 180) as f64); cell.inputs.background.complete = true;
+        }
+        session.fanout.push("\x1b[>1u\x1b[?25h\x1b[HUsage limit\r\n❯ \x1b[2;3H".as_bytes());
+        let mut daemon = crate::state::DaemonState::new(); daemon.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
+        daemon.messaging_root = dir.path().into(); daemon.sessions.insert(uid.clone(), session);
+        let state = Arc::new(Mutex::new(daemon));
+        let target = targets(&state.lock().unwrap()).pop().expect("failed managed candidate");
+        let journal_path = dir.path().join("recovery.json"); let mut journal = Journal::new();
+        journal.observe(&uid, &record, None).manager = Some("manager".into()); journal.save(&journal_path).unwrap();
+        let mut runtime = AccountObservation::default();
+        state.lock().unwrap().config.claude_limit_recovery = false;
+        assert!(!attempt(&state, &target, &record, &profile, &mut journal, &journal_path, dir.path(), &mut runtime).unwrap());
+        assert!(!journal.episodes.values().next().unwrap().attempted);
+        state.lock().unwrap().config.claude_limit_recovery = true;
+        state.lock().unwrap().sessions.get_mut(&uid).unwrap().managed_by_uid = None;
+        assert!(!attempt(&state, &target, &record, &profile, &mut journal, &journal_path, dir.path(), &mut runtime).unwrap());
+        assert!(!journal.episodes.values().next().unwrap().attempted);
+        state.lock().unwrap().sessions.get_mut(&uid).unwrap().managed_by_uid = Some("manager".into());
+        write(&transcript, &[failure.clone(), json!({"type":"user","message":{"content":"resume"}})]);
+        assert!(!attempt(&state, &target, &record, &profile, &mut journal, &journal_path, dir.path(), &mut runtime).unwrap());
+        assert!(!journal.episodes.values().next().unwrap().attempted);
+        write(&transcript, &[failure, json!({"type":"system","subtype":"turn_duration"})]);
+        assert!(attempt(&state, &target, &record, &profile, &mut journal, &journal_path, dir.path(), &mut runtime).unwrap());
+        assert!(Journal::load(&journal_path).unwrap().episodes.values().next().unwrap().attempted);
+        assert!(!attempt(&state, &target, &record, &profile, &mut journal, &journal_path, dir.path(), &mut runtime).unwrap());
+        let _ = state.lock().unwrap().sessions.get_mut(&uid).unwrap().kill();
     }
 }

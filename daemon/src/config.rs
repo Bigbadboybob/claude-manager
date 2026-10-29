@@ -916,6 +916,7 @@ mode = "ssh-trust"
     #[test]
     fn serde_round_trip() {
         let original = DaemonConfig {
+            claude_limit_recovery: true,
             memory: MemoryConfig::default(),
             s4_min_write: true,
             transcript_rotation: Default::default(),

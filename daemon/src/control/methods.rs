@@ -3757,7 +3757,7 @@ pub(crate) fn transcript_updated_entry(s: &crate::session::DaemonSession) -> Val
 /// critical section — `ManifestWatcher::broadcast` is non-blocking
 /// (bounded channels, drops on a stalled consumer), so holding the
 /// lock across it is the same cost as the existing `Exited` path.
-fn broadcast_transcript_updated(state: &DaemonState, uid: &str, entry: Value) {
+pub(crate) fn broadcast_transcript_updated(state: &DaemonState, uid: &str, entry: Value) {
     state
         .manifest_watcher
         .broadcast(crate::manifest::ManifestDiff::Updated {
@@ -4571,6 +4571,10 @@ pub fn reload_config(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
             format!("daemon.reload_config: {}", e),
         )
     })?;
+
+    // Admission holds the matching read side through a recovery write. A
+    // completed disable therefore cannot race a later automatic prompt.
+    let _recovery_config = crate::claude_account_recovery::config_gate().write().unwrap_or_else(|p| p.into_inner());
 
     const RESTART_ONLY: &[&str] = &["auth", "tls"];
 
@@ -23782,6 +23786,7 @@ mod tests {
                 },
             );
             s.config = crate::config::DaemonConfig {
+                claude_limit_recovery: true,
                 memory: Default::default(),
                 s4_min_write: false,
                 transcript_rotation: Default::default(),

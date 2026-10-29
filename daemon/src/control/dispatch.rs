@@ -11354,6 +11354,7 @@ mod tests {
         {
             let mut st = state.lock().unwrap();
             st.config = crate::config::DaemonConfig {
+                claude_limit_recovery: true,
                 memory: Default::default(),
                 s4_min_write: false,
                 transcript_rotation: Default::default(),
@@ -11464,6 +11465,7 @@ mod tests {
     fn set_stub_api_config(state: &Arc<Mutex<DaemonState>>, port: u16) {
         let mut st = state.lock().unwrap();
         st.config = crate::config::DaemonConfig {
+            claude_limit_recovery: true,
                 memory: Default::default(),
             s4_min_write: false,
             transcript_rotation: Default::default(),
