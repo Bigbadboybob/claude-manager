@@ -4602,6 +4602,10 @@ pub fn reload_config(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
                 || st.config.api_url != applied.api_url || st.config.api_token != applied.api_token {
                 crate::items::s4_attribution::invalidate_config_epoch();
             }
+            // Serialize trim policy publication with periodic admission. This
+            // short control lock is never held by allocator calls and the trim
+            // worker never takes the daemon state lock.
+            crate::memory_trim::reload(applied.memory.clone());
             st.config = applied;
         }
         (changed, requires_restart)
@@ -23778,6 +23782,7 @@ mod tests {
                 },
             );
             s.config = crate::config::DaemonConfig {
+                memory: Default::default(),
                 s4_min_write: false,
                 transcript_rotation: Default::default(),
                 chat_search_budget_bytes: 512 * 1024 * 1024,
@@ -26324,6 +26329,26 @@ while True:
     /// names them in `requires_restart`, and re-runs the MCP preflight
     /// when `mcp_server_path` moved (failing loudly here, since the
     /// test's new path is fake).
+    #[test]
+    fn memory_trim_reload_config_is_hot_and_zero_disables_periodic() {
+        with_temp_home(|| {
+            let state = make_state_arc();
+            let path = crate::config::default_config_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "[memory]\ntrim_interval_secs=0\ntrim_min_free_bytes=17\n").unwrap();
+            let result = reload_config(&state).unwrap();
+            assert_eq!(result["changed"], json!(["memory"]));
+            assert_eq!(result["requires_restart"], json!([]));
+            assert_eq!(state.lock().unwrap().config.memory.trim_interval_secs, 0);
+            assert_eq!(state.lock().unwrap().config.memory.trim_min_free_bytes, 17);
+            assert_eq!(reload_config(&state).unwrap()["changed"], json!([]));
+            std::fs::write(&path, "[memory]\ntrim_interval_secs=2\n").unwrap();
+            reload_config(&state).unwrap();
+            assert_eq!(state.lock().unwrap().config.memory.trim_interval_secs, 2);
+            assert_eq!(state.lock().unwrap().config.memory.trim_min_free_bytes, 1 << 30);
+        });
+    }
+
     #[test]
     fn reload_config_applies_hot_keys_and_reports_restart_only() {
         with_temp_home(|| {

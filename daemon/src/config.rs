@@ -406,6 +406,9 @@ impl Default for SchedulerConfig {
 /// Parsed `daemon.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DaemonConfig {
+    /// Reloadable allocator maintenance. Interval zero disables periodic runs.
+    #[serde(default)]
+    pub memory: MemoryConfig,
     /// Opt-in S4 display evidence on supported daemon writes. Hot reloadable;
     /// disabling does not cancel writes that already captured evidence.
     #[serde(default)]
@@ -515,6 +518,21 @@ pub struct DaemonConfig {
     pub transcript_rotation: TranscriptRotationConfig,
 }
 
+/// GNU allocator maintenance; defaults are an explicit operator policy, not a
+/// measured guarantee of reclaimed bytes or maximum pause time.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryConfig {
+    pub trim_interval_secs: u32,
+    pub trim_min_free_bytes: u64,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self { trim_interval_secs: 600, trim_min_free_bytes: 1 << 30 }
+    }
+}
+
 /// `[transcript_rotation]` in `daemon.toml`. Claude Code replays and keeps
 /// the whole transcript file in memory on every resume, and compaction never
 /// shrinks it, so a long-lived session slows to a crawl (a 1.67 GB file left
@@ -591,6 +609,7 @@ impl DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            memory: MemoryConfig::default(),
             s4_min_write: false,
             chat_search_budget_bytes: default_chat_search_budget_bytes(),
             presence_idle_enabled: default_presence_idle_enabled(),
@@ -890,6 +909,7 @@ mode = "ssh-trust"
     #[test]
     fn serde_round_trip() {
         let original = DaemonConfig {
+            memory: MemoryConfig::default(),
             s4_min_write: true,
             transcript_rotation: Default::default(),
             chat_search_budget_bytes: 128 * 1024 * 1024,

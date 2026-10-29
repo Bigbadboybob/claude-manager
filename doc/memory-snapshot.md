@@ -27,6 +27,10 @@ allocator bookkeeping affect what appears allocated. Arenas are visited under
 their individual allocator locks, not one atomic global snapshot. Other libc
 targets report `unsupported` with null data. No trimming is performed.
 
+The snapshot itself never trims. [Allocator maintenance](memory-trim.md) uses
+the same admission flag; the unchanged `snapshot_in_flight` busy reason can
+also mean a periodic check or pending/running operator trim holds that flag.
+
 **There is no hard total-time bound.** `mallinfo2` can wait for internal glibc
 arena locks and has no cancellation API. It executes on the existing RPC
 handler, never on a detached diagnostic worker. A process-wide admission flag

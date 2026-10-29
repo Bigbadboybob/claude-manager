@@ -84,6 +84,7 @@ pub mod maintenance;
 pub mod manifest;
 pub mod messaging;
 mod memory_snapshot;
+mod memory_trim;
 pub mod mcp_config;
 pub mod migrate;
 pub mod models;
@@ -737,6 +738,7 @@ pub fn run() -> anyhow::Result<()> {
     crate::mcp_config::set_codex_inline_scrollback(daemon_config.codex_inline_scrollback);
     crate::models::set_models(daemon_config.models.clone());
     initial_state.config = daemon_config;
+    memory_trim::start(initial_state.config.memory.clone());
     // Phase 3b: the dev flag (read once above) and the listener's
     // raw fd — the latter is MANIFEST INPUT ONLY (see the field doc):
     // `reexec::perform_reexec` copies the number into the FD

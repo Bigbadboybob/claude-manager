@@ -24,11 +24,11 @@ use std::{
 
 const COLLECTION_BUDGET: Duration = Duration::from_millis(20);
 const PARTICIPANT_LIMIT: usize = 4096;
-static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+pub(crate) static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
-struct Admission<'a>(&'a AtomicBool);
+pub(crate) struct Admission<'a>(&'a AtomicBool);
 impl<'a> Admission<'a> {
-    fn enter(flag: &'a AtomicBool) -> Option<Self> {
+    pub(crate) fn enter(flag: &'a AtomicBool) -> Option<Self> {
         flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
             .map(|_| Self(flag))
@@ -40,15 +40,15 @@ impl Drop for Admission<'_> {
     }
 }
 
-#[derive(Serialize)]
-struct Section<T> {
-    status: &'static str,
-    reason: Option<&'static str>,
-    elapsed_us: u64,
-    data: Option<T>,
+#[derive(Clone, Serialize)]
+pub(crate) struct Section<T> {
+    pub(crate) status: &'static str,
+    pub(crate) reason: Option<&'static str>,
+    pub(crate) elapsed_us: u64,
+    pub(crate) data: Option<T>,
 }
 impl<T> Section<T> {
-    fn unavailable(reason: &'static str) -> Self {
+    pub(crate) fn unavailable(reason: &'static str) -> Self {
         Self {
             status: "unavailable",
             reason: Some(reason),
@@ -58,13 +58,13 @@ impl<T> Section<T> {
     }
 }
 
-#[derive(Serialize)]
-struct Allocator {
-    units: &'static str,
-    arena_bytes: usize,
-    used_arena_bytes: usize,
-    free_arena_bytes: usize,
-    mmapped_bytes: usize,
+#[derive(Clone, Serialize)]
+pub(crate) struct Allocator {
+    pub(crate) units: &'static str,
+    pub(crate) arena_bytes: usize,
+    pub(crate) used_arena_bytes: usize,
+    pub(crate) free_arena_bytes: usize,
+    pub(crate) mmapped_bytes: usize,
 }
 
 #[derive(Serialize)]
@@ -112,7 +112,7 @@ pub(crate) fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Respon
     )
 }
 
-fn capture(
+pub(crate) fn capture(
     state: &Arc<Mutex<DaemonState>>,
     in_flight: &AtomicBool,
     budget: Duration,
@@ -238,7 +238,7 @@ fn collect_messaging(state: &Arc<Mutex<DaemonState>>, deadline: Instant, out: &m
     };
 }
 
-fn process_start_ticks() -> Option<u64> {
+pub(crate) fn process_start_ticks() -> Option<u64> {
     let mut text = String::new();
     std::fs::File::open("/proc/self/stat")
         .ok()?
@@ -256,7 +256,7 @@ fn parse_start_ticks(text: &str) -> Option<u64> {
         .ok()
 }
 
-fn allocator() -> Section<Allocator> {
+pub(crate) fn allocator() -> Section<Allocator> {
     #[cfg(target_env = "gnu")]
     {
         // glibc takes each arena's mutex. This can block without a finite bound;
