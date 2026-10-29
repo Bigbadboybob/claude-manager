@@ -297,6 +297,16 @@ class Compose(unittest.TestCase):
         self.assertIn(f"+{len(flags) - shown} more: board(board=\"sfd\", flags_only=true)", text)
         self.assertTrue(text.endswith('flags_only=true)'))
 
+    def test_truncated_single_flag_and_tiny_limit_do_not_misdirect(self):
+        text = compose("sfd", ["x" * 2000], {"done": [9]})
+        self.assertIn("1 flag · 1 done", text)
+        self.assertNotIn("flags: ·", text)
+        self.assertTrue(text.endswith('+1 more: board(board="sfd", flags_only=true)'))
+        tiny = compose("other-board", ["x" * 200], {}, limit=25)
+        self.assertLessEqual(len(tiny), 25)
+        self.assertNotIn("board(flags_only=true)", tiny)
+        self.assertIn("+1 more", tiny)
+
     def test_shape_and_limit(self):
         text = compose("sfd", ["#14 holder_idle (rl idle 24m)"], {"done": [9, 11]})
         self.assertEqual(text, '[cm-board sfd] 1 flag: #14 holder_idle (rl idle 24m) · 2 done '

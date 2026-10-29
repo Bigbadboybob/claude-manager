@@ -458,18 +458,24 @@ def compose(slug: str, flag_parts: list[str], closed: dict[str, list[int]],
         for count in range(len(flag_parts) - 1, -1, -1):
             omitted = len(flag_parts) - count
             shown = "; ".join(flag_parts[:count])
-            prefix = f"{head} {len(flag_parts)} flags:" + (f" {shown}" if shown else "")
+            noun = "flag" if len(flag_parts) == 1 else "flags"
+            prefix = f"{head} {len(flag_parts)} {noun}" + (f": {shown}" if shown else "")
             if keep_digest:
                 prefix += f" · {digest}"
-            separator = " · " if keep_digest else "; " if shown else " "
+            separator = " · " if keep_digest else "; " if shown else ": "
             suffix = f'+{omitted} more: board(board="{slug}", flags_only=true)'
             candidate = prefix + separator + suffix
             if len(candidate) <= limit:
                 return candidate
-    # A tiny caller-supplied limit may not even hold the board name. Keep the
-    # count and instruction when possible instead of a misleading partial list.
-    fallback = f"+{len(flag_parts)} more: board(flags_only=true)"
-    return fallback if len(fallback) <= limit else fallback[:limit]
+    # With a tiny limit the board-specific command may not fit. Never point
+    # to a different board: retain its name if possible, otherwise the count.
+    fallback = f'+{len(flag_parts)} more: board(board="{slug}", flags_only=true)'
+    if len(fallback) <= limit:
+        return fallback
+    fallback = f"+{len(flag_parts)} more (board: {slug})"
+    if len(fallback) <= limit:
+        return fallback
+    return f"+{len(flag_parts)} more"[:limit]
 
 
 # ---- one board, one tick ---------------------------------------------------
