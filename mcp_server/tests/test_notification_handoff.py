@@ -16,6 +16,7 @@ from mcp_server.native_claude import (
     argv_session_id,
     background_match,
     channel_flag_present,
+    recovery_record_state,
 )
 from mcp_server.notifications import Queue, consume, delivery_health
 
@@ -59,6 +60,25 @@ def ev(id, status, at):
 
 
 class DeliveryHealthTests(unittest.TestCase):
+    def test_recovery_record_rechecks_exact_failure_and_later_input(self):
+        sid = "93686392-56ae-455c-803d-6ce59cc55e29"
+        rid = "e3c16692-eddd-4ec9-9fd5-282de7a3de11"
+        record = {"type":"assistant", "sessionId":sid, "uuid":rid, "error":"rate_limit",
+                  "isApiErrorMessage":True, "message":{"model":"<synthetic>"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / f"{sid}.jsonl"
+            def write(*rows):
+                path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            write(record, {"type":"system", "subtype":"turn_duration"})
+            self.assertEqual(recovery_record_state(path, sid, rid), "ready")
+            write(record, {"type":"user", "message":{"content":"resume"}})
+            self.assertEqual(recovery_record_state(path, sid, rid), "superseded")
+            write(record, {"type":"queue-operation", "operation":"enqueue"})
+            self.assertEqual(recovery_record_state(path, sid, rid), "superseded")
+            path.write_text(json.dumps(record))
+            self.assertEqual(recovery_record_state(path, sid, rid), "unknown")
+            write(record)
+            self.assertEqual(recovery_record_state(path, sid, "123e4567-e89b-12d3-a456-426614174000"), "superseded")
     def test_untrusted_chronology_degrades_both_surfaces_without_rewriting_receipts(self):
         with tempfile.TemporaryDirectory() as tmp:
             q = Queue("s", Path(tmp))
@@ -208,6 +228,54 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
         # live pid (our parent) so the holder does not treat it as its own.
         notifications.atomic_write(self.queue.takeover_path(os.getppid()),
                                    dict(claim, pid=os.getppid(), requested_at=time.time()))
+
+    async def test_recovery_consumer_rechecks_after_claim_and_supersedes_without_send(self):
+        notifications.atomic_write(self.queue.path.parent / "claude-limit-recovery-state", {"version":1, "enabled":True})
+        self.queue.publish("recover", "claude-limit-recovery", "[recover] continue", "[recover]")
+        adapter = Fixture("current")
+        adapter.recovery_check = mock.AsyncMock(side_effect=["ready", "superseded"])
+        self.run_consumer(adapter)
+        await eventually(lambda: self.queue.get("recover")["status"] == "cancelled")
+        self.assertEqual(self.queue.get("recover")["cancel_reason"], "superseded")
+        self.assertEqual(adapter.sent, [])
+
+    async def test_real_adapter_rechecks_live_scope_before_claim(self):
+        sid = "93686392-56ae-455c-803d-6ce59cc55e29"
+        rid = "e3c16692-eddd-4ec9-9fd5-282de7a3de11"
+        path = Path(self.tmp.name) / f"{sid}.jsonl"
+        path.write_text(json.dumps({"type":"assistant", "sessionId":sid, "uuid":rid,
+                                    "error":"rate_limit", "isApiErrorMessage":True,
+                                    "message":{"model":"<synthetic>"}}) + "\n")
+        event = {"id":f"claude-limit:{sid}:{rid}", "recovery_scope":{"manager":"manager", "generation":7}}
+        base = {"transcript_path":str(path), "claude_recovery_eligible":True, "managed_by_uid":"manager",
+                "generation":7, "workflow_run_id":None, "continuous_task_id":None}
+        adapter = ClaudeAdapter(self.queue.uid)
+        with mock.patch.object(adapter, "live", return_value=True), mock.patch.object(control_client, "call", return_value=base) as call:
+            self.assertEqual(await adapter.recovery_check(event), "ready")
+            for changed in ({"managed_by_uid":None}, {"managed_by_uid":"other"},
+                            {"workflow_run_id":"run"}, {"continuous_task_id":"ct"},
+                            {"generation":8}, {"claude_recovery_eligible":False}):
+                call.return_value = dict(base, **changed)
+                self.assertEqual(await adapter.recovery_check(event), "superseded", changed)
+
+    async def test_recovery_disable_cancels_pending_without_send(self):
+        notifications.atomic_write(self.queue.path.parent / "claude-limit-recovery-state", {"version":1, "enabled":False})
+        self.queue.publish("recover", "claude-limit-recovery", "[recover] continue", "[recover]")
+        adapter = Fixture("current")
+        adapter.recovery_check = mock.AsyncMock(return_value="ready")
+        self.run_consumer(adapter)
+        await eventually(lambda: self.queue.get("recover")["status"] == "cancelled")
+        self.assertEqual(self.queue.get("recover")["cancel_reason"], "recovery_disabled")
+        self.assertEqual(adapter.sent, [])
+
+    async def test_recovery_event_sends_once_when_both_guards_pass(self):
+        notifications.atomic_write(self.queue.path.parent / "claude-limit-recovery-state", {"version":1, "enabled":True})
+        self.queue.publish("recover", "claude-limit-recovery", "[recover] continue", "[recover]")
+        adapter = Fixture("current")
+        adapter.recovery_check = mock.AsyncMock(return_value="ready")
+        self.run_consumer(adapter)
+        await eventually(lambda: self.queue.get("recover")["status"] == "submitted")
+        self.assertEqual(adapter.sent, ["recover"])
 
     async def test_unknown_chronology_holds_pending_until_census_is_trustworthy(self):
         adapter = Fixture("old")
@@ -536,7 +604,8 @@ class SlimReadTests(unittest.TestCase):
             self.assertNotIn("view", call.call_args.args[1])
             self.assertEqual(call.call_args.args[1], {"inbox": True, "unread_only": True,
                                                       "time_basis": "created", "freshness": "cached",
-                                                      "limit": 50, "dms": False, "newest_first": True})
+                                                      "limit": 50, "dms": False, "newest_first": True,
+                                                      "mark_read": True, "mentions_only": False})
             self.assertEqual(slim["view"], "slim")
             full = server.chat_read(inbox=True, unread_only=True, view="full", newest_first=False)
             self.assertIn("norms", full)

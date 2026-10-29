@@ -291,6 +291,36 @@ class Queue:
         # Once claimed, cancellation cannot retract an accepted native event.
         return self.change(event_id, {"pending"}, status="cancelled")
 
+    def recovery_enabled(self):
+        try:
+            path = self.path.parent / "claude-limit-recovery-state"
+            if path.stat().st_size > 4096:
+                return None
+            state = json.loads(path.read_text())
+            return state.get("enabled") if state.get("version") == 1 and isinstance(state.get("enabled"), bool) else None
+        except (OSError, ValueError, AttributeError):
+            return None
+
+    def claim_recovery(self, event_id, binding):
+        # The config marker is checked under the same lock as the claim.
+        with self.locked():
+            path = self.event_path(event_id)
+            try:
+                event = json.loads(path.read_text())
+            except (OSError, ValueError):
+                return None
+            if event.get("status") != "pending":
+                return None
+            enabled = self.recovery_enabled()
+            if enabled is None:
+                return None
+            if not enabled:
+                event.update(status="cancelled", cancel_reason="recovery_disabled", updated_at=time.time())
+            else:
+                event.update(status="submitting", binding=binding, updated_at=time.time())
+            atomic_write(path, event)
+            return event if enabled else None
+
     def snapshot(self):
         with self.locked():
             events = self._events()
@@ -548,14 +578,29 @@ async def consume(queue: Queue, adapter):
                 if held and event.get("source") not in Queue.HOLD_EXEMPT:
                     # A rotation is due or running: the new process gets it.
                     continue
-                event = queue.change(
-                    event["id"],
-                    {"pending"},
-                    status="submitting",
-                    binding=adapter.identity(),
-                )
+                recovery = event.get("source") == "claude-limit-recovery"
+                if recovery:
+                    check = await adapter.recovery_check(event) if hasattr(adapter, "recovery_check") else "unknown"
+                    if check == "superseded":
+                        queue.change(event["id"], {"pending"}, status="cancelled", cancel_reason="superseded")
+                        continue
+                    if check != "ready":
+                        continue
+                    event = queue.claim_recovery(event["id"], adapter.identity())
+                else:
+                    event = queue.change(event["id"], {"pending"}, status="submitting", binding=adapter.identity())
                 if not event or event["status"] != "submitting":
                     continue
+                if recovery:
+                    check = await adapter.recovery_check(event)
+                    enabled = queue.recovery_enabled()
+                    if check != "ready" or enabled is not True:
+                        if check == "superseded" or enabled is False:
+                            reason = "superseded" if check == "superseded" else "recovery_disabled"
+                            queue.change(event["id"], {"submitting"}, status="cancelled", cancel_reason=reason)
+                        else:
+                            queue.change(event["id"], {"submitting"}, status="pending")
+                        continue
                 try:
                     receipt = await adapter.send(event)
                 except NotSubmitted:

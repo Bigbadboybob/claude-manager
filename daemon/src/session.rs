@@ -115,6 +115,7 @@ pub struct FanoutSnapshot {
 
 pub struct PtyByteFanout {
     inner: Mutex<FanoutInner>,
+    geometry: std::sync::atomic::AtomicU64,
     /// Sub-2b-1 review-r#2 #1: shared activity timestamp.
     /// `None` for fanouts constructed via the unit-test
     /// `PtyByteFanout::new` shortcut (idle isn't observable
@@ -241,8 +242,13 @@ impl PtyByteFanout {
                 stream_id: new_stream_id(),
                 keyboard: crate::keys::KeyboardTracker::fresh(),
             }),
+            geometry: std::sync::atomic::AtomicU64::new(0),
             last_activity_at,
         }
+    }
+
+    pub(crate) fn geometry_version(&self) -> u64 {
+        self.geometry.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Seed an adopted session's fanout: its keyboard mode, then its replay
@@ -3216,6 +3222,88 @@ impl InputHandle {
         Ok(true)
     }
 
+    /// A single guarded resume. `commit` revalidates transcript evidence
+    /// and durably records the attempt while this writer is exclusively held;
+    /// neither an ambiguous write nor a crash may trigger a second attempt.
+    pub(crate) fn write_claude_limit_resume(
+        &self, captured: Instant, turn_seq: u64, ended_at: Option<f64>,
+        background: &crate::agent_state::Background,
+        enter: &[u8], commit: impl FnOnce() -> std::io::Result<bool>,
+        after_commit: impl FnOnce() -> std::io::Result<bool>,
+        screen_unchanged: impl FnOnce() -> bool,
+        gap_safe: impl FnOnce() -> std::io::Result<bool>,
+    ) -> std::io::Result<bool> {
+        let _unit = crate::writer_gate::unit_permit();
+        let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
+        let _fence = gate.as_ref().map(|g| g.read().unwrap_or_else(|p| p.into_inner()));
+        if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
+        let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        let typed = *self.last_operator_input_at.lock().unwrap_or_else(|p| p.into_inner());
+        let input = *self.last_input_at.lock().unwrap_or_else(|p| p.into_inner());
+        if typed.is_some_and(|t| t >= captured || input.is_none_or(|i| t > i))
+            || input.is_some_and(|t| t >= captured) { return Ok(false); }
+        let token = crate::agent_state::unix_now();
+        {
+            let mut cell = self.agent_state.lock().unwrap_or_else(|p| p.into_inner());
+            let state = cell.recompute(token);
+            if !crate::claude_account_recovery::failed_boundary(&state)
+                || state.turn_seq != turn_seq || state.last_turn.ended_at != ended_at
+                || !crate::claude_account_recovery::same_background(background, &state.background) { return Ok(false); }
+        }
+        if !commit()? { return Ok(false); }
+        // Slow transcript reads and journal fsync have finished. Recheck the
+        // active census and the rendered screen immediately before any bytes.
+        if !after_commit()? || !self.claude_limit_boundary_matches(turn_seq, ended_at, background)
+            || !screen_unchanged() { return Ok(false); }
+        self.agent_state.lock().unwrap_or_else(|p| p.into_inner()).note_input(token);
+        writer.write_all(b"\x1b[200~Your last turn stopped on a usage limit. Capacity may be available now; continue where you stopped. If it fails again, stop and wait.\x1b[201~")?;
+        writer.flush()?;
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let background_unchanged = {
+            let cell = self.agent_state.lock().unwrap_or_else(|p| p.into_inner());
+            crate::claude_account_recovery::same_background(background, &cell.inputs.background)
+        };
+        if !background_unchanged || !gap_safe()? {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted,
+                "resume paste may be present; submit withheld after background activity"));
+        }
+        writer.write_all(enter)?;
+        writer.flush()?;
+        stamp_now(&self.last_activity_at);
+        stamp_now(&self.last_input_at);
+        self.agent_state.lock().unwrap_or_else(|p| p.into_inner())
+            .note_submitted(token, crate::agent_state::unix_now());
+        Ok(true)
+    }
+
+    pub(crate) fn claude_limit_boundary_matches(&self, turn_seq: u64, ended_at: Option<f64>,
+        background: &crate::agent_state::Background) -> bool {
+        let state = self.agent_state.lock().unwrap_or_else(|p| p.into_inner()).recompute(crate::agent_state::unix_now());
+        crate::claude_account_recovery::failed_boundary(&state)
+            && state.turn_seq == turn_seq && state.last_turn.ended_at == ended_at
+            && crate::claude_account_recovery::same_background(background, &state.background)
+    }
+
+    /// Hold the same input serialization while admitting an atomic native
+    /// recovery notification. No PTY bytes are written on this path.
+    pub(crate) fn admit_claude_limit_notice(
+        &self, captured: Instant, turn_seq: u64, ended_at: Option<f64>,
+        background: &crate::agent_state::Background,
+        publish: impl FnOnce() -> std::io::Result<bool>,
+    ) -> std::io::Result<bool> {
+        let _unit = crate::writer_gate::unit_permit();
+        let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
+        let _fence = gate.as_ref().map(|g| g.read().unwrap_or_else(|p| p.into_inner()));
+        if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
+        let _writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        let typed = *self.last_operator_input_at.lock().unwrap_or_else(|p| p.into_inner());
+        let input = *self.last_input_at.lock().unwrap_or_else(|p| p.into_inner());
+        if typed.is_some_and(|t| t >= captured || input.is_none_or(|i| t > i))
+            || input.is_some_and(|t| t >= captured) { return Ok(false); }
+        if !self.claude_limit_boundary_matches(turn_seq, ended_at, background) { return Ok(false); }
+        publish()
+    }
+
     /// Bump the activity clock WITHOUT writing to the PTY. The agent
     /// `send_input` path hands the actual PTY write to a detached delivery
     /// thread (settle → bracketed body → gap → kitty-Enter), but the caller
@@ -3590,6 +3678,7 @@ impl DaemonSession {
         rows: u16,
         cell_pixels: Option<(u16, u16)>,
     ) -> std::io::Result<()> {
+        self.fanout.geometry.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         use portable_pty::PtySize;
         if let Some((w, h)) = cell_pixels.filter(|&(w, h)| w > 0 && h > 0) {
             self.last_cell_pixels = Some((w, h));
