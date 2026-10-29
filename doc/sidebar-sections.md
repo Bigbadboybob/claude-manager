@@ -8,7 +8,7 @@ Owner-created, collapsible sections in the Sessions-view sidebar (Task sub-view)
 - **Group strip.** The focused row's group (its task or workspace and everything below it) shows as a narrow coloured strip (`▏`) at the sidebar's left edge, clear of the row text. The group has no background tint, so section tints show unchanged.
 - **Leader marks.** The lead session of a task with live reports carries its level's mark: ★ for a root task, ☆ one level down, ✦, then ✧ for every deeper level. A live report is a subtask that is not done or archived and has a live agent session in its subtree; sessionless, bash-only and finished subtasks don't count. The F6 org chart draws the same marks (`App::leader_marks`; see doc/org-chart.md).
 
-Space/Enter on a task header folds only its subtasks: the task's workspace row and its own sessions stay, and the folded header's count covers just the hidden subtree. Only a task with live reports has a fold glyph and folds, decided per task, so a task bound to two workspaces folds from either header. A division header still folds its whole tree.
+Space/Enter on a task header folds only its subtasks: the task's workspace row and its own sessions stay, and the folded header's count covers just the hidden subtree. Only a task with live reports has a fold glyph. Fold state is separate for each workspace and task, so folding one header leaves another workspace’s header open. A child workspace attaches to a parent on its own host, preferring its managing session’s workspace; otherwise it remains top-level when no parent is on that host. A division header still folds its whole tree.
 
 ## Agent tools: remote subsection assignment
 

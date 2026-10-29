@@ -23,12 +23,30 @@
 use super::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+/// Migrate old task-wide folds to each known workspace. New keys are JSON
+/// pairs of stable workspace and task IDs and survive workspace reordering.
+pub(super) fn migrate_task_folds<'a>(
+    folds: &std::collections::BTreeSet<String>,
+    workspaces: impl Iterator<Item = &'a String>,
+) -> HashSet<String> {
+    let workspaces: Vec<&String> = workspaces.collect();
+    folds.iter().flat_map(|key| {
+        if serde_json::from_str::<[String; 2]>(key).is_ok() {
+            vec![key.clone()]
+        } else {
+            workspaces.iter().map(|ws|
+                serde_json::to_string(&[ws.as_str(), key.as_str()]).unwrap()
+            ).collect()
+        }
+    }).collect()
+}
+
 /// What a sidebar row belongs to.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Node {
     Division(String),
     Workspace(usize),
-    Task(String),
+    Task(usize, String),
 }
 
 /// Tree metadata for one Task sub-view row.
@@ -126,14 +144,14 @@ struct Forest {
     buckets: HashMap<usize, BTreeMap<Option<String>, Vec<usize>>>,
     /// Tasks bound to each workspace, in display order.
     bound: HashMap<usize, Vec<String>>,
-    /// The workspace whose block holds each task's header.
-    home: HashMap<String, usize>,
+    /// Every workspace whose block holds the task's header.
+    home: HashMap<String, Vec<usize>>,
     /// A nested block: child workspace → (parent workspace, task it hangs under).
     attach: HashMap<usize, (usize, String)>,
     /// Blocks hanging under each task, in display order.
-    children: HashMap<String, Vec<usize>>,
+    children: HashMap<(usize, String), Vec<usize>>,
     /// Nearest ancestor of a task bound to the same workspace.
-    local_parent: HashMap<String, String>,
+    local_parent: HashMap<(usize, String), String>,
 }
 
 impl Forest {
@@ -141,7 +159,7 @@ impl Forest {
         self.bound
             .get(&wi)?
             .iter()
-            .find(|t| !self.local_parent.contains_key(*t))
+            .find(|t| !self.local_parent.contains_key(&(wi, (*t).clone())))
     }
 
     fn local_children<'a>(
@@ -153,14 +171,11 @@ impl Forest {
             .get(&wi)
             .into_iter()
             .flatten()
-            .filter(move |c| self.local_parent.get(*c).map(String::as_str) == Some(t))
+            .filter(move |c| self.local_parent.get(&(wi, (*c).clone())).map(String::as_str) == Some(t))
     }
 
     fn nested_blocks(&self, wi: usize, t: &str) -> Vec<usize> {
-        if self.home.get(t) != Some(&wi) {
-            return Vec::new();
-        }
-        self.children.get(t).cloned().unwrap_or_default()
+        self.children.get(&(wi, t.to_owned())).cloned().unwrap_or_default()
     }
 
     fn bucket(&self, wi: usize, t: Option<&str>) -> &[usize] {
@@ -205,7 +220,7 @@ impl Forest {
             .get(&wi)
             .into_iter()
             .flatten()
-            .filter(|t| !self.local_parent.contains_key(*t))
+            .filter(|t| !self.local_parent.contains_key(&(wi, (*t).clone())))
             .cloned()
             .collect();
         for t in roots {
@@ -254,14 +269,14 @@ impl App {
             tail.sort();
             bound.extend(tail);
             for t in &bound {
-                f.home.entry(t.clone()).or_insert(wi);
+                f.home.entry(t.clone()).or_default().push(wi);
             }
             for t in &bound {
                 let mut seen: HashSet<&str> = HashSet::new();
                 let mut p = parents.get(t.as_str()).copied();
                 while let Some(pt) = p.filter(|pt| seen.insert(*pt)) {
                     if bound.iter().any(|b| b == pt) {
-                        f.local_parent.insert(t.clone(), pt.to_owned());
+                        f.local_parent.insert((wi, t.clone()), pt.to_owned());
                         break;
                     }
                     p = parents.get(pt).copied();
@@ -273,11 +288,11 @@ impl App {
             for t in &bound {
                 let mut seen: Vec<&str> = vec![t.as_str()];
                 let mut cur = t.as_str();
-                while let Some(p) = f.local_parent.get(cur).map(String::as_str) {
+                while let Some(p) = f.local_parent.get(&(wi, cur.to_owned())).map(String::as_str) {
                     if let Some(at) = seen.iter().position(|s| *s == p) {
                         let lowest = seen[at..].iter().min().map(|s| s.to_string());
                         if let Some(lowest) = lowest {
-                            f.local_parent.remove(&lowest);
+                            f.local_parent.remove(&(wi, lowest));
                         }
                         break;
                     }
@@ -297,9 +312,21 @@ impl App {
             let mut seen: HashSet<&str> = HashSet::new();
             let mut p = parents.get(root.as_str()).copied();
             while let Some(pt) = p.filter(|pt| seen.insert(*pt)) {
-                if let Some(&h) = f.home.get(pt).filter(|h| **h != wi) {
-                    f.attach.insert(wi, (h, pt.to_owned()));
-                    break;
+                if let Some(candidates) = f.home.get(pt) {
+                    // A manager's workspace is authoritative when it holds
+                    // this ancestor. Otherwise choose a parent on the child's
+                    // host; never attach a block to an unrelated remote host.
+                    let ws = &self.workspaces[wi];
+                    let candidates: Vec<usize> = candidates.iter().copied()
+                        .filter(|h| *h != wi && self.workspaces[*h].host_id == ws.host_id)
+                        .collect();
+                    let manager_home = ws.sessions.iter().filter_map(|s| s.managed_by_uid.as_deref())
+                        .find_map(|uid| candidates.iter().copied().find(|h|
+                            self.workspaces[*h].sessions.iter().any(|s| s.uid == uid)));
+                    if let Some(h) = manager_home.or_else(|| candidates.first().copied()) {
+                        f.attach.insert(wi, (h, pt.to_owned()));
+                        break;
+                    }
                 }
                 p = parents.get(pt).copied();
             }
@@ -326,8 +353,8 @@ impl App {
             f.attach.remove(&wi);
         }
         for &wi in &f.order {
-            if let Some((_, t)) = f.attach.get(&wi) {
-                f.children.entry(t.clone()).or_default().push(wi);
+            if let Some((parent, t)) = f.attach.get(&wi) {
+                f.children.entry((*parent, t.clone())).or_default().push(wi);
             }
         }
         f
@@ -355,7 +382,7 @@ impl App {
         let node = self.workspaces[wi].sessions[si]
             .task_id
             .clone()
-            .map_or(Node::Workspace(wi), Node::Task);
+            .map_or(Node::Workspace(wi), |t| Node::Task(wi, t));
         self.reveal_row(VisualItem::Session(wi, si), wi, &node)
     }
 
@@ -382,7 +409,7 @@ impl App {
         let target = match &self.cursor {
             Cursor::Session(wi, si) => {
                 let ts = self.workspaces.get(*wi).and_then(|w| w.sessions.get(*si))?;
-                let node = ts.task_id.clone().map_or(Node::Workspace(*wi), Node::Task);
+                let node = ts.task_id.clone().map_or(Node::Workspace(*wi), |t| Node::Task(*wi, t));
                 (VisualItem::Session(*wi, *si), *wi, node)
             }
             Cursor::Task { ws_idx, task_id } => (
@@ -391,7 +418,7 @@ impl App {
                     task_id: task_id.clone(),
                 },
                 *ws_idx,
-                Node::Task(task_id.clone()),
+                Node::Task(*ws_idx, task_id.clone()),
             ),
             Cursor::Workspace(wi) => (VisualItem::WorkspaceHeader(*wi), *wi, Node::Workspace(*wi)),
             _ => return None,
@@ -448,7 +475,7 @@ impl App {
         let chain = self.task_tree_with(false).chain(node);
         for n in chain.into_iter().skip(1) {
             changed |= match n {
-                Node::Task(t) => self.folded_tasks.remove(&t),
+                Node::Task(wi, t) => self.folded_tasks.remove(&self.task_fold_key(wi, &t)),
                 Node::Division(d) => self.folded_divisions.remove(&d),
                 Node::Workspace(_) => false,
             };
@@ -567,19 +594,24 @@ impl App {
     pub(super) fn cursor_node(&self) -> Option<Node> {
         match &self.cursor {
             Cursor::Division(id) => Some(Node::Division(id.clone())),
-            Cursor::Task { task_id, .. } => Some(Node::Task(task_id.clone())),
+            Cursor::Task { ws_idx, task_id } => Some(Node::Task(*ws_idx, task_id.clone())),
             Cursor::Workspace(wi) => Some(Node::Workspace(*wi)),
             Cursor::Session(wi, si) => {
                 let ts = self.workspaces.get(*wi)?.sessions.get(*si)?;
-                Some(ts.task_id.clone().map_or(Node::Workspace(*wi), Node::Task))
+                Some(ts.task_id.clone().map_or(Node::Workspace(*wi), |t| Node::Task(*wi, t)))
             }
             Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Org(_) => None,
         }
     }
 
+    /// Serialized as a JSON pair so workspace and task IDs cannot collide.
+    fn task_fold_key(&self, wi: usize, task: &str) -> String {
+        serde_json::to_string(&[self.workspaces[wi].id.as_str(), task]).unwrap()
+    }
+
     pub(super) fn tree_folded(&self, node: &Node) -> bool {
         match node {
-            Node::Task(t) => self.folded_tasks.contains(t),
+            Node::Task(wi, t) => self.folded_tasks.contains(&self.task_fold_key(*wi, t)),
             Node::Division(d) => self.folded_divisions.contains(d),
             Node::Workspace(_) => false,
         }
@@ -588,16 +620,20 @@ impl App {
     /// Space/Enter on a task or division header: fold or unfold it. A task
     /// without subtasks has nothing to fold.
     pub(crate) fn toggle_tree_fold(&mut self) -> bool {
-        if let Cursor::Task { task_id, .. } = &self.cursor {
-            if !self.folded_tasks.contains(task_id)
+        if let Cursor::Task { ws_idx, task_id } = &self.cursor {
+            if !self.folded_tasks.contains(&self.task_fold_key(*ws_idx, task_id))
                 && !self.org_index().has_reports(task_id)
             {
                 self.set_status_msg("No subtasks to fold");
                 return true;
             }
         }
+        let task_key = match &self.cursor {
+            Cursor::Task { ws_idx, task_id } => Some(self.task_fold_key(*ws_idx, task_id)),
+            _ => None,
+        };
         let set = match &self.cursor {
-            Cursor::Task { task_id, .. } => Some((&mut self.folded_tasks, task_id.clone())),
+            Cursor::Task { .. } => Some((&mut self.folded_tasks, task_key.unwrap())),
             Cursor::Division(id) => Some((&mut self.folded_divisions, id.clone())),
             Cursor::Org(key) => Some((&mut self.folded_org, key.clone())),
             _ => None,
@@ -937,7 +973,7 @@ impl Emit<'_> {
         self.sessions(wi, &unbound, &node, &cells, 0);
         let roots: Vec<String> = self.f.bound[&wi]
             .iter()
-            .filter(|t| !self.f.local_parent.contains_key(*t))
+            .filter(|t| !self.f.local_parent.contains_key(&(wi, (*t).clone())))
             .cloned()
             .collect();
         for t in roots {
@@ -949,9 +985,9 @@ impl Emit<'_> {
         if !self.f.has_content(wi, t) {
             return;
         }
-        let node = Node::Task(t.to_owned());
-        let parent = match self.f.local_parent.get(t) {
-            Some(p) => Node::Task(p.clone()),
+        let node = Node::Task(wi, t.to_owned());
+        let parent = match self.f.local_parent.get(&(wi, t.to_owned())) {
+            Some(p) => Node::Task(wi, p.clone()),
             None => Node::Workspace(wi),
         };
         self.out.parents.insert(node.clone(), parent);
@@ -1167,13 +1203,13 @@ mod tree_tests {
         let tree = app.task_tree();
         assert_eq!(tree.block_root[&2], 0, "g renders under r's block");
         assert_eq!(
-            tree.chain(&Node::Task("tg".into())),
+            tree.chain(&Node::Task(2, "tg".into())),
             [
-                Node::Task("tg".into()),
+                Node::Task(2, "tg".into()),
                 Node::Workspace(2),
-                Node::Task("tc".into()),
+                Node::Task(1, "tc".into()),
                 Node::Workspace(1),
-                Node::Task("tr".into()),
+                Node::Task(0, "tr".into()),
                 Node::Workspace(0),
             ],
         );
@@ -1190,7 +1226,7 @@ mod tree_tests {
         };
         let space = Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         assert!(app.handle_event(&space));
-        assert!(app.folded_tasks.contains("tc"));
+        assert!(app.folded_tasks.contains(&app.task_fold_key(1, "tc")));
         let outline_folded = outline(&app);
         for kept in ["ws:r", ">ws:c", ">task:tc", ">ts-12-0"] {
             assert!(
@@ -1206,7 +1242,7 @@ mod tree_tests {
         }
         let tree = app.task_tree();
         assert_eq!(
-            tree.folded[&Node::Task("tc".into())].0,
+            tree.folded[&Node::Task(1, "tc".into())].0,
             1,
             "only g's session is hidden"
         );
@@ -1221,20 +1257,20 @@ mod tree_tests {
             KeyCode::Enter,
             KeyModifiers::NONE
         ))));
-        assert!(!app.folded_tasks.contains("tc"));
+        assert!(!app.folded_tasks.contains(&app.task_fold_key(1, "tc")));
         assert_eq!(outline(&app), outline(&org_app()));
         // reveal_session unfolds every header above a session's task; the
         // task's own fold never hid it, so it stays.
         app.folded_tasks.extend([
-            "tr".to_string(),
-            "tc".to_string(),
-            "tg".to_string(),
-            "tl".to_string(),
+            app.task_fold_key(0, "tr"),
+            app.task_fold_key(1, "tc"),
+            app.task_fold_key(2, "tg"),
+            app.task_fold_key(4, "tl"),
         ]);
         assert!(app.reveal_session("ts-13-0"));
         assert_eq!(
             app.folded_tasks,
-            HashSet::from(["tg".to_string(), "tl".to_string()]),
+            HashSet::from([app.task_fold_key(2, "tg"), app.task_fold_key(4, "tl")]),
         );
         assert!(outline(&app).contains(&">>ts-13-0".to_string()));
         assert!(!app.reveal_session("ts-13-0"), "nothing left to unfold");
@@ -1257,7 +1293,7 @@ mod tree_tests {
             outline(&app),
             ["ws:r", "task:tr", "ts-10-0", "ws:l", "task:tl", "ts-15-0"]
         );
-        assert_eq!(app.task_tree().folded[&Node::Task("tr".into())].0, 4);
+        assert_eq!(app.task_tree().folded[&Node::Task(0, "tr".into())].0, 4);
     }
 
     /// Owner, 2026-10-21 (longstanding): a task-feed refresh re-sorts the
@@ -1450,42 +1486,71 @@ mod tree_tests {
         assert_eq!(chart_marks(&app), sidebar);
     }
 
-    /// Review of f385d1b (3): a task bound to two workspaces has its
-    /// reports task-wide: both headers show the fold glyph and fold from
-    /// either one.
+    /// #77: duplicate task bindings on two hosts must not duplicate children,
+    /// and each workspace header owns its own fold and reveal chain.
     #[test]
-    fn a_task_in_two_workspaces_folds_and_marks_from_either_header() {
+    fn shared_task_routes_children_by_manager_and_host_and_folds_independently() {
         let mut app = org_app();
-        // tc gets a second checkout, "c2", after its home "c".
         app.workspaces.push(bare_ws("c2"));
+        app.workspaces[5].host_id = crate::hosts::HostId("remote".into());
         session(&mut app, 5, "tc", "ts-40-0", "codex");
+        app.workspaces[5].sessions[0].host_id = crate::hosts::HostId("remote".into());
+        app.workspaces.push(bare_ws("g2"));
+        app.workspaces[6].host_id = crate::hosts::HostId("remote".into());
+        app.tasks.push(task("tg2", "g2", Some("tc")));
+        session(&mut app, 6, "tg2", "ts-41-0", "codex");
+        app.workspaces[6].sessions[0].host_id = crate::hosts::HostId("remote".into());
+        app.workspaces[6].sessions[0].managed_by_uid = Some("ts-40-0".into());
         let tree = app.task_tree();
-        assert!(tree.org.has_reports("tc"));
-        let headers: Vec<usize> = tree
-            .items
-            .iter()
-            .filter_map(|vi| match vi {
-                VisualItem::TaskHeader { ws_idx, task_id } if task_id == "tc" => Some(*ws_idx),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(headers, [1, 5]);
-        let buffer = sidebar_buffer(&mut app, 40);
-        let glyphs = (0..40u16)
-            .filter(|y| {
-                let row: String = (0..40u16).map(|x| buffer[(x, *y)].symbol().to_string()).collect();
-                row.contains("\u{25be} tc")
-            })
-            .count();
-        assert_eq!(glyphs, 2, "both tc headers show the fold glyph");
-        app.cursor = Cursor::Task {
-            ws_idx: 5,
-            task_id: "tc".into(),
-        };
+        assert_eq!(tree.parents[&Node::Workspace(2)], Node::Task(1, "tc".into()));
+        assert_eq!(tree.parents[&Node::Workspace(6)], Node::Task(5, "tc".into()));
+        for wi in [2, 6] {
+            assert_eq!(tree.items.iter().filter(|v| **v == VisualItem::Session(wi, 0)).count(), 1);
+        }
+        app.cursor = Cursor::Task { ws_idx: 5, task_id: "tc".into() };
         assert!(app.toggle_tree_fold());
-        assert!(app.folded_tasks.contains("tc"), "the second header folds tc");
-        assert!(!shown(&app, "ts-13-0"), "g folds away under the home header");
-        assert!(shown(&app, "ts-40-0") && shown(&app, "ts-12-0"), "tc's own sessions stay");
+        assert!(!shown(&app, "ts-41-0"));
+        assert!(shown(&app, "ts-13-0"));
+        assert!(app.reveal_session("ts-41-0"));
+        assert!(shown(&app, "ts-41-0"));
+        app.cursor = Cursor::Task { ws_idx: 1, task_id: "tc".into() };
+        assert!(app.toggle_tree_fold());
+        assert!(!shown(&app, "ts-13-0"));
+        assert!(shown(&app, "ts-41-0"));
+    }
+
+    #[test]
+    fn attachment_prefers_manager_then_falls_back_to_the_child_host() {
+        let mut app = test_app();
+        app.sidebar_view = SidebarView::Task;
+        app.workspaces = ["first", "manager", "child", "foreign"]
+            .into_iter().map(bare_ws).collect();
+        app.workspaces[3].host_id = crate::hosts::HostId("foreign".into());
+        app.tasks = vec![task("parent", "first", None), task("child", "child", Some("parent"))];
+        session(&mut app, 0, "parent", "ts-1-0", "codex");
+        session(&mut app, 1, "parent", "ts-2-0", "codex");
+        session(&mut app, 2, "child", "ts-3-0", "codex");
+        session(&mut app, 3, "parent", "ts-4-0", "codex");
+        app.workspaces[2].sessions[0].managed_by_uid = Some("ts-2-0".into());
+        assert_eq!(app.task_tree().parents[&Node::Workspace(2)], Node::Task(1, "parent".into()));
+        // A stale manager must fall back to this host, not the foreign one.
+        app.workspaces[2].sessions[0].managed_by_uid = Some("missing".into());
+        assert_eq!(app.task_tree().parents[&Node::Workspace(2)], Node::Task(0, "parent".into()));
+        // If no parent is on the child's host, leave it top-level.
+        app.workspaces[0].host_id = crate::hosts::HostId("foreign".into());
+        app.workspaces[1].host_id = crate::hosts::HostId("foreign".into());
+        assert!(!app.task_tree().parents.contains_key(&Node::Workspace(2)));
+    }
+
+    #[test]
+    fn old_task_wide_folds_migrate_to_stable_workspace_keys() {
+        let folds = std::collections::BTreeSet::from(["tc".to_string()]);
+        let workspaces = ["c".to_string(), "c2".to_string()];
+        let scoped = migrate_task_folds(&folds, workspaces.iter());
+        assert!(scoped.contains(&serde_json::to_string(&["c", "tc"]).unwrap()));
+        assert!(scoped.contains(&serde_json::to_string(&["c2", "tc"]).unwrap()));
+        let saved = scoped.into_iter().collect();
+        assert_eq!(migrate_task_folds(&saved, workspaces.iter()), saved.into_iter().collect());
     }
 
     /// Owner-approved 2026-10-20: a task header is a tree row. Even with a
@@ -1504,7 +1569,7 @@ mod tree_tests {
     #[test]
     fn fold_state_rides_the_manifest() {
         let mut app = org_app();
-        app.folded_tasks.insert("tc".into());
+        app.folded_tasks.insert(app.task_fold_key(1, "tc"));
         app.folded_divisions.insert("div-1".into());
         let manifest: cm_daemon::manifest::Manifest = serde_json::from_value(serde_json::json!({
             "folded_tasks": ["tc"], "folded_divisions": ["div-1"],
@@ -1755,23 +1820,23 @@ mod tree_tests {
     fn a_cursor_landing_inside_a_fold_unfolds_it() {
         let mut app = org_app();
         app.folded_tasks
-            .extend(["tr".to_string(), "tc".to_string(), "tl".to_string()]);
+            .extend([app.task_fold_key(0, "tr"), app.task_fold_key(1, "tc"), app.task_fold_key(4, "tl")]);
         assert!(!shown(&app, "ts-13-0"));
         // The A-p / A-; / org chart jump.
         assert!(app.jump_cursor_to_session_uid("ts-13-0"));
         assert!(shown(&app, "ts-13-0"));
         assert_eq!(
             app.folded_tasks,
-            HashSet::from(["tl".to_string()]),
+            HashSet::from([app.task_fold_key(4, "tl")]),
             "only the folds above it open"
         );
         // A spawn / restore that sets the cursor directly: the next draw
         // reveals it, and A-j moves on from there.
-        app.folded_tasks.insert("tr".into());
+        app.folded_tasks.insert(app.task_fold_key(0, "tr"));
         app.cursor = Cursor::Session(3, 0); // ts-14-0, under tr
         sidebar_buffer(&mut app, 30);
         app.navigate(1);
-        assert!(app.folded_tasks.iter().all(|t| t != "tr"));
+        assert!(!app.folded_tasks.contains(&app.task_fold_key(0, "tr")));
         assert_eq!(
             app.cursor,
             Cursor::Task {
@@ -1780,7 +1845,7 @@ mod tree_tests {
             },
             "A-j moved on from ts-14-0, not from the top"
         );
-        app.folded_tasks.insert("tr".into());
+        app.folded_tasks.insert(app.task_fold_key(0, "tr"));
         app.cursor = Cursor::Session(2, 0);
         sidebar_buffer(&mut app, 30);
         assert!(shown(&app, "ts-13-0"), "the draw reveals it too");
@@ -1841,7 +1906,7 @@ mod tree_tests {
         };
         assert!(app.toggle_tree_fold());
         sidebar_buffer(&mut app, 30);
-        assert!(app.folded_tasks.contains("tc"), "the fold stays");
+        assert!(app.folded_tasks.contains(&app.task_fold_key(1, "tc")), "the fold stays");
         app.cursor = Cursor::Section("s1".into());
         assert!(app.toggle_section_fold());
         sidebar_buffer(&mut app, 30);
@@ -1849,7 +1914,7 @@ mod tree_tests {
         assert!(app.sections[0].folded, "the section fold stays");
         // A later jump into it still reveals.
         assert!(app.jump_cursor_to_session_uid("ts-13-0"));
-        assert!(!app.sections[0].folded && !app.folded_tasks.contains("tc"));
+        assert!(!app.sections[0].folded && !app.folded_tasks.contains(&app.task_fold_key(1, "tc")));
     }
 
     /// Review (2): A-g reaches an alert inside a fold, and a folded header
@@ -1858,10 +1923,10 @@ mod tree_tests {
     fn a_g_reaches_an_alert_inside_a_fold_and_the_rollup_counts_it() {
         let mut app = org_app();
         app.raise_alert("ts-13-0", "g", "decide");
-        app.folded_tasks.insert("tc".into());
+        app.folded_tasks.insert(app.task_fold_key(1, "tc"));
         let tree = app.task_tree();
         assert_eq!(
-            tree.folded[&Node::Task("tc".into())].3,
+            tree.folded[&Node::Task(1, "tc".into())].3,
             1,
             "one alert under tc"
         );
@@ -1874,7 +1939,7 @@ mod tree_tests {
         app.cursor = Cursor::Workspace(4);
         app.jump_to_next_attention();
         assert_eq!(app.cursor, Cursor::Session(2, 0));
-        assert!(!app.folded_tasks.contains("tc") && shown(&app, "ts-13-0"));
+        assert!(!app.folded_tasks.contains(&app.task_fold_key(1, "tc")) && shown(&app, "ts-13-0"));
     }
 
     /// Review (4): a parent cycle inside one checkout keeps every session;

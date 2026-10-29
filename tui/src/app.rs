@@ -812,7 +812,7 @@ impl App {
         let mut planning = PlanningView::new();
         planning.keybinding_helper_visible = keybinding_helper_visible;
         let task_colors = manifest.task_colors.clone();
-        let folded_tasks: HashSet<String> = manifest.folded_tasks.iter().cloned().collect();
+        let folded_tasks = tree::migrate_task_folds(&manifest.folded_tasks, manifest.workspaces.keys());
         let folded_divisions: HashSet<String> = manifest.folded_divisions.iter().cloned().collect();
         let folded_org: HashSet<String> = manifest.folded_org.iter().cloned().collect();
         let sections = manifest.sections.clone();
