@@ -559,8 +559,8 @@ pub fn mint_task_worktree_at_verified(
 pub(crate) fn verify_task_worktree_repo(main_repo: &Path, path: &Path) -> anyhow::Result<()> {
     let expected = std::fs::canonicalize(main_repo)?;
     let actual = main_checkout_of(path).and_then(|p| std::fs::canonicalize(p).ok());
-    if actual.as_ref() != Some(&expected) {
-        anyhow::bail!("task worktree {} does not belong to repo_path {}", path.display(), main_repo.display());
+    if actual.as_ref() != Some(&expected) || !is_git_worktree_root(path) {
+        anyhow::bail!("task worktree {} does not belong to repo_path {} or is not a valid git checkout", path.display(), main_repo.display());
     }
     Ok(())
 }

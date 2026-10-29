@@ -39605,6 +39605,29 @@ printf ran > "$MAIN_REPO/setup-ran"
         });
     }
 
+    #[test]
+    fn session_launch_verified_mint_refuses_pruned_admin_before_setup() {
+        with_home_and_repo("pruned-launch72", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            run_git(&repo, &["branch", "-M", "main"]);
+            let branch = crate::worktree::task_worktree_branch("pruned72", "Broken checkout");
+            let path = crate::worktree::worktree_dir_for_branch(&repo, &branch).unwrap();
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join(".git"), format!("gitdir: {}\n", repo.join(".git/worktrees/pruned-admin").display())).unwrap();
+            // Path parsing alone still identifies the right main repository.
+            assert_eq!(crate::worktree::main_checkout_of(&path), Some(repo.clone()));
+            assert!(!crate::worktree::is_git_worktree_root(&path));
+            std::fs::write(repo.join("setup_worktree.sh"), r#"#!/bin/sh
+printf ran > "$MAIN_REPO/setup-ran"
+"#).unwrap();
+            let error = crate::worktree::mint_task_worktree_at_verified(
+                &repo, "pruned72", "Broken checkout", None, None).err().unwrap();
+            assert!(error.to_string().contains("not a valid git checkout"));
+            assert!(!repo.join("setup-ran").exists());
+            assert!(!crate::worktree::local_branch_exists(&repo, &branch));
+        });
+    }
+
     /// ux-1a, the headline: `start_session(task_id=<workspace-less task>)`
     /// MINTS that task a branch worktree cut from the project's main and
     /// spawns the worker THERE — outside the caller's checkout. Pre-fix
