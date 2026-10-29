@@ -6,6 +6,7 @@
     scripts/cm-op session.handoff_cancel '{"uid": "<session uid>"}'
     scripts/cm-op --ssh cm-manager daemon.health
     scripts/cm-op --ssh cm-manager --batch '[["worktree.cleanup", {...}], ...]'
+    scripts/cm-op --ssh f-sessions host.readiness
 
 Auth: the host's own ~/.cm/operator-token (the TUI mints it locally;
 cm-redeploy minted cm-manager's). Socket: $CM_DAEMON_SOCKET or
@@ -31,8 +32,462 @@ import struct
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import getpass
+import ipaddress
+import re
+import shutil
+import urllib.parse
+import urllib.request
+import uuid
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 hosts can still report other checks.
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        tomllib = None
 
 BATCH_WORKERS = 8
+
+def _read_json(path):
+    """Read bounded local metadata; callers never return credential contents."""
+    try:
+        if path.stat().st_size > 8 * 1024 * 1024:
+            return None
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _safe_remote(url):
+    """Strip userinfo, query and fragment before reporting a Git remote."""
+    if not isinstance(url, str) or not url.strip():
+        return None
+    url = url.strip()
+    if "://" in url:
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            host = parsed.hostname
+            if not host:
+                return "<redacted>"
+            port = f":{parsed.port}" if parsed.port else ""
+            return f"{parsed.scheme}://{host}{port}{parsed.path}"
+        except ValueError:
+            return "<redacted>"
+    if "@" in url and ":" in url:
+        url = url.split("@", 1)[1]
+    return url.split("?", 1)[0].split("#", 1)[0]
+
+
+def _payload_hash(root):
+    files = []
+    for directory, dirs, names in os.walk(root):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in
+                   {"tests", "__pycache__", "site-packages", "node_modules", "venv"}]
+        files.extend(pathlib.Path(directory) / name for name in names if name.endswith(".py"))
+    files.extend(root / name for name in ("AGENT_GUIDE.md", "tool_schemas.json", "requirements.txt")
+                 if (root / name).is_file())
+    digest = hashlib.sha256()
+    for path in sorted(set(files)):
+        digest.update(str(path.relative_to(root)).encode() + b"\0")
+        digest.update(path.read_bytes() + b"\0")
+    return digest.hexdigest()[:16]
+
+
+def _daemon_environment(health, proc_root=pathlib.Path("/proc")):
+    """Read only launch-relevant keys from the holder; never return them to the caller."""
+    pid = health.get("brain_pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        proc = proc_root / str(pid)
+        stat = (proc / "stat").read_text().rsplit(") ", 1)[1].split()
+        parent = proc_root / str(int(stat[1]))
+        parent_argv = (parent / "cmdline").read_bytes().split(b"\0", 1)[0]
+        if pathlib.Path(os.fsdecode(parent_argv)).name == "cm-holder":
+            proc = parent
+        raw = (proc / "environ").read_bytes()
+        if len(raw) > 1024 * 1024:
+            return None
+        names = {"PATH", "HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY"}
+        result = {}
+        for entry in raw.split(b"\0"):
+            key, sep, value = entry.partition(b"=")
+            name = os.fsdecode(key)
+            if sep and name in names:
+                result[name] = os.fsdecode(value)
+        return result
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _daemon_search_path(health, proc_root=pathlib.Path("/proc")):
+    env = _daemon_environment(health, proc_root)
+    return env.get("PATH") if env is not None else None
+
+
+def _version(program, search_path=None):
+    path = shutil.which(program, path=search_path)
+    if not path:
+        return None
+    try:
+        env = dict(os.environ)
+        if search_path is not None:
+            env["PATH"] = search_path
+        result = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=5, check=False, env=env)
+        match = re.search(r"\b\d+\.\d+\.\d+(?:[-+][A-Za-z0-9._-]+)?", result.stdout[:1024])
+        return match.group(0) if result.returncode == 0 and match else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _service_active(name):
+    try:
+        return subprocess.run(["systemctl", "--user", "is-active", "--quiet", name],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _loopback_ready(url):
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme not in ("http", "https") or parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
+            return False
+        host = "[::1]" if parsed.hostname == "::1" else parsed.hostname
+        endpoint = f"{parsed.scheme}://{host}:{parsed.port or (443 if parsed.scheme == 'https' else 80)}/health"
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(endpoint, timeout=3) as response:
+            return response.status == 200
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _metadata(path):
+    request = urllib.request.Request("http://metadata.google.internal/computeMetadata/v1/" + path,
+                                     headers={"Metadata-Flavor": "Google"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=3) as response:
+        return response.read(1024 * 1024).decode().strip()
+
+
+def _external_ip_status():
+    """Verify the current IPv4 is a reserved GCE address when API access permits."""
+    try:
+        external = str(ipaddress.IPv4Address(_metadata("instance/network-interfaces/0/access-configs/0/external-ip")))
+    except (OSError, ValueError, UnicodeError):
+        return None, False
+    try:
+        project = _metadata("project/project-id")
+        zone = _metadata("instance/zone").rsplit("/", 1)[-1]
+        if not re.fullmatch(r"[a-z][a-z0-9-]{4,62}", project) or not re.fullmatch(r"[a-z0-9-]+-[a-z]", zone):
+            return external, False
+        region = zone.rsplit("-", 1)[0]
+        token = json.loads(_metadata("instance/service-accounts/default/token"))["access_token"]
+        url = f"https://compute.googleapis.com/compute/v1/projects/{project}/regions/{region}/addresses"
+        request = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(request, timeout=5) as response:
+            listing = json.loads(response.read(1024 * 1024))
+        reserved = any(item.get("address") == external and item.get("addressType") == "EXTERNAL"
+                       and item.get("status") == "IN_USE" for item in listing.get("items", []) if isinstance(item, dict))
+        return external, reserved
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, UnicodeError):
+        return external, False
+
+
+def _account_identity(profile, machine_id=pathlib.Path("/etc/machine-id")):
+    """Return one-way account/machine fingerprints, never the raw IDs."""
+    try:
+        account = profile.get("oauthAccount")
+        if not isinstance(account, dict):
+            return None
+        canonical = str(uuid.UUID(account.get("accountUuid")))
+        digest = hashlib.sha256(b"cm-host-claude-account-v1\0" + canonical.encode()).hexdigest()
+        try:
+            machine = machine_id.read_bytes().strip()
+            machine_hash = hashlib.sha256(b"cm-host-machine-v1\0" + machine).hexdigest() if machine else None
+        except OSError:
+            machine_hash = None
+        return {"fingerprint": digest, "machine": machine_hash, "hostname": socket.gethostname()}
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def host_readiness(params, timeout=5, home=None, meminfo=pathlib.Path("/proc/meminfo")):
+    """Read-only host checks. Presence and measurement are not live-auth or capacity guarantees."""
+    home = pathlib.Path(home or pathlib.Path.home())
+    checks = []
+    def add(name, ok, detail, hint):
+        checks.append({"name": name, "status": "PASS" if ok else "FAIL", "detail": detail,
+                       "hint": None if ok else hint})
+
+    token = home / ".cm" / "operator-token"
+    try:
+        token_ok = token.is_file() and token.stat().st_size > 0 and bool(token.read_bytes().strip())
+    except OSError:
+        token_ok = False
+    add("operator_token", token_ok, "present" if token_ok else "missing or unreadable",
+        "Provision the host-local operator token through CM setup.")
+    health = {}
+    for method in ("daemon.health",):
+        try:
+            response = rpc(method, {}, timeout=timeout, strict=True)
+            data = response.get("result") if response.get("ok") is True else None
+            if isinstance(data, dict):
+                if method == "daemon.health":
+                    health = data
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            pass
+    sync = health.get("messaging_sync") if isinstance(health.get("messaging_sync"), dict) else {}
+    sync_state = ("unknown (old brain)" if "messaging_sync_state" not in health
+                  else "unknown (" + str(health.get("messaging_sync_state")) + ")" if health.get("messaging_sync_state") != "ready"
+                  else "ready")
+    build = health.get("build_id")
+    add("daemon", bool(health.get("ok") is True and isinstance(build, str) and build
+                       and health.get("restarting") is False and health.get("draining") is False),
+        {"build_id": build, "restarting": health.get("restarting"), "draining": health.get("draining")},
+        "Start or repair the host daemon and verify daemon.health.")
+    split_ok = health.get("split") is True and health.get("holder_epoch") is not None and not health.get("holder_status_error")
+    add("holder_split", split_ok, {"split": health.get("split"), "holder_build_id": health.get("holder_build_id"),
+                                  "holder_epoch": health.get("holder_epoch")},
+        "Inspect the holder and its status connection.")
+    sync_ok = (sync.get("enabled") is True and sync.get("role") == "replica" and sync.get("connected") is True
+               and sync.get("pending") == 0 and sync.get("handoff_paused") is False and not sync.get("error"))
+    add("replica_sync", sync_ok, dict({"availability": sync_state}, **{k: sync.get(k) for k in ("enabled", "role", "connected", "pending", "handoff_paused", "last_reconciled")}),
+        "Inspect replica connectivity; a daemon without the read-only sync health field needs an upgrade.")
+    add("mcp_preflight", health.get("mcp_ok") is True, "daemon MCP preflight " + ("passed" if health.get("mcp_ok") is True else "not passed"),
+        "Inspect daemon.health MCP preflight and repair the deployed MCP payload.")
+
+    roots = params.get("repo_roots") or [str(home / "code" / "projects")]
+    required = params.get("required_repos") or []
+    if not isinstance(roots, list) or not all(isinstance(x, str) for x in roots) or not isinstance(required, list) or not all(isinstance(x, str) for x in required):
+        raise ValueError("repo_roots and required_repos must be lists of paths and names")
+    repos = {}
+    for root in map(pathlib.Path, roots):
+        try:
+            for path in sorted(root.iterdir()):
+                if path.is_dir() and (path / ".git").exists():
+                    try:
+                        result = subprocess.run(["git", "-C", str(path), "config", "--get", "remote.origin.url"],
+                                                capture_output=True, text=True, timeout=5, check=False,
+                                                env=dict(os.environ, GIT_OPTIONAL_LOCKS="0"))
+                        remote = _safe_remote(result.stdout) if result.returncode == 0 else None
+                    except (OSError, subprocess.TimeoutExpired):
+                        remote = None
+                    repos[str(path)] = remote
+        except OSError:
+            continue
+    present = {pathlib.Path(path).name for path in repos}
+    missing = sorted(set(required) - present)
+    repos_ok = bool(repos) and not missing and all(repos.values())
+    add("repositories", repos_ok, {"repositories": repos, "missing_required": missing,
+                                    "expected_list_supplied": bool(required)},
+        "Clone the required repositories and configure their origin remotes; pass required_repos to verify names.")
+
+    daemon_env = _daemon_environment(health)
+    if daemon_env is not None and (not daemon_env.get("PATH") or not daemon_env.get("HOME")):
+        daemon_env = None
+    launch_env = daemon_env if daemon_env is not None else os.environ
+    daemon_path = launch_env.get("PATH")
+    environment_hint = "Inspect the holder's launch environment; the SSH environment alone cannot establish readiness."
+    for program in ("claude", "codex"):
+        version = _version(program, daemon_path)
+        add(program + "_version", version is not None and daemon_env is not None, {"version": version, "path_source": "holder/daemon" if daemon_env is not None else "SSH environment"},
+            environment_hint if daemon_env is None else f"Install {program} on the holder's PATH; confirm the daemon launch environment.")
+    launch_home = pathlib.Path(launch_env.get("HOME") or home)
+    config_dir = pathlib.Path(launch_env.get("CLAUDE_CONFIG_DIR") or launch_home / ".claude")
+    claude_json = _read_json((config_dir / ".claude.json") if launch_env.get("CLAUDE_CONFIG_DIR") else launch_home / ".claude.json") or {}
+    if not isinstance(claude_json, dict):
+        claude_json = {}
+    claude_creds = _read_json(config_dir / ".credentials.json") or {}
+    claude_auth = bool(launch_env.get("ANTHROPIC_API_KEY") or launch_env.get("CLAUDE_CODE_OAUTH_TOKEN")
+                       or (isinstance(claude_creds, dict) and isinstance(claude_creds.get("claudeAiOauth"), dict)
+                           and claude_creds["claudeAiOauth"].get("accessToken")))
+    add("claude_auth", claude_auth and daemon_env is not None, "credentials present (not validated)" if claude_auth else "credentials not found",
+        environment_hint if daemon_env is None else "Authenticate Claude for this host user.")
+    add("claude_onboarding", claude_json.get("hasCompletedOnboarding") is True and daemon_env is not None,
+        {"completed": claude_json.get("hasCompletedOnboarding") is True}, environment_hint if daemon_env is None else "Complete Claude's first-run onboarding for this host user.")
+    channel_config = _read_json(launch_home / ".cm" / "claude-notifications.json")
+    channel_enabled = isinstance(channel_config, dict) and channel_config.get("transport") == "channel"
+    add("claude_notification_channel", channel_enabled and daemon_env is not None,
+        {"channel_enabled": channel_enabled}, (environment_hint + " " if daemon_env is None else "") +
+        'Set ~/.cm/claude-notifications.json to {"transport":"channel"}; sessions launched before the fix require a restart to pick it up.')
+    worktree = str(pathlib.Path(params.get("worktree_root") or home / ".cm" / "worktrees"))
+    projects = claude_json.get("projects") if isinstance(claude_json.get("projects"), dict) else {}
+    claude_trust = isinstance(projects.get(worktree), dict) and projects[worktree].get("hasTrustDialogAccepted") is True
+    add("claude_worktree_trust", claude_trust and daemon_env is not None, {"path": worktree, "exact_root_only": True},
+        environment_hint if daemon_env is None else "Review and trust the worktree root; each actual working directory can need its own trust entry.")
+    codex_home = pathlib.Path(launch_env.get("CODEX_HOME") or launch_home / ".codex")
+    try:
+        codex_config = tomllib.loads((codex_home / "config.toml").read_text()) if tomllib else {}
+    except (OSError, ValueError):
+        codex_config = {}
+    codex_creds = _read_json(codex_home / "auth.json") or {}
+    codex_direct_auth = bool(launch_env.get("OPENAI_API_KEY") or (isinstance(codex_creds, dict) and
+        (codex_creds.get("OPENAI_API_KEY") or (isinstance(codex_creds.get("tokens"), dict) and codex_creds["tokens"].get("access_token")))))
+    codex_projects = codex_config.get("projects") if isinstance(codex_config.get("projects"), dict) else {}
+    codex_trust = isinstance(codex_projects.get(worktree), dict) and codex_projects[worktree].get("trust_level") == "trusted"
+    add("codex_worktree_trust", codex_trust and daemon_env is not None, {"path": worktree, "exact_root_only": True, "toml_parser_available": tomllib is not None},
+        environment_hint if daemon_env is None else "Review and trust the worktree root; native remote launches also check the exact working directory. Python 3.11 or tomli is needed to inspect TOML.")
+
+    try:
+        usage = shutil.disk_usage(params.get("disk_path") or home)
+        add("disk", usage.total > 0 and usage.free > 0, {"path": str(params.get("disk_path") or home), "free_bytes": usage.free, "total_bytes": usage.total},
+            "Inspect disk capacity and free space; select a threshold appropriate to the workload.")
+    except OSError:
+        add("disk", False, "unavailable", "Inspect the requested filesystem and its mount.")
+    try:
+        fields = {line.split(":", 1)[0]: int(line.split()[1]) * 1024 for line in meminfo.read_text().splitlines() if ":" in line and len(line.split()) >= 2 and line.split()[1].isdigit()}
+        add("ram", fields.get("MemTotal", 0) > 0 and fields.get("MemAvailable", 0) > 0,
+            {"total_bytes": fields.get("MemTotal"), "available_bytes": fields.get("MemAvailable")}, "Inspect host memory availability.")
+        add("swap", "SwapTotal" in fields and "SwapFree" in fields,
+            {"total_bytes": fields.get("SwapTotal"), "free_bytes": fields.get("SwapFree")}, "Inspect host swap configuration.")
+    except (OSError, ValueError, UnicodeError):
+        add("ram", False, "unavailable", "Inspect host memory availability.")
+        add("swap", False, "unavailable", "Inspect host swap configuration.")
+
+    candidates = _read_json(home / ".cm" / "mcp" / "launcher-candidates.json") or []
+    mcp = None
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            if not isinstance(candidate, dict) or not isinstance(candidate.get("server"), str):
+                continue
+            root = pathlib.Path(candidate["server"]).parent
+            if (root / "server.py").is_file():
+                stamp = _read_json(root / "VERSION") or {}
+                if not isinstance(stamp, dict):
+                    stamp = {}
+                try:
+                    actual = _payload_hash(root)
+                except OSError:
+                    actual = None
+                mcp = {"version": stamp.get("version"), "payload_hash": stamp.get("payload_hash"),
+                       "consistent": actual is not None and actual == stamp.get("payload_hash")}
+                break
+    add("mcp_stamp", bool(mcp and mcp.get("version") and mcp.get("consistent")), mcp or "no deployed payload stamp",
+        "Deploy and stamp the MCP payload; check launcher candidates and hash consistency.")
+    active = _service_active("cm-codex-lb.service")
+    tunnel = _service_active("cm-codex-lb-tunnel.service")
+    provider = codex_config.get("model_provider")
+    if not isinstance(provider, str):
+        provider = None
+    providers = codex_config.get("model_providers") if isinstance(codex_config.get("model_providers"), dict) else {}
+    provider_data = providers.get(provider) if isinstance(providers.get(provider), dict) else {}
+    endpoint = provider_data.get("base_url")
+    ready = _loopback_ready(endpoint) if isinstance(endpoint, str) else False
+    add("codex_lb", (active or tunnel) and ready, {"service_active": active, "tunnel_active": tunnel, "loopback_health": ready, "provider": provider},
+        "Inspect the Codex pool or forward-only tunnel and its loopback /health endpoint; do not clone a pool's refresh tokens.")
+    auth = provider_data.get("auth") if isinstance(provider_data.get("auth"), dict) else {}
+    command = auth.get("command")
+    command_configured = "command" in auth
+    try:
+        parts = shlex.split(command) if isinstance(command, str) else []
+    except ValueError:
+        parts = []
+    executable = parts[0] if parts else ""
+    if executable.startswith("~/"):
+        executable = str(launch_home / executable[2:])
+    command_path = shutil.which(executable, path=daemon_path) if executable else None
+    command_ok = bool(command_path and pathlib.Path(command_path).is_file() and os.access(command_path, os.X_OK))
+    key_file = launch_home / ".config" / "cm-codex-lb" / "proxy.key"
+    try:
+        key_ok = key_file.is_file() and key_file.stat().st_size > 0 and os.access(key_file, os.R_OK)
+    except OSError:
+        key_ok = False
+    needs_pool_key = provider == "local_pool" or pathlib.Path(executable).name == "cm-codex-local-pool-token"
+    provider_auth = (command_ok and (key_ok or not needs_pool_key)) if command_configured else codex_direct_auth
+    auth_description = "selected provider credential mechanism present (not validated)" if provider_auth else "selected provider credentials unavailable"
+    add("codex_auth", daemon_env is not None and provider_auth, auth_description,
+        environment_hint if daemon_env is None else "Authenticate Codex or configure the selected provider's credentials.")
+    add("codex_provider_auth", daemon_env is not None and provider_auth,
+        {"provider": provider, "command_configured": command_configured, "command_resolves": command_ok,
+         "proxy_key_required": needs_pool_key, "proxy_key_present": key_ok},
+        environment_hint if daemon_env is None else "Install or repair the selected provider's auth helper and required key; never print the key.")
+    external, reserved = _external_ip_status()
+    add("static_external_ip", reserved, {"external_ip": external, "reserved_verified": reserved},
+        "Verify or reserve the host's external IP in the cloud console; metadata or API access may be unavailable.")
+    host_name = socket.gethostname().split(".", 1)[0]
+    block = None
+    if external:
+        block = ("[[host]]\n" + f"name = {json.dumps(host_name)}\ntransport = \"ssh-unix\"\n"
+                 + f"ssh_host = {json.dumps(external)}\nssh_user = {json.dumps(getpass.getuser())}\n"
+                 + f"remote_socket = {json.dumps(str(home / '.cm' / 'daemon.sock'))}\n")
+    add("laptop_hosts_entry", False, {"checked": False, "suggested_block": block},
+        "The laptop was not inspected. Verify its ~/.cm/hosts.toml and SSH access; add the suggested block if absent.")
+    result = {"ok": all(check["status"] == "PASS" for check in checks), "checks": checks,
+            "note": "Credentials are presence-only; resource checks report measurements, not workload capacity thresholds.",
+            "launch_environment": "holder/daemon" if daemon_env is not None else "SSH environment (holder environment unavailable)"}
+    if params.get("__internal_account_probe") is True:
+        result["_account_identity"] = _account_identity(claude_json) if daemon_env is not None else None
+    return result
+
+
+def _local_account_probe(timeout=5):
+    try:
+        response = rpc("daemon.health", {}, timeout=timeout, strict=True)
+        health = response.get("result") if response.get("ok") is True else None
+        env = _daemon_environment(health) if isinstance(health, dict) else None
+        if not env or not env.get("HOME"):
+            return None
+        home = pathlib.Path(env["HOME"])
+        profile = (pathlib.Path(env["CLAUDE_CONFIG_DIR"]) / ".claude.json"
+                   if env.get("CLAUDE_CONFIG_DIR") else home / ".claude.json")
+        return _account_identity(_read_json(profile) or {})
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+def _peer_account_probe(host, timeout=5):
+    try:
+        source = pathlib.Path(__file__).read_text()
+        result = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host,
+                                 "python3 - host.account_fingerprint"],
+                                input=source, capture_output=True, text=True, timeout=timeout + 5)
+        if result.returncode != 0:
+            return None, "SSH or remote probe failed"
+        value = json.loads(result.stdout)
+        return (value, None) if isinstance(value, dict) else (None, "account identity unavailable")
+    except subprocess.TimeoutExpired:
+        return None, "SSH timed out"
+    except (OSError, ValueError):
+        return None, "SSH unavailable or invalid response"
+
+
+def _account_comparison(result, target, params, target_host=None, timeout=5):
+    peers = params.get("peer_hosts", [])
+    if (not isinstance(peers, list) or len(peers) > 20 or not all(isinstance(p, str)
+            and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.@:-]*", p) for p in peers)):
+        raise ValueError("peer_hosts must be at most 20 SSH host names")
+    peers_supplied = bool(peers)
+    peers = list(dict.fromkeys(p for p in peers if p != target_host))
+    matched, unavailable, compared, same_host = [], {}, [], []
+    target_valid = isinstance(target, dict) and isinstance(target.get("fingerprint"), str) and re.fullmatch(r"[0-9a-f]{64}", target["fingerprint"]) is not None
+    if target_valid:
+        for peer in peers:
+            other, reason = _peer_account_probe(peer, timeout)
+            if not isinstance(other, dict) or not isinstance(other.get("fingerprint"), str) or re.fullmatch(r"[0-9a-f]{64}", other["fingerprint"]) is None:
+                unavailable[peer] = reason or "account identity unavailable"
+                continue
+            if (target.get("machine") and target.get("machine") == other.get("machine")
+                    and target.get("hostname") == other.get("hostname")):
+                same_host.append(peer)
+                continue
+            compared.append(peer)
+            if target["fingerprint"] == other["fingerprint"]:
+                matched.append(peer)
+    else:
+        unavailable.update({peer:"target account identity unavailable" for peer in peers})
+    status = "FAIL" if matched else "WARN" if not target_valid or not compared or unavailable else "PASS"
+    detail = {"compared": compared, "matching": matched, "unavailable": unavailable,
+              "same_host_skipped": same_host, "target_account_available": target_valid,
+              "reason": "unverified (no peers given)" if not peers_supplied else "unverified (no other peers)" if not peers else None}
+    result["checks"].append({"name":"claude_account_collision", "status":status, "detail":detail,
+        "hint":None if status == "PASS" else 'Use distinct Claude logins; never copy .credentials.json between live hosts. Supply peer_hosts=["cm-manager","cm-sessions","f-sessions"] and retry unreachable peers.'})
+    result["ok"] = result.get("ok") is True and status != "FAIL"
+    result["warnings"] = sum(check.get("status") == "WARN" for check in result["checks"])
+    return result
 
 def rpc(method, params, timeout=120, strict=False):
     """One framed call. `strict` (batch mode) raises on a dead or silent
@@ -88,11 +543,34 @@ def main(argv):
     if ssh_host:
         # Run THIS script remotely (the token and socket are host-local).
         me = pathlib.Path(__file__).read_text()
-        remote_args = (["--timeout", str(timeout)] if timeout is not None else []) + [args[0], args[1] if len(args) > 1 else "{}"]
-        remote = subprocess.run(
-            ["ssh", "-o", "ConnectTimeout=15", ssh_host,
-             "python3 - " + shlex.join(remote_args)],
-            input=me, capture_output=True, text=True)
+        readiness = args[0] == "host.readiness"
+        params = json.loads(args[1]) if len(args) > 1 else {}
+        if readiness and not isinstance(params, dict):
+            raise ValueError("host.readiness parameters must be an object")
+        remote_params = dict(params, __internal_account_probe=True) if readiness else params
+        remote_args = (["--timeout", str(timeout)] if timeout is not None else []) + [args[0], json.dumps(remote_params)]
+        try:
+            remote = subprocess.run(
+                ["ssh", "-o", "ConnectTimeout=15", ssh_host,
+                 "python3 - " + shlex.join(remote_args)],
+                input=me, capture_output=True, text=True, timeout=45 if readiness else None)
+        except subprocess.TimeoutExpired:
+            print(json.dumps({"ok":False, "error":"remote readiness timed out"}))
+            return 1
+        if readiness:
+            if remote.returncode != 0:
+                print(json.dumps({"ok":False, "error":"remote readiness unavailable"}))
+                return remote.returncode
+            try:
+                result = json.loads(remote.stdout)
+                target = result.pop("_account_identity", None)
+                result = _account_comparison(result, target, params, target_host=ssh_host,
+                                             timeout=min(max(timeout or 5, 0.1), 5))
+            except (ValueError, TypeError, AttributeError):
+                print(json.dumps({"ok":False, "error":"invalid readiness response or peer inventory"}))
+                return 1
+            print(json.dumps(result, indent=1))
+            return 0
         sys.stdout.write(remote.stdout)
         sys.stderr.write(remote.stderr)
         return remote.returncode
@@ -104,6 +582,18 @@ def main(argv):
         return 0
     method = args[0]
     params = json.loads(args[1]) if len(args) > 1 else {}
+    if method == "host.readiness":
+        if not isinstance(params, dict):
+            raise ValueError("host.readiness parameters must be an object")
+        result = host_readiness(dict(params, __internal_account_probe=True), timeout=min(max(timeout or 5, 0.1), 5))
+        if params.get("__internal_account_probe") is not True:
+            target = result.pop("_account_identity", None)
+            result = _account_comparison(result, target, params, timeout=min(max(timeout or 5, 0.1), 5))
+        print(json.dumps(result, indent=1))
+        return 0
+    if method == "host.account_fingerprint":
+        print(json.dumps(_local_account_probe(timeout=min(max(timeout or 5, 0.1), 5))))
+        return 0
     print(json.dumps(rpc(method, params, 120 if timeout is None else timeout), indent=1))
     return 0
 

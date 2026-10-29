@@ -311,6 +311,34 @@ binding and prompt evidence before any deliberate new request; even an error
 may follow a partial launch. Receipts have no automatic expiry. A retry returns
 the original launch receipt, not a fresh liveness or delivery-status read.
 
+Before using a new session host, run the read-only preflight from a checkout:
+
+```sh
+scripts/cm-op --ssh f-sessions host.readiness '{"required_repos":["claude-manager","predictionTrading"],"peer_hosts":["cm-manager","cm-sessions","f-sessions"]}'
+```
+
+The report gives individual PASS/FAIL checks and repair hints for daemon and
+replica health, repository origins, engine versions and credential presence,
+Claude onboarding and notification-channel preference, exact worktree-root trust, resources, MCP stamp, Codex pool,
+and external IP. It uses the holder's launch environment when available and
+does not print tokens or remote URL credentials. Credential presence does not
+prove login validity; disk, RAM and swap are measurements, not workload capacity
+guarantees. Root trust does not prove each new working directory is trusted.
+The laptop's `hosts.toml` is not remotely inspected: that check remains
+unverified and supplies a `[[host]]` block to review on the laptop. A reserved
+IP is only marked verified when the cloud metadata and API checks succeed.
+Replica status comes from a nonblocking read-only `daemon.health` snapshot;
+older brains report `unknown (old brain)` until upgraded, and a busy store
+reports `unknown (busy)`. The pool check accepts either the local service or
+the forward-only tunnel and checks loopback `/health`; it checks that the
+configured auth command resolves and the proxy key exists without executing
+the helper or displaying the key. Do not clone a pool's refresh tokens.
+The explicit `peer_hosts` list compares one-way hashes of Claude account UUIDs
+without printing the UUIDs or hashes. Matching accounts fail the check;
+unreachable peers or an absent list are WARN and leave coverage unverified.
+Never copy `.credentials.json` between live hosts: rotating refresh tokens can
+invalidate the other host's login.
+
 For routine coordination, post in the task channel (`chat_open().continuous.channel`) mentioning the current parent or worker. Native wake availability is a separate question from SSH/control reachability. Do not spawn a duplicate worker or move its implementation to a different host solely because a local session-control lookup failed.
 
 Use `notification_status()` to inspect your native connection and delivery receipts. Claude uses its own-session socket; new CM Codex sessions use an owned app-server. The connection starts automatically, so there is no per-notification arming call. A submitted notice is distinct from an observed receipt, and neither marks its chat messages read. Pending or uncertain notices do not fall back to terminal typing. See [native notifications and upgrade steps](messaging/NATIVE_NOTIFICATIONS.md).

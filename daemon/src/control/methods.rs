@@ -4395,6 +4395,18 @@ pub fn register_agent_subtask(
 // parity, pinned by a test). This is Operator-only.
 
 pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
+    // Read the already-open store without projecting names or touching disk.
+    // Drop this lock before taking state again: delivery can hold the store
+    // while it needs state, and health must not wait on that path.
+    let messaging = state_arc.lock().unwrap_or_else(|p| p.into_inner()).messaging.clone();
+    let (messaging_sync, messaging_sync_state) = match messaging.try_lock() {
+        Ok(slot) => match slot.as_ref() {
+            Some(store) => (Some(store.sync_status()), "ready"),
+            None => (None, "starting"),
+        },
+        Err(std::sync::TryLockError::WouldBlock) => (None, "busy"),
+        Err(std::sync::TryLockError::Poisoned(_)) => (None, "unavailable"),
+    };
     // Holder-split (phase 4): the holder status round-trip runs
     // BEFORE the state lock — a channel wait under the lock would be
     // a convoy (and a holder that doesn't answer means this brain is
@@ -4507,6 +4519,8 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         "holder_status_error": holder_status_err,
         "mcp_ok": mcp_ok,
         "mcp_detail": mcp_detail,
+        "messaging_sync": messaging_sync,
+        "messaging_sync_state": messaging_sync_state,
         "owner_notifications": state.owner_notifications.health(),
         "sessions": total,
         "sessions_with_transcript": with_transcript,
@@ -22216,6 +22230,28 @@ mod tests {
         state.lock().unwrap().mcp_preflight = Some(Ok("41 tools".into()));
         let passed = daemon_health(&state).expect("health ok");
         assert_eq!(passed["mcp_ok"], json!(true));
+    }
+
+    #[test]
+    fn daemon_health_reads_sync_without_projecting_or_waiting_for_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("daemon-sessions.json");
+        std::fs::write(&manifest, b"manifest sentinel").unwrap();
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        state.lock().unwrap().daemon_sessions_path = Some(manifest.clone());
+        let messaging = state.lock().unwrap().messaging.clone();
+        assert_eq!(daemon_health(&state).unwrap()["messaging_sync_state"], "starting");
+        *messaging.lock().unwrap() = Some(crate::messaging::Store::open(dir.path()).unwrap());
+        let health = daemon_health(&state).unwrap();
+        assert_eq!(health["messaging_sync_state"], "ready");
+        assert!(health["messaging_sync"]["role"].is_string());
+        assert_eq!(std::fs::read(&manifest).unwrap(), b"manifest sentinel");
+        let held = messaging.lock().unwrap();
+        let busy = daemon_health(&state).unwrap();
+        assert_eq!(busy["messaging_sync_state"], "busy");
+        assert!(busy["messaging_sync"].is_null());
+        drop(held);
+        assert_eq!(std::fs::read(&manifest).unwrap(), b"manifest sentinel");
     }
 
     /// DESIGN_SEAMLESS_RESTART phase 2e (R14): `daemon.health` carries
