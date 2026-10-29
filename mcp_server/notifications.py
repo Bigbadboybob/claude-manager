@@ -579,6 +579,11 @@ async def consume(queue: Queue, adapter):
                 if held and event.get("source") not in Queue.HOLD_EXEMPT:
                     # A rotation is due or running: the new process gets it.
                     continue
+                # A Codex interrupt owns the relay's submission boundary.
+                # Leave the event pending rather than claiming it and then
+                # waiting behind that operation as an ambiguous submission.
+                if hasattr(adapter, "can_claim") and not adapter.can_claim():
+                    continue
                 recovery = event.get("source") == "claude-limit-recovery"
                 if recovery:
                     check = await adapter.recovery_check(event) if hasattr(adapter, "recovery_check") else "unknown"

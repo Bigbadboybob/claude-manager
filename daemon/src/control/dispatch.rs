@@ -316,6 +316,7 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "read_session_output",
     "resolve_authorized_session",
     "session.list_transcripts",
+    "session.interrupt_authority",
     "get_workflow_state",
     "workflow.get_state",
     "list_workflows",
@@ -585,6 +586,23 @@ pub fn dispatch_request(
         // results. `send_key` is the MCP tool's name for it (TUI-routed on
         // a laptop, like send_input; a headless host's daemon serves it).
         "session.send_key" | "send_key" => DispatchOutcome::Done(dispatch_send_key(state, req)),
+        "session.send_bound_escape" => DispatchOutcome::Done(dispatch_send_bound_escape(state, req)),
+        "session.interrupt" => DispatchOutcome::Done(dispatch_interrupt(state, req)),
+        "session.interrupt_authority" => {
+            let binding = match &req.caller {
+                Caller::Session(s) => {
+                    let st = state.lock().unwrap_or_else(|p| p.into_inner());
+                    st.sessions.get(&s.session_uid).map(|session| serde_json::json!({
+                        "pid": std::process::id(), "session_pid": session.pid,
+                        "incarnation": session.holder_incarnation,
+                        "thread_id": session.transcript_path.as_deref().and_then(crate::session::transcript_id_from_path),
+                    }))
+                },
+                Caller::Operator(_) => None,
+            };
+            if let Some(binding) = binding { DispatchOutcome::Done(Response::ok(req.id.clone(), binding)) }
+            else { DispatchOutcome::Done(Response::err(req.id.clone(), ErrorCode::Unauthorized, "live session required")) }
+        },
         // Reliable out-of-band PTY resize. Operator-only — the TUI's
         // adopt scan re-asserts the pane size on any session whose
         // daemon PTY drifted (dropped attach-stream resize frame,
@@ -3563,6 +3581,33 @@ fn dispatch_send_key(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response
         Caller::Session(s) => Some(s.session_uid.clone()),
     };
     match super::send_key::send_key(state, &req.params, caller_uid.as_deref()) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_send_bound_escape(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let caller_uid = match &req.caller {
+        Caller::Session(s) => Some(s.session_uid.as_str()),
+        Caller::Operator(_) => None,
+    };
+    match super::send_key::send_bound_escape(state, &req.params, caller_uid) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_interrupt(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let caller_uid = match &req.caller {
+        Caller::Session(s) => Some(s.session_uid.as_str()),
+        Caller::Operator(_) => {
+            if let Err(response) = require_operator(req, "interrupt requires an authenticated Operator") {
+                return response;
+            }
+            None
+        },
+    };
+    match methods::interrupt_session(state, &req.params, caller_uid) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

@@ -112,6 +112,9 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # One key to one or more sessions, for direct daemon clients. The MCP
     # tool calls `send_key` (TUI-routed, like send_input).
     "session.send_key",
+    "session.send_bound_escape",
+    "session.interrupt",
+    "session.interrupt_authority",
     "sidebar.list",
     "sidebar.assign",
     "sidebar.publish",

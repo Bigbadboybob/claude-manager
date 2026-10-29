@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import shutil
 import signal
+import socket
+import struct
 import sys
 import tempfile
 import time
@@ -32,6 +35,7 @@ from mcp_server.codex_state import CodexState
 from mcp_server.notifications import (
     NotSubmitted,
     Queue,
+    atomic_write,
     consume_supervised,
     transcript_observed,
 )
@@ -233,6 +237,9 @@ class Relay:
         self.background_poller = None
         self.background_supported = None
         self.launch_permissions = permissions
+        # Serialize native wakes with a manager's interrupt-and-stop operation.
+        self.delivery_lock = asyncio.Lock()
+        self.interrupt_waiters = 0
 
     def identity(self):
         return {
@@ -245,6 +252,9 @@ class Relay:
 
     def health_status(self):
         return "ready" if self.ready.is_set() else "awaiting_thread"
+
+    def can_claim(self):
+        return not self.delivery_lock.locked() and not self.interrupt_waiters
 
     async def connect(self):
         self.upstream = await unix_connect(
@@ -717,7 +727,11 @@ class Relay:
                             )
                         )
                     continue
-                await self.upstream.send(json.dumps(message))
+                if self.interrupt_waiters and method in {"turn/start", "thread/start", "thread/resume", "thread/fork"}:
+                    async with self.delivery_lock:
+                        await self.upstream.send(json.dumps(message))
+                else:
+                    await self.upstream.send(json.dumps(message))
         except (ConnectionClosed, OSError):
             pass
         finally:
@@ -726,6 +740,10 @@ class Relay:
                 self.attachment.detached()
 
     async def send(self, event):
+        async with self.delivery_lock:
+            return await self._send_locked(event)
+
+    async def _send_locked(self, event):
         if not self.ready.is_set() or self.selecting or not self.thread:
             raise NotSubmitted("no selected live thread")
         # An event claimed before a thread switch must not drift to that thread.
@@ -749,6 +767,141 @@ class Relay:
             "turn_id": result["turn"]["id"],
             "transcript_path": selected.get("path"),
         }
+
+    async def interrupt_and_stop(self, request, press_escape, timeout=15.0, validate_identity=None):
+        """Interrupt one observed turn and submit one user stop instruction.
+
+        The durable intent is written before any side effect. A repeated or
+        interrupted request never replays an Escape or an ambiguous user turn.
+        """
+        request_id = request.get("request_id")
+        uid = request.get("session_uid")
+        thread_id = request.get("thread_id")
+        note = request.get("note")
+        if (not isinstance(request_id, str) or not request_id or len(request_id) > 200
+                or uid != self.queue.uid or not isinstance(thread_id, str)
+                or not thread_id or not isinstance(note, str) or not note.strip()
+                or len(note.encode()) > 4096):
+            return {"status": "refused", "reason": "invalid_request"}
+        identity = {k: request.get(k) for k in
+                    ("request_id", "session_uid", "thread_id", "pid", "incarnation", "note")}
+        path = self.queue.path / ("interrupt-" + hashlib.sha256(request_id.encode()).hexdigest() + ".receipt")
+        async with self.delivery_lock:
+            try:
+                if path.exists() and path.stat().st_size > 65536:
+                    return {"status": "uncertain", "reason": "receipt_unreadable"}
+                previous = json.loads(path.read_text())
+            except FileNotFoundError:
+                previous = None
+            except (OSError, ValueError):
+                return {"status": "uncertain", "reason": "receipt_unreadable"}
+            if previous is not None:
+                saved = previous.get("identity") or {}
+                if any(saved.get(k) != identity[k] for k in ("request_id", "session_uid", "note")):
+                    return {"status": "refused", "reason": "request_id_conflict"}
+                return previous.get("result") or {"status": "uncertain", "reason": "operation_interrupted"}
+            if (not self.ready.is_set() or self.selecting or not self.state_enabled
+                    or (self.thread or {}).get("id") != thread_id
+                    or self.state.foreground != thread_id):
+                return {"status": "refused", "reason": "thread_not_proven"}
+            if any(method == "turn/start" and (params or {}).get("threadId") == thread_id
+                   for method, params in self.requests.values()):
+                return {"status": "refused", "reason": "frontend_turn_pending"}
+            thread = self.state.threads.get(thread_id)
+            if not thread or not thread.turn_id or thread.completed_id == thread.turn_id:
+                return {"status": "refused", "reason": "no_active_turn"}
+            turn_id = thread.turn_id
+            revision = self.identity_revision
+            try:
+                atomic_write(path, {"identity": identity, "result": None})
+            except OSError:
+                return {"status": "refused", "reason": "receipt_write_failed"}
+            result = {"status": "uncertain", "reason": "interrupt_unconfirmed"}
+            try:
+                await press_escape()
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    if (not self.ready.is_set() or self.identity_revision != revision
+                            or (self.thread or {}).get("id") != thread_id):
+                        result = {"status": "uncertain", "reason": "thread_changed"}
+                        break
+                    thread = self.state.threads.get(thread_id)
+                    if thread and thread.turn_id != turn_id:
+                        result = {"status": "uncertain", "reason": "turn_changed"}
+                        break
+                    if thread and thread.completed_id == turn_id:
+                        if thread.last_status != "interrupted":
+                            result = {"status": "uncertain", "reason": "turn_not_interrupted"}
+                            break
+                        if validate_identity is not None and not await validate_identity():
+                            result = {"status": "uncertain", "reason": "incarnation_changed"}
+                            break
+                        if (self.selecting or self.identity_revision != revision or (self.thread or {}).get("id") != thread_id
+                                or self.state.threads.get(thread_id).turn_id != turn_id):
+                            result = {"status": "uncertain", "reason": "thread_changed"}
+                            break
+                        text = f"[cm] Stop: {note.strip()}. Do not resume the interrupted work; wait for new instructions."
+                        reply = await self.call("turn/start", {"threadId": thread_id,
+                                                "input": [{"type": "text", "text": text}]})
+                        new_turn = (reply.get("turn") or {}).get("id")
+                        result = ({"status": "delivered", "turn_id": new_turn,
+                                   "thread_id": thread_id, "pid": request.get("pid"),
+                                   "incarnation": request.get("incarnation")}
+                                  if new_turn else {"status": "uncertain", "reason": "missing_turn_receipt"})
+                        break
+                    await asyncio.sleep(0.05)
+            except Exception:
+                result = {"status": "uncertain", "reason": "operation_failed"}
+            try:
+                atomic_write(path, {"identity": identity, "result": result})
+            except OSError:
+                return {"status": "uncertain", "reason": "receipt_write_failed"}
+            return result
+
+    async def serve_interrupt(self, reader, writer):
+        """Accept commands only from the currently authenticated CM brain."""
+        try:
+            sock = writer.get_extra_info("socket")
+            peer_pid, _, _ = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            authority = await asyncio.to_thread(control_client.call, "session.interrupt_authority", {})
+            if authority.get("pid") != peer_pid:
+                return
+            raw = await asyncio.wait_for(reader.readline(), 5)
+            if len(raw) > 32768:
+                return
+            request = json.loads(raw)
+
+            async def valid_identity():
+                binding = await asyncio.to_thread(control_client.call, "session.interrupt_authority", {})
+                return (binding.get("session_pid") == os.getpid() == request.get("pid")
+                        and binding.get("incarnation") == request.get("incarnation")
+                        and binding.get("thread_id") == request.get("thread_id"))
+
+            if not await valid_identity():
+                return
+
+            async def escape():
+                await asyncio.to_thread(control_client.call, "session.send_bound_escape", {
+                    "session_uid": self.queue.uid, "pid": request.get("pid"),
+                    "incarnation": request.get("incarnation"),
+                })
+
+            self.interrupt_waiters += 1
+            try:
+                result = await asyncio.wait_for(
+                    self.interrupt_and_stop(request, escape, validate_identity=valid_identity), 20
+                )
+            finally:
+                self.interrupt_waiters -= 1
+            writer.write(json.dumps(result).encode() + b"\n")
+            await writer.drain()
+        except (OSError, ValueError, TimeoutError, ConnectionError,
+                control_client.ControlError, control_client.TransportError):
+            pass
+        finally:
+            writer.close()
+            with suppress(OSError):
+                await writer.wait_closed()
 
     async def observed(self, event):
         # Bind positive receipt checks to the exact target rollout, including
@@ -903,6 +1056,7 @@ async def launch(args):
     with tempfile.TemporaryDirectory(prefix="cm-codex-") as private:
         backend_socket = str(Path(private) / "backend.sock")
         frontend_socket = str(Path(private) / "terminal.sock")
+        interrupt_socket = str(Path(private) / "interrupt.sock")
         log_path = queue.path / "backend.log"
         log_fd = os.open(log_path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
         try:
@@ -939,12 +1093,14 @@ async def launch(args):
                 launch_effort(args.codex_args),
             )
             await relay.connect()
+            interrupt_server = await asyncio.start_unix_server(relay.serve_interrupt, interrupt_socket)
+            atomic_write(queue.path / "interrupt-control", {"socket": interrupt_socket, "pid": os.getpid()})
             async with unix_serve(
                 relay.serve_frontend,
                 frontend_socket,
                 compression=None,
                 max_size=None,
-            ):
+            ), interrupt_server:
                 consumer = asyncio.create_task(consume_supervised(queue, relay))
 
                 async def spawn_frontend():

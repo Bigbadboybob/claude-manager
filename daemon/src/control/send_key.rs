@@ -126,6 +126,28 @@ fn send_one(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, key: &str, caller_ui
     })
 }
 
+/// A relay may send Escape only to its own exact process incarnation.
+pub fn send_bound_escape(state_arc: &Arc<Mutex<DaemonState>>, params: &Value, caller_uid: Option<&str>) -> MethodResult {
+    let uid = params["session_uid"].as_str().ok_or((ErrorCode::InvalidParams, "missing session_uid".into()))?;
+    let pid = params["pid"].as_i64().ok_or((ErrorCode::InvalidParams, "missing pid".into()))?;
+    let incarnation = params.get("incarnation").and_then(Value::as_u64);
+    if caller_uid != Some(uid) {
+        return Err((ErrorCode::Unauthorized, "bound escape is self-only".into()));
+    }
+    let (handle, fanout) = {
+        let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let session = state.sessions.get_mut(uid).ok_or((ErrorCode::NotFound, "session not found".into()))?;
+        if session.pid as i64 != pid || session.holder_incarnation != incarnation || session.try_wait().is_some() {
+            return Err((ErrorCode::Conflict, "session incarnation changed".into()));
+        }
+        (session.input_handle(), session.fanout.clone())
+    };
+    let (mode, _) = keyboard_mode(&fanout, true);
+    let bytes = crate::keys::key_bytes("escape", mode).map_err(|e| (ErrorCode::InvalidParams, e))?;
+    handle.write_key(&bytes).map_err(|e| (ErrorCode::Internal, format!("escape write: {e}")))?;
+    Ok(json!({"ok": true}))
+}
+
 /// The target's keyboard mode and how we know it: `"observed"` from its
 /// tracked state, else `"assumed"` from its engine (kitty for an agent,
 /// as prompt delivery assumes; legacy for bash).
@@ -282,6 +304,24 @@ mod tests {
         ] {
             assert_eq!(send_key(&state, &params, None).unwrap_err().0, ErrorCode::InvalidParams, "{why}");
         }
+        kill_all(&state);
+    }
+
+    #[test]
+    fn bound_escape_requires_self_and_exact_incarnation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let out = dir.path().join("keys");
+        recorder(&state, "ts-bound", "ws", "codex", "\\033[>1u", &out);
+        settle(&state, "ts-bound");
+        let pid = state.lock().unwrap().sessions["ts-bound"].pid;
+        let request = json!({"session_uid":"ts-bound", "pid":pid, "incarnation":null});
+        assert_eq!(send_bound_escape(&state, &request, Some("ts-other")).unwrap_err().0, ErrorCode::Unauthorized);
+        let wrong = json!({"session_uid":"ts-bound", "pid":pid + 1, "incarnation":null});
+        assert_eq!(send_bound_escape(&state, &wrong, Some("ts-bound")).unwrap_err().0, ErrorCode::Conflict);
+        assert!(std::fs::read(&out).unwrap_or_default().is_empty());
+        send_bound_escape(&state, &request, Some("ts-bound")).unwrap();
+        assert!(!wait_for(&out, 1).is_empty());
         kill_all(&state);
     }
 
