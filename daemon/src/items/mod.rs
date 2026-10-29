@@ -12,6 +12,7 @@ pub mod grants;
 pub mod heartbeat;
 pub mod held;
 pub mod org;
+pub mod roster;
 pub mod rpc;
 pub(crate) mod s4_attribution;
 

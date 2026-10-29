@@ -143,6 +143,10 @@ fn capture(state: &Arc<Mutex<DaemonState>>) -> Option<Snapshot> {
             // Org model S2: what the roster needs (workspace, continuous
             // ownership, age). An API before S2 ignores these keys.
             if let Some(obj) = row.as_object_mut() {
+                // Recorded launch/resume settings, not a claim about the
+                // engine's currently active model. Old APIs ignore row keys.
+                obj.insert("recorded_model".into(), json!(sess.model.as_deref().map(|m| clip(m, 200))));
+                obj.insert("recorded_model_source".into(), json!(sess.model_source.as_deref().map(|m| clip(m, 64))));
                 obj.extend(super::org::session_facts(&s, sess, now));
             }
             row

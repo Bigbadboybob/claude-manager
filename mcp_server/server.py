@@ -2203,6 +2203,36 @@ def _list_sessions_raw(task_id: str | None, include_exited: bool, include_shells
 
 
 @mcp.tool()
+def session_roster(
+    host: str | None = None,
+    member: str | None = None,
+    manager: str | None = None,
+    state: str | None = None,
+    task: str | None = None,
+    include_exited: bool = False,
+    limit: int = 100,
+    cursor: str | None = None,
+) -> dict:
+    """Read a bounded cross-host roster of visible sessions and their holds.
+
+    Scope is your org subtree plus task tree, or your local workspace when
+    taskless. Assistants and workers receive their member's subtree for this
+    read. Owner and global-permissions callers have fleet-wide read-only
+    visibility. Filters narrow that scope. Host is an exact daemon ID or an
+    unambiguous visible host label. Shells and unknown session kinds are
+    omitted; coverage says when the result is incomplete. Each page is a
+    separate snapshot, not an atomic fleet census. Heartbeat timestamps and
+    host-clock activity observations are labelled separately. Recovery is
+    not exported. Recorded model is a launch/resume setting, not verified
+    active engine state. Pass the returned cursor with unchanged filters.
+    """
+    params = {"host": host, "member": member, "manager": manager, "state": state,
+              "task": task, "include_exited": include_exited, "limit": limit,
+              "cursor": cursor}
+    return control_client.call("session.roster", params)
+
+
+@mcp.tool()
 def list_sessions(
     task_id: str | None = None,
     include_exited: bool = False,
