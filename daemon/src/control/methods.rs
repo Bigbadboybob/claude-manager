@@ -1979,10 +1979,235 @@ struct SendInputParams {
     /// the agent to receive the prompt as a submission).
     #[serde(default = "default_submit")]
     submit: bool,
+    #[serde(default)]
+    expected_pid: Option<i64>,
+    #[serde(default)]
+    expected_incarnation: Option<u64>,
 }
 
 fn default_submit() -> bool {
     true
+}
+
+/// Interrupt an exact Codex incarnation through its owning relay. A transport
+/// failure is ambiguous: the relay may have acted before the reply was lost.
+pub fn interrupt_session(state_arc: &Arc<Mutex<DaemonState>>, params: &Value, caller_uid: Option<&str>) -> MethodResult {
+    use std::io::{BufRead, BufReader, Read, Write};
+    #[cfg(target_os = "linux")]
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    let uid = params["session_uid"].as_str().filter(|s| !s.is_empty())
+        .ok_or((ErrorCode::InvalidParams, "missing session_uid".into()))?;
+    let request_id = params["request_id"].as_str().filter(|s| !s.is_empty() && s.len() <= 200)
+        .ok_or((ErrorCode::InvalidParams, "request_id is required (max 200 bytes)".into()))?;
+    let note = params["note"].as_str().filter(|s| !s.trim().is_empty() && s.len() <= 4096)
+        .ok_or((ErrorCode::InvalidParams, "note is required (max 4096 bytes)".into()))?;
+    if let Some(caller) = caller_uid {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let decision = crate::control::auth::check_session_caller(&state, caller, uid);
+        return_auth_error_if_denied_with_state(decision, caller, uid, Some(&state))?;
+    }
+    let lifecycle = crate::claude_recovery::lifecycle_gate(uid);
+    let lifecycle_guard = lifecycle.try_write().map_err(|_| (ErrorCode::Conflict, "session lifecycle is reserved".into()))?;
+    let (root, pid, incarnation, thread_id, engine) = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(caller) = caller_uid {
+            let decision = crate::control::auth::check_session_caller(&state, caller, uid);
+            return_auth_error_if_denied_with_state(decision, caller, uid, Some(&state))?;
+        }
+        let session = state.sessions.get(uid).ok_or((ErrorCode::NotFound, "session not found".into()))?;
+        if !matches!(session.session_type.as_str(), "codex" | "claude-code") || session.last_exit.kernel_set() {
+            return Err((ErrorCode::Conflict, "interrupt requires a live agent session".into()));
+        }
+        let thread = session.transcript_path.as_deref().and_then(crate::session::transcript_id_from_path);
+        (state.messaging_root.clone(), session.pid, session.holder_incarnation, thread, session.session_type.clone())
+    };
+    if let Some(prior) = interrupt_receipt(&root, uid, note, request_id)? {
+        return Ok(prior);
+    }
+    if engine == "claude-code" {
+        drop(lifecycle_guard);
+        return interrupt_claude(state_arc, uid, note, request_id, caller_uid, &root, pid as i64, incarnation);
+    }
+    let thread_id = thread_id.ok_or((ErrorCode::Conflict, "native thread identity is unavailable".into()))?;
+    let registry = crate::notifications::directory(&root, uid).join("interrupt-control");
+    let endpoint: Value = std::fs::metadata(&registry).ok().filter(|m| m.len() <= 4096)
+        .and_then(|_| std::fs::read(&registry).ok()).and_then(|v| serde_json::from_slice(&v).ok())
+        .ok_or((ErrorCode::Conflict, "interrupt relay is unavailable".into()))?;
+    let socket = endpoint["socket"].as_str().ok_or((ErrorCode::Conflict, "interrupt relay is unavailable".into()))?;
+    let mut stream = UnixStream::connect(socket).map_err(|_| (ErrorCode::Conflict, "interrupt relay is unavailable".into()))?;
+    // The registry is a hint, not authority: the connected peer must be the
+    // exact registered session process before it receives the request.
+    #[cfg(target_os = "linux")]
+    {
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let ok = unsafe { libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(), &mut len) } == 0;
+        if !ok || cred.pid as i64 != pid as i64 {
+            return Err((ErrorCode::Conflict, "interrupt relay process does not match session".into()));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    return Err((ErrorCode::Conflict, "Codex interrupt requires Linux peer credentials".into()));
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(25)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+    let request = json!({"session_uid": uid, "request_id": request_id, "note": note,
+                         "thread_id": thread_id, "pid": pid, "incarnation": incarnation});
+    let outcome = (|| -> std::io::Result<Value> {
+        writeln!(stream, "{}", request)?;
+        let mut reply = String::new();
+        BufReader::new(stream).take(16384).read_line(&mut reply)?;
+        serde_json::from_str(&reply).map_err(std::io::Error::other)
+    })();
+    Ok(outcome.unwrap_or_else(|_| json!({"status":"uncertain", "reason":"relay_reply_lost"})))
+}
+
+fn interrupt_receipt(root: &std::path::Path, uid: &str, note: &str, request_id: &str) -> Result<Option<Value>, (ErrorCode, String)> {
+    use sha2::{Digest, Sha256};
+    let path = crate::notifications::directory(root, uid)
+        .join(format!("interrupt-{:x}.receipt", Sha256::digest(request_id.as_bytes())));
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 65536) {
+        return Ok(Some(json!({"status":"uncertain","reason":"receipt_unreadable"})));
+    }
+    let old: Value = match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| (ErrorCode::Conflict, "interrupt receipt unreadable".into()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Ok(Some(json!({"status":"uncertain","reason":"receipt_unreadable"}))),
+    };
+    if old["identity"]["session_uid"] != uid || old["identity"]["note"] != note
+        || old["identity"]["request_id"] != request_id {
+        return Err((ErrorCode::Conflict, "request_id conflict".into()));
+    }
+    Ok(Some(old.get("result").filter(|r| !r.is_null()).cloned()
+        .unwrap_or_else(|| json!({"status":"uncertain","reason":"operation_interrupted"}))))
+}
+
+#[cfg(test)]
+mod interrupt_receipt_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn ambiguous_receipt_survives_a_new_incarnation_and_conflicts_do_not_replay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crate::notifications::directory(tmp.path(), "target");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("interrupt-{:x}.receipt", Sha256::digest(b"stable")));
+        crate::messaging::atomic_replace(&path, &json!({"identity": {
+            "session_uid":"target", "request_id":"stable", "note":"stop", "pid": 1,
+            "incarnation": 7, "thread_id":"old-thread"}, "result": null})).unwrap();
+        assert_eq!(interrupt_receipt(tmp.path(), "target", "stop", "stable").unwrap().unwrap()["status"], "uncertain");
+        assert_eq!(interrupt_receipt(tmp.path(), "target", "other", "stable").unwrap_err().0, ErrorCode::Conflict);
+        assert!(interrupt_receipt(tmp.path(), "target", "stop", "new").unwrap().is_none());
+    }
+
+    #[test]
+    fn interrupt_refuses_a_socket_owned_by_a_different_process() {
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::new();
+        state.messaging_root = tmp.path().to_path_buf();
+        let mut spawn = crate::session::SpawnParams::new("target", "target", "/bin/sh");
+        spawn.args = vec!["-c".into(), "sleep 30".into()];
+        spawn.session_type = "codex".into();
+        spawn.transcript_path = Some("/tmp/rollout-2026-10-29T19-32-57-01a18926-b5b3-72b2-97c8-63a73a45e13c.jsonl".into());
+        state.sessions.insert("target".into(), crate::session::DaemonSession::spawn(spawn).unwrap());
+        let state = Arc::new(Mutex::new(state));
+        let path = tmp.path().join("foreign.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let dir = crate::notifications::directory(tmp.path(), "target");
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::messaging::atomic_replace(&dir.join("interrupt-control"), &json!({"socket":path})).unwrap();
+        let request = json!({"session_uid":"target","note":"stop","request_id":"stable"});
+        assert_eq!(interrupt_session(&state, &request, Some("not-authorized")).unwrap_err().0, ErrorCode::Unauthorized);
+        let error = interrupt_session(&state, &request, None).unwrap_err();
+        assert_eq!(error.0, ErrorCode::Conflict);
+        let (mut peer, _) = listener.accept().unwrap();
+        let mut bytes = Vec::new();
+        peer.read_to_end(&mut bytes).unwrap();
+        assert!(bytes.is_empty(), "no command or note reaches the wrong process");
+        state.lock().unwrap().sessions.get_mut("target").unwrap().kill().unwrap();
+    }
+
+    #[test]
+    fn claude_without_a_fresh_turn_end_is_uncertain_and_not_replayed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("input");
+        let mut state = DaemonState::new();
+        state.messaging_root = tmp.path().to_path_buf();
+        let mut spawn = crate::session::SpawnParams::new("claude-target", "target", "/bin/sh");
+        spawn.args = vec!["-c".into(), format!("stty raw -echo; exec cat > '{}'", out.display())];
+        spawn.session_type = "claude-code".into();
+        state.sessions.insert("claude-target".into(), crate::session::DaemonSession::spawn(spawn).unwrap());
+        let state = Arc::new(Mutex::new(state));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let request = json!({"session_uid":"claude-target","note":"stop","request_id":"stable"});
+        let first = interrupt_session(&state, &request, None).unwrap();
+        assert_eq!(first["status"], "uncertain");
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(!bytes.is_empty(), "one Escape was sent");
+        let second = interrupt_session(&state, &request, None).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(std::fs::read(&out).unwrap(), bytes, "retry must not send another key or prompt");
+        state.lock().unwrap().sessions.get_mut("claude-target").unwrap().kill().unwrap();
+    }
+}
+
+fn interrupt_claude(state: &Arc<Mutex<DaemonState>>, uid: &str, note: &str, request_id: &str,
+    caller_uid: Option<&str>, root: &std::path::Path, pid: i64, incarnation: Option<u64>) -> MethodResult {
+    use sha2::{Digest, Sha256};
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|p| p.into_inner());
+    let dir = crate::notifications::directory(root, uid);
+    std::fs::create_dir_all(&dir).map_err(|e| (ErrorCode::Internal, e.to_string()))?;
+    let path = dir.join(format!("interrupt-{:x}.receipt", Sha256::digest(request_id.as_bytes())));
+    let identity = json!({"session_uid":uid,"note":note,"request_id":request_id,"pid":pid,"incarnation":incarnation});
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let old: Value = serde_json::from_slice(&bytes).map_err(|_| (ErrorCode::Conflict, "interrupt receipt unreadable".into()))?;
+            if old["identity"]["session_uid"] != uid || old["identity"]["note"] != note
+                || old["identity"]["request_id"] != request_id {
+                return Err((ErrorCode::Conflict, "request_id conflict".into()));
+            }
+            return Ok(old.get("result").filter(|r| !r.is_null()).cloned()
+                .unwrap_or_else(|| json!({"status":"uncertain","reason":"operation_interrupted"})));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Ok(json!({"status":"uncertain","reason":"receipt_unreadable"})),
+    }
+    crate::messaging::atomic_replace(&path, &json!({"identity":identity,"result":null}))
+        .map_err(|e| (ErrorCode::Internal, e.to_string()))?;
+    let before = now_unix_f64();
+    let escape = super::send_key::send_bound_escape(state, &json!({"session_uid":uid,"pid":pid,"incarnation":incarnation}), Some(uid));
+    let mut result = json!({"status":"uncertain","reason":"interrupt_unconfirmed"});
+    if escape.is_ok() {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < end {
+            let ready = {
+                let st = state.lock().unwrap_or_else(|p| p.into_inner());
+                st.sessions.get(uid).is_some_and(|s| {
+                    if s.pid as i64 != pid || s.holder_incarnation != incarnation || s.last_exit.kernel_set() { return false; }
+                    let a = crate::agent_state::current(s);
+                    a.state == crate::agent_state::State::Idle && a.last_turn.ended_at.is_some_and(|t| t >= before)
+                })
+            };
+            if ready {
+                let text = format!("[cm] Stop: {}. Do not resume the interrupted work; wait for new instructions.", note.trim());
+                let queued = send_input(state, &json!({"session_uid":uid,"text":text,
+                    "expected_pid":pid,"expected_incarnation":incarnation}), caller_uid);
+                result = if queued.is_ok() { json!({"status":"uncertain","reason":"stop_queued_unconfirmed"}) }
+                         else { json!({"status":"uncertain","reason":"stop_not_queued"}) };
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    if crate::messaging::atomic_replace(&path, &json!({"identity":identity,"result":result})).is_err() {
+        return Ok(json!({"status":"uncertain","reason":"receipt_write_failed"}));
+    }
+    Ok(result)
 }
 
 /// Write `params.text` to the target session's PTY.
@@ -2071,6 +2296,9 @@ pub fn send_input(
                 format!("session '{}' not in daemon registry", p.session_uid),
             )
         })?;
+        if p.expected_pid.is_some_and(|pid| session.pid as i64 != pid || session.holder_incarnation != p.expected_incarnation) {
+            return Err((ErrorCode::Conflict, "session incarnation changed".into()));
+        }
         // Liveness gate: a session whose child has exited has a
         // dead PTY. Surface Conflict for TUI parity. `try_wait`
         // drains the reaper's mpsc channel (side-effectful on

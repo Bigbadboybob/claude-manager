@@ -3091,6 +3091,23 @@ SEND_KEY_MAX_TARGETS = 50
 
 
 @mcp.tool()
+async def interrupt(session_uid: str, note: str, request_id: str) -> dict:
+    """Interrupt a session and submit a stop instruction as a user turn.
+
+    Reuse the same request_id and identical arguments after a timeout. The
+    result is delivered only when the native backend accepts the stop turn;
+    uncertain means it may have acted and must not be repeated as a new ID.
+    Escape alone interrupts a turn but does not erase its instructions from
+    history. This action does not guarantee that a model obeys the note.
+    """
+    return await asyncio.to_thread(
+        control_client.call, "session.interrupt",
+        {"session_uid": session_uid, "note": note, "request_id": request_id},
+        timeout=35,
+    )
+
+
+@mcp.tool()
 async def send_key(
     session_uids: str | list[str],
     key: str,

@@ -247,6 +247,7 @@ After dispatching, end your turn; the monitor, mention or board push wakes you. 
 | Create a child task | `create_subtask`; creating a task does not start its session |
 | Assign follow-up work | `send_input(session_uid=..., text=...)`; check its schema for options |
 | Revive rate-limited or errored sessions, answer a menu | `send_key(session_uids=[...], key="enter")`: exactly one key per session (no text, no trailing Enter), encoded for each session's keyboard mode; also `escape`, arrows, `tab`, `ctrl-c`, or one character like `"1"`. Per-session results; send_input's scope. A key is not new work: it leaves a `reported` status and watches as they are |
+| Stop an interrupted assignment | `interrupt(session_uid=..., note="...", request_id="...")`. Escape alone stops the current turn; the earlier instruction remains in history and a later notification may wake the model. This action sends a stop instruction too. Reuse the same request ID and identical arguments after a timeout; an `uncertain` result may have acted and is not safe to repeat under a new ID. |
 | Watch worker completion | `monitor_sessions(session_uids=[...], until="final")`; a prompted `start_session` / `send_input` already registers a watch by default |
 | Report your own completion | `report_done(reason="...")` when your assignment is actually finished |
 
@@ -255,6 +256,8 @@ Use the session UIDs returned by CM for session-control tools. Tool access is no
 ### Controlling a session on another host
 
 Chat and session control have different routing. Chat spans enrolled hosts; `list_sessions`, `send_input`, `read_session_output`, `read_last_turn` and worker monitors address the daemon attached to your MCP process. They do not search other hosts for a UID. `global_perms` broadens task access on that daemon; it does not make the tools reach another daemon. The laptop TUI's multi-host view does not make an agent's MCP multi-host.
+
+For Codex on Linux, `interrupt` serializes the operation with native notification submissions in the owning relay, verifies the bound thread and interrupted turn, and reports `delivered` when the app server accepts the stop user turn. Other platforms refuse the Codex operation because this path requires Linux peer credentials. Acceptance does not prove the model will obey it. The Claude path sends Escape and queues the stop only after a fresh idle observation; it cannot serialize Claude notifications or confirm the queued prompt, so its outcome is `uncertain`. Neither path retracts work already performed or guarantees that background commands stopped.
 
 For example, a Claude reviewer on cm-sessions calling `send_input` with a cm-manager worker UID gets `not_found: target session ... not in the daemon registry`. This means the local registry lacks that UID; it does not prove the remote worker is dead or unreachable. Resolve its owning host and stable task/worktree binding before considering a replacement.
 
@@ -268,6 +271,7 @@ For an already-authorized instruction to that settled worker:
 
 ```bash
 scripts/cm-op --ssh cm-manager send_input '{"session_uid":"<worker-uid>","text":"<authorized instruction>","submit":true}'
+scripts/cm-op --ssh cm-manager session.interrupt '{"session_uid":"<worker-uid>","note":"stop the old assignment","request_id":"<stable-id>"}'
 ```
 
 On cm-manager itself, omit `--ssh cm-manager`; a deployed copy of the helper is `~/.cm/docs/continuous-tasks/scripts/cm-op`. Discover workers with the helper's `list_sessions`, matched by task UUID, and use `resolve_authorized_session` for the bound remote transcript. Read that transcript on its owning host; a remote path is not a local file. The daemon's `read_session_output` returns PTY bytes, whereas the similarly named MCP tool parses transcript messages.
