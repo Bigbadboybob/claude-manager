@@ -31,6 +31,7 @@ pub const METHODS: &[&str] = &[
     "org.reinstate",
     "org.close_assistant",
     "org.promote",
+    "org.rebind_main",
 ];
 
 /// The read-only ones (restart-barrier classification).
@@ -78,6 +79,7 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
             }
             "org.close_assistant" => close_assistant(state, &ctx, p),
             "org.promote" => promote(state, &ctx, p),
+            "org.rebind_main" => rebind_main(state, &ctx, p),
             other => Err((ErrorCode::UnknownMethod, format!("unknown org method {other}"))),
         }
     });
@@ -539,6 +541,60 @@ pub(crate) fn hand_back_after_kill(state: &Arc<Mutex<DaemonState>>, req: &Reques
             eprintln!("cm org: holds of killed assistant {uid} not handed back: {e}");
         }
     });
+}
+
+/// Hand an existing member's main role to a live agent session. The planning
+/// API performs the atomic occupancy/hold move; this daemon updates local
+/// cache/stamps and writes native notices for sessions hosted here.
+fn rebind_main(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, mut p: Map<String, Value>) -> RpcResult {
+    let member = match take_str(&mut p, "member")? {
+        Some(v) => v,
+        None => take_str(&mut p, "ref")?.ok_or_else(|| bad("org.rebind_main needs member"))?,
+    };
+    let uid = match take_str(&mut p, "session_uid")? {
+        Some(v) => v,
+        None => take_str(&mut p, "session")?.ok_or_else(|| bad("org.rebind_main needs session"))?,
+    };
+    let reason = take_str(&mut p, "reason")?.ok_or_else(|| bad("org.rebind_main needs reason"))?;
+    let pid = if uid.starts_with("agent:") { uid.clone() } else { format!("agent:{}:{uid}", ctx.daemon_id) };
+    let mut body = Map::new();
+    body.insert("pid".into(), json!(pid));
+    body.insert("reason".into(), json!(reason));
+    if let Some(v) = p.get("request_id").filter(|v| v.is_string()) { body.insert("request_id".into(), v.clone()); }
+    let path = format!("/org/members/{}/rebind_main", encode(&member));
+    let reply = api(ctx.api.post(&path, &with_actor(ctx, body)))?;
+    let member_obj = reply["member"].clone();
+    let new_uid = reply["new_main"]["session_uid"].as_str().unwrap_or(&uid).to_string();
+    let old_uid = reply["old_main"]["session_uid"].as_str().unwrap_or("").to_string();
+    let root = {
+        let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(sess) = s.sessions.get_mut(&old_uid) {
+            if let Some(org) = sess.org.as_mut() { org.remove(crate::assistants::MEMBER_ID); org.remove(crate::assistants::ACTING_AS); }
+        }
+        note_main(&new_uid, &member_obj);
+        if let Some(sess) = s.sessions.get_mut(&new_uid) {
+            let member_id = member_obj["id"].as_str().unwrap_or_default();
+            crate::assistants::stamp(&mut sess.org, member_id, crate::assistants::MAIN, "rebind:operator");
+        }
+        s.persist_sessions_best_effort();
+        s.messaging_root.clone()
+    };
+    let handle = member_obj["handle"].as_str().unwrap_or(member.as_str());
+    let manager = member_obj["manager_handle"].as_str().unwrap_or("Owner");
+    let marker = "[cm-org]";
+    let text = format!("{marker} Main session changed to {handle}; reporting to {manager}. The member seat and board holds moved with it.");
+    let mut noticed = Map::new();
+    for target in [old_uid.as_str(), new_uid.as_str()] {
+        if !target.is_empty() {
+            let id = format!("org-rebind-main:{}:{}", member_obj["id"], target);
+            let ok = crate::notifications::publish(&root, target, &id, "cm", &text, marker).is_ok();
+            noticed.insert(target.to_string(), json!(ok));
+        }
+    }
+    let mut out = reply;
+    out["session_uid"] = json!(new_uid);
+    out["noticed"] = Value::Object(noticed);
+    Ok(out)
 }
 
 /// `org.promote` (doc/org-model.md §4.2): one of a member's assistants on
@@ -1201,6 +1257,48 @@ mod tests {
                    (&json!("kestrel"), &json!("swarm"), &json!("q1")));
         assert!(move_body.get("member").is_none() && move_body.get("action").is_none());
         assert_eq!(posts[3].2["actor"]["pid"], "owner");
+    }
+
+    #[test]
+    fn org_tool_rebind_main_routes_to_the_api_as_the_caller() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let (url, seen) = test_stub(|method, path, _| match (method, path) {
+            ("POST", "/org/members/main/ep/rebind_main") => (200, json!({
+                "member": {"id": "mem_ep", "handle": "ep", "manager_handle": "owner"},
+                "old_main": {"pid": "agent:old:old-uid", "session_uid": "old-uid"},
+                "new_main": {"session_uid": "new-uid"}, "holds": {}
+            }).to_string()),
+            _ => (500, "{}".into()),
+        });
+        let state = state(root.path(), &url);
+        let daemon = daemon_id(&state);
+        let caller = Caller::session("me-uid");
+        let request = Request { id: "rebind".into(), caller: caller.clone(), method: "org".into(),
+            params: json!({"action": "rebind_main", "member": "main/ep", "session_uid": "new-uid",
+                           "reason": "handoff", "request_id": "rebind-1"}) };
+        let response = crate::control::dispatch::dispatch_org(&state, &request);
+        assert!(response.ok, "{:?}", response.error);
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            let (method, path, body) = &seen[0];
+            assert_eq!((method.as_str(), path.as_str()), ("POST", "/org/members/main/ep/rebind_main"));
+            assert_eq!(body["pid"], format!("agent:{daemon}:new-uid"));
+            assert_eq!(body["actor"]["pid"], format!("agent:{daemon}:me-uid"));
+            assert_eq!(body["actor"]["session_uid"], "me-uid");
+            assert_eq!(body["actor"]["task_id"], "t-1");
+            assert_eq!((body["reason"].as_str(), body["request_id"].as_str()),
+                       (Some("handoff"), Some("rebind-1")));
+            assert!(body.get("action").is_none() && body.get("member").is_none());
+        }
+        let unknown = crate::control::dispatch::dispatch_org(&state, &Request {
+            id: "unknown".into(), caller, method: "org".into(), params: json!({"action": "unknown-action"})
+        });
+        let error = unknown.error.expect("unknown action must be rejected");
+        assert!(matches!(error.code, ErrorCode::InvalidParams));
+        assert!(error.message.contains("unknown action"), "{}", error.message);
+        assert_eq!(seen.lock().unwrap().len(), 1, "unknown action must not reach the API");
     }
 
     #[test]

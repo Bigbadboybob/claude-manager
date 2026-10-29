@@ -946,7 +946,7 @@ pub fn dispatch_request(
         // adoption, proxied like items. Roster and adoption are Owner's.
         "org.snapshot" | "org.member" | "org.team" | "org.roster" | "org.roster_apply"
         | "org.adopt" | "org.team_create" | "org.team_update" | "org.move" | "org.retire"
-        | "org.reinstate" | "org.close_assistant" | "org.promote" => {
+        | "org.reinstate" | "org.close_assistant" | "org.promote" | "org.rebind_main" => {
             DispatchOutcome::Done(crate::items::org::dispatch(state, req))
         }
         // Gate receipts (doc/gate-receipts.md §9): same proxy shape as items.
@@ -1838,7 +1838,8 @@ pub(crate) fn dispatch_org(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Re
     // may close it.
     // `org(action="promote", session, handle, title?, team?, manager?, reason)`
     // (§4.2) likewise: the API decides who may promote whose assistant.
-    if let Some(verb @ ("close_assistant" | "promote")) = req.params["action"].as_str() {
+    // `rebind_main` likewise forwards the member and target to the API.
+    if let Some(verb @ ("close_assistant" | "promote" | "rebind_main")) = req.params["action"].as_str() {
         let mut fwd = req.clone();
         fwd.method = format!("org.{verb}");
         if let Some(obj) = fwd.params.as_object_mut() {

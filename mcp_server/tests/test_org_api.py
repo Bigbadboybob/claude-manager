@@ -789,6 +789,33 @@ class OrgApiDb(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.status_code, status, r.text)
         return r.json()
 
+    async def test_rebind_main_moves_incarnation_holds_and_is_idempotent(self):
+        await self.applied_swarm()
+        new_uid = uid_at(65, 9)
+        await self.beat("f-sessions", [{"uid": new_uid, "name": "f-lead", "ws": "ws-f",
+                                        "path": "/w/f"}])
+        old_pid = pid(self.coord)
+        new_pid = pid(new_uid, "f-sessions")
+        await self.board_with_holder(self.root, old_pid, "rebind-me")
+        r = await self.http.post("/org/members/swarm-coord/rebind_main", json={
+            "actor": OWNER, "pid": new_pid, "reason": "F-Lead move", "request_id": "rebind-1"})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["old_main"]["pid"], old_pid)
+        self.assertEqual(body["new_main"]["pid"], new_pid)
+        self.assertEqual(body["member"]["main"]["pid"], new_pid)
+        self.assertEqual(body["notices"], [{"session_uid": self.coord, "kind": "main_rebound"},
+                                            {"session_uid": new_uid, "kind": "main_rebound"}])
+        async with self.pool.acquire() as conn:
+            self.assertEqual(await conn.fetchval("SELECT count(*) FROM incarnations WHERE member_id = $1 AND role='main' AND ended_at IS NULL", body["member"]["id"]), 1)
+            self.assertEqual(await conn.fetchval("SELECT pid FROM incarnations WHERE member_id = $1 AND role='main' AND ended_at IS NULL", body["member"]["id"]), new_pid)
+            self.assertEqual(await conn.fetchval("SELECT count(*) FROM item_holders WHERE pid = $1", new_pid), 1)
+            self.assertEqual(await conn.fetchval("SELECT count(*) FROM item_holders WHERE pid = $1", old_pid), 0)
+        replay = await self.http.post("/org/members/swarm-coord/rebind_main", json={
+            "actor": OWNER, "pid": new_pid, "reason": "F-Lead move", "request_id": "rebind-1"})
+        self.assertEqual(replay.status_code, 200, replay.text)
+        self.assertEqual(replay.json()["new_main"]["pid"], new_pid)
+
     async def test_move_and_retire_authority_follows_the_manager_chain(self):
         await self.applied_swarm()
         coord, org, orch = {"pid": pid(self.coord)}, {"pid": pid(self.lane)}, {"pid": pid(self.orch)}

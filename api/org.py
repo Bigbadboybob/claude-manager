@@ -127,6 +127,13 @@ class AuthorityBatchBody(_Strict):
     self_ok: bool = True
 
 
+class RebindMainBody(_Strict):
+    actor: Actor
+    pid: Annotated[str, Field(min_length=1, max_length=300)]
+    reason: Annotated[str, Field(min_length=1, max_length=500)]
+    request_id: RequestId | None = None
+
+
 class ReinstateBody(_Strict):
     actor: Actor
     reason: Annotated[str, Field(min_length=1, max_length=500)] | None = None
@@ -239,6 +246,13 @@ async def member_authority_batch(body: AuthorityBatchBody, request: Request):
     return await _call(org_db.authority_batch(
         _pool(request), body.actor.model_dump(),
         [target.model_dump() for target in body.targets], self_ok=body.self_ok))
+
+
+@router.post("/members/{ref:path}/rebind_main")
+async def rebind_main(ref: Ref, body: RebindMainBody, request: Request):
+    return await _call(org_db.rebind_main(
+        _pool(request), body.actor.model_dump(), ref, session=body.pid,
+        reason=body.reason, request_id=body.request_id))
 
 
 @router.post("/members/{ref:path}/reinstate")
