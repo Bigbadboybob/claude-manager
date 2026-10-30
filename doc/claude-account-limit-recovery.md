@@ -39,6 +39,18 @@ observed yet), `started` (a newer engine-origin turn edge is present),
 `uncertain` are receipts, not proof that assigned work resumed; an uncertain
 receipt is never replayed automatically.
 
+`resume_claude_sessions([uid, ...])` is the bounded explicit path for a caller
+that already has `send_input` authority over each selected managed Claude UID
+(at most 32). It reuses the journal's armed episode, account/profile check,
+incarnation fence and native notification admission; it never answers a PTY
+dialog. Each target returns independently. The current admission pass submits
+at most one native recovery event; additional selected targets are returned as
+`refused` with `one native admission per recovery pass`, so callers can make a
+later explicit selection after inspecting the first receipt. `resume_claude_status`
+is read-only and reports the durable fence as `submitted`, `started`, `no_turn`,
+`uncertain`, or `refused`; a source/incarnation change is uncertain and the
+deadline without an observed start is `no_turn`.
+
 Recovery notices use a version-2 envelope, which older MCP consumers leave
 pending. After ten minutes, an unclaimed version-2 notice is reported as
 `pending (delivery unconfirmed — consumer may need MCP reconnect)`; the new

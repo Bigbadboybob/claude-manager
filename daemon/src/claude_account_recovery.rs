@@ -51,34 +51,43 @@ pub(crate) struct LimitRecord {
     pub reset_at: Option<i64>,
 }
 
-/// Classify an explicitly admitted recovery attempt from two state samples.
-/// An accepted write is only `submitted`; it becomes `started` after a new
-/// engine edge, `no_turn` after the existing bounded delivery escape, and
-/// `uncertain` when the source is no longer trustworthy.  Callers must keep
-/// `uncertain` receipts durable and must never replay them automatically.
-pub(crate) fn resume_outcome(
-    before: &crate::agent_state::AgentState,
-    after: &crate::agent_state::AgentState,
-    admitted: bool,
-) -> &'static str {
-    if !admitted {
-        return "refused";
-    }
-    let started = after.engine_turn_started_at.is_some_and(|at| {
-        before.engine_turn_started_at.is_none_or(|old| at > old)
-    });
-    if started {
-        return "started";
-    }
-    if after.detail.no_turn_at.is_some_and(|at| {
-        before.latest_start_at.is_none_or(|old| at >= old)
-    }) {
-        return "no_turn";
-    }
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+struct AttemptFence {
+    pid: libc::pid_t,
+    generation: u64,
+    incarnation: Option<u64>,
+    admitted_at: f64,
+    deadline_at: f64,
+    turn_seq_before: u64,
+    engine_started_before: Option<f64>,
+}
+
+/// Classify a selected recovery only against its durable admission fence.
+fn resume_outcome(fence: &AttemptFence, before: &crate::agent_state::AgentState,
+    after: &crate::agent_state::AgentState, event_observed: bool, now: f64) -> &'static str {
     if matches!(after.state, crate::agent_state::State::Unknown | crate::agent_state::State::Exited) {
         return "uncertain";
     }
+    let started = event_observed && after.engine_turn_started_at.is_some_and(|at| {
+        at >= fence.admitted_at && fence.engine_started_before.is_none_or(|old| at > old)
+    }) && after.turn_seq >= fence.turn_seq_before;
+    if started { return "started"; }
+    if now >= fence.deadline_at { return "no_turn"; }
+    let _ = before;
     "submitted"
+}
+
+fn native_event_observed(event: &Value, uid: &str, id: &str) -> bool {
+    event["version"] == 2
+        && event["source"] == "claude-limit-recovery"
+        && event["recipient"] == uid
+        && event["id"] == id
+        && event["status"] == "observed"
+}
+
+fn attempt_identity_matches(fence: &AttemptFence, pid: libc::pid_t, generation: u64,
+    incarnation: Option<u64>) -> bool {
+    pid == fence.pid && generation == fence.generation && incarnation == fence.incarnation
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -113,6 +122,8 @@ struct Episode {
     deferred_account: Option<String>,
     #[serde(default)]
     deferred_reset_due: bool,
+    #[serde(default)]
+    fence: Option<AttemptFence>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -317,7 +328,7 @@ impl Journal {
             manager: None, label: uid.into(), outcome: None, digest: None,
             unmanaged_logged: false,
             native_event: None, queued_at: None, unclaimed_v2: false,
-            deferred: false, deferred_account: None, deferred_reset_due: false,
+            deferred: false, deferred_account: None, deferred_reset_due: false, fence: None,
         })
     }
 }
@@ -610,7 +621,7 @@ fn session_still_eligible(st: &crate::state::DaemonState, target: &Target) -> bo
 
 fn attempt(state: &Arc<Mutex<crate::state::DaemonState>>, target: &Target, record: &LimitRecord,
     profile: &Path, journal: &mut Journal, journal_path: &Path, messaging_root: &Path,
-    observation: &mut AccountObservation) -> io::Result<bool> {
+    observation: &mut AccountObservation, allow_pty: bool) -> io::Result<bool> {
     observation.composer_busy = false;
     if target.manager.is_none() { return Ok(false); }
     let lifecycle = crate::claude_recovery::lifecycle_gate(&target.uid);
@@ -642,9 +653,14 @@ fn attempt(state: &Arc<Mutex<crate::state::DaemonState>>, target: &Target, recor
                         let Some(episode) = journal.episodes.get_mut(&key) else { return Ok(false); };
                         if !episode.armed(account.as_deref(), chrono::Utc::now().timestamp()) { return Ok(false); }
                         episode.attempted = true; episode.native_event = Some(id.clone()); episode.queued_at.get_or_insert_with(crate::agent_state::unix_now);
+                        episode.fence = Some(AttemptFence { pid: target.pid, generation: target.generation,
+                            incarnation: target.incarnation, admitted_at: crate::agent_state::unix_now(),
+                            deadline_at: crate::agent_state::unix_now() + 15.0,
+                            turn_seq_before: target.agent.turn_seq,
+                            engine_started_before: target.agent.engine_turn_started_at });
                         journal.refresh_pending();
                         if let Err(e) = journal.save(journal_path) {
-                            let episode = journal.episodes.get_mut(&key).unwrap(); episode.attempted = false; episode.native_event = None;
+                            let episode = journal.episodes.get_mut(&key).unwrap(); episode.attempted = false; episode.native_event = None; episode.fence = None;
                             journal.refresh_pending();
                             return Err(e);
                         }
@@ -653,7 +669,7 @@ fn attempt(state: &Arc<Mutex<crate::state::DaemonState>>, target: &Target, recor
                         target.agent.last_turn.ended_at, &target.agent.background)).map(|event| event.is_some())
             });
     }
-    if !crate::notifications::recovery_transport_definitely_unready(transport.as_ref(), &target.native_id, crate::agent_state::unix_now()) { return Ok(false); }
+    if !allow_pty || !crate::notifications::recovery_transport_definitely_unready(transport.as_ref(), &target.native_id, crate::agent_state::unix_now()) { return Ok(false); }
     // The PTY fallback has a paste/submit gap. Never use it while Claude has
     // live background work that can enqueue another turn during that gap.
     if !target.agent.background.jobs.is_empty() || !target.agent.background.crons.is_empty() { return Ok(false); }
@@ -703,11 +719,17 @@ fn attempt(state: &Arc<Mutex<crate::state::DaemonState>>, target: &Target, recor
         if !episode.armed(account.as_deref(), chrono::Utc::now().timestamp()) { return Ok(false); }
         *committed_stamp.borrow_mut() = Some(FileStamp::read(path)?);
         episode.attempted = true;
+        episode.fence = Some(AttemptFence { pid: target.pid, generation: target.generation,
+            incarnation: target.incarnation, admitted_at: crate::agent_state::unix_now(),
+            deadline_at: crate::agent_state::unix_now() + 15.0,
+            turn_seq_before: target.agent.turn_seq,
+            engine_started_before: target.agent.engine_turn_started_at });
         let was_unstaged = journal.unstaged;
         journal.unstaged = true;
         if let Err(e) = journal.save(journal_path) {
             // No terminal byte has been written when persistence fails.
             journal.episodes.get_mut(&key).unwrap().attempted = false;
+            journal.episodes.get_mut(&key).unwrap().fence = None;
             journal.unstaged = was_unstaged;
             return Err(e);
         }
@@ -719,6 +741,148 @@ fn attempt(state: &Arc<Mutex<crate::state::DaemonState>>, target: &Target, recor
         Ok(target.fanout.geometry_version() == geometry_version
             && latest_limit(path, &target.native_id)?.as_ref() == Some(record))
     })
+}
+
+/// Explicit, caller-selected recovery using the same durable episode and
+/// native publication fences as the background policy.  This path is native
+/// only: it never guesses at a PTY dialog or presses Enter.  A target must
+/// already have an observed, armed episode (account switch/reset evidence),
+/// which keeps arbitrary selected UIDs from bypassing #69's provenance fence.
+pub(crate) const MAX_BULK_RESUME_TARGETS: usize = 32;
+
+pub(crate) fn request_many(
+    state: &Arc<Mutex<crate::state::DaemonState>>,
+    uids: &[String],
+) -> Value {
+    let (journal_path, root, enabled, candidates) = {
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(base) = st.daemon_sessions_path.as_ref() else {
+            return json!({"results": uids.iter().map(|uid| json!({"session_uid":uid,"status":"refused","reason":"recovery journal unavailable"})).collect::<Vec<_>>()});
+        };
+        let candidates = if st.config.claude_limit_recovery && !st.restarting && !st.draining {
+            targets(&st)
+        } else { Vec::new() };
+        (base.with_file_name("daemon-claude-account-recovery.json"), st.messaging_root.clone(),
+         st.config.claude_limit_recovery && !st.restarting && !st.draining, candidates)
+    };
+    let mut runtime = AccountObservation::default();
+    let mut journal = match runtime.read_journal(&journal_path) {
+        Ok(journal) => journal,
+        Err(e) => return json!({"results": uids.iter().map(|uid| json!({"session_uid":uid,"status":"uncertain","reason":format!("journal unreadable: {e}")})).collect::<Vec<_>>()})
+    };
+    let Some(profile) = profile_path() else {
+        return json!({"results": uids.iter().map(|uid| json!({"session_uid":uid,"status":"refused","reason":"Claude account identity unavailable"})).collect::<Vec<_>>()});
+    };
+    let account = runtime.fingerprint(&profile).ok();
+    let mut admitted = false;
+    let mut results = Vec::with_capacity(uids.len());
+    for uid in uids {
+        let result = || -> Value {
+            let Some(target) = candidates.iter().find(|target| &target.uid == uid) else {
+                return json!({"session_uid":uid,"status":"refused","reason": if !enabled { "recovery disabled or daemon not at a safe boundary" } else { "target is not an eligible managed Claude limit episode" }});
+            };
+            let Some(path) = target.path.as_ref() else {
+                return json!({"session_uid":uid,"status":"refused","reason":"bound transcript unavailable"});
+            };
+            if !process_uses_profile(target.pid, &profile).unwrap_or(false) {
+                return json!({"session_uid":uid,"status":"refused","reason":"account identity is not bound to target"});
+            }
+            let record = match runtime.limit(path, &target.native_id) {
+                Ok(Some(record)) => record,
+                Ok(None) => return json!({"session_uid":uid,"status":"refused","reason":"limit episode no longer current"}),
+                Err(_) => return json!({"session_uid":uid,"status":"uncertain","reason":"limit episode could not be checked"}),
+            };
+            let key = format!("{}:{}", uid, record.id);
+            let Some(episode) = journal.episodes.get(&key) else {
+                return json!({"session_uid":uid,"status":"refused","reason":"episode has not been armed by account switch/reset evidence"});
+            };
+            if episode.attempted {
+                return json!({"session_uid":uid,"status":"uncertain","reason":"episode already attempted; no replay"});
+            }
+            if !episode.armed(account.as_deref(), chrono::Utc::now().timestamp()) {
+                return json!({"session_uid":uid,"status":"refused","reason":"episode has no fresh account switch/reset edge"});
+            }
+            if admitted {
+                return json!({"session_uid":uid,"status":"refused","reason":"one native admission per recovery pass"});
+            }
+            let result = attempt(state, target, &record, &profile, &mut journal, &journal_path, &root, &mut runtime, false);
+            let event = journal.episodes.get(&key).and_then(|episode| {
+                episode.attempted.then(|| episode.native_event.clone()).flatten()
+            });
+            if event.is_some() || journal.episodes.get(&key).is_some_and(|episode| episode.attempted) {
+                journal.save(&journal_path).ok();
+                admitted = true;
+                if let Some(event) = event {
+                    return json!({"session_uid":uid,"status": if result.is_ok() { "submitted" } else { "uncertain" }, "receipt_id":event});
+                }
+                return json!({"session_uid":uid,"status":"uncertain","reason":"durable claim has no native receipt"});
+            }
+            json!({"session_uid":uid,"status": if result.is_err() { "uncertain" } else { "refused" },
+                   "reason": if result.is_err() { "native publication outcome unknown" } else { "final safety check refused" }})
+        }();
+        results.push(result);
+    }
+    json!({"results":results,"admitted":admitted})
+}
+
+/// Read-only follow-up for `session.resume_many`. It binds engine evidence to
+/// the durable attempt fence and deadline; an older no-turn field or another
+/// session's turn cannot settle this request.
+pub(crate) fn status_many(
+    state: &Arc<Mutex<crate::state::DaemonState>>,
+    uids: &[String],
+) -> Value {
+    let (journal_path, root) = {
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(base) = st.daemon_sessions_path.as_ref() else {
+            return json!({"results": uids.iter().map(|uid| json!({"session_uid":uid,"status":"uncertain","reason":"recovery journal unavailable"})).collect::<Vec<_>>()});
+        };
+        (base.with_file_name("daemon-claude-account-recovery.json"), st.messaging_root.clone())
+    };
+    let journal = match Journal::load(&journal_path) {
+        Ok(journal) => journal,
+        Err(_) => return json!({"results": uids.iter().map(|uid| json!({"session_uid":uid,"status":"uncertain","reason":"journal unreadable"})).collect::<Vec<_>>()})
+    };
+    let now = crate::agent_state::unix_now();
+    let mut results = Vec::with_capacity(uids.len());
+    for uid in uids {
+        let Some(episode) = journal.episodes.values()
+            .filter(|e| &e.uid == uid && e.fence.is_some())
+            .max_by(|a, b| {
+                a.fence.as_ref().unwrap().admitted_at
+                    .partial_cmp(&b.fence.as_ref().unwrap().admitted_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }) else {
+            results.push(json!({"session_uid":uid,"status":"refused","reason":"no selected recovery attempt"}));
+            continue;
+        };
+        let fence = episode.fence.as_ref().unwrap();
+        let (identity_ok, current) = {
+            let st = state.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(session) = st.sessions.get(uid) {
+                let current = crate::agent_state::current(session);
+                (attempt_identity_matches(fence, session.pid, session.generation, session.holder_incarnation), Some(current))
+            } else { (false, None) }
+        };
+        let Some(current) = current else {
+            results.push(json!({"session_uid":uid,"status":"uncertain","reason":"source or incarnation changed"}));
+            continue;
+        };
+        if !identity_ok {
+            results.push(json!({"session_uid":uid,"status":"uncertain","reason":"source or incarnation changed"}));
+            continue;
+        }
+        let event_observed = episode.native_event.as_ref()
+            .and_then(|id| crate::notifications::get(&root, uid, id).ok().flatten()
+                .map(|event| native_event_observed(&event, uid, id)))
+            .unwrap_or(false);
+        let mut before = current.clone();
+        before.turn_seq = fence.turn_seq_before;
+        before.engine_turn_started_at = fence.engine_started_before;
+        let outcome = resume_outcome(fence, &before, &current, event_observed, now);
+        results.push(json!({"session_uid":uid,"status":outcome,"receipt_id":episode.native_event,"deadline_at":fence.deadline_at}));
+    }
+    json!({"results":results})
 }
 
 fn pass(state: &Arc<Mutex<crate::state::DaemonState>>, observation: &mut AccountObservation) -> io::Result<()> {
@@ -824,7 +988,7 @@ fn pass(state: &Arc<Mutex<crate::state::DaemonState>>, observation: &mut Account
             if changed { journal.refresh_pending(); journal.save(&journal_path)?; }
             continue;
         }
-        let result = attempt(state, target, &record, &profile, &mut journal, &journal_path, &root, observation);
+        let result = attempt(state, target, &record, &profile, &mut journal, &journal_path, &root, observation, true);
         let episode = journal.episodes.get_mut(&key).unwrap();
         // A durable pre-effect claim counts even if publication or a partial
         // PTY write fails: the outcome may be uncertain and consumes this pass.
@@ -1290,18 +1454,46 @@ mod tests {
             stalled_since: None,
         };
         let mut after = before.clone();
-        assert_eq!(resume_outcome(&before, &after, false), "refused");
-        assert_eq!(resume_outcome(&before, &after, true), "submitted");
+        let fence = AttemptFence { pid: 1, generation: 1, incarnation: None,
+            admitted_at: 100.0, deadline_at: 115.0, turn_seq_before: 3,
+            engine_started_before: Some(80.0) };
+        assert_eq!(resume_outcome(&fence, &before, &after, false, 100.0), "submitted");
         after.turn_seq = 4;
         after.engine_turn_started_at = Some(101.0);
-        assert_eq!(resume_outcome(&before, &after, true), "started");
+        assert_eq!(resume_outcome(&fence, &before, &after, true, 101.0), "started");
         after.engine_turn_started_at = before.engine_turn_started_at;
         after.turn_seq = before.turn_seq;
-        after.detail.no_turn_at = Some(106.0);
-        assert_eq!(resume_outcome(&before, &after, true), "no_turn");
+        assert_eq!(resume_outcome(&fence, &before, &after, false, 116.0), "no_turn");
         after.detail.no_turn_at = None;
         after.state = crate::agent_state::State::Unknown;
-        assert_eq!(resume_outcome(&before, &after, true), "uncertain");
+        assert_eq!(resume_outcome(&fence, &before, &after, false, 101.0), "uncertain");
+    }
+
+    #[test]
+    fn selected_status_requires_the_matching_v2_recovery_receipt() {
+        let good = json!({"version":2,"source":"claude-limit-recovery","recipient":"uid",
+            "id":"event","status":"observed"});
+        assert!(native_event_observed(&good, "uid", "event"));
+        let wrong_source = json!({"version":2,"source":"chat","recipient":"uid",
+            "id":"event","status":"observed"});
+        assert!(!native_event_observed(&wrong_source, "uid", "event"));
+        let wrong_recipient = json!({"version":2,"source":"claude-limit-recovery","recipient":"other",
+            "id":"event","status":"observed"});
+        assert!(!native_event_observed(&wrong_recipient, "uid", "event"));
+        let pending = json!({"version":2,"source":"claude-limit-recovery","recipient":"uid",
+            "id":"event","status":"pending"});
+        assert!(!native_event_observed(&pending, "uid", "event"));
+    }
+
+    #[test]
+    fn status_fence_rejects_a_rebound_source_even_when_the_uid_is_reused() {
+        let fence = AttemptFence { pid: 41, generation: 7, incarnation: Some(3),
+            admitted_at: 100.0, deadline_at: 115.0, turn_seq_before: 4,
+            engine_started_before: None };
+        assert!(attempt_identity_matches(&fence, 41, 7, Some(3)));
+        assert!(!attempt_identity_matches(&fence, 41, 8, Some(3)));
+        assert!(!attempt_identity_matches(&fence, 41, 7, Some(4)));
+        assert!(!attempt_identity_matches(&fence, 42, 7, Some(3)));
     }
     #[test]
     fn actual_attempt_rechecks_manager_disable_and_new_user_before_writing() {
@@ -1345,20 +1537,20 @@ mod tests {
         journal.observe(&uid, &record, None).manager = Some("manager".into()); journal.save(&journal_path).unwrap();
         let mut runtime = AccountObservation::default();
         state.lock().unwrap().config.claude_limit_recovery = false;
-        assert!(!attempt(&state, &target, &record, &profile, &mut journal, &journal_path, dir.path(), &mut runtime).unwrap());
+        assert!(!attempt(&state, &target, &record, &profile, &mut journal, &journal_path, dir.path(), &mut runtime, true).unwrap());
         assert!(!journal.episodes.values().next().unwrap().attempted);
         state.lock().unwrap().config.claude_limit_recovery = true;
         state.lock().unwrap().sessions.get_mut(&uid).unwrap().managed_by_uid = None;
-        assert!(!attempt(&state, &target, &record, &profile, &mut journal, &journal_path, dir.path(), &mut runtime).unwrap());
+        assert!(!attempt(&state, &target, &record, &profile, &mut journal, &journal_path, dir.path(), &mut runtime, true).unwrap());
         assert!(!journal.episodes.values().next().unwrap().attempted);
         state.lock().unwrap().sessions.get_mut(&uid).unwrap().managed_by_uid = Some("manager".into());
         write(&transcript, &[failure.clone(), json!({"type":"user","message":{"content":"resume"}})]);
-        assert!(!attempt(&state, &target, &record, &profile, &mut journal, &journal_path, dir.path(), &mut runtime).unwrap());
+        assert!(!attempt(&state, &target, &record, &profile, &mut journal, &journal_path, dir.path(), &mut runtime, true).unwrap());
         assert!(!journal.episodes.values().next().unwrap().attempted);
         write(&transcript, &[failure, json!({"type":"system","subtype":"turn_duration"})]);
-        assert!(attempt(&state, &target, &record, &profile, &mut journal, &journal_path, dir.path(), &mut runtime).unwrap());
+        assert!(attempt(&state, &target, &record, &profile, &mut journal, &journal_path, dir.path(), &mut runtime, true).unwrap());
         assert!(Journal::load(&journal_path).unwrap().episodes.values().next().unwrap().attempted);
-        assert!(!attempt(&state, &target, &record, &profile, &mut journal, &journal_path, dir.path(), &mut runtime).unwrap());
+        assert!(!attempt(&state, &target, &record, &profile, &mut journal, &journal_path, dir.path(), &mut runtime, true).unwrap());
         let _ = state.lock().unwrap().sessions.get_mut(&uid).unwrap().kill();
     }
     #[test]
@@ -1397,12 +1589,12 @@ mod tests {
         let before = target.input.last_activity(); let journal_path = dir.path().join("journal.json");
         let mut journal = Journal::new(); journal.observe(&uid, &record, None).manager = Some("manager".into()); journal.save(&journal_path).unwrap();
         let mut runtime = AccountObservation::default();
-        assert!(attempt(&state, &target, &record, &profile, &mut journal, &journal_path, dir.path(), &mut runtime).unwrap());
+        assert!(attempt(&state, &target, &record, &profile, &mut journal, &journal_path, dir.path(), &mut runtime, true).unwrap());
         assert_eq!(target.input.last_activity(), before, "native recovery must not write to the PTY");
         let episode = journal.episodes.values().next().unwrap(); assert!(episode.attempted && episode.native_event.is_some());
         let events = crate::notifications::snapshot(dir.path(), &uid).unwrap().0;
         assert_eq!(events.len(), 1); assert_eq!(events[0]["status"], "pending");
-        assert!(!attempt(&state, &target, &record, &profile, &mut journal, &journal_path, dir.path(), &mut runtime).unwrap());
+        assert!(!attempt(&state, &target, &record, &profile, &mut journal, &journal_path, dir.path(), &mut runtime, true).unwrap());
         assert_eq!(crate::notifications::snapshot(dir.path(), &uid).unwrap().0.len(), 1);
         let _ = state.lock().unwrap().sessions.get_mut(&uid).unwrap().kill();
     }

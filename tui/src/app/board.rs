@@ -811,16 +811,17 @@ impl App {
             for limit in limits {
                 let host = limit["host"].as_str().unwrap_or("unknown host");
                 let sessions = limit["session_count"].as_i64().unwrap_or(0);
-                let reset = match limit["resets_at"].as_i64() {
-                    Some(at) if at > now_unix() => format!("resets {}", age(at - now_unix())),
+                let reset = match limit["resets_at"].as_f64() {
+                    Some(at) if at > now_unix() as f64 => format!("resets {}", age((at - now_unix() as f64) as i64)),
                     _ => "reset unknown".to_owned(),
                 };
+                let attribution = limit["attribution"].as_str().unwrap_or("unknown");
                 let items = limit["items"].as_array().map(|ns| {
                     ns.iter().filter_map(Value::as_i64).map(|n| format!("#{n}")).collect::<Vec<_>>().join(",")
                 }).unwrap_or_default();
                 spans.push(sep());
                 spans.push(Span::styled(
-                    format!("⚠ Claude usage limit {host}: {sessions} session{} · {reset}{}",
+                    format!("⚠ Claude usage limit {host}: {sessions} session{} · {reset} · {attribution}{}",
                             if sessions == 1 { "" } else { "s" },
                             if items.is_empty() { String::new() } else { format!(" · items {items}") }),
                     Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD),
@@ -1894,7 +1895,7 @@ mod tests {
             "session_count": 2,
             "resets_at": now_unix() + 1800,
             "items": [3, 4],
-            "attribution": "unknown"
+            "attribution": "current"
         }]);
         let text = screen_at(&mut app, 160, 34);
         assert!(text.contains("Claude usage limit cm-sessions: 2 sessions"), "{text}");

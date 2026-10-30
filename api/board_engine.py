@@ -131,7 +131,9 @@ def account_limit_banner(items: dict[int, Item], states: dict, now: datetime) ->
     """
     hosts: dict[str, dict] = {}
     for item in items.values():
-        for holder in item.holders:
+        holders = item.holders if hasattr(item, "holders") else item.get("holders", [])
+        item_number = item.n if hasattr(item, "n") else item.get("n")
+        for holder in holders:
             pid = holder["pid"]
             row = states.get(pid) or {}
             if not isinstance(row, dict):
@@ -164,8 +166,8 @@ def account_limit_banner(items: dict[int, Item], states: dict, now: datetime) ->
             uid = row.get("session_uid") or pid
             if uid not in entry["sessions"]:
                 entry["sessions"].append(uid)
-            if item.n not in entry["items"]:
-                entry["items"].append(item.n)
+            if item_number not in entry["items"]:
+                entry["items"].append(item_number)
             if reset is not None and (entry["resets_at"] is None or reset < entry["resets_at"]):
                 entry["resets_at"] = reset
     for entry in hosts.values():
@@ -175,7 +177,11 @@ def account_limit_banner(items: dict[int, Item], states: dict, now: datetime) ->
         entry["session_count"] = len(entry["sessions"])
         entry["item_count"] = len(entry["items"])
         entry["cause"] = "rate_limit"
-        entry["attribution"] = "unknown"
+        # The roster has no account-baseline timestamp.  A journal fingerprint
+        # inferred after a switch cannot prove that this old failure belongs to
+        # the current account, so never present its reset as a live countdown.
+        entry["attribution"] = "historical / attribution unknown"
+        entry["resets_at"] = None
     return sorted(hosts.values(), key=lambda e: (e["host"].lower(), e["daemon_id"]))
 
 

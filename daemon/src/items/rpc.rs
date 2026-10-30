@@ -956,6 +956,9 @@ pub(crate) fn shape_board(read: &Value, pid: &str, params: &Value, now: DateTime
         read["recently_closed"].as_array().map(|v| v.iter().filter(keep).collect()).unwrap_or_default()
     };
     let mut out = json!({"board": board_header(&read["board"]), "free_capacity": names(&read["free_capacity"])});
+    // Account-limit presentation is additive and must survive the daemon's
+    // shape step on both full and slim board reads.
+    out["account_limits"] = read.get("account_limits").cloned().unwrap_or_else(|| json!([]));
     // Headings and epics (doc/org-model.md §7.3), for the Alt+B tree.
     if let Some(groups) = read["groups"].as_array().filter(|g| !g.is_empty()) {
         out["groups"] = json!(groups);
@@ -1456,6 +1459,17 @@ mod tests {
         let out = shape_board(&sample_read(), "x", &json!({"group":"rl","view":"full"}), now);
         assert_eq!(out["items"].as_array().unwrap().len(), 2);
         assert_eq!(out["items"][0]["n"], 14);
+    }
+
+    #[test]
+    fn shaped_board_preserves_account_limit_banner_for_full_and_slim_reads() {
+        let mut read = sample_read();
+        read["account_limits"] = json!([{"host":"cm-sessions","session_count":1,
+            "resets_at":null,"attribution":"historical / attribution unknown"}]);
+        for params in [json!({"view":"full"}), json!({"view":"slim"})] {
+            let out = shape_board(&read, "agent:d1:me-uid", &params, Utc::now());
+            assert_eq!(out["account_limits"][0]["host"], "cm-sessions");
+        }
     }
 
     #[test]

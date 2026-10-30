@@ -733,8 +733,22 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
         board = await self.read()
         version = board["board"]["version"]
         self.assertGreater(version, 0)
+        # Account-limit presentation is refreshed on unchanged item versions
+        # so a resolved banner clears without a board write.
         self.assertEqual(await self.read(since_version=version),
-                         {"unchanged": True, "version": version})
+                         {"unchanged": True, "version": version, "account_limits": []})
+        await self.beat([self.row("lane", engine="claude-code", state="errored",
+                                   agent_state={"source": "presence",
+                                                "detail": {"error_kind": "rate_limit",
+                                                           "resumes_at": (datetime.now(timezone.utc) + timedelta(minutes=15)).timestamp()},
+                                                "last_turn": {"status": "failed"}})])
+        limited = await self.read(since_version=version)
+        self.assertEqual(limited["version"], version)
+        self.assertEqual(limited["account_limits"][0]["attribution"],
+                         "historical / attribution unknown")
+        await self.beat([self.row("lane")])
+        self.assertEqual(await self.read(since_version=version),
+                         {"unchanged": True, "version": version, "account_limits": []})
         lane_state = board["items"][1]["holders"][0]["state"]
         self.assertEqual(lane_state["state"], "unknown")  # no heartbeat yet
         now = datetime.now(timezone.utc)

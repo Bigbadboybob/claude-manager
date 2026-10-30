@@ -967,6 +967,31 @@ async def _free_capacity(conn, board: dict, now: datetime,
     return free, untracked
 
 
+async def _account_limit_snapshot(conn, board_id: str) -> tuple[dict, dict]:
+    """Narrow unchanged-read census: holders + session state only.
+
+    It avoids loading item notes, dependencies, flags, groups or history. The
+    board version remains the item version; heartbeat changes only refresh the
+    additive account-limit presentation field.
+    """
+    rows = await conn.fetch(
+        """SELECT i.number AS n, h.pid, s.*
+             FROM item_holders h
+             JOIN items i ON i.id = h.item_id
+             LEFT JOIN session_states s ON s.pid = h.pid
+            WHERE i.board_id = $1 AND i.closed_at IS NULL AND i.archived_at IS NULL""",
+        uuid.UUID(board_id),
+    )
+    items: dict[int, dict] = {}
+    states: dict[str, object] = {}
+    for row in rows:
+        n = int(row["n"])
+        items.setdefault(n, {"n": n, "holders": []})["holders"].append({"pid": row["pid"]})
+        if row["pid"] not in states and row["daemon_id"] is not None:
+            states[row["pid"]] = row
+    return items, states
+
+
 def free_label(row: dict) -> str:
     """`rev1 (for ep)` for a member's assistant, else the session's name."""
     name = row.get("name") or row["pid"]
@@ -985,12 +1010,7 @@ async def read_board(pool, ref: str, *, since_version: int | None = None,
             # account-limit evidence can appear or clear between item writes.
             # Refresh this bounded presentation field even on an unchanged
             # board so a stale banner cannot persist in the viewer.
-            unchanged_items = await _load_items(conn, board["id"], archived=False)
-            pids = sorted({h["pid"] for it in unchanged_items.values() for h in it.holders})
-            states = {
-                r["pid"]: r for r in await conn.fetch(
-                    "SELECT * FROM session_states WHERE pid = ANY($1::text[])", pids)
-            }
+            unchanged_items, states = await _account_limit_snapshot(conn, board["id"])
             from api.board_engine import account_limit_banner
             return {"unchanged": True, "version": version,
                     "account_limits": account_limit_banner(unchanged_items, states, now)}

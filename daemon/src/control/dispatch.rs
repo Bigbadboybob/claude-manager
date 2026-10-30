@@ -72,12 +72,13 @@
 //! the slice-arc ordering. Don't re-litigate it round by round.
 
 use std::sync::{mpsc, Arc, Mutex};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::attach::{
     self, AttachOpenParams, AttachOpenResponse, SessionAttachParams, SessionAttachResponse,
 };
 use crate::control::methods;
+use crate::control::auth::{check_session_caller, AuthDecision};
 use crate::control::operator;
 use crate::control::protocol::{Caller, ErrorCode, Request, Response};
 use crate::session::SharedLastExit;
@@ -587,6 +588,8 @@ pub fn dispatch_request(
         // results. `send_key` is the MCP tool's name for it (TUI-routed on
         // a laptop, like send_input; a headless host's daemon serves it).
         "session.send_key" | "send_key" => DispatchOutcome::Done(dispatch_send_key(state, req)),
+        "session.resume_many" => DispatchOutcome::Done(dispatch_session_resume_many(state, req)),
+        "session.resume_status" => DispatchOutcome::Done(dispatch_session_resume_status(state, req)),
         "session.send_bound_escape" => DispatchOutcome::Done(dispatch_send_bound_escape(state, req)),
         "session.interrupt" => DispatchOutcome::Done(dispatch_interrupt(state, req)),
         "session.interrupt_authority" => {
@@ -3587,6 +3590,88 @@ fn dispatch_send_key(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response
     }
 }
 
+/// Explicit selected Claude-limit recovery. The operation only publishes
+/// through the durable #69 native journal fence; it never presses a PTY key.
+fn dispatch_session_resume_many(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let Some(values) = req.params.get("session_uids").and_then(Value::as_array) else {
+        return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session_uids must be an array");
+    };
+    let mut uids = Vec::new();
+    for value in values {
+        let Some(uid) = value.as_str().map(str::trim).filter(|uid| !uid.is_empty()) else {
+            return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session_uids must contain nonempty strings");
+        };
+        if !uids.iter().any(|old| old == uid) { uids.push(uid.to_owned()); }
+    }
+    if uids.is_empty() || uids.len() > crate::claude_account_recovery::MAX_BULK_RESUME_TARGETS {
+        return Response::err(req.id.clone(), ErrorCode::InvalidParams,
+            format!("session.resume_many takes 1..{} explicit session UIDs", crate::claude_account_recovery::MAX_BULK_RESUME_TARGETS));
+    }
+    let caller_uid = match &req.caller {
+        Caller::Operator(_) => None,
+        Caller::Session(s) => Some(s.session_uid.clone()),
+    };
+    let mut allowed = Vec::new();
+    let mut refused = Vec::new();
+    if let Some(caller) = caller_uid.as_deref() {
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+        for uid in &uids {
+            match check_session_caller(&st, caller, uid) {
+                AuthDecision::Allow => allowed.push(uid.clone()),
+                AuthDecision::TargetNotInRegistry => refused.push(json!({"session_uid":uid,"status":"refused","reason":"target not found"})),
+                AuthDecision::CallerNotInRegistry => return Response::err(req.id.clone(), ErrorCode::Unauthorized, "caller is not in the daemon registry"),
+                AuthDecision::TaskTreeNotYetSynced => refused.push(json!({"session_uid":uid,"status":"refused","reason":"caller task scope is not synced"})),
+                AuthDecision::OutOfScope => refused.push(json!({"session_uid":uid,"status":"refused","reason":"target is outside caller scope"})),
+            }
+        }
+    } else {
+        allowed = uids.clone();
+    }
+    let mut out = crate::claude_account_recovery::request_many(state, &allowed);
+    if let Some(rows) = out.get_mut("results").and_then(Value::as_array_mut) {
+        rows.extend(refused);
+    }
+    Response::ok(req.id.clone(), out)
+}
+
+fn dispatch_session_resume_status(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let Some(values) = req.params.get("session_uids").and_then(Value::as_array) else {
+        return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session_uids must be an array");
+    };
+    let mut uids = Vec::new();
+    for value in values {
+        let Some(uid) = value.as_str().map(str::trim).filter(|uid| !uid.is_empty()) else {
+            return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session_uids must contain nonempty strings");
+        };
+        if !uids.iter().any(|old| old == uid) { uids.push(uid.to_owned()); }
+    }
+    if uids.is_empty() || uids.len() > crate::claude_account_recovery::MAX_BULK_RESUME_TARGETS {
+        return Response::err(req.id.clone(), ErrorCode::InvalidParams,
+            format!("session.resume_status takes 1..{} explicit session UIDs", crate::claude_account_recovery::MAX_BULK_RESUME_TARGETS));
+    }
+    let mut allowed = Vec::new();
+    let mut refused = Vec::new();
+    if let Caller::Session(caller) = &req.caller {
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+        for uid in &uids {
+            match check_session_caller(&st, &caller.session_uid, uid) {
+                AuthDecision::Allow => allowed.push(uid.clone()),
+                AuthDecision::TargetNotInRegistry => refused.push(json!({"session_uid":uid,"status":"refused","reason":"target not found"})),
+                AuthDecision::CallerNotInRegistry => return Response::err(req.id.clone(), ErrorCode::Unauthorized, "caller is not in the daemon registry"),
+                AuthDecision::TaskTreeNotYetSynced => refused.push(json!({"session_uid":uid,"status":"refused","reason":"caller task scope is not synced"})),
+                AuthDecision::OutOfScope => refused.push(json!({"session_uid":uid,"status":"refused","reason":"target is outside caller scope"})),
+            }
+        }
+    } else {
+        allowed = uids;
+    }
+    let mut out = crate::claude_account_recovery::status_many(state, &allowed);
+    if let Some(rows) = out.get_mut("results").and_then(Value::as_array_mut) {
+        rows.extend(refused);
+    }
+    Response::ok(req.id.clone(), out)
+}
+
 fn dispatch_send_bound_escape(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
     let caller_uid = match &req.caller {
         Caller::Session(s) => Some(s.session_uid.as_str()),
@@ -3825,6 +3910,30 @@ mod tests {
             method: method.into(),
             params,
         }
+    }
+
+    #[test]
+    fn selected_resume_enforces_cap_and_per_target_scope_refusal() {
+        let state = make_state();
+        let too_many = (0..=crate::claude_account_recovery::MAX_BULK_RESUME_TARGETS)
+            .map(|n| format!("uid-{n}"))
+            .collect::<Vec<_>>();
+        let capped = dispatch_request(&state, &operator_request(
+            "session.resume_many", serde_json::json!({"session_uids": too_many}),
+        )).into_response();
+        assert_eq!(capped.error.unwrap().code, ErrorCode::InvalidParams);
+
+        add_session(&state, "resume-caller", "ws-a");
+        add_session(&state, "resume-outside", "ws-b");
+        let scoped = dispatch_request(&state, &session_request(
+            "session.resume_many", serde_json::json!({"session_uids": ["resume-outside"]}),
+            "resume-caller",
+        )).into_response();
+        assert!(scoped.ok, "scope refusals are per target: {:?}", scoped.error);
+        assert_eq!(scoped.result.unwrap()["results"][0]["status"], "refused");
+
+        let mut st = state.lock().unwrap_or_else(|p| p.into_inner());
+        for session in st.sessions.values_mut() { let _ = session.kill(); }
     }
 
     /// A viewer's spawn at a uid a rotation is bringing back (TUI restore or
