@@ -311,6 +311,7 @@ pub struct ClientSession {
     /// description with the socket alacritty owns, so it reflects the real
     /// state without touching alacritty's fd. `None` if the dup failed.
     pub hup_fd: Option<std::os::fd::OwnedFd>,
+    pub attach_progress: Option<Arc<std::sync::Mutex<std::time::Instant>>>,
     pub output_control: Option<crate::attach_writer::OutputControl>,
     /// Kitty graphics passthrough state; `None` when it is off.
     pub graphics: Option<crate::graphics::PaneGraphics>,
@@ -450,6 +451,10 @@ impl ClientSession {
             format!("attach-{}", session_uid),
         )
         .context("wrap attach socket as AttachedPty")?;
+        let attach_progress = open_resp.heartbeat.then(|| Arc::new(std::sync::Mutex::new(std::time::Instant::now())));
+        if let Some(progress) = &attach_progress {
+            pty.set_progress_tracker(progress.clone());
+        }
         // A resumed stream continues `how.resume`'s terminal: its replay is
         // output that terminal never saw, so queries in it are answered.
         let resume = how.resume.as_ref().filter(|_| open_resp.resumed);
@@ -546,6 +551,7 @@ impl ClientSession {
             memory_cap_kill,
             transport_eof,
             hup_fd,
+            attach_progress,
             output_control,
             graphics,
             history_deferred: open_resp.screen,
@@ -1342,6 +1348,7 @@ fn open_attach_socket(
     // Raw output frames instead of base64 JSON; older daemons ignore it and
     // the reader takes either.
     params["binary"] = serde_json::json!(true);
+    params["heartbeat"] = serde_json::json!(true);
     if screen {
         // Older daemons ignore it and replay the whole ring.
         params["replay"] = serde_json::json!("screen");
@@ -1377,6 +1384,7 @@ fn open_attach_socket(
         }
         AttachOpenResp {
             output_flow: result["output_flow"].as_bool().unwrap_or(false),
+            heartbeat: result["heartbeat_interval_secs"] == 10,
             replay_bytes: result["replay_bytes"].as_u64(),
             screen: result["replay"] == "screen",
             resumed: result["replay"] == "resume",
@@ -1421,6 +1429,7 @@ fn open_attach_socket(
 struct AttachOpenResp {
     session_uid: String,
     output_flow: bool,
+    heartbeat: bool,
     /// Replayed ring bytes ahead of live output; absent on older daemons.
     replay_bytes: Option<u64>,
     /// The daemon sent the visible screen only, not the output ring.
@@ -1505,6 +1514,7 @@ fn rpc_attach_open(
     let result = resp.result.context("attach.open response missing result")?;
     Ok(AttachOpenResp {
         output_flow: result["output_flow"].as_bool().unwrap_or(false),
+        heartbeat: false,
         replay_bytes: result["replay_bytes"].as_u64(),
         screen: false,
         resumed: false,
@@ -3117,6 +3127,33 @@ time.sleep(60)
             let config = bash_config(&path, dir.path(), "token", "test", "ws", "test", &[], 80, 24);
             let result = open_attach_socket(&config, "test", false, &AttachHow::default());
             assert_eq!(result.is_ok(), code == ErrorCode::UnknownMethod);
+            if let Ok((_, open)) = result {
+                assert!(!open.heartbeat, "legacy attach.open cannot acknowledge heartbeat");
+            }
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn direct_attach_arms_heartbeat_only_on_matching_acknowledgement() {
+        for (interval, expected) in [(None, false), (Some(10), true), (Some(30), false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("daemon.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = wire::read_request(&mut stream).unwrap().unwrap();
+                assert_eq!(req.method, "attach.direct");
+                assert_eq!(req.params["heartbeat"], true);
+                let mut result = serde_json::json!({"session_uid": "test"});
+                if let Some(interval) = interval {
+                    result["heartbeat_interval_secs"] = serde_json::json!(interval);
+                }
+                wire::write_response(&mut stream, &Response::ok(req.id, result)).unwrap();
+            });
+            let config = bash_config(&path, dir.path(), "token", "test", "ws", "test", &[], 80, 24);
+            let (_, open) = open_attach_socket(&config, "test", false, &AttachHow::default()).unwrap();
+            assert_eq!(open.heartbeat, expected);
             server.join().unwrap();
         }
     }

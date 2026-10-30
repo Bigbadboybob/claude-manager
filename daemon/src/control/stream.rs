@@ -67,6 +67,9 @@ const BASE64: base64::engine::GeneralPurpose = base64::engine::general_purpose::
 /// disconnect is observed promptly, long enough not to busy-spin.
 const FANOUT_RECV_TICK: Duration = Duration::from_millis(250);
 
+/// Negotiated attach liveness frames; quiet viewers receive one every 10s.
+pub const ATTACH_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
 /// A blocked write to an attach viewer gives up after this long without
 /// progress. Long enough for a slow-but-alive viewer, bounded for a dead one.
 pub const ATTACH_STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -101,6 +104,7 @@ pub fn handle_attach_stream(
         kill_attribution,
         request_id,
         binary,
+        heartbeat,
     } = handle;
 
     // Attach streams are long-lived. Clear the read timeout the
@@ -150,6 +154,7 @@ pub fn handle_attach_stream(
                 writer_last_exit,
                 kill_attribution,
                 binary,
+                heartbeat.then_some(ATTACH_HEARTBEAT_INTERVAL),
             );
         });
     let writer_handle = match writer_handle {
@@ -482,7 +487,9 @@ fn run_outbound(
     last_exit: SharedLastExit,
     kill_attribution: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     binary: bool,
+    heartbeat: Option<Duration>,
 ) {
+    let mut last_frame = std::time::Instant::now();
     loop {
         // Check the stop flag every iteration so the writer
         // thread can exit promptly when the inbound side signals
@@ -515,6 +522,7 @@ fn run_outbound(
                     let _ = write_socket.shutdown(std::net::Shutdown::Both);
                     return;
                 }
+                last_frame = std::time::Instant::now();
             }
             Err(crate::attach_output::RecvError::Overflow) => {
                 // A byte gap cannot be fed into an existing terminal parser.
@@ -529,7 +537,15 @@ fn run_outbound(
                 return;
             }
             Err(crate::attach_output::RecvError::Timeout) => {
-                // Liveness tick — loop, recheck stop flag, re-poll.
+                if heartbeat.is_some_and(|interval| last_frame.elapsed() >= interval) {
+                    if let Err(e) = wire::write_stream_frame(&mut write_socket, &StreamFrame::heartbeat(request_id)) {
+                        eprintln!("cm-daemon: attach stream {} heartbeat write error: {}", session_uid, e);
+                        stop.store(true, Ordering::SeqCst);
+                        let _ = write_socket.shutdown(std::net::Shutdown::Both);
+                        return;
+                    }
+                    last_frame = std::time::Instant::now();
+                }
             }
             Err(crate::attach_output::RecvError::Closed) => {
                 // Fanout closed cleanly. Build End-frame payload
@@ -809,6 +825,7 @@ mod tests {
             kill_attribution: session.kill_attribution_cell(),
             request_id: request_id.to_string(),
             binary: false,
+            heartbeat: false,
         }
     }
 
@@ -830,7 +847,7 @@ mod tests {
         let worker_stop = stop.clone();
         let worker = std::thread::spawn(move || run_outbound(writer, rx, "request", "session",
             worker_stop, Arc::new(crate::session::LastExitProbe::new("session".into(), None, 0)),
-            Arc::new(std::sync::Mutex::new(None)), false));
+            Arc::new(std::sync::Mutex::new(None)), false, None));
         // Leave the peer unread so the writer exhausts the kernel send buffer.
         worker.join().unwrap();
         assert!(stop.load(Ordering::SeqCst), "writer failure must stop the connection");
@@ -838,6 +855,38 @@ mod tests {
         let mut partial = Vec::new();
         client.read_to_end(&mut partial).unwrap();
         assert!(!partial.is_empty(), "test must exercise a partial frame write");
+    }
+
+    #[test]
+    fn negotiated_idle_attach_emits_heartbeat_without_pty_output() {
+        let (mut client, writer) = UnixStream::pair().unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (_tx, rx) = crate::attach_output::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker = std::thread::spawn(move || run_outbound(writer, rx, "request", "session",
+            worker_stop, Arc::new(crate::session::LastExitProbe::new("session".into(), None, 0)),
+            Arc::new(std::sync::Mutex::new(None)), false, Some(Duration::from_millis(20))));
+        let frame = wire::read_stream_frame(&mut client).unwrap().unwrap();
+        assert_eq!(frame.kind, StreamKind::Heartbeat);
+        stop.store(true, Ordering::SeqCst);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn legacy_idle_attach_emits_no_heartbeat() {
+        let (mut client, writer) = UnixStream::pair().unwrap();
+        client.set_read_timeout(Some(Duration::from_millis(600))).unwrap();
+        let (_tx, rx) = crate::attach_output::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker = std::thread::spawn(move || run_outbound(writer, rx, "request", "session",
+            worker_stop, Arc::new(crate::session::LastExitProbe::new("session".into(), None, 0)),
+            Arc::new(std::sync::Mutex::new(None)), false, None));
+        let err = wire::read_stream_frame(&mut client).unwrap_err();
+        assert!(matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
+        stop.store(true, Ordering::SeqCst);
+        worker.join().unwrap();
     }
 
     #[test]
