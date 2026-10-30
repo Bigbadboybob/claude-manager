@@ -24,6 +24,18 @@ class ItemToolsTests(unittest.TestCase):
         _, params = self.call(server.item, "a", request_id="mine")
         self.assertEqual(params["request_id"], "mine")
 
+    def test_item_read_is_additive_and_routes_detail_arguments(self):
+        method, params = self.call(server.item_read, 14, board="sfd",
+                                   section="text", field="description", offset=2048)
+        self.assertEqual(method, "item.read")
+        self.assertEqual(params, {"n": 14, "board": "sfd", "section": "text",
+                                  "field": "description", "index": 0, "offset": 2048})
+        with mock.patch.object(control_client, "call", return_value={"ok": 1}) as call:
+            result = asyncio.run(server.mcp._tool_manager.call_tool("item_read", {"n": 14}))
+        self.assertEqual(result, {"ok": 1})
+        self.assertEqual(call.call_args.args[0], "item.read")
+        self.assertIn("item.read", control_client.DAEMON_METHODS)
+
     def test_item_set_status_shorthand_and_clears(self):
         method, params = self.call(server.item_set, 14, "done", note="")
         self.assertEqual(method, "item.set")

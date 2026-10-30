@@ -385,6 +385,36 @@ def item(
 
 
 @mcp.tool()
+def item_read(
+    n: int,
+    board: str | None = None,
+    section: str = "summary",
+    field: str | None = None,
+    index: int = 0,
+    offset: int = 0,
+) -> dict:
+    """Read one board item by number without loading the whole board.
+
+    A closed or archived item can be read by its original number. Any session
+    that can read a board may read its items. The default summary has bounded
+    text and holder/flag previews; its truncation markers identify more detail.
+    For a text field, use section="text" and field="title", "description",
+    "note", "group", "blocked_on" or "job". For full stored JSON, use
+    section="record" or "links". List sections are "holders", "history",
+    "flags" (open), "blocked_by" and "blocks"; each returns one JSON record.
+
+    Detail data is a string of at most 2048 Unicode characters. Follow
+    next_offset with the same section/field/index until it is null; then use
+    next_index for the next list record. Concatenate JSON chunks before
+    parsing them. Each call is a separate snapshot, so refresh if work changes.
+    No board-wide flags, groups or unrelated item histories are returned.
+    A new tool appears in an existing Codex session only after MCP activation
+    and session restart; deployment alone does not update its tool list.
+    """
+    return _items_call("item.read", dict(locals()))
+
+
+@mcp.tool()
 def item_set(
     n: int | list[int],
     status: str | None = None,

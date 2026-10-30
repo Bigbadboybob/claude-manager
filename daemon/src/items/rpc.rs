@@ -13,7 +13,7 @@ use serde_json::{json, Map, Value};
 use std::sync::{Arc, Mutex};
 
 pub const METHODS: &[&str] = &[
-    "item.create", "item.set", "item.resolve", "board.read", "board.settings", "board.owner_blocked",
+    "item.create", "item.read", "item.set", "item.resolve", "board.read", "board.settings", "board.owner_blocked",
     // Org model S3 (doc/org-model.md §7): placement, groups, the on-boards list.
     "item.place", "item.unplace", "group.create", "group.set", "boards.on_boards",
     "epic.set_poc", "epic.staff", "epic.close_plan", "epic.close_apply",
@@ -30,6 +30,7 @@ pub(crate) fn bad(message: impl Into<String>) -> (ErrorCode, String) {
 pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
     let result = Ctx::capture(state, req).and_then(|ctx| match req.method.as_str() {
         "item.create" => item_create(&ctx, &req.params),
+        "item.read" => item_read(&ctx, &req.params),
         "item.set" => item_set(&ctx, &req.params),
         "item.resolve" => item_resolve(state, &ctx, &req.params),
         "board.read" => board_read(&ctx, &req.params),
@@ -1249,6 +1250,32 @@ fn board_read(ctx: &Ctx, params: &Value) -> RpcResult {
     Ok(shape_board(&read, &ctx.pid, params, Utc::now()))
 }
 
+/// One bounded item read. Explicit boards go straight to the API rather
+/// than fetching a board or its unrelated flags. The API resolves a default
+/// caller task without loading a board header or creating a missing board.
+fn item_read(ctx: &Ctx, params: &Value) -> RpcResult {
+    if params.as_object().is_some_and(|obj| obj.keys().any(|key|
+        !matches!(key.as_str(), "board" | "n" | "section" | "field" | "index" | "offset"))) {
+        return Err(bad("unknown item.read parameter"));
+    }
+    let n = params.get("n").and_then(Value::as_i64)
+        .filter(|n| (1..=i32::MAX as i64).contains(n))
+        .ok_or_else(|| bad("n must be a positive item number"))?;
+    let mut body = json!({"n":n});
+    match params.get("board").filter(|v| !v.is_null()) {
+        Some(v) => body["board"] = json!(v.as_str().map(str::trim).filter(|v| !v.is_empty())
+            .ok_or_else(|| bad("board must be a nonempty board reference"))?),
+        None => body["task_id"] = json!(ctx.task_id.as_deref().ok_or_else(||
+            bad("no board: this session has no task; pass board=<slug>"))?),
+    }
+    for key in ["section", "field", "index", "offset"] {
+        if let Some(v) = params.get(key).filter(|v| !v.is_null()) {
+            body[key] = v.clone();
+        }
+    }
+    ctx.api.post("/items/read", &body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1877,6 +1904,40 @@ mod tests {
         assert!(resp.ok, "{:?}", resp.error);
         assert_eq!(resp.result.unwrap()["flags"][0]["title"], "fuse SEJD");
         assert!(seen.lock().unwrap().iter().any(|(m, p, _)| m == "GET" && p == "/boards/sfd"));
+    }
+
+    #[test]
+    fn exact_item_read_uses_only_target_endpoint_and_preserves_read_scope() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let (url, seen) = stub(|method, path, body| match (method, path) {
+            ("POST", "/boards/resolve") => (200, BOARD.into()),
+            ("POST", "/items/read") => (200, json!({"board":body["board"],"n":body["n"],"item":{"title":"target"}}).to_string()),
+            _ => (500, "{}".into()),
+        });
+        let state = state_with_session(root.path(), &url);
+        let result = call(&state, "me-uid", "item.read", json!({"board":"other","n":14,"section":"history","index":2}));
+        assert!(result.ok, "{:?}", result.error);
+        assert_eq!(result.result.unwrap()["item"]["title"], "target");
+        {
+            let log = seen.lock().unwrap();
+            assert_eq!(log.len(), 1);
+            assert_eq!(log[0].1, "/items/read");
+            assert_eq!(log[0].2, json!({"board":"other","n":14,"section":"history","index":2}));
+        }
+        let result = call(&state, "me-uid", "item.read", json!({"n":14}));
+        assert!(result.ok, "{:?}", result.error);
+        {
+            let log = seen.lock().unwrap();
+            assert_eq!(log.len(), 2, "default task must not fetch a board header");
+            assert_eq!(log[1].2, json!({"task_id":"task-a","n":14}));
+        }
+        assert!(matches!(call(&state, "me-uid", "item.read", json!({"n":0})).error.unwrap().code, ErrorCode::InvalidParams));
+        assert!(matches!(call(&state, "me-uid", "item.read", json!({"n":14,"task_id":"forged"})).error.unwrap().code, ErrorCode::InvalidParams));
+        assert!(matches!(call(&state, "ghost", "item.read", json!({"board":"other","n":14})).error.unwrap().code, ErrorCode::Unauthorized));
+        state.lock().unwrap().tui_sessions.get_mut("rl-uid").unwrap().session_type = Some("bash".into());
+        assert!(matches!(call(&state, "rl-uid", "item.read", json!({"board":"other","n":14})).error.unwrap().code, ErrorCode::InvalidParams));
+        assert!(crate::control::dispatch::RESTART_BARRIER_READ_ONLY_METHODS.contains(&"item.read"));
     }
 
     #[test]

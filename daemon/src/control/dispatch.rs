@@ -329,6 +329,7 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "get_initiative",
     "backtest.result",
     "board.read",
+    "item.read",
     "board.owner_blocked",
     "boards.on_boards",
     "gate.receipts",
@@ -956,7 +957,7 @@ pub fn dispatch_request(
                 }
             },
         ),
-        "item.create" | "item.set" | "item.resolve" | "board.read" | "board.settings"
+        "item.create" | "item.read" | "item.set" | "item.resolve" | "board.read" | "board.settings"
         | "board.owner_blocked" | "item.place" | "item.unplace" | "group.create" | "group.set"
         | "boards.on_boards" | "epic.set_poc" | "epic.staff" | "epic.close_plan"
         | "epic.close_apply" | "board.join" | "board.leave" | "board.remove_member" => {

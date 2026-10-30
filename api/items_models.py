@@ -298,6 +298,16 @@ class RosterBody(_Strict):
     filters: RosterFilters
 
 
+class ItemReadBody(_Strict):
+    board: str | None = Field(default=None, min_length=1, max_length=120)
+    task_id: str | None = Field(default=None, min_length=1, max_length=200)
+    n: int = Field(strict=True, ge=1, le=2**31 - 1)
+    section: str = Field(default="summary", min_length=1, max_length=32)
+    field: str | None = Field(default=None, max_length=32)
+    index: int = Field(default=0, strict=True, ge=0, le=2**31 - 2)
+    offset: int = Field(default=0, strict=True, ge=0, le=2**31 - 2)
+
+
 # ---- gate receipts (doc/gate-receipts.md §9) -----------------------------------
 
 class ReceiptBody(_Strict):

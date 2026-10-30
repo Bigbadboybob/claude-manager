@@ -423,6 +423,9 @@ item(title: str | list[str], holder=None, status="active", note=None, group=None
      links: list[str] | None = None, board=None)
   -> {board, items: [{n, title, status, holders}]}
 
+item_read(n: int, board=None, section="summary", field=None, index=0, offset=0)
+  -> {board, n, section, item? | data?, next_offset?, next_index?}
+
 item_set(n: int | list[int], status=None, note=None, holder=None, add_holder=None,
          remove_holder=None, group=None, blocked_by=None, blocked_on=None,
          check_back=None, eta=None, job=None, title=None, links=None, reason=None, board=None,
@@ -450,6 +453,18 @@ item_resolve(n: int, action: "nudge"|"reassign"|"launch"|"block"|"drop"|"answer"
 ```
 
 - A bare string as `item_set`'s second argument is `status`.
+- `item_read(14, board="sfd")` selects exactly #14, including a closed or
+  archived item, without returning other items or board-wide flags. The summary
+  contains 240-character text previews and up to five holders and open flags;
+  truncation markers show when detail remains. For a full field, request
+  `section="text"` with `field="description"` (or title, note, group,
+  blocked_on or job). `record` and `links` return stored JSON. `holders`,
+  `history`, `flags`, `blocked_by` and `blocks` return one JSON record
+  per index. Concatenate up to 2048-character data chunks using `next_offset`,
+  then request `next_index` at offset zero. Each read is a separate snapshot;
+  concurrent edits can change indexes or text, so refresh when consistency
+  matters. Deployment enables the daemon/API method; existing Codex sessions
+  gain a newly named MCP tool only after activation and a session restart.
 - `item_set` on a list of `n` is all-or-nothing. `each=True` writes each item
   on its own and adds `results: [{n, ok, error?}]`, so one refused item does
   not block the rest (bulk housekeeping, e.g. a wave of stale flags). Every

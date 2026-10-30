@@ -1115,6 +1115,31 @@
     "title"
    ]
   },
+  "item_read": {
+   "params": {
+    "board": {
+     "type": "string"
+    },
+    "field": {
+     "type": "string"
+    },
+    "index": {
+     "type": "integer"
+    },
+    "n": {
+     "type": "integer"
+    },
+    "offset": {
+     "type": "integer"
+    },
+    "section": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "n"
+   ]
+  },
   "item_resolve": {
    "params": {
     "action": {
