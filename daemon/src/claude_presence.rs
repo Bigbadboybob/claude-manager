@@ -536,6 +536,35 @@ mod tests {
     }
 
     #[test]
+    fn needs_human81_matching_foreground_result_clears_stale_presence_wait() {
+        use serde_json::json;
+        let mut f = Fixture::new();
+        f.install("waiting-permission"); // Real wait edge at 990, not poll time.
+        let record = |kind: &str, at: i64, content: serde_json::Value| json!({
+            "type":kind, "sessionId":"transcript", "isSidechain":false,
+            "timestamp":chrono::DateTime::from_timestamp(at,0).unwrap().to_rfc3339_opts(chrono::SecondsFormat::Millis,true),
+            "message":{"role":kind,"content":content}}).to_string();
+        let mut lines = vec![
+            record("user",950,json!("do the task")),
+            record("assistant",985,json!([{"type":"tool_use","id":"agent-a","name":"Agent","input":{}}])),
+        ];
+        f.transcript(&(lines.join("\n")+"\n"));
+        let mut c = StateCell::new(0.0, Some(42));
+        c.inputs.presence = f.sample();
+        let blocked = derive(&c.inputs,1000.0);
+        assert_eq!(blocked.state,State::WaitingOnHuman);
+        assert_eq!(blocked.since,990.0);
+        c.inputs.previous = Some(blocked);
+        lines.push(record("user",991,json!([{"type":"tool_result","tool_use_id":"agent-a","content":"completed"}])));
+        lines.push(record("assistant",992,json!([{"type":"tool_use","id":"bash-next","name":"Bash","input":{}}])));
+        f.transcript(&(lines.join("\n")+"\n"));
+        c.inputs.presence = f.sample();
+        let resumed = derive(&c.inputs,1002.0);
+        assert_eq!(resumed.state,State::Working,"matching foreground result must resolve stale waiting presence");
+        assert_eq!(resumed.since,991.0,"the resolving event dates the transition, not the poll or original prompt");
+    }
+
+    #[test]
     fn native_conversation_mismatch_rechecks_cached_presence_after_rebinding() {
         let mut f = Fixture::new();
         f.install("idle");
