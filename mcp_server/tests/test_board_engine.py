@@ -282,6 +282,30 @@ class StrictFlags(unittest.TestCase):
 
 
 class Compose(unittest.TestCase):
+    def test_account_limit_banner_is_fresh_host_summary_and_preserves_unknowns(self):
+        raw = {"source": "presence", "detail": {"error_kind": "rate_limit", "resumes_at": int(NOW.timestamp()) + 900},
+               "last_turn": {"status": "failed"}}
+        row = {**state("errored"), "pid": LANE["pid"], "daemon_id": "d1", "session_uid": "lane",
+               "engine": "claude-code", "host_label": "cm-sessions", "agent_state": raw}
+        it = item(1, holders=(LANE,))
+        got = board_engine.account_limit_banner({1: it}, {LANE["pid"]: row}, NOW)
+        self.assertEqual(len(got), 1)
+        self.assertEqual((got[0]["host"], got[0]["session_count"], got[0]["items"], got[0]["attribution"]),
+                         ("cm-sessions", 1, [1], "historical / attribution unknown"))
+        self.assertIsNone(got[0]["resets_at"], "without an account baseline, an old future reset is historical")
+        self.assertEqual(got[0]["attribution"], "historical / attribution unknown")
+
+        # A generic dialog/error, stale row, and expired reset never become a
+        # false account banner; their raw holder states remain independent.
+        generic = {**row, "agent_state": {"source": "presence", "detail": {"waiting_for": "dialog open"},
+                                           "last_turn": {"status": "failed"}}, "state": "waiting-on-human"}
+        stale = {**row, "reported_at": ago(seconds=board_engine.STATE_FRESH_S + 1)}
+        expired = {**row, "agent_state": {**raw, "detail": {**raw["detail"], "resumes_at": int(NOW.timestamp()) - 1}}}
+        self.assertEqual(board_engine.account_limit_banner({1: it}, {LANE["pid"]: generic}, NOW), [])
+        self.assertEqual(board_engine.account_limit_banner({1: it}, {LANE["pid"]: stale}, NOW), [])
+        self.assertEqual(board_engine.account_limit_banner({1: it}, {LANE["pid"]: expired}, NOW), [])
+
+
     def test_unassigned_reports_item_age_not_flag_age(self):
         it = item(status="open", holders=(), touched=ago(minutes=7))
         flag = {"kind": "unassigned", "n": 1, "detail": None, "raised_at": NOW}
@@ -317,6 +341,23 @@ class Compose(unittest.TestCase):
         digest = compose("sfd", [], {"done": list(range(1, 15))})
         self.assertIn("14 done (#1,#2,#3,#4,#5,#6,#7,#8,#9,#10,+4)", digest)
 
+
+class AccountLimitSnapshot(unittest.IsolatedAsyncioTestCase):
+    async def test_unchanged_read_uses_one_narrow_holder_state_query(self):
+        class Conn:
+            def __init__(self):
+                self.calls = []
+
+            async def fetch(self, query, board_id):
+                self.calls.append((query, board_id))
+                return []
+
+        conn = Conn()
+        items, states = await items_db._account_limit_snapshot(conn, "00000000-0000-0000-0000-000000000001")
+        self.assertEqual((items, states), ({}, {}))
+        self.assertEqual(len(conn.calls), 1)
+        self.assertIn("item_holders", conn.calls[0][0])
+        self.assertIn("session_states", conn.calls[0][0])
 
 DSN = os.environ.get("CM_ITEMS_TEST_DSN")
 ORCH = {"pid": "agent:d1:orch-uid", "name": "orch", "session_uid": "orch-uid", "daemon_id": "d1"}

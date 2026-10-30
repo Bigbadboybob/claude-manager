@@ -147,6 +147,9 @@ impl Board {
     /// Apply a `board.read` reply: `{unchanged}` keeps the current data.
     fn accept(&mut self, v: Value) {
         if v["unchanged"] == true {
+            if let Some(limits) = v.get("account_limits") {
+                self.data["account_limits"] = limits.clone();
+            }
             return;
         }
         self.version = v["board"]["version"].as_i64();
@@ -803,6 +806,27 @@ impl App {
             spans.push(sep());
             let (glyph, style) = self.owner_indicator();
             spans.push(Span::styled(format!("{glyph} {owner} blocked on Owner"), style));
+        }
+        if let Some(limits) = b.data["account_limits"].as_array() {
+            for limit in limits {
+                let host = limit["host"].as_str().unwrap_or("unknown host");
+                let sessions = limit["session_count"].as_i64().unwrap_or(0);
+                let reset = match limit["resets_at"].as_f64() {
+                    Some(at) if at > now_unix() as f64 => format!("resets {}", age((at - now_unix() as f64) as i64)),
+                    _ => "reset unknown".to_owned(),
+                };
+                let attribution = limit["attribution"].as_str().unwrap_or("unknown");
+                let items = limit["items"].as_array().map(|ns| {
+                    ns.iter().filter_map(Value::as_i64).map(|n| format!("#{n}")).collect::<Vec<_>>().join(",")
+                }).unwrap_or_default();
+                spans.push(sep());
+                spans.push(Span::styled(
+                    format!("⚠ Claude usage limit {host}: {sessions} session{} · {reset} · {attribution}{}",
+                            if sessions == 1 { "" } else { "s" },
+                            if items.is_empty() { String::new() } else { format!(" · items {items}") }),
+                    Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD),
+                ));
+            }
         }
         spans.push(sep());
         if unresolved > 0 {
@@ -1863,6 +1887,23 @@ mod tests {
     }
 
     #[test]
+    fn account_limit_banner_shows_reset_and_item_drilldown_without_hiding_flags() {
+        let mut app = test_app();
+        loaded(&mut app);
+        app.board.data["account_limits"] = json!([{
+            "host": "cm-sessions",
+            "session_count": 2,
+            "resets_at": now_unix() + 1800,
+            "items": [3, 4],
+            "attribution": "current"
+        }]);
+        let text = screen_at(&mut app, 160, 34);
+        assert!(text.contains("Claude usage limit cm-sessions: 2 sessions"), "{text}");
+        assert!(text.contains("resets 30m") && text.contains("items #3,#4"), "{text}");
+        assert!(text.contains("⚑ Flags (1)"), "raw holder flags remain visible: {text}");
+    }
+
+    #[test]
     fn free_capacity_expands_and_the_focused_sessions_board_is_preferred() {
         use crossterm::event::{Event, KeyEvent, KeyModifiers};
         let mut app = test_app();
@@ -2183,5 +2224,9 @@ mod tests {
         b.accept(json!({"unchanged":true,"version":7}));
         assert_eq!(b.items().len(), 2);
         assert_eq!(b.selected_n(), Some(2));
+        b.accept(json!({"unchanged":true,"version":7,"account_limits":[{"host":"cm","session_count":1}]}));
+        assert_eq!(b.data["account_limits"][0]["host"], "cm");
+        b.accept(json!({"unchanged":true,"version":7,"account_limits":[]}));
+        assert_eq!(b.data["account_limits"], json!([]), "unchanged empty field clears a resolved banner");
     }
 }

@@ -134,6 +134,11 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "task.register_agent_subtask",
     "session.revive",
     "session.resume",  # Alias of add_session; same Operator gate.
+    # Explicit, caller-selected Claude account-limit recovery and its
+    # read-only outcome census.  Both are daemon-routed so the journal fence
+    # and per-target session authority stay on the owning host.
+    "session.resume_many",
+    "session.resume_status",
     # Operator-only daemon lifecycle/configuration RPCs. Routing does not
     # grant access: the daemon retains each method's authorization gates.
     "daemon.health",

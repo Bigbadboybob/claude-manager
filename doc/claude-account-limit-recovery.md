@@ -31,6 +31,30 @@ final consumer check may complete after disable returns; its receipt is retained
 Transient admission refusals retry until the ten-minute notice bound, then are
 reported as pending and delivery unconfirmed.
 
+Recovery consumers distinguish `refused` (the target or safety fence did not
+admit the action), `submitted` (the write was admitted but no engine edge is
+observed yet), `started` (a newer engine-origin turn edge is present),
+`not_observed` (the bounded observation deadline elapsed without correlated
+engine-start evidence; the native delivery status is returned separately), and
+`uncertain` (the source became untrusted after admission). `submitted`,
+`not_observed`, and `uncertain` are receipts, not proof that assigned work
+resumed; none is permission to resend, and an uncertain receipt is never
+replayed automatically.
+
+`resume_claude_sessions([uid, ...])` is the bounded explicit path for a caller
+that already has `send_input` authority over each selected managed Claude UID
+(at most 32). It reuses the journal's armed episode, account/profile check,
+incarnation fence and native notification admission; it never answers a PTY
+dialog. Each target returns independently. The current admission pass submits
+at most one native recovery event; additional selected targets are returned as
+`refused` with `one native admission per recovery pass`, so callers can make a
+later explicit selection after inspecting the first receipt. `resume_claude_status`
+is read-only and reports the durable fence as `submitted`, `started`,
+`not_observed`, `uncertain`, or `refused`, with the native `delivery_status`.
+A source/incarnation change is uncertain; the deadline without an observed
+start is `not_observed` even if delivery settled, because delivery alone does
+not prove a turn occurred. The retained fence can later resolve to `started`.
+
 Recovery notices use a version-2 envelope, which older MCP consumers leave
 pending. After ten minutes, an unclaimed version-2 notice is reported as
 `pending (delivery unconfirmed — consumer may need MCP reconnect)`; the new

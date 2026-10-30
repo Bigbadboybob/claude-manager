@@ -1775,6 +1775,32 @@
     "task_id"
    ]
   },
+  "resume_claude_sessions": {
+   "params": {
+    "session_uids": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    }
+   },
+   "required": [
+    "session_uids"
+   ]
+  },
+  "resume_claude_status": {
+   "params": {
+    "session_uids": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    }
+   },
+   "required": [
+    "session_uids"
+   ]
+  },
   "rotate_transcript": {
    "params": {
     "reason": {

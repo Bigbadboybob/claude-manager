@@ -3240,6 +3240,32 @@ async def send_key(
 
 
 @mcp.tool()
+async def resume_claude_sessions(session_uids: list[str]) -> dict:
+    """Queue one durable, native Claude account-limit recovery per selected UID.
+
+    The list is explicit and capped at 32. The current daemon admits at most
+    one native event per call; later selected targets receive an independent
+    refusal. Each target passes the same
+    send_input scope check; workflow/continuous/unmanaged sessions and
+    unarmed account episodes return per-target ``refused``. The operation
+    never presses a PTY key. Poll ``resume_claude_status`` for ``started``,
+    ``not_observed``, ``uncertain`` or still ``submitted``; no outcome grants
+    permission to resend and uncertain attempts are never replayed.
+    """
+    if not isinstance(session_uids, list) or not 1 <= len(session_uids) <= 32:
+        return {"error": "invalid_params", "message": "resume_claude_sessions takes 1..32 explicit session UIDs"}
+    return await asyncio.to_thread(control_client.call, "session.resume_many", {"session_uids": session_uids})
+
+
+@mcp.tool()
+async def resume_claude_status(session_uids: list[str]) -> dict:
+    """Read durable outcomes for selected Claude account-limit recoveries."""
+    if not isinstance(session_uids, list) or not 1 <= len(session_uids) <= 32:
+        return {"error": "invalid_params", "message": "resume_claude_status takes 1..32 explicit session UIDs"}
+    return await asyncio.to_thread(control_client.call, "session.resume_status", {"session_uids": session_uids})
+
+
+@mcp.tool()
 def list_sidebar_sections() -> dict:
     """List Owner's work-sidebar subsections and caller-visible workspace choices.
 

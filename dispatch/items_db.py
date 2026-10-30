@@ -967,6 +967,31 @@ async def _free_capacity(conn, board: dict, now: datetime,
     return free, untracked
 
 
+async def _account_limit_snapshot(conn, board_id: str) -> tuple[dict, dict]:
+    """Narrow unchanged-read census: holders + session state only.
+
+    It avoids loading item notes, dependencies, flags, groups or history. The
+    board version remains the item version; heartbeat changes only refresh the
+    additive account-limit presentation field.
+    """
+    rows = await conn.fetch(
+        """SELECT i.number AS n, h.pid, s.*
+             FROM item_holders h
+             JOIN items i ON i.id = h.item_id
+             LEFT JOIN session_states s ON s.pid = h.pid
+            WHERE i.board_id = $1 AND i.archived_at IS NULL""",
+        uuid.UUID(board_id),
+    )
+    items: dict[int, dict] = {}
+    states: dict[str, object] = {}
+    for row in rows:
+        n = int(row["n"])
+        items.setdefault(n, {"n": n, "holders": []})["holders"].append({"pid": row["pid"]})
+        if row["pid"] not in states and row["daemon_id"] is not None:
+            states[row["pid"]] = row
+    return items, states
+
+
 def free_label(row: dict) -> str:
     """`rev1 (for ep)` for a member's assistant, else the session's name."""
     name = row.get("name") or row["pid"]
@@ -981,7 +1006,14 @@ async def read_board(pool, ref: str, *, since_version: int | None = None,
         board = await _board_by_ref(conn, ref)
         version = await _version(conn, board["id"])
         if since_version is not None and since_version == version:
-            return {"unchanged": True, "version": version}
+            # Session heartbeats do not advance the item-board version, but
+            # account-limit evidence can appear or clear between item writes.
+            # Refresh this bounded presentation field even on an unchanged
+            # board so a stale banner cannot persist in the viewer.
+            unchanged_items, states = await _account_limit_snapshot(conn, board["id"])
+            from api.board_engine import account_limit_banner
+            return {"unchanged": True, "version": version,
+                    "account_limits": account_limit_banner(unchanged_items, states, now)}
         header = await _board_header(conn, board, now)
         items = await _load_items(conn, board["id"], archived=archived)
         pids = sorted({h["pid"] for it in items.values() for h in it.holders})
@@ -1062,6 +1094,11 @@ async def read_board(pool, ref: str, *, since_version: int | None = None,
             "items": live,
             "recently_closed": closed,
         }
+        # Account-limit evidence is a host banner only.  The board retains
+        # every raw holder flag because roster/session evidence has no
+        # identity-bound account episode to justify folding it away.
+        from api.board_engine import account_limit_banner
+        out["account_limits"] = account_limit_banner(items, states, now)
         from dispatch import placement
         out["groups"] = await placement.group_rows(conn, board)
         orch_pid = (header.get("orchestrator") or {}).get("pid")
