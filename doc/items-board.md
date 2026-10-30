@@ -327,7 +327,7 @@ FastAPI's standard 422.
 |---|---|---|
 | `POST /boards/resolve` | `{task_id}` or `{ref}` | `board` header (creates if needed) |
 | `GET /boards` | `?open_only=true` | `[board header]` |
-| `GET /boards/{ref}` | `?since_version=&archived=false&q=&history=0` | `{board, items, flags, recently_closed, free_capacity, untracked, launch: {unlaunched: [{n, title, since}], free: [name]}}` (+ `archived` when `archived=true`) or `{unchanged: true, version}` |
+| `GET /boards/{ref}` | `?since_version=&archived=false&q=&history=0` | `{board, items, flags, account_limits, recently_closed, free_capacity, untracked, launch: {unlaunched: [{n, title, since}], free: [name]}}` (+ `archived` when `archived=true`) or `{unchanged: true, version}` |
 | `DELETE /boards/{ref}` | (none) | `{deleted, id, items}`; `409 board_not_empty` with `open_items` while any item is open. Deletes the board's items, history, flags and pushes. For scratch boards |
 | `PATCH /boards/{ref}` | `{actor, settings…, orchestrator_pid?}` | `board` header |
 | `POST /boards/{ref}/items` | `{actor, items: [{title, holders?, status?, note?, group?, blocked_by?, blocked_on?, eta?, check_back?, links?}], request_id?}` (≤ 50, all-or-nothing) | `{board, items, unblocked, warnings}`; a repeated `request_id` on the board returns the first call's items with `replayed: true` |
@@ -438,8 +438,8 @@ item_set(n: int | list[int], status=None, note=None, holder=None, add_holder=Non
 
 board(board=None, view="slim", mine=False, group=None, include_closed=True,
       archived=False, query=None, settings=None)
-  -> {board: {slug, orchestrator, health, backlog_allowed}, flags, items, recently_closed,
-      free_capacity, untracked?, launch?}
+  -> {board: {slug, orchestrator, health, backlog_allowed}, flags, account_limits,
+      items, recently_closed, free_capacity, untracked?, launch?}
   # settings={...}: board.settings first, e.g. {"stale_s": 9000}; the governed
   # settings (orchestrator_pid, steward_pid, backlog_allowed, idle_s, launch_s,
   # max_active_per_holder, check_back_max_s) are Owner's or the orchestrator's
@@ -477,7 +477,16 @@ item_resolve(n: int, action: "nudge"|"reassign"|"launch"|"block"|"drop"|"answer"
   blockers; `holder="none"` hands the item back. A strict board refuses to
   clear the check-back while a free-text block still requires one.
 - `board.read` also takes `since_version` (for the TUI's poll) and then may
-  answer `{unchanged: true, version}`.
+  answer `{unchanged: true, version, account_limits}`; the bounded
+  `account_limits` field is refreshed even when item content is unchanged,
+  because session heartbeats do not advance the item version.
+- `account_limits` is a presentation-only host summary of fresh, positive
+  Claude `rate_limit` evidence. Each row carries `host`, `session_count`,
+  `sessions`, affected item numbers, and `resets_at` when the reset is still
+  future; absent reset means unknown. `attribution="unknown"` is intentional:
+  the roster does not carry an account UUID or identity-bound episode, so the
+  banner never folds away the raw `holder_errored` or `holder_waiting_on_human`
+  flags and never implies that work resumed.
 - `board(view="slim")` returns one line per item, flags first, then by group:
   `#14 active "fuse SEJD" @rl-scale-out[idle 24m] ⚑holder_idle · waiting on JP`;
   a job shows beside the holder's state, never merged with it:

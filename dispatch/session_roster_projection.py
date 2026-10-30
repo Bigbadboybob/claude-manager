@@ -49,6 +49,7 @@ def project_activity(state, reported_at: datetime, state_since, agent_state, now
             "state_since_api_clock": state_since,
             "since_host_clock": _number(raw.get("since")),
             "observed_at_host_clock": _number(raw.get("observed_at")),
+            "engine_turn_started_at_host_clock": _number(raw.get("engine_turn_started_at")),
             "source": source if isinstance(source, str) and source in _SOURCES else None,
             "last_turn_ended_at_host_clock": _number(turn.get("ended_at")),
             "last_turn_status": (turn_status if isinstance(turn_status, str)
@@ -58,6 +59,9 @@ def project_activity(state, reported_at: datetime, state_since, agent_state, now
             "error_kind": error_kind,
             "resumes_at_host_clock": _number(detail.get("resumes_at")),
             "retrying": detail.get("retrying") if isinstance(detail.get("retrying"), bool) else None,
+            "dialog_visible": (detail.get("dialog_visible")
+                               if not stale and isinstance(detail.get("dialog_visible"), bool)
+                               else None),
             "recovery": "not_exported",
         },
     }

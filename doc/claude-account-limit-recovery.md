@@ -31,6 +31,14 @@ final consumer check may complete after disable returns; its receipt is retained
 Transient admission refusals retry until the ten-minute notice bound, then are
 reported as pending and delivery unconfirmed.
 
+Recovery consumers distinguish `refused` (the target or safety fence did not
+admit the action), `submitted` (the write was admitted but no engine edge is
+observed yet), `started` (a newer engine-origin turn edge is present),
+`no_turn` (the existing bounded delivery escape elapsed without an edge), and
+`uncertain` (the source became untrusted after admission). `submitted` and
+`uncertain` are receipts, not proof that assigned work resumed; an uncertain
+receipt is never replayed automatically.
+
 Recovery notices use a version-2 envelope, which older MCP consumers leave
 pending. After ten minutes, an unclaimed version-2 notice is reported as
 `pending (delivery unconfirmed — consumer may need MCP reconnect)`; the new

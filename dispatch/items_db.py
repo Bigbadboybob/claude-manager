@@ -981,7 +981,19 @@ async def read_board(pool, ref: str, *, since_version: int | None = None,
         board = await _board_by_ref(conn, ref)
         version = await _version(conn, board["id"])
         if since_version is not None and since_version == version:
-            return {"unchanged": True, "version": version}
+            # Session heartbeats do not advance the item-board version, but
+            # account-limit evidence can appear or clear between item writes.
+            # Refresh this bounded presentation field even on an unchanged
+            # board so a stale banner cannot persist in the viewer.
+            unchanged_items = await _load_items(conn, board["id"], archived=False)
+            pids = sorted({h["pid"] for it in unchanged_items.values() for h in it.holders})
+            states = {
+                r["pid"]: r for r in await conn.fetch(
+                    "SELECT * FROM session_states WHERE pid = ANY($1::text[])", pids)
+            }
+            from api.board_engine import account_limit_banner
+            return {"unchanged": True, "version": version,
+                    "account_limits": account_limit_banner(unchanged_items, states, now)}
         header = await _board_header(conn, board, now)
         items = await _load_items(conn, board["id"], archived=archived)
         pids = sorted({h["pid"] for it in items.values() for h in it.holders})
@@ -1062,6 +1074,11 @@ async def read_board(pool, ref: str, *, since_version: int | None = None,
             "items": live,
             "recently_closed": closed,
         }
+        # Account-limit evidence is a host banner only.  The board retains
+        # every raw holder flag because roster/session evidence has no
+        # identity-bound account episode to justify folding it away.
+        from api.board_engine import account_limit_banner
+        out["account_limits"] = account_limit_banner(items, states, now)
         from dispatch import placement
         out["groups"] = await placement.group_rows(conn, board)
         orch_pid = (header.get("orchestrator") or {}).get("pid")

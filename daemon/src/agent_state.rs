@@ -69,6 +69,9 @@ pub struct Detail {
     pub retrying: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_tool: Option<String>,
+    /// Positive engine evidence of a visible dialog; absent means unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialog_visible: Option<bool>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -176,6 +179,9 @@ pub struct AgentState {
     /// Latest accepted input or engine start; idle alone cannot complete it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_start_at: Option<f64>,
+    /// Last positively observed engine turn start, distinct from queued input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_turn_started_at: Option<f64>,
     pub last_turn: LastTurn,
     pub background: Background,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -632,6 +638,17 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
     if state == State::Unknown && confirmed_hook_open {
         detail.confirmed_turn_open = Some(true);
     }
+    if state == State::WaitingOnHuman && source == Source::Presence
+        && detail.waiting_for.as_deref() == Some("dialog open") {
+        detail.dialog_visible = Some(true);
+    }
+    let engine_turn_started_at = if source == Source::Relay {
+        relay.and_then(|r| r.turn_started_at)
+    } else if matches!(source, Source::Hooks | Source::Presence) {
+        hooks.prompt_at
+    } else {
+        None
+    };
     AgentState {
         state,
         since: entered.min(now),
@@ -643,6 +660,7 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
         // Publish stable event time, not the wall-clock conversion of a legacy
         // Instant on each read (which would churn diffs and evidence hashes).
         latest_start_at: max_time(input.latest_start, relay.and_then(|r| r.turn_started_at)),
+        engine_turn_started_at,
         last_turn,
         background: input.background.clone(),
         stalled_since,
@@ -1915,6 +1933,38 @@ mod tests {
         }
         c.apply(hook(HookEvent::Stop, 2001.0), 2001.0).unwrap();
         assert_eq!(c.recompute(2003.0).state, State::Idle);
+    }
+
+    #[test]
+    fn engine_start_is_not_the_input_admission_timestamp() {
+        let mut c = StateCell::new(0.0, None);
+        c.inputs = presence(PresenceStatus::Idle);
+        c.note_input(1000.0);
+        assert_eq!(c.recompute(1001.0).latest_start_at, Some(1000.0));
+        assert_eq!(c.recompute(1001.0).engine_turn_started_at, None);
+        c.apply(hook(HookEvent::UserPromptSubmit, 1002.0), 1002.0).unwrap();
+        assert_eq!(c.recompute(1003.0).engine_turn_started_at, Some(1002.0));
+
+        let mut i = relay(RelayStatus::Idle);
+        i.latest_start = Some(1000.0);
+        i.relay.as_mut().unwrap().turn_started_at = Some(900.0);
+        let state = derive(&i, 1001.0);
+        assert_eq!(state.latest_start_at, Some(1000.0));
+        assert_eq!(state.engine_turn_started_at, Some(900.0));
+    }
+
+    #[test]
+    fn dialog_visibility_never_infers_absence_or_a_limit_cause() {
+        let mut i = presence(PresenceStatus::Waiting);
+        i.presence.as_mut().unwrap().waiting_for = Some("dialog open".into());
+        let state = derive(&i, 1000.0);
+        assert_eq!(state.state, State::WaitingOnHuman);
+        assert_eq!(state.detail.dialog_visible, Some(true));
+        assert!(state.detail.error_kind.is_none());
+        i.presence.as_mut().unwrap().waiting_for = Some("permission prompt".into());
+        assert_eq!(derive(&i, 1000.0).detail.dialog_visible, None);
+        i.presence.as_mut().unwrap().valid = false;
+        assert_eq!(derive(&i, 1000.0).detail.dialog_visible, None);
     }
 
     #[test]

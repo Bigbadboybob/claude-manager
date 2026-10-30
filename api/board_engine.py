@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import uuid
 from datetime import datetime, timedelta
 
@@ -116,6 +117,66 @@ def background_busy(row: dict | None, now: datetime) -> bool:
         return True
     jobs = ((row.get("agent_state") or {}).get("background") or {}).get("jobs") or []
     return any(isinstance(j, dict) and j.get("wakes_agent") for j in jobs)
+
+
+def account_limit_banner(items: dict[int, Item], states: dict, now: datetime) -> list[dict]:
+    """Summarize fresh, positive Claude limit evidence by host.
+
+    This is deliberately presentation-only.  It never removes holder flags:
+    the daemon does not export an account UUID or an identity-bound episode,
+    so same-account attribution after a login switch remains unknown.  A
+    current synthetic failure with a future (or absent) reset is enough for a
+    host banner; stale, reset-expired, non-Claude, and generic dialog/error
+    rows remain visible through their ordinary flags.
+    """
+    hosts: dict[str, dict] = {}
+    for item in items.values():
+        for holder in item.holders:
+            pid = holder["pid"]
+            row = states.get(pid) or {}
+            if not isinstance(row, dict):
+                row = dict(row)
+            if row.get("engine") not in ("claude-code", "claude") or row.get("exited_at") is not None:
+                continue
+            reported = row.get("reported_at")
+            if not isinstance(reported, datetime) or _seconds(now - reported) > STATE_FRESH_S:
+                continue
+            raw = row.get("agent_state")
+            if not isinstance(raw, dict) or raw.get("source") != "presence" or row.get("state") != "errored":
+                continue
+            detail = raw.get("detail") if isinstance(raw.get("detail"), dict) else {}
+            turn = raw.get("last_turn") if isinstance(raw.get("last_turn"), dict) else {}
+            if detail.get("error_kind") != "rate_limit" or turn.get("status") != "failed":
+                continue
+            reset = detail.get("resumes_at")
+            if isinstance(reset, bool) or not isinstance(reset, (int, float)):
+                reset = None
+            elif not math.isfinite(reset) or reset <= now.timestamp():
+                # A known old reset must not keep a banner alive after the
+                # provider says the window has elapsed.
+                continue
+            daemon = str(row.get("daemon_id") or (pid.split(":", 2)[1] if pid.count(":") >= 2 else ""))
+            host = str(row.get("host_label") or daemon or "unknown host")
+            entry = hosts.setdefault(host, {"daemon_id": daemon, "daemon_ids": [], "host": host,
+                                            "sessions": [], "items": [], "resets_at": None})
+            if daemon and daemon not in entry["daemon_ids"]:
+                entry["daemon_ids"].append(daemon)
+            uid = row.get("session_uid") or pid
+            if uid not in entry["sessions"]:
+                entry["sessions"].append(uid)
+            if item.n not in entry["items"]:
+                entry["items"].append(item.n)
+            if reset is not None and (entry["resets_at"] is None or reset < entry["resets_at"]):
+                entry["resets_at"] = reset
+    for entry in hosts.values():
+        entry["daemon_ids"].sort()
+        entry["sessions"].sort()
+        entry["items"].sort()
+        entry["session_count"] = len(entry["sessions"])
+        entry["item_count"] = len(entry["items"])
+        entry["cause"] = "rate_limit"
+        entry["attribution"] = "unknown"
+    return sorted(hosts.values(), key=lambda e: (e["host"].lower(), e["daemon_id"]))
 
 
 def stale_step(item: Item, board: dict, now: datetime) -> str:

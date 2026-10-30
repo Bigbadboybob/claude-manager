@@ -282,6 +282,28 @@ class StrictFlags(unittest.TestCase):
 
 
 class Compose(unittest.TestCase):
+    def test_account_limit_banner_is_fresh_host_summary_and_preserves_unknowns(self):
+        raw = {"source": "presence", "detail": {"error_kind": "rate_limit", "resumes_at": int(NOW.timestamp()) + 900},
+               "last_turn": {"status": "failed"}}
+        row = {**state("errored"), "pid": LANE["pid"], "daemon_id": "d1", "session_uid": "lane",
+               "engine": "claude-code", "host_label": "cm-sessions", "agent_state": raw}
+        it = item(1, holders=(LANE,))
+        got = board_engine.account_limit_banner({1: it}, {LANE["pid"]: row}, NOW)
+        self.assertEqual(len(got), 1)
+        self.assertEqual((got[0]["host"], got[0]["session_count"], got[0]["items"], got[0]["attribution"]),
+                         ("cm-sessions", 1, [1], "unknown"))
+        self.assertEqual(got[0]["resets_at"], int(NOW.timestamp()) + 900)
+
+        # A generic dialog/error, stale row, and expired reset never become a
+        # false account banner; their raw holder states remain independent.
+        generic = {**row, "agent_state": {"source": "presence", "detail": {"waiting_for": "dialog open"},
+                                           "last_turn": {"status": "failed"}}, "state": "waiting-on-human"}
+        stale = {**row, "reported_at": ago(seconds=board_engine.STATE_FRESH_S + 1)}
+        expired = {**row, "agent_state": {**raw, "detail": {**raw["detail"], "resumes_at": int(NOW.timestamp()) - 1}}}
+        self.assertEqual(board_engine.account_limit_banner({1: it}, {LANE["pid"]: generic}, NOW), [])
+        self.assertEqual(board_engine.account_limit_banner({1: it}, {LANE["pid"]: stale}, NOW), [])
+        self.assertEqual(board_engine.account_limit_banner({1: it}, {LANE["pid"]: expired}, NOW), [])
+
     def test_unassigned_reports_item_age_not_flag_age(self):
         it = item(status="open", holders=(), touched=ago(minutes=7))
         flag = {"kind": "unassigned", "n": 1, "detail": None, "raised_at": NOW}

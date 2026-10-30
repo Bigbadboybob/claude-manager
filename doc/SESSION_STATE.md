@@ -21,12 +21,13 @@ agent_state = {
          idle | starting | exited | unknown,
   since: unix_s,
   detail: {waiting_for?, error_kind?, resumes_at?, retrying?, open_tool?,
-           input_pending?, no_turn_at?, confirmed_turn_open?},
+           input_pending?, no_turn_at?, confirmed_turn_open?, dialog_visible?},
   source: presence | hooks | relay | transcript | pty,
   observed_at: unix_s,
   engine_version?: string,
   turn_seq: u64,
   latest_start_at?: unix_s,
+  engine_turn_started_at?: unix_s,
   last_turn: {ended_at: unix_s | null,
               status: completed | interrupted | failed | null},
   background: {
@@ -58,6 +59,13 @@ when a delivery hold expires: idle then describes the engine, while
 not completed. Old brains omit the field. A newly observed relay turn can
 reconcile a fractional accepted-input timestamp to Codex's whole-second start;
 an unchanged older completion never gets that allowance.
+
+`engine_turn_started_at` is the latest engine-origin Claude prompt hook or
+Codex relay turn-start edge, not CM's queued or written-input timestamp. It
+does not by itself prove which prompt or recovery attempt started the turn.
+`detail.dialog_visible=true` requires a valid Claude presence observation of
+`dialog open` while the state is waiting on a human. The dialog's cause is
+not established; absence of the field means unknown, not no dialog.
 
 Local slash commands and empty sends record a delivery without advancing
 `latest_start_at` or `turn_seq`. The delivery token records actual Enter,

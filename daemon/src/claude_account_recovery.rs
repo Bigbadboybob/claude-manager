@@ -51,6 +51,36 @@ pub(crate) struct LimitRecord {
     pub reset_at: Option<i64>,
 }
 
+/// Classify an explicitly admitted recovery attempt from two state samples.
+/// An accepted write is only `submitted`; it becomes `started` after a new
+/// engine edge, `no_turn` after the existing bounded delivery escape, and
+/// `uncertain` when the source is no longer trustworthy.  Callers must keep
+/// `uncertain` receipts durable and must never replay them automatically.
+pub(crate) fn resume_outcome(
+    before: &crate::agent_state::AgentState,
+    after: &crate::agent_state::AgentState,
+    admitted: bool,
+) -> &'static str {
+    if !admitted {
+        return "refused";
+    }
+    let started = after.engine_turn_started_at.is_some_and(|at| {
+        before.engine_turn_started_at.is_none_or(|old| at > old)
+    });
+    if started {
+        return "started";
+    }
+    if after.detail.no_turn_at.is_some_and(|at| {
+        before.latest_start_at.is_none_or(|old| at >= old)
+    }) {
+        return "no_turn";
+    }
+    if matches!(after.state, crate::agent_state::State::Unknown | crate::agent_state::State::Exited) {
+        return "uncertain";
+    }
+    "submitted"
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 struct Episode {
     uid: String,
@@ -1241,6 +1271,37 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Interrupted);
         assert!(resizer.join().unwrap() < std::time::Duration::from_secs(1));
         assert_eq!(resize_writes.lock().unwrap().len(), 1, "resize during paste withholds Enter");
+    }
+
+    #[test]
+    fn resume_outcome_requires_a_new_engine_edge_and_preserves_uncertainty() {
+        let before = crate::agent_state::AgentState {
+            state: crate::agent_state::State::Errored,
+            since: 100.0,
+            detail: Default::default(),
+            source: crate::agent_state::Source::Presence,
+            observed_at: 100.0,
+            engine_version: None,
+            turn_seq: 3,
+            latest_start_at: Some(90.0),
+            engine_turn_started_at: Some(80.0),
+            last_turn: crate::agent_state::LastTurn { ended_at: Some(90.0), status: Some(crate::agent_state::TurnStatus::Failed) },
+            background: Default::default(),
+            stalled_since: None,
+        };
+        let mut after = before.clone();
+        assert_eq!(resume_outcome(&before, &after, false), "refused");
+        assert_eq!(resume_outcome(&before, &after, true), "submitted");
+        after.turn_seq = 4;
+        after.engine_turn_started_at = Some(101.0);
+        assert_eq!(resume_outcome(&before, &after, true), "started");
+        after.engine_turn_started_at = before.engine_turn_started_at;
+        after.turn_seq = before.turn_seq;
+        after.detail.no_turn_at = Some(106.0);
+        assert_eq!(resume_outcome(&before, &after, true), "no_turn");
+        after.detail.no_turn_at = None;
+        after.state = crate::agent_state::State::Unknown;
+        assert_eq!(resume_outcome(&before, &after, true), "uncertain");
     }
     #[test]
     fn actual_attempt_rechecks_manager_disable_and_new_user_before_writing() {

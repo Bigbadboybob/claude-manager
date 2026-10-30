@@ -53,3 +53,16 @@ class ActivityTests(unittest.TestCase):
             self.assertEqual(out["activity"]["state"], "waiting-on-human")
             self.assertEqual(out["activity"]["since_host_clock"], 990.0)
             self.assertEqual(out["activity"]["observed_at_host_clock"], observed)
+
+    def test_engine_start_and_dialog_are_separate_from_input_and_staleness(self):
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        raw = {"source": "presence", "latest_start_at": 200.0,
+               "engine_turn_started_at": 100.0, "detail": {"dialog_visible": True}}
+        fresh = project_activity("waiting-on-human", now, None, raw, now)
+        self.assertEqual(fresh["activity"]["engine_turn_started_at_host_clock"], 100.0)
+        self.assertIs(fresh["limit"]["dialog_visible"], True)
+        stale = project_activity("waiting-on-human", now - timedelta(seconds=91), None, raw, now)
+        self.assertIsNone(stale["limit"]["dialog_visible"])
+        unknown = project_activity("idle", now, None, {"latest_start_at": 200.0}, now)
+        self.assertIsNone(unknown["activity"]["engine_turn_started_at_host_clock"])
+        self.assertIsNone(unknown["limit"]["dialog_visible"])

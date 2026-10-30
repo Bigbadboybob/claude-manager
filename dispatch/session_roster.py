@@ -48,6 +48,9 @@ facts AS MATERIALIZED (
              'observed_at', CASE WHEN jsonb_typeof(s.agent_state->'observed_at') = 'number'
                                       AND length(s.agent_state->>'observed_at') <= 32
                                  THEN s.agent_state->'observed_at' END,
+             'engine_turn_started_at', CASE WHEN jsonb_typeof(s.agent_state->'engine_turn_started_at') = 'number'
+                                      AND length(s.agent_state->>'engine_turn_started_at') <= 32
+                                 THEN s.agent_state->'engine_turn_started_at' END,
              'last_turn', jsonb_build_object(
                'status', left(s.agent_state#>>'{last_turn,status}', 16),
                'ended_at', CASE WHEN jsonb_typeof(s.agent_state#>'{last_turn,ended_at}') = 'number'
@@ -58,6 +61,8 @@ facts AS MATERIALIZED (
                'resumes_at', CASE WHEN jsonb_typeof(s.agent_state#>'{detail,resumes_at}') = 'number'
                                        AND length(s.agent_state#>>'{detail,resumes_at}') <= 32
                                   THEN s.agent_state#>'{detail,resumes_at}' END,
+               'dialog_visible', CASE WHEN jsonb_typeof(s.agent_state#>'{detail,dialog_visible}') = 'boolean'
+                                  THEN s.agent_state#>'{detail,dialog_visible}' END,
                'retrying', CASE WHEN jsonb_typeof(s.agent_state#>'{detail,retrying}') = 'boolean'
                                 THEN s.agent_state#>'{detail,retrying}' END)
            ) AS agent_state,
