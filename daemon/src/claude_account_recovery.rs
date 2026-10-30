@@ -1268,7 +1268,7 @@ mod tests {
                 native_session_id:Some(SESSION.into()), engine_version:Some("2.1.312".into()),
                 waiting_for:None, main_turn_open:None, transcript_error:Some("rate_limit".into()),
                 transcript_end:Some(crate::agent_state::LastTurn { ended_at:Some((now - 120) as f64), status:Some(crate::agent_state::TurnStatus::Failed) }),
-                transcript_evidence_path:Some(transcript.clone()) });
+                transcript_evidence_path:Some(transcript.clone()), wait_resolution:None });
             cell.inputs.latest_start = Some((now - 180) as f64); cell.inputs.background.complete = true;
         }
         session.fanout.push("\x1b[>1u\x1b[?25h\x1b[HUsage limit\r\n❯ \x1b[2;3H".as_bytes());
@@ -1322,7 +1322,7 @@ mod tests {
                 native_session_id:Some(SESSION.into()), engine_version:Some("2.1.312".into()), waiting_for:None,
                 main_turn_open:None, transcript_error:Some("rate_limit".into()),
                 transcript_end:Some(crate::agent_state::LastTurn { ended_at:Some((now - 120) as f64), status:Some(crate::agent_state::TurnStatus::Failed) }),
-                transcript_evidence_path:Some(transcript.clone()) });
+                transcript_evidence_path:Some(transcript.clone()), wait_resolution:None });
             cell.inputs.latest_start = Some((now - 180) as f64); cell.inputs.background.complete = true;
             cell.inputs.background.jobs.push(serde_json::from_value(json!({"id":"bg","label":"bg","kind":"shell","first_seen_at":1.0,"wakes_agent":true})).unwrap());
         }
