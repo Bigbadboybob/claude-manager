@@ -350,6 +350,7 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # planning API. The daemon stamps the caller as actor and resolves holder
     # names; there is no TUI handler and no PlanningClient fallback.
     "item.create",
+    "item.read",
     # Org model S3 (doc/org-model.md §7): placement, groups, epics, on-boards.
     "item.place",
     "item.unplace",

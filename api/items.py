@@ -26,6 +26,7 @@ from api.items_models import (
     RefreshBody,
     ItemsChatTouchBody,
     HeartbeatBody,
+    ItemReadBody,
     RosterBody,
     BoardResolveBody,
     ItemResolveBody,
@@ -35,7 +36,7 @@ from api.items_models import (
 )
 import logging
 
-from dispatch import epics, gate_db, items_db, org_db, placement, session_roster
+from dispatch import epics, gate_db, item_read, items_db, org_db, placement, session_roster
 from dispatch.items_rules import ItemsError
 
 router = APIRouter(dependencies=[Depends(verify_token)])
@@ -76,6 +77,13 @@ async def resolve_board(body: BoardResolveBody, request: Request):
         })
     return await _call(items_db.resolve_board(
         _pool(request), task_id=body.task_id, ref=body.ref))
+
+
+@router.post("/items/read")
+async def read_one_item(body: ItemReadBody, request: Request):
+    return await _call(item_read.read(_pool(request), body.board, body.n,
+        task_id=body.task_id, section=body.section, field=body.field,
+        index=body.index, offset=body.offset))
 
 
 @router.get("/boards")

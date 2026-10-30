@@ -134,6 +134,12 @@ everyone who holds what, with each holder's live state, so nobody has to ask.
   who is free; `board(mine=True)` filters items, while flags remain board-wide.
   `board(flags_only=True)` lists all open flags with item title, holders and
   block/check-back context, without item bodies. Any session may read any board.
+- Read one item with `item_read(n, board=...)`: its summary is bounded;
+  `section="text"` plus `field` retrieves omitted text in chunks, and
+  `section="holders"` or `section="history"` pages one JSON record at a
+  time. Follow `next_offset`, then `next_index`; each call is a separate
+  snapshot. New tools appear in an existing Codex session only after MCP
+  activation and session restart.
 - Any item on a board can be edited by sessions whose task belongs to that
   board, by anyone holding an item there, by `global_perms` sessions and by
   Owner; every session can read every board. History is kept, so give a short

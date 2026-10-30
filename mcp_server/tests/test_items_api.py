@@ -14,6 +14,7 @@ Without it only the migration text checks run.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import unittest
 import uuid
@@ -97,6 +98,118 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
 
     async def post(self, path, body):
         return await self.http.post(path, json=body)
+
+    async def test_item_read_exact_number_is_bounded_and_detail_is_retrievable(self):
+        await self.create("unrelated-one", "target", "unrelated-three")
+        description = ("🔬quoted\n" * 900) + "END"
+        async with self.pool.acquire() as conn:
+            item_id = await conn.fetchval("SELECT id FROM items WHERE board_id=$1 AND number=2",
+                                          uuid.UUID(self.board["id"]))
+            first_id = await conn.fetchval("SELECT id FROM items WHERE board_id=$1 AND number=1",
+                                           uuid.UUID(self.board["id"]))
+            third_id = await conn.fetchval("SELECT id FROM items WHERE board_id=$1 AND number=3",
+                                           uuid.UUID(self.board["id"]))
+            await conn.execute("INSERT INTO item_deps(item_id,blocker_id) VALUES($1,$2),($3,$1)",
+                               item_id, first_id, third_id)
+            await conn.execute("UPDATE items SET description=$2, note=$3, archived_at=now() WHERE id=$1",
+                               item_id, description, "n" * 2000)
+            await conn.execute("DELETE FROM item_holders WHERE item_id=$1", item_id)
+            await conn.executemany(
+                "INSERT INTO item_holders(item_id,pid,name,role,attribution) VALUES($1,$2,$3,'reviewer',$4)",
+                [(item_id, f"agent:d:{i}", f"holder-{i}", {"proof": "p" * 6000}) for i in range(8)])
+            await conn.execute("""INSERT INTO item_events(board_id,item_id,item_number,actor_pid,type,new)
+                VALUES($1,$2,2,'owner','updated',$3)""", uuid.UUID(self.board["id"]), item_id,
+                {"evidence": "q" * 7000})
+            await conn.execute("INSERT INTO item_flags(item_id,kind) VALUES($1,'stale')", item_id)
+            await conn.executemany(
+                "INSERT INTO items(board_id,number,title,status) VALUES($1,$2,$3,'active')",
+                [(uuid.UUID(self.board["id"]), n, "unrelated-" + str(n)) for n in range(4, 504)])
+        with mock.patch.object(items_db, "_load_items", side_effect=AssertionError("whole board loaded")), \
+             mock.patch.object(items_db, "_board_header", side_effect=AssertionError("whole board header loaded")):
+            response = await self.post("/items/read", {"board": self.ref, "n": 2})
+            self.assertEqual(response.status_code, 200, response.text)
+            summary = response.json()
+            self.assertEqual(summary["item"]["title"], "target")
+            self.assertTrue(summary["item"]["truncated"]["description"])
+            self.assertTrue(summary["item"]["truncated"]["note"])
+            self.assertTrue(summary["item"]["holders_more"])
+            self.assertEqual(len(summary["item"]["holders"]), 5)
+            self.assertEqual([f["kind"] for f in summary["item"]["flags"]], ["stale"])
+            self.assertEqual(summary["item"]["blocked_by"], [1])
+            self.assertEqual(summary["item"]["blocks"], [3])
+            self.assertNotIn("unrelated-one", response.text)
+            self.assertLess(len(response.content), 12000)
+
+            async def collect(section, **extra):
+                offset, pieces = 0, []
+                while True:
+                    r = await self.post("/items/read", {"board": self.ref, "n": 2,
+                        "section": section, "offset": offset, **extra})
+                    self.assertEqual(r.status_code, 200, r.text)
+                    page = r.json()
+                    self.assertLessEqual(len(page["data"]), 2048)
+                    self.assertLess(len(r.content), 15000)
+                    pieces.append(page["data"])
+                    if page["next_offset"] is None:
+                        return "".join(pieces), page
+                    offset = page["next_offset"]
+
+            full_description, _ = await collect("text", field="description")
+            self.assertEqual(full_description, description)
+            holder, holder_page = await collect("holders", index=0)
+            self.assertEqual(json.loads(holder)["attribution"]["proof"], "p" * 6000)
+            self.assertEqual(holder_page["next_index"], 1)
+            event, event_page = await collect("history", index=0)
+            self.assertEqual(json.loads(event)["new"]["evidence"], "q" * 7000)
+            self.assertEqual(event_page["next_index"], 1)
+            record, _ = await collect("record")
+            self.assertEqual(json.loads(record)["note"], "n" * 2000)
+            flag, _ = await collect("flags", index=0)
+            self.assertEqual(json.loads(flag)["kind"], "stale")
+            blocker, _ = await collect("blocked_by", index=0)
+            self.assertEqual(json.loads(blocker)["n"], 1)
+
+    async def test_item_read_uses_linked_task_title_and_description(self):
+        await self.create("old-title")
+        task = await self._task("live-task-title")
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE tasks SET description=$2, description_rev=7 WHERE id=$1",
+                               uuid.UUID(task), "task description")
+            await conn.execute("UPDATE items SET task_id=$1, description='old text' WHERE board_id=$2 AND number=1",
+                               uuid.UUID(task), uuid.UUID(self.board["id"]))
+        r = await self.post("/items/read", {"board": self.ref, "n": 1})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["item"]["title"], "live-task-title")
+        self.assertEqual(r.json()["item"]["description"], "task description")
+        self.assertEqual(r.json()["item"]["description_rev"], 7)
+        r = await self.post("/items/read", {"board": self.ref, "n": 1,
+                                           "section": "text", "field": "description"})
+        self.assertEqual(r.json()["data"], "task description")
+
+    async def test_item_read_missing_invalid_and_any_board_reader(self):
+        await self.create("only")
+        for body in ({"board": self.ref, "n": 0}, {"board": self.ref, "n": True},
+                     {"board": self.ref, "n": 1, "section": "text", "field": "bad"},
+                     {"board": self.ref, "n": 1, "section": "history", "offset": -1}):
+            r = await self.post("/items/read", body)
+            self.assertEqual(r.status_code, 422, r.text)
+        for body in ({"board": self.ref, "n": 999}, {"board": "no-such-board", "n": 1}):
+            r = await self.post("/items/read", body)
+            self.assertEqual(r.status_code, 404, r.text)
+        r = await self.http.post("/items/read", json={"board": self.ref, "n": 1}, headers={"Authorization": "Bearer wrong"})
+        self.assertEqual(r.status_code, 401)
+        # The existing board read policy permits any authenticated session to
+        # read an explicit board; no edit membership is required.
+        r = await self.post("/items/read", {"board": self.ref, "n": 1})
+        self.assertEqual(r.status_code, 200, r.text)
+        with mock.patch.object(items_db, "_board_header", side_effect=AssertionError("whole board header loaded")):
+            r = await self.post("/items/read", {"task_id": self.root, "n": 1})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["item"]["title"], "only")
+        r = await self.post("/items/read", {"board": self.ref, "task_id": self.root, "n": 1})
+        self.assertEqual(r.status_code, 422, r.text)
+        r = await self.post("/items/read", {"task_id": str(uuid.uuid4()), "n": 1})
+        self.assertEqual(r.status_code, 404, r.text)
 
     async def create(self, *specs, actor=ORCH, ok=True):
         r = await self.post(f"/boards/{self.ref}/items", {
