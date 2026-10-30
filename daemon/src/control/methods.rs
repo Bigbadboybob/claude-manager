@@ -3603,6 +3603,21 @@ pub fn session_agent_report(
     if !correct_engine {
         return Err((ErrorCode::InvalidParams, "report kind does not match the session engine".into()));
     }
+    // Permission hooks inherit the parent's CM identity in nested engines.
+    // They cannot rebind the main transcript or report a different conversation.
+    if let crate::agent_state::Report::Hook {
+        event: crate::agent_state::HookEvent::PermissionRequest | crate::agent_state::HookEvent::Notification,
+        payload,
+    } = &p.report {
+        let bound = session.transcript_path.as_deref().map(std::path::Path::new);
+        let foreign = payload.agent_id.is_some()
+            || bound.is_some_and(|path| payload.session_id.as_deref().is_some_and(|id|
+                path.file_stem().and_then(|s| s.to_str()) != Some(id))
+                || payload.transcript_path.as_deref().is_some_and(|reported| std::path::Path::new(reported) != path));
+        if foreign {
+            return Ok(json!({"ok":true,"applied":false,"agent_state":crate::agent_state::current(session)}));
+        }
+    }
     // Establish a pre-report baseline even if the periodic tick has not run yet.
     crate::agent_state::recompute_and_publish(&state, &p.session_uid);
     let continuing = matches!(&p.report, crate::agent_state::Report::Hook {
@@ -25948,7 +25963,7 @@ while True:
             s.sessions[&uid].agent_state.lock().unwrap().inputs.presence = Some(crate::agent_state::PresenceObs {
                 valid: true, status: crate::agent_state::PresenceStatus::Idle,
                 observed_at: now_unix_f64(), status_updated_at: Some(now_unix_f64() - 60.0), native_session_id: None,
-                engine_version: None, waiting_for: None, main_turn_open: None, transcript_error: None, transcript_end: None, transcript_evidence_path: None,
+                engine_version: None, waiting_for: None, main_turn_open: None, transcript_error: None, transcript_end: None, transcript_evidence_path: None, wait_resolution: None,
             });
         }
         let params = json!({ "session_uid": &uid, "text": "implement the fix" });
@@ -37814,7 +37829,7 @@ while True:
                         engine_version: None,
                         waiting_for: None,
                         main_turn_open: Some(false),
-                        transcript_error: None, transcript_end: None, transcript_evidence_path: None,
+                        transcript_error: None, transcript_end: None, transcript_evidence_path: None, wait_resolution: None,
                     });
                     cell.inputs.hooks.stop_at = Some(now - 30.0);
                 }
@@ -37886,7 +37901,7 @@ while True:
                     engine_version: None,
                     waiting_for: None,
                     main_turn_open: None,
-                    transcript_error: None, transcript_end: None, transcript_evidence_path: None,
+                    transcript_error: None, transcript_end: None, transcript_evidence_path: None, wait_resolution: None,
                 });
             }
             assert!(!crate::control::continuous_drain::notice_ready(
@@ -37956,7 +37971,7 @@ while True:
                         valid, status: PresenceStatus::Idle, observed_at: now_unix_f64() - 100.0,
                         status_updated_at: None, native_session_id: None,
                         engine_version: None, waiting_for: None, main_turn_open: None,
-                        transcript_error: Some("unverified".into()), transcript_end: None, transcript_evidence_path: None,
+                        transcript_error: Some("unverified".into()), transcript_end: None, transcript_evidence_path: None, wait_resolution: None,
                     });
                 }
                 let resolved = resolve_authorized_session(&state, &json!({"session_uid":uid}), None).unwrap();
@@ -38128,7 +38143,7 @@ while True:
                         // the presence status timestamp cannot date the hint.
                         transcript_end: failed.then(|| LastTurn {
                             ended_at: Some(report.at_unix + 0.02), status: Some(TurnStatus::Failed),
-                        }), transcript_evidence_path: None,
+                        }), transcript_evidence_path: None, wait_resolution: None,
                     });
                     assert_eq!(
                         crate::agent_state::derive(&cell.inputs, now_unix_f64()).state,
@@ -41787,6 +41802,7 @@ printf ran > "$MAIN_REPO/setup-ran"
         insert_session(&state, uid, "ws-state");
         state.lock().unwrap().sessions.get_mut(uid).unwrap().session_type = "claude-code".into();
         let now = now_unix_f64();
+        state.lock().unwrap().sessions[uid].agent_state.lock().unwrap().inputs.spawned_at = now - 60.0;
         session_agent_report(&state, &json!({"session_uid":uid, "kind":"hook",
             "event":"UserPromptSubmit", "payload":{"observed_at":now - 2.0}}), Some(uid)).unwrap();
         assert_eq!(session_agent_report(&state, &json!({"session_uid":uid, "kind":"hook",
@@ -41811,6 +41827,7 @@ printf ran > "$MAIN_REPO/setup-ran"
         insert_session(&state, uid, "ws-state");
         state.lock().unwrap().sessions.get_mut(uid).unwrap().session_type = "claude-code".into();
         let now = now_unix_f64();
+        state.lock().unwrap().sessions[uid].agent_state.lock().unwrap().inputs.spawned_at = now - 60.0;
         session_agent_report(&state, &json!({"session_uid":uid, "kind":"hook",
             "event":"UserPromptSubmit", "payload":{"observed_at":now}}), Some(uid)).unwrap();
         {
@@ -41843,7 +41860,7 @@ printf ran > "$MAIN_REPO/setup-ran"
             session.agent_state.lock().unwrap().inputs.presence = Some(crate::agent_state::PresenceObs {
                 valid: true, status: crate::agent_state::PresenceStatus::Idle,
                 observed_at: now_unix_f64(), status_updated_at: Some(now_unix_f64() - 60.0), native_session_id: None,
-                engine_version: None, waiting_for: None, main_turn_open: None, transcript_error: None, transcript_end: None, transcript_evidence_path: None,
+                engine_version: None, waiting_for: None, main_turn_open: None, transcript_error: None, transcript_end: None, transcript_evidence_path: None, wait_resolution: None,
             });
         }
         let reads = |expected_state: &str, expected_idle: bool| {
@@ -41869,6 +41886,48 @@ printf ran > "$MAIN_REPO/setup-ran"
     }
 
     #[test]
+    fn needs_human81_agent_report_identity_order_and_since_on_both_reads() {
+        let state=make_state_arc(); let uid="ts-permission81";
+        insert_session(&state,uid,"ws-permission81");
+        let now=now_unix_f64();
+        {
+            let mut st=state.lock().unwrap(); let s=st.sessions.get_mut(uid).unwrap();
+            s.session_type="claude-code".into();
+            s.transcript_path=Some("/fixture/main.jsonl".into());
+            s.agent_state.lock().unwrap().inputs.spawned_at=now-50.0;
+        }
+        let report=|payload:Value| json!({"session_uid":uid,"kind":"hook","event":"PermissionRequest","payload":payload});
+        let waiting=json!({"observed_at":now-10.0,"session_id":"main","transcript_path":"/fixture/main.jsonl",
+            "tool_use_id":"a","tool_name":"Agent"});
+        for change in [json!({"agent_id":"nested"}),json!({"session_id":"other"}),
+            json!({"transcript_path":"/fixture/child.jsonl"}),json!({"observed_at":now-60.0})] {
+            let mut payload=waiting.clone();
+            payload.as_object_mut().unwrap().extend(change.as_object().unwrap().clone());
+            assert_eq!(session_agent_report(&state,&report(payload),Some(uid)).unwrap()["applied"],false);
+            let st=state.lock().unwrap();
+            assert!(st.sessions[uid].agent_state.lock().unwrap().inputs.hooks.waiting_at.is_none());
+            assert_eq!(st.sessions[uid].transcript_path.as_deref(),Some("/fixture/main.jsonl"));
+        }
+        let accepted=session_agent_report(&state,&report(waiting.clone()),Some(uid)).unwrap();
+        assert_eq!(accepted["applied"],true);
+        assert_eq!(accepted["agent_state"]["state"],"waiting-on-human");
+        assert_eq!(accepted["agent_state"]["since"],json!(now-10.0));
+        let mut stale=waiting.clone(); stale["observed_at"]=json!(now-11.0); stale["tool_use_id"]=json!("stale");
+        assert_eq!(session_agent_report(&state,&report(stale),Some(uid)).unwrap()["applied"],false);
+        let rows=list_sessions(&state,&json!({}),None).unwrap();
+        let row=rows.as_array().unwrap().iter().find(|r| r["session_uid"]==uid).unwrap();
+        let resolved=resolve_authorized_session(&state,&json!({"session_uid":uid}),Some(uid)).unwrap();
+        for value in [row,&resolved] {
+            assert_eq!(value["agent_state"]["state"],"waiting-on-human");
+            assert_eq!(value["agent_state"]["since"],json!(now-10.0));
+            assert_eq!(value["idle"],true,"legacy compatibility idle remains unchanged; consumers use agent_state");
+        }
+        let mut oversized=waiting; oversized["tool_use_id"]=json!("x".repeat(257));
+        assert_eq!(session_agent_report(&state,&report(oversized),Some(uid)).unwrap_err().0,ErrorCode::InvalidParams);
+        kill_all_sessions(&state);
+    }
+
+    #[test]
     fn agent_report_hooks_rebind_transcript_and_clear_failure_on_new_prompt() {
         let dir = TempDir::new().unwrap();
         let state = state_with_workspace("ws-hooks", &dir);
@@ -41876,6 +41935,7 @@ printf ran > "$MAIN_REPO/setup-ran"
         insert_session(&state, uid, "ws-hooks");
         state.lock().unwrap().sessions.get_mut(uid).unwrap().session_type = "claude-code".into();
         let now = now_unix_f64();
+        state.lock().unwrap().sessions[uid].agent_state.lock().unwrap().inputs.spawned_at = now - 60.0;
         let make = |event: &str, at: f64| json!({"session_uid": uid, "kind": "hook", "event": event,
             "payload": {"observed_at": at}});
         session_agent_report(&state, &make("UserPromptSubmit", now - 5.0), Some(uid)).unwrap();
@@ -42115,7 +42175,7 @@ printf ran > "$MAIN_REPO/setup-ran"
                 waiting_for: None,
                 main_turn_open: Some(true),
                 transcript_error: (uid == "ts-error").then(|| "auth".into()),
-                transcript_end: None, transcript_evidence_path: None,
+                transcript_end: None, transcript_evidence_path: None, wait_resolution: None,
             });
             state.lock().unwrap().sessions.insert(uid.into(), session);
         }

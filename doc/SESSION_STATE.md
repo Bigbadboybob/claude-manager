@@ -111,6 +111,35 @@ native conversation ID as well as the live PID/start identity. Mismatch yields
 another process or rebind the session. Older engines without `sessionId` retain
 the process identity checks. Native background-session recovery is separate.
 
+A stale Claude permission wait can also resolve on a **newer matching foreground
+`tool_result`** in the bound main transcript. Permission hooks preserve optional
+native `session_id` and `tool_use_id`; subagent, foreign-transcript and pre-spawn
+hook reports are ignored. Wait hooks cannot rebind the main transcript. Exact
+IDs match the waiting tool. Older hooks/status files require a visible current
+turn boundary and exactly one outstanding foreground call; ambiguity stays
+`waiting-on-human`. Elicitation/user-input waits are not permission waits.
+
+The separate permission proof probes at most 256 KiB of tail and 200 complete
+records; revalidating an old witness can read up to another 256 KiB before that
+probe (512 KiB total worst case per sample). It requires native conversation
+identity and ordered event timestamps within the
+current incarnation/turn, and rejects sidechain/subagent/background/chat results.
+Busy status, file growth/mtime, progress, chat and unrelated parallel tools never
+clear a wait. Valid presence and PID/start identity are required; missing or
+incomplete proof retains the wait. A compact file-identity/range/hash witness is
+revalidated after append and brain restart, and cannot cross transcript rebinds
+or process incarnations. No transcript payload is persisted in that witness.
+Newer waits and real Stop/StopFailure remain authoritative. A resolved wait
+transitions to `working` at the result's event time; ordinary polls preserve
+`since`. This is not a completed-turn or safe-drain signal. There is currently
+no trustworthy post-approval tool-start hook: an approved long-running call can
+remain visibly waiting until its matching result or a real lifecycle edge.
+
+`since` is already exported in full daemon/MCP `agent_state` and the TUI waiting
+badge; the slim roster exposes it as `activity.since_host_clock`, separately
+from `state_since_api_clock` and `observed_at_host_clock`. A poll is never a new
+state transition and never updates the host `since` merely to show freshness.
+
 The bounded Claude transcript probe can supply a missing turn boundary only
 from main-conversation records carrying the bound native `sessionId` and their
 own timestamps. Normal completion requires settled `turn_duration`; an assistant
@@ -222,6 +251,7 @@ During a brain restart the RPC returns conflict; retry the latest report.
 {session_uid, kind: "hook", event: UserPromptSubmit | Stop | StopFailure |
                                   PermissionRequest | Notification,
  payload: {observed_at?, prompt_id?, continuing?, transcript_path?,
+           session_id?, agent_id?, tool_use_id?,
            waiting_for?, error_kind?, resumes_at?, tool_name?, notification_type?,
            source?, stop_hook_active?, last_assistant_message?, error_details?,
            background?}}
@@ -464,7 +494,8 @@ or MCP reconnect is needed.
 After input newer than `statusUpdatedAt`, an unchanged valid presence is
 treated as working for up to ten seconds while async prompt delivery settles.
 Repeated file observations do not end that guard. An unchanged waiting status
-returns to waiting-on-human after the guard, until the engine changes status.
+returns to waiting-on-human after the guard, until the engine changes status
+or a matching permission-resolution proof/lifecycle edge supersedes it.
 
 `presence_idle_enabled = true` is the default in daemon.toml. For a quick
 compatibility rollback, set it to false and call `daemon.reload_config` (or send

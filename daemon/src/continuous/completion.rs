@@ -370,7 +370,7 @@ mod tests {
             engine_version: None,
             waiting_for: None,
             main_turn_open: None,
-            transcript_error: None, transcript_end: None, transcript_evidence_path: None,
+            transcript_error: None, transcript_end: None, transcript_evidence_path: None, wait_resolution: None,
         });
         let initial = cell.recompute(100.0);
         assert_eq!(

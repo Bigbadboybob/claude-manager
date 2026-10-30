@@ -42,3 +42,14 @@ class ActivityTests(unittest.TestCase):
         self.assertIsNone(out["activity"]["last_turn_status"])
         self.assertIsNone(out["limit"]["error_kind"])
         self.assertIsNone(out["limit"]["retrying"])
+
+    def test_wait_since_is_host_transition_time_not_poll_or_api_time(self):
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        for observed in [1000.0, 1005.0]:
+            out = project_activity("waiting-on-human", now, now, {
+                "source": "presence", "since": 990.0, "observed_at": observed,
+                "detail": {"waiting_for": "permission"},
+            }, now)
+            self.assertEqual(out["activity"]["state"], "waiting-on-human")
+            self.assertEqual(out["activity"]["since_host_clock"], 990.0)
+            self.assertEqual(out["activity"]["observed_at_host_clock"], observed)

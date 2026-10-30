@@ -20,6 +20,9 @@ pub(crate) struct Target {
     pub transcript: Option<PathBuf>,
     pub had_presence: bool,
     pub needs_turn_probe: bool,
+    pub wait_hooks: crate::agent_state::HookEdges,
+    pub wait_floor: f64,
+    pub prior_wait: Option<crate::claude_wait::Resolution>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -95,6 +98,7 @@ pub(crate) struct Reader {
     proc_root: PathBuf,
     files: HashMap<PathBuf, CachedFile>,
     tails: HashMap<String, CachedTail>,
+    waits: crate::claude_wait::Reader,
     directory: Option<Result<Vec<u32>, ()>>,
     ancestry: HashMap<u32, Option<(u32, u64)>>,
     tick: u64,
@@ -122,6 +126,7 @@ impl Reader {
             proc_root,
             files: HashMap::new(),
             tails: HashMap::new(),
+            waits: crate::claude_wait::Reader::default(),
             directory: None,
             ancestry: HashMap::new(),
             tick: 0,
@@ -140,6 +145,7 @@ impl Reader {
         self.files.retain(|_, cached| cached.tick == self.tick);
         let live: HashSet<_> = targets.iter().map(|t| t.uid.as_str()).collect();
         self.tails.retain(|uid, _| live.contains(uid.as_str()));
+        self.waits.retain(&live);
         observations
     }
 
@@ -272,7 +278,7 @@ impl Reader {
             engine_version: None,
             waiting_for: None,
             main_turn_open: None,
-            transcript_error: None, transcript_end: None, transcript_evidence_path: None,
+            transcript_error: None, transcript_end: None, transcript_evidence_path: None, wait_resolution: None,
         };
         let root_valid = self
             .process(target.pid)
@@ -353,6 +359,17 @@ impl Reader {
                         .or_else(|| p.auth_error.map(|_| "authentication_failed".into()))
                         .or_else(|| p.usage_limit.map(|_| "usage_limit".into()))
                 });
+            }
+        }
+        if observation.valid {
+            if let (Some(path), Some(key)) = (target.transcript.as_deref(),
+                crate::claude_wait::Key::new(&target.wait_hooks, &observation, target.wait_floor)) {
+                observation.transcript_evidence_path = Some(path.to_owned());
+                observation.wait_resolution = self.waits.observe(&target.uid,
+                    (target.pid,target.child_start_time), path, key, target.prior_wait.as_ref(), now);
+                if !self.process(target.pid).is_some_and(|(_,start)| Some(start) == target.child_start_time) {
+                    return Some(invalid());
+                }
             }
         }
         Some(observation)
@@ -440,7 +457,7 @@ fn parse(v: serde_json::Value, now: f64) -> Option<PresenceFile> {
             engine_version: short(v.get("version"), 256),
             waiting_for: short(v.get("waitingFor"), 4096),
             main_turn_open: None,
-            transcript_error: None, transcript_end: None, transcript_evidence_path: None,
+            transcript_error: None, transcript_end: None, transcript_evidence_path: None, wait_resolution: None,
         },
     })
 }
@@ -462,6 +479,7 @@ pub(crate) fn fixture_observation(transcript: &Path, native_id: &str, process_va
         "procStart":"42", "status":"idle", "sessionId":native_id}).to_string()).unwrap();
     Reader::new(root, proc_root).observe(&[Target {
         uid: "fixture".into(), pid: 1001, child_start_time: Some(42), transcript: Some(transcript.to_path_buf()),
+        wait_hooks: Default::default(), wait_floor: 0.0, prior_wait: None,
         had_presence: true, needs_turn_probe: false, // A real hook already supplies turn-open evidence.
     }], now).pop().unwrap().unwrap()
 }
@@ -492,6 +510,7 @@ mod tests {
                     transcript: None,
                     had_presence: false,
                     needs_turn_probe: true,
+                    wait_hooks: Default::default(), wait_floor: 0.0, prior_wait: None,
                 },
                 _dir: dir,
             };
@@ -532,6 +551,127 @@ mod tests {
             let mut cell = StateCell::new(0.0, Some(42));
             cell.inputs.presence = self.sample();
             derive(&cell.inputs, 1000.0).state
+        }
+    }
+
+    #[test]
+    fn needs_human81_matching_foreground_result_clears_stale_presence_wait() {
+        use serde_json::json;
+        let mut f = Fixture::new();
+        f.install("waiting-permission"); // Real wait edge at 990, not poll time.
+        let record = |kind: &str, at: i64, content: serde_json::Value| json!({
+            "type":kind, "sessionId":"transcript", "isSidechain":false,
+            "timestamp":chrono::DateTime::from_timestamp(at,0).unwrap().to_rfc3339_opts(chrono::SecondsFormat::Millis,true),
+            "message":{"role":kind,"content":content}}).to_string();
+        let mut lines = vec![
+            record("user",950,json!("do the task")),
+            record("assistant",985,json!([{"type":"tool_use","id":"agent-a","name":"Agent","input":{}}])),
+        ];
+        f.transcript(&(lines.join("\n")+"\n"));
+        let mut c = StateCell::new(0.0, Some(42));
+        c.inputs.presence = f.sample();
+        let blocked = derive(&c.inputs,1000.0);
+        assert_eq!(blocked.state,State::WaitingOnHuman);
+        assert_eq!(blocked.since,990.0);
+        c.inputs.previous = Some(blocked);
+        lines.push(record("user",991,json!([{"type":"tool_result","tool_use_id":"agent-a","content":"completed"}])));
+        lines.push(record("assistant",992,json!([{"type":"tool_use","id":"bash-next","name":"Bash","input":{}}])));
+        f.transcript(&(lines.join("\n")+"\n"));
+        c.inputs.presence = f.sample();
+        let resumed = derive(&c.inputs,1002.0);
+        assert_eq!(resumed.state,State::Working,"matching foreground result must resolve stale waiting presence");
+        assert_eq!(resumed.since,991.0,"the resolving event dates the transition, not the poll or original prompt");
+    }
+
+    #[test]
+    fn needs_human81_hook_and_presence_resolve_together_since_survives_heartbeat() {
+        use crate::agent_state::{HookEvent, HookPayload, Report};
+        use crate::claude_wait::tests::{rows, log, row, call, result};
+        use serde_json::json;
+        let mut f=Fixture::new(); f.install("waiting-permission");
+        let mut c=StateCell::new(900.0,Some(42));
+        let hook=|event,at,id:Option<&str>| Report::Hook {event,payload:HookPayload {
+            observed_at:Some(at), tool_use_id:id.map(str::to_owned),
+            tool_name:id.map(|_| "Agent".into()), ..Default::default() }};
+        c.apply(hook(HookEvent::UserPromptSubmit,950.0,None),1000.0).unwrap();
+        c.apply(hook(HookEvent::PermissionRequest,990.0,Some("a")),1000.0).unwrap();
+        f.target.wait_hooks=c.inputs.hooks.clone();
+        f.target.wait_floor=crate::agent_state::wait_floor(&c.inputs);
+        f.transcript(&log(&rows()[..2]));
+        c.inputs.presence=f.sample();
+        assert_eq!(c.recompute(1000.0).state,State::WaitingOnHuman);
+        assert_eq!(c.inputs.previous.as_ref().unwrap().since,990.0);
+        // Heartbeats, PTY/chat/subagent-directory progress do not resolve it.
+        c.inputs.last_progress_at=Some(1001.0);
+        c.inputs.presence=f.sample();
+        c.inputs.presence.as_mut().unwrap().observed_at=1002.0;
+        assert_eq!(c.recompute(1002.0).state,State::WaitingOnHuman);
+        assert_eq!(c.inputs.previous.as_ref().unwrap().since,990.0);
+        let mut transcript=rows();
+        transcript.push(row("assistant",992,json!([call("b","Bash",false)])));
+        f.transcript(&log(&transcript));
+        c.inputs.presence=f.sample();
+        let resumed=c.recompute(1003.0);
+        assert_eq!((resumed.state,resumed.since),(State::Working,991.0));
+        assert_eq!(resumed.turn_seq,1,"resolution neither injects a prompt nor invents a new turn");
+        assert!(resumed.detail.waiting_for.is_none());
+        assert_eq!(crate::continuous::completion::claude_drain_state_finished_after(
+            &resumed,990.0,1003.0,false),Some(false),"a result is not a completed-turn/drain boundary");
+        // A persisted witness is not an already-verified observation after a
+        // brain restart; require the bounded file/process check again.
+        c.inputs.presence=Some(serde_json::from_slice(&serde_json::to_vec(
+            c.inputs.presence.as_ref().unwrap()).unwrap()).unwrap());
+        assert_eq!(derive(&c.inputs,1003.0).state,State::WaitingOnHuman);
+        f.reader.waits=crate::claude_wait::Reader::default();
+        f.target.prior_wait=c.inputs.presence.as_ref().unwrap().wait_resolution.clone();
+        c.inputs.presence=f.sample();
+        c.inputs.presence.as_mut().unwrap().observed_at=1004.0;
+        let after_restart=c.recompute(1004.0);
+        assert_eq!((after_restart.state,after_restart.since),(State::Working,991.0));
+        // A later real approval remains blocked even with the old cached proof.
+        c.apply(hook(HookEvent::PermissionRequest,994.0,Some("b")),1004.0).unwrap();
+        f.target.wait_hooks=c.inputs.hooks.clone();
+        c.inputs.presence=f.sample();
+        let blocked=c.recompute(1005.0);
+        assert_eq!((blocked.state,blocked.since),(State::WaitingOnHuman,994.0));
+        transcript.push(row("user",993,json!([result("b")])));
+        f.transcript(&log(&transcript));
+        c.inputs.presence=f.sample();
+        assert_eq!(c.recompute(1006.0).state,State::WaitingOnHuman,"an older result cannot clear the new wait");
+        // A real Stop remains authoritative, as do the ordinary Busy/Idle paths.
+        c.apply(hook(HookEvent::Stop,996.0,None),1006.0).unwrap();
+        f.target.wait_floor=crate::agent_state::wait_floor(&c.inputs);
+        c.inputs.presence=f.sample();
+        assert_eq!(c.recompute(1007.0).state,State::Idle);
+    }
+
+    #[test]
+    fn needs_human81_busy_idle_and_unrelated_result_cannot_clear_hook_permission() {
+        use crate::agent_state::HookEdges;
+        use crate::claude_wait::tests::{rows,log,row,result};
+        use serde_json::json;
+        for status in ["busy","idle","waiting"] {
+            let mut f=Fixture::new(); f.install("waiting-permission");
+            let presence_path=f.reader.root.join("1001.json");
+            let mut v:serde_json::Value=serde_json::from_slice(&std::fs::read(&presence_path).unwrap()).unwrap();
+            v["status"]=status.into();
+            std::fs::write(&presence_path,v.to_string()).unwrap();
+            let mut c=StateCell::new(900.0,Some(42));
+            c.inputs.latest_start=Some(950.0);
+            c.inputs.hooks=HookEdges {prompt_at:Some(950.0),waiting_at:Some(990.0),
+                waiting_for:Some("permission".into()),waiting_tool_id:Some("a".into()),
+                open_tool:Some("Agent".into()),..Default::default()};
+            f.target.wait_hooks=c.inputs.hooks.clone(); f.target.wait_floor=950.0;
+            let mut unrelated=rows(); unrelated[2]=row("user",991,json!([result("other")]));
+            f.transcript(&log(&unrelated));
+            c.inputs.presence=f.sample();
+            assert_eq!(derive(&c.inputs,1000.0).state,State::WaitingOnHuman,"{status}");
+            f.transcript(&log(&rows()));
+            c.inputs.presence=f.sample();
+            assert_eq!(derive(&c.inputs,1000.0).state,State::Working,"{status} must honor matched result");
+            f.process(1001,1,43,"S");
+            c.inputs.presence=f.sample();
+            assert_eq!(derive(&c.inputs,1001.0).state,State::Unknown,"PID reuse cannot carry proof");
         }
     }
 
