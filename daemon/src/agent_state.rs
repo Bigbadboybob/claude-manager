@@ -2677,6 +2677,7 @@ mod tests {
         let now = unix_now().floor();
         {
             let mut c = state.sessions[uid].agent_state.lock().unwrap();
+            c.inputs.spawned_at = now - 60.0;
             c.apply(hook(HookEvent::UserPromptSubmit, now - 20.0), now)
                 .unwrap();
             c.apply(hook(HookEvent::Stop, now - 10.0), now).unwrap();
@@ -2694,6 +2695,7 @@ mod tests {
             );
         }
         let before = current(&state.sessions[uid]);
+        assert_eq!((before.state, before.turn_seq), (State::Idle, 1));
         let state = Arc::new(Mutex::new(state));
         save_checked(&state).unwrap();
         let state = state.lock().unwrap();
