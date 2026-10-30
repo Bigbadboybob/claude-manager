@@ -381,7 +381,11 @@ impl BackendHandle {
         // exited (clean shutdown race); skip the warn helper.
         let _ = self.cmd_tx.send(BackendCommand::Shutdown);
         if let Some(handle) = self.thread.take() {
-            let _ = handle.join();
+            crate::push_worker::join_with_deadline(
+                handle,
+                crate::push_worker::SHUTDOWN_JOIN_DEADLINE,
+                "planning backend",
+            );
         }
     }
 }

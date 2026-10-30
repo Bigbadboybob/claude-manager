@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cm_daemon::host_id::HostId;
 use cm_daemon::workflow::toml_schema::Workflow;
@@ -161,9 +161,35 @@ impl PushWorker {
     pub fn shutdown(&mut self) {
         let _ = self.cmd_tx.send(PushCommand::Shutdown);
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            join_with_deadline(t, SHUTDOWN_JOIN_DEADLINE, "push worker");
         }
     }
+}
+
+/// How long quit waits for a worker thread to finish its current pass.
+/// A healthy final flush lands well inside this; a pass stuck dialing an
+/// unreachable host (up to `SPAWN_SOCKET_WAIT` plus lock queueing) would
+/// otherwise freeze the alt screen after A-q, because `App` drops before
+/// `main` restores the terminal.
+pub(crate) const SHUTDOWN_JOIN_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Join `t`, or detach it once `deadline` passes. A detached thread dies
+/// with the process; its in-flight RPC is lost, which on quit only skips a
+/// push the daemon re-receives on the next viewer connect.
+pub(crate) fn join_with_deadline(
+    t: JoinHandle<()>,
+    deadline: Duration,
+    what: &str,
+) {
+    let until = Instant::now() + deadline;
+    while !t.is_finished() {
+        if Instant::now() >= until {
+            eprintln!("cm-tui: {what} still busy after {deadline:?} at shutdown; detaching");
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = t.join();
 }
 
 impl Drop for PushWorker {
