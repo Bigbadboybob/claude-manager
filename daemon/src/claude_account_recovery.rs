@@ -21,6 +21,14 @@ pub(crate) fn config_gate() -> &'static RwLock<()> {
     GATE.get_or_init(|| RwLock::new(()))
 }
 
+/// Serialize every recovery-journal load/modify/save transaction.  The
+/// per-UID lifecycle gate protects session admission, but it cannot prevent a
+/// background pass from rewriting the whole journal over a selected RPC.
+pub(crate) fn journal_gate() -> &'static Mutex<()> {
+    static GATE: OnceLock<Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(()))
+}
+
 pub(crate) fn failed_boundary(agent: &crate::agent_state::AgentState) -> bool {
     use crate::agent_state::{Source, State, TurnStatus};
     agent.source == Source::Presence && agent.state == State::Errored
@@ -70,9 +78,9 @@ fn resume_outcome(fence: &AttemptFence, before: &crate::agent_state::AgentState,
     }
     let started = event_observed && after.engine_turn_started_at.is_some_and(|at| {
         at >= fence.admitted_at && fence.engine_started_before.is_none_or(|old| at > old)
-    }) && after.turn_seq >= fence.turn_seq_before;
+    }) && after.turn_seq > fence.turn_seq_before;
     if started { return "started"; }
-    if now >= fence.deadline_at { return "no_turn"; }
+    if now >= fence.deadline_at { return "not_observed"; }
     let _ = before;
     "submitted"
 }
@@ -381,10 +389,11 @@ fn profile_path() -> Option<PathBuf> {
     }
 }
 
-/// Called under the configuration write gate during reload, and before the
-/// worker starts. A disabled marker stops consumers before pending events are
+/// Journal/config mutation body. Reload calls this while holding the journal
+/// gate followed by the configuration write gate; startup uses the public
+/// wrapper below. A disabled marker stops consumers before pending events are
 /// cancelled; submitted/uncertain receipts are never retracted or replayed.
-pub(crate) fn configure(state: &Arc<Mutex<crate::state::DaemonState>>, enabled: bool) -> io::Result<()> {
+pub(crate) fn configure_inner(state: &Arc<Mutex<crate::state::DaemonState>>, enabled: bool) -> io::Result<()> {
     let (root, path) = {
         let st = state.lock().unwrap_or_else(|p| p.into_inner());
         let Some(base) = &st.daemon_sessions_path else { return Ok(()); };
@@ -420,6 +429,11 @@ pub(crate) fn configure(state: &Arc<Mutex<crate::state::DaemonState>>, enabled: 
         crate::notifications::set_recovery_enabled(&root, true)?;
     }
     Ok(())
+}
+
+pub(crate) fn configure(state: &Arc<Mutex<crate::state::DaemonState>>, enabled: bool) -> io::Result<()> {
+    let _journal = journal_gate().lock().unwrap_or_else(|p| p.into_inner());
+    configure_inner(state, enabled)
 }
 
 /// A session can override HOME or CLAUDE_CONFIG_DIR at launch. Never use the
@@ -754,6 +768,7 @@ pub(crate) fn request_many(
     state: &Arc<Mutex<crate::state::DaemonState>>,
     uids: &[String],
 ) -> Value {
+    let _journal_gate = journal_gate().lock().unwrap_or_else(|p| p.into_inner());
     let (journal_path, root, enabled, candidates) = {
         let st = state.lock().unwrap_or_else(|p| p.into_inner());
         let Some(base) = st.daemon_sessions_path.as_ref() else {
@@ -832,6 +847,7 @@ pub(crate) fn status_many(
     state: &Arc<Mutex<crate::state::DaemonState>>,
     uids: &[String],
 ) -> Value {
+    let _journal_gate = journal_gate().lock().unwrap_or_else(|p| p.into_inner());
     let (journal_path, root) = {
         let st = state.lock().unwrap_or_else(|p| p.into_inner());
         let Some(base) = st.daemon_sessions_path.as_ref() else {
@@ -872,20 +888,23 @@ pub(crate) fn status_many(
             results.push(json!({"session_uid":uid,"status":"uncertain","reason":"source or incarnation changed"}));
             continue;
         }
-        let event_observed = episode.native_event.as_ref()
-            .and_then(|id| crate::notifications::get(&root, uid, id).ok().flatten()
-                .map(|event| native_event_observed(&event, uid, id)))
-            .unwrap_or(false);
+        let event = episode.native_event.as_ref()
+            .and_then(|id| crate::notifications::get(&root, uid, id).ok().flatten());
+        let event_observed = episode.native_event.as_ref().zip(event.as_ref())
+            .is_some_and(|(id, event)| native_event_observed(event, uid, id));
         let mut before = current.clone();
         before.turn_seq = fence.turn_seq_before;
         before.engine_turn_started_at = fence.engine_started_before;
         let outcome = resume_outcome(fence, &before, &current, event_observed, now);
-        results.push(json!({"session_uid":uid,"status":outcome,"receipt_id":episode.native_event,"deadline_at":fence.deadline_at}));
+        results.push(json!({"session_uid":uid,"status":outcome,"delivery_status":event.as_ref().and_then(|v| v["status"].as_str()),
+            "receipt_id":episode.native_event,"deadline_at":fence.deadline_at,
+            "resend_allowed":false}));
     }
     json!({"results":results})
 }
 
 fn pass(state: &Arc<Mutex<crate::state::DaemonState>>, observation: &mut AccountObservation) -> io::Result<()> {
+    let _journal_gate = journal_gate().lock().unwrap_or_else(|p| p.into_inner());
     let (journal_path, root, enabled, candidates) = {
         let st = state.lock().unwrap_or_else(|p| p.into_inner());
         let Some(base) = st.daemon_sessions_path.as_ref() else { return Ok(()); };
@@ -1463,10 +1482,31 @@ mod tests {
         assert_eq!(resume_outcome(&fence, &before, &after, true, 101.0), "started");
         after.engine_turn_started_at = before.engine_turn_started_at;
         after.turn_seq = before.turn_seq;
-        assert_eq!(resume_outcome(&fence, &before, &after, false, 116.0), "no_turn");
+        assert_eq!(resume_outcome(&fence, &before, &after, false, 116.0), "not_observed");
         after.detail.no_turn_at = None;
         after.state = crate::agent_state::State::Unknown;
         assert_eq!(resume_outcome(&fence, &before, &after, false, 101.0), "uncertain");
+    }
+
+    #[test]
+    fn journal_gate_serializes_two_read_modify_write_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.json");
+        Journal::new().save(&path).unwrap();
+        std::thread::scope(|scope| {
+            for (uid, record_id) in [("one", "record-one"), ("two", "record-two")] {
+                let path = &path;
+                scope.spawn(move || {
+                    let _guard = journal_gate().lock().unwrap_or_else(|p| p.into_inner());
+                    let mut journal = Journal::load(path).unwrap();
+                    let record = LimitRecord { id: record_id.into(), session_id: format!("session-{uid}"), at: 1000, reset_at: None };
+                    journal.observe(uid, &record, None);
+                    journal.save(path).unwrap();
+                });
+            }
+        });
+        let journal = Journal::load(&path).unwrap();
+        assert_eq!(journal.episodes.len(), 2, "serialized updates must not erase a sibling episode");
     }
 
     #[test]

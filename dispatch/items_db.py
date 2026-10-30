@@ -979,7 +979,7 @@ async def _account_limit_snapshot(conn, board_id: str) -> tuple[dict, dict]:
              FROM item_holders h
              JOIN items i ON i.id = h.item_id
              LEFT JOIN session_states s ON s.pid = h.pid
-            WHERE i.board_id = $1 AND i.closed_at IS NULL AND i.archived_at IS NULL""",
+            WHERE i.board_id = $1 AND i.archived_at IS NULL""",
         uuid.UUID(board_id),
     )
     items: dict[int, dict] = {}

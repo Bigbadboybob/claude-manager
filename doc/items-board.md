@@ -482,12 +482,12 @@ item_resolve(n: int, action: "nudge"|"reassign"|"launch"|"block"|"drop"|"answer"
   is unchanged, because session heartbeats do not advance the item version.
 - `account_limits` is a presentation-only host summary of fresh, positive
   Claude `rate_limit` evidence. Each row carries `host`, `session_count`,
-  `sessions`, affected item numbers, and `resets_at` only when an
-  account-baseline timestamp proves the episode belongs to the current
-  account; otherwise `attribution="historical / attribution unknown"` and no
-  current reset claim are shown. The banner never folds away raw
-  `holder_errored` or `holder_waiting_on_human` flags and never implies that
-  work resumed.
+  `sessions`, affected item numbers, and a reset field only when a future
+  account-baseline producer proves the episode belongs to the current
+  account. The current roster has no such producer, so it emits
+  `attribution="historical / attribution unknown"` and `resets_at: null`.
+  The banner never folds away raw `holder_errored` or
+  `holder_waiting_on_human` flags and never implies that work resumed.
 - `board(view="slim")` returns one line per item, flags first, then by group:
   `#14 active "fuse SEJD" @rl-scale-out[idle 24m] ⚑holder_idle · waiting on JP`;
   a job shows beside the holder's state, never merged with it:

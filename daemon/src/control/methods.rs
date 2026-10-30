@@ -4839,9 +4839,12 @@ pub fn reload_config(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
 
     // Admission holds the matching read side through a recovery write. A
     // completed disable therefore cannot race a later automatic prompt.
+    // Keep the journal transaction outermost: the recovery worker holds this
+    // gate before taking the config read lock during an admitted attempt.
+    let _recovery_journal = crate::claude_account_recovery::journal_gate().lock().unwrap_or_else(|p| p.into_inner());
     let _recovery_config = crate::claude_account_recovery::config_gate().write().unwrap_or_else(|p| p.into_inner());
     let mut warnings = Vec::new();
-    if let Err(e) = crate::claude_account_recovery::configure(state_arc, new_cfg.claude_limit_recovery) {
+    if let Err(e) = crate::claude_account_recovery::configure_inner(state_arc, new_cfg.claude_limit_recovery) {
         let root = state_arc.lock().unwrap_or_else(|p| p.into_inner()).messaging_root.clone();
         let marker_confirmed = crate::notifications::recovery_disabled_confirmed(&root);
         new_cfg.claude_limit_recovery = false;

@@ -3249,8 +3249,8 @@ async def resume_claude_sessions(session_uids: list[str]) -> dict:
     send_input scope check; workflow/continuous/unmanaged sessions and
     unarmed account episodes return per-target ``refused``. The operation
     never presses a PTY key. Poll ``resume_claude_status`` for ``started``,
-    ``no_turn``, ``uncertain`` or still ``submitted``; uncertain attempts are
-    never replayed automatically.
+    ``not_observed``, ``uncertain`` or still ``submitted``; no outcome grants
+    permission to resend and uncertain attempts are never replayed.
     """
     if not isinstance(session_uids, list) or not 1 <= len(session_uids) <= 32:
         return {"error": "invalid_params", "message": "resume_claude_sessions takes 1..32 explicit session UIDs"}

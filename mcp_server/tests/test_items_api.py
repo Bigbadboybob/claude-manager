@@ -749,6 +749,9 @@ class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
         await self.beat([self.row("lane")])
         self.assertEqual(await self.read(since_version=version),
                          {"unchanged": True, "version": version, "account_limits": []})
+        # The banner fixture is only for the unchanged-read transition; clear
+        # its heartbeat row before the pre-existing holder-state insert below.
+        await self.pool.execute("DELETE FROM session_states WHERE pid = $1", LANE["pid"])
         lane_state = board["items"][1]["holders"][0]["state"]
         self.assertEqual(lane_state["state"], "unknown")  # no heartbeat yet
         now = datetime.now(timezone.utc)

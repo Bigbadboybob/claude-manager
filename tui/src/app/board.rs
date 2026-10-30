@@ -2226,5 +2226,7 @@ mod tests {
         assert_eq!(b.selected_n(), Some(2));
         b.accept(json!({"unchanged":true,"version":7,"account_limits":[{"host":"cm","session_count":1}]}));
         assert_eq!(b.data["account_limits"][0]["host"], "cm");
+        b.accept(json!({"unchanged":true,"version":7,"account_limits":[]}));
+        assert_eq!(b.data["account_limits"], json!([]), "unchanged empty field clears a resolved banner");
     }
 }
