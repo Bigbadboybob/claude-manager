@@ -119,8 +119,10 @@ IDs match the waiting tool. Older hooks/status files require a visible current
 turn boundary and exactly one outstanding foreground call; ambiguity stays
 `waiting-on-human`. Elicitation/user-input waits are not permission waits.
 
-The separate permission proof reads at most 256 KiB and 200 complete records,
-requires native conversation identity and ordered event timestamps within the
+The separate permission proof probes at most 256 KiB of tail and 200 complete
+records; revalidating an old witness can read up to another 256 KiB before that
+probe (512 KiB total worst case per sample). It requires native conversation
+identity and ordered event timestamps within the
 current incarnation/turn, and rejects sidechain/subagent/background/chat results.
 Busy status, file growth/mtime, progress, chat and unrelated parallel tools never
 clear a wait. Valid presence and PID/start identity are required; missing or

@@ -604,6 +604,7 @@ mod tests {
         // Heartbeats, PTY/chat/subagent-directory progress do not resolve it.
         c.inputs.last_progress_at=Some(1001.0);
         c.inputs.presence=f.sample();
+        c.inputs.presence.as_mut().unwrap().observed_at=1002.0;
         assert_eq!(c.recompute(1002.0).state,State::WaitingOnHuman);
         assert_eq!(c.inputs.previous.as_ref().unwrap().since,990.0);
         let mut transcript=rows();
@@ -614,9 +615,19 @@ mod tests {
         assert_eq!((resumed.state,resumed.since),(State::Working,991.0));
         assert_eq!(resumed.turn_seq,1,"resolution neither injects a prompt nor invents a new turn");
         assert!(resumed.detail.waiting_for.is_none());
+        assert_eq!(crate::continuous::completion::claude_drain_state_finished_after(
+            &resumed,990.0,1003.0,false),Some(false),"a result is not a completed-turn/drain boundary");
+        // A persisted witness is not an already-verified observation after a
+        // brain restart; require the bounded file/process check again.
+        c.inputs.presence=Some(serde_json::from_slice(&serde_json::to_vec(
+            c.inputs.presence.as_ref().unwrap()).unwrap()).unwrap());
+        assert_eq!(derive(&c.inputs,1003.0).state,State::WaitingOnHuman);
+        f.reader.waits=crate::claude_wait::Reader::default();
         f.target.prior_wait=c.inputs.presence.as_ref().unwrap().wait_resolution.clone();
         c.inputs.presence=f.sample();
-        assert_eq!(c.recompute(1004.0).since,991.0);
+        c.inputs.presence.as_mut().unwrap().observed_at=1004.0;
+        let after_restart=c.recompute(1004.0);
+        assert_eq!((after_restart.state,after_restart.since),(State::Working,991.0));
         // A later real approval remains blocked even with the old cached proof.
         c.apply(hook(HookEvent::PermissionRequest,994.0,Some("b")),1004.0).unwrap();
         f.target.wait_hooks=c.inputs.hooks.clone();
