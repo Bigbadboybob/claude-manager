@@ -233,6 +233,8 @@ pub struct PresenceObs {
     pub transcript_end: Option<LastTurn>,
     #[serde(default)]
     pub transcript_evidence_path: Option<PathBuf>,
+    #[serde(default)]
+    pub wait_resolution: Option<crate::claude_wait::Resolution>,
 }
 impl PresenceObs {
     pub(crate) fn matches_transcript(&self, transcript: Option<&std::path::Path>) -> bool {
@@ -252,6 +254,7 @@ pub struct HookEdges {
     pub stop_at: Option<f64>,
     pub failure_at: Option<f64>,
     pub waiting_at: Option<f64>,
+    pub waiting_tool_id: Option<String>,
     pub waiting_for: Option<String>,
     pub error_kind: Option<String>,
     pub resumes_at: Option<f64>,
@@ -359,6 +362,12 @@ fn max_time(a: Option<f64>, b: Option<f64>) -> Option<f64> {
     a.into_iter().chain(b).max_by(f64::total_cmp)
 }
 
+pub(crate) fn wait_floor(input: &Inputs) -> f64 {
+    [Some(input.spawned_at), input.latest_start, input.hooks.prompt_at,
+        input.hooks.stop_at, input.hooks.failure_at, input.legacy.turn_ended_at]
+        .into_iter().flatten().max_by(f64::total_cmp).unwrap_or(input.spawned_at)
+}
+
 /// Pure precedence/freshness function. `previous` preserves entered-at times and
 /// supplies the working-to-idle debounce; source observations retain true times.
 pub fn derive(input: &Inputs, now: f64) -> AgentState {
@@ -409,6 +418,14 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
             }
         }
     }
+    let wait_resolution = presence.filter(|p| p.valid).and_then(|p| p.wait_resolution.as_ref())
+        .filter(|r| r.verified && r.at <= now && r.at > wait_floor(input)
+            && presence.and_then(|p| p.transcript_evidence_path.as_ref()) == Some(&r.path));
+    let hook_resolved = wait_resolution.is_some_and(|r| r.key.hook_at.is_some()
+        && r.key.hook_at == hooks.waiting_at && newer(Some(r.at), hooks.waiting_at));
+    let presence_resolved = wait_resolution.is_some_and(|r| r.key.presence_at.is_some()
+        && r.key.presence_at == presence.and_then(|p| p.status_updated_at));
+    let resumed_at = wait_resolution.filter(|_| hook_resolved || presence_resolved).map(|r| r.at);
     let mut detail = Detail::default();
     let mut entered = observed_at;
     // A cached presence file predates a submitted prompt even when we just
@@ -476,14 +493,14 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
                 .iter()
                 .find(|f| matches!(f.as_str(), "waitingOnApproval" | "waitingOnUserInput"))
         });
-        let hook_wait = hooks.waiting_for.as_deref() != Some("idle_prompt") && newer(
+        let hook_wait = !hook_resolved && hooks.waiting_for.as_deref() != Some("idle_prompt") && newer(
             hooks.waiting_at,
             max_time(start, last_turn.ended_at),
         );
         if pending.is_some()
             || flag.is_some()
             || hook_wait
-            || presence.is_some_and(|p| p.status == PresenceStatus::Waiting
+            || presence.is_some_and(|p| p.status == PresenceStatus::Waiting && !presence_resolved
                 && !newer(max_time(hooks.prompt_at, last_turn.ended_at), p.status_updated_at))
         {
             detail.waiting_for = pending
@@ -544,6 +561,9 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
             };
             let pending_input = relay.is_none() && !no_turn_candidate && newer(start, Some(observed_at));
             if pending_input
+                || (newer(resumed_at, last_turn.ended_at) && presence.is_some_and(|p|
+                    matches!(p.status, PresenceStatus::Waiting | PresenceStatus::Idle)
+                        && newer(resumed_at, p.status_updated_at)))
                 || (presence_behind_hook && presence.is_some_and(|p|
                     matches!(p.status, PresenceStatus::Idle | PresenceStatus::Waiting | PresenceStatus::Shell)))
                 || relay.is_some_and(|r| r.foreground == RelayStatus::Active)
@@ -553,7 +573,7 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
                 if relay.is_some_and(|r| r.retrying) {
                     detail.retrying = Some(true);
                 }
-                entered = start.unwrap_or(observed_at);
+                entered = max_time(start, resumed_at).unwrap_or(observed_at);
                 State::Working
             } else if presence
                 .is_some_and(|p| matches!(p.status, PresenceStatus::Busy | PresenceStatus::Shell))
@@ -642,6 +662,9 @@ pub enum HookEvent {
 pub struct HookPayload {
     pub observed_at: Option<f64>,
     pub prompt_id: Option<String>,
+    pub session_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub tool_use_id: Option<String>,
     // Accepted adapter metadata; not published as session state.
     pub source: Option<String>,
     pub stop_hook_active: Option<bool>,
@@ -840,6 +863,10 @@ impl StateCell {
             Report::Hook { event, payload } => {
                 let at = payload.observed_at.unwrap_or(now);
                 validate_time(Some(at), now)?;
+                // Detached hook children may outlive the process incarnation.
+                if at < self.inputs.spawned_at || payload.agent_id.is_some() {
+                    return Ok(applied);
+                }
                 validate_time(payload.resumes_at, f64::MAX)?;
                 if let Some(bg) = &payload.background {
                     validate_background(bg, now)?;
@@ -902,6 +929,7 @@ impl StateCell {
                             return Ok(applied);
                         }
                         self.inputs.hooks.waiting_at = Some(at);
+                        self.inputs.hooks.waiting_tool_id = payload.tool_use_id;
                         self.inputs.hooks.waiting_for = payload
                             .waiting_for
                             .or(payload.notification_type)
@@ -914,7 +942,8 @@ impl StateCell {
                         self.inputs.background.update(bg, at);
                     }
                 }
-                if !newer(self.inputs.latest_start, Some(at)) {
+                if !matches!(event, HookEvent::PermissionRequest | HookEvent::Notification)
+                    && !newer(self.inputs.latest_start, Some(at)) {
                     applied.transcript_path = payload.transcript_path;
                 }
             }
@@ -962,6 +991,9 @@ fn validate_report_bounds(report: &Report) -> Result<(), String> {
         Report::Hook { payload, .. } => {
             bounded(payload.prompt_id.as_deref(), MAX_ID_BYTES, "prompt_id")?;
             bounded(payload.source.as_deref(), MAX_ID_BYTES, "source")?;
+            bounded(payload.session_id.as_deref(), MAX_ID_BYTES, "session_id")?;
+            bounded(payload.agent_id.as_deref(), MAX_ID_BYTES, "agent_id")?;
+            bounded(payload.tool_use_id.as_deref(), MAX_ID_BYTES, "tool_use_id")?;
             for (field, text) in [
                 ("transcript_path", &payload.transcript_path),
                 ("waiting_for", &payload.waiting_for),
@@ -1415,6 +1447,9 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>) -> std::io::Result<()> {
                     transcript: s.transcript_path.as_ref().map(PathBuf::from),
                     had_presence: cell.inputs.presence.is_some(),
                     needs_turn_probe: cell.inputs.hooks.prompt_at.is_none(),
+                    wait_hooks: cell.inputs.hooks.clone(),
+                    wait_floor: wait_floor(&cell.inputs),
+                    prior_wait: cell.inputs.presence.as_ref().and_then(|p| p.wait_resolution.clone()),
                 })
             })
             .collect();
@@ -1490,6 +1525,7 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>) -> std::io::Result<()> {
                         observation.main_turn_open = None;
                         observation.transcript_error = None;
                         observation.transcript_end = None;
+                        observation.wait_resolution = None;
                     }
                     cell.inputs.presence = Some(observation);
                 }
@@ -1545,7 +1581,7 @@ mod tests {
             engine_version: Some("2.1.291".into()),
             waiting_for: None,
             main_turn_open: Some(true),
-            transcript_error: None, transcript_end: None, transcript_evidence_path: None,
+            transcript_error: None, transcript_end: None, transcript_evidence_path: None, wait_resolution: None,
         });
         i
     }
@@ -2495,7 +2531,7 @@ mod tests {
                 valid: true, status: PresenceStatus::Idle,
                 observed_at: now, status_updated_at: Some(now - 3600.0), native_session_id: None,
                 engine_version: None, waiting_for: None,
-                main_turn_open: None, transcript_error: None, transcript_end: None, transcript_evidence_path: None,
+                main_turn_open: None, transcript_error: None, transcript_end: None, transcript_evidence_path: None, wait_resolution: None,
             });
             c.apply(hook(HookEvent::Stop, now - 1800.0), now).unwrap();
             c.apply(hook(HookEvent::UserPromptSubmit, now - 60.0), now).unwrap();

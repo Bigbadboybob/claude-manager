@@ -110,6 +110,11 @@ def normalize(
         value = text(payload.get(key), 256 if key in {"prompt_id", "source"} else 4096)
         if value:
             body[key] = value
+    if event in {"PermissionRequest", "Notification"}:
+        for key in ("session_id", "tool_use_id"):
+            value = text(payload.get(key), 256)
+            if value:
+                body[key] = value
     if event == "Stop":
         body["continuing"] = continuing
         body["stop_hook_active"] = payload.get("stop_hook_active") is True

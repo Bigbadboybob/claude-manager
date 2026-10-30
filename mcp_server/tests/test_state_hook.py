@@ -271,3 +271,17 @@ def test_double_fork_returns_before_daemon_reply_and_closes_output_pipes(tmp_pat
             worker.join(timeout=6)
         assert not worker.is_alive()
         assert not errors
+
+
+@pytest.mark.parametrize("event", ["PermissionRequest", "Notification"])
+def test_permission_identity_forwarded_without_raw_tool_inputs(event):
+    payload = {**fixture(event), "session_id": "native-main", "tool_use_id": "tool-a"}
+    report = hook.normalize(payload, observed_at=1000.0)["payload"]
+    assert report["session_id"] == "native-main"
+    assert report["tool_use_id"] == "tool-a"
+    assert "tool_input" not in report
+    assert "PRIVATE" not in json.dumps(report)
+    payload["session_id"] = payload["tool_use_id"] = "🐈" * 500
+    bounded = hook.normalize(payload, observed_at=1000.0)["payload"]
+    assert len(bounded["session_id"].encode()) <= 256
+    assert len(bounded["tool_use_id"].encode()) <= 256

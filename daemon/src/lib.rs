@@ -65,6 +65,7 @@ pub use cm_holder_proto::org as org_bridge;
 pub mod claude_trust;
 pub mod claude_channels;
 pub mod claude_presence;
+mod claude_wait;
 pub mod claude_recovery;
 pub mod claude_account_recovery;
 pub mod codex_trust;

@@ -252,7 +252,7 @@ mod tests {
             valid: true, status: PresenceStatus::Busy, observed_at: 102.0,
             status_updated_at: Some(101.0), native_session_id: Some("original".into()),
             main_turn_open: Some(true), engine_version: None, waiting_for: None,
-            transcript_error: None, transcript_end: None, transcript_evidence_path: None,
+            transcript_error: None, transcript_end: None, transcript_evidence_path: None, wait_resolution: None,
         });
         assert_eq!(baseline.confirmed_for(&mut cell.inputs, Some("/fixture/original.jsonl")), Some("presence"));
         assert_eq!(baseline.confirmed_for(&mut cell.inputs, Some("/fixture/rebound.jsonl")), None,
@@ -276,7 +276,7 @@ mod tests {
             main_turn_open: Some(false),
             engine_version: None,
             waiting_for: None,
-            transcript_error: None, transcript_end: None, transcript_evidence_path: None,
+            transcript_error: None, transcript_end: None, transcript_evidence_path: None, wait_resolution: None,
         });
         assert_eq!(baseline.confirmed_by(&cell.inputs), None);
         cell.inputs.presence.as_mut().unwrap().main_turn_open = Some(true);

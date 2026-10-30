@@ -1190,7 +1190,7 @@ mod tests {
                 native_session_id: Some(SESSION.into()), engine_version: Some("2.1.312".into()),
                 waiting_for: None, main_turn_open: None, transcript_error: Some("rate_limit".into()),
                 transcript_end: Some(crate::agent_state::LastTurn { ended_at: Some(now - 1.0), status: Some(crate::agent_state::TurnStatus::Failed) }),
-                transcript_evidence_path: None,
+                transcript_evidence_path: None, wait_resolution: None,
             });
             cell.inputs.latest_start = Some(now - 10.0);
             cell.inputs.background.complete = true;
