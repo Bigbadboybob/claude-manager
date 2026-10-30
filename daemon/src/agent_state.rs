@@ -2527,6 +2527,7 @@ mod tests {
         let now = unix_now();
         {
             let mut c = state.sessions[uid].agent_state.lock().unwrap();
+            c.inputs.spawned_at = now - 3601.0; // Lifecycle fixture predates these hooks.
             c.inputs.presence = Some(PresenceObs {
                 valid: true, status: PresenceStatus::Idle,
                 observed_at: now, status_updated_at: Some(now - 3600.0), native_session_id: None,
@@ -2758,6 +2759,7 @@ mod tests {
         {
             let st = state.lock().unwrap();
             let mut c = st.sessions["ts-agent-state"].agent_state.lock().unwrap();
+            c.inputs.spawned_at = now - 10.0;
             c.apply(hook(HookEvent::UserPromptSubmit, now - 3.0), now)
                 .unwrap();
             c.apply(hook(HookEvent::Stop, now - 2.0), now).unwrap();
@@ -2780,7 +2782,6 @@ mod tests {
     #[test]
     fn fifty_sessions_seed_silently_and_coalesce_to_bounded_ticks() {
         let mut state = DaemonState::new();
-        let now = unix_now();
         for n in 0..50 {
             let uid = format!("ts-state-burst-{n}");
             let mut params = crate::session::SpawnParams::new(&uid, "burst", "/bin/sleep");
@@ -2788,6 +2789,7 @@ mod tests {
             let session = DaemonSession::spawn(params).unwrap();
             state.sessions.insert(uid, session);
         }
+        let now = unix_now(); // All children now exist before their hook events.
         let (rx, _guard) = state.manifest_watcher.subscribe();
         let state = Arc::new(Mutex::new(state));
         tick(&state).unwrap();

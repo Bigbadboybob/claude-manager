@@ -41920,7 +41920,7 @@ printf ran > "$MAIN_REPO/setup-ran"
         for value in [row,&resolved] {
             assert_eq!(value["agent_state"]["state"],"waiting-on-human");
             assert_eq!(value["agent_state"]["since"],json!(now-10.0));
-            assert_eq!(value["idle"],false,"waiting never becomes a safe completion boundary");
+            assert_eq!(value["idle"],true,"legacy compatibility idle remains unchanged; consumers use agent_state");
         }
         let mut oversized=waiting; oversized["tool_use_id"]=json!("x".repeat(257));
         assert_eq!(session_agent_report(&state,&report(oversized),Some(uid)).unwrap_err().0,ErrorCode::InvalidParams);

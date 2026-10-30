@@ -121,6 +121,7 @@ struct Cached {
     key: Key,
     stamp: Stamp,
     result: Option<Resolution>,
+    retry_at: Option<f64>,
 }
 #[derive(Default)]
 pub(crate) struct Reader {
@@ -156,7 +157,11 @@ impl Reader {
             })
         };
         if let Some(c) = self.cache.get(uid).filter(|c| {
-            c.identity == identity && c.path == path && c.key == key && c.stamp == stamp
+            c.identity == identity
+                && c.path == path
+                && c.key == key
+                && c.stamp == stamp
+                && c.retry_at.is_none_or(|at| now < at)
         }) {
             return stable(&file).and(c.result.clone());
         }
@@ -173,6 +178,7 @@ impl Reader {
                     .checked_add(p.len as u64)
                     .is_some_and(|end| end <= stamp.len)
         });
+        let mut retry_at = None;
         let mut result = old.and_then(|p| {
             let mut bytes = vec![0; p.len];
             file.seek(SeekFrom::Start(p.offset)).ok()?;
@@ -199,7 +205,7 @@ impl Reader {
                 let lines: Vec<_> = text.split_inclusive('\n').rev().take(MAX_LINES).collect();
                 let len: usize = lines.iter().map(|s| s.len()).sum();
                 let span = &text[text.len() - len..];
-                result = resolved_at(span, path, &key, now).map(|at| Resolution {
+                result = resolved_at(span, path, &key, now, &mut retry_at).map(|at| Resolution {
                     key: key.clone(),
                     at,
                     path: path.to_owned(),
@@ -222,6 +228,7 @@ impl Reader {
                 key,
                 stamp,
                 result: result.clone(),
+                retry_at,
             },
         );
         result
@@ -235,7 +242,13 @@ struct Call {
 fn short(v: Option<&serde_json::Value>) -> Option<&str> {
     v?.as_str().filter(|s| !s.is_empty() && s.len() <= 256)
 }
-fn resolved_at(text: &str, path: &Path, key: &Key, now: f64) -> Option<f64> {
+fn resolved_at(
+    text: &str,
+    path: &Path,
+    key: &Key,
+    now: f64,
+    retry_at: &mut Option<f64>,
+) -> Option<f64> {
     let native = path.file_stem()?.to_str()?;
     let mut calls = BTreeMap::<String, Call>::new();
     let mut anchored = false;
@@ -271,7 +284,13 @@ fn resolved_at(text: &str, path: &Path, key: &Key, now: f64) -> Option<f64> {
             return None;
         }
         let at = crate::workflow::history::iso8601_to_ms(stamp)? as f64 / 1000.0;
-        if at > now || prior_at.is_some_and(|last| at < last) {
+        if at > now {
+            // Writers can append just after the tick sampled `now`. Do not
+            // permanently cache a negative verdict for that unchanged file.
+            *retry_at = Some(at);
+            return None;
+        }
+        if prior_at.is_some_and(|last| at < last) {
             return None;
         }
         // A bounded tail often includes history before this incarnation/turn.
@@ -396,7 +415,13 @@ pub(crate) mod tests {
         ]
     }
     fn resolve(rows: &[Value], key: &Key) -> Option<f64> {
-        resolved_at(&log(rows), Path::new("transcript.jsonl"), key, 1000.0)
+        resolved_at(
+            &log(rows),
+            Path::new("transcript.jsonl"),
+            key,
+            1000.0,
+            &mut None,
+        )
     }
 
     #[test]
@@ -642,6 +667,29 @@ pub(crate) mod tests {
                 1000.0
             )
             .is_none());
+    }
+
+    #[test]
+    fn needs_human81_future_result_is_rechecked_without_file_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let mut future = rows();
+        future[2] = row("user", 1001, json!([result("a")]));
+        std::fs::write(&path, log(&future)).unwrap();
+        let mut reader = Reader::default();
+        assert!(reader
+            .observe("uid", (1001, Some(42)), &path, key(true), None, 1000.0)
+            .is_none());
+        assert!(reader
+            .observe("uid", (1001, Some(42)), &path, key(true), None, 1000.5)
+            .is_none());
+        assert_eq!(
+            reader
+                .observe("uid", (1001, Some(42)), &path, key(true), None, 1001.0)
+                .unwrap()
+                .at,
+            1001.0
+        );
     }
 
     #[test]
