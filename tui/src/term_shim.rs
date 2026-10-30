@@ -159,6 +159,8 @@ pub struct StreamReader<R: Read> {
     /// True once any terminating frame arrives or the underlying
     /// stream signals EOF — subsequent `read` calls return `Ok(0)`.
     eof: bool,
+    /// Negotiated attach liveness; updated as inbound bytes arrive.
+    progress: Option<std::sync::Arc<std::sync::Mutex<std::time::Instant>>>,
 }
 
 /// Stream-side representation of a session exit. Carries more than
@@ -198,7 +200,12 @@ impl<R: Read> StreamReader<R> {
             pending_pos: 0,
             child_event: None,
             eof: false,
+            progress: None,
         }
+    }
+
+    pub fn set_progress(&mut self, progress: std::sync::Arc<std::sync::Mutex<std::time::Instant>>) {
+        self.progress = Some(progress);
     }
 
     /// Drain any pending child event from a previously-consumed
@@ -244,9 +251,30 @@ impl<R: Read> StreamReader<R> {
         // Drive state out of `self` so we can mutably borrow
         // `self.inner` alongside the state without aliasing.
         let mut state = std::mem::replace(&mut self.state, ReadState::fresh());
-        let outcome = drive_read_fsm(&mut state, &mut self.inner);
+        let outcome = drive_read_fsm(&mut state, &mut ProgressReader {
+            inner: &mut self.inner,
+            progress: self.progress.as_ref(),
+        });
         self.state = state;
         outcome
+    }
+}
+
+/// Count partial frames too: a slow but progressing frame is not a stall.
+struct ProgressReader<'a, R> {
+    inner: &'a mut R,
+    progress: Option<&'a std::sync::Arc<std::sync::Mutex<std::time::Instant>>>,
+}
+
+impl<R: Read> Read for ProgressReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            if let Some(progress) = self.progress {
+                *progress.lock().unwrap_or_else(|p| p.into_inner()) = std::time::Instant::now();
+            }
+        }
+        Ok(n)
     }
 }
 
@@ -524,19 +552,18 @@ impl<R: Read> Read for StreamReader<R> {
                         ),
                     ));
                 }
+                // Negotiated attach heartbeat has no terminal bytes.
+                StreamKind::Heartbeat => continue,
                 // 10e-b: `ManifestSnapshot` and `ManifestDiff`
                 // belong to the `manifest.watch` stream, NOT the
                 // PTY-attach stream this `term_shim` decodes.
                 // Reaching this arm means the wrong stream is
                 // wired to this reader — surface as malformed.
-                // 10e-b r1: `Heartbeat` likewise — manifest.watch
-                // sends them on idle, but PTY attach never does.
                 // 11b: `WorkflowEventStateSnapshot` /
                 // `WorkflowEvent` belong to `events.subscribe`,
                 // same rationale.
                 StreamKind::ManifestSnapshot
                 | StreamKind::ManifestDiff
-                | StreamKind::Heartbeat
                 | StreamKind::WorkflowEventStateSnapshot
                 | StreamKind::WorkflowEvent => {
                     self.eof = true;
@@ -947,6 +974,33 @@ mod tests {
             StreamKind::Data,
             serde_json::json!({ "bytes": BASE64.encode(payload_bytes) }),
         )
+    }
+
+    #[test]
+    fn attach_heartbeat_refreshes_progress_without_terminal_output() {
+        let mut source = ScriptedReader::new();
+        source.push_bytes(frame_bytes(StreamKind::Heartbeat, Value::Null));
+        source.push_block();
+        let old = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(old));
+        let mut reader = StreamReader::new(source);
+        reader.set_progress(progress.clone());
+        assert_eq!(reader.read(&mut [0u8; 8]).unwrap_err().kind(), ErrorKind::WouldBlock);
+        assert!(*progress.lock().unwrap() > old);
+        assert!(reader.take_child_event().is_none());
+    }
+
+    #[test]
+    fn partial_attach_frame_refreshes_progress() {
+        let mut source = ScriptedReader::new();
+        source.push_bytes(vec![0, 0]);
+        source.push_block();
+        let old = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(old));
+        let mut reader = StreamReader::new(source);
+        reader.set_progress(progress.clone());
+        assert_eq!(reader.read(&mut [0u8; 8]).unwrap_err().kind(), ErrorKind::WouldBlock);
+        assert!(*progress.lock().unwrap() > old);
     }
 
     // --- StreamReader: blocking-style happy path -------------------

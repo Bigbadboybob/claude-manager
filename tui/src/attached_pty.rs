@@ -349,6 +349,11 @@ impl AttachedPty {
         self.reader.position = Some((position, replay_bytes, replay_done));
     }
 
+    /// Track inbound bytes for a negotiated attach heartbeat.
+    pub fn set_progress_tracker(&mut self, progress: Arc<std::sync::Mutex<std::time::Instant>>) {
+        self.reader.inner.set_progress(progress);
+    }
+
     /// Route this pane's stream through kitty graphics passthrough. Call
     /// before the EventLoop takes ownership.
     pub fn set_graphics_tap(&mut self, tap: crate::graphics::Tap) {

@@ -652,7 +652,7 @@ impl App {
     /// Catch an attach stream that's dead but that never produced a clean
     /// EOF — the half-open freeze (renders stale, normal indicator, dead to
     /// input; `transport_eof` never fires because there's no `read()==0`, and
-    /// alacritty's EventLoop SPINS at 100% CPU on the fd's `POLLHUP`). Two
+    /// alacritty's EventLoop can spin on the fd's `POLLHUP`). Three
     /// triggers per attached remote session:
     ///
     ///   - **S5 socket HUP** — `session.attach_socket_hung_up()` polls the
@@ -663,15 +663,17 @@ impl App {
     ///   - **S3 stale generation** — the session's dialed-under tunnel
     ///     generation is behind the host's current one (its tunnel was replaced
     ///     under it). Catches the case where the fd hasn't HUP'd yet but a
-    ///     respawn already happened; `ServerAlive` turns a half-open tunnel into
-    ///     a respawn within ~15s, bumping the generation.
+    ///     respawn already happened. SSH keepalives can trigger a respawn,
+    ///     but do not prove application data is flowing.
+    ///   - **Negotiated heartbeat** — no inbound bytes for 45 seconds after
+    ///     the daemon has acknowledged its 10-second heartbeat.
     ///
-    /// Both re-queue through the same path a transport EOF takes. Un-recorded
+    /// All re-queue through the same path a transport EOF takes. Un-recorded
     /// live sessions are baselined at the current generation (safety net for
     /// attach paths that don't record explicitly). Cheap: one non-blocking
-    /// `poll`, one HashMap lookup + atomic read per remote session per tick.
+    /// `poll`, one HashMap lookup and a short progress lock per session per tick.
     ///
-    /// LOCAL daemon-attached rows get the **S5 probe only**
+    /// LOCAL daemon-attached rows get S5 and negotiated heartbeat probes
     /// (DESIGN_SEAMLESS_RESTART phase 5): a daemon re-exec closes every
     /// attach socket, and when alacritty's EventLoop spins on the `POLLHUP`
     /// instead of reading the EOF (the exact half-open shape S5 was built
@@ -682,11 +684,8 @@ impl App {
     /// sessions have no `attach_hup_fd` and are never touched.
     pub fn requeue_stale_generation_remote_sessions(&mut self) {
         let local = cm_daemon::host_id::HostId::local();
-        // (wi, si, reason). Two triggers, both meaning "this attached remote
-        // stream is dead": S5 socket HUP (fast, direct — the fd this session's
-        // spinning alacritty EventLoop can't act on) and S3 stale generation
-        // (the tunnel was replaced under it). HUP wins the label since it's the
-        // stronger signal.
+        // (wi, si, reason). HUP wins the label over a heartbeat timeout or
+        // stale tunnel generation.
         let mut dead: Vec<(usize, usize, &'static str)> = Vec::new();
         let mut baseline: Vec<(String, u64)> = Vec::new();
         for wi in 0..self.workspaces.len() {
@@ -704,15 +703,20 @@ impl App {
                 // S5: probe the attach socket for POLLHUP/POLLERR while we hold
                 // the borrow (cheap non-blocking poll of the dup'd fd).
                 let hung_up = ts.session.attach_socket_hung_up();
+                let stalled = ts.session.attach_progress.as_ref().is_some_and(|p| {
+                    p.lock().unwrap_or_else(|e| e.into_inner()).elapsed() >= std::time::Duration::from_secs(45)
+                });
                 // A session already in the reconnect flow is handled there.
                 if self.reconnecting_sessions.contains(&uid) {
                     continue;
                 }
-                // Local rows: S5 only (see the doc comment) — no tunnel, so
+                // Local rows have no tunnel, so
                 // no generation record and no S3 arm.
                 if is_local {
                     if hung_up {
                         dead.push((wi, si, "socket hangup (POLLHUP)"));
+                    } else if stalled {
+                        dead.push((wi, si, "attach heartbeat timed out"));
                     }
                     continue;
                 }
@@ -723,6 +727,8 @@ impl App {
                 );
                 if hung_up {
                     dead.push((wi, si, "socket hangup (POLLHUP)"));
+                } else if stalled {
+                    dead.push((wi, si, "attach heartbeat timed out"));
                 } else if stale_gen {
                     dead.push((wi, si, "tunnel replaced (no EOF)"));
                 } else if !self.attached_tunnel_generation.contains_key(&uid) {
@@ -3765,6 +3771,36 @@ mod remote_reconnect_tests {
         );
         assert!(app.pending_remote_reattach.is_empty());
         drop(b); // keep the peer alive across the poll above
+    }
+
+    #[test]
+    fn heartbeat_timeout_requeues_open_stream_once_but_legacy_and_fresh_stay() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cm_dir = tmp.path().join(".cm");
+        std::fs::create_dir_all(&cm_dir).unwrap();
+        let (mut app, ghost) = app_with_ghost_unix_host(&cm_dir);
+        let mut peers = Vec::new();
+        for (uid, age) in [("stalled", Some(46)), ("fresh", Some(0)), ("legacy", None)] {
+            let (mut ts, _tx, _teof) = session_with_injected_exit(uid, ghost.clone(), false);
+            let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+            ts.session.attach_hup_fd = Some(std::os::fd::OwnedFd::from(a));
+            ts.session.attach_progress = age.map(|seconds| Arc::new(std::sync::Mutex::new(
+                Instant::now() - Duration::from_secs(seconds))));
+            let mut workspace = workspace_with(ts);
+            workspace.id = format!("ws-{uid}");
+            app.workspaces.push(workspace);
+            app.attached_tunnel_generation.insert(uid.into(), 1);
+            peers.push(b);
+        }
+        app.host_pool.set_tunnel_generation_for_test(&ghost, 1);
+        app.requeue_stale_generation_remote_sessions();
+        app.requeue_stale_generation_remote_sessions();
+        assert!(app.reconnecting_sessions.contains("stalled"));
+        assert!(!app.reconnecting_sessions.contains("fresh"));
+        assert!(!app.reconnecting_sessions.contains("legacy"));
+        assert_eq!(app.pending_remote_reattach.iter().filter(|p| p.entry.uid == "stalled").count(), 1);
+        drop(peers);
     }
 
     // --- S3: stale-tunnel-generation watchdog (half-open freeze) -----------

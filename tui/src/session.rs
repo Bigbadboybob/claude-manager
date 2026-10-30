@@ -160,6 +160,8 @@ pub struct Session {
     /// for daemon-attached sessions; `None` for local-PTY sessions. See
     /// [`Self::attach_socket_hung_up`].
     pub attach_hup_fd: Option<std::os::fd::OwnedFd>,
+    /// Present only when the daemon acknowledged attach heartbeats.
+    pub attach_progress: Option<std::sync::Arc<std::sync::Mutex<Instant>>>,
     /// Kitty graphics passthrough for daemon-attached panes; `None` when it
     /// is off or for local PTYs. See doc/kitty-graphics-passthrough.md.
     pub graphics: Option<crate::graphics::PaneGraphics>,
@@ -352,6 +354,7 @@ impl Session {
             daemon_transport_eof: None,
             // Local PTY session — no attach socket to watch for HUP.
             attach_hup_fd: None,
+            attach_progress: None,
             output_control: None,
             graphics: None,
             history_deferred: false,
@@ -431,6 +434,7 @@ impl Session {
             // session triggers reconnect, not teardown.
             daemon_transport_eof: Some(cs.transport_eof),
             attach_hup_fd: cs.hup_fd,
+            attach_progress: cs.attach_progress,
             output_control: cs.output_control,
             graphics: cs.graphics,
             history_deferred: cs.history_deferred,
@@ -498,6 +502,7 @@ impl Session {
             // session reconnects instead of tearing down.
             daemon_transport_eof: Some(cs.transport_eof),
             attach_hup_fd: cs.hup_fd,
+            attach_progress: cs.attach_progress,
             output_control: cs.output_control,
             graphics: cs.graphics,
             history_deferred: cs.history_deferred,

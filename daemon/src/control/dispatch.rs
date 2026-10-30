@@ -142,6 +142,8 @@ pub struct AttachStreamHandle {
     pub request_id: String,
     /// The client asked for raw data frames (`wire::write_raw_data_frame`).
     pub binary: bool,
+    /// Heartbeats are opt-in so older viewers never receive an unknown frame.
+    pub heartbeat: bool,
 }
 
 /// What `dispatch_request` returns. Most arms produce `Done` with
@@ -3213,6 +3215,7 @@ fn dispatch_attach_direct(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Dis
         stream_id: Option<u64>,
         /// Send output as raw data frames instead of base64 JSON.
         binary: Option<bool>,
+        heartbeat: Option<bool>,
     }
     #[derive(serde::Deserialize)]
     struct Context {
@@ -3263,6 +3266,10 @@ fn dispatch_attach_direct(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Dis
         if params.binary == Some(true) {
             handle.binary = true;
             result["binary"] = serde_json::json!(true);
+        }
+        if params.heartbeat == Some(true) {
+            handle.heartbeat = true;
+            result["heartbeat_interval_secs"] = serde_json::json!(crate::control::stream::ATTACH_HEARTBEAT_INTERVAL.as_secs());
         }
         if let Some(ring) = ring {
             // Built outside the state lock; output that arrived meanwhile is
@@ -3391,6 +3398,7 @@ fn bind_attach_stream_with(
         kill_attribution,
         request_id: req.id.clone(),
         binary: false,
+        heartbeat: false,
     };
     (DispatchOutcome::AttachStream { response, handle }, ring)
 }
@@ -5707,6 +5715,20 @@ mod tests {
             };
             assert_eq!(handle.binary, expected);
             assert_eq!(response.result.unwrap().get("binary").is_some(), expected);
+        }
+    }
+
+    #[test]
+    fn direct_attach_heartbeat_is_opt_in_and_acknowledged() {
+        let state = state_with_session("ts-live");
+        for (request, expected) in [(json!({}), false), (json!({"heartbeat": true}), true)] {
+            let mut params = json!({"uid":"ts-live"});
+            params.as_object_mut().unwrap().extend(request.as_object().unwrap().clone());
+            let DispatchOutcome::AttachStream { response, handle } = dispatch_request(
+                &state, &operator_request("attach.direct", params),
+            ) else { panic!("expected live stream") };
+            assert_eq!(handle.heartbeat, expected);
+            assert_eq!(response.result.unwrap().get("heartbeat_interval_secs").is_some(), expected);
         }
     }
 
