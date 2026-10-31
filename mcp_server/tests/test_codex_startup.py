@@ -134,18 +134,27 @@ def test_startup90_concurrent_cm_launches_preserve_other_keys(home):
     assert json.loads((home/"version.json").read_text())=={**old,"dismissed_version":"0.999.0"}
 
 
-def test_startup90_detected_upstream_rewrite_is_not_overwritten(home):
+@pytest.mark.parametrize("stage", [1, 2, 3])
+def test_startup90_detected_upstream_rewrite_is_not_overwritten(home,stage):
     cache(home)
-    real_stat=startup.os.stat;changed=False
+    real_stat=startup.os.stat;calls=0
     def race(path,*args,**kwargs):
-        nonlocal changed
-        if path=="version.json" and not changed:
-            changed=True;cache(home,latest_version="new",new_unknown="keep")
+        nonlocal calls
+        if path=="version.json":
+            calls+=1
+            if calls==stage:cache(home,latest_version="new",new_unknown="keep")
         return real_stat(path,*args,**kwargs)
     with patch.object(startup.os,"stat",side_effect=race):
-        with pytest.raises(startup.StartupSuppressionError,match="changed"):
-            startup.dismiss_cached_update()
-    assert json.loads((home/"version.json").read_text())["new_unknown"]=="keep"
+        if stage==1:
+            # A preflight race is re-read under the shared CM lock, preserving
+            # the new fields; races during the protected attempt must refuse.
+            assert startup.dismiss_cached_update()=="dismissed"
+        else:
+            with pytest.raises(startup.StartupSuppressionError,match="changed"):
+                startup.dismiss_cached_update()
+    value=json.loads((home/"version.json").read_text())
+    assert value["new_unknown"]=="keep" and value["latest_version"]=="new"
+    assert value["dismissed_version"] == ("new" if stage==1 else None)
 
 
 @pytest.mark.parametrize("mode",[[],["resume","saved"],["fork","saved"]])
