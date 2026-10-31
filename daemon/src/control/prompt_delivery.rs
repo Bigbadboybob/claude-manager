@@ -18,6 +18,64 @@ pub struct Receipt {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_seq_before: Option<u64>,
 }
+/// Content-free evidence captured from the existing bounded PTY ring before
+/// registry removal. Markers are observations, not a claim about root cause.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct StartupFailure {
+    pub session_uid: String,
+    pub pid: i32,
+    pub process_start: Option<u64>,
+    pub generation: u64,
+    pub receipt_id: Option<String>,
+    pub exited_at: f64,
+    pub exit_code: i32,
+    pub pty_bytes_inspected: usize,
+    pub pty_tail_truncated: bool,
+    pub pty_closed: bool,
+    pub markers: Vec<String>,
+    pub hint: Option<String>,
+}
+
+pub(crate) fn startup_failure(
+    session: &crate::session::DaemonSession,
+    code: Option<i32>,
+    at: f64,
+    killed: bool,
+) -> Option<StartupFailure> {
+    let code = code.filter(|c| *c != 0)?;
+    if session.session_type != "codex" || killed || session.reported_done().is_some() {
+        return None;
+    }
+    let cell = session.agent_state.lock().unwrap_or_else(|p| p.into_inner());
+    // A known engine turn excludes startup failure, even if a confirmation
+    // worker has not published its result yet. Never inspect a running turn.
+    if at - cell.inputs.spawned_at > 120.0 || at < cell.inputs.spawned_at
+        || cell.inputs.hooks.prompt_at.is_some_and(|t| t >= cell.inputs.spawned_at)
+        || cell.inputs.relay.as_ref().is_some_and(|r| r.turn_started_at.is_some_and(|t| t >= cell.inputs.spawned_at)) {
+        return None;
+    }
+    let process_start = cell.child_start_time;
+    drop(cell);
+    let receipt = session.prompt_delivery.as_ref().map(|t| t.lock().unwrap_or_else(|p| p.into_inner()).clone());
+    if receipt.as_ref().is_some_and(|r| r.submitted) { return None; }
+    let tail = session.fanout.startup_tail();
+    let bytes: Vec<u8> = tail.bytes.iter().map(u8::to_ascii_lowercase).collect();
+    let markers: Vec<String> = [
+        ("update available", "update_notice"), ("update now", "update_choice"),
+        ("eacces", "permission_denied"),
+        ("startupsuppressionerror", "update_suppression_failed"),
+        ("codex app-server did not start", "backend_start_failed"),
+        ("codex app-server startup timed out", "backend_start_timeout"),
+    ].into_iter().filter(|(needle,_)| bytes.windows(needle.len()).any(|w| w == needle.as_bytes()))
+        .map(|(_,label)| label.to_owned()).collect();
+    let hint = markers.iter().any(|m| m == "update_suppression_failed" || m == "update_notice")
+        .then(|| "Inspect effective CODEX_HOME/version.json; repair the cache and set dismissed_version to latest_version. CM never installs updates.".to_string());
+    Some(StartupFailure {session_uid:session.uid.clone(), pid:session.pid,
+        process_start, generation:session.generation, receipt_id:receipt.map(|r|r.id),
+        exited_at:at, exit_code:code, pty_bytes_inspected:bytes.len(),
+        pty_tail_truncated:tail.evicted_since_cursor, pty_closed:tail.closed, markers, hint})
+}
+
 pub type Ticket = Arc<Mutex<Receipt>>;
 impl Receipt {
     pub fn pending() -> Ticket {

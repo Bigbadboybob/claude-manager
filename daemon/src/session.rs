@@ -405,6 +405,21 @@ impl PtyByteFanout {
     /// `closed` is the producer's "no more bytes coming" flag —
     /// see [`close`](Self::close). Useful for one-shot MCP callers
     /// that want to know if they should stop polling.
+    /// Small forensic tail without cloning the replay ring or subscribing.
+    pub(crate) fn startup_tail(&self) -> FanoutSnapshot {
+        const MAX: usize = 4096;
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut bytes: Vec<u8> = inner.buffer.iter().rev().take(MAX).copied().collect();
+        bytes.reverse();
+        FanoutSnapshot {
+            start_offset: inner.bytes_written.saturating_sub(bytes.len() as u64),
+            evicted_since_cursor: inner.bytes_written > bytes.len() as u64,
+            cursor: inner.bytes_written,
+            closed: inner.closed,
+            bytes,
+        }
+    }
+
     pub fn snapshot_since(&self, since: Option<u64>) -> FanoutSnapshot {
         let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let bytes_written = inner.bytes_written;

@@ -87,6 +87,18 @@ class LaunchConfirmationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(result["submitted"])
                 self.assertEqual(result["reason"], reason)
 
+    async def test_startup90_failed_launch_keeps_only_its_bound_diagnostics(self):
+        for matching in [True, False]:
+            initial=receipt()
+            diagnostic={"receipt_id":initial["id"] if matching else "old-incarnation",
+                        "session_uid":"worker","exit_code":1,"markers":["permission_denied"]}
+            with patch.object(control_client,"call",return_value={"state":"exited","startup_failure":diagnostic}):
+                result=await server._await_launch_confirmation("worker",initial,socket_path=None)
+            self.assertEqual(result["reason"],"session_gone")
+            self.assertFalse(result["submitted"])
+            self.assertEqual("startup_failure" in result,matching)
+            if matching:self.assertEqual(result["startup_failure"],diagnostic)
+
     async def test_transient_poll_failures_retry_until_confirmation_or_deadline(self):
         for transient in [
             control_client.TransportError("timeout"),
