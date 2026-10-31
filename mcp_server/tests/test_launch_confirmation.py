@@ -36,6 +36,15 @@ class LaunchConfirmationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result["prompt_delivery"], receipt())
                 self.assertNotIn("submitted", result)
 
+    def test_startup90_exited_reads_retain_safe_diagnostics_without_a_transcript(self):
+        diagnostic={"receipt_id":"launch-1","session_uid":"worker","exit_code":1,
+                    "markers":["update_suppression_failed"],"pty_bytes_inspected":64}
+        with patch.object(control_client,"call",return_value={"state":"exited","engine":"codex",
+                "transcript_path":None,"startup_failure":diagnostic,"generation":0,"idle":True}):
+            for read in [server.read_last_turn,server.read_session_output]:
+                result=read("worker")
+                self.assertEqual(result["startup_failure"],diagnostic)
+
     async def test_pending_then_confirmed_keeps_pinned_socket(self):
         path = Path("/original/daemon.sock")
         with patch.object(

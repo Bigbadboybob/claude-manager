@@ -93,6 +93,8 @@ for update notice/choice, EACCES, suppression or backend-start failure. A repair
 hint is included for observed update markers. No raw PTY text, prompt, credentials
 or transcript is persisted. Initial-prompt confirmation carries these diagnostics
 only when the receipt ID matches; `session_gone` still means unconfirmed.
+MCP `read_last_turn` and `read_session_output` expose the retained diagnostic on
+authorized readback too, even when no transcript was created.
 
 Clean exits, known operator/cap kills, established turns and later exits do not
 produce this startup diagnostic. A signal-only or lost exit status cannot prove

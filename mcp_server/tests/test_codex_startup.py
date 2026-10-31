@@ -102,6 +102,31 @@ def test_startup90_missing_regular_and_suspicious_entries(home):
     with pytest.raises(startup.StartupSuppressionError):startup.dismiss_cached_update()
 
 
+def test_startup90_real_symlink_hardlink_and_unreadable_cache_refuse(home):
+    target=home/"original";target.write_text('{"latest_version":"x","secret":"untouched"}')
+    before=target.read_bytes();path=home/"version.json"
+    path.symlink_to(target)
+    with pytest.raises(startup.StartupSuppressionError):startup.dismiss_cached_update()
+    assert target.read_bytes()==before
+    path.unlink();os.link(target,path)
+    with pytest.raises(startup.StartupSuppressionError):startup.dismiss_cached_update()
+    assert target.read_bytes()==before
+    path.unlink();cache(home);path.chmod(0)
+    try:
+        with pytest.raises(startup.StartupSuppressionError,match="version.json.*dismissed_version"):
+            startup.dismiss_cached_update()
+    finally:path.chmod(0o600)
+
+
+def test_startup90_clean_frontend_can_start_without_cache_or_settings_changes(home):
+    backend,frontend=native_codex.split_args([])
+    with patch.object(native_codex.asyncio,"create_subprocess_exec",new=AsyncMock(return_value="child")) as spawn:
+        assert asyncio.run(native_codex.spawn_frontend("fake",frontend,"/tmp/fake.sock"))=="child"
+    assert startup.UPDATE_OFF in spawn.call_args.args
+    assert startup.UPDATE_OFF in backend
+    assert list(home.iterdir())==[]
+
+
 def test_startup90_dangling_configured_home_or_ancestor_fails(home,monkeypatch):
     link=home/"dangling";link.symlink_to(home/"absent")
     for path in [link,link/"nested"/"codex"]:
