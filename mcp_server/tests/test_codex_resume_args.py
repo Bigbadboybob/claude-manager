@@ -66,7 +66,7 @@ class CodexResumeArgsTests(unittest.TestCase):
         policy = {"approvalPolicy": "never", "approvalsReviewer": "user",
                   "permissions": ":danger-full-access"}
         backend, frontend = split_args(["resume", BYPASS, "--no-alt-screen", "saved-thread"], policy)
-        self.assertEqual(frontend, ["--no-alt-screen", "resume", "saved-thread"])
+        self.assertEqual(frontend, ["--no-alt-screen", "-c", "check_for_update_on_startup=false", "resume", "saved-thread"])
         self.assertIn('approval_policy="never"', backend)
         self.assertIn('approvals_reviewer="user"', backend)
         self.assertNotIn('approvals_reviewer="auto_review"', backend)
@@ -81,10 +81,10 @@ class CodexResumeArgsTests(unittest.TestCase):
             backend, frontend = split_args(["fork", "-c", "x=1", "--no-alt-screen", "src-thread"])
         # The fork runs in its new worktree, never the source's directory.
         self.assertEqual(frontend, [
-            "--no-alt-screen", "-c", 'tui.resume_cwd="current"',
+            "--no-alt-screen", "-c", "check_for_update_on_startup=false", "-c", 'tui.resume_cwd="current"',
             "--cd", "/work/fork with spaces", "fork", "src-thread",
         ])
-        self.assertEqual(backend, ["-c", "x=1"])
+        self.assertEqual(backend, ["-c", "x=1", "-c", "check_for_update_on_startup=false"])
         policy = {"approvalPolicy": "never", "approvalsReviewer": "user",
                   "permissions": ":danger-full-access"}
         backend, frontend = split_args(["fork", "src-thread"], policy)
@@ -97,8 +97,9 @@ class CodexResumeArgsTests(unittest.TestCase):
         self.assertEqual(backend, [
             "-c", 'approval_policy="never"',
             "-c", 'sandbox_mode="danger-full-access"',
+            "-c", "check_for_update_on_startup=false",
         ])
-        self.assertEqual(frontend, [BYPASS, "--no-alt-screen"])
+        self.assertEqual(frontend, [BYPASS, "--no-alt-screen", "-c", "check_for_update_on_startup=false"])
 
     def test_remote_resume_inherits_permissions_with_old_or_new_viewer(self):
         for legacy in ([], [BYPASS]):
@@ -112,8 +113,9 @@ class CodexResumeArgsTests(unittest.TestCase):
                 self.assertEqual(backend, [
                     "-c", "check_for_update_on_startup=false",
                     "-c", 'mcp_servers.claude-manager.command="launcher.sh"',
+                    "-c", "check_for_update_on_startup=false",
                 ])
-                self.assertEqual(frontend, ["--no-alt-screen", "resume", "saved-thread"])
+                self.assertEqual(frontend, ["--no-alt-screen", "-c", "check_for_update_on_startup=false", "resume", "saved-thread"])
 
     def test_model_reaches_frontend_backend_and_thread_requests(self):
         for argv in ([BYPASS, "--no-alt-screen", "-m", "gpt-6-luna"],

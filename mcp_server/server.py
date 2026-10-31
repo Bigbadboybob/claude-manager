@@ -3401,6 +3401,7 @@ _OUTCOME_FIELDS = (
     "prompt_delivery",
     "agent_state",
     "pty_idle",
+    "startup_failure",
 )
 
 

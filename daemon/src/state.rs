@@ -58,6 +58,8 @@ pub const RECENTLY_EXITED_CAP: usize = 256;
 /// swap instead of dying with the old image (the P4b known gap).
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ExitedTombstone {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_failure: Option<crate::control::prompt_delivery::StartupFailure>,
     pub session_uid: String,
     pub transcript_path: Option<String>,
     pub generation: u64,
@@ -1593,6 +1595,7 @@ mod tests {
 
     fn tomb(uid: &str) -> ExitedTombstone {
         ExitedTombstone {
+            startup_failure: None,
             org: None,
             incarnation: None,
             status_lost: false,

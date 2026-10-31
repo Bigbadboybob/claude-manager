@@ -51,3 +51,54 @@ To remove the service, delete only the marked cron block and restore Codex start
 ## Verification
 
 Run `python3 -m unittest discover -s tests -p test_codex_update_check.py -v` for release ordering, deduplication, hold drift, error/recovery alerts, retryable delivery, file locking, corrupt/atomic state behavior, bounded registry requests and safe notifier errors. Deployment also requires a real registry check, a second check proving stable behavior, and one setup notification through the real notifier. Keep fake-release tests local; do not inject a fabricated available-version alert into production.
+
+### CM native launch protection
+
+The CM native Codex launcher forces `check_for_update_on_startup=false` on both
+its app-server and remote terminal frontend, including fresh, resume, fork and
+frontend relaunch paths. This disables fetching; it does **not** dismiss a
+previously cached update menu. Immediately before every frontend process is
+created, CM reads the effective `$CODEX_HOME/version.json` (literal nonempty
+`CODEX_HOME`, otherwise `~/.codex/version.json`) and sets only `dismissed_version`
+to the cached `latest_version`. Other cache keys are preserved. No menu-choice
+keystrokes, package updates, auth/trust/approval bypasses, or user config edits
+are part of this protection.
+
+A missing home/cache, empty cache or object without a latest version starts
+normally, with no cache creation or write access required. An already dismissed
+notice also needs no write. Malformed, oversized (>64 KiB), suspicious/nonregular
+or unreadable entries refuse startup visibly; an actual notice that cannot be
+written/dismissed also refuses. The error names `version.json` and the
+`dismissed_version` repair. Inspect that file in the session's effective home,
+repair invalid data if needed, and set `dismissed_version` to `latest_version`
+after verifying the cached version. An unwritable lock/cache is an operator
+repair, never a reason to send Enter to a menu. The existing updater remains the
+only update-check/installation policy; this launcher change installs nothing.
+
+CM launches serialize updates with `.cm-version.lock` in that home (one-second
+lock deadline), use regular-file/owner checks and atomic replacement, and refuse
+detected concurrent rewrites. This lock coordinates CM only. An external Codex
+process/updater can still overwrite the cache after verification because upstream
+does not honor this lock. That residual race cannot be eliminated by a cache-only
+scheme; the flags prevent CM's own processes from fetching a new notice. The
+launcher does not claim that successful suppression proves the composer ready.
+
+If a Codex launch exits nonzero within 120 seconds without a positively observed
+turn start or confirmed initial prompt, the daemon captures **content-free**
+`startup_failure` diagnostics before removing the session. Existing authorized
+`resolve_authorized_session` and `list_sessions(include_exited=true)` reads retain
+PID/start, generation, exit time/code, optional prompt receipt ID, up to 4096 bytes
+inspected from the existing PTY tail, truncation/closed markers, and fixed labels
+for update notice/choice, EACCES, suppression or backend-start failure. A repair
+hint is included for observed update markers. No raw PTY text, prompt, credentials
+or transcript is persisted. Initial-prompt confirmation carries these diagnostics
+only when the receipt ID matches; `session_gone` still means unconfirmed.
+MCP `read_last_turn` and `read_session_output` expose the retained diagnostic on
+authorized readback too, even when no transcript was created.
+
+Clean exits, known operator/cap kills, established turns and later exits do not
+produce this startup diagnostic. A signal-only or lost exit status cannot prove
+a nonzero startup failure. The tail may be empty, partial or lack the final
+reader bytes; its markers are observations, not a root-cause claim. Retention is
+that of existing bounded exit tombstones; diagnostics do not promise permanent
+logs or a full terminal capture. CM's release operator owns live canary testing.

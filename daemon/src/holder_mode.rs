@@ -2070,6 +2070,7 @@ pub fn adopt_at_boot(
             }
             let exited_at = unix_now();
             st.record_exited(crate::state::ExitedTombstone {
+                startup_failure: None,
                 session_uid: uid.clone(),
                 transcript_path: e.transcript_path.clone(),
                 generation: e.generation,

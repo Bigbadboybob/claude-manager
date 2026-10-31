@@ -1628,6 +1628,8 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
             .or_else(|| memory_cap_kill.then(|| MEMORY_CAP_KILLER.to_string()));
         let report = sess.reported_done();
         crate::state::ExitedTombstone {
+            startup_failure: super::prompt_delivery::startup_failure(sess,
+                last_exit_opt.as_ref().and_then(|e| e.code), exited_at, killed),
             session_uid: uid.to_string(),
             transcript_path: sess.transcript_path.clone(),
             generation: sess.generation,
@@ -3299,6 +3301,7 @@ pub fn list_sessions(
                 "worktree_path": tomb.worktree_path,
                 // UX item 3b: how it ended, not just that it ended.
                 "exited_at": tomb.exited_at,
+                "startup_failure": tomb.startup_failure,
                 "killed": tomb.killed,
                 "killed_by": tomb.killed_by,
                 // UX item 4a: and whether it finished before ending.
@@ -3541,6 +3544,7 @@ pub fn resolve_authorized_session(
             "agent_state": {"state": "exited"},
             "semantic_idle": true,
             "exited_at": tomb.exited_at,
+                "startup_failure": tomb.startup_failure,
             "killed": tomb.killed,
             "killed_by": tomb.killed_by.clone(),
             // UX item 4a: did it finish, or just stop? A tombstoned report
@@ -25482,6 +25486,68 @@ mod tests {
     /// (untracked-uid call) without needing a real spawn. Subscriber
     /// receives nothing; manifest snapshot stays untouched.
     #[test]
+    fn startup90_exit_preserves_content_free_diagnostics_before_session_removal() {
+        let state=make_state_arc();let uid="ts-startup90";
+        insert_session(&state,uid,"ws-startup90");
+        let id;
+        {
+            let mut st=state.lock().unwrap();
+            let s=st.sessions.get_mut(uid).unwrap();s.session_type="codex".into();
+            let ticket=super::super::prompt_delivery::Receipt::pending();
+            id=ticket.lock().unwrap().id.clone();s.prompt_delivery=Some(ticket);
+            s.fanout.push(&vec![b'x';8192]);
+            s.fanout.push(b"Update available\r\nUpdate now\r\nnpm error EACCES secret-token=DO_NOT_RETAIN\n");
+            s.fanout.close();
+            s.last_exit.set_kernel(crate::session::KernelExitStatus {code:Some(1),signal:None});
+            handle_session_exit(&mut st,uid);
+            assert!(!st.sessions.contains_key(uid));
+            let tomb=st.exited_tombstone(uid).unwrap();
+            let failure=tomb.startup_failure.as_ref().unwrap();
+            assert_eq!(failure.receipt_id.as_deref(),Some(id.as_str()));
+            assert_eq!(failure.exit_code,1);
+            assert_eq!(failure.pty_bytes_inspected,4096);
+            assert!(failure.pty_tail_truncated && failure.pty_closed);
+            assert_eq!(failure.markers,vec!["update_notice","update_choice","permission_denied"]);
+            let saved=serde_json::to_string(tomb).unwrap();
+            assert!(!saved.contains("DO_NOT_RETAIN") && !saved.contains("secret-token"));
+            let restored:crate::state::ExitedTombstone=serde_json::from_str(&saved).unwrap();
+            assert_eq!(restored.startup_failure,tomb.startup_failure,"existing persisted tombstone schema retains evidence");
+        }
+        let read=resolve_authorized_session(&state,&json!({"session_uid":uid}),None).unwrap();
+        assert_eq!(read["startup_failure"]["receipt_id"],id);
+        assert_eq!(read["state"],"exited");
+        let list=list_sessions(&state,&json!({"include_exited":true}),None).unwrap();
+        assert_eq!(list.as_array().unwrap().iter().find(|r|r["session_uid"]==uid).unwrap()["startup_failure"],read["startup_failure"]);
+    }
+
+    #[test]
+    fn startup90_clean_intentional_late_and_started_exits_do_not_capture() {
+        let state=make_state_arc();let uid="ts-startup90-control";
+        insert_session(&state,uid,"ws-startup90");
+        {
+            let mut st=state.lock().unwrap();let s=st.sessions.get_mut(uid).unwrap();
+            s.session_type="codex".into();let at=now_unix_f64();
+            s.agent_state.lock().unwrap().inputs.spawned_at=at-1.0;
+            s.fanout.push(b"Update available EACCES");
+            let collect=super::super::prompt_delivery::startup_failure;
+            assert!(collect(s,Some(0),at,false).is_none());
+            assert!(collect(s,Some(1),at,true).is_none());
+            assert!(collect(s,None,at,false).is_none());
+            assert!(collect(s,Some(1),at+121.0,false).is_none());
+            s.agent_state.lock().unwrap().inputs.relay=Some(crate::agent_state::RelaySnapshot {
+                turn_started_at:Some(at),..Default::default()});
+            assert!(collect(s,Some(1),at,false).is_none());
+            // A resume's historical turn is not a turn started by this process.
+            s.agent_state.lock().unwrap().inputs.relay.as_mut().unwrap().turn_started_at=Some(at-3600.0);
+            assert!(collect(s,Some(1),at,false).is_some());
+            let ticket=super::super::prompt_delivery::Receipt::pending();
+            super::super::prompt_delivery::finish(&ticket,Ok("relay"));s.prompt_delivery=Some(ticket);
+            assert!(collect(s,Some(1),at,false).is_none());
+        }
+        kill_all_sessions(&state);
+    }
+
+    #[test]
     fn handle_session_exit_noops_when_uid_not_in_sessions() {
         let dir = TempDir::new().unwrap();
         let state = state_with_workspace("ws-10e-a-t3", &dir);
@@ -27365,6 +27431,7 @@ while True:
 
     fn tombstone(uid: &str, engine: &str) -> crate::state::ExitedTombstone {
         crate::state::ExitedTombstone {
+            startup_failure: None,
             org: None,
             model: None,
             model_source: None,
@@ -28343,6 +28410,7 @@ while True:
             ws.sessions = vec![e];
             s.workspaces.insert("ws-rv".into(), ws);
             s.record_exited(crate::state::ExitedTombstone {
+                startup_failure: None,
                 org: None,
                 model: None,
                 model_source: None,
@@ -28454,6 +28522,7 @@ while True:
             ws.worktree_path = Some(wt.clone());
             s.workspaces.insert("ws-org".into(), ws);
             s.record_exited(crate::state::ExitedTombstone {
+                startup_failure: None,
                 org: Some(org.clone()),
                 model: None,
                 model_source: None,
@@ -28618,6 +28687,7 @@ while True:
         let wt = std::env::temp_dir();
         let state = make_state_arc();
         state.lock().unwrap().record_exited(crate::state::ExitedTombstone {
+            startup_failure: None,
             org: None,
             model: None,
             model_source: None,

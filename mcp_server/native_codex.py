@@ -32,6 +32,7 @@ from websockets.exceptions import ConnectionClosed
 
 from mcp_server import control_client
 from mcp_server.codex_state import CodexState
+from mcp_server.codex_startup import UPDATE_OFF, dismiss_cached_update
 from mcp_server.notifications import (
     NotSubmitted,
     Queue,
@@ -982,6 +983,9 @@ def split_args(args, permissions=None):
             index += 2
         else:
             raise ValueError(f"unsupported CM Codex launch argument: {arg}")
+    # Override both configs: a remote frontend owns startup menus too.
+    backend.extend(["-c", UPDATE_OFF])
+    frontend.extend(["-c", UPDATE_OFF])
     if resume:
         if subcommand == "fork":
             # A fork runs in a NEW worktree; without this the frontend stops
@@ -1030,6 +1034,18 @@ def configure_external_editor():
             os.environ["VISUAL"] = editor
             os.environ["EDITOR"] = editor
             return
+
+
+async def spawn_frontend(binary, frontend_args, frontend_socket):
+    # Fresh/resume/fork and every detached-frontend relaunch share this gate.
+    # Failure exits before another child can consume the inherited PTY input.
+    dismiss_cached_update()
+    return await asyncio.create_subprocess_exec(
+        sys.executable,
+        str(Path(__file__).with_name("native_process.py")),
+        "--exec-child", str(os.getpid()), binary,
+        "--remote", "unix://" + frontend_socket, *frontend_args,
+    )
 
 
 async def launch(args):
@@ -1103,20 +1119,9 @@ async def launch(args):
             ), interrupt_server:
                 consumer = asyncio.create_task(consume_supervised(queue, relay))
 
-                async def spawn_frontend():
-                    return await asyncio.create_subprocess_exec(
-                        sys.executable,
-                        str(Path(__file__).with_name("native_process.py")),
-                        "--exec-child",
-                        str(os.getpid()),
-                        binary,
-                        "--remote",
-                        "unix://" + frontend_socket,
-                        *frontend_args,
-                    )
 
                 respawns = 0
-                frontend = await spawn_frontend()
+                frontend = await spawn_frontend(binary, frontend_args, frontend_socket)
                 while True:
                     detach = asyncio.create_task(
                         relay.detached_for(FRONTEND_DETACH_GRACE_SECS)
@@ -1171,7 +1176,7 @@ async def launch(args):
                     )
                     await terminate(frontend)
                     relay.attachment.detached()
-                    frontend = await spawn_frontend()
+                    frontend = await spawn_frontend(binary, frontend_args, frontend_socket)
         finally:
             if consumer:
                 consumer.cancel()

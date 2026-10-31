@@ -68,7 +68,13 @@ async def await_launch_confirmation(
                 continue
             return failed("confirmation_unavailable")
         if not isinstance(resolved, dict) or resolved.get("state") == "exited":
-            return failed("session_gone")
+            result = failed("session_gone")
+            failure = resolved.get("startup_failure") if isinstance(resolved, dict) else None
+            # Exact receipt binding; an older incarnation's tombstone is not
+            # evidence for this launch. This is content-free daemon metadata.
+            if isinstance(failure, dict) and failure.get("receipt_id") == receipt_id:
+                result["startup_failure"] = failure
+            return result
         current = resolved.get("prompt_delivery")
         if not isinstance(current, dict) or current.get("id") != receipt_id:
             return failed("confirmation_lost_or_session_replaced")

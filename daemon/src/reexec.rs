@@ -2509,6 +2509,7 @@ fn swap_exit_tombstone(
         }
     });
     crate::state::ExitedTombstone {
+        startup_failure: None,
         session_uid: rec.uid.clone(),
         transcript_path: rec.transcript_path.clone(),
         generation: rec.generation,

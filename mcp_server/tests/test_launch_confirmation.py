@@ -36,6 +36,15 @@ class LaunchConfirmationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result["prompt_delivery"], receipt())
                 self.assertNotIn("submitted", result)
 
+    def test_startup90_exited_reads_retain_safe_diagnostics_without_a_transcript(self):
+        diagnostic={"receipt_id":"launch-1","session_uid":"worker","exit_code":1,
+                    "markers":["update_suppression_failed"],"pty_bytes_inspected":64}
+        with patch.object(control_client,"call",return_value={"state":"exited","engine":"codex",
+                "transcript_path":None,"startup_failure":diagnostic,"generation":0,"idle":True}):
+            for read in [server.read_last_turn,server.read_session_output]:
+                result=read("worker")
+                self.assertEqual(result["startup_failure"],diagnostic)
+
     async def test_pending_then_confirmed_keeps_pinned_socket(self):
         path = Path("/original/daemon.sock")
         with patch.object(
@@ -86,6 +95,18 @@ class LaunchConfirmationTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertFalse(result["submitted"])
                 self.assertEqual(result["reason"], reason)
+
+    async def test_startup90_failed_launch_keeps_only_its_bound_diagnostics(self):
+        for matching in [True, False]:
+            initial=receipt()
+            diagnostic={"receipt_id":initial["id"] if matching else "old-incarnation",
+                        "session_uid":"worker","exit_code":1,"markers":["permission_denied"]}
+            with patch.object(control_client,"call",return_value={"state":"exited","startup_failure":diagnostic}):
+                result=await server._await_launch_confirmation("worker",initial,socket_path=None)
+            self.assertEqual(result["reason"],"session_gone")
+            self.assertFalse(result["submitted"])
+            self.assertEqual("startup_failure" in result,matching)
+            if matching:self.assertEqual(result["startup_failure"],diagnostic)
 
     async def test_transient_poll_failures_retry_until_confirmation_or_deadline(self):
         for transient in [

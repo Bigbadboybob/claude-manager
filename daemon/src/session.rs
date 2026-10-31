@@ -382,6 +382,21 @@ impl PtyByteFanout {
         }
     }
 
+    /// Small forensic tail without cloning the replay ring or subscribing.
+    pub(crate) fn startup_tail(&self) -> FanoutSnapshot {
+        const MAX: usize = 4096;
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut bytes: Vec<u8> = inner.buffer.iter().rev().take(MAX).copied().collect();
+        bytes.reverse();
+        FanoutSnapshot {
+            start_offset: inner.bytes_written.saturating_sub(bytes.len() as u64),
+            evicted_since_cursor: inner.bytes_written > bytes.len() as u64,
+            cursor: inner.bytes_written,
+            closed: inner.closed,
+            bytes,
+        }
+    }
+
     /// Return a "give me what's buffered right now" snapshot,
     /// scoped to bytes pushed since the caller's cursor (if any).
     /// Slice 10c-d's `read_session_output` is the consumer.
