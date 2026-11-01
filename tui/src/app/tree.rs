@@ -2316,9 +2316,14 @@ mod tree_tests {
         assert!(!std::rc::Rc::ptr_eq(&role_changed, &ungrouped));
         assert!(ungrouped.items.iter().filter(|item| matches!(item, VisualItem::WorkflowHeader { .. })).count() < role_changed.items.iter().filter(|item| matches!(item, VisualItem::WorkflowHeader { .. })).count());
 
+        let alert_host = app.workspaces[0].sessions[1].host_id.clone();
+        app.owner_alert_rows.insert((alert_host, "ts-wf-0".into()), "host-alert".into());
+        assert!(app.session_has_alert("ts-wf-0", &app.workspaces[0].sessions[1].host_id));
+        app.folded_tasks.insert(app.task_fold_key(0, "tr"));
+        let alert_before = app.task_tree_shared();
         app.workspaces[0].sessions[1].host_id = cm_daemon::host_id::HostId::new("other");
         let host_changed = app.task_tree_shared();
-        assert!(!std::rc::Rc::ptr_eq(&ungrouped, &host_changed), "session host rebinding invalidates folded alert/rollup cache");
+        assert!(!std::rc::Rc::ptr_eq(&alert_before, &host_changed), "session host rebinding invalidates folded alert/rollup cache");
 
         app.tasks.iter_mut().find(|t| t.task_id.as_deref() == Some("tl")).unwrap().metadata =
             Some(serde_json::json!({"filer": {"task_id": "tr2"}}));
