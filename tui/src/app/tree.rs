@@ -394,6 +394,12 @@ impl App {
             t.parent_task_id.hash(&mut h);
             t.workspace_id.hash(&mut h);
             t.is_continuous.hash(&mut h);
+            t.metadata
+                .as_ref()
+                .and_then(|m| m.get("filer"))
+                .and_then(|f| f.get("task_id"))
+                .and_then(serde_json::Value::as_str)
+                .hash(&mut h);
             match t.api_status {
                 TaskStatus::Running => 0u8,
                 TaskStatus::Blocked => 1,
@@ -419,10 +425,13 @@ impl App {
             ws.worktree_path.hash(&mut h);
             for ts in &ws.sessions {
                 ts.uid.hash(&mut h);
+                ts.host_id.hash(&mut h);
                 ts.task_id.hash(&mut h);
                 ts.managed_by_uid.hash(&mut h);
                 ts.continuous_task_id.hash(&mut h);
                 ts.session_type.hash(&mut h);
+                ts.workflow_run_id.hash(&mut h);
+                ts.workflow_role.hash(&mut h);
                 ts.session.exited.hash(&mut h);
                 ts.hidden.hash(&mut h);
                 match ts.status {
@@ -456,6 +465,18 @@ impl App {
         let mut local_alerts: Vec<_> = self.alerts.keys().collect();
         local_alerts.sort();
         local_alerts.hash(&mut h);
+        let mut workflow_runs: Vec<_> = self.workflow_runs.iter().collect();
+        workflow_runs.sort_by(|a, b| a.run_id.cmp(&b.run_id));
+        for run in workflow_runs {
+            run.run_id.hash(&mut h);
+            run.workflow_name.hash(&mut h);
+        }
+        let mut workflows: Vec<_> = self.workflows.iter().collect();
+        workflows.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, workflow) in workflows {
+            name.hash(&mut h);
+            workflow.role_order.hash(&mut h);
+        }
         for section in &self.sections {
             section.id.hash(&mut h);
             section.folded.hash(&mut h);
@@ -2234,5 +2255,87 @@ mod tree_tests {
             buffer.content().iter().all(|c| c.bg == ratatui::style::Color::Reset),
             "no group tint anywhere"
         );
+    }
+
+    #[test]
+    fn task_tree_cache_rebuilds_for_workflow_host_and_filer_inputs() {
+        let mut app = org_app();
+        session(&mut app, 0, "tr", "ts-wf-0", "claude");
+        session(&mut app, 0, "tr", "ts-wf-1", "claude");
+        for (si, role) in [(1usize, "worker"), (2usize, "reviewer")] {
+            app.workspaces[0].sessions[si].workflow_run_id = Some("wf".into());
+            app.workspaces[0].sessions[si].workflow_role = Some(role.into());
+        }
+        app.workflow_runs.push(WorkflowRun::new(
+            "wf".into(),
+            "wf".into(),
+            "ws-1".into(),
+            BTreeMap::new(),
+            "worker".into(),
+            BTreeMap::new(),
+            None,
+            BTreeMap::new(),
+            0,
+        ));
+        app.workflows.insert(
+            "wf".into(),
+            Workflow {
+                name: "wf".into(),
+                description: String::new(),
+                roles: BTreeMap::new(),
+                role_order: vec!["worker".into(), "reviewer".into()],
+                transitions: Vec::new(),
+            },
+        );
+        let session_order = |app: &App, tree: &TaskTree| {
+            tree.items
+                .iter()
+                .filter_map(|item| match item {
+                    VisualItem::Session(wi, si) => Some(app.workspaces[*wi].sessions[*si].uid.clone()),
+                    _ => None,
+                })
+                .filter(|uid| uid.starts_with("ts-wf-"))
+                .collect::<Vec<_>>()
+        };
+        let first = app.task_tree_shared();
+        let initial_order = session_order(&app, &first);
+        assert_eq!(initial_order.len(), 2);
+
+        app.workflows.get_mut("wf").unwrap().role_order.reverse();
+        let reordered = app.task_tree_shared();
+        assert!(!std::rc::Rc::ptr_eq(&first, &reordered));
+        assert_eq!(session_order(&app, &reordered).len(), initial_order.len());
+
+        app.workspaces[0].sessions[2].workflow_role = Some("manager".into());
+        let role_changed = app.task_tree_shared();
+        assert!(!std::rc::Rc::ptr_eq(&reordered, &role_changed));
+        assert_eq!(session_order(&app, &role_changed).len(), session_order(&app, &reordered).len());
+
+        app.workspaces[0].sessions[1].workflow_run_id = None;
+        let ungrouped = app.task_tree_shared();
+        assert!(!std::rc::Rc::ptr_eq(&role_changed, &ungrouped));
+        assert!(ungrouped.items.iter().filter(|item| matches!(item, VisualItem::WorkflowHeader { .. })).count() < role_changed.items.iter().filter(|item| matches!(item, VisualItem::WorkflowHeader { .. })).count());
+
+        app.workspaces[0].sessions[1].host_id = cm_daemon::host_id::HostId::new("other");
+        let host_changed = app.task_tree_shared();
+        assert!(!std::rc::Rc::ptr_eq(&role_changed, &host_changed));
+
+        app.tasks.iter_mut().find(|t| t.task_id.as_deref() == Some("tl")).unwrap().metadata =
+            Some(serde_json::json!({"filer": {"task_id": "tr2"}}));
+        let filer_changed = app.task_tree_shared();
+        assert!(!std::rc::Rc::ptr_eq(&host_changed, &filer_changed));
+
+        app.sections.push(cm_daemon::manifest::SidebarSection { id: "sec".into(), name: "Project".into(), color: None, folded: false });
+        app.workspace_sections.insert("r".into(), "sec".into());
+        app.tasks.iter_mut().find(|t| t.task_id.as_deref() == Some("tl")).unwrap().metadata =
+            Some(serde_json::json!({"filer": {"task_id": "tr"}}));
+        let section_tree = app.task_tree_shared();
+        assert_eq!(app.section_of_workspace(4).as_deref(), Some("sec"));
+        assert!(!std::rc::Rc::ptr_eq(&filer_changed, &section_tree));
+        app.tasks.iter_mut().find(|t| t.task_id.as_deref() == Some("tl")).unwrap().metadata =
+            Some(serde_json::json!({"filer": {"task_id": "missing"}}));
+        let loose_tree = app.task_tree_shared();
+        assert_eq!(app.section_of_workspace(4), None);
+        assert!(!std::rc::Rc::ptr_eq(&section_tree, &loose_tree));
     }
 }
