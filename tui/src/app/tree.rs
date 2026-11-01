@@ -412,6 +412,7 @@ impl App {
         for ws in &self.workspaces {
             ws.id.hash(&mut h);
             ws.is_closed.hash(&mut h);
+            ws.is_cloud.hash(&mut h);
             ws.host_id.hash(&mut h);
             ws.worktree_path.hash(&mut h);
             for ts in &ws.sessions {
@@ -472,6 +473,7 @@ impl App {
             task.hash(&mut h);
             division.id.hash(&mut h);
             division.name.hash(&mut h);
+            division.color.hash(&mut h);
             division.coordinator.hash(&mut h);
         }
         let mut closed: Vec<String> = self.planning.closed_task_ids().into_iter().collect();
