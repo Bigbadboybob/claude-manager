@@ -1938,13 +1938,13 @@ impl App {
         // or folds.
         let moved = self.last_drawn_cursor.as_ref() != Some(&self.cursor);
         self.last_drawn_cursor = Some(self.cursor.clone());
-        let mut tree = self.tree_view().then(|| self.task_tree());
+        let mut tree = self.tree_view().then(|| self.task_tree_shared());
         let mut visual = match &tree {
             Some(t) => self.filter_visual_items(t.items.clone()),
             None => self.visual_items(),
         };
         if moved && tree.is_some() && self.cursor_row_hidden(&visual) && self.reveal_cursor() {
-            let t = self.task_tree();
+            let t = self.task_tree_shared();
             visual = self.filter_visual_items(t.items.clone());
             tree = Some(t);
         }

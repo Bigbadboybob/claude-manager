@@ -430,6 +430,10 @@ pub struct App {
     /// The last `App::session_attachments` result and the key it was
     /// computed for (F6, the Team sidebar and the roster share it).
     pub(crate) attach_cache: std::cell::RefCell<Option<(u64, std::rc::Rc<orgchart_teams::Attachments>)>>,
+    /// Cached Task-sidebar tree. The model is immutable between data/fold
+    /// changes; keeping it across draws avoids rebuilding the full forest on
+    /// every frame when a large group is expanded.
+    pub(crate) task_tree_cache: std::cell::RefCell<Option<(u64, std::rc::Rc<tree::TaskTree>)>>,
     /// Set per frame while an A-e form is open on a nested workspace: the
     /// read-only Section value it inherits (`App::nested_section_label`).
     pub(crate) section_note: Option<String>,
@@ -1103,6 +1107,7 @@ impl App {
             folded_divisions,
             folded_org,
             attach_cache: Default::default(),
+            task_tree_cache: Default::default(),
             section_note: None,
             last_drawn_cursor: None,
             sections,
