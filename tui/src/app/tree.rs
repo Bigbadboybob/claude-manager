@@ -402,7 +402,9 @@ impl App {
             }
             .hash(&mut h);
         }
-        for (id, parent) in &self.sidebar_task_parents {
+        let mut sidebar_parents: Vec<_> = self.sidebar_task_parents.iter().collect();
+        sidebar_parents.sort_by(|a, b| a.0.cmp(b.0));
+        for (id, parent) in sidebar_parents {
             id.hash(&mut h);
             parent.hash(&mut h);
         }
