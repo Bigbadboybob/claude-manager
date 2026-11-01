@@ -2318,7 +2318,7 @@ mod tree_tests {
 
         app.workspaces[0].sessions[1].host_id = cm_daemon::host_id::HostId::new("other");
         let host_changed = app.task_tree_shared();
-        assert!(!std::rc::Rc::ptr_eq(&role_changed, &host_changed));
+        assert!(!std::rc::Rc::ptr_eq(&ungrouped, &host_changed), "session host rebinding invalidates folded alert/rollup cache");
 
         app.tasks.iter_mut().find(|t| t.task_id.as_deref() == Some("tl")).unwrap().metadata =
             Some(serde_json::json!({"filer": {"task_id": "tr2"}}));
