@@ -1390,6 +1390,46 @@ mod tests {
         app
     }
 
+    /// Owner's reported F-Lead scale: 202 planning tasks (168 running), a
+    /// depth-three task topology, and 107 live sessions attached to one lead.
+    /// This fixture drives the real Team/F6/sidebar draw and input paths.
+    fn large_group_app() -> App {
+        let mut app = test_app();
+        app.workspaces = vec![ws("f-root"), ws("f-aux-a"), ws("f-aux-b")];
+        for workspace in &mut app.workspaces {
+            workspace.host_id = HostId::new("f-sessions");
+        }
+        for i in 0..202u32 {
+            let id = format!("f-task-{i}");
+            let parent = match i {
+                0 => None,
+                1..=168 => Some("f-task-0".to_owned()),
+                _ => Some("f-task-1".to_owned()),
+            };
+            let mut t = task(&id, parent.as_deref());
+            t.api_status = if i < 168 { TaskStatus::Running } else { TaskStatus::Backlog };
+            t.workspace_id = Some("f-root".into());
+            app.tasks.push(t);
+        }
+        let main_uid = "ts-500-0";
+        for i in 0..107u32 {
+            let wi = match i % 3 {
+                0 => 0,
+                1 => 1,
+                _ => 2,
+            };
+            let task_id = format!("f-task-{}", i % 50);
+            session(&mut app, wi, 0x500 + i, &format!("F-Lead session {i:03}"), Some(&task_id));
+            if i > 0 {
+                spawned_by(&mut app, wi, main_uid);
+            }
+        }
+        let lead = member("f-lead", "F-Lead", Some("mem-owner"), Some("f-team"), Some(main_uid));
+        let f_team = team("f-team", "F-Lead", None, Some("f-lead"), &[("f-lead", "primary")]);
+        app.org.accept(snapshot(202, vec![owner(), lead], vec![f_team]));
+        app
+    }
+
     #[test]
     fn a_full_roster_puts_every_worker_under_its_leader_and_stays_narrow() {
         let mut app = full_app();
@@ -1471,5 +1511,108 @@ mod tests {
         assert!(groups.len() >= 45, "{}", groups.len());
         app.roster.open.extend(groups);
         time(&mut app, "roster");
+    }
+
+    #[test]
+    fn large_group_baseline_real_paths() {
+        let mut app = large_group_app();
+        let task_count = app.tasks.len();
+        let running = app.tasks.iter().filter(|t| t.api_status == TaskStatus::Running).count();
+        let sessions = app.workspaces.iter().map(|w| w.sessions.len()).sum::<usize>();
+        assert_eq!((task_count, running, sessions), (202, 168, 107));
+        let frames = 20;
+        let time = |app: &mut App, what: &str| {
+            let t = Instant::now();
+            for _ in 0..frames {
+                screen(app, 160, 60);
+            }
+            let ms = t.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+            println!("BASELINE {what}: {ms:.3} ms/frame");
+        };
+        app.sidebar_view = SidebarView::Task;
+        let cached_tree_ms = {
+            let t = Instant::now();
+            for _ in 0..frames {
+                let _ = app.task_tree();
+            }
+            t.elapsed().as_secs_f64() * 1000.0 / frames as f64
+        };
+        let uncached_tree_ms = {
+            let t = Instant::now();
+            for _ in 0..frames {
+                *app.task_tree_cache.borrow_mut() = None;
+                let _ = app.task_tree();
+            }
+            t.elapsed().as_secs_f64() * 1000.0 / frames as f64
+        };
+        println!("BASELINE task-tree cached: {cached_tree_ms:.3} ms; uncached: {uncached_tree_ms:.3} ms");
+        let tree = app.task_tree_shared();
+        let t = Instant::now();
+        for _ in 0..frames { let _ = app.leader_marks(&tree.org); }
+        println!("BASELINE leader-marks: {:.3} ms/frame", t.elapsed().as_secs_f64() * 1000.0 / frames as f64);
+        let t = Instant::now();
+        for _ in 0..frames { let _ = app.owner_leads(); }
+        println!("BASELINE owner-leads: {:.3} ms/frame", t.elapsed().as_secs_f64() * 1000.0 / frames as f64);
+        let list_ms = {
+            let t = Instant::now();
+            for _ in 0..frames {
+                let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 60)).unwrap();
+                terminal.draw(|frame| app.draw_session_list(frame, frame.area())).unwrap();
+            }
+            t.elapsed().as_secs_f64() * 1000.0 / frames as f64
+        };
+        println!("BASELINE session-list-only: {list_ms:.3} ms/frame");
+        time(&mut app, "task-expanded");
+        app.sidebar_view = SidebarView::Team;
+        time(&mut app, "team-expanded");
+        let team_items = app.visual_items();
+        app.cursor = Cursor::Org("member:f-lead".into());
+        let before = app.visual_items().len();
+        let t = Instant::now();
+        app.handle_event(&key(KeyCode::Char(' ')));
+        let toggle_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let after = app.visual_items().len();
+        println!("BASELINE team-fold-toggle: {toggle_ms:.3} ms; rows {before}->{after}; unfolded_rows={}", team_items.len());
+        assert!(after < before, "folding F-Lead must hide its sessions");
+        app.handle_event(&key(KeyCode::Char(' ')));
+        assert_eq!(app.visual_items().len(), before, "unfold restores all rows");
+        app.handle_event(&key(KeyCode::F(6)));
+        time(&mut app, "F6-expanded");
+    }
+
+    #[test]
+    fn large_group_cursor_scroll_fold_and_render_invariants() {
+        let mut app = large_group_app();
+        app.sidebar_view = SidebarView::Task;
+        let expanded = app.visual_items();
+        let session_rows = expanded.iter().filter(|v| matches!(v, VisualItem::Session(..))).count();
+        let task_rows = expanded.iter().filter(|v| matches!(v, VisualItem::TaskHeader { .. })).count();
+        assert_eq!(session_rows, 107);
+        assert!(task_rows > 0 && task_rows <= 202, "rendered task headers stay within the 202-task topology");
+        let known_tasks: HashSet<String> = app.tasks.iter().filter_map(|t| t.task_id.clone()).collect();
+        assert!(expanded.iter().filter_map(|v| match v { VisualItem::TaskHeader { task_id, .. } => Some(task_id), _ => None }).all(|id| known_tasks.contains(id)), "no phantom task IDs");
+        assert!(expanded.windows(2).all(|rows| rows[0] != rows[1]), "no duplicate adjacent visual rows");
+
+        app.cursor = Cursor::Task { ws_idx: 0, task_id: "f-task-0".into() };
+        let before = app.visual_items().len();
+        let root_sessions = app
+            .visual_items()
+            .iter()
+            .filter(|v| matches!(v, VisualItem::Session(wi, si) if *wi == 0 && app.workspaces[*wi].sessions[*si].task_id.as_deref() == Some("f-task-0")))
+            .count();
+        app.handle_event(&CrosstermEvent::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)));
+        let folded = app.visual_items();
+        assert!(folded.len() < before, "root fold must hide descendants");
+        assert_eq!(folded.iter().filter(|v| matches!(v, VisualItem::Session(wi, si) if *wi == 0 && app.workspaces[*wi].sessions[*si].task_id.as_deref() == Some("f-task-0"))).count(), root_sessions, "root sessions stay visible");
+        app.handle_event(&CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert_eq!(app.visual_items().len(), before, "unfold restores the same rows");
+
+        app.page_sidebar(1);
+        assert!(matches!(app.cursor, Cursor::Task { .. } | Cursor::Session(..) | Cursor::Workspace(_)));
+        app.page_sidebar(-1);
+        assert!(app.sidebar_cursor_index(&app.visual_items()).is_some(), "cursor remains visible after paging");
+        let narrow = screen(&mut app, 60, 12);
+        assert_eq!(narrow.lines().count(), 12);
+        assert!(narrow.lines().all(|line| line.chars().count() == 60), "narrow render clips safely");
     }
 }

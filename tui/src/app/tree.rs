@@ -66,6 +66,7 @@ pub(super) struct TreeRow {
 /// `(sessions, running, idle, alerting)` under a folded header.
 pub(super) type Rollup = (usize, usize, usize, usize);
 
+#[derive(Clone)]
 pub(super) struct TaskTree {
     pub items: Vec<VisualItem>,
     pub rows: HashMap<VisualItem, TreeRow>,
@@ -84,7 +85,7 @@ pub(super) struct TaskTree {
 
 /// Reporting lines and liveness, built once per frame and shared by the
 /// sidebar (fold glyph, fold, leader marks) and the F6 org chart.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct OrgIndex {
     parents: HashMap<String, String>,
     /// Tasks with at least one live report: a child task that is not done
@@ -152,6 +153,10 @@ struct Forest {
     children: HashMap<(usize, String), Vec<usize>>,
     /// Nearest ancestor of a task bound to the same workspace.
     local_parent: HashMap<(usize, String), String>,
+    /// Local task children indexed once per tree build. Keeping this adjacency
+    /// list avoids rescanning every task for every header during `has_content`
+    /// and emission on large planning trees.
+    local_children: HashMap<(usize, String), Vec<String>>,
 }
 
 impl Forest {
@@ -162,16 +167,11 @@ impl Forest {
             .find(|t| !self.local_parent.contains_key(&(wi, (*t).clone())))
     }
 
-    fn local_children<'a>(
-        &'a self,
-        wi: usize,
-        t: &'a str,
-    ) -> impl Iterator<Item = &'a String> + 'a {
-        self.bound
-            .get(&wi)
+    fn local_children<'a>(&'a self, wi: usize, t: &str) -> impl Iterator<Item = &'a String> + 'a {
+        self.local_children
+            .get(&(wi, t.to_owned()))
             .into_iter()
             .flatten()
-            .filter(move |c| self.local_parent.get(&(wi, (*c).clone())).map(String::as_str) == Some(t))
     }
 
     fn nested_blocks(&self, wi: usize, t: &str) -> Vec<usize> {
@@ -303,6 +303,16 @@ impl App {
             f.buckets.insert(wi, buckets);
             f.bound.insert(wi, bound);
         }
+        for (&wi, bound) in &f.bound {
+            for task in bound {
+                if let Some(parent) = f.local_parent.get(&(wi, task.clone())) {
+                    f.local_children
+                        .entry((wi, parent.clone()))
+                        .or_default()
+                        .push(task.clone());
+                }
+            }
+        }
         // Hang each block under the nearest ancestor of its root task that
         // another visible block holds.
         for &wi in &f.order {
@@ -363,7 +373,111 @@ impl App {
     /// The Task sub-view's rows and their tree metadata.
     pub(super) fn task_tree(&self) -> TaskTree {
         // While filtering, folds are ignored so a match is never hidden.
-        self.task_tree_with(self.sidebar_filter.is_none())
+        self.task_tree_shared_with(self.sidebar_filter.is_none()).as_ref().clone()
+    }
+
+    /// Shared tree model for rendering. The draw path only needs immutable
+    /// access, so avoid cloning all row metadata on every frame.
+    pub(super) fn task_tree_shared(&self) -> std::rc::Rc<TaskTree> {
+        self.task_tree_shared_with(self.sidebar_filter.is_none())
+    }
+
+    /// Hash the inputs read by the forest/emitter. This keeps the cache
+    /// correct across manifest refreshes and fold changes without requiring
+    /// every mutation path to remember an explicit invalidation call.
+    fn task_tree_cache_key(&self, folds: bool) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        folds.hash(&mut h);
+        for t in &self.tasks {
+            t.task_id.hash(&mut h);
+            t.parent_task_id.hash(&mut h);
+            t.workspace_id.hash(&mut h);
+            t.is_continuous.hash(&mut h);
+            match t.api_status {
+                TaskStatus::Running => 0u8,
+                TaskStatus::Blocked => 1,
+                TaskStatus::Backlog => 2,
+                TaskStatus::Done => 3,
+            }
+            .hash(&mut h);
+        }
+        for (id, parent) in &self.sidebar_task_parents {
+            id.hash(&mut h);
+            parent.hash(&mut h);
+        }
+        let mut done: Vec<&String> = self.sidebar_done_task_ids.iter().collect();
+        done.sort();
+        done.hash(&mut h);
+        for ws in &self.workspaces {
+            ws.id.hash(&mut h);
+            ws.is_closed.hash(&mut h);
+            ws.host_id.hash(&mut h);
+            ws.worktree_path.hash(&mut h);
+            for ts in &ws.sessions {
+                ts.uid.hash(&mut h);
+                ts.task_id.hash(&mut h);
+                ts.managed_by_uid.hash(&mut h);
+                ts.continuous_task_id.hash(&mut h);
+                ts.session_type.hash(&mut h);
+                ts.session.exited.hash(&mut h);
+                ts.hidden.hash(&mut h);
+                match ts.status {
+                    SessionStatus::Running => 0u8,
+                    SessionStatus::Idle => 1,
+                }
+                .hash(&mut h);
+            }
+        }
+        let mut agent_states: Vec<_> = self.agent_states.iter().collect();
+        agent_states.sort_by(|a, b| a.0.0.as_str().cmp(b.0.0.as_str()).then_with(|| a.0.1.cmp(&b.0.1)));
+        for ((host, uid), state) in agent_states {
+            host.hash(&mut h);
+            uid.hash(&mut h);
+            let activity = match state.activity {
+                super::agent_state::Activity::Working => 0u8,
+                super::agent_state::Activity::Background => 1,
+                super::agent_state::Activity::Waiting => 2,
+                super::agent_state::Activity::Errored => 3,
+                super::agent_state::Activity::Idle => 4,
+                super::agent_state::Activity::Starting => 5,
+                super::agent_state::Activity::Exited => 6,
+                super::agent_state::Activity::Unknown => 7,
+            };
+            activity.hash(&mut h);
+            state.stalled.hash(&mut h);
+        }
+        let mut owner_alerts: Vec<_> = self.owner_alert_rows.keys().collect();
+        owner_alerts.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()).then_with(|| a.1.cmp(&b.1)));
+        owner_alerts.hash(&mut h);
+        let mut local_alerts: Vec<_> = self.alerts.keys().collect();
+        local_alerts.sort();
+        local_alerts.hash(&mut h);
+        for section in &self.sections {
+            section.id.hash(&mut h);
+            section.folded.hash(&mut h);
+        }
+        let mut workspace_sections: Vec<_> = self.workspace_sections.iter().collect();
+        workspace_sections.sort_by(|a, b| a.0.cmp(b.0));
+        workspace_sections.hash(&mut h);
+        let mut folded_tasks: Vec<&String> = self.folded_tasks.iter().collect();
+        folded_tasks.sort();
+        folded_tasks.hash(&mut h);
+        let mut folded_divisions: Vec<&String> = self.folded_divisions.iter().collect();
+        folded_divisions.sort();
+        folded_divisions.hash(&mut h);
+        let mut divisions: Vec<_> = self.planning.divisions_by_task().into_iter().collect();
+        divisions.sort_by(|a, b| a.0.cmp(&b.0));
+        for (task, division) in divisions {
+            task.hash(&mut h);
+            division.id.hash(&mut h);
+            division.name.hash(&mut h);
+            division.coordinator.hash(&mut h);
+        }
+        let mut closed: Vec<String> = self.planning.closed_task_ids().into_iter().collect();
+        closed.sort();
+        closed.hash(&mut h);
+        h.finish()
     }
 
     /// Make a session's row show: clear an A-/ filter that excludes it,
@@ -493,6 +607,16 @@ impl App {
     }
 
     fn task_tree_with(&self, folds: bool) -> TaskTree {
+        self.task_tree_shared_with(folds).as_ref().clone()
+    }
+
+    fn task_tree_shared_with(&self, folds: bool) -> std::rc::Rc<TaskTree> {
+        let cache_key = self.task_tree_cache_key(folds);
+        if let Some((key, cached)) = self.task_tree_cache.borrow().as_ref() {
+            if *key == cache_key {
+                return cached.clone();
+            }
+        }
         let members = self.continuous_members();
         let f = self.forest(&members);
         let by_task = self.planning.divisions_by_task();
@@ -561,7 +685,9 @@ impl App {
             }
             emit.entry(entry);
         }
-        out
+        let cached = std::rc::Rc::new(out);
+        *self.task_tree_cache.borrow_mut() = Some((cache_key, cached.clone()));
+        cached
     }
 
     /// `(sessions, running, idle)` for a set of session rows: engine state
