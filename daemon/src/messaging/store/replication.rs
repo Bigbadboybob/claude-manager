@@ -757,10 +757,11 @@ impl Store {
         Ok(true)
     }
     pub(super) fn validate_replication_envelope(&self, raw: &[u8]) -> Result<Value> {
-        if raw.len() > 65536 {
-            return Err(err("event_too_large", "Serialized event exceeds 64 KiB"));
+        if raw.len() > MAX_HOST_DIRECTORY_BYTES {
+            return Err(err("event_too_large", "Serialized event exceeds 1 MiB"));
         }
         let e: Value = serde_json::from_slice(raw)?;
+        check_event_size(&e, raw.len())?;
         if e["protocol"] != 1
             || e["space_id"] != self.space_id
             || !e["data"].is_object()

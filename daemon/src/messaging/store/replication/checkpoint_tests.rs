@@ -368,3 +368,40 @@ fn a_failing_wire_keeps_earlier_page_records_durable() {
     reopen(&mut p);
     assert_eq!(fingerprint(&p.replica)["events"], state["events"]);
 }
+
+/// A host with 512 live agents (the peer limit) must enroll and replicate.
+/// The directory event used to share the 64 KiB event limit, which F's host
+/// crossed near 200 agents on 2026-11-02 and lost its hub link.
+#[test]
+fn full_host_directory_enrolls_and_replicates() {
+    let mut p = pair();
+    let host = p.replica.daemon_id.clone();
+    let people: Vec<Person> = (0..512)
+        .map(|i| {
+            let uid = format!("ts-18e31532355fdd0f-{i:x}");
+            Person {
+                id: format!("agent:{host}:{uid}"),
+                name: format!("F-Worker-{i}"),
+                session_uid: uid,
+                task: Some("cd6e6ff0-33de-4f59-8d52-8c299f30e2c3".into()),
+                present: true,
+                kind: "agent".into(),
+                engine: Some("codex".into()),
+            }
+        })
+        .collect();
+    p.hub.register_host(&host, true, true, &people).unwrap();
+    sync(&mut p);
+    let directory = &p.replica.replication.hosts[&host]["people"];
+    assert_eq!(directory.as_array().unwrap().len(), 512);
+}
+
+#[test]
+fn ordinary_events_keep_the_64_kib_limit() {
+    let event = json!({"type":"message.create","actor":{"id":"agent:x:y"}});
+    assert!(check_event_size(&event, MAX_EVENT_BYTES).is_ok());
+    let e = check_event_size(&event, MAX_EVENT_BYTES + 1).unwrap_err();
+    assert_eq!(e.code, "event_too_large");
+    let directory = json!({"type":"host.update","actor":{"id":"system"}});
+    assert!(check_event_size(&directory, 200 * 1024).is_ok());
+}

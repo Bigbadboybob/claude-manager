@@ -44,6 +44,15 @@ fn write_frame(writer: &Writer, value: &Value) -> io::Result<()> {
 fn wire_error(e: ChatError) -> Value {
     json!({"code":e.code,"message":e.message})
 }
+/// Tell the peer why the hub is dropping its link. Without this the peer
+/// sees only EOF ("failed to fill whole buffer") and cannot tell a rejected
+/// request from a dead hub.
+fn send_peer_error(connection: &PeerConnection, e: &ChatError) {
+    let _ = write_frame(
+        &connection.writer,
+        &json!({"kind":"error","error":{"code":e.code,"message":e.message}}),
+    );
+}
 fn unmarshal_error(v: &Value) -> ChatError {
     error(
         v["code"].as_str().unwrap_or("sync_error"),
@@ -541,22 +550,26 @@ fn serve_peer(runtime: &Arc<Runtime>, stream: UnixStream) -> Result<()> {
         }
         return serve_revoked(runtime, &host, owner_access, &mut link);
     }
-    let people: Vec<Person> = serde_json::from_value(hello["people"].clone())?;
-    if people.len() > 512 {
-        return Err(error(
-            "invalid_params",
-            "Peer directory exceeds 512 live participants",
-        ));
-    }
-    let own_people = runtime.local_people();
-    {
+    let registered = (|| {
+        let people: Vec<Person> = serde_json::from_value(hello["people"].clone())?;
+        if people.len() > 512 {
+            return Err(error(
+                "invalid_params",
+                "Peer directory exceeds 512 live participants",
+            ));
+        }
+        let own_people = runtime.local_people();
         let mut slot = runtime.store.lock().unwrap_or_else(|p| p.into_inner());
         let store = slot.as_mut().unwrap();
         if store.host_info(&host).is_some_and(|h| h["active"] != true) {
             return Err(error("host_revoked", "Host enrollment is revoked"));
         }
         store.register_host(&runtime.daemon_id, true, true, &own_people)?;
-        store.register_host(&host, true, owner_access, &people)?;
+        store.register_host(&host, true, owner_access, &people)
+    })();
+    if let Err(e) = registered {
+        send_peer_error(&link.connection, &e);
+        return Err(e);
     }
     let initial: BTreeSet<String> = serde_json::from_value(hello["interests"].clone())?;
     let scoped = has_feature(&hello, FEATURE_SCOPED);
@@ -875,6 +888,9 @@ fn serve_peer(runtime: &Arc<Runtime>, stream: UnixStream) -> Result<()> {
         }
         Ok(())
     })();
+    if let Err(e) = &result {
+        send_peer_error(&link.connection, e);
+    }
     link.connection.close();
     runtime.signal.signal();
     let current = {

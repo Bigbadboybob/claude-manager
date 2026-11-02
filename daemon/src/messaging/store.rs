@@ -66,6 +66,24 @@ fn err(code: &str, message: impl Into<String>) -> ChatError {
         message: message.into(),
     }
 }
+/// Ordinary events stay within 64 KiB. A host directory event lists every
+/// live agent on its host (peers may report up to 512), so it gets more room:
+/// at 64 KiB it overflowed near 200 agents and broke that host's link.
+const MAX_EVENT_BYTES: usize = 64 * 1024;
+const MAX_HOST_DIRECTORY_BYTES: usize = 1024 * 1024;
+fn check_event_size(event: &Value, len: usize) -> Result<()> {
+    if event["type"] == "host.update" && event["actor"]["id"] == "system" {
+        if len > MAX_HOST_DIRECTORY_BYTES {
+            return Err(err(
+                "event_too_large",
+                format!("Host directory event is {len} bytes, over the 1 MiB limit"),
+            ));
+        }
+    } else if len > MAX_EVENT_BYTES {
+        return Err(err("event_too_large", "Serialized event exceeds 64 KiB"));
+    }
+    Ok(())
+}
 #[derive(Debug)]
 pub struct ChatError {
     pub code: String,
@@ -933,9 +951,7 @@ impl Store {
             }
         }
         let path = self.event_path(&event)?;
-        if bytes.len() > 65536 {
-            return Err(err("event_too_large", "Serialized event exceeds 64 KiB"));
-        }
+        check_event_size(&event, bytes.len())?;
         let pos = self
             .position
             .checked_add(1)
