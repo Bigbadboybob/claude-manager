@@ -126,9 +126,17 @@ struct Batch {
     // next one (2026-09-14: an orchestrator's 11:01 wake swallowed a 16:17
     // mention for good).
     delivered_at: u64,
+    // When `compact_history` first saw this batch as settled history with no
+    // delivery time of its own (a wake cancelled before delivery, or a legacy
+    // record). Its age anchor for the history horizon.
+    #[serde(skip_serializing_if = "is_zero")]
+    settled_at: u64,
     // Set by `load` when this record predates `released`; never persisted.
     #[serde(skip)]
     migrated: bool,
+}
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 /// The on-disk batch. `released` and `status` are optional only so a record
 /// that predates the latch can be migrated while it is parsed: the queue is
@@ -151,6 +159,7 @@ struct BatchWire {
     released: Option<bool>,
     coalesced: BTreeSet<String>,
     delivered_at: u64,
+    settled_at: u64,
 }
 impl From<BatchWire> for Batch {
     fn from(w: BatchWire) -> Self {
@@ -175,6 +184,7 @@ impl From<BatchWire> for Batch {
             released,
             coalesced: w.coalesced,
             delivered_at: w.delivered_at,
+            settled_at: w.settled_at,
             migrated,
         }
     }
@@ -228,6 +238,56 @@ fn expire_latches(q: &mut Queue, now: u64) -> bool {
             changed = true;
         }
     }
+    changed
+}
+/// How long settled wake history outlives its last use. History is the dedup
+/// record that stops a key from being woken twice, so a batch whose keys are
+/// still wake intents (an unread DM, an unacknowledged monitor hit) is kept
+/// whatever its age. Once none of its keys is an intent, the horizon only
+/// absorbs brief intent gaps (DND, a membership flip); past it the batch goes.
+/// Before this, queues kept every batch ever delivered: execution-policy's was
+/// 23 MB (28,722 batches, median age 17 days), re-read and re-written by every
+/// delivery tick, ~400 MiB/min of rewrites across cm-sessions (2026-11-05).
+const HISTORY_HORIZON_SECS: u64 = 24 * 3600;
+/// The newest batches are always kept, so recent status lookups and
+/// `monitor_status` counts keep their context.
+const HISTORY_TAIL: usize = 16;
+
+/// Drop settled history (released, confirmed/cancelled) that no current
+/// intent needs and that settled at least `HISTORY_HORIZON_SECS` ago. Deferred
+/// task work is never touched. A batch with no delivery time is stamped
+/// `settled_at` the first time it is seen here and ages from then.
+fn compact_history(q: &mut Queue, intents: &[WakeIntent], now: u64) -> bool {
+    if q.batches.len() <= HISTORY_TAIL {
+        return false;
+    }
+    let eligible: BTreeSet<&str> = intents.iter().map(|i| i.key.as_str()).collect();
+    let tail_from = q.batches.len() - HISTORY_TAIL;
+    let Queue { batches, deferred, .. } = q;
+    let mut changed = false;
+    let mut index = 0;
+    batches.retain_mut(|batch| {
+        let in_tail = index >= tail_from;
+        index += 1;
+        if in_tail
+            || !batch.settled_history()
+            || batch.deferred(deferred)
+            || batch.ids.iter().chain(&batch.coalesced).any(|id| eligible.contains(id.as_str()))
+        {
+            return true;
+        }
+        let since = if batch.delivered_at != 0 { batch.delivered_at } else { batch.settled_at };
+        if since == 0 {
+            batch.settled_at = now;
+            changed = true;
+            return true;
+        }
+        if now.saturating_sub(since) < HISTORY_HORIZON_SECS {
+            return true;
+        }
+        changed = true;
+        false
+    });
     changed
 }
 fn queue_path(root: &Path, uid: &str) -> PathBuf {
@@ -611,6 +671,7 @@ fn deliver_queue(
     let path = queue_path(store_root, uid);
     q.dirty |= expire_latches(q, now);
     q.dirty |= collect(q, intents);
+    q.dirty |= compact_history(q, intents, now);
     checkpoint(&path, q)?;
     let first = q
         .batches
@@ -1295,7 +1356,7 @@ mod tests {
     }
 
     #[test]
-    fn messaging_large_settled_history_needs_no_native_io_or_queue_writes() {
+    fn messaging_large_settled_history_needs_no_native_io_and_ages_out_past_the_horizon() {
         let (tmp, store, _, _) = fixture();
         let path = queue_path(&store.root, "b");
         let q = Queue {
@@ -1309,20 +1370,88 @@ mod tests {
             ..Queue::default()
         };
         save(&path, &q).unwrap();
-        let bytes = fs::read(&path).unwrap();
         // Any native lookup/lock would fail: settled history must not touch it.
         fs::write(tmp.path().join("notifications"), "not a directory").unwrap();
-        let (loads, writes) = (queue_load_count(), save_calls());
+        let pass = |now: u64| {
+            let (loads, writes) = (queue_load_count(), save_calls());
+            let mut q = reconcile_intents(tmp.path(), &store, "b", &[]).unwrap();
+            deliver_queue(tmp.path(), &store.root, "b", &[], &recipient("codex"),
+                now, &no_preview, &mut q).unwrap();
+            assert_eq!(queue_load_count() - loads, 1);
+            (save_calls() - writes, q)
+        };
+        let t0 = 1_000_000;
+        // Undelivered history has no age yet: the first pass stamps it once.
         let started = std::time::Instant::now();
-        let mut q = reconcile_intents(tmp.path(), &store, "b", &[]).unwrap();
-        deliver_queue(tmp.path(), &store.root, "b", &[], &recipient("codex"),
-            1_000_000, &no_preview, &mut q).unwrap();
-        eprintln!("P2 synthetic history: 7745 batches, {} bytes, {:.3} ms, one load, zero writes/native reads",
-            bytes.len(), started.elapsed().as_secs_f64() * 1000.0);
-        assert_eq!(queue_load_count() - loads, 1);
-        assert_eq!(save_calls() - writes, 0);
-        assert_eq!(fs::read(&path).unwrap(), bytes, "all dedup history remains intact");
-        assert_eq!(q.batches.len(), 7745);
+        let (writes, q) = pass(t0);
+        eprintln!("P2 synthetic history: 7745 batches, {:.3} ms, one load, no native reads",
+            started.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(writes, 1);
+        assert_eq!(q.batches.len(), 7745, "history inside the horizon remains intact");
+        assert!(q.batches[..7745 - HISTORY_TAIL].iter().all(|b| b.settled_at == t0));
+        let bytes = fs::read(&path).unwrap();
+        let (writes, q) = pass(t0 + HISTORY_HORIZON_SECS - 1);
+        assert_eq!((writes, q.batches.len()), (0, 7745));
+        assert_eq!(fs::read(&path).unwrap(), bytes, "no rewrite inside the horizon");
+        // Past the horizon only the newest tail is left, in order.
+        let (writes, q) = pass(t0 + HISTORY_HORIZON_SECS);
+        assert_eq!(writes, 1);
+        let kept: Vec<_> = q.batches.iter().map(|b| b.wake_id.clone()).collect();
+        let tail: Vec<_> = (7745 - HISTORY_TAIL..7745).map(|i| format!("history-{i}")).collect();
+        assert_eq!(kept, tail);
+        let (writes, q) = pass(t0 + 2 * HISTORY_HORIZON_SECS);
+        assert_eq!((writes, q.batches.len()), (0, HISTORY_TAIL));
+        assert!(fs::metadata(&path).unwrap().len() < 64 * 1024);
+    }
+
+    #[test]
+    fn messaging_history_compaction_keeps_live_intents_open_work_and_the_tail() {
+        let now = 10 * HISTORY_HORIZON_SECS;
+        let old = now - HISTORY_HORIZON_SECS;
+        let settled = |i: usize, delivered_at: u64| Batch {
+            wake_id: format!("w{i}"),
+            ids: vec![format!("k{i}")],
+            status: "confirmed".into(),
+            released: true,
+            delivered_at,
+            ..Batch::default()
+        };
+        let mut batches: Vec<Batch> = (0..200).map(|i| settled(i, old)).collect();
+        // Still an intent (e.g. an unread DM): its history is the dedup record.
+        batches[3].ids.push("unread".into());
+        // A coalesced arrival that is still an intent also keeps its batch.
+        batches[4].coalesced.insert("k-coalesced".into());
+        batches[4].ids.push("k-coalesced".into());
+        // Delivered inside the horizon.
+        batches[5].delivered_at = old + 1;
+        // Not settled: released but only submitted, or settled but not released.
+        batches[6].status = "submitted_unverified".into();
+        batches[7].released = false;
+        // Deferred task work is never compacted.
+        batches[8].ids = vec!["deferred-key".into()];
+        let mut q = Queue {
+            batches,
+            deferred: BTreeSet::from(["deferred-key".to_string()]),
+            ..Queue::default()
+        };
+        let intents: Vec<_> = ["unread", "k-coalesced"].iter().map(|k| WakeIntent {
+            key: (*k).into(), event_id: (*k).into(), monitor: None,
+        }).collect();
+        assert!(compact_history(&mut q, &intents, now));
+        let kept: Vec<_> = q.batches.iter().map(|b| b.wake_id.as_str()).collect();
+        let mut expected = vec!["w3", "w4", "w5", "w6", "w7", "w8"];
+        let tail: Vec<String> = (200 - HISTORY_TAIL..200).map(|i| format!("w{i}")).collect();
+        expected.extend(tail.iter().map(String::as_str));
+        assert_eq!(kept, expected);
+        assert!(!compact_history(&mut q, &intents, now), "a second pass changes nothing");
+        // Intents whose history was kept stay covered: no second wake.
+        let n = q.batches.len();
+        collect(&mut q, &intents);
+        assert_eq!(q.batches.len(), n);
+        // Small queues are never compacted.
+        let mut small = Queue { batches: (0..HISTORY_TAIL).map(|i| settled(i, 1)).collect(), ..Queue::default() };
+        assert!(!compact_history(&mut small, &[], now));
+        assert_eq!(small.batches.len(), HISTORY_TAIL);
     }
 
     #[test]
@@ -1346,6 +1475,7 @@ mod tests {
         let q = load(&path).unwrap();
         assert!(!q.dirty);
         let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(saved["batches"][0].get("settled_at").is_none(), "an unset stamp is not written");
         assert!(saved["batches"][0].get("migrated").is_none());
         assert_eq!(saved["batches"][0]["released"], true);
     }

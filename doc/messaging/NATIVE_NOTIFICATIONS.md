@@ -80,6 +80,18 @@ being swallowed for good (2026-09-14: an orchestrator's 11:01 wake absorbed a
 keeps its ids as history. Mute/cancellation can still retract unclaimed native
 work.
 
+That history is bounded. A settled batch (released, and confirmed or
+cancelled) stays while any of its keys is still a wake intent, such as an
+unread DM or an unacknowledged monitor hit, so nothing is woken twice. Once no
+key is an intent, the batch is dropped 24 hours after delivery, or 24 hours
+after it was first seen settled if it was never delivered. The newest 16
+batches always stay, and deferred task work is never dropped. The one effect is
+that a message unread for over a day, whose intent was briefly suspended (DND,
+leaving and rejoining a channel), can be woken once more. Before this, every
+batch ever delivered was kept and rewritten on each delivery pass: one
+orchestrator's ledger had reached 23 MB and 28,722 batches, and cm-sessions
+rewrote about 400 MiB/min of ledgers (2026-11-05, #105).
+
 Chat wake text and worker-completion notices instruct agents to inspect pending
 activity before responding, continue the existing task, and report only meaningful
 changes, blockers or Owner decisions. They must not repeat a completed summary.
