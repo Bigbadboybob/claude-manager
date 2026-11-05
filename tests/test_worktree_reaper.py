@@ -84,6 +84,33 @@ class WorktreeReaperTests(unittest.TestCase):
         self.assertEqual(result.reason, "terminal_and_inactive")
         self.assertEqual(result.landed_reason, "head_is_ancestor")
 
+    def test_landed_clean_checkout_of_a_done_task_is_reaped_after_one_day(self) -> None:
+        # #109: a done task's checkout whose HEAD is in origin main no longer
+        # waits the full 7 days.
+        def decide(age_days, *, landed_days=1.0, status="done"):
+            context = self.context(status=status)
+            context.now = time.time() + age_days * reaper.DAY
+            context.landed_retention_days = landed_days
+            return reaper.decision(self.worktree, context)
+
+        fast = decide(2)
+        self.assertTrue(fast.eligible)
+        self.assertEqual((fast.reason, fast.landed_reason), ("terminal_and_landed", "head_is_ancestor"))
+        self.assertEqual(decide(0.5).reason, "below_retention", "still inside the landed window")
+        self.assertEqual(decide(2, landed_days=None).reason, "below_retention", "fast path disabled")
+        self.assertEqual(decide(2, status="running").reason, "task_not_terminal")
+        self.assertEqual(decide(8).reason, "terminal_and_inactive", "full retention is unchanged")
+
+        (self.worktree / "NOTES.md").write_text("dirty\n")
+        dirty = decide(2)
+        self.assertEqual(dirty.reason, "below_retention")
+        self.assertIn("dirty tree waits for full retention", dirty.details)
+        self.git(self.worktree, "commit", "-am", "unlanded work")
+        unlanded = decide(2)
+        self.assertEqual(unlanded.reason, "below_retention")
+        self.assertTrue(any(d.startswith("not landed:") for d in unlanded.details), unlanded.details)
+        self.assertEqual(decide(8).reason, "terminal_and_inactive", "unlanded work still goes at 7 days")
+
     def test_durable_workspaces_and_open_assistants_checkouts_are_protected(self) -> None:
         # doc/org-model.md §5, O5: a member's home/stream workspace, or a
         # checkout an assistant was live in within 7 days, survives a done

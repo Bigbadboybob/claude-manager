@@ -274,6 +274,10 @@ class ScanContext:
     scope_guard: Callable[[ScanContext, Path], WorkspaceFacts] | None = None
     fetched_repos: dict[Path, bool] = dataclasses.field(default_factory=dict)
     landed_cache: dict[tuple[Path, str], LandedProof] = dataclasses.field(default_factory=dict)
+    # #109 fast path: a task-owned checkout whose tasks are all terminal, whose
+    # tree is clean and whose HEAD is proven in origin main is reaped after
+    # this many quiet days instead of `retention_days`. None disables it.
+    landed_retention_days: float | None = None
 
 
 def run(
@@ -1280,7 +1284,13 @@ def decision(
             "threshold_days": threshold,
         }
     )
-    if age_days < threshold:
+    landed_window = (
+        not unowned
+        and not immediate
+        and ctx.landed_retention_days is not None
+        and ctx.landed_retention_days < threshold
+    )
+    if age_days < threshold and not (landed_window and age_days >= ctx.landed_retention_days):
         return Decision(path, "wait", below_retention_reason, False, **common)
 
     full_git_facts, full_error = inspect_git(path)
@@ -1306,7 +1316,8 @@ def decision(
     full_activity.extend(ctx.external_activity.get(resolved, ()))
     full_age_days = max(0.0, (ctx.now - max(full_activity)) / DAY)
     common["age_days"] = full_age_days
-    if full_age_days < threshold:
+    landed_only = full_age_days < threshold
+    if landed_only and not (landed_window and full_age_days >= ctx.landed_retention_days):
         return Decision(path, "wait", below_retention_reason, False, **common)
     common.update(
         {
@@ -1351,6 +1362,21 @@ def decision(
     proof = landed_proof(ctx, git_facts)
     commit_detail = ("will create WIP commit before removal",) if git_facts.dirty_entries else ()
     common.update({"main_ref": proof.main_ref, "landed_reason": proof.reason})
+    if landed_only:
+        # Inside full retention: only a clean, landed checkout goes early.
+        if not proof.landed or git_facts.dirty_entries or not git_facts.branch:
+            why = (f"not landed: {proof.reason}" if not proof.landed
+                   else "dirty tree waits for full retention" if git_facts.dirty_entries
+                   else "detached HEAD waits for full retention")
+            return Decision(path, "wait", below_retention_reason, False, details=(why,), **common)
+        return Decision(
+            path,
+            "reap",
+            "terminal_and_landed",
+            True,
+            details=archive_detail + discard_detail + standalone_detail,
+            **common,
+        )
     if unowned:
         reason = "unowned_inactive_auto_commit" if git_facts.dirty_entries else "unowned_inactive"
         return Decision(
@@ -1406,6 +1432,7 @@ def build_context(args: argparse.Namespace) -> tuple[ScanContext, list[str]]:
             now=args.now if args.now is not None else dt.datetime.now(dt.UTC).timestamp(),
             retention_days=args.retention_days,
             unowned_retention_days=args.unowned_retention_days,
+            landed_retention_days=args.landed_retention_days or None,
             workspaces=workspace_facts,
             tasks=tasks,
             tasks_by_branch=dict(tasks_by_branch),
@@ -2022,6 +2049,13 @@ def parser() -> argparse.ArgumentParser:
         default=7,
         help="retention for unowned worktrees; their branch and any safe WIP commit are preserved",
     )
+    result.add_argument(
+        "--landed-retention-days",
+        type=float,
+        default=1.0,
+        help="retention for a clean task-owned checkout whose HEAD is proven in origin main "
+             "and whose tasks are all terminal; 0 disables the fast path",
+    )
     result.add_argument("--max-removals", type=int, default=100, help="mass-event cap per apply run")
     result.add_argument(
         "--apply",
@@ -2146,6 +2180,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "policy": {
                         "retention_days": args.retention_days,
                         "unowned_retention_days": args.unowned_retention_days,
+                        "landed_retention_days": args.landed_retention_days,
                         "terminal_statuses": sorted(TERMINAL_TASK_STATUSES),
                         "roots": [str(ctx.root) for ctx in contexts],
                         "artifact_root": str(args.artifact_root.expanduser().resolve(strict=False)),
