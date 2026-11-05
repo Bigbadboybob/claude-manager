@@ -140,6 +140,29 @@ class ReinstateBody(_Strict):
     request_id: RequestId | None = None
 
 
+class HireBody(_Strict):
+    actor: Actor
+    handle: Short
+    kind: str = Field(default="agent", pattern=r"^agent$")
+    # Limits are checked in org_db (TITLE_MAX / MANDATE_MAX) with a named code.
+    title: Annotated[str, Field(max_length=1000)] | None = None
+    mandate: Annotated[str, Field(max_length=4000)] | None = None
+    # A member reference: id, handle, `main/<handle>` or `owner`.
+    manager: Short | None = None
+    team: Short | None = None
+    reason: Annotated[str, Field(max_length=500)] | None = None
+    request_id: RequestId | None = None
+
+
+class ProfileBody(_Strict):
+    actor: Actor
+    title: Annotated[str, Field(max_length=1000)] | None = None
+    mandate: Annotated[str, Field(max_length=4000)] | None = None
+    reason: Annotated[str, Field(max_length=500)] | None = None
+    expected_revision: int | None = None
+    request_id: RequestId | None = None
+
+
 class TeamCreateBody(_Strict):
     actor: Actor
     name: Short
@@ -207,6 +230,28 @@ async def member_by_pid(request: Request,
 @router.get("/members/{ref:path}")
 async def get_member(ref: Ref, request: Request):
     return await _call(org_db.get_member(_pool(request), ref))
+
+
+@router.post("/members")
+async def hire_member(body: HireBody, request: Request):
+    """Owner hires a member with no session yet (doc/org-model.md §4.2)."""
+    return await _call(org_db.hire(
+        _pool(request), body.actor.model_dump(), handle=body.handle, kind=body.kind,
+        title=body.title, mandate=body.mandate, manager=body.manager, team=body.team,
+        reason=body.reason, request_id=body.request_id))
+
+
+@router.patch("/members/{ref:path}")
+async def update_member_profile(ref: Ref, body: ProfileBody, request: Request):
+    """Edit a member's title and/or mandate (§8.2): Owner or its manager chain."""
+    changes = body.model_dump(exclude_unset=True)
+    actor = changes.pop("actor")
+    reason = changes.pop("reason", None)
+    expected = changes.pop("expected_revision", None)
+    request_id = changes.pop("request_id", None)
+    return await _call(org_db.update_profile(
+        _pool(request), actor, ref, changes, reason=reason, expected_revision=expected,
+        request_id=request_id))
 
 
 @router.post("/members/{ref:path}/move")

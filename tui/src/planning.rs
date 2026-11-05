@@ -1324,6 +1324,22 @@ impl PlanningView {
             .map(PlanTask::initiative_marker).unwrap_or("")
     }
 
+    /// Backlog tasks not on a board yet, for F6's assign picker (#96):
+    /// `(task id, title, project)`, by project, in board order. Placed
+    /// tasks are board items there; backtests and continuous tasks are
+    /// never handed to a member.
+    pub(crate) fn backlog_tasks(&self) -> Vec<(String, String, String)> {
+        self.project_data
+            .iter()
+            .flat_map(|pd| {
+                pd.tasks
+                    .iter()
+                    .filter(|t| t.status == PlanStatus::Backlog && !matches!(t.kind.as_str(), "backtest" | "continuous") && !self.placements.contains_key(&t.id))
+                    .map(|t| (t.id.clone(), t.title.clone(), pd.project.name.clone()))
+            })
+            .collect()
+    }
+
     /// Update planning data from API tasks. Called when BackendEvent::PlanTasksUpdated arrives.
     /// Merges API state into existing local state rather than rebuilding from scratch.
     pub fn update_from_api(&mut self, api_tasks: Vec<Task>) {

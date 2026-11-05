@@ -143,6 +143,7 @@ items it holds. (The four S5 facts replace mandate and focus when they land.)
 | `i` | show or hide the info pane |
 | `a` | team mode: expand or fold the focused member's assistants |
 | `R` | team mode: open the roster |
+| `A` `p` `m` `X` `e` `E` `o` | team mode: Owner actions on the focused box — assign, hire, move, retire, edit the profile (a team's charter and rules), the lead's profile, open the main session. See [Owner actions](org-tui.md#org-chart-f6-owner-actions) |
 | Enter (or `A-t`) | open the Sessions view with that session focused; folded sidebar headers above it unfold. Enter on a reporting reference opens its team; on another box with no session it stays in the chart |
 | F6, Esc, `q` | the same, except that with no session selected (a box without one, or a header the chart opened on and you haven't moved from) the sidebar cursor goes back exactly where it was when the chart opened |
 

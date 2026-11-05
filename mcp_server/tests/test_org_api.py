@@ -848,6 +848,80 @@ class OrgApiDb(unittest.IsolatedAsyncioTestCase):
         r = await self.member_write("retire", "org", coord, status=422)
         self.assertEqual(r["detail"][0]["loc"][-1], "reason")
 
+    async def hire(self, actor=OWNER, status=200, **body):
+        r = await self.http.post("/org/members", json={"actor": actor, **body})
+        self.assertEqual(r.status_code, status, r.text)
+        return r.json()
+
+    async def test_owner_hires_a_sessionless_member_under_a_manager_or_team_lead(self):
+        await self.applied_swarm()
+        # Owner's (as adopt is); agents hire by spawning with start_session(hire=).
+        r = await self.hire({"pid": pid(self.coord)}, 403, handle="rev")
+        self.assertEqual(r["detail"]["code"], "owner_only")
+        self.assertEqual((await self.hire(status=422, handle="rev", title="x" * 61))["detail"]["code"], "too_long")
+        self.assertEqual((await self.hire(status=422, handle="rev", mandate="x" * 401))["detail"]["code"], "too_long")
+        self.assertEqual((await self.hire(status=422, handle="Rev!"))["detail"]["code"], "invalid_handle")
+        self.assertEqual((await self.hire(status=422, handle="rev", team="nope"))["detail"]["code"], "unknown_team")
+        # Into a team: its lead is the manager (§6.2); no session yet.
+        body = {"handle": "rev", "title": " Reviewer ", "mandate": "Reviews org changes",
+                "team": "swarm", "reason": "F6 hire", "request_id": "hire-1"}
+        r = await self.hire(**body)
+        rev = r["member"]
+        self.assertEqual(
+            (rev["handle"], rev["title"], rev["mandate"], rev["manager_handle"],
+             rev["primary_team_id"], rev["main"], rev["status"]),
+            ("rev", "Reviewer", "Reviews org changes", "swarm-coord", self.init_id, None, "active"))
+        self.assertEqual((await self.hire(**body))["member"]["id"], rev["id"], "a retry answers the first hire")
+        self.assertEqual((await self.hire(status=409, handle="rev"))["detail"]["code"], "handle_taken")
+        # Under a named manager, no team.
+        r = await self.hire(handle="rev2", manager="org")
+        self.assertEqual((r["member"]["manager_handle"], r["member"]["primary_team_id"]), ("org", None))
+        snap = await self.snapshot()
+        self.assertEqual({m["handle"] for m in snap["members"]} >= {"rev", "rev2"}, True)
+        team = next(t for t in snap["teams"] if t["id"] == self.init_id)
+        self.assertIn({"member_id": rev["id"], "role": "primary"}, team["members"])
+        events = (await self.http.get("/org/events", params={"subject_type": "member", "subject_id": rev["id"]})).json()
+        self.assertEqual((events[0]["type"], events[0]["new"]["via"], events[0]["reason"]), ("hire", "hire", "F6 hire"))
+
+    async def test_title_and_mandate_are_the_manager_chains_to_edit(self):
+        await self.applied_swarm()
+        coord, org = {"pid": pid(self.coord)}, {"pid": pid(self.lane)}
+
+        async def patch(ref, actor, status=200, **body):
+            r = await self.http.patch(f"/org/members/{ref}", json={"actor": actor, **body})
+            self.assertEqual(r.status_code, status, r.text)
+            return r.json()
+
+        # Not the member itself, not a report on its lead, not a non-member.
+        self.assertEqual((await patch("org", org, 403, title="Boss"))["detail"]["code"], "not_manager")
+        self.assertEqual((await patch("swarm-coord", org, 403, title="x"))["detail"]["code"], "not_manager")
+        self.assertEqual((await patch("org", {"pid": pid(self.helper)}, 403, title="x"))["detail"]["code"], "not_member")
+        self.assertEqual((await patch("org", coord, 422, title="x" * 61))["detail"]["code"], "too_long")
+        self.assertEqual((await patch("org", coord, 422, mandate="x" * 401))["detail"]["code"], "too_long")
+        self.assertEqual((await patch("org", coord, 422))["detail"]["code"], "invalid_field")
+        self.assertEqual((await patch("owner", OWNER, 404, title="x"))["detail"]["code"], "not_found")
+        before = (await self.http.get("/org/members/org")).json()["member"]
+        r = await patch("org", coord, title="  Org model lane ", mandate="Builds the org model",
+                        expected_revision=before["revision"], request_id="p-1")
+        self.assertEqual((r["member"]["title"], r["member"]["mandate"], r["changed"]),
+                         ("Org model lane", "Builds the org model", ["mandate", "title"]))
+        self.assertEqual(r["member"]["revision"], before["revision"] + 1)
+        # Owner clears the mandate; a stale revision is refused; no-op writes change nothing.
+        stale = await patch("org", OWNER, 409, mandate="", expected_revision=before["revision"])
+        self.assertEqual(stale["detail"]["code"], "revision_conflict")
+        r = await patch("org", OWNER, mandate="", title="Org model lane")
+        self.assertEqual((r["member"]["mandate"], r["member"]["title"], r["changed"]), ("", "Org model lane", ["mandate"]))
+        unchanged = await patch("org", OWNER, title="Org model lane")
+        self.assertEqual((unchanged["changed"], unchanged["member"]["revision"]), ([], r["member"]["revision"]))
+        events = (await self.http.get("/org/events", params={"subject_type": "member"})).json()
+        self.assertEqual((events[0]["type"], events[0]["new"], events[0]["prev"]),
+                         ("profile_set", {"mandate": ""}, {"mandate": "Builds the org model"}))
+        snap = await self.snapshot()
+        self.assertEqual(next(m for m in snap["members"] if m["handle"] == "org")["title"], "Org model lane")
+        # A retired member is reinstated before its profile changes.
+        await self.member_write("retire", "org", OWNER, reason="done")
+        self.assertEqual((await patch("org", OWNER, 409, title="x"))["detail"]["code"], "retired")
+
     async def test_retire_moves_reports_up_keeps_sessions_and_owner_reinstates(self):
         await self.applied_swarm()
         snap = await self.snapshot()

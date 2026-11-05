@@ -182,6 +182,10 @@ pub(super) struct Team {
     pub coordinator_task_id: Option<String>,
     pub board: Option<String>,
     pub channel: Option<String>,
+    /// What the team is for (Owner edits it in F6, `e` on its box).
+    pub charter: Option<String>,
+    /// `[{text, source}]`, at most ten one-liners (doc/org-model.md §8.4).
+    pub standing_rules: Vec<Value>,
     pub members: Vec<TeamMembership>,
     pub revision: i64,
 }

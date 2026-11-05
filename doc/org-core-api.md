@@ -47,6 +47,8 @@ S6/S7 item.
 |---|---|---|
 | `POST /roster/apply {rows:[{proposal_id, approve?, handle?, kind?, title?, team_id?, manager?, home_workspace?}], request_id}` | Owner | Each row is applied in its own transaction, against proposals regenerated under the lock inside it, so a row sees the rows applied before it. Per-row rejections are `stale`, `handle_taken`, `cycle`, `pid_already_member`, `unknown_manager`, `unknown_ref`, `coordinator_taken` and `conflict`. `approve: false` records a decline. |
 | `POST /adopt {pid, handle, title?, kind, team_id?, manager?, home_workspace?, request_id}` | Owner | Returns `{member, home_mark: {state}}`. |
+| `POST /members {handle, kind: "agent", title?, mandate?, manager?, team?, reason?, request_id?}` | Owner | Hire: a member with no session yet (F6 `p`, the place dialog's new hire). Its manager is `manager` (id, handle, `main/<handle>` or `owner`), else the lead of `team`, else Owner. `team` (id or slug) is its primary team (`422 unknown_team`). Title ≤ 60 and mandate ≤ 400 (`422 too_long`). Returns `{member, notes, version}`. |
+| `PATCH /members/{ref} {title?, mandate?, reason?, expected_revision?, request_id?}` | Owner, or a member above the target in its manager chain | Authored profile (§8.2): each value is stored as `{value, set_by, via, set_at}`; an empty value clears it; one `profile_set` event records what changed. `422 too_long`, `409 retired`, `409 revision_conflict`. Returns the member's detail plus `changed`. |
 | `POST /members/{ref}/move {manager?, primary_team_id?, reason, expected_revision?}` | Owner, or a member above the target in its manager chain | `primary_team_id` is a team id or slug (`422 unknown_team`). |
 | `POST /members/{ref}/retire {reason, request_id?}` | Owner, or a member above the target in its manager chain | Status `retired`. Its reports move up to its manager (one `move` event each, `via: "retire"`) and the teams it leads lose their lead. Its main session's open board holds go to its manager's main session, or Owner (`hand_back_holds`, as for closing an assistant); a vacant manager's stay, listed as `kept`. Returns `{member, …, reports_moved, teams_unled, holds}`. Incarnations and sessions are untouched: nothing is killed, and the handle stays reserved. `409 already_retired`. |
 | `POST /members/{ref}/reinstate {reason?, request_id?}` | Owner | Undoes a retire: the status before the retire comes back (`active`, `vacant` or `suspended`), and it leads again any team from the `retire` event that has had no lead since (`teams_led_again`). Reports that moved up stay put. `409 not_retired`; `409 retired_manager` when its manager is retired too (reinstate that one first). |
@@ -110,8 +112,9 @@ host advertises `org_marks_v1`, its marks stay `central`.
 `org.snapshot`, `org.member`, `org.team` and `org.roster` are reads.
 `org.roster_apply`, `org.adopt` (`session_uid` may stand in for `pid`; the
 daemon fills in its own id), `org.team_create`, `org.team_update`, `org.move`,
-`org.retire` and `org.reinstate` are writes. The roster, adopt and reinstate
-are refused for session callers. An old API (404, or 405 on a route it lacks)
+`org.retire`, `org.reinstate`, `org.hire` and `org.member_update` are
+writes. The roster, adopt, reinstate and hire are refused for session callers
+(agents hire by spawning: `start_session(hire=)`). An old API (404, or 405 on a route it lacks)
 answers `unknown_method` with `unsupported: … needs an API deploy`, so the TUI
 turns the feature off.
 

@@ -51,6 +51,9 @@ TEAM_STATUSES = {"active", "standby", "archived"}
 CLOSED_INITIATIVE = ("archived", "cancelled", "completed")
 OPEN_ITEM = ("open", "active", "waiting", "blocked")
 AGENT_ENGINES = {"claude", "claude-code", "codex"}
+# Authored profile limits (doc/org-model.md §8.2).
+TITLE_MAX = 60
+MANDATE_MAX = 400
 
 
 class OrgError(ItemsError):
@@ -958,9 +961,10 @@ async def _set_leads(conn, actor, member_id, lead_of, request_id) -> list[str]:
 
 async def _create_member(conn, actor, *, handle, kind, title, manager_ref, team_id, pid,
                          home, aliases=(), continuous=None, source, request_id,
-                         reason=None) -> tuple[str, list[str]]:
+                         reason=None, mandate=None) -> tuple[str, list[str]]:
     """One new member, its main occupancy row, aliases, continuous mapping,
-    primary team and home mark. Raises OrgError with a row-level code."""
+    primary team and home mark. Raises OrgError with a row-level code.
+    `pid` None hires a member with no session yet (`hire`)."""
     check_handle(handle)
     if kind not in MEMBER_KINDS:
         raise _err(422, "invalid_field", f"kind must be one of {sorted(MEMBER_KINDS)}")
@@ -991,6 +995,9 @@ async def _create_member(conn, actor, *, handle, kind, title, manager_ref, team_
     now = utcnow().isoformat()
     profile = {"title": {"value": _clip(title, 200) or "", "set_by": actor.get("pid"),
                          "via": source, "set_at": now}} if title else {}
+    if mandate:
+        profile["mandate"] = {"value": _clip(mandate, MANDATE_MAX), "set_by": actor.get("pid"),
+                              "via": source, "set_at": now}
     defaults = {"home_workspace": home} if home else None
     await conn.execute(
         """INSERT INTO members (id, handle, kind, status, manager_member_id, primary_team_id,
@@ -1818,6 +1825,105 @@ async def reinstate(pool, actor: dict, ref: str, *, reason: str | None = None,
         return {**detail, "teams_led_again": restored}
 
     return await _member_write(pool, actor, request_id, "reinstate", body)
+
+
+def _authored(value, limit: int, field: str) -> str:
+    """A title or mandate as written: trimmed, within its §8.2 limit."""
+    text = "" if value is None else str(value).strip()
+    if len(text) > limit:
+        raise _err(422, "too_long", f"{field} is at most {limit} characters ({len(text)} given)")
+    return text
+
+
+async def hire(pool, actor: dict, *, handle: str, kind: str = "agent", title=None,
+               mandate=None, manager=None, team=None, reason=None,
+               request_id: str | None = None) -> dict:
+    """Owner hires a new member with no session yet (doc/org-model.md §4.2:
+    F6's hire and the place dialog's "new hire"). Its manager is `manager`,
+    else the lead of `team` (§6.2), else Owner; `team` is its primary team.
+    It shows as an empty box under its manager until a session takes its
+    seat (`rebind_main` today, `start_session(member=)` from S6). Agents hire
+    by spawning (`start_session(hire=)`, which promotes); this route is
+    Owner's, like adopt."""
+    _require_owner(actor, "hiring a member")
+    title = _authored(title, TITLE_MAX, "title")
+    mandate = _authored(mandate, MANDATE_MAX, "mandate")
+    if kind != "agent":
+        raise _err(422, "invalid_field", "a hire is an agent member; continuous members come from their scheduler")
+
+    async def body(conn):
+        team_row = None
+        if team is not None and str(team).strip():
+            try:
+                team_row = await _team_row(conn, str(team).strip())
+            except OrgError:
+                raise _err(422, "unknown_team", f"no team {team}") from None
+        manager_ref = manager if manager is not None and str(manager).strip() else None
+        if manager_ref is None and team_row is not None and team_row["lead_member_id"]:
+            manager_ref = team_row["lead_member_id"]
+        member_id, notes = await _create_member(
+            conn, actor, handle=handle, kind="agent", title=title or None,
+            mandate=mandate or None, manager_ref=manager_ref,
+            team_id=str(team_row["id"]) if team_row is not None else None, pid=None,
+            home=None, source="hire", request_id=request_id, reason=reason)
+        detail = await _detail(conn, member_id)
+        return {"member": detail["member"], "notes": notes}
+
+    response = await _member_write(pool, actor, request_id, "hire", body)
+    async with pool.acquire() as conn:
+        return {**response, "version": await version(conn)}
+
+
+PROFILE_FIELDS = {"title": TITLE_MAX, "mandate": MANDATE_MAX}
+
+
+async def update_profile(pool, actor: dict, ref: str, changes: dict, *, reason=None,
+                         expected_revision: int | None = None,
+                         request_id: str | None = None) -> dict:
+    """Edit a member's authored title and/or mandate (doc/org-model.md §8.2):
+    Owner, or a member up its manager chain acting as its main session (the
+    check move uses; never the member itself). Each value is stored as
+    `{value, set_by, via, set_at}`; an empty value clears it. One
+    `profile_set` org event records what changed."""
+    unknown = set(changes) - set(PROFILE_FIELDS)
+    if unknown or not changes:
+        raise _err(422, "invalid_field", f"editable profile fields: {sorted(PROFILE_FIELDS)}")
+    values = {field: _authored(changes[field], PROFILE_FIELDS[field], field) for field in changes}
+
+    async def body(conn):
+        member_id = await _resolve_member_id(conn, ref)
+        if not member_id or member_id == OWNER_ID:
+            raise _err(404, "not_found", f"no editable member {ref!r}")
+        row = await conn.fetchrow("SELECT * FROM members WHERE id = $1", member_id)
+        if row["status"] == "retired":
+            raise _err(409, "retired", f"{row['handle']} is retired; reinstate it first")
+        await _require_chain(conn, actor, member_id, "edit the profile of")
+        if expected_revision is not None and row["revision"] != expected_revision:
+            raise _err(409, "revision_conflict", "the member changed; re-read it",
+                       current_revision=row["revision"])
+        profile = dict(row["profile"] or {})
+        now = utcnow().isoformat()
+        prev, new = {}, {}
+        for field, value in values.items():
+            before = _profile_value(profile, field) or ""
+            if before == value:
+                continue
+            prev[field], new[field] = before, value
+            if value:
+                profile[field] = {"value": value, "set_by": actor.get("pid"), "via": "profile",
+                                  "set_at": now}
+            else:
+                profile.pop(field, None)
+        if new:
+            await conn.execute(
+                """UPDATE members SET profile = $2, revision = revision + 1, updated_at = now()
+                    WHERE id = $1""", member_id, profile)
+            await _event(conn, "member", member_id, "profile_set", actor, prev=prev, new=new,
+                         reason=reason, request_id=request_id)
+        detail = await _detail(conn, member_id)
+        return {**detail, "changed": sorted(new)}
+
+    return await _member_write(pool, actor, request_id, "profile", body)
 
 
 async def team_create(pool, actor: dict, *, name: str, slug=None, kind="team", parent_team_id=None,

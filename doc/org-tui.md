@@ -45,6 +45,62 @@ kind, manager, team_id?, home_workspace?, request_id}` for each marked row, one
 at a time, to the session's own host; after an error the rows not yet sent
 keep their marks for another `A`. Hire, move and retire come later.
 
+## Org chart (F6): Owner actions
+
+With the org model live, F6 acts on the focused box as well as showing it
+([org model §13.4](org-model.md#134-close-out-owner-2026-11-05), item 2).
+The help line starts with the focused box's keys, and `?` adds a legend
+line listing all of them.
+
+| Key | On a member's box | On a team's box | On Owner's box |
+|---|---|---|---|
+| `A` | assign work to them | assign work to the team: its lead (O8) | — |
+| `p` | hire a new member reporting to them (in their primary team) | hire into the team, under its lead (Owner when it has none) | hire a report of Owner's |
+| `m` | move to another manager and/or primary team | move the lead | — |
+| `X` | retire | retire the lead | — |
+| `e` | edit title (≤ 60) and mandate (≤ 400) | edit the charter and standing rules | — |
+| `E` | same as `e` | edit the lead's title and mandate | — |
+| `o` | open their main session in the Sessions view | open the lead's | — |
+
+Guest boxes and reporting references act on the member they show. A team led
+by Owner, or with no lead, says so instead of acting on a lead.
+
+- **Assign** opens a picker with the backlog tasks that are not on a board yet
+  and the open board items the member doesn't already hold. Type to filter;
+  ↑/↓ choose; Enter assigns. A task opens the planning view's place dialog
+  (`open_place_dialog`, shared with `A-f`) with the holder preset to the
+  member, or to the team on a team's box: `item.place` with `team`, and the
+  API gives it to the lead's main session. An item is handed over with
+  `item.set {board, n, owner: <main session pid>, reason}`, which on a team's
+  box is the lead's pid. A member with no session yet can't hold a board item,
+  and the picker says so.
+- **Hire** asks for a handle (2–40 of `a-z 0-9 -`; a space types `-`), an
+  optional title and mandate, a manager and a team, and sends `org.hire`. The
+  new member has no session: it shows as an empty box under its manager and is
+  focused once the snapshot has it. A session takes the seat later
+  (`org.rebind_main` today, `start_session(member=)` from S6).
+- **Move** sends `org.move` with only what changed. Choosing team `none`
+  clears the primary team. **Retire** names who takes the reports and the open
+  board items, and sends `org.retire`. Owner can reinstate.
+- **Profile** sends `org.member_update` with the changed fields and the
+  member's revision. Clearing a field clears the value.
+- **Team** sends `org.team_update` with the charter and/or `standing_rules`
+  and the team's revision. A rule left unchanged keeps its `source`, and a new
+  or edited rule gets `source: "owner"`. Empty a rule to drop it. A team has at
+  most ten rules; Ctrl+J starts a new charter line.
+
+Text fields edit in place: ←/→, Home/End, Backspace/Delete, Ctrl+U clears,
+and paste works. Tab or ↑/↓ moves between fields, ←/→ (or a letter) picks a
+choice, Enter sends, and Esc cancels. A refusal (`revision_conflict`,
+`not_manager`, `handle_taken`, …) stays in the form. A daemon or API without a
+route says it needs a newer one.
+
+Who may do what stays with the daemon and API: the viewer is the operator
+caller, so it acts as Owner. Hiring and team edits are Owner-only (the
+daemon refuses `org.hire` from a session, and the API refuses both from
+anyone else). Moves, retires and profile edits are Owner's, or belong to a
+member up the target's manager chain.
+
 ## Sessions sidebar: Team sub-view
 
 `A-v` cycles **Status → Task → Team**. The Team sub-view lists the teams
@@ -150,6 +206,7 @@ minutes, and whenever a screen opens.
 |---|---|
 | `tui/src/app/org_model.rs` | snapshot types, polling, `owner_rpc`, support checks |
 | `tui/src/app/orgchart_teams.rs` | the F6 team-mode model and info pane |
+| `tui/src/app/orgchart_actions.rs` | F6 Owner actions: the forms, the assign picker and their writes |
 | `tui/src/app/roster.rs` | the roster overlay |
 | `tui/src/app/team_view.rs` | the Team sub-view |
 | `tui/src/app/board/epics.rs` | the Alt+B group tree, group menu and close plan |

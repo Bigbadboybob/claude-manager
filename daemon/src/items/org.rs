@@ -32,6 +32,8 @@ pub const METHODS: &[&str] = &[
     "org.close_assistant",
     "org.promote",
     "org.rebind_main",
+    "org.hire",
+    "org.member_update",
 ];
 
 /// The read-only ones (restart-barrier classification).
@@ -76,6 +78,19 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
                 let mut p = p;
                 let member = take_str(&mut p, "member")?.ok_or_else(|| bad(format!("{} needs member", req.method)))?;
                 api(ctx.api.post(&format!("/org/members/{}/{verb}", encode(&member)), &with_actor(&ctx, p)))
+            }
+            // Owner hires a member with no session yet (F6, the place
+            // dialog); agents hire by spawning (`start_session(hire=)`).
+            "org.hire" => {
+                owner_only(&ctx, "hiring a member")?;
+                api(ctx.api.post("/org/members", &with_actor(&ctx, p)))
+            }
+            // Title and mandate (§8.2): the API allows Owner or the member's
+            // manager chain, as for move.
+            "org.member_update" => {
+                let mut p = p;
+                let member = take_str(&mut p, "member")?.ok_or_else(|| bad("org.member_update needs member"))?;
+                api(ctx.api.patch(&format!("/org/members/{}", encode(&member)), &with_actor(&ctx, p)))
             }
             "org.close_assistant" => close_assistant(state, &ctx, p),
             "org.promote" => promote(state, &ctx, p),
@@ -1185,6 +1200,40 @@ mod tests {
         assert_eq!(body["actor"]["pid"], "owner");
         assert!(body.get("session_uid").is_none());
         assert_eq!(seen.iter().filter(|(m, p, _)| m == "POST" && p == "/org/adopt").count(), 1);
+    }
+
+    #[test]
+    fn hire_is_owners_and_member_update_proxies_as_the_caller() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let (url, seen) = test_stub(|method, path, body| match (method, path) {
+            ("POST", "/org/members") => (200, json!({"member": {"handle": body["handle"]}}).to_string()),
+            ("PATCH", "/org/members/main/ep") => (200, r#"{"member":{"handle":"ep"},"changed":["title"]}"#.into()),
+            _ => (500, "{}".into()),
+        });
+        let state = state(root.path(), &url);
+        let d = daemon_id(&state);
+        let me = Caller::session("me-uid");
+        // Agents hire by spawning; this route is Owner's, refused before the API.
+        let err = call(&state, me.clone(), "org.hire", json!({"handle": "rev"})).error.unwrap();
+        assert!(matches!(err.code, ErrorCode::Unauthorized) && err.message.starts_with("owner_only"), "{err:?}");
+        let owner = Caller::operator("op");
+        let resp = call(&state, owner.clone(), "org.hire",
+                        json!({"handle": "rev", "title": "Reviewer", "manager": "main/ep", "request_id": "h1"}));
+        assert_eq!(resp.result.unwrap()["member"]["handle"], "rev");
+        // The API decides who may edit a profile (Owner or the manager chain).
+        let resp = call(&state, me, "org.member_update", json!({"member": "main/ep", "title": "Lead"}));
+        assert!(resp.ok, "{:?}", resp.error);
+        let err = call(&state, owner, "org.member_update", json!({"title": "x"})).error.unwrap();
+        assert!(matches!(err.code, ErrorCode::InvalidParams));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "refusals never reach the API: {seen:?}");
+        let (_, _, hire) = seen.iter().find(|(m, p, _)| m == "POST" && p == "/org/members").unwrap();
+        assert_eq!((&hire["actor"]["pid"], &hire["handle"], &hire["manager"], &hire["request_id"]),
+                   (&json!("owner"), &json!("rev"), &json!("main/ep"), &json!("h1")));
+        let (_, _, patch) = seen.iter().find(|(m, _, _)| m == "PATCH").unwrap();
+        assert_eq!((&patch["actor"]["pid"], &patch["title"]), (&json!(format!("agent:{d}:me-uid")), &json!("Lead")));
+        assert!(patch.get("member").is_none());
     }
 
     #[test]

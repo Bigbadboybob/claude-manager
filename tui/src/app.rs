@@ -72,6 +72,7 @@ mod availability;
 mod agent_state;
 mod board;
 mod orgchart;
+mod orgchart_actions;
 mod orgchart_teams;
 mod org_model;
 mod place;

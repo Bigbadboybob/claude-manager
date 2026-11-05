@@ -675,6 +675,11 @@ impl ChartBoards {
         out
     }
 
+    /// Read `slug` again on the next tick (a write just changed it).
+    pub(super) fn reread(&mut self, slug: &str) {
+        self.read_at.remove(slug);
+    }
+
     /// The open items session `uid` holds, by board then number.
     pub(super) fn held_by(&self, uid: &str) -> Vec<HeldItem> {
         let mut out = Vec::new();
@@ -739,9 +744,11 @@ pub(super) struct OrgChart {
     search: Option<String>,
     search_origin: Option<(Option<String>, Option<String>)>,
     last_query: Option<String>,
-    status: String,
+    pub(super) status: String,
     last_paint: Option<Instant>,
     pub(super) boards: ChartBoards,
+    /// Owner's actions on the focused box (app/orgchart_actions.rs).
+    pub(super) actions: super::orgchart_actions::Actions,
 }
 
 impl App {
@@ -1059,6 +1066,7 @@ impl App {
     }
 
     fn close_orgchart(&mut self) {
+        self.chart_actions_close();
         self.orgchart.visible = false;
         self.orgchart.opened_from = None;
         self.orgchart.bash_uid = None;
@@ -1067,7 +1075,7 @@ impl App {
     }
 
     /// Unfold `i`'s ancestors so it is visible.
-    fn orgchart_reveal(&mut self, model: &ChartModel, i: usize) {
+    pub(super) fn orgchart_reveal(&mut self, model: &ChartModel, i: usize) {
         for a in model.ancestors(i) {
             self.orgchart.folds.remove(&model.nodes[a].key);
         }
@@ -1083,7 +1091,7 @@ impl App {
         hidden_by.unwrap_or(i)
     }
 
-    fn orgchart_set_focus(&mut self, model: &ChartModel, i: usize) {
+    pub(super) fn orgchart_set_focus(&mut self, model: &ChartModel, i: usize) {
         let here = self.orgchart_focus(model);
         if let Some(s) = self.orgchart_focused_session(model) {
             self.orgchart.last_session.insert(model.nodes[here].key.clone(), s.uid);
@@ -1121,7 +1129,7 @@ impl App {
     /// the focused session selected. Enter on a box with no session stays
     /// in the chart; other exits with no session selected put the sidebar
     /// cursor back where it was when the chart opened.
-    fn orgchart_jump(&mut self, model: &ChartModel, explicit: bool) {
+    pub(super) fn orgchart_jump(&mut self, model: &ChartModel, explicit: bool) {
         // Without a selection (opened on a header, not moved since), only
         // Enter picks the box's first session.
         let target = self.orgchart_focused_session(model).filter(|_| explicit || self.orgchart.session.is_some());
@@ -1210,6 +1218,12 @@ impl App {
 
     /// F6 opens the chart; while open it takes every key and mouse event.
     pub(super) fn orgchart_event(&mut self, event: &CrosstermEvent) -> bool {
+        if let CrosstermEvent::Paste(text) = event {
+            if self.orgchart.visible {
+                self.chart_actions_paste(text);
+            }
+            return self.orgchart.visible;
+        }
         let CrosstermEvent::Key(key) = event else {
             return self.orgchart.visible;
         };
@@ -1221,6 +1235,10 @@ impl App {
             return false;
         }
         self.needs_redraw = true;
+        // An action's form, picker or place dialog takes every key.
+        if self.chart_actions_key(key) {
+            return true;
+        }
         let model = self.org_model(self.orgchart.show_bash);
         if let Some(mut query) = self.orgchart.search.take() {
             match key.code {
@@ -1459,6 +1477,9 @@ impl App {
             (_, KeyCode::Char('L')) | (_, KeyCode::Right) => self.orgchart_pan(step_x, 0),
             (_, KeyCode::Char('K')) | (_, KeyCode::Up) => self.orgchart_pan(0, -step_y),
             (_, KeyCode::Char('J')) | (_, KeyCode::Down) => self.orgchart_pan(0, step_y),
+            (_, KeyCode::Char(c @ ('A' | 'p' | 'm' | 'X' | 'e' | 'E' | 'o'))) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) && self.org_live().is_some() => {
+                self.chart_action(&model, focus, c);
+            }
             _ => {}
         }
         true
@@ -1484,6 +1505,7 @@ impl App {
 
     /// Replies, the open-only board poll, and the repaint cadence.
     pub fn orgchart_tick(&mut self) {
+        self.chart_actions_tick();
         if let Some((slug, result)) = self.orgchart.boards.rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
             let b = &mut self.orgchart.boards;
             b.rx = None;
@@ -1582,11 +1604,20 @@ impl App {
             return;
         }
         let status_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
-        let legend_rows = if self.orgchart.legend && inner.height > 5 { 2 } else { 0 };
+        let org = self.org_live().is_some();
+        let legend_rows = match (self.orgchart.legend && inner.height > 5, org && inner.height > 6) {
+            (false, _) => 0,
+            (true, false) => 2,
+            (true, true) => 3,
+        };
         let body = Rect::new(inner.x, inner.y, inner.width, inner.height - 1 - legend_rows);
-        if legend_rows == 2 {
-            let legend_area = Rect::new(inner.x, inner.y + inner.height - 3, inner.width, 2);
-            frame.render_widget(Paragraph::new(vec![orgchart_legend_line(self.org_live().is_some()), orgchart_activity_legend_line()]), legend_area);
+        if legend_rows > 0 {
+            let legend_area = Rect::new(inner.x, inner.y + inner.height - 1 - legend_rows, inner.width, legend_rows);
+            let mut legend = vec![orgchart_legend_line(org), orgchart_activity_legend_line()];
+            if legend_rows == 3 {
+                legend.push(super::orgchart_actions::chart_actions_legend_line());
+            }
+            frame.render_widget(Paragraph::new(legend), legend_area);
         }
         let (chart_area, info_area) = if self.orgchart.hide_info {
             (body, None)
@@ -1604,7 +1635,9 @@ impl App {
         if let Some(info) = info_area {
             self.draw_chart_info(frame, info, &model, focus);
         }
-        frame.render_widget(Paragraph::new(self.orgchart_status_line(status_area.width as usize)), status_area);
+        let actions = self.chart_action_hints(&model, focus);
+        frame.render_widget(Paragraph::new(self.orgchart_status_line(status_area.width as usize, &actions)), status_area);
+        self.draw_chart_actions(frame, inner);
     }
 
     /// Scroll so the focused box is in view. After a pan or `c` the
@@ -2076,7 +2109,9 @@ impl App {
         lines
     }
 
-    fn orgchart_status_line(&self, width: usize) -> Line<'static> {
+    /// `actions`: the focused box's Owner actions, first (they change with
+    /// the box; the navigation keys after them don't).
+    fn orgchart_status_line(&self, width: usize, actions: &str) -> Line<'static> {
         let c = &self.orgchart;
         if let Some(q) = &c.search {
             return Line::from(vec![
@@ -2092,7 +2127,8 @@ impl App {
         } else {
             "h/l sibling  j child  k boss  gg/G  Tab session  / n N  Space fold  zM/zR orgs  +/- zoom  HJKL pan  c centre  b bash  i info  ? legend  Enter go  F6 close"
         };
-        let mut text = if c.status.is_empty() { help.to_owned() } else { format!("{}  \u{00b7}  {help}", c.status) };
+        let help = if actions.is_empty() { help.to_owned() } else { format!("{actions}  \u{2502}  {help}") };
+        let mut text = if c.status.is_empty() { help } else { format!("{}  \u{00b7}  {help}", c.status) };
         if let Some(p) = c.pending {
             text = format!("{p}…  {text}");
         }
