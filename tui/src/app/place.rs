@@ -1,17 +1,21 @@
-//! Planning view placement (doc/org-model.md §7.1, §11; S3).
+//! Planning view placement (doc/org-model.md §7.1, §11, §13.4; S3).
 //!
-//! - `A-f` on a task opens a two-line chooser when the API supports
-//!   placement: **Launch** (preselected, so Enter keeps today's flow) or
-//!   **Place on a board…** (`p` or ↓). A placed task also offers **Unplace**.
-//! - The place dialog picks a board, an epic (or none) and who holds it: a
-//!   member, nobody, or a new hire (`org.hire` first, then the place).
+//! Planning is the backlog only (O7): it adds tasks and places them on
+//! boards, and never launches a session (those start from the Sessions view,
+//! `A-n` / `A-s`).
+//!
+//! - `A-f` on a task opens the place dialog: a board, an epic (or none) and
+//!   who holds it: nobody, a member, a team, or a new hire (`org.hire` first,
+//!   then the place). A team (O8) hands the item to its lead's main session,
+//!   and the lead hands it out; CM never picks a member. On a placed task
+//!   `u` unplaces it.
 //! - Placed tasks show a board chip (`planning.rs`, from `Task::placement`).
 //! - A read-only "On boards" strip under the board lists open epics and
 //!   board-native items (`boards.on_boards`); `A-b` hides or shows it.
 //!
 //! `boards.on_boards` doubles as the feature check: it is polled only while
-//! the planning view is shown, and an old daemon or API turns the chooser
-//! and the strip off (app/org_model.rs).
+//! the planning view is shown. An old daemon or API turns the strip off and
+//! `A-f` shows [`PLACE_UNSUPPORTED`] instead of the dialog (app/org_model.rs).
 use super::org_model::{owner_rpc, RpcFail, Support, OFF_RETRY};
 use super::*;
 use serde_json::{json, Value};
@@ -21,32 +25,21 @@ const ON_BOARDS_EVERY: Duration = Duration::from_secs(30);
 const ERROR_RETRY: Duration = Duration::from_secs(15);
 const STRIP_MAX: u16 = 10;
 
+/// What `A-f` says when the daemon or planning API cannot place. Planning
+/// has no launch fallback (O7).
+pub(super) const PLACE_UNSUPPORTED: &str = "Placing on boards needs a newer daemon and planning API. Planning no longer launches sessions: start one from the Sessions view (A-n / A-s).";
+
 /// Who will hold the placed item.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Holder {
     Nobody,
+    /// A member, by member id.
     Member(String),
+    /// A team, by team id (O8): the API gives the item to the team lead's
+    /// main session, and the lead hands it out.
+    Team(String),
     /// Hire a new member for it: `(handle, title)`.
     Hire(String, String),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(super) struct Chooser {
-    pub task_id: String,
-    pub title: String,
-    /// The task's current board link, when placed.
-    pub placed: Option<Value>,
-    pub cursor: usize,
-}
-
-impl Chooser {
-    fn options(&self) -> Vec<String> {
-        let mut out = vec!["Launch".to_owned(), "Place on a board\u{2026}".to_owned()];
-        if let Some(p) = &self.placed {
-            out.push(format!("Unplace from {} #{}", p["board"].as_str().unwrap_or("?"), p["n"]));
-        }
-        out
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -66,6 +59,9 @@ pub(super) struct PlaceDialog {
     pub error: String,
     /// The board the task is on now: placing elsewhere sends `replace`.
     pub placed_board: Option<String>,
+    /// The task's current board link (`{board, n, ...}`), when placed: `u`
+    /// unplaces it.
+    pub placed: Option<Value>,
 }
 
 type Reply = (&'static str, Result<Value, RpcFail>);
@@ -82,7 +78,6 @@ pub(super) struct Place {
     on_boards_full: Option<Instant>,
     last_poll: Option<Instant>,
     retry_at: Option<Instant>,
-    pub(super) chooser: Option<Chooser>,
     pub(super) dialog: Option<PlaceDialog>,
     /// The "On boards" strip is hidden (`A-b`).
     pub(super) hide_strip: bool,
@@ -93,7 +88,7 @@ pub(super) struct Place {
 
 impl App {
     pub(super) fn planning_place_open(&self) -> bool {
-        self.place.chooser.is_some() || self.place.dialog.is_some()
+        self.place.dialog.is_some()
     }
 
     fn place_request(&mut self, op: &'static str, method: &'static str, params: Value) {
@@ -119,6 +114,15 @@ impl App {
     fn place_members(&self) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = self.org.snapshot.as_ref().map_or_else(Vec::new, |s| {
             s.members.iter().filter(|m| !m.is_owner() && m.status != "retired").map(|m| (m.id.clone(), m.handle.clone())).collect()
+        });
+        out.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        out
+    }
+
+    /// Teams a task can go to (not archived), by name: `(id, name)`.
+    fn place_teams(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self.org.snapshot.as_ref().map_or_else(Vec::new, |s| {
+            s.teams.iter().filter(|t| !t.archived()).map(|t| (t.id.clone(), t.name.clone())).collect()
         });
         out.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
         out
@@ -196,6 +200,10 @@ impl App {
                 self.place.on_boards = Value::Null;
                 self.planning.placement_on = false;
                 self.place.retry_at = Some(Instant::now() + OFF_RETRY);
+                // A dialog opened before the first answer says so in place.
+                if let Some(d) = self.place.dialog.as_mut() {
+                    d.error = PLACE_UNSUPPORTED.into();
+                }
             }
             ("on_boards", Err(_)) => {
                 // Unknown support stays unknown; probe again after the retry.
@@ -231,13 +239,19 @@ impl App {
             }
             ("place", Ok(v)) => {
                 self.place.dialog = None;
-                self.set_status_msg(&format!("Placed on {} #{} ({})", v["board"].as_str().unwrap_or("?"), v["n"], v["item_status"].as_str().unwrap_or("open")));
+                let to = match v["team"]["name"].as_str() {
+                    Some(team) => format!(", team {team}: its lead {} hands it out", v["team"]["lead_handle"].as_str().unwrap_or("?")),
+                    None => String::new(),
+                };
+                self.set_status_msg(&format!("Placed on {} #{} ({}){to}", v["board"].as_str().unwrap_or("?"), v["n"], v["item_status"].as_str().unwrap_or("open")));
                 self.place.last_poll = None;
             }
             ("unplace", Ok(_)) => {
+                self.place.dialog = None;
                 self.set_status_msg("Unplaced: back in the backlog");
                 self.place.last_poll = None;
             }
+            ("place" | "unplace", Err(f)) if f.unsupported => self.place_error(PLACE_UNSUPPORTED.into()),
             (_, Err(f)) if f.unsupported => self.place_error(format!("{op} is not supported by this daemon or planning API yet")),
             (_, Err(f)) => self.place_error(f.message),
             _ => {}
@@ -251,8 +265,9 @@ impl App {
         }
     }
 
-    /// Planning-view keys this module owns: `A-f` (when placement is on),
-    /// `A-b`, and every key while the chooser or dialog is open.
+    /// Planning-view keys this module owns: `A-f` (always: it places, or
+    /// says why it can't; planning never launches), `A-b`, and every key
+    /// while the dialog is open.
     pub(super) fn place_event(&mut self, event: &CrosstermEvent) -> bool {
         if self.view_mode != ViewMode::Planning {
             return false;
@@ -265,52 +280,16 @@ impl App {
             self.place_dialog_key(key);
             return true;
         }
-        if let Some(mut c) = self.place.chooser.take() {
-            let n = c.options().len();
-            if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd')) {
-                let step = (n / 2).max(1);
-                c.cursor = if key.code == KeyCode::Char('u') { c.cursor.saturating_sub(step) } else { c.cursor.saturating_add(step).min(n.saturating_sub(1)) };
-                self.place.chooser = Some(c);
-                return true;
-            }
-            match key.code {
-                KeyCode::Esc => {}
-                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                    c.cursor = (c.cursor + 1) % n;
-                    self.place.chooser = Some(c);
-                }
-                KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
-                    c.cursor = (c.cursor + n - 1) % n;
-                    self.place.chooser = Some(c);
-                }
-                KeyCode::Char('p') => self.open_place_dialog(c),
-                KeyCode::Char('l') => {
-                    let _ = self.planning.open_launch();
-                }
-                KeyCode::Char('u') if c.placed.is_some() => self.place_unplace(&c.task_id),
-                KeyCode::Enter => match c.cursor {
-                    0 => {
-                        let _ = self.planning.open_launch();
-                    }
-                    1 => self.open_place_dialog(c),
-                    _ => self.place_unplace(&c.task_id),
-                },
-                _ => self.place.chooser = Some(c),
-            }
-            return true;
-        }
         let alt = key.modifiers.contains(KeyModifiers::ALT) && !key.modifiers.contains(KeyModifiers::SHIFT);
-        if !alt || !self.planning.normal_mode() || self.place.support != Support::On {
+        if !alt || !self.planning.normal_mode() {
             return false;
         }
         match key.code {
             KeyCode::Char('f') => {
-                let Some((task_id, title)) = self.planning.selected_task_ref() else { return false };
-                let placed = self.planning.placements.get(&task_id).cloned();
-                self.place.chooser = Some(Chooser { task_id, title, placed, cursor: 0 });
+                self.open_place();
                 true
             }
-            KeyCode::Char('b') => {
+            KeyCode::Char('b') if self.place.support == Support::On => {
                 self.place.hide_strip = !self.place.hide_strip;
                 true
             }
@@ -318,9 +297,29 @@ impl App {
         }
     }
 
-    fn open_place_dialog(&mut self, c: Chooser) {
-        let placed_board = c.placed.as_ref().and_then(|p| p["board"].as_str()).map(str::to_owned);
-        self.place.dialog = Some(PlaceDialog { task_id: c.task_id, title: c.title, boards: Vec::new(), board: 0, epic: 0, holder: Holder::Nobody, field: 0, typing: None, error: String::new(), placed_board });
+    /// `A-f`: the place dialog for the selected task, or a notice.
+    fn open_place(&mut self) {
+        if self.place.support == Support::Off {
+            // Ask again on the next tick, in case the daemon or API was
+            // upgraded since the last answer.
+            self.place.retry_at = None;
+            self.place.last_poll = None;
+            self.set_status_msg(PLACE_UNSUPPORTED);
+            return;
+        }
+        let Some((task_id, title)) = self.planning.selected_task_ref() else {
+            self.set_status_msg("A-f places a task on a board: select a task first");
+            return;
+        };
+        let placed = self.planning.placements.get(&task_id).cloned();
+        self.open_place_dialog(task_id, title, placed);
+    }
+
+    /// The place dialog for `task_id`; `placed` is its current board link
+    /// (`Task::placement`), when it has one. Also F6's entry point (#96).
+    pub(super) fn open_place_dialog(&mut self, task_id: String, title: String, placed: Option<Value>) {
+        let placed_board = placed.as_ref().and_then(|p| p["board"].as_str()).map(str::to_owned);
+        self.place.dialog = Some(PlaceDialog { task_id, title, boards: Vec::new(), board: 0, epic: 0, holder: Holder::Nobody, field: 0, typing: None, error: String::new(), placed_board, placed });
         self.org_refresh_soon();
         let (url, token) = (self.config.api_url.clone(), self.config.api_token.clone());
         let (tx, rx) = mpsc::channel();
@@ -343,15 +342,17 @@ impl App {
         self.place_request("unplace", "item.unplace", json!({"task_id": task_id, "request_id": rid}));
     }
 
-    /// The holders the dialog cycles through: nobody, each member, hire.
+    /// The holders the dialog cycles through: nobody, each member, each
+    /// team, hire.
     fn place_holders(&self) -> Vec<Holder> {
         let mut out = vec![Holder::Nobody];
         out.extend(self.place_members().into_iter().map(|(id, _)| Holder::Member(id)));
+        out.extend(self.place_teams().into_iter().map(|(id, _)| Holder::Team(id)));
         out.push(Holder::Hire(String::new(), String::new()));
         out
     }
 
-    fn place_dialog_key(&mut self, key: &crossterm::event::KeyEvent) {
+    pub(super) fn place_dialog_key(&mut self, key: &crossterm::event::KeyEvent) {
         let holders = self.place_holders();
         let Some(mut d) = self.place.dialog.take() else { return };
         if let Some((stage, mut text)) = d.typing.take() {
@@ -388,20 +389,27 @@ impl App {
             }
             1 => d.epic = (d.epic as i32 + dir).rem_euclid(epics as i32 + 1) as usize,
             2 => {
-                let at = holders.iter().position(|h| std::mem::discriminant(h) == std::mem::discriminant(&d.holder) && (!matches!(h, Holder::Member(_)) || *h == d.holder)).unwrap_or(0);
+                let at = holders.iter().position(|h| *h == d.holder || matches!((h, &d.holder), (Holder::Hire(..), Holder::Hire(..)))).unwrap_or(0);
                 d.holder = holders[(at as i32 + dir).rem_euclid(holders.len() as i32) as usize].clone();
             }
             _ => {}
         };
         match key.code {
             KeyCode::Esc => return,
+            KeyCode::Char('u') if key.modifiers.is_empty() && d.placed.is_some() => {
+                d.error.clear();
+                let task_id = d.task_id.clone();
+                self.place_unplace(&task_id);
+            }
             KeyCode::Tab | KeyCode::Down => d.field = (d.field + 1) % 3,
             KeyCode::BackTab | KeyCode::Up => d.field = (d.field + 2) % 3,
             KeyCode::Right | KeyCode::Char('l') => step(&mut d, 1),
             KeyCode::Left | KeyCode::Char('h') => step(&mut d, -1),
             KeyCode::Enter if d.field == 2 && matches!(&d.holder, Holder::Hire(h, _) if h.is_empty()) => d.typing = Some((0, String::new())),
             KeyCode::Enter => {
-                if slug.is_empty() {
+                if self.place.support == Support::Off {
+                    d.error = PLACE_UNSUPPORTED.into();
+                } else if slug.is_empty() {
                     d.error = "Pick a board first".into();
                 } else {
                     d.error.clear();
@@ -436,12 +444,18 @@ impl App {
         if let Some(e) = d.epic.checked_sub(1).and_then(|i| self.place_epics(&slug).get(i).cloned()) {
             params["group_id"] = e["group_id"].clone();
         }
-        if let Holder::Member(id) = &d.holder {
-            // Holders resolve by session uid or name, not member id.
-            let m = self.org.snapshot.as_ref().and_then(|s| s.member(id));
-            let r = m.and_then(|m| m.main_uid().map(str::to_owned).or_else(|| Some(m.handle.clone()))).unwrap_or_else(|| id.clone());
-            params["holder"] = json!(r);
-            params["role"] = json!("owner");
+        match &d.holder {
+            Holder::Member(id) => {
+                // Holders resolve by session uid or name, not member id.
+                let m = self.org.snapshot.as_ref().and_then(|s| s.member(id));
+                let r = m.and_then(|m| m.main_uid().map(str::to_owned).or_else(|| Some(m.handle.clone()))).unwrap_or_else(|| id.clone());
+                params["holder"] = json!(r);
+                params["role"] = json!("owner");
+            }
+            // The API resolves the lead's main session (O8); the TUI never
+            // picks a member for a team.
+            Holder::Team(id) => params["team"] = json!(id),
+            Holder::Nobody | Holder::Hire(..) => {}
         }
         if d.placed_board.as_deref().is_some_and(|b| b != slug) {
             params["replace"] = json!(true);
@@ -451,27 +465,6 @@ impl App {
 
     pub(super) fn draw_place(&self, frame: &mut Frame, area: Rect) {
         let snap = self.org.snapshot.as_ref();
-        if let Some(c) = &self.place.chooser {
-            let opts = c.options();
-            let h = (opts.len() as u16 + 4).min(area.height);
-            let w = 56.min(area.width);
-            let r = Rect::new(area.x + area.width.saturating_sub(w) / 2, area.y + area.height.saturating_sub(h) / 2, w, h);
-            frame.render_widget(Clear, r);
-            let block = Block::default().borders(Borders::ALL).title(format!(" {} ", crate::planning::truncate_with_ellipsis(&c.title, (w as usize).saturating_sub(4)))).border_style(Style::default().fg(theme::ATTN));
-            let inner = block.inner(r);
-            frame.render_widget(block, r);
-            let mut lines: Vec<Line> = opts
-                .iter()
-                .enumerate()
-                .map(|(i, o)| {
-                    let st = if i == c.cursor { Style::default().fg(theme::TEXT).bg(theme::SELECT_BG).add_modifier(Modifier::BOLD) } else { Style::default().fg(theme::TEXT) };
-                    Line::styled(format!(" {o}"), st)
-                })
-                .collect();
-            lines.push(Line::styled(" Enter pick \u{00b7} p place \u{00b7} l launch \u{00b7} Esc cancel", Style::default().fg(theme::DIM)));
-            frame.render_widget(Paragraph::new(lines), inner);
-            return;
-        }
         let Some(d) = &self.place.dialog else { return };
         let w = 72.min(area.width);
         let h = 9u16.min(area.height);
@@ -489,6 +482,14 @@ impl App {
         let holder = match &d.holder {
             Holder::Nobody => "\u{25c2} nobody (open) \u{25b8}".to_owned(),
             Holder::Member(id) => format!("\u{25c2} {} \u{25b8}", snap.map_or_else(|| id.clone(), |s| s.handle(id))),
+            Holder::Team(id) => {
+                let team = snap.and_then(|s| s.team(id));
+                let lead = match team.and_then(|t| t.lead_member_id.as_deref()) {
+                    Some(l) => format!("\u{2192} lead {} hands it out", snap.map_or_else(|| l.to_owned(), |s| s.handle(l))),
+                    None => "(no lead: placing is refused)".to_owned(),
+                };
+                format!("\u{25c2} team {} {lead} \u{25b8}", team.map_or(id.as_str(), |t| t.name.as_str()))
+            }
             Holder::Hire(h, _) if h.is_empty() => "\u{25c2} hire a new member\u{2026} (Enter) \u{25b8}".to_owned(),
             Holder::Hire(h, t) => format!("\u{25c2} hire {h}{} \u{25b8}", if t.is_empty() { String::new() } else { format!(" \u{00b7} {t}") }),
         };
@@ -496,8 +497,9 @@ impl App {
             let st = if d.field == i { Style::default().fg(theme::TEXT).bg(theme::SELECT_BG) } else { Style::default().fg(theme::TEXT) };
             Line::from(vec![Span::styled(format!(" {label:<8}"), Style::default().fg(theme::DIM)), Span::styled(value, st)])
         };
+        let on = d.placed.as_ref().map(|p| format!("  (on {} #{})", p["board"].as_str().unwrap_or("?"), p["n"])).unwrap_or_default();
         let mut lines = vec![
-            Line::styled(format!(" {}", crate::planning::truncate_with_ellipsis(&d.title, (w as usize).saturating_sub(4))), Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)),
+            Line::styled(format!(" {}{on}", crate::planning::truncate_with_ellipsis(&d.title, (w as usize).saturating_sub(4 + on.chars().count()))), Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)),
             row(0, "board", board),
             row(1, "epic", epic),
             row(2, "holder", holder),
@@ -508,7 +510,8 @@ impl App {
             None if !d.error.is_empty() => lines.push(Line::styled(format!(" {}", d.error), Style::default().fg(theme::ERROR))),
             None => lines.push(Line::from("")),
         }
-        lines.push(Line::styled(" Tab field \u{00b7} \u{2190}/\u{2192} change \u{00b7} Enter place \u{00b7} Esc cancel", Style::default().fg(theme::DIM)));
+        let unplace = if d.placed.is_some() { " \u{00b7} u unplace" } else { "" };
+        lines.push(Line::styled(format!(" Tab field \u{00b7} \u{2190}/\u{2192} change \u{00b7} Enter place{unplace} \u{00b7} Esc cancel"), Style::default().fg(theme::DIM)));
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
@@ -559,7 +562,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::super::org_model::fixtures::{member, owner, snapshot};
+    use super::super::org_model::fixtures::{member, owner, snapshot, team};
     use super::*;
     use crossterm::event::KeyEvent;
 
@@ -595,15 +598,121 @@ mod tests {
         app
     }
 
+    /// A planning view holding one backlog task, selected.
+    fn with_task(mut app: App) -> App {
+        let task: crate::api::Task = serde_json::from_value(json!({
+            "id": "t1", "slug": "org-tui", "name": "Org TUI", "created_at": "2026-11-05T00:00:00Z",
+            "repo_url": "", "repo_branch": "main", "status": "backlog", "project": "p",
+            "description": "the work contract"
+        }))
+        .unwrap();
+        app.planning.update_from_api(vec![task]);
+        assert_eq!(app.planning.selected_task_ref().map(|t| t.0), Some("t1".into()), "the task is selected");
+        app
+    }
+
+    fn status(app: &App) -> String {
+        app.status_msg.as_ref().map(|m| m.0.clone()).unwrap_or_default()
+    }
+
+    /// O7: an old daemon or API gets a notice on A-f, never a launch.
     #[test]
-    fn old_apis_keep_a_f_as_launch() {
-        let mut app = test_app();
+    fn old_apis_get_a_notice_never_a_launch() {
+        let mut app = with_task(test_app());
         app.view_mode = ViewMode::Planning;
-        assert!(!key(&mut app, KeyCode::Char('f'), KeyModifiers::ALT), "unknown support: planning handles A-f");
         app.place_accept("on_boards", Err(RpcFail { unsupported: true, message: "unknown method".into() }));
         assert_eq!(app.place.support, Support::Off);
-        assert!(!key(&mut app, KeyCode::Char('f'), KeyModifiers::ALT));
+        assert!(key(&mut app, KeyCode::Char('f'), KeyModifiers::ALT), "A-f is placement's, even unsupported");
+        assert!(app.place.dialog.is_none());
+        assert_eq!(status(&app), PLACE_UNSUPPORTED);
+        assert!(app.planning.normal_mode(), "no launch dialog opened");
+        assert!(app.place.retry_at.is_none(), "A-f asks again on the next tick");
         assert_eq!(app.on_boards_height(Rect::new(0, 0, 100, 40)), 0);
+        assert!(!key(&mut app, KeyCode::Char('b'), KeyModifiers::ALT), "no strip to toggle");
+
+        // Support not known yet: the dialog opens, and an unsupported answer
+        // says so inside it; Enter then sends nothing.
+        let mut app = with_task(test_app());
+        app.view_mode = ViewMode::Planning;
+        assert!(key(&mut app, KeyCode::Char('f'), KeyModifiers::ALT));
+        assert!(app.place.dialog.is_some());
+        app.place_accept("on_boards", Err(RpcFail { unsupported: true, message: "unknown method".into() }));
+        assert_eq!(app.place.dialog.as_ref().unwrap().error, PLACE_UNSUPPORTED);
+        app.place.dialog.as_mut().unwrap().boards = vec![json!({"slug": "swarm"})];
+        let pending = app.place.rx.len();
+        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.place.rx.len(), pending, "nothing is sent");
+        assert_eq!(app.place.dialog.as_ref().unwrap().error, PLACE_UNSUPPORTED);
+        // A place that the daemon refuses as unknown reads the same.
+        app.place_accept("place", Err(RpcFail { unsupported: true, message: "unknown method".into() }));
+        assert_eq!(app.place.dialog.as_ref().unwrap().error, PLACE_UNSUPPORTED);
+    }
+
+    /// O7: A-f opens the place dialog itself (no Launch choice); `u` in it
+    /// unplaces a placed task.
+    #[test]
+    fn a_f_opens_the_place_dialog_directly_and_u_unplaces() {
+        let mut app = with_task(placing_app());
+        assert!(key(&mut app, KeyCode::Char('f'), KeyModifiers::ALT));
+        let d = app.place.dialog.clone().expect("the place dialog opens directly");
+        assert_eq!((d.task_id.as_str(), d.placed.is_none()), ("t1", true));
+        let pending = app.place.rx.len();
+        key(&mut app, KeyCode::Char('u'), KeyModifiers::NONE);
+        assert_eq!(app.place.rx.len(), pending, "u does nothing on an unplaced task");
+        key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.place.dialog.is_none());
+
+        app.planning.placements.insert("t1".into(), json!({"board": "swarm", "n": 15, "status": "active"}));
+        assert!(key(&mut app, KeyCode::Char('f'), KeyModifiers::ALT));
+        let d = app.place.dialog.clone().unwrap();
+        assert_eq!(d.placed_board.as_deref(), Some("swarm"));
+        key(&mut app, KeyCode::Char('u'), KeyModifiers::NONE);
+        assert_eq!(app.place.rx.len(), pending + 2, "the board list and the unplace");
+        app.place_accept("unplace", Ok(json!({"task_status": "backlog"})));
+        assert!(app.place.dialog.is_none());
+        assert_eq!(status(&app), "Unplaced: back in the backlog");
+        // A-f with nothing selected says what it needs.
+        let mut app = placing_app();
+        assert!(key(&mut app, KeyCode::Char('f'), KeyModifiers::ALT));
+        assert!(app.place.dialog.is_none());
+        assert!(status(&app).contains("select a task first"));
+    }
+
+    /// O8: the holder field offers teams; a team sends `team` and no holder
+    /// (the API gives it to the lead's main session).
+    #[test]
+    fn a_team_holder_sends_the_team_and_lets_the_lead_hand_it_out() {
+        let mut app = placing_app();
+        app.org.accept(snapshot(
+            2,
+            vec![owner(), member("m1", "ep", Some("mem-owner"), Some("team-a"), Some("ep-uid")), member("m2", "beta", Some("m1"), Some("team-a"), None)],
+            vec![team("team-a", "Alpha", None, Some("m1"), &[("m1", "primary"), ("m2", "primary")]), team("team-b", "Beta squad", None, None, &[])],
+        ));
+        assert_eq!(
+            app.place_holders(),
+            vec![Holder::Nobody, Holder::Member("m2".into()), Holder::Member("m1".into()), Holder::Team("team-a".into()), Holder::Team("team-b".into()), Holder::Hire(String::new(), String::new())]
+        );
+        app.place.dialog = Some(PlaceDialog { task_id: "t1".into(), title: "x".into(), boards: vec![json!({"slug": "swarm"})], board: 0, epic: 0, holder: Holder::Member("m1".into()), field: 2, typing: None, error: String::new(), placed_board: None, placed: None });
+        key(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        let d = app.place.dialog.clone().unwrap();
+        assert_eq!(d.holder, Holder::Team("team-a".into()));
+        let p = app.place_params(&d);
+        assert_eq!(p["team"], "team-a");
+        assert!(p.get("holder").is_none() && p.get("role").is_none(), "CM never picks a member: {p}");
+        let text: Vec<String> = dialog_text(&app);
+        assert!(text.iter().any(|l| l.contains("team Alpha \u{2192} lead ep hands it out")), "{text:?}");
+        key(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        assert!(dialog_text(&app).iter().any(|l| l.contains("team Beta squad (no lead")), "a leadless team says so");
+        app.place_accept("place", Ok(json!({"board": "swarm", "n": 16, "item_status": "active", "team": {"name": "Alpha", "lead_handle": "ep"}})));
+        assert_eq!(status(&app), "Placed on swarm #16 (active), team Alpha: its lead ep hands it out");
+    }
+
+    fn dialog_text(app: &App) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(100, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw_place(f, f.area())).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>()).collect()
     }
 
     #[test]
@@ -634,24 +743,9 @@ mod tests {
     }
 
     #[test]
-    fn the_chooser_preselects_launch_and_offers_unplace_when_placed() {
-        let mut app = placing_app();
-        app.place.chooser = Some(Chooser { task_id: "t1".into(), title: "Org TUI".into(), placed: None, cursor: 0 });
-        assert_eq!(app.place.chooser.as_ref().unwrap().options().len(), 2);
-        // Enter on Launch closes the chooser (the launch dialog is planning's).
-        key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-        assert!(app.place.chooser.is_none() && app.place.dialog.is_none());
-        let c = Chooser { task_id: "t1".into(), title: "Org TUI".into(), placed: Some(json!({"board": "swarm", "n": 15})), cursor: 0 };
-        assert_eq!(c.options()[2], "Unplace from swarm #15");
-        app.place.chooser = Some(c);
-        key(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
-        assert!(app.place.dialog.is_some(), "p opens the place dialog");
-    }
-
-    #[test]
     fn the_dialog_builds_item_place_with_epic_and_member() {
         let mut app = placing_app();
-        app.place.dialog = Some(PlaceDialog { task_id: "t1".into(), title: "Org TUI".into(), boards: vec![json!({"slug": "swarm"})], board: 0, epic: 0, holder: Holder::Nobody, field: 1, typing: None, error: String::new(), placed_board: None });
+        app.place.dialog = Some(PlaceDialog { task_id: "t1".into(), title: "Org TUI".into(), boards: vec![json!({"slug": "swarm"})], board: 0, epic: 0, holder: Holder::Nobody, field: 1, typing: None, error: String::new(), placed_board: None, placed: None });
         key(&mut app, KeyCode::Right, KeyModifiers::NONE); // epic: Org model
         key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
         key(&mut app, KeyCode::Right, KeyModifiers::NONE); // holder: beta (sorted)
@@ -677,7 +771,7 @@ mod tests {
     #[test]
     fn hiring_types_a_handle_then_places_with_the_new_member() {
         let mut app = placing_app();
-        app.place.dialog = Some(PlaceDialog { task_id: "t1".into(), title: "x".into(), boards: vec![json!({"slug": "swarm"})], board: 0, epic: 0, holder: Holder::Hire(String::new(), String::new()), field: 2, typing: None, error: String::new(), placed_board: None });
+        app.place.dialog = Some(PlaceDialog { task_id: "t1".into(), title: "x".into(), boards: vec![json!({"slug": "swarm"})], board: 0, epic: 0, holder: Holder::Hire(String::new(), String::new()), field: 2, typing: None, error: String::new(), placed_board: None, placed: None });
         key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         for c in "newbie".chars() {
             key(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
@@ -695,7 +789,7 @@ mod tests {
     #[test]
     fn placed_reply_closes_the_dialog_and_the_strip_lists_epics_and_items() {
         let mut app = placing_app();
-        app.place.dialog = Some(PlaceDialog { task_id: "t1".into(), title: "x".into(), boards: vec![], board: 0, epic: 0, holder: Holder::Nobody, field: 0, typing: None, error: String::new(), placed_board: None });
+        app.place.dialog = Some(PlaceDialog { task_id: "t1".into(), title: "x".into(), boards: vec![], board: 0, epic: 0, holder: Holder::Nobody, field: 0, typing: None, error: String::new(), placed_board: None, placed: None });
         app.place_accept("place", Ok(json!({"board": "swarm", "n": 15, "item_status": "open", "task_status": "backlog"})));
         assert!(app.place.dialog.is_none());
         let text: Vec<String> = app.on_boards_lines(100).iter().map(|l| l.to_string()).collect();

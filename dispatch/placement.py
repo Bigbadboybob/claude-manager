@@ -282,12 +282,59 @@ async def _live_link(conn, task_id: str):
         uuid.UUID(str(task_id)))
 
 
+async def _team_holder(conn, ref: str) -> tuple[dict, dict]:
+    """A team as the holder (O8, doc/org-model.md §13.4): the item goes to the
+    team lead's main session as owner, and the lead hands it out. CM never
+    picks a member, so a team without a lead, or whose lead has no main
+    session, is refused. Returns (team summary, holder)."""
+    cols = "id, slug, name, lead_member_id, team_status"
+    try:
+        row = await conn.fetchrow(f"SELECT {cols} FROM initiatives WHERE id = $1",
+                                  uuid.UUID(str(ref)))
+    except ValueError:
+        row = await conn.fetchrow(f"SELECT {cols} FROM initiatives WHERE slug = $1", str(ref))
+    if row is None:
+        raise ItemsError(404, "team_not_found", f"no team {ref!r}: org(view=\"team\") lists them",
+                         field="team")
+    team = {"id": str(row["id"]), "slug": row["slug"], "name": row["name"],
+            "lead_member_id": row["lead_member_id"], "lead_handle": None}
+    if row["team_status"] == "archived":
+        raise ItemsError(409, "team_archived", f"team {row['name']} is archived", team=team)
+    if not row["lead_member_id"]:
+        raise ItemsError(409, "team_no_lead",
+                         f"team {row['name']} has no lead to hand the work out; name a lead "
+                         f"first, or place it with a member as holder", team=team)
+    lead = await conn.fetchrow("SELECT handle, status FROM members WHERE id = $1",
+                               row["lead_member_id"])
+    team["lead_handle"] = lead["handle"] if lead else None
+    main = await conn.fetchrow(
+        """SELECT pid, daemon_id, session_uid FROM incarnations
+            WHERE member_id = $1 AND role = 'main' AND ended_at IS NULL""",
+        row["lead_member_id"])
+    if lead is None or lead["status"] == "retired" or main is None:
+        raise ItemsError(409, "team_lead_no_session",
+                         f"team {row['name']}'s lead {team['lead_handle'] or row['lead_member_id']} "
+                         f"has no main session to receive it; place it with nobody and assign "
+                         f"it once the lead is back", team=team)
+    state = await conn.fetchrow("SELECT name FROM session_states WHERE pid = $1", main["pid"])
+    holder = {"pid": main["pid"], "name": (state["name"] if state else None) or lead["handle"],
+              "session_uid": main["session_uid"], "daemon_id": main["daemon_id"],
+              "role": "owner"}
+    return team, holder
+
+
 async def place_task(pool, task_id: str, ref: str, actor: dict, *, group: str | None = None,
                      group_id: str | None = None, holder: dict | None = None,
-                     role: str | None = None, replace: bool = False) -> dict:
+                     role: str | None = None, replace: bool = False,
+                     team: str | None = None) -> dict:
     """Place a planning task on a board (§7.1). Re-placing on the same board
     reactivates the archived link; a task placed elsewhere is refused unless
-    `replace` (unplace there and place here, one step)."""
+    `replace` (unplace there and place here, one step). `team` (O8) makes the
+    team's lead the owner and the team the item's owning team."""
+    if team is not None and holder is not None:
+        raise invalid("holder_or_team",
+                      "pass a holder or a team, not both: a team's work goes to its lead, "
+                      "who hands it out", field="team")
     now = items_db.utcnow()
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -305,6 +352,10 @@ async def place_task(pool, task_id: str, ref: str, actor: dict, *, group: str | 
                               "placing needs a description: it is the work contract the holder "
                               "receives (scope, acceptance criteria, constraints)",
                               field="description")
+            team_row = None
+            if team is not None:
+                team_row, holder = await _team_holder(conn, team)
+                role = "owner"
             link = await _live_link(conn, task_id)
             if link is not None and str(link["board_id"]) == board["id"]:
                 items = await items_db._load_items(conn, board["id"], [link["number"]])
@@ -332,11 +383,17 @@ async def place_task(pool, task_id: str, ref: str, actor: dict, *, group: str | 
             groups = await items_db._load_groups(conn, board["id"])
             tx = BoardTx(board, items, actor, now, groups)
             holders = [_holder({**holder, "role": role or holder.get("role")})] if holder else []
+            if team_row is not None:
+                tx.assign_notes[holder["pid"]] = (
+                    f"It is for team {team_row['name']}, which you lead: hand it to a member "
+                    f"(item_set with holder=...) or keep it.")
             spec: dict = {}
             if group_id:
                 spec["group_id"] = group_id
             elif group:
                 spec["group"] = group
+            if team_row is not None:
+                spec["team_id"] = team_row["id"]
             if archived is not None:
                 # Re-placing on the same board reactivates the old link: the
                 # item keeps its number, history and flags.
@@ -372,6 +429,8 @@ async def place_task(pool, task_id: str, ref: str, actor: dict, *, group: str | 
                                          uuid.UUID(task_id))
             reply = {"board": board["slug"], "n": n, "item_status": it.status,
                      "task_status": status, "item": it.public(), "warnings": tx.warnings}
+            if team_row is not None:
+                reply["team"] = team_row
             dups = duplicate_hints(it, tx.items.values())
             if dups:
                 reply["possible_duplicate"] = dups

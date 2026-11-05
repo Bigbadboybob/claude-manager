@@ -220,7 +220,7 @@ so it can ship first; hires (§4.2) use it once members exist.
     current preference;
   - `start_session` may omit `type`; the policy picks the engine from an
     optional `work_kind` hint (`math`, `design`, `architecture`, `metric`,
-    `coding`, `fanout`, `busywork`), else the default. A-n, A-s and the A-f launch dialogs
+    `coding`, `fanout`, `busywork`), else the default. A-n and A-s
     preselect the cached policy's engine when opened;
   - daemons cache the policy, so a spawn never waits on the API: they use the
     last policy seen, else today's default, and `ping` serves it from the
@@ -873,7 +873,11 @@ ask(topic=None, to=None, text, item=None)            # write, later
   folding as today). The Task sub-view stays selectable until S8.
 - **Planning view** is the backlog only (O7, §13.4). `A-f` places a task on a
   board, held by a member, a team (its lead hands it out, O8), nobody, or a
-  new hire. There is no Launch path in planning. Placed tasks show a
+  new hire. There is no Launch path in planning; an API or daemon too old to
+  place gets a notice on `A-f`, not a launch. `place(task, team=…)` is the
+  same path for agents: the API resolves the team's lead to that member's main
+  session (owner) and sets the item's team, and refuses a team with no lead
+  or a lead with no main session. Placed tasks show a
   board chip and their item status. A read-only "on boards" section lists
   epics and board-native items, so everything in flight is visible from one
   place.

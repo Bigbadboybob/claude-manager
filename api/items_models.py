@@ -140,6 +140,9 @@ class PlaceBody(_Strict):
     role: Short | None = None
     # Placed on another board: unplace there and place here, one step.
     replace: bool = False
+    # A team (id or slug) instead of a holder (O8): the item goes to the
+    # team lead's main session, who hands it out.
+    team: Short | None = None
 
 
 class UnplaceBody(_Strict):

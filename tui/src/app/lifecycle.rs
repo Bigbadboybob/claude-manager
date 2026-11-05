@@ -1,4 +1,4 @@
-//! Session + workspace lifecycle: daemon spawn/attach plumbing, create/close/tombstone, planning launch, daemon state pushes.
+//! Session + workspace lifecycle: daemon spawn/attach plumbing, create/close/tombstone, task-bound launch (A-n "Reports to"), daemon state pushes.
 
 use super::*;
 
@@ -4089,7 +4089,8 @@ impl App {
         self.set_status_msg("Deleted");
     }
 
-    /// Launch a task from the planning view.
+    /// Launch a task-bound session in a new workspace: the A-n "Reports
+    /// to" path (app/reports_to.rs). Planning never launches (O7).
     pub(super) fn launch_from_plan(
         &mut self,
         project: &str,
@@ -4109,9 +4110,9 @@ impl App {
         // sentinel: run in the main repo in-place (no worktree, no
         // `cm/<slug>` branch).
         in_place: bool,
-        // Agent engine picked in the launch dialog — internal
+        // Agent engine picked in the A-n dialog — internal
         // session-type vocabulary ("claude" | "codex"). Defaults to
-        // "codex" in the UI; never "bash" (a planning launch always
+        // "codex" in the UI; never "bash" (a task-bound launch always
         // delivers the task prompt to an agent).
         engine: &str,
         chosen_host: &cm_daemon::host_id::HostId,
@@ -4491,204 +4492,6 @@ impl App {
         self.hosts.default_host().expect("validated hosts config").id.clone()
     }
 
-    pub(super) fn collect_workspace_candidates(&self) -> Vec<WorkspaceCandidate> {
-        self.workspaces
-            .iter()
-            .filter(|w| !w.is_closed && w.worktree_path.is_some())
-            .map(|w| WorkspaceCandidate {
-                workspace_id: w.id.clone(),
-                name: w.name.clone(),
-                repo_url: w.repo_url.clone(),
-            })
-            .collect()
-    }
-
-    /// Spawn a new agent session (`engine`: claude | codex) in an existing
-    /// workspace and bind the given task to it. No new worktree — the
-    /// workspace already has one.
-    pub(super) fn launch_into_workspace(
-        &mut self,
-        workspace_id: &str,
-        task_id: &str,
-        task_title: &str,
-        task_repo_url: &str,
-        project: &str,
-        prompt: &str,
-        // Sub-2a Finding #2: parent edge from the planning row.
-        // See `launch_from_plan` for the full backstory.
-        parent_task_id: Option<&str>,
-        // Agent engine picked in the workspace picker — internal
-        // session-type vocabulary ("claude" | "codex").
-        engine: &str,
-        // The dialog's explicit Model; `None` = task default, else engine default.
-        model: Option<&str>,
-        effort: Option<&str>,
-    ) {
-        // Planning A-l into an existing workspace → use THAT workspace's host
-        // (not the global active_host — the old read mistagged a session when
-        // the global differed from the workspace's worktree host). The guard
-        // then correctly fail-fasts on a remote workspace (TUI-initiated remote
-        // launch isn't supported yet — local-only paths can't be sent remote).
-        let active_host = self
-            .workspaces
-            .iter()
-            .find(|w| w.id == workspace_id)
-            .map(|w| w.host_id.clone())
-            .unwrap_or_else(cm_daemon::host_id::HostId::local);
-        if let Err(e) = guard_local_host_only(
-            &active_host,
-            "A-l launch-into-workspace",
-        ) {
-            self.set_status_msg(&format!("{}", e));
-            return;
-        }
-        let Some(wi) = self.workspace_index_by_id(workspace_id) else {
-            self.set_status_msg("Workspace no longer exists");
-            return;
-        };
-        let Some(worktree_path) = self.workspaces[wi].worktree_path.clone() else {
-            self.set_status_msg("Workspace has no worktree");
-            return;
-        };
-
-        let (cols, rows) = self.last_term_size;
-        // Pre-generate UID so the per-session MCP config carries the
-        // matching CM_TUI_SESSION_ID. Phase 1 "MCP-everywhere" — without
-        // this, a session launched into an existing workspace can't call
-        // any orchestration tool.
-        let session_uid = new_session_uid();
-        // Engine-specific transcript baseline — see `launch_from_plan`.
-        let pending = if engine == "codex" {
-            Self::list_codex_sessions(&worktree_path)
-        } else {
-            Self::list_jsonl_files(&worktree_path)
-        };
-        let workspace_id_owned = workspace_id.to_string();
-        let new_sess = match self.try_spawn_via_daemon(
-            &session_uid,
-            &workspace_id_owned,
-            &worktree_path,
-            engine,
-            task_title,
-            None,
-            cols,
-            rows,
-            Some(task_id),
-            None,
-            None,
-            &active_host,
-            // launch_into_workspace is a fresh spawn — post-
-            // spawn detector handles the transcript path.
-            None,
-            true, // fresh plan-launched agent
-            false, // global_perms
-            model,
-            effort,
-        ) {
-            Some(Ok(s)) => s,
-            Some(Err(e)) => {
-                self.set_status_msg(&format!("Launch: {}", e));
-                return;
-            }
-            None => {
-                self.set_status_msg(&format!(
-                    "Internal: try_spawn_via_daemon returned None for daemon-eligible '{}'",
-                    engine,
-                ));
-                return;
-            }
-        };
-        let mut ts = make_simple_session_with_uid(
-            session_uid,
-            task_title,
-            engine,
-            new_sess,
-            Some(pending),
-        );
-        ts.task_id = Some(task_id.to_string());
-        ts.host_id = active_host.clone();
-        if !prompt.trim().is_empty() {
-            ts.pending_prompt = Some(PendingWrite::wait_for_quiet(
-                prompt.to_string(),
-                false,
-                Duration::from_secs(1),
-                Duration::from_secs(2),
-                Duration::from_secs(60),
-            ));
-        }
-        let si = self.workspaces[wi].sessions.len();
-        self.workspaces[wi].sessions.push(ts);
-
-        // The task may be in backlog (not yet in self.tasks because
-        // reconcile only pulls running/blocked). Upsert a stub with
-        // the workspace binding set; a later reconcile will fill in
-        // the remaining API fields without clobbering workspace_id.
-        if let Some(task) = self
-            .tasks
-            .iter_mut()
-            .find(|t| t.task_id.as_deref() == Some(task_id))
-        {
-            task.workspace_id = Some(workspace_id.to_string());
-        } else {
-            self.tasks.push(TaskEntry {
-                task_id: Some(task_id.to_string()),
-                name: task_title.to_string(),
-                api_status: TaskStatus::Running,
-                repo_url: Some(task_repo_url.to_string()),
-                prompt: Some(prompt.to_string()),
-                wip_branch: None,
-                session_id: None,
-                blocked_at: None,
-                is_cloud: false,
-                is_continuous: false,
-                workspace_id: Some(workspace_id.to_string()),
-                // Same race fix as `launch_from_plan` — pin the
-                // project synchronously from the planning row so
-                // an early `create_subtask` inherits it.
-                project: Some(project.to_string()),
-                // Sub-2a Finding #2: pin the parent edge so the
-                // first `push_task_tree_to_daemon` publishes the
-                // correct subtask edge — pre-fix `None` here
-                // showed the subtask as top-level on the daemon
-                // until reconcile patched it.
-                parent_task_id: parent_task_id.map(str::to_string),
-                worktree_mode: WorktreeMode::Inherit,
-                metadata: None,
-            });
-        }
-        self.cursor = Cursor::Session(wi, si);
-        self.view_mode = ViewMode::Sessions;
-
-        let mut fields = std::collections::HashMap::new();
-        fields.insert(
-            "status".to_string(),
-            serde_json::Value::String("running".to_string()),
-        );
-        self.backend
-            .update_plan_task(task_id.to_string(), fields);
-        self.save_session_manifest();
-        // Sub-2a Finding #1: same as `launch_from_plan`,
-        // a launch may have inserted a new TaskEntry.
-        self.push_state_to_daemon();
-        self.set_status_msg("Task launched into workspace");
-    }
-
-    /// Set a task's reporting line (`parent_task_id`; `None` = standalone),
-    /// from the launch forms' "Reports to" field. The API inherits the new
-    /// parent's initiative; the local entry is updated now so the next
-    /// task-tree push carries the edge.
-    pub(super) fn set_task_parent(&mut self, task_id: &str, parent_task_id: Option<&str>) {
-        if let Some(task) = self.tasks.iter_mut().find(|t| t.task_id.as_deref() == Some(task_id)) {
-            task.parent_task_id = parent_task_id.map(str::to_string);
-        }
-        let mut fields = std::collections::HashMap::new();
-        fields.insert(
-            "parent_task_id".to_string(),
-            parent_task_id.map_or(serde_json::Value::Null, |p| serde_json::Value::String(p.into())),
-        );
-        self.backend.update_plan_task(task_id.to_string(), fields);
-    }
-
     /// Clear a task's workspace binding. Task status is left alone.
     pub(super) fn unbind_task_from_workspace(&mut self, task_id: &str) {
         if let Some(task) = self
@@ -4861,36 +4664,6 @@ impl App {
             self.set_status_msg("Reopened — A-s to add session");
         }
     }
-
-    pub(super) fn unlaunch_task(&mut self, task_id: &str) {
-        let mut fields = std::collections::HashMap::new();
-        fields.insert("status".to_string(), serde_json::Value::String("backlog".to_string()));
-        self.backend.update_plan_task(task_id.to_string(), fields);
-
-        let ws_id = self
-            .tasks
-            .iter_mut()
-            .find(|t| t.task_id.as_deref() == Some(task_id))
-            .and_then(|t| {
-                t.api_status = TaskStatus::Backlog;
-                t.workspace_id.take()
-            });
-
-        if let Some(ws_id) = ws_id {
-            if let Some(wi) = self.workspaces.iter().position(|w| w.id == ws_id) {
-                // Tombstone each session before dropping so post-unlaunch
-                // `read_session_output` works for the closed sessions.
-                // Helper persists the manifest internally.
-                self.tombstone_and_remove(wi, |_| true);
-                if let Some(ws) = self.workspaces.get_mut(wi) {
-                    ws.is_closed = true;
-                }
-            }
-        }
-        self.save_session_manifest();
-        self.clamp_cursor();
-        self.set_status_msg("Task unlaunched \u{2192} backlog");
-    }
 }
 
 #[cfg(test)]
@@ -5053,7 +4826,6 @@ mod slice_12e_tests {
     // `cycle_active_host_single_host_shows_hint` exercised `A-H` /
     // `cycle_active_host`, both removed in DESIGN_REMOVE_GLOBAL_HOST.md Phase D.
     // Host is now a per-workspace attribute — see
-    // `launch_into_workspace_guards_on_workspace_host_not_global` and
     // `a_n_form_defaults_host_to_local`.)
 
     /// An explicitly configured local default remains supported.
@@ -5153,7 +4925,6 @@ mod slice_12e_tests {
     // pinned the `ts.host_id = self.active_host.clone()` injection at the A-n /
     // A-s / A-f call sites. New sessions now inherit host from their WORKSPACE
     // (DESIGN_REMOVE_GLOBAL_HOST.md Phases A–C); see
-    // `launch_into_workspace_guards_on_workspace_host_not_global` and
     // `a_n_submit_routes_by_chosen_host`.)
 
     /// Hosting does not add rows or reorder sessions in the status view.
@@ -6790,7 +6561,7 @@ remote_socket = "/remote/manager.sock"
         drop(guard);
     }
 
-    /// 12e-r7 F2: `launch_from_plan` (planning A-l, creating
+    /// 12e-r7 F2: `launch_from_plan` (A-n "Reports to", creating
     /// a new workspace + worktree) MUST call the shared
     /// guard BEFORE worktree creation. Same orphan-disk
     /// rationale as round-6 F1 for `create_local_session`.
@@ -6806,58 +6577,6 @@ remote_socket = "/remote/manager.sock"
         assert!(!tmp.path().join(".cm/worktrees").exists());
         app.start_new_session();
         assert!(matches!(&app.input_mode, InputMode::NewSession { host_id, .. } if *host_id == HostId::new("manager")));
-    }
-
-    /// 12e-r7 F2: `launch_into_workspace` (planning A-l,
-    /// reusing an existing workspace) MUST call the shared
-    /// guard at the top. Same shape as round-6 F1 for
-    /// `spawn_session_on_workspace`.
-    #[test]
-    fn launch_into_workspace_fails_fast_for_non_local_active_host() {
-        let src = crate::app::APP_SRC_FOR_SCAN;
-        let sig = "fn launch_into_workspace(";
-        let start = src.find(sig).expect("must find sig");
-        let rest = &src[start..];
-        let end = rest[1..]
-            .find("\n    fn ")
-            .into_iter()
-            .chain(rest[1..].find("\n    pub fn "))
-            .chain(rest[1..].find("\n    pub(crate) fn "))
-            .chain(rest[1..].find("\n    pub(super) fn "))
-            .chain(rest[1..].find("\n#[cfg(test)]"))
-            .min()
-            .map(|i| 1 + i)
-            .unwrap_or(rest.len());
-        let body = &rest[..end];
-
-        assert!(
-            body.contains(
-                "guard_local_host_only(\n            &active_host,\n            \"A-l launch-into-workspace\",\n        )",
-            ) || body.contains(
-                "guard_local_host_only(&active_host, \"A-l launch-into-workspace\")",
-            ),
-            "launch_into_workspace must call \
-             guard_local_host_only at the top (12e-r7 F2); \
-             body:\n{}",
-            body,
-        );
-
-        // Ordering: guard MUST precede the workspace lookup
-        // + any spawn work. The guard short-circuits the
-        // function on non-local active_host.
-        // migrate-tui-local: the spawn call shape moved from
-        // `self.spawn_agent_session(` (local PTY) to
-        // `self.try_spawn_via_daemon(` (daemon RPC).
-        let guard_idx = body
-            .find("guard_local_host_only(")
-            .expect("guard call not found");
-        let spawn_idx = body
-            .find("self.try_spawn_via_daemon(")
-            .expect("try_spawn_via_daemon call not found");
-        assert!(
-            guard_idx < spawn_idx,
-            "guard must precede try_spawn_via_daemon",
-        );
     }
 
     /// 12e-r4 F1.2: `spawn_managed_session` MUST take the

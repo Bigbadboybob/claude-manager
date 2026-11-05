@@ -1,6 +1,7 @@
 # Cloud-first interactive sessions
 
-Fresh sessions and planning launches use the default in `~/.cm/hosts.toml`.
+Fresh sessions use the default in `~/.cm/hosts.toml` (planning no longer
+launches; see [org model §13.4](org-model.md#134-close-out-owner-2026-11-05)).
 The migration sets this to `sessions`. The Host field remains available for
 explicit local execution; an unavailable cloud host produces an error.
 

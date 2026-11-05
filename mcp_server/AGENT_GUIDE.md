@@ -147,6 +147,8 @@ everyone who holds what, with each holder's live state, so nobody has to ask.
 - A planning task goes on a board with `place(task, group=..., holder=...)`:
   the item then owns status, holders and group, the task keeps title,
   description and metadata, and the task's status follows the item.
+  `place(task, team=...)` assigns it to a team: it goes to the team lead's
+  main session, and the lead hands it out.
   `unplace(task)` sends it back to the backlog. A held item that is active,
   waiting or blocked has one owner: `item_set(n, owner="name")` transfers it,
   `add_holder=` takes `role=` (contributor, reviewer, approver). Groups are

@@ -130,11 +130,11 @@ configured worker default, not the task's.
 
 ## TUI forms
 
-`A-n`, `A-s`, `A-F` and the `A-f` launch dialogs have a Model row prefilled
+`A-n`, `A-s` and `A-F` have a Model row prefilled
 with the task default, else the engine default (shown dimmed with its origin),
 and the Effort on the same row. On the row, ←/→ cycle the model presets,
-typing edits the model freely, and Shift+←/→ step the effort (no wrap); in
-the `A-f` dialogs, Alt+o cycles the presets. An untouched prefill sends no
+typing edits the model freely, and Shift+←/→ step the effort (no wrap).
+An untouched prefill sends no
 explicit value, so the spawn resolves it again on the host. A fork's row
 starts from the source session's recorded values. A new subtask under
 "Reports to" still picks up its parent's default.

@@ -503,7 +503,7 @@ pub(crate) enum SubmitAction {
     /// empty workspace name, no workflow selected). Modal still closes.
     None,
     /// A-n with "Reports to" set: create the workspace's task under
-    /// `parent`, then launch it like a planning launch (see
+    /// `parent`, then launch it task-bound (see
     /// `App::create_reporting_workspace`).
     CreateReportingWorkspace {
         engine: LaunchEngine,
@@ -3201,15 +3201,8 @@ impl App {
 
         // Delegate to planning view when in Planning mode.
         if self.view_mode == ViewMode::Planning {
-            self.planning.staffing_policy = self.global_settings.staffing.snapshot.policy.clone();
-            // Keep planning's workspace picker in sync with the current
-            // set of open workspaces before it sees the event.
-            let candidates = self.collect_workspace_candidates();
-            self.planning.set_launch_hosts(
-                self.hosts.hosts.iter().map(|h| h.id.clone()).collect(),
-                self.default_launch_host(),
-            );
-            self.planning.set_workspace_candidates(candidates);
+            // Planning is the backlog only (doc/org-model.md §13.4, O7):
+            // A-f places on a board; sessions start from the Sessions view.
             if self.place_event(event) {
                 self.needs_redraw = true;
                 return true;
@@ -3218,72 +3211,8 @@ impl App {
             match action {
                 PlanAction::Consumed => return true,
                 PlanAction::Ignored => return false,
-                PlanAction::LaunchTask {
-                    project,
-                    slug,
-                    prompt,
-                    branch,
-                    autostart,
-                    task_id,
-                    parent_task_id,
-                    in_place,
-                    engine,
-                    host_id,
-                    reparent,
-                    model, effort,
-                } => {
-                    if reparent {
-                        self.set_task_parent(&task_id, parent_task_id.as_deref());
-                    }
-                    self.launch_from_plan(
-                        &project,
-                        &slug,
-                        &prompt,
-                        branch.as_deref(),
-                        autostart,
-                        &task_id,
-                        parent_task_id.as_deref(),
-                        in_place,
-                        engine.as_session_type(),
-                        &host_id,
-                        model.as_deref(), effort.as_deref(),
-                    );
-                    return true;
-                }
-                PlanAction::LaunchTaskIntoWorkspace {
-                    workspace_id,
-                    task_id,
-                    task_title,
-                    task_repo_url,
-                    project,
-                    prompt,
-                    parent_task_id,
-                    engine,
-                    reparent,
-                    model, effort,
-                } => {
-                    if reparent {
-                        self.set_task_parent(&task_id, parent_task_id.as_deref());
-                    }
-                    self.launch_into_workspace(
-                        &workspace_id,
-                        &task_id,
-                        &task_title,
-                        &task_repo_url,
-                        &project,
-                        &prompt,
-                        parent_task_id.as_deref(),
-                        engine.as_session_type(),
-                        model.as_deref(), effort.as_deref(),
-                    );
-                    return true;
-                }
                 PlanAction::UnbindTask { task_id } => {
                     self.unbind_task_from_workspace(&task_id);
-                    return true;
-                }
-                PlanAction::UnlaunchTask { task_id } => {
-                    self.unlaunch_task(&task_id);
                     return true;
                 }
                 PlanAction::ReopenTask { task_id } => {

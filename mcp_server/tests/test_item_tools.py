@@ -101,6 +101,10 @@ class ItemToolsTests(unittest.TestCase):
         self.assertEqual(method, "item.place")
         self.assertRegex(params.pop("request_id"), r"^[0-9a-f]{32}$")
         self.assertEqual(params, {"task_id": "t-1", "group": "Latent", "holder": "me"})
+        # O8: a team instead of a holder; the API gives it to the lead.
+        _, params = self.call(server.place, "t-1", team="alpha")
+        params.pop("request_id")
+        self.assertEqual(params, {"task_id": "t-1", "team": "alpha"})
         method, params = self.call(server.unplace, "t-1", reason="later")
         self.assertEqual((method, params), ("item.unplace", {"task_id": "t-1", "reason": "later"}))
         _, params = self.call(server.item_set, 14, owner="rl", add_holder="ep", role="reviewer")
