@@ -871,9 +871,9 @@ ask(topic=None, to=None, text, item=None)            # write, later
   count. `e` edits the profile; `/?topic` runs `who` and highlights matches.
 - **Sessions sidebar** gains a Team sub-view (team → member → sessions,
   folding as today). The Task sub-view stays selectable until S8.
-- **Planning view** is the backlog, as today. `A-f` places a task on a board,
-  with "assign to member" and "hire a new member for it". `A-f` opens a
-  chooser with Launch preselected (Enter launches as today; `p`/↓ places). Placed tasks show a
+- **Planning view** is the backlog only (O7, §13.4). `A-f` places a task on a
+  board, held by a member, a team (its lead hands it out, O8), nobody, or a
+  new hire. There is no Launch path in planning. Placed tasks show a
   board chip and their item status. A read-only "on boards" section lists
   epics and board-native items, so everything in flight is visible from one
   place.
@@ -1020,6 +1020,35 @@ Other hazards (details in the impact map): `sql/005` re-creates the status
 CHECK on every start, so new statuses need 005 edited plus a later "replace
 only if missing" block; backfills run once behind `migrations_applied` as
 single statements.
+
+### 13.4 Close-out (Owner, 2026-11-05)
+
+Owner asked to finish the move from "a task is a session" to "members hold
+board items", and decided two things:
+
+- **O7: planning is the backlog only.** The planning view adds tasks and
+  places them on boards. Its Launch path is removed (`A-f` opens the place
+  dialog directly). One-off sessions start from the Sessions view
+  (`A-n` / `A-s`).
+- **O8: assigning to a team goes to its lead.** The place dialog can name a
+  team as holder; the item goes to the team lead's main session, and the lead
+  hands it out. CM does not pick a member.
+
+The close-out epic, in order:
+
+| # | Work | Stage |
+|---|---|---|
+| 1 | Planning backlog-only (O7) + team holder (O8) in the place dialog and API | S3 follow-up |
+| 2 | Owner actions in F6: on a member, assign an item, hire under them, move to another lead or team, retire, edit title and mandate, jump to the main session; on a team, hire into it, edit charter and rules | §11 |
+| 3 | Profiles (derived first, §8) and `who`, for agents (`org(view=member)`, `who`) and in F6 (info pane; `/topic` highlights matches) | S5 |
+| 4 | Members survive replacement: holds, handles and pending pushes follow the member | S6 |
+| 5 | Cleanup: workspaces named for their member's office, the Task sub-view becomes a filter, task-tree scope retired | S7–S8 |
+
+Legacy behaviour this retires: task-named `cm-sub/<task>` worktrees as the
+way to hand out work, `start_session(task_id)` as "give this to someone"
+(it stays for spawning assistants), the terminal-task sweep closing a
+member's sessions, holds keyed by session, and permissions that follow the
+task tree.
 
 ## 14. Schema sketch (planning DB)
 
@@ -1194,6 +1223,11 @@ viewers never poll.
   that work. Trigger: on 2026-10-27 an org-chart move (QRM-DeepDecay under
   Joint-Decision) did not reach the sidebar, which still nested by
   `parent_task_id`.
+
+- **O7. Planning is the backlog only — decided (Owner, 2026-11-05).** The
+  planning view's Launch path is removed; `A-f` places on a board (§13.4).
+- **O8. A team assignment goes to its lead — decided (Owner, 2026-11-05).**
+  The lead hands the item out; CM does not pick a member (§13.4).
 
 ### 15.2 Design decisions (override any)
 
