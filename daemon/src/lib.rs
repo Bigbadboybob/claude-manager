@@ -54,6 +54,7 @@
 #![cfg(target_os = "linux")]
 
 pub mod adopt;
+pub mod allocator_tuning;
 pub mod assistants;
 pub mod agent_state;
 pub mod attach;
@@ -460,6 +461,10 @@ pub fn run() -> anyhow::Result<()> {
             0,
         );
     }
+
+    // Before the first thread: an arena cap does not merge arenas that
+    // already exist (#105, `allocator_tuning`).
+    let allocator = allocator_tuning::apply();
 
     // FIRST, before anything reads env or spawns: scrub Claude-session
     // identity vars inherited from a launcher that ran inside a claude
@@ -1347,6 +1352,7 @@ pub fn run() -> anyhow::Result<()> {
 
     worktree_cleanup::bootstrap();
 
+    eprintln!("cm-daemon: allocator: {allocator}");
     eprintln!("cm-daemon: rpc ready after {:.3}s ({})", startup_at.elapsed().as_secs_f64(), path.display());
     for incoming in listener.incoming() {
         match incoming {
