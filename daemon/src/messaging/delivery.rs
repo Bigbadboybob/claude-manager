@@ -390,19 +390,43 @@ pub fn spawn(state: &Arc<Mutex<DaemonState>>) {
         .unwrap_or_else(|p| p.into_inner())
         .messaging_wake
         .clone();
-    thread::spawn(move || loop {
+    thread::spawn(move || {
+        worker_loop(&wake, Duration::from_secs(2), MIN_TICK_SPACING, || {
+            let Some(state) = weak.upgrade() else {
+                return false;
+            };
+            tick(&state);
+            true
+        })
+    });
+}
+/// Shortest interval between delivery ticks; the most a wake waits for the
+/// previous tick's spacing.
+const MIN_TICK_SPACING: Duration = Duration::from_millis(250);
+type Wake = (Mutex<bool>, std::sync::Condvar);
+/// Run `tick` on each signal or every `idle`, at most once per `spacing`.
+/// Every chat send/read/follow and every replicated batch signals delivery,
+/// so under load the worker used to run back to back (35–57% of a core on
+/// cm-sessions, 30% on f-sessions; 2026-11-05). A signal that arrives during a
+/// tick or its spacing stays latched and is served by the next tick. Stops
+/// when `tick` returns false.
+fn worker_loop(wake: &Wake, idle: Duration, spacing: Duration, mut tick: impl FnMut() -> bool) {
+    loop {
         let ready = wake.0.lock().unwrap_or_else(|p| p.into_inner());
         let (mut ready, _) = wake
             .1
-            .wait_timeout_while(ready, Duration::from_secs(2), |v| !*v)
+            .wait_timeout_while(ready, idle, |v| !*v)
             .unwrap_or_else(|p| p.into_inner());
         *ready = false;
         drop(ready);
-        let Some(state) = weak.upgrade() else {
-            break;
-        };
-        tick(&state);
-    });
+        let started = std::time::Instant::now();
+        if !tick() {
+            return;
+        }
+        if let Some(rest) = spacing.checked_sub(started.elapsed()) {
+            thread::sleep(rest);
+        }
+    }
 }
 pub fn signal(state: &Arc<Mutex<DaemonState>>) {
     let wake = state
@@ -1066,6 +1090,48 @@ mod tests {
         let _busy = store.lock().unwrap();
         alarm_tick(&state, dir.path());
         assert!(crate::owner_attention::snapshot(&state.lock().unwrap()).unwrap().contains_key("notification-stall:ts-stalled"));
+    }
+    #[test]
+    fn delivery_worker_serves_signal_bursts_with_spaced_ticks() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        use std::time::Instant;
+        let wake: Arc<Wake> = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let ticks = Arc::new(Mutex::new(Vec::<Instant>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let spacing = Duration::from_millis(100);
+        let worker = {
+            let (wake, ticks, stop) = (wake.clone(), ticks.clone(), stop.clone());
+            thread::spawn(move || worker_loop(&wake, Duration::from_secs(60), spacing, || {
+                ticks.lock().unwrap().push(Instant::now());
+                !stop.load(SeqCst)
+            }))
+        };
+        let raise = || {
+            *wake.0.lock().unwrap() = true;
+            wake.1.notify_one();
+        };
+        // ~450 signals in 450 ms are served by a handful of ticks.
+        let burst = Instant::now();
+        while burst.elapsed() < Duration::from_millis(450) {
+            raise();
+            thread::sleep(Duration::from_millis(1));
+        }
+        let during = ticks.lock().unwrap().len();
+        assert!(during <= 6, "{during} ticks for a 450 ms burst");
+        // After an idle gap a signal is served at once: no fixed debounce.
+        thread::sleep(spacing * 2);
+        let raised = Instant::now();
+        raise();
+        let deadline = raised + Duration::from_secs(5);
+        while !ticks.lock().unwrap().iter().any(|t| *t >= raised) {
+            assert!(Instant::now() < deadline, "an idle worker must serve a signal");
+            thread::sleep(Duration::from_millis(5));
+        }
+        stop.store(true, SeqCst);
+        raise();
+        worker.join().unwrap();
+        let ticks = ticks.lock().unwrap();
+        assert!(ticks.windows(2).all(|w| w[1] - w[0] >= spacing), "ticks closer than the spacing");
     }
     fn recipient(engine: &str) -> Recipient {
         Recipient {
