@@ -356,6 +356,13 @@ pub(super) struct SubtaskFlight {
         (crate::control::protocol::ErrorCode, String)>>,
 }
 
+/// An exit another agent caused: `kill_session` from a lead (its uid,
+/// possibly `"<uid> (mark_subtask_done)"`) or the daemon's terminal-task
+/// sweep. Not Owner (`operator`), a memory cap, a crash, or a respawn.
+fn is_agent_kill(killed_by: &str) -> bool {
+    killed_by.starts_with("ts-") || killed_by.starts_with("terminal-task-sweep")
+}
+
 impl App {
     /// Append a Phase 6 activity-feed entry. `caller_uid` is resolved to
     /// a friendly label (workflow role, else session label, else uid
@@ -2205,6 +2212,7 @@ impl App {
                     return;
                 }
                 let memory_cap_kill = last_exit.memory_cap_kill;
+                let agent_kill = last_exit.killed_by.as_deref().is_some_and(is_agent_kill);
                 // #24/#25: a rotation or handoff stop comes straight back at
                 // the same uid: keep the row (its section and placement).
                 let respawning = last_exit
@@ -2313,6 +2321,19 @@ impl App {
                     // left to the `reap_spent_workspaces` sweep, whose
                     // task-liveness gates still apply to them).
                     self.close_agent_marker_if_empty(wi);
+                }
+                if agent_kill {
+                    // The row may already be gone (an attach-stream exit
+                    // pruned it first): its tombstone still names the
+                    // workspace.
+                    let wi = self.workspaces.iter().position(|ws| {
+                        !ws.is_closed
+                            && (ws.sessions.iter().any(|ts| ts.uid == uid)
+                                || ws.tombstones.iter().any(|t| t.uid == uid))
+                    });
+                    if let Some(wi) = wi {
+                        self.after_agent_gone(wi, super::lifecycle::LastAgentClose::AgentKill);
+                    }
                 }
                 if not_back && found {
                     self.pending_remote_reattach.retain(|p| p.entry.uid != uid);
@@ -4290,6 +4311,92 @@ mod apply_manifest_diff_tests {
         assert!(!app.workspaces[0].is_closed);
         // Out-of-range index is a no-op.
         assert!(!app.close_agent_marker_if_empty(99));
+    }
+
+    fn add_bash_row(app: &mut App, uid: &str, daemon_uid: &str) {
+        let session = crate::session::Session::new("/bin/true", &[], 80, 24, None, HashMap::new(), None)
+            .expect("test PTY");
+        let mut ts = make_simple_session_with_uid(uid.to_string(), "shell", "bash", session, None);
+        ts.session.daemon_session_uid = Some(daemon_uid.into());
+        app.workspaces[0].sessions.push(ts);
+    }
+
+    fn kill_exit(killed_by: &str) -> LastExit {
+        LastExit { killed_by: Some(killed_by.into()), code: None, memory_cap_kill: false, kills_file_offset: None, exited_at: 1.0 }
+    }
+
+    /// Owner rule 2026-11-05: A-w on a workspace's last agent asks whether
+    /// to close the workspace too; with another agent left it does not.
+    #[test]
+    fn closing_the_last_agent_asks_to_close_the_workspace() {
+        let mut app = build_app_with_session("ts-lead");
+        add_bash_row(&mut app, "ts-sh", "d-sh");
+        app.cursor = Cursor::Session(0, 0);
+        app.close_active_session();
+        assert!(matches!(
+            &app.input_mode,
+            InputMode::Confirm { action: ConfirmAction::CloseAfterLastAgent { ws_id }, .. } if ws_id == "ws-test"
+        ));
+
+        let mut app = build_app_with_session("ts-a");
+        let second = build_app_with_session("ts-b").workspaces.remove(0).sessions.remove(0);
+        app.workspaces[0].sessions.push(second);
+        app.cursor = Cursor::Session(0, 0);
+        app.close_active_session();
+        assert!(matches!(app.input_mode, InputMode::Normal), "another agent is still working");
+    }
+
+    /// The bash-pane answers decide: a busy pane, or a pane the daemon was
+    /// not asked about, keeps the workspace; all idle closes it and its panes.
+    #[test]
+    fn last_agent_verdicts_close_only_when_every_pane_is_idle() {
+        use super::lifecycle::{LastAgentClose, LastAgentVerdict};
+        let mut app = build_app_with_session("ts-gone");
+        app.workspaces[0].sessions.clear();
+        add_bash_row(&mut app, "ts-sh", "d-sh");
+        let verdict = |checked: &[&str], busy: Vec<(String, String)>| LastAgentVerdict {
+            ws_id: "ws-test".into(),
+            trigger: LastAgentClose::Owner,
+            checked: checked.iter().map(|s| s.to_string()).collect(),
+            busy: Ok(busy),
+        };
+        app.last_agent_close_tx.send(verdict(&["d-sh"], vec![("d-sh".into(), "nvim".into())])).unwrap();
+        app.drain_last_agent_closes();
+        assert!(!app.workspaces[0].is_closed, "a pane running nvim keeps it open");
+        assert!(app.status_msg.as_ref().is_some_and(|(m, _)| m.contains("shell is running nvim")), "{:?}", app.status_msg);
+
+        app.last_agent_close_tx.send(verdict(&[], vec![])).unwrap();
+        app.drain_last_agent_closes();
+        assert!(!app.workspaces[0].is_closed, "a pane nobody asked about keeps it open");
+
+        app.last_agent_close_tx.send(verdict(&["d-sh"], vec![])).unwrap();
+        app.drain_last_agent_closes();
+        assert!(app.workspaces[0].is_closed);
+        assert!(app.workspaces[0].sessions.is_empty());
+        assert!(app.workspaces[0].tombstones.iter().any(|t| t.uid == "ts-sh"), "the idle pane closes with it");
+    }
+
+    /// A lead's kill of the last agent closes the workspace without asking;
+    /// Owner's own kill (operator) does not reach this path.
+    #[test]
+    fn an_agent_kill_of_the_last_agent_closes_the_workspace() {
+        for (killer, closes) in [("ts-lead", true), ("terminal-task-sweep (terminal task)", true), ("operator", false), ("memory-cap", false)] {
+            let mut app = build_app_with_session("ts-worker");
+            app.workspaces[0].sessions[0].session.exited = true;
+            let mut other = build_app_with_session("ts-other").workspaces.remove(0);
+            other.id = "ws-other".into();
+            app.workspaces.push(other);
+            app.cursor = Cursor::Session(1, 0);
+            app.apply_manifest_diff(ManifestDiff::Exited { uid: "ts-worker".into(), last_exit: kill_exit(killer) });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while closes && !app.workspaces[0].is_closed && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                app.drain_last_agent_closes();
+            }
+            app.drain_last_agent_closes();
+            assert_eq!(app.workspaces[0].is_closed, closes, "killed_by {killer}");
+            assert!(!app.workspaces[1].is_closed);
+        }
     }
 
     /// Cursor safety: when the cursor sits on the pruned row, the apply

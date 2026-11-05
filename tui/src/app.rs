@@ -459,6 +459,10 @@ pub struct App {
     /// restore had failed was auto-closed seconds later). Cleared when Owner
     /// closes the workspace.
     pub(crate) user_reopened: HashSet<String>,
+    /// Bash-pane checks in flight for a workspace whose last agent is gone
+    /// (`check_and_close_workspace`); drained by `drain_last_agent_closes`.
+    last_agent_close_tx: std::sync::mpsc::Sender<lifecycle::LastAgentVerdict>,
+    last_agent_close_rx: std::sync::mpsc::Receiver<lifecycle::LastAgentVerdict>,
     /// Cloud backtest runs, rendered in the continuous panel's `backtests`
     /// group instead of per-task workspaces (they never hold a local session).
     /// Rebuilt from the API task list by `reconcile_tasks` →
@@ -824,6 +828,7 @@ impl App {
         // manifest — otherwise we'd set workspace_id to a dangling id that
         // nothing resolves to.
         let known_ws_ids: HashSet<&String> = manifest.workspaces.keys().collect();
+        let (last_agent_close_tx, last_agent_close_rx) = std::sync::mpsc::channel();
         let auto_close_workspaces = manifest.auto_close_workspaces.iter()
             .filter(|id| known_ws_ids.contains(id))
             .cloned().collect();
@@ -1117,6 +1122,8 @@ impl App {
             sidebar_retry_at: Instant::now(),
             auto_close_workspaces,
             user_reopened: HashSet::new(),
+            last_agent_close_tx,
+            last_agent_close_rx,
             backtest_rows: Vec::new(),
             backtests_folded: false,
             backtest_unfolded_fleets: HashSet::new(),

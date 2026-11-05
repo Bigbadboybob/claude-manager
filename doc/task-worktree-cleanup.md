@@ -27,6 +27,23 @@ New ownership discovered after the preview still blocks removal.
 
 An already-reaped workspace can still be closed with either choice. The host reports “Workspace checkout already absent” and checks any surviving descendants using retained ownership records. A checkout removed between preview and cleanup is reported as already absent. A new checkout at the same path is never covered by the old checkout's approval. If the dialog was opened before the host update and still shows a missing-path error, cancel and reopen it for a fresh preview.
 
+**A workspace closes when its last agent goes (2026-11-05).** Once a
+workspace has no live Claude or Codex session left, leftover bash panes no
+longer keep it open. When Owner closes that last agent with Alt+w, the viewer
+asks "Close workspace … too?"; when another agent kills it (a lead's
+`kill_session`, `mark_subtask_done`, or the terminal-task sweep) the workspace
+closes without asking. Before closing, the viewer asks each pane's daemon
+(`session.shell_busy`) whether the shell is running something: a foreground
+job or any child process, such as an editor or a backgrounded build. A busy
+pane keeps the workspace open, and Owner sees which command when they asked.
+Idle panes close with the workspace and stay revivable from Alt+Shift+O.
+Pinned, cloud-worker, workflow and continuous workspaces are excluded, and an
+agent's kill never closes the workspace Owner has focused or reopened. Owner's
+own exits (`operator`), memory-cap kills and crashes do not trigger the
+automatic close. The planning task's status does not change. A brain that
+predates `session.shell_busy` answers no, so on such hosts only workspaces
+with no live bash pane close.
+
 Workspaces the viewer creates for adopted agent sessions close automatically when their last session is removed, including workers whose tasks still await review or monitoring. The viewer saves this policy independently of workspace names, so plain labels such as `scraper-cohort-914e0fc2` work. Closure only hides the empty workspace: planning tasks, task bindings, Git worktrees, branches and transcript tombstones remain. A later worker on the same daemon workspace makes it visible again. User-created workspaces, pinned workspaces, live session rows and pending/offline attachments are protected. Renaming an adopted workspace claims it as a user workspace and turns off this automatic closure; pinning also keeps it visible.
 
 The policy applies to newly adopted workspaces after the viewer update. Older empty headers without the saved policy can be closed with **Alt+Shift+w → Keep worktrees**; there is no need to delete the task or its checkout. Existing legacy `agent:` workspace markers retain automatic cleanup. The viewer also reconciles marked empty workspaces after task updates, protecting the currently focused workspace during that sweep.

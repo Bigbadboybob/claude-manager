@@ -403,6 +403,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         let t = Instant::now();
         app.maybe_adopt_daemon_sessions();
         log_slow_phase("maybe_adopt_daemon_sessions", t.elapsed());
+        // Close workspaces whose last agent went, once their bash panes
+        // answered (`check_and_close_workspace`).
+        app.drain_last_agent_closes();
 
         // 11d: drain WorkflowWatchEvent frames from the
         // events.subscribe consumer. Same shape as the

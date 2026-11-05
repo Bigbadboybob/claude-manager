@@ -708,6 +708,21 @@ pub(crate) fn rpc_continuous_control(daemon_socket: &Path, token: &str, method: 
     response.result.ok_or_else(|| anyhow::anyhow!("daemon returned no result"))
 }
 
+/// `session.shell_busy` (operator): which of these bash panes are running
+/// something. `{uid: {known, busy, command?}}`; an old brain answers an
+/// unknown-method error, which the caller reads as "keep them all".
+pub(crate) fn rpc_shell_busy(socket: &Path, token: &str, uids: &[String]) -> anyhow::Result<serde_json::Value> {
+    let request = Request {
+        id: next_request_id(),
+        caller: Caller::operator(token),
+        method: "session.shell_busy".into(),
+        params: serde_json::json!({ "uids": uids }),
+    };
+    let response = rpc_round_trip_with_read_timeout(socket, &request, Duration::from_secs(5))?;
+    anyhow::ensure!(response.ok, "{}", response.error.map(|e| e.message).unwrap_or_default());
+    response.result.and_then(|r| r.get("shells").cloned()).ok_or_else(|| anyhow::anyhow!("daemon returned no shells"))
+}
+
 /// `session.send_key` on a session's host daemon (operator): the TUI's
 /// `send_key` forwards there once it has checked the caller's scope, so the
 /// key is encoded by the daemon's tracked keyboard mode and written without

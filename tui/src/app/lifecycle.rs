@@ -579,6 +579,23 @@ pub(crate) fn spawn_model(session_type: &str, chosen: Option<&str>) -> Option<St
     }
 }
 
+/// Who ended a workspace's last agent: Owner (A-w, asked first) or an
+/// agent's kill (closed without asking).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LastAgentClose {
+    Owner,
+    AgentKill,
+}
+
+/// A bash-pane check for `App::check_and_close_workspace`: the daemon uids
+/// asked about, and the busy ones as `(uid, command)` (Err: no answer).
+pub(crate) struct LastAgentVerdict {
+    pub(crate) ws_id: String,
+    pub(crate) trigger: LastAgentClose,
+    pub(crate) checked: Vec<String>,
+    pub(crate) busy: Result<Vec<(String, String)>, String>,
+}
+
 impl App {
     /// The task's default model or effort for `session_type` (its own,
     /// else inherited from its nearest ancestor).
@@ -2083,6 +2100,7 @@ impl App {
                         Self::kill_daemon_session_for_close(&pool, &ws.sessions[si]);
                         Self::tombstone_session(ws, si);
                         let closed_uid = ws.sessions[si].uid.clone();
+                        let was_agent = ws.sessions[si].session_type != "bash";
                         ws.sessions.remove(si);
                         if ws.sessions.is_empty() {
                             self.cursor = Cursor::Workspace(wi);
@@ -2095,6 +2113,9 @@ impl App {
                         self.forget_reconnect_state(&closed_uid);
                         self.save_session_manifest();
                         self.set_status_msg("Session closed");
+                        if was_agent {
+                            self.after_agent_gone(wi, LastAgentClose::Owner);
+                        }
                     }
                 }
             }
@@ -2106,12 +2127,16 @@ impl App {
                         Self::kill_daemon_session_for_close(&pool, &ws.sessions[0]);
                         Self::tombstone_session(ws, 0);
                         let closed_uid = ws.sessions[0].uid.clone();
+                        let was_agent = ws.sessions[0].session_type != "bash";
                         ws.sessions.remove(0);
                         self.cursor = Cursor::Workspace(wi);
                         // Cancel any reconnect/reattach for the closed session.
                         self.forget_reconnect_state(&closed_uid);
                         self.save_session_manifest();
                         self.set_status_msg("Session closed");
+                        if was_agent {
+                            self.after_agent_gone(wi, LastAgentClose::Owner);
+                        }
                     }
                 }
             }
@@ -2127,6 +2152,7 @@ impl App {
                     if removed > 0 {
                         // Helper already saved the manifest.
                         self.set_status_msg(&format!("Closed {} session(s)", removed));
+                        self.after_agent_gone(ws_idx, LastAgentClose::Owner);
                     }
                 }
             }
@@ -3573,6 +3599,158 @@ impl App {
         attach_pending
             .extend(self.attaching.values().map(|p| p.ws_id().to_string()));
         attach_pending
+    }
+
+    /// Owner rule (2026-11-05): a workspace whose last Claude/Codex session
+    /// is gone closes, unless a bash pane in it is running something. An
+    /// Owner A-w close of that agent asks first (`ConfirmAction::
+    /// CloseAfterLastAgent`); an agent's kill closes it straight away.
+    /// Pre-fix a leftover idle bash pane counted as a session and pinned
+    /// the workspace (and its task header) on the sidebar indefinitely.
+    pub(crate) fn after_agent_gone(&mut self, wi: usize, trigger: LastAgentClose) {
+        let Some(ws) = self.workspaces.get(wi) else { return };
+        if !self.last_agent_gone(ws) {
+            return;
+        }
+        match trigger {
+            LastAgentClose::Owner => {
+                if matches!(self.input_mode, InputMode::Normal) {
+                    self.input_mode = InputMode::Confirm {
+                        prompt: format!(
+                            "Close workspace \"{}\" too? Idle bash panes close with it.",
+                            ws.name,
+                        ),
+                        action: ConfirmAction::CloseAfterLastAgent { ws_id: ws.id.clone() },
+                    };
+                }
+            }
+            LastAgentClose::AgentKill => {
+                let focused = matches!(self.cursor, Cursor::Workspace(c) | Cursor::Session(c, _) if c == wi)
+                    || matches!(self.cursor, Cursor::Task { ws_idx, .. } if ws_idx == wi);
+                if !focused && !self.user_reopened.contains(&ws.id) {
+                    let id = ws.id.clone();
+                    self.check_and_close_workspace(&id, trigger);
+                }
+            }
+        }
+    }
+
+    /// No live agent left and nothing that respawns its own sessions:
+    /// every row is a bash pane or an exited agent; not pinned, not a cloud
+    /// worker, no workflow or continuous session.
+    fn last_agent_gone(&self, ws: &Workspace) -> bool {
+        !ws.is_closed && !ws.is_cloud && !ws.pinned
+            && ws.sessions.iter().all(|ts| {
+                ts.workflow_run_id.is_none()
+                    && ts.continuous_task_id.is_none()
+                    && (ts.session_type == "bash" || ts.session.exited || ts.preserved_last_exit.is_some())
+            })
+            && !self.tasks.iter().any(|t| t.workspace_id.as_deref() == Some(ws.id.as_str()) && t.is_continuous)
+    }
+
+    /// Ask each remaining pane's daemon whether it is busy (off the input
+    /// thread), then close in `drain_last_agent_closes`. Every row goes in
+    /// the question, agents too, so a row the viewer thinks exited but the
+    /// daemon still runs keeps the workspace open.
+    pub(crate) fn check_and_close_workspace(&mut self, ws_id: &str, trigger: LastAgentClose) {
+        let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id) else { return };
+        let mut by_host: HashMap<crate::hosts::HostId, Vec<String>> = HashMap::new();
+        for ts in &ws.sessions {
+            if ts.session.exited {
+                continue;
+            }
+            match ts.session.daemon_session_uid.clone() {
+                Some(uid) => by_host.entry(ts.host_id.clone()).or_default().push(uid),
+                None => {
+                    // A viewer-local pane has no daemon to ask: keep it.
+                    let verdict = LastAgentVerdict {
+                        ws_id: ws_id.to_string(),
+                        trigger,
+                        checked: Vec::new(),
+                        busy: Err(format!("{} is a viewer-local pane", ts.label)),
+                    };
+                    let _ = self.last_agent_close_tx.send(verdict);
+                    return;
+                }
+            }
+        }
+        let tx = self.last_agent_close_tx.clone();
+        let pool = std::sync::Arc::clone(&self.host_pool);
+        let ws_id = ws_id.to_string();
+        let ask = move || -> Result<(Vec<String>, Vec<(String, String)>), String> {
+            let mut checked = Vec::new();
+            let mut busy = Vec::new();
+            for (host, uids) in by_host {
+                let socket = pool.for_host(&host).ok().and_then(|h| h.socket_path())
+                    .ok_or_else(|| format!("host {} is not reachable", host.as_str()))?;
+                let shells = crate::client_session::rpc_shell_busy(&socket, &pool.operator_token_for(&host), &uids)
+                    .map_err(|e| format!("host {}: {e}", host.as_str()))?;
+                for uid in uids {
+                    let row = shells.get(&uid);
+                    // A uid missing from the answer is not known to be idle.
+                    if row.and_then(|r| r["busy"].as_bool()).unwrap_or(true) {
+                        let command = row.and_then(|r| r["command"].as_str()).unwrap_or("unknown");
+                        busy.push((uid.clone(), command.to_string()));
+                    }
+                    checked.push(uid);
+                }
+            }
+            Ok((checked, busy))
+        };
+        let spawned = std::thread::Builder::new().name("cm-last-agent-close".into()).spawn({
+            let tx = tx.clone();
+            let ws_id = ws_id.clone();
+            move || {
+                let (checked, busy) = match ask() {
+                    Ok((c, b)) => (c, Ok(b)),
+                    Err(e) => (Vec::new(), Err(e)),
+                };
+                let _ = tx.send(LastAgentVerdict { ws_id, trigger, checked, busy });
+            }
+        });
+        if spawned.is_err() {
+            let _ = tx.send(LastAgentVerdict { ws_id, trigger, checked: Vec::new(), busy: Err("no thread".into()) });
+        }
+    }
+
+    /// Apply the answers from `check_and_close_workspace`. The workspace is
+    /// re-checked: a new agent, a new pane the daemon was not asked about,
+    /// or a busy pane keeps it open; Owner hears why when they asked.
+    pub(crate) fn drain_last_agent_closes(&mut self) {
+        while let Ok(v) = self.last_agent_close_rx.try_recv() {
+            let Some(wi) = self.workspaces.iter().position(|w| w.id == v.ws_id) else { continue };
+            let ws = &self.workspaces[wi];
+            let name = ws.name.clone();
+            let unasked = ws.sessions.iter().any(|ts| {
+                !ts.session.exited
+                    && ts.session.daemon_session_uid.as_ref().is_some_and(|u| !v.checked.contains(u))
+            });
+            let kept = match (&v.busy, self.last_agent_gone(ws), unasked) {
+                (Err(e), ..) => Some(format!("couldn't check its bash panes ({e})")),
+                (_, false, _) | (_, _, true) => Some("it has a new session".to_string()),
+                (Ok(busy), ..) => busy.first().map(|(uid, command)| {
+                    let label = ws.sessions.iter().find(|ts| ts.session.daemon_session_uid.as_deref() == Some(uid.as_str()))
+                        .map_or(uid.as_str(), |ts| ts.label.as_str());
+                    format!("{label} is running {command}")
+                }),
+            };
+            if let Some(why) = kept {
+                eprintln!("cm-tui: kept workspace `{name}` open after its last agent went: {why}");
+                if v.trigger == LastAgentClose::Owner {
+                    self.set_status_msg(&format!("Kept \"{name}\" open: {why}"));
+                }
+                continue;
+            }
+            self.tombstone_and_remove(wi, |_| true);
+            let ws = &mut self.workspaces[wi];
+            ws.is_closed = true;
+            self.user_reopened.remove(&v.ws_id);
+            self.save_session_manifest();
+            self.clamp_cursor();
+            self.needs_redraw = true;
+            eprintln!("cm-tui: closed workspace `{name}` — its last agent is gone");
+            self.set_status_msg(&format!("Closed \"{name}\": its last agent is gone (A-O reopens)"));
+        }
     }
 
     /// Kill-time close for an adoption-created agent workspace: the

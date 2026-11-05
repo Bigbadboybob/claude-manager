@@ -788,6 +788,7 @@ pub fn dispatch_request(
             DispatchOutcome::Done(dispatch_session_revive(state, req))
         }
         "session.viewed" => DispatchOutcome::Done(dispatch_session_viewed(state, req)),
+        "session.shell_busy" => DispatchOutcome::Done(dispatch_session_shell_busy(state, req)),
         // #24 transcript rotation: operator for any session (and `force`);
         // a Session caller may rotate only itself, at a safe boundary.
         "session.handoff" => DispatchOutcome::Done(dispatch_session_handoff(state, req)),
@@ -2166,6 +2167,65 @@ fn dispatch_session_viewed(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Re
         guard.note_owner_activity(uid);
     }
     Response::ok(req.id.clone(), serde_json::json!({ "uid": uid, "known": known }))
+}
+
+/// `session.shell_busy {uids}` — for each bash pane, whether it is running
+/// something: a foreground job, or any child process at all (a backgrounded
+/// job, an editor). The viewer asks before it closes a workspace whose last
+/// agent is gone; an idle prompt may close with it, a busy shell keeps it
+/// open. Agent sessions always answer busy (this is not their test), and a
+/// uid the daemon no longer holds answers `known: false`, not busy.
+fn dispatch_session_shell_busy(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(resp) = require_operator(req, "session.shell_busy is Operator-callable only") {
+        return resp;
+    }
+    let Some(uids) = req.params.get("uids").and_then(Value::as_array) else {
+        return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session.shell_busy requires uids");
+    };
+    let targets: Vec<(String, Option<(libc::pid_t, bool)>)> = {
+        let guard = state.lock().unwrap_or_else(|p| p.into_inner());
+        uids.iter()
+            .filter_map(Value::as_str)
+            .map(|uid| (uid.to_string(), guard.sessions.get(uid).map(|s| (s.pid, s.session_type == "bash"))))
+            .collect()
+    };
+    let mut out = serde_json::Map::new();
+    for (uid, found) in targets {
+        let row = match found {
+            None => json!({ "known": false, "busy": false }),
+            Some((_, false)) => json!({ "known": true, "busy": true, "command": "agent" }),
+            Some((pid, true)) => match shell_running(std::path::Path::new("/proc"), pid) {
+                Some(command) => json!({ "known": true, "busy": true, "command": command }),
+                None => json!({ "known": true, "busy": false }),
+            },
+        };
+        out.insert(uid, row);
+    }
+    Response::ok(req.id.clone(), json!({ "shells": out }))
+}
+
+/// What the shell `pid` is running, read from `proc`: the foreground job when
+/// the terminal's foreground group is not the shell's own, else its first
+/// child. None when it sits at its prompt. An unreadable stat reads as busy
+/// (`"unknown"`) — the caller then keeps the pane.
+fn shell_running(proc: &std::path::Path, pid: libc::pid_t) -> Option<String> {
+    let comm = |p: &str| {
+        std::fs::read_to_string(proc.join(p).join("comm")).map(|c| c.trim().to_string()).unwrap_or_else(|_| p.to_string())
+    };
+    let Ok(stat) = std::fs::read_to_string(proc.join(pid.to_string()).join("stat")) else {
+        return Some("unknown".into());
+    };
+    // Fields after the parenthesised comm: state ppid pgrp session tty_nr tpgid.
+    let rest: Vec<&str> = stat.rsplit_once(')').map(|(_, r)| r.split_whitespace().collect()).unwrap_or_default();
+    let (Some(pgrp), Some(tpgid)) = (rest.get(2), rest.get(5)) else {
+        return Some("unknown".into());
+    };
+    if tpgid.parse::<i64>().is_ok_and(|t| t > 0) && tpgid != pgrp {
+        return Some(comm(tpgid));
+    }
+    let children = std::fs::read_to_string(proc.join(pid.to_string()).join("task").join(pid.to_string()).join("children"))
+        .unwrap_or_default();
+    children.split_whitespace().next().map(comm)
 }
 
 /// `session.rotate_transcript {uid?, reason?, force?, status?}` (#24): move a
@@ -4438,6 +4498,47 @@ mod tests {
             let _ = s.kill();
         }
         crate::handoff::test_drop_queued("ts-ho-b");
+    }
+
+    fn fake_proc(stat: &str, children: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let task = dir.path().join("100/task/100");
+        std::fs::create_dir_all(&task).unwrap();
+        std::fs::write(dir.path().join("100/stat"), stat).unwrap();
+        std::fs::write(task.join("children"), children).unwrap();
+        std::fs::create_dir_all(dir.path().join("200")).unwrap();
+        std::fs::write(dir.path().join("200/comm"), "nvim\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn shell_running_reads_the_foreground_job_and_children() {
+        // pid (comm) state ppid pgrp session tty_nr tpgid ...
+        let idle = fake_proc("100 (bash) S 1 100 100 34816 100 4194560", "");
+        assert_eq!(shell_running(idle.path(), 100), None, "a shell at its prompt is idle");
+        let fg = fake_proc("100 (ba sh) S 1 100 100 34816 200 4194560", "200 ");
+        assert_eq!(shell_running(fg.path(), 100).as_deref(), Some("nvim"), "a foreground job is busy");
+        let bg = fake_proc("100 (bash) S 1 100 100 34816 100 4194560", "200 ");
+        assert_eq!(shell_running(bg.path(), 100).as_deref(), Some("nvim"), "a background child is busy");
+        let gone = tempfile::tempdir().unwrap();
+        assert_eq!(shell_running(gone.path(), 100).as_deref(), Some("unknown"), "unreadable keeps the pane");
+    }
+
+    #[test]
+    fn session_shell_busy_answers_per_uid_for_operators_only() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let mut sp = crate::session::SpawnParams::new("ts-sh", "sh", "/bin/sleep");
+        sp.args = vec!["30".into()];
+        let mut sess = crate::session::DaemonSession::spawn(sp).unwrap();
+        sess.session_type = "claude".into();
+        state.lock().unwrap().sessions.insert("ts-sh".into(), sess);
+        let params = serde_json::json!({"uids": ["ts-sh", "ts-gone"]});
+        let agent = dispatch_session_shell_busy(&state, &session_request("session.shell_busy", params.clone(), "ts-sh"));
+        assert!(!agent.ok);
+        let ok = dispatch_session_shell_busy(&state, &operator_request("session.shell_busy", params));
+        let shells = ok.result.unwrap()["shells"].clone();
+        assert_eq!(shells["ts-sh"]["busy"], true, "an agent session is never an idle shell");
+        assert_eq!(shells["ts-gone"], serde_json::json!({"known": false, "busy": false}));
     }
 
     #[test]
