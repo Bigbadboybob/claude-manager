@@ -296,6 +296,14 @@ pub struct WorkflowPoller {
     finalize_quiet_ms: AtomicU64,
     /// Metadata is refreshed outside the registry lock at every read phase.
     file_snapshots: Mutex<snapshots::RunSnapshots>,
+    /// The tick's opening refresh. When it found no active run, every later
+    /// phase of the tick reuses it instead of re-checking each run on disk;
+    /// otherwise only the first phase does, and the rest refresh as before.
+    /// cm-sessions holds 361 runs, all Done/Detached, so five refreshes per
+    /// 250 ms tick cost ~14k stat calls/s and 8–19% of a core for no work
+    /// (2026-11-05). A run started or reactivated mid-tick is seen at the
+    /// next tick's opening refresh.
+    tick_runs: Mutex<Option<TickRuns>>,
     /// P-A (criterion #4): per-run hash of the last broadcast snapshot. The
     /// poller reads every run from disk each tick, so broadcasting a fresh
     /// snapshot whenever a run's serialized form changes makes ALL daemon-driven
@@ -343,6 +351,22 @@ pub fn resolve_existing_sid(session_type: &str, transcript_path: &str) -> Option
     }
 }
 
+/// A tick's opening refresh (see `WorkflowPoller::tick_runs`). `quiet`: no
+/// run was active, so the whole tick reuses it; otherwise only the next
+/// read does.
+struct TickRuns {
+    runs: Vec<snapshots::Snapshot>,
+    quiet: bool,
+}
+
+/// Ends a tick (see `WorkflowPoller::tick_runs`).
+struct TickGuard<'a>(&'a Mutex<Option<TickRuns>>);
+impl Drop for TickGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
+
 impl WorkflowPoller {
     /// Construct without starting the loop thread. Tests use this
     /// to drive `poll_once` manually.
@@ -359,6 +383,7 @@ impl WorkflowPoller {
             finalize_gap_ms: AtomicU64::new(crate::workflow::finalize::DEFAULT_ENTER_GAP_MS),
             finalize_quiet_ms: AtomicU64::new(2_000),
             file_snapshots: Mutex::new(snapshots::RunSnapshots::default()),
+            tick_runs: Mutex::new(None),
             last_broadcast_hashes: Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -470,6 +495,7 @@ impl WorkflowPoller {
     ///    `workflow_transition` calls — the same handler MCP
     ///    callers use.
     pub fn poll_once(&self) -> Vec<Decision> {
+        let _tick = self.begin_tick();
         // Phase 4 (P1): bridge each daemon-launched participant's detected
         // transcript sid into its run binding's `current_session_id`, so the
         // idle gate has a transcript to read. Must run BEFORE the gate
@@ -607,8 +633,29 @@ impl WorkflowPoller {
     }
 
     fn refresh_runs(&self) -> Vec<snapshots::Snapshot> {
+        {
+            let mut tick = self.tick_runs.lock().unwrap_or_else(|p| p.into_inner());
+            match tick.take() {
+                Some(TickRuns { runs, quiet: true }) => {
+                    *tick = Some(TickRuns { runs: runs.clone(), quiet: true });
+                    return runs;
+                }
+                Some(TickRuns { runs, quiet: false }) => return runs,
+                None => {}
+            }
+        }
         self.file_snapshots.lock().unwrap_or_else(|p| p.into_inner())
             .refresh(&crate::workflow::run::runs_dir())
+    }
+
+    /// Open a tick with one refresh (see `tick_runs`). The guard drops any
+    /// unused result when the tick ends, including by panic.
+    fn begin_tick(&self) -> TickGuard<'_> {
+        *self.tick_runs.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        let runs = self.refresh_runs();
+        let quiet = runs.iter().all(|r| !r.run.is_active());
+        *self.tick_runs.lock().unwrap_or_else(|p| p.into_inner()) = Some(TickRuns { runs, quiet });
+        TickGuard(&self.tick_runs)
     }
 
     /// Broadcast a state snapshot for every run whose serialized form changed
@@ -3735,6 +3782,34 @@ mod tests {
                 assert!(matches!(rx.try_recv().unwrap(), WorkflowWatchMsg::Snapshot(_)),
                     "recreation broadcasts even with the same semantic hash");
             }
+        });
+    }
+
+    #[test]
+    fn poller_quiet_tick_reads_the_runs_once_and_still_sees_reactivation() {
+        with_cache_test_home(|_| {
+            use crate::workflow::run::RunStatus;
+            let state = make_state_with_one_active_run("quiet-tick");
+            crate::workflow::run::modify("quiet-tick", |run| run.status = RunStatus::Done).unwrap();
+            let poller = WorkflowPoller::new(state);
+            let refreshes = || poller.file_snapshots.lock().unwrap().refreshes;
+            assert!(poller.poll_once().is_empty());
+            assert_eq!(refreshes(), 1, "a tick with only terminal runs refreshes once");
+            assert!(poller.poll_once().is_empty());
+            assert_eq!(refreshes(), 2);
+            assert!(poller.tick_runs.lock().unwrap().is_none(), "nothing outlives the tick");
+
+            crate::workflow::run::modify("quiet-tick", |run| run.status = RunStatus::Running).unwrap();
+            let before = refreshes();
+            assert!(!poller.poll_once().is_empty(), "the next tick sees the reactivated run");
+            // Live work: the opening refresh serves the first phase and the
+            // others re-check disk, as each phase did before.
+            assert_eq!(refreshes() - before, 5);
+
+            crate::workflow::run::modify("quiet-tick", |run| run.status = RunStatus::Detached).unwrap();
+            let before = refreshes();
+            assert!(poller.poll_once().is_empty());
+            assert_eq!(refreshes() - before, 1);
         });
     }
 
