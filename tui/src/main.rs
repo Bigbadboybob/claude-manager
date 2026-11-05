@@ -406,6 +406,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         // Close workspaces whose last agent went, once their bash panes
         // answered (`check_and_close_workspace`).
         app.drain_last_agent_closes();
+        app.maybe_offer_bash_only_sweep();
 
         // 11d: drain WorkflowWatchEvent frames from the
         // events.subscribe consumer. Same shape as the

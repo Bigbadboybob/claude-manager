@@ -4376,6 +4376,30 @@ mod apply_manifest_diff_tests {
         assert!(app.workspaces[0].tombstones.iter().any(|t| t.uid == "ts-sh"), "the idle pane closes with it");
     }
 
+    /// The one-time sweep lists workspaces that had an agent and now hold
+    /// only live bash panes, and asks once.
+    #[test]
+    fn bash_only_sweep_offers_workspaces_that_lost_their_agents() {
+        let mut app = build_app_with_session("ts-agent");
+        add_bash_row(&mut app, "ts-sh", "d-sh");
+        assert!(app.bash_only_workspaces().is_empty(), "the agent is still there");
+        app.tombstone_and_remove(0, |ts| ts.session_type == "claude");
+        assert_eq!(app.bash_only_workspaces(), vec!["ws-test".to_string()]);
+
+        let mut shell_only = build_app_with_session("ts-x");
+        shell_only.workspaces[0].sessions.clear();
+        add_bash_row(&mut shell_only, "ts-sh2", "d-sh2");
+        assert!(shell_only.bash_only_workspaces().is_empty(), "a shell-only workspace never had an agent");
+
+        app.bash_sweep_due = Some(Instant::now());
+        app.maybe_offer_bash_only_sweep();
+        assert!(matches!(
+            &app.input_mode,
+            InputMode::Confirm { action: ConfirmAction::CloseBashOnlyWorkspaces { ws_ids }, .. } if ws_ids == &vec!["ws-test".to_string()]
+        ));
+        assert!(app.bash_sweep_due.is_none(), "asked once");
+    }
+
     /// A lead's kill of the last agent closes the workspace without asking;
     /// Owner's own kill (operator) does not reach this path.
     #[test]

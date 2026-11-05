@@ -354,6 +354,8 @@ pub enum ConfirmAction {
     /// Y/n after A-w closed a workspace's last agent: close the workspace
     /// too (its idle bash panes with it; a busy one keeps it open).
     CloseAfterLastAgent { ws_id: String },
+    /// The one-time startup offer (`maybe_offer_bash_only_sweep`).
+    CloseBashOnlyWorkspaces { ws_ids: Vec<String> },
     /// Alt+T (#24): move this session's conversation to a fresh transcript.
     RotateTranscript { uid: String },
     /// Explicit operator authorization for this exact background identity.
@@ -689,6 +691,10 @@ pub(crate) enum SubmitAction {
     /// Confirmed Y on "Close workspace … too?" after A-w.
     CloseAfterLastAgent {
         ws_id: String,
+    },
+    /// Confirmed Y on the one-time bash-only sweep.
+    CloseBashOnlyWorkspaces {
+        ws_ids: Vec<String>,
     },
 }
 
@@ -2503,6 +2509,7 @@ pub(crate) fn handle_confirm(
                     SubmitAction::RestoreTombstones { ws_id }
                 }
                 ConfirmAction::CloseAfterLastAgent { ws_id } => SubmitAction::CloseAfterLastAgent { ws_id },
+                ConfirmAction::CloseBashOnlyWorkspaces { ws_ids } => SubmitAction::CloseBashOnlyWorkspaces { ws_ids },
                 ConfirmAction::RotateTranscript { uid } => SubmitAction::RotateTranscript { uid },
                 ConfirmAction::BackgroundRecovery { uid, host, identity, prompt } => SubmitAction::BackgroundRecovery { uid, host, identity, prompt },
                 ConfirmAction::ReconcileBackground { uid, host, identity, prompt } => SubmitAction::ReconcileBackground { uid, host, identity, prompt },
@@ -4867,6 +4874,11 @@ impl App {
             }
             SubmitAction::CloseAfterLastAgent { ws_id } => {
                 self.check_and_close_workspace(&ws_id, lifecycle::LastAgentClose::Owner);
+            }
+            SubmitAction::CloseBashOnlyWorkspaces { ws_ids } => {
+                for ws_id in ws_ids {
+                    self.check_and_close_workspace(&ws_id, lifecycle::LastAgentClose::Owner);
+                }
             }
             SubmitAction::RestoreTombstones { ws_id } => {
                 self.restore_tombstones_for_workspace(&ws_id);

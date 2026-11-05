@@ -463,6 +463,9 @@ pub struct App {
     /// (`check_and_close_workspace`); drained by `drain_last_agent_closes`.
     last_agent_close_tx: std::sync::mpsc::Sender<lifecycle::LastAgentVerdict>,
     last_agent_close_rx: std::sync::mpsc::Receiver<lifecycle::LastAgentVerdict>,
+    /// When to make the one-time bash-only sweep offer; None once made (or
+    /// made in an earlier run, per its marker file).
+    bash_sweep_due: Option<Instant>,
     /// Cloud backtest runs, rendered in the continuous panel's `backtests`
     /// group instead of per-task workspaces (they never hold a local session).
     /// Rebuilt from the API task list by `reconcile_tasks` →
@@ -1124,6 +1127,8 @@ impl App {
             user_reopened: HashSet::new(),
             last_agent_close_tx,
             last_agent_close_rx,
+            bash_sweep_due: (!lifecycle::bash_sweep_marker().exists())
+                .then(|| Instant::now() + lifecycle::BASH_SWEEP_DELAY),
             backtest_rows: Vec::new(),
             backtests_folded: false,
             backtest_unfolded_fleets: HashSet::new(),

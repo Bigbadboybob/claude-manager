@@ -579,6 +579,16 @@ pub(crate) fn spawn_model(session_type: &str, chosen: Option<&str>) -> Option<St
     }
 }
 
+/// One-time offer (Owner, 2026-11-05): workspaces whose agents went before
+/// the last-agent close shipped still hold only bash panes. Asked once,
+/// this long after start so sessions have attached; the marker file records
+/// that it was asked, whatever the answer.
+pub(crate) const BASH_SWEEP_DELAY: Duration = Duration::from_secs(20);
+
+pub(crate) fn bash_sweep_marker() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join(".cm/bash-only-sweep-asked")
+}
+
 /// Who ended a workspace's last agent: Owner (A-w, asked first) or an
 /// agent's kill (closed without asking).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3646,6 +3656,52 @@ impl App {
                     && (ts.session_type == "bash" || ts.session.exited || ts.preserved_last_exit.is_some())
             })
             && !self.tasks.iter().any(|t| t.workspace_id.as_deref() == Some(ws.id.as_str()) && t.is_continuous)
+    }
+
+    /// The one-time startup offer behind `bash_sweep_due`: list workspaces
+    /// that once had an agent (a closed agent session or a bound task), have
+    /// none live now, and still hold bash panes, and ask Owner once to close
+    /// them. Each yes goes through `check_and_close_workspace`, so a busy
+    /// pane still keeps its workspace.
+    pub(crate) fn maybe_offer_bash_only_sweep(&mut self) {
+        if !self.bash_sweep_due.is_some_and(|due| Instant::now() >= due)
+            || !matches!(self.input_mode, InputMode::Normal)
+            || !self.attach_pending_ws_ids().is_empty()
+        {
+            return;
+        }
+        self.bash_sweep_due = None;
+        let marker = bash_sweep_marker();
+        if let Err(e) = std::fs::write(&marker, b"asked\n") {
+            eprintln!("cm-tui: bash-only sweep marker {} not written: {e}", marker.display());
+        }
+        let ws_ids = self.bash_only_workspaces();
+        if ws_ids.is_empty() {
+            return;
+        }
+        self.input_mode = InputMode::Confirm {
+            prompt: format!(
+                "Close {} workspace{} whose agents are gone and that hold only bash panes? \
+                 A pane running something keeps its workspace. (Asked once.)",
+                ws_ids.len(),
+                if ws_ids.len() == 1 { "" } else { "s" },
+            ),
+            action: ConfirmAction::CloseBashOnlyWorkspaces { ws_ids },
+        };
+    }
+
+    pub(crate) fn bash_only_workspaces(&self) -> Vec<String> {
+        self.workspaces
+            .iter()
+            .filter(|ws| {
+                self.last_agent_gone(ws)
+                    && ws.sessions.iter().any(|ts| ts.session_type == "bash" && !ts.session.exited)
+                    && (ws.sessions.iter().any(|ts| ts.session_type != "bash")
+                        || ws.tombstones.iter().any(|t| t.session_type != "bash")
+                        || self.tasks.iter().any(|t| t.workspace_id.as_deref() == Some(ws.id.as_str())))
+            })
+            .map(|ws| ws.id.clone())
+            .collect()
     }
 
     /// Ask each remaining pane's daemon whether it is busy (off the input
