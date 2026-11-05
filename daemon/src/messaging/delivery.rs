@@ -3,6 +3,8 @@
 //! delivery. Native adapters never resend an ambiguous submission.
 pub mod alarm;
 mod marker;
+use super::atomic_replace_json;
+#[cfg(test)]
 use super::atomic_replace;
 use super::{Store, WakeIntent};
 use crate::{session::PtyByteFanout, state::DaemonState};
@@ -100,7 +102,7 @@ struct Queue {
     deferred: BTreeSet<String>,
 }
 #[derive(Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(from = "BatchWire")]
 struct Batch {
     wake_id: String,
     ids: Vec<String>,
@@ -123,8 +125,59 @@ struct Batch {
     // `LATCH_HORIZON_SECS`, so a session that ignored one wake still gets the
     // next one (2026-09-14: an orchestrator's 11:01 wake swallowed a 16:17
     // mention for good).
-    #[serde(default)]
     delivered_at: u64,
+    // Set by `load` when this record predates `released`; never persisted.
+    #[serde(skip)]
+    migrated: bool,
+}
+/// The on-disk batch. `released` and `status` are optional only so a record
+/// that predates the latch can be migrated while it is parsed: the queue is
+/// deserialized straight into structs instead of through a `Value` tree
+/// (2026-11-05: a 23 MB queue's two Value copies per load/save were most of
+/// the brain's allocator churn).
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct BatchWire {
+    wake_id: String,
+    ids: Vec<String>,
+    status: Option<String>,
+    attempts: u8,
+    attempted_at: u64,
+    original: Option<Binding>,
+    scan: Scan,
+    hook_keys: Vec<String>,
+    checked: BTreeSet<String>,
+    sealed: bool,
+    released: Option<bool>,
+    coalesced: BTreeSet<String>,
+    delivered_at: u64,
+}
+impl From<BatchWire> for Batch {
+    fn from(w: BatchWire) -> Self {
+        let migrated = w.released.is_none();
+        // Keep old unsubmitted work live. Delivered/ambiguous old receipts
+        // have no fetch history and cannot own a new latch.
+        let released = w.released.unwrap_or_else(|| {
+            let status = w.status.as_deref().unwrap_or("pending");
+            !pending(status) && status != "native_pending"
+        });
+        Batch {
+            wake_id: w.wake_id,
+            ids: w.ids,
+            status: w.status.unwrap_or_default(),
+            attempts: w.attempts,
+            attempted_at: w.attempted_at,
+            original: w.original,
+            scan: w.scan,
+            hook_keys: w.hook_keys,
+            checked: w.checked,
+            sealed: w.sealed,
+            released,
+            coalesced: w.coalesced,
+            delivered_at: w.delivered_at,
+            migrated,
+        }
+    }
 }
 impl Batch {
     fn deferred(&self, keys: &BTreeSet<String>) -> bool {
@@ -196,19 +249,9 @@ fn load(path: &Path) -> io::Result<Queue> {
     QUEUE_LOADS.with(|count| count.set(count.get() + 1));
     match fs::read(path) {
         Ok(b) => {
-            let mut value: Value = serde_json::from_slice(&b)?;
-            let mut migrated = false;
-            for batch in value["batches"].as_array_mut().into_iter().flatten() {
-                if batch.get("released").is_none() {
-                    let status = batch["status"].as_str().unwrap_or("pending");
-                    // Keep old unsubmitted work live. Delivered/ambiguous old
-                    // receipts have no fetch history and cannot own a new latch.
-                    batch["released"] = json!(!pending(status) && status != "native_pending");
-                    migrated = true;
-                }
-            }
-            let mut queue: Queue = serde_json::from_value(value)?;
-            queue.dirty = migrated;
+            // Legacy records are migrated in `From<BatchWire>`; persist that.
+            let mut queue: Queue = serde_json::from_slice(&b)?;
+            queue.dirty = queue.batches.iter().any(|b| b.migrated);
             Ok(queue)
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Queue::default()),
@@ -226,7 +269,7 @@ fn save(path: &Path, q: &Queue) -> io::Result<()> {
             return Err(io::Error::other("injected delivery checkpoint failure"));
         }
     }
-    atomic_replace(path, &serde_json::to_value(q)?)
+    atomic_replace_json(path, q)
 }
 fn checkpoint(path: &Path, q: &mut Queue) -> io::Result<()> {
     if q.dirty {
@@ -1280,6 +1323,31 @@ mod tests {
         assert_eq!(save_calls() - writes, 0);
         assert_eq!(fs::read(&path).unwrap(), bytes, "all dedup history remains intact");
         assert_eq!(q.batches.len(), 7745);
+    }
+
+    #[test]
+    fn messaging_queue_loads_without_a_value_round_trip_and_keeps_legacy_migration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("q.json");
+        let legacy = json!({"last_attempt": 7, "batches": [
+            {"wake_id": "a", "ids": ["x"], "status": "confirmed"},
+            {"wake_id": "b", "ids": ["y"], "status": "native_pending"},
+            {"wake_id": "c", "ids": ["z"]},
+            {"wake_id": "d", "ids": ["w"], "status": "confirmed", "released": false, "delivered_at": 5},
+        ]});
+        atomic_replace(&path, &legacy).unwrap();
+        let q = load(&path).unwrap();
+        assert!(q.dirty, "a migrated legacy record is persisted");
+        let released: Vec<_> = q.batches.iter().map(|b| b.released).collect();
+        assert_eq!(released, [true, false, false, false]);
+        assert_eq!(q.batches[2].status, "", "a missing status stays empty, as before");
+        assert_eq!((q.last_attempt, q.batches[3].delivered_at), (7, 5));
+        save(&path, &q).unwrap();
+        let q = load(&path).unwrap();
+        assert!(!q.dirty);
+        let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(saved["batches"][0].get("migrated").is_none());
+        assert_eq!(saved["batches"][0]["released"], true);
     }
 
     #[test]
