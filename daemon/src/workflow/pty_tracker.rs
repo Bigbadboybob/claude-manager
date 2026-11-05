@@ -231,6 +231,20 @@ impl PtyModeTracker {
         self.term.grid().display_iter().map(|cell| cell.c).collect()
     }
 
+    /// Current visible grid as one string per screen row, top to bottom
+    /// (trailing blanks kept). For matches that depend on row order and on
+    /// what is drawn at the bottom of the screen.
+    pub fn visible_lines(&self) -> Vec<String> {
+        use alacritty_terminal::index::{Column, Line};
+        let grid = self.term.grid();
+        (0..grid.screen_lines())
+            .map(|row| {
+                let line = Line(row as i32);
+                (0..grid.columns()).map(|col| grid[line][Column(col)].c).collect()
+            })
+            .collect()
+    }
+
     /// Codex's empty composer at its input cursor. Accept its observed ghost
     /// placeholder, never arbitrary text/history that happens to contain `›`.
     pub(crate) fn codex_recovery_composer_ready(&self) -> bool {

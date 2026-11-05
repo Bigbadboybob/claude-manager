@@ -72,6 +72,45 @@ pub struct Detail {
     /// Positive engine evidence of a visible dialog; absent means unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialog_visible: Option<bool>,
+    /// CM's handling of Claude's usage-limit menu at the current turn
+    /// boundary (`claude_limit_menu`): `escape_sent`, `cleared` or
+    /// `needs_human`. Absent once a new turn starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_menu: Option<String>,
+    /// Unix seconds of that outcome: the Escape that was sent or cleared
+    /// the menu, or when CM gave up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_menu_at: Option<f64>,
+}
+/// What CM did about Claude's usage-limit menu at one turn boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitMenuOutcome {
+    /// Escape written; the menu's disappearance is not yet confirmed.
+    EscapeSent,
+    /// The menu closed after CM's Escape.
+    Cleared,
+    /// Bounded Escapes did not close it; a human has to.
+    NeedsHuman,
+}
+impl LimitMenuOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EscapeSent => "escape_sent",
+            Self::Cleared => "cleared",
+            Self::NeedsHuman => "needs_human",
+        }
+    }
+}
+/// Kept in the state cell (and the restart sidecar) so the bounded attempt
+/// count and the give-up verdict survive a brain restart. Bound to the turn
+/// counter at the boundary: any later turn makes it stale.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LimitMenuRecord {
+    pub outcome: LimitMenuOutcome,
+    pub at: f64,
+    pub attempts: u32,
+    pub turn_seq: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -360,6 +399,8 @@ pub struct Inputs {
     pub background: Background,
     pub last_progress_at: Option<f64>,
     pub previous: Option<AgentState>,
+    #[serde(default)]
+    pub limit_menu: Option<LimitMenuRecord>,
 }
 fn newer(edge: Option<f64>, than: Option<f64>) -> bool {
     edge.is_some_and(|at| than.is_none_or(|other| at > other))
@@ -661,6 +702,12 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
         && detail.waiting_for.as_deref() == Some("dialog open") {
         detail.dialog_visible = Some(true);
     }
+    if let Some(menu) = input.limit_menu.as_ref()
+        .filter(|m| state != State::Exited && m.turn_seq == input.turn_seq)
+    {
+        detail.limit_menu = Some(menu.outcome.as_str().into());
+        detail.limit_menu_at = Some(menu.at);
+    }
     let engine_turn_started_at = if source == Source::Relay {
         relay.and_then(|r| r.turn_started_at)
     } else if matches!(source, Source::Hooks | Source::Presence) {
@@ -768,6 +815,7 @@ impl StateCell {
                 background: Background::default(),
                 last_progress_at: None,
                 previous: None,
+                limit_menu: None,
             },
             epoch: None,
             seq: 0,
@@ -1288,6 +1336,8 @@ struct RestartRecord {
     retired_epochs: BTreeSet<String>,
     prompt_ids: VecDeque<String>,
     pending_starts: u64,
+    #[serde(default)]
+    limit_menu: Option<LimitMenuRecord>,
 }
 impl RestartRecord {
     fn capture(session: &DaemonSession) -> Self {
@@ -1320,6 +1370,7 @@ impl RestartRecord {
             retired_epochs: c.retired_epochs.clone(),
             prompt_ids: c.prompt_ids.clone(),
             pending_starts: c.pending_starts,
+            limit_menu: c.inputs.limit_menu.clone(),
         }
     }
     fn restore(self, cell: &mut StateCell, legacy: LegacyObs, now: f64) {
@@ -1336,6 +1387,7 @@ impl RestartRecord {
             background: self.background,
             last_progress_at: Some(self.stalled_since.map_or(now, |at| at - 900.0)),
             previous: None,
+            limit_menu: self.limit_menu,
         };
         let mut state = derive(&cell.inputs, now);
         if state.state == self.state && state.source == self.source {
@@ -1581,6 +1633,9 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>) -> std::io::Result<()> {
 pub fn start(state: &Arc<Mutex<DaemonState>>) -> std::io::Result<()> {
     if let Err(e) = crate::claude_account_recovery::start(state) {
         eprintln!("cm-daemon: Claude account recovery unavailable at startup: {e}");
+    }
+    if let Err(e) = crate::claude_limit_menu::start(state) {
+        eprintln!("cm-daemon: Claude usage-limit menu clearing unavailable at startup: {e}");
     }
     let weak = Arc::downgrade(state);
     std::thread::Builder::new()

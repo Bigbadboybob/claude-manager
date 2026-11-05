@@ -11,6 +11,12 @@ admitted per two-second polling pass. Codex, workflow participants, continuous-t
 and sessions with no manager are excluded; the continuous scheduler owns its
 own recovery. Unmanaged sessions are logged for the operator.
 
+Claude's own usage-limit menu ("What do you want to do? … Esc to cancel")
+keeps presence waiting, so recovery cannot see the failed boundary while it is
+open. The daemon closes that menu with one guarded Escape after a two-minute
+grace, independently of this setting and without stamping input; see
+[Claude usage-limit menu](SESSION_STATE.md#claude-usage-limit-menu).
+
 Set `claude_limit_recovery = false` in `daemon.toml` and run
 `daemon.reload_config` to disable new admissions. The reload is serialized
 with an admitted terminal write. An account fingerprint is retained when a

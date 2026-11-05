@@ -11637,6 +11637,7 @@ mod tests {
             let mut st = state.lock().unwrap();
             st.config = crate::config::DaemonConfig {
                 claude_limit_recovery: true,
+                claude_limit_menu_clear: true,
                 memory: Default::default(),
                 s4_min_write: false,
                 transcript_rotation: Default::default(),
@@ -11748,6 +11749,7 @@ mod tests {
         let mut st = state.lock().unwrap();
         st.config = crate::config::DaemonConfig {
             claude_limit_recovery: true,
+            claude_limit_menu_clear: true,
                 memory: Default::default(),
             s4_min_write: false,
             transcript_rotation: Default::default(),

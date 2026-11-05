@@ -21,7 +21,8 @@ agent_state = {
          idle | starting | exited | unknown,
   since: unix_s,
   detail: {waiting_for?, error_kind?, resumes_at?, retrying?, open_tool?,
-           input_pending?, no_turn_at?, confirmed_turn_open?, dialog_visible?},
+           input_pending?, no_turn_at?, confirmed_turn_open?, dialog_visible?,
+           limit_menu?: escape_sent | cleared | needs_human, limit_menu_at?},
   source: presence | hooks | relay | transcript | pty,
   observed_at: unix_s,
   engine_version?: string,
@@ -66,6 +67,9 @@ does not by itself prove which prompt or recovery attempt started the turn.
 `detail.dialog_visible=true` requires a valid Claude presence observation of
 `dialog open` while the state is waiting on a human. The dialog's cause is
 not established; absence of the field means unknown, not no dialog.
+`detail.limit_menu` records what CM did about Claude's usage-limit menu at the
+current turn boundary, with `limit_menu_at` (Unix seconds); it disappears when
+the next turn starts. See [Claude usage-limit menu](#claude-usage-limit-menu).
 
 Local slash commands and empty sends record a delivery without advancing
 `latest_start_at` or `turn_seq`. The delivery token records actual Enter,
@@ -523,3 +527,54 @@ Claude 2.1.292's installed implementation registers `/compact` as a local
 command, invokes PreCompact/PostCompact, and returns `shouldQuery:false` from
 its compact-result dispatcher. It does not run the normal assistant-turn Stop
 path; drain must not require a Stop after this local command.
+
+## Claude usage-limit menu
+
+After a turn fails on the weekly or 5-hour limit, Claude Code (2.1.318) opens
+its own `/rate-limit-options` menu, once per reset time: "You've hit your …
+limit · resets …", "What do you want to do?", options such as "Stop and wait
+for limit to reset", "Wait here, then continue automatically at …" and "Switch
+to usage credits", and the footer "Enter to confirm · Esc to cancel". A
+session nobody watches stays on it. Escape closes it the same way as "Stop and
+wait": nothing is written to the transcript and the session remains at its
+failed turn. The daemon (`daemon/src/claude_limit_menu.rs`) sends that Escape
+and never selects an option. Option 2 arms Claude's automatic continue, and
+option 3 spends money.
+
+It acts on a live Claude session only when all of these hold:
+
+- Presence reports `waiting` with `waitingFor: "dialog open"`. Permission
+  prompts report `permission prompt` and are never touched.
+- The visible screen, rendered from the replay ring at the session's size,
+  ends with the menu: the limit header, the question, the "Stop and wait"
+  option and the footer within its last rows. Scrollback and transcript text
+  never count. The confirmation shown after choosing option 2 ("… Press esc to
+  cancel the wait") does not match, so a chosen wait is never cancelled.
+- It has seen the menu for 120 seconds with the same option highlighted, and
+  nobody has typed or delivered input for 120 seconds. Arrow keys do not stamp
+  operator input, so moving the highlight restarts the grace instead.
+- Immediately before the write, under the session writer, nothing new has been
+  printed and no input has arrived.
+
+The Escape uses the `send_key` encoding (kitty `CSI 27 u` for Claude) but its
+own write, which stamps no input clock. `send_key` records operator input,
+which would make limit recovery's admission refuse that session. The 10
+seconds after each Escape are allowed for the menu to close. CM sends at most
+three Escapes per turn boundary, 30 seconds apart; if the menu is still open
+after the third, `detail.limit_menu` becomes `needs_human` (the state remains
+waiting-on-human) and CM stops. A menu that closed after CM's Escape reads
+`cleared`; `escape_sent` covers the check in between. When a human later closes
+a menu CM gave up on, the flag is removed. Each step is logged as
+`cm-daemon: Claude usage-limit menu on <uid> (<label>) …`. The record survives a
+brain restart in the agent-state sidecar, so a restart does not reset the
+attempt bound.
+
+Clearing the menu does not resume the session.
+[`claude_limit_recovery`](claude-account-limit-recovery.md) alone decides
+that: it needs presence idle at the failed boundary, which a session with the
+menu open never has. Where recovery is off (f-sessions, per EP 2026-10-29),
+the session simply waits at its failed turn as `errored` with
+`error_kind=rate_limit`. Set `claude_limit_menu_clear = false` in `daemon.toml`
+and run `daemon.reload_config` (or SIGHUP the brain) to stop new Escapes;
+checks already in progress still record their outcome. Deployment needs only
+the updated brain; no session restart or MCP reconnect is required.

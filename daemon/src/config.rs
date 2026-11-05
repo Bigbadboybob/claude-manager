@@ -410,6 +410,12 @@ pub struct DaemonConfig {
     /// limit clears. Set false and reload config to disable new attempts.
     #[serde(default = "default_claude_limit_recovery")]
     pub claude_limit_recovery: bool,
+    /// Press Escape (never an option) on Claude's usage-limit menu after a
+    /// grace, so sessions do not park on it. Independent of
+    /// `claude_limit_recovery`, which alone decides whether a session is
+    /// resumed. Set false and reload config to stop new Escapes.
+    #[serde(default = "default_claude_limit_menu_clear")]
+    pub claude_limit_menu_clear: bool,
     /// Reloadable allocator maintenance. Interval zero disables periodic runs.
     #[serde(default)]
     pub memory: MemoryConfig,
@@ -614,6 +620,7 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             claude_limit_recovery: true,
+            claude_limit_menu_clear: default_claude_limit_menu_clear(),
             memory: MemoryConfig::default(),
             s4_min_write: false,
             chat_search_budget_bytes: default_chat_search_budget_bytes(),
@@ -639,6 +646,7 @@ impl Default for DaemonConfig {
 }
 
 fn default_claude_limit_recovery() -> bool { true }
+fn default_claude_limit_menu_clear() -> bool { true }
 
 /// Errors surfaced by `DaemonConfig::load_or_default`.
 #[derive(Debug)]
@@ -917,6 +925,7 @@ mode = "ssh-trust"
     fn serde_round_trip() {
         let original = DaemonConfig {
             claude_limit_recovery: true,
+            claude_limit_menu_clear: false,
             memory: MemoryConfig::default(),
             s4_min_write: true,
             transcript_rotation: Default::default(),
@@ -949,6 +958,7 @@ mode = "ssh-trust"
         assert!(reparsed.s4_min_write);
         assert_eq!(reparsed.mcp_server_path, original.mcp_server_path);
         assert_eq!(reparsed.presence_idle_enabled, original.presence_idle_enabled);
+        assert_eq!(reparsed.claude_limit_menu_clear, original.claude_limit_menu_clear);
         assert_eq!(reparsed.workflow_state_gate, original.workflow_state_gate);
         assert_eq!(reparsed.api_url, original.api_url);
         assert_eq!(reparsed.api_token, original.api_token);

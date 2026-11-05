@@ -3146,6 +3146,35 @@ impl InputHandle {
         Ok(())
     }
 
+    /// CM's own Escape on Claude's usage-limit menu (`claude_limit_menu`).
+    /// Unlike [`write_key`](Self::write_key) it stamps no input clock:
+    /// Escape closes the menu without typing, submitting or starting a
+    /// turn, so the failed-turn boundary that limit recovery admits on
+    /// (and a done report) must survive it. Refused, before any byte,
+    /// while recovery or retirement holds the input gate, when a human or
+    /// agent wrote input within `quiet`, or when `screen_unchanged` reports
+    /// new output since the caller matched the menu.
+    pub(crate) fn write_limit_menu_escape(&self, bytes: &[u8], quiet: std::time::Duration,
+        screen_unchanged: impl FnOnce() -> bool) -> std::io::Result<bool> {
+        let _permit = crate::writer_gate::write_permit();
+        let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
+        let _fence = match gate.as_ref().map(|g| g.try_read()) {
+            Some(Ok(guard)) => Some(guard),
+            Some(Err(_)) => return Ok(false),
+            None => None,
+        };
+        if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
+        let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        let recent = |slot: &SharedLastActivity| slot.lock().unwrap_or_else(|p| p.into_inner())
+            .is_some_and(|at| at.elapsed() < quiet);
+        if recent(&self.last_operator_input_at) || recent(&self.last_input_at) || !screen_unchanged() {
+            return Ok(false);
+        }
+        writer.write_all(bytes)?;
+        writer.flush()?;
+        Ok(true)
+    }
+
     /// A recovery Enter must not touch a draft typed since the agent paste.
     /// Check under the same writer lock used to stamp human input, closing
     /// the race between checking operator activity and writing the retry.

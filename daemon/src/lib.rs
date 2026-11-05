@@ -68,6 +68,7 @@ pub mod claude_presence;
 mod claude_wait;
 pub mod claude_recovery;
 pub mod claude_account_recovery;
+pub mod claude_limit_menu;
 pub mod codex_trust;
 pub mod codex_recovery;
 pub mod config;

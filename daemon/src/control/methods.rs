@@ -24173,6 +24173,7 @@ mod tests {
             );
             s.config = crate::config::DaemonConfig {
                 claude_limit_recovery: true,
+                claude_limit_menu_clear: true,
                 memory: Default::default(),
                 s4_min_write: false,
                 transcript_rotation: Default::default(),
