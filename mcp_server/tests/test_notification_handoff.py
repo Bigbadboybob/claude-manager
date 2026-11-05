@@ -554,6 +554,36 @@ class ClaudeEvidenceTests(unittest.IsolatedAsyncioTestCase):
             with mock.patch("mcp_server.native_claude.TAIL_BYTES", 4000 * 50 + 300):
                 self.assertEqual(ClaudeAdapter.stale_evidence(str(path), markers), [])
 
+    def test_own_evidence_rereads_only_a_changed_transcript(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.jsonl"
+            markers = ["[cm-chat a]", "[cm-chat b]", "[cm-chat c]"]
+            enq = lambda m: json.dumps({"type": "queue-operation", "operation": "enqueue",
+                                        "content": f"<channel>{m} hint</channel>"}) + "\n"
+            path.write_text("".join(enq(m) for m in markers))
+            adapter = ClaudeAdapter("uid")
+            reads = []
+            real = ClaudeAdapter.stale_evidence
+
+            def counting(own, marks):
+                reads.append(own)
+                return real(own, marks)
+
+            with mock.patch.object(ClaudeAdapter, "stale_evidence", staticmethod(counting)):
+                self.assertEqual(adapter.own_evidence(str(path), markers), ["enqueued_unobserved"])
+                self.assertEqual(adapter.own_evidence(str(path), markers), ["enqueued_unobserved"])
+                self.assertEqual(len(reads), 1, "an unchanged transcript is not read again")
+                self.assertEqual(adapter.own_evidence(str(path), markers[:2]), [])
+                self.assertEqual(len(reads), 2, "new markers re-evaluate")
+                with path.open("a") as out:
+                    out.write(json.dumps({"type": "queue-operation", "operation": "dequeue"}) + "\n")
+                self.assertEqual(adapter.own_evidence(str(path), markers), [])
+                self.assertEqual(len(reads), 3, "an appended transcript is read again")
+                path.unlink()
+                self.assertEqual(adapter.own_evidence(str(path), markers), [])
+                self.assertEqual(adapter.own_evidence(str(path), markers), [])
+                self.assertEqual(len(reads), 5, "a missing file is never cached")
+
     async def test_fork_leaves_old_consumer_stale_and_new_one_live(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)

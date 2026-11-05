@@ -268,6 +268,7 @@ class ClaudeAdapter:
         self._bg_probe_after = 0.0
         self._bg_result = None
         self._bg_identity = None
+        self._evidence_cache = None
 
     def identity(self):
         # No socket credentials in persistent diagnostics.
@@ -396,6 +397,22 @@ class ClaudeAdapter:
             out.append("enqueued_unobserved")
         return out
 
+    def own_evidence(self, own, markers):
+        """`stale_evidence`, reused while the transcript file and the markers
+        are unchanged: an idle session's diagnostics heartbeat otherwise
+        re-reads the same 2 MiB tail every 5 s."""
+        try:
+            st = os.stat(own)
+            key = (own, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, list(markers))
+        except OSError:
+            key = None
+        cached = self._evidence_cache
+        if key is not None and cached is not None and cached[0] == key:
+            return list(cached[1])
+        evidence = self.stale_evidence(own, markers)
+        self._evidence_cache = None if key is None else (key, list(evidence))
+        return evidence
+
     async def diagnostics(self, events):
         await self._resolve()
         live = self.live()
@@ -405,7 +422,7 @@ class ClaudeAdapter:
         own = self.own_transcript()
         if own:
             markers = delivery_health(events)["unobserved_markers"]
-            evidence = await asyncio.to_thread(self.stale_evidence, own, markers)
+            evidence = await asyncio.to_thread(self.own_evidence, own, markers)
             # `continued-in` alone can be an in-pane resume. Queue-only
             # submissions are stronger evidence even when inherited identity
             # misleadingly equals the daemon's binding.
