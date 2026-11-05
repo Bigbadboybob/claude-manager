@@ -562,6 +562,48 @@ class CleanupTests(unittest.TestCase):
         facts = cleanup.scope_facts(self.context, row, {'task-1'}, 'task-1')
         self.assertEqual(facts.task_ids, {'task-1'})
 
+    def test_lineage_prune_drops_only_old_unreachable_records_of_gone_checkouts(self):
+        directory = self.cm / 'worktree-lineage'
+        kept_child = lineage.register(self.child('kept-child'), self.worktree, inherit_session=False)
+        leaf_path = self.child('gone-leaf')
+        leaf = lineage.register(leaf_path, self.worktree, inherit_session=False)
+        middle_path = self.child('gone-middle')
+        middle = lineage.register(middle_path, self.worktree, inherit_session=False)
+        grandchild = lineage.register(self.child('grandchild', middle_path), middle_path, inherit_session=False)
+        moved_path = self.child('moved')
+        moved = lineage.register(moved_path, self.worktree, inherit_session=False)
+        recent_path = self.child('gone-recent')
+        recent = lineage.register(recent_path, self.worktree, inherit_session=False)
+        for path in (leaf_path, middle_path, recent_path):
+            self.git(self.repo, 'worktree', 'remove', str(path))
+        self.git(self.repo, 'worktree', 'move', str(moved_path), str(self.root / 'moved-elsewhere'))
+        orphan_lock = directory / (str(uuid.uuid4()) + '.lock')
+        orphan_lock.touch()
+        hook_lock = directory / 'hook-0123.lock'
+        hook_lock.touch()
+        old = time.time() - 40 * 86400
+        for path in directory.iterdir():
+            if path.name != recent['id'] + '.json':
+                os.utime(path, (old, old))
+
+        before = sorted(p.name for p in directory.iterdir())
+        dry = lineage.prune(14)
+        self.assertEqual(sorted(p.name for p in directory.iterdir()), before)
+        self.assertEqual((dry['live'], dry['ancestors_kept'], dry['stamped_kept'], dry['recent_kept']), (3, 1, 1, 1))
+        self.assertEqual((dry['removed'], dry['orphan_locks_removed']), (1, 1))
+
+        self.assertEqual(lineage.prune(14, apply=True)['removed'], 1)
+        self.assertFalse((directory / (leaf['id'] + '.json')).exists())
+        self.assertFalse((directory / (leaf['id'] + '.lock')).exists())
+        self.assertFalse(orphan_lock.exists())
+        self.assertTrue(hook_lock.exists())
+        for row in (self.parent, kept_child, middle, grandchild, moved, recent):
+            self.assertTrue((directory / (row['id'] + '.json')).exists(), row['path'])
+        # The surviving descendant still inherits its removed parent's owners.
+        facts = cleanup.scope_facts(self.context, lineage.records()[grandchild['id']], {'task-1'}, 'task-1')
+        self.assertEqual(facts.task_ids, {'task-1'})
+        self.assertEqual(lineage.prune(14, apply=True)['removed'], 0)
+
     def test_symlink_checkout_is_rejected(self):
         link = self.root / 'alias'
         link.symlink_to(self.worktree)

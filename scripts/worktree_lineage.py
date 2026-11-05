@@ -237,6 +237,84 @@ def register(path: Path, parent: Path | None = None, task_ids=(), source='git-ho
     return value
 
 
+PRUNE_AFTER_DAYS = 14.0
+
+
+def prune(min_age_days: float = PRUNE_AFTER_DAYS, apply: bool = False, now: float | None = None) -> dict:
+    """Drop creation evidence nothing can use any more (#109).
+
+    Every record stays until its checkout is gone, so the directory only grew:
+    on cm-sessions 2026-11-05 it held 6,849 records (and as many `.lock`
+    files) for 232 live checkouts, and every cleanup preview and per-candidate
+    scope check reads all of them (0.65 s warm, 7.8 s cold each time).
+
+    A record is removed only when all of these hold:
+    - its checkout is not current (`records()` rejected it);
+    - its own identity stamp is gone too, so a moved checkout keeps its record;
+    - no current checkout descends from it, since a reaped ancestor's task ids
+      still protect surviving descendants;
+    - nothing has rewritten it for `min_age_days`.
+    New records only ever name existing parents, so a removed record cannot be
+    needed later. Dry run unless `apply`."""
+    now = time.time() if now is None else now
+    directory = cm_home() / 'worktree-lineage'
+    stored = stored_records()
+    live = records()
+    needed = set(live)
+    pending = list(live)
+    while pending:
+        for parent in stored.get(pending.pop(), {}).get('parents', []):
+            if parent not in needed:
+                needed.add(parent)
+                pending.append(parent)
+    cutoff = now - min_age_days * 86400
+    summary = {'mode': 'apply' if apply else 'dry-run', 'min_age_days': min_age_days, 'records': len(stored),
+               'live': len(live), 'ancestors_kept': len(needed - set(live)), 'recent_kept': 0,
+               'stamped_kept': 0, 'removed': 0, 'orphan_locks_removed': 0}
+    for ident, row in stored.items():
+        if ident in needed:
+            continue
+        target = directory / (ident + '.json')
+        try:
+            if target.stat().st_mtime > cutoff:
+                summary['recent_kept'] += 1
+                continue
+        except FileNotFoundError:
+            continue
+        try:
+            stamped = (Path(row['git_dir']) / 'cm-checkout-id').read_text().strip() == ident
+        except FileNotFoundError:
+            stamped = False
+        except (OSError, KeyError, TypeError):
+            stamped = True  # unreadable is not proof of absence
+        if stamped:
+            summary['stamped_kept'] += 1
+            continue
+        summary['removed'] += 1
+        if apply:
+            lock = target.with_suffix('.lock')
+            with locked(lock):
+                target.unlink(missing_ok=True)
+            lock.unlink(missing_ok=True)
+    # Per-record locks whose record is gone (hook locks are named `hook-*`).
+    for lock in directory.glob('*.lock'):
+        try:
+            ident = str(uuid.UUID(lock.stem))
+        except ValueError:
+            continue
+        if lock.stem != ident or ident in stored or (directory / (ident + '.json')).exists():
+            continue
+        try:
+            if lock.stat().st_mtime > cutoff:
+                continue
+        except FileNotFoundError:
+            continue
+        summary['orphan_locks_removed'] += 1
+        if apply:
+            lock.unlink(missing_ok=True)
+    return summary
+
+
 def _chain_hook(repo: Path, name: str, marker: str, ours: str, ours_first: bool) -> dict:
     """Chain the existing `name` hook in place; never change core.hooksPath or bootstrap.
 
@@ -386,5 +464,12 @@ if __name__ == '__main__':
     elif sys.argv[1:2] == ['install']:
         for arg in sys.argv[2:]:
             print(json.dumps(install_hooks(Path(arg))))
+    elif sys.argv[1:2] == ['prune']:
+        # prune [--days N] [--apply]: dry run by default.
+        rest = sys.argv[2:]
+        days = float(rest[rest.index('--days') + 1]) if '--days' in rest else PRUNE_AFTER_DAYS
+        if days <= 0:
+            raise SystemExit('--days must be positive')
+        print(json.dumps(prune(days, apply='--apply' in rest)))
     elif sys.argv[1:2] == ['register']:
         print(json.dumps(register(Path(sys.argv[2]), Path(sys.argv[3]) if len(sys.argv) > 3 else None, source='cm')))

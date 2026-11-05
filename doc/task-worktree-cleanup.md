@@ -137,6 +137,18 @@ hooks in another repository:
 python3 ~/.cm/worktree-tools/worktree_lineage.py install /absolute/repository
 ```
 
+Records of removed checkouts are kept only while they are useful. `prune`
+removes a record once its checkout and identity stamp are gone, no current
+checkout descends from it, and it has not been rewritten for 14 days. It also
+removes its `.lock` file. A dry run is the default:
+
+```bash
+python3 ~/.cm/worktree-tools/worktree_lineage.py prune [--days N] [--apply]
+```
+
+On cm-sessions on 2026-11-05 there were 6,849 records for 232 live checkouts.
+Every preview reads all of them, at 0.65 s warm and 7.8 s cold.
+
 The same install also chains a `prepare-commit-msg` hook (org model §8.3).
 A commit made inside a CM session gets a `CM-Session: <session uid>` trailer,
 and `CM-Member: <id>` once sessions carry a member id. The hook runs after any
