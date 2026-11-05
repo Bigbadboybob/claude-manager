@@ -16,7 +16,7 @@ use crate::agent_memory;
 use crate::api::Task;
 use crate::backend::{BackendEvent, BackendHandle};
 use crate::config::Config;
-use crate::planning::{LaunchEngine, PlanAction, PlanningView, WorkspaceCandidate};
+use crate::planning::{LaunchEngine, PlanAction, PlanningView};
 use crate::session::Session;
 use crate::terminal_widget::TerminalWidget;
 use crate::theme;

@@ -94,27 +94,39 @@ on, so a poll that moves rows doesn't change its target.
 
 ## Planning view: placing tasks
 
-When the API serves placement (`boards.on_boards`: probed once on entering the
+Planning is the backlog only (Owner decision O7, [org model
+§13.4](org-model.md#134-close-out-owner-2026-11-05)): it adds and edits tasks
+and places them on boards. It has no Launch path; one-off sessions start from
+the Sessions view (`A-n` / `A-s`).
+
+Placement support is read from `boards.on_boards`: probed once on entering the
 planning view, then polled every 30 s only while the On-boards strip is shown
 and the terminal is focused, with `since_version` so an idle board answers
-`unchanged`; a full read at most every 5 minutes):
+`unchanged`; a full read at most every 5 minutes.
 
-- **`A-f`** opens a chooser with **Launch** preselected, so Enter keeps
-  today's launch flow (`l` also launches). **Place on a board…** (`p`, or ↓
-  then Enter) opens the place dialog. A placed task also offers **Unplace**
-  (`u`), which returns it to the backlog. On an old API, `A-f` is the plain
-  launch, as before.
+- **`A-f`** opens the place dialog for the selected task. When the daemon or
+  planning API is too old to place, `A-f` shows a notice saying so (and that
+  sessions start from the Sessions view) and asks again on the next tick; it
+  never falls back to launching. Before the first answer the dialog opens, and
+  an unsupported answer replaces its contents with the same notice.
 - **Place dialog:** Tab moves between fields and ←/→ changes the value:
   - **board:** an open board;
   - **epic:** none, or one of the board's active epics;
-  - **holder:** nobody (open), a member, or *hire a new member…* (Enter,
-    then a handle and an optional title).
+  - **holder:** nobody (open), a member, a team, or *hire a new member…*
+    (Enter, then a handle and an optional title). A team (O8) shows its lead
+    (`team Alpha → lead ep hands it out`, or `(no lead: placing is refused)`).
 
   Enter places the task with `item.place {task_id, board, group_id?, holder?,
-  role: "owner", replace?, request_id}`. A member is named by its main
-  session uid, else its handle. A hire runs `org.hire` first and then places
-  the task with the new handle, and the dialog says so if the API can't hire
-  yet. Placing a task that is on another board sends `replace`.
+  role: "owner", team?, replace?, request_id}`. A member is named by its main
+  session uid, else its handle. A team is sent as `team` with no holder: the
+  API gives the item to the team lead's main session as owner, sets the item's
+  team, and the lead's "assigned" push tells it to hand the work out. CM never
+  picks a member; a team with no lead, or whose lead has no main session, is
+  refused (`team_no_lead`, `team_lead_no_session`). A hire runs `org.hire`
+  first and then places the task with the new handle, and the dialog says so
+  if the API can't hire yet. Placing a task that is on another board sends
+  `replace`. On a placed task the dialog's title shows `(on board #n)` and
+  `u` unplaces it (back to the backlog).
 - **Board chip.** A placed task shows `[board #n mark]` before its title,
   and the detail pane adds `Board: board #n (status) · group`, noting when
   the status mirror is off.

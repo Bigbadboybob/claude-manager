@@ -1,4 +1,5 @@
-//! Remote planning launches: checkout setup and attachment must not block input.
+//! Remote task-bound launches (A-n "Reports to"): checkout setup and
+//! attachment must not block input. Planning itself never launches (O7).
 use super::*;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 

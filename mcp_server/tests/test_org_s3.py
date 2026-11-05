@@ -550,6 +550,72 @@ class OrgS3Db(unittest.IsolatedAsyncioTestCase):
                 "SELECT until FROM team_memberships WHERE member_id = 'mem_lane' AND role = 'guest'")
         self.assertIsNotNone(until, "the guest membership ended")
 
+    # ---- O8: a team holds work through its lead --------------------------
+    async def test_placing_for_a_team_goes_to_its_lead(self):
+        """doc/org-model.md §13.4 O8: the item goes to the team lead's main
+        session as owner, carries the team, and tells the lead to hand it
+        out. CM never picks a member: no lead, or a lead with no main
+        session, is refused."""
+        try:
+            from dispatch import org_db
+        except ImportError:
+            self.skipTest("needs the org core (S2)")
+        lfl = agent("lfl")
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO members (id, handle, kind, manager_member_id)
+                   VALUES ('mem_lfl', 'lfl', 'agent', 'mem_owner'),
+                          ('mem_lane', 'lane', 'agent', 'mem_lfl'),
+                          ('mem_idle', 'idle', 'agent', 'mem_owner')
+                   ON CONFLICT DO NOTHING""")
+            await conn.execute(
+                """INSERT INTO member_aliases (org_id, alias, member_id)
+                   VALUES ('main', 'lfl', 'mem_lfl'), ('main', 'lane', 'mem_lane'),
+                          ('main', 'idle', 'mem_idle')
+                   ON CONFLICT DO NOTHING""")
+            await conn.execute(
+                """INSERT INTO incarnations (member_id, role, pid, daemon_id, session_uid)
+                   VALUES ('mem_lfl', 'main', $1, 'd1', 'lfl-uid'),
+                          ('mem_lane', 'main', $2, 'd1', 'lane-uid')""", lfl["pid"], LANE["pid"])
+        alpha = await org_db.team_create(self.pool, OWNER, name="Alpha", lead="lfl")
+        await org_db.team_create(self.pool, OWNER, name="Beta")
+        await org_db.team_create(self.pool, OWNER, name="Gamma", lead="idle")
+        await self.beat(ORCH, lfl, LANE, task=self.root, caps=GUARDED)
+
+        t = await self.task("forecaster")
+        r = await self.place(t, team="alpha")
+        body = r.json()
+        self.assertEqual(body["team"], {"id": alpha["id"], "slug": "alpha", "name": "Alpha",
+                                        "lead_member_id": "mem_lfl", "lead_handle": "lfl"})
+        self.assertEqual((body["item_status"], body["task_status"]), ("active", "running"))
+        item = await self.item(body["n"])
+        self.assertEqual([(h["pid"], h.get("role")) for h in item["holders"]],
+                         [(lfl["pid"], "owner")], "the lead, never a member")
+        self.assertEqual(item["team_id"], alpha["id"])
+        async with self.pool.acquire() as conn:
+            push = await conn.fetchrow(
+                "SELECT session_uid, text FROM item_pushes WHERE kind = 'assigned' AND pid = $1",
+                lfl["pid"])
+        self.assertEqual(push["session_uid"], "lfl-uid")
+        self.assertIn("It is for team Alpha, which you lead: hand it to a member", push["text"])
+        # By team id too.
+        t_id = await self.task("by id")
+        self.assertEqual((await self.place(t_id, team=alpha["id"])).json()["team"]["slug"], "alpha")
+
+        refused = {
+            "beta": (409, "team_no_lead"),
+            "gamma": (409, "team_lead_no_session"),
+            "nope": (404, "team_not_found"),
+        }
+        for team, (status, code) in refused.items():
+            t2 = await self.task(f"for {team}")
+            r = await self.place(t2, ok=False, team=team)
+            self.assertEqual((r.status_code, r.json()["detail"]["code"]), (status, code), r.text)
+            self.assertEqual((await self.task_row(t2))["status"], "backlog", "nothing placed")
+        t3 = await self.task("both")
+        r = await self.place(t3, ok=False, team="alpha", holder=LANE)
+        self.assertEqual((r.status_code, r.json()["detail"]["code"]), (422, "holder_or_team"))
+
     # ---- review of 6522623 ---------------------------------------------
     async def test_the_mirror_gate_fails_closed_and_legacy_writes_still_land(self):
         async with self.pool.acquire() as conn:

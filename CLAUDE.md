@@ -32,7 +32,7 @@ Effort levels are low/medium/high/xhigh, plus max on Claude. Both are recorded
 on the session, reused by revive/resume (older sessions: what the transcript
 ran on, else the default as `default_on_resume`), and shown in
 `list_sessions`, `A-i` and F6. The Model row (Effort on Shift+←/→) is in
-`A-n`, `A-s`, `A-F` and the `A-f` dialogs (Alt+o). See
+`A-n`, `A-s` and `A-F` (Alt+o). See
 [explicit model and effort](doc/models.md).
 
 ## Repository workflow
@@ -67,7 +67,7 @@ Preferences live on the laptop in `~/.cm/tui-settings.toml` and apply
 immediately when saved. See [sidebar appearance settings](doc/sidebar-sections.md#layout).
 
 The **Staffing policy** row (`s`) edits Owner's central engine guidance: rules,
-default and an optional expiring preference. A-n, A-s and A-f preselect from
+default and an optional expiring preference. A-n and A-s preselect from
 the cached policy. See [staffing policy](doc/staffing-policy.md).
 
 ## If you are running inside CM
@@ -118,7 +118,7 @@ For a tutorial to hand to existing agents, use [Claude Manager: quick start for 
   `daemon.restart` / `rollback_brain` / `upgrade_holder` / `migrate_split` / `split_rollback` are strong-operator gated (fail CLOSED when the daemon started without `CM_OPERATOR_TOKEN` — the TUI sets it and persists the token at `~/.cm/operator-token`, which cm-redeploy reads); `daemon.restart` still refuses on `[tls]`-configured daemons (listener handoff unimplemented — use the `--hard` row there). Verification is fire-and-verify: the RPC connection dies at the exec/brain-exit, so callers poll `daemon.health` — in split mode the surface is `split`, `holder_epoch` (the brain-generation counter), `holder_build_id`, `brain_pid`, `breaker_state`, `brain_restarts`, `sessions`; the all-clear after a deploy is `breaker_state == "running"` with no `brain_restarts` delta through the breaker's 10-minute stability horizon.
 - **`workflows/`** — TOML definitions for multi-agent workflows (e.g. `feedback.toml`). Loaded at TUI startup; each defines roles, transitions, and activation prompts. See the Workflows section below.
 - **`mcp_server/`** — MCP server exposing tools that agents running inside the TUI can call:
-  - `place(task, board, group, holder)` / `unplace(task)` / `epic(action=...)` — org model S3 ([org-model.md](doc/org-model.md) §7, contract in [items-board.md](doc/items-board.md) §8): placing links a planning task to a board item that owns its status, holders and group (the task's status mirrors it, with `terminal_via=item` on a board close, so the terminal sweep only unassigns); one owner per held item; groups are headings or epics with a PoC-led team and a persisted close plan; launch grants let an item's owner launch for its task.
+  - `place(task, board, group, holder | team)` / `unplace(task)` / `epic(action=...)` — org model S3 ([org-model.md](doc/org-model.md) §7, contract in [items-board.md](doc/items-board.md) §8): placing links a planning task to a board item that owns its status, holders and group; `team=` (O8) gives it to that team's lead's main session as owner and sets the item's team (no lead, or a lead without a main session, is refused) (the task's status mirrors it, with `terminal_via=item` on a board close, so the terminal sweep only unassigns); one owner per held item; groups are headings or epics with a PoC-led team and a persisted close plan; launch grants let an item's owner launch for its task.
   - **Durable assistants (O5)**: an agent spawned by a member's session (main or assistant) is that member's assistant: stamped `org.member_id`/`acting_as="assistant"` at spawn (a fork from its source), backfilled by spawner (task chain only for a broken chain), never for an Owner-started session or a shell; a continuous member's spawns are `worker`s, attributed but torn down as today (`daemon/src/assistants.rs`; `list_sessions` `member`). The terminal sweep, `mark_subtask_done`, A-D and teardown never close an assistant or remove its checkout (its minted checkout is a `stream`; the reaper protects it while the assistant was live within 7 days); `org(action="close_assistant")` / A-w / an agent's `kill_session` end it (holds go back to the member). `org(action="promote", session=, handle=, reason=)` makes one the main session of a new member reporting to it, keeping its session, checkout (now `home`) and holds. Gated by brain-only `assistant_guard_v1` beside `lifecycle_guard_v1` in the status mirror. See [org-core-api.md](doc/org-core-api.md#assistants-o5).
   - **Spawn-time setup (#28)**: `start_session(name=, channels=, board=, group=/epic=, items=, poc_of=, hire=)` sets the new session up with the creator's authority right after the spawn (daemon `session.setup`, `daemon/src/spawn_setup.rs`): chat name (a first claim, no message), channel joins, board membership (`board.join`, table `board_members`), item holds, epic PoC; `hire` uses org's promote. Per-step `setup` result; a refused step never stops the spawn. `org(action="setup", session_uid=...)` repeats it for a session you spawned. `set_poc` takes `session=`, joins a PoC that never touched the board, and is open to the board's steward and the epic's PoC chain too. Recipe for a new lead in [ORCHESTRATION.md §11](doc/ORCHESTRATION.md).
   - `propose_task(...)` — push a task to the planning backlog. The row gets the target project's repo (`GET /projects`: the project record, else the repo most of its rows carry), never the caller's checkout unless the caller works in that same, still repo-less project; an unknown project is refused. `create_subtask` into another project, or under a lead whose checkout is another repo, likewise cuts from that repo's clone at its trunk. New rows stamp versioned `metadata.filer` provenance from the authenticated caller (engine, session, parent task, workspace/worktree, machine, continuous/workflow context, manager, and submission surface); planning detail renders it in every board column, while legacy rows simply omit it. When the proposer is a tasked session, the daemon records a creator edge (`DaemonState::agent_task_edges`, surviving TUI `task.update_tree` pushes and daemon restarts) so the proposer can `start_session(task_id=<proposed>)` and drive the worker it spawns — pre-fix every such spawn bounced `unauthorized: task '<id>' is not the caller's task or a descendant` (the "phantom task each attempt" bug). A proposed task has no worktree; `start_session` **mints** it one (see below) rather than spawning the worker in the creator's workspace.
@@ -169,7 +169,7 @@ Local session state lives on disk:
 
 ### Planning view
 
-A task board for triaging a backlog before you work on it. Tasks have statuses (`draft` → `backlog` → `running` → `done` / `blocked`). Launch a task from here with `A-f` (cloud) or `A-l` (linear-mode launch).
+The backlog (Owner decision O7, [org model §13.4](doc/org-model.md#134-close-out-owner-2026-11-05)): add and edit tasks, then place them on boards with `A-f`. Tasks have statuses (`draft` → `backlog` → `running` → `done` / `blocked`); a placed task's status follows its board item. Planning never launches a session: one-off sessions start from the Sessions view (`A-n` / `A-s`).
 
 ## Workflows (multi-agent framework)
 
@@ -203,13 +203,13 @@ Global:
 - `A-?` — show/hide shortcut hints in Sessions and Planning; saved in `~/.cm/tui-sessions.json` and restored on viewer restart
 - `A-q` — quit
 - `A-j/k` — navigate
-- `A-u` / `A-d` — page the focused list up / down by half its visible rows, like vim's Ctrl-u / Ctrl-d; stops at the ends. In Planning, `A-y` unbinds a task and `A-U` unlaunches it
+- `A-u` / `A-d` — page the focused list up / down by half its visible rows, like vim's Ctrl-u / Ctrl-d; stops at the ends. In Planning, `A-y` unbinds a task
 - `A-D` — mark task done (Sessions and Planning; moved from `A-d` 2026-10-20)
 - `A-x` — delete
 - `A-,` — toggle the activity feed (5-line strip above the status bar showing recent agent-initiated mutations: start_session, send_input, kill_session, start/stop_workflow, create_subtask, mark_subtask_done). Off by default.
 
 Sessions view:
-- `A-n` — new workspace (creates a worktree); Tab to Engine and ←/→ to choose Claude or Codex, preselected by staffing policy. **Reports to** (last field): Standalone by default; Enter or typing opens the type-to-filter task picker, Backspace returns to Standalone. With a parent chosen, A-n first creates the workspace's task under it (`parent_task_id`, inheriting its division), then launches it like a planning launch. It can't be combined with Seed.
+- `A-n` — new workspace (creates a worktree); Tab to Engine and ←/→ to choose Claude or Codex, preselected by staffing policy. **Reports to** (last field): Standalone by default; Enter or typing opens the type-to-filter task picker, Backspace returns to Standalone. With a parent chosen, A-n first creates the workspace's task under it (`parent_task_id`, inheriting its division), then launches a session bound to that task. It can't be combined with Seed.
 - `A-s` — add a session to the focused task (preselected by staffing policy). The form has a **Resume** field (Tab to it, Enter opens a picker of the worktree's claude/codex transcripts, newest first with age, size, and the first prompt): the new session spawns `claude --resume <id>` / `codex resume <id>` with its row bound to that transcript from the start. This is the native replacement for "A-s, then `/resume` inside the pane". Mutually exclusive with the Seed field.
 - `A-a` — attach
 - `A-F` — **fork into a task**: on a Claude/Codex session row, opens a form — Into (new task / existing task), Task (name prefilled `<label> fork`, or a type-to-filter task picker), Parent (new task only: the source's task, top-level in the same project, or any task via the picker), Base (source HEAD / trunk). No prompt: the fork waits at its composer for your first message. The source's host runs the engine-native fork (`claude --resume <id> --fork-session --session-id <new>` / `codex fork <id>`) in the new task's own `cm-sub/...` worktree, or in the existing task's workspace (shared checkouts allowed). The source is untouched and CM keeps no history copy (unlike `A-b` snapshots). The status line names the source branch, the source commits not carried over, and any uncommitted source files left behind. Same daemon RPC (`session.fork`) as the MCP `fork_session` tool. See [doc/fork-session-into-task.md](doc/fork-session-into-task.md).
@@ -240,21 +240,8 @@ Sidebar/pane state cues: idle sessions age through three visual buckets — just
 
 Planning view:
 - `/` — incremental search: live-jumps to the first match as you type (Esc restores cursor + fold state, Enter commits). `n`/`N` cycle through matches afterwards with a `match i/N` echo; matching titles highlight; jumping to a folded subtask auto-unfolds its ancestors. The old always-on `[debug]` grid line is gone (re-enable with `CM_PLANNING_DEBUG=1`).
-- `A-e` edit, `A-n` new, `A-N` new subtask of focused task (persists `parent_task_id` on the API row; same input form as `A-n` with the parent name shown for confirmation; worktree mode defaults to `inherit`), `A-a` accept (claim claude-proposed task), `A-i` insert header (bold-text section label), `A-A` bulk-archive done tasks in current project (with confirm), `A-V` toggle archived task visibility, `A-s/S` cycle status, `A-f` launch (cloud) — when the API serves placement it opens a chooser with Launch preselected (Enter keeps the launch flow; `p`/↓ gives Place on a board…, with board, epic and holder or hire; placed tasks show a board chip and `A-b` toggles a read-only On boards strip; [org TUI](doc/org-tui.md#planning-view-placing-tasks)), `A-g` grid/linear toggle, `Space` toggle subtask fold on focused parent
+- `A-e` edit, `A-n` new, `A-N` new subtask of focused task (persists `parent_task_id` on the API row; same input form as `A-n` with the parent name shown for confirmation; worktree mode defaults to `inherit`), `A-a` accept (claim claude-proposed task), `A-i` insert header (bold-text section label), `A-A` bulk-archive done tasks in current project (with confirm), `A-V` toggle archived task visibility, `A-s/S` cycle status, `A-f` **place on a board** — the dialog picks board, epic and holder: nobody, a member, a team (O8: the item goes to the team lead's main session, and the lead hands it out; CM never picks a member) or a new hire; on a placed task `u` unplaces it. Placed tasks show a board chip and `A-b` toggles a read-only On boards strip. When the daemon or planning API is too old to place, `A-f` says so; there is no launch fallback ([org TUI](doc/org-tui.md#planning-view-placing-tasks)). `A-g` grid/linear toggle, `Space` toggle subtask fold on focused parent
 - `A-w` — **watch a cloud backtest** (only on a `kind=backtest` task): spawns a local, READ-ONLY terminal view of the worker VM's tmux (the pipeline runs in a root-owned tmux named `backtest`), rendered like any other session and switched to in the Sessions view. Runs `gcloud compute ssh <worker_vm> --project <metadata.vm.project> --zone <metadata.vm.zone> -- -t "TERM=xterm-256color sudo sh -c '…wait for the backtest session then exec tmux attach -r -t backtest…'"` — the `-r` makes the attach read-only so watching can never disturb the run. It waits (bounded ~120s) for the session because `worker_vm`/`ttyd_url` are stamped at VM-CREATE time, before the in-VM startup has created the tmux — so hitting `A-w` the instant a VM appears would otherwise race the session and get an immediate "no sessions" exit. **The VM's project comes from `metadata.vm.project`, NOT the CM default project** (backtest VMs run in `prediction-market-scalper`). Direct SSH by default (the backtest project's firewall already allows tcp:22); set `CM_BACKTEST_SSH_IAP=1` to route through `--tunnel-through-iap` if your network blocks outbound port 22. On a non-backtest task, or a backtest not yet dispatched (no `worker_vm`), `A-w` shows a status-line hint instead of spawning; if the VM is already gone the ssh fails and the session exits cleanly.
-
-The `A-f` launch dialogs (the "Launch Into" workspace picker and the
-"Launch Task" branch prompt) carry an **Engine** field — `claude`
-or `codex` — cycled with `←`/`→`/`Tab`. The choice is picked
-once in the workspace picker and rides into the branch dialog, so both
-launch routes (new worktree / existing workspace) spawn the chosen
-agent. Each fresh dialog preselects Owner's cached staffing policy (Codex
-when no policy has been seen). Agents can omit `type` in `start_session`
-and pass `work_kind` for the same selection; explicit choices win.
-Both dialogs also show **Reports to**
-(the task's current parent, or Standalone). **Alt+r** opens the task
-picker; it lists open tasks, excluding the task's own subtree. A change
-is PATCHed as `parent_task_id` when the task launches.
 
 The grid renders subtasks as an indented tree under each parent in
 the parent's column. Subtasks are hidden from their own raw column
@@ -270,7 +257,7 @@ operate on. `A-J/K` reorder is the exception: on a subtask it
 swaps with the adjacent sibling under the same parent (clamped
 to the parent's slot range, so subtasks never leak out from
 under their parent). Task-level ops (`A-D` done, `A-s/S` status,
-`A-e` edit, `A-x` delete, `A-f` launch) work on subtasks normally
+`A-e` edit, `A-x` delete, `A-f` place) work on subtasks normally
 since they go through the slug, not the raw layout.
 
 ## Persistent cloud sessions

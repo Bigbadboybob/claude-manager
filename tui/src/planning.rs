@@ -93,12 +93,8 @@ pub struct PlanTask {
     pub source: String,
     pub is_cloud: bool,
     pub repo_url: String,
-    /// Sub-2a Finding #2: pinned at the planning row so launch
-    /// actions can surface the parent edge in `LaunchTask` /
-    /// `LaunchTaskIntoWorkspace`. Without it the launch site
-    /// would have to look up the parent off the API row again
-    /// — which is exactly the race the finding describes (local
-    /// stub init happens BEFORE the next API reconcile).
+    /// The reporting line (`parent_task_id` on the API row): subtask
+    /// folding, `A-N` and the "Reports to" pickers read it.
     pub parent_task_id: Option<String>,
     /// First-class initiative membership. `None` means standalone task.
     pub initiative_id: Option<String>,
@@ -449,11 +445,11 @@ struct ProjectData {
 #[derive(Clone, Copy, PartialEq)]
 enum NewProjectField { Name, RepoUrl }
 
-/// Agent engine chosen in the workspace and planning launch dialogs.
+/// Agent engine chosen in the Sessions view's workspace dialog (`A-n`).
 /// Codex is the default; `←/→` cycles. Only the two agent engines are
-/// offered — a planning launch always delivers the task prompt to an
-/// agent, so `bash` (the third session type elsewhere in the TUI) has
-/// no meaning here.
+/// offered: a task-bound launch delivers the task prompt to an agent, so
+/// `bash` (the third session type elsewhere in the TUI) has no meaning
+/// here. Planning never launches (doc/org-model.md §13.4, O7).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LaunchEngine {
     Claude,
@@ -491,7 +487,7 @@ impl Default for LaunchEngine {
     }
 }
 
-/// The `Engine: [claude]  codex` row shared by the launch dialogs.
+/// The `Engine: [claude]  codex` row of the workspace dialog.
 /// Selected option is bracketed + bold so it reads at a glance in the
 /// same style as the other in-place cyclers (A-e color pickers).
 pub(crate) fn engine_line(engine: LaunchEngine) -> Line<'static> {
@@ -537,27 +533,8 @@ enum PlanInputMode {
     BulkArchiveConfirm { project_idx: usize, count: usize },
     NewProject { name: String, repo_url: String, field: NewProjectField },
     ProjectPicker { selected: usize },
-    /// Before LaunchConfirm: pick either "new workspace" or an existing one.
-    /// Selected is an index into [NewWorkspace, ...workspace_candidates].
-    /// `engine` is the agent to spawn (←/→ cycles); it rides through to
-    /// LaunchConfirm when "New workspace" is picked, so the choice is made
-    /// once regardless of which of the two launch routes is taken.
-    WorkspacePicker { project_idx: usize, task_idx: usize, selected: usize, engine: LaunchEngine },
-    LaunchConfirm { project_idx: usize, task_idx: usize, branch_text: String, engine: LaunchEngine },
 }
 
-/// An open workspace the planning view can offer as a launch target.
-/// Populated by the App from its current workspace list each event cycle.
-#[derive(Clone, Debug)]
-pub struct WorkspaceCandidate {
-    pub workspace_id: String,
-    pub name: String,
-    pub repo_url: Option<String>,
-}
-
-/// Reduce a repo URL to a comparable form so SSH and HTTPS pointers to the
-/// same repo match. `git@github.com:org/repo.git` and
-/// `https://github.com/org/repo.git` both collapse to `github.com/org/repo`.
 /// A task's brief (doc/org-model.md §13.2): its description, plus a legacy
 /// `prompt` only when that says something the description does not. A
 /// prompt that is empty, equal to the title, or contained in the
@@ -575,8 +552,8 @@ pub(crate) fn task_brief(description: &str, prompt: &str, title: &str) -> String
     }
 }
 
-/// The activation text delivered to a worker on planning launch: the
-/// task's brief, else its title (so a worker never spawns with nothing to
+/// The activation text delivered to a task-bound worker (the TUI's
+/// `start_session(task_id=…)` auto-delivery): the task's brief, else its title (so a worker never spawns with nothing to
 /// do). Whitespace-only fields are treated as empty.
 pub(crate) fn compose_launch_prompt(
     description: &str,
@@ -591,97 +568,11 @@ pub(crate) fn compose_launch_prompt(
     }
 }
 
-/// Used when matching task→workspace at launch time, where the task's URL
-/// often comes from `git remote get-url origin` (SSH) and the workspace's
-/// from `~/.cm/projects/*/repo_url` (HTTPS).
-fn normalize_repo_url(url: &str) -> String {
-    let s = url.trim();
-    let s = s
-        .strip_prefix("https://")
-        .or_else(|| s.strip_prefix("http://"))
-        .or_else(|| s.strip_prefix("ssh://"))
-        .or_else(|| s.strip_prefix("git@"))
-        .unwrap_or(s);
-    // SSH form `host:org/repo` — turn the first ':' into '/' so it lines up
-    // with HTTPS form `host/org/repo`.
-    let s = s.replacen(':', "/", 1);
-    let s = s.strip_suffix(".git").unwrap_or(&s).to_string();
-    let s = s.trim_end_matches('/').to_string();
-    s.to_lowercase()
-}
-
 pub enum PlanAction {
     Consumed,
     Ignored,
-    LaunchTask {
-        project: String,
-        slug: String,
-        prompt: String,
-        branch: Option<String>,
-        autostart: bool,
-        task_id: String,
-        /// Sub-2a Finding #2: subtask launches must surface
-        /// `parent_task_id` from the planning row so the
-        /// launch site can initialize the local TaskEntry
-        /// stub with the correct edge. Pre-fix the stub set
-        /// `parent_task_id: None` and `push_task_tree_to_daemon`
-        /// published the wrong tree until the next API
-        /// reconcile patched it — opening a window where the
-        /// daemon saw a subtask as top-level and the
-        /// descendant-task auth walk could not authorize a
-        /// parent → subtask action.
-        parent_task_id: Option<String>,
-        /// `true` when the branch field held the `.` sentinel: launch
-        /// in-place in the main repo (no worktree, no branch).
-        in_place: bool,
-        /// Agent to spawn into the new worktree (launch-dialog choice,
-        /// Claude by default).
-        engine: LaunchEngine,
-        host_id: crate::hosts::HostId,
-        /// The A-f "Reports to" row changed the parent: PATCH
-        /// `parent_task_id` (to the value above) with the launch.
-        reparent: bool,
-        /// Model picked with Alt+o; `None` = the task default, else the
-        /// engine default.
-        model: Option<String>,
-        effort: Option<String>,
-    },
-    /// Bind a task to an existing workspace and spawn a session there
-    /// (no new worktree, no branch input).
-    LaunchTaskIntoWorkspace {
-        workspace_id: String,
-        task_id: String,
-        task_title: String,
-        task_repo_url: String,
-        /// Project name from the planning row. Pinned at action time so
-        /// the launch site can persist it on the local TaskEntry stub
-        /// even when the API row hasn't been reconciled yet — fixes
-        /// the disappearing-subtask race when an agent calls
-        /// `create_subtask` before reconcile backfills `project`.
-        project: String,
-        prompt: String,
-        /// Sub-2a Finding #2: same backstory as LaunchTask. The
-        /// "into existing workspace" variant carries it too so
-        /// the stub at the call site lands with the correct
-        /// parent edge on first push.
-        parent_task_id: Option<String>,
-        /// Agent to spawn into the existing workspace (picker
-        /// choice, Claude by default).
-        engine: LaunchEngine,
-        /// See `LaunchTask::reparent`.
-        reparent: bool,
-        /// See `LaunchTask::model`.
-        model: Option<String>,
-        effort: Option<String>,
-    },
     /// Clear a task's `workspace_id`. Task status is not affected.
     UnbindTask {
-        task_id: String,
-    },
-    /// Send a running task back to backlog: PATCH status, clear workspace_id
-    /// on the local TaskEntry, and close the bound workspace. Worktree and
-    /// branch are left on disk.
-    UnlaunchTask {
         task_id: String,
     },
     /// Reopen a done task: validate the worktree is still on disk, PATCH the
@@ -1198,20 +1089,7 @@ fn repo_url_for_project(project: &str) -> String {
 // ── PlanningView ────────────────────────────────────────────
 
 pub struct PlanningView {
-    pub staffing_policy: cm_daemon::staffing::Policy,
     pub keybinding_helper_visible: bool,
-    pub launch_host: crate::hosts::HostId,
-    launch_hosts: Vec<crate::hosts::HostId>,
-    default_launch_host: crate::hosts::HostId,
-    /// A-f "Reports to" row: the launched task's parent. Seeded from the
-    /// row's current parent when the dialog opens; a change is PATCHed as
-    /// `parent_task_id` on launch (`reparent` on the action).
-    launch_reports_to: crate::task_picker::ReportsTo,
-    /// The launch dialogs' Model row (Alt+o cycles presets).
-    launch_model: crate::app::model_field::ModelField,
-    launch_reports_to_orig: crate::task_picker::ReportsTo,
-    /// Open Alt+r picker over the launch dialogs.
-    launch_picker: Option<crate::task_picker::TaskPicker>,
     projects: Vec<PlanProject>,
     project_data: Vec<ProjectData>,
     /// None = show all projects, Some(idx) = show one project.
@@ -1250,15 +1128,13 @@ pub struct PlanningView {
     /// the detail line. Kept beside the rows so a missing API field is
     /// simply an empty map.
     pub placements: HashMap<String, serde_json::Value>,
-    /// The API places tasks on boards (app/place.rs): `A-f` opens the
-    /// launch-or-place chooser and `A-b` toggles the on-boards strip.
+    /// The API places tasks on boards (app/place.rs): `A-b` toggles the
+    /// on-boards strip. `A-f` always opens the place dialog, or a notice
+    /// when placing is unsupported; planning never launches (O7).
     pub placement_on: bool,
     pub needs_redraw: bool,
     last_editor_size: (u16, u16),
     initialized: bool,
-    /// Open workspaces the user can launch a task into. Populated by App
-    /// before each planning event / render.
-    workspace_candidates: Vec<WorkspaceCandidate>,
     /// When false, archived tasks are skipped from rendering and cursor
     /// navigation. Toggled with alt+shift+v.
     show_archived: bool,
@@ -1339,15 +1215,7 @@ impl PlanningView {
 
     pub fn new() -> Self {
         PlanningView {
-            staffing_policy: cm_daemon::staffing::Snapshot::default().policy,
             keybinding_helper_visible: true,
-            launch_host: crate::hosts::HostId::local(),
-            launch_hosts: vec![crate::hosts::HostId::local()],
-            default_launch_host: crate::hosts::HostId::local(),
-            launch_reports_to: Default::default(),
-            launch_model: Default::default(),
-            launch_reports_to_orig: Default::default(),
-            launch_picker: None,
             projects: vec![],
             project_data: vec![],
             project_filter: None,
@@ -1370,7 +1238,6 @@ impl PlanningView {
             needs_redraw: true,
             last_editor_size: (80, 24),
             initialized: false,
-            workspace_candidates: vec![],
             show_archived: false,
             expanded_tasks: HashSet::new(),
             last_search: None,
@@ -1885,12 +1752,6 @@ impl PlanningView {
         self.selected_task().map(|(t, _)| (t.id.clone(), t.title.clone()))
     }
 
-    /// A-f's launch dialog, as the plain key opens it.
-    pub fn open_launch(&mut self) -> PlanAction {
-        self.cancel_visual();
-        self.start_launch()
-    }
-
     /// The board chip for a placed task: `swarm #15 ➤`.
     fn placement_chip(&self, task_id: &str) -> Option<(String, Style)> {
         let p = self.placements.get(task_id)?;
@@ -2390,8 +2251,6 @@ impl PlanningView {
             PlanInputMode::BulkArchiveConfirm { .. } => self.handle_bulk_archive_confirm_event(event),
             PlanInputMode::NewProject { .. } => self.handle_new_project_event(event),
             PlanInputMode::ProjectPicker { .. } => self.handle_project_picker_event(event),
-            PlanInputMode::WorkspacePicker { .. } => self.handle_workspace_picker_event(event),
-            PlanInputMode::LaunchConfirm { .. } => self.handle_launch_confirm_event(event),
             PlanInputMode::Normal => self.handle_normal_event(event),
         }
     }
@@ -2448,7 +2307,6 @@ impl PlanningView {
                         }
                         return PlanAction::Consumed;
                     }
-                    KeyCode::Char('u') | KeyCode::Char('U') => { return self.unlaunch_task(); }
                     KeyCode::Char('a') | KeyCode::Char('A') => {
                         self.cancel_visual();
                         if let Some(pi) = self.cursor_project_idx() {
@@ -2481,7 +2339,6 @@ impl PlanningView {
                     KeyCode::Char('t') => return PlanAction::SwitchToSessions,
                     KeyCode::Char('d') if !key.modifiers.contains(KeyModifiers::CONTROL) => { self.page_vertical(1); return PlanAction::Consumed; }
                     KeyCode::Char('u') if !key.modifiers.contains(KeyModifiers::CONTROL) => { self.page_vertical(-1); return PlanAction::Consumed; }
-                    KeyCode::Char('U') => { return self.unlaunch_task(); }
                     KeyCode::Char('j') => { self.navigate_vertical(1); return PlanAction::Consumed; }
                     KeyCode::Char('k') => { self.navigate_vertical(-1); return PlanAction::Consumed; }
                     KeyCode::Char('h') => { self.navigate_horizontal(-1); return PlanAction::Consumed; }
@@ -2557,7 +2414,6 @@ impl PlanningView {
                     // A-D marks done (Alt+Shift+d arrives here when the
                     // terminal folds Shift into the char).
                     KeyCode::Char('D') => { return self.cycle_status_to_done(); }
-                    KeyCode::Char('f') => { self.cancel_visual(); return self.start_launch(); }
                     KeyCode::Char('y') => {
                         self.cancel_visual();
                         if let Some((pi, ti)) = self.selected_task_loc() {
@@ -2958,220 +2814,6 @@ impl PlanningView {
         PlanAction::Consumed
     }
 
-    fn handle_workspace_picker_event(&mut self, event: &CrosstermEvent) -> PlanAction {
-        let (project_idx, task_idx, mut selected, mut engine) = match self.input_mode {
-            PlanInputMode::WorkspacePicker {
-                project_idx,
-                task_idx,
-                selected,
-                engine,
-            } => (project_idx, task_idx, selected, engine),
-            _ => return PlanAction::Consumed,
-        };
-        let num_candidates = self.candidates_for(project_idx, task_idx).len();
-        // Option 0 is always "New workspace"; options 1..=num_candidates are
-        // existing workspaces.
-        let total = num_candidates + 1;
-
-        if let CrosstermEvent::Key(key) = event {
-            if self.launch_reports_to_key(key, project_idx, task_idx) {
-                return PlanAction::Consumed;
-            }
-            if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('h') {
-                self.cycle_launch_host();
-                return PlanAction::Consumed;
-            }
-            if self.launch_model_key(key) {
-                return PlanAction::Consumed;
-            }
-
-            if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd')) {
-                let step = (total.min(self.grid_rows_visible.get()) / 2).max(1);
-                selected = if key.code == KeyCode::Char('u') { selected.saturating_sub(step) } else { selected.saturating_add(step).min(total - 1) };
-                self.input_mode = PlanInputMode::WorkspacePicker { project_idx, task_idx, selected, engine };
-                return PlanAction::Consumed;
-            }
-            match key.code {
-                KeyCode::Esc => {
-                    self.input_mode = PlanInputMode::Normal;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    selected = (selected + total - 1) % total;
-                    self.input_mode = PlanInputMode::WorkspacePicker {
-                        project_idx,
-                        task_idx,
-                        selected,
-                        engine,
-                    };
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    selected = (selected + 1) % total;
-                    self.input_mode = PlanInputMode::WorkspacePicker {
-                        project_idx,
-                        task_idx,
-                        selected,
-                        engine,
-                    };
-                }
-                // Engine picker: only two options, so either arrow
-                // toggles. j/k stay reserved for the workspace list.
-                KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                    engine = engine.cycle();
-                    self.launch_model.retarget(engine.as_session_type());
-                    self.input_mode = PlanInputMode::WorkspacePicker {
-                        project_idx,
-                        task_idx,
-                        selected,
-                        engine,
-                    };
-                }
-                KeyCode::Enter => {
-                    if selected == 0 {
-                        // Fall through to branch-input dialog (current flow),
-                        // carrying the engine picked here.
-                        let branch_text = self.project_data[project_idx].tasks[task_idx]
-                            .branch
-                            .clone()
-                            .unwrap_or_default();
-                        self.input_mode = PlanInputMode::LaunchConfirm {
-                            project_idx,
-                            task_idx,
-                            branch_text,
-                            engine,
-                        };
-                    } else {
-                        // Bind task to the selected existing workspace.
-                        let ws = {
-                            let cands = self.candidates_for(project_idx, task_idx);
-                            cands.get(selected - 1).map(|c| (*c).clone())
-                        };
-                        let Some(ws) = ws else {
-                            self.input_mode = PlanInputMode::Normal;
-                            return PlanAction::Consumed;
-                        };
-                        self.input_mode = PlanInputMode::Normal;
-                        let reparent = self.apply_launch_reports_to(project_idx, task_idx);
-                        if let Some(pd) = self.project_data.get_mut(project_idx) {
-                            if let Some(task) = pd.tasks.get_mut(task_idx) {
-                                let prompt = compose_launch_prompt(
-                                    &task.description,
-                                    &task.prompt,
-                                    &task.title,
-                                );
-                                task.status = PlanStatus::InProgress;
-                                return PlanAction::LaunchTaskIntoWorkspace {
-                                    workspace_id: ws.workspace_id,
-                                    task_id: task.id.clone(),
-                                    task_title: task.title.clone(),
-                                    task_repo_url: task.repo_url.clone(),
-                                    project: pd.project.name.clone(),
-                                    prompt,
-                                    // Sub-2a Finding #2: pin the parent
-                                    // at action time so the launch site
-                                    // initializes the local stub with
-                                    // the correct edge.
-                                    parent_task_id: task.parent_task_id.clone(),
-                                    engine,
-                                    reparent,
-                                    model: self.launch_model.value().unwrap_or(None), effort: self.launch_model.effort_value(),
-                                };
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        PlanAction::Consumed
-    }
-
-    fn handle_launch_confirm_event(&mut self, event: &CrosstermEvent) -> PlanAction {
-        if let CrosstermEvent::Key(key) = event {
-            if let PlanInputMode::LaunchConfirm { project_idx, task_idx, .. } = self.input_mode {
-                if self.launch_reports_to_key(key, project_idx, task_idx) {
-                    return PlanAction::Consumed;
-                }
-            }
-            if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('h') {
-                self.cycle_launch_host();
-                return PlanAction::Consumed;
-            }
-            if self.launch_model_key(key) {
-                return PlanAction::Consumed;
-            }
-
-            let (project_idx, task_idx, mut branch_text, mut engine) = match &self.input_mode {
-                PlanInputMode::LaunchConfirm { project_idx, task_idx, branch_text, engine } => {
-                    (*project_idx, *task_idx, branch_text.clone(), *engine)
-                }
-                _ => return PlanAction::Consumed,
-            };
-            match key.code {
-                KeyCode::Esc => self.input_mode = PlanInputMode::Normal,
-                KeyCode::Enter => {
-                    self.input_mode = PlanInputMode::Normal;
-                    let reparent = self.apply_launch_reports_to(project_idx, task_idx);
-                    if let Some(pd) = self.project_data.get_mut(project_idx) {
-                        if let Some(task) = pd.tasks.get_mut(task_idx) {
-                            let project = pd.project.name.clone();
-                            let prompt = compose_launch_prompt(
-                                &task.description,
-                                &task.prompt,
-                                &task.title,
-                            );
-                            let slug = task.slug.clone();
-                            // Branch field: "." → in-place (main repo, no
-                            // worktree/branch); "" → new worktree from HEAD;
-                            // other → new worktree from that base branch.
-                            let trimmed = branch_text.trim();
-                            let in_place = trimmed == ".";
-                            let branch = if trimmed.is_empty() || in_place {
-                                None
-                            } else {
-                                Some(trimmed.to_string())
-                            };
-                            let task_id = task.id.clone();
-                            let parent_task_id = task.parent_task_id.clone();
-                            task.status = PlanStatus::InProgress;
-                            return PlanAction::LaunchTask {
-                                project,
-                                slug,
-                                prompt,
-                                branch,
-                                autostart: false,
-                                task_id,
-                                // Sub-2a Finding #2: see LaunchTaskIntoWorkspace.
-                                parent_task_id,
-                                in_place,
-                                engine,
-                                host_id: self.launch_host.clone(),
-                                reparent,
-                                model: self.launch_model.value().unwrap_or(None), effort: self.launch_model.effort_value(),
-                            };
-                        }
-                    }
-                }
-                // Branch is a free-text field, so the engine toggle can't
-                // use letters — arrows (unused by this dialog) and Tab do it.
-                KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                    engine = engine.cycle();
-                    self.launch_model.retarget(engine.as_session_type());
-                    self.input_mode = PlanInputMode::LaunchConfirm { project_idx, task_idx, branch_text, engine };
-                }
-                KeyCode::Backspace => {
-                    branch_text.pop();
-                    self.input_mode = PlanInputMode::LaunchConfirm { project_idx, task_idx, branch_text, engine };
-                }
-                KeyCode::Char(c) => {
-                    branch_text.push(c);
-                    self.input_mode = PlanInputMode::LaunchConfirm { project_idx, task_idx, branch_text, engine };
-                }
-                _ => {}
-            }
-        }
-        PlanAction::Consumed
-    }
-
     // ── Task / Grid Operations ──────────────────────────────
 
     fn sort_column_by_status(&mut self) {
@@ -3236,19 +2878,6 @@ impl PlanningView {
             }
         }
         PlanAction::Consumed
-    }
-
-    fn unlaunch_task(&mut self) -> PlanAction {
-        let (pi, ti) = match self.selected_task_loc() {
-            Some(v) => v,
-            None => return PlanAction::Consumed,
-        };
-        let task = &mut self.project_data[pi].tasks[ti];
-        if task.status != PlanStatus::InProgress {
-            return PlanAction::Consumed;
-        }
-        task.status = PlanStatus::Backlog;
-        PlanAction::UnlaunchTask { task_id: task.id.clone() }
     }
 
     fn cycle_status_to_done(&mut self) -> PlanAction {
@@ -3942,41 +3571,6 @@ impl PlanningView {
         action
     }
 
-    /// Workspace candidates visible for launching `task_idx` of `project_idx`
-    /// — filtered to those in the same repo so the worktree is meaningful.
-    fn candidates_for(&self, project_idx: usize, task_idx: usize) -> Vec<&WorkspaceCandidate> {
-        let Some(pd) = self.project_data.get(project_idx) else {
-            return vec![];
-        };
-        let Some(task) = pd.tasks.get(task_idx) else {
-            return vec![];
-        };
-        let task_repo = normalize_repo_url(&task.repo_url);
-        self.workspace_candidates
-            .iter()
-            .filter(|c| {
-                c.repo_url
-                    .as_deref()
-                    .map_or(false, |u| normalize_repo_url(u) == task_repo)
-            })
-            .collect()
-    }
-
-    pub fn set_launch_hosts(&mut self, hosts: Vec<crate::hosts::HostId>, default: crate::hosts::HostId) {
-        self.launch_hosts = hosts;
-        self.default_launch_host = default;
-    }
-
-    fn cycle_launch_host(&mut self) {
-        if self.launch_hosts.is_empty() { return; }
-        let i = self.launch_hosts.iter().position(|h| h == &self.launch_host).unwrap_or(0);
-        self.launch_host = self.launch_hosts[(i + 1) % self.launch_hosts.len()].clone();
-    }
-
-    fn launch_host_line(&self) -> Line<'static> {
-        Line::from(Span::styled(format!("  Host: {}  (Alt+h change; new workspace)", self.launch_host), Style::default().fg(theme::MUTED)))
-    }
-
     /// Every open (not done/archived) task on the board, for "Reports to"
     /// pickers outside the planning view.
     pub fn open_task_choices(&self) -> Vec<crate::task_picker::TaskChoice> {
@@ -3986,171 +3580,6 @@ impl PlanningView {
             .filter(|t| !t.id.is_empty() && !matches!(t.status, PlanStatus::Done | PlanStatus::Archived))
             .map(|t| crate::task_picker::TaskChoice { task_id: t.id.clone(), name: t.title.clone() })
             .collect()
-    }
-
-    /// The "Reports to" row value for the task at (pi, ti).
-    fn reports_to_of(&self, pi: usize, ti: usize) -> crate::task_picker::ReportsTo {
-        use crate::task_picker::{ReportsTo, TaskChoice};
-        let Some(parent) = self
-            .project_data
-            .get(pi)
-            .and_then(|pd| pd.tasks.get(ti))
-            .and_then(|t| t.parent_task_id.clone())
-        else {
-            return ReportsTo::Standalone;
-        };
-        let name = self
-            .project_data
-            .iter()
-            .flat_map(|pd| pd.tasks.iter())
-            .find(|t| t.id == parent)
-            .map(|t| t.title.clone())
-            .unwrap_or_else(|| parent.clone());
-        ReportsTo::Task(TaskChoice { task_id: parent, name })
-    }
-
-    /// Picker candidates for the launched task: "Standalone" first, then
-    /// every open task outside its own subtree (a cycle the API would
-    /// accept and every tree walk would then have to survive).
-    fn reports_to_candidates(&self, pi: usize, ti: usize) -> Vec<crate::task_picker::TaskChoice> {
-        use crate::task_picker::TaskChoice;
-        let Some(me) = self.project_data.get(pi).and_then(|pd| pd.tasks.get(ti)) else {
-            return Vec::new();
-        };
-        let all: Vec<&PlanTask> = self.project_data.iter().flat_map(|pd| pd.tasks.iter()).collect();
-        let parent_of: HashMap<&str, &str> = all
-            .iter()
-            .filter_map(|t| Some((t.id.as_str(), t.parent_task_id.as_deref()?)))
-            .collect();
-        let under_me = |id: &str| {
-            let mut cur = Some(id);
-            for _ in 0..64 {
-                match cur {
-                    Some(c) if c == me.id => return true,
-                    Some(c) => cur = parent_of.get(c).copied(),
-                    None => return false,
-                }
-            }
-            true
-        };
-        let mut out = vec![TaskChoice { task_id: String::new(), name: "Standalone".into() }];
-        out.extend(
-            all.iter()
-                .filter(|t| !matches!(t.status, PlanStatus::Done | PlanStatus::Archived))
-                .filter(|t| !t.id.is_empty() && !under_me(&t.id))
-                .map(|t| TaskChoice { task_id: t.id.clone(), name: t.title.clone() }),
-        );
-        out
-    }
-
-    /// Alt+r opens the picker; while open it takes every key. Returns true
-    /// when the key was the picker's.
-    fn launch_reports_to_key(&mut self, key: &crossterm::event::KeyEvent, pi: usize, ti: usize) -> bool {
-        use crate::task_picker::{PickerKey, ReportsTo, TaskPicker};
-        if let Some(picker) = self.launch_picker.as_mut() {
-            match picker.key(*key) {
-                PickerKey::Open => {}
-                PickerKey::Cancelled => self.launch_picker = None,
-                PickerKey::Picked(choice) => {
-                    self.launch_reports_to = if choice.task_id.is_empty() {
-                        ReportsTo::Standalone
-                    } else {
-                        ReportsTo::Task(choice)
-                    };
-                    self.launch_picker = None;
-                }
-            }
-            return true;
-        }
-        if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('r') {
-            let tasks = self.reports_to_candidates(pi, ti);
-            self.launch_picker = Some(TaskPicker::new(" Reports to ", tasks, String::new()));
-            return true;
-        }
-        false
-    }
-
-    /// Fold the "Reports to" choice into the planning row; true when it
-    /// changed (the launch then PATCHes `parent_task_id`).
-    fn apply_launch_reports_to(&mut self, pi: usize, ti: usize) -> bool {
-        self.launch_picker = None;
-        if self.launch_reports_to == self.launch_reports_to_orig {
-            return false;
-        }
-        let parent = self.launch_reports_to.parent_task_id().map(str::to_string);
-        if let Some(task) = self.project_data.get_mut(pi).and_then(|pd| pd.tasks.get_mut(ti)) {
-            task.parent_task_id = parent;
-        }
-        true
-    }
-
-    /// Alt+o / Alt+Shift+o step the Model row through the presets.
-    fn launch_model_key(&mut self, key: &crossterm::event::KeyEvent) -> bool {
-        if key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char('o' | 'O')) {
-            let back = key.code == KeyCode::Char('O') || key.modifiers.contains(KeyModifiers::SHIFT);
-            self.launch_model.cycle(!back);
-            return true;
-        }
-        false
-    }
-
-    /// Per-engine default models for a task, inherited through its parents.
-    fn task_models_of(
-        &self,
-        pi: usize,
-        ti: usize,
-        setting: cm_daemon::models::Setting,
-    ) -> std::collections::BTreeMap<String, String> {
-        let Some(id) = self.project_data.get(pi).and_then(|pd| pd.tasks.get(ti)).map(|t| t.id.clone()) else {
-            return Default::default();
-        };
-        ["claude", "codex"]
-            .into_iter()
-            .filter_map(|e| Some((e.to_string(), self.task_default(&id, e, setting)?.0)))
-            .collect()
-    }
-
-    fn launch_model_line(&self) -> Line<'static> {
-        let mut line = self.launch_model.line("  Model: ", false);
-        line.spans.push(Span::styled("  (Alt+o change)", Style::default().fg(theme::MUTED)));
-        line
-    }
-
-    fn reports_to_line(&self) -> Line<'static> {
-        Line::from(Span::styled(
-            format!("  Reports to: {}  (Alt+r change)", self.launch_reports_to.label()),
-            Style::default().fg(theme::MUTED),
-        ))
-    }
-
-    fn start_launch(&mut self) -> PlanAction {
-        let engine = LaunchEngine::for_staffing(&self.staffing_policy);
-        self.launch_host = self.default_launch_host.clone();
-        self.launch_picker = None;
-        if let Some((pi, ti)) = self.selected_task_loc() {
-            self.launch_reports_to = self.reports_to_of(pi, ti);
-            self.launch_reports_to_orig = self.launch_reports_to.clone();
-            self.launch_model = crate::app::model_field::ModelField::for_task(
-                engine.as_session_type(),
-                self.task_models_of(pi, ti, cm_daemon::models::Setting::Model),
-                self.task_models_of(pi, ti, cm_daemon::models::Setting::Effort),
-            );
-            self.input_mode = PlanInputMode::WorkspacePicker {
-                project_idx: pi,
-                task_idx: ti,
-                selected: 0,
-                // Fresh default per launch — the engine choice is
-                // deliberately not sticky.
-                engine,
-            };
-        }
-        PlanAction::Consumed
-    }
-
-    /// Sync the list of open workspaces for the picker. Called by App each
-    /// event cycle before the picker is drawn or handled.
-    pub fn set_workspace_candidates(&mut self, candidates: Vec<WorkspaceCandidate>) {
-        self.workspace_candidates = candidates;
     }
 
     // ── Search ──────────────────────────────────────────────
@@ -4467,8 +3896,6 @@ impl PlanningView {
             PlanInputMode::BulkArchiveConfirm { project_idx, count } => self.draw_bulk_archive_confirm(frame, area, *project_idx, *count),
             PlanInputMode::NewProject { name, repo_url, field } => self.draw_new_project_overlay(frame, area, name, repo_url, *field),
             PlanInputMode::ProjectPicker { selected } => self.draw_project_picker(frame, area, *selected),
-            PlanInputMode::WorkspacePicker { project_idx, task_idx, selected, engine } => self.draw_workspace_picker(frame, area, *project_idx, *task_idx, *selected, *engine),
-            PlanInputMode::LaunchConfirm { project_idx, task_idx, branch_text, engine } => self.draw_launch_confirm(frame, area, *project_idx, *task_idx, branch_text, *engine),
             _ => {}
         }
     }
@@ -4574,9 +4001,9 @@ impl PlanningView {
             " A-j/k nav \u{00b7} A-u/d half page \u{00b7} A-h/l cols \u{00b7} A-J/K reorder \u{00b7} A-H/L move \u{00b7} A-v visual \u{00b7} A-g linear \u{00b7} / search \u{00b7} n/N match",
             dim,
         )));
-        let launch = if self.placement_on { "A-f launch/place \u{00b7} A-b on boards" } else { "A-f launch" };
+        let place = if self.placement_on { "A-f place \u{00b7} A-b on boards" } else { "A-f place" };
         help_lines.push(Line::from(Span::styled(
-            format!(" A-e edit \u{00b7} A-n new \u{00b7} A-i header \u{00b7} A-Ent sep \u{00b7} A-Spc empty \u{00b7} Spc fold \u{00b7} A-s status \u{00b7} A-D done \u{00b7} A-a accept \u{00b7} A-A archive done \u{00b7} A-V show arch \u{00b7} A-x del \u{00b7} {launch} \u{00b7} A-y unbind \u{00b7} A-U unlaunch \u{00b7} A-c col \u{00b7} A-r refresh \u{00b7} A-q quit"),
+            format!(" A-e edit \u{00b7} A-n new \u{00b7} A-i header \u{00b7} A-Ent sep \u{00b7} A-Spc empty \u{00b7} Spc fold \u{00b7} A-s status \u{00b7} A-D done \u{00b7} A-a accept \u{00b7} A-A archive done \u{00b7} A-V show arch \u{00b7} A-x del \u{00b7} {place} \u{00b7} A-y unbind \u{00b7} A-c col \u{00b7} A-r refresh \u{00b7} A-q quit"),
             dim,
         )));
         frame.render_widget(Paragraph::new(help_lines), help_area);
@@ -4794,12 +4221,11 @@ impl PlanningView {
 
         let mut help_entries: Vec<(&str, &str)> = vec![
             ("A-j/k  nav", "A-D    done"),
-            ("A-J/K  reorder", if self.placement_on { "A-f    launch/place" } else { "A-f    launch" }),
+            ("A-J/K  reorder", "A-f    place"),
             ("A-e    edit", "A-a    accept"),
             ("A-n    new", "A-x    delete"),
             ("A-N    subtask", "A-O    reopen done"),
             ("A-u/d  half page", "A-y    unbind"),
-            ("A-U    unlaunch", ""),
             ("A-Ent  sep", "A-Spc  empty"),
             ("A-i    header", "A-A    archive done"),
             ("A-s/S  status", "A-V    show arch"),
@@ -5260,91 +4686,6 @@ impl PlanningView {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
-    fn draw_workspace_picker(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        project_idx: usize,
-        task_idx: usize,
-        selected: usize,
-        engine: LaunchEngine,
-    ) {
-        let task_name = self
-            .project_data
-            .get(project_idx)
-            .and_then(|pd| pd.tasks.get(task_idx))
-            .map(|t| t.title.as_str())
-            .unwrap_or("?");
-        let candidates = self.candidates_for(project_idx, task_idx);
-        // +2 for the engine row and its blank separator; +1 Reports to; +1 Model.
-        let rows = 5 + candidates.len() as u16 + 2 + 3 + 1 + 1;
-        let (w, h) = (60u16.min(area.width.saturating_sub(4)), rows);
-        let dialog = Rect::new(
-            (area.width - w) / 2,
-            (area.height.saturating_sub(h)) / 2,
-            w,
-            h,
-        );
-        frame.render_widget(Clear, dialog);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::TEXT))
-            .title(Span::styled(
-                " Launch Into ",
-                Style::default()
-                    .fg(theme::TEXT)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(dialog);
-        frame.render_widget(block, dialog);
-
-        let display_name: String = task_name
-            .chars()
-            .take((w as usize).saturating_sub(10))
-            .collect();
-        let mut lines: Vec<Line> = Vec::new();
-        lines.push(Line::from(vec![
-            Span::styled("  Task: ", Style::default().fg(theme::DIM)),
-            Span::styled(display_name, Style::default().fg(theme::TEXT)),
-        ]));
-        lines.push(Line::from(""));
-        let row = |label: &str, idx: usize| -> Line<'static> {
-            let is_sel = idx == selected;
-            let ind = if is_sel { ">" } else { " " };
-            let st = if is_sel {
-                Style::default()
-                    .fg(theme::TEXT)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme::MUTED)
-            };
-            Line::from(Span::styled(format!("  {} {}", ind, label), st))
-        };
-        lines.push(row("+ New workspace (create worktree)", 0));
-        for (i, c) in candidates.iter().enumerate() {
-            let label = if c.name.len() > (w as usize).saturating_sub(8) {
-                truncate_with_ellipsis(&c.name, (w as usize).saturating_sub(8))
-            } else {
-                c.name.clone()
-            };
-            lines.push(row(&label, i + 1));
-        }
-        lines.push(Line::from(""));
-        lines.push(engine_line(engine));
-        lines.push(self.launch_model_line());
-        lines.push(self.launch_host_line());
-        lines.push(self.reports_to_line());
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  j/k navigate \u{00b7} \u{2190}/\u{2192} engine \u{00b7} Enter select \u{00b7} Esc cancel",
-            Style::default().fg(theme::DIM),
-        )));
-        frame.render_widget(Paragraph::new(lines), inner);
-        if let Some(picker) = &self.launch_picker {
-            picker.draw(frame, dialog);
-        }
-    }
-
     fn draw_bulk_archive_confirm(&self, frame: &mut Frame, area: Rect, project_idx: usize, count: usize) {
         let project_name = self.project_data.get(project_idx)
             .map(|pd| pd.project.name.as_str())
@@ -5366,53 +4707,6 @@ impl PlanningView {
             Line::from(""),
             Line::from(Span::styled("  Enter confirm \u{00b7} Esc cancel", Style::default().fg(theme::DIM))),
         ]), inner);
-    }
-
-    fn draw_launch_confirm(&self, frame: &mut Frame, area: Rect, project_idx: usize, task_idx: usize, branch_text: &str, engine: LaunchEngine) {
-        let task_name = self.project_data.get(project_idx)
-            .and_then(|pd| pd.tasks.get(task_idx))
-            .map(|t| t.title.as_str())
-            .unwrap_or("?");
-        // +2 rows for the engine line and its blank separator; +1 Reports to; +1 Model.
-        let (w, h) = (60u16.min(area.width.saturating_sub(4)), 14u16);
-        let dialog = Rect::new((area.width - w) / 2, (area.height - h) / 2, w, h);
-        frame.render_widget(Clear, dialog);
-        let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::TEXT))
-            .title(Span::styled(" Launch Task ", Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)));
-        let inner = block.inner(dialog);
-        frame.render_widget(block, dialog);
-
-        let display_name: String = task_name.chars().take((w as usize).saturating_sub(10)).collect();
-        let branch_hint = if branch_text.trim() == "." {
-            "  in-place (main repo, no worktree)"
-        } else if branch_text.is_empty() {
-            "main"
-        } else {
-            ""
-        };
-        frame.render_widget(Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled("    Task: ", Style::default().fg(theme::DIM)),
-                Span::styled(display_name, Style::default().fg(theme::TEXT)),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("  Branch: ", Style::default().fg(theme::DIM)),
-                Span::styled(branch_text, Style::default().fg(theme::TEXT)),
-                Span::styled("\u{2588}", Style::default().fg(theme::TEXT)),
-                Span::styled(branch_hint, Style::default().fg(theme::DIM)),
-            ]),
-            Line::from(""),
-            engine_line(engine),
-            self.launch_model_line(),
-            self.launch_host_line(),
-            self.reports_to_line(),
-            Line::from(""),
-            Line::from(Span::styled("  \u{2190}/\u{2192} engine \u{00b7} Enter launch \u{00b7} Esc cancel", Style::default().fg(theme::DIM))),
-        ]), inner);
-        if let Some(picker) = &self.launch_picker {
-            picker.draw(frame, dialog);
-        }
     }
 }
 
@@ -6123,293 +5417,9 @@ mod tests {
         assert_eq!(parent, Some("parent-id-123".to_string()));
     }
 
-    // ── Sub-2a Finding #2: launch actions carry parent_task_id ───────
-    //
-    // Without this, a subtask launched via A-l / A-f publishes a
-    // local TaskEntry stub with `parent_task_id: None`. The first
-    // `push_task_tree_to_daemon` then sends the subtask to the
-    // daemon as top-level — daemon's auth walk can't see the
-    // parent → subtask edge until the next API reconcile, leaving
-    // a window where descendant-task auth fails for actions that
-    // SHOULD succeed.
+    // ── One-task fixture ─────────────────────────────────────
 
-    /// Pin: `LaunchTask` carries `parent_task_id` derived from the
-    /// PlanTask. Drives the LaunchConfirm input mode through Enter
-    /// and inspects the returned action.
-    #[test]
-    fn launch_task_action_carries_parent_task_id_for_subtask() {
-        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
-        let mut view = PlanningView::new();
-        let mut pd = make_project("repo", "git@example.com:org/repo.git");
-        pd.tasks.push(PlanTask {
-            id: "sub-id".to_string(),
-            slug: "subtask".to_string(),
-            title: "Subtask".to_string(),
-            status: PlanStatus::Backlog,
-            difficulty: None,
-            depends: vec![],
-            branch: None,
-            created: None,
-            description: String::new(),
-            prompt: String::new(),
-            source: "user".to_string(),
-            is_cloud: false,
-            repo_url: "git@example.com:org/repo.git".to_string(),
-            parent_task_id: Some("parent-id".to_string()),
-            initiative_id: None,
-            initiative_name: None,
-            initiative_status: None,
-            initiative_color: None,
-            is_initiative_coordinator: false,
-            lead_pin: None,
-            initiative_kind: None,
-            kind: "oneshot".to_string(),
-            worker_vm: None,
-            vm_project: None,
-            vm_zone: None,
-            run_key: None,
-            bt_label: None,
-            filer: None,
-            models: Default::default(),
-            efforts: Default::default(),
-        });
-        view.project_data.push(pd);
-        view.projects = view
-            .project_data
-            .iter()
-            .map(|pd| pd.project.clone())
-            .collect();
-        view.input_mode = PlanInputMode::LaunchConfirm {
-            project_idx: 0,
-            task_idx: 0,
-            branch_text: String::new(),
-            engine: LaunchEngine::Claude,
-        };
-        let enter = CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let action = view.handle_event(&enter);
-        match action {
-            PlanAction::LaunchTask { parent_task_id, task_id, .. } => {
-                assert_eq!(task_id, "sub-id");
-                assert_eq!(
-                    parent_task_id,
-                    Some("parent-id".to_string()),
-                    "launch action must carry parent_task_id from PlanTask",
-                );
-            }
-            other => panic!(
-                "expected LaunchTask, got {:?}",
-                std::mem::discriminant(&other)
-            ),
-        }
-    }
-
-    /// A-f "Reports to": Alt+r opens a picker of open tasks outside the
-    /// launched task's own subtree; a pick reparents on launch.
-    #[test]
-    fn launch_reports_to_reparents_through_the_picker() {
-        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
-        let ev = |code, m| CrosstermEvent::Key(KeyEvent::new(code, m));
-        let mut view = PlanningView::new();
-        let mut pd = make_project("repo", "git@example.com:org/repo.git");
-        pd.tasks.push(make_task("boss-id", "boss", None));
-        pd.tasks.push(make_task("me-id", "me", None));
-        pd.tasks.push(make_task("kid-id", "kid", Some("me-id")));
-        view.project_data.push(pd);
-        view.projects = view.project_data.iter().map(|pd| pd.project.clone()).collect();
-        view.launch_reports_to = view.reports_to_of(0, 1);
-        view.launch_reports_to_orig = view.launch_reports_to.clone();
-        view.input_mode = PlanInputMode::LaunchConfirm {
-            project_idx: 0,
-            task_idx: 1,
-            branch_text: String::new(),
-            engine: LaunchEngine::Claude,
-        };
-        view.handle_event(&ev(KeyCode::Char('r'), KeyModifiers::ALT));
-        let names: Vec<String> = view.launch_picker.as_ref().unwrap().tasks.iter()
-            .map(|t| t.name.clone()).collect();
-        assert_eq!(names, ["Standalone", "boss"], "self and own subtree are excluded");
-        // Letters go to the picker, not the branch field.
-        view.handle_event(&ev(KeyCode::Char('b'), KeyModifiers::NONE));
-        view.handle_event(&ev(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(view.launch_picker.is_none());
-        match &view.input_mode {
-            PlanInputMode::LaunchConfirm { branch_text, .. } => assert_eq!(branch_text, ""),
-            _ => panic!("dialog stays open after a pick"),
-        }
-        match view.handle_event(&ev(KeyCode::Enter, KeyModifiers::NONE)) {
-            PlanAction::LaunchTask { parent_task_id, reparent, .. } => {
-                assert_eq!(parent_task_id.as_deref(), Some("boss-id"));
-                assert!(reparent);
-            }
-            _ => panic!("expected LaunchTask"),
-        }
-        // Unchanged → no reparent.
-        view.launch_reports_to = view.reports_to_of(0, 2);
-        view.launch_reports_to_orig = view.launch_reports_to.clone();
-        view.input_mode = PlanInputMode::WorkspacePicker {
-            project_idx: 0, task_idx: 2, selected: 0, engine: LaunchEngine::Claude,
-        };
-        view.handle_event(&ev(KeyCode::Enter, KeyModifiers::NONE));
-        match view.handle_event(&ev(KeyCode::Enter, KeyModifiers::NONE)) {
-            PlanAction::LaunchTask { parent_task_id, reparent, .. } => {
-                assert_eq!(parent_task_id.as_deref(), Some("me-id"));
-                assert!(!reparent);
-            }
-            _ => panic!("expected LaunchTask"),
-        }
-    }
-
-    /// Top-level task (no parent) → `parent_task_id: None` rides
-    /// through unchanged.
-    #[test]
-    fn launch_task_action_carries_none_for_top_level_task() {
-        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
-        let mut view = PlanningView::new();
-        let mut pd = make_project("repo", "git@example.com:org/repo.git");
-        pd.tasks.push(PlanTask {
-            id: "top-id".to_string(),
-            slug: "toplevel".to_string(),
-            title: "Top".to_string(),
-            status: PlanStatus::Backlog,
-            difficulty: None,
-            depends: vec![],
-            branch: None,
-            created: None,
-            description: String::new(),
-            prompt: String::new(),
-            source: "user".to_string(),
-            is_cloud: false,
-            repo_url: "git@example.com:org/repo.git".to_string(),
-            parent_task_id: None,
-            initiative_id: None,
-            initiative_name: None,
-            initiative_status: None,
-            initiative_color: None,
-            is_initiative_coordinator: false,
-            lead_pin: None,
-            initiative_kind: None,
-            kind: "oneshot".to_string(),
-            worker_vm: None,
-            vm_project: None,
-            vm_zone: None,
-            run_key: None,
-            bt_label: None,
-            filer: None,
-            models: Default::default(),
-            efforts: Default::default(),
-        });
-        view.project_data.push(pd);
-        view.projects = view
-            .project_data
-            .iter()
-            .map(|pd| pd.project.clone())
-            .collect();
-        view.input_mode = PlanInputMode::LaunchConfirm {
-            project_idx: 0,
-            task_idx: 0,
-            branch_text: String::new(),
-            engine: LaunchEngine::Claude,
-        };
-        let enter = CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let action = view.handle_event(&enter);
-        match action {
-            PlanAction::LaunchTask { parent_task_id, .. } => {
-                assert_eq!(parent_task_id, None);
-            }
-            other => panic!(
-                "expected LaunchTask, got {:?}",
-                std::mem::discriminant(&other)
-            ),
-        }
-    }
-
-    /// The `.` sentinel in the LaunchConfirm branch field launches
-    /// in-place: `in_place: true`, `branch: None`. Empty branch stays
-    /// `in_place: false`.
-    #[test]
-    fn launch_confirm_dot_branch_sets_in_place() {
-        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
-        let enter = CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        let mk = || {
-            let mut view = PlanningView::new();
-            let mut pd = make_project("repo", "git@example.com:org/repo.git");
-            pd.tasks.push(PlanTask {
-                id: "top-id".to_string(),
-                slug: "toplevel".to_string(),
-                title: "Top".to_string(),
-                status: PlanStatus::Backlog,
-                difficulty: None,
-                depends: vec![],
-                branch: None,
-                created: None,
-                description: String::new(),
-                prompt: String::new(),
-                source: "user".to_string(),
-                is_cloud: false,
-                repo_url: "git@example.com:org/repo.git".to_string(),
-                parent_task_id: None,
-                initiative_id: None,
-                initiative_name: None,
-                initiative_status: None,
-                initiative_color: None,
-                is_initiative_coordinator: false,
-                lead_pin: None,
-                initiative_kind: None,
-                kind: "oneshot".to_string(),
-                worker_vm: None,
-                vm_project: None,
-                vm_zone: None,
-                run_key: None,
-                bt_label: None,
-                filer: None,
-                models: Default::default(),
-                efforts: Default::default(),
-            });
-            view.project_data.push(pd);
-            view.projects = view
-                .project_data
-                .iter()
-                .map(|pd| pd.project.clone())
-                .collect();
-            view
-        };
-
-        // "." → in-place.
-        let mut view = mk();
-        view.input_mode = PlanInputMode::LaunchConfirm {
-            project_idx: 0,
-            task_idx: 0,
-            branch_text: ".".to_string(),
-            engine: LaunchEngine::Claude,
-        };
-        match view.handle_event(&enter) {
-            PlanAction::LaunchTask { in_place, branch, .. } => {
-                assert!(in_place, "`.` must launch in-place");
-                assert!(branch.is_none(), "in-place carries no branch");
-            }
-            other => panic!("expected LaunchTask, got {:?}", std::mem::discriminant(&other)),
-        }
-
-        // empty → normal worktree launch.
-        let mut view = mk();
-        view.input_mode = PlanInputMode::LaunchConfirm {
-            project_idx: 0,
-            task_idx: 0,
-            branch_text: String::new(),
-            engine: LaunchEngine::Claude,
-        };
-        match view.handle_event(&enter) {
-            PlanAction::LaunchTask { in_place, .. } => {
-                assert!(!in_place, "empty branch is not in-place");
-            }
-            other => panic!("expected LaunchTask, got {:?}", std::mem::discriminant(&other)),
-        }
-    }
-
-    // ── Launch engine picker (claude | codex) ────────────────
-
-    /// Build a one-task planning view for the launch-dialog tests.
+    /// Build a one-task planning view.
     #[cfg(test)]
     fn view_with_one_task() -> PlanningView {
         let mut view = PlanningView::new();
@@ -6479,167 +5489,6 @@ mod tests {
 
         let mut view = focused();
         assert!(is_done(&view.handle_event(&key('D', KeyModifiers::ALT))), "Shift folded into the char");
-    }
-
-    #[test]
-    fn staffing_launch_dialog_preselects_policy_without_changing_open_choice() {
-        let mut view = view_with_one_task();
-        view.project_data[0].layout.columns = vec![vec![GridItem::Task("toplevel".into())]];
-        view.rebuild_unified_cols();
-        view.cursor = GridCursor { col: 0, row: 0 };
-        assert!(view.selected_task_loc().is_some());
-        view.staffing_policy.default_engine = cm_daemon::staffing::Engine::Claude;
-        view.start_launch();
-        assert!(matches!(
-            view.input_mode,
-            PlanInputMode::WorkspacePicker {
-                engine: LaunchEngine::Claude,
-                ..
-            }
-        ));
-        view.staffing_policy.default_engine = cm_daemon::staffing::Engine::Codex;
-        assert!(matches!(
-            view.input_mode,
-            PlanInputMode::WorkspacePicker {
-                engine: LaunchEngine::Claude,
-                ..
-            }
-        ));
-        view.start_launch();
-        assert!(matches!(
-            view.input_mode,
-            PlanInputMode::WorkspacePicker {
-                engine: LaunchEngine::Codex,
-                ..
-            }
-        ));
-    }
-
-    /// Default is Codex, and ←/→ toggles to Claude. The chosen engine
-    /// rides out on the `LaunchTask` action so the launch site honors it.
-    #[test]
-    fn launch_confirm_engine_defaults_codex_and_arrow_toggles() {
-        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
-        let key = |c: KeyCode| CrosstermEvent::Key(KeyEvent::new(c, KeyModifiers::NONE));
-
-        // Untouched → codex.
-        let mut view = view_with_one_task();
-        view.input_mode = PlanInputMode::LaunchConfirm {
-            project_idx: 0,
-            task_idx: 0,
-            branch_text: String::new(),
-            engine: LaunchEngine::default(),
-        };
-        match view.handle_event(&key(KeyCode::Enter)) {
-            PlanAction::LaunchTask { engine, .. } => {
-                assert_eq!(engine, LaunchEngine::Codex, "default engine is codex");
-                assert_eq!(engine.as_session_type(), "codex");
-            }
-            other => panic!("expected LaunchTask, got {:?}", std::mem::discriminant(&other)),
-        }
-
-        // One → (or ←) → claude.
-        for toggle in [KeyCode::Right, KeyCode::Left, KeyCode::Tab] {
-            let mut view = view_with_one_task();
-            view.input_mode = PlanInputMode::LaunchConfirm {
-                project_idx: 0,
-                task_idx: 0,
-                branch_text: String::new(),
-                engine: LaunchEngine::default(),
-            };
-            view.handle_event(&key(toggle));
-            match view.handle_event(&key(KeyCode::Enter)) {
-                PlanAction::LaunchTask { engine, .. } => {
-                    assert_eq!(engine, LaunchEngine::Claude, "{:?} must select claude", toggle);
-                    assert_eq!(engine.as_session_type(), "claude");
-                }
-                other => panic!("expected LaunchTask, got {:?}", std::mem::discriminant(&other)),
-            }
-        }
-    }
-
-    /// The engine toggle must not steal characters from the branch
-    /// field — it's a free-text input, so `h`/`l`/`j`/`k` are branch
-    /// name characters, not navigation.
-    #[test]
-    fn launch_confirm_letters_still_edit_branch_text() {
-        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
-        let key = |c: char| {
-            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
-        };
-        let mut view = view_with_one_task();
-        view.input_mode = PlanInputMode::LaunchConfirm {
-            project_idx: 0,
-            task_idx: 0,
-            branch_text: String::new(),
-            engine: LaunchEngine::default(),
-        };
-        for c in "hjkl".chars() {
-            view.handle_event(&key(c));
-        }
-        let enter = CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        match view.handle_event(&enter) {
-            PlanAction::LaunchTask { branch, engine, .. } => {
-                assert_eq!(branch.as_deref(), Some("hjkl"));
-                assert_eq!(engine, LaunchEngine::Codex, "letters must not cycle engine");
-            }
-            other => panic!("expected LaunchTask, got {:?}", std::mem::discriminant(&other)),
-        }
-    }
-
-    /// The picker's engine choice survives the hop into the branch
-    /// dialog ("New workspace" route) — the operator picks once.
-    #[test]
-    fn workspace_picker_engine_rides_into_launch_confirm() {
-        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
-        let key = |c: KeyCode| CrosstermEvent::Key(KeyEvent::new(c, KeyModifiers::NONE));
-        let mut view = view_with_one_task();
-        view.input_mode = PlanInputMode::WorkspacePicker {
-            project_idx: 0,
-            task_idx: 0,
-            selected: 0,
-            engine: LaunchEngine::default(),
-        };
-        view.handle_event(&key(KeyCode::Right));
-        view.handle_event(&key(KeyCode::Enter));
-        match view.input_mode {
-            PlanInputMode::LaunchConfirm { engine, .. } => {
-                assert_eq!(engine, LaunchEngine::Claude, "engine carries into LaunchConfirm");
-            }
-            _ => panic!("expected LaunchConfirm after selecting 'New workspace'"),
-        }
-    }
-
-    /// The existing-workspace route honors the picker's engine too, so
-    /// both launch paths can start a claude worker.
-    #[test]
-    fn workspace_picker_engine_rides_into_existing_workspace_launch() {
-        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
-        let key = |c: KeyCode| CrosstermEvent::Key(KeyEvent::new(c, KeyModifiers::NONE));
-        let mut view = view_with_one_task();
-        view.set_workspace_candidates(vec![WorkspaceCandidate {
-            workspace_id: "ws-1".to_string(),
-            name: "repo-toplevel".to_string(),
-            repo_url: Some("https://example.com/org/repo.git".to_string()),
-        }]);
-        view.input_mode = PlanInputMode::WorkspacePicker {
-            project_idx: 0,
-            task_idx: 0,
-            // 0 is "New workspace"; 1 is the candidate above.
-            selected: 1,
-            engine: LaunchEngine::default(),
-        };
-        view.handle_event(&key(KeyCode::Right));
-        match view.handle_event(&key(KeyCode::Enter)) {
-            PlanAction::LaunchTaskIntoWorkspace { engine, workspace_id, .. } => {
-                assert_eq!(workspace_id, "ws-1");
-                assert_eq!(engine, LaunchEngine::Claude);
-            }
-            other => panic!(
-                "expected LaunchTaskIntoWorkspace, got {:?}",
-                std::mem::discriminant(&other)
-            ),
-        }
     }
 
     // ── Frontmatter round-trip tests ─────────────────────────

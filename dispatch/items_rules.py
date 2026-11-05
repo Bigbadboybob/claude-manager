@@ -425,6 +425,9 @@ class BoardTx:
         self.board_changed = False
         # (n, entered) for every move into or out of blocked_on_owner.
         self.owner_transitions: list[tuple[int, bool]] = []
+        # holder pid -> a sentence appended to its "assigned" pushes in this
+        # transaction (a team placement tells the lead to hand it out, O8).
+        self.assign_notes: dict[str, str] = {}
 
     # ---- lookups -------------------------------------------------------
     def item(self, n: int) -> Item:
@@ -1045,9 +1048,11 @@ class BoardTx:
         # Assigned pushes (rule 8).
         for h in it.holders:
             if h["pid"] not in prev_pids and h["pid"] != self.actor["pid"]:
+                note = self.assign_notes.get(h["pid"])
                 self._push(it, h, "assigned",
                            f"{self._prefix()} you were assigned #{n} \"{it.title}\" by "
-                           f"{self.actor.get('name') or self.actor['pid']}. Update it with "
+                           f"{self.actor.get('name') or self.actor['pid']}."
+                           f"{' ' + note if note else ''} Update it with "
                            f"item_set({n}, ...); hand it back with item_set({n}, holder=\"none\").")
 
         self.dirty.add(n)

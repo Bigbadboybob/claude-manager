@@ -513,6 +513,7 @@ def place(
     role: str | None = None,
     replace: bool = False,
     request_id: str | None = None,
+    team: str | None = None,
 ) -> dict:
     """Place a planning task on a board (doc/org-model.md §7.1): the board
     gets an item linked to the task, and from then on the item owns status,
@@ -522,13 +523,17 @@ def place(
     blocked, done/dropped → done.
 
     board defaults to yours; group / group_id put it under a heading or epic;
-    holder makes that session (or "me") its owner. Placing a draft accepts
-    it. Refused: backtests, continuous tasks, auto-dispatchable cloud tasks,
+    holder makes that session (or "me") its owner. team (an org team's id or
+    slug, instead of holder) assigns it to that team: the item goes to the
+    team lead's main session as owner, and the lead hands it out; CM never
+    picks a member, so a team with no lead, or whose lead has no main
+    session, is refused. Placing a draft accepts it. Refused: backtests, continuous tasks, auto-dispatchable cloud tasks,
     a task with no description, and one placed on another board (pass
     replace=True to move it: unplace there, place here). Re-placing on the
     same board brings back the same item number.
 
-    Returns {board, n, item_status, task_status, item, possible_duplicate?}.
+    Returns {board, n, item_status, task_status, item, possible_duplicate?,
+    team?}.
     """
     params = dict(locals())
     params["task_id"] = params.pop("task")

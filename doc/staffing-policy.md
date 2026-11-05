@@ -43,7 +43,7 @@ no expiry. Tab or arrows select fields; left/right cycles engines (rules can be
 unset), and text is typed into model/reason/expiry. Blank rule model keeps
 task/host defaults. Enter saves centrally; Esc returns; Ctrl+r reloads and
 discards edits. A failed save leaves the draft visible. Concurrent edits are
-refused with a version conflict; reload before retrying. A-n, A-s and A-f
+refused with a version conflict; reload before retrying. A-n and A-s
 preselect from the latest cached policy when their forms open; later updates do
 not change a user's selection in an already-open form.
 

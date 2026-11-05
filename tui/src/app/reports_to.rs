@@ -2,8 +2,8 @@
 //!
 //! A-n workspaces are otherwise taskless. With a parent chosen, the form
 //! first creates the workspace's task row under that parent (the API
-//! inherits its initiative/division), then launches it through the
-//! planning-launch path, so the session is task-bound from its first spawn
+//! inherits its initiative/division), then launches it through
+//! `launch_from_plan`, so the session is task-bound from its first spawn
 //! and the reporting line (`parent_task_id`) holds everywhere.
 use super::*;
 use crate::task_picker::TaskChoice;

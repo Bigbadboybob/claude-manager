@@ -251,7 +251,7 @@ async def place_task(task_id: str, body: PlaceBody, request: Request):
     return await _call(placement.place_task(
         _pool(request), task_id, body.board, body.actor.model_dump(), group=body.group,
         group_id=body.group_id, holder=body.holder.model_dump() if body.holder else None,
-        role=body.role, replace=body.replace))
+        role=body.role, replace=body.replace, team=body.team))
 
 
 @router.post("/tasks/{task_id}/unplace")

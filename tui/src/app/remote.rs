@@ -2839,56 +2839,6 @@ mod remote_reconnect_tests {
         }
     }
 
-    /// Global-host removal Phase B: a "launch into existing workspace" path
-    /// routes by the WORKSPACE's host. With the workspace on `manager`, the
-    /// local-only guard fail-fasts on `manager` (proving it read the workspace
-    /// host) instead of proceeding and mistagging the session — the latent bug
-    /// this fixes.
-    #[test]
-    fn launch_into_workspace_guards_on_workspace_host_not_global() {
-        let _guard = crate::test_support::home_lock();
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().to_path_buf();
-        std::fs::create_dir_all(home.join(".cm")).unwrap();
-        let orig = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", &home);
-        }
-
-        let mut app = app_with_manager_host(&home.join(".cm/daemon.sock"));
-        app.workspaces.clear();
-        let (seed, _t, _e) = session_with_injected_exit(
-            "seed",
-            cm_daemon::host_id::HostId::local(),
-            false,
-        );
-        let mut ws = workspace_with(seed);
-        ws.id = "ws-mgr".into();
-        ws.host_id = cm_daemon::host_id::HostId("manager".into()); // but workspace on manager
-        ws.worktree_path = Some(std::path::PathBuf::from("/tmp/mgr-wt"));
-        ws.sessions.clear();
-        app.workspaces.push(ws);
-
-        app.launch_into_workspace(
-            "ws-mgr", "task-1", "Title", "https:,
-            None,//repo", "proj", "do x", None, "claude", None, None,
-        );
-
-        let (msg, _) = app.status_msg.clone().expect("a status message was set");
-        assert!(
-            msg.contains("manager"),
-            "fail-fast names the WORKSPACE host (manager): {}",
-            msg,
-        );
-        let after = app.workspaces.iter().find(|w| w.id == "ws-mgr").unwrap();
-        assert!(after.sessions.is_empty(), "guard fired before any spawn");
-
-        match orig {
-            Some(h) => unsafe { std::env::set_var("HOME", h) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-    }
-
     /// Reported bug: `A-a` on an EMPTY workspace whose host is REMOTE spawned a
     /// fresh LOCAL claude (in `$HOME`, since the remote worktree path doesn't
     /// exist locally) — orphaning the real daemon-owned session. `attach_active`

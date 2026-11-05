@@ -1086,7 +1086,24 @@ fn item_place(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, params: &Value) -> Rpc
     if params["replace"] == true {
         body["replace"] = json!(true);
     }
-    ctx.api.post(&format!("/tasks/{}/place", task.trim()), &body)
+    // O8 (doc/org-model.md §13.4): a team holds work through its lead. The
+    // API gives the item to the lead's main session; nobody here picks a
+    // member.
+    let team = params.get("team").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty());
+    if let Some(team) = team {
+        if body.get("holder").is_some() {
+            return Err(bad("pass holder or team, not both: a team's work goes to its lead, who hands it out"));
+        }
+        body["team"] = json!(team);
+    }
+    ctx.api.post(&format!("/tasks/{}/place", task.trim()), &body).map_err(|(code, message)| {
+        // A planning API from before O8 rejects the field itself.
+        if team.is_some() && code == ErrorCode::InvalidParams && message.contains("team:") && message.contains("xtra") {
+            (code, "team_unsupported: this planning API cannot place for a team yet; place it with a member, or update the API on cm-manager".to_string())
+        } else {
+            (code, message)
+        }
+    })
 }
 
 fn item_unplace(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, params: &Value) -> RpcResult {
@@ -1862,6 +1879,35 @@ mod tests {
         let set = body("PATCH", "/boards/sfd/items");
         assert!(set["owner"]["pid"].as_str().unwrap().ends_with(":me-uid"));
         assert_eq!(set["role"], "reviewer");
+    }
+
+    /// O8: `team` goes to the API as is (it resolves the lead's main
+    /// session); with a holder it is refused, and an API from before O8
+    /// gets a plain notice.
+    #[test]
+    fn place_for_a_team_forwards_the_team_and_never_a_holder() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let (url, seen) = stub(|method, path, _| match (method, path) {
+            ("POST", "/boards/resolve") => (200, BOARD.into()),
+            ("POST", "/tasks/task-a/place") => (200, r#"{"board":"sfd","n":8,"item_status":"active","task_status":"running","team":{"name":"Alpha","lead_handle":"ep"}}"#.into()),
+            ("POST", "/tasks/task-b/place") => (422, r#"{"detail":[{"loc":["body","team"],"msg":"Extra inputs are not permitted"}]}"#.into()),
+            _ => (500, "{}".into()),
+        });
+        let state = state_with_session(root.path(), &url);
+        let resp = call(&state, "me-uid", "item.place", json!({"task_id":"task-a","team":"alpha"}));
+        assert!(resp.ok, "{:?}", resp.error);
+        assert_eq!(resp.result.as_ref().unwrap()["team"]["lead_handle"], "ep");
+        let resp = call(&state, "me-uid", "item.place", json!({"task_id":"task-a","team":"alpha","holder":"me"}));
+        assert_eq!(resp.error.as_ref().unwrap().code, ErrorCode::InvalidParams);
+        assert!(resp.error.as_ref().unwrap().message.contains("not both"));
+        let resp = call(&state, "rl-uid", "item.place", json!({"task_id":"task-b","team":"alpha"}));
+        assert!(resp.error.as_ref().unwrap().message.starts_with("team_unsupported:"), "{:?}", resp.error);
+        let seen = seen.lock().unwrap();
+        let places: Vec<&Value> = seen.iter().filter(|(m, p, _)| m == "POST" && p == "/tasks/task-a/place").map(|(_, _, b)| b).collect();
+        assert_eq!(places.len(), 1, "the refused call never reached the API");
+        assert_eq!(places[0]["team"], "alpha");
+        assert!(places[0].get("holder").is_none() && places[0].get("role").is_none());
     }
 
     #[test]
