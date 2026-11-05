@@ -2,7 +2,7 @@
 
 `scripts/worktree_reaper.py` removes old claude-manager and Claude-native checkout directories while preserving Git branches and ignored outputs. It is dry-run by default. The daily policy is seven days for both task-owned and unowned checkouts, with an apply-time mass-event cap of 100 removals. Eligible candidates are measured and processed largest-first.
 
-**Landed fast path (#109).** A task-owned checkout whose tasks are all terminal, whose tree is clean, whose branch is checked out (not a detached HEAD) and whose HEAD is proven in `origin/main` (ancestor, matching tree, patch-equivalent commits, or the combined patch already present) is reaped after one quiet day (`--landed-retention-days`, default 1; `0` disables it). The reason is `terminal_and_landed`. Every other gate below still applies, and a checkout that is dirty or not proven landed keeps the seven-day policy.
+**Landed fast path (#109).** A task-owned checkout whose tasks are all terminal, whose tree is clean, whose branch is checked out (not a detached HEAD) and whose HEAD is proven in `origin/main` (ancestor, matching tree, patch-equivalent commits, or the combined patch already present) is reaped after one quiet day (`--landed-retention-days`, default 1; `0` disables it). The reason is `terminal_and_landed`. Every other gate below still applies, and a checkout that is dirty or not proven landed keeps the seven-day policy. `--unowned-landed-retention-days N` applies the same test to unowned checkouts, which have no task to be terminal. It is off by default (`0`), and when used the reason is `unowned_and_landed`. On cm-sessions on 2026-11-05, a value of 1 would have reaped 17 unowned checkouts holding 22.6 GiB.
 
 ## Eligibility
 

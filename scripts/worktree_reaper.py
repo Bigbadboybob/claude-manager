@@ -278,6 +278,9 @@ class ScanContext:
     # tree is clean and whose HEAD is proven in origin main is reaped after
     # this many quiet days instead of `retention_days`. None disables it.
     landed_retention_days: float | None = None
+    # The same fast path for an unowned checkout (no task to be terminal):
+    # clean, HEAD proven in origin main, quiet this many days. Off by default.
+    unowned_landed_retention_days: float | None = None
 
 
 def run(
@@ -1284,13 +1287,9 @@ def decision(
             "threshold_days": threshold,
         }
     )
-    landed_window = (
-        not unowned
-        and not immediate
-        and ctx.landed_retention_days is not None
-        and ctx.landed_retention_days < threshold
-    )
-    if age_days < threshold and not (landed_window and age_days >= ctx.landed_retention_days):
+    landed_days = ctx.unowned_landed_retention_days if unowned else ctx.landed_retention_days
+    landed_window = not immediate and landed_days is not None and landed_days < threshold
+    if age_days < threshold and not (landed_window and age_days >= landed_days):
         return Decision(path, "wait", below_retention_reason, False, **common)
 
     full_git_facts, full_error = inspect_git(path)
@@ -1317,7 +1316,7 @@ def decision(
     full_age_days = max(0.0, (ctx.now - max(full_activity)) / DAY)
     common["age_days"] = full_age_days
     landed_only = full_age_days < threshold
-    if landed_only and not (landed_window and full_age_days >= ctx.landed_retention_days):
+    if landed_only and not (landed_window and full_age_days >= landed_days):
         return Decision(path, "wait", below_retention_reason, False, **common)
     common.update(
         {
@@ -1372,7 +1371,7 @@ def decision(
         return Decision(
             path,
             "reap",
-            "terminal_and_landed",
+            "unowned_and_landed" if unowned else "terminal_and_landed",
             True,
             details=archive_detail + discard_detail + standalone_detail,
             **common,
@@ -1433,6 +1432,7 @@ def build_context(args: argparse.Namespace) -> tuple[ScanContext, list[str]]:
             retention_days=args.retention_days,
             unowned_retention_days=args.unowned_retention_days,
             landed_retention_days=args.landed_retention_days or None,
+            unowned_landed_retention_days=args.unowned_landed_retention_days or None,
             workspaces=workspace_facts,
             tasks=tasks,
             tasks_by_branch=dict(tasks_by_branch),
@@ -2056,6 +2056,13 @@ def parser() -> argparse.ArgumentParser:
         help="retention for a clean task-owned checkout whose HEAD is proven in origin main "
              "and whose tasks are all terminal; 0 disables the fast path",
     )
+    result.add_argument(
+        "--unowned-landed-retention-days",
+        type=float,
+        default=0.0,
+        help="the same fast path for a clean unowned checkout whose HEAD is proven in origin "
+             "main; 0 (the default) keeps unowned checkouts on --unowned-retention-days",
+    )
     result.add_argument("--max-removals", type=int, default=100, help="mass-event cap per apply run")
     result.add_argument(
         "--apply",
@@ -2181,6 +2188,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "retention_days": args.retention_days,
                         "unowned_retention_days": args.unowned_retention_days,
                         "landed_retention_days": args.landed_retention_days,
+                        "unowned_landed_retention_days": args.unowned_landed_retention_days,
                         "terminal_statuses": sorted(TERMINAL_TASK_STATUSES),
                         "roots": [str(ctx.root) for ctx in contexts],
                         "artifact_root": str(args.artifact_root.expanduser().resolve(strict=False)),

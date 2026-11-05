@@ -111,6 +111,28 @@ class WorktreeReaperTests(unittest.TestCase):
         self.assertTrue(any(d.startswith("not landed:") for d in unlanded.details), unlanded.details)
         self.assertEqual(decide(8).reason, "terminal_and_inactive", "unlanded work still goes at 7 days")
 
+    def test_unowned_landed_fast_path_is_opt_in_and_needs_a_clean_landed_head(self) -> None:
+        # #109: 17 unowned checkouts (22.6 GiB) on cm-sessions were landed and
+        # clean but waited the full unowned retention.
+        def decide(age_days, *, landed_days=1.0):
+            context = self.context(task_owned=False)
+            context.unowned_retention_days = 7
+            context.now = time.time() + age_days * reaper.DAY
+            context.unowned_landed_retention_days = landed_days
+            return reaper.decision(self.worktree, context)
+
+        fast = decide(2)
+        self.assertTrue(fast.eligible)
+        self.assertEqual((fast.reason, fast.landed_reason), ("unowned_and_landed", "head_is_ancestor"))
+        self.assertEqual(decide(2, landed_days=None).reason, "unowned_below_retention", "off by default")
+        self.assertEqual(decide(0.5).reason, "unowned_below_retention")
+        self.assertEqual(decide(8).reason, "unowned_inactive", "full retention is unchanged")
+        (self.worktree / "NOTES.md").write_text("dirty\n")
+        self.assertIn("dirty tree waits for full retention", decide(2).details)
+        self.git(self.worktree, "commit", "-am", "unlanded work")
+        self.assertFalse(decide(2).eligible)
+        self.assertEqual(reaper.parser().parse_args([]).unowned_landed_retention_days, 0.0)
+
     def test_durable_workspaces_and_open_assistants_checkouts_are_protected(self) -> None:
         # doc/org-model.md §5, O5: a member's home/stream workspace, or a
         # checkout an assistant was live in within 7 days, survives a done
