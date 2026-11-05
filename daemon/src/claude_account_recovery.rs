@@ -370,13 +370,26 @@ fn notice_ready(e: &Episode) -> bool {
 /// Return a one-way, stable account identity, never a token or e-mail address.
 /// Token refresh and unrelated profile changes do not count as a switch.
 fn account_fingerprint(path: &Path) -> io::Result<String> {
+    const MAX: u64 = 8 * 1024 * 1024;
     let file = std::fs::File::open(path)?;
-    if file.metadata()?.len() > 8 * 1024 * 1024 {
+    if file.metadata()?.len() > MAX {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "Claude profile too large"));
     }
-    let profile: Value = serde_json::from_reader(file)?;
-    let id = profile["oauthAccount"]["accountUuid"].as_str()
-        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+    // One read, then parse only the account id. `from_reader` on a bare File
+    // issued one read(2) per byte: ~320k syscalls for cm-sessions' profile on
+    // every change Claude makes to it (2026-11-05).
+    #[derive(Deserialize)]
+    struct Profile { #[serde(rename = "oauthAccount")] oauth_account: Option<Account> }
+    #[derive(Deserialize)]
+    struct Account { #[serde(rename = "accountUuid")] account_uuid: Option<Value> }
+    let mut bytes = Vec::new();
+    file.take(MAX + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Claude profile too large"));
+    }
+    let profile: Profile = serde_json::from_slice(&bytes)?;
+    let id = profile.oauth_account.and_then(|a| a.account_uuid)
+        .and_then(|v| v.as_str().and_then(|s| uuid::Uuid::parse_str(s).ok()))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Claude account identity unavailable"))?;
     Ok(format!("{:x}", Sha256::digest(id.as_bytes())))
 }
@@ -1193,6 +1206,25 @@ mod tests {
         let mut restored = Journal::load(&path).unwrap();
         assert!(!restored.observe("worker", &record, Some("different-account")).armed(Some("different-account"), 3000));
         std::fs::write(&path, "{").unwrap(); assert!(Journal::load(&path).is_err());
+    }
+    #[test]
+    fn account_fingerprint_reads_only_the_account_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile.json");
+        let id = "123e4567-e89b-12d3-a456-426614174000";
+        let expected = format!("{:x}", Sha256::digest(uuid::Uuid::parse_str(id).unwrap().as_bytes()));
+        let projects: serde_json::Map<String, Value> = (0..2000)
+            .map(|i| (format!("/w/{i}"), json!({"hasTrustDialogAccepted": true, "history": vec!["x"; 8]})))
+            .collect();
+        std::fs::write(&profile, json!({"projects": projects, "oauthAccount": {"accountUuid": id, "emailAddress": "a@b"}}).to_string()).unwrap();
+        assert_eq!(account_fingerprint(&profile).unwrap(), expected);
+        for bad in [json!({}), json!({"oauthAccount": null}), json!({"oauthAccount": {"accountUuid": 7}}),
+            json!({"oauthAccount": {"accountUuid": "not-a-uuid"}}), json!([1])] {
+            std::fs::write(&profile, bad.to_string()).unwrap();
+            assert!(account_fingerprint(&profile).is_err(), "{bad}");
+        }
+        std::fs::write(&profile, "{").unwrap();
+        assert!(account_fingerprint(&profile).is_err());
     }
     #[test]
     fn deferred_record_waits_for_a_new_switch_or_reset_edge() {
