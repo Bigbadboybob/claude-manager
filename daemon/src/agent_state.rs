@@ -376,6 +376,10 @@ pub(crate) fn wait_floor(input: &Inputs) -> f64 {
 
 /// Pure precedence/freshness function. `previous` preserves entered-at times and
 /// supplies the working-to-idle debounce; source observations retain true times.
+/// How long Claude's status file must stay non-waiting after an id-less
+/// permission hook before the wait counts as settled.
+const PRESENCE_SETTLE_SECS: f64 = 10.0;
+
 pub fn derive(input: &Inputs, now: f64) -> AgentState {
     let hooks = &input.hooks;
     let presence = input.presence.as_ref();
@@ -499,7 +503,22 @@ pub fn derive(input: &Inputs, now: f64) -> AgentState {
                 .iter()
                 .find(|f| matches!(f.as_str(), "waitingOnApproval" | "waitingOnUserInput"))
         });
-        let hook_wait = !hook_resolved && hooks.waiting_for.as_deref() != Some("idle_prompt") && newer(
+        // Claude 2.1.318 permission hooks can arrive without `tool_use_id`, and a
+        // long turn hides the boundary the transcript proof needs. The engine's
+        // own status file is the dialog's other witness: a real prompt shows as
+        // waiting there. A status written after the hook that has stayed
+        // non-waiting for PRESENCE_SETTLE_SECS ends the id-less wait.
+        let presence_settled = hooks.waiting_tool_id.is_none()
+            && crate::claude_wait::is_permission(hooks.waiting_for.as_deref())
+            && presence.is_some_and(|p| {
+                p.valid
+                    && matches!(p.status, PresenceStatus::Busy | PresenceStatus::Idle)
+                    && newer(p.status_updated_at, hooks.waiting_at)
+                    && p.status_updated_at
+                        .is_some_and(|at| p.observed_at - at >= PRESENCE_SETTLE_SECS)
+            });
+        let hook_wait = !hook_resolved && !presence_settled
+            && hooks.waiting_for.as_deref() != Some("idle_prompt") && newer(
             hooks.waiting_at,
             max_time(start, last_turn.ended_at),
         );
@@ -2119,6 +2138,42 @@ mod tests {
         assert_eq!(derive(&i, 1040.0).state, State::Errored);
         assert_eq!(derive(&i, 1040.0).detail.error_kind, None, "kind-less new failure cannot inherit an old error label");
 
+    }
+
+    #[test]
+    fn idless_permission_wait_ends_when_claude_status_settles_non_waiting() {
+        // F-Custody 2026-11-05: PermissionRequest at 15:17:07.290 with no
+        // tool_use_id, status file `busy` at .388, mid-way through a long turn.
+        let base = |status: PresenceStatus| {
+            let mut i = presence(status);
+            i.latest_start = Some(1001.0);
+            i.hooks.prompt_at = Some(1001.0);
+            i.hooks.waiting_at = Some(1012.0);
+            i.hooks.waiting_for = Some("permission".into());
+            i.hooks.open_tool = Some("Bash".into());
+            let p = i.presence.as_mut().unwrap();
+            p.status_updated_at = Some(1012.1);
+            p.observed_at = 1022.2;
+            i
+        };
+        assert_eq!(derive(&base(PresenceStatus::Busy), 1023.0).state, State::Working);
+        assert_eq!(derive(&base(PresenceStatus::Idle), 1023.0).state, State::Idle);
+        let mut early = base(PresenceStatus::Busy);
+        early.presence.as_mut().unwrap().observed_at = 1015.0;
+        assert_eq!(derive(&early, 1016.0).state, State::WaitingOnHuman, "not settled yet");
+        let mut older = base(PresenceStatus::Busy);
+        older.presence.as_mut().unwrap().status_updated_at = Some(1011.0);
+        assert_eq!(derive(&older, 1023.0).state, State::WaitingOnHuman, "status predates the hook");
+        assert_eq!(derive(&base(PresenceStatus::Waiting), 1023.0).state, State::WaitingOnHuman);
+        let mut exact = base(PresenceStatus::Busy);
+        exact.hooks.waiting_tool_id = Some("toolu_1".into());
+        assert_eq!(derive(&exact, 1023.0).state, State::WaitingOnHuman, "exact ids keep transcript proof");
+        let mut elicit = base(PresenceStatus::Busy);
+        elicit.hooks.waiting_for = Some("elicitation".into());
+        assert_eq!(derive(&elicit, 1023.0).state, State::WaitingOnHuman, "only permission waits");
+        let mut invalid = base(PresenceStatus::Busy);
+        invalid.presence.as_mut().unwrap().valid = false;
+        assert_ne!(derive(&invalid, 1023.0).state, State::Working, "invalid provenance stays fail closed");
     }
 
     #[test]

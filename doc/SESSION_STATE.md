@@ -143,6 +143,12 @@ transitions to `working` at the result's event time; ordinary polls preserve
 no trustworthy post-approval tool-start hook: an approved long-running call can
 remain visibly waiting until its matching result or a real lifecycle edge.
 
+Claude 2.1.318 permission hooks can omit `tool_use_id`. For such an id-less
+permission wait only, a valid Claude status file whose status was written after
+the hook as `busy` or `idle`, and is still observed so at least 10 s later, ends
+the wait: a real dialog shows as `waiting` there. Exact-id waits, elicitations,
+an unsettled or older status, and invalid presence keep the rules above.
+
 `since` is already exported in full daemon/MCP `agent_state` and the TUI waiting
 badge; the slim roster exposes it as `activity.since_host_clock`, separately
 from `state_since_api_clock` and `observed_at_host_clock`. A poll is never a new

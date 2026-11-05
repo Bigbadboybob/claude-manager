@@ -22,7 +22,7 @@ pub struct Key {
     pub tool_name: Option<String>,
     pub floor: f64,
 }
-fn permission(reason: Option<&str>) -> bool {
+pub(crate) fn is_permission(reason: Option<&str>) -> bool {
     matches!(
         reason,
         Some("permission" | "permission_prompt" | "permission prompt")
@@ -33,13 +33,13 @@ impl Key {
         let hook_at = hooks
             .waiting_at
             .filter(|at| *at > floor)
-            .filter(|_| permission(hooks.waiting_for.as_deref()));
+            .filter(|_| is_permission(hooks.waiting_for.as_deref()));
         let presence_at = presence
             .status_updated_at
             .filter(|at| *at > floor)
             .filter(|_| {
                 presence.status == PresenceStatus::Waiting
-                    && permission(presence.waiting_for.as_deref())
+                    && is_permission(presence.waiting_for.as_deref())
             });
         let at = hook_at
             .into_iter()
