@@ -20,6 +20,9 @@ from mcp_server.notifications import (
 # removal afterwards) in this consumer's own transcript mark it stale.
 ENQUEUE_ONLY_STALE = 3
 TAIL_BYTES = 2 * 1024 * 1024
+# Every record `stale_evidence` reads has one of these types; other lines of
+# the tail are skipped unparsed.
+STALE_EVIDENCE_NEEDLES = (b"continued-in", b"queue-operation")
 BG_PROBE_INTERVAL = 30.0
 
 
@@ -216,7 +219,10 @@ def channel_flag_present(argv: list[str]) -> bool:
     return False
 
 
-def transcript_tail(path: str | None):
+def transcript_tail(path: str | None, needles: tuple[bytes, ...] | None = None):
+    """Parsed records of the transcript's last TAIL_BYTES. With `needles`,
+    only lines containing one of them are parsed: a 2 MiB tail of large
+    assistant turns costs 20-40 ms to parse in full, every 5 s per session."""
     if not path:
         return
     try:
@@ -224,15 +230,18 @@ def transcript_tail(path: str | None):
             stream.seek(0, 2)
             start = max(0, stream.tell() - TAIL_BYTES)
             stream.seek(start)
-            if start:
-                stream.readline()
-            for line in stream:
-                try:
-                    yield json.loads(line)
-                except (ValueError, UnicodeError):
-                    continue
+            data = stream.read()
     except OSError:
         return
+    if start:
+        data = data.partition(b"\n")[2]
+    for line in data.split(b"\n"):
+        if needles is not None and not any(n in line for n in needles):
+            continue
+        try:
+            yield json.loads(line)
+        except (ValueError, UnicodeError):
+            continue
 
 
 class ClaudeAdapter:
@@ -370,7 +379,7 @@ class ClaudeAdapter:
         our recent submissions were only enqueued, never processed."""
         continued = False
         enqueued = []
-        for item in transcript_tail(own):
+        for item in transcript_tail(own, STALE_EVIDENCE_NEEDLES):
             kind = item.get("type")
             if kind == "continued-in":
                 continued = True

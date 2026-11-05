@@ -528,6 +528,32 @@ class ClaudeEvidenceTests(unittest.IsolatedAsyncioTestCase):
             write([{"type": "continued-in", "continuedInSessionId": "new"}])
             self.assertEqual(ClaudeAdapter.stale_evidence(str(path), markers), ["continued_in"])
 
+    def test_own_transcript_evidence_parses_only_candidate_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.jsonl"
+            markers = ["[cm-chat a]", "[cm-chat b]", "[cm-chat c]"]
+            enq = lambda m: {"type": "queue-operation", "operation": "enqueue",
+                             "content": f"<channel>{m} hint</channel>"}
+            turn = {"type": "assistant", "message": {"content": "x" * 4000}}
+            records = []
+            for m in markers:
+                records += [turn] * 50 + [enq(m)]
+            path.write_text("".join(json.dumps(r) + "\n" for r in records) + "{broken\n")
+            real = json.loads
+            parsed = []
+
+            def counting(s, *a, **k):
+                parsed.append(s)
+                return real(s, *a, **k)
+
+            with mock.patch("mcp_server.native_claude.json.loads", counting):
+                self.assertEqual(ClaudeAdapter.stale_evidence(str(path), markers),
+                                 ["enqueued_unobserved"])
+            self.assertEqual(len(parsed), len(markers), "assistant turns are never parsed")
+            # The tail still starts on a line boundary once the file exceeds it.
+            with mock.patch("mcp_server.native_claude.TAIL_BYTES", 4000 * 50 + 300):
+                self.assertEqual(ClaudeAdapter.stale_evidence(str(path), markers), [])
+
     async def test_fork_leaves_old_consumer_stale_and_new_one_live(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
