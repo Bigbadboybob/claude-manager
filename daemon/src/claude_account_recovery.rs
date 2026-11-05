@@ -1135,6 +1135,7 @@ pub(crate) fn latest_limit(path: &Path, native_id: &str) -> io::Result<Option<Li
             }
             Some("queue-operation" | "attachment") => { later_queue_activity = true; continue; },
             Some("system" | "progress" | "file-history-snapshot" | "last-prompt" | "summary") => continue,
+            Some(kind) if crate::continuous::probe::is_claude_bookkeeping(kind) => continue,
             _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown transcript record")),
         }
     }

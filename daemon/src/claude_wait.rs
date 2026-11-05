@@ -267,9 +267,9 @@ fn resolved_at(
         }
         let kind = row.get("type")?.as_str()?;
         match kind {
-            "progress" | "file-history-snapshot" | "last-prompt" | "summary" | "attachment" => {
-                continue
-            }
+            "progress" | "file-history-snapshot" | "last-prompt" | "summary" | "attachment"
+            | "queue-operation" => continue,
+            kind if crate::continuous::probe::is_claude_bookkeeping(kind) => continue,
             "system" if row.get("subtype").and_then(|v| v.as_str()) != Some("turn_duration") => {
                 continue
             }
@@ -422,6 +422,28 @@ pub(crate) mod tests {
             1000.0,
             &mut None,
         )
+    }
+
+    #[test]
+    fn needs_human_claude_2_1_318_bookkeeping_rows_do_not_hide_the_result() {
+        let meta = |kind: &str| json!({"type": kind, "sessionId": "transcript"});
+        let mut rows = rows();
+        rows.insert(2, json!({"type":"api-request-blob","sessionId":"transcript",
+            "hash":"h","message":{"role":"user"}}));
+        rows.insert(3, json!({"type":"api-request","sessionId":"transcript",
+            "timestamp":"1970-01-01T00:16:30.000Z","id":"r"}));
+        rows.insert(4, json!({"type":"queue-operation","sessionId":"transcript",
+            "operation":"enqueue","timestamp":"1970-01-01T00:16:30.500Z"}));
+        for kind in ["ai-title", "mode", "permission-mode", "session-owner", "atis-latch"] {
+            rows.insert(5, meta(kind));
+        }
+        rows.push(json!({"type":"file-history-delta","messageId":"m",
+            "timestamp":"1970-01-01T00:16:32.000Z"}));
+        for exact in [false, true] {
+            assert_eq!(resolve(&rows, &key(exact)), Some(991.0));
+        }
+        rows.push(meta("brand-new-kind"));
+        assert_eq!(resolve(&rows, &key(true)), None, "unknown types stay fail-closed");
     }
 
     #[test]

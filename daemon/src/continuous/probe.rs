@@ -53,6 +53,24 @@ const TAIL_READ_BYTES: u64 = 256 * 1024;
 /// records) from turning the probe into a full-file parse.
 const MAX_SCAN_LINES: usize = 200;
 
+/// Bookkeeping records Claude Code 2.1.318+ appends between conversation
+/// rows: request/cache fingerprints, titles, mode and owner markers. They
+/// carry no turn, tool, or permission evidence, so every transcript reader
+/// skips them; an unknown type still ends a strict scan.
+pub(crate) fn is_claude_bookkeeping(kind: &str) -> bool {
+    matches!(
+        kind,
+        "api-request"
+            | "api-request-blob"
+            | "ai-title"
+            | "mode"
+            | "permission-mode"
+            | "session-owner"
+            | "atis-latch"
+            | "file-history-delta"
+    )
+}
+
 /// Shape of the transcript's last substantive record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TailShape {
@@ -208,6 +226,7 @@ fn claude_boundary(text: &str, path: &Path) -> Option<crate::agent_state::LastTu
         let kind = v.get("type")?.as_str()?;
         match kind {
             "file-history-snapshot" | "last-prompt" | "summary" | "attachment" | "progress" => continue,
+            kind if is_claude_bookkeeping(kind) => continue,
             "system" if v.get("subtype").and_then(|v| v.as_str()) == Some("stop_hook_summary") => continue,
             "system" | "assistant" | "user" => {},
             _ => return None,
@@ -428,6 +447,42 @@ mod tests {
         assert_eq!(probe.shape, TailShape::TurnComplete);
         assert_eq!(probe.claude_end.unwrap().ended_at, Some(961.0));
         assert!(probe.auth_error.is_none());
+    }
+
+    /// Claude Code 2.1.318 writes bookkeeping rows around every request
+    /// (shapes from an F-Custody transcript, 2026-11-05). The boundary
+    /// reader skips them instead of losing the turn end.
+    #[test]
+    fn claude_2_1_318_bookkeeping_rows_keep_the_turn_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current.jsonl");
+        let row = |v: serde_json::Value| v.to_string();
+        let lines = [
+            row(serde_json::json!({"type":"assistant", "sessionId":"current",
+                "timestamp":"1970-01-01T00:16:00Z", "message":{"stop_reason":"end_turn"}})),
+            row(serde_json::json!({"type":"api-request-blob", "sessionId":"current",
+                "hash":"h", "message":{"role":"user"}})),
+            row(serde_json::json!({"type":"api-request", "sessionId":"current",
+                "timestamp":"1970-01-01T00:16:00.5Z", "id":"r"})),
+            row(serde_json::json!({"type":"system", "subtype":"turn_duration",
+                "sessionId":"current", "timestamp":"1970-01-01T00:16:01Z"})),
+            row(serde_json::json!({"type":"ai-title", "sessionId":"current", "aiTitle":"t"})),
+            row(serde_json::json!({"type":"mode", "sessionId":"current", "mode":"normal"})),
+            row(serde_json::json!({"type":"permission-mode", "sessionId":"current",
+                "permissionMode":"bypassPermissions"})),
+            row(serde_json::json!({"type":"session-owner", "sessionId":"current"})),
+            row(serde_json::json!({"type":"atis-latch", "sessionId":"current", "atis":1})),
+            row(serde_json::json!({"type":"file-history-delta", "messageId":"m",
+                "timestamp":"1970-01-01T00:16:02Z"})),
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let probe = probe_transcript_tail(&path).unwrap();
+        assert_eq!(probe.shape, TailShape::TurnComplete);
+        assert_eq!(probe.claude_end.unwrap().ended_at, Some(961.0));
+        std::fs::write(&path, format!("{}\n{}\n",
+            lines.join("\n"), r#"{"type":"brand-new-kind","sessionId":"current"}"#)).unwrap();
+        assert!(probe_transcript_tail(&path).unwrap().claude_end.is_none(),
+            "an unrecognised type still ends the strict boundary scan");
     }
 
     #[test]

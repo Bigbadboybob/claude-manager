@@ -283,6 +283,7 @@ pub fn claude_turn_finished_after(path: &str, after: f64) -> bool {
                 "file-history-snapshot" | "last-prompt" | "summary" | "attachment" | "progress" => {
                     continue
                 }
+                kind if crate::continuous::probe::is_claude_bookkeeping(kind) => continue,
                 _ => return Some(false),
             };
             if !terminal {
