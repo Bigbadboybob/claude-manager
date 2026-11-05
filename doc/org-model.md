@@ -870,7 +870,9 @@ ask(topic=None, to=None, text, item=None)            # write, later
   pane shows the four facts, mandate, focus, current items and inbound question
   count. `e` edits the profile; `/?topic` runs `who` and highlights matches.
 - **Sessions sidebar** gains a Team sub-view (team → member → sessions,
-  folding as today). The Task sub-view stays selectable until S8.
+  folding as today). The Task sub-view stays selectable until S8; since
+  2026-11-05 it is titled Workspaces and has no task subheaders (a workspace
+  shows its sessions directly; its row stands for its task).
 - **Planning view** is the backlog only (O7, §13.4). `A-f` places a task on a
   board, held by a member, a team (its lead hands it out, O8), nobody, or a
   new hire. There is no Launch path in planning; an API or daemon too old to

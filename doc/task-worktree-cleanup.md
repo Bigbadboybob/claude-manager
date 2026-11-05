@@ -1,6 +1,8 @@
 # Closing tasks and reclaiming worktrees
 
-In the work view, **Alt+D** opens the completion dialog for the selected task.
+In the work view, **Alt+D** opens the completion dialog for the selected task:
+the task of the focused session, or of the focused workspace row (the sidebar
+has no task subheaders since 2026-11-05; a workspace row stands for its task).
 **Keep worktrees** is the default. Use Tab or the arrow keys to select
 **Reap this task + descendants** and press Enter. Reap does not wait for the
 preview: Enter marks the task done (or closes the workspace), closes the
@@ -16,8 +18,10 @@ the preview, which names the task that owns it.
 **Alt+Shift+w** opens the same choice for closing a workspace. Closing a
 workspace does not mark its associated planning tasks done: any nonterminal
 task still protects its checkout. For task completion and cleanup, use Alt+D
-on that task's header. Plain Alt+w retains its existing close-session behavior.
-A workspace containing several tasks requires selecting a specific task before
+on that task's workspace row or one of its sessions. Plain Alt+w retains its
+existing close-session behavior (on a workspace row in the Workspaces sub-view
+it closes that task's sessions and leaves shells). A workspace shared by
+several tasks requires focusing a session of the task to complete before
 Alt+D; cleanup never guesses which one to complete.
 For an exited worker whose viewer binding is missing, Alt+D resolves a single
 associated task from the host's checkout inventory before completion. A

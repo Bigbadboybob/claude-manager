@@ -2786,7 +2786,6 @@ impl App {
         let saved_ws_id = match &self.cursor {
             Cursor::Workspace(wi) => self.workspaces.get(*wi).map(|w| w.id.clone()),
             Cursor::Session(wi, _) => self.workspaces.get(*wi).map(|w| w.id.clone()),
-            Cursor::Task { ws_idx, .. } => self.workspaces.get(*ws_idx).map(|w| w.id.clone()),
             // Not workspace-scoped; clamp_cursor re-validates it at the end.
             Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => None,
         };
@@ -2796,12 +2795,6 @@ impl App {
                 .get(*wi)
                 .and_then(|w| w.sessions.get(*si))
                 .map(|s| s.uid.clone()),
-            _ => None,
-        };
-        // A task header keeps its task too: pre-fix every task-feed refresh
-        // dropped the cursor from a task header to its workspace's header.
-        let saved_task_id = match &self.cursor {
-            Cursor::Task { task_id, .. } => Some(task_id.clone()),
             _ => None,
         };
 
@@ -3142,8 +3135,6 @@ impl App {
                     } else {
                         self.cursor = Cursor::Workspace(wi);
                     }
-                } else if let Some(task_id) = saved_task_id {
-                    self.cursor = Cursor::Task { ws_idx: wi, task_id };
                 } else {
                     self.cursor = Cursor::Workspace(wi);
                 }
@@ -3808,8 +3799,9 @@ mod apply_manifest_diff_tests {
         std::mem::forget(tx);
     }
 
-    /// A task header no longer displays its single session (2026-10-20: it
-    /// is a tree row, app/tree.rs), so only the workspace row is pinned.
+    /// In the Status sub-view a single-session workspace row displays that
+    /// session's terminal, and it must repaint. (In the Task sub-view the
+    /// workspace header is a tree row and displays none, app/tree.rs.)
     #[test]
     fn single_session_workspace_row_repaints_terminal_output() {
         let mut app = build_app_with_session("ts-visible");
@@ -4344,6 +4336,37 @@ mod apply_manifest_diff_tests {
         app.cursor = Cursor::Session(0, 0);
         app.close_active_session();
         assert!(matches!(app.input_mode, InputMode::Normal), "another agent is still working");
+    }
+
+    /// A-w on the workspace header (Task sub-view; it replaced the task
+    /// header, 2026-11-05) closes the sessions of the workspace's task and
+    /// leaves its shells, and closing the last agent that way still asks to
+    /// close the workspace (5752067).
+    #[test]
+    fn closing_the_task_from_the_workspace_header_keeps_shells_and_asks() {
+        let mut app = build_app_with_session("ts-lead");
+        app.sidebar_view = SidebarView::Task;
+        app.workspaces[0].sessions[0].task_id = Some("t-lead".into());
+        add_bash_row(&mut app, "ts-sh", "d-sh");
+        assert_eq!(app.workspace_task(0).as_deref(), Some("t-lead"));
+        app.cursor = Cursor::Workspace(0);
+        app.close_active_session();
+        let left: Vec<&str> = app.workspaces[0].sessions.iter().map(|s| s.uid.as_str()).collect();
+        assert_eq!(left, ["ts-sh"], "the shell stays");
+        assert!(app.workspaces[0].tombstones.iter().any(|t| t.uid == "ts-lead"));
+        assert!(matches!(
+            &app.input_mode,
+            InputMode::Confirm { action: ConfirmAction::CloseAfterLastAgent { ws_id }, .. } if ws_id == "ws-test"
+        ));
+
+        // A workspace with several sessions and no task: nothing closes.
+        let mut app = build_app_with_session("ts-a");
+        app.sidebar_view = SidebarView::Task;
+        add_bash_row(&mut app, "ts-sh", "d-sh");
+        app.cursor = Cursor::Workspace(0);
+        app.close_active_session();
+        assert_eq!(app.workspaces[0].sessions.len(), 2);
+        assert!(matches!(app.input_mode, InputMode::Normal));
     }
 
     /// The bash-pane answers decide: a busy pane, or a pane the daemon was

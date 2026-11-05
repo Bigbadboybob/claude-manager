@@ -1438,33 +1438,20 @@ impl App {
         let (wi, si) = match &self.cursor {
             Cursor::Session(wi, si) => (*wi, *si),
             Cursor::Workspace(wi) => {
-                let wi = *wi;
-                if self.workspaces.get(wi).map_or(false, |w| w.sessions.len() == 1) {
-                    (wi, 0)
-                } else {
-                    return;
-                }
-            }
-            Cursor::Task { ws_idx, task_id } => {
-                // Toggle hidden on every session belonging to the task.
+                // Toggle hidden on every session of the workspace (the task
+                // header it replaced did this for its task's sessions).
                 // Uses the majority-hidden state as the "current" so one
                 // keypress always flips everything in unison.
-                let wi = *ws_idx;
-                let tid = task_id.clone();
+                let wi = *wi;
                 let Some(ws) = self.workspaces.get_mut(wi) else {
                     return;
                 };
-                let matching: Vec<&mut TerminalSession> = ws
-                    .sessions
-                    .iter_mut()
-                    .filter(|ts| ts.task_id.as_deref() == Some(tid.as_str()))
-                    .collect();
-                if matching.is_empty() {
+                if ws.sessions.is_empty() {
                     return;
                 }
-                let hidden_count = matching.iter().filter(|ts| ts.hidden).count();
-                let new_hidden = hidden_count * 2 < matching.len();
-                for ts in matching {
+                let hidden_count = ws.sessions.iter().filter(|ts| ts.hidden).count();
+                let new_hidden = hidden_count * 2 < ws.sessions.len();
+                for ts in &mut ws.sessions {
                     ts.hidden = new_hidden;
                 }
                 self.save_session_manifest();
@@ -1519,8 +1506,8 @@ impl App {
     }
 
     /// Enter input mode to add a terminal session to the active workspace.
-    /// If the cursor is inside a task scope, the new session inherits that
-    /// task_id so it appears under the task subheader.
+    /// The new session inherits the task of the cursor's row: a session's
+    /// task, or the workspace's task on its header.
     pub(super) fn start_new_terminal_session(&mut self) {
         let wi = match self.active_workspace_index() {
             Some(wi) => wi,
@@ -1529,7 +1516,7 @@ impl App {
                 return;
             }
         };
-        let task_id = self.cursor_task_id();
+        let task_id = self.cursor_scope_task_id();
         // Capture workspace_id (stable) instead of the index — backend
         // events fired while the form is open can reorder workspaces,
         // and a stored index would silently target the wrong workspace
@@ -2130,39 +2117,44 @@ impl App {
                 }
             }
             Cursor::Workspace(wi) => {
-                if let Some(ws) = self.workspaces.get_mut(wi) {
-                    if ws.sessions.len() == 1 {
-                        // Same operator-kill semantics as the
-                        // Session-cursor arm above.
-                        Self::kill_daemon_session_for_close(&pool, &ws.sessions[0]);
-                        Self::tombstone_session(ws, 0);
-                        let closed_uid = ws.sessions[0].uid.clone();
-                        let was_agent = ws.sessions[0].session_type != "bash";
-                        ws.sessions.remove(0);
-                        self.cursor = Cursor::Workspace(wi);
-                        // Cancel any reconnect/reattach for the closed session.
-                        self.forget_reconnect_state(&closed_uid);
-                        self.save_session_manifest();
-                        self.set_status_msg("Session closed");
-                        if was_agent {
-                            self.after_agent_gone(wi, LastAgentClose::Owner);
-                        }
+                let task = self.workspace_task(wi);
+                let Some(ws) = self.workspaces.get_mut(wi) else { return };
+                if ws.sessions.len() == 1 {
+                    // Same operator-kill semantics as the
+                    // Session-cursor arm above.
+                    Self::kill_daemon_session_for_close(&pool, &ws.sessions[0]);
+                    Self::tombstone_session(ws, 0);
+                    let closed_uid = ws.sessions[0].uid.clone();
+                    let was_agent = ws.sessions[0].session_type != "bash";
+                    ws.sessions.remove(0);
+                    self.cursor = Cursor::Workspace(wi);
+                    // Cancel any reconnect/reattach for the closed session.
+                    self.forget_reconnect_state(&closed_uid);
+                    self.save_session_manifest();
+                    self.set_status_msg("Session closed");
+                    if was_agent {
+                        self.after_agent_gone(wi, LastAgentClose::Owner);
                     }
-                }
-            }
-            Cursor::Task { ws_idx, task_id } => {
-                // Close every session belonging to the task. The task remains
-                // in the sidebar (as an empty subheader) until A-x removes it.
-                // Tombstone each so `read_session_output` keeps working.
-                if ws_idx < self.workspaces.len() {
-                    let target = task_id.clone();
-                    let removed = self.tombstone_and_remove(ws_idx, |ts| {
+                } else if ws.sessions.len() > 1 {
+                    // The workspace row stands for its task (it replaced the
+                    // task header, 2026-11-05): close every session of that
+                    // task. Shells and other tasks' sessions stay. Tombstone
+                    // each so `read_session_output` keeps working.
+                    let Some(target) = task else {
+                        self.set_status_msg(
+                            "Focus a session to close it (A-W closes the workspace)",
+                        );
+                        return;
+                    };
+                    let removed = self.tombstone_and_remove(wi, |ts| {
                         ts.task_id.as_deref() == Some(target.as_str())
                     });
                     if removed > 0 {
                         // Helper already saved the manifest.
                         self.set_status_msg(&format!("Closed {} session(s)", removed));
-                        self.after_agent_gone(ws_idx, LastAgentClose::Owner);
+                        self.after_agent_gone(wi, LastAgentClose::Owner);
+                    } else {
+                        self.set_status_msg("No session of this workspace's task to close");
                     }
                 }
             }
@@ -3073,8 +3065,8 @@ impl App {
     }
 
     /// Spawn a session on an existing workspace by type ("claude" / "codex" / "bash").
-    /// If `task_id` is Some, the new session is tagged with that task so it
-    /// appears under the corresponding task subheader.
+    /// If `task_id` is Some, the new session is tagged with that task (it
+    /// shows under its workspace like any other session).
     pub(super) fn spawn_session_on_workspace(
         &mut self,
         workspace_id: &str,
@@ -3490,19 +3482,24 @@ impl App {
         self.set_status_msg(&format!("{} {} on `{}`", action, label, host.as_str()));
     }
 
-    /// Mark the first task bound to the active workspace as done via the API.
-    /// Does nothing if the workspace has zero or multiple bound tasks (ambiguous).
+    /// Mark the task of the cursor's row done via the API: a session's
+    /// task, or on a workspace row the workspace's task. Refuses when
+    /// several unrelated tasks share the workspace (ambiguous).
     pub(super) fn mark_active_done(&mut self) {
+        let task = self.cursor_scope_task_id();
+        self.mark_done_in_workspace(task);
+    }
+
+    /// [`App::mark_active_done`] for an explicit task of the cursor's
+    /// workspace (the A-d cleanup dialog's choice); `None` resolves it
+    /// from the workspace's bound tasks.
+    pub(super) fn mark_done_in_workspace(&mut self, scoped_tid: Option<String>) {
         let Some(wi) = self.active_workspace_index() else {
             return;
         };
 
-        // Task-scoped: if the cursor is on a task header, or on a session
-        // tagged with a task, mark THAT task done (and close only its
-        // sessions). If the cursor is workspace-scoped, fall back to the
-        // old "single bound task" logic.
-        let scoped_tid = self.cursor_task_id();
-
+        // Task-scoped: mark THAT task done (and close only its sessions).
+        // Otherwise fall back to the workspace's single bound task.
         let ws_id = self.workspaces[wi].id.clone();
         let tid = match scoped_tid {
             Some(t) => t,
@@ -3514,7 +3511,9 @@ impl App {
                     .filter_map(|t| t.task_id.clone())
                     .collect();
                 if bound.len() > 1 {
-                    self.set_status_msg("Multiple tasks bound — pick one (A-D on its header)");
+                    self.set_status_msg(
+                        "Several tasks share this workspace — A-D on one of their sessions",
+                    );
                     return;
                 }
                 match bound.into_iter().next() {
@@ -3616,7 +3615,7 @@ impl App {
     /// Owner A-w close of that agent asks first (`ConfirmAction::
     /// CloseAfterLastAgent`); an agent's kill closes it straight away.
     /// Pre-fix a leftover idle bash pane counted as a session and pinned
-    /// the workspace (and its task header) on the sidebar indefinitely.
+    /// the workspace on the sidebar indefinitely.
     pub(crate) fn after_agent_gone(&mut self, wi: usize, trigger: LastAgentClose) {
         let Some(ws) = self.workspaces.get(wi) else { return };
         if !self.last_agent_gone(ws) {
@@ -3635,8 +3634,7 @@ impl App {
                 }
             }
             LastAgentClose::AgentKill => {
-                let focused = matches!(self.cursor, Cursor::Workspace(c) | Cursor::Session(c, _) if c == wi)
-                    || matches!(self.cursor, Cursor::Task { ws_idx, .. } if ws_idx == wi);
+                let focused = matches!(self.cursor, Cursor::Workspace(c) | Cursor::Session(c, _) if c == wi);
                 if !focused && !self.user_reopened.contains(&ws.id) {
                     let id = ws.id.clone();
                     self.check_and_close_workspace(&id, trigger);
@@ -3868,7 +3866,6 @@ impl App {
         // which is reaped as soon as they navigate away.
         let cursor_wi = match &self.cursor {
             Cursor::Workspace(wi) | Cursor::Session(wi, _) => *wi,
-            Cursor::Task { ws_idx, .. } => *ws_idx,
             // Not on any workspace — nothing to exempt from the sweep.
             Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => usize::MAX,
         };
@@ -3962,10 +3959,11 @@ impl App {
     }
 
     /// Delete whatever the cursor resolves to:
-    ///   - Cursor::Task → delete just that task (close its sessions, remove
-    ///     from backend + local TaskEntry). The workspace, worktree, and any
-    ///     other tasks / workspace-level sessions survive.
-    ///   - Cursor::Session on a task-tagged session → same as Cursor::Task.
+    ///   - Cursor::Session on a task-tagged session → delete just that task
+    ///     (close its sessions, remove from backend + local TaskEntry). The
+    ///     workspace, worktree, and any other tasks / workspace-level
+    ///     sessions survive. (The task header that also did this is gone,
+    ///     2026-11-05.)
     ///   - Otherwise → delete the whole workspace: close sessions, remove
     ///     worktree + branch, delete any bound tasks from the API.
     pub(super) fn delete_active(&mut self) {
@@ -7901,9 +7899,10 @@ mod migrate_tui_local_tests {
     /// the cursor's task scope through to `App::launch_workflow`
     /// so the daemon records `DaemonSession.task_id` for fresh
     /// participants. Pre-fix the handler hardcoded `None`, so
-    /// an A-f on a `Cursor::Task` (tasked planning workspace,
-    /// or tasked focused session) silently lost the task scope
-    /// and reproduced the Issue G failure for the UI path.
+    /// an A-f on a task row (then a task header, now the
+    /// workspace row of a tasked workspace, or a tasked focused
+    /// session) silently lost the task scope and reproduced the
+    /// Issue G failure for the UI path.
     ///
     /// Pinned at four points:
     ///   1. `InputMode::WorkflowLaunchConfirm` carries a
@@ -7911,7 +7910,7 @@ mod migrate_tui_local_tests {
     ///   2. `InputMode::WorkflowPicker` carries a
     ///      `cursor_task_id` field.
     ///   3. `open_workflow_launch` captures
-    ///      `cursor_task_id` from `Cursor::Task { task_id, .. }`.
+    ///      `cursor_task_id` from the workspace row's task.
     ///   4. The `SubmitAction::LaunchWorkflow` handler at the
     ///      App level passes the captured value to
     ///      `self.launch_workflow(...)` — NOT a hardcoded
@@ -7962,7 +7961,7 @@ mod migrate_tui_local_tests {
         );
 
         // 3. open_workflow_launch captures cursor_task_id from
-        // Cursor::Task.
+        // the workspace row's task.
         let open_idx = src
             .find("fn open_workflow_launch(&mut self)")
             .expect("open_workflow_launch must exist");
@@ -7978,8 +7977,7 @@ mod migrate_tui_local_tests {
             .map(|i| 1 + i)
             .unwrap_or(open_rest.len());
         let open_body = &open_rest[..open_end];
-        // Three-arm destructure (Session/Workspace/Task) — all
-        // three branches must yield a (wi, focused_si,
+        // Every cursor arm must yield a (wi, focused_si,
         // cursor_task_id) triple.
         assert!(
             open_body.contains("let (wi, focused_si, cursor_task_id)"),
@@ -7988,12 +7986,12 @@ mod migrate_tui_local_tests {
              cursor (Issue I); body excerpt:\n{}",
             &open_body[..open_body.len().min(2000)],
         );
-        // The Cursor::Task arm yields Some(task_id) for the
-        // task scope.
+        // The workspace row yields Some(task_id) for its task's
+        // scope.
         assert!(
-            open_body.contains("Cursor::Task { ws_idx, task_id }")
-                && open_body.contains("(ws_idx, si, Some(task_id))"),
-            "the Cursor::Task arm of open_workflow_launch MUST \
+            open_body.contains("Cursor::Workspace(wi) => match self.workspace_task(wi)")
+                && open_body.contains("(wi, si, Some(task_id))"),
+            "the Cursor::Workspace arm of open_workflow_launch MUST \
              yield `Some(task_id)` so the daemon records the \
              task scope (Issue I); body excerpt:\n{}",
             &open_body[..open_body.len().min(2000)],

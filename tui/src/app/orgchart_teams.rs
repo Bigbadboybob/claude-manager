@@ -1586,29 +1586,32 @@ mod tests {
         app.sidebar_view = SidebarView::Task;
         let expanded = app.visual_items();
         let session_rows = expanded.iter().filter(|v| matches!(v, VisualItem::Session(..))).count();
-        let task_rows = expanded.iter().filter(|v| matches!(v, VisualItem::TaskHeader { .. })).count();
+        let ws_rows: Vec<usize> = expanded.iter().filter_map(|v| match v { VisualItem::WorkspaceHeader(wi) => Some(*wi), _ => None }).collect();
         assert_eq!(session_rows, 107);
-        assert!(task_rows > 0 && task_rows <= 202, "rendered task headers stay within the 202-task topology");
+        assert_eq!(ws_rows.len(), 3, "one header per workspace, no task subheaders");
         let known_tasks: HashSet<String> = app.tasks.iter().filter_map(|t| t.task_id.clone()).collect();
-        assert!(expanded.iter().filter_map(|v| match v { VisualItem::TaskHeader { task_id, .. } => Some(task_id), _ => None }).all(|id| known_tasks.contains(id)), "no phantom task IDs");
+        assert!(ws_rows.iter().flat_map(|wi| app.workspace_tasks(*wi)).all(|id| known_tasks.contains(&id)), "no phantom task IDs");
         assert!(expanded.windows(2).all(|rows| rows[0] != rows[1]), "no duplicate adjacent visual rows");
 
-        app.cursor = Cursor::Task { ws_idx: 0, task_id: "f-task-0".into() };
+        app.cursor = Cursor::Workspace(0);
         let before = app.visual_items().len();
         let root_sessions = app
             .visual_items()
             .iter()
             .filter(|v| matches!(v, VisualItem::Session(wi, si) if *wi == 0 && app.workspaces[*wi].sessions[*si].task_id.as_deref() == Some("f-task-0")))
             .count();
+        // Every workspace holds the root task f-task-0 (sessions i % 50 == 0
+        // land on all three), so no block nests under another: there are
+        // no task subheaders (2026-11-05), and the header has nothing to fold.
+        assert!(app.task_tree().foldable.is_empty(), "no nested blocks to fold");
         app.handle_event(&CrosstermEvent::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)));
         let folded = app.visual_items();
-        assert!(folded.len() < before, "root fold must hide descendants");
+        assert_eq!(folded.len(), before, "a header with nothing nested does not fold");
         assert_eq!(folded.iter().filter(|v| matches!(v, VisualItem::Session(wi, si) if *wi == 0 && app.workspaces[*wi].sessions[*si].task_id.as_deref() == Some("f-task-0"))).count(), root_sessions, "root sessions stay visible");
-        app.handle_event(&CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
-        assert_eq!(app.visual_items().len(), before, "unfold restores the same rows");
+        assert!(app.folded_workspaces.is_empty());
 
         app.page_sidebar(1);
-        assert!(matches!(app.cursor, Cursor::Task { .. } | Cursor::Session(..) | Cursor::Workspace(_)));
+        assert!(matches!(app.cursor, Cursor::Session(..) | Cursor::Workspace(_)));
         app.page_sidebar(-1);
         assert!(app.sidebar_cursor_index(&app.visual_items()).is_some(), "cursor remains visible after paging");
         let narrow = screen(&mut app, 60, 12);

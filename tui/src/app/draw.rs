@@ -334,6 +334,8 @@ impl App {
                     color,
                     pinned,
                     section,
+                    tasks,
+                    task_at,
                     active_field,
                 } => {
                     self.section_note = self.nested_section_label(workspace_id);
@@ -344,6 +346,8 @@ impl App {
                         color.as_deref(),
                         *pinned,
                         section.as_deref(),
+                        tasks,
+                        *task_at,
                         *active_field,
                     );
                 }
@@ -404,37 +408,6 @@ impl App {
                         goal,
                     );
                 }
-                InputMode::TaskSettings { task_id, workspace_id, name, color, section, lead, lead_choices, active_field, .. } => {
-                    self.section_note = self.nested_section_label(workspace_id);
-                    let lead_label = match lead {
-                        Some(uid) => lead_choices
-                            .iter()
-                            .find(|(u, _)| u == uid)
-                            .map_or_else(|| uid.clone(), |(_, label)| label.clone()),
-                        None => {
-                            // What the rule picks with no pin.
-                            let rule = match self.all_leads().get(task_id.as_str()) {
-                                Some(super::tree::Lead::Session(uid)) => {
-                                    lead_choices.iter().find(|(u, _)| u == uid).map(|(_, l)| l.clone())
-                                }
-                                Some(super::tree::Lead::Owner { stand_in }) => {
-                                    Some(super::symbols::owner_label(*stand_in).to_owned())
-                                }
-                                _ => None,
-                            };
-                            format!("auto ({})", rule.as_deref().unwrap_or("no live agent"))
-                        }
-                    };
-                    self.draw_task_settings(
-                        frame,
-                        area,
-                        name,
-                        color.as_deref(),
-                        section.as_deref(),
-                        &lead_label,
-                        *active_field,
-                    );
-                }
                 InputMode::WorkflowHistory { run_id } => {
                     self.draw_workflow_history(frame, area, run_id);
                 }
@@ -473,72 +446,32 @@ impl App {
         self.draw_availability(frame, area);
     }
 
-    /// Minimal dialog for renaming a task from the sidebar.
-    fn draw_task_settings(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        name: &str,
-        color: Option<&str>,
-        section: Option<&str>,
-        lead: &str,
-        active_field: u8,
-    ) {
-        let width = 60u16.min(area.width.saturating_sub(4));
-        let height = 13u16;
-        let x = (area.width.saturating_sub(width)) / 2;
-        let y = (area.height.saturating_sub(height)) / 2;
-        let dialog_area = Rect::new(x, y, width, height);
-
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::TEXT))
-            .title(" Task Settings ");
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
-
-        let dim = Style::default().fg(theme::DIM);
-        let white = Style::default().fg(theme::TEXT);
-        let name_cursor = if active_field == 0 { "\u{2588}" } else { "" };
-        let lines = vec![
-            Line::from(vec![
-                Span::styled("   Name: ", dim),
-                Span::styled(name, white),
-                Span::styled(name_cursor, white),
-            ]),
-            Line::from(""),
-            {
-                let mut spans = vec![Span::styled(
-                    "  Color: ",
-                    if active_field == 1 { white } else { dim },
-                )];
-                spans.extend(color_picker_spans(color, active_field == 1));
-                Line::from(spans)
-            },
-            Line::from(""),
-            self.section_picker_line("Section: ", section, active_field == 2),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("   Lead: ", if active_field == 3 { white } else { dim }),
-                Span::styled("\u{2605} ", Style::default().fg(theme::LEAD)),
-                Span::styled(lead.to_string(), white),
-                Span::styled(if active_field == 3 { "  \u{2190}/\u{2192}" } else { "" }, dim),
-            ]),
-            self.task_form_models.line(0, " Claude: ", active_field == 4),
-            self.task_form_models.line(1, "  Codex: ", active_field == 5),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Tab next \u{00b7} Enter save \u{00b7} Esc cancel",
-                dim,
-            )),
-        ];
-        frame.render_widget(Paragraph::new(lines), inner);
+    /// The Lead field's text: the pinned session's label, or what the
+    /// shared rule picks with no pin.
+    fn lead_label(&self, task: &super::input::WorkspaceTaskEdit) -> String {
+        match &task.lead {
+            Some(uid) => task
+                .lead_choices
+                .iter()
+                .find(|(u, _)| u == uid)
+                .map_or_else(|| uid.clone(), |(_, label)| label.clone()),
+            None => {
+                let rule = match self.all_leads().get(task.task_id.as_str()) {
+                    Some(super::tree::Lead::Session(uid)) => {
+                        task.lead_choices.iter().find(|(u, _)| u == uid).map(|(_, l)| l.clone())
+                    }
+                    Some(super::tree::Lead::Owner { stand_in }) => {
+                        Some(super::symbols::owner_label(*stand_in).to_owned())
+                    }
+                    _ => None,
+                };
+                format!("auto ({})", rule.as_deref().unwrap_or("no live agent"))
+            }
+        }
     }
 
     /// `<label>: <choice>` row for the sidebar-section picker on the
-    /// workspace / task settings forms. `auto` = inherit through the task
+    /// workspace settings form. `auto` = inherit through the task
     /// tree, `none` = explicitly loose, else the section name.
     fn section_picker_line(
         &self,
@@ -1170,10 +1103,13 @@ impl App {
         color: Option<&str>,
         pinned: bool,
         section: Option<&str>,
+        tasks: &[super::input::WorkspaceTaskEdit],
+        task_at: usize,
         active_field: u8,
     ) {
         let width = 60u16.min(area.width.saturating_sub(4));
-        let height = 11u16;
+        // The workspace's task adds its name, lead and default models.
+        let height = if tasks.is_empty() { 11u16 } else { 16u16 };
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -1197,7 +1133,7 @@ impl App {
         let name_cursor = if active_field == 0 { "\u{2588}" } else { "" };
         let pinned_marker = if pinned { "[x]" } else { "[ ]" };
         let pinned_style = if active_field == 2 { white } else { dim };
-        let lines = vec![
+        let mut lines = vec![
             Line::from(vec![
                 Span::styled("    Name: ", dim),
                 Span::styled(name, white),
@@ -1224,11 +1160,36 @@ impl App {
             Line::from(""),
             self.section_picker_line(" Section: ", section, active_field == 3),
             Line::from(""),
-            Line::from(Span::styled(
-                "Tab next \u{00b7} Enter save \u{00b7} Esc cancel  (branch unchanged)",
-                dim,
-            )),
         ];
+        if let Some(task) = tasks.get(task_at.min(tasks.len().saturating_sub(1))) {
+            let field = |n: u8| if active_field == n { white } else { dim };
+            let mut name_line = vec![
+                Span::styled("    Task: ", field(4)),
+                Span::styled(task.name.clone(), white),
+                Span::styled(if active_field == 4 { "\u{2588}" } else { "" }, white),
+            ];
+            // Several tasks share the checkout: ←/→ picks which one.
+            if tasks.len() > 1 {
+                name_line.push(Span::styled(
+                    format!("  {}/{}{}", task_at + 1, tasks.len(), if active_field == 4 { " \u{2190}/\u{2192}" } else { "" }),
+                    dim,
+                ));
+            }
+            lines.push(Line::from(name_line));
+            lines.push(Line::from(vec![
+                Span::styled("    Lead: ", field(5)),
+                Span::styled("\u{2605} ", Style::default().fg(theme::LEAD)),
+                Span::styled(self.lead_label(task), white),
+                Span::styled(if active_field == 5 { "  \u{2190}/\u{2192}" } else { "" }, dim),
+            ]));
+            lines.push(task.models.line(0, "  Claude: ", active_field == 6));
+            lines.push(task.models.line(1, "   Codex: ", active_field == 7));
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            "Tab next \u{00b7} Enter save \u{00b7} Esc cancel  (branch unchanged)",
+            dim,
+        )));
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
@@ -1866,7 +1827,7 @@ impl App {
         let view_label = match self.sidebar_view {
             SidebarView::Status => " Sessions ",
             SidebarView::Team if self.org_live().is_some() => " Teams ",
-            SidebarView::Task | SidebarView::Team => " Tasks ",
+            SidebarView::Task | SidebarView::Team => " Workspaces ",
         };
         let view_label = if let Some(filter) = self.sidebar_filter.as_deref() {
             format!("{} · /{} ", view_label.trim(), filter)
@@ -1953,8 +1914,8 @@ impl App {
         // A nested block renders inside its root block's section.
         let block_root = |wi: usize| tree.as_ref().and_then(|t| t.block_root.get(&wi).copied()).unwrap_or(wi);
         // Workspaces rendered inside a section get one extra leading space
-        // on every row (header, task subheaders, sessions, workflow
-        // headers) so the grouping reads at a glance. Resolved once per
+        // on every row (header, sessions, workflow headers) so the
+        // grouping reads at a glance. Resolved once per
         // frame; empty when no sections exist (byte-identical pre-feature
         // rendering).
         let in_section: HashSet<usize> = if self.sections.is_empty() {
@@ -2010,7 +1971,8 @@ impl App {
         // Leader marks: the lead of each task with subtasks, by level.
         let marks = tree.as_ref().map_or_else(HashMap::new, |t| self.leader_marks(&t.org));
         // Owner-led tasks (pinned, or standing in for a division root): their
-        // header carries the level's leader mark with Owner's ♔ beside it.
+        // workspace header carries the level's leader mark with Owner's ♔
+        // beside it.
         let owner_led = if tree.is_some() { self.owner_leads() } else { HashMap::new() };
         let owner_mark = |task_id: &str| -> Option<Vec<Span<'static>>> {
             owner_led.get(task_id)?;
@@ -2046,11 +2008,36 @@ impl App {
                         .sessions
                         .iter()
                         .any(|s| self.owner_blocked_session(&s.uid));
+                    // Task sub-view: the header stands for the workspace's
+                    // task — a fold glyph when blocks nest under it, the
+                    // folded rollup, Owner's lead mark and the initiative
+                    // marker of its (first) root task.
+                    let node = super::tree::Node::Workspace(*wi);
+                    let root_task = tree
+                        .as_ref()
+                        .and_then(|t| t.roots.get(wi))
+                        .and_then(|r| r.first())
+                        .cloned();
+                    let fold_glyph = match &tree {
+                        Some(t) if t.foldable.contains(wi) => {
+                            if self.tree_folded(&node) { "\u{25b8} " } else { "\u{25be} " }
+                        }
+                        _ => "",
+                    };
+                    let tail = fold_tail(&node);
+                    let owner = root_task.as_deref().and_then(|t| owner_mark(t));
+                    let initiative_marker = root_task
+                        .as_deref()
+                        .map_or("", |t| self.planning.task_initiative_marker(t));
                     let max_name = (inner.width as usize)
                         .saturating_sub(2)
                         .saturating_sub(host_tag.chars().count())
                         .saturating_sub(if ws.pinned { 3 } else { 0 })
-                        .saturating_sub(if ws_owner_blocked { 8 } else { 0 });
+                        .saturating_sub(if ws_owner_blocked { 8 } else { 0 })
+                        .saturating_sub(fold_glyph.chars().count())
+                        .saturating_sub(tail.chars().count())
+                        .saturating_sub(initiative_marker.chars().count())
+                        .saturating_sub(owner.as_ref().map_or(0, |o| o.len()));
                     // Char-boundary-safe truncation — a raw `&ws.name[..n]` byte
                     // slice panics when the cut lands inside a multibyte char
                     // (e.g. '≤' in a workspace name). Matches the session/task
@@ -2058,6 +2045,8 @@ impl App {
                     let name = crate::planning::truncate_with_ellipsis(&ws.name, max_name);
 
                     let mut header_spans = tree_prefix(vi, *wi);
+                    header_spans.push(Span::raw(fold_glyph));
+                    header_spans.extend(owner.into_iter().flatten());
                     if ws_owner_blocked {
                         let (glyph, style) = self.owner_indicator();
                         header_spans.push(Span::styled(format!("{glyph} "), style));
@@ -2065,6 +2054,7 @@ impl App {
                     if ws.pinned {
                         header_spans.push(Span::raw("\u{1f4cc} "));
                     }
+                    header_spans.push(Span::raw(initiative_marker));
                     header_spans.push(Span::raw(name));
                     if ws_owner_blocked {
                         header_spans.push(super::owner_blocked::owner_tag());
@@ -2072,11 +2062,26 @@ impl App {
                     if !host_tag.is_empty() {
                         header_spans.push(Span::styled(host_tag, Style::default().fg(theme::DIM)));
                     }
+                    if !tail.is_empty() {
+                        header_spans.push(Span::styled(tail, Style::default().fg(theme::DIM)));
+                    }
                     let header_line = Line::from(header_spans);
 
                     // The user accent tints unselected rows; selection keeps
                     // the White+BOLD highlight so the cursor stays obvious.
-                    let ws_accent = ws.color.as_deref().and_then(theme::user_color);
+                    // A workspace without its own colour takes the legacy
+                    // colour of its task (set on the old task subheader),
+                    // read from the cached tree, not a per-frame task scan.
+                    let ws_accent = ws
+                        .color
+                        .as_deref()
+                        .or_else(|| {
+                            tree.as_ref()
+                                .and_then(|t| t.roots.get(wi))?
+                                .iter()
+                                .find_map(|t| self.task_colors.get(t.as_str()).map(String::as_str))
+                        })
+                        .and_then(theme::user_color);
                     let base_style = if is_selected {
                         Style::default()
                             .fg(theme::TEXT)
@@ -2196,25 +2201,16 @@ impl App {
                         }
                         SidebarView::Team if tree.is_none() => format!("      {}", ts.label),
                         SidebarView::Task | SidebarView::Team => {
-                            // Indent levels (Phase 6 deepened by 2 cells per tier
-                            // so workflow-participant nesting reads cleanly):
-                            //   - Workspace-level (no task): 2 spaces.
-                            //   - Task-scoped, no workflow:  4 spaces.
-                            //   - Workflow participant:      6 spaces, putting
-                            //     them visually inside the task they belong to.
+                            // Sessions sit directly under their workspace
+                            // (2 spaces); a workflow participant goes one
+                            // tier deeper, under its workflow header.
                             let in_active_wf = ts
                                 .workflow_run_id
                                 .as_deref()
                                 .is_some_and(|id| {
                                     self.workflow_runs.iter().any(|r| r.run_id == id)
                                 });
-                            let pad = if in_active_wf {
-                                "      "
-                            } else if ts.task_id.is_some() {
-                                "    "
-                            } else {
-                                "  "
-                            };
+                            let pad = if in_active_wf { "    " } else { "  " };
                             format!("{pad}{}", ts.label)
                         }
                     };
@@ -2380,62 +2376,6 @@ impl App {
                         lead_in
                     });
                     items.push(ListItem::new(line));
-                }
-                VisualItem::TaskHeader { ws_idx, task_id } => {
-                    let is_selected = match &self.cursor {
-                        Cursor::Task { ws_idx: cwi, task_id: ctid } => {
-                            cwi == ws_idx && ctid == task_id
-                        }
-                        _ => false,
-                    };
-                    let name = self
-                        .tasks
-                        .iter()
-                        .find(|t| t.task_id.as_deref() == Some(task_id.as_str()))
-                        .map(|t| t.name.clone())
-                        .unwrap_or_else(|| "task".into());
-                    let initiative_marker = self.planning.task_initiative_marker(task_id);
-                    let node = super::tree::Node::Task(*ws_idx, task_id.clone());
-                    let folded = self.tree_folded(&node);
-                    let has_reports = tree.as_ref().is_some_and(|t| t.org.has_reports(task_id));
-                    let tail = fold_tail(&node);
-                    let owner = owner_mark(task_id);
-                    let prefix = tree_prefix(vi, *ws_idx);
-                    let prefix_width: usize = prefix.iter().map(|s| s.content.chars().count()).sum();
-                    let max_name = (inner.width as usize).saturating_sub(
-                        prefix_width + 3 + initiative_marker.chars().count() + tail.chars().count()
-                            + owner.as_ref().map_or(0, |o| o.len()),
-                    );
-                    let name = crate::planning::truncate_with_ellipsis(&name, max_name);
-                    // Style lives on the ListItem so selection highlight can
-                    // override. Using Span::styled with a fixed color here
-                    // would mask the base_style on selection.
-                    let task_accent = self
-                        .task_colors
-                        .get(task_id.as_str())
-                        .map(String::as_str)
-                        .and_then(theme::user_color);
-                    let base_style = if is_selected {
-                        Style::default()
-                            .fg(theme::TEXT)
-                            .add_modifier(Modifier::BOLD)
-                    } else if let Some(c) = task_accent {
-                        Style::default().fg(c)
-                    } else {
-                        Style::default().fg(theme::HEADER)
-                    };
-                    let mut spans = prefix;
-                    // Only a task with subtasks folds, so only it has a glyph.
-                    spans.push(Span::raw(match (has_reports, folded) {
-                        (false, _) => "   ",
-                        (true, true) => " \u{25b8} ",
-                        (true, false) => " \u{25be} ",
-                    }));
-                    spans.extend(owner.into_iter().flatten());
-                    spans.push(Span::raw(initiative_marker));
-                    spans.push(Span::raw(name));
-                    spans.push(Span::styled(tail, Style::default().fg(theme::DIM)));
-                    items.push(ListItem::new(Line::from(spans)).style(base_style));
                 }
                 // Division header: `▾ ◆ Name`, `▸ ◆ Name (n) ⠿r ●i` folded,
                 // in the initiative's colour (else HEADER), bold.
@@ -2687,11 +2627,12 @@ impl App {
         } else {
             String::new()
         };
-        // A task or division header is a tree row: say so, since keys typed
-        // there reach no terminal.
+        // A workspace (Task sub-view) or division header is a tree row: say
+        // so, since keys typed there reach no terminal.
         let center = if center.is_empty()
             && self.view_mode == ViewMode::Sessions
-            && matches!(self.cursor, Cursor::Task { .. } | Cursor::Division(_) | Cursor::Org(_))
+            && (matches!(self.cursor, Cursor::Division(_) | Cursor::Org(_))
+                || (matches!(self.cursor, Cursor::Workspace(_)) && self.workspace_header_is_tree_row()))
         {
             "Space/Enter fold \u{00b7} headers don't send keys to a terminal".to_string()
         } else {

@@ -319,12 +319,10 @@ fn peek_session_lines(
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Cursor {
-    /// Cursor is on a workspace header (by workspace index).
+    /// Cursor is on a workspace header (by workspace index). In the Task
+    /// sub-view it stands for the workspace's task and is a tree row (see
+    /// `app/tree.rs`).
     Workspace(usize),
-    /// Cursor is on a task subheader within a workspace. Identified by
-    /// workspace index plus task_id (tasks can move / be renumbered, so an
-    /// index wouldn't be stable).
-    Task { ws_idx: usize, task_id: String },
     /// Cursor is on a session within a workspace (workspace index, session index).
     Session(usize, usize),
     /// Cursor is inside the sidebar's `backtests` group (cloud backtest
@@ -370,6 +368,9 @@ pub enum SidebarColumn {
 #[derive(Clone, Debug, PartialEq)]
 pub enum SidebarView {
     Status,
+    /// The work tree (`app/tree.rs`), titled "Workspaces": sections,
+    /// divisions, workspaces with their sessions. The name and the persisted
+    /// `"task"` value predate the removal of the task level (2026-11-05).
     Task,
     /// Teams and members (app/team_view.rs); the Task tree when the org
     /// model isn't live.
@@ -385,9 +386,6 @@ pub enum ViewMode {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum VisualItem {
     WorkspaceHeader(usize),
-    /// Subheader for a task inside a workspace. Sessions tagged with this
-    /// task_id follow immediately after.
-    TaskHeader { ws_idx: usize, task_id: String },
     Session(usize, usize),
     Separator,
     /// Closing boundary of a sidebar section, including the final section.
@@ -585,26 +583,18 @@ impl App {
     /// re-resolved by workspace id / session uid so it stays on the
     /// same row across the reorder.
     pub(super) fn resort_workspaces_for_pin(&mut self) {
-        let (saved_ws_id, saved_uid, saved_task) = match &self.cursor {
+        let (saved_ws_id, saved_uid) = match &self.cursor {
             Cursor::Session(wi, si) => (
                 self.workspaces.get(*wi).map(|w| w.id.clone()),
                 self.workspaces
                     .get(*wi)
                     .and_then(|w| w.sessions.get(*si))
                     .map(|s| s.uid.clone()),
-                None,
             ),
-            Cursor::Workspace(wi) => {
-                (self.workspaces.get(*wi).map(|w| w.id.clone()), None, None)
-            }
-            Cursor::Task { ws_idx, task_id } => (
-                self.workspaces.get(*ws_idx).map(|w| w.id.clone()),
-                None,
-                Some(task_id.clone()),
-            ),
+            Cursor::Workspace(wi) => (self.workspaces.get(*wi).map(|w| w.id.clone()), None),
             // Backtest rows live outside the workspace list — the reorder
             // can't move them, so the cursor needs no re-resolution.
-            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => (None, None, None),
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => (None, None),
         };
         self.workspaces.sort_by_key(|w| !w.pinned);
         if let Some(id) = saved_ws_id {
@@ -618,8 +608,6 @@ impl App {
                         Some(si) => Cursor::Session(wi, si),
                         None => Cursor::Workspace(wi),
                     }
-                } else if let Some(task_id) = saved_task {
-                    Cursor::Task { ws_idx: wi, task_id }
                 } else {
                     Cursor::Workspace(wi)
                 };
@@ -712,21 +700,6 @@ impl App {
                         Cursor::Session(wi, self.workspaces[wi].sessions.len() - 1);
                 }
             }
-            Cursor::Task { ws_idx, task_id } => {
-                let wi = *ws_idx;
-                let tid = task_id.clone();
-                if wi > max {
-                    self.cursor = Cursor::Workspace(max);
-                } else if !self.task_tree_unfolded().items.iter().any(|vi| {
-                    matches!(vi, VisualItem::TaskHeader { ws_idx, task_id } if *ws_idx == wi && *task_id == tid)
-                }) {
-                    // Its header no longer draws (its last session left) —
-                    // fall back to workspace. A header for a task known only
-                    // from its sessions (not yet in the task feed) draws too,
-                    // so the cursor may rest on it.
-                    self.cursor = Cursor::Workspace(wi);
-                }
-            }
             // Fully handled by the early-returns at the top of this fn.
             Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => {}
         }
@@ -779,12 +752,15 @@ impl App {
     fn visual_item_matches(&self, item: &VisualItem, query: &str) -> bool {
         let contains = |s: &str| s.to_lowercase().contains(query);
         match item {
-            VisualItem::WorkspaceHeader(wi) => self.workspaces.get(*wi).is_some_and(|w| contains(&w.name)),
+            // A workspace row stands for its tasks: their names match too.
+            VisualItem::WorkspaceHeader(wi) => self.workspaces.get(*wi).is_some_and(|w| contains(&w.name))
+                || self.workspace_tasks(*wi).iter().any(|id| {
+                    contains(id) || self.find_task_entry(id).is_some_and(|t| contains(&t.name))
+                }),
             VisualItem::Session(wi, si) => self.workspaces.get(*wi).and_then(|w| w.sessions.get(*si)).is_some_and(|s| {
                 contains(&s.label)
                     || s.task_id.as_deref().and_then(|id| self.find_task_entry(id)).is_some_and(|t| contains(&t.name))
             }),
-            VisualItem::TaskHeader { task_id, .. } => self.find_task_entry(task_id).is_some_and(|t| contains(&t.name) || contains(task_id)),
             VisualItem::WorkflowHeader { run_id, .. } => contains(run_id),
             VisualItem::SectionHeader(id) => self.section_by_id(id).is_some_and(|s| contains(&s.name) || contains(id)),
             VisualItem::DivisionHeader(id) => self.planning.division(id).is_some_and(|d| contains(&d.name)) || contains(id),
@@ -800,7 +776,6 @@ impl App {
         items.iter().position(|item| match (&self.cursor, item) {
             (Cursor::Workspace(a), VisualItem::WorkspaceHeader(b)) => a == b,
             (Cursor::Session(a, b), VisualItem::Session(c, d)) => a == c && b == d,
-            (Cursor::Task { ws_idx, task_id }, VisualItem::TaskHeader { ws_idx: a, task_id: b }) => ws_idx == a && task_id == b,
             (Cursor::Section(a), VisualItem::SectionHeader(b)) => a == b,
             (Cursor::Division(a), VisualItem::DivisionHeader(b)) => a == b,
             (Cursor::Org(a), VisualItem::OrgHeader { key: b, .. }) => a == b,
@@ -1454,17 +1429,18 @@ impl App {
             return false;
         }
 
-        // Workspace headers are selectable only when the workspace has no
-        // sessions (otherwise the cursor lives on a child session).
-        // Task headers are always selectable — they support A-D / A-x / A-e
-        // etc. even when they have sessions underneath.
+        // In the Task sub-view workspace headers are always selectable: the
+        // workspace row stands for its task (A-D / A-e / A-i / fold), as the
+        // task header it replaced did. Elsewhere a workspace header is
+        // selectable only when the workspace has no sessions (otherwise the
+        // cursor lives on a child session).
+        let tree_rows = self.tree_view();
         let is_selectable = |item: &VisualItem| match item {
             VisualItem::Session(_, _) => true,
             VisualItem::WorkspaceHeader(wi) => self
                 .workspaces
                 .get(*wi)
-                .map_or(false, |w| w.sessions.is_empty()),
-            VisualItem::TaskHeader { .. } => true,
+                .map_or(false, |w| tree_rows || w.sessions.is_empty()),
             VisualItem::Separator | VisualItem::SectionEnd => false,
             VisualItem::WorkflowHeader { .. } => false,
             // 12e: host headers are presentation-only; skip
@@ -1496,10 +1472,6 @@ impl App {
                 (Cursor::Session(wi, si), VisualItem::Session(vwi, vsi)) => {
                     wi == vwi && si == vsi
                 }
-                (
-                    Cursor::Task { ws_idx, task_id },
-                    VisualItem::TaskHeader { ws_idx: vwi, task_id: vtid },
-                ) => ws_idx == vwi && task_id == vtid,
                 (
                     Cursor::Backtest(BacktestCursor::Group),
                     VisualItem::BacktestHeader,
@@ -1541,12 +1513,6 @@ impl App {
         match &items[next as usize] {
             VisualItem::Session(wi, si) => self.cursor = Cursor::Session(*wi, *si),
             VisualItem::WorkspaceHeader(wi) => self.cursor = Cursor::Workspace(*wi),
-            VisualItem::TaskHeader { ws_idx, task_id } => {
-                self.cursor = Cursor::Task {
-                    ws_idx: *ws_idx,
-                    task_id: task_id.clone(),
-                };
-            }
             VisualItem::BacktestHeader => {
                 self.cursor = Cursor::Backtest(BacktestCursor::Group);
             }
@@ -1922,10 +1888,6 @@ impl App {
         )
     }
 
-    /// Assemble the peek content for the focused row: bound-task detail
-    /// when a task resolves (session's `task_id` or the Task cursor's),
-    /// the workspace fallback otherwise; Session cursors get an identity
-    /// header block on top either way.
     /// `claude: X (task) · codex: Y (inherited)` for the peek: each
     /// engine's default as a spawn on this task would resolve it.
     pub(crate) fn task_models_summary(&self, task_id: &str, setting: cm_daemon::models::Setting) -> String {
@@ -1949,6 +1911,10 @@ impl App {
             .join(" \u{00b7} ")
     }
 
+    /// Assemble the peek content for the focused row: bound-task detail
+    /// when a task resolves (the session's `task_id`, or the workspace
+    /// row's tasks), the workspace otherwise; Session cursors get an
+    /// identity header block on top either way.
     pub(crate) fn build_peek_lines(&self) -> Vec<PeekLine> {
         let mut out: Vec<PeekLine> = Vec::new();
         match &self.cursor {
@@ -2019,29 +1985,37 @@ impl App {
                     None => out.extend(self.workspace_peek_lines(ws)),
                 }
             }
-            Cursor::Task { ws_idx, task_id } => match self.find_task_entry(task_id) {
-                Some(task) => {
-                    let parent = task
-                        .parent_task_id
-                        .as_deref()
-                        .and_then(|p| self.find_task_entry(p))
-                        .map(|t| t.name.as_str());
-                    let mut lines = peek_task_lines(task, parent);
-                    // Default models sit with the task's fields, before the prompt.
-                    let at = lines.iter().position(|l| *l == PeekLine::Blank).unwrap_or(lines.len());
-                    use cm_daemon::models::Setting;
-                    lines.insert(at, PeekLine::Field { label: "Models".into(), value: self.task_models_summary(task_id, Setting::Model) });
-                    lines.insert(at + 1, PeekLine::Field { label: "Efforts".into(), value: self.task_models_summary(task_id, Setting::Effort) });
-                    out.extend(lines);
-                }
-                None => {
-                    if let Some(ws) = self.workspaces.get(*ws_idx) {
-                        out.extend(self.workspace_peek_lines(ws));
-                    }
-                }
-            },
+            // The workspace row stands for its task (the task header it
+            // replaced showed this): the task first, with its default
+            // models, then the workspace.
             Cursor::Workspace(wi) => {
                 if let Some(ws) = self.workspaces.get(*wi) {
+                    let tasks = self.workspace_tasks(*wi);
+                    let known: Vec<&TaskEntry> = tasks.iter().filter_map(|t| self.find_task_entry(t)).collect();
+                    if let Some(task) = known.first() {
+                        let task_id = task.task_id.as_deref().unwrap_or_default();
+                        let parent = task
+                            .parent_task_id
+                            .as_deref()
+                            .and_then(|p| self.find_task_entry(p))
+                            .map(|t| t.name.as_str());
+                        let mut lines = peek_task_lines(task, parent);
+                        // Default models sit with the task's fields, before the prompt.
+                        let at = lines.iter().position(|l| *l == PeekLine::Blank).unwrap_or(lines.len());
+                        use cm_daemon::models::Setting;
+                        let mut fields = vec![
+                            PeekLine::Field { label: "Models".into(), value: self.task_models_summary(task_id, Setting::Model) },
+                            PeekLine::Field { label: "Efforts".into(), value: self.task_models_summary(task_id, Setting::Effort) },
+                        ];
+                        // Other tasks sharing the checkout: A-e edits them too.
+                        if known.len() > 1 {
+                            let names: Vec<&str> = known[1..].iter().map(|t| t.name.as_str()).collect();
+                            fields.push(PeekLine::Field { label: "Also here".into(), value: names.join(", ") });
+                        }
+                        lines.splice(at..at, fields);
+                        out.extend(lines);
+                        out.push(PeekLine::Blank);
+                    }
                     out.extend(self.workspace_peek_lines(ws));
                 }
             }

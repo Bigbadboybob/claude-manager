@@ -167,7 +167,7 @@ impl Menu {
                 }
                 if self.mark_done && self.task_id.is_none() && self.completion_task_ids().len() > 1
                 {
-                    return InputOutcome::Status("Multiple tasks own this workspace — select a task header before marking done.".into());
+                    return InputOutcome::Status("Several tasks own this workspace — A-D on one of their sessions to mark one done.".into());
                 }
                 return InputOutcome::Submit(SubmitAction::CompleteWithCleanup);
             }
@@ -426,7 +426,9 @@ impl App {
             return;
         };
         let workspace = &self.workspaces[wi];
-        let task_id = self.cursor_task_id().or_else(|| {
+        // A session's task, or the workspace row's task (the task header
+        // it replaced, 2026-11-05).
+        let task_id = self.cursor_scope_task_id().or_else(|| {
             let ids: Vec<_> = self
                 .tasks
                 .iter()
@@ -444,7 +446,7 @@ impl App {
                 .count()
                 > 1
         {
-            self.set_status_msg("Multiple tasks bound — pick one (A-D on its header)");
+            self.set_status_msg("Several tasks share this workspace — A-D on one of their sessions");
             return;
         }
         // A workspace shared by several tasks cannot acquire one task's scope
@@ -486,25 +488,19 @@ impl App {
             let ids = menu.completion_task_ids();
             if ids.len() > 1 {
                 self.set_status_msg(
-                    "Multiple tasks own this workspace — select a task header before marking done.",
+                    "Several tasks own this workspace — A-D on one of their sessions to mark one done.",
                 );
                 return;
             }
             menu.task_id = ids.into_iter().next();
         }
-        self.cursor = match &menu.task_id {
-            Some(id) => Cursor::Task {
-                ws_idx: wi,
-                task_id: id.clone(),
-            },
-            None => Cursor::Workspace(wi),
-        };
+        self.cursor = Cursor::Workspace(wi);
         // Reap submits at once: the hosts accept it durably (even mid-preview)
         // and resolve + reap in the background with the usual safety checks,
         // so the task is closed now and the dialog goes away.
         let reaping = !menu.submitted && menu.start();
         if menu.mark_done {
-            self.mark_active_done();
+            self.mark_done_in_workspace(menu.task_id.clone());
         } else {
             self.close_active_workspace();
         }

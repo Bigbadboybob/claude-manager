@@ -46,8 +46,8 @@ pub(super) enum InputMode {
     NewTerminalSession {
         workspace_id: String,
         session_type: String,
-        /// Task scope inherited from the cursor when A-s was pressed. None =
-        /// workspace-level session (no task subheader).
+        /// Task scope inherited from the cursor when A-s was pressed (a
+        /// session's task, or the workspace row's task). None = no task.
         task_id: Option<String>,
         /// `Some(snapshot_name)` when the session should be cloned from
         /// that agent-memory snapshot. Cleared whenever `session_type`
@@ -107,7 +107,10 @@ pub(super) enum InputMode {
         target: TranscriptPickTarget,
     },
     /// Workspace settings: display label (branch and worktree path stay
-    /// the same), accent color, the pinned flag, and the sidebar section.
+    /// the same), accent color, the pinned flag, the sidebar section and,
+    /// when tasks are bound, the workspace's task: its name, lead and
+    /// default models (the task header whose form had them is gone,
+    /// 2026-11-05).
     WorkspaceSettings {
         workspace_id: String,
         name: String,
@@ -120,7 +123,13 @@ pub(super) enum InputMode {
         /// auto (inherit through the task tree), `Some("")` = loose,
         /// `Some(id)` = that section.
         section: Option<String>,
-        /// 0 = name, 1 = color, 2 = pinned, 3 = section
+        /// The tasks the workspace row stands for (`App::workspace_tasks`);
+        /// empty for a taskless workspace.
+        tasks: Vec<WorkspaceTaskEdit>,
+        /// Which of `tasks` the task fields show (←/→ on the Task field).
+        task_at: usize,
+        /// 0 = name, 1 = color, 2 = pinned, 3 = section; with a task also
+        /// 4 = task name, 5 = lead, 6/7 = default claude/codex model
         active_field: u8,
     },
     /// Create (`section_id == None`) or edit a sidebar section: name and
@@ -177,29 +186,6 @@ pub(super) enum InputMode {
         /// input so it doesn't linger across mode transitions.
         status_msg: Option<String>,
     },
-    /// Task settings: rename (updates the `name` field via the planning
-    /// API and the local TaskEntry so the sidebar subheader refreshes)
-    /// plus the accent color (stored TUI-side in `App::task_colors`).
-    TaskSettings {
-        task_id: String,
-        workspace_id: String,
-        name: String,
-        /// Accent color (`USER_COLORS` name) for the sidebar task header.
-        color: Option<String>,
-        /// Sidebar section choice for the task's WORKSPACE (sections group
-        /// workspaces; a task row is just the handiest place to set it).
-        /// Same encoding as `WorkspaceSettings::section`.
-        section: Option<String>,
-        /// Lead session pin: None = the rule's choice (`app/tree.rs`).
-        lead: Option<String>,
-        /// `(uid, label)` of the sessions that can be pinned.
-        lead_choices: Vec<(String, String)>,
-        /// The pin when the form opened; a save changes it only if it moved.
-        lead_pinned: Option<String>,
-        /// 0 = name, 1 = color, 2 = section, 3 = lead, 4/5 = default
-        /// claude/codex model (`App::task_form_models`)
-        active_field: u8,
-    },
     /// Picking which workflow to launch when more than one is defined.
     WorkflowPicker {
         // Stable workspace id captured at modal-open. Re-resolved to a current
@@ -211,8 +197,9 @@ pub(super) enum InputMode {
         names: Vec<String>,
         selected: usize,
         /// migrate-tui-local Issue I: the task scope the launch
-        /// descends from, captured at A-f time from
-        /// `Cursor::Task { task_id, .. }`. Threaded through to
+        /// descends from, captured at A-f time from the cursor's
+        /// row (a session's task, or the workspace row's task).
+        /// Threaded through to
         /// `LaunchWorkflow` so the controller's
         /// `spawn_workflow_session` records the daemon-side
         /// `DaemonSession.task_id` at spawn time. `None` for
@@ -461,7 +448,7 @@ pub(crate) struct InputCtx<'a> {
     /// apply — cycling is then a no-op.
     pub host_ids: &'a [cm_daemon::host_id::HostId],
     /// Sidebar section ids in display order, for the ←/→ section picker
-    /// on the workspace / task settings forms (`cycle_section_choice`).
+    /// on the workspace settings form (`cycle_section_choice`).
     pub section_ids: &'a [String],
 }
 
@@ -612,6 +599,8 @@ pub(crate) enum SubmitAction {
         color: Option<String>,
         pinned: bool,
         section: Option<String>,
+        /// Changes to the workspace's tasks (only those that changed).
+        tasks: Vec<TaskSettingsSave>,
     },
     /// Create (`section_id == None`) or update a sidebar section.
     SaveSection {
@@ -635,19 +624,6 @@ pub(crate) enum SubmitAction {
     /// to be wired up later.
     SnapshotPicked {
         name: String,
-    },
-    SaveTaskName {
-        task_id: String,
-        workspace_id: String,
-        name: String,
-        color: Option<String>,
-        section: Option<String>,
-        /// `Some(pin)` when the lead pin changed (`Some(None)` clears it).
-        lead: Option<Option<String>>,
-        /// Changed default models, `(engine, Some(model) | None = clear)`.
-        models: Vec<(String, Option<String>)>,
-        /// Changed default efforts, the same shape.
-        efforts: Vec<(String, Option<String>)>,
     },
     EnterWorkflowLaunchConfirm {
         ws_id: String,
@@ -746,7 +722,41 @@ pub(crate) struct WorkspaceSettingsMut<'a> {
     pub color: &'a mut Option<String>,
     pub pinned: &'a mut bool,
     pub section: &'a mut Option<String>,
+    pub tasks: &'a mut Vec<WorkspaceTaskEdit>,
+    pub task_at: &'a mut usize,
     pub active_field: &'a mut u8,
+}
+
+/// The A-e workspace form's fields for one task the workspace row stands
+/// for (they were the task header's form until 2026-11-05).
+#[derive(Debug, Clone)]
+pub(crate) struct WorkspaceTaskEdit {
+    pub task_id: String,
+    /// The task's name as edited, and as it was when the form opened.
+    pub name: String,
+    pub orig_name: String,
+    /// Lead session pin: None = the rule's choice (`app/tree.rs`).
+    pub lead: Option<String>,
+    /// `(uid, label)` of the sessions that can be pinned.
+    pub lead_choices: Vec<(String, String)>,
+    /// The pin when the form opened; a save changes it only if it moved.
+    pub lead_pinned: Option<String>,
+    /// The task's own default models and efforts.
+    pub models: super::model_field::TaskModelsEdit,
+}
+
+/// One task's changes from the A-e workspace form.
+#[derive(Debug, Clone)]
+pub(crate) struct TaskSettingsSave {
+    pub task_id: String,
+    /// The new name, when it changed (an emptied name keeps the old one).
+    pub name: Option<String>,
+    /// `Some(pin)` when the lead pin changed (`Some(None)` clears it).
+    pub lead: Option<Option<String>>,
+    /// Changed default models, `(engine, Some(model) | None = clear)`.
+    pub models: Vec<(String, Option<String>)>,
+    /// Changed default efforts, the same shape.
+    pub efforts: Vec<(String, Option<String>)>,
 }
 
 pub(crate) struct SectionSettingsMut<'a> {
@@ -1033,20 +1043,6 @@ impl SnapshotCatalogMut<'_> {
     fn is_picker(&self) -> bool {
         self.picker_target.is_some()
     }
-}
-
-pub(crate) struct TaskSettingsMut<'a> {
-    pub task_id: &'a str,
-    pub workspace_id: &'a str,
-    pub name: &'a mut String,
-    pub color: &'a mut Option<String>,
-    pub section: &'a mut Option<String>,
-    pub lead: &'a mut Option<String>,
-    pub lead_choices: &'a [(String, String)],
-    pub lead_pinned: Option<&'a str>,
-    pub active_field: &'a mut u8,
-    /// Fields 4 (claude) and 5 (codex): the task's default models.
-    pub models: &'a mut super::model_field::TaskModelsEdit,
 }
 
 pub(crate) struct WorkflowLaunchConfirmMut<'a> {
@@ -1533,10 +1529,25 @@ pub(crate) fn handle_workspace_settings(
     let CrosstermEvent::Key(key) = event else {
         return InputOutcome::Consumed;
     };
+    // Fields 4-7 (task name, lead, default models) exist only when the
+    // workspace has a task.
+    let fields: u8 = if state.tasks.is_empty() { 4 } else { 8 };
+    let at = (*state.task_at).min(state.tasks.len().saturating_sub(1));
+    if matches!(*state.active_field, 6 | 7) {
+        if let Some(task) = state.tasks.get_mut(at) {
+            if task.models.key(*state.active_field as usize - 6, *key) {
+                return InputOutcome::Consumed;
+            }
+        }
+    }
     match key.code {
         KeyCode::Esc => InputOutcome::Cancel,
-        KeyCode::Tab | KeyCode::BackTab => {
-            *state.active_field = (*state.active_field + 1) % 4;
+        KeyCode::Tab => {
+            *state.active_field = (*state.active_field + 1) % fields;
+            InputOutcome::Consumed
+        }
+        KeyCode::BackTab => {
+            *state.active_field = (*state.active_field + fields - 1) % fields;
             InputOutcome::Consumed
         }
         KeyCode::Char(' ') | KeyCode::Right if *state.active_field == 3 => {
@@ -1553,19 +1564,76 @@ pub(crate) fn handle_workspace_settings(
             *state.pinned = !*state.pinned;
             InputOutcome::Consumed
         }
-        KeyCode::Enter => InputOutcome::Submit(SubmitAction::SaveWorkspaceSettings {
-            workspace_id: state.workspace_id.to_string(),
-            name: state.name.trim().to_string(),
-            color: state.color.clone(),
-            pinned: *state.pinned,
-            section: state.section.clone(),
-        }),
+        // Several tasks share the checkout: ←/→ on the Task field picks
+        // which one the task fields edit. Each keeps its own edits.
+        KeyCode::Left | KeyCode::Right if *state.active_field == 4 && state.tasks.len() > 1 => {
+            let n = state.tasks.len();
+            *state.task_at = if key.code == KeyCode::Left { (at + n - 1) % n } else { (at + 1) % n };
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(' ') | KeyCode::Right | KeyCode::Left if *state.active_field == 5 => {
+            // auto, then each pinnable session, wrapping.
+            let Some(task) = state.tasks.get_mut(at) else {
+                return InputOutcome::Consumed;
+            };
+            let n = task.lead_choices.len() + 1;
+            let cur = task
+                .lead
+                .as_deref()
+                .and_then(|uid| task.lead_choices.iter().position(|(u, _)| u == uid))
+                .map_or(0, |i| i + 1);
+            let next = if key.code == KeyCode::Left { (cur + n - 1) % n } else { (cur + 1) % n };
+            task.lead = next.checked_sub(1).map(|i| task.lead_choices[i].0.clone());
+            InputOutcome::Consumed
+        }
+        KeyCode::Enter => {
+            let mut tasks = Vec::new();
+            for task in state.tasks.iter() {
+                let models = match task.models.changes() {
+                    Ok(m) => m,
+                    Err(e) => return InputOutcome::Status(e),
+                };
+                let efforts = task.models.effort_changes();
+                let name = task.name.trim();
+                let name = (!name.is_empty() && name != task.orig_name).then(|| name.to_string());
+                let lead = (task.lead != task.lead_pinned).then(|| task.lead.clone());
+                if name.is_some() || lead.is_some() || !models.is_empty() || !efforts.is_empty() {
+                    tasks.push(TaskSettingsSave {
+                        task_id: task.task_id.clone(),
+                        name,
+                        lead,
+                        models,
+                        efforts,
+                    });
+                }
+            }
+            InputOutcome::Submit(SubmitAction::SaveWorkspaceSettings {
+                workspace_id: state.workspace_id.to_string(),
+                name: state.name.trim().to_string(),
+                color: state.color.clone(),
+                pinned: *state.pinned,
+                section: state.section.clone(),
+                tasks,
+            })
+        }
         KeyCode::Backspace if *state.active_field == 0 => {
             state.name.pop();
             InputOutcome::Consumed
         }
         KeyCode::Char(c) if *state.active_field == 0 => {
             state.name.push(c);
+            InputOutcome::Consumed
+        }
+        KeyCode::Backspace if *state.active_field == 4 => {
+            if let Some(task) = state.tasks.get_mut(at) {
+                task.name.pop();
+            }
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(c) if *state.active_field == 4 => {
+            if let Some(task) = state.tasks.get_mut(at) {
+                task.name.push(c);
+            }
             InputOutcome::Consumed
         }
         _ => InputOutcome::Consumed,
@@ -1965,77 +2033,6 @@ pub(crate) fn handle_save_snapshot(
             };
             buf.push(c);
             *state.error = None;
-            InputOutcome::Consumed
-        }
-        _ => InputOutcome::Consumed,
-    }
-}
-
-pub(crate) fn handle_task_settings(
-    state: TaskSettingsMut<'_>,
-    ctx: InputCtx<'_>,
-    event: &CrosstermEvent,
-) -> InputOutcome {
-    let CrosstermEvent::Key(key) = event else {
-        return InputOutcome::Consumed;
-    };
-    if matches!(*state.active_field, 4 | 5) && state.models.key(*state.active_field as usize - 4, *key) {
-        return InputOutcome::Consumed;
-    }
-    match key.code {
-        KeyCode::Esc => InputOutcome::Cancel,
-        KeyCode::Tab => {
-            *state.active_field = (*state.active_field + 1) % 6;
-            InputOutcome::Consumed
-        }
-        KeyCode::BackTab => {
-            *state.active_field = (*state.active_field + 5) % 6;
-            InputOutcome::Consumed
-        }
-        KeyCode::Char(' ') | KeyCode::Right | KeyCode::Left if *state.active_field == 3 => {
-            // auto, then each pinnable session, wrapping.
-            let n = state.lead_choices.len() + 1;
-            let at = state
-                .lead
-                .as_deref()
-                .and_then(|uid| state.lead_choices.iter().position(|(u, _)| u == uid))
-                .map_or(0, |i| i + 1);
-            let next = if key.code == KeyCode::Left { (at + n - 1) % n } else { (at + 1) % n };
-            *state.lead = next.checked_sub(1).map(|i| state.lead_choices[i].0.clone());
-            InputOutcome::Consumed
-        }
-        KeyCode::Char(' ') | KeyCode::Right if *state.active_field == 2 => {
-            *state.section =
-                cycle_section_choice(state.section.as_deref(), ctx.section_ids, true);
-            InputOutcome::Consumed
-        }
-        KeyCode::Left if *state.active_field == 2 => {
-            *state.section =
-                cycle_section_choice(state.section.as_deref(), ctx.section_ids, false);
-            InputOutcome::Consumed
-        }
-        KeyCode::Enter => {
-            let models = match state.models.changes() {
-                Ok(m) => m,
-                Err(e) => return InputOutcome::Status(e),
-            };
-            InputOutcome::Submit(SubmitAction::SaveTaskName {
-                task_id: state.task_id.to_string(),
-                workspace_id: state.workspace_id.to_string(),
-                name: state.name.trim().to_string(),
-                color: state.color.clone(),
-                section: state.section.clone(),
-                lead: (state.lead.as_deref() != state.lead_pinned).then(|| state.lead.clone()),
-                models,
-                efforts: state.models.effort_changes(),
-            })
-        }
-        KeyCode::Backspace if *state.active_field == 0 => {
-            state.name.pop();
-            InputOutcome::Consumed
-        }
-        KeyCode::Char(c) if *state.active_field == 0 => {
-            state.name.push(c);
             InputOutcome::Consumed
         }
         _ => InputOutcome::Consumed,
@@ -2796,9 +2793,24 @@ impl App {
         };
     }
 
-    /// Open settings for whatever the cursor is focused on — a workspace
-    /// (rename) when on a header, a session (label / idle / hidden) when on
-    /// a specific session.
+    /// The A-e workspace form's fields for one of its tasks.
+    fn workspace_task_edit(&self, task_id: &str) -> WorkspaceTaskEdit {
+        let name = self
+            .find_task_entry(task_id)
+            .map(|t| t.name.clone())
+            .unwrap_or_default();
+        let (lead_choices, lead_pinned) = self.lead_choices(task_id);
+        WorkspaceTaskEdit {
+            task_id: task_id.to_string(),
+            orig_name: name.clone(),
+            name,
+            lead: lead_pinned.clone(),
+            lead_choices,
+            lead_pinned,
+            models: self.task_models_edit(task_id),
+        }
+    }
+
     /// A-N: open the create-section form.
     fn open_new_section(&mut self) {
         self.input_mode = InputMode::SectionSettings {
@@ -2818,6 +2830,9 @@ impl App {
         }
     }
 
+    /// Open settings for whatever the cursor is focused on — a workspace
+    /// (and its task) when on a header, a session (label / idle / hidden)
+    /// when on a specific session.
     pub(super) fn open_session_settings(&mut self) {
         match self.cursor.clone() {
             Cursor::Session(wi, si) => {
@@ -2854,40 +2869,27 @@ impl App {
             }
             Cursor::Workspace(wi) => {
                 if let Some(ws) = self.workspaces.get(wi) {
+                    // The workspace row stands for its tasks: their name,
+                    // lead and default models edit here too.
+                    let task_ids = self.workspace_tasks(wi);
+                    // A task colour from the task-header era prefills a
+                    // workspace without a colour of its own.
+                    let color = ws
+                        .color
+                        .clone()
+                        .or_else(|| task_ids.iter().find_map(|t| self.task_colors.get(t).cloned()));
+                    let tasks = task_ids.iter().map(|t| self.workspace_task_edit(t)).collect();
                     self.input_mode = InputMode::WorkspaceSettings {
                         workspace_id: ws.id.clone(),
                         name: ws.name.clone(),
-                        color: ws.color.clone(),
+                        color,
                         pinned: ws.pinned,
                         section: self.workspace_sections.get(&ws.id).cloned(),
+                        tasks,
+                        task_at: 0,
                         active_field: 0,
                     };
                 }
-            }
-            Cursor::Task { task_id, ws_idx } => {
-                let current_name = self
-                    .tasks
-                    .iter()
-                    .find(|t| t.task_id.as_deref() == Some(task_id.as_str()))
-                    .map(|t| t.name.clone())
-                    .unwrap_or_default();
-                let current_color = self.task_colors.get(&task_id).cloned();
-                let Some(ws) = self.workspaces.get(ws_idx) else { return; };
-                let workspace_id = ws.id.clone();
-                let current_section = self.workspace_sections.get(&workspace_id).cloned();
-                let (lead_choices, lead_pinned) = self.lead_choices(&task_id);
-                self.task_form_models = self.task_models_edit(&task_id);
-                self.input_mode = InputMode::TaskSettings {
-                    task_id,
-                    workspace_id,
-                    name: current_name,
-                    color: current_color,
-                    section: current_section,
-                    lead: lead_pinned.clone(),
-                    lead_choices,
-                    lead_pinned,
-                    active_field: 0,
-                };
             }
             Cursor::Backtest(_) => {
                 self.set_status_msg(
@@ -3659,14 +3661,14 @@ impl App {
         // Space/Enter are free to fold/unfold (matching the planning view's
         // Space-fold idiom). Guarded on the cursor so a stray Space while a
         // real session is focused still reaches its terminal below.
-        // Task and division headers of the work tree (app/tree.rs) are
-        // pure tree rows too: Space/Enter fold them, and no other key
+        // Workspace and division headers of the work tree (app/tree.rs)
+        // are pure tree rows too: Space/Enter fold them, and no other key
         // reaches a terminal from them.
         if let CrosstermEvent::Key(key) = event {
             let header = matches!(
                 self.cursor,
-                Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Task { .. } | Cursor::Division(_) | Cursor::Org(_)
-            );
+                Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_)
+            ) || (matches!(self.cursor, Cursor::Workspace(_)) && self.workspace_header_is_tree_row());
             if header
                 && matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter)
                 && !key
@@ -4057,8 +4059,7 @@ impl App {
         // Section field shows that and does not cycle.
         if let CrosstermEvent::Key(key) = event {
             let section_field = match &self.input_mode {
-                InputMode::WorkspaceSettings { workspace_id, active_field: 3, .. }
-                | InputMode::TaskSettings { workspace_id, active_field: 2, .. } => Some(workspace_id.clone()),
+                InputMode::WorkspaceSettings { workspace_id, active_field: 3, .. } => Some(workspace_id.clone()),
                 _ => None,
             };
             if section_field.is_some_and(|id| self.nested_section_label(&id).is_some())
@@ -4067,7 +4068,7 @@ impl App {
                 return true;
             }
         }
-        // Section ids for the workspace / task settings pickers.
+        // Section ids for the workspace settings picker.
         let section_ids: Vec<String> = self.section_ids();
         let report_tasks = if matches!(self.input_mode, InputMode::NewSession { .. }) {
             self.reports_to_choices()
@@ -4176,6 +4177,8 @@ impl App {
                 color,
                 pinned,
                 section,
+                tasks,
+                task_at,
                 active_field,
             } => handle_workspace_settings(
                 WorkspaceSettingsMut {
@@ -4184,6 +4187,8 @@ impl App {
                     color,
                     pinned,
                     section,
+                    tasks,
+                    task_at,
                     active_field,
                 },
                 InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
@@ -4238,26 +4243,6 @@ impl App {
                 InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                 event,
             ),
-            InputMode::TaskSettings {
-                task_id, workspace_id, name, color, section, lead, lead_choices, lead_pinned, active_field,
-            } => {
-                handle_task_settings(
-                    TaskSettingsMut {
-                        task_id: task_id.as_str(),
-                        workspace_id: workspace_id.as_str(),
-                        name,
-                        color,
-                        section,
-                        lead,
-                        lead_choices,
-                        lead_pinned: lead_pinned.as_deref(),
-                        active_field,
-                        models: &mut self.task_form_models,
-                    },
-                    InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
-                    event,
-                )
-            }
             InputMode::WorkflowLaunchConfirm {
                 ws_id,
                 workflow_name,
@@ -4442,6 +4427,41 @@ impl App {
         self.input_mode = rebuild_form_from_picker(target, name);
     }
 
+    /// Apply one task's changes from the A-e workspace form.
+    fn save_task_settings(&mut self, task: TaskSettingsSave) {
+        let TaskSettingsSave { task_id, name, lead, models, efforts } = task;
+        // Each changed default goes through `POST /tasks/{id}/model`,
+        // which touches only `metadata.models.<engine>` (or
+        // `metadata.efforts.<engine>`).
+        use cm_daemon::models::Setting;
+        let changed = models
+            .into_iter()
+            .map(|c| (Setting::Model, c))
+            .chain(efforts.into_iter().map(|c| (Setting::Effort, c)));
+        for (setting, (engine, value)) in changed {
+            self.backend.set_task_default(task_id.clone(), engine, setting, value);
+        }
+        // The lead pin goes through its own endpoint, which changes only
+        // that metadata key. Applied locally at once so the ★ moves now;
+        // the API row confirms it.
+        if let Some(pin) = lead {
+            let previous = self.set_local_lead_pin(&task_id, pin.clone());
+            self.backend.set_task_lead(task_id.clone(), pin, previous);
+        }
+        if let Some(name) = name {
+            if let Some(entry) = self
+                .tasks
+                .iter_mut()
+                .find(|t| t.task_id.as_deref() == Some(task_id.as_str()))
+            {
+                entry.name = name.clone();
+            }
+            let mut fields = HashMap::new();
+            fields.insert("name".to_string(), serde_json::Value::String(name));
+            self.backend.update_plan_task(task_id, fields);
+        }
+    }
+
     pub(super) fn apply_submit_action(&mut self, action: SubmitAction) {
         match action {
             SubmitAction::None => {}
@@ -4611,7 +4631,7 @@ impl App {
                     None => self.set_status_msg("Settings saved"),
                 }
             }
-            SubmitAction::SaveWorkspaceSettings { workspace_id, name, color, pinned, section } => {
+            SubmitAction::SaveWorkspaceSettings { workspace_id, name, color, pinned, section, tasks } => {
                 let mut pinned_changed = false;
                 // A nested workspace's section is its root block's.
                 let nested = self.nested_section_label(&workspace_id).is_some();
@@ -4641,10 +4661,29 @@ impl App {
                         pinned_changed = true;
                     }
                 }
+                // The colour lives on the workspace now: drop the legacy
+                // task colours it replaces (the form prefilled from them).
+                // Another workspace showing the same task (a shared task on
+                // two hosts) keeps that colour as its own.
+                if let Some(wi) = self.workspaces.iter().position(|w| w.id == workspace_id) {
+                    for t in self.workspace_tasks(wi) {
+                        let Some(c) = self.task_colors.remove(&t) else { continue };
+                        let others: Vec<usize> = (0..self.workspaces.len())
+                            .filter(|&wj| wj != wi && self.workspaces[wj].color.is_none())
+                            .filter(|&wj| self.workspace_tasks(wj).contains(&t))
+                            .collect();
+                        for wj in others {
+                            self.workspaces[wj].color = Some(c.clone());
+                        }
+                    }
+                }
                 if pinned_changed {
                     self.resort_workspaces_for_pin();
                 }
                 self.save_session_manifest();
+                for task in tasks {
+                    self.save_task_settings(task);
+                }
                 self.set_status_msg("Workspace settings saved");
             }
             SubmitAction::SaveSnapshot {
@@ -4667,61 +4706,6 @@ impl App {
                 // the variant has somewhere to land if a misbehaving caller
                 // emits it.
                 let _ = name;
-            }
-            SubmitAction::SaveTaskName { task_id, workspace_id, name, color, section, lead, models, efforts } => {
-                // Each changed default goes through `POST /tasks/{id}/model`,
-                // which touches only `metadata.models.<engine>` (or
-                // `metadata.efforts.<engine>`).
-                use cm_daemon::models::Setting;
-                let changed = models
-                    .into_iter()
-                    .map(|c| (Setting::Model, c))
-                    .chain(efforts.into_iter().map(|c| (Setting::Effort, c)));
-                for (setting, (engine, value)) in changed {
-                    self.backend.set_task_default(task_id.clone(), engine, setting, value);
-                }
-                // The lead pin goes through its own endpoint, which changes
-                // only that metadata key. Applied locally at once so the ★
-                // moves now; the API row confirms it.
-                if let Some(pin) = lead {
-                    let previous = self.set_local_lead_pin(&task_id, pin.clone());
-                    self.backend.set_task_lead(task_id.clone(), pin, previous);
-                }
-                // Color rides the local manifest sidecar, not the API row —
-                // apply it regardless of whether the rename half is valid.
-                match color {
-                    Some(c) => {
-                        self.task_colors.insert(task_id.clone(), c);
-                    }
-                    None => {
-                        self.task_colors.remove(&task_id);
-                    }
-                }
-                // Capture the workspace at modal-open: neither cursor movement
-                // nor a delayed task binding may redirect the section change.
-                // A nested workspace's section is its root block's.
-                if self.nested_section_label(&workspace_id).is_none()
-                    && self.workspaces.iter().any(|w| w.id == workspace_id)
-                {
-                    match section {
-                        Some(sid) => { self.workspace_sections.insert(workspace_id, sid); }
-                        None => { self.workspace_sections.remove(&workspace_id); }
-                    }
-                }
-                self.save_session_manifest();
-                if !name.is_empty() {
-                    if let Some(task) = self
-                        .tasks
-                        .iter_mut()
-                        .find(|t| t.task_id.as_deref() == Some(task_id.as_str()))
-                    {
-                        task.name = name.clone();
-                    }
-                    let mut fields = HashMap::new();
-                    fields.insert("name".to_string(), serde_json::Value::String(name));
-                    self.backend.update_plan_task(task_id, fields);
-                }
-                self.set_status_msg("Task settings saved");
             }
             SubmitAction::EnterWorkflowLaunchConfirm {
                 ws_id,
@@ -4755,7 +4739,7 @@ impl App {
                 // carry the cursor's task scope (captured at
                 // observation time in `open_workflow_launch` per
                 // Issue I). When the cursor was on a tasked
-                // session or `Cursor::Task`, the daemon records
+                // session or workspace row, the daemon records
                 // the participant's task_id at spawn time —
                 // matching the MCP-launched path. When the
                 // cursor was workspace-scope (no task), this is
@@ -7333,6 +7317,8 @@ mod input_handler_tests {
                 color: &mut color,
                 pinned: &mut pinned,
                 section: &mut section,
+                tasks: &mut Vec::new(),
+                task_at: &mut 0,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -7354,6 +7340,8 @@ mod input_handler_tests {
                 color: &mut color,
                 pinned: &mut pinned,
                 section: &mut section,
+                tasks: &mut Vec::new(),
+                task_at: &mut 0,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -7375,6 +7363,8 @@ mod input_handler_tests {
                 color: &mut color,
                 pinned: &mut pinned,
                 section: &mut section,
+                tasks: &mut Vec::new(),
+                task_at: &mut 0,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -7409,6 +7399,8 @@ mod input_handler_tests {
                 color: &mut color,
                 pinned: &mut pinned,
                 section: &mut section,
+                tasks: &mut Vec::new(),
+                task_at: &mut 0,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -8229,93 +8221,136 @@ mod input_handler_tests {
         );
     }
 
-    // ── TaskSettings ──────────────────────────────────────────────
+    // ── WorkspaceSettings: the task fields ────────────────────────
+    // The task subheader's form merged into the workspace's (2026-11-05):
+    // fields 4-7 (task name, lead, default models) edit the task the
+    // workspace row stands for.
 
-    #[test]
-    fn task_settings_backspace_pops_name() {
-        let task_id = "task-id-1".to_string();
-        let mut name = "abc".to_string();
-        let (mut color, mut active) = (None::<String>, 0u8);
+    fn task_edit(id: &str, name: &str) -> WorkspaceTaskEdit {
+        WorkspaceTaskEdit {
+            task_id: id.to_string(),
+            name: name.to_string(),
+            orig_name: name.to_string(),
+            lead: None,
+            lead_choices: vec![("owner".into(), "Owner".into()), ("ts-1-0".into(), "agent".into())],
+            lead_pinned: None,
+            models: Default::default(),
+        }
+    }
+
+    fn workspace_form(
+        tasks: &mut Vec<WorkspaceTaskEdit>,
+        task_at: &mut usize,
+        active: &mut u8,
+        keys: &[KeyCode],
+    ) -> InputOutcome {
+        let mut name = "ws".to_string();
+        let (mut color, mut pinned) = (None::<String>, false);
         let mut section: Option<String> = None;
-        let outcome = handle_task_settings(
-            TaskSettingsMut {
-                models: &mut Default::default(),
-                task_id: task_id.as_str(),
-                workspace_id: "ws-task",
-                name: &mut name,
-                color: &mut color,
-                section: &mut section,
-                lead: &mut None,
-                lead_choices: &[],
-                lead_pinned: None,
-                active_field: &mut active,
-            },
-            ctx_no_repos(),
-            &key(KeyCode::Backspace),
-        );
-        assert_consumed(&outcome);
-        assert_eq!(name, "ab");
+        let mut outcome = InputOutcome::Consumed;
+        for code in keys {
+            outcome = handle_workspace_settings(
+                WorkspaceSettingsMut {
+                    workspace_id: "ws-task",
+                    name: &mut name,
+                    color: &mut color,
+                    pinned: &mut pinned,
+                    section: &mut section,
+                    tasks: &mut *tasks,
+                    task_at: &mut *task_at,
+                    active_field: &mut *active,
+                },
+                ctx_no_repos(),
+                &key(*code),
+            );
+        }
+        outcome
     }
 
     #[test]
-    fn task_settings_enter_submits_save_task_name() {
-        let task_id = "task-id-1".to_string();
-        let mut name = " new name ".to_string();
-        let (mut color, mut active) = (Some("cyan".to_string()), 0u8);
-        let mut section: Option<String> = None;
-        let outcome = handle_task_settings(
-            TaskSettingsMut {
-                models: &mut Default::default(),
-                task_id: task_id.as_str(),
-                workspace_id: "ws-task",
-                name: &mut name,
-                color: &mut color,
-                section: &mut section,
-                lead: &mut None,
-                lead_choices: &[],
-                lead_pinned: None,
-                active_field: &mut active,
-            },
-            ctx_no_repos(),
-            &key(KeyCode::Enter),
+    fn workspace_settings_tab_reaches_the_task_fields_only_with_a_task() {
+        let (mut at, mut active) = (0usize, 3u8);
+        workspace_form(&mut Vec::new(), &mut at, &mut active, &[KeyCode::Tab]);
+        assert_eq!(active, 0, "no task: four fields, wrapping");
+        let mut tasks = vec![task_edit("t1", "one")];
+        let mut active = 3u8;
+        workspace_form(&mut tasks, &mut at, &mut active, &[KeyCode::Tab]);
+        assert_eq!(active, 4, "the task name follows the section");
+        workspace_form(&mut tasks, &mut at, &mut active, &[KeyCode::Tab; 4]);
+        assert_eq!(active, 0, "eight fields, wrapping");
+    }
+
+    #[test]
+    fn workspace_settings_edits_and_saves_the_task_name_and_lead() {
+        let mut tasks = vec![task_edit("t1", "abc")];
+        let (mut at, mut active) = (0usize, 4u8);
+        workspace_form(
+            &mut tasks,
+            &mut at,
+            &mut active,
+            &[KeyCode::Backspace, KeyCode::Char('z'), KeyCode::Tab, KeyCode::Right],
         );
-        match outcome {
-            InputOutcome::Submit(SubmitAction::SaveTaskName { task_id, name, color, .. }) => {
-                assert_eq!(task_id, "task-id-1");
-                assert_eq!(name, "new name");
-                assert_eq!(color.as_deref(), Some("cyan"));
+        assert_eq!(tasks[0].name, "abz");
+        assert_eq!(tasks[0].lead.as_deref(), Some("owner"), "→ from auto: Owner first");
+        match workspace_form(&mut tasks, &mut at, &mut active, &[KeyCode::Enter]) {
+            InputOutcome::Submit(SubmitAction::SaveWorkspaceSettings { tasks, .. }) => {
+                assert_eq!(tasks.len(), 1);
+                assert_eq!(tasks[0].task_id, "t1");
+                assert_eq!(tasks[0].name.as_deref(), Some("abz"));
+                assert_eq!(tasks[0].lead, Some(Some("owner".to_string())));
             }
-            other => panic!("expected SaveTaskName, got {:?}", other),
+            other => panic!("expected SaveWorkspaceSettings, got {:?}", other),
         }
     }
 
     #[test]
-    fn task_settings_space_on_color_field_is_left_to_the_grid() {
+    fn workspace_settings_saves_no_task_change_when_nothing_changed() {
+        let mut tasks = vec![task_edit("t1", "abc")];
+        let (mut at, mut active) = (0usize, 0u8);
+        match workspace_form(&mut tasks, &mut at, &mut active, &[KeyCode::Enter]) {
+            InputOutcome::Submit(SubmitAction::SaveWorkspaceSettings { tasks, .. }) => {
+                assert!(tasks.is_empty(), "an untouched task is not saved");
+            }
+            other => panic!("expected SaveWorkspaceSettings, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn workspace_settings_left_right_on_the_task_field_picks_a_co_tenant_task() {
+        let mut tasks = vec![task_edit("t1", "one"), task_edit("t2", "two")];
+        let (mut at, mut active) = (0usize, 4u8);
+        workspace_form(&mut tasks, &mut at, &mut active, &[KeyCode::Right, KeyCode::Char('!')]);
+        assert_eq!(at, 1);
+        assert_eq!((tasks[0].name.as_str(), tasks[1].name.as_str()), ("one", "two!"));
+        workspace_form(&mut tasks, &mut at, &mut active, &[KeyCode::Right]);
+        assert_eq!(at, 0, "wraps");
+        workspace_form(&mut tasks, &mut at, &mut active, &[KeyCode::Left]);
+        assert_eq!(at, 1);
+        match workspace_form(&mut tasks, &mut at, &mut active, &[KeyCode::Enter]) {
+            InputOutcome::Submit(SubmitAction::SaveWorkspaceSettings { tasks, .. }) => {
+                let ids: Vec<&str> = tasks.iter().map(|t| t.task_id.as_str()).collect();
+                assert_eq!(ids, ["t2"], "only the edited task");
+                assert_eq!(tasks[0].name.as_deref(), Some("two!"));
+            }
+            other => panic!("expected SaveWorkspaceSettings, got {:?}", other),
+        }
+        // With one task, ←/→ on the name field do nothing.
+        let mut one = vec![task_edit("t1", "one")];
+        let mut at = 0usize;
+        workspace_form(&mut one, &mut at, &mut active, &[KeyCode::Right]);
+        assert_eq!((at, one[0].name.as_str()), (0, "one"));
+    }
+
+    #[test]
+    fn workspace_settings_space_on_color_field_is_left_to_the_grid() {
         // The App-level color grid opens on this key before the form
         // handler sees it (`color_grid.rs`); the handler itself must neither
-        // cycle the color nor type the space into the name.
-        let task_id = "task-id-1".to_string();
-        let mut name = "abc".to_string();
-        let (mut color, mut active) = (None::<String>, 1u8);
-        let mut section: Option<String> = None;
-        let _ = handle_task_settings(
-            TaskSettingsMut {
-                models: &mut Default::default(),
-                task_id: task_id.as_str(),
-                workspace_id: "ws-task",
-                name: &mut name,
-                color: &mut color,
-                section: &mut section,
-                lead: &mut None,
-                lead_choices: &[],
-                lead_pinned: None,
-                active_field: &mut active,
-            },
-            ctx_no_repos(),
-            &key(KeyCode::Char(' ')),
-        );
-        assert_eq!(color, None);
-        assert_eq!(name, "abc");
+        // cycle the color nor type the space into a name.
+        let mut tasks = vec![task_edit("t1", "abc")];
+        let (mut at, mut active) = (0usize, 1u8);
+        workspace_form(&mut tasks, &mut at, &mut active, &[KeyCode::Char(' ')]);
+        assert_eq!(tasks[0].name, "abc");
+        assert_eq!(active, 1);
     }
 
     // ── WorkflowLaunchConfirm ─────────────────────────────────────

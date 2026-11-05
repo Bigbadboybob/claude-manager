@@ -555,20 +555,20 @@ impl App {
                     .and_then(|ts| ts.task_id.clone());
                 (wi, Some(si), task)
             }
-            Cursor::Workspace(wi) => (wi, None, None),
-            Cursor::Task { ws_idx, task_id } => {
-                // Focus on the first running session of the task so the
-                // launch modal can prefill a reasonable worker slot.
-                let si = self
-                    .workspaces
-                    .get(ws_idx)
-                    .and_then(|w| {
+            // The workspace row stands for its task (it replaced the task
+            // header, 2026-11-05): launch in that task's scope, focused on
+            // its first session so the modal can prefill a worker slot.
+            Cursor::Workspace(wi) => match self.workspace_task(wi) {
+                Some(task_id) => {
+                    let si = self.workspaces.get(wi).and_then(|w| {
                         w.sessions
                             .iter()
                             .position(|ts| ts.task_id.as_deref() == Some(task_id.as_str()))
                     });
-                (ws_idx, si, Some(task_id))
-            }
+                    (wi, si, Some(task_id))
+                }
+                None => (wi, None, None),
+            },
             Cursor::Backtest(_) => {
                 self.set_status_msg(
                     "Workflows run on local sessions — backtest runs are cloud-only",
@@ -576,7 +576,7 @@ impl App {
                 return;
             }
             Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => {
-                self.set_status_msg("Focus a session or task to launch a workflow");
+                self.set_status_msg("Focus a session or workspace to launch a workflow");
                 return;
             }
         };
@@ -957,17 +957,12 @@ impl App {
                 .get(wi)
                 .and_then(|w| w.sessions.get(si))
                 .and_then(|s| s.workflow_run_id.clone()),
-            Cursor::Task { ws_idx, task_id } => {
-                // Return the first workflow run_id seen on any session tagged
-                // with this task. Usually unique per task.
-                self.workspaces.get(ws_idx).and_then(|w| {
-                    w.sessions
-                        .iter()
-                        .filter(|ts| ts.task_id.as_deref() == Some(task_id.as_str()))
-                        .find_map(|ts| ts.workflow_run_id.clone())
-                })
-            }
-            Cursor::Workspace(_) => None,
+            // A workspace row: the first workflow run on any of its
+            // sessions (usually the only one).
+            Cursor::Workspace(wi) => self
+                .workspaces
+                .get(wi)
+                .and_then(|w| w.sessions.iter().find_map(|ts| ts.workflow_run_id.clone())),
             Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => None,
         }
     }

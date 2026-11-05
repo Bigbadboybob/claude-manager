@@ -113,8 +113,9 @@ per engine. Sources:
   and an absent field is left alone. `GET /tasks/{id}/model?engine=codex`
   returns the inherited values. Never PATCH `metadata` for this; PATCH
   replaces the whole bag.
-- TUI: `A-e` on a task has Claude and Codex rows, each with its Effort
-  (Shift+←/→). Empty means inherit, and the row shows what it inherits.
+- TUI: `A-e` on a task's workspace row has Claude and Codex rows for that
+  task, each with its Effort (Shift+←/→). Empty means inherit, and the row
+  shows what it inherits.
 - Continuous tasks: `continuous.create` / `continuous.update` take `model` and
   `effort` (`""` clears). Workflow roles take optional `model` and `effort` in
   the TOML; `start_workflow` takes `role_models` / `role_efforts`.

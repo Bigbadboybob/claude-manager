@@ -117,7 +117,7 @@ folds are kept in the manifest (`folded_org`). `A-g` still reaches a session
 inside a fold.
 
 The view is skipped when the daemon has no org model. Until a snapshot with
-members arrives, it draws the Task tree (the sidebar title says "Tasks") and
+members arrives, it draws the work tree (the sidebar title says "Workspaces") and
 behaves exactly like it. It
 is saved like the other sub-views (`view = "team"` in the manifest); an older
 viewer reads that as Status.

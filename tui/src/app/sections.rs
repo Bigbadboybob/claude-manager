@@ -31,8 +31,8 @@ pub(crate) fn new_section_id() -> String {
     format!("sec-{:x}", nanos)
 }
 
-/// Step a section CHOICE one slot for the ←/→ pickers on the workspace /
-/// task settings forms. The cycle is `None` (auto: inherit through the task
+/// Step a section CHOICE one slot for the ←/→ picker on the workspace
+/// settings form. The cycle is `None` (auto: inherit through the task
 /// tree) → `Some("")` (explicitly loose) → each section id in display
 /// order → back to `None`. An unknown stored id behaves like `None` so the
 /// picker recovers from a deleted section.
@@ -89,7 +89,6 @@ impl App {
         let mut workspace_sections = HashMap::new();
         for row in rows {
             if let VisualItem::WorkspaceHeader(wi) | VisualItem::Session(wi, _)
-                | VisualItem::TaskHeader { ws_idx: wi, .. }
                 | VisualItem::WorkflowHeader { ws_idx: wi, .. } = row
             {
                 workspace_sections.entry(*wi).or_insert_with(|| self.section_of_workspace(block_root(*wi)));
@@ -98,7 +97,6 @@ impl App {
         let mut sections: Vec<Option<&str>> = rows.iter().map(|row| match row {
             VisualItem::SectionHeader(id) => Some(id.as_str()),
             VisualItem::WorkspaceHeader(wi) | VisualItem::Session(wi, _)
-            | VisualItem::TaskHeader { ws_idx: wi, .. }
             | VisualItem::WorkflowHeader { ws_idx: wi, .. } => workspace_sections[wi].as_deref(),
             _ => None,
         }).collect();
@@ -226,7 +224,7 @@ impl App {
         match &self.cursor {
             Cursor::Section(id) => Some(id.clone()),
             // A nested row belongs to the section its root block is drawn in.
-            Cursor::Workspace(wi) | Cursor::Session(wi, _) | Cursor::Task { ws_idx: wi, .. } => {
+            Cursor::Workspace(wi) | Cursor::Session(wi, _) => {
                 let root = self.task_tree().block_root.get(wi).copied().unwrap_or(*wi);
                 self.section_of_workspace(root)
             }
@@ -571,30 +569,30 @@ pub(crate) mod layout_tests {
         app.workspace_sections.insert("c".into(), "s2".into());
         add_task_session(&mut app, 0, "ta");
         add_task_session(&mut app, 1, "tb");
-        app.cursor = Cursor::Task { ws_idx: 1, task_id: "tb".into() };
+        app.cursor = Cursor::Workspace(1);
         let buffer = sidebar_buffer(&mut app, 24);
         let blue = theme::sidebar_section_bg(Some("blue"), 2.0);
-        // Header, workspace, task, session, internal gap, inherited workspace/task/session.
-        // The focused group (tb's header and session) keeps the section
+        // Header, workspace, session, internal gap, second workspace/session.
+        // The focused group (b's header and session) keeps the section
         // tint: only its left-edge strip marks it.
-        for y in 1..=8 {
+        for y in 1..=6 {
             for x in 1..=38 {
                 assert_eq!(buffer[(x, y)].bg, blue, "section cell ({x}, {y})");
             }
             assert_eq!(buffer[(0, y)].bg, Color::Reset, "border stays clear");
         }
-        assert!(buffer[(4, 7)].modifier.contains(Modifier::BOLD), "selected task stays bold");
-        for y in [9, 12, 13, 14] {
+        assert!(buffer[(4, 5)].modifier.contains(Modifier::BOLD), "selected workspace stays bold");
+        for y in [7, 10, 11, 12] {
             assert_eq!(buffer[(38, y)].bg, Color::Reset, "section boundaries and loose rows");
         }
-        for y in [9, 12] {
+        for y in [7, 10] {
             assert_eq!(buffer[(2, y)].symbol(), "━");
             assert_eq!(buffer[(2, y)].fg, theme::SECTION_BOUNDARY);
             assert!(buffer[(2, y)].modifier.contains(Modifier::BOLD));
         }
-        assert_eq!(buffer[(2, 5)].symbol(), "─", "internal workspace divider stays thin");
-        assert_eq!(buffer[(2, 5)].fg, theme::DIM);
-        assert_eq!(buffer[(38, 10)].bg, blue, "same-colored next section still has a clear boundary");
+        assert_eq!(buffer[(2, 4)].symbol(), "─", "internal workspace divider stays thin");
+        assert_eq!(buffer[(2, 4)].fg, theme::DIM);
+        assert_eq!(buffer[(38, 8)].bg, blue, "same-colored next section still has a clear boundary");
 
         app.sections[0].folded = true;
         app.cursor = Cursor::Section("s1".into());
@@ -623,7 +621,7 @@ pub(crate) mod layout_tests {
         app.sidebar_filter = Some("tb".into());
         app.sidebar_list_state = Default::default();
         let buffer = sidebar_buffer(&mut app, 10);
-        assert_eq!(buffer[(38, 1)].bg, lifted, "filtered task keeps tint without its heading");
+        assert_eq!(buffer[(38, 1)].bg, lifted, "filtered workspace (its task matches) keeps tint without its heading");
         assert_eq!(buffer[(38, 2)].bg, lifted, "filtered session keeps tint without its heading");
         assert_eq!(buffer[(38, 3)].bg, Color::Reset, "empty space stays transparent");
     }
@@ -634,10 +632,11 @@ pub(crate) mod layout_tests {
         app.workspaces.truncate(2);
         app.cursor = Cursor::Section("s1".into());
         let buffer = sidebar_buffer(&mut app, 10);
-        assert_eq!(buffer[(2, 5)].symbol(), "━");
-        assert_eq!(buffer[(2, 5)].fg, theme::SECTION_BOUNDARY);
-        assert_eq!(buffer[(38, 5)].bg, Color::Reset);
-        assert_eq!(buffer[(2, 6)].symbol(), " ");
+        // Header, a, b (nested under a), then the rule.
+        assert_eq!(buffer[(2, 4)].symbol(), "━");
+        assert_eq!(buffer[(2, 4)].fg, theme::SECTION_BOUNDARY);
+        assert_eq!(buffer[(38, 4)].bg, Color::Reset);
+        assert_eq!(buffer[(2, 5)].symbol(), " ");
 
         app.sections[0].folded = true;
         let buffer = sidebar_buffer(&mut app, 10);
@@ -657,8 +656,8 @@ pub(crate) mod layout_tests {
         for _ in 0..30 { app.handle_event(&key(KeyCode::Left)); }
         let buffer = sidebar_buffer(&mut app, 20);
         assert_eq!(buffer[(38, 1)].bg, Color::Reset, "zero disables tint");
-        // Header, a, ta (holding the nested blocks), b, c, then the rule.
-        assert_eq!(buffer[(2, 6)].symbol(), "━", "closing rule survives tint off");
+        // Header, a, b and c (nested under a), then the rule.
+        assert_eq!(buffer[(2, 5)].symbol(), "━", "closing rule survives tint off");
         app.handle_event(&key(KeyCode::Esc));
         assert_eq!(sidebar_buffer(&mut app, 20)[(38, 1)].bg, original);
     }
@@ -698,15 +697,19 @@ pub(crate) mod layout_tests {
         assert_eq!(app.section_of_workspace(1), None);
     }
 
+    /// The Section field moved from the task subheader's form to the
+    /// workspace's (2026-11-05); a save with the task's fields present
+    /// still lands on the workspace the form opened on.
     #[test]
-    fn task_section_save_survives_cursor_change_and_missing_binding() {
-        let mut app = sectioned_app();
-        app.tasks[1].workspace_id = None;
-        app.cursor = Cursor::Task { ws_idx: 1, task_id: "tb".into() };
+    fn workspace_section_save_with_a_task_survives_cursor_change() {
+        let mut app = flat_sectioned_app();
+        app.workspace_sections.remove("b");
+        app.cursor = Cursor::Workspace(1);
         app.open_session_settings();
-        let InputMode::TaskSettings { section, name, .. } = &mut app.input_mode else { panic!("task settings"); };
+        let InputMode::WorkspaceSettings { section, tasks, .. } = &mut app.input_mode else { panic!("workspace settings"); };
+        assert_eq!(tasks.iter().map(|t| t.task_id.as_str()).collect::<Vec<_>>(), ["tb"]);
         *section = Some("s1".into());
-        name.clear(); // Only the section changes; no API rename is needed.
+        tasks[0].name.clear(); // Only the section changes; no API rename is needed.
         app.workspaces.swap(1, 3);
         app.cursor = Cursor::Workspace(0);
         app.handle_input_event(&CrosstermEvent::Key(crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
@@ -774,7 +777,7 @@ pub(crate) mod layout_tests {
         assert_eq!(app.cursor_section_id().as_deref(), Some("s1"));
         app.cursor = Cursor::Workspace(1); // b, inherited
         assert_eq!(app.cursor_section_id().as_deref(), Some("s1"));
-        app.cursor = Cursor::Task { ws_idx: 0, task_id: "ta".into() };
+        app.cursor = Cursor::Workspace(0); // a, explicit
         assert_eq!(app.cursor_section_id().as_deref(), Some("s1"));
         app.cursor = Cursor::Workspace(3); // d, loose
         assert_eq!(app.cursor_section_id(), None);

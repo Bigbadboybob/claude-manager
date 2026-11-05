@@ -8,7 +8,8 @@
 //! Team sub-view is skipped when the daemon has no org model, and draws the
 //! Task tree until a snapshot with members arrives (app/org_model.rs).
 //!
-//! Team, member and Unassigned rows are tree headers, like task headers:
+//! Team, member and Unassigned rows are tree headers, like workspace
+//! headers in the Task sub-view:
 //! Space/Enter fold them (kept in the manifest as `folded_org`), and keys
 //! typed there reach no terminal. A folded team hides its members and
 //! sub-teams; a folded member hides its sessions.

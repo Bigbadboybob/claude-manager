@@ -36,7 +36,7 @@ previously called.
 Cloud Neovim uses OSC 52 through the TUI for the viewing machine's clipboard.
 Clipboard reads support Wayland and X11, run on a bounded background worker,
 and reply to the requesting attachment. Reads are served for the visible
-terminal, including single-session workspace/task rows. Those rows also repaint
+terminal, including single-session workspace rows in the Status sub-view. Those rows also repaint
 on terminal output; previously only an explicit session row passed that gate.
 Local and attached terminals share the 1,500-line scrollback setting.
 Actual cloud Neovim edit/save, copy/paste in both directions, and unchanged

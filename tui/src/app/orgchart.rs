@@ -1032,7 +1032,8 @@ impl App {
         }
         self.org_refresh_soon();
         // Start on the sidebar's focus: its session, else the box for its
-        // task or workspace header, else Owner. Never the last visit's focus.
+        // workspace header's task or workspace, else Owner. Never the last
+        // visit's focus.
         let mut model = self.org_model(self.orgchart.show_bash);
         // A folded assistant: open its member's assistants.
         if let Some(uid) = uid.as_deref().filter(|u| model.find_session(u).is_none()) {
@@ -1047,11 +1048,13 @@ impl App {
         }
         let start = match (&uid, &self.cursor) {
             (Some(uid), _) if model.find_session(uid).is_some() => model.find_session(uid).map(|(i, _)| (i, Some(uid.clone()))),
-            (_, Cursor::Task { task_id, .. }) => model.find(&format!("task:{task_id}")).map(|i| (i, None)),
             (_, Cursor::Workspace(wi)) => self.workspaces.get(*wi).and_then(|ws| {
-                // A loose workspace has its own box; otherwise the box of its first charted session.
+                // A loose workspace has its own box; a tasked one its task's
+                // box (the row stands for its task); otherwise the box of
+                // its first charted session.
                 let own = model.find(&format!("ws:{}", ws.id));
-                own.or_else(|| ws.sessions.iter().find_map(|ts| model.find_session(&ts.uid).map(|(i, _)| i)))
+                own.or_else(|| self.workspace_task(*wi).and_then(|t| model.find(&format!("task:{t}"))))
+                    .or_else(|| ws.sessions.iter().find_map(|ts| model.find_session(&ts.uid).map(|(i, _)| i)))
             }).map(|i| (i, None)),
             _ => None,
         };
@@ -2400,8 +2403,9 @@ mod tests {
         app.handle_event(&key(KeyCode::F(6)));
         assert_eq!(focused_title(&app), "Leaf work");
         app.handle_event(&key(KeyCode::Esc));
-        // A task header opens on that task's box; Esc puts the cursor back.
-        let on_task = Cursor::Task { ws_idx: 1, task_id: "mid".into() };
+        // A tasked workspace header opens on its task's box; Esc puts the
+        // cursor back.
+        let on_task = Cursor::Workspace(1);
         app.cursor = on_task.clone();
         app.handle_event(&key(KeyCode::F(6)));
         assert_eq!(focused_title(&app), "Middle");

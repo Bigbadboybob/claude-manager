@@ -1,6 +1,11 @@
-//! The nested work tree of the Sessions view's Task sub-view (org batch,
-//! 2026-10-20; spec: Swarm-Coord's org-design PLAN.md, "msgfix").
+//! The nested work tree of the Sessions view's Task sub-view, titled
+//! "Workspaces" (org batch, 2026-10-20; spec: Swarm-Coord's org-design
+//! PLAN.md, "msgfix").
 //!
+//! - A workspace header has its sessions directly underneath it. Tasks
+//!   live on the board, so the blue task subheaders are gone (Owner,
+//!   2026-11-05); the workspace row stands for its task
+//!   ([`App::workspace_tasks`]): A-D, A-e, A-i, A-w and A-s act on it there.
 //! - A workspace block nests under the block that holds its root task's
 //!   parent task, at any depth. Reporting lines follow `parent_task_id`.
 //! - A division (an initiative with `kind = "division"`) groups the
@@ -8,9 +13,11 @@
 //! - Every block draws at the top-level indent, whatever its depth
 //!   (Owner, 2026-10-21): the group strip and the level marks carry the
 //!   hierarchy.
-//! - Task and division headers fold with Space/Enter; the fold state rides
-//!   the manifest. A folded task hides only its subtasks (its own sessions
-//!   stay), and shows the hidden subtree's rollup.
+//! - Workspace headers are tree rows here, as the task headers were: cursor
+//!   stops whose keys reach no terminal. Space/Enter on one whose task has
+//!   live reports in blocks nested under it folds those blocks (its own
+//!   sessions stay) and shows the hidden subtree's rollup; a division
+//!   header folds its whole tree. The fold state rides the manifest.
 //! - The focused group draws a narrow coloured strip at the sidebar's left
 //!   edge (no tint).
 //! - The lead session (see [`task_lead`]) of a task with subtasks
@@ -23,22 +30,26 @@
 use super::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-/// Migrate old task-wide folds to each known workspace. New keys are JSON
-/// pairs of stable workspace and task IDs and survive workspace reordering.
-pub(super) fn migrate_task_folds<'a>(
+/// Workspace folds from the manifest's `folded_tasks` field, which holds
+/// workspace ids since the task level went (2026-11-05). A key from the
+/// task-header era (a JSON `[workspace, task]` pair) folds its workspace,
+/// since a workspace header now folds what its task headers did; a bare
+/// pre-pair task id, or a workspace the manifest no longer has, is dropped.
+pub(super) fn migrate_workspace_folds<'a>(
     folds: &std::collections::BTreeSet<String>,
     workspaces: impl Iterator<Item = &'a String>,
 ) -> HashSet<String> {
-    let workspaces: Vec<&String> = workspaces.collect();
-    folds.iter().flat_map(|key| {
-        if serde_json::from_str::<[String; 2]>(key).is_ok() {
-            vec![key.clone()]
-        } else {
-            workspaces.iter().map(|ws|
-                serde_json::to_string(&[ws.as_str(), key.as_str()]).unwrap()
-            ).collect()
-        }
-    }).collect()
+    let known: HashSet<&String> = workspaces.collect();
+    folds
+        .iter()
+        .filter_map(|key| {
+            let ws = match serde_json::from_str::<[String; 2]>(key) {
+                Ok([ws, _]) => ws,
+                Err(_) => key.clone(),
+            };
+            known.contains(&ws).then_some(ws)
+        })
+        .collect()
 }
 
 /// What a sidebar row belongs to.
@@ -46,7 +57,6 @@ pub(super) fn migrate_task_folds<'a>(
 pub(super) enum Node {
     Division(String),
     Workspace(usize),
-    Task(usize, String),
 }
 
 /// Tree metadata for one Task sub-view row.
@@ -55,11 +65,8 @@ pub(super) struct TreeRow {
     /// Enclosing nodes of the blocks this row sits inside, outermost first.
     /// Structure only: the sidebar no longer indents by depth.
     pub cells: Vec<Node>,
-    /// Extra depth inside its own block: an inherit-mode subtask shares its
-    /// parent's checkout and nests under it there.
-    pub local: u8,
-    /// The node the row belongs to: a header's own node, a session's task
-    /// (or its workspace when unbound).
+    /// The node the row belongs to: a header's own node, a session's
+    /// workspace.
     pub node: Option<Node>,
 }
 
@@ -76,15 +83,21 @@ pub(super) struct TaskTree {
     pub block_root: HashMap<usize, usize>,
     /// Rollups for folded headers.
     pub folded: HashMap<Node, Rollup>,
+    /// Workspaces whose task has live reports in nested blocks under
+    /// them: their header folds.
+    pub foldable: HashSet<usize>,
+    /// The tasks each visible workspace row stands for (see
+    /// [`App::workspace_tasks`]), for header rendering.
+    pub roots: HashMap<usize, Vec<String>>,
     /// Divisions by initiative id, for header rendering.
     pub divisions: HashMap<String, crate::planning::Division>,
     /// Reporting lines for this frame: levels and live reports (the tasks
-    /// that fold and whose lead carries a leader mark).
+    /// whose lead carries a leader mark).
     pub org: OrgIndex,
 }
 
 /// Reporting lines and liveness, built once per frame and shared by the
-/// sidebar (fold glyph, fold, leader marks) and the F6 org chart.
+/// sidebar (leader marks) and the F6 org chart.
 #[derive(Clone, Default)]
 pub(crate) struct OrgIndex {
     parents: HashMap<String, String>,
@@ -137,94 +150,73 @@ impl TaskTree {
     }
 }
 
+/// The bound tasks with no bound ancestor, in order. A parent cycle among
+/// them would leave no root and hide the workspace's task: it breaks at its
+/// lowest task id, which becomes a root.
+fn root_tasks(bound: &[String], parents: &HashMap<&str, &str>) -> Vec<String> {
+    let mut local_parent: HashMap<&str, &str> = HashMap::new();
+    for t in bound {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut p = parents.get(t.as_str()).copied();
+        while let Some(pt) = p.filter(|pt| seen.insert(*pt)) {
+            if let Some(b) = bound.iter().find(|b| b.as_str() == pt) {
+                local_parent.insert(t.as_str(), b.as_str());
+                break;
+            }
+            p = parents.get(pt).copied();
+        }
+    }
+    for t in bound {
+        let mut seen: Vec<&str> = vec![t.as_str()];
+        let mut cur = t.as_str();
+        while let Some(p) = local_parent.get(cur).copied() {
+            if let Some(at) = seen.iter().position(|s| *s == p) {
+                if let Some(lowest) = seen[at..].iter().min().copied() {
+                    local_parent.remove(lowest);
+                }
+                break;
+            }
+            seen.push(p);
+            cur = p;
+        }
+    }
+    bound
+        .iter()
+        .filter(|t| !local_parent.contains_key(t.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// How visible workspaces relate through the task tree.
 #[derive(Default)]
 struct Forest {
     order: Vec<usize>,
-    /// Session buckets per workspace, keyed by task (None = unbound).
-    buckets: HashMap<usize, BTreeMap<Option<String>, Vec<usize>>>,
-    /// Tasks bound to each workspace, in display order.
-    bound: HashMap<usize, Vec<String>>,
-    /// Every workspace whose block holds the task's header.
+    /// Session rows per workspace (continuous members excluded).
+    sessions: HashMap<usize, Vec<usize>>,
+    /// The root tasks of each workspace, in display order.
+    roots: HashMap<usize, Vec<String>>,
+    /// Every workspace that has the task bound.
     home: HashMap<String, Vec<usize>>,
-    /// A nested block: child workspace → (parent workspace, task it hangs under).
-    attach: HashMap<usize, (usize, String)>,
-    /// Blocks hanging under each task, in display order.
-    children: HashMap<(usize, String), Vec<usize>>,
-    /// Nearest ancestor of a task bound to the same workspace.
-    local_parent: HashMap<(usize, String), String>,
-    /// Local task children indexed once per tree build. Keeping this adjacency
-    /// list avoids rescanning every task for every header during `has_content`
-    /// and emission on large planning trees.
-    local_children: HashMap<(usize, String), Vec<String>>,
+    /// A nested block: child workspace → the workspace it hangs under.
+    attach: HashMap<usize, usize>,
+    /// Blocks hanging under each workspace, in display order.
+    children: HashMap<usize, Vec<usize>>,
 }
 
 impl Forest {
     fn root(&self, wi: usize) -> Option<&String> {
-        self.bound
-            .get(&wi)?
-            .iter()
-            .find(|t| !self.local_parent.contains_key(&(wi, (*t).clone())))
+        self.roots.get(&wi)?.first()
     }
 
-    fn local_children<'a>(&'a self, wi: usize, t: &str) -> impl Iterator<Item = &'a String> + 'a {
-        self.local_children
-            .get(&(wi, t.to_owned()))
-            .into_iter()
-            .flatten()
+    fn nested_blocks(&self, wi: usize) -> Vec<usize> {
+        self.children.get(&wi).cloned().unwrap_or_default()
     }
 
-    fn nested_blocks(&self, wi: usize, t: &str) -> Vec<usize> {
-        self.children.get(&(wi, t.to_owned())).cloned().unwrap_or_default()
-    }
-
-    fn bucket(&self, wi: usize, t: Option<&str>) -> &[usize] {
-        self.buckets
-            .get(&wi)
-            .and_then(|b| b.get(&t.map(str::to_owned)))
-            .map_or(&[], Vec::as_slice)
-    }
-
-    /// A task header shows when anything sits under it.
-    fn has_content(&self, wi: usize, t: &str) -> bool {
-        !self.bucket(wi, Some(t)).is_empty()
-            || !self.nested_blocks(wi, t).is_empty()
-            || self.local_children(wi, t).any(|c| self.has_content(wi, c))
-    }
-
-    /// Every session row under a task header, nested blocks included.
-    fn task_sessions(&self, wi: usize, t: &str, out: &mut Vec<(usize, usize)>) {
-        out.extend(self.bucket(wi, Some(t)).iter().map(|si| (wi, *si)));
-        for c in self.local_children(wi, t) {
-            self.task_sessions(wi, c, out);
-        }
-        for wj in self.nested_blocks(wi, t) {
-            self.block_sessions(wj, out);
-        }
-    }
-
-    /// The session rows a task's fold hides: its subtasks', not its own.
-    fn subtask_sessions(&self, wi: usize, t: &str, out: &mut Vec<(usize, usize)>) {
-        for c in self.local_children(wi, t) {
-            self.task_sessions(wi, c, out);
-        }
-        for wj in self.nested_blocks(wi, t) {
-            self.block_sessions(wj, out);
-        }
-    }
-
+    /// Every session row of a block, nested blocks included.
     fn block_sessions(&self, wi: usize, out: &mut Vec<(usize, usize)>) {
-        out.extend(self.bucket(wi, None).iter().map(|si| (wi, *si)));
-        let roots: Vec<String> = self
-            .bound
-            .get(&wi)
-            .into_iter()
-            .flatten()
-            .filter(|t| !self.local_parent.contains_key(&(wi, (*t).clone())))
-            .cloned()
-            .collect();
-        for t in roots {
-            self.task_sessions(wi, &t, out);
+        out.extend(self.sessions.get(&wi).into_iter().flatten().map(|si| (wi, *si)));
+        for wj in self.nested_blocks(wi) {
+            self.block_sessions(wj, out);
         }
     }
 }
@@ -236,6 +228,57 @@ enum Entry {
 }
 
 impl App {
+    /// Tasks bound to workspace `wi`, in display order: its planning
+    /// bindings, then tasks known only from `sessions` (stale API state,
+    /// sorted), so none silently vanish.
+    fn bound_tasks<'a>(&self, wi: usize, sessions: impl Iterator<Item = &'a TerminalSession>) -> Vec<String> {
+        let ws = &self.workspaces[wi];
+        let mut bound: Vec<String> = Vec::new();
+        for task in &self.tasks {
+            if task.workspace_id.as_deref() == Some(ws.id.as_str()) {
+                if let Some(tid) = task.task_id.as_ref().filter(|t| !bound.contains(t)) {
+                    bound.push(tid.clone());
+                }
+            }
+        }
+        let mut tail: Vec<String> = sessions
+            .filter_map(|ts| ts.task_id.clone())
+            .filter(|t| !bound.contains(t))
+            .collect();
+        tail.sort();
+        tail.dedup();
+        bound.extend(tail);
+        bound
+    }
+
+    /// The tasks a workspace row stands for: the root tasks bound to it
+    /// (planning bindings first), where a subtask sharing its parent's
+    /// checkout belongs to that parent. Usually one; several when unrelated
+    /// tasks share the checkout. A-e and A-i show them all; A-d, A-w, A-s
+    /// and A-f act on the workspace's task only when there is exactly one
+    /// ([`App::workspace_task`]).
+    pub(crate) fn workspace_tasks(&self, wi: usize) -> Vec<String> {
+        let Some(ws) = self.workspaces.get(wi) else {
+            return Vec::new();
+        };
+        let bound = self.bound_tasks(wi, ws.sessions.iter());
+        root_tasks(&bound, &self.task_parent_map())
+    }
+
+    /// The workspace's task, when exactly one root task is bound to it.
+    pub(crate) fn workspace_task(&self, wi: usize) -> Option<String> {
+        let mut tasks = self.workspace_tasks(wi);
+        (tasks.len() == 1).then(|| tasks.remove(0))
+    }
+
+    /// In the Task sub-view the workspace header is a tree row, as the task
+    /// header it replaced was: no keys reach a terminal from it, even when
+    /// the workspace has a single session (that session is one row down),
+    /// and Space/Enter fold its nested blocks.
+    pub(crate) fn workspace_header_is_tree_row(&self) -> bool {
+        self.tree_view() && self.cursor_column == SidebarColumn::Main
+    }
+
     fn forest(&self, members: &HashSet<(usize, usize)>) -> Forest {
         let mut f = Forest {
             order: self.task_view_visible_workspaces(members),
@@ -244,74 +287,15 @@ impl App {
         let parents = self.task_parent_map();
         for &wi in &f.order {
             let ws = &self.workspaces[wi];
-            let mut buckets: BTreeMap<Option<String>, Vec<usize>> = BTreeMap::new();
-            for (si, ts) in ws.sessions.iter().enumerate() {
-                if !members.contains(&(wi, si)) {
-                    buckets.entry(ts.task_id.clone()).or_default().push(si);
-                }
-            }
-            // Planning binding order first, then tasks known only from
-            // their sessions (stale API state), so none silently vanish.
-            let mut bound: Vec<String> = Vec::new();
-            for task in &self.tasks {
-                if task.workspace_id.as_deref() == Some(ws.id.as_str()) {
-                    if let Some(tid) = task.task_id.as_ref().filter(|t| !bound.contains(t)) {
-                        bound.push(tid.clone());
-                    }
-                }
-            }
-            let mut tail: Vec<String> = buckets
-                .keys()
-                .flatten()
-                .filter(|t| !bound.contains(t))
-                .cloned()
+            let own: Vec<usize> = (0..ws.sessions.len())
+                .filter(|si| !members.contains(&(wi, *si)))
                 .collect();
-            tail.sort();
-            bound.extend(tail);
+            let bound = self.bound_tasks(wi, own.iter().map(|si| &ws.sessions[*si]));
             for t in &bound {
                 f.home.entry(t.clone()).or_default().push(wi);
             }
-            for t in &bound {
-                let mut seen: HashSet<&str> = HashSet::new();
-                let mut p = parents.get(t.as_str()).copied();
-                while let Some(pt) = p.filter(|pt| seen.insert(*pt)) {
-                    if bound.iter().any(|b| b == pt) {
-                        f.local_parent.insert((wi, t.clone()), pt.to_owned());
-                        break;
-                    }
-                    p = parents.get(pt).copied();
-                }
-            }
-            // A parent cycle inside one checkout would leave no root and
-            // hide its sessions: break it at the lowest task id, which
-            // becomes the root.
-            for t in &bound {
-                let mut seen: Vec<&str> = vec![t.as_str()];
-                let mut cur = t.as_str();
-                while let Some(p) = f.local_parent.get(&(wi, cur.to_owned())).map(String::as_str) {
-                    if let Some(at) = seen.iter().position(|s| *s == p) {
-                        let lowest = seen[at..].iter().min().map(|s| s.to_string());
-                        if let Some(lowest) = lowest {
-                            f.local_parent.remove(&(wi, lowest));
-                        }
-                        break;
-                    }
-                    seen.push(p);
-                    cur = p;
-                }
-            }
-            f.buckets.insert(wi, buckets);
-            f.bound.insert(wi, bound);
-        }
-        for (&wi, bound) in &f.bound {
-            for task in bound {
-                if let Some(parent) = f.local_parent.get(&(wi, task.clone())) {
-                    f.local_children
-                        .entry((wi, parent.clone()))
-                        .or_default()
-                        .push(task.clone());
-                }
-            }
+            f.roots.insert(wi, root_tasks(&bound, &parents));
+            f.sessions.insert(wi, own);
         }
         // Hang each block under the nearest ancestor of its root task that
         // another visible block holds.
@@ -334,7 +318,7 @@ impl App {
                         .find_map(|uid| candidates.iter().copied().find(|h|
                             self.workspaces[*h].sessions.iter().any(|s| s.uid == uid)));
                     if let Some(h) = manager_home.or_else(|| candidates.first().copied()) {
-                        f.attach.insert(wi, (h, pt.to_owned()));
+                        f.attach.insert(wi, h);
                         break;
                     }
                 }
@@ -350,7 +334,7 @@ impl App {
             .filter(|&wi| {
                 let mut seen = HashSet::from([wi]);
                 let mut cur = wi;
-                while let Some((p, _)) = f.attach.get(&cur) {
+                while let Some(p) = f.attach.get(&cur) {
                     if !seen.insert(*p) {
                         return true;
                     }
@@ -363,8 +347,8 @@ impl App {
             f.attach.remove(&wi);
         }
         for &wi in &f.order {
-            if let Some((parent, t)) = f.attach.get(&wi) {
-                f.children.entry((*parent, t.clone())).or_default().push(wi);
+            if let Some(parent) = f.attach.get(&wi) {
+                f.children.entry(*parent).or_default().push(wi);
             }
         }
         f
@@ -381,7 +365,6 @@ impl App {
     pub(super) fn task_tree_shared(&self) -> std::rc::Rc<TaskTree> {
         self.task_tree_shared_with(self.sidebar_filter.is_none())
     }
-
     /// Hash the inputs read by the forest/emitter. This keeps the cache
     /// correct across manifest refreshes and fold changes without requiring
     /// every mutation path to remember an explicit invalidation call.
@@ -484,9 +467,9 @@ impl App {
         let mut workspace_sections: Vec<_> = self.workspace_sections.iter().collect();
         workspace_sections.sort_by(|a, b| a.0.cmp(b.0));
         workspace_sections.hash(&mut h);
-        let mut folded_tasks: Vec<&String> = self.folded_tasks.iter().collect();
-        folded_tasks.sort();
-        folded_tasks.hash(&mut h);
+        let mut folded_workspaces: Vec<&String> = self.folded_workspaces.iter().collect();
+        folded_workspaces.sort();
+        folded_workspaces.hash(&mut h);
         let mut folded_divisions: Vec<&String> = self.folded_divisions.iter().collect();
         folded_divisions.sort();
         folded_divisions.hash(&mut h);
@@ -505,10 +488,12 @@ impl App {
         h.finish()
     }
 
+
     /// Make a session's row show: clear an A-/ filter that excludes it,
-    /// then unfold every task and division header above its task (whose
-    /// own fold never hides it) and its root block's section. For jumps from the org
-    /// chart (F6) and the board (A-B). Returns true when anything changed.
+    /// then unfold every workspace and division header above its workspace
+    /// (whose own fold never hides it) and its root block's section. For
+    /// jumps from the org chart (F6) and the board (A-B). Returns true when
+    /// anything changed.
     pub(crate) fn reveal_session(&mut self, uid: &str) -> bool {
         let Some((wi, si)) = self
             .workspaces
@@ -518,11 +503,7 @@ impl App {
         else {
             return false;
         };
-        let node = self.workspaces[wi].sessions[si]
-            .task_id
-            .clone()
-            .map_or(Node::Workspace(wi), |t| Node::Task(wi, t));
-        self.reveal_row(VisualItem::Session(wi, si), wi, &node)
+        self.reveal_row(VisualItem::Session(wi, si), wi, &Node::Workspace(wi))
     }
 
     /// Reveal the cursor's row when a fold, a folded section or the filter
@@ -540,25 +521,17 @@ impl App {
 
     /// The main-column Task sub-view row the cursor stands for:
     /// `(row, workspace, node)`. Only the folds above the node can hide it:
-    /// a task's own fold hides its subtasks, never its header or sessions.
+    /// a workspace's own fold hides its nested blocks, never its header or
+    /// sessions.
     fn cursor_target(&self) -> Option<(VisualItem, usize, Node)> {
         if !self.tree_view() || self.cursor_column != SidebarColumn::Main {
             return None;
         }
         let target = match &self.cursor {
             Cursor::Session(wi, si) => {
-                let ts = self.workspaces.get(*wi).and_then(|w| w.sessions.get(*si))?;
-                let node = ts.task_id.clone().map_or(Node::Workspace(*wi), |t| Node::Task(*wi, t));
-                (VisualItem::Session(*wi, *si), *wi, node)
+                self.workspaces.get(*wi).and_then(|w| w.sessions.get(*si))?;
+                (VisualItem::Session(*wi, *si), *wi, Node::Workspace(*wi))
             }
-            Cursor::Task { ws_idx, task_id } => (
-                VisualItem::TaskHeader {
-                    ws_idx: *ws_idx,
-                    task_id: task_id.clone(),
-                },
-                *ws_idx,
-                Node::Task(*ws_idx, task_id.clone()),
-            ),
             Cursor::Workspace(wi) => (VisualItem::WorkspaceHeader(*wi), *wi, Node::Workspace(*wi)),
             _ => return None,
         };
@@ -614,9 +587,11 @@ impl App {
         let chain = self.task_tree_with(false).chain(node);
         for n in chain.into_iter().skip(1) {
             changed |= match n {
-                Node::Task(wi, t) => self.folded_tasks.remove(&self.task_fold_key(wi, &t)),
+                Node::Workspace(wi) => match self.workspaces.get(wi) {
+                    Some(ws) => self.folded_workspaces.remove(&ws.id),
+                    None => false,
+                },
                 Node::Division(d) => self.folded_divisions.remove(&d),
-                Node::Workspace(_) => false,
             };
         }
         if changed {
@@ -651,6 +626,8 @@ impl App {
             parents: HashMap::new(),
             block_root: HashMap::new(),
             folded: HashMap::new(),
+            foldable: HashSet::new(),
+            roots: f.roots.clone(),
             divisions: by_task
                 .values()
                 .map(|d| (d.id.clone(), d.clone()))
@@ -659,7 +636,7 @@ impl App {
         };
         for &wi in &f.order {
             let mut top = wi;
-            while let Some((p, _)) = f.attach.get(&top) {
+            while let Some(p) = f.attach.get(&top) {
                 top = *p;
             }
             out.block_root.insert(wi, top);
@@ -745,51 +722,46 @@ impl App {
     pub(super) fn cursor_node(&self) -> Option<Node> {
         match &self.cursor {
             Cursor::Division(id) => Some(Node::Division(id.clone())),
-            Cursor::Task { ws_idx, task_id } => Some(Node::Task(*ws_idx, task_id.clone())),
             Cursor::Workspace(wi) => Some(Node::Workspace(*wi)),
             Cursor::Session(wi, si) => {
-                let ts = self.workspaces.get(*wi)?.sessions.get(*si)?;
-                Some(ts.task_id.clone().map_or(Node::Workspace(*wi), |t| Node::Task(*wi, t)))
+                self.workspaces.get(*wi)?.sessions.get(*si)?;
+                Some(Node::Workspace(*wi))
             }
             Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Org(_) => None,
         }
     }
 
-    /// Serialized as a JSON pair so workspace and task IDs cannot collide.
-    fn task_fold_key(&self, wi: usize, task: &str) -> String {
-        serde_json::to_string(&[self.workspaces[wi].id.as_str(), task]).unwrap()
-    }
-
     pub(super) fn tree_folded(&self, node: &Node) -> bool {
         match node {
-            Node::Task(wi, t) => self.folded_tasks.contains(&self.task_fold_key(*wi, t)),
+            Node::Workspace(wi) => self
+                .workspaces
+                .get(*wi)
+                .is_some_and(|ws| self.folded_workspaces.contains(&ws.id)),
             Node::Division(d) => self.folded_divisions.contains(d),
-            Node::Workspace(_) => false,
         }
     }
 
-    /// Space/Enter on a task or division header: fold or unfold it. A task
-    /// without subtasks has nothing to fold.
+    /// Space/Enter on a workspace (Task sub-view), division or Team header:
+    /// fold or unfold it. A workspace without nested blocks has nothing to
+    /// fold.
     pub(crate) fn toggle_tree_fold(&mut self) -> bool {
-        if let Cursor::Task { ws_idx, task_id } = &self.cursor {
-            if !self.folded_tasks.contains(&self.task_fold_key(*ws_idx, task_id))
-                && !self.org_index().has_reports(task_id)
-            {
-                self.set_status_msg("No subtasks to fold");
-                return true;
+        let (set, id) = match self.cursor.clone() {
+            Cursor::Workspace(wi) if self.workspace_header_is_tree_row() => {
+                let Some(ws_id) = self.workspaces.get(wi).map(|w| w.id.clone()) else {
+                    return false;
+                };
+                if !self.folded_workspaces.contains(&ws_id)
+                    && !self.task_tree_unfolded().foldable.contains(&wi)
+                {
+                    self.set_status_msg("No subtasks to fold");
+                    return true;
+                }
+                (&mut self.folded_workspaces, ws_id)
             }
-        }
-        let task_key = match &self.cursor {
-            Cursor::Task { ws_idx, task_id } => Some(self.task_fold_key(*ws_idx, task_id)),
-            _ => None,
+            Cursor::Division(id) => (&mut self.folded_divisions, id),
+            Cursor::Org(key) => (&mut self.folded_org, key),
+            _ => return false,
         };
-        let set = match &self.cursor {
-            Cursor::Task { .. } => Some((&mut self.folded_tasks, task_key.unwrap())),
-            Cursor::Division(id) => Some((&mut self.folded_divisions, id.clone())),
-            Cursor::Org(key) => Some((&mut self.folded_org, key.clone())),
-            _ => None,
-        };
-        let Some((set, id)) = set else { return false };
         if !set.remove(&id) {
             set.insert(id);
         }
@@ -797,6 +769,7 @@ impl App {
         self.needs_redraw = true;
         true
     }
+
 
     /// The A-e Lead field: Owner, then the task's live agent sessions as
     /// `(uid, label)` in spawn order (a pinned session that no longer qualifies is listed
@@ -1107,6 +1080,10 @@ impl Emit<'_> {
         self.out.folded.insert(node, rollup);
     }
 
+    /// A workspace header, its sessions, then the blocks nested under it.
+    /// A fold hides the nested blocks only: the workspace's own sessions
+    /// stay. Only a workspace whose task has live reports folds (the rule
+    /// the leader marks and the F6 chart use).
     fn block(&mut self, wi: usize, cells: Vec<Node>) {
         let node = Node::Workspace(wi);
         if let Some(parent) = cells.last() {
@@ -1116,70 +1093,44 @@ impl Emit<'_> {
             VisualItem::WorkspaceHeader(wi),
             TreeRow {
                 cells: cells.clone(),
-                local: 0,
                 node: Some(node.clone()),
             },
         );
-        let unbound = self.f.bucket(wi, None).to_vec();
-        self.sessions(wi, &unbound, &node, &cells, 0);
-        let roots: Vec<String> = self.f.bound[&wi]
-            .iter()
-            .filter(|t| !self.f.local_parent.contains_key(&(wi, (*t).clone())))
-            .cloned()
-            .collect();
-        for t in roots {
-            self.task(wi, &t, &cells, 0);
-        }
-    }
-
-    fn task(&mut self, wi: usize, t: &str, cells: &[Node], local: u8) {
-        if !self.f.has_content(wi, t) {
+        let own = self.f.sessions.get(&wi).cloned().unwrap_or_default();
+        self.sessions(wi, &own, &node, &cells);
+        let nested = self.f.nested_blocks(wi);
+        if nested.is_empty() {
             return;
         }
-        let node = Node::Task(wi, t.to_owned());
-        let parent = match self.f.local_parent.get(&(wi, t.to_owned())) {
-            Some(p) => Node::Task(wi, p.clone()),
-            None => Node::Workspace(wi),
-        };
-        self.out.parents.insert(node.clone(), parent);
-        self.push(
-            VisualItem::TaskHeader {
-                ws_idx: wi,
-                task_id: t.to_owned(),
-            },
-            TreeRow {
-                cells: cells.to_vec(),
-                local,
-                node: Some(node.clone()),
-            },
-        );
-        // A fold hides the subtasks only: the task's own sessions stay.
-        let own = self.f.bucket(wi, Some(t)).to_vec();
-        self.sessions(wi, &own, &node, cells, local);
-        if self.folds && self.app.tree_folded(&node) && self.out.org.has_reports(t) {
+        let reports = self
+            .f
+            .roots
+            .get(&wi)
+            .is_some_and(|roots| roots.iter().any(|t| self.out.org.has_reports(t)));
+        if reports {
+            self.out.foldable.insert(wi);
+        }
+        if reports && self.folds && self.app.tree_folded(&node) {
             let mut sessions = Vec::new();
-            self.f.subtask_sessions(wi, t, &mut sessions);
+            for wj in &nested {
+                self.f.block_sessions(*wj, &mut sessions);
+            }
             self.fold(node, &sessions);
             return;
         }
-        let local_children: Vec<String> = self.f.local_children(wi, t).cloned().collect();
-        for c in local_children {
-            self.task(wi, &c, cells, local.saturating_add(1));
-        }
-        let mut inner = cells.to_vec();
+        let mut inner = cells;
         inner.push(node);
-        for wj in self.f.nested_blocks(wi, t) {
+        for wj in nested {
             self.block(wj, inner.clone());
         }
     }
 
-    /// A bucket's session rows: standalone (running first), then workflow
-    /// groups in role order, exactly as the flat view drew them.
-    fn sessions(&mut self, wi: usize, indices: &[usize], node: &Node, cells: &[Node], local: u8) {
+    /// A workspace's session rows: standalone (running first), then
+    /// workflow groups in role order, exactly as the flat view drew them.
+    fn sessions(&mut self, wi: usize, indices: &[usize], node: &Node, cells: &[Node]) {
         let ws = &self.app.workspaces[wi];
         let row = || TreeRow {
             cells: cells.to_vec(),
-            local,
             node: Some(node.clone()),
         };
         let mut standalone: Vec<usize> = Vec::new();
@@ -1229,6 +1180,7 @@ impl Emit<'_> {
         }
     }
 }
+
 
 /// Leader marks by level below Owner, shared by the sidebar and the F6 org
 /// chart: ★ for a root task's lead, ☆ one level down, then ✦, then ✧ for
@@ -1298,9 +1250,8 @@ mod tree_tests {
         app
     }
 
-    /// `<depth>name`: workspace headers as `ws:<id>`, task headers as
-    /// `task:<id>`, sessions by uid, with their gutter depth (cells) and
-    /// local depth.
+    /// `<depth>name`: workspace headers as `ws:<id>`, sessions by uid,
+    /// with their gutter depth (cells).
     fn outline(app: &App) -> Vec<String> {
         let tree = app.task_tree();
         tree.items
@@ -1308,21 +1259,19 @@ mod tree_tests {
             .filter_map(|vi| {
                 let label = match vi {
                     VisualItem::WorkspaceHeader(wi) => format!("ws:{}", app.workspaces[*wi].id),
-                    VisualItem::TaskHeader { task_id, .. } => format!("task:{task_id}"),
                     VisualItem::Session(wi, si) => app.workspaces[*wi].sessions[*si].uid.clone(),
                     VisualItem::DivisionHeader(id) => format!("division:{id}"),
                     _ => return None,
                 };
                 let row = &tree.rows[vi];
-                Some(format!(
-                    "{}{}{label}",
-                    ">".repeat(row.cells.len()),
-                    "+".repeat(row.local as usize)
-                ))
+                Some(format!("{}{label}", ">".repeat(row.cells.len())))
             })
             .collect()
     }
 
+    /// Owner, 2026-11-05: no task subheaders. A workspace shows its
+    /// sessions directly under it, an inherit-mode subtask's included, and
+    /// blocks still nest by the task tree.
     #[test]
     fn blocks_nest_under_their_parent_task_at_any_depth() {
         let app = org_app();
@@ -1330,73 +1279,57 @@ mod tree_tests {
             outline(&app),
             [
                 "ws:r",
-                "task:tr",
                 "ts-10-0",
-                // Inherit-mode subtask: same checkout, one level in.
-                "+task:tr2",
-                "+ts-11-0",
+                // Inherit-mode subtask tr2: same checkout, same level.
+                "ts-11-0",
                 // c under tr, g under tc: depth follows the task tree.
                 ">ws:c",
-                ">task:tc",
                 ">ts-12-0",
                 ">>ws:g",
-                ">>task:tg",
                 ">>ts-13-0",
                 // tx has no block: o hangs under tx's nearest visible ancestor.
                 ">ws:o",
-                ">task:to",
                 ">ts-14-0",
                 "ws:l",
-                "task:tl",
                 "ts-15-0",
             ],
         );
         let tree = app.task_tree();
         assert_eq!(tree.block_root[&2], 0, "g renders under r's block");
         assert_eq!(
-            tree.chain(&Node::Task(2, "tg".into())),
-            [
-                Node::Task(2, "tg".into()),
-                Node::Workspace(2),
-                Node::Task(1, "tc".into()),
-                Node::Workspace(1),
-                Node::Task(0, "tr".into()),
-                Node::Workspace(0),
-            ],
+            tree.chain(&Node::Workspace(2)),
+            [Node::Workspace(2), Node::Workspace(1), Node::Workspace(0)],
         );
+        assert_eq!(tree.roots[&0], ["tr"], "r stands for tr, not its subtask tr2");
+        assert_eq!(app.workspace_task(0).as_deref(), Some("tr"));
+        assert_eq!(app.workspace_task(2).as_deref(), Some("tg"));
     }
 
-    /// Owner, 2026-10-21: a fold hides the task's subtasks only. Its own
-    /// sessions stay, and the rollup counts just the hidden subtree.
+    /// Owner, 2026-10-21, now on the workspace header: a fold hides the
+    /// blocks nested under it only. Its own sessions stay, and the rollup
+    /// counts just the hidden subtree.
     #[test]
-    fn a_folded_task_hides_its_subtasks_only_and_rolls_them_up_until_unfolded() {
+    fn a_folded_workspace_hides_its_nested_blocks_only_and_rolls_them_up_until_unfolded() {
         let mut app = org_app();
-        app.cursor = Cursor::Task {
-            ws_idx: 1,
-            task_id: "tc".into(),
-        };
+        app.cursor = Cursor::Workspace(1);
         let space = Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         assert!(app.handle_event(&space));
-        assert!(app.folded_tasks.contains(&app.task_fold_key(1, "tc")));
+        assert!(app.folded_workspaces.contains("c"));
         let outline_folded = outline(&app);
-        for kept in ["ws:r", ">ws:c", ">task:tc", ">ts-12-0"] {
+        for kept in ["ws:r", ">ws:c", ">ts-12-0"] {
             assert!(
                 outline_folded.contains(&kept.to_string()),
-                "{kept}: the header, its workspace and its own session stay"
+                "{kept}: the header, its parent and its own session stay"
             );
         }
-        for hidden in [">>ws:g", ">>task:tg", ">>ts-13-0"] {
+        for hidden in [">>ws:g", ">>ts-13-0"] {
             assert!(
                 !outline_folded.contains(&hidden.to_string()),
                 "{hidden} folds away"
             );
         }
         let tree = app.task_tree();
-        assert_eq!(
-            tree.folded[&Node::Task(1, "tc".into())].0,
-            1,
-            "only g's session is hidden"
-        );
+        assert_eq!(tree.folded[&Node::Workspace(1)].0, 1, "only g's session is hidden");
         // Filtering ignores folds, so a match is never hidden.
         app.sidebar_filter = Some("ts-13".into());
         assert!(app
@@ -1408,55 +1341,35 @@ mod tree_tests {
             KeyCode::Enter,
             KeyModifiers::NONE
         ))));
-        assert!(!app.folded_tasks.contains(&app.task_fold_key(1, "tc")));
+        assert!(!app.folded_workspaces.contains("c"));
         assert_eq!(outline(&app), outline(&org_app()));
-        // reveal_session unfolds every header above a session's task; the
-        // task's own fold never hid it, so it stays.
-        app.folded_tasks.extend([
-            app.task_fold_key(0, "tr"),
-            app.task_fold_key(1, "tc"),
-            app.task_fold_key(2, "tg"),
-            app.task_fold_key(4, "tl"),
-        ]);
+        // reveal_session unfolds every header above a session's workspace;
+        // the workspace's own fold never hid it, so it stays.
+        app.folded_workspaces
+            .extend(["r", "c", "g", "l"].map(String::from));
         assert!(app.reveal_session("ts-13-0"));
-        assert_eq!(
-            app.folded_tasks,
-            HashSet::from([app.task_fold_key(2, "tg"), app.task_fold_key(4, "tl")]),
-        );
+        assert_eq!(app.folded_workspaces, HashSet::from(["g".to_string(), "l".to_string()]));
         assert!(outline(&app).contains(&">>ts-13-0".to_string()));
         assert!(!app.reveal_session("ts-13-0"), "nothing left to unfold");
-        // A task without subtasks has nothing to fold.
-        app.folded_tasks.clear();
-        app.cursor = Cursor::Task {
-            ws_idx: 4,
-            task_id: "tl".into(),
-        };
+        // A workspace without nested blocks has nothing to fold.
+        app.folded_workspaces.clear();
+        app.cursor = Cursor::Workspace(4);
         assert!(app.handle_event(&space));
-        assert!(app.folded_tasks.is_empty(), "a leaf does not fold");
-        assert!(!app.task_tree().org.has_reports("tl"));
-        // Inherit-mode subtasks fold too: tr hides tr2 and every block below.
-        app.cursor = Cursor::Task {
-            ws_idx: 0,
-            task_id: "tr".into(),
-        };
+        assert!(app.folded_workspaces.is_empty(), "a leaf does not fold");
+        assert!(!app.task_tree().foldable.contains(&4));
+        // Folding r hides every block below it; tr2's session lives in r's
+        // own checkout, so it stays.
+        app.cursor = Cursor::Workspace(0);
         assert!(app.handle_event(&space));
-        assert_eq!(
-            outline(&app),
-            ["ws:r", "task:tr", "ts-10-0", "ws:l", "task:tl", "ts-15-0"]
-        );
-        assert_eq!(app.task_tree().folded[&Node::Task(0, "tr".into())].0, 4);
+        assert_eq!(outline(&app), ["ws:r", "ts-10-0", "ts-11-0", "ws:l", "ts-15-0"]);
+        assert_eq!(app.task_tree().folded[&Node::Workspace(0)].0, 3);
     }
 
     /// Owner, 2026-10-21 (longstanding): a task-feed refresh re-sorts the
-    /// workspaces and used to drop the cursor from a task header to its
-    /// workspace's header. It stays on the task.
+    /// workspaces. The cursor stays on the same workspace header.
     #[test]
-    fn a_task_header_keeps_the_cursor_through_a_task_refresh() {
+    fn a_workspace_header_keeps_the_cursor_through_a_task_refresh() {
         let mut app = org_app();
-        app.cursor = Cursor::Task {
-            ws_idx: 1,
-            task_id: "tc".into(),
-        };
         let api = |id: &str, parent: Option<&str>| -> crate::api::Task {
             serde_json::from_value(serde_json::json!({
                 "id": id, "created_at": "2026-10-21T00:00:00Z", "repo_url": "",
@@ -1476,28 +1389,22 @@ mod tree_tests {
         // Move c to the end first, so the re-sort really moves it.
         let c = app.workspaces.remove(1);
         app.workspaces.push(c);
-        app.cursor = Cursor::Task {
-            ws_idx: 4,
-            task_id: "tc".into(),
-        };
+        app.cursor = Cursor::Workspace(4);
         for _ in 0..3 {
             app.reconcile_tasks(feed.clone());
-            let Cursor::Task { ws_idx, task_id } = &app.cursor else {
-                panic!("cursor left the task header: {:?}", app.cursor);
+            let Cursor::Workspace(wi) = &app.cursor else {
+                panic!("cursor left the workspace header: {:?}", app.cursor);
             };
-            assert_eq!(task_id, "tc");
-            assert_eq!(app.workspaces[*ws_idx].id, "c");
+            assert_eq!(app.workspaces[*wi].id, "c");
         }
-        // A header for a task only its sessions know (not in the feed yet)
-        // holds the cursor too.
+        // A workspace whose task only its sessions know (not in the feed
+        // yet) holds the cursor too: its header is a tree row.
         app.tasks.retain(|t| t.task_id.as_deref() != Some("tl"));
         let wl = app.workspaces.iter().position(|w| w.id == "l").unwrap();
-        app.cursor = Cursor::Task {
-            ws_idx: wl,
-            task_id: "tl".into(),
-        };
+        app.cursor = Cursor::Workspace(wl);
         app.clamp_cursor();
-        assert!(matches!(&app.cursor, Cursor::Task { task_id, .. } if task_id == "tl"));
+        assert_eq!(app.cursor, Cursor::Workspace(wl));
+        assert_eq!(app.workspace_task(wl).as_deref(), Some("tl"));
     }
 
     /// Owner, 2026-10-21: only the lead of a task with subtasks carries a
@@ -1587,7 +1494,7 @@ mod tree_tests {
         };
         let mut app = base();
         assert_eq!(sidebar_marks(&mut app).get("ts-12-0"), Some(&"\u{2606}"));
-        assert!(fold_glyph(&mut app, "tc"));
+        assert!(fold_glyph(&mut app, "c"), "c's header folds: tc has a live report");
 
         // Sessionless: g's workspace stays, its session is gone.
         let mut app = base();
@@ -1615,7 +1522,7 @@ mod tree_tests {
             assert!(!app.org_index().has_reports("tc"), "{case}");
             let sidebar = sidebar_marks(app);
             assert!(!sidebar.contains_key("ts-12-0"), "{case}: no mark on tc's lead");
-            assert!(!fold_glyph(app, "tc"), "{case}: tc does not fold");
+            assert!(!fold_glyph(app, "c"), "{case}: c does not fold");
             assert_eq!(chart_marks(app), sidebar, "{case}: the chart agrees");
             // tr still has live reports (o's to): its mark stays.
             assert_eq!(sidebar.get("ts-10-0"), Some(&"\u{2605}"), "{case}");
@@ -1653,18 +1560,18 @@ mod tree_tests {
         app.workspaces[6].sessions[0].host_id = crate::hosts::HostId("remote".into());
         app.workspaces[6].sessions[0].managed_by_uid = Some("ts-40-0".into());
         let tree = app.task_tree();
-        assert_eq!(tree.parents[&Node::Workspace(2)], Node::Task(1, "tc".into()));
-        assert_eq!(tree.parents[&Node::Workspace(6)], Node::Task(5, "tc".into()));
+        assert_eq!(tree.parents[&Node::Workspace(2)], Node::Workspace(1));
+        assert_eq!(tree.parents[&Node::Workspace(6)], Node::Workspace(5));
         for wi in [2, 6] {
             assert_eq!(tree.items.iter().filter(|v| **v == VisualItem::Session(wi, 0)).count(), 1);
         }
-        app.cursor = Cursor::Task { ws_idx: 5, task_id: "tc".into() };
+        app.cursor = Cursor::Workspace(5);
         assert!(app.toggle_tree_fold());
         assert!(!shown(&app, "ts-41-0"));
         assert!(shown(&app, "ts-13-0"));
         assert!(app.reveal_session("ts-41-0"));
         assert!(shown(&app, "ts-41-0"));
-        app.cursor = Cursor::Task { ws_idx: 1, task_id: "tc".into() };
+        app.cursor = Cursor::Workspace(1);
         assert!(app.toggle_tree_fold());
         assert!(!shown(&app, "ts-13-0"));
         assert!(shown(&app, "ts-41-0"));
@@ -1683,44 +1590,52 @@ mod tree_tests {
         session(&mut app, 2, "child", "ts-3-0", "codex");
         session(&mut app, 3, "parent", "ts-4-0", "codex");
         app.workspaces[2].sessions[0].managed_by_uid = Some("ts-2-0".into());
-        assert_eq!(app.task_tree().parents[&Node::Workspace(2)], Node::Task(1, "parent".into()));
+        assert_eq!(app.task_tree().parents[&Node::Workspace(2)], Node::Workspace(1));
         // A stale manager must fall back to this host, not the foreign one.
         app.workspaces[2].sessions[0].managed_by_uid = Some("missing".into());
-        assert_eq!(app.task_tree().parents[&Node::Workspace(2)], Node::Task(0, "parent".into()));
+        assert_eq!(app.task_tree().parents[&Node::Workspace(2)], Node::Workspace(0));
         // If no parent is on the child's host, leave it top-level.
         app.workspaces[0].host_id = crate::hosts::HostId("foreign".into());
         app.workspaces[1].host_id = crate::hosts::HostId("foreign".into());
         assert!(!app.task_tree().parents.contains_key(&Node::Workspace(2)));
     }
 
+    /// Task folds saved before the task subheaders went (`[workspace,
+    /// task]` pairs) fold that workspace; workspace ids pass through; keys
+    /// naming no known workspace are dropped.
     #[test]
-    fn old_task_wide_folds_migrate_to_stable_workspace_keys() {
-        let folds = std::collections::BTreeSet::from(["tc".to_string()]);
+    fn saved_task_folds_migrate_to_their_workspace() {
         let workspaces = ["c".to_string(), "c2".to_string()];
-        let scoped = migrate_task_folds(&folds, workspaces.iter());
-        assert!(scoped.contains(&serde_json::to_string(&["c", "tc"]).unwrap()));
-        assert!(scoped.contains(&serde_json::to_string(&["c2", "tc"]).unwrap()));
-        let saved = scoped.into_iter().collect();
-        assert_eq!(migrate_task_folds(&saved, workspaces.iter()), saved.into_iter().collect());
+        let folds = std::collections::BTreeSet::from([
+            serde_json::to_string(&["c", "tc"]).unwrap(),
+            "c2".to_string(),
+            "tc".to_string(),
+            serde_json::to_string(&["gone", "tg"]).unwrap(),
+        ]);
+        let migrated = migrate_workspace_folds(&folds, workspaces.iter());
+        assert_eq!(migrated, HashSet::from(["c".to_string(), "c2".to_string()]));
+        let saved = migrated.iter().cloned().collect();
+        assert_eq!(migrate_workspace_folds(&saved, workspaces.iter()), migrated, "stable");
     }
 
-    /// Owner-approved 2026-10-20: a task header is a tree row. Even with a
-    /// single session under it, no key reaches that session's terminal.
+    /// Owner-approved 2026-10-20, now for the workspace header: in the
+    /// Task sub-view it is a tree row, so even with a single session under
+    /// it no key reaches that session's terminal. The flat Status view
+    /// keeps its old single-session shortcut.
     #[test]
-    fn a_task_header_never_stands_in_for_its_session() {
+    fn a_workspace_header_never_stands_in_for_its_session() {
         let mut app = org_app();
-        app.cursor = Cursor::Task {
-            ws_idx: 4,
-            task_id: "tl".into(),
-        };
+        app.cursor = Cursor::Workspace(4);
         assert!(app.active_session().is_none());
         assert!(app.active_session_mut().is_none());
+        app.sidebar_view = SidebarView::Status;
+        assert!(app.active_session().is_some());
     }
 
     #[test]
     fn fold_state_rides_the_manifest() {
         let mut app = org_app();
-        app.folded_tasks.insert(app.task_fold_key(1, "tc"));
+        app.folded_workspaces.insert("c".into());
         app.folded_divisions.insert("div-1".into());
         let manifest: cm_daemon::manifest::Manifest = serde_json::from_value(serde_json::json!({
             "folded_tasks": ["tc"], "folded_divisions": ["div-1"],
@@ -1827,31 +1742,33 @@ mod tree_tests {
         assert_eq!(app.all_leads()["tc"], Lead::Session("ts-12-0".into()));
     }
 
-    /// The A-e Lead field offers Owner first after auto, and saving it pins
-    /// "owner".
+    /// The A-e Lead field (on the workspace header, for its task) offers
+    /// Owner first after auto, and saving it pins "owner".
     #[test]
     fn the_lead_field_offers_owner() {
         let mut app = owner_division_app();
         let (choices, pinned) = app.lead_choices("tc");
         assert_eq!(choices[0], ("owner".to_string(), "Owner".to_string()));
         assert_eq!(pinned, None);
-        app.cursor = Cursor::Task { ws_idx: 1, task_id: "tc".into() };
+        app.cursor = Cursor::Workspace(1);
         let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
         assert!(app.handle_event(&Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT))));
-        for _ in 0..3 {
+        for _ in 0..5 {
             app.handle_event(&key(KeyCode::Tab));
         }
         app.handle_event(&key(KeyCode::Right));
-        let InputMode::TaskSettings { lead, .. } = &app.input_mode else { panic!("open") };
-        assert_eq!(lead.as_deref(), Some("owner"));
+        let InputMode::WorkspaceSettings { tasks, task_at, active_field, .. } = &app.input_mode else { panic!("open") };
+        assert_eq!(*active_field, 5);
+        assert_eq!(tasks[*task_at].task_id, "tc");
+        assert_eq!(tasks[*task_at].lead.as_deref(), Some("owner"));
         app.handle_event(&key(KeyCode::Enter));
         let meta = app.find_task_entry("tc").and_then(|t| t.metadata.as_ref()).unwrap();
         assert_eq!(pinned_lead(meta), Some("owner"));
         assert_eq!(app.lead_choices("tc").1.as_deref(), Some("owner"));
     }
 
-    /// The sidebar: an Owner-led division and task header carry the level's
-    /// mark with ♔.
+    /// The sidebar: an Owner-led division and workspace header (for its
+    /// task) carry the level's mark with ♔.
     #[test]
     fn owner_led_headers_carry_the_level_mark_with_the_owner_crown() {
         let mut app = owner_division_app();
@@ -1861,9 +1778,9 @@ mod tree_tests {
         let rows: Vec<String> = (0..30u16).map(|y| (0..40u16).map(|x| buffer[(x, y)].symbol().to_string()).collect()).collect();
         let joined = rows.join("\n");
         assert!(joined.contains("\u{25c6} \u{2605}\u{2654} Trader"), "division header: {joined}");
-        assert!(rows.iter().any(|r| r.contains("\u{2605}\u{2654} \u{25c6} tr")), "root task header (level 1, coordinator ◆): {joined}");
-        assert!(rows.iter().any(|r| r.contains("\u{2606}\u{2654} tc")), "tc header (level 2): {joined}");
-        assert!(!rows.iter().any(|r| r.contains("\u{2654} tl")), "tl is led by its session: {joined}");
+        assert!(rows.iter().any(|r| r.contains("\u{25be} \u{2605}\u{2654} \u{25c6} r")), "r, tr's workspace (level 1, coordinator ◆): {joined}");
+        assert!(rows.iter().any(|r| r.contains("\u{25be} \u{2606}\u{2654} c")), "c, tc's workspace (level 2): {joined}");
+        assert!(!rows.iter().any(|r| r.contains("\u{2654} l")), "tl is led by its session: {joined}");
     }
 
     #[test]
@@ -1899,9 +1816,9 @@ mod tree_tests {
         assert_eq!(super::super::tree::tree_tests::outline(&app)[0], "ws:r");
     }
 
-    /// A-e on a task header: the Lead field cycles auto → each live agent
-    /// session, and a save pins it (the ★ moves at once; the API call goes
-    /// through the backend thread).
+    /// A-e on a workspace header: the Lead field of its task cycles auto →
+    /// Owner → each live agent session, and a save pins it (the ★ moves at
+    /// once; the API call goes through the backend thread).
     #[test]
     fn the_lead_field_pins_another_session() {
         let mut app = org_app();
@@ -1913,40 +1830,35 @@ mod tree_tests {
             .unwrap()
             .workspace_id = Some("c".into());
         assert_eq!(app.task_leads()["tc"], "ts-12-0");
-        app.cursor = Cursor::Task {
-            ws_idx: 1,
-            task_id: "tc".into(),
-        };
+        app.cursor = Cursor::Workspace(1);
         let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
         assert!(app.handle_event(&Event::Key(KeyEvent::new(
             KeyCode::Char('e'),
             KeyModifiers::ALT
         ))));
-        let InputMode::TaskSettings {
-            lead, lead_choices, ..
-        } = &app.input_mode
-        else {
+        let InputMode::WorkspaceSettings { tasks, .. } = &app.input_mode else {
             panic!(
-                "task settings, got {:?}",
+                "workspace settings, got {:?}",
                 std::mem::discriminant(&app.input_mode)
             );
         };
-        assert_eq!(*lead, None, "no pin yet: auto");
-        let uids: Vec<&str> = lead_choices.iter().map(|(u, _)| u.as_str()).collect();
+        assert_eq!(tasks.len(), 1, "c's one task");
+        assert_eq!(tasks[0].lead, None, "no pin yet: auto");
+        let uids: Vec<&str> = tasks[0].lead_choices.iter().map(|(u, _)| u.as_str()).collect();
         assert_eq!(
             uids,
             ["owner", "ts-12-0", "ts-20-0"],
             "Owner, then live agents only, in spawn order"
         );
-        for _ in 0..3 {
+        for _ in 0..5 {
             app.handle_event(&key(KeyCode::Tab));
         }
         app.handle_event(&key(KeyCode::Left));
-        let InputMode::TaskSettings { lead, .. } = &app.input_mode else {
+        let InputMode::WorkspaceSettings { tasks, .. } = &app.input_mode else {
             panic!("still open")
         };
         assert_eq!(
-            lead.as_deref(),
+            tasks[0].lead.as_deref(),
             Some("ts-20-0"),
             "← wraps from auto to the last choice"
         );
@@ -1970,33 +1882,29 @@ mod tree_tests {
     #[test]
     fn a_cursor_landing_inside_a_fold_unfolds_it() {
         let mut app = org_app();
-        app.folded_tasks
-            .extend([app.task_fold_key(0, "tr"), app.task_fold_key(1, "tc"), app.task_fold_key(4, "tl")]);
+        app.folded_workspaces.extend(["r", "c", "l"].map(String::from));
         assert!(!shown(&app, "ts-13-0"));
         // The A-p / A-; / org chart jump.
         assert!(app.jump_cursor_to_session_uid("ts-13-0"));
         assert!(shown(&app, "ts-13-0"));
         assert_eq!(
-            app.folded_tasks,
-            HashSet::from([app.task_fold_key(4, "tl")]),
+            app.folded_workspaces,
+            HashSet::from(["l".to_string()]),
             "only the folds above it open"
         );
         // A spawn / restore that sets the cursor directly: the next draw
         // reveals it, and A-j moves on from there.
-        app.folded_tasks.insert(app.task_fold_key(0, "tr"));
-        app.cursor = Cursor::Session(3, 0); // ts-14-0, under tr
+        app.folded_workspaces.insert("r".into());
+        app.cursor = Cursor::Session(3, 0); // ts-14-0, under r
         sidebar_buffer(&mut app, 30);
         app.navigate(1);
-        assert!(!app.folded_tasks.contains(&app.task_fold_key(0, "tr")));
+        assert!(!app.folded_workspaces.contains("r"));
         assert_eq!(
             app.cursor,
-            Cursor::Task {
-                ws_idx: 4,
-                task_id: "tl".into()
-            },
-            "A-j moved on from ts-14-0, not from the top"
+            Cursor::Workspace(4),
+            "A-j moved on from ts-14-0 to l's header, not from the top"
         );
-        app.folded_tasks.insert(app.task_fold_key(0, "tr"));
+        app.folded_workspaces.insert("r".into());
         app.cursor = Cursor::Session(2, 0);
         sidebar_buffer(&mut app, 30);
         assert!(shown(&app, "ts-13-0"), "the draw reveals it too");
@@ -2051,13 +1959,10 @@ mod tree_tests {
             folded: false,
         });
         app.workspace_sections.insert("r".into(), "s1".into());
-        app.cursor = Cursor::Task {
-            ws_idx: 1,
-            task_id: "tc".into(),
-        };
+        app.cursor = Cursor::Workspace(1);
         assert!(app.toggle_tree_fold());
         sidebar_buffer(&mut app, 30);
-        assert!(app.folded_tasks.contains(&app.task_fold_key(1, "tc")), "the fold stays");
+        assert!(app.folded_workspaces.contains("c"), "the fold stays");
         app.cursor = Cursor::Section("s1".into());
         assert!(app.toggle_section_fold());
         sidebar_buffer(&mut app, 30);
@@ -2065,7 +1970,7 @@ mod tree_tests {
         assert!(app.sections[0].folded, "the section fold stays");
         // A later jump into it still reveals.
         assert!(app.jump_cursor_to_session_uid("ts-13-0"));
-        assert!(!app.sections[0].folded && !app.folded_tasks.contains(&app.task_fold_key(1, "tc")));
+        assert!(!app.sections[0].folded && !app.folded_workspaces.contains("c"));
     }
 
     /// Review (2): A-g reaches an alert inside a fold, and a folded header
@@ -2074,23 +1979,19 @@ mod tree_tests {
     fn a_g_reaches_an_alert_inside_a_fold_and_the_rollup_counts_it() {
         let mut app = org_app();
         app.raise_alert("ts-13-0", "g", "decide");
-        app.folded_tasks.insert(app.task_fold_key(1, "tc"));
+        app.folded_workspaces.insert("c".into());
         let tree = app.task_tree();
-        assert_eq!(
-            tree.folded[&Node::Task(1, "tc".into())].3,
-            1,
-            "one alert under tc"
-        );
+        assert_eq!(tree.folded[&Node::Workspace(1)].3, 1, "one alert under c");
         let buffer = sidebar_buffer(&mut app, 30);
         let text: String = (0..30u16)
             .flat_map(|y| (0..40u16).map(move |x| (x, y)))
             .map(|p| buffer[p].symbol().to_string())
             .collect();
-        assert!(text.contains("\u{2691}1"), "folded tc shows ⚑1");
+        assert!(text.contains("\u{2691}1"), "folded c shows ⚑1");
         app.cursor = Cursor::Workspace(4);
         app.jump_to_next_attention();
         assert_eq!(app.cursor, Cursor::Session(2, 0));
-        assert!(!app.folded_tasks.contains(&app.task_fold_key(1, "tc")) && shown(&app, "ts-13-0"));
+        assert!(!app.folded_workspaces.contains("c") && shown(&app, "ts-13-0"));
     }
 
     /// Review (4): a parent cycle inside one checkout keeps every session;
@@ -2103,10 +2004,8 @@ mod tree_tests {
         app.tasks = vec![task("t2", "w", Some("t1")), task("t1", "w", Some("t2"))];
         session(&mut app, 0, "t1", "ts-1-0", "codex");
         session(&mut app, 0, "t2", "ts-2-0", "codex");
-        assert_eq!(
-            outline(&app),
-            ["ws:w", "task:t1", "ts-1-0", "+task:t2", "+ts-2-0"]
-        );
+        assert_eq!(outline(&app), ["ws:w", "ts-1-0", "ts-2-0"]);
+        assert_eq!(app.workspace_task(0).as_deref(), Some("t1"), "the cycle breaks at t1");
     }
 
     /// Review (3): a header that stops drawing moves the cursor to a row.
@@ -2116,12 +2015,9 @@ mod tree_tests {
         app.cursor = Cursor::Division("div-gone".into());
         app.clamp_cursor();
         assert_eq!(app.cursor, Cursor::Workspace(0));
-        // tl's only session leaves: its header no longer draws.
+        // tl's only session leaves: the cursor moves to l's header.
         app.workspaces[4].sessions.clear();
-        app.cursor = Cursor::Task {
-            ws_idx: 4,
-            task_id: "tl".into(),
-        };
+        app.cursor = Cursor::Session(4, 0);
         app.clamp_cursor();
         assert_eq!(app.cursor, Cursor::Workspace(4));
     }
@@ -2198,9 +2094,81 @@ mod tree_tests {
         );
     }
 
+    /// The workspace row stands for its task (Owner, 2026-11-05: the task
+    /// subheaders are gone). A-i shows the task's brief; A-s, A-d and the
+    /// workflow launch scope to it; A-x on the row still means the
+    /// workspace. A checkout shared by two tasks names the other one in
+    /// A-i, scopes nothing, and A-e offers both.
+    #[test]
+    fn the_workspace_row_stands_for_its_task() {
+        let mut app = org_app();
+        app.tasks
+            .iter_mut()
+            .find(|t| t.task_id.as_deref() == Some("tc"))
+            .unwrap()
+            .prompt = Some("Fix the flaky bench".into());
+        app.cursor = Cursor::Workspace(1);
+        let peek = format!("{:?}", app.build_peek_lines());
+        assert!(peek.contains("Fix the flaky bench"), "{peek}");
+        assert!(!peek.contains("Also here"), "{peek}");
+        assert_eq!(app.cursor_scope_task_id().as_deref(), Some("tc"));
+        assert_eq!(app.cursor_task_id(), None, "A-x on the row deletes the workspace, not the task");
+        // A second, unrelated task in c's checkout.
+        app.tasks.push(task("tq", "c", None));
+        assert_eq!(app.workspace_tasks(1), ["tc", "tq"]);
+        assert_eq!(app.workspace_task(1), None);
+        assert_eq!(app.cursor_scope_task_id(), None, "ambiguous: a session row picks");
+        let peek = format!("{:?}", app.build_peek_lines());
+        assert!(peek.contains("Fix the flaky bench") && peek.contains("Also here"), "{peek}");
+        app.open_session_settings();
+        let InputMode::WorkspaceSettings { tasks, .. } = &app.input_mode else {
+            panic!("workspace settings")
+        };
+        let ids: Vec<&str> = tasks.iter().map(|t| t.task_id.as_str()).collect();
+        assert_eq!(ids, ["tc", "tq"]);
+    }
+
+    /// A-e renames the workspace's task from the merged form, and a
+    /// workspace without its own colour shows its task's legacy colour.
+    #[test]
+    fn the_workspace_form_renames_its_task() {
+        let mut app = org_app();
+        app.cursor = Cursor::Workspace(4);
+        app.open_session_settings();
+        let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        for _ in 0..4 {
+            app.handle_event(&key(KeyCode::Tab));
+        }
+        for c in "-v2".chars() {
+            app.handle_event(&key(KeyCode::Char(c)));
+        }
+        app.handle_event(&key(KeyCode::Enter));
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        let name = |app: &App| app.tasks.iter().find(|t| t.task_id.as_deref() == Some("tl")).unwrap().name.clone();
+        assert_eq!(name(&app), "tl-v2");
+        assert_eq!(app.workspaces[4].name, "l", "the workspace keeps its own name");
+        // The legacy task colour prefills the workspace's Color field, and
+        // a save moves it onto the workspace; another workspace showing the
+        // same task keeps it as its own.
+        app.workspaces.push(bare_ws("l2"));
+        session(&mut app, 5, "tl", "ts-50-0", "codex");
+        app.task_colors.insert("tl".into(), "cyan".into());
+        app.open_session_settings();
+        let InputMode::WorkspaceSettings { color, .. } = &app.input_mode else {
+            panic!("workspace settings")
+        };
+        assert_eq!(color.as_deref(), Some("cyan"));
+        app.handle_event(&key(KeyCode::Enter));
+        assert_eq!(app.workspaces[4].color.as_deref(), Some("cyan"));
+        assert_eq!(app.workspaces[5].color.as_deref(), Some("cyan"));
+        assert!(!app.task_colors.contains_key("tl"));
+    }
+
     /// Owner, 2026-10-21: no indent by depth (every block at the top-level
     /// indent; sessions keep theirs), and the focused group shows only as
     /// a narrow strip at the sidebar's left edge: no tint, no ancestor bar.
+    /// Owner, 2026-11-05: no task subheaders; sessions sit one indent under
+    /// their workspace header, which carries the fold glyph.
     #[test]
     fn the_sidebar_draws_flat_blocks_level_marks_and_a_group_edge_strip() {
         let mut app = org_app();
@@ -2227,12 +2195,16 @@ mod tree_tests {
             }
             panic!("{needle}\n{}", (0..30).map(text).collect::<Vec<_>>().join("\n"));
         };
-        // Task headers at every depth share one column, and so do
-        // workspace headers; sessions keep one indent.
-        let (_, tr) = at("\u{25be} tr");
-        assert_eq!(at("\u{25be} tc").1, tr, "tc (level 2) at the root's indent");
-        assert_eq!(at("   tg").1 + 1, tr, "tg (level 3) too, a leaf: no fold glyph");
-        assert_eq!(at("   to").1 + 1, tr, "to (level 3, under a missing tx) too");
+        // No task subheaders: no row names a task.
+        for t in ["tr", "tc", "tg", "to", "tl"] {
+            assert!(!rows.iter().any(|r| r.concat().contains(&format!(" {t} "))), "{t} has no row");
+        }
+        // Workspace headers at every depth share one column; a leaf has no
+        // fold glyph. Sessions keep one indent, two cells in from it.
+        let (_, r) = at("\u{25be} r");
+        assert_eq!(at("\u{25be} c").1, r, "c (level 2) at the root's indent");
+        assert_eq!(at("g \u{2302}").1, r, "g (level 3) too, a leaf: no fold glyph");
+        assert_eq!(at("o \u{2302}").1, r, "o (level 3, under a missing tx) too");
         assert_eq!(at("ts-13-0").1, at("ts-15-0").1, "sessions keep their indent");
         // Level marks on the leads with reports only.
         assert_eq!(at("\u{2605} ts-10-0").1 + 2, at("ts-10-0").1);
@@ -2243,12 +2215,12 @@ mod tree_tests {
         }
         // The group (tc and everything under it) gets the edge strip and no
         // background; its ancestors and an unrelated block get neither.
-        for needle in ["\u{25be} tc", "ts-12-0", "ts-20-0", "   tg", "ts-13-0"] {
+        for needle in ["\u{25be} c", "ts-12-0", "ts-20-0", "g \u{2302}", "ts-13-0"] {
             let (y, _) = at(needle);
             assert_eq!(rows[y][1], "\u{258f}", "{needle}: edge strip");
             assert_eq!(buffer[(1, y as u16)].fg, theme::TREE_FOCUS);
         }
-        for needle in ["\u{25be} tr", "ts-10-0", "ts-15-0"] {
+        for needle in ["\u{25be} r", "ts-10-0", "ts-15-0"] {
             assert_eq!(rows[at(needle).0][1], " ", "{needle}: no strip");
         }
         assert!(
@@ -2311,7 +2283,9 @@ mod tree_tests {
         assert!(!std::rc::Rc::ptr_eq(&reordered, &role_changed));
         assert_eq!(session_order(&app, &role_changed).len(), session_order(&app, &reordered).len());
 
+        // Both participants leave the run: its header goes.
         app.workspaces[0].sessions[1].workflow_run_id = None;
+        app.workspaces[0].sessions[2].workflow_run_id = None;
         let ungrouped = app.task_tree_shared();
         assert!(!std::rc::Rc::ptr_eq(&role_changed, &ungrouped));
         assert!(ungrouped.items.iter().filter(|item| matches!(item, VisualItem::WorkflowHeader { .. })).count() < role_changed.items.iter().filter(|item| matches!(item, VisualItem::WorkflowHeader { .. })).count());
@@ -2319,7 +2293,7 @@ mod tree_tests {
         let alert_host = app.workspaces[0].sessions[2].host_id.clone();
         app.owner_alert_rows.insert((alert_host, "ts-wf-0".into()), "host-alert".into());
         assert!(app.session_has_alert("ts-wf-0", &app.workspaces[0].sessions[2].host_id));
-        app.folded_tasks.insert(app.task_fold_key(0, "tr"));
+        app.folded_workspaces.insert("r".into());
         let alert_before = app.task_tree_shared();
         app.workspaces[0].sessions[2].host_id = cm_daemon::host_id::HostId::new("other");
         let host_changed = app.task_tree_shared();

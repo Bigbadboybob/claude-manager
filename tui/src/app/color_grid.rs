@@ -21,8 +21,7 @@ impl App {
         match &mut self.input_mode {
             InputMode::SessionSettings { color, active_field: 6, .. }
             | InputMode::WorkspaceSettings { color, active_field: 1, .. }
-            | InputMode::SectionSettings { color, active_field: 1, .. }
-            | InputMode::TaskSettings { color, active_field: 1, .. } => Some(color),
+            | InputMode::SectionSettings { color, active_field: 1, .. } => Some(color),
             _ => None,
         }
     }

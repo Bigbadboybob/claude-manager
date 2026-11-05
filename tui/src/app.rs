@@ -328,8 +328,6 @@ pub struct App {
     /// The open launch form's Model field (A-n, A-s, A-f, A-F); each form
     /// re-seeds it when it opens. See `model_field.rs`.
     form_model: model_field::ModelField,
-    /// The A-e task form's per-engine default models.
-    task_form_models: model_field::TaskModelsEdit,
     /// A-n forms with a "Reports to" parent, parked until their task row
     /// exists (`BackendEvent::ReportingTaskCreated`), keyed by request id.
     pending_report_launches: HashMap<String, reports_to::PendingReportLaunch>,
@@ -416,15 +414,15 @@ pub struct App {
     /// sidebar builders NEVER emit continuous sessions — they render only in the
     /// column, never in both places. Off by default. Persisted in the manifest.
     pub continuous_column_on: bool,
-    /// User-assigned accent colors for planning tasks, keyed by task id.
-    /// Tasks live in the planning API, so their color rides in the local
-    /// manifest as a sidecar (`Manifest::task_colors`). Consumed by the
-    /// sidebar `TaskHeader` arm; edited via A-e on a task row.
+    /// Legacy accent colors of planning tasks, keyed by task id, from the
+    /// task-header era (`Manifest::task_colors`). A workspace header with no
+    /// color of its own falls back to its task's; A-e on the workspace row
+    /// moves it onto the workspace.
     pub task_colors: HashMap<String, String>,
-    /// Folded task and division headers of the Task sub-view's work tree
-    /// (`app/tree.rs`), by task id and initiative id. Persisted in the
-    /// manifest.
-    pub(crate) folded_tasks: HashSet<String>,
+    /// Folded workspace and division headers of the Task sub-view's work
+    /// tree (`app/tree.rs`), by workspace id and initiative id. Persisted in
+    /// the manifest (workspace folds in its `folded_tasks` field).
+    pub(crate) folded_workspaces: HashSet<String>,
     pub(crate) folded_divisions: HashSet<String>,
     /// Folded Team sub-view headers (app/team_view.rs).
     pub(crate) folded_org: HashSet<String>,
@@ -824,7 +822,7 @@ impl App {
         let mut planning = PlanningView::new();
         planning.keybinding_helper_visible = keybinding_helper_visible;
         let task_colors = manifest.task_colors.clone();
-        let folded_tasks = tree::migrate_task_folds(&manifest.folded_tasks, manifest.workspaces.keys());
+        let folded_workspaces = tree::migrate_workspace_folds(&manifest.folded_tasks, manifest.workspaces.keys());
         let folded_divisions: HashSet<String> = manifest.folded_divisions.iter().cloned().collect();
         let folded_org: HashSet<String> = manifest.folded_org.iter().cloned().collect();
         let sections = manifest.sections.clone();
@@ -1085,7 +1083,6 @@ impl App {
             new_session_reports_to: Default::default(),
             new_session_picker: None,
             form_model: Default::default(),
-            task_form_models: Default::default(),
             pending_report_launches: HashMap::new(),
             start_time: Instant::now(),
             sessions_restored: false,
@@ -1112,7 +1109,7 @@ impl App {
             hide_continuous,
             continuous_column_on,
             task_colors,
-            folded_tasks,
+            folded_workspaces,
             folded_divisions,
             folded_org,
             attach_cache: Default::default(),
@@ -1234,20 +1231,19 @@ impl App {
         }
         let wi = match &self.cursor {
             Cursor::Workspace(wi) => *wi,
-            Cursor::Task { ws_idx, .. } => *ws_idx,
             Cursor::Session(wi, _) => *wi,
             Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => return None,
         };
         (wi < self.workspaces.len()).then_some(wi)
     }
 
-    /// Return the task_id for the cursor's current task scope, if any:
-    ///   - Cursor::Task → the task_id on the cursor
+    /// Return the task_id of the session the cursor is on, if any:
     ///   - Cursor::Session → the session's task_id (may be None)
-    ///   - Cursor::Workspace → None (not task-scoped, even if one task is bound)
+    ///   - Cursor::Workspace → None: A-x there deletes the whole workspace.
+    ///     Actions that take the workspace row as its task use
+    ///     [`App::cursor_scope_task_id`].
     fn cursor_task_id(&self) -> Option<String> {
         match &self.cursor {
-            Cursor::Task { task_id, .. } => Some(task_id.clone()),
             Cursor::Session(wi, si) => self
                 .workspaces
                 .get(*wi)
@@ -1264,6 +1260,17 @@ impl App {
         }
     }
 
+    /// The task the cursor's row stands for: a session's task, or on a
+    /// workspace row the workspace's task when exactly one is bound
+    /// (`App::workspace_task`; the workspace row replaced the task header,
+    /// 2026-11-05). A-d, A-s and A-f launch use it.
+    fn cursor_scope_task_id(&self) -> Option<String> {
+        match &self.cursor {
+            Cursor::Workspace(wi) => self.workspace_task(*wi),
+            _ => self.cursor_task_id(),
+        }
+    }
+
     /// Return a reference to the active terminal session (workspace + session).
     fn active_session(&self) -> Option<(&Workspace, &TerminalSession)> {
         match &self.cursor {
@@ -1272,6 +1279,11 @@ impl App {
                 let ts = ws.sessions.get(*si)?;
                 Some((ws, ts))
             }
+            // In the Task sub-view a workspace header is a tree row
+            // (app/tree.rs): Space/Enter fold it, and no keys reach a
+            // terminal from it, even when the workspace has a single
+            // session (that session is one row down).
+            Cursor::Workspace(_) if self.workspace_header_is_tree_row() => None,
             Cursor::Workspace(wi) => {
                 let ws = self.workspaces.get(*wi)?;
                 if ws.sessions.len() == 1 {
@@ -1280,10 +1292,6 @@ impl App {
                     None
                 }
             }
-            // A task header is a tree row (app/tree.rs): Space/Enter fold
-            // it, and no keys reach a terminal from it, even when its task
-            // has a single session (that session is one row down).
-            Cursor::Task { .. } => None,
             // No PTY behind backtest rows — plain keys fall through to the
             // fold toggle in input.rs instead of a terminal.
             Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => None,
@@ -1297,6 +1305,7 @@ impl App {
                 let ws = self.workspaces.get_mut(*wi)?;
                 ws.sessions.get_mut(*si)
             }
+            Cursor::Workspace(_) if self.workspace_header_is_tree_row() => None,
             Cursor::Workspace(wi) => {
                 let ws = self.workspaces.get_mut(*wi)?;
                 if ws.sessions.len() == 1 {
@@ -1305,7 +1314,6 @@ impl App {
                     None
                 }
             }
-            Cursor::Task { .. } => None,
             Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => None,
         }
     }

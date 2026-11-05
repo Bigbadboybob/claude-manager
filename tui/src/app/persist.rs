@@ -164,7 +164,7 @@ impl App {
             continuous_column_on: self.continuous_column_on,
             hide_keybinding_helper: !self.keybinding_helper_visible,
             task_colors: self.task_colors.clone(),
-            folded_tasks: self.folded_tasks.iter().cloned().collect(),
+            folded_tasks: self.folded_workspaces.iter().cloned().collect(),
             folded_divisions: self.folded_divisions.iter().cloned().collect(),
             folded_org: self.folded_org.iter().cloned().collect(),
             sections: self.sections.clone(),
@@ -1861,7 +1861,7 @@ mod adopt_daemon_session_tests {
         assert!(!app.workspaces[wi].is_closed, "follow-up adoption reopens the same workspace");
         app.apply_submit_action(crate::app::input::SubmitAction::SaveWorkspaceSettings {
             workspace_id: wid.clone(), name: "keep this investigation".into(),
-            color: None, pinned: false, section: None,
+            color: None, pinned: false, section: None, tasks: vec![],
         });
         assert!(!app.auto_close_workspaces.contains(&wid), "rename claims the wrapper");
         assert!(!app.close_agent_marker_if_empty(wi));

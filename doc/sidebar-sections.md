@@ -2,13 +2,13 @@
 
 ## Summary
 
-Owner-created, collapsible sections in the Sessions-view sidebar (Task sub-view) that group workspaces by project. A section is a display construct stored in the TUI manifest. The viewer publishes its catalogue to each daemon; agent tools can queue durable workspace assignment changes. Sections remain separate from planning initiatives. Membership is explicit per workspace, and a workspace without an explicit assignment inherits its parent task's section through the task tree, so an agent's `create_subtask` lands under its parent's section automatically. Since 2026-10-20 the Task sub-view is a nested work tree (`tui/src/app/tree.rs`): sections group the top-level blocks, and a block nested under another task's block follows that root's section even when it was assigned elsewhere.
+Owner-created, collapsible sections in the Sessions-view sidebar (Workspaces sub-view, `Task` in the code) that group workspaces by project. A section is a display construct stored in the TUI manifest. The viewer publishes its catalogue to each daemon; agent tools can queue durable workspace assignment changes. Sections remain separate from planning initiatives. Membership is explicit per workspace, and a workspace without an explicit assignment inherits its parent task's section through the task tree, so an agent's `create_subtask` lands under its parent's section automatically. Since 2026-10-20 the Task sub-view is a nested work tree (`tui/src/app/tree.rs`): sections group the top-level blocks, and a block nested under another task's block follows that root's section even when it was assigned elsewhere. Since 2026-11-05 it has no task subheaders (tasks live on the board): each workspace shows its sessions directly under it, and its header is titled "Workspaces".
 
 **Work tree display (2026-10-21).** Every block draws at the top-level indent, whatever its depth; only sessions keep their indent under their workspace row. The hierarchy shows through two cues instead:
-- **Group strip.** The focused row's group (its task or workspace and everything below it) shows as a narrow coloured strip (`▏`) at the sidebar's left edge, clear of the row text. The group has no background tint, so section tints show unchanged.
+- **Group strip.** The focused row's group (its workspace and everything below it) shows as a narrow coloured strip (`▏`) at the sidebar's left edge, clear of the row text. The group has no background tint, so section tints show unchanged.
 - **Leader marks.** The lead session of a task with live reports carries its level's mark: ★ for a root task, ☆ one level down, ✦, then ✧ for every deeper level. A live report is a subtask that is not done or archived and has a live agent session in its subtree; sessionless, bash-only and finished subtasks don't count. The F6 org chart draws the same marks (`App::leader_marks`; see doc/org-chart.md).
 
-Space/Enter on a task header folds only its subtasks: the task's workspace row and its own sessions stay, and the folded header's count covers just the hidden subtree. Only a task with live reports has a fold glyph. Fold state is separate for each workspace and task, so folding one header leaves another workspace’s header open. A child workspace attaches to a parent on its own host, preferring its managing session’s workspace; otherwise it remains top-level when no parent is on that host. A division header still folds its whole tree.
+Space/Enter on a workspace header folds only the blocks nested under it: the header and its own sessions stay, and the folded header's count covers just the hidden subtree. Only a workspace whose task has live reports has a fold glyph (`▾`/`▸`). Fold state is separate for each workspace (the manifest's `folded_tasks` field now holds workspace ids; older `[workspace, task]` keys migrate to their workspace), so folding one header leaves another workspace’s header open, even when both hold the same task. A child workspace attaches to a parent on its own host, preferring its managing session’s workspace; otherwise it remains top-level when no parent is on that host. A division header still folds its whole tree.
 
 ## Agent tools: remote subsection assignment
 
@@ -107,7 +107,7 @@ Subtasks nest to arbitrary depth, and rendering that tree faithfully in one side
 ## Goals
 
 - Create, rename, recolor, reorder, fold, and delete sections from the Sessions view.
-- Assign a workspace to a section from the A-e settings form on a workspace or task row.
+- Assign a workspace to a section from the A-e settings form on a workspace row.
 - A new workspace created with A-n while the cursor is inside a section joins that section.
 - A subtask (task with `parent_task_id`) whose parent's workspace is in a section renders in that section without any assignment.
 - Everything persists in `~/.cm/tui-sessions.json`, including fold state.
