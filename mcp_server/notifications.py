@@ -21,6 +21,9 @@ from pathlib import Path
 
 TERMINAL = {"observed", "cancelled"}
 MAX_EVENTS = 512
+# A queue directory listing is reused only when taken this long after the
+# directory last changed (its mtime is a coarse, tick-granular stamp).
+DIR_SETTLE_NS = 1_000_000_000
 MAX_TEXT_BYTES = 65536
 # Submitted notices with no inbound observation for this long mark the
 # transport degraded (the daemon raises an Owner alert at its own horizon).
@@ -153,30 +156,54 @@ class Queue:
         """Every event file, parsed. Files are replaced atomically (a new
         inode per write), so an unchanged (inode, size, mtime) is an
         unchanged event and its cached parse is reused. Top-level copies are
-        returned (callers set fields on events, never inside nested ones)."""
+        returned (callers set fields on events, never inside nested ones).
+
+        Every write here is a rename into this directory, so an unchanged
+        directory (inode, mtime, ctime) also means an unchanged listing and
+        the per-file stats can be skipped. The consumer snapshots several
+        times a second over ~512 retained events (11 ms each, about 1% of a
+        core per session). Directory timestamps are coarse (one kernel tick),
+        so a listing is reused only if it was taken DIR_SETTLE_NS after the
+        directory last changed: a later rename then carries a newer stamp."""
         cache = self.__dict__.setdefault("_event_cache", {})
+        checked = time.time_ns()
+        try:
+            d = os.stat(self.path)
+            dir_key = (d.st_ino, d.st_mtime_ns, d.st_ctime_ns)
+        except OSError:
+            d = dir_key = None
+        listing = self.__dict__.get("_listing")
+        if dir_key is not None and listing is not None and listing[0] == dir_key:
+            return [dict(hit[1]) for hit in listing[1]]
         seen = set()
-        out = []
-        for p in self.path.glob("*.json"):
-            if p.name == "transport.json":
+        hits = []
+        try:
+            entries = list(os.scandir(self.path))
+        except FileNotFoundError:
+            entries = []
+        for entry in entries:
+            name = entry.name
+            if not name.endswith(".json") or name == "transport.json":
                 continue
             try:
-                info = p.stat()
+                info = entry.stat()
             except FileNotFoundError:
                 continue
             key = (info.st_ino, info.st_size, info.st_mtime_ns)
-            seen.add(p.name)
-            hit = cache.get(p.name)
+            seen.add(name)
+            hit = cache.get(name)
             if hit is None or hit[0] != key:
                 try:
-                    hit = (key, json.loads(p.read_text()))
+                    hit = (key, json.loads((self.path / name).read_text()))
                 except FileNotFoundError:
                     continue
-                cache[p.name] = hit
-            out.append(dict(hit[1]))
+                cache[name] = hit
+            hits.append(hit)
         for name in [n for n in cache if n not in seen]:
             del cache[name]
-        return out
+        settled = d is not None and checked - d.st_mtime_ns > DIR_SETTLE_NS
+        self.__dict__["_listing"] = (dir_key, hits) if settled else None
+        return [dict(hit[1]) for hit in hits]
 
     # Consumer handoff. A waiting consumer that proves it is attached to the
     # daemon-bound conversation files a request; the holder releases only with

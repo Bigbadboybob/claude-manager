@@ -329,6 +329,43 @@ class EventCacheTests(unittest.TestCase):
             q.event_path("e5").unlink()
             self.assertEqual(len(q.snapshot()["notifications"]), 19)
 
+    def test_settled_listing_skips_the_directory_scan_until_a_rename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            q = Queue("uid-listing", Path(tmp))
+            for i in range(5):
+                q.publish(f"e{i}", "cm", f"[m{i}] hi", f"[m{i}]")
+            real_scandir = os.scandir
+            scans = []
+
+            def counting(path):
+                scans.append(path)
+                return real_scandir(path)
+
+            mtime = os.stat(q.path).st_mtime_ns
+            with patch.object(notifications.os, "scandir", counting):
+                # Taken within DIR_SETTLE_NS of the last change: a rename in
+                # the same coarse tick would not move the stamp, so the
+                # listing is not trusted and the next snapshot scans again.
+                with patch.object(notifications.time, "time_ns", return_value=mtime + 1):
+                    first = q.snapshot()["notifications"]
+                    q.snapshot()
+                self.assertEqual(len(scans), 2)
+                # Settled: reused without listing or stat'ing the files.
+                later = mtime + notifications.DIR_SETTLE_NS + 1
+                with patch.object(notifications.time, "time_ns", return_value=later):
+                    q.snapshot()
+                    again = q.snapshot()["notifications"]
+                self.assertEqual(len(scans), 3)
+                self.assertEqual(again, first)
+                # Reused events are copies too.
+                again[0]["status"] = "bogus"
+                self.assertNotIn("bogus", {e["status"] for e in q.snapshot()["notifications"]})
+                # Any write is a rename into the directory: rescanned at once.
+                q.change("e2", {"pending"}, status="cancelled")
+                snap = q.snapshot()["notifications"]
+            self.assertEqual(len(scans), 4)
+            self.assertEqual({e["id"]: e["status"] for e in snap}["e2"], "cancelled")
+
 
 if __name__ == "__main__":
     unittest.main()
