@@ -55,7 +55,7 @@ pub(super) fn migrate_workspace_folds<'a>(
 /// What a sidebar row belongs to.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Node {
-    Division(String),
+    Division(DivisionKey),
     Workspace(usize),
 }
 
@@ -224,7 +224,7 @@ impl Forest {
 /// One entry of a top-level list: a block, or a division's blocks.
 enum Entry {
     Block(usize),
-    Division(String, Vec<usize>),
+    Division(DivisionKey, Vec<usize>),
 }
 
 impl App {
@@ -591,7 +591,7 @@ impl App {
                     Some(ws) => self.folded_workspaces.remove(&ws.id),
                     None => false,
                 },
-                Node::Division(d) => self.folded_divisions.remove(&d),
+                Node::Division(d) => self.folded_divisions.remove(&d.fold_key()),
             };
         }
         if changed {
@@ -669,7 +669,7 @@ impl App {
                 .push(VisualItem::SectionHeader(sec.id.clone()));
             // The unfolded tree (`folds == false`) opens sections too.
             if !emit.folds || !sec.folded {
-                let entries = emit.entries(by_section.remove(&sec.id).unwrap_or_default());
+                let entries = emit.entries(by_section.remove(&sec.id).unwrap_or_default(), Some(&sec.id));
                 for (i, entry) in entries.into_iter().enumerate() {
                     if i > 0 {
                         emit.out.items.push(VisualItem::Separator);
@@ -679,7 +679,7 @@ impl App {
             }
             emit.out.items.push(VisualItem::SectionEnd);
         }
-        for entry in emit.entries(loose) {
+        for entry in emit.entries(loose, None) {
             if !emit.out.items.is_empty()
                 && !matches!(emit.out.items.last(), Some(VisualItem::SectionEnd))
             {
@@ -737,7 +737,7 @@ impl App {
                 .workspaces
                 .get(*wi)
                 .is_some_and(|ws| self.folded_workspaces.contains(&ws.id)),
-            Node::Division(d) => self.folded_divisions.contains(d),
+            Node::Division(d) => self.folded_divisions.contains(&d.fold_key()),
         }
     }
 
@@ -758,7 +758,7 @@ impl App {
                 }
                 (&mut self.folded_workspaces, ws_id)
             }
-            Cursor::Division(id) => (&mut self.folded_divisions, id),
+            Cursor::Division(key) => (&mut self.folded_divisions, key.fold_key()),
             Cursor::Org(key) => (&mut self.folded_org, key),
             _ => return false,
         };
@@ -1007,9 +1007,11 @@ impl Emit<'_> {
         self.out.items.push(item);
     }
 
-    /// Group a top-level list by division, a division at its first block,
-    /// its coordinator's block first.
-    fn entries(&self, tops: Vec<usize>) -> Vec<Entry> {
+    /// Group a top-level list (one section's, or the loose list when
+    /// `section` is None) by division, a division at its first block, its
+    /// coordinator's block first. The header's key carries `section`, so a
+    /// division split across sections draws distinct rows.
+    fn entries(&self, tops: Vec<usize>, section: Option<&str>) -> Vec<Entry> {
         let mut entries: Vec<Entry> = Vec::new();
         for wi in tops {
             let division = self
@@ -1023,10 +1025,13 @@ impl Emit<'_> {
             };
             match entries
                 .iter_mut()
-                .find(|e| matches!(e, Entry::Division(id, _) if *id == d))
+                .find(|e| matches!(e, Entry::Division(key, _) if key.id == d))
             {
                 Some(Entry::Division(_, blocks)) => blocks.push(wi),
-                _ => entries.push(Entry::Division(d, vec![wi])),
+                _ => entries.push(Entry::Division(
+                    DivisionKey { id: d, section: section.map(str::to_owned) },
+                    vec![wi],
+                )),
             }
         }
         for entry in &mut entries {
@@ -1260,7 +1265,7 @@ mod tree_tests {
                 let label = match vi {
                     VisualItem::WorkspaceHeader(wi) => format!("ws:{}", app.workspaces[*wi].id),
                     VisualItem::Session(wi, si) => app.workspaces[*wi].sessions[*si].uid.clone(),
-                    VisualItem::DivisionHeader(id) => format!("division:{id}"),
+                    VisualItem::DivisionHeader(key) => format!("division:{}", key.id),
                     _ => return None,
                 };
                 let row = &tree.rows[vi];
@@ -1803,17 +1808,90 @@ mod tree_tests {
             outline.contains(&">>>ws:g".to_string()),
             "nesting continues inside the division"
         );
-        app.cursor = Cursor::Division("div-1".into());
+        app.cursor = Cursor::Division(loose_division("div-1"));
         assert!(app.toggle_tree_fold());
         let tree = app.task_tree();
         assert_eq!(tree.items.len(), 1, "a folded division is its header alone");
-        assert_eq!(tree.folded[&Node::Division("div-1".into())].0, 6);
+        assert_eq!(tree.folded[&Node::Division(loose_division("div-1"))].0, 6);
         // An ordinary initiative draws no header.
         let mut app = org_app();
         let mut plain = division_task("tr", None, true);
         plain.initiative.as_mut().unwrap()["kind"] = serde_json::json!("initiative");
         app.planning.update_from_api(vec![plain]);
         assert_eq!(super::super::tree::tree_tests::outline(&app)[0], "ws:r");
+    }
+
+    fn loose_division(id: &str) -> DivisionKey {
+        DivisionKey { id: id.into(), section: None }
+    }
+
+    /// Laptop diag 2026-11-05: a division with top-level blocks both in a
+    /// section and in the loose list drew two headers with one identity, so
+    /// the cursor resolved to the first one and A-k (or A-j from above) on
+    /// the lower block jumped to the top. Each header is its own row now:
+    /// every row is drawn once, A-j/A-k walk the list in order, and each
+    /// header folds on its own.
+    #[test]
+    fn a_division_split_across_sections_draws_distinct_rows_and_navigates_linearly() {
+        let mut app = org_app();
+        app.planning.update_from_api(vec![
+            division_task("tr", None, true),
+            division_task("tl", None, false),
+        ]);
+        app.sections.push(cm_daemon::manifest::SidebarSection {
+            id: "s1".into(),
+            name: "SEJD".into(),
+            color: None,
+            folded: false,
+        });
+        app.workspace_sections.insert("r".into(), "s1".into());
+        let items = app.task_tree().items;
+        let upper = DivisionKey { id: "div-1".into(), section: Some("s1".into()) };
+        let lower = loose_division("div-1");
+        let pos = |k: &DivisionKey| {
+            items.iter().position(|vi| *vi == VisualItem::DivisionHeader(k.clone())).unwrap()
+        };
+        assert!(pos(&upper) < pos(&lower), "{items:?}");
+        let mut drawn = HashSet::new();
+        for vi in items.iter().filter(|vi| !matches!(vi, VisualItem::Separator | VisualItem::SectionEnd)) {
+            assert!(drawn.insert(vi.clone()), "{vi:?} drawn twice: {items:?}");
+        }
+
+        // A-j from the top visits every stop once, in order, then wraps.
+        app.cursor = Cursor::Section("s1".into());
+        let mut visited = vec![app.sidebar_cursor_index(&items).unwrap()];
+        loop {
+            app.navigate(1);
+            let at = app.sidebar_cursor_index(&items).unwrap();
+            if at <= *visited.last().unwrap() {
+                assert_eq!(at, 0, "wraps to the top only after the last row");
+                break;
+            }
+            visited.push(at);
+        }
+        assert!(visited.contains(&pos(&upper)) && visited.contains(&pos(&lower)), "{visited:?}");
+        // A-k from the lower header goes to the row just above it.
+        app.cursor = Cursor::Division(lower.clone());
+        app.navigate(-1);
+        let above = visited[visited.iter().position(|p| *p == pos(&lower)).unwrap() - 1];
+        assert_eq!(app.sidebar_cursor_index(&items), Some(above));
+        assert!(above > pos(&upper));
+
+        // Folding the lower header folds it alone and keeps the cursor there.
+        app.cursor = Cursor::Division(lower.clone());
+        assert!(app.toggle_tree_fold());
+        let tree = app.task_tree();
+        assert!(tree.folded.contains_key(&Node::Division(lower.clone())));
+        assert!(!tree.folded.contains_key(&Node::Division(upper.clone())));
+        assert!(tree.items.contains(&VisualItem::Session(0, 0)), "the upper division stays open");
+        assert_eq!(
+            app.sidebar_cursor_index(&tree.items),
+            tree.items.iter().position(|vi| *vi == VisualItem::DivisionHeader(lower.clone()))
+        );
+        // A header that stops drawing falls back to the division's other one.
+        app.workspace_sections.insert("l".into(), "s1".into());
+        app.clamp_cursor();
+        assert_eq!(app.cursor, Cursor::Division(upper));
     }
 
     /// A-e on a workspace header: the Lead field of its task cycles auto →
@@ -2012,7 +2090,7 @@ mod tree_tests {
     #[test]
     fn a_vanished_header_moves_the_cursor_to_a_row() {
         let mut app = org_app();
-        app.cursor = Cursor::Division("div-gone".into());
+        app.cursor = Cursor::Division(loose_division("div-gone"));
         app.clamp_cursor();
         assert_eq!(app.cursor, Cursor::Workspace(0));
         // tl's only session leaves: the cursor moves to l's header.

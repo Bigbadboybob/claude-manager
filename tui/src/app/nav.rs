@@ -317,6 +317,28 @@ fn peek_session_lines(
     out
 }
 
+/// One division header row: the division (initiative id) and the section it
+/// draws in (`None` = the loose list). A division whose top-level blocks sit
+/// in several sections draws a header in each; the section keeps every
+/// header its own row, cursor stop and fold.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DivisionKey {
+    pub id: String,
+    pub section: Option<String>,
+}
+
+impl DivisionKey {
+    /// The `folded_divisions` key. A loose header keeps the bare initiative
+    /// id (the key every header used before headers were per section); a
+    /// header in a section uses the JSON pair `[section, id]`.
+    pub(crate) fn fold_key(&self) -> String {
+        match &self.section {
+            None => self.id.clone(),
+            Some(sec) => serde_json::to_string(&[sec.as_str(), self.id.as_str()]).unwrap(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Cursor {
     /// Cursor is on a workspace header (by workspace index). In the Task
@@ -335,9 +357,9 @@ pub enum Cursor {
     /// A-e / A-x / A-J / A-K edit / delete / reorder it, and A-n creates a
     /// workspace inside it. See `app/sections.rs`.
     Section(String),
-    /// Cursor is on a division header (Task sub-view), by initiative id.
+    /// Cursor is on a division header (Task sub-view).
     /// Space/Enter fold it; no terminal behind it.
-    Division(String),
+    Division(DivisionKey),
     /// Cursor is on a Team sub-view header (`team:<id>`, `member:<id>` or
     /// the unassigned group; app/team_view.rs). Space/Enter fold it.
     Org(String),
@@ -413,10 +435,10 @@ pub(super) enum VisualItem {
     /// workspaces follow until the next section header / separator unless
     /// the section is folded. See doc/sidebar-sections.md.
     SectionHeader(String),
-    /// A division's header (Task sub-view), by initiative id: groups the
-    /// top-level blocks of the division's tree. Selectable; Space/Enter
-    /// fold it. See `app/tree.rs`.
-    DivisionHeader(String),
+    /// A division's header (Task sub-view): groups the top-level blocks of
+    /// the division's tree within one section (or the loose list).
+    /// Selectable; Space/Enter fold it. See `app/tree.rs`.
+    DivisionHeader(DivisionKey),
     /// Team sub-view header (app/team_view.rs): `team:<id>`, `member:<id>`
     /// or the unassigned group. Not a cursor stop.
     OrgHeader { key: String, depth: u8 },
@@ -663,17 +685,24 @@ impl App {
             self.clamp_org_cursor();
             return;
         }
-        if let Cursor::Division(id) = &self.cursor {
+        if let Cursor::Division(key) = &self.cursor {
             let items = self.task_tree().items;
-            if !items.iter().any(|vi| matches!(vi, VisualItem::DivisionHeader(d) if d == id)) {
-                self.cursor = items
-                    .iter()
-                    .find_map(|vi| match vi {
+            if !items.iter().any(|vi| matches!(vi, VisualItem::DivisionHeader(d) if d == key)) {
+                // The same division's header in another section, else the
+                // first workspace.
+                let same = items.iter().find_map(|vi| match vi {
+                    VisualItem::DivisionHeader(d) if d.id == key.id => Some(Cursor::Division(d.clone())),
+                    _ => None,
+                });
+                self.cursor = same
+                    .or_else(|| items.iter().find_map(|vi| match vi {
                         VisualItem::WorkspaceHeader(wi) => Some(Cursor::Workspace(*wi)),
                         _ => None,
-                    })
+                    }))
                     .unwrap_or(Cursor::Workspace(0));
-                self.clamp_cursor();
+                if !matches!(self.cursor, Cursor::Division(_)) {
+                    self.clamp_cursor();
+                }
             }
             return;
         }
@@ -763,7 +792,7 @@ impl App {
             }),
             VisualItem::WorkflowHeader { run_id, .. } => contains(run_id),
             VisualItem::SectionHeader(id) => self.section_by_id(id).is_some_and(|s| contains(&s.name) || contains(id)),
-            VisualItem::DivisionHeader(id) => self.planning.division(id).is_some_and(|d| contains(&d.name)) || contains(id),
+            VisualItem::DivisionHeader(key) => self.planning.division(&key.id).is_some_and(|d| contains(&d.name)) || contains(&key.id),
             VisualItem::BacktestHeader => contains("backtest") || self.backtest_rows.iter().any(|r| contains(&r.label)),
             VisualItem::BacktestFleet(stem) => contains(stem),
             VisualItem::BacktestRun { task_id, .. } => self.backtest_rows.iter().find(|r| r.task_id == *task_id).is_some_and(|r| contains(&r.label) || contains(task_id)),
@@ -2050,7 +2079,8 @@ impl App {
                     ));
                 }
             }
-            Cursor::Division(id) => {
+            Cursor::Division(key) => {
+                let id = &key.id;
                 let name = self.planning.division(id).map_or_else(|| id.clone(), |d| d.name);
                 out.push(PeekLine::Title(format!("Division: {name}")));
                 out.push(PeekLine::Field { label: "Initiative".into(), value: id.clone() });

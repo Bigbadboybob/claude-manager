@@ -2379,10 +2379,11 @@ impl App {
                 }
                 // Division header: `▾ ◆ Name`, `▸ ◆ Name (n) ⠿r ●i` folded,
                 // in the initiative's colour (else HEADER), bold.
-                VisualItem::DivisionHeader(id) => {
-                    let is_selected = matches!(&self.cursor, Cursor::Division(cid) if cid == id);
+                VisualItem::DivisionHeader(key) => {
+                    let is_selected = matches!(&self.cursor, Cursor::Division(cid) if cid == key);
+                    let id = &key.id;
                     let division = tree.as_ref().and_then(|t| t.divisions.get(id)).cloned();
-                    let node = super::tree::Node::Division(id.clone());
+                    let node = super::tree::Node::Division(key.clone());
                     let glyph = if self.tree_folded(&node) { "\u{25b8}" } else { "\u{25be}" };
                     let tail = fold_tail(&node);
                     let prefix = tree_prefix(vi, usize::MAX);
