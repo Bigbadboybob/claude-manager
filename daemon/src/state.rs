@@ -1565,14 +1565,23 @@ pub(crate) fn write_json_atomic(path: &Path, json: &str, durable: bool) -> std::
     }
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), n));
-    if durable {
-        let mut f = std::fs::File::create(&tmp)?;
-        std::io::Write::write_all(&mut f, json.as_bytes())?;
-        f.sync_all()?;
-    } else {
-        std::fs::write(&tmp, json.as_bytes())?;
+    let staged = (|| {
+        if durable {
+            let mut f = std::fs::File::create(&tmp)?;
+            std::io::Write::write_all(&mut f, json.as_bytes())?;
+            f.sync_all()?;
+        } else {
+            std::fs::write(&tmp, json.as_bytes())?;
+        }
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(e) = staged {
+        // A failed write (ENOSPC on 2026-10-14) used to leave its temp file
+        // behind, one per retry: ten empty `daemon-agent-state.tmp.*` files
+        // were still in ~/.cm three weeks later (#109).
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    std::fs::rename(&tmp, path)?;
     if durable {
         if let Some(parent) = path.parent() {
             // Directory fsync makes the rename itself durable (the
@@ -1591,6 +1600,26 @@ mod tests {
 
     fn lock() -> std::sync::MutexGuard<'static, ()> {
         crate::test_support::env_lock()
+    }
+
+    #[test]
+    fn failed_atomic_write_leaves_no_temp_file() {
+        let dir = TempDir::new().unwrap();
+        // A non-empty directory where the file should be: the rename fails.
+        let path = dir.path().join("daemon-agent-state.json");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("occupied"), b"x").unwrap();
+        for durable in [true, false] {
+            assert!(write_json_atomic(&path, "{}", durable).is_err());
+        }
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["daemon-agent-state.json".to_string()]);
+        std::fs::remove_dir_all(&path).unwrap();
+        write_json_atomic(&path, "{}", true).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
     }
 
     fn tomb(uid: &str) -> ExitedTombstone {
