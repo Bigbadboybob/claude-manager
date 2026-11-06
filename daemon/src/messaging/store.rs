@@ -443,6 +443,8 @@ pub struct Store {
     channel_norms: BTreeMap<String, Value>,
     enrollment_revision: String,
     owner_identity_revision: String,
+    /// Where the last open spent its time, for the startup log line.
+    pub open_report: String,
 }
 impl Store {
     pub fn open(cm_root: &Path) -> Result<Self> {
@@ -538,6 +540,7 @@ impl Store {
             channel_norms: BTreeMap::new(),
             enrollment_revision: required(&meta, "enrollment_revision")?,
             owner_identity_revision: required(&meta, "owner_identity_revision")?,
+            open_report: String::new(),
         };
         for id in [
             &s.space_id,
@@ -553,9 +556,25 @@ impl Store {
             })?;
         }
         mkdir(&s.journal_dir())?;
-        if let Err(e) = s.rebuild(workers) {
-            s.degraded = Some(e.to_string());
-            return Ok(s);
+        let began = std::time::Instant::now();
+        let mut phase = began;
+        let mut lap = |name: &str, report: &mut String| {
+            let now = std::time::Instant::now();
+            report.push_str(&format!(" {name}={:.1}s", (now - phase).as_secs_f64()));
+            phase = now;
+        };
+        match s.rebuild(workers) {
+            Ok((read, skipped)) => {
+                s.open_report = format!(
+                    "journal_read={read} journal_skipped={skipped} events={} readers={workers}",
+                    s.events.len()
+                );
+                lap("rebuild", &mut s.open_report);
+            }
+            Err(e) => {
+                s.degraded = Some(e.to_string());
+                return Ok(s);
+            }
         }
         if let Err(e) = s
             .load_personal()
@@ -575,6 +594,7 @@ impl Store {
                 }
             }
         }
+        lap("state", &mut s.open_report);
         if let Err(e) = s
             .quarantine_staged()
             .and_then(|_| File::open(s.journal_dir())?.sync_all())
@@ -582,6 +602,7 @@ impl Store {
             s.degraded = Some(format!("Recovery reconciliation failed: {e}"));
             return Ok(s);
         }
+        lap("quarantine_scan", &mut s.open_report);
         if s.is_coordinator() && !s.messaging_frozen() {
             for (path, description) in [
                 ("general", "Shared discussion"),
@@ -622,6 +643,7 @@ impl Store {
         if let Err(e) = recovered.and_then(|_| s.project()) {
             s.degraded = Some(format!("Projection recovery failed: {e}"));
         }
+        lap("recovery", &mut s.open_report);
         Ok(s)
     }
     /// Unreferenced objects never become messages by directory scanning. Move
@@ -700,7 +722,8 @@ impl Store {
         };
         Ok(dir.join("_events").join(format!("{origin}--{event}.json")))
     }
-    fn rebuild(&mut self, workers: usize) -> Result<()> {
+    /// Replays the journal; returns (journal files read, superseded skipped).
+    fn rebuild(&mut self, workers: usize) -> Result<(usize, usize)> {
         let index = self.load_journal_index();
         let mut paths = fs::read_dir(self.journal_dir())?
             .map(|x| x.map(|e| e.path()))
@@ -718,8 +741,10 @@ impl Store {
             }
             true
         });
+        let counts = (paths.len(), scan.superseded.len());
         rebuild::replay(self, &paths, workers, &mut scan)?;
-        self.finish_journal_scan(index, scan)
+        self.finish_journal_scan(index, scan)?;
+        Ok(counts)
     }
     fn apply_rebuilt(
         &mut self,

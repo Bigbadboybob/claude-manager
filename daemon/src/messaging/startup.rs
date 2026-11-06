@@ -44,9 +44,10 @@ fn start_with(
             // during journal reads/rebuild or while waiting to retry an error.
             let result = open(&root);
             eprintln!(
-                "cm-daemon: messaging store open took {:.3}s ({})",
+                "cm-daemon: messaging store open took {:.3}s ({}){}",
                 began.elapsed().as_secs_f64(),
                 if result.is_ok() { "ready" } else { "failed" },
+                result.as_ref().map_or(String::new(), |s| format!(": {}", s.open_report)),
             );
             match result {
                 Ok(store) => {

@@ -2,10 +2,20 @@
 use super::*;
 use std::sync::mpsc;
 
+/// Upper bound on journal reader threads. A rebuild reads ~600k small files
+/// (cm-sessions, 2026-11-05) and the readers mostly wait on per-read disk
+/// latency, so more of them may keep more reads in flight; whether that helps
+/// depends on the disk's IOPS ceiling. `CM_MESSAGING_REBUILD_READERS` lets an
+/// operator measure it (the open log line reports readers and phase times)
+/// without changing the default of up to eight.
+pub(super) const MAX_READERS: usize = 32;
+
 pub(super) fn worker_count() -> usize {
-    std::thread::available_parallelism()
-        .map_or(2, usize::from)
-        .clamp(1, 8)
+    std::env::var("CM_MESSAGING_REBUILD_READERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, usize::from).min(8))
+        .clamp(1, MAX_READERS)
 }
 
 pub(super) struct Prepared {
@@ -40,7 +50,7 @@ pub(super) fn replay(
     workers: usize,
     scan: &mut replication::JournalScan,
 ) -> Result<()> {
-    let workers = workers.clamp(1, 8).min(paths.len());
+    let workers = workers.clamp(1, MAX_READERS).min(paths.len());
     if workers <= 1 {
         for path in paths {
             store.apply_rebuilt(path, prepare(&store.root, path)?, scan)?;
@@ -176,7 +186,7 @@ mod tests {
         let s = fixture(tmp.path());
         let expected = fingerprint(&s);
         drop(s);
-        for workers in [1, 2, 8] {
+        for workers in [1, 2, 8, MAX_READERS] {
             let s = reopen(tmp.path(), workers);
             assert!(s.degraded.is_none(), "{:?}", s.degraded);
             assert_eq!(fingerprint(&s), expected, "{workers} readers");
