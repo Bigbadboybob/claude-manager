@@ -1206,6 +1206,14 @@ pub fn read_only(session: &DaemonSession) -> AgentState {
 /// the bounded drain leaves room for unrelated lifecycle diffs in the watcher.
 const MAX_STATE_DIFFS_PER_TICK: usize = crate::manifest::MANIFEST_WATCH_BUFFER / 4;
 const PERSIST_INTERVAL: Duration = Duration::from_secs(5);
+/// A sidecar whose only change is source-poll freshness (`observed_at` on
+/// presence, relay and background) is rewritten at most this often (#109).
+/// Presence polls bump it every few seconds for every session, which made
+/// every 5 s tick a full ~400 KB fsynced rewrite (~6.6 GB/day on cm-sessions
+/// with 79 sessions). Any other change still persists on the next tick, and
+/// a checked restart flush always writes current values. 30 s keeps a crash
+/// restore inside the relay's 90 s staleness window.
+const HEARTBEAT_PERSIST_INTERVAL: Duration = Duration::from_secs(30);
 #[derive(Default)]
 struct Publisher {
     started: bool,
@@ -1216,6 +1224,9 @@ struct Publisher {
 struct Persistence {
     last_attempt: Option<Instant>,
     saved: Option<String>,
+    /// `saved` with poll freshness blanked; see `HEARTBEAT_PERSIST_INTERVAL`.
+    saved_facts: Option<String>,
+    last_write: Option<Instant>,
 }
 #[derive(Default)]
 pub struct Runtime {
@@ -1458,17 +1469,40 @@ fn persist_with(
         (path, capture(&state))
     };
     persistence.last_attempt = Some(now);
+    let facts = without_poll_freshness(&sessions)?;
     let encoded = serde_json::to_string(&Sidecar {
         version: 2,
         boot_id: boot_id()?,
         sessions,
     })
     .map_err(std::io::Error::other)?;
-    if force || persistence.saved.as_ref() != Some(&encoded) {
+    let facts_changed = persistence.saved_facts.as_ref() != Some(&facts);
+    let freshness_due = persistence.saved.as_ref() != Some(&encoded)
+        && persistence
+            .last_write
+            .is_none_or(|at| now.saturating_duration_since(at) >= HEARTBEAT_PERSIST_INTERVAL);
+    if force || facts_changed || freshness_due {
         write(&path, &encoded)?;
         persistence.saved = Some(encoded);
+        persistence.saved_facts = Some(facts);
+        persistence.last_write = Some(now);
     }
     Ok(())
+}
+/// The sidecar's sessions with source-poll clocks blanked: what changed
+/// beyond freshness (same rule as `AgentState::publication_eq`).
+fn without_poll_freshness(sessions: &BTreeMap<String, RestartRecord>) -> std::io::Result<String> {
+    let mut value = serde_json::to_value(sessions).map_err(std::io::Error::other)?;
+    if let Some(map) = value.as_object_mut() {
+        for record in map.values_mut() {
+            for source in ["presence", "relay", "background"] {
+                if let Some(obj) = record.get_mut(source).and_then(|v| v.as_object_mut()) {
+                    obj.remove("observed_at");
+                }
+            }
+        }
+    }
+    serde_json::to_string(&value).map_err(std::io::Error::other)
 }
 /// Call outside DaemonState while the restart writer/reader barriers are held.
 /// The gate waits for any older tick write, then this fresh checked flush wins.
@@ -3023,6 +3057,52 @@ mod tests {
             50,
             "bounded draining must also make progress for every session"
         );
+    }
+
+    #[test]
+    fn sidecar_rewrites_poll_freshness_only_every_30s_but_real_changes_next_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = session_state();
+        st.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
+        let uid = "ts-agent-state";
+        let presence_at = |st: &DaemonState, at: f64, status: PresenceStatus| {
+            let mut c = st.sessions[uid].agent_state.lock().unwrap();
+            let mut p = presence(status).presence.unwrap();
+            p.observed_at = at;
+            c.inputs.presence = Some(p);
+            let bg = &mut c.inputs.background;
+            bg.observed_at = Some(at);
+        };
+        presence_at(&st, 1000.0, PresenceStatus::Idle);
+        let state = Arc::new(Mutex::new(st));
+        let writes = std::cell::RefCell::new(Vec::<String>::new());
+        let write = |_: &std::path::Path, json: &str| {
+            writes.borrow_mut().push(json.to_string());
+            Ok(())
+        };
+        let start = Instant::now();
+        persist_with(&state, false, start, write).unwrap();
+        assert_eq!(writes.borrow().len(), 1, "first tick writes the baseline");
+        // Polls refresh observed_at every 5 s: no rewrite inside 30 s.
+        for n in 1..=5u64 {
+            presence_at(&*state.lock().unwrap(), 1000.0 + 5.0 * n as f64, PresenceStatus::Idle);
+            persist_with(&state, false, start + Duration::from_secs(5 * n), write).unwrap();
+        }
+        assert_eq!(writes.borrow().len(), 1, "poll freshness alone waits");
+        // Past 30 s since the last write, freshness is written.
+        presence_at(&*state.lock().unwrap(), 1030.0, PresenceStatus::Idle);
+        persist_with(&state, false, start + Duration::from_secs(30), write).unwrap();
+        assert_eq!(writes.borrow().len(), 2);
+        let json: serde_json::Value = serde_json::from_str(writes.borrow().last().unwrap()).unwrap();
+        assert_eq!(json["sessions"][uid]["presence"]["observed_at"], 1030.0, "the file keeps real freshness");
+        // A real change (status) persists on the very next tick.
+        presence_at(&*state.lock().unwrap(), 1035.0, PresenceStatus::Busy);
+        persist_with(&state, false, start + Duration::from_secs(35), write).unwrap();
+        assert_eq!(writes.borrow().len(), 3, "a status edge is not a heartbeat");
+        // A checked restart flush always writes current values.
+        presence_at(&*state.lock().unwrap(), 1036.0, PresenceStatus::Busy);
+        persist_with(&state, true, start + Duration::from_secs(36), write).unwrap();
+        assert_eq!(writes.borrow().len(), 4);
     }
 
     #[test]
