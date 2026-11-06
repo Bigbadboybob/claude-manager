@@ -32,6 +32,10 @@ pub(crate) fn follow_claude_id(worktree: &std::path::Path, id: &str) -> Option<S
 const TASKLESS_ADOPT_GRACE: Duration = Duration::from_secs(30);
 /// First-seen entries for uids no pass has listed lately are dropped.
 const TASKLESS_SEEN_TTL: Duration = Duration::from_secs(24 * 3600);
+/// How long the adopt pass ignores a session this viewer just tombstoned
+/// (see `recently_removed_uids`): many session-poll intervals, so a cached
+/// list from before the kill landed never brings it back.
+const READOPT_HOLD_SECS: f64 = 120.0;
 
 /// How often the TUI re-reports the session it keeps showing. Well inside
 /// the daemon sweep's two-hour owner grace.
@@ -939,10 +943,12 @@ impl App {
                 }
 
                 let in_flight = self.session_uids_in_flight();
+                let removed = self.recently_removed_uids();
                 let tracked: std::collections::HashSet<&str> = self
                     .workspaces
                     .iter()
                     .flat_map(|w| w.sessions.iter().map(|s| s.uid.as_str()))
+                    .chain(removed.iter().map(String::as_str))
                     .collect();
                 let settled = Self::settle_taskless(
                     &mut self.taskless_seen,
@@ -1030,6 +1036,7 @@ impl App {
             .iter()
             .map(|p| p.entry.uid.clone())
             .chain(self.plan_launches.iter().map(|f| f.spec.uid.clone()))
+            .chain(self.recently_removed_uids())
             .collect();
         // In-flight uids: dispatched to the attach worker but not yet bound into
         // a slot (so absent from BOTH `tracked` and `pending`). Without this set
@@ -1060,6 +1067,27 @@ impl App {
                     .push(PendingRemoteReattach::new(target_ws_id, entry));
             }
         }
+    }
+
+    /// Sessions this viewer tombstoned (closed, or pruned as exited) within
+    /// [`READOPT_HOLD_SECS`]. The session pollers' cached lists keep
+    /// reporting such a session until its kill lands, and adopting it again
+    /// reopened the workspace it was closed with: the attach then failed,
+    /// leaving that workspace open and empty, and a running bound task kept
+    /// the spent sweep from closing it again (laptop diag 2026-11-05: four
+    /// workspaces the bash-only sweep closed). A session still listed after
+    /// the hold is really alive and is adopted as before; a new session
+    /// (another uid) still lands at once and reopens its workspace.
+    fn recently_removed_uids(&self) -> std::collections::HashSet<String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64());
+        self.workspaces
+            .iter()
+            .flat_map(|w| &w.tombstones)
+            .filter(|t| now - t.exited_at < READOPT_HOLD_SECS)
+            .map(|t| t.uid.clone())
+            .collect()
     }
 
     /// Resolve (target workspace id, worktree) for an adoptee, creating a

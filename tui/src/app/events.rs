@@ -4399,6 +4399,65 @@ mod apply_manifest_diff_tests {
         assert!(app.workspaces[0].tombstones.iter().any(|t| t.uid == "ts-sh"), "the idle pane closes with it");
     }
 
+    /// Laptop diag 2026-11-05: the bash-only sweep closed workspaces bound
+    /// to running tasks; the adopt pass then took the killed bash pane back
+    /// from the session poll's cached list (taken before the kill landed),
+    /// which reopened the workspace, and the failed attach left it open and
+    /// empty. A session the viewer just closed is not adopted back; a new
+    /// session in the workspace still reopens it.
+    #[test]
+    fn a_swept_workspace_stays_closed_until_a_new_session_lands() {
+        use super::lifecycle::{LastAgentClose, LastAgentVerdict};
+        // The fixture takes home_lock itself: build first, then hold it
+        // while manifest saves go to a scratch HOME.
+        let mut app = build_app_with_session("ts-agent");
+        let _guard = crate::test_support::home_lock();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home.path()) };
+        add_bash_row(&mut app, "ts-sh", "ts-sh");
+        app.tasks.push(super::super::sections::layout_tests::task("t-run", "ws-test", None));
+        let (worker, _requests, _results) = crate::attach_worker::AttachWorker::for_test();
+        app.attach_worker = Some(worker);
+        app.sessions_restored = true;
+        app.tombstone_and_remove(0, |ts| ts.session_type == "claude");
+        app.last_agent_close_tx
+            .send(LastAgentVerdict {
+                ws_id: "ws-test".into(),
+                trigger: LastAgentClose::Owner,
+                checked: vec!["ts-sh".into()],
+                busy: Ok(vec![]),
+            })
+            .unwrap();
+        app.drain_last_agent_closes();
+        assert!(app.workspaces[0].is_closed);
+
+        let summary = |uid: &str| {
+            crate::client_session::parse_daemon_session_summary(&serde_json::json!({
+                "session_uid": uid, "type": "bash", "label": "shell",
+                "task_id": "t-run", "workspace_id": "ws-test",
+            }))
+            .unwrap()
+        };
+        let local = cm_daemon::host_id::HostId::local();
+        let queued = |app: &App, uid: &str| app.pending_remote_reattach.iter().any(|p| p.entry.uid == uid);
+        app.remote_session_lists.insert(local.clone(), vec![summary("ts-sh")]);
+        app.maybe_adopt_daemon_sessions();
+        assert!(app.workspaces[0].is_closed, "the closed pane does not reopen it");
+        assert!(!queued(&app, "ts-sh"));
+
+        app.remote_session_lists.insert(local, vec![summary("ts-sh"), summary("ts-new")]);
+        app.last_adopt_scan = None;
+        app.maybe_adopt_daemon_sessions();
+        assert!(!app.workspaces[0].is_closed, "a new session lands and reopens it");
+        assert!(queued(&app, "ts-new"));
+        assert!(!queued(&app, "ts-sh"));
+        match old_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
     /// The one-time sweep lists workspaces that had an agent and now hold
     /// only live bash panes, and asks once.
     #[test]
