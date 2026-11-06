@@ -41,8 +41,10 @@ end state. Only Owner retires a source we want.
 
 Any older ruling, prompt, skill or doc that says "if blocked, stop", "do not
 work around blocks" or similar is **void** (Owner, 2026-11-06). Such rules
-are being purged from the repo and from the continuous tasks' standing
-instructions.
+were purged from the predictionTrading repo in 0853ed43f45. The same rules
+still sit in the continuous tasks' state and memory on cm-manager. They are
+rewritten when those tasks move to Ingest. Ten code paths still pause or
+retire blocked sources; changing them is Ingest's first backlog.
 
 **Owner:** is there a monthly spend cap for proxies and paid scraping
 services that Ingest may use without asking? Is there any hard line, such
@@ -50,8 +52,8 @@ as never using logged-in accounts?
 
 ## The scraping playbook
 
-All scraping know-how lives in **one folder**, the scraping playbook in
-predictionTrading. It holds:
+All scraping know-how lives in **one folder**, the scraping playbook at
+`prediction/ingest/playbook/` in predictionTrading (landed 0853ed43f45). It holds:
 
 - how to get around each kind of blocker;
 - what worked for which source, and what didn't;
