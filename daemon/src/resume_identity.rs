@@ -75,8 +75,14 @@ pub struct History {
     handoffs: BTreeMap<String, Handoff>,
     #[serde(skip)]
     loaded: bool,
+    /// Something changed since the file was last read or written. `persist`
+    /// runs on every `save_daemon_sessions`, under the daemon state lock. It
+    /// used to pretty-print the whole history (1 MB, 734 records against 79
+    /// live sessions on cm-sessions, 2026-11-05) just to compare it with the
+    /// last write. Now an unchanged history costs one comparison per live
+    /// record (#109).
     #[serde(skip)]
-    last_saved: String,
+    dirty: bool,
 }
 impl History {
     fn load(&mut self, state: &DaemonState) -> std::io::Result<()> {
@@ -87,9 +93,9 @@ impl History {
             match std::fs::read_to_string(path) {
                 Ok(text) => {
                     *self = serde_json::from_str(&text)?;
-                    self.last_saved = text;
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // The first persist creates the file, as it always did.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.dirty = true,
                 Err(e) => return Err(e),
             }
         }
@@ -119,6 +125,13 @@ impl History {
         if let Some(p) = self.preferences.get(&record.entry.uid) {
             p.apply(&mut record.entry);
         }
+        // Compared as JSON values: the types have no PartialEq, and a value
+        // comparison ignores map order. A record that fails to serialize
+        // counts as changed.
+        let same = self.records.get(&record.entry.uid).is_some_and(|old| {
+            matches!((serde_json::to_value(old), serde_json::to_value(&record)), (Ok(a), Ok(b)) if a == b)
+        });
+        self.dirty |= !same;
         self.records.insert(record.entry.uid.clone(), record);
     }
     fn overlay(&self, e: &mut ManifestEntry) {
@@ -188,10 +201,10 @@ pub fn persist(state: &DaemonState) -> std::io::Result<()> {
     let Some(path) = path(state) else {
         return Ok(());
     };
-    let text = serde_json::to_string_pretty(&*h)?;
-    if h.last_saved != text {
+    if h.dirty {
+        let text = serde_json::to_string_pretty(&*h)?;
         crate::state::write_json_atomic(&path, &text, true)?;
-        h.last_saved = text;
+        h.dirty = false;
     }
     Ok(())
 }
@@ -210,6 +223,7 @@ pub fn save_preferences(state: &DaemonState, preferences: Vec<Preferences>) -> s
                     p.apply(&mut r.entry);
                 }
                 h.preferences.insert(p.uid.clone(), p);
+                h.dirty = true;
             }
         }
     }
@@ -233,6 +247,7 @@ pub fn record_rotation(state: &DaemonState, from: &str, to: &str) -> std::io::Re
             .unwrap_or_else(|p| p.into_inner());
         h.load(state)?;
         h.rotated.insert(from.to_string(), to.to_string());
+        h.dirty = true;
     }
     persist(state)
 }
@@ -260,6 +275,7 @@ pub fn record_handoff(state: &DaemonState, h: Handoff) -> std::io::Result<()> {
         hist.load(state)?;
         let key = if h.from_id.is_empty() { format!("uid:{}", h.uid) } else { h.from_id.clone() };
         hist.handoffs.insert(key, h);
+        hist.dirty = true;
     }
     persist(state)
 }
@@ -492,6 +508,41 @@ mod tests {
             .unwrap(),
             transcript_ids: Default::default(),
         }
+    }
+    #[test]
+    fn persist_rewrites_the_archive_only_when_something_changed() {
+        use std::os::unix::fs::MetadataExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = DaemonState::new();
+        s.daemon_sessions_path = Some(tmp.path().join("daemon-sessions.json"));
+        let archive = path(&s).unwrap();
+        let ino = || std::fs::metadata(&archive).unwrap().ino();
+        persist(&s).unwrap();
+        let created = ino();
+        persist(&s).unwrap();
+        assert_eq!(ino(), created, "unchanged history is not rewritten");
+        remember(&s, record("ts-abc-0", "thread-a")).unwrap();
+        persist(&s).unwrap();
+        let first = ino();
+        assert_ne!(first, created);
+        remember(&s, record("ts-abc-0", "thread-a")).unwrap();
+        persist(&s).unwrap();
+        assert_eq!(ino(), first, "an identical record changes nothing");
+        let mut changed = record("ts-abc-0", "thread-a");
+        changed.entry.label = "Renamed".into();
+        remember(&s, changed).unwrap();
+        persist(&s).unwrap();
+        let second = ino();
+        assert_ne!(second, first);
+        record_rotation(&s, "thread-a", "thread-b").unwrap();
+        assert_ne!(ino(), second, "a rotation is written at once");
+        let third = ino();
+        // A restarted daemon reads the file and has nothing new to write.
+        let mut restarted = DaemonState::new();
+        restarted.daemon_sessions_path = s.daemon_sessions_path.clone();
+        persist(&restarted).unwrap();
+        assert_eq!(ino(), third);
+        assert_eq!(lookup_uid(&restarted, "ts-abc-0").unwrap().unwrap().entry.label, "Renamed");
     }
     #[test]
     fn resume_identity_survives_closed_rows_tombstone_eviction_and_restart() {
