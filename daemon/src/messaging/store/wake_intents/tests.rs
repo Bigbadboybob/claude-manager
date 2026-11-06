@@ -145,7 +145,7 @@ fn p4_randomized_differential_intent_keys_and_order() {
             .enumerate()
         {
             let cid = format!("dm-{i}");
-            s.conversations.insert(
+            s.insert_dm(
                 cid.clone(),
                 members.iter().map(|j| actors[*j].clone()).collect(),
             );
@@ -373,6 +373,81 @@ fn p4_default_path_visits_only_unread_dm_and_frozen_mentions() {
     assert_actor(&s, &actor, "fully read follow and monitor");
 }
 
+/// A space shaped like cm-sessions on 2026-11-05 (37 channels, 1,043 DMs
+/// among 381 members) with one message per conversation and an unknown one.
+fn many_dms_store(dms: usize, members: usize) -> (tempfile::TempDir, Store, Vec<String>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Store::open(tmp.path()).unwrap();
+    let actors: Vec<_> = (0..members)
+        .map(|i| s.participant_id(&format!("member-{i}")))
+        .chain(["owner".into()])
+        .collect();
+    let mut cids = Vec::new();
+    for c in 0..37 {
+        let cid = format!("public-{c:02}");
+        channel(&mut s, &format!("work/{c}"), &cid, &format!("create-{c}"));
+        cids.push(cid);
+    }
+    let mut rng = Rng(5);
+    for d in 0..dms {
+        let mut group: Vec<String> = (0..2 + rng.n(3) % 2)
+            .map(|_| actors[rng.n(actors.len())].clone())
+            .collect();
+        group.sort();
+        group.dedup();
+        let cid = format!("dm-{d:04}");
+        s.insert_dm(cid.clone(), group);
+        cids.push(cid);
+    }
+    // A DM ID that is also a channel ID is still one conversation.
+    s.insert_dm("public-00".into(), vec![actors[0].clone(), actors[1].clone()]);
+    cids.push("unknown".into());
+    for (i, cid) in cids.iter().enumerate() {
+        publish(
+            &mut s,
+            json!({"type":"message.create","actor":{"id":actors[i % actors.len()]},
+            "conversation_id":cid,"logical_time":i.to_string(),"data":{},"body":"x"}),
+        );
+    }
+    (tmp, s, actors)
+}
+
+#[test]
+fn visible_conversations_match_filtering_every_conversation() {
+    let (_tmp, s, mut actors) = many_dms_store(200, 12);
+    actors.push("stranger".into());
+    for actor in &actors {
+        let fast: Vec<&str> = s.visible_conversations(actor).into_iter().map(|(cid, _)| cid).collect();
+        let all: Vec<&str> = s.read_model.conversations.keys()
+            .filter(|cid| s.visible(actor, cid))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(fast, all, "{actor}");
+        assert!(fast.len() >= 37, "{actor} sees every channel");
+    }
+}
+
+#[test]
+#[ignore = "manual before/after microbenchmark; run with --ignored --nocapture"]
+fn p4_visible_scan_1043_dms() {
+    let (_tmp, s, actors) = many_dms_store(1043, 381);
+    let recipients = &actors[..80];
+    let time = |f: &dyn Fn() -> usize| {
+        let mut runs: Vec<_> = (0..9).map(|_| {
+            let start = Instant::now();
+            std::hint::black_box(f());
+            start.elapsed()
+        }).collect();
+        runs.sort();
+        runs[4]
+    };
+    let before = time(&|| recipients.iter().map(|a| s.read_model.conversations.keys()
+        .filter(|cid| s.visible(a, cid)).count()).sum());
+    let after = time(&|| recipients.iter().map(|a| s.visible_conversations(a).len()).sum());
+    println!("VISIBLE_BENCH recipients=80 dms=1043 channels=37 filter_all_ms={:.3} index_ms={:.3}",
+        before.as_secs_f64() * 1000., after.as_secs_f64() * 1000.);
+}
+
 #[test]
 #[ignore = "manual before/after microbenchmark; run with --ignored --nocapture"]
 fn p4_wake_microbenchmark_39_recipients() {
@@ -390,8 +465,7 @@ fn p4_wake_microbenchmark_39_recipients() {
         );
     }
     for (i, actor) in actors.iter().enumerate() {
-        s.conversations
-            .insert(format!("dm-{i}"), vec![actor.clone(), "sender".into()]);
+        s.insert_dm(format!("dm-{i}"), vec![actor.clone(), "sender".into()]);
     }
     let mut rng = Rng(73421);
     for i in 0..40_000 {

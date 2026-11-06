@@ -279,8 +279,8 @@ impl Store {
         // bulk mark_read_before) is not outstanding, even before the monitor's
         // own result receipt is acknowledged: the two ack systems used to be
         // independent, so reading never lowered this count.
-        self.read_model.conversations.keys().filter(|cid|self.visible(actor,cid))
-            .flat_map(|cid|self.message_candidates(actor,cid,None,false,true,false))
+        self.visible_conversations(actor).into_iter()
+            .flat_map(|(cid, _)|self.message_candidates(actor,cid,None,false,true,false))
             .filter(|e| e.position > m.acknowledged && e.position <= m.hit_high && self.monitor_matches(actor,m,e)).count()
     }
 

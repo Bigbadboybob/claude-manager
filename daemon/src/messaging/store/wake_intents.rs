@@ -281,10 +281,7 @@ impl Store {
         }
         let plan = WakeRules::new(self, actor, personal);
         let mut ordered = Vec::new();
-        for (cid, index) in &self.read_model.conversations {
-            if !self.visible(actor, cid) {
-                continue;
-            }
+        for (cid, index) in self.visible_conversations(actor) {
             let read = self.reads.get(actor).and_then(|r| r.cursors.get(cid));
             let unread_lo = read.map_or(0, |r| index.messages.partition_point(|(k, _)| k <= r));
             let unread = &index.messages[unread_lo..];

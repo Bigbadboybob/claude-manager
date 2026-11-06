@@ -427,6 +427,9 @@ pub struct Store {
     membership_revisions: BTreeMap<String, String>,
     enrolled: BTreeSet<String>,
     conversations: BTreeMap<String, Vec<String>>,
+    /// Member actor -> its DM conversation IDs (the inverse of
+    /// `conversations`), so per-actor scans skip everyone else's DMs.
+    member_dms: HashMap<String, BTreeSet<String>>,
     requests: BTreeMap<String, (String, String, String)>,
     position: u64,
     clock: u64,
@@ -523,6 +526,7 @@ impl Store {
             membership_revisions: BTreeMap::new(),
             enrolled: BTreeSet::new(),
             conversations: BTreeMap::new(),
+            member_dms: HashMap::new(),
             requests: BTreeMap::new(),
             position: 0,
             clock: 0,
@@ -851,7 +855,7 @@ impl Store {
                     "DM needs 2–32 sorted, distinct, immutable members including its sender",
                 ));
             }
-            self.conversations.insert(id, members);
+            self.insert_dm(id, members);
         }
         let name = if e["type"] == "identity.update" {
             e["data"].get("identity")
@@ -1316,6 +1320,27 @@ impl Store {
                 .conversations
                 .get(conv)
                 .is_some_and(|m| m.iter().any(|p| p == actor))
+    }
+    /// Record a DM's (immutable) membership and its per-member index.
+    fn insert_dm(&mut self, id: String, members: Vec<String>) {
+        for member in &members {
+            self.member_dms.entry(member.clone()).or_default().insert(id.clone());
+        }
+        self.conversations.insert(id, members);
+    }
+    /// The read-model conversations `actor` can see, in ID order: the same
+    /// sequence as filtering all of them by [`Self::visible`], without
+    /// visiting every other actor's DMs (1,043 DMs against 37 channels and a
+    /// median of 2 DMs per member on cm-sessions, 2026-11-05).
+    fn visible_conversations(&self, actor: &str) -> Vec<(&str, &read_model::ConversationIndex)> {
+        let dms = self.member_dms.get(actor).into_iter().flatten()
+            .filter(|cid| !self.channel_paths.contains_key(*cid));
+        let mut out: Vec<_> = self.channel_paths.keys().chain(dms)
+            .filter_map(|cid| self.read_model.conversations.get_key_value(cid))
+            .map(|(cid, index)| (cid.as_str(), index))
+            .collect();
+        out.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        out
     }
     fn resolve(
         &self,
