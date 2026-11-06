@@ -2973,6 +2973,7 @@ impl App {
                 }
             })
             .collect();
+        candidates.extend(self.archived_past_candidates());
         if candidates.is_empty() {
             self.set_status_msg("No past workspaces");
             return;
@@ -4783,6 +4784,7 @@ impl App {
             }
             SubmitAction::StopWorkflow { run_id } => self.stop_workflow_run(&run_id),
             SubmitAction::ReopenPastWorkspace { ws_id } => {
+                self.unarchive_workspace(&ws_id);
                 self.reopen_workspace_by_id(&ws_id);
             }
             SubmitAction::CloseAfterLastAgent { ws_id } => {

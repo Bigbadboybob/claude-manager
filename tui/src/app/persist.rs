@@ -358,6 +358,8 @@ impl App {
                 .ok()
             })
             .unwrap_or_default();
+        // #109: bound tombstones, and move long-closed workspaces to the archive.
+        self.compact_and_archive_manifest(&mut manifest, &live_daemon_uids);
 
         // Identify worktree paths that are "covered" by a useful workspace —
         // one with sessions or referenced in bindings. We use this to drop

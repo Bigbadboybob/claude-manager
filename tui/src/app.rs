@@ -28,6 +28,7 @@ use crate::workflow::observer::{
 };
 use cm_daemon::worktree;
 
+mod archive;
 mod backtests;
 use backtests::*;
 mod sections;
