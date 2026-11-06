@@ -1,6 +1,9 @@
 # Continuous tasks become continuous teams
 
-Status: plan agreed with Owner 2026-11-06. Phases below; nothing retired yet.
+Status: plan agreed with Owner 2026-11-06. Phase 1 cleanup done (45 stale items
+closed, 623 merged branches deleted); kept items await their teams. Ingest
+charter draft is in [ingest-charter-draft.md](ingest-charter-draft.md), waiting
+for Owner. Nothing retired yet.
 
 ## Why
 
