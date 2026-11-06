@@ -67,8 +67,9 @@ Preferences live on the laptop in `~/.cm/tui-settings.toml` and apply
 immediately when saved. See [sidebar appearance settings](doc/sidebar-sections.md#layout).
 
 The **Staffing policy** row (`s`) edits Owner's central engine guidance: rules,
-default and an optional expiring preference. A-n and A-s preselect from
-the cached policy. See [staffing policy](doc/staffing-policy.md).
+default and an optional expiring preference. The **Staffing guide** row (`g`)
+shows the live cached rules, model advice, version and freshness. A-n and A-s
+preselect from the cached policy. See [staffing policy](doc/staffing-policy.md).
 
 ## If you are running inside CM
 

@@ -47,6 +47,10 @@ refused with a version conflict; reload before retrying. A-n and A-s
 preselect from the latest cached policy when their forms open; later updates do
 not change a user's selection in an already-open form.
 
+**F9 → Staffing guide** (`g`) is a read-only view of the cached policy, with
+its model guidance, version, last update and cache freshness; agents can also
+inspect the same policy through `start_session(work_kind=...)` and `ping().staffing`.
+
 Operators can also use `scripts/cm-op staffing.get '{"refresh":true}'`, followed
 by `scripts/cm-op staffing.set` with a JSON object containing `expected_version`
 and `policy`. The policy has `default_engine`, a `rules` object, and

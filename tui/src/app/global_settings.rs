@@ -59,16 +59,29 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.toml");
         let settings = GlobalSettings::load_from(path.clone());
-        assert_eq!(settings.models(), &cm_daemon::models::ModelConfig::default());
+        assert_eq!(
+            settings.models(),
+            &cm_daemon::models::ModelConfig::default()
+        );
         std::fs::write(&path, "[models]\ncodex = \"gpt-6-luna\"\n").unwrap();
         let settings = GlobalSettings::load_from(path.clone());
         assert_eq!(settings.models().codex, "gpt-6-luna");
-        assert_eq!(settings.models().claude, cm_daemon::models::DEFAULT_CLAUDE_MODEL);
+        assert_eq!(
+            settings.models().claude,
+            cm_daemon::models::DEFAULT_CLAUDE_MODEL
+        );
         assert!(settings.load_error.is_none());
         std::fs::write(&path, "[models]\nclaude = \"opus latest\"\n").unwrap();
         let settings = GlobalSettings::load_from(path.clone());
-        assert_eq!(settings.models(), &cm_daemon::models::ModelConfig::default());
-        assert!(settings.load_error.as_deref().unwrap().contains("models.claude"));
+        assert_eq!(
+            settings.models(),
+            &cm_daemon::models::ModelConfig::default()
+        );
+        assert!(settings
+            .load_error
+            .as_deref()
+            .unwrap()
+            .contains("models.claude"));
     }
 
     #[test]
@@ -113,7 +126,11 @@ mod tests {
         settings.handle_event(&key(KeyCode::F(9)));
         settings.handle_event(&key(KeyCode::Down));
         settings.handle_event(&key(KeyCode::Char(' ')));
-        assert_eq!(settings.tint_strength(), 2.0, "the badge row leaves the tint alone");
+        assert_eq!(
+            settings.tint_strength(),
+            2.0,
+            "the badge row leaves the tint alone"
+        );
         settings.handle_event(&key(KeyCode::Up));
         settings.handle_event(&key(KeyCode::Right));
         settings.handle_event(&key(KeyCode::Enter));
@@ -160,6 +177,38 @@ mod tests {
             "modal keys must be consumed"
         );
     }
+
+    #[test]
+    fn staffing_guide_key_opens_read_only_page_and_esc_returns_to_f9() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut settings = GlobalSettings::load_from(temp.path().join("settings.toml"));
+        assert!(!settings.is_open());
+        settings.handle_event(&key(KeyCode::F(9)));
+        settings.handle_event(&key(KeyCode::Char('g')));
+        assert!(settings.staffing.is_open());
+        settings.handle_event(&key(KeyCode::Char('j')));
+        settings.handle_event(&key(KeyCode::Esc));
+        assert!(
+            settings.is_open(),
+            "Esc from the guide returns to the F9 list"
+        );
+        assert!(!settings.staffing.is_open());
+
+        // The existing policy key still opens the editor from the same list.
+        settings.handle_event(&key(KeyCode::Char('s')));
+        assert!(settings.staffing.is_open());
+        settings.handle_event(&key(KeyCode::Esc));
+        assert!(settings.is_open());
+
+        // The row is also reachable from the short F9 menu.
+        for _ in 0..3 {
+            settings.handle_event(&key(KeyCode::Down));
+        }
+        settings.handle_event(&key(KeyCode::Enter));
+        assert!(settings.staffing.is_open());
+        settings.handle_event(&key(KeyCode::Esc));
+        assert!(settings.is_open());
+    }
 }
 
 impl Default for Preferences {
@@ -176,7 +225,7 @@ impl Default for Preferences {
 struct Dialog {
     draft: Preferences,
     error: Option<String>,
-    /// The focused row: 0 section tint, 1 activity badges.
+    /// The focused row: 0 section tint, 1 activity badges, 2 policy, 3 guide.
     row: u8,
 }
 
@@ -217,9 +266,7 @@ impl GlobalSettings {
         );
         // Process-wide, so only the production load sets it (tests use
         // `load_from` and must not flip other tests' argv).
-        cm_daemon::mcp_config::set_codex_inline_scrollback(
-            settings.saved.codex_inline_scrollback,
-        );
+        cm_daemon::mcp_config::set_codex_inline_scrollback(settings.saved.codex_inline_scrollback);
         cm_daemon::models::set_models(settings.models.clone());
         settings
     }
@@ -273,7 +320,9 @@ impl GlobalSettings {
     /// Whether rows and cards show the activity badge (the draft while
     /// F9 is open, for a live preview).
     pub(super) fn activity_badges(&self) -> bool {
-        self.dialog.as_ref().map_or(self.saved.activity_badges, |d| d.draft.activity_badges)
+        self.dialog
+            .as_ref()
+            .map_or(self.saved.activity_badges, |d| d.draft.activity_badges)
     }
 
     pub(super) fn is_open(&self) -> bool {
@@ -293,8 +342,14 @@ impl GlobalSettings {
 
     fn save(&self, draft: Preferences) -> anyhow::Result<()> {
         self.write_keys(&[
-            ("sidebar_tint_strength", toml::Value::Float(draft.sidebar_tint_strength)),
-            ("activity_badges", toml::Value::Boolean(draft.activity_badges)),
+            (
+                "sidebar_tint_strength",
+                toml::Value::Float(draft.sidebar_tint_strength),
+            ),
+            (
+                "activity_badges",
+                toml::Value::Boolean(draft.activity_badges),
+            ),
         ])
     }
 
@@ -328,7 +383,9 @@ impl GlobalSettings {
 
     /// Consume every event while open so preview keys never reach a session.
     pub(super) fn handle_event(&mut self, event: &CrosstermEvent) -> bool {
-        if self.staffing.event(event) { return true; }
+        if self.staffing.event(event) {
+            return true;
+        }
         let CrosstermEvent::Key(key) = event else {
             return self.is_open();
         };
@@ -344,14 +401,28 @@ impl GlobalSettings {
             return true;
         }
         let dialog = self.dialog.as_mut().unwrap();
-        if key.code == KeyCode::Char('s') || dialog.row == 2 && matches!(key.code, KeyCode::Enter | KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+        if key.code == KeyCode::Char('s')
+            || dialog.row == 2
+                && matches!(
+                    key.code,
+                    KeyCode::Enter | KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                )
+        {
             self.staffing.open();
             return true;
         }
+        if key.code == KeyCode::Char('g') || dialog.row == 3 && matches!(key.code, KeyCode::Enter) {
+            self.staffing.open_guide();
+            return true;
+        }
         match key.code {
-            KeyCode::Down | KeyCode::Tab => dialog.row = (dialog.row + 1) % 3,
-            KeyCode::Up | KeyCode::BackTab => dialog.row = (dialog.row + 2) % 3,
-            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Char('-') | KeyCode::Char('+')
+            KeyCode::Down | KeyCode::Tab => dialog.row = (dialog.row + 1) % 4,
+            KeyCode::Up | KeyCode::BackTab => dialog.row = (dialog.row + 3) % 4,
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Char(' ')
+            | KeyCode::Char('-')
+            | KeyCode::Char('+')
                 if dialog.row == 1 =>
             {
                 dialog.draft.activity_badges = !dialog.draft.activity_badges;
@@ -387,7 +458,7 @@ impl GlobalSettings {
             return;
         };
         let width = 60.min(area.width);
-        let height = (if dialog.error.is_some() { 21 } else { 18 }).min(area.height);
+        let height = (if dialog.error.is_some() { 23 } else { 20 }).min(area.height);
         let area = Rect::new(
             area.x + area.width.saturating_sub(width) / 2,
             area.y + area.height.saturating_sub(height) / 2,
@@ -404,14 +475,21 @@ impl GlobalSettings {
         let strength = dialog.draft.sidebar_tint_strength;
         let row_style = |focused: bool| {
             let s = Style::default().fg(theme::TEXT);
-            if focused { s.add_modifier(Modifier::BOLD) } else { s }
+            if focused {
+                s.add_modifier(Modifier::BOLD)
+            } else {
+                s
+            }
         };
         let pointer = |focused: bool| if focused { "› " } else { "  " };
         let mut lines = vec![
             Line::from("All projects on this laptop."),
             Line::from(""),
             Line::styled(
-                format!("{}Section tint:  ◀  {strength:.2}×  ▶", pointer(dialog.row == 0)),
+                format!(
+                    "{}Section tint:  ◀  {strength:.2}×  ▶",
+                    pointer(dialog.row == 0)
+                ),
                 row_style(dialog.row == 0),
             ),
             Line::from("←/→ 0.25 steps · 0 off · Default 2×"),
@@ -434,13 +512,25 @@ impl GlobalSettings {
                 format!(
                     "{}Activity badges:  [{}]",
                     pointer(dialog.row == 1),
-                    if dialog.draft.activity_badges { "x" } else { " " }
+                    if dialog.draft.activity_badges {
+                        "x"
+                    } else {
+                        " "
+                    }
                 ),
                 row_style(dialog.row == 1),
             ),
             Line::from("What each agent is doing, on rows and F6 cards."),
-            Line::styled(format!("{}Staffing policy → (s)", pointer(dialog.row == 2)), row_style(dialog.row == 2)),
-            Line::from("Engine guidance shared across this org."),
+            Line::styled(
+                format!("{}Staffing policy → (s)", pointer(dialog.row == 2)),
+                row_style(dialog.row == 2),
+            ),
+            Line::from("Edit the shared engine guidance."),
+            Line::styled(
+                format!("{}Staffing guide → (g)", pointer(dialog.row == 3)),
+                row_style(dialog.row == 3),
+            ),
+            Line::from("Read the live policy and how to choose models."),
             Line::from(""),
             Line::from("Live preview · Opacity unchanged."),
             Line::from("↑/↓ row · Home reset · Enter save · Esc cancel"),

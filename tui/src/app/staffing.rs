@@ -8,6 +8,33 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 type Target = (String, PathBuf, String);
 type Reply = Result<(Snapshot, Target), String>;
+const CACHE_STALE_AFTER_SECS: u64 = 90;
+
+/// Keep the user-facing model guidance together so it can be revised without
+/// hunting through the renderer. The policy chooses an engine and optional
+/// rule model; this text explains the model choices that sit behind it.
+const MODEL_GUIDANCE: &[(&str, &str)] = &[
+    (
+        "Claude Opus (claude-opus-5-5)",
+        "Use for leads and hard architecture, design, or math reasoning.",
+    ),
+    (
+        "Codex Terra (gpt-6.1-terra)",
+        "Use as the general Codex coder and for metrics; it is the best performance per dollar.",
+    ),
+    (
+        "Codex Luna (gpt-6-luna)",
+        "Use for cheap, simple work and wide fan-outs.",
+    ),
+    (
+        "Codex Sol (gpt-6.1-sol)",
+        "Use as the remaining balanced Codex choice when Terra or Luna is not the fit.",
+    ),
+    (
+        "Codex Astra (gpt-6-astra)",
+        "Use as the remaining high-capability Codex choice for work that needs more depth.",
+    ),
+];
 const PREFERENCE_ROW: usize = 1 + KINDS.len() * 2;
 const STRENGTH_ROW: usize = PREFERENCE_ROW + 1;
 const REASON_ROW: usize = PREFERENCE_ROW + 2;
@@ -35,6 +62,99 @@ struct Dialog {
     expires: String,
     row: usize,
     error: Option<String>,
+}
+
+struct Guide {
+    scroll: u16,
+}
+
+fn guide_rule(rule: Option<&Rule>) -> String {
+    rule.map_or_else(
+        || "no rule (default engine/model)".to_string(),
+        |rule| {
+            let default_model = match rule.engine() {
+                Engine::Claude => "claude-opus-5-5",
+                Engine::Codex => "gpt-6.1-terra",
+            };
+            format!(
+                "{} / {}",
+                rule.engine().wire(),
+                rule.model().unwrap_or(default_model)
+            )
+        },
+    )
+}
+
+fn guide_lines(snapshot: &Snapshot, loaded_at: Option<Instant>) -> Vec<String> {
+    let now = chrono::Utc::now();
+    let status = if snapshot.version == 0 {
+        "Policy status: not loaded yet.".to_string()
+    } else if loaded_at.is_some_and(|at| at.elapsed().as_secs() > CACHE_STALE_AFTER_SECS) {
+        "Policy status: stale; the last cache poll is more than 90 seconds old.".to_string()
+    } else if loaded_at.is_none() {
+        "Policy status: loaded from cache; freshness is unknown.".to_string()
+    } else {
+        "Policy status: live cached policy.".to_string()
+    };
+    let updated = snapshot
+        .updated_at
+        .map(|at| at.to_rfc3339())
+        .unwrap_or_else(|| "unknown".to_string());
+    let mut lines = vec![
+        status,
+        format!("Policy version: {}", snapshot.version),
+        format!("Last update: {updated}"),
+        format!("Default engine: {}", snapshot.policy.default_engine.wire()),
+    ];
+    match snapshot.policy.preference.as_ref() {
+        Some(preference) if snapshot.policy.active_preference(now).is_some() => {
+            lines.push(format!(
+                "Active preference: {} ({})",
+                preference.engine.wire(),
+                match preference.strength {
+                    Strength::Strong => "strong",
+                    Strength::Lean => "lean",
+                }
+            ));
+            lines.push(format!("  reason: {}", preference.reason));
+            lines.push(format!(
+                "  expiry: {}",
+                preference
+                    .expires_at
+                    .map(|at| at.to_rfc3339())
+                    .unwrap_or_else(|| "none".to_string())
+            ));
+        }
+        Some(preference) => {
+            lines.push("Active preference: none (the cached preference is expired).".into());
+            lines.push(format!(
+                "  expired: {}",
+                preference
+                    .expires_at
+                    .map(|at| at.to_rfc3339())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
+        None => lines.push("Active preference: none".into()),
+    }
+    lines.push(String::new());
+    lines.push("Work kinds".into());
+    for kind in KINDS {
+        lines.push(format!(
+            "  {kind}: {}",
+            guide_rule(snapshot.policy.rules.get(kind))
+        ));
+    }
+    lines.push(String::new());
+    lines.push("How to choose".into());
+    for (model, explanation) in MODEL_GUIDANCE {
+        lines.push(format!("  {model}: {explanation}"));
+    }
+    lines.push(String::new());
+    lines.push(
+        "Agents get this policy with start_session(work_kind=...) and ping().staffing.".into(),
+    );
+    lines
 }
 impl Dialog {
     fn new(snapshot: &Snapshot) -> Self {
@@ -111,33 +231,42 @@ impl Dialog {
 pub(super) struct Staffing {
     pub snapshot: Snapshot,
     dialog: Option<Dialog>,
+    guide: Option<Guide>,
     target: Option<Target>,
     pending: Option<(Operation, Value)>,
     io: Option<(Operation, mpsc::Receiver<Reply>)>,
     polled: Option<Instant>,
+    loaded_at: Option<Instant>,
 }
 impl Default for Staffing {
     fn default() -> Self {
         Self {
             snapshot: Snapshot::default(),
             dialog: None,
+            guide: None,
             target: None,
             pending: None,
             io: None,
             polled: None,
+            loaded_at: None,
         }
     }
 }
 impl Staffing {
     pub fn is_open(&self) -> bool {
-        self.dialog.is_some()
+        self.dialog.is_some() || self.guide.is_some()
     }
     pub fn engine(&self) -> LaunchEngine {
         LaunchEngine::for_staffing(&self.snapshot.policy)
     }
     pub fn open(&mut self) {
+        self.guide = None;
         self.dialog = Some(Dialog::new(&self.snapshot));
         self.pending = Some((Operation::Reload, json!({"refresh":true})));
+    }
+    pub fn open_guide(&mut self) {
+        self.dialog = None;
+        self.guide = Some(Guide { scroll: 0 });
     }
     pub fn tick(&mut self, targets: impl FnOnce() -> Vec<Target> + Send + 'static) -> bool {
         let mut changed = false;
@@ -153,6 +282,7 @@ impl Staffing {
             changed = true;
             match result {
                 Ok((snapshot, target)) => {
+                    self.loaded_at = Some(Instant::now());
                     if snapshot.version >= self.snapshot.version {
                         self.snapshot = snapshot;
                         self.target = Some(target);
@@ -240,6 +370,20 @@ impl Staffing {
         true
     }
     pub fn event(&mut self, event: &CrosstermEvent) -> bool {
+        if let Some(guide) = &mut self.guide {
+            let CrosstermEvent::Key(key) = event else {
+                return true;
+            };
+            match key.code {
+                KeyCode::Esc | KeyCode::F(9) => self.guide = None,
+                KeyCode::Char('k') | KeyCode::Up => guide.scroll = guide.scroll.saturating_sub(1),
+                KeyCode::Char('j') | KeyCode::Down => guide.scroll = guide.scroll.saturating_add(1),
+                KeyCode::PageUp => guide.scroll = guide.scroll.saturating_sub(10),
+                KeyCode::PageDown => guide.scroll = guide.scroll.saturating_add(10),
+                _ => (),
+            }
+            return true;
+        }
         let Some(d) = self.dialog.as_mut() else {
             return false;
         };
@@ -357,125 +501,164 @@ impl Staffing {
         true
     }
     pub fn draw(&self, frame: &mut Frame, area: Rect) {
-        let Some(d) = &self.dialog else {
-            return;
-        };
-        let width = area.width.min(100);
-        let height = area.height.min((ROW_COUNT + 6) as u16);
-        let area = Rect::new(
-            area.x + (area.width - width) / 2,
-            area.y + (area.height - height) / 2,
-            width,
-            height,
-        );
-        frame.render_widget(Clear, area);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" Staffing policy · v{} ", d.version));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        let mut rows = vec![format!("Default: {}", d.policy.default_engine.wire())];
-        for (i, kind) in KINDS.iter().enumerate() {
+        if let Some(d) = &self.dialog {
+            let width = area.width.min(100);
+            let height = area.height.min((ROW_COUNT + 6) as u16);
+            let area = Rect::new(
+                area.x + (area.width - width) / 2,
+                area.y + (area.height - height) / 2,
+                width,
+                height,
+            );
+            frame.render_widget(Clear, area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" Staffing policy · v{} ", d.version));
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            let mut rows = vec![format!("Default: {}", d.policy.default_engine.wire())];
+            for (i, kind) in KINDS.iter().enumerate() {
+                rows.push(format!(
+                    "{kind}: {}",
+                    d.policy
+                        .rules
+                        .get(*kind)
+                        .map_or("no rule", |r| r.engine().wire())
+                ));
+                rows.push(format!(
+                    "  model: {}",
+                    if d.models[i].is_empty() {
+                        "(task/host default)"
+                    } else {
+                        &d.models[i]
+                    }
+                ));
+            }
             rows.push(format!(
-                "{kind}: {}",
-                d.policy
-                    .rules
-                    .get(*kind)
-                    .map_or("no rule", |r| r.engine().wire())
+                "Current preference: {}",
+                d.preference.map_or("none", |e| e.wire())
             ));
             rows.push(format!(
-                "  model: {}",
-                if d.models[i].is_empty() {
-                    "(task/host default)"
+                "Preference strength: {}",
+                if d.strength == Strength::Strong {
+                    "strong"
                 } else {
-                    &d.models[i]
+                    "lean"
                 }
             ));
-        }
-        rows.push(format!(
-            "Current preference: {}",
-            d.preference.map_or("none", |e| e.wire())
-        ));
-        rows.push(format!(
-            "Preference strength: {}",
-            if d.strength == Strength::Strong {
-                "strong"
-            } else {
-                "lean"
-            }
-        ));
-        rows.push(format!("Reason: {}", d.reason));
-        rows.push(format!("Expires (blank = no expiry): {}", d.expires));
-        let lines: Vec<Line> = rows
-            .into_iter()
-            .enumerate()
-            .map(|(i, s)| {
-                // Text editing appends at the end; keep that end visible.
-                let s = if i == d.row && text_row(i) && s.width() + 2 > inner.width as usize {
-                    let mut width = 0;
-                    let tail: String = s
-                        .chars()
-                        .rev()
-                        .take_while(|c| {
-                            width += c.width().unwrap_or(0);
-                            width <= inner.width.saturating_sub(3) as usize
-                        })
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect();
-                    format!("…{tail}")
-                } else {
-                    s
-                };
-                Line::styled(
-                    format!("{} {s}", if i == d.row { "›" } else { " " }),
-                    if i == d.row {
-                        Style::default()
-                            .fg(theme::TEXT)
-                            .add_modifier(Modifier::BOLD)
+            rows.push(format!("Reason: {}", d.reason));
+            rows.push(format!("Expires (blank = no expiry): {}", d.expires));
+            let lines: Vec<Line> = rows
+                .into_iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    // Text editing appends at the end; keep that end visible.
+                    let s = if i == d.row && text_row(i) && s.width() + 2 > inner.width as usize {
+                        let mut width = 0;
+                        let tail: String = s
+                            .chars()
+                            .rev()
+                            .take_while(|c| {
+                                width += c.width().unwrap_or(0);
+                                width <= inner.width.saturating_sub(3) as usize
+                            })
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect();
+                        format!("…{tail}")
                     } else {
-                        Style::default().fg(theme::MUTED)
-                    },
-                )
-            })
-            .collect();
-        let footer_height = inner.height.min(4);
-        let body = Rect {
-            height: inner.height - footer_height,
-            ..inner
-        };
-        let footer = Rect {
-            y: inner.y + body.height,
-            height: footer_height,
-            ..inner
-        };
-        let scroll = d.row.saturating_sub(body.height.saturating_sub(1) as usize) as u16;
-        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), body);
-        let busy = self
-            .io
-            .as_ref()
-            .is_some_and(|(op, _)| *op != Operation::Poll)
-            || self
-                .pending
+                        s
+                    };
+                    Line::styled(
+                        format!("{} {s}", if i == d.row { "›" } else { " " }),
+                        if i == d.row {
+                            Style::default()
+                                .fg(theme::TEXT)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(theme::MUTED)
+                        },
+                    )
+                })
+                .collect();
+            let footer_height = inner.height.min(4);
+            let body = Rect {
+                height: inner.height - footer_height,
+                ..inner
+            };
+            let footer = Rect {
+                y: inner.y + body.height,
+                height: footer_height,
+                ..inner
+            };
+            let scroll = d.row.saturating_sub(body.height.saturating_sub(1) as usize) as u16;
+            frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), body);
+            let busy = self
+                .io
                 .as_ref()
-                .is_some_and(|(op, _)| *op != Operation::Poll);
-        let status = if let Some(error) = &d.error {
-            Line::styled(error.clone(), Style::default().fg(theme::ERROR))
-        } else if busy {
-            Line::from("Loading/saving…")
-        } else {
-            Line::from("Model: explicit → task → work rule → host")
-        };
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from("Tab/↑/↓ field · ←/→ engine · type model/reason/expiry"),
-                Line::from("Enter save · Esc back · Ctrl+r reload/discard"),
-                Line::from("Blank model uses task/host; blank expiry never expires"),
-                status,
-            ]),
-            footer,
-        );
+                .is_some_and(|(op, _)| *op != Operation::Poll)
+                || self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|(op, _)| *op != Operation::Poll);
+            let status = if let Some(error) = &d.error {
+                Line::styled(error.clone(), Style::default().fg(theme::ERROR))
+            } else if busy {
+                Line::from("Loading/saving…")
+            } else {
+                Line::from("Model: explicit → task → work rule → host")
+            };
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from("Tab/↑/↓ field · ←/→ engine · type model/reason/expiry"),
+                    Line::from("Enter save · Esc back · Ctrl+r reload/discard"),
+                    Line::from("Blank model uses task/host; blank expiry never expires"),
+                    status,
+                ]),
+                footer,
+            );
+        }
+        if let Some(guide) = &self.guide {
+            let width = area.width.saturating_sub(4).min(110);
+            let height = area.height.saturating_sub(2);
+            let area = Rect::new(
+                area.x + (area.width.saturating_sub(width)) / 2,
+                area.y + (area.height.saturating_sub(height)) / 2,
+                width,
+                height,
+            );
+            frame.render_widget(Clear, area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" Staffing guide · v{} ", self.snapshot.version));
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            let footer_height = inner.height.min(1);
+            let body = Rect {
+                height: inner.height.saturating_sub(footer_height),
+                ..inner
+            };
+            let footer = Rect {
+                y: inner.y + body.height,
+                height: footer_height,
+                ..inner
+            };
+            let lines = guide_lines(&self.snapshot, self.loaded_at)
+                .into_iter()
+                .map(Line::from)
+                .collect::<Vec<_>>();
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .wrap(ratatui::widgets::Wrap { trim: false })
+                    .scroll((guide.scroll, 0)),
+                body,
+            );
+            frame.render_widget(
+                Paragraph::new("j/k or ↑/↓ scroll · PgUp/PgDn · Esc back"),
+                footer,
+            );
+        }
     }
 }
 impl App {
@@ -621,5 +804,58 @@ mod tests {
         assert_eq!(d.version, 3);
         assert_eq!(d.error.as_deref(), Some("policy changed; reload"));
         assert_eq!(d.policy.default_engine, Engine::Claude);
+    }
+
+    #[test]
+    fn staffing_guide_renders_rules_models_and_expired_preference() {
+        let now = chrono::Utc::now();
+        let mut snapshot = Snapshot {
+            version: 12,
+            updated_at: Some(now),
+            ..Snapshot::default()
+        };
+        snapshot.policy.default_engine = Engine::Codex;
+        snapshot.policy.rules.insert(
+            "coding".into(),
+            Rule::new(Engine::Codex, Some("gpt-6.1-terra".into())),
+        );
+        snapshot.policy.rules.insert(
+            "fanout".into(),
+            Rule::new(Engine::Codex, Some("gpt-6-luna".into())),
+        );
+        snapshot.policy.preference = Some(Preference {
+            engine: Engine::Claude,
+            strength: Strength::Strong,
+            reason: "old preference".into(),
+            expires_at: Some(now - chrono::Duration::minutes(1)),
+        });
+
+        let text = guide_lines(&snapshot, None).join("\n");
+        assert!(text.contains("Default engine: codex"));
+        assert!(text.contains("Active preference: none (the cached preference is expired)."));
+        assert!(text.contains("coding: codex / gpt-6.1-terra"));
+        assert!(text.contains("fanout: codex / gpt-6-luna"));
+        assert!(text.contains("Claude Opus (claude-opus-5-5)"));
+        assert!(text.contains("Codex Terra (gpt-6.1-terra)"));
+        assert!(text.contains("start_session(work_kind=...)"));
+        assert!(text.contains("ping().staffing"));
+        assert!(text.contains("Policy version: 12"));
+        assert!(text.contains("Last update:"));
+    }
+
+    #[test]
+    fn staffing_guide_scrolls_and_esc_closes() {
+        let mut ui = Staffing::default();
+        ui.open_guide();
+        assert!(ui.is_open());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
+        terminal.draw(|f| ui.draw(f, f.area())).unwrap();
+        ui.event(&key(KeyCode::PageDown));
+        assert_eq!(ui.guide.as_ref().unwrap().scroll, 10);
+        ui.event(&key(KeyCode::Char('k')));
+        assert_eq!(ui.guide.as_ref().unwrap().scroll, 9);
+        ui.event(&key(KeyCode::Esc));
+        assert!(!ui.is_open());
     }
 }
