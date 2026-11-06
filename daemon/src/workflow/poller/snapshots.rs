@@ -42,6 +42,8 @@ struct Entry {
 pub(super) struct RunSnapshots {
     entries: HashMap<PathBuf, Entry>,
     #[cfg(test)]
+    pub refreshes: usize,
+    #[cfg(test)]
     pub parses: usize,
     #[cfg(test)]
     pub fingerprints: usize,
@@ -56,6 +58,8 @@ impl RunSnapshots {
     /// Caller must not hold the daemon registry lock while checking disk.
     pub fn refresh(&mut self, root: &Path) -> Vec<Snapshot> {
         #[cfg(test)]
+        { self.refreshes += 1; }
+        #[cfg(test)]
         if let Some(hook) = self.before_refresh.as_mut() { hook(); }
         let Ok(entries) = fs::read_dir(root) else {
             self.entries.clear();
@@ -65,7 +69,13 @@ impl RunSnapshots {
         let mut out = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() { continue; }
+            // The entry's own type costs no stat; follow only a symlink.
+            let dir = match entry.file_type() {
+                Ok(kind) if kind.is_symlink() => path.is_dir(),
+                Ok(kind) => kind.is_dir(),
+                Err(_) => path.is_dir(),
+            };
+            if !dir { continue; }
             let path = path.join("state.json");
             seen.insert(path.clone());
             match self.refresh_file(&path) {

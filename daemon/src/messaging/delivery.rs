@@ -3,6 +3,8 @@
 //! delivery. Native adapters never resend an ambiguous submission.
 pub mod alarm;
 mod marker;
+use super::atomic_replace_json;
+#[cfg(test)]
 use super::atomic_replace;
 use super::{Store, WakeIntent};
 use crate::{session::PtyByteFanout, state::DaemonState};
@@ -100,7 +102,7 @@ struct Queue {
     deferred: BTreeSet<String>,
 }
 #[derive(Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(from = "BatchWire")]
 struct Batch {
     wake_id: String,
     ids: Vec<String>,
@@ -123,8 +125,69 @@ struct Batch {
     // `LATCH_HORIZON_SECS`, so a session that ignored one wake still gets the
     // next one (2026-09-14: an orchestrator's 11:01 wake swallowed a 16:17
     // mention for good).
-    #[serde(default)]
     delivered_at: u64,
+    // When `compact_history` first saw this batch as settled history with no
+    // delivery time of its own (a wake cancelled before delivery, or a legacy
+    // record). Its age anchor for the history horizon.
+    #[serde(skip_serializing_if = "is_zero")]
+    settled_at: u64,
+    // Set by `load` when this record predates `released`; never persisted.
+    #[serde(skip)]
+    migrated: bool,
+}
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+/// The on-disk batch. `released` and `status` are optional only so a record
+/// that predates the latch can be migrated while it is parsed: the queue is
+/// deserialized straight into structs instead of through a `Value` tree
+/// (2026-11-05: a 23 MB queue's two Value copies per load/save were most of
+/// the brain's allocator churn).
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct BatchWire {
+    wake_id: String,
+    ids: Vec<String>,
+    status: Option<String>,
+    attempts: u8,
+    attempted_at: u64,
+    original: Option<Binding>,
+    scan: Scan,
+    hook_keys: Vec<String>,
+    checked: BTreeSet<String>,
+    sealed: bool,
+    released: Option<bool>,
+    coalesced: BTreeSet<String>,
+    delivered_at: u64,
+    settled_at: u64,
+}
+impl From<BatchWire> for Batch {
+    fn from(w: BatchWire) -> Self {
+        let migrated = w.released.is_none();
+        // Keep old unsubmitted work live. Delivered/ambiguous old receipts
+        // have no fetch history and cannot own a new latch.
+        let released = w.released.unwrap_or_else(|| {
+            let status = w.status.as_deref().unwrap_or("pending");
+            !pending(status) && status != "native_pending"
+        });
+        Batch {
+            wake_id: w.wake_id,
+            ids: w.ids,
+            status: w.status.unwrap_or_default(),
+            attempts: w.attempts,
+            attempted_at: w.attempted_at,
+            original: w.original,
+            scan: w.scan,
+            hook_keys: w.hook_keys,
+            checked: w.checked,
+            sealed: w.sealed,
+            released,
+            coalesced: w.coalesced,
+            delivered_at: w.delivered_at,
+            settled_at: w.settled_at,
+            migrated,
+        }
+    }
 }
 impl Batch {
     fn deferred(&self, keys: &BTreeSet<String>) -> bool {
@@ -177,6 +240,56 @@ fn expire_latches(q: &mut Queue, now: u64) -> bool {
     }
     changed
 }
+/// How long settled wake history outlives its last use. History is the dedup
+/// record that stops a key from being woken twice, so a batch whose keys are
+/// still wake intents (an unread DM, an unacknowledged monitor hit) is kept
+/// whatever its age. Once none of its keys is an intent, the horizon only
+/// absorbs brief intent gaps (DND, a membership flip); past it the batch goes.
+/// Before this, queues kept every batch ever delivered: execution-policy's was
+/// 23 MB (28,722 batches, median age 17 days), re-read and re-written by every
+/// delivery tick, ~400 MiB/min of rewrites across cm-sessions (2026-11-05).
+const HISTORY_HORIZON_SECS: u64 = 24 * 3600;
+/// The newest batches are always kept, so recent status lookups and
+/// `monitor_status` counts keep their context.
+const HISTORY_TAIL: usize = 16;
+
+/// Drop settled history (released, confirmed/cancelled) that no current
+/// intent needs and that settled at least `HISTORY_HORIZON_SECS` ago. Deferred
+/// task work is never touched. A batch with no delivery time is stamped
+/// `settled_at` the first time it is seen here and ages from then.
+fn compact_history(q: &mut Queue, intents: &[WakeIntent], now: u64) -> bool {
+    if q.batches.len() <= HISTORY_TAIL {
+        return false;
+    }
+    let eligible: BTreeSet<&str> = intents.iter().map(|i| i.key.as_str()).collect();
+    let tail_from = q.batches.len() - HISTORY_TAIL;
+    let Queue { batches, deferred, .. } = q;
+    let mut changed = false;
+    let mut index = 0;
+    batches.retain_mut(|batch| {
+        let in_tail = index >= tail_from;
+        index += 1;
+        if in_tail
+            || !batch.settled_history()
+            || batch.deferred(deferred)
+            || batch.ids.iter().chain(&batch.coalesced).any(|id| eligible.contains(id.as_str()))
+        {
+            return true;
+        }
+        let since = if batch.delivered_at != 0 { batch.delivered_at } else { batch.settled_at };
+        if since == 0 {
+            batch.settled_at = now;
+            changed = true;
+            return true;
+        }
+        if now.saturating_sub(since) < HISTORY_HORIZON_SECS {
+            return true;
+        }
+        changed = true;
+        false
+    });
+    changed
+}
 fn queue_path(root: &Path, uid: &str) -> PathBuf {
     root.join("_delivery").join(format!("{}.json", digest(uid)))
 }
@@ -196,19 +309,9 @@ fn load(path: &Path) -> io::Result<Queue> {
     QUEUE_LOADS.with(|count| count.set(count.get() + 1));
     match fs::read(path) {
         Ok(b) => {
-            let mut value: Value = serde_json::from_slice(&b)?;
-            let mut migrated = false;
-            for batch in value["batches"].as_array_mut().into_iter().flatten() {
-                if batch.get("released").is_none() {
-                    let status = batch["status"].as_str().unwrap_or("pending");
-                    // Keep old unsubmitted work live. Delivered/ambiguous old
-                    // receipts have no fetch history and cannot own a new latch.
-                    batch["released"] = json!(!pending(status) && status != "native_pending");
-                    migrated = true;
-                }
-            }
-            let mut queue: Queue = serde_json::from_value(value)?;
-            queue.dirty = migrated;
+            // Legacy records are migrated in `From<BatchWire>`; persist that.
+            let mut queue: Queue = serde_json::from_slice(&b)?;
+            queue.dirty = queue.batches.iter().any(|b| b.migrated);
             Ok(queue)
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Queue::default()),
@@ -226,7 +329,7 @@ fn save(path: &Path, q: &Queue) -> io::Result<()> {
             return Err(io::Error::other("injected delivery checkpoint failure"));
         }
     }
-    atomic_replace(path, &serde_json::to_value(q)?)
+    atomic_replace_json(path, q)
 }
 fn checkpoint(path: &Path, q: &mut Queue) -> io::Result<()> {
     if q.dirty {
@@ -287,19 +390,43 @@ pub fn spawn(state: &Arc<Mutex<DaemonState>>) {
         .unwrap_or_else(|p| p.into_inner())
         .messaging_wake
         .clone();
-    thread::spawn(move || loop {
+    thread::spawn(move || {
+        worker_loop(&wake, Duration::from_secs(2), MIN_TICK_SPACING, || {
+            let Some(state) = weak.upgrade() else {
+                return false;
+            };
+            tick(&state);
+            true
+        })
+    });
+}
+/// Shortest interval between delivery ticks; the most a wake waits for the
+/// previous tick's spacing.
+const MIN_TICK_SPACING: Duration = Duration::from_millis(250);
+type Wake = (Mutex<bool>, std::sync::Condvar);
+/// Run `tick` on each signal or every `idle`, at most once per `spacing`.
+/// Every chat send/read/follow and every replicated batch signals delivery,
+/// so under load the worker used to run back to back (35–57% of a core on
+/// cm-sessions, 30% on f-sessions; 2026-11-05). A signal that arrives during a
+/// tick or its spacing stays latched and is served by the next tick. Stops
+/// when `tick` returns false.
+fn worker_loop(wake: &Wake, idle: Duration, spacing: Duration, mut tick: impl FnMut() -> bool) {
+    loop {
         let ready = wake.0.lock().unwrap_or_else(|p| p.into_inner());
         let (mut ready, _) = wake
             .1
-            .wait_timeout_while(ready, Duration::from_secs(2), |v| !*v)
+            .wait_timeout_while(ready, idle, |v| !*v)
             .unwrap_or_else(|p| p.into_inner());
         *ready = false;
         drop(ready);
-        let Some(state) = weak.upgrade() else {
-            break;
-        };
-        tick(&state);
-    });
+        let started = std::time::Instant::now();
+        if !tick() {
+            return;
+        }
+        if let Some(rest) = spacing.checked_sub(started.elapsed()) {
+            thread::sleep(rest);
+        }
+    }
 }
 pub fn signal(state: &Arc<Mutex<DaemonState>>) {
     let wake = state
@@ -568,6 +695,7 @@ fn deliver_queue(
     let path = queue_path(store_root, uid);
     q.dirty |= expire_latches(q, now);
     q.dirty |= collect(q, intents);
+    q.dirty |= compact_history(q, intents, now);
     checkpoint(&path, q)?;
     let first = q
         .batches
@@ -963,6 +1091,48 @@ mod tests {
         alarm_tick(&state, dir.path());
         assert!(crate::owner_attention::snapshot(&state.lock().unwrap()).unwrap().contains_key("notification-stall:ts-stalled"));
     }
+    #[test]
+    fn delivery_worker_serves_signal_bursts_with_spaced_ticks() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        use std::time::Instant;
+        let wake: Arc<Wake> = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let ticks = Arc::new(Mutex::new(Vec::<Instant>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let spacing = Duration::from_millis(100);
+        let worker = {
+            let (wake, ticks, stop) = (wake.clone(), ticks.clone(), stop.clone());
+            thread::spawn(move || worker_loop(&wake, Duration::from_secs(60), spacing, || {
+                ticks.lock().unwrap().push(Instant::now());
+                !stop.load(SeqCst)
+            }))
+        };
+        let raise = || {
+            *wake.0.lock().unwrap() = true;
+            wake.1.notify_one();
+        };
+        // ~450 signals in 450 ms are served by a handful of ticks.
+        let burst = Instant::now();
+        while burst.elapsed() < Duration::from_millis(450) {
+            raise();
+            thread::sleep(Duration::from_millis(1));
+        }
+        let during = ticks.lock().unwrap().len();
+        assert!(during <= 6, "{during} ticks for a 450 ms burst");
+        // After an idle gap a signal is served at once: no fixed debounce.
+        thread::sleep(spacing * 2);
+        let raised = Instant::now();
+        raise();
+        let deadline = raised + Duration::from_secs(5);
+        while !ticks.lock().unwrap().iter().any(|t| *t >= raised) {
+            assert!(Instant::now() < deadline, "an idle worker must serve a signal");
+            thread::sleep(Duration::from_millis(5));
+        }
+        stop.store(true, SeqCst);
+        raise();
+        worker.join().unwrap();
+        let ticks = ticks.lock().unwrap();
+        assert!(ticks.windows(2).all(|w| w[1] - w[0] >= spacing), "ticks closer than the spacing");
+    }
     fn recipient(engine: &str) -> Recipient {
         Recipient {
             engine: engine.into(),
@@ -1252,7 +1422,7 @@ mod tests {
     }
 
     #[test]
-    fn messaging_large_settled_history_needs_no_native_io_or_queue_writes() {
+    fn messaging_large_settled_history_needs_no_native_io_and_ages_out_past_the_horizon() {
         let (tmp, store, _, _) = fixture();
         let path = queue_path(&store.root, "b");
         let q = Queue {
@@ -1266,20 +1436,114 @@ mod tests {
             ..Queue::default()
         };
         save(&path, &q).unwrap();
-        let bytes = fs::read(&path).unwrap();
         // Any native lookup/lock would fail: settled history must not touch it.
         fs::write(tmp.path().join("notifications"), "not a directory").unwrap();
-        let (loads, writes) = (queue_load_count(), save_calls());
+        let pass = |now: u64| {
+            let (loads, writes) = (queue_load_count(), save_calls());
+            let mut q = reconcile_intents(tmp.path(), &store, "b", &[]).unwrap();
+            deliver_queue(tmp.path(), &store.root, "b", &[], &recipient("codex"),
+                now, &no_preview, &mut q).unwrap();
+            assert_eq!(queue_load_count() - loads, 1);
+            (save_calls() - writes, q)
+        };
+        let t0 = 1_000_000;
+        // Undelivered history has no age yet: the first pass stamps it once.
         let started = std::time::Instant::now();
-        let mut q = reconcile_intents(tmp.path(), &store, "b", &[]).unwrap();
-        deliver_queue(tmp.path(), &store.root, "b", &[], &recipient("codex"),
-            1_000_000, &no_preview, &mut q).unwrap();
-        eprintln!("P2 synthetic history: 7745 batches, {} bytes, {:.3} ms, one load, zero writes/native reads",
-            bytes.len(), started.elapsed().as_secs_f64() * 1000.0);
-        assert_eq!(queue_load_count() - loads, 1);
-        assert_eq!(save_calls() - writes, 0);
-        assert_eq!(fs::read(&path).unwrap(), bytes, "all dedup history remains intact");
-        assert_eq!(q.batches.len(), 7745);
+        let (writes, q) = pass(t0);
+        eprintln!("P2 synthetic history: 7745 batches, {:.3} ms, one load, no native reads",
+            started.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(writes, 1);
+        assert_eq!(q.batches.len(), 7745, "history inside the horizon remains intact");
+        assert!(q.batches[..7745 - HISTORY_TAIL].iter().all(|b| b.settled_at == t0));
+        let bytes = fs::read(&path).unwrap();
+        let (writes, q) = pass(t0 + HISTORY_HORIZON_SECS - 1);
+        assert_eq!((writes, q.batches.len()), (0, 7745));
+        assert_eq!(fs::read(&path).unwrap(), bytes, "no rewrite inside the horizon");
+        // Past the horizon only the newest tail is left, in order.
+        let (writes, q) = pass(t0 + HISTORY_HORIZON_SECS);
+        assert_eq!(writes, 1);
+        let kept: Vec<_> = q.batches.iter().map(|b| b.wake_id.clone()).collect();
+        let tail: Vec<_> = (7745 - HISTORY_TAIL..7745).map(|i| format!("history-{i}")).collect();
+        assert_eq!(kept, tail);
+        let (writes, q) = pass(t0 + 2 * HISTORY_HORIZON_SECS);
+        assert_eq!((writes, q.batches.len()), (0, HISTORY_TAIL));
+        assert!(fs::metadata(&path).unwrap().len() < 64 * 1024);
+    }
+
+    #[test]
+    fn messaging_history_compaction_keeps_live_intents_open_work_and_the_tail() {
+        let now = 10 * HISTORY_HORIZON_SECS;
+        let old = now - HISTORY_HORIZON_SECS;
+        let settled = |i: usize, delivered_at: u64| Batch {
+            wake_id: format!("w{i}"),
+            ids: vec![format!("k{i}")],
+            status: "confirmed".into(),
+            released: true,
+            delivered_at,
+            ..Batch::default()
+        };
+        let mut batches: Vec<Batch> = (0..200).map(|i| settled(i, old)).collect();
+        // Still an intent (e.g. an unread DM): its history is the dedup record.
+        batches[3].ids.push("unread".into());
+        // A coalesced arrival that is still an intent also keeps its batch.
+        batches[4].coalesced.insert("k-coalesced".into());
+        batches[4].ids.push("k-coalesced".into());
+        // Delivered inside the horizon.
+        batches[5].delivered_at = old + 1;
+        // Not settled: released but only submitted, or settled but not released.
+        batches[6].status = "submitted_unverified".into();
+        batches[7].released = false;
+        // Deferred task work is never compacted.
+        batches[8].ids = vec!["deferred-key".into()];
+        let mut q = Queue {
+            batches,
+            deferred: BTreeSet::from(["deferred-key".to_string()]),
+            ..Queue::default()
+        };
+        let intents: Vec<_> = ["unread", "k-coalesced"].iter().map(|k| WakeIntent {
+            key: (*k).into(), event_id: (*k).into(), monitor: None,
+        }).collect();
+        assert!(compact_history(&mut q, &intents, now));
+        let kept: Vec<_> = q.batches.iter().map(|b| b.wake_id.as_str()).collect();
+        let mut expected = vec!["w3", "w4", "w5", "w6", "w7", "w8"];
+        let tail: Vec<String> = (200 - HISTORY_TAIL..200).map(|i| format!("w{i}")).collect();
+        expected.extend(tail.iter().map(String::as_str));
+        assert_eq!(kept, expected);
+        assert!(!compact_history(&mut q, &intents, now), "a second pass changes nothing");
+        // Intents whose history was kept stay covered: no second wake.
+        let n = q.batches.len();
+        collect(&mut q, &intents);
+        assert_eq!(q.batches.len(), n);
+        // Small queues are never compacted.
+        let mut small = Queue { batches: (0..HISTORY_TAIL).map(|i| settled(i, 1)).collect(), ..Queue::default() };
+        assert!(!compact_history(&mut small, &[], now));
+        assert_eq!(small.batches.len(), HISTORY_TAIL);
+    }
+
+    #[test]
+    fn messaging_queue_loads_without_a_value_round_trip_and_keeps_legacy_migration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("q.json");
+        let legacy = json!({"last_attempt": 7, "batches": [
+            {"wake_id": "a", "ids": ["x"], "status": "confirmed"},
+            {"wake_id": "b", "ids": ["y"], "status": "native_pending"},
+            {"wake_id": "c", "ids": ["z"]},
+            {"wake_id": "d", "ids": ["w"], "status": "confirmed", "released": false, "delivered_at": 5},
+        ]});
+        atomic_replace(&path, &legacy).unwrap();
+        let q = load(&path).unwrap();
+        assert!(q.dirty, "a migrated legacy record is persisted");
+        let released: Vec<_> = q.batches.iter().map(|b| b.released).collect();
+        assert_eq!(released, [true, false, false, false]);
+        assert_eq!(q.batches[2].status, "", "a missing status stays empty, as before");
+        assert_eq!((q.last_attempt, q.batches[3].delivered_at), (7, 5));
+        save(&path, &q).unwrap();
+        let q = load(&path).unwrap();
+        assert!(!q.dirty);
+        let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(saved["batches"][0].get("settled_at").is_none(), "an unset stamp is not written");
+        assert!(saved["batches"][0].get("migrated").is_none());
+        assert_eq!(saved["batches"][0]["released"], true);
     }
 
     #[test]

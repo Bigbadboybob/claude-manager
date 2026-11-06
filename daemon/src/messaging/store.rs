@@ -175,6 +175,12 @@ fn write_file_synced(path: &Path, bytes: &[u8], replace: bool, sync_dir: bool) -
     result
 }
 pub fn atomic_replace(path: &Path, value: &Value) -> io::Result<()> {
+    atomic_replace_json(path, value)
+}
+/// `atomic_replace` for any serializable value, without first building a
+/// `serde_json::Value` copy of it (a large struct's Value tree is several
+/// times its JSON size, and every copy is allocator churn).
+pub fn atomic_replace_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> io::Result<()> {
     write_file(path, &serde_json::to_vec_pretty(value)?, true)
 }
 // Projections are disposable. Avoid fsyncing identical directory/name/norm
