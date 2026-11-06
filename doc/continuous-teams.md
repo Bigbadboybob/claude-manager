@@ -71,7 +71,7 @@ triage and code bug hunt for the execution side.
 
 - health-alert-triage: replaced by a scheduled check session.
 - The four codex-migration-* canaries.
-- behavior-triage: paused; to be retired unless Owner keeps it.
+- behavior-triage: paused; retiring (Owner, 2026-11-06).
 
 ## Sidebar and dashboard
 
