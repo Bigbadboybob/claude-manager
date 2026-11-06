@@ -94,6 +94,11 @@ pub(super) struct TaskTree {
     /// Reporting lines for this frame: levels and live reports (the tasks
     /// whose lead carries a leader mark).
     pub org: OrgIndex,
+    /// The section each visible workspace draws in (its root block's);
+    /// loose workspaces are absent.
+    pub section_of: HashMap<usize, String>,
+    /// Each section's visible workspaces, in workspace order.
+    pub section_members: HashMap<String, Vec<usize>>,
 }
 
 /// Reporting lines and liveness, built once per frame and shared by the
@@ -185,6 +190,23 @@ fn root_tasks(bound: &[String], parents: &HashMap<&str, &str>) -> Vec<String> {
         .filter(|t| !local_parent.contains_key(t.as_str()))
         .cloned()
         .collect()
+}
+
+/// Hash a collection's elements in any order, without sorting or
+/// allocating: the count, the sum and a mixed xor of the elements' own
+/// hashes identify the multiset.
+fn hash_unordered<T: std::hash::Hash>(items: impl IntoIterator<Item = T>, h: &mut impl std::hash::Hasher) {
+    use std::hash::{Hash, Hasher};
+    let (mut n, mut sum, mut mix) = (0u64, 0u64, 0u64);
+    for item in items {
+        let mut e = std::collections::hash_map::DefaultHasher::new();
+        item.hash(&mut e);
+        let v = e.finish();
+        n += 1;
+        sum = sum.wrapping_add(v);
+        mix ^= v.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29);
+    }
+    (n, sum, mix).hash(h);
 }
 
 /// How visible workspaces relate through the task tree.
@@ -354,7 +376,8 @@ impl App {
         f
     }
 
-    /// The Task sub-view's rows and their tree metadata.
+    /// The Task sub-view's rows and their tree metadata, owned (tests).
+    #[cfg(test)]
     pub(super) fn task_tree(&self) -> TaskTree {
         // While filtering, folds are ignored so a match is never hidden.
         self.task_tree_shared_with(self.sidebar_filter.is_none()).as_ref().clone()
@@ -367,7 +390,11 @@ impl App {
     }
     /// Hash the inputs read by the forest/emitter. This keeps the cache
     /// correct across manifest refreshes and fold changes without requiring
-    /// every mutation path to remember an explicit invalidation call.
+    /// every mutation path to remember an explicit invalidation call. It
+    /// runs on every key and frame, so it neither sorts nor allocates, and
+    /// a closed workspace without sessions (the laptop keeps thousands for
+    /// A-O) costs one check: it draws nothing and the tree reads nothing
+    /// from it.
     fn task_tree_cache_key(&self, folds: bool) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -391,21 +418,23 @@ impl App {
             }
             .hash(&mut h);
         }
-        let mut sidebar_parents: Vec<_> = self.sidebar_task_parents.iter().collect();
-        sidebar_parents.sort_by(|a, b| a.0.cmp(b.0));
-        for (id, parent) in sidebar_parents {
-            id.hash(&mut h);
-            parent.hash(&mut h);
-        }
-        let mut done: Vec<&String> = self.sidebar_done_task_ids.iter().collect();
-        done.sort();
-        done.hash(&mut h);
-        for ws in &self.workspaces {
+        hash_unordered(&self.sidebar_task_parents, &mut h);
+        hash_unordered(&self.sidebar_done_task_ids, &mut h);
+        // Open workspaces hash with their index: closing or removing one
+        // shifts the indices after it.
+        self.workspaces.len().hash(&mut h);
+        for (wi, ws) in self.workspaces.iter().enumerate() {
+            if ws.is_closed && ws.sessions.is_empty() {
+                continue;
+            }
+            wi.hash(&mut h);
             ws.id.hash(&mut h);
             ws.is_closed.hash(&mut h);
             ws.is_cloud.hash(&mut h);
             ws.host_id.hash(&mut h);
             ws.worktree_path.hash(&mut h);
+            // Folds are read for drawn workspaces only.
+            self.folded_workspaces.contains(&ws.id).hash(&mut h);
             for ts in &ws.sessions {
                 ts.uid.hash(&mut h);
                 ts.host_id.hash(&mut h);
@@ -424,11 +453,7 @@ impl App {
                 .hash(&mut h);
             }
         }
-        let mut agent_states: Vec<_> = self.agent_states.iter().collect();
-        agent_states.sort_by(|a, b| a.0.0.as_str().cmp(b.0.0.as_str()).then_with(|| a.0.1.cmp(&b.0.1)));
-        for ((host, uid), state) in agent_states {
-            host.hash(&mut h);
-            uid.hash(&mut h);
+        let agent_states = self.agent_states.iter().map(|((host, uid), state)| {
             let activity = match state.activity {
                 super::agent_state::Activity::Working => 0u8,
                 super::agent_state::Activity::Background => 1,
@@ -439,52 +464,35 @@ impl App {
                 super::agent_state::Activity::Exited => 6,
                 super::agent_state::Activity::Unknown => 7,
             };
-            activity.hash(&mut h);
-            state.stalled.hash(&mut h);
-        }
-        let mut owner_alerts: Vec<_> = self.owner_alert_rows.keys().collect();
-        owner_alerts.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()).then_with(|| a.1.cmp(&b.1)));
-        owner_alerts.hash(&mut h);
-        let mut local_alerts: Vec<_> = self.alerts.keys().collect();
-        local_alerts.sort();
-        local_alerts.hash(&mut h);
-        let mut workflow_runs: Vec<_> = self.workflow_runs.iter().collect();
-        workflow_runs.sort_by(|a, b| a.run_id.cmp(&b.run_id));
-        for run in workflow_runs {
-            run.run_id.hash(&mut h);
-            run.workflow_name.hash(&mut h);
-        }
-        let mut workflows: Vec<_> = self.workflows.iter().collect();
-        workflows.sort_by(|a, b| a.0.cmp(b.0));
-        for (name, workflow) in workflows {
-            name.hash(&mut h);
-            workflow.role_order.hash(&mut h);
-        }
+            (host, uid, activity, state.stalled)
+        });
+        hash_unordered(agent_states, &mut h);
+        hash_unordered(self.owner_alert_rows.keys(), &mut h);
+        hash_unordered(self.alerts.keys(), &mut h);
+        hash_unordered(self.workflow_runs.iter().map(|run| (&run.run_id, &run.workflow_name)), &mut h);
+        hash_unordered(self.workflows.iter().map(|(name, wf)| (name, &wf.role_order)), &mut h);
         for section in &self.sections {
             section.id.hash(&mut h);
             section.folded.hash(&mut h);
         }
-        let mut workspace_sections: Vec<_> = self.workspace_sections.iter().collect();
-        workspace_sections.sort_by(|a, b| a.0.cmp(b.0));
-        workspace_sections.hash(&mut h);
-        let mut folded_workspaces: Vec<&String> = self.folded_workspaces.iter().collect();
-        folded_workspaces.sort();
-        folded_workspaces.hash(&mut h);
-        let mut folded_divisions: Vec<&String> = self.folded_divisions.iter().collect();
-        folded_divisions.sort();
-        folded_divisions.hash(&mut h);
-        let mut divisions: Vec<_> = self.planning.divisions_by_task().into_iter().collect();
-        divisions.sort_by(|a, b| a.0.cmp(&b.0));
-        for (task, division) in divisions {
-            task.hash(&mut h);
-            division.id.hash(&mut h);
-            division.name.hash(&mut h);
-            division.color.hash(&mut h);
-            division.coordinator.hash(&mut h);
-        }
-        let mut closed: Vec<String> = self.planning.closed_task_ids().into_iter().collect();
-        closed.sort();
-        closed.hash(&mut h);
+        hash_unordered(&self.workspace_sections, &mut h);
+        hash_unordered(&self.folded_divisions, &mut h);
+        // What `divisions_by_task` and the closed set (`org_index`) read,
+        // without building them.
+        hash_unordered(
+            self.planning
+                .loaded_tasks()
+                .filter(|t| t.initiative_kind.as_deref() == Some("division"))
+                .map(|t| (&t.id, &t.initiative_id, &t.initiative_name, &t.initiative_color, t.is_initiative_coordinator)),
+            &mut h,
+        );
+        hash_unordered(
+            self.planning
+                .loaded_tasks()
+                .filter(|t| matches!(t.status, crate::planning::PlanStatus::Done | crate::planning::PlanStatus::Archived))
+                .map(|t| &t.id),
+            &mut h,
+        );
         h.finish()
     }
 
@@ -584,7 +592,7 @@ impl App {
     /// Clear the folds above `node`.
     fn reveal_node(&mut self, node: &Node) -> bool {
         let mut changed = false;
-        let chain = self.task_tree_with(false).chain(node);
+        let chain = self.task_tree_unfolded().chain(node);
         for n in chain.into_iter().skip(1) {
             changed |= match n {
                 Node::Workspace(wi) => match self.workspaces.get(wi) {
@@ -602,12 +610,8 @@ impl App {
     }
 
     /// The tree with every fold open: what exists, not what shows.
-    pub(super) fn task_tree_unfolded(&self) -> TaskTree {
-        self.task_tree_with(false)
-    }
-
-    fn task_tree_with(&self, folds: bool) -> TaskTree {
-        self.task_tree_shared_with(folds).as_ref().clone()
+    pub(super) fn task_tree_unfolded(&self) -> std::rc::Rc<TaskTree> {
+        self.task_tree_shared_with(false)
     }
 
     fn task_tree_shared_with(&self, folds: bool) -> std::rc::Rc<TaskTree> {
@@ -633,6 +637,8 @@ impl App {
                 .map(|d| (d.id.clone(), d.clone()))
                 .collect(),
             org: self.org_index(),
+            section_of: HashMap::new(),
+            section_members: HashMap::new(),
         };
         for &wi in &f.order {
             let mut top = wi;
@@ -650,11 +656,23 @@ impl App {
 
         let mut loose: Vec<usize> = Vec::new();
         let mut by_section: HashMap<String, Vec<usize>> = HashMap::new();
+        let lookup = self.section_lookup();
         for &wi in &tops {
-            match self.section_of_workspace(wi) {
-                Some(sid) => by_section.entry(sid).or_default().push(wi),
+            match self.section_of_workspace_in(&lookup, wi) {
+                Some(sid) => {
+                    out.section_of.insert(wi, sid.clone());
+                    by_section.entry(sid).or_default().push(wi);
+                }
                 None => loose.push(wi),
             }
+        }
+        // A nested block draws in its root block's section.
+        for &wi in &f.order {
+            let Some(sid) = out.section_of.get(&out.block_root[&wi]).cloned() else {
+                continue;
+            };
+            out.section_members.entry(sid.clone()).or_default().push(wi);
+            out.section_of.insert(wi, sid);
         }
         let mut emit = Emit {
             app: self,
@@ -879,13 +897,19 @@ impl App {
             .into_iter()
             .map(|(t, p)| (t.to_owned(), p.to_owned()))
             .collect();
-        let mut closed = self.planning.closed_task_ids();
-        closed.extend(self.sidebar_done_task_ids.iter().cloned());
+        // Borrowed: the planning snapshot's done tasks number thousands.
+        let mut closed: HashSet<&str> = self
+            .planning
+            .loaded_tasks()
+            .filter(|t| matches!(t.status, crate::planning::PlanStatus::Done | crate::planning::PlanStatus::Archived))
+            .map(|t| t.id.as_str())
+            .collect();
+        closed.extend(self.sidebar_done_task_ids.iter().map(String::as_str));
         closed.extend(
             self.tasks
                 .iter()
                 .filter(|t| t.api_status == TaskStatus::Done)
-                .filter_map(|t| t.task_id.clone()),
+                .filter_map(|t| t.task_id.as_deref()),
         );
         // Walk up from every open task with a live agent session: each open
         // task on the way is a live report of its parent. A closed task
@@ -2394,5 +2418,29 @@ mod tree_tests {
         let loose_tree = app.task_tree_shared();
         assert_eq!(app.section_of_workspace(4), None);
         assert!(!std::rc::Rc::ptr_eq(&section_tree, &loose_tree));
+    }
+
+    /// The key skips a closed workspace without sessions (the laptop keeps
+    /// thousands for A-O): a fold on one keeps the cached tree; reopening
+    /// it or folding a drawn workspace rebuilds.
+    #[test]
+    fn task_tree_cache_skips_closed_workspaces_without_sessions() {
+        let mut app = org_app();
+        let mut gone = super::super::sections::layout_tests::bare_ws("gone");
+        gone.is_closed = true;
+        app.workspaces.push(gone);
+        let gi = app.workspaces.len() - 1;
+        let first = app.task_tree_shared();
+        app.folded_workspaces.insert("gone".into());
+        assert!(std::rc::Rc::ptr_eq(&first, &app.task_tree_shared()));
+
+        app.workspaces[gi].is_closed = false;
+        let reopened = app.task_tree_shared();
+        assert!(!std::rc::Rc::ptr_eq(&first, &reopened));
+        assert!(reopened.items.contains(&VisualItem::WorkspaceHeader(gi)));
+
+        let id = app.workspaces[0].id.clone();
+        app.folded_workspaces.insert(id);
+        assert!(!std::rc::Rc::ptr_eq(&reopened, &app.task_tree_shared()));
     }
 }

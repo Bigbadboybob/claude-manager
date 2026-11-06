@@ -72,32 +72,39 @@ fn inherited_parent_task(task: &TaskEntry) -> Option<String> {
         .map(str::to_string)
 }
 
+/// What section inheritance reads, indexed once ([`App::section_lookup`])
+/// so that resolving a workspace costs its task chain rather than a scan of
+/// every workspace: the laptop keeps thousands of closed ones, and the
+/// sidebar resolves a section for each visible block.
+pub(crate) struct SectionLookup<'a> {
+    /// The first workspace with each id.
+    workspace: HashMap<&'a str, usize>,
+    /// Work-list rows (indices into `App::tasks`) bound to each workspace.
+    tasks_by_workspace: HashMap<&'a str, Vec<usize>>,
+    /// Work-list rows by task id, in list order.
+    tasks_by_id: HashMap<&'a str, Vec<usize>>,
+    /// Workspaces with a session on each task, in workspace order.
+    session_workspaces: HashMap<&'a str, Vec<usize>>,
+}
+
 impl App {
     /// Resolve each displayed row independently so filtering or scrolling away
     /// a section heading cannot lose its tint. Only gaps within the same
     /// section share the surface; boundaries and loose rows stay transparent.
-    /// `block_root` maps a workspace to the top-level block it renders
-    /// under in the work tree: a nested block takes its root's section.
-    pub(super) fn sidebar_section_backgrounds(
+    /// `section_of` is the section a workspace's rows draw in: its root
+    /// block's, as the work tree resolved it.
+    pub(super) fn sidebar_section_backgrounds<'s>(
         &self,
-        rows: &[VisualItem],
-        block_root: &dyn Fn(usize) -> usize,
+        rows: &'s [VisualItem],
+        section_of: &dyn Fn(usize) -> Option<&'s str>,
     ) -> Vec<Option<Color>> {
         if !self.tree_view() || self.sections.is_empty() {
             return vec![None; rows.len()];
         }
-        let mut workspace_sections = HashMap::new();
-        for row in rows {
-            if let VisualItem::WorkspaceHeader(wi) | VisualItem::Session(wi, _)
-                | VisualItem::WorkflowHeader { ws_idx: wi, .. } = row
-            {
-                workspace_sections.entry(*wi).or_insert_with(|| self.section_of_workspace(block_root(*wi)));
-            }
-        }
         let mut sections: Vec<Option<&str>> = rows.iter().map(|row| match row {
             VisualItem::SectionHeader(id) => Some(id.as_str()),
             VisualItem::WorkspaceHeader(wi) | VisualItem::Session(wi, _)
-            | VisualItem::WorkflowHeader { ws_idx: wi, .. } => workspace_sections[wi].as_deref(),
+            | VisualItem::WorkflowHeader { ws_idx: wi, .. } => section_of(*wi),
             _ => None,
         }).collect();
         // A division header sits inside the section of the rows before it.
@@ -154,14 +161,57 @@ impl App {
     /// Resolve the section a workspace renders under: the explicit
     /// assignment when present (a `SECTION_NONE` sentinel resolves to loose),
     /// else inherited through the task tree, else `None` (loose).
+    /// Builds the index each call; resolve many workspaces with
+    /// [`App::section_of_workspace_in`] and one [`App::section_lookup`].
     pub(crate) fn section_of_workspace(&self, wi: usize) -> Option<String> {
+        self.section_of_workspace_in(&self.section_lookup(), wi)
+    }
+
+    /// [`App::section_of_workspace`] against a prebuilt index.
+    pub(crate) fn section_of_workspace_in(&self, lookup: &SectionLookup<'_>, wi: usize) -> Option<String> {
         let ws = self.workspaces.get(wi)?;
         let mut seen = HashSet::new();
-        self.section_of_workspace_id(&ws.id, &mut seen)
+        self.section_of_workspace_id(lookup, &ws.id, &mut seen)
+    }
+
+    /// Index what section inheritance reads: one pass over the workspaces
+    /// and the work list.
+    pub(crate) fn section_lookup(&self) -> SectionLookup<'_> {
+        let mut lookup = SectionLookup {
+            workspace: HashMap::new(),
+            tasks_by_workspace: HashMap::new(),
+            tasks_by_id: HashMap::new(),
+            session_workspaces: HashMap::new(),
+        };
+        for (wi, ws) in self.workspaces.iter().enumerate() {
+            // Only a workspace's sessions are read once it is found, so a
+            // closed one without sessions (thousands, kept for A-O) resolves
+            // exactly as a missing one.
+            if ws.is_closed && ws.sessions.is_empty() {
+                continue;
+            }
+            lookup.workspace.entry(ws.id.as_str()).or_insert(wi);
+            for tid in ws.sessions.iter().filter_map(|s| s.task_id.as_deref()) {
+                let homes = lookup.session_workspaces.entry(tid).or_default();
+                if homes.last() != Some(&wi) {
+                    homes.push(wi);
+                }
+            }
+        }
+        for (i, t) in self.tasks.iter().enumerate() {
+            if let Some(ws) = t.workspace_id.as_deref() {
+                lookup.tasks_by_workspace.entry(ws).or_default().push(i);
+            }
+            if let Some(id) = t.task_id.as_deref() {
+                lookup.tasks_by_id.entry(id).or_default().push(i);
+            }
+        }
+        lookup
     }
 
     fn section_of_workspace_id(
         &self,
+        lookup: &SectionLookup<'_>,
         ws_id: &str,
         seen: &mut HashSet<String>,
     ) -> Option<String> {
@@ -181,22 +231,28 @@ impl App {
         // A cloud session can be adopted before the planning task's workspace
         // binding arrives; its retained task_id is still a valid membership
         // edge.
-        let workspace = self.workspaces.iter().find(|w| w.id == ws_id);
-        let mut parent_ids: Vec<String> = self.tasks.iter().filter(|t| {
-            t.workspace_id.as_deref() == Some(ws_id)
-                || t.task_id.as_deref().is_some_and(|tid| {
-                    workspace.is_some_and(|w| {
-                        w.sessions.iter().any(|s| s.task_id.as_deref() == Some(tid))
-                    })
-                })
-        }).filter_map(inherited_parent_task).collect();
+        let workspace = lookup.workspace.get(ws_id).map(|&wi| &self.workspaces[wi]);
+        let session_tasks: Vec<&str> = workspace
+            .into_iter()
+            .flat_map(|w| &w.sessions)
+            .filter_map(|s| s.task_id.as_deref())
+            .collect();
+        // The work-list rows bound to the workspace or to one of its
+        // sessions' tasks, in list order.
+        let mut rows: Vec<usize> = lookup.tasks_by_workspace.get(ws_id).cloned().unwrap_or_default();
+        for tid in &session_tasks {
+            rows.extend(lookup.tasks_by_id.get(tid).into_iter().flatten());
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        let mut parent_ids: Vec<String> =
+            rows.iter().filter_map(|&i| inherited_parent_task(&self.tasks[i])).collect();
         // `self.tasks` drops terminal tasks. A live session bound to a done
         // task (a long-lived lead, e.g. F-Lead on "F-Plan-Lead") inherits
         // through the planning snapshot's parent edge instead, so its block
         // keeps its section after a viewer restart.
-        let session_tasks = workspace.into_iter().flat_map(|w| &w.sessions).filter_map(|s| s.task_id.as_deref());
         for tid in session_tasks {
-            if self.tasks.iter().any(|t| t.task_id.as_deref() == Some(tid)) {
+            if lookup.tasks_by_id.contains_key(tid) {
                 continue;
             }
             if let Some(Some(parent)) = self.planning_task_parent(tid) {
@@ -206,23 +262,24 @@ impl App {
             }
         }
         for parent_id in parent_ids {
-            let bound_parent = self
-                .tasks
-                .iter()
-                .find(|t| t.task_id.as_deref() == Some(parent_id.as_str()))
-                .and_then(|t| t.workspace_id.as_deref());
+            let bound_parent = lookup
+                .tasks_by_id
+                .get(parent_id.as_str())
+                .and_then(|rows| rows.first())
+                .and_then(|&i| self.tasks[i].workspace_id.as_deref());
             let parent_workspaces = bound_parent.into_iter().chain(
-                self.workspaces.iter().filter(|w| {
-                    w.sessions
-                        .iter()
-                        .any(|s| s.task_id.as_deref() == Some(parent_id.as_str()))
-                }).map(|w| w.id.as_str()),
+                lookup
+                    .session_workspaces
+                    .get(parent_id.as_str())
+                    .into_iter()
+                    .flatten()
+                    .map(|&wi| self.workspaces[wi].id.as_str()),
             );
             for parent_ws in parent_workspaces {
                 if parent_ws == ws_id {
                     continue;
                 }
-                if let Some(sid) = self.section_of_workspace_id(parent_ws, seen) {
+                if let Some(sid) = self.section_of_workspace_id(lookup, parent_ws, seen) {
                     return Some(sid);
                 }
             }
@@ -238,7 +295,7 @@ impl App {
             Cursor::Section(id) => Some(id.clone()),
             // A nested row belongs to the section its root block is drawn in.
             Cursor::Workspace(wi) | Cursor::Session(wi, _) => {
-                let root = self.task_tree().block_root.get(wi).copied().unwrap_or(*wi);
+                let root = self.task_tree_shared().block_root.get(wi).copied().unwrap_or(*wi);
                 self.section_of_workspace(root)
             }
             Cursor::Backtest(_) | Cursor::Division(_) | Cursor::Org(_) => None,
@@ -349,27 +406,24 @@ impl App {
     /// Visible member workspaces of a section, for the folded header's
     /// rollup and the A-i peek.
     pub(crate) fn section_members(&self, id: &str) -> Vec<usize> {
-        self.section_members_in(id, &self.task_tree().block_root)
+        self.section_members_in(id, &self.task_tree_shared())
     }
 
-    /// `section_members` against an already-built tree's block roots: a
-    /// nested block belongs to its root block's section.
-    pub(crate) fn section_members_in(&self, id: &str, roots: &HashMap<usize, usize>) -> Vec<usize> {
-        let members = self.continuous_members();
-        self.task_view_visible_workspaces(&members)
-            .into_iter()
-            .filter(|wi| self.section_of_workspace(roots.get(wi).copied().unwrap_or(*wi)).as_deref() == Some(id))
-            .collect()
+    /// `section_members` from an already-built tree, which resolved each
+    /// visible workspace's section (a nested block's is its root
+    /// block's).
+    pub(super) fn section_members_in(&self, id: &str, tree: &super::tree::TaskTree) -> Vec<usize> {
+        tree.section_members.get(id).cloned().unwrap_or_default()
     }
 
     /// `(workspaces, running, idle)` counts for a section's folded header.
     pub(crate) fn section_rollup(&self, id: &str) -> (usize, usize, usize) {
-        self.section_rollup_in(id, &self.task_tree().block_root)
+        self.section_rollup_in(id, &self.task_tree_shared())
     }
 
     /// `section_rollup` against an already-built tree (one per frame).
-    pub(crate) fn section_rollup_in(&self, id: &str, roots: &HashMap<usize, usize>) -> (usize, usize, usize) {
-        let members = self.section_members_in(id, roots);
+    pub(super) fn section_rollup_in(&self, id: &str, tree: &super::tree::TaskTree) -> (usize, usize, usize) {
+        let members = self.section_members_in(id, tree);
         let (_, running, idle, _) = self.rollup(members.iter().flat_map(|wi| &self.workspaces[*wi].sessions));
         (members.len(), running, idle)
     }

@@ -1913,6 +1913,10 @@ impl App {
         let mut items: Vec<ListItem> = Vec::new();
         // A nested block renders inside its root block's section.
         let block_root = |wi: usize| tree.as_ref().and_then(|t| t.block_root.get(&wi).copied()).unwrap_or(wi);
+        // The section a workspace's rows draw in (its root block's): the
+        // tree resolved them once per build, so a frame only looks them up.
+        let section_of =
+            |wi: usize| tree.as_ref().and_then(|t| t.section_of.get(&wi)).map(String::as_str);
         // Workspaces rendered inside a section get one extra leading space
         // on every row (header, sessions, workflow headers) so the
         // grouping reads at a glance. Resolved once per
@@ -1920,14 +1924,24 @@ impl App {
         // rendering).
         let in_section: HashSet<usize> = if self.sections.is_empty() {
             HashSet::new()
-        } else {
+        } else if tree.is_some() {
             visual
                 .iter()
                 .filter_map(|vi| match vi {
                     VisualItem::WorkspaceHeader(wi) => Some(*wi),
                     _ => None,
                 })
-                .filter(|wi| self.section_of_workspace(block_root(*wi)).is_some())
+                .filter(|wi| section_of(*wi).is_some())
+                .collect()
+        } else {
+            let lookup = self.section_lookup();
+            visual
+                .iter()
+                .filter_map(|vi| match vi {
+                    VisualItem::WorkspaceHeader(wi) => Some(*wi),
+                    _ => None,
+                })
+                .filter(|wi| self.section_of_workspace_in(&lookup, block_root(*wi)).is_some())
                 .collect()
         };
         let indent = |wi: usize| -> &'static str {
@@ -1984,7 +1998,8 @@ impl App {
             ])
         };
 
-        let section_backgrounds = self.sidebar_section_backgrounds(&visual, &block_root);
+        let initiative_markers = self.planning.initiative_markers();
+        let section_backgrounds = self.sidebar_section_backgrounds(&visual, &section_of);
         for (vi, background) in visual.iter().zip(section_backgrounds) {
             let first_item = items.len();
             match vi {
@@ -2028,7 +2043,7 @@ impl App {
                     let owner = root_task.as_deref().and_then(|t| owner_mark(t));
                     let initiative_marker = root_task
                         .as_deref()
-                        .map_or("", |t| self.planning.task_initiative_marker(t));
+                        .map_or("", |t| initiative_markers.get(t).copied().unwrap_or(""));
                     let max_name = (inner.width as usize)
                         .saturating_sub(2)
                         .saturating_sub(host_tag.chars().count())
@@ -2415,7 +2430,7 @@ impl App {
                         continue;
                     };
                     let (n, running, idle) = match &tree {
-                        Some(t) => self.section_rollup_in(id, &t.block_root),
+                        Some(t) => self.section_rollup_in(id, t),
                         None => self.section_rollup(id),
                     };
                     let glyph = if sec.folded { "\u{25b8}" } else { "\u{25be}" };
@@ -2596,21 +2611,22 @@ impl App {
             return;
         }
 
-        let running = self
-            .tasks
-            .iter()
-            .filter(|t| matches!(self.task_status(t), TaskStatus::Running))
-            .count();
-        let blocked = self
-            .tasks
-            .iter()
-            .filter(|t| matches!(self.task_status(t), TaskStatus::Blocked))
-            .count();
-        let backlog = self
-            .tasks
-            .iter()
-            .filter(|t| matches!(self.task_status(t), TaskStatus::Backlog))
-            .count();
+        // One pass, each task's workspace found by id (a `task_status`
+        // per task scanned every workspace, every frame).
+        let mut by_id: HashMap<&str, &Workspace> = HashMap::new();
+        for w in &self.workspaces {
+            by_id.entry(w.id.as_str()).or_insert(w);
+        }
+        let (mut running, mut blocked, mut backlog) = (0, 0, 0);
+        for t in &self.tasks {
+            let ws = t.workspace_id.as_deref().and_then(|id| by_id.get(id).copied());
+            match Self::task_status_in(t, ws) {
+                TaskStatus::Running => running += 1,
+                TaskStatus::Blocked => blocked += 1,
+                TaskStatus::Backlog => backlog += 1,
+                TaskStatus::Done => {}
+            }
+        }
 
         let conn_indicator = if self.connected { "\u{25cf}" } else { "\u{25cb}" };
         let conn_color = if self.connected {

@@ -1262,16 +1262,6 @@ impl PlanningView {
         })
     }
 
-    /// Ids of done and archived tasks, in one pass.
-    pub(crate) fn closed_task_ids(&self) -> HashSet<String> {
-        self.project_data
-            .iter()
-            .flat_map(|pd| &pd.tasks)
-            .filter(|t| matches!(t.status, PlanStatus::Done | PlanStatus::Archived))
-            .map(|t| t.id.clone())
-            .collect()
-    }
-
     /// Every task in a division, mapped to that division: one pass over the
     /// planning data, for the sidebar tree.
     pub(crate) fn divisions_by_task(&self) -> HashMap<String, Division> {
@@ -1288,6 +1278,11 @@ impl PlanningView {
                 }))
             })
             .collect()
+    }
+
+    /// Every loaded task, across projects.
+    pub(crate) fn loaded_tasks(&self) -> impl Iterator<Item = &PlanTask> {
+        self.project_data.iter().flat_map(|pd| &pd.tasks)
     }
 
     /// A division's root task (its coordinator task), if loaded.
@@ -1318,10 +1313,19 @@ impl PlanningView {
         self.task_division(&task.id)
     }
 
-    pub(crate) fn task_initiative_marker(&self, task_id: &str) -> &'static str {
-        self.project_data.iter().flat_map(|pd| &pd.tasks)
-            .find(|task| task.id == task_id)
-            .map(PlanTask::initiative_marker).unwrap_or("")
+    /// The initiative marker (◆ for a coordinator) of every loaded task that
+    /// has one, in one pass: the sidebar draws one per workspace header
+    /// each frame, and a scan of the snapshot per header was a frame-sized
+    /// cost.
+    pub(crate) fn initiative_markers(&self) -> HashMap<&str, &'static str> {
+        let mut markers = HashMap::new();
+        for task in self.project_data.iter().flat_map(|pd| &pd.tasks) {
+            let marker = task.initiative_marker();
+            if !marker.is_empty() {
+                markers.entry(task.id.as_str()).or_insert(marker);
+            }
+        }
+        markers
     }
 
     /// Backlog tasks not on a board yet, for F6's assign picker (#96):

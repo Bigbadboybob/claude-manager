@@ -83,6 +83,8 @@ mod owner_blocked;
 mod maintenance;
 mod color_grid;
 mod unread;
+#[cfg(test)]
+mod sidebar_perf_tests;
 
 pub(crate) use lifecycle::{attach_via_daemon, is_open_assistant_row, try_attach_via_daemon_with_deps};
 
@@ -1385,14 +1387,11 @@ impl App {
                 .all(|t| matches!(t.api_status, TaskStatus::Done))
     }
 
-    /// Compute effective task status: derived from the workspace's sessions
-    /// if bound, otherwise falls back to api_status.
-    fn task_status(&self, task: &TaskEntry) -> TaskStatus {
-        if let Some(ws) = task
-            .workspace_id
-            .as_deref()
-            .and_then(|id| self.workspaces.iter().find(|w| w.id == id))
-        {
+    /// Compute effective task status: derived from its workspace's sessions
+    /// when bound (`ws`, found by the caller from an index: the manifest
+    /// holds thousands of workspaces), otherwise falls back to api_status.
+    fn task_status_in(task: &TaskEntry, ws: Option<&Workspace>) -> TaskStatus {
+        if let Some(ws) = ws {
             if ws.sessions.iter().any(|s| s.status == SessionStatus::Running) {
                 return TaskStatus::Running;
             }

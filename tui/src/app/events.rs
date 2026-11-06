@@ -2800,6 +2800,15 @@ impl App {
 
         let mut seen_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // Work-list rows by task id, the first row winning as a scan would:
+        // the feed carries every task, done ones included, and a scan of
+        // the work list per feed task made each update O(feed × list).
+        let mut task_pos: HashMap<String, usize> = HashMap::new();
+        for (i, t) in self.tasks.iter().enumerate() {
+            if let Some(id) = &t.task_id {
+                task_pos.entry(id.clone()).or_insert(i);
+            }
+        }
 
         for task in &tasks {
             // Only show active tasks in the sessions view; backlog/draft/done
@@ -2810,10 +2819,8 @@ impl App {
                     // Update existing bindings before pruning. Otherwise a
                     // task that just completed retains its old Running status
                     // and pins an empty workspace until the next TUI restart.
-                    if let Some(entry) = self.tasks.iter_mut()
-                        .find(|entry| entry.task_id.as_deref() == Some(task.id.as_str()))
-                    {
-                        entry.api_status = TaskStatus::from_api(&task.status);
+                    if let Some(&i) = task_pos.get(&task.id) {
+                        self.tasks[i].api_status = TaskStatus::from_api(&task.status);
                     }
                     continue;
                 }
@@ -2852,11 +2859,8 @@ impl App {
                 });
 
             // Upsert TaskEntry.
-            if let Some(entry) = self
-                .tasks
-                .iter_mut()
-                .find(|e| e.task_id.as_deref() == Some(&task.id))
-            {
+            if let Some(&i) = task_pos.get(&task.id) {
+                let entry = &mut self.tasks[i];
                 entry.name = display_name.clone();
                 entry.api_status = TaskStatus::from_api(&task.status);
                 entry.repo_url = Some(task.repo_url.clone());
@@ -2888,6 +2892,7 @@ impl App {
                     worktree_mode: parse_worktree_mode(&task.worktree_mode),
                     metadata: task.metadata.clone(),
                 });
+                task_pos.insert(task.id.clone(), self.tasks.len() - 1);
             }
 
             // Cloud backtest tasks never get a workspace: nothing local ever
@@ -2904,11 +2909,7 @@ impl App {
             // have one. Multi-task workspaces: users explicitly bind via the
             // launch-into-workspace picker, so we only auto-bind when the
             // task's own worktree (local) or VM (cloud) matches.
-            let task_idx = self
-                .tasks
-                .iter()
-                .position(|t| t.task_id.as_deref() == Some(&task.id))
-                .expect("just inserted");
+            let task_idx = task_pos[&task.id];
             if self.tasks[task_idx].workspace_id.is_some() {
                 continue;
             }
@@ -3004,16 +3005,15 @@ impl App {
         // Retain tasks: keep those still seen by the API, plus anything still
         // referenced by a workspace (in case a bound task temporarily vanished
         // from the API — unlikely but defensive).
+        let ws_ids: std::collections::HashSet<&str> =
+            self.workspaces.iter().map(|w| w.id.as_str()).collect();
         let ws_bound_task_ids: std::collections::HashSet<String> = self
-            .workspaces
+            .tasks
             .iter()
-            .flat_map(|w| {
-                self.tasks
-                    .iter()
-                    .filter(move |t| t.workspace_id.as_deref() == Some(&w.id))
-                    .filter_map(|t| t.task_id.clone())
-            })
+            .filter(|t| t.workspace_id.as_deref().is_some_and(|w| ws_ids.contains(w)))
+            .filter_map(|t| t.task_id.clone())
             .collect();
+        drop(ws_ids);
         self.tasks.retain(|t| {
             if t.api_status == TaskStatus::Done {
                 return false;
@@ -3084,43 +3084,40 @@ impl App {
                 TaskStatus::Done => 3,
             }
         };
-        let workspace_rank: Vec<(String, u8)> = self
-            .workspaces
-            .iter()
-            .map(|w| {
-                let rank = match self.first_task_for_ws(&w.id) {
-                    Some(t) => status_rank(&self.task_status(t)),
-                    // No bound task: rank by the workspace's own session
-                    // activity, mirroring how `task_status` derives a bound
-                    // task's status. This makes a taskless workspace sort
-                    // identically to a task-bound one — an active (running)
-                    // session floats up alongside running tasks instead of
-                    // always sinking to the bottom. A sessionless taskless
-                    // workspace still ranks last (it's a fresh, empty slot).
-                    None => {
-                        if w.sessions.iter().any(|s| s.status == SessionStatus::Running) {
-                            status_rank(&TaskStatus::Running)
-                        } else if w.sessions.iter().any(|s| s.status == SessionStatus::Idle) {
-                            status_rank(&TaskStatus::Blocked)
-                        } else {
-                            4
-                        }
-                    }
-                };
-                (w.id.clone(), rank)
-            })
-            .collect();
-        let rank_of = |id: &str| -> u8 {
-            workspace_rank
-                .iter()
-                .find(|(i, _)| i == id)
-                .map(|(_, r)| *r)
-                .unwrap_or(4)
-        };
         // Pinned workspaces float to the top; status rank orders each
-        // group. Stable sort keeps ties in their previous order.
-        self.workspaces
-            .sort_by_key(|w| (!w.pinned, rank_of(&w.id)));
+        // group, and the stable sort keeps ties in their previous order.
+        // The manifest holds thousands of closed workspaces, so each key is
+        // computed once from an index: a task scan per workspace and a rank
+        // lookup per comparison made every task-feed update quadratic in
+        // them (laptop diag 2026-11-05: drain_backend_events 200-300 ms).
+        let mut first_task: HashMap<&str, &TaskEntry> = HashMap::new();
+        for t in &self.tasks {
+            if let Some(ws) = t.workspace_id.as_deref() {
+                first_task.entry(ws).or_insert(t);
+            }
+        }
+        self.workspaces.sort_by_cached_key(|w| {
+            let rank = match first_task.get(w.id.as_str()).copied() {
+                Some(t) => status_rank(&Self::task_status_in(t, Some(w))),
+                // No bound task: rank by the workspace's own session
+                // activity, mirroring how `task_status` derives a bound
+                // task's status. This makes a taskless workspace sort
+                // identically to a task-bound one — an active (running)
+                // session floats up alongside running tasks instead of
+                // always sinking to the bottom. A sessionless taskless
+                // workspace still ranks last (it's a fresh, empty slot).
+                None => {
+                    if w.sessions.iter().any(|s| s.status == SessionStatus::Running) {
+                        status_rank(&TaskStatus::Running)
+                    } else if w.sessions.iter().any(|s| s.status == SessionStatus::Idle) {
+                        status_rank(&TaskStatus::Blocked)
+                    } else {
+                        4
+                    }
+                }
+            };
+            (!w.pinned, rank)
+        });
 
         // Restore cursor by workspace id.
         if let Some(ref id) = saved_ws_id {

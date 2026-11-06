@@ -686,7 +686,8 @@ impl App {
             return;
         }
         if let Cursor::Division(key) = &self.cursor {
-            let items = self.task_tree().items;
+            let tree = self.task_tree_shared();
+            let items = &tree.items;
             if !items.iter().any(|vi| matches!(vi, VisualItem::DivisionHeader(d) if d == key)) {
                 // The same division's header in another section, else the
                 // first workspace.
@@ -961,7 +962,7 @@ impl App {
     /// follows. Past workspaces are hidden — reachable via the A-O picker.
     /// Task sub-view rows: the nested work tree (`app/tree.rs`).
     pub(super) fn visual_items_task(&self) -> Vec<VisualItem> {
-        self.task_tree().items
+        self.task_tree_shared().items.clone()
     }
 
     /// `parent_task_id` of any task in the last planning snapshot, whatever
@@ -1580,7 +1581,7 @@ impl App {
         // Folded sessions count: an alert inside a fold must still be
         // reachable (the jump unfolds it).
         let main = if self.tree_view() {
-            self.filter_visual_items(self.task_tree_unfolded().items)
+            self.filter_visual_items(self.task_tree_unfolded().items.clone())
         } else if self.sidebar_view == SidebarView::Team {
             self.filter_visual_items(self.visual_items_team_unfolded())
         } else {

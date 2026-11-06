@@ -11,6 +11,8 @@ fn receipt_key(host: &HostId, workspace: &str) -> String {
 }
 impl App {
     pub(crate) fn sidebar_publications(&self) -> HashMap<HostId, Publication> {
+        // Every manifest save publishes: index once, not per workspace.
+        let lookup = self.section_lookup();
         self.hosts
             .hosts
             .iter()
@@ -31,7 +33,7 @@ impl App {
                                     .map(|s| s.uid.clone())
                                     .collect(),
                                 choice: self.workspace_sections.get(&w.id).cloned(),
-                                effective_section_id: self.section_of_workspace(wi),
+                                effective_section_id: self.section_of_workspace_in(&lookup, wi),
                                 receipt: self
                                     .sidebar_receipts
                                     .get(&receipt_key(&h.id, &w.id))
