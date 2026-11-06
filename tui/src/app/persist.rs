@@ -183,7 +183,10 @@ impl App {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let saved = serde_json::to_vec_pretty(&manifest)
+        // Compact (#109): every reader is a JSON parser, and pretty-printing
+        // added ~25% to the bytes serialized and fsynced on the main thread
+        // at every save.
+        let saved = serde_json::to_vec(&manifest)
             .map_err(std::io::Error::other)
             .and_then(|bytes| Self::atomic_write_manifest(&path, &bytes));
         if let Err(e) = saved {
