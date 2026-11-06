@@ -182,17 +182,30 @@ impl App {
         // binding arrives; its retained task_id is still a valid membership
         // edge.
         let workspace = self.workspaces.iter().find(|w| w.id == ws_id);
-        for task in self.tasks.iter().filter(|t| {
+        let mut parent_ids: Vec<String> = self.tasks.iter().filter(|t| {
             t.workspace_id.as_deref() == Some(ws_id)
                 || t.task_id.as_deref().is_some_and(|tid| {
                     workspace.is_some_and(|w| {
                         w.sessions.iter().any(|s| s.task_id.as_deref() == Some(tid))
                     })
                 })
-        }) {
-            let Some(parent_id) = inherited_parent_task(task) else {
+        }).filter_map(inherited_parent_task).collect();
+        // `self.tasks` drops terminal tasks. A live session bound to a done
+        // task (a long-lived lead, e.g. F-Lead on "F-Plan-Lead") inherits
+        // through the planning snapshot's parent edge instead, so its block
+        // keeps its section after a viewer restart.
+        let session_tasks = workspace.into_iter().flat_map(|w| &w.sessions).filter_map(|s| s.task_id.as_deref());
+        for tid in session_tasks {
+            if self.tasks.iter().any(|t| t.task_id.as_deref() == Some(tid)) {
                 continue;
-            };
+            }
+            if let Some(Some(parent)) = self.planning_task_parent(tid) {
+                if !parent_ids.contains(&parent) {
+                    parent_ids.push(parent);
+                }
+            }
+        }
+        for parent_id in parent_ids {
             let bound_parent = self
                 .tasks
                 .iter()
@@ -695,6 +708,27 @@ pub(crate) mod layout_tests {
         assert_eq!(app.section_of_workspace(1).as_deref(), Some("s1"));
         app.workspace_sections.insert("b".into(), SECTION_NONE.into());
         assert_eq!(app.section_of_workspace(1), None);
+    }
+
+    /// Laptop diag 2026-11-05: F-Lead (its own host, no explicit section)
+    /// runs on its done task, which `self.tasks` drops, so after a viewer
+    /// restart its block lost the section it inherits through that task's
+    /// parent. The planning snapshot's parent edge carries it.
+    #[test]
+    fn a_live_session_on_a_done_task_inherits_through_its_planning_parent() {
+        let mut app = sectioned_app();
+        let mut f = bare_ws("f");
+        f.host_id = cm_daemon::host_id::HostId::new("f");
+        app.workspaces.push(f);
+        add_task_session(&mut app, 4, "t-done");
+        assert_eq!(app.section_of_workspace(4), None, "no parent edge known yet");
+        // The full planning snapshot (done tasks included) names tb as the
+        // parent; b inherits s1 through ta.
+        app.sidebar_task_parents.insert("t-done".into(), Some("tb".into()));
+        assert_eq!(app.section_of_workspace(4).as_deref(), Some("s1"));
+        assert_eq!(layout(&app), ["#s1", "a", "b", "c", "f", "d"]);
+        app.workspace_sections.insert("f".into(), SECTION_NONE.into());
+        assert_eq!(app.section_of_workspace(4), None, "an explicit choice still wins");
     }
 
     /// The Section field moved from the task subheader's form to the
