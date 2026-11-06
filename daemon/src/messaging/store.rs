@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{self, Write},
     os::unix::{
@@ -325,6 +325,64 @@ impl Person {
         }
     }
 }
+/// First-match answers over `Store::events`, kept in step with appends.
+#[derive(Default)]
+struct EventLookups {
+    /// `data.conversation_create.id` -> index of the first event creating it.
+    conversation_creations: HashMap<String, usize>,
+    /// Channel ID -> (position of the first `data.channels` listing it,
+    /// whether any listing marked it archived).
+    channel_listings: HashMap<String, (u64, bool)>,
+    /// `channel.update` (channel ID, revision) -> index of the first such event.
+    channel_revisions: HashMap<(String, String), usize>,
+    /// Identity revisions published by `identity.update` or claimed by any
+    /// event: (participant_id, revision_id, JSON text of name).
+    identities: HashSet<(String, String, String)>,
+    /// (host ID, enrollment revision) of every active `host.update`.
+    host_enrollments: HashSet<(String, String)>,
+}
+impl EventLookups {
+    fn observe(&mut self, e: &Value, position: u64, index: usize) {
+        if let Some(id) = e["data"]["conversation_create"]["id"].as_str() {
+            self.conversation_creations.entry(id.to_owned()).or_insert(index);
+        }
+        for c in e["data"]["channels"].as_array().into_iter().flatten() {
+            if let Some(id) = c["id"].as_str() {
+                let entry = self
+                    .channel_listings
+                    .entry(id.to_owned())
+                    .or_insert((position, false));
+                entry.1 |= c["archived"] == true;
+            }
+        }
+        let channel = &e["data"]["channel"];
+        if e["type"] == "channel.update" {
+            if let (Some(id), Some(rev)) = (channel["id"].as_str(), channel["revision"].as_str()) {
+                self.channel_revisions
+                    .entry((id.to_owned(), rev.to_owned()))
+                    .or_insert(index);
+            }
+        }
+        let n = if e["type"] == "identity.update" {
+            &e["data"]["identity"]
+        } else {
+            &e["data"]["identity_claim"]
+        };
+        if let (Some(id), Some(rev)) = (n["participant_id"].as_str(), n["revision_id"].as_str()) {
+            self.identities
+                .insert((id.to_owned(), rev.to_owned(), n["name"].to_string()));
+        }
+        let data = &e["data"];
+        if e["type"] == "host.update" && data["active"] == true {
+            if let (Some(host), Some(rev)) =
+                (data["host_id"].as_str(), data["enrollment_revision"].as_str())
+            {
+                self.host_enrollments.insert((host.to_owned(), rev.to_owned()));
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Published {
     event: Value,
@@ -354,6 +412,11 @@ pub struct Store {
     events: Vec<Published>,
     /// Event ID -> index into `events` (append-only, so indices are stable).
     event_index: HashMap<String, usize>,
+    /// Lookups the hub's per-peer sync loop and replica-ingest validation
+    /// used to answer by scanning every retained event under the store slot
+    /// (~22 ms per uploaded message on cm-manager at 243k events, growing
+    /// with history). Maintained only by `push_published`.
+    lookups: EventLookups,
     /// Replica ingest page in progress: journal records wait here until the
     /// page's event files and directories are durable (see `ingest_replica_page`).
     ingest_batch: Option<replication::IngestBatch>,
@@ -451,6 +514,7 @@ impl Store {
             _lock: lock,
             events: Vec::new(),
             event_index: HashMap::new(),
+            lookups: EventLookups::default(),
             ingest_batch: None,
             compactor: None,
             channels: BTreeMap::new(),
@@ -736,6 +800,8 @@ impl Store {
     }
     fn push_published(&mut self, published: Published) {
         self.index_read_model(&published, self.events.len());
+        self.lookups
+            .observe(&published.event, published.position, self.events.len());
         self.event_index
             .insert(strv(&published.event, "id").to_owned(), self.events.len());
         self.events.push(published);

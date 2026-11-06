@@ -1279,16 +1279,11 @@ impl Store {
             if identity != self.owner_identity_revision {
                 return Err(err("invalid_metadata", "Unknown Owner identity revision"));
             }
-        } else if !self.events.iter().any(|p| {
-            let n = if p.event["type"] == "identity.update" {
-                &p.event["data"]["identity"]
-            } else {
-                &p.event["data"]["identity_claim"]
-            };
-            n["participant_id"] == actor
-                && n["revision_id"] == identity
-                && n["name"] == e["actor"]["name"]
-        }) {
+        } else if !self.lookups.identities.contains(&(
+            actor.clone(),
+            identity.clone(),
+            e["actor"]["name"].to_string(),
+        )) {
             return Err(err("invalid_metadata", "Unknown sender identity revision"));
         }
         let enrollment = required(&e["data"]["metadata_seen"], "enrollment")?;
@@ -1298,12 +1293,11 @@ impl Store {
                 "An earlier host enrollment cannot submit new operations",
             ));
         }
-        if !self.events.iter().any(|p| {
-            p.event["type"] == "host.update"
-                && p.event["data"]["host_id"] == host
-                && p.event["data"]["enrollment_revision"] == enrollment
-                && p.event["data"]["active"] == true
-        }) {
+        if !self
+            .lookups
+            .host_enrollments
+            .contains(&(host.to_owned(), enrollment.clone()))
+        {
             return Err(err("invalid_metadata", "Unknown host enrollment revision"));
         }
         let tags: Vec<String> = serde_json::from_value(e["data"]["tags"].clone())?;
@@ -1328,31 +1322,26 @@ impl Store {
                 return Err(err("invalid_metadata", "Invalid immutable DM revision"));
             }
         } else if conversation_revision != conv
-            && !self.events.iter().any(|p| {
-                p.event["type"] == "channel.update"
-                    && p.event["data"]["channel"]["id"] == conv
-                    && p.event["data"]["channel"]["revision"] == conversation_revision
-            })
+            && !self
+                .lookups
+                .channel_revisions
+                .contains_key(&(conv.clone(), conversation_revision.clone()))
         {
             return Err(err("invalid_metadata", "Unknown channel revision"));
         }
         let mut stale_archive = false;
         if let Some((path, cid)) = self.channels.iter().find(|(_, cid)| *cid == &conv) {
             let observed = self
-                .events
-                .iter()
-                .find(|p| {
-                    p.event["type"] == "channel.update"
-                        && p.event["data"]["channel"]["id"] == conv
-                        && p.event["data"]["channel"]["revision"] == conversation_revision
-                })
-                .map(|p| &p.event["data"]["channel"]);
+                .lookups
+                .channel_revisions
+                .get(&(conv.clone(), conversation_revision.clone()))
+                .map(|&i| &self.events[i].event["data"]["channel"]);
             let created_archived = conversation_revision == conv
-                && self.events.iter().any(|p| {
-                    p.event["data"]["channels"]
-                        .as_array()
-                        .is_some_and(|a| a.iter().any(|c| c["id"] == conv && c["archived"] == true))
-                });
+                && self
+                    .lookups
+                    .channel_listings
+                    .get(&conv)
+                    .is_some_and(|(_, archived)| *archived);
             if created_archived || observed.is_some_and(|c| c["archived"] == true) {
                 return Err(err(
                     "conversation_archived",
@@ -1596,11 +1585,7 @@ impl Store {
         let mut visited = BTreeSet::new();
         let mut bytes = 0;
         let mut scanned = after;
-        for p in self
-            .events
-            .iter()
-            .filter(|p| p.position > after && p.position <= through)
-        {
+        for p in self.events_between(after, through) {
             let e = &p.event;
             let conv = strv(e, "conversation_id");
             if e["type"] == "message.create"
@@ -1609,15 +1594,15 @@ impl Store {
                     || mention_recipients(e).iter().any(|m| owns(m)))
             {
                 let creation = self
-                    .events
-                    .iter()
-                    .find(|v| v.event["data"]["conversation_create"]["id"] == conv);
-                let channel_known = self.events.iter().any(|v| {
-                    v.position <= covered
-                        && v.event["data"]["channels"]
-                            .as_array()
-                            .is_some_and(|cs| cs.iter().any(|c| c["id"] == conv))
-                });
+                    .lookups
+                    .conversation_creations
+                    .get(conv)
+                    .map(|&i| &self.events[i]);
+                let channel_known = self
+                    .lookups
+                    .channel_listings
+                    .get(conv)
+                    .is_some_and(|(first, _)| *first <= covered);
                 if !channel_known && creation.is_none() {
                     scanned = p.position;
                     continue;
@@ -1626,11 +1611,11 @@ impl Store {
                 if let Some(c) = creation.filter(|v| v.position > covered) {
                     ids.push(required(&c.event, "id")?);
                 }
-                ids.extend(self.dependency_ids(e)?.into_iter().filter(|id| {
-                    self.events
-                        .iter()
-                        .any(|v| v.event["id"] == *id && v.position > covered)
-                }));
+                ids.extend(
+                    self.dependency_ids(e)?
+                        .into_iter()
+                        .filter(|id| self.published(id).is_some_and(|v| v.position > covered)),
+                );
                 ids.push(required(e, "id")?);
                 let mut extra = Vec::new();
                 let mut extra_ids = BTreeSet::new();
@@ -1757,11 +1742,7 @@ impl Store {
         let mut bytes = 0;
         let mut cursor = after;
         let mut visited = BTreeSet::new();
-        for p in self
-            .events
-            .iter()
-            .filter(|p| p.position > after && p.position <= through)
-        {
+        for p in self.events_between(after, through) {
             if eligible(p) {
                 let mut ids = self.dependency_ids(&p.event)?;
                 ids.push(required(&p.event, "id")?);
@@ -1854,6 +1835,75 @@ mod tests {
         };
         catch_up(&mut pair);
         pair
+    }
+    /// The indexed answers equal the full scans they replaced, for every key
+    /// the history mentions plus misses, across DMs, channel updates and an
+    /// archive, identity claims and host enrollments.
+    #[test]
+    fn event_lookups_match_full_scans() {
+        let mut p = pair();
+        let host = p.replica.daemon_id.clone();
+        let actor = p.people[0].id.clone();
+        p.hub.coordinate(&host, &actor, "messaging.send", &json!({"dm":"owner","body":"DM","request_id":"dm-1"})).unwrap();
+        p.hub.coordinate(&host, &actor, "messaging.send", &json!({"dm":["owner",p.people[1].id],"body":"Group","request_id":"dm-2"})).unwrap();
+        p.hub.create_channel("owner", &json!({"path":"work/a","request_id":"c-a"})).unwrap();
+        p.hub.create_channel("owner", &json!({"path":"work/old","archived":true,"request_id":"c-old"})).unwrap();
+        let id = p.hub.channels["general"].clone();
+        let rev = p.hub.channel_info("general", &id)["revision"].clone();
+        p.hub.channel_action("owner",&json!({"action":"update","path":"general","archived":true,"expected_revision":rev,"request_id":"archive"}),&p.people).unwrap();
+        let s = &p.hub;
+        let mut convs: BTreeSet<String> = s.events.iter().map(|v| strv(&v.event, "conversation_id").to_owned()).collect();
+        convs.extend(s.channels.values().cloned());
+        convs.insert("missing".into());
+        for conv in &convs {
+            let scan = s.events.iter().position(|v| v.event["data"]["conversation_create"]["id"] == conv.as_str());
+            assert_eq!(s.lookups.conversation_creations.get(conv).copied(), scan, "{conv}");
+            for covered in [0, s.position / 2, s.position] {
+                let scan = s.events.iter().any(|v| v.position <= covered && v.event["data"]["channels"].as_array().is_some_and(|cs| cs.iter().any(|c| c["id"] == conv.as_str())));
+                assert_eq!(s.lookups.channel_listings.get(conv).is_some_and(|(f, _)| *f <= covered), scan);
+            }
+            let scan = s.events.iter().any(|v| v.event["data"]["channels"].as_array().is_some_and(|a| a.iter().any(|c| c["id"] == conv.as_str() && c["archived"] == true)));
+            assert_eq!(s.lookups.channel_listings.get(conv).is_some_and(|(_, a)| *a), scan, "{conv}");
+            let mut revs: BTreeSet<String> = s.events.iter().filter_map(|v| v.event["data"]["channel"]["revision"].as_str().map(str::to_owned)).collect();
+            revs.insert(conv.clone());
+            for rev in revs {
+                let scan = s.events.iter().position(|v| v.event["type"] == "channel.update" && v.event["data"]["channel"]["id"] == conv.as_str() && v.event["data"]["channel"]["revision"] == rev.as_str());
+                assert_eq!(s.lookups.channel_revisions.get(&(conv.clone(), rev.clone())).copied(), scan);
+            }
+        }
+        assert!(s.lookups.channel_listings.values().any(|(_, a)| *a), "the archived creation was indexed");
+        assert!(
+            s.lookups.channel_revisions.values().any(|&i| s.events[i].event["data"]["channel"]["archived"] == true),
+            "the archive's revision was indexed"
+        );
+        let mut claims = Vec::new();
+        for v in &s.events {
+            for n in [&v.event["data"]["identity"], &v.event["data"]["identity_claim"]] {
+                claims.push((strv(n, "participant_id").to_owned(), strv(n, "revision_id").to_owned(), n["name"].clone()));
+            }
+            claims.push((strv(&v.event["actor"], "id").to_owned(), "nope".into(), v.event["actor"]["name"].clone()));
+        }
+        for (actor, rev, name) in claims {
+            let scan = s.events.iter().any(|p| {
+                let n = if p.event["type"] == "identity.update" { &p.event["data"]["identity"] } else { &p.event["data"]["identity_claim"] };
+                n["participant_id"] == actor.as_str() && n["revision_id"] == rev.as_str() && n["name"] == name
+            });
+            assert_eq!(s.lookups.identities.contains(&(actor.clone(), rev.clone(), name.to_string())), scan, "{actor} {rev} {name}");
+        }
+        let mut enrollments: BTreeSet<(String, String)> = s.events.iter().map(|v| (strv(&v.event["data"], "host_id").to_owned(), strv(&v.event["data"], "enrollment_revision").to_owned())).collect();
+        enrollments.insert((host.clone(), "stale".into()));
+        for (h, rev) in enrollments {
+            let scan = s.events.iter().any(|p| p.event["type"] == "host.update" && p.event["data"]["host_id"] == h.as_str() && p.event["data"]["enrollment_revision"] == rev.as_str() && p.event["data"]["active"] == true);
+            assert_eq!(s.lookups.host_enrollments.contains(&(h.clone(), rev.clone())), scan);
+        }
+        assert!(s.lookups.host_enrollments.iter().any(|(h, _)| *h == host));
+        // A reopened store rebuilds the same lookups from the journal.
+        let root = s.root.parent().unwrap().parent().unwrap().to_path_buf();
+        let (creations, listings) = (s.lookups.conversation_creations.clone(), s.lookups.channel_listings.clone());
+        drop(p.hub);
+        let hub = Store::open(&root).unwrap();
+        assert_eq!(hub.lookups.conversation_creations, creations);
+        assert_eq!(hub.lookups.channel_listings, listings);
     }
     fn catch_up(pair: &mut Pair) {
         let mut after = 0;
@@ -2603,10 +2653,10 @@ impl Store {
         let mut requested = requested.clone();
         for selector in requested.clone() {
             if let Some(event) = selector.strip_prefix("thread:") {
+                // Indexed, as on the replica side: this runs on every
+                // per-peer push-loop pass under the store slot.
                 if let Some(conv) = self
-                    .events
-                    .iter()
-                    .find(|e| e.event["id"] == event)
+                    .published(event)
                     .and_then(|e| e.event["conversation_id"].as_str())
                 {
                     requested.insert(conv.into());
