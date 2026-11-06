@@ -463,6 +463,7 @@ impl WorkflowPoller {
         self.shutdown.store(true, Ordering::SeqCst);
         let handle = self.handle.lock().unwrap().take();
         if let Some(h) = handle {
+            h.thread().unpark();
             // Ignore join errors — a panicked poll iteration would
             // have already been caught by `catch_unwind` inside the
             // loop, so a panic at the join boundary would be a bug
@@ -1359,26 +1360,30 @@ impl WorkflowPoller {
             let target = Duration::from_micros(tick_micros);
             let elapsed = tick_start.elapsed();
             if elapsed < target {
-                let remaining = target - elapsed;
-                // Sleep in small chunks so shutdown latency is
-                // bounded by ~MIN_TICK_INTERVAL_MICROS rather than
-                // the full tick. This matters for the
-                // `shutdown_latency_bounded` test under a 250ms
-                // production interval — a single `sleep(target)`
-                // would otherwise make T5 require a faster tick to
-                // pass.
-                let chunk = Duration::from_micros(MIN_TICK_INTERVAL_MICROS);
-                let mut left = remaining;
-                while left > Duration::ZERO {
-                    if self.shutdown.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    let sleep_for = if left < chunk { left } else { chunk };
-                    std::thread::sleep(sleep_for);
-                    left = left.saturating_sub(sleep_for);
+                // Park for the rest of the tick; `shutdown` unparks this
+                // thread, so shutdown latency stays short without waking
+                // every millisecond (the old 1ms sleep chunks cost ~1000
+                // wakeups/s, about 1% of a core on an idle host).
+                if park_until_shutdown(&self.shutdown, tick_start + target) {
+                    return;
                 }
             }
         }
+    }
+}
+
+/// Park the loop thread until `deadline`, returning early (true) once
+/// `shutdown` is set. Spurious wakeups re-check the flag and park again.
+pub(crate) fn park_until_shutdown(shutdown: &AtomicBool, deadline: Instant) -> bool {
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::park_timeout(deadline - now);
     }
 }
 
@@ -2064,11 +2069,39 @@ mod tests {
         let elapsed = t0.elapsed();
         assert!(
             elapsed < Duration::from_millis(200),
-            "shutdown took {:?} — flag should be checked at sleep-chunk granularity \
-             (~1ms), not full tick boundary; if this regresses, the run_loop's \
-             chunked-sleep got removed",
+            "shutdown took {:?} — shutdown must unpark the loop thread rather \
+             than wait out the tick",
             elapsed,
         );
+    }
+
+    /// The loop parks for the whole tick instead of waking every millisecond,
+    /// so shutdown must unpark it: with a long tick, a missing unpark would
+    /// hold `shutdown` for the full interval.
+    #[test]
+    fn shutdown_unparks_a_long_tick() {
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        let poller = Arc::new(WorkflowPoller::new(state));
+        poller.set_tick_interval_for_test(30_000_000); // 30s
+        poller.start().expect("spawn poller thread under test load");
+        std::thread::sleep(Duration::from_millis(100)); // let it park
+        let t0 = Instant::now();
+        poller.shutdown();
+        assert!(t0.elapsed() < Duration::from_secs(2), "shutdown took {:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn park_until_shutdown_waits_out_the_deadline_or_the_flag() {
+        let flag = AtomicBool::new(false);
+        let t0 = Instant::now();
+        assert!(!park_until_shutdown(&flag, t0 + Duration::from_millis(30)));
+        assert!(t0.elapsed() >= Duration::from_millis(30));
+        std::thread::current().unpark(); // a stray token is not a deadline
+        let t1 = Instant::now();
+        assert!(!park_until_shutdown(&flag, t1 + Duration::from_millis(30)));
+        assert!(t1.elapsed() >= Duration::from_millis(30));
+        flag.store(true, Ordering::SeqCst);
+        assert!(park_until_shutdown(&flag, Instant::now() + Duration::from_secs(30)));
     }
 
     /// T4 part A: `panic_payload_to_string` recovers the message

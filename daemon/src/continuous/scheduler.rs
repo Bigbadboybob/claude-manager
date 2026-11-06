@@ -392,6 +392,7 @@ impl ContinuousScheduler {
         self.shutdown.store(true, Ordering::SeqCst);
         let handle = self.handle.lock().unwrap().take();
         if let Some(h) = handle {
+            h.thread().unpark();
             // Ignore join errors — a panicked tick was already caught by
             // `catch_unwind` inside the loop, so a panic at the join boundary
             // would be a bug to surface but not abort shutdown over.
@@ -2562,25 +2563,15 @@ impl ContinuousScheduler {
                 *rec = Some(PanicRecord { message: msg, count });
             }
 
-            // Sleep the remainder of the tick interval in small chunks so
-            // shutdown latency is bounded by ~MIN_TICK_INTERVAL_MICROS rather
-            // than the full tick. The shutdown flag is re-checked at the top of
-            // the loop, so worst-case shutdown latency is `2 × tick_interval`.
+            // Park for the remainder of the tick interval; `shutdown` unparks
+            // this thread, so shutdown stays prompt without a wakeup every
+            // millisecond.
             let tick_micros = self.tick_micros.load(Ordering::SeqCst);
             let target = Duration::from_micros(tick_micros);
-            let elapsed = tick_start.elapsed();
-            if elapsed < target {
-                let remaining = target - elapsed;
-                let chunk = Duration::from_micros(MIN_TICK_INTERVAL_MICROS);
-                let mut left = remaining;
-                while left > Duration::ZERO {
-                    if self.shutdown.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    let sleep_for = if left < chunk { left } else { chunk };
-                    std::thread::sleep(sleep_for);
-                    left = left.saturating_sub(sleep_for);
-                }
+            if tick_start.elapsed() < target
+                && crate::workflow::poller::park_until_shutdown(&self.shutdown, tick_start + target)
+            {
+                return;
             }
         }
     }
@@ -4220,6 +4211,22 @@ mod tests {
                 "shutdown should be prompt, took {:?}",
                 t0.elapsed(),
             );
+        });
+    }
+
+    /// The loop parks for the whole tick, so `shutdown` must unpark it.
+    #[test]
+    fn shutdown_unparks_a_long_tick() {
+        let _tmp = with_temp_home(|| {
+            let sched = Arc::new(ContinuousScheduler::new(Arc::new(Mutex::new(
+                DaemonState::default(),
+            ))));
+            sched.set_tick_interval_for_test(30_000_000); // 30s
+            sched.start().expect("spawn scheduler thread under test load");
+            std::thread::sleep(Duration::from_millis(100)); // let it park
+            let t0 = Instant::now();
+            sched.shutdown();
+            assert!(t0.elapsed() < Duration::from_secs(2), "shutdown took {:?}", t0.elapsed());
         });
     }
 
