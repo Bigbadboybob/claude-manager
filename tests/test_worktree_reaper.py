@@ -210,6 +210,18 @@ class WorktreeReaperTests(unittest.TestCase):
         self.assertTrue(decide(8).eligible, "dead 8 days: normal rules")
         self.assertTrue(decide(2, org_key=False).eligible, "a member-less exit changes nothing")
 
+    def test_viewer_workspace_archive_still_protects_its_checkout(self) -> None:
+        # #109: the TUI moves long-closed workspaces from tui-sessions.json to
+        # tui-workspace-archive.jsonl. Their tombstones must still bind tasks.
+        archive = self.base / "tui-workspace-archive.jsonl"
+        ws = {"id": "ws-arch", "worktree_path": str(self.worktree), "is_closed": True,
+              "tombstones": [{"uid": "u", "task_id": "task-live", "continuous_task_id": "ct"}]}
+        archive.write_text("{broken\n" + reaper.json.dumps({"v": 1, "archived_at": 1.0, "workspace": ws}) + "\n")
+        facts = reaper.load_workspace_facts([archive])[self.worktree.resolve()]
+        self.assertIn("task-live", facts.task_ids)
+        self.assertTrue(facts.continuous)
+        self.assertIn("ws-arch", facts.workspace_ids)
+
     def test_nonterminal_and_young_unowned_worktrees_fail_closed(self) -> None:
         running = reaper.decision(self.worktree, self.context(status="running"))
         self.assertFalse(running.eligible)

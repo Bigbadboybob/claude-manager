@@ -381,6 +381,27 @@ def iter_manifest_workspaces(data: dict[str, Any]) -> Iterable[dict[str, Any]]:
         yield from (value for value in raw if isinstance(value, dict))
 
 
+def read_manifest_document(path: Path) -> Any:
+    """One manifest as a dict. The viewer's closed-workspace archive
+    (`tui-workspace-archive.jsonl`, one `{"workspace": {...}}` per line) reads
+    as a manifest whose workspaces are its records, so an archived workspace
+    keeps protecting its checkout exactly as it did in tui-sessions.json.
+    Unreadable archive lines are skipped."""
+    text = path.read_text()
+    if path.suffix != ".jsonl":
+        return json.loads(text)
+    workspaces: dict[str, Any] = {}
+    for line in text.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        workspace = record.get("workspace") if isinstance(record, dict) else None
+        if isinstance(workspace, dict) and isinstance(workspace.get("id"), str):
+            workspaces[workspace["id"]] = workspace
+    return {"workspaces": workspaces}
+
+
 def load_workspace_facts(manifest_paths: Iterable[Path]) -> dict[Path, WorkspaceFacts]:
     facts: dict[Path, WorkspaceFacts] = defaultdict(WorkspaceFacts)
     # Daemon exits (`recently_exited`: daemon-tombstones.json, and older
@@ -390,7 +411,7 @@ def load_workspace_facts(manifest_paths: Iterable[Path]) -> dict[Path, Workspace
     path_of: dict[str, Path] = {}
     for manifest_path in manifest_paths:
         try:
-            data = json.loads(manifest_path.read_text())
+            data = read_manifest_document(manifest_path)
         except (OSError, json.JSONDecodeError):
             continue
         if isinstance(data, dict) and isinstance(data.get("recently_exited"), list):
@@ -1409,7 +1430,8 @@ def build_context(args: argparse.Namespace) -> tuple[ScanContext, list[str]]:
     root = args.root.expanduser().resolve(strict=False)
     cm_home = args.cm_home.expanduser().resolve(strict=False)
     manifests = tuple(args.manifest or [cm_home / "daemon-sessions.json", cm_home / "tui-sessions.json",
-                                        cm_home / "daemon-tombstones.json"])
+                                        cm_home / "daemon-tombstones.json",
+                                        cm_home / "tui-workspace-archive.jsonl"])
     workspace_facts = load_workspace_facts(path for path in manifests if path.is_file())
     tasks, task_ok, task_error = load_tasks(args.config.expanduser())
     live_paths, sessions_ok, session_error = load_live_paths(cm_home)
