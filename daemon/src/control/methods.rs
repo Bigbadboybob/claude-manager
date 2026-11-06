@@ -2664,9 +2664,10 @@ pub(crate) fn deliver_agent_prompt(
     session_uid: String,
     prompt: String,
     fresh_spawn: bool,
+    strict_ready: bool,
     state: Arc<Mutex<DaemonState>>,
 ) {
-    spawn_agent_prompt_delivery(handle, fanout, session_uid, prompt, fresh_spawn, Some(state));
+    spawn_agent_prompt_delivery(handle, fanout, session_uid, prompt, fresh_spawn, strict_ready, Some(state));
 }
 
 /// Attribution recorded for a kill that came in on the OPERATOR route
@@ -8206,6 +8207,12 @@ const AGENT_PROMPT_SETTLE: std::time::Duration = std::time::Duration::from_milli
 /// caps pathological cold starts.
 const AGENT_MODE_WAIT_FRESH: std::time::Duration = std::time::Duration::from_secs(25);
 
+/// A resumed Claude session may load a very large transcript after its input
+/// modes appear. Strict handoff delivery waits for real readiness for up to
+/// three minutes and refuses to type after the bound instead of losing the
+/// notice during that load.
+const AGENT_RESUME_READY_MAX: std::time::Duration = std::time::Duration::from_secs(3 * 60);
+
 /// Poll cadence for the mode-await loop.
 const AGENT_MODE_POLL: std::time::Duration = std::time::Duration::from_millis(150);
 
@@ -8797,6 +8804,7 @@ fn spawn_agent_prompt_delivery(
     session_uid: String,
     prompt: String,
     fresh_spawn: bool,
+    strict_ready: bool,
     confirm_state: Option<Arc<Mutex<DaemonState>>>,
 ) {
     let pending = match confirm_state.as_ref() {
@@ -8814,7 +8822,11 @@ fn spawn_agent_prompt_delivery(
             #[cfg(test)]
             test_pause_queued_input(&session_uid);
             if let Some(state) = confirm_state {
-                deliver_agent_body_confirmed(&state, &handle, &fanout, &session_uid, &prompt, fresh_spawn, "prompt");
+                if strict_ready {
+                    deliver_agent_body_confirmed_with(&state, &handle, &fanout, &session_uid, &prompt, fresh_spawn, true, "prompt");
+                } else {
+                    deliver_agent_body_confirmed(&state, &handle, &fanout, &session_uid, &prompt, fresh_spawn, "prompt");
+                }
             } else {
                 deliver_agent_body(&handle, &fanout, &session_uid, &prompt, fresh_spawn, "prompt");
             }
@@ -9005,8 +9017,21 @@ fn deliver_agent_body_confirmed(
     fresh: bool,
     what: &str,
 ) -> bool {
+    deliver_agent_body_confirmed_with(state, handle, fanout, uid, body, fresh, false, what)
+}
+
+fn deliver_agent_body_confirmed_with(
+    state: &Arc<Mutex<DaemonState>>,
+    handle: &crate::session::InputHandle,
+    fanout: &Arc<crate::session::PtyByteFanout>,
+    uid: &str,
+    body: &str,
+    fresh: bool,
+    strict_ready: bool,
+    what: &str,
+) -> bool {
     let mut evidence = None;
-    let wrote = deliver_agent_body_guarded(handle, fanout, uid, body, fresh, what, None,
+    let wrote = deliver_agent_body_guarded_with(handle, fanout, uid, body, fresh, strict_ready, what, None,
         Some(&mut || { evidence = super::codex_delivery::DeliveryEvidence::capture(state, uid, body); }));
     if wrote {
         if let Some(mut evidence) = evidence {
@@ -9131,7 +9156,21 @@ fn deliver_agent_body_guarded(
     notice: Option<&super::continuous_drain::NoticeBinding<'_>>,
     before_write: Option<&mut dyn FnMut()>,
 ) -> bool {
-    deliver_agent_body_inner(handle, fanout, session_uid, body_text, fresh_spawn, what, notice, before_write, None)
+    deliver_agent_body_guarded_with(handle, fanout, session_uid, body_text, fresh_spawn, false, what, notice, before_write)
+}
+
+fn deliver_agent_body_guarded_with(
+    handle: &crate::session::InputHandle,
+    fanout: &std::sync::Arc<crate::session::PtyByteFanout>,
+    session_uid: &str,
+    body_text: &str,
+    fresh_spawn: bool,
+    strict_ready: bool,
+    what: &str,
+    notice: Option<&super::continuous_drain::NoticeBinding<'_>>,
+    before_write: Option<&mut dyn FnMut()>,
+) -> bool {
+    deliver_agent_body_inner_with(handle, fanout, session_uid, body_text, fresh_spawn, strict_ready, what, notice, before_write, None)
 }
 
 #[cfg(test)]
@@ -9144,6 +9183,17 @@ fn deliver_agent_body_inner(
     handle: &crate::session::InputHandle,
     fanout: &Arc<crate::session::PtyByteFanout>,
     session_uid: &str, body_text: &str, fresh_spawn: bool, what: &str,
+    notice: Option<&super::continuous_drain::NoticeBinding<'_>>,
+    before_write: Option<&mut dyn FnMut()>,
+    launch: Option<&mut super::prompt_delivery::LaunchWrite>,
+) -> bool {
+    deliver_agent_body_inner_with(handle, fanout, session_uid, body_text, fresh_spawn, false, what, notice, before_write, launch)
+}
+
+fn deliver_agent_body_inner_with(
+    handle: &crate::session::InputHandle,
+    fanout: &Arc<crate::session::PtyByteFanout>,
+    session_uid: &str, body_text: &str, fresh_spawn: bool, strict_ready: bool, what: &str,
     notice: Option<&super::continuous_drain::NoticeBinding<'_>>,
     before_write: Option<&mut dyn FnMut()>,
     mut launch: Option<&mut super::prompt_delivery::LaunchWrite>,
@@ -9181,15 +9231,31 @@ fn deliver_agent_body_inner(
             }
         }
     };
-    let wait = if fresh_spawn {
+    let started = Instant::now();
+    let deadline = started + if strict_ready {
+        AGENT_RESUME_READY_MAX
+    } else if fresh_spawn {
         AGENT_MODE_WAIT_FRESH
     } else {
         AGENT_PROMPT_SETTLE
     };
-    let started = Instant::now();
-    let deadline = started + wait;
     let mut observed = false;
+    let mut answered_model_switch = false;
     loop {
+        if strict_ready && !answered_model_switch {
+            let screen = tracker.visible_text();
+            if crate::claude_channels::model_switch_prompt(&screen) {
+                let since = Instant::now();
+                if handle.write_and_stamp(b"1").is_err() {
+                    return false;
+                }
+                if !matches!(handle.write_recovery_enter(tracker.enter_bytes(), since), Ok(true)) {
+                    return false;
+                }
+                answered_model_switch = true;
+                eprintln!("cm-daemon: agent {} for {} accepted the Claude model-switch confirmation", what, session_uid);
+            }
+        }
         if tracker.composer_ready() {
             observed = true;
             break;
@@ -9202,6 +9268,10 @@ fn deliver_agent_body_inner(
         }
     }
     let mode_wait_ms = started.elapsed().as_millis();
+    if strict_ready && !observed {
+        eprintln!("cm-daemon: agent {} for {} never reached composer readiness within {}s; prompt not typed", what, session_uid, AGENT_RESUME_READY_MAX.as_secs());
+        return false;
+    }
     // Modes on != composer ready. The agent paints its UI right after
     // enabling them, and a paste landing mid-render is dropped, so wait
     // for the PTY to go quiet before writing. Bounded, and skipped
@@ -9212,12 +9282,7 @@ fn deliver_agent_body_inner(
         let settle_started = Instant::now();
         // A fresh spawn has a whole UI to mount; a live target painted
         // long ago and only needs its current burst (if any) to finish.
-        let settle_deadline = settle_started
-            + if fresh_spawn {
-                AGENT_RENDER_SETTLE_MAX
-            } else {
-                AGENT_RENDER_QUIET * 2
-            };
+        let settle_deadline = if strict_ready { deadline } else { settle_started + if fresh_spawn { AGENT_RENDER_SETTLE_MAX } else { AGENT_RENDER_QUIET * 2 } };
         let paint_floor = bytes_seen + AGENT_PAINT_MIN_BYTES;
         loop {
             let painted = !fresh_spawn || bytes_seen >= paint_floor;
@@ -9225,6 +9290,10 @@ fn deliver_agent_body_inner(
                 break;
             }
             if Instant::now() >= settle_deadline {
+                if strict_ready {
+                    eprintln!("cm-daemon: agent {} for {} did not settle after composer readiness within {}s; prompt not typed", what, session_uid, AGENT_RESUME_READY_MAX.as_secs());
+                    return false;
+                }
                 break;
             }
             if !drain_for(&mut tracker, &mut bytes_seen, AGENT_MODE_POLL) {
@@ -14112,6 +14181,7 @@ pub fn trigger(
                     session_uid.clone(),
                     resolved_prompt.clone(),
                     true,
+                    false,
                     Some(Arc::clone(state_arc)),
                 );
             }
@@ -15266,6 +15336,7 @@ pub(crate) fn spawn_investigator(
             uid.clone(),
             prompt,
             true,
+            false,
             Some(Arc::clone(state_arc)),
         );
     }
@@ -25738,7 +25809,7 @@ while True:
             let fanout = session.fanout.clone();
             state.lock().unwrap().sessions.insert(uid.clone(), session);
             match route {
-                "fresh" => spawn_agent_prompt_delivery(handle, fanout, uid.clone(), body.clone(), true, Some(state.clone())),
+                "fresh" => spawn_agent_prompt_delivery(handle, fanout, uid.clone(), body.clone(), true, false, Some(state.clone())),
                 "persistent" => spawn_persistent_prompt_delivery(handle, fanout, uid.clone(), body.clone(), false, state.clone()),
                 _ => { send_input(&state, &json!({"session_uid":uid,"text":body,"submit":true}), None).unwrap(); }
             }

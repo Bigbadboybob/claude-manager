@@ -101,6 +101,22 @@ pub(crate) fn client_ready(screen: &str) -> bool {
     compact.contains("shift+tabtocycle") || compact.contains("?forshortcuts")
 }
 
+/// Claude's `/model` confirmation menu can appear while a large resumed
+/// transcript is still loading. It is safe for CM to choose the first option
+/// only when the complete, distinctive menu is visible; otherwise a generic
+/// prompt must never receive an unsolicited `1`.
+pub(crate) fn model_switch_prompt(screen: &str) -> bool {
+    let compact: String = screen
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    compact.contains("switchmodel?")
+        && compact.contains("nextresponsewillbeslowerandusemoretokens")
+        && compact.contains("1.yes")
+        && compact.contains("2.no")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +130,15 @@ mod tests {
         assert!(client_ready("❯ \n ⏵⏵ bypass permissions on (shift+tab to cycle)"));
         assert!(client_ready("  ? for shortcuts"));
         assert!(!client_ready(SCREEN), "the consent dialog itself is not the composer");
+    }
+
+    #[test]
+    fn model_switch_prompt_requires_the_complete_menu() {
+        assert!(model_switch_prompt(
+            "Switch model? Your next response will be slower and use more tokens…\n1. Yes, switch to Sonnet 5.5\n2. No, go back"
+        ));
+        assert!(!model_switch_prompt("Switch model? 1. Yes 2. No"));
+        assert!(!model_switch_prompt("1. Yes, switch to Sonnet 5.5 2. No, go back"));
     }
 
     #[test]

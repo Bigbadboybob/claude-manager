@@ -786,22 +786,29 @@ fn deliver_ready(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, text: String, n
 }
 
 pub(crate) fn deliver(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, text: String) -> bool {
-    deliver_with(state_arc, uid, text, true)
+    deliver_with(state_arc, uid, text, true, false)
+}
+
+/// Deliver a notice to a session resuming a large transcript. Strict mode
+/// waits for the real composer-ready signal instead of typing at the old
+/// render-wait cap, where a resume can still be loading.
+pub(crate) fn deliver_resume(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, text: String) -> bool {
+    deliver_with(state_arc, uid, text, true, true)
 }
 
 /// [`deliver`] to a session that is already running (`fresh: false`: no
 /// wait for a startup render).
 pub(crate) fn deliver_live(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, text: String) -> bool {
-    deliver_with(state_arc, uid, text, false)
+    deliver_with(state_arc, uid, text, false, false)
 }
 
-fn deliver_with(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, text: String, fresh: bool) -> bool {
+fn deliver_with(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, text: String, fresh: bool, strict_ready: bool) -> bool {
     let io = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         state.sessions.get(uid).map(|s| (s.input_handle(), s.fanout.clone()))
     };
     let Some((handle, fanout)) = io else { return false };
-    crate::control::methods::deliver_agent_prompt(handle, fanout, uid.to_string(), text, fresh, Arc::clone(state_arc));
+    crate::control::methods::deliver_agent_prompt(handle, fanout, uid.to_string(), text, fresh, strict_ready, Arc::clone(state_arc));
     true
 }
 

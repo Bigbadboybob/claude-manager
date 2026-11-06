@@ -827,9 +827,13 @@ fn idle_since(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, after: f64) -> boo
 
 /// Wait until `uid`'s (new) transcript, other than `old`, records `needle`
 /// and an assistant reply after it.
-fn confirmed(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, old: &Path, needle: &str) -> Result<(PathBuf, u64), String> {
+const CONFIRM_REDELIVER_AFTER: Duration = Duration::from_secs(60);
+
+fn confirmed(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, old: &Path, needle: &str, notice: &str) -> Result<(PathBuf, u64), String> {
     let deadline = Instant::now() + CONFIRM_DEADLINE;
+    let confirm_started = Instant::now();
     let started = now();
+    let mut redelivered = false;
     while Instant::now() < deadline {
         let (live, path) = live_transcript(state_arc, uid);
         if !live {
@@ -845,10 +849,21 @@ fn confirmed(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, old: &Path, needle:
                 let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
                 return Ok((p, len));
             }
+            if should_redeliver(confirm_started.elapsed(), redelivered, user_row_contains(&p, needle)) {
+                redelivered = true;
+                eprintln!("cm-daemon: handoff of {uid}: notice not recorded after {}s; re-delivering once", CONFIRM_REDELIVER_AFTER.as_secs());
+                if !crate::rotation::deliver_resume(state_arc, uid, notice.to_string()) {
+                    return Err("the new session vanished while re-delivering its first message".into());
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(500));
     }
     Err("the new session did not answer its first message (API error or a menu?)".into())
+}
+
+fn should_redeliver(elapsed: Duration, redelivered: bool, needle_present: bool) -> bool {
+    !redelivered && !needle_present && elapsed >= CONFIRM_REDELIVER_AFTER
 }
 
 /// The error kind, when `uid`'s agent errored after `since`.
@@ -867,6 +882,29 @@ fn replied_after(path: &Path, needle: &str) -> bool {
     text[at..].lines().skip(1).any(|l| serde_json::from_str::<Value>(l).is_ok_and(|row| assistant_text(&row).is_some()))
 }
 
+fn user_row_contains(path: &Path, needle: &str) -> bool {
+    let Some(text) = tail(path) else { return false };
+    text.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).any(|row| {
+        let content = if row["type"] == "user" {
+            row.pointer("/message/content")
+        } else if row["type"] == "response_item" && row.pointer("/payload/role").and_then(Value::as_str) == Some("user") {
+            row.pointer("/payload/content")
+        } else {
+            None
+        };
+        content_contains(content, needle)
+    })
+}
+
+fn content_contains(content: Option<&Value>, needle: &str) -> bool {
+    match content {
+        Some(Value::String(text)) => text.contains(needle),
+        Some(Value::Array(parts)) => parts.iter().any(|part| content_contains(Some(part), needle)),
+        Some(Value::Object(object)) => object.values().any(|part| content_contains(Some(part), needle)),
+        _ => false,
+    }
+}
+
 fn stop(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) -> crate::rotation::Stopped {
     crate::rotation::stop_tracked(state_arc, uid, HANDOFF_KILLER, "handoff")
 }
@@ -882,7 +920,7 @@ fn restore_old(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: &crate::rot
     }
     match crate::control::methods::restore_one_session_launch(state_arc, &snap.workspace_id, &snap.worktree, &snap.entry, None, false) {
         Ok(_) => {
-            crate::rotation::deliver(state_arc, uid, fallback_notice(why, file));
+            crate::rotation::deliver_resume(state_arc, uid, fallback_notice(why, file));
             fail(state_arc, uid, format!("{why}; resumed the original {} session", snap.entry.session_type));
         }
         Err((_, e)) => fail(state_arc, uid, format!("{why}; resuming the original also failed: {e}")),
@@ -934,14 +972,15 @@ fn run_repick(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, plan: &Plan, _req:
     };
     let marker = crate::rotation::nonce();
     update(uid, |r| r.phase = "confirming");
-    if !crate::rotation::deliver(state_arc, uid, repick_notice(&marker, &model, &effort)) {
+    let notice = repick_notice(&marker, &model, &effort);
+    if !crate::rotation::deliver_resume(state_arc, uid, notice.clone()) {
         restore_old(state_arc, uid, &snap, "the restarted session vanished before its first message", None);
         return;
     }
     // A resume keeps a Claude transcript; a Codex resume may write a new
     // rollout. Either way the notice and a reply must land.
     let needle = format!("[cm-handoff {marker}]");
-    match confirmed(state_arc, uid, Path::new(""), &needle) {
+    match confirmed(state_arc, uid, Path::new(""), &needle, &notice) {
         Ok((path, _)) => {
             let id = crate::session::transcript_id_from_path(&path.to_string_lossy());
             update(uid, |r| r.to_id = id);
@@ -1051,12 +1090,13 @@ fn confirm_takeover(
 ) {
     let marker = crate::rotation::nonce();
     update(uid, |r| r.phase = "confirming");
-    if !crate::rotation::deliver(state_arc, uid, takeover_notice(&marker, &snap.entry.label, from_who, reason, file)) {
+    let notice = takeover_notice(&marker, &snap.entry.label, from_who, reason, file);
+    if !crate::rotation::deliver_resume(state_arc, uid, notice.clone()) {
         restore_old(state_arc, uid, snap, "the new session vanished before its first message", Some(file));
         return;
     }
     let needle = format!("[cm-handoff {marker}]");
-    match confirmed(state_arc, uid, &snap.from_path, &needle) {
+    match confirmed(state_arc, uid, &snap.from_path, &needle, &notice) {
         Ok((path, bytes)) => {
             let to_id = crate::session::transcript_id_from_path(&path.to_string_lossy());
             update(uid, |r| r.to_id = to_id.clone());
@@ -1238,6 +1278,27 @@ mod tests {
         let last = json!({"type": "last-prompt", "lastPrompt": "[cm-handoff-request abcd1234] write it"});
         std::fs::write(&path, format!("{req}\n{reply}\n{last}\n")).unwrap();
         assert_eq!(extract_document(&path, "abcd1234").as_deref(), Some("# Goal\nship it"));
+    }
+
+    #[test]
+    fn repick_redelivery_is_due_once_after_sixty_seconds_without_a_user_row() {
+        assert!(!should_redeliver(Duration::from_secs(59), false, false));
+        assert!(should_redeliver(Duration::from_secs(60), false, false));
+        assert!(!should_redeliver(Duration::from_secs(61), true, false));
+        assert!(!should_redeliver(Duration::from_secs(61), false, true));
+    }
+
+    #[test]
+    fn repick_redelivery_checks_user_rows_and_ignores_last_prompt_repeats() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let needle = "[cm-handoff marker]";
+        let user = json!({"type": "user", "message": {"role": "user", "content": format!("{needle} notice")}});
+        let last = json!({"type": "last-prompt", "lastPrompt": needle});
+        std::fs::write(&path, format!("{last}\n")).unwrap();
+        assert!(!user_row_contains(&path, needle));
+        std::fs::write(&path, format!("{last}\n{user}\n")).unwrap();
+        assert!(user_row_contains(&path, needle));
     }
 
     #[test]
