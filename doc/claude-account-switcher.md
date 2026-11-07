@@ -233,9 +233,13 @@ full 6 s hold and landed 1.5 s after release.
   access token already in `.credentials.json`:
   `GET https://api.anthropic.com/api/oauth/usage` with
   `Authorization: Bearer <accessToken>` (no beta header needed; validated,
-  HTTP 200). The response has `five_hour` and `seven_day`, each with
-  `utilization` (whole percent) and `resets_at`, plus model-specific and
-  spend fields. Undocumented, so tolerate it changing shape. Never poll an
+  HTTP 200). Read the `limits` list, not fixed fields: each entry has
+  `kind` (`session` = 5-hour, `weekly_all`, `weekly_scoped` per model),
+  `group`, `scope`, `percent`, `is_active` (the binding limit), `severity`
+  (`normal` / `warning` / …) and `resets_at`. Plans differ: as of
+  2026-11-07 some Max accounts have **no 5-hour limit**, and their
+  `five_hour` field is `null`. Thresholds apply per limit present.
+  Undocumented, so tolerate it changing shape. Never poll an
   inactive account's saved token (decision 3); it only stays valid until
   that account's next refresh anyway.
 - **`poll` never refreshes a token.** If the live access token has
@@ -346,8 +350,15 @@ stale in-memory `oauthAccount` (a written value held for 60 s here).
    fake credential files. **Started:** `scripts/cm-claude-accounts` and
    `tests/test_cm_claude_accounts.py` (16 tests; run
    `python3 -m unittest tests.test_cm_claude_accounts`). `capture` and
-   `list` checked on the laptop, including a real Anthropic confirmation;
-   a real `switch` has not run yet.
+   `list` checked on the laptop, including a real Anthropic confirmation.
+   **Real switch passed (laptop, 2026-11-07, Claude Code 2.1.316):** with
+   two running sessions on account A (42% weekly, 5-hour limit), `switch`
+   to B (89% weekly, no 5-hour limit) moved both: `/usage` showed B
+   immediately and a prompt succeeded on B; `switch` back moved both
+   again. In place (same inode), profile updated, locks released, the
+   outgoing login identified by token. The 2.1.316 binary has the same
+   refresh lock (paths, `stale:60000,update:5000`, owner record) and the
+   same profile and usage endpoints as 2.1.308.
 2. `poll` + state + alerts + a systemd user timer (every ~5 min).
 3. `suggest` autoswitch, then `auto` behind a config flag.
 4. Laptop rollout, then cm-sessions and cm-manager (one host at a time,
