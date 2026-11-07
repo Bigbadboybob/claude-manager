@@ -32,7 +32,7 @@ task's default (`metadata.models`, inherited by subtasks), else the compatible
 work-rule model, else the host's
 `[models]` engine default (Claude `claude-opus-5-5`, Codex `gpt-6.1-terra`, the best performance per dollar).
 **Delegate to Codex where you can; Claude subagents default to Sonnet**
-(Owner, 2026-11-07, staffing policy v9). Before staffing anything, ask
+(Owner, 2026-11-07, staffing policy v10). Before staffing anything, ask
 whether Codex can do it:
 
 - **Codex Terra** (`type="codex", model="gpt-6.1-terra"`): well-specified
@@ -46,11 +46,10 @@ whether Codex can do it:
 - **Claude Code `Agent` subagents** (children inside your session): Sonnet by
   default (`model="sonnet"`). Use Opus only when the work needs real
   intelligence or attention to detail. Never use Fable.
-- **Full CM Claude sessions**: use your best judgement, leaning a bit more
-  toward Opus (`claude-opus-5-5`, the host default) than for subagents.
-  Architecture, design, math, coding (`work_kind` of those) and review
-  verdicts get Opus. A session that doesn't need Opus gets
-  `model="claude-sonnet-5-5"` (`work_kind="metric"` selects it).
+- **Full CM Claude sessions**: Opus by default (`claude-opus-5-5`, the host
+  default). They run longer and take on more involved work, so most end up
+  on Opus. Use Sonnet (`model="claude-sonnet-5-5"`) only for a session whose
+  work is plainly simple or routine.
 Set a task default with `create_subtask(model=...)` so a whole subtree
 inherits it. Effort works the same way (`effort=`, default `xhigh`; levels
 low/medium/high/xhigh, plus max on Claude): lower it for mechanical work.
