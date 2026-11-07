@@ -31,16 +31,29 @@ Pick the model too. Every spawn names one: the `model=` you pass, else the
 task's default (`metadata.models`, inherited by subtasks), else the compatible
 work-rule model, else the host's
 `[models]` engine default (Claude `claude-opus-5-5`, Codex `gpt-6.1-terra`, the best performance per dollar).
-**Claude Opus for most work; Codex Luna for simple work and wide fan-outs**
-(Owner, 2026-10-28, staffing policy v5). Design, architecture, coding,
-debugging unknowns, review verdicts and anything judgement-heavy go to Claude
-(`claude-opus-5-5`), the policy default. Luna is the cost-effective choice for
-simple work and whenever you want many agents at once:
-`start_session(type="codex", model="gpt-6-luna")`, or `work_kind="busywork"` /
-`work_kind="fanout"`, whose rules select Luna (task defaults still win). Simple
-work covers mechanical edits, renames and reformatting, running and triaging
-known tests or scripts, collecting logs or data, filling templates, checklist
-verification, and simple well-specified fixes.
+**Delegate to Codex where you can; Claude workers and subagents default to
+Sonnet** (Owner, 2026-11-07, staffing policy v8). Before staffing anything,
+ask whether Codex can do it:
+
+- **Codex Terra** (`type="codex", model="gpt-6.1-terra"`): well-specified
+  implementation, test writing, refactors with a clear target, and reviews
+  against a known checklist.
+- **Codex Luna** (`type="codex", model="gpt-6-luna"`, or `work_kind="busywork"`
+  / `"fanout"`): simple work and wide fan-outs. That means mechanical edits,
+  renames and reformatting, running and triaging known tests or scripts,
+  collecting logs or data, filling templates, checklist verification, and
+  simple well-specified fixes.
+- **Claude Sonnet** (`claude-sonnet-5-5`, or `work_kind="coding"` /
+  `"metric"`): the default for Claude work that needs Claude but not top
+  intelligence. This covers CM worker sessions and Claude Code `Agent` tool
+  subagents (pass `model="sonnet"`).
+- **Claude Opus** (`claude-opus-5-5`, or `work_kind="architecture"` /
+  `"design"` / `"math"`): only when the work needs higher intelligence or
+  close attention to detail. That means architecture, design, math, debugging
+  unknowns, subtle concurrency or data-loss risks, and review verdicts.
+
+The host default model for a bare Claude spawn is still Opus, so name
+Sonnet explicitly (or pass a `work_kind`) when you mean it.
 Set a task default with `create_subtask(model=...)` so a whole subtree
 inherits it. Effort works the same way (`effort=`, default `xhigh`; levels
 low/medium/high/xhigh, plus max on Claude): lower it for mechanical work.
