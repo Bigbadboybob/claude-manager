@@ -4057,6 +4057,16 @@ mod remote_reconnect_tests {
             ReviveRefusal::ComingBack
         );
         assert_eq!(classify_revive_refusal("worktree /w/x missing", false), ReviveRefusal::Failed);
+        // #114: A-R / Alt+T during a rotation show where it is, not an error.
+        let busy = format!(
+            "{}: delivering the fork's first message (started 1m10s ago, at most 2m40s left); CM restarts \
+             the session itself and it comes straight back",
+            super::super::restart::ROTATION_BUSY
+        );
+        assert_eq!(
+            super::super::restart::rotation_progress(&busy),
+            "delivering the fork's first message (started 1m10s ago, at most 2m40s left); it reattaches on its own"
+        );
 
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = dhandle.join();

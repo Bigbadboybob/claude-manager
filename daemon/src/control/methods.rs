@@ -3775,7 +3775,9 @@ fn rebind_reported_transcript(state: &mut DaemonState, session_uid: &str, report
             .zip(std::path::Path::new(reported).parent())
             .is_some_and(|(dir, parent)| dir == parent);
         let changed = contained
-            && session.transcript_path.as_deref() != Some(reported);
+            && session.transcript_path.as_deref() != Some(reported)
+            // #114: never back onto the transcript a rotation is moving it off.
+            && !crate::rotation::refuses_restamp(session_uid, reported);
         if changed {
             let reported = reported.to_string();
             let mut entry = None;
@@ -3939,6 +3941,10 @@ pub fn set_transcript_path(
         .then(|| recovery_gate.read().unwrap_or_else(|p| p.into_inner()));
     if let Some(reason) = crate::claude_recovery::admission_refusal(&p.session_uid) {
         return Err((ErrorCode::Conflict, reason));
+    }
+    // #114: a fork being verified is never bound back to its source.
+    if crate::rotation::refuses_restamp(&p.session_uid, &p.transcript_path) {
+        return Ok(json!({ "ok": true, "ignored": "the session is being rotated off that transcript" }));
     }
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     let session = state.sessions.get_mut(&p.session_uid).ok_or_else(|| {
@@ -28343,10 +28349,14 @@ while True:
             *c.last_turn_end_at.lock().unwrap() = ago(1000);
         }
         assert_eq!(crate::rotation::boundary(&s, "ts-cl-0", idle, quiet), Ok(()));
-        // A pending scheduled wakeup blocks it (a restart would lose it).
+        // A pending scheduled wakeup does not block a rotation (#114): the
+        // rotation carries it over (saved and named in the after-notice).
         s.sessions.get("ts-cl-0").unwrap().agent_state.lock().unwrap().inputs.background.crons.push(
             crate::agent_state::Cron { id: "c1".into(), schedule: "44 23 * * *".into(), recurring: false });
-        let why = crate::rotation::boundary(&s, "ts-cl-0", idle, quiet).unwrap_err();
+        assert_eq!(crate::rotation::boundary(&s, "ts-cl-0", idle, quiet), Ok(()), "crons are carried, not blocking");
+        // A handoff does not carry them yet: there they still block.
+        let handoff = crate::rotation::Checks { idle, owner_quiet: quiet, draft: true, at_turn_end: false, crons_block: true };
+        let why = crate::rotation::boundary_checked(&s, "ts-cl-0", &["claude-code"], handoff).unwrap_err();
         assert!(why.contains("scheduled wakeup"), "{why}");
         s.sessions.get("ts-cl-0").unwrap().agent_state.lock().unwrap().inputs.background.crons.clear();
         // Owner typing recently, or typing since the last turn (a draft).
@@ -30615,6 +30625,45 @@ while True:
                 rx.recv_timeout(std::time::Duration::from_millis(100)).is_err(),
                 "a same-path re-push must not broadcast",
             );
+        });
+    }
+
+    /// #114: while a rotation moves a session off its transcript, neither a
+    /// detector push nor the turn-end hook can bind it back to that source.
+    #[test]
+    fn a_rotating_fork_is_not_restamped_to_its_source() {
+        let _tmp = with_temp_home(|| {
+            let _serial = crate::rotation::test_registry_lock();
+            let state = make_state_arc();
+            let wt = std::env::temp_dir();
+            let uid = "ts-1a2b3c4d5e6f0114-0";
+            start_session(
+                &state,
+                &json!({
+                    "uid": uid, "session_type": "claude-code", "workspace_id": "ws-rot",
+                    "working_dir": wt.to_str().unwrap(), "worktree_path": wt.to_str().unwrap(),
+                    "label": "ep", "argv": ["/bin/sleep", "120"], "model": "test-model", "effort": "xhigh",
+                }),
+            )
+            .expect("start_session ok");
+            let dir = crate::transcript_detect::claude_transcript_dir_for(&wt).expect("claude dir");
+            let old = dir.join("650fb958-1e42-4428-b4aa-33e4f7061ba5.jsonl").to_string_lossy().into_owned();
+            let fork = dir.join("9f6089a3-30f8-40ab-8194-05333e583b84.jsonl").to_string_lossy().into_owned();
+            set_transcript_path(&state, &json!({ "session_uid": uid, "transcript_path": fork })).unwrap();
+            crate::rotation::test_set_rotating(uid, "650fb958-1e42-4428-b4aa-33e4f7061ba5", "verifying");
+            let r = set_transcript_path(&state, &json!({ "session_uid": uid, "transcript_path": old })).unwrap();
+            assert!(r["ignored"].is_string(), "{r}");
+            rebind_reported_transcript(&mut state.lock().unwrap(), uid, Some(&old));
+            let path = |st: &Arc<Mutex<DaemonState>>| st.lock().unwrap().sessions[uid].transcript_path.clone();
+            assert_eq!(path(&state).as_deref(), Some(fork.as_str()), "still on the fork");
+            // Once the rotation is over, an in-pane /resume of the old one binds.
+            crate::rotation::test_finish(uid);
+            rebind_reported_transcript(&mut state.lock().unwrap(), uid, Some(&old));
+            assert_eq!(path(&state).as_deref(), Some(old.as_str()));
+            crate::rotation::test_set_running(uid, false);
+            for s in state.lock().unwrap().sessions.values_mut() {
+                let _ = s.kill();
+            }
         });
     }
 

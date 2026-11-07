@@ -67,8 +67,15 @@ struct Receipt {
 struct Snapshot {
     identity: Identity,
     worktree: PathBuf,
+    /// Native background work (shells, subagents, monitors, workflows).
+    /// Session crons are not counted: they are not a native background
+    /// session, and a restart hands them back to the agent (#114).
     background_jobs: usize,
     background_complete: bool,
+    /// The session crons a restart loses, and the transcript their prompts
+    /// are recovered from.
+    crons: Vec<crate::agent_state::Cron>,
+    transcript: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -659,6 +666,7 @@ fn snapshot(state: &DaemonState, uid: &str) -> Result<Snapshot, String> {
                     background_pid: 0, background_start_time: 0,
                 },
                 worktree: cwd, background_jobs: 0, background_complete: false,
+                crons: Vec::new(), transcript: None,
             });
         };
         if tomb.session_type != "claude-code" {
@@ -699,6 +707,8 @@ fn snapshot(state: &DaemonState, uid: &str) -> Result<Snapshot, String> {
             worktree: cwd,
             background_jobs: 0,
             background_complete: false,
+            crons: Vec::new(),
+            transcript: None,
         });
     };
     if session.session_type != "claude-code" {
@@ -741,8 +751,10 @@ fn snapshot(state: &DaemonState, uid: &str) -> Result<Snapshot, String> {
         background_start_time: 0,
     };
     Ok(Snapshot { identity, worktree: cwd,
-        background_jobs: agent.background.jobs.len() + agent.background.crons.len(),
-        background_complete: agent.background.complete && agent.background.observed_at.is_some() })
+        background_jobs: agent.background.jobs.len(),
+        background_complete: agent.background.complete && agent.background.observed_at.is_some(),
+        transcript: session.transcript_path.clone().map(PathBuf::from),
+        crons: agent.background.crons })
 }
 
 fn lifecycle_refusal(state: &DaemonState, uid: &str) -> Option<String> {
@@ -750,8 +762,8 @@ fn lifecycle_refusal(state: &DaemonState, uid: &str) -> Option<String> {
     if state.draining || state.restarting {
         return Some("daemon is draining or restarting".into());
     }
-    if crate::rotation::in_progress(uid) {
-        return Some("transcript rotation is already running".into());
+    if let Some(busy) = crate::rotation::busy_message(uid) {
+        return Some(busy);
     }
     if crate::handoff::in_progress(uid) {
         return Some("session handoff is already running".into());
@@ -1030,9 +1042,9 @@ pub(crate) fn confirm(
             return Err((ErrorCode::Conflict, "recovery is already in progress".into()));
         }
         active().lock().unwrap_or_else(|p| p.into_inner()).insert(uid.clone());
-        Reservation { uid: uid.clone() }
+        (Reservation { uid: uid.clone() }, snap.crons, snap.transcript)
     };
-    let _reservation = reservation;
+    let (_reservation, crons, transcript) = reservation;
     let normal_restart = identity.background_pid == 0 && identity.background_start_time == 0;
     if !normal_restart {
         let roster_before = roster(Path::new(&identity.canonical_cwd))
@@ -1127,6 +1139,9 @@ pub(crate) fn confirm(
             }
         },
     );
+    if outcome == EffectOutcome::Revived {
+        hand_back_crons(state_arc, &uid, &crons, transcript.as_deref());
+    }
     Ok(match outcome {
         EffectOutcome::Revived if normal_restart => json!({"status":"revived","message":"session restarted under the captured CM identity"}),
         EffectOutcome::Revived => json!({"status":"revived","message":"native background stopped and session revived"}),
@@ -1134,6 +1149,24 @@ pub(crate) fn confirm(
         EffectOutcome::Partial(message) => json!({"status":"partial","message":format!("native background stopped but revive failed: {message}")}),
         EffectOutcome::Unknown(message) => json!({"status":"unknown","message":message}),
     })
+}
+
+/// After a restart: the session crons the old process had are gone. Save
+/// them (with prompts recovered from the transcript) and tell the agent to
+/// re-create them, as a rotation does (#114).
+fn hand_back_crons(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, crons: &[crate::agent_state::Cron], transcript: Option<&Path>) {
+    if crons.is_empty() {
+        return;
+    }
+    let carried = crate::session_crons::with_prompts(crons, transcript);
+    let file = crate::session_crons::save(&state_arc.lock().unwrap_or_else(|p| p.into_inner()), uid, "restart (A-R)", &carried);
+    let text = format!(
+        "[cm-restart] CM restarted this session (A-R); your conversation is unchanged.{}",
+        crate::session_crons::notice(&carried, file.as_deref())
+    );
+    if !crate::rotation::deliver_resume(state_arc, uid, text) {
+        eprintln!("cm-daemon: restart of {uid}: the cron notice was not delivered (session gone)");
+    }
 }
 
 /// Explicit operator reconciliation.  Preflight is intentionally stateless;
@@ -1468,6 +1501,61 @@ mod tests {
         assert_eq!(preflight(&state, uid)["status"], "unavailable");
         FAKE.with(|f| f.borrow_mut().as_mut().unwrap().roster.rows = json!([{"kind":"unknown"}]));
         assert_eq!(preflight(&state, uid)["status"], "unavailable");
+        state.lock().unwrap().sessions.get_mut(uid).unwrap().kill().unwrap();
+        FAKE.with(|f| *f.borrow_mut() = None);
+    }
+
+    /// EP (2026-11-07): an interactive Claude session with two session crons
+    /// and no background jobs was refused A-R ("daemon reports background
+    /// work but Claude roster does not prove its identity"). Crons are not a
+    /// native background session: they do not block, and the snapshot keeps
+    /// them for the restart notice (#114).
+    #[test]
+    fn session_crons_alone_do_not_block_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let uid = "ts-cron-preflight-fixture";
+        let native_id = "650fb958-1e42-4428-b4aa-33e4f7061ba5";
+        let mut params = crate::session::SpawnParams::new(uid, "ep", "/bin/sleep");
+        params.args = vec!["60".into()];
+        params.workspace_id = "w".into();
+        params.session_type = "claude-code".into();
+        let mut session = crate::session::PendingSession::spawn(params).unwrap().arm_reaper(None).unwrap();
+        session.transcript_path = Some(dir.path().join(format!("{native_id}.jsonl")).to_string_lossy().into_owned());
+        let child_pid = session.pid;
+        let mut state = DaemonState::new();
+        state.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
+        let mut workspace = crate::manifest::ManifestWorkspace::default();
+        workspace.id = "w".into();
+        workspace.worktree_path = Some(dir.path().to_path_buf());
+        state.workspaces.insert("w".into(), workspace);
+        state.sessions.insert(uid.into(), session);
+        let state = Arc::new(Mutex::new(state));
+        FAKE.with(|f| *f.borrow_mut() = Some(FakeEffects {
+            roster:Roster { rows:json!([{"kind":"interactive", "sessionId":native_id, "cwd":dir.path(), "pid":child_pid}]) },
+            host:BackgroundHost { pid:1, start:1 },
+            fail_phase:None, fail_stop:false, fail_proof:false, fail_revive:false, real_revive:false, stops:0, revives:0,
+        }));
+        let report = |jobs: Value| {
+            let observed_at = crate::agent_state::unix_now();
+            crate::control::methods::session_agent_report(&state, &json!({
+                "session_uid":uid, "kind":"hook", "event":"Stop",
+                "payload":{"observed_at":observed_at,
+                    "background":{"complete":true, "observed_at":observed_at, "jobs":jobs,
+                        "crons":[{"id":"aa502fcc","schedule":"17 * * * *","recurring":true},
+                                 {"id":"38aa2766","schedule":"43 */3 * * *","recurring":true}]}}
+            }), Some(uid)).unwrap();
+        };
+        report(json!([]));
+        let pre = preflight(&state, uid);
+        assert_eq!(pre["status"], "normal", "{pre}");
+        assert_eq!(pre["identity"]["native_session_id"], native_id);
+        let snap = snapshot(&state.lock().unwrap(), uid).unwrap();
+        assert_eq!(snap.background_jobs, 0);
+        assert_eq!(snap.crons.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["38aa2766", "aa502fcc"]);
+        // Real native background work the roster cannot prove still refuses.
+        report(json!([{"id":"job1","kind":"shell","label":"sleep","first_seen_at":1.0,"wakes_agent":true}]));
+        let pre = preflight(&state, uid);
+        assert_eq!(pre["status"], "unavailable", "{pre}");
         state.lock().unwrap().sessions.get_mut(uid).unwrap().kill().unwrap();
         FAKE.with(|f| *f.borrow_mut() = None);
     }

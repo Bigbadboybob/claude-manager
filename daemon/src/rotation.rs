@@ -159,6 +159,16 @@ pub(crate) fn test_set_running(uid: &str, running: bool) {
     }
 }
 
+/// Tests: mark `uid` as being rotated off `from_id`, in `phase`.
+#[cfg(test)]
+pub(crate) fn test_set_rotating(uid: &str, from_id: &str, phase: &'static str) {
+    registry().lock().unwrap_or_else(|p| p.into_inner()).insert(uid.into(), Rotation {
+        phase, origin: Origin::Operator, reason: String::new(), started_at: now(),
+        from_id: from_id.into(), from_bytes: 0, to_id: None, to_bytes: None, path: "fork",
+        outcome: None, finished_at: None, requested_by: None,
+    });
+}
+
 /// Whether `uid` is being rotated right now (its process is expected to
 /// stop and come back).
 pub fn in_progress(uid: &str) -> bool {
@@ -171,6 +181,76 @@ pub fn in_progress(uid: &str) -> bool {
 
 fn now() -> f64 {
     crate::control::methods::now_unix_f64()
+}
+
+/// When the running phase of each rotation ends at the latest (unix secs).
+fn etas() -> &'static Mutex<HashMap<String, f64>> {
+    static ETAS: std::sync::OnceLock<Mutex<HashMap<String, f64>>> = std::sync::OnceLock::new();
+    ETAS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Enter `phase`, which ends within `within` at the latest (`None`: unknown).
+fn set_phase(uid: &str, phase: &'static str, within: Option<Duration>) {
+    update(uid, |r| r.phase = phase);
+    let mut etas = etas().lock().unwrap_or_else(|p| p.into_inner());
+    match within {
+        Some(d) => etas.insert(uid.to_string(), now() + d.as_secs_f64()),
+        None => etas.remove(uid),
+    };
+}
+
+/// Whether a transcript report (a turn-end hook, the TUI's or the `/proc`
+/// detector's `set_transcript_path`) that names `path` for `uid` must be
+/// ignored: `uid` is being moved off that very transcript, and its fork is
+/// starting or being verified. Only the rotation itself rebinds the row
+/// until it finishes (its fallback resumes the original through the
+/// restore path, not through a report).
+pub fn refuses_restamp(uid: &str, path: &str) -> bool {
+    let Some(id) = crate::session::transcript_id_from_path(path) else { return false };
+    registry().lock().unwrap_or_else(|p| p.into_inner()).get(uid).is_some_and(|r| {
+        r.finished_at.is_none() && matches!(r.phase, "forking" | "notifying" | "verifying") && r.from_id == id
+    })
+}
+
+/// The first words of every "a rotation is running" refusal.
+pub const BUSY: &str = "transcript rotation in progress";
+
+fn phase_label(phase: &str) -> &'static str {
+    match phase {
+        "stopping" => "stopping the old process",
+        "forking" => "starting the fork",
+        "notifying" => "delivering the fork's first message",
+        "verifying" => "confirming the fork's new transcript",
+        "falling back" => "resuming the original transcript",
+        _ => "finishing",
+    }
+}
+
+fn short_secs(secs: f64) -> String {
+    let s = secs.max(0.0).round() as u64;
+    if s >= 60 { format!("{}m{:02}s", s / 60, s % 60) } else { format!("{s}s") }
+}
+
+/// What to tell someone who asks for a restart (Alt+T, A-R, a revive) while
+/// `uid` is being rotated: the phase and how long it can still take. It
+/// ends "comes straight back" (what viewers key their wait on).
+pub fn busy_message(uid: &str) -> Option<String> {
+    let reg = registry().lock().unwrap_or_else(|p| p.into_inner());
+    let r = reg.get(uid).filter(|r| r.finished_at.is_none())?;
+    let t = now();
+    let left = etas()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(uid)
+        .copied()
+        .filter(|&e| e > t)
+        .map(|e| format!(", at most {} left", short_secs(e - t)))
+        .unwrap_or_default();
+    Some(format!(
+        "{BUSY}: {} (started {} ago{left}); CM restarts the session itself and it comes straight back",
+        phase_label(r.phase),
+        short_secs(t - r.started_at)
+    ))
 }
 
 /// Why `uid` cannot rotate right now, if it cannot. The safe boundary:
@@ -193,7 +273,7 @@ pub fn boundary_for(
     owner_quiet: Duration,
     engines: &[&str],
 ) -> Result<(), String> {
-    boundary_checked(state, uid, engines, Checks { idle, owner_quiet, draft: !owner_quiet.is_zero(), at_turn_end: false })
+    boundary_checked(state, uid, engines, Checks { idle, owner_quiet, draft: !owner_quiet.is_zero(), at_turn_end: false, crons_block: false })
 }
 
 /// What a boundary check asks for.
@@ -211,6 +291,11 @@ pub(crate) struct Checks {
     /// (they are held for the new process, `notifications::set_hold`), only
     /// one being submitted to the old process right now does.
     pub at_turn_end: bool,
+    /// Whether a pending session cron blocks it. A rotation carries crons
+    /// over (`session_crons`: saved, named in the after-notice, re-created
+    /// by the agent), so for it they never block (#114: 787 of ~2,200
+    /// deferrals of a busy lead); a handoff does not carry them yet.
+    pub crons_block: bool,
 }
 
 /// An unconfirmed receipt older than this does not block a boundary...
@@ -225,7 +310,7 @@ fn job_alive(job: &crate::agent_state::Job) -> bool {
 }
 
 pub(crate) fn boundary_checked(state: &DaemonState, uid: &str, engines: &[&str], checks: Checks) -> Result<(), String> {
-    let Checks { idle, owner_quiet, draft, at_turn_end } = checks;
+    let Checks { idle, owner_quiet, draft, at_turn_end, crons_block } = checks;
     let sess = state.sessions.get(uid).ok_or_else(|| format!("session '{uid}' is not live on this host"))?;
     if !engines.contains(&sess.session_type.as_str()) {
         return Err(format!("{} sessions cannot do this (only {})", sess.session_type, engines.join(", ")));
@@ -233,8 +318,8 @@ pub(crate) fn boundary_checked(state: &DaemonState, uid: &str, engines: &[&str],
     if sess.transcript_path.is_none() {
         return Err("the session has no bound transcript".into());
     }
-    if in_progress(uid) {
-        return Err("a rotation is already running".into());
+    if let Some(busy) = busy_message(uid) {
+        return Err(busy);
     }
     if crate::handoff::in_progress(uid) {
         return Err("a handoff is running".into());
@@ -260,9 +345,9 @@ pub(crate) fn boundary_checked(state: &DaemonState, uid: &str, engines: &[&str],
     if jobs > 0 {
         return Err(format!("{jobs} background job(s) running"));
     }
-    // A scheduled wakeup lives in the process: a restart would lose it (CM
-    // does not carry session crons across a fork).
-    if !agent.background.crons.is_empty() {
+    // A scheduled wakeup lives in the process: a restart loses it unless
+    // the caller carries it over (a rotation does).
+    if crons_block && !agent.background.crons.is_empty() {
         return Err(format!("{} scheduled wakeup(s) pending", agent.background.crons.len()));
     }
     if let Some(at) = state.owner_seen.get(uid) {
@@ -382,8 +467,8 @@ pub fn start(
     force: bool,
 ) -> MethodResult {
     // A running rotation or handoff is not a reason to arm a second one.
-    if in_progress(uid) {
-        return Err((ErrorCode::Conflict, "a rotation of this session is already running".into()));
+    if let Some(busy) = busy_message(uid) {
+        return Err((ErrorCode::Conflict, busy));
     }
     if crate::handoff::in_progress(uid) {
         return Err((ErrorCode::Conflict, "a handoff of this session is running".into()));
@@ -397,13 +482,14 @@ pub fn start(
             // the new process); a tool call, background job, a wake going in
             // right now, a workflow transition or a continuous run still
             // refuse, and then the request is ARMED for the next turn end.
-            Checks { idle: Duration::ZERO, owner_quiet: Duration::ZERO, draft: false, at_turn_end: true }
+            Checks { idle: Duration::ZERO, owner_quiet: Duration::ZERO, draft: false, at_turn_end: true, crons_block: false }
         } else {
             Checks {
                 idle: Duration::from_secs(c.idle_secs),
                 owner_quiet: if origin == Origin::Policy { Duration::from_secs(c.owner_quiet_secs) } else { Duration::ZERO },
                 draft: origin != Origin::Operator,
                 at_turn_end: false,
+                crons_block: false,
             }
         }
     };
@@ -543,17 +629,57 @@ pub(crate) fn stop_tracked(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, kille
     Stopped::Stuck
 }
 
-/// A fork's transcript is in place: the file exists and holds message rows
-/// (Claude's chain rows, or Codex's `response_item`s).
+/// How far into a fork's file CM looks for its first message row. A fork
+/// opens with metadata and `file-history-snapshot` rows (34 KB each on EP's
+/// 2026-11-07 fork, whose first message sat at byte 275,257: the old 256 KB
+/// window never saw it, and a working fork was rolled back).
+const MESSAGE_SCAN_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Whether one transcript line is a message row: a Claude chain row (a
+/// top-level `user`/`assistant` with a `parentUuid`) or a Codex
+/// `response_item`.
+fn is_message_row(line: &[u8]) -> bool {
+    let has = |needle: &[u8]| line.windows(needle.len()).any(|w| w == needle);
+    if !(has(b"\"user\"") || has(b"\"assistant\"") || has(b"\"response_item\"")) {
+        return false;
+    }
+    let Ok(row) = serde_json::from_slice::<Value>(line) else { return false };
+    match row["type"].as_str() {
+        Some("user" | "assistant") => row.get("parentUuid").is_some(),
+        Some("response_item") => true,
+        _ => false,
+    }
+}
+
+/// The offset just past the first message row at or after `since` in
+/// `path` (scanning at most [`MESSAGE_SCAN_BYTES`]), if there is one.
+fn first_message_after(path: &Path, since: u64) -> Option<u64> {
+    use std::io::{BufRead, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    f.seek(SeekFrom::Start(since)).ok()?;
+    let mut reader = std::io::BufReader::new(f);
+    let (mut at, mut line) = (since, Vec::new());
+    while at - since < MESSAGE_SCAN_BYTES {
+        line.clear();
+        let n = reader.read_until(b'\n', &mut line).ok()?;
+        // A row still being written (no newline yet) is read next time.
+        if n == 0 || line.last() != Some(&b'\n') {
+            return None;
+        }
+        at += n as u64;
+        if is_message_row(&line) {
+            return Some(at);
+        }
+    }
+    None
+}
+
+/// A fork's transcript is in place: the file exists and holds a message
+/// row anywhere (Claude's chain rows, or Codex's `response_item`s).
+/// Returns its length.
 fn fork_written(path: &Path) -> Option<u64> {
     let len = std::fs::metadata(path).ok()?.len();
-    let mut head = vec![0u8; len.min(256 * 1024) as usize];
-    use std::io::Read;
-    std::fs::File::open(path).ok()?.read_exact(&mut head).ok()?;
-    let text = String::from_utf8_lossy(&head);
-    let claude = text.contains("\"parentUuid\":") && (text.contains("\"type\":\"user\"") || text.contains("\"type\":\"assistant\""));
-    let codex = text.contains("\"type\":\"response_item\"");
-    (claude || codex).then_some(len)
+    first_message_after(path, 0).map(|_| len)
 }
 
 /// Whether the fork at `path` is in use: the after-notice's marker is
@@ -712,6 +838,25 @@ enum Delivered {
     Unconfirmed,
     /// The session is gone.
     Vanished,
+    /// Owner typed in it while CM waited: nothing was typed (it would have
+    /// mixed with their draft); the notice went to the native queue.
+    OwnerTyped,
+}
+
+/// Once the composer is drawn, how long CM waits for the screen to settle
+/// before typing anyway: a busy session's footer (a background job's timer,
+/// a spinner) never settles. Both of EP's 2026-11-07 waits ran the full
+/// 239 s and the notice was then recorded within 5 s.
+const COMPOSER_GRACE: Duration = Duration::from_secs(10);
+
+/// Queue `text` for `uid` on the durable native notification queue (it
+/// never types into the composer; rotation notices are exempt from the
+/// wake hold).
+fn publish_notice(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, key: &str, text: &str, marker: &str) {
+    let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    if let Err(e) = crate::notifications::publish(&st.messaging_root, uid, key, "rotation", text, marker) {
+        eprintln!("cm-daemon: rotation of {uid}: notice not queued: {e}");
+    }
 }
 
 /// Deliver `text` to a Claude session that was just (re)started, once its
@@ -722,13 +867,56 @@ enum Delivered {
 /// transcript records `needle`, press Enter if it is visibly sitting in the
 /// composer (up to 3 times), or type it once more if it vanished while the
 /// agent sits idle. Human input stops the re-drive.
-fn deliver_ready(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, text: String, needle: &str, source_bytes: u64) -> Delivered {
+///
+/// The wait for a still composer ends early (#114): when Owner types in it
+/// (nothing is typed then: the notice goes to the native queue, keyed
+/// `key`), when `turns` (a transcript and the offset to look past) records
+/// a new message (the process is up and taking turns, so text typed now is
+/// queued by Claude), or [`COMPOSER_GRACE`] after the composer is first
+/// drawn.
+fn deliver_ready(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    uid: &str,
+    text: String,
+    needle: &str,
+    source_bytes: u64,
+    turns: Option<(&Path, u64)>,
+    key: &str,
+) -> Delivered {
     let Some(watch) = ScreenWatch::start(state_arc, uid) else { return Delivered::Vanished };
     let started = Instant::now();
     let budget = verify_deadline(source_bytes);
+    let mut composer_at: Option<Instant> = None;
     while !watch.ready(Duration::from_millis(1500)) {
-        if !state_arc.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid) {
-            return Delivered::Vanished;
+        let handle = {
+            let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            match st.sessions.get(uid) {
+                Some(s) => s.input_handle(),
+                None => return Delivered::Vanished,
+            }
+        };
+        if handle.operator_quiet_for().is_some_and(|q| q < started.elapsed()) {
+            eprintln!("cm-daemon: rotation of {uid}: Owner is typing in it; the notice goes to the native queue");
+            publish_notice(state_arc, uid, key, &text, needle);
+            return Delivered::OwnerTyped;
+        }
+        if let Some((path, since)) = turns {
+            if first_message_after(path, since).is_some() {
+                eprintln!(
+                    "cm-daemon: rotation of {uid}: already taking turns after {:.1}s; typing now",
+                    started.elapsed().as_secs_f64()
+                );
+                break;
+            }
+        }
+        if crate::claude_channels::client_ready(&watch.screen()) {
+            if composer_at.get_or_insert_with(Instant::now).elapsed() >= COMPOSER_GRACE {
+                eprintln!(
+                    "cm-daemon: rotation of {uid}: composer up for {}s but the screen keeps changing; typing",
+                    COMPOSER_GRACE.as_secs()
+                );
+                break;
+            }
         }
         if started.elapsed() >= budget {
             eprintln!("cm-daemon: rotation of {uid}: no composer after {}s; typing anyway", budget.as_secs());
@@ -755,7 +943,9 @@ fn deliver_ready(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, text: String, n
         if !live {
             return Delivered::Vanished;
         }
-        if path.as_deref().is_some_and(|p| tail_contains(Path::new(p), needle)) {
+        let recorded = path.as_deref().is_some_and(|p| tail_contains(Path::new(p), needle))
+            || turns.is_some_and(|(p, _)| tail_contains(p, needle));
+        if recorded {
             eprintln!(
                 "cm-daemon: rotation of {uid}: notice confirmed (composer after {:.1}s, {enters} extra Enter(s){})",
                 waited.as_secs_f64(),
@@ -815,6 +1005,7 @@ fn deliver_with(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, text: String, fr
 fn finish(uid: &str, phase: &'static str, outcome: String) {
     eprintln!("cm-daemon: rotation of {uid}: {outcome}");
     unhold(uid, HoldOwner::Rotation);
+    etas().lock().unwrap_or_else(|p| p.into_inner()).remove(uid);
     update(uid, |r| {
         r.phase = phase;
         r.outcome = Some(outcome);
@@ -1085,7 +1276,8 @@ pub fn recover_inflight(state_arc: &Arc<Mutex<DaemonState>>) -> usize {
                 // A live fork: finish what the previous brain started (its
                 // marker stays until that is done).
                 Some(to_path) => {
-                    if complete_after_restart(state_arc, uid, snap, to_path) {
+                    let fork_path = v["fork_path"].as_str().map(PathBuf::from);
+                    if complete_after_restart(state_arc, uid, snap, to_path, fork_path) {
                         continue;
                     }
                 }
@@ -1093,18 +1285,32 @@ pub fn recover_inflight(state_arc: &Arc<Mutex<DaemonState>>) -> usize {
             inflight_remove(&state_arc.lock().unwrap_or_else(|p| p.into_inner()), uid);
             continue;
         }
+        // A Claude fork that already holds turns is resumed, not discarded
+        // (#114): the original lacks them.
+        let mut entry = entry;
+        let fork = v["fork_path"].as_str().map(PathBuf::from).filter(|p| fork_written(p).is_some());
+        if let Some(fork) = &fork {
+            entry.transcript_id = crate::session::transcript_id_from_path(&fork.to_string_lossy());
+            entry.transcript_path = Some(fork.to_string_lossy().into_owned());
+        }
         match crate::control::methods::restore_one_session_launch(state_arc, ws, Path::new(wt), &entry, None, false) {
             Ok(_) => {
                 resumed += 1;
-                deliver(
-                    state_arc,
-                    uid,
+                rebroadcast_binding(state_arc, uid);
+                let text = if fork.is_some() {
+                    "[cm-rotation] A daemon restart interrupted CM while it was moving this session to a \
+                     fresh transcript. You are on the new transcript, with everything you did there. Re-read \
+                     your board items and inbox from CM, then carry on."
+                } else {
                     "[cm-rotation] A daemon restart interrupted CM while it was moving this session (a \
                      transcript rotation or handoff). You are back on your original conversation; \
                      nothing was lost. Carry on."
-                        .into(),
+                };
+                deliver(state_arc, uid, text.into());
+                eprintln!(
+                    "cm-daemon: rotation of {uid} was interrupted by a restart; resumed its {} transcript",
+                    if fork.is_some() { "forked" } else { "original" }
                 );
-                eprintln!("cm-daemon: rotation of {uid} was interrupted by a restart; resumed its original transcript");
             }
             Err((_, e)) => eprintln!("cm-daemon: rotation of {uid} was interrupted; resuming it failed: {e}"),
         }
@@ -1118,7 +1324,7 @@ pub fn recover_inflight(state_arc: &Arc<Mutex<DaemonState>>) -> usize {
 /// after-notice, verify the fork records it, record the lineage; else roll
 /// back to the original transcript. Runs on its own thread, holding the
 /// host's one rotation slot.
-fn complete_after_restart(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: Snapshot, to_path: PathBuf) -> bool {
+fn complete_after_restart(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: Snapshot, to_path: PathBuf, fork_path: Option<PathBuf>) -> bool {
     let record = Rotation {
         phase: "verifying",
         origin: Origin::Policy,
@@ -1141,46 +1347,152 @@ fn complete_after_restart(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: 
     let state = Arc::clone(state_arc);
     let uid = uid.to_string();
     let spawned = std::thread::Builder::new().name(format!("cm-rotate-recover-{uid}")).spawn(move || {
-        complete_fork(&state, &uid, &snap, &to_path);
+        complete_fork(&state, &uid, &snap, &to_path, fork_path.as_deref());
         inflight_remove(&state.lock().unwrap_or_else(|p| p.into_inner()), &uid);
     });
     spawned.is_ok()
 }
 
-fn complete_fork(state: &Arc<Mutex<DaemonState>>, uid: &str, snap: &Snapshot, to_path: &Path) {
-    if !deliver(state, uid, after_notice(snap.from_bytes)) {
-        resume_old(state, uid, snap, "the forked session vanished after a daemon restart");
+fn complete_fork(state: &Arc<Mutex<DaemonState>>, uid: &str, snap: &Snapshot, to_path: &Path, fork_path: Option<&Path>) {
+    // The fork the previous brain pinned, if it said, else the live path.
+    let pinned = fork_path.unwrap_or(to_path);
+    if fork_written(pinned).is_some() || fork_written(to_path).is_some() {
+        // It already took (its file holds messages): no notice needed to tell.
+    } else if !deliver(state, uid, after_notice(snap.from_bytes)) {
+        resume_old(state, uid, snap, "the forked session vanished after a daemon restart", Some(pinned));
         return;
     }
+    set_phase(uid, "verifying", Some(verify_deadline(std::fs::metadata(&snap.from_path).map(|m| m.len()).unwrap_or(0))));
     let deadline = Instant::now() + verify_deadline(std::fs::metadata(&snap.from_path).map(|m| m.len()).unwrap_or(0));
     while Instant::now() < deadline {
-        if !state.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid) {
-            break;
-        }
-        if let Some(bytes) = fork_written(to_path) {
-            let to_id = crate::session::transcript_id_from_path(&to_path.to_string_lossy());
-            if let Some(to) = to_id.as_deref() {
-                let st = state.lock().unwrap_or_else(|p| p.into_inner());
-                if let Err(e) = crate::resume_identity::record_rotation(&st, &snap.from_id, to) {
-                    eprintln!("cm-daemon: rotation of {uid}: lineage not recorded: {e}");
-                }
+        let live = state.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid);
+        if let Some((path, bytes)) = [pinned, to_path].into_iter().find_map(|p| fork_written(p).map(|b| (p, b))) {
+            if live {
+                succeed(state, uid, snap, path, bytes, "completed after a restart");
+            } else {
+                keep_fork(state, uid, snap, path, "the fork exited after recording turns");
             }
-            update(uid, |r| r.to_bytes = Some(bytes));
-            finish(uid, "done", format!("completed after a restart: {} to {}", snap.from_id, to_id.unwrap_or_default()));
             return;
+        }
+        if !live {
+            break;
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    resume_old(state, uid, snap, "the fork a daemon restart interrupted wrote no transcript");
+    resume_old(state, uid, snap, "the fork a daemon restart interrupted wrote no transcript", Some(pinned));
+}
+
+/// The rotation took: record the lineage (the A-s / A-e pickers label the
+/// old file) and finish.
+fn succeed(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: &Snapshot, to_path: &Path, bytes: u64, how: &str) {
+    let to_id = crate::session::transcript_id_from_path(&to_path.to_string_lossy());
+    update(uid, |r| {
+        r.to_id = to_id.clone();
+        r.to_bytes = Some(bytes);
+    });
+    if let Some(to) = to_id.as_deref() {
+        let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        if let Err(e) = crate::resume_identity::record_rotation(&st, &snap.from_id, to) {
+            eprintln!("cm-daemon: rotation of {uid}: lineage not recorded: {e}");
+        }
+    }
+    finish(
+        uid,
+        "done",
+        format!(
+            "{how}: {} ({}) to {} ({})",
+            snap.from_id,
+            mb(snap.from_bytes),
+            to_id.as_deref().unwrap_or("?"),
+            mb(bytes)
+        ),
+    );
+}
+
+/// Why a fork that was not confirmed in time must still be kept (#114:
+/// never discard history): Owner typed in it, its file exists, or it is
+/// mid-turn. `None`: nothing would be lost by resuming the original.
+fn keep_reason(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, spawned: Instant, owner_typed: bool, candidates: &[PathBuf]) -> Option<String> {
+    let (typed, working) = {
+        let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        match st.sessions.get(uid) {
+            Some(s) => (
+                s.input_handle().operator_quiet_for().is_some_and(|q| q < spawned.elapsed()),
+                crate::agent_state::current(s).state == crate::agent_state::State::Working,
+            ),
+            None => (false, false),
+        }
+    };
+    if owner_typed || typed {
+        return Some("Owner typed in the fork".into());
+    }
+    if let Some((p, len)) = candidates.iter().find_map(|p| std::fs::metadata(p).ok().filter(|m| m.len() > 0).map(|m| (p, m.len()))) {
+        return Some(format!("its file {} exists ({}) but CM found no turn in it", p.display(), mb(len)));
+    }
+    working.then(|| "it is mid-turn".to_string())
+}
+
+/// Keep an unconfirmed (or already exited) fork rather than discard what it
+/// holds: tell Owner, and leave the session on it.
+fn keep_fork(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: &Snapshot, fork: &Path, why: &str) {
+    let live = state_arc.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid);
+    let fork_id = crate::session::transcript_id_from_path(&fork.to_string_lossy()).unwrap_or_default();
+    if !live {
+        // The fork exited after recording turns: bring it back on the fork,
+        // not on the original (which lacks them).
+        let mut entry = snap.entry.clone();
+        entry.transcript_id = Some(fork_id.clone());
+        entry.transcript_path = Some(fork.to_string_lossy().into_owned());
+        if let Err((_, e)) = crate::control::methods::restore_one_session_launch(
+            state_arc, &snap.workspace_id, &snap.worktree, &entry, None, false,
+        ) {
+            fail(state_arc, uid, format!("{why}; the fork {fork_id} holds new turns, but resuming it failed: {e}"));
+            return;
+        }
+        rebroadcast_binding(state_arc, uid);
+    }
+    let bytes = std::fs::metadata(fork).map(|m| m.len()).unwrap_or(0);
+    if fork_written(fork).is_some() {
+        succeed(state_arc, uid, snap, fork, bytes, &format!("kept the fork ({why})"));
+    } else {
+        update(uid, |r| r.to_id = Some(fork_id.clone()));
+        finish(uid, "done", format!("kept the unconfirmed fork {fork_id} ({why})"));
+    }
+    let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    let message = format!(
+        "CM moved this session to a fresh transcript ({fork_id}) but could not confirm it ({why}). CM kept \
+         the fork rather than discard its history. If the session misbehaves, A-e Transcript can point it \
+         back at {} before A-R.",
+        snap.from_id
+    );
+    if let Err(e) = crate::owner_attention::raise_system(&st, uid, &message) {
+        eprintln!("cm-daemon: rotation of {uid}: kept-fork alert: {e}");
+    }
+}
+
+/// Re-send `uid`'s live transcript binding to every viewer. A fallback
+/// resumes the transcript the row had before the fork, so the restore path
+/// sees no change to broadcast, while viewers were told about the fork
+/// (#114: Owner's A-e picker still marked the rolled-back fork "this").
+pub(crate) fn rebroadcast_binding(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) {
+    let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(sess) = st.sessions.get(uid) {
+        let entry = crate::control::methods::transcript_updated_entry(sess);
+        crate::control::methods::broadcast_transcript_updated(&st, uid, entry);
+    }
 }
 
 fn run(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: Snapshot) {
+    // Session crons die with the process: note them before the stop so the
+    // after-notice can hand them back (#114).
+    let crons = crate::session_crons::capture(&state_arc.lock().unwrap_or_else(|p| p.into_inner()), uid);
     // 1. Stop the process. Viewers and monitors see killed_by
     //    `transcript-rotation`: the uid comes straight back.
+    set_phase(uid, "stopping", Some(STOP_DEADLINE));
     match stop_tracked(state_arc, uid, ROTATION_KILLER, "transcript rotation") {
         Stopped::Yes => {}
         Stopped::Late => {
-            resume_old(state_arc, uid, &snap, "the session stopped only after a delay");
+            resume_old(state_arc, uid, &snap, "the session stopped only after a delay", None);
             return;
         }
         Stopped::Stuck => {
@@ -1188,8 +1500,15 @@ fn run(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: Snapshot) {
             return;
         }
     }
+    let carried = crate::session_crons::with_prompts(&crons, Some(&snap.from_path));
+    let cron_file = if carried.is_empty() {
+        None
+    } else {
+        crate::session_crons::save(&state_arc.lock().unwrap_or_else(|p| p.into_inner()), uid, "transcript rotation", &carried)
+    };
+    let cron_note = crate::session_crons::notice(&carried, cron_file.as_deref());
     // 2. Fork at the same uid.
-    update(uid, |r| r.phase = "forking");
+    set_phase(uid, "forking", Some(Duration::from_secs(60)));
     if let Err((_, e)) = crate::control::methods::restore_one_session_launch(
         state_arc,
         &snap.workspace_id,
@@ -1198,82 +1517,106 @@ fn run(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: Snapshot) {
         None,
         true,
     ) {
-        resume_old(state_arc, uid, &snap, &format!("the fork did not start: {e}"));
+        resume_old(state_arc, uid, &snap, &format!("the fork did not start: {e}"), None);
         return;
+    }
+    let spawned = Instant::now();
+    let claude = snap.entry.session_type == "claude-code";
+    // The file a Claude fork writes is the one the daemon pinned with
+    // `--session-id` and stamped at spawn: verification watches IT, whatever
+    // the row's transcript_path says later.
+    let pinned: Option<PathBuf> = claude
+        .then(|| {
+            let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            st.sessions.get(uid).and_then(|s| s.transcript_path.clone()).map(PathBuf::from)
+        })
+        .flatten()
+        .filter(|p| p != &snap.from_path);
+    if let Some(p) = &pinned {
+        update(uid, |r| r.to_id = crate::session::transcript_id_from_path(&p.to_string_lossy()));
+        let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        if let Err(e) = inflight_put_with(&st, uid, &snap, json!({ "fork_path": p })) {
+            eprintln!("cm-daemon: rotation of {uid}: in-flight marker not updated: {e}");
+        }
     }
     // 3. The first message writes a Claude fork's file; a Codex fork's
     //    rollout is bound by the detector. Either way the new transcript must
-    //    record the notice (its marker) before the rotation counts.
+    //    record a turn (a Claude fork) or the notice (its marker) before the
+    //    rotation counts.
     let marker = format!(" {}", nonce());
+    let needle = format!("[cm-rotation{marker}]");
     let requester = registry().lock().unwrap_or_else(|p| p.into_inner()).get(uid).and_then(|r| r.requested_by.clone());
-    update(uid, |r| r.phase = "notifying");
-    let delivered = if snap.entry.session_type == "claude-code" {
+    let notice = format!("{}{cron_note}", after_notice_for(snap.from_bytes, &marker, requester.as_deref()));
+    set_phase(uid, "notifying", Some(verify_deadline(snap.from_bytes) + Duration::from_secs(120)));
+    let delivered = if claude {
         // A large fork loads its history after the process is up: wait for
         // its composer, then make sure the notice was submitted (#24: a 1 GB
         // fork took the notice while still loading and never sent it).
-        deliver_ready(state_arc, uid, after_notice_for(snap.from_bytes, &marker, requester.as_deref()),
-                      &format!("[cm-rotation{marker}]"), snap.from_bytes)
-            != Delivered::Vanished
+        deliver_ready(state_arc, uid, notice, &needle, snap.from_bytes,
+                      pinned.as_deref().map(|p| (p, 0)), &format!("rotation-after:{uid}{marker}"))
+    } else if deliver(state_arc, uid, notice) {
+        Delivered::Unconfirmed
     } else {
-        deliver(state_arc, uid, after_notice_for(snap.from_bytes, &marker, requester.as_deref()))
+        Delivered::Vanished
     };
-    if !delivered {
-        resume_old(state_arc, uid, &snap, "the forked session vanished before its first message");
+    if delivered == Delivered::Vanished {
+        resume_old(state_arc, uid, &snap, "the forked session vanished before its first message", pinned.as_deref());
         return;
     }
-    update(uid, |r| r.phase = "verifying");
-    let needle = format!("[cm-rotation{marker}]");
+    set_phase(uid, "verifying", Some(verify_deadline(snap.from_bytes)));
     let deadline = Instant::now() + verify_deadline(snap.from_bytes);
-    let claude = snap.entry.session_type == "claude-code";
     let mut first_len: Option<(PathBuf, u64)> = None;
+    let mut candidates: Vec<PathBuf> = pinned.iter().cloned().collect();
     while Instant::now() < deadline {
-        let (live, to_path) = {
+        let (live, live_path) = {
             let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
             let sess = st.sessions.get(uid);
             (sess.is_some(), sess.and_then(|s| s.transcript_path.clone()).map(PathBuf::from))
         };
-        if !live {
-            resume_old(state_arc, uid, &snap, "the forked session exited before writing its transcript");
-            return;
+        if let Some(p) = live_path.filter(|p| p != &snap.from_path && !candidates.contains(p)) {
+            candidates.push(p);
         }
-        if let Some(to_path) = to_path.filter(|p| p != &snap.from_path) {
-            let to_id = crate::session::transcript_id_from_path(&to_path.to_string_lossy());
-            update(uid, |r| r.to_id = to_id.clone());
-            if first_len.as_ref().is_none_or(|(p, _)| p != &to_path) {
-                first_len = Some((to_path.clone(), std::fs::metadata(&to_path).map(|m| m.len()).unwrap_or(0)));
+        for to_path in &candidates {
+            if first_len.as_ref().is_none_or(|(p, _)| p != to_path) && Some(to_path) != pinned.as_ref() {
+                first_len = Some((to_path.clone(), std::fs::metadata(to_path).map(|m| m.len()).unwrap_or(0)));
             }
-            let since = first_len.as_ref().map_or(0, |(_, n)| *n);
-            if let Some(bytes) = fork_written(&to_path).filter(|_| fork_took(&to_path, &needle, claude, since)) {
-                update(uid, |r| r.to_bytes = Some(bytes));
-                if let Some(to) = to_id.as_deref() {
-                    let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-                    if let Err(e) = crate::resume_identity::record_rotation(&st, &snap.from_id, to) {
-                        eprintln!("cm-daemon: rotation of {uid}: lineage not recorded: {e}");
-                    }
+            let since = first_len.as_ref().filter(|(p, _)| p == to_path).map_or(0, |(_, n)| *n);
+            if let Some(bytes) = fork_written(to_path).filter(|_| fork_took(to_path, &needle, claude, since)) {
+                if live {
+                    succeed(state_arc, uid, &snap, to_path, bytes, "rotated");
+                } else {
+                    // It took, then exited: bring it back on the fork.
+                    keep_fork(state_arc, uid, &snap, to_path, "the fork exited after recording turns");
                 }
-                finish(
-                    uid,
-                    "done",
-                    format!(
-                        "rotated {} ({}) to {} ({})",
-                        snap.from_id,
-                        mb(snap.from_bytes),
-                        to_id.as_deref().unwrap_or("?"),
-                        mb(bytes)
-                    ),
-                );
                 return;
             }
         }
+        if !live {
+            resume_old(state_arc, uid, &snap, "the forked session exited before writing its transcript", pinned.as_deref());
+            return;
+        }
         std::thread::sleep(Duration::from_millis(500));
     }
-    resume_old(state_arc, uid, &snap, "the fork wrote no transcript (API error or a menu?)");
+    let why = "the fork wrote no transcript in time (API error or a menu?)";
+    if claude {
+        if let (Some(fork), Some(reason)) = (&pinned, keep_reason(state_arc, uid, spawned, delivered == Delivered::OwnerTyped, &candidates)) {
+            keep_fork(state_arc, uid, &snap, fork, &format!("{why}, but {reason}"));
+            return;
+        }
+    }
+    resume_old(state_arc, uid, &snap, why, pinned.as_deref());
 }
 
 /// The fork did not take: stop whatever runs at the uid and resume the old
-/// transcript, as it was.
-fn resume_old(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: &Snapshot, why: &str) {
-    update(uid, |r| r.phase = "falling back");
+/// transcript, as it was. A Claude `fork` whose file holds messages is
+/// never discarded (#114): it is kept (and resumed if it exited) instead.
+fn resume_old(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: &Snapshot, why: &str, fork: Option<&Path>) {
+    if let Some(fork) = fork.filter(|p| fork_written(p).is_some()) {
+        keep_fork(state_arc, uid, snap, fork, &format!("{why}, but the fork holds new turns"));
+        return;
+    }
+    let source_bytes = std::fs::metadata(&snap.from_path).map(|m| m.len()).unwrap_or(snap.from_bytes);
+    set_phase(uid, "falling back", Some(STOP_DEADLINE + verify_deadline(source_bytes) + Duration::from_secs(120)));
     let live = state_arc.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid);
     if live {
         if stop_tracked(state_arc, uid, ROTATION_KILLER, "transcript rotation") == Stopped::Stuck {
@@ -1290,12 +1633,20 @@ fn resume_old(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: &Snapshot, w
         false,
     ) {
         Ok(_) => {
+            // Viewers were told about the fork: point them back.
+            rebroadcast_binding(state_arc, uid);
             if snap.entry.session_type == "claude-code" {
-                // The original transcript is the large one: same readiness.
-                deliver_ready(state_arc, uid, fallback_notice(why), FALLBACK_NEEDLE, snap.from_bytes);
+                // The original transcript is the large one: same readiness,
+                // but a turn it records proves it is up (#114: this wait
+                // used to run its full 239 s a second time).
+                let key = format!("rotation-fallback:{uid}:{}", nonce());
+                deliver_ready(state_arc, uid, fallback_notice(why), FALLBACK_NEEDLE, snap.from_bytes,
+                              Some((&snap.from_path, source_bytes)), &key);
             } else {
                 deliver(state_arc, uid, fallback_notice(why));
             }
+            // Again, for a viewer that was still reattaching the first time.
+            rebroadcast_binding(state_arc, uid);
             update(uid, |r| r.path = "fallback-resume");
             fail(state_arc, uid, format!("{why}; resumed the original transcript {}", snap.from_id));
         }
@@ -1712,7 +2063,7 @@ fn try_due(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) {
         Some(a) => (
             a.reason,
             a.origin,
-            Checks { idle: Duration::ZERO, owner_quiet: Duration::ZERO, draft: a.origin != Origin::Operator, at_turn_end: true },
+            Checks { idle: Duration::ZERO, owner_quiet: Duration::ZERO, draft: a.origin != Origin::Operator, at_turn_end: true, crons_block: false },
         ),
         None => {
             let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
@@ -1722,7 +2073,7 @@ fn try_due(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) {
                 return;
             }
             let quiet = Duration::from_secs(st.config.transcript_rotation.owner_quiet_secs);
-            (why, Origin::Policy, Checks { idle: Duration::ZERO, owner_quiet: quiet, draft: true, at_turn_end: true })
+            (why, Origin::Policy, Checks { idle: Duration::ZERO, owner_quiet: quiet, draft: true, at_turn_end: true, crons_block: false })
         }
     };
     match start_with(state_arc, uid, &reason, origin, checks) {
@@ -2049,8 +2400,8 @@ mod tests {
         let mut st = DaemonState::new();
         st.messaging_root = dir.path().to_path_buf();
         st.sessions.insert("ts-te-0".into(), idle_session("ts-te-0", 3));
-        let at_end = Checks { idle: Duration::ZERO, owner_quiet: Duration::ZERO, draft: false, at_turn_end: true };
-        let polled = Checks { idle: Duration::ZERO, owner_quiet: Duration::ZERO, draft: false, at_turn_end: false };
+        let at_end = Checks { idle: Duration::ZERO, owner_quiet: Duration::ZERO, draft: false, at_turn_end: true, crons_block: false };
+        let polled = Checks { idle: Duration::ZERO, owner_quiet: Duration::ZERO, draft: false, at_turn_end: false, crons_block: false };
         let engines = ["claude-code"];
         assert_eq!(boundary_checked(&st, "ts-te-0", &engines, at_end), Ok(()));
         crate::notifications::publish(dir.path(), "ts-te-0", "chat-1", "chat", "[m1] hi", "[m1]").unwrap();
@@ -2187,7 +2538,8 @@ mod tests {
         test_set_running("ts-dup-0", true);
         let r = start(&state, "ts-dup-0", "again", Origin::Operator, true);
         test_set_running("ts-dup-0", false);
-        assert!(r.unwrap_err().1.contains("already running"));
+        let why = r.unwrap_err().1;
+        assert!(why.starts_with(BUSY) && why.contains("starting the fork") && why.contains("comes straight back"), "{why}");
         assert!(!armed("ts-dup-0"));
     }
 
@@ -2345,5 +2697,165 @@ mod tests {
         assert_eq!(mb(323_505), "323 KB");
         assert_eq!(mb(9_121_310), "9.1 MB");
         assert!(before_notice("transcript is 400 MB").contains("next turn ends"));
+    }
+
+    /// EP's fork (2026-11-07): metadata and four 34 KB file-history
+    /// snapshots put its first message past 256 KB, so the old head check
+    /// never saw it and a working fork was rolled back.
+    #[test]
+    fn a_fork_whose_first_message_is_past_256_kb_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let fork = dir.path().join("fork.jsonl");
+        let mut text = String::new();
+        for t in ["custom-title", "ai-title", "agent-name", "mode", "permission-mode"] {
+            text += &format!("{}\n", json!({"type": t, "sessionId": "fork"}));
+        }
+        let blob = "x".repeat(60_000);
+        for i in 0..5 {
+            // Backups of other transcripts may mention user rows in content.
+            text += &format!("{}\n", json!({"type": "file-history-snapshot", "messageId": i,
+                "snapshot": {"backup": format!("{{\"type\":\"user\",\"parentUuid\":null}} {blob}")}}));
+        }
+        std::fs::write(&fork, &text).unwrap();
+        assert!(text.len() > 256 * 1024);
+        assert_eq!(fork_written(&fork), None, "metadata and snapshots alone are not a turn");
+        let row = json!({"type": "user", "parentUuid": "p", "message": {"role": "user", "content": "rotation done"}});
+        // A row still being written (no newline yet) does not count yet.
+        std::fs::write(&fork, format!("{text}{row}")).unwrap();
+        assert_eq!(fork_written(&fork), None);
+        std::fs::write(&fork, format!("{text}{row}\n")).unwrap();
+        assert_eq!(fork_written(&fork), Some(std::fs::metadata(&fork).unwrap().len()));
+        assert!(fork_took(&fork, "[cm-rotation zz]", true, 0));
+        let at = first_message_after(&fork, 0).unwrap();
+        assert_eq!(first_message_after(&fork, at), None, "nothing new after the last row");
+    }
+
+    /// A report naming the transcript a rotation is moving the session off
+    /// is ignored while its fork starts or is verified (#114).
+    #[test]
+    fn a_rotating_session_is_never_restamped_to_its_source() {
+        let _serial = test_registry_lock();
+        let old = "/p/650fb958-1e42-4428-b4aa-33e4f7061ba5.jsonl";
+        let fork = "/p/9f6089a3-30f8-40ab-8194-05333e583b84.jsonl";
+        for phase in ["forking", "notifying", "verifying"] {
+            test_set_rotating("ts-restamp-0", "650fb958-1e42-4428-b4aa-33e4f7061ba5", phase);
+            assert!(refuses_restamp("ts-restamp-0", old), "{phase}");
+            assert!(!refuses_restamp("ts-restamp-0", fork), "{phase}: the fork itself is fine");
+            assert!(!refuses_restamp("ts-other-0", old), "{phase}: only that session");
+        }
+        // The fallback resumes the original: that is not a re-stamp.
+        test_set_rotating("ts-restamp-0", "650fb958-1e42-4428-b4aa-33e4f7061ba5", "falling back");
+        assert!(!refuses_restamp("ts-restamp-0", old));
+        test_set_rotating("ts-restamp-0", "650fb958-1e42-4428-b4aa-33e4f7061ba5", "verifying");
+        test_finish("ts-restamp-0");
+        assert!(!refuses_restamp("ts-restamp-0", old), "a finished rotation guards nothing");
+        test_set_running("ts-restamp-0", false);
+    }
+
+    /// The verifier gave up while the fork it should have accepted was
+    /// live and held Owner's turns (#114). A fork with turns is kept: the
+    /// process is not stopped, the lineage is recorded, nothing is resumed.
+    #[test]
+    fn a_fork_with_turns_is_never_rolled_back() {
+        let _serial = test_registry_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old-id.jsonl");
+        let fork = dir.path().join("new-id.jsonl");
+        std::fs::write(&old, format!("{}\n", json!({"type":"user","parentUuid":null}))).unwrap();
+        std::fs::write(&fork, format!("{}\n{}\n",
+            json!({"type":"file-history-snapshot","messageId":"m"}),
+            json!({"type":"user","parentUuid":"p","message":{"role":"user","content":"rotation done"}}))).unwrap();
+        let mut state = DaemonState::new();
+        state.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
+        let mut sess = idle_session("ts-keep-0", 0);
+        sess.transcript_path = Some(fork.to_string_lossy().into_owned());
+        let pid = sess.pid;
+        state.sessions.insert("ts-keep-0".into(), sess);
+        let entry: crate::manifest::ManifestEntry = serde_json::from_value(json!({
+            "uid": "ts-keep-0", "label": "r", "session_type": "claude-code",
+            "transcript_id": "old-id", "transcript_path": old})).unwrap();
+        let snap = Snapshot { entry, workspace_id: "ws".into(), worktree: dir.path().into(),
+                              from_path: old.clone(), from_id: "old-id".into(), from_bytes: 0 };
+        let state = Arc::new(Mutex::new(state));
+        test_set_rotating("ts-keep-0", "old-id", "verifying");
+        resume_old(&state, "ts-keep-0", &snap, "the fork wrote no transcript in time", Some(&fork));
+        let r = status("ts-keep-0").expect("recorded");
+        assert_eq!(r["phase"], "done", "{r}");
+        assert_eq!(r["to_transcript_id"], "new-id", "{r}");
+        assert!(r["outcome"].as_str().unwrap().contains("kept the fork"), "{r}");
+        {
+            let st = state.lock().unwrap();
+            let s = st.sessions.get("ts-keep-0").expect("the fork was not stopped");
+            assert_eq!(s.pid, pid);
+            assert_eq!(s.transcript_path.as_deref(), Some(fork.to_string_lossy().as_ref()));
+        }
+        let archive = std::fs::read_to_string(dir.path().join("daemon-resume-identities.json")).unwrap();
+        assert!(archive.contains("\"old-id\": \"new-id\""), "{archive}");
+        test_set_running("ts-keep-0", false);
+        for s in state.lock().unwrap().sessions.values_mut() {
+            let _ = s.kill();
+        }
+    }
+
+    /// At the deadline, a fork with no turns is still kept when Owner typed
+    /// in it or its file exists; only an empty, untouched fork is rolled back.
+    #[test]
+    fn an_unconfirmed_fork_is_kept_when_rolling_back_could_lose_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let fork = dir.path().join("new-id.jsonl");
+        let mut state = DaemonState::new();
+        state.sessions.insert("ts-unsure-0".into(), idle_session("ts-unsure-0", 0));
+        let state = Arc::new(Mutex::new(state));
+        let spawned = Instant::now() - Duration::from_secs(60);
+        let none: Vec<PathBuf> = vec![fork.clone()];
+        assert_eq!(keep_reason(&state, "ts-unsure-0", spawned, false, &none), None, "no file, no input: roll back");
+        assert!(keep_reason(&state, "ts-unsure-0", spawned, true, &none).unwrap().contains("Owner typed"));
+        *state.lock().unwrap().sessions["ts-unsure-0"].last_operator_input_at.lock().unwrap() =
+            Some(Instant::now() - Duration::from_secs(5));
+        assert!(keep_reason(&state, "ts-unsure-0", spawned, false, &none).unwrap().contains("Owner typed"));
+        *state.lock().unwrap().sessions["ts-unsure-0"].last_operator_input_at.lock().unwrap() = None;
+        std::fs::write(&fork, "{\"type\":\"mode\"}\n").unwrap();
+        assert!(keep_reason(&state, "ts-unsure-0", spawned, false, &none).unwrap().contains("exists"));
+        for s in state.lock().unwrap().sessions.values_mut() {
+            let _ = s.kill();
+        }
+    }
+
+    /// A fallback re-sends the restored binding, so a viewer told about the
+    /// fork follows the session back (#114: the A-e picker still marked the
+    /// rolled-back fork "this").
+    #[test]
+    fn a_fallback_rebroadcasts_the_restored_binding() {
+        let mut state = DaemonState::new();
+        let mut sess = idle_session("ts-rebind-0", 0);
+        sess.transcript_path = Some("/p/650fb958-1e42-4428-b4aa-33e4f7061ba5.jsonl".into());
+        state.sessions.insert("ts-rebind-0".into(), sess);
+        let (rx, _guard) = state.manifest_watcher.subscribe();
+        let state = Arc::new(Mutex::new(state));
+        rebroadcast_binding(&state, "ts-rebind-0");
+        match rx.recv_timeout(Duration::from_millis(500)).expect("a fallback must broadcast") {
+            crate::manifest::ManifestDiff::Updated { uid, entry } => {
+                assert_eq!(uid, "ts-rebind-0");
+                assert_eq!(entry["transcript_id"], "650fb958-1e42-4428-b4aa-33e4f7061ba5");
+            }
+            other => panic!("expected Updated, got {other:?}"),
+        }
+        for s in state.lock().unwrap().sessions.values_mut() {
+            let _ = s.kill();
+        }
+    }
+
+    /// A restart request during a rotation names the phase and a bound.
+    #[test]
+    fn a_busy_message_names_phase_and_time_left() {
+        let _serial = test_registry_lock();
+        test_set_rotating("ts-busy-0", "old", "notifying");
+        set_phase("ts-busy-0", "notifying", Some(Duration::from_secs(300)));
+        let m = busy_message("ts-busy-0").unwrap();
+        assert!(m.starts_with(BUSY) && m.contains("delivering the fork's first message"), "{m}");
+        assert!(m.contains("left") && m.contains("comes straight back"), "{m}");
+        test_finish("ts-busy-0");
+        assert_eq!(busy_message("ts-busy-0"), None);
+        test_set_running("ts-busy-0", false);
     }
 }

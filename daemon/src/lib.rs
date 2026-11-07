@@ -104,6 +104,7 @@ pub mod reader_gate;
 pub mod reap_gate;
 pub mod resume_identity;
 pub mod rotation;
+pub mod session_crons;
 pub mod handoff;
 pub mod reaper;
 pub mod reexec;

@@ -91,6 +91,22 @@ pub(crate) enum ReviveRefusal {
 /// Classify a `session.revive` error. `killed`: this A-R killed the session
 /// first, so "still running" means the kill did not land (the old process),
 /// which is a failure to show, not a session to reattach to.
+/// The words the daemon's "a rotation is running" refusals start with
+/// (`cm_daemon::rotation::BUSY`).
+pub(crate) const ROTATION_BUSY: &str = cm_daemon::rotation::BUSY;
+
+/// The phase and time left from a daemon rotation refusal, e.g.
+/// "delivering the fork's first message (started 1m10s ago, at most 2m40s
+/// left); it reattaches on its own".
+pub(crate) fn rotation_progress(error: &str) -> String {
+    let detail = error
+        .split_once(&format!("{ROTATION_BUSY}: "))
+        .map(|(_, rest)| rest)
+        .unwrap_or(error);
+    let detail = detail.split("; CM restarts").next().unwrap_or(detail);
+    format!("{detail}; it reattaches on its own")
+}
+
 pub(crate) fn classify_revive_refusal(error: &str, killed: bool) -> ReviveRefusal {
     if error.contains("comes straight back") {
         ReviveRefusal::ComingBack
@@ -700,6 +716,11 @@ impl App {
                     prompt: prompt.clone(),
                     action: ConfirmAction::BackgroundRecovery { uid: flight.uid, host: flight.host_id, identity, prompt },
                 };
+            }
+            // #114: A-R during a rotation: say where it is, not an error.
+            RestartOutcome::RecoveryNeedsAttention(message) if message.contains(ROTATION_BUSY) => {
+                unmark(self);
+                self.set_status_msg(&format!("CM is rotating this session: {}", rotation_progress(&message)));
             }
             RestartOutcome::RecoveryNeedsAttention(message) => {
                 unmark(self);

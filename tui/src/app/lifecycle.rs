@@ -2659,6 +2659,11 @@ impl App {
                         super::agent_state::short_size(from)
                     ));
                 }
+                // #114: a rotation already running is progress, not an error.
+                Err(e) if e.to_string().contains(super::restart::ROTATION_BUSY) => app.set_status_msg(&format!(
+                    "Already rotating: {}",
+                    super::restart::rotation_progress(&e.to_string())
+                )),
                 Err(e) => app.set_status_msg(&format!("Rotation refused: {e}")),
             })
         });

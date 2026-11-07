@@ -512,7 +512,7 @@ fn boundary(state: &DaemonState, uid: &str, req: &Request) -> Result<(), String>
         state,
         uid,
         &["claude-code", "codex"],
-        crate::rotation::Checks { idle, owner_quiet: quiet, draft, at_turn_end: false },
+        crate::rotation::Checks { idle, owner_quiet: quiet, draft, at_turn_end: false, crons_block: true },
     )
 }
 
@@ -920,6 +920,9 @@ fn restore_old(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, snap: &crate::rot
     }
     match crate::control::methods::restore_one_session_launch(state_arc, &snap.workspace_id, &snap.worktree, &snap.entry, None, false) {
         Ok(_) => {
+            // Viewers were told about the new engine's transcript: point
+            // them back at the restored one (#114).
+            crate::rotation::rebroadcast_binding(state_arc, uid);
             crate::rotation::deliver_resume(state_arc, uid, fallback_notice(why, file));
             fail(state_arc, uid, format!("{why}; resumed the original {} session", snap.entry.session_type));
         }

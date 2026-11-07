@@ -23,6 +23,10 @@ due when:
   rotation or handoff of that session is running is refused, not armed. Arms
   persist across a brain restart (`rotation-arms.json`); one that finds no
   usable turn end in 6 h is dropped, and so is one whose session exits.
+  Alt+T, A-R or a revive while a rotation runs is answered with its phase
+  and how long it can still take ("transcript rotation in progress:
+  delivering the fork's first message (started 1m10s ago, at most 2m40s
+  left)"), shown as progress, not as an error.
 
 The 5-minute policy pass stays as a fallback.
 
@@ -75,21 +79,48 @@ the previous brain (the recoveries below hold again if they run).
    file. A `turn_end` monitor absorbs the turn this notice causes; it does
    not fire it as the worker's completion.
    For a Claude session (the fork, and the original on a fallback) the
-   notice goes in only once the new process's composer is drawn and its
-   screen has been still for 1.5 s, waiting up to the verification deadline.
-   A large transcript keeps loading after the process is up, and text typed
-   meanwhile sat unsent (a 1.07 GB fork on 2026-10-26). Until the transcript
-   records the notice, CM presses Enter if it is visibly sitting in the
-   composer (up to 3 times, 10 s apart), or types it once more if it vanished
-   while the agent sits idle. Human input stops this.
+   notice goes in once the new process's composer is drawn and its screen
+   has been still for 1.5 s. A large transcript keeps loading after the
+   process is up, and text typed meanwhile sat unsent (a 1.07 GB fork on
+   2026-10-26). The wait ends early when the transcript already records a
+   new turn (the process is up; Claude queues what is typed while it
+   works), 10 s after the composer is first drawn (a busy footer never
+   settles: both of EP's waits on 2026-11-07 ran their full 239 s, and the
+   notice was then recorded within 5 s), or when Owner types in it: then
+   nothing is typed into their draft, and the notice goes to the native
+   notification queue instead. Until the transcript records the notice, CM
+   presses Enter if it is visibly sitting in the composer (up to 3 times,
+   10 s apart), or types it once more if it vanished while the agent sits
+   idle. Human input stops this.
+
+   **Session crons** (`CronCreate` wakeups) live only in the process. CM
+   notes them before the stop (the Stop hook reports id, schedule and
+   recurring), recovers each prompt from the last 64 MB of the old
+   transcript (`CronList` results and `CronCreate` calls), saves them to
+   `~/.cm/session-crons/<uid>.json`, and names them in the after-notice
+   so the agent re-creates them. An A-R restart does the same in its
+   `[cm-restart]` notice; crons no longer count as background work there.
 4. Confirm the rotation from the new transcript, not from keystrokes, within
    180 s plus 60 s per GB of source (fractional; at most 20 min). The fork
    took if it recorded the after-notice's marker or any new turn: a Claude
    fork's file is only written when its first message is recorded, whatever
    that message was; a Codex fork needs a new user row after its copied
-   history.
+   history. A Claude fork is checked at the file the daemon pinned with
+   `--session-id`, whatever the row's `transcript_path` says meanwhile, and
+   the whole file is searched for a message row: a fork opens with metadata
+   and `file-history-snapshot` rows, and EP's first message on 2026-11-07
+   sat at byte 275,257, past the 256 KB the check used to read, so a fork
+   holding Owner's turns was rolled back. While a fork starts or is
+   verified, no hook report or detector push may bind the session back to
+   the source transcript.
 5. If it is not (an API error, a rate-limit menu, an early exit), resume the
-   old id unchanged and tell the agent. The policy then leaves the session
+   old id unchanged and tell the agent. **A fork with new turns is never
+   rolled back:** if its file holds a message it is kept (and resumed on
+   the fork if it exited). At the deadline it is also kept, with an alert to
+   Owner, when Owner typed in it, its file exists, or it is mid-turn; only
+   an empty, untouched fork is discarded. A fallback re-sends the restored
+   binding to viewers (`manifest.watch` Updated), so the TUI row and its
+   A-e picker follow the session back to the original transcript. The policy then leaves the session
    alone for 6 h, doubling with each consecutive failure (at most a week;
    the counts persist in `~/.cm/rotation-failures.json` across restarts).
    Owner is alerted at once when a failed rotation leaves the session not
@@ -105,8 +136,9 @@ A brain restart between the stop and the confirmation leaves the marker. The
 next brain resumes a session that is not live on its original transcript
 (and tells it). A live session still on its original transcript is left as
 it is. A live fork that has not confirmed gets the after-notice again and is
-verified the same way: on success the lineage is recorded, otherwise it is
-rolled back to the original transcript.
+verified the same way (at the pinned file the marker records): on success
+the lineage is recorded, otherwise it is rolled back to the original
+transcript. A fork that is not live but holds turns is resumed on the fork.
 
 CM never writes into Claude's files. The old transcript stays as it was, and
 the lineage (old id → new id) is kept in `~/.cm/daemon-resume-identities.json`
@@ -155,8 +187,8 @@ these hold:
 - it is idle (for `idle_secs` on the fallback pass), with no tool call or
   background job in flight. A job whose process is gone has exited and does
   not count, even if the agent's last snapshot still lists it;
-- it has no pending scheduled wakeup (a session cron: CM does not carry
-  crons across a fork, so a restart would lose it);
+- (a pending scheduled wakeup no longer blocks a rotation: it is carried
+  over, see step 3; a handoff to another engine still waits for it);
 - on the fallback pass, it has no queued native notices and no receipts
   under 10 minutes old (other than rotation's own). An unconfirmed receipt
   older than 10 minutes never blocks, and one older than 24 h is retired
