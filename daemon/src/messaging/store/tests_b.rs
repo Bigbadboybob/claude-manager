@@ -534,3 +534,38 @@ fn dm_rows_carry_member_names_including_departed_agents() {
     assert_eq!(row["member_names"]["owner"], "Owner");
     assert_eq!(row["peer"], json!(a.id), "existing fields unchanged");
 }
+
+/// A DM by NAME to a closed session is refused when a live session carries
+/// that name plus a suffix (a replaced lead), and names the live one; the
+/// closed participant stays reachable by ID, and a closed name with no live
+/// successor still resolves (Owner 2026-11-08: "PP-Lead" went to a closed
+/// session while "PP-Lead-6ef" was live).
+#[test]
+fn dm_by_name_refuses_closed_session_with_live_successor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Store::open(tmp.path()).unwrap();
+    let old = person(&s, "old");
+    let new = person(&s, "new");
+    let lone = person(&s, "lone");
+    let me = person(&s, "me");
+    let send = |s: &mut Store, from: &Person, name: &str, target: Value, key: &str, people: &[Person]| {
+        let mut q = target;
+        q["body"] = json!(key);
+        q["request_id"] = json!(key);
+        q["name"] = json!(name);
+        s.send(&from.id, &from.session_uid, "agent", &q, people)
+    };
+    send(&mut s, &old, "PP-Lead", json!({"dm":"owner"}), "o1", &[old.clone()]).unwrap();
+    send(&mut s, &new, "PP-Lead-6ef", json!({"dm":"owner"}), "n1", &[new.clone()]).unwrap();
+    send(&mut s, &lone, "Solo-Lead", json!({"dm":"owner"}), "l1", &[lone.clone()]).unwrap();
+    // `old` and `lone` have exited: only `new` and `me` are present.
+    let live = vec![new.clone(), me.clone()];
+    let e = send(&mut s, &me, "Me", json!({"dm":"PP-Lead"}), "m1", &live).unwrap_err();
+    assert_eq!(e.code, "not_found", "{e:?}");
+    assert!(e.message.contains("PP-Lead-6ef") && e.message.contains("closed"), "{e:?}");
+    // The live successor by name, and the closed one by explicit ID, both work.
+    send(&mut s, &me, "Me", json!({"dm":"PP-Lead-6ef"}), "m2", &live).unwrap();
+    send(&mut s, &me, "Me", json!({"dm":old.id.clone()}), "m3", &live).unwrap();
+    // A closed name with no live successor keeps resolving as before.
+    send(&mut s, &me, "Me", json!({"dm":"Solo-Lead"}), "m4", &live).unwrap();
+}

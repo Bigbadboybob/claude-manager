@@ -1434,8 +1434,17 @@ impl Store {
         }
         let mut members = vec![actor.to_owned()];
         for peer in peers {
+            let by_id = peer == "owner"
+                || self.names.contains_key(&peer)
+                || people.iter().any(|x| x.id == peer);
+            let typed = peer.clone();
             let peer = match self.resolve_participant_ref(&peer, people) {
-                mentions::ParticipantRef::Found(id) => id,
+                mentions::ParticipantRef::Found(id) => {
+                    if !by_id {
+                        self.refuse_closed_name_with_live_successor(&typed, &id, people)?;
+                    }
+                    id
+                }
                 _ => {
                     return Err(err(
                         "not_found",
@@ -1465,6 +1474,53 @@ impl Store {
         Ok((
             id.clone(),
             Some(json!({"id":id,"kind":"dm","members":members})),
+        ))
+    }
+    /// A DM addressed by NAME that lands on a closed session while a live
+    /// session carries the same name plus a suffix (a replaced lead:
+    /// "PP-Lead" closed, "PP-Lead-6ef" live) is refused and names the live
+    /// one. Owner 2026-11-08: lookups should not land on closed sessions by
+    /// default. Addressing the closed participant by its ID still works.
+    /// A participant's current chat name and aliases, else its directory name.
+    fn chat_names<'a>(&'a self, x: &'a Person) -> Box<dyn Iterator<Item = &'a str> + 'a> {
+        match self.names.get(&x.id) {
+            Some(n) => Box::new(std::iter::once(n.name.as_str()).chain(n.aliases.iter().map(String::as_str))),
+            None => Box::new(std::iter::once(x.name.as_str())),
+        }
+    }
+    fn refuse_closed_name_with_live_successor(
+        &self,
+        typed: &str,
+        id: &str,
+        people: &[Person],
+    ) -> Result<()> {
+        if people.iter().any(|x| x.id == id && x.present) {
+            return Ok(());
+        }
+        let key = name_key(typed);
+        let prefix = format!("{key}-");
+        let mut live: Vec<&str> = people
+            .iter()
+            .filter(|x| {
+                x.present
+                    && x.id != id
+                    && x.kind == "agent"
+                    && x.engine.as_deref() != Some("bash")
+                    && self.chat_names(x).any(|n| name_key(n).starts_with(&prefix))
+            })
+            .map(|x| self.names.get(&x.id).map_or(x.name.as_str(), |n| n.name.as_str()))
+            .collect();
+        if live.is_empty() {
+            return Ok(());
+        }
+        live.sort_unstable();
+        live.dedup();
+        Err(err(
+            "not_found",
+            format!(
+                "'{typed}' is a closed session. Live: {}. DM the live one, or pass the closed participant ID ({id}) to reach it anyway",
+                live.join(", ")
+            ),
         ))
     }
     fn request(
