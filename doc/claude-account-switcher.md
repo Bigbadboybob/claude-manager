@@ -397,6 +397,15 @@ stale in-memory `oauthAccount` (a written value held for 60 s here).
    trigger a switch or rule out a target; a full model-scoped limit
    (`week:Fable`) alerts without advice unless `"switch_on_scoped": true`.
    50 tests.
+   **Laptop run of 35ed90c (2026-11-09, 05:03-05:47Z, timer only):** a 429
+   on the first call (9 min after the previous) was skipped with a 15-min
+   backoff; then three clean calls 10 min apart. The undelivered 96% alert
+   was retried after an hour, carrying `Suggest: cm-claude-accounts switch
+   <email> (no usage reading yet)`. A session refresh at 05:17:40Z replaced
+   `.credentials.json` (new inode, by rename), and the next `poll` saved the
+   new login after Anthropic confirmed it; `poll` itself never wrote the
+   file. Still unproven: Telegram delivery (no notifier on the laptop yet),
+   a match with `/usage`, and `auto` on a real login.
 4. Laptop rollout, then cm-sessions and cm-manager (one host at a time,
    with Owner present for the per-account `/login`s).
 5. Optional: TUI dashboard panel; multi-host `switch`/`status` through CM.
