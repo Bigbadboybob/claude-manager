@@ -751,8 +751,8 @@ class PollTests(PollHarness):
 
 
 
-class AutoswitchTests(PollHarness):
-    """On threshold: suggest the account with most room; auto switches behind a flag."""
+class AutoswitchHarness(PollHarness):
+    """alice (active, week 95%), bob and carol saved."""
 
     def setUp(self):
         super().setUp()
@@ -782,6 +782,15 @@ class AutoswitchTests(PollHarness):
             if h["event"] == "switch":
                 h["at"] -= seconds
         self.paths.state.write_text(json.dumps(state))
+
+    def alerts_reset(self):
+        state = self.state()
+        state["limit_alerts"] = {}
+        self.paths.state.write_text(json.dumps(state))
+
+
+class AutoswitchTests(AutoswitchHarness):
+    """On threshold: suggest the account with most room; auto switches behind a flag."""
 
     def test_suggests_the_account_with_most_room(self):
         self.set_reading("bob", ("weekly_all", None, 40, 2 * 86400, True))
@@ -864,11 +873,6 @@ class AutoswitchTests(PollHarness):
         self.poll()
         self.assertEqual(self.live()["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-bob")
 
-    def alerts_reset(self):
-        state = self.state()
-        state["limit_alerts"] = {}
-        self.paths.state.write_text(json.dumps(state))
-
     def test_auto_without_a_target_only_alerts(self):
         self.set_reading("bob", ("weekly_all", None, 97, 86400, True), autoswitch="auto")
         self.set_reading("carol", ("weekly_all", None, 97, 86400, True))
@@ -876,6 +880,312 @@ class AutoswitchTests(PollHarness):
         self.poll()
         self.assertEqual(self.live_token(), "sk-ant-oat-ACCESS-alice")
         self.assertIn("No other saved account has room", self.alerts()[0])
+
+
+def peer_export(active=None, **readings):
+    """Another host's `export`: readings given as name=(age, *limits)."""
+    now = int(time.time())
+    accts = {}
+    for name, (age, *limits) in readings.items():
+        accts[f"{name}-uuid-0000"] = {
+            "email": f"{name}@example.com", "login": "login valid 20d",
+            "reading": {"at": now - age, "limits": accounts.parse_limits(usage(*limits))}}
+    return {"version": 1, "host": "peerhost", "at": now,
+            "active": f"{active}-uuid-0000" if active else None, "accounts": accts, "poll": {}}
+
+
+class PeerTests(AutoswitchHarness):
+    """Hosts share readings (never logins) to choose better targets."""
+
+    def setUp(self):
+        super().setUp()
+        self.peer_data = {}
+        self.peer_calls = []
+
+        def fetch(host):
+            self.peer_calls.append(host)
+            data = self.peer_data.get(host)
+            if isinstance(data, Exception):
+                raise data
+            if data is None:
+                raise accounts.AccountError(f"{host}: export failed (exit 255)")
+            return data
+
+        self.enterContext(mock.patch.object(accounts, "fetch_peer", side_effect=fetch))
+
+    def test_export_lists_readings_and_never_tokens(self):
+        self.poll()
+        code, text = self.run_cli("export")
+        self.assertEqual(code, 0)
+        data = json.loads(text)
+        self.assertEqual(data["version"], 1)
+        self.assertEqual(data["active"], "alice-uuid-0000")
+        self.assertEqual(set(data["accounts"]), {"alice-uuid-0000", "bob-uuid-0000", "carol-uuid-0000"})
+        self.assertEqual(data["accounts"]["alice-uuid-0000"]["reading"]["limits"][0]["percent"], 95)
+        self.assertIsNone(data["accounts"]["bob-uuid-0000"]["reading"])
+        self.assertNotIn("sk-ant", text)
+
+    def test_export_does_not_wait_for_the_store_lock(self):
+        fd = os.open(self.paths.store / "lock", os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, fd)
+        accounts.fcntl.flock(fd, accounts.fcntl.LOCK_EX)
+        result = {}
+        t = threading.Thread(target=lambda: result.update(r=self.run_cli("export")))
+        t.start()
+        t.join(5)
+        self.assertFalse(t.is_alive(), "export blocked on the store lock")
+        self.assertEqual(result["r"][0], 0)
+
+    def test_a_fresher_reading_from_a_peer_wins(self):
+        self.set_reading("bob", ("weekly_all", None, 97, 86400, True), age=2 * 86400)
+        self.set_config(peers=["cm-sessions"])
+        self.peer_data["cm-sessions"] = peer_export(bob=(300, ("weekly_all", None, 30, 86400, True)))
+        self.poll()
+        self.assertIn("switch bob@example.com (week 30% 5m ago on cm-sessions)", self.alerts()[0])
+        self.assertEqual(self.peer_calls, ["cm-sessions"])
+
+    def test_peers_are_only_read_when_a_switch_is_being_considered(self):
+        self.set_config(peers=["cm-sessions"])
+        self.usage[self.live_token()] = usage(("weekly_all", None, 20, 3 * 86400, True))
+        self.poll()
+        self.assertEqual(self.peer_calls, [])
+
+    def test_an_account_active_on_another_host_ranks_after_idle_ones(self):
+        self.set_config(peers=["cm-sessions"])
+        self.peer_data["cm-sessions"] = peer_export(
+            active="bob", bob=(60, ("weekly_all", None, 10, 86400, True)),
+            carol=(3600, ("weekly_all", None, 60, 86400, True)))
+        self.poll()
+        self.assertIn("switch carol@example.com (week 60% 1.0h ago on cm-sessions)", self.alerts()[0])
+        # When the busy account is the only one with room, it is still suggested, flagged.
+        self.peer_data["cm-sessions"] = peer_export(
+            active="bob", bob=(60, ("weekly_all", None, 10, 86400, True)),
+            carol=(60, ("weekly_all", None, 99, 86400, True)))
+        self.alerts_reset()
+        self.age_alerts_sent()
+        self.poll()
+        self.assertIn("switch bob@example.com (week 10% 1m ago on cm-sessions; active on cm-sessions)",
+                      self.alerts()[-1])
+
+    def age_alerts_sent(self):
+        if self.sent.exists():
+            self.sent.unlink()
+
+    def test_unreachable_peer_does_not_break_poll_and_status_says_so(self):
+        self.set_config(peers=["cm-sessions", "cm-manager"])
+        self.peer_data["cm-sessions"] = peer_export(bob=(300, ("weekly_all", None, 30, 86400, True)))
+        code, _ = self.poll()
+        self.assertEqual(code, 0)
+        self.assertIn("switch bob@example.com", self.alerts()[0])
+        del self.peer_data["cm-sessions"]  # now unreachable: the last good copy is kept
+        code, text = self.run_cli("status")
+        self.assertEqual(code, 0)
+        self.assertIn("peer cm-manager: cm-manager: export failed (exit 255)\n", text)
+        self.assertIn("peer cm-sessions: cm-sessions: export failed (exit 255); using its reading from", text)
+        self.assertIn("week 30% (resets in 24.0h, binding)  [read 5m ago on cm-sessions]", text)
+
+    def test_status_shows_peer_activity_and_peer_only_accounts(self):
+        self.set_config(peers=["cm-sessions"])
+        data = peer_export(active="bob", bob=(60, ("weekly_all", None, 10, 86400, True)),
+                           dave=(60, ("weekly_all", None, 50, 86400, True)))
+        self.peer_data["cm-sessions"] = data
+        text = self.run_cli("status")[1]
+        self.assertIn("bob@example.com (bob-uuid)", text)
+        self.assertRegex(text, r"bob@example.com \(bob-uuid\).*; active on cm-sessions")
+        self.assertIn("dave@example.com (dave-uui): saved on cm-sessions only, not here", text)
+        self.assertIn("peer cm-sessions: active bob@example.com", text)
+        self.assertEqual(self.run_cli("status", "--local")[0], 0)
+        self.assertEqual(self.peer_calls, ["cm-sessions"])  # --local reads no peer
+
+    def test_dropping_a_peer_forgets_its_readings(self):
+        self.set_config(peers=["cm-sessions"])
+        self.peer_data["cm-sessions"] = peer_export(bob=(60, ("weekly_all", None, 10, 86400, True)))
+        self.run_cli("status")
+        self.assertEqual(self.run_cli("config", "peers", "default")[0], 0)
+        self.assertNotIn("cm-sessions", self.state().get("peers", {}))
+
+
+class FetchPeerTests(unittest.TestCase):
+    def run_with(self, returncode=0, stdout="", exc=None):
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append((argv, kw))
+            if exc:
+                raise exc
+            return mock.Mock(returncode=returncode, stdout=stdout, stderr="secret-ish detail")
+
+        with mock.patch.object(accounts.subprocess, "run", side_effect=fake_run):
+            return calls, accounts.fetch_peer("cm-sessions")
+
+    def test_reads_export_over_batch_ssh(self):
+        calls, data = self.run_with(stdout=json.dumps(peer_export()))
+        argv, kw = calls[0]
+        self.assertEqual(argv[:5], ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5"])
+        self.assertEqual(argv[5:], ["cm-sessions", accounts.REMOTE_EXPORT])
+        self.assertEqual(kw["stdin"], accounts.subprocess.DEVNULL)
+        self.assertEqual(data["version"], 1)
+
+    def test_failures_name_the_host_only(self):
+        cases = [dict(returncode=255), dict(stdout="not json"), dict(stdout='{"version": 9}'),
+                 dict(exc=accounts.subprocess.TimeoutExpired("ssh", 20))]
+        for case in cases:
+            with self.assertRaises(accounts.AccountError) as cm:
+                self.run_with(**case)
+            self.assertTrue(str(cm.exception).startswith("cm-sessions: "), cm.exception)
+            self.assertNotIn("secret-ish", str(cm.exception))
+
+    def test_option_like_host_names_are_refused(self):
+        for bad in ("-oProxyCommand=sh", "a b", "", "x;y"):
+            with self.assertRaises(accounts.AccountError):
+                accounts.fetch_peer(bad)
+
+
+class SafeguardTests(AutoswitchHarness):
+    """auto never switches blind, honours exclusions, and caps switches per day."""
+
+    def auto_ready(self, **config):
+        self.set_config(autoswitch="auto", **config)
+        self.age_last_switch(31 * 60)
+
+    def test_auto_does_not_switch_to_an_unread_account_by_default(self):
+        self.set_reading("bob", ("weekly_all", None, 97, 86400, True))
+        self.auto_ready()
+        self.poll()
+        self.assertEqual(self.live_token(), "sk-ant-oat-ACCESS-alice")
+        self.assertIn("Suggest: cm-claude-accounts switch carol@example.com (no usage reading yet); "
+                      "automatic switch needs a usage reading for the target", self.alerts()[0])
+
+    def test_auto_allow_unread_lets_it_switch_blind(self):
+        self.set_reading("bob", ("weekly_all", None, 97, 86400, True))
+        self.auto_ready(auto_allow_unread=True)
+        self.poll()
+        self.assertEqual(self.live()["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-carol")
+
+    def test_excluded_accounts_are_never_targets(self):
+        self.set_reading("bob", ("weekly_all", None, 10, 86400, True))
+        self.set_reading("carol", ("weekly_all", None, 50, 86400, True))
+        code, text = self.run_cli("exclude", "bob@example.com")
+        self.assertEqual(code, 0)
+        self.assertIn("will never be a switch target", text)
+        self.poll()
+        self.assertIn("switch carol@example.com", self.alerts()[0])
+        self.assertRegex(self.run_cli("status")[1], r"bob@example.com.*; never a switch target")
+        self.run_cli("include", "bob")
+        self.assertNotIn("exclude", self.state()["config"])
+
+    def test_excluding_everything_else_means_no_room(self):
+        self.set_reading("bob", ("weekly_all", None, 10, 86400, True))
+        self.run_cli("exclude", "bob@example.com")
+        self.run_cli("exclude", "carol@example.com")
+        self.auto_ready(exclude=self.state()["config"]["exclude"])
+        self.poll()
+        self.assertEqual(self.live_token(), "sk-ant-oat-ACCESS-alice")
+        self.assertIn("No other saved account has room", self.alerts()[0])
+
+    def test_automatic_switches_are_capped_per_day(self):
+        self.set_reading("bob", ("weekly_all", None, 10, 86400, True))
+        self.auto_ready(max_auto_switches_per_day=2)
+        state = self.state()
+        old = int(time.time()) - 3 * 3600
+        state["history"] += [{"at": old, "event": "switch", "account": "x", "reason": "auto: week 95%"}
+                             for _ in range(2)]
+        self.paths.state.write_text(json.dumps(state))
+        self.poll()
+        self.assertEqual(self.live_token(), "sk-ant-oat-ACCESS-alice")
+        self.assertIn("automatic switches paused: 2 in the last 24 h", self.alerts()[0])
+        # Manual switches don't count, and day-old ones age out.
+        state = self.state()
+        for h in state["history"]:
+            if h.get("reason", "").startswith("auto:"):
+                h["at"] -= 86400
+        state["history"].append({"at": int(time.time()) - 7200, "event": "switch", "account": "x"})
+        state["limit_alerts"] = {}
+        self.paths.state.write_text(json.dumps(state))
+        self.poll()
+        self.assertEqual(self.live()["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-bob")
+
+
+class ConfigTests(AutoswitchHarness):
+    def test_show_set_and_reset(self):
+        code, text = self.run_cli("config")
+        self.assertEqual(code, 0)
+        self.assertIn("autoswitch                 suggest (default)", text)
+        self.assertIn("thresholds.weekly          90 (default)", text)
+        self.assertEqual(self.run_cli("config", "autoswitch", "auto")[0], 0)
+        self.assertEqual(self.run_cli("config", "min_dwell_minutes", "45")[0], 0)
+        self.assertEqual(self.run_cli("config", "auto_allow_unread", "true")[0], 0)
+        self.assertEqual(self.run_cli("config", "thresholds.weekly", "97")[0], 0)
+        self.assertEqual(self.run_cli("config", "peers", "cm-sessions,cm-manager")[0], 0)
+        cfg = self.state()["config"]
+        self.assertEqual(cfg, {"autoswitch": "auto", "min_dwell_minutes": 45, "auto_allow_unread": True,
+                               "thresholds": {"weekly": 97.0}, "peers": ["cm-sessions", "cm-manager"]})
+        self.assertIn("auto_allow_unread          true", self.run_cli("config")[1])
+        self.run_cli("config", "thresholds.weekly", "default")
+        self.run_cli("config", "autoswitch", "default")
+        cfg = self.state()["config"]
+        self.assertNotIn("thresholds", cfg)
+        self.assertNotIn("autoswitch", cfg)
+
+    def test_invalid_values_change_nothing(self):
+        for argv in (("autoswitch", "yes"), ("min_dwell_minutes", "5m"), ("thresholds.weekly", "150"),
+                     ("peers", "a,-oProxyCommand=x"), ("bogus", "1"), ("thresholds.Bad-Kind", "50")):
+            code, text = self.run_cli("config", *argv)
+            self.assertEqual(code, 1, argv)
+        self.assertEqual(self.state().get("config", {}), {})
+
+    def test_threshold_setting_takes_effect(self):
+        self.run_cli("config", "thresholds.weekly", "97")
+        self.poll()  # alice is at 95%
+        self.assertEqual(self.alerts(), [])
+
+    def test_history_shows_switches_and_settings(self):
+        self.run_cli("config", "autoswitch", "off")
+        code, text = self.run_cli("history", "-n", "5")
+        self.assertEqual(code, 0)
+        self.assertIn("switch carol@example.com (carol-uu) -> alice@example.com (alice-uu)", text)
+        self.assertIn("config autoswitch = off", text)
+        self.assertRegex(text, r"\d{4}-\d\d-\d\d \d\d:\d\dZ  capture")
+
+
+class InstallTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.home)}))
+        self.calls = []
+        self.enterContext(mock.patch.object(accounts, "systemctl",
+                                            side_effect=lambda *a: self.calls.append(a)))
+
+    def run_cli(self, *argv):
+        out = io.StringIO()
+        with contextlib.redirect_stderr(io.StringIO()):
+            return accounts.main(list(argv), paths=accounts.Paths(
+                self.home / ".claude", self.home / ".claude.json", self.home / "store"), out=out), out.getvalue()
+
+    def test_installs_script_and_timer(self):
+        code, text = self.run_cli("install")
+        self.assertEqual(code, 0, text)
+        target = self.home / ".local/bin/cm-claude-accounts"
+        self.assertEqual(target.read_bytes(), SCRIPT.read_bytes())
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+        for unit in accounts.UNITS:
+            self.assertTrue((self.home / ".config/systemd/user" / unit).is_file())
+        self.assertEqual(self.calls, [("daemon-reload",), ("enable", "--now", accounts.UNITS[1])])
+        self.assertFalse((self.home / "store").exists())  # install touches no saved logins
+
+    def test_no_timer_only_copies(self):
+        code, _ = self.run_cli("install", "--no-timer")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.calls, [])
+        self.assertFalse((self.home / ".config/systemd").exists())
+
+    def test_refuses_outside_a_checkout(self):
+        with mock.patch.object(accounts, "__file__", str(self.home / "elsewhere/cm-claude-accounts")):
+            code, _ = self.run_cli("install")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.calls, [])
 
 
 if __name__ == "__main__":

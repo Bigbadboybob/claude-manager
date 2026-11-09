@@ -17,9 +17,13 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
+import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -558,49 +562,172 @@ def over_threshold(limits: list[dict], config: dict, now: float,
 
 
 def pick_target(state: dict, accounts: dict[str, dict], active: str | None,
-                now: float) -> tuple[str, str] | None:
-    """The saved account with the most room, from last readings (decision 3:
-    inactive accounts are never polled). A limit whose reset has passed counts
-    as empty. Accounts with no reading rank after any with known room.
-    Returns (accountUuid, why) or None."""
+                now: float) -> tuple[str, str, bool] | None:
+    """The saved account with the most room, from the freshest reading on any
+    host (decision 3: inactive accounts are never polled; peers read the ones
+    active there). A limit whose reset has passed counts as empty. Accounts
+    active on another host rank after idle ones with room, and accounts with
+    no reading anywhere rank last. Excluded accounts never qualify.
+    Returns (accountUuid, why, has_reading) or None."""
     config = state.get("config") or {}
-    readings = state.get("usage") or {}
+    readings = merged_readings(state)
+    busy = in_use_elsewhere(state, now)
+    excluded = set(config.get("exclude") or [])
     ranked = []
     for uuid, rec in accounts.items():
-        if uuid == active or login_state(rec, now) in ("needs /login", "login expired"):
+        if (uuid == active or uuid in excluded
+                or login_state(rec, now) in ("needs /login", "login expired")):
             continue
+        elsewhere = busy.get(uuid)
+        note = f"; active on {', '.join(elsewhere)}" if elsewhere else ""
         reading = readings.get(uuid)
         if not reading:
-            ranked.append(((1, 0.0), uuid, "no usage reading yet"))
+            ranked.append(((1, bool(elsewhere), 0.0), uuid, "no usage reading yet" + note, False))
             continue
         limits = reading.get("limits") or []
         if over_threshold(limits, config, now, for_switch=True):
             continue
         live = [l for l in limits if not (l.get("resets_at") is not None and l["resets_at"] <= now)]
         worst = max(live, key=lambda l: l["percent"] / threshold_for(l, config), default=None)
+        source = f" on {reading['host']}" if reading.get("host") else ""
         if worst is None:
             why = "likely refilled"
         else:
-            why = f"{limit_name(worst)} {worst['percent']:.0f}% {describe_age(now - reading['at'])}"
+            why = f"{limit_name(worst)} {worst['percent']:.0f}% {describe_age(now - reading['at'])}{source}"
         ratio = worst["percent"] / threshold_for(worst, config) if worst else 0.0
-        ranked.append(((0, ratio), uuid, why))
+        ranked.append(((0, bool(elsewhere), ratio), uuid, why + note, True))
     if not ranked:
         return None
-    _, uuid, why = min(ranked, key=lambda r: (r[0], label(accounts[r[1]])))
-    return uuid, why
+    _, uuid, why, has_reading = min(ranked, key=lambda r: (r[0], label(accounts[r[1]])))
+    return uuid, why, has_reading
 
 
 def switch_advice(state: dict, accounts: dict[str, dict], active: str, now: float) -> str:
     target = pick_target(state, accounts, active, now)
     if target is None:
         return "No other saved account has room"
-    uuid, why = target
+    uuid, why, _ = target
     email = accounts[uuid]["oauthAccount"].get("emailAddress") or uuid
     return f"Suggest: cm-claude-accounts switch {email} ({why})"
 
 
+# --- other hosts ------------------------------------------------------------------
+#
+# Each host keeps its own logins (never copied). Hosts share only readings:
+# `export` prints accounts, usage and the active account, never tokens, and
+# a host lists the others as "peers" (ssh aliases) to read them.
+
+EXPORT_VERSION = 1
+PEER_TIMEOUT_SECONDS = 20
+# A peer's "active" is trusted for this long after it was read.
+PEER_ACTIVE_FRESH_SECONDS = 3600
+PEER_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.@-]*$")
+REMOTE_EXPORT = "python3 .local/bin/cm-claude-accounts export"
+
+
+def export_view(paths: Paths, state: dict) -> dict:
+    now = time.time()
+    readings = state.get("usage") or {}
+    out = {}
+    for uuid, rec in load_accounts(paths).items():
+        out[uuid] = {"email": rec["oauthAccount"].get("emailAddress"),
+                     "login": login_state(rec, now),
+                     "reading": readings.get(uuid)}
+    poll = state.get("poll") or {}
+    return {"version": EXPORT_VERSION, "host": socket.gethostname(), "at": int(now),
+            "active": state.get("active"), "accounts": out,
+            "poll": {k: poll[k] for k in ("at", "ok", "reason") if k in poll}}
+
+
+def fetch_peer(host: str) -> dict:
+    """Read another host's export over ssh. Errors name the host and exit status only."""
+    if not PEER_NAME.match(host):
+        raise AccountError(f"peer {host!r} is not a plain ssh host name")
+    try:
+        result = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, REMOTE_EXPORT],
+            capture_output=True, text=True, timeout=PEER_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AccountError(f"{host}: unreachable ({type(exc).__name__})") from None
+    if result.returncode:
+        raise AccountError(f"{host}: export failed (exit {result.returncode})")
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        raise AccountError(f"{host}: export was not JSON") from None
+    if not isinstance(data, dict) or data.get("version") != EXPORT_VERSION \
+            or not isinstance(data.get("accounts"), dict):
+        raise AccountError(f"{host}: unsupported export (update cm-claude-accounts there)")
+    return data
+
+
+def refresh_peers(state: dict) -> None:
+    """Read every configured peer in parallel; keep the last good copy on failure."""
+    hosts = list((state.get("config") or {}).get("peers") or [])
+    cache = state.setdefault("peers", {})
+    for gone in [h for h in cache if h not in hosts]:
+        del cache[gone]
+    if not hosts:
+        return
+    results: dict[str, object] = {}
+
+    def one(host):
+        try:
+            results[host] = fetch_peer(host)
+        except AccountError as exc:
+            results[host] = exc
+
+    threads = [threading.Thread(target=one, args=(h,), daemon=True) for h in hosts]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(PEER_TIMEOUT_SECONDS + 5)
+    now = int(time.time())
+    for host in hosts:
+        result = results.get(host, AccountError(f"{host}: no answer"))
+        entry = cache.setdefault(host, {})
+        if isinstance(result, dict):
+            entry.clear()
+            entry.update(at=now, ok=True, data=result)
+        else:
+            entry.update(tried_at=now, ok=False, error=str(result))
+
+
+def merged_readings(state: dict) -> dict[str, dict]:
+    """Per account, the freshest reading from here or any peer; a peer's
+    carries "host"."""
+    merged = {uuid: dict(r) for uuid, r in (state.get("usage") or {}).items()
+              if isinstance(r, dict) and "at" in r}
+    for host, entry in (state.get("peers") or {}).items():
+        for uuid, info in ((entry.get("data") or {}).get("accounts") or {}).items():
+            reading = info.get("reading") if isinstance(info, dict) else None
+            if not isinstance(reading, dict) or not isinstance(reading.get("at"), (int, float)) \
+                    or not isinstance(reading.get("limits"), list):
+                continue
+            if uuid not in merged or reading["at"] > merged[uuid]["at"]:
+                merged[uuid] = {**reading, "host": host}
+    return merged
+
+
+def in_use_elsewhere(state: dict, now: float) -> dict[str, list[str]]:
+    busy: dict[str, list[str]] = {}
+    for host, entry in (state.get("peers") or {}).items():
+        data = entry.get("data") or {}
+        if data.get("active") and now - entry.get("at", 0) <= PEER_ACTIVE_FRESH_SECONDS:
+            busy.setdefault(data["active"], []).append(host)
+    return busy
+
+
 def last_switch_at(state: dict) -> float:
     return max((h["at"] for h in state.get("history", []) if h.get("event") == "switch"), default=0)
+
+
+DEFAULT_MAX_AUTO_SWITCHES_PER_DAY = 6
+
+
+def auto_switches_since(state: dict, since: float) -> int:
+    return sum(1 for h in state.get("history", []) if h.get("event") == "switch"
+               and str(h.get("reason", "")).startswith("auto:") and h.get("at", 0) >= since)
 
 
 def poll_failed(state: dict, reason: str, alert) -> int:
@@ -685,35 +812,66 @@ def cmd_list(paths: Paths, state: dict, out) -> int:
     return 0
 
 
-def cmd_status(paths: Paths, state: dict, out) -> int:
-    """Every account's last usage reading; inactive ones are never polled."""
+def describe_reading(reading: dict, now: float) -> str:
+    parts = []
+    for limit in reading["limits"]:
+        reset = limit.get("resets_at")
+        if reset is not None and reset <= now:
+            parts.append(f"{limit_name(limit)} {limit['percent']:.0f}% -> likely refilled")
+            continue
+        binding = ", binding" if limit.get("active") else ""
+        parts.append(f"{limit_name(limit)} {limit['percent']:.0f}% "
+                     f"({describe_reset(reset, now)}{binding})")
+    source = f" on {reading['host']}" if reading.get("host") else ""
+    return f"{'; '.join(parts) or 'no limits reported'}  [read {describe_age(now - reading['at'])}{source}]"
+
+
+def cmd_status(paths: Paths, state: dict, out, local: bool = False) -> int:
+    """Every account's freshest usage reading, from here or a peer host;
+    inactive accounts are never polled."""
     accounts = load_accounts(paths)
     if not accounts:
         print("no saved accounts; run /login, then `capture`", file=out)
         return 0
+    if not local:
+        refresh_peers(state)
     now = time.time()
-    readings = state.get("usage") or {}
+    config = state.get("config") or {}
+    readings = merged_readings(state)
+    busy = in_use_elsewhere(state, now)
+    excluded = set(config.get("exclude") or [])
     for uuid, rec in sorted(accounts.items(), key=lambda kv: label(kv[1])):
         active = uuid == state.get("active")
+        notes = [f"active on {', '.join(busy[uuid])}"] if uuid in busy else []
+        if uuid in excluded:
+            notes.append("never a switch target")
         print(f"{'*' if active else ' '} {label(rec):45} "
-              f"{rec['claudeAiOauth'].get('subscriptionType', '?'):6} {login_state(rec, now)}", file=out)
+              f"{rec['claudeAiOauth'].get('subscriptionType', '?'):6} {login_state(rec, now)}"
+              + "".join(f"; {n}" for n in notes), file=out)
         reading = readings.get(uuid)
         if not reading:
             print("    no usage reading yet" + ("" if active else " (read only while active)"), file=out)
             continue
-        parts = []
-        for limit in reading["limits"]:
-            reset = limit.get("resets_at")
-            if reset is not None and reset <= now:
-                parts.append(f"{limit_name(limit)} {limit['percent']:.0f}% -> likely refilled")
-                continue
-            binding = ", binding" if limit.get("active") else ""
-            parts.append(f"{limit_name(limit)} {limit['percent']:.0f}% "
-                         f"({describe_reset(reset, now)}{binding})")
-        print(f"    {'; '.join(parts) or 'no limits reported'}  [read {describe_age(now - reading['at'])}]",
-              file=out)
+        print(f"    {describe_reading(reading, now)}", file=out)
+    others = {}
+    for host, entry in (state.get("peers") or {}).items():
+        for uuid, info in ((entry.get("data") or {}).get("accounts") or {}).items():
+            if uuid not in accounts and isinstance(info, dict):
+                others.setdefault(uuid, (host, info))
+    for uuid, (host, info) in sorted(others.items(), key=lambda kv: str(kv[1][1].get("email"))):
+        print(f"  {info.get('email') or '?'} ({uuid[:8]}): saved on {host} only, not here", file=out)
+        if uuid in readings:
+            print(f"    {describe_reading(readings[uuid], now)}", file=out)
+    for host, entry in (state.get("peers") or {}).items():
+        data = entry.get("data") or {}
+        active_email = ((data.get("accounts") or {}).get(data.get("active")) or {}).get("email")
+        if entry.get("ok"):
+            print(f"peer {host}: active {active_email or data.get('active') or 'none'}", file=out)
+        else:
+            stale = f"; using its reading from {describe_age(now - entry['at'])}" if entry.get("at") else ""
+            print(f"peer {host}: {entry.get('error', 'not read')}{stale}", file=out)
     active = state.get("active")
-    config = state.get("config") or {}
+    readings = state.get("usage") or {}
     if active in accounts and active in readings:
         over = over_threshold(readings[active]["limits"], config, now)
         if over:
@@ -833,10 +991,21 @@ def cmd_poll(paths: Paths, state: dict, out, notify_command: str) -> int:
     advice = None
     over = over_threshold(limits, config, now, for_switch=True)
     if over and mode in ("suggest", "auto"):
+        refresh_peers(state)  # fresh readings from other hosts before choosing
         target = pick_target(state, accounts, uuid, now)
         dwell = config.get("min_dwell_minutes", DEFAULT_MIN_DWELL_MINUTES) * 60
         since = now - last_switch_at(state)
-        if mode == "auto" and target and since >= dwell:
+        cap = config.get("max_auto_switches_per_day", DEFAULT_MAX_AUTO_SWITCHES_PER_DAY)
+        held = None
+        if mode == "auto" and target:
+            if since < dwell:
+                held = f"automatic switch waits until {dwell // 60:.0f} min after the last switch"
+            elif not target[2] and not config.get("auto_allow_unread"):
+                held = ("automatic switch needs a usage reading for the target "
+                        "(`config auto_allow_unread true` allows it)")
+            elif auto_switches_since(state, now - 86400) >= cap:
+                held = f"automatic switches paused: {cap} in the last 24 h"
+        if mode == "auto" and target and not held:
             reason = ", ".join(f"{limit_name(l)} {l['percent']:.0f}%" for l in over)
             try:
                 cmd_switch(paths, state, target[0], out)
@@ -849,11 +1018,170 @@ def cmd_poll(paths: Paths, state: dict, out, notify_command: str) -> int:
                 return 0
         else:
             advice = switch_advice(state, accounts, uuid, now)
-            if mode == "auto" and target:
-                advice += f"; automatic switch waits until {dwell // 60:.0f} min after the last switch"
+            if held:
+                advice += f"; {held}"
     check_limits(state, uuid, record, limits, alert, advice)
     summary = ", ".join(f"{limit_name(l)} {l['percent']:.0f}%" for l in limits)
     print(f"{label(record)}: {summary}", file=out)
+    return 0
+
+
+CONFIG_KEYS = {
+    # key: (parse, describe default)
+    "autoswitch": (lambda v: v if v in ("off", "suggest", "auto") else None, "suggest"),
+    "min_dwell_minutes": (lambda v: int(v) if v.isdigit() else None, str(DEFAULT_MIN_DWELL_MINUTES)),
+    "max_auto_switches_per_day": (lambda v: int(v) if v.isdigit() else None,
+                                  str(DEFAULT_MAX_AUTO_SWITCHES_PER_DAY)),
+    "auto_allow_unread": (lambda v: {"true": True, "false": False}.get(v), "false"),
+    "switch_on_scoped": (lambda v: {"true": True, "false": False}.get(v), "false"),
+    "notify_command": (lambda v: v or None, str(DEFAULT_NOTIFY)),
+    "peers": (lambda v: [h for h in v.split(",") if h] if all(
+        PEER_NAME.match(h) for h in v.split(",") if h) else None, "none"),
+}
+
+
+def parse_threshold(value: str):
+    try:
+        number = float(value)
+    except ValueError:
+        return None
+    return number if 0 < number <= 100 else None
+
+
+def cmd_config(paths: Paths, state: dict, key: str | None, value: str | None, out) -> int:
+    """Show or change state.json "config" under the store lock, so the timer
+    never sees a half-written file. VALUE "default" removes the setting."""
+    config = state.setdefault("config", {})
+    if key is None:
+        for name, (_, default) in CONFIG_KEYS.items():
+            current = config.get(name)
+            shown = (",".join(current) if isinstance(current, list) else json.dumps(current)
+                     if isinstance(current, bool) else current)
+            print(f"{name:26} {shown if current is not None else default + ' (default)'}", file=out)
+        thresholds = {**DEFAULT_THRESHOLDS, **(config.get("thresholds") or {})}
+        for kind, pct in thresholds.items():
+            note = "" if kind in (config.get("thresholds") or {}) else " (default)"
+            print(f"{'thresholds.' + kind:26} {pct:g}{note}", file=out)
+        excluded = config.get("exclude") or []
+        print(f"{'exclude':26} {len(excluded)} account(s); see `status`", file=out)
+        return 0
+    if key.startswith("thresholds."):
+        kind = key.split(".", 1)[1]
+        if not re.fullmatch(r"[a-z_]+", kind):
+            raise AccountError(f"{key}: not a limit kind (session, weekly, weekly_all, ...)")
+        parse = parse_threshold
+    elif key in CONFIG_KEYS:
+        parse = CONFIG_KEYS[key][0]
+    else:
+        raise AccountError(f"unknown setting {key!r}; run `config` to list them")
+    if value is None:
+        current = (config.get("thresholds") or {}).get(key.split(".", 1)[1]) \
+            if key.startswith("thresholds.") else config.get(key)
+        print(f"{key} = {json.dumps(current) if current is not None else '(default)'}", file=out)
+        return 0
+    if value == "default":
+        parsed = None
+    else:
+        parsed = parse(value)
+        if parsed is None:
+            raise AccountError(f"{key}: invalid value {value!r}")
+    if key.startswith("thresholds."):
+        thresholds = config.setdefault("thresholds", {})
+        thresholds.pop(key.split(".", 1)[1], None) if parsed is None \
+            else thresholds.__setitem__(key.split(".", 1)[1], parsed)
+        if not thresholds:
+            config.pop("thresholds")
+    elif parsed is None:
+        config.pop(key, None)
+    else:
+        config[key] = parsed
+    if key == "peers":
+        refresh_peers(state)  # drops cached peers no longer listed
+    record_history(state, "config", key=key, value=value)
+    print(f"{key} = {value}", file=out)
+    if key == "autoswitch" and value == "auto":
+        print("note: poll now moves every session on this host on its own when the active "
+              "account crosses a threshold", file=out)
+    return 0
+
+
+def cmd_exclude(paths: Paths, state: dict, name: str, exclude: bool, out) -> int:
+    accounts = load_accounts(paths)
+    uuid = resolve(accounts, name)
+    config = state.setdefault("config", {})
+    excluded = [u for u in config.get("exclude") or [] if u != uuid]
+    if exclude:
+        excluded.append(uuid)
+    if excluded:
+        config["exclude"] = sorted(excluded)
+    else:
+        config.pop("exclude", None)
+    record_history(state, "exclude" if exclude else "include", account=uuid)
+    print(f"{label(accounts[uuid])} " + ("will never be a switch target" if exclude
+                                         else "can be a switch target again"), file=out)
+    return 0
+
+
+def cmd_history(paths: Paths, state: dict, limit: int, out) -> int:
+    accounts = load_accounts(paths)
+
+    def name(uuid):
+        return label(accounts[uuid]) if uuid in accounts else str(uuid)[:8]
+
+    events = state.get("history") or []
+    if not events:
+        print("no history yet", file=out)
+    for h in events[-limit:]:
+        when = datetime.fromtimestamp(h.get("at", 0), timezone.utc).strftime("%Y-%m-%d %H:%MZ")
+        text = h.get("event", "?")
+        if "previous" in h:
+            text += f" {name(h['previous'])} ->"
+        if "account" in h:
+            text += f" {name(h['account'])}"
+        if "key" in h:
+            text += f" {h['key']} = {h.get('value')}"
+        if h.get("reason"):
+            text += f" ({h['reason']})"
+        print(f"{when}  {text}", file=out)
+    return 0
+
+
+UNITS = ("cm-claude-accounts-poll.service", "cm-claude-accounts-poll.timer")
+
+
+def systemctl(*args: str) -> None:
+    subprocess.run(["systemctl", "--user", *args], check=True)
+
+
+def cmd_install(out, timer: bool = True) -> int:
+    """Copy this script to ~/.local/bin and (optionally) start the poll timer.
+    Run from a checkout. Starting the timer also saves this host's current
+    login on the next poll, as `capture` would."""
+    source = Path(__file__).resolve()
+    deploy = source.parent.parent / "deploy"
+    if not all((deploy / unit).is_file() for unit in UNITS):
+        raise AccountError(f"run install from a claude-manager checkout ({deploy} has no units)")
+    home = Path.home()
+    target = home / ".local/bin/cm-claude-accounts"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.new")
+    shutil.copyfile(source, tmp)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, target)
+    print(f"installed {target}", file=out)
+    if not timer:
+        return 0
+    units = home / ".config/systemd/user"
+    units.mkdir(parents=True, exist_ok=True)
+    for unit in UNITS:
+        shutil.copyfile(deploy / unit, units / unit)
+        os.chmod(units / unit, 0o644)
+    try:
+        systemctl("daemon-reload")
+        systemctl("enable", "--now", UNITS[1])
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise AccountError(f"units copied, but systemctl failed ({exc})") from None
+    print(f"timer enabled: {UNITS[1]} (poll every 10 min)", file=out)
     return 0
 
 
@@ -919,7 +1247,23 @@ def main(argv: list[str] | None = None, paths: Paths | None = None, out=None) ->
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("capture", help="save the current login (run right after /login)")
     sub.add_parser("list", help="saved accounts; * marks the active one")
-    sub.add_parser("status", help="every account's last usage reading, poll health, last alert")
+    status = sub.add_parser("status", help="every account's freshest usage reading (here or on "
+                            "a peer host), poll health, last alert")
+    status.add_argument("--local", action="store_true", help="skip reading peer hosts")
+    sub.add_parser("export", help="this host's accounts and readings as JSON, no tokens "
+                   "(peers read it over ssh)")
+    config = sub.add_parser("config", help="show or change settings (VALUE 'default' resets one)")
+    config.add_argument("key", nargs="?")
+    config.add_argument("value", nargs="?")
+    for name, verb in (("exclude", "never switch to an account"),
+                       ("include", "undo exclude")):
+        p = sub.add_parser(name, help=verb)
+        p.add_argument("account", help="email or accountUuid prefix")
+    history = sub.add_parser("history", help="recent switches and other events")
+    history.add_argument("-n", type=int, default=20)
+    install = sub.add_parser("install", help="copy to ~/.local/bin and start the poll timer "
+                             "(run from a checkout)")
+    install.add_argument("--no-timer", action="store_true")
     poll = sub.add_parser("poll", help="read the active account's usage and alert (run by the timer)")
     test_alert = sub.add_parser("test-alert", help="send a test alert through the notifier")
     for p in (poll, test_alert):
@@ -930,6 +1274,23 @@ def main(argv: list[str] | None = None, paths: Paths | None = None, out=None) ->
     remove = sub.add_parser("remove", help="delete a saved account")
     remove.add_argument("account")
     args = parser.parse_args(argv)
+    if args.command == "install":
+        try:
+            return cmd_install(out, timer=not args.no_timer)
+        except (AccountError, OSError) as exc:
+            print(f"cm-claude-accounts: {exc}", file=sys.stderr)
+            return 1
+    if args.command == "export":
+        # No store lock: two hosts reading each other while each holds its
+        # own lock would wait on each other. state.json is replaced
+        # atomically, so an unlocked read is consistent.
+        try:
+            json.dump(export_view(paths, load_json(paths.state)), out)
+            out.write("\n")
+            return 0
+        except (AccountError, OSError, ValueError, KeyError) as exc:
+            print(f"cm-claude-accounts: {exc}", file=sys.stderr)
+            return 1
     try:
         init_store(paths)
         fd = os.open(paths.store / "lock", os.O_CREAT | os.O_RDWR, 0o600)
@@ -942,7 +1303,13 @@ def main(argv: list[str] | None = None, paths: Paths | None = None, out=None) ->
                 if args.command == "list":
                     return cmd_list(paths, state, out)
                 if args.command == "status":
-                    return cmd_status(paths, state, out)
+                    return cmd_status(paths, state, out, local=args.local)
+                if args.command == "config":
+                    return cmd_config(paths, state, args.key, args.value, out)
+                if args.command in ("exclude", "include"):
+                    return cmd_exclude(paths, state, args.account, args.command == "exclude", out)
+                if args.command == "history":
+                    return cmd_history(paths, state, args.n, out)
                 if args.command in ("poll", "test-alert"):
                     notify_command = (args.notify_command
                                       or (state.get("config") or {}).get("notify_command")

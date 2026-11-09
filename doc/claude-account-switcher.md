@@ -285,14 +285,38 @@ No switching back and forth: require a minimum dwell time (e.g. 30 min) and
 never switch to an account whose last reading is above threshold and whose
 reset has not passed.
 
+Safeguards in `auto` (built 2026-11-09): it never switches to an account
+with no reading on any host unless `auto_allow_unread` is set; it never
+picks an account Owner has excluded (`exclude <email>`); and it stops after
+`max_auto_switches_per_day` automatic switches (default 6) in 24 h. In
+each case it falls back to the `suggest` alert and says why.
+
 ### Multiple hosts
 
 Each host (laptop, cm-sessions, cm-manager) has its own `~/.claude`, so each
 needs its own store and a one-time `/login` + `capture` per account. Do not
 copy saved logins between hosts: each host keeps its own refresh-token
 lineage, and sharing one lineage across hosts would make them overwrite
-each other. A later CM command can run `switch` on every host and aggregate
-`status`.
+each other.
+
+Hosts share **readings**, never logins (built 2026-11-09). `export` prints
+this host's accounts, their last readings and the active account as JSON,
+with no tokens. A host that lists others as `peers` (ssh aliases) reads
+their exports with `ssh -o BatchMode=yes <peer> python3
+.local/bin/cm-claude-accounts export`. Then:
+
+- `status` shows each account's freshest reading from any host ("read 5m
+  ago on cm-sessions"), which host each account is active on, accounts
+  saved only on a peer, and peers that could not be read.
+- When `poll` is choosing a target, it reads the peers first. An account's
+  freshest reading counts. An account active on another host ranks after
+  idle accounts with room, since both hosts would be drawing on it.
+- `export` takes no store lock, so two hosts that list each other never
+  wait on each other. A peer that fails keeps its last good copy;
+  "active on" is trusted for an hour after the last good read.
+
+Running `switch` on several hosts at once is still manual (one `switch` per
+host).
 
 ### Costs and caveats
 
@@ -397,6 +421,10 @@ stale in-memory `oauthAccount` (a written value held for 60 s here).
    trigger a switch or rule out a target; a full model-scoped limit
    (`week:Fable`) alerts without advice unless `"switch_on_scoped": true`.
    50 tests.
+   **Safeguards and other hosts (2026-11-09), fakes only:** peers and
+   `export` (see Multiple hosts); `auto` needs a reading for its target,
+   honours `exclude`, and caps itself per day; `config`, `history`,
+   `exclude`/`include` and `install` commands. 73 tests.
    **Laptop run of 35ed90c (2026-11-09, 05:03-05:47Z, timer only):** a 429
    on the first call (9 min after the previous) was skipped with a 15-min
    backoff; then three clean calls 10 min apart. The undelivered 96% alert
@@ -408,7 +436,8 @@ stale in-memory `oauthAccount` (a written value held for 60 s here).
    a match with `/usage`, and `auto` on a real login.
 4. Laptop rollout, then cm-sessions and cm-manager (one host at a time,
    with Owner present for the per-account `/login`s).
-5. Optional: TUI dashboard panel; multi-host `switch`/`status` through CM.
+5. Optional: TUI dashboard panel; multi-host `switch` (multi-host `status`
+   is built: peers).
 
 Follow the repository workflow (branch, test, merge to `main`; no PRs).
 
@@ -418,38 +447,48 @@ Per host, as the user who runs Claude Code. Never copy the store between
 hosts (see Multiple hosts).
 
 ```bash
-install -m 0755 scripts/cm-claude-accounts ~/.local/bin/cm-claude-accounts
+scripts/cm-claude-accounts install    # from a checkout: ~/.local/bin + poll timer
 cm-claude-accounts capture            # right after each /login
-cm-claude-accounts status             # dashboard: every account's last reading
+cm-claude-accounts status             # dashboard: every account's freshest reading
 cm-claude-accounts switch <email>     # move every session on this host
+cm-claude-accounts config             # list settings; `config KEY VALUE` changes one
+cm-claude-accounts history            # recent switches, captures, setting changes
 cm-claude-accounts test-alert         # check the alert path
-install -m 0644 deploy/cm-claude-accounts-poll.service \
-  deploy/cm-claude-accounts-poll.timer ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now cm-claude-accounts-poll.timer
 journalctl --user -u cm-claude-accounts-poll.service -n 20   # last runs
 ```
 
+`install --no-timer` copies the script only. Starting the timer also means
+the next `poll` saves this host's current login (as `capture` would), so on
+a new host run it with Owner present.
+
 - **Store:** `~/.config/cm-claude-accounts/` (0700): `accounts/<uuid>.json`
-  (saved logins, 0600), `state.json` (active account, readings, alert
-  bookkeeping, history; no tokens), `alerts.log` (every alert, delivered or
-  not).
+  (saved logins, 0600), `state.json` (active account, readings, peer
+  copies, settings, alert bookkeeping, history; no tokens), `alerts.log`
+  (every alert, delivered or not).
 - **Alerts** run `~/.cm/bin/cm-notify "<message>"` with
   `CM_NOTIFY_TAG=claude-accounts` (Telegram; needs `~/.cm/notify.env`).
-  Override with `--notify-command` or `"config": {"notify_command": ...}`
-  in `state.json`. A failed delivery is logged and shown by `status`.
+  Override with `--notify-command` or `config notify_command <path>`.
+  A failed delivery is logged and shown by `status`.
   Sent: active account at or over its threshold (once per limit per reset
   period), a saved login that has expired, an active login that is not
   saved, 3 failed polls in a row, and recovery after that.
-- **Thresholds:** `"config": {"thresholds": {"session": 80, "weekly": 90}}`
-  in `state.json` (defaults shown); a key per limit `kind` overrides its
-  family.
-- **Autoswitch:** `"config": {"autoswitch": "suggest"}` (default; also
-  `"off"` or `"auto"`), `"min_dwell_minutes": 30` and
-  `"switch_on_scoped": false`. `auto` moves every
-  session on the host on its own: turn it on only with Owner's say-so. Edit
-  `state.json` only while no `cm-claude-accounts` runs (stop the timer, or
-  hold the store's `lock` file).
+- **Settings** (`config KEY VALUE`; `default` resets one). `config` takes
+  the store lock, so it is safe while the timer runs; don't hand-edit
+  `state.json`.
+
+  | Key | Default | Meaning |
+  |---|---|---|
+  | `autoswitch` | `suggest` | `off`, `suggest` or `auto`. `auto` moves every session on the host on its own: only with Owner's say-so |
+  | `thresholds.session` / `thresholds.weekly` | 80 / 90 | alert percent; `thresholds.<kind>` overrides one limit kind |
+  | `min_dwell_minutes` | 30 | no automatic switch sooner than this after any switch |
+  | `max_auto_switches_per_day` | 6 | automatic switches allowed in 24 h |
+  | `auto_allow_unread` | false | let `auto` pick an account never read on any host |
+  | `switch_on_scoped` | false | let a full model-scoped limit (`week:Fable`) trigger a switch |
+  | `peers` | none | comma-separated ssh aliases to read (see Multiple hosts); keys must work without a passphrase prompt, since the timer has no agent |
+  | `notify_command` | `~/.cm/bin/cm-notify` | alert command |
+
+  `exclude <email>` keeps an account out of every suggestion and automatic
+  switch (`include` undoes it); `status` marks it.
 - `poll` exits 0 when it skips (access token expired or rejected: the next
   prompt in any session renews it; or backing off after HTTP 429) and 1
   when it fails, printing the reason to the journal.
