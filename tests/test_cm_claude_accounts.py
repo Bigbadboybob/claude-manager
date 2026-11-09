@@ -598,6 +598,62 @@ class PollTests(Harness):
         self.assertIn("NOT delivered (notifier failed (FileNotFoundError))", self.run_cli("status")[1])
         self.assert_no_tokens_on_disk()
 
+    def test_reset_time_jitter_does_not_repeat_an_alert(self):
+        # Seen on the laptop 2026-11-09: 1794636000.02, then 1794635999.68.
+        self.do_login("alice")
+        self.run_cli("capture")
+        token = self.live_token()
+        for stamp in ("2026-11-14T06:00:00.020Z", "2026-11-14T05:59:59.680Z"):
+            self.usage[token] = {"five_hour": None, "limits": [
+                {"kind": "weekly_all", "group": "all", "scope": None, "percent": 96,
+                 "is_active": True, "severity": "warning", "resets_at": stamp}]}
+            self.poll()
+        self.assertEqual(len(self.alerts()), 1)
+
+    def test_model_scoped_limit_is_named_by_model(self):
+        # weekly_scoped scope shape seen on the laptop 2026-11-09.
+        self.do_login("alice")
+        self.run_cli("capture")
+        self.usage[self.live_token()] = {"five_hour": None, "limits": [
+            {"kind": "weekly_scoped", "group": "model",
+             "scope": {"model": {"id": None, "display_name": "Fable"}, "surface": None},
+             "percent": 97, "is_active": False, "severity": "warning",
+             "resets_at": iso_in(86400)}]}
+        code, text = self.poll()
+        self.assertIn("week:Fable 97%", text)
+        self.assertIn("97% of its week:Fable limit", self.alerts()[0])
+        self.assertIn("alice-uuid-0000:weekly_scoped:Fable:model", self.state()["limit_alerts"])
+        self.assertNotIn("display_name", self.run_cli("status")[1])
+
+    def test_undelivered_alert_is_retried_hourly_until_delivered(self):
+        self.do_login("alice")
+        self.run_cli("capture")
+        self.usage[self.live_token()] = usage(("session", None, 90, 4 * 3600, True))
+        hidden = self.notifier.with_suffix(".off")
+        self.notifier.rename(hidden)
+        log = self.paths.store / "alerts.log"
+        self.poll()
+        self.poll()
+        self.assertEqual(len(log.read_text().splitlines()), 1)  # not every 5 minutes
+
+        def age_alerts():
+            state = self.state()
+            for entry in state["limit_alerts"].values():
+                entry["at"] -= 3601
+            self.paths.state.write_text(json.dumps(state))
+
+        age_alerts()
+        self.poll()
+        self.assertEqual(len(log.read_text().splitlines()), 2)
+        self.assertEqual(self.alerts(), [])
+        hidden.rename(self.notifier)
+        age_alerts()
+        self.poll()
+        self.assertEqual(len(self.alerts()), 1)  # delivered now
+        age_alerts()
+        self.poll()
+        self.assertEqual(len(self.alerts()), 1)  # and never again this period
+
     def test_test_alert_reports_delivery(self):
         self.assertEqual(self.run_cli("test-alert", "--notify-command", str(self.notifier))[0], 0)
         self.assertEqual(self.alerts(), ["claude-accounts|test alert from cm-claude-accounts"])

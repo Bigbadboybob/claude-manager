@@ -320,6 +320,10 @@ USAGE_TIMEOUT_SECONDS = 15
 # 5-hour limit, 90% of a weekly one). Override in state.json "config".
 DEFAULT_THRESHOLDS = {"session": 80, "weekly": 90}
 FAILURE_ALERT_AFTER = 3
+UNDELIVERED_RETRY_SECONDS = 3600
+# The API's resets_at jitters by under a second between readings; a reset
+# this far from the alerted one is a new period.
+NEW_PERIOD_SECONDS = 3600
 DEFAULT_NOTIFY = Path.home() / ".cm/bin/cm-notify"
 
 
@@ -355,6 +359,25 @@ def parse_time(value) -> float | None:
     return None
 
 
+def scope_text(value) -> str | None:
+    """A limit's scope as a short name. weekly_scoped scopes are objects such
+    as {"model": {"id": null, "display_name": "Fable"}, "surface": null}."""
+    if isinstance(value, str):
+        return value or None
+    if isinstance(value, dict):
+        model = value.get("model")
+        if isinstance(model, dict):
+            name = model.get("display_name") or model.get("id")
+            if isinstance(name, str) and name:
+                return name
+        if isinstance(model, str) and model:
+            return model
+        surface = value.get("surface")
+        if isinstance(surface, str) and surface:
+            return surface
+    return None
+
+
 def parse_limits(usage: dict) -> list[dict]:
     """Normalize the response's limits list. Plans differ (some have no 5-hour
     limit) and the format is undocumented, so skip anything unrecognized."""
@@ -369,8 +392,8 @@ def parse_limits(usage: dict) -> list[dict]:
                 continue
             out.append({
                 "kind": item["kind"],
-                "scope": item.get("scope") or None,
-                "group": item.get("group") or None,
+                "scope": scope_text(item.get("scope")),
+                "group": scope_text(item.get("group")),
                 "percent": percent,
                 "active": item.get("is_active") is True,
                 "severity": item.get("severity") if isinstance(item.get("severity"), str) else None,
@@ -417,7 +440,7 @@ def describe_reset(resets_at: float | None, now: float) -> str:
     return f"resets in {left / 86400:.1f}d"
 
 
-def notify(state: dict, paths: Paths, message: str, command: str) -> None:
+def notify(state: dict, paths: Paths, message: str, command: str) -> bool:
     """Send an operator alert; always log it. Messages name accounts, never tokens."""
     now = int(time.time())
     with open(paths.store / "alerts.log", "a") as log:
@@ -434,6 +457,16 @@ def notify(state: dict, paths: Paths, message: str, command: str) -> None:
     # The notifier's output may hold its own credentials; never keep it.
     state["last_alert"] = {"at": now, "message": message, "delivered": delivered,
                            **({"error": why} if why else {})}
+    return delivered
+
+
+def alert_due(entry, now: float) -> bool:
+    """Send unless already delivered; retry an undelivered one hourly."""
+    if entry is None:
+        return True
+    if not isinstance(entry, dict):  # older state: a bare timestamp meant sent
+        return False
+    return not entry.get("delivered") and now - entry.get("at", 0) >= UNDELIVERED_RETRY_SECONDS
 
 
 def check_logins(state: dict, accounts: dict[str, dict], alert) -> None:
@@ -446,10 +479,10 @@ def check_logins(state: dict, accounts: dict[str, dict], alert) -> None:
         if not (expired or rec.get("needs_login")):
             sent.pop(uuid, None)
             continue
-        if uuid not in sent:
-            sent[uuid] = int(now)
-            alert(f"{label(rec)} needs a new login: /login as it, then "
-                  "`cm-claude-accounts capture`")
+        if alert_due(sent.get(uuid), now):
+            delivered = alert(f"{label(rec)} needs a new login: /login as it, then "
+                              "`cm-claude-accounts capture`")
+            sent[uuid] = {"at": int(now), "delivered": delivered}
 
 
 def check_limits(state: dict, uuid: str, record: dict, limits: list[dict], alert) -> None:
@@ -463,13 +496,16 @@ def check_limits(state: dict, uuid: str, record: dict, limits: list[dict], alert
         threshold = threshold_for(limit, config)
         if limit["percent"] < threshold:
             continue
-        key = (f"{uuid}:{limit['kind']}:{limit['scope'] or ''}:{limit.get('group') or ''}:"
-               f"{int(limit['resets_at'] or 0)}")
-        if key in sent:
+        key = f"{uuid}:{limit['kind']}:{limit['scope'] or ''}:{limit.get('group') or ''}"
+        entry = sent.get(key)
+        if (entry and limit["resets_at"] and entry.get("resets_at")
+                and abs(limit["resets_at"] - entry["resets_at"]) > NEW_PERIOD_SECONDS):
+            entry = None
+        if not alert_due(entry, now):
             continue
-        sent[key] = {"at": int(now), "resets_at": limit["resets_at"]}
-        alert(f"{label(record)} is at {limit['percent']:.0f}% of its {limit_name(limit)} "
-              f"limit ({describe_reset(limit['resets_at'], now)})")
+        delivered = alert(f"{label(record)} is at {limit['percent']:.0f}% of its "
+                          f"{limit_name(limit)} limit ({describe_reset(limit['resets_at'], now)})")
+        sent[key] = {"at": int(now), "resets_at": limit["resets_at"], "delivered": delivered}
 
 
 def poll_failed(state: dict, reason: str, alert) -> int:
@@ -585,9 +621,9 @@ def cmd_poll(paths: Paths, state: dict, out, notify_command: str) -> int:
 
     Never refreshes a token and never polls an inactive account's saved one.
     """
-    def alert(message: str) -> None:
-        notify(state, paths, message, notify_command)
+    def alert(message: str) -> bool:
         print(f"alert: {message}", file=out)
+        return notify(state, paths, message, notify_command)
 
     accounts = load_accounts(paths)
     if not accounts:
@@ -619,10 +655,14 @@ def cmd_poll(paths: Paths, state: dict, out, notify_command: str) -> int:
             except AccountError as exc:
                 unsaved = exc
         if unsaved:
-            if state.get("unsaved_alert") != uuid:
-                state["unsaved_alert"] = uuid
-                alert(f"the active login is account {uuid[:8]}, which is not saved; "
-                      "run `cm-claude-accounts capture`")
+            entry = state.get("unsaved_alert")
+            if not isinstance(entry, dict) or entry.get("account") != uuid:
+                entry = None
+            if alert_due(entry, time.time()):
+                delivered = alert(f"the active login is account {uuid[:8]}, which is not saved; "
+                                  "run `cm-claude-accounts capture`")
+                state["unsaved_alert"] = {"account": uuid, "at": int(time.time()),
+                                          "delivered": delivered}
             return poll_failed(state, str(unsaved), alert)
         state.pop("unsaved_alert", None)
         record_history(state, "poll-saved-login", account=uuid, identified_by=how)
