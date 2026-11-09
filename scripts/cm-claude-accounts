@@ -10,6 +10,7 @@ See doc/claude-account-switcher.md.
 from __future__ import annotations
 
 import argparse
+import email.utils
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
@@ -36,6 +37,14 @@ class AccountError(Exception):
 
 class TokenRejected(AccountError):
     """Anthropic answered 401: the access token expired early or was revoked."""
+
+
+class RateLimited(AccountError):
+    """Anthropic answered 429. retry_after is its Retry-After in seconds, if any."""
+
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 @dataclass(frozen=True)
@@ -241,6 +250,8 @@ def fetch_account_uuid(access_token: str) -> str:
         with urllib.request.urlopen(req, timeout=PROFILE_TIMEOUT_SECONDS) as resp:
             uuid = json.load(resp).get("account", {}).get("uuid")
     except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            raise RateLimited("profile requests are rate limited (HTTP 429)") from None
         error = TokenRejected if exc.code == 401 else AccountError
         raise error(f"Anthropic rejected the current access token (HTTP {exc.code})") from None
     except (urllib.error.URLError, TimeoutError, ValueError) as exc:
@@ -320,6 +331,9 @@ USAGE_TIMEOUT_SECONDS = 15
 # 5-hour limit, 90% of a weekly one). Override in state.json "config".
 DEFAULT_THRESHOLDS = {"session": 80, "weekly": 90}
 FAILURE_ALERT_AFTER = 3
+# After a 429, wait at least this long, doubling per consecutive 429.
+RATE_LIMIT_BACKOFF_SECONDS = 15 * 60
+RATE_LIMIT_BACKOFF_MAX_SECONDS = 2 * 3600
 UNDELIVERED_RETRY_SECONDS = 3600
 # The API's resets_at jitters by under a second between readings; a reset
 # this far from the alerted one is a new period.
@@ -340,12 +354,28 @@ def fetch_usage(access_token: str) -> dict:
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
             raise TokenRejected("Anthropic rejected the current access token (HTTP 401)") from None
+        if exc.code == 429:
+            raise RateLimited("usage requests are rate limited (HTTP 429)",
+                              parse_retry_after(exc.headers.get("Retry-After") if exc.headers else None)) from None
         raise AccountError(f"usage request failed (HTTP {exc.code})") from None
     except (urllib.error.URLError, TimeoutError, ValueError) as exc:
         raise AccountError(f"could not reach Anthropic for usage ({type(exc).__name__})") from None
     if not isinstance(data, dict):
         raise AccountError("usage response was not a JSON object")
     return data
+
+
+def parse_retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        return max(0.0, email.utils.parsedate_to_datetime(value).timestamp() - time.time())
+    except (TypeError, ValueError):
+        return None
 
 
 def parse_time(value) -> float | None:
@@ -515,10 +545,16 @@ def check_limits(state: dict, uuid: str, record: dict, limits: list[dict], alert
 DEFAULT_MIN_DWELL_MINUTES = 30
 
 
-def over_threshold(limits: list[dict], config: dict, now: float) -> list[dict]:
-    """Limits at or over threshold whose reset has not passed."""
+def over_threshold(limits: list[dict], config: dict, now: float,
+                   for_switch: bool = False) -> list[dict]:
+    """Limits at or over threshold whose reset has not passed. for_switch
+    keeps only the limits that block every model (5-hour and all-models
+    weekly): a full model-scoped limit alerts, but moving every session for
+    one model needs "switch_on_scoped": true."""
     return [l for l in limits if l["percent"] >= threshold_for(l, config)
-            and not (l.get("resets_at") is not None and l["resets_at"] <= now)]
+            and not (l.get("resets_at") is not None and l["resets_at"] <= now)
+            and (not for_switch or l["kind"] in ("session", "weekly_all")
+                 or config.get("switch_on_scoped"))]
 
 
 def pick_target(state: dict, accounts: dict[str, dict], active: str | None,
@@ -538,7 +574,7 @@ def pick_target(state: dict, accounts: dict[str, dict], active: str | None,
             ranked.append(((1, 0.0), uuid, "no usage reading yet"))
             continue
         limits = reading.get("limits") or []
-        if over_threshold(limits, config, now):
+        if over_threshold(limits, config, now, for_switch=True):
             continue
         live = [l for l in limits if not (l.get("resets_at") is not None and l["resets_at"] <= now)]
         worst = max(live, key=lambda l: l["percent"] / threshold_for(l, config), default=None)
@@ -568,12 +604,27 @@ def last_switch_at(state: dict) -> float:
 
 
 def poll_failed(state: dict, reason: str, alert) -> int:
+    print(f"poll failed: {reason}", file=sys.stderr)  # the journal shows why
     poll = state.setdefault("poll", {})
     poll.update(at=int(time.time()), ok=False, reason=reason)
     poll["failures"] = poll.get("failures", 0) + 1
     if poll["failures"] == FAILURE_ALERT_AFTER:
         alert(f"usage poll failed {FAILURE_ALERT_AFTER} times in a row: {reason}")
     return 1
+
+
+def poll_rate_limited(state: dict, exc: RateLimited, out) -> int:
+    """Back off instead of failing: the endpoint's limit may be shared with
+    Owner's own /usage, so never keep hitting it."""
+    poll = state.setdefault("poll", {})
+    streak = poll.get("rate_limited", 0) + 1
+    wait = min(RATE_LIMIT_BACKOFF_SECONDS * 2 ** (streak - 1), RATE_LIMIT_BACKOFF_MAX_SECONDS)
+    wait = max(wait, exc.retry_after or 0)
+    now = int(time.time())
+    poll.update(at=now, ok=False, skipped=True, reason=str(exc), rate_limited=streak,
+                backoff_until=now + int(wait))
+    print(f"skipped: {exc}; no usage request for {wait / 60:.0f} min", file=out)
+    return 0
 
 
 def poll_skipped(state: dict, reason: str) -> int:
@@ -667,7 +718,9 @@ def cmd_status(paths: Paths, state: dict, out) -> int:
         over = over_threshold(readings[active]["limits"], config, now)
         if over:
             names = ", ".join(f"{limit_name(l)} {l['percent']:.0f}%" for l in over)
-            print(f"over threshold: {names}. {switch_advice(state, accounts, active, now)}", file=out)
+            advice = (f". {switch_advice(state, accounts, active, now)}"
+                      if over_threshold(over, config, now, for_switch=True) else "")
+            print(f"over threshold: {names}{advice}", file=out)
     print(f"autoswitch: {config.get('autoswitch', 'suggest')}", file=out)
     poll = state.get("poll")
     if poll:
@@ -697,6 +750,11 @@ def cmd_poll(paths: Paths, state: dict, out, notify_command: str) -> int:
         print("no saved accounts; nothing to poll", file=out)
         return 0
     check_logins(state, accounts, alert)
+    backoff_until = (state.get("poll") or {}).get("backoff_until", 0)
+    if backoff_until > time.time():
+        print(f"skipped: backing off after HTTP 429 for another "
+              f"{(backoff_until - time.time()) / 60:.0f} min", file=out)
+        return 0
     login = read_login(paths)
     expires = login.get("expiresAt")
     if isinstance(expires, (int, float)) and expires / 1000 <= time.time():
@@ -713,6 +771,8 @@ def cmd_poll(paths: Paths, state: dict, out, notify_command: str) -> int:
         except TokenRejected as exc:
             print(f"skipped: {exc}", file=out)
             return poll_skipped(state, "access token rejected")
+        except RateLimited as exc:
+            return poll_rate_limited(state, exc, out)
         except AccountError as exc:
             return poll_failed(state, str(exc), alert)
         unsaved = None
@@ -743,6 +803,8 @@ def cmd_poll(paths: Paths, state: dict, out, notify_command: str) -> int:
     except TokenRejected as exc:
         print(f"skipped: {exc}", file=out)
         return poll_skipped(state, "access token rejected")
+    except RateLimited as exc:
+        return poll_rate_limited(state, exc, out)
     except AccountError as exc:
         return poll_failed(state, str(exc), alert)
     limits = parse_limits(usage)
@@ -769,7 +831,7 @@ def cmd_poll(paths: Paths, state: dict, out, notify_command: str) -> int:
     config = state.get("config") or {}
     mode = config.get("autoswitch", "suggest")
     advice = None
-    over = over_threshold(limits, config, now)
+    over = over_threshold(limits, config, now, for_switch=True)
     if over and mode in ("suggest", "auto"):
         target = pick_target(state, accounts, uuid, now)
         dwell = config.get("min_dwell_minutes", DEFAULT_MIN_DWELL_MINUTES) * 60

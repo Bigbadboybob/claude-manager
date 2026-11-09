@@ -245,6 +245,12 @@ full 6 s hold and landed 1.5 s after release.
   Undocumented, so tolerate it changing shape. Never poll an
   inactive account's saved token (decision 3); it only stays valid until
   that account's next refresh anyway.
+- **Rate limit:** the usage endpoint answered HTTP 429 on the laptop
+  (2026-11-09) at the 7th call in about 30 minutes (5-minute timer plus a
+  manual run). Its budget may be shared with Owner's own `/usage`, so
+  `poll` runs every 10 minutes and treats a 429 as a skip: no request for
+  15 min, doubling per consecutive 429 up to 2 h, or longer if
+  `Retry-After` says so.
 - **`poll` never refreshes a token.** If the live access token has
   expired (`expiresAt` passed, or the usage request returns 401), skip the
   cycle and record why; the next real request from a session refreshes it.
@@ -364,7 +370,8 @@ stale in-memory `oauthAccount` (a written value held for 60 s here).
    same profile and usage endpoints as 2.1.308.
 2. `poll` + state + alerts + a systemd user timer (every ~5 min).
    **Built (2026-11-09), fakes only:** `poll`, `status`, `test-alert`,
-   `deploy/cm-claude-accounts-poll.{service,timer}`; 33 tests. Beyond the
+   `deploy/cm-claude-accounts-poll.{service,timer}` (every 10 min since the
+   429 below); 33 tests. Beyond the
    rules above, `poll` also saves the live login whenever a session has
    refreshed it (confirmed with Anthropic, as in `switch`), so the saved
    copy stays current and `switch` rarely refuses after idle time; and a
@@ -386,7 +393,10 @@ stale in-memory `oauthAccount` (a written value held for 60 s here).
    alert, or "No other saved account has room"; `status` shows the same.
    `auto` runs `switch` itself, at most once per `min_dwell_minutes`
    (default 30) after any switch, records `reason: auto: …` in history and
-   alerts what it did. 45 tests.
+   alerts what it did. Only the 5-hour and all-models weekly limits
+   trigger a switch or rule out a target; a full model-scoped limit
+   (`week:Fable`) alerts without advice unless `"switch_on_scoped": true`.
+   50 tests.
 4. Laptop rollout, then cm-sessions and cm-manager (one host at a time,
    with Owner present for the per-account `/login`s).
 5. Optional: TUI dashboard panel; multi-host `switch`/`status` through CM.
@@ -426,9 +436,11 @@ journalctl --user -u cm-claude-accounts-poll.service -n 20   # last runs
   in `state.json` (defaults shown); a key per limit `kind` overrides its
   family.
 - **Autoswitch:** `"config": {"autoswitch": "suggest"}` (default; also
-  `"off"` or `"auto"`) and `"min_dwell_minutes": 30`. `auto` moves every
+  `"off"` or `"auto"`), `"min_dwell_minutes": 30` and
+  `"switch_on_scoped": false`. `auto` moves every
   session on the host on its own: turn it on only with Owner's say-so. Edit
   `state.json` only while no `cm-claude-accounts` runs (stop the timer, or
   hold the store's `lock` file).
 - `poll` exits 0 when it skips (access token expired or rejected: the next
-  prompt in any session renews it) and 1 when it fails.
+  prompt in any session renews it; or backing off after HTTP 429) and 1
+  when it fails, printing the reason to the journal.

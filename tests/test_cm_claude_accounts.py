@@ -1,6 +1,7 @@
 """Account switching must follow Claude Code's files and lock, and never leak tokens."""
 
 import contextlib
+import email.utils
 from datetime import datetime, timezone
 import importlib.machinery
 import importlib.util
@@ -658,6 +659,65 @@ class PollTests(PollHarness):
         self.poll()
         self.assertEqual(len(self.alerts()), 1)  # and never again this period
 
+    def test_rate_limit_backs_off_without_counting_a_failure(self):
+        # Seen on the laptop 2026-11-09: HTTP 429 on the 7th call in ~30 min.
+        self.do_login("alice")
+        self.run_cli("capture")
+        self.usage[self.live_token()] = WEEKLY_ONLY
+        self.usage_error = accounts.RateLimited("usage requests are rate limited (HTTP 429)")
+        code, text = self.poll()
+        self.assertEqual(code, 0)
+        self.assertIn("no usage request for 15 min", text)
+        self.usage_error = None
+        for _ in range(3):  # inside the backoff: no request at all
+            self.assertIn("backing off", self.poll()[1])
+        self.assertEqual(len(self.usage_calls), 1)
+        poll = self.state()["poll"]
+        self.assertNotIn("failures", poll)
+        self.assertEqual(self.alerts(), [])
+        # Back off longer each time, and honor a longer Retry-After.
+        self.usage_error = accounts.RateLimited("usage requests are rate limited (HTTP 429)")
+        self.expire_backoff()
+        self.assertIn("for 30 min", self.poll()[1])
+        self.usage_error = accounts.RateLimited("rate limited (HTTP 429)", retry_after=3 * 3600)
+        self.expire_backoff()
+        self.assertIn("for 180 min", self.poll()[1])
+        self.usage_error = None
+        self.expire_backoff()
+        self.assertEqual(self.poll()[0], 0)
+        self.assertEqual(self.state()["poll"], {"at": mock.ANY, "ok": True, "account": "alice-uuid-0000"})
+
+    def expire_backoff(self):
+        state = self.state()
+        state["poll"]["backoff_until"] = int(time.time()) - 1
+        self.paths.state.write_text(json.dumps(state))
+
+    def test_rate_limited_profile_check_backs_off_too(self):
+        self.do_login("alice")
+        self.run_cli("capture")
+        self.session_refresh("alice-2", owner="alice")
+        with mock.patch.object(accounts, "fetch_account_uuid",
+                               side_effect=accounts.RateLimited("profile requests are rate limited (HTTP 429)")):
+            code, text = self.poll()
+        self.assertEqual(code, 0)
+        self.assertIn("backoff_until", self.state()["poll"])
+        self.assertEqual(self.usage_calls, [])
+
+    def test_retry_after_header_forms(self):
+        self.assertEqual(accounts.parse_retry_after("120"), 120)
+        self.assertIsNone(accounts.parse_retry_after(None))
+        self.assertIsNone(accounts.parse_retry_after("soon"))
+        future = email.utils.formatdate(time.time() + 600, usegmt=True)
+        self.assertAlmostEqual(accounts.parse_retry_after(future), 600, delta=5)
+
+    def test_failure_reason_reaches_the_journal(self):
+        self.do_login("alice")
+        self.run_cli("capture")
+        self.usage_error = accounts.AccountError("usage request failed (HTTP 500)")
+        code, text = self.poll()
+        self.assertEqual(code, 1)
+        self.assertIn("poll failed: usage request failed (HTTP 500)", text)
+
     def test_test_alert_reports_delivery(self):
         self.assertEqual(self.run_cli("test-alert", "--notify-command", str(self.notifier))[0], 0)
         self.assertEqual(self.alerts(), ["claude-accounts|test alert from cm-claude-accounts"])
@@ -785,6 +845,29 @@ class AutoswitchTests(PollHarness):
         self.poll()  # the setUp switch to alice was moments ago
         self.assertEqual(self.live_token(), "sk-ant-oat-ACCESS-alice")
         self.assertIn("automatic switch waits until 30 min after the last switch", self.alerts()[0])
+
+    def test_a_full_model_scoped_limit_alerts_but_does_not_switch(self):
+        self.usage[self.live_token()] = usage(("weekly_all", None, 50, 3 * 86400, True),
+                                              ("weekly_scoped", "Fable", 97, 3 * 86400, False))
+        self.set_reading("bob", ("weekly_all", None, 40, 2 * 86400, True), autoswitch="auto")
+        self.age_last_switch(31 * 60)
+        self.poll()
+        self.assertEqual(self.live_token(), "sk-ant-oat-ACCESS-alice")
+        self.assertEqual(len(self.alerts()), 1)
+        self.assertIn("97% of its week:Fable limit", self.alerts()[0])
+        self.assertNotIn("Suggest", self.alerts()[0])
+        status = self.run_cli("status")[1]
+        self.assertIn("over threshold: week:Fable 97%\n", status)
+        # Opting in makes a scoped limit count, for both target and trigger.
+        self.set_config(autoswitch="auto", switch_on_scoped=True)
+        self.alerts_reset()
+        self.poll()
+        self.assertEqual(self.live()["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-bob")
+
+    def alerts_reset(self):
+        state = self.state()
+        state["limit_alerts"] = {}
+        self.paths.state.write_text(json.dumps(state))
 
     def test_auto_without_a_target_only_alerts(self):
         self.set_reading("bob", ("weekly_all", None, 97, 86400, True), autoswitch="auto")
