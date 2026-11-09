@@ -424,7 +424,7 @@ stale in-memory `oauthAccount` (a written value held for 60 s here).
    **Safeguards and other hosts (2026-11-09), fakes only:** peers and
    `export` (see Multiple hosts); `auto` needs a reading for its target,
    honours `exclude`, and caps itself per day; `config`, `history`,
-   `exclude`/`include` and `install` commands. 73 tests.
+   `exclude`/`include` and `install` commands. 74 tests.
    **Laptop run of 35ed90c (2026-11-09, 05:03-05:47Z, timer only):** a 429
    on the first call (9 min after the previous) was skipped with a 15-min
    backoff; then three clean calls 10 min apart. The undelivered 96% alert
@@ -466,7 +466,7 @@ a new host run it with Owner present.
   copies, settings, alert bookkeeping, history; no tokens), `alerts.log`
   (every alert, delivered or not).
 - **Alerts** run `~/.cm/bin/cm-notify "<message>"` with
-  `CM_NOTIFY_TAG=claude-accounts` (Telegram; needs `~/.cm/notify.env`).
+  `CM_NOTIFY_TAG=claude-accounts@<host>` (Telegram; needs `~/.cm/notify.env`).
   Override with `--notify-command` or `config notify_command <path>`.
   A failed delivery is logged and shown by `status`.
   Sent: active account at or over its threshold (once per limit per reset

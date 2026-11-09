@@ -439,7 +439,7 @@ class PollTests(PollHarness):
         self.poll()
         self.poll()
         self.assertEqual(len(self.alerts()), 1)
-        self.assertIn("claude-accounts|alice@example.com (alice-uu) is at 85% of its 5h limit",
+        self.assertIn(f"{accounts.notify_tag()}|alice@example.com (alice-uu) is at 85% of its 5h limit",
                       self.alerts()[0])
         # A new 5-hour window is a new period: alert again.
         self.usage[token] = usage(("session", None, 81, 5 * 3600, True))
@@ -718,9 +718,15 @@ class PollTests(PollHarness):
         self.assertEqual(code, 1)
         self.assertIn("poll failed: usage request failed (HTTP 500)", text)
 
+    def test_alerts_name_the_sending_host(self):
+        with mock.patch.object(accounts.socket, "gethostname", return_value="pop-os.lan"):
+            self.assertEqual(accounts.notify_tag(), "claude-accounts@pop-os")
+            self.run_cli("test-alert", "--notify-command", str(self.notifier))
+        self.assertEqual(self.alerts(), ["claude-accounts@pop-os|test alert from cm-claude-accounts"])
+
     def test_test_alert_reports_delivery(self):
         self.assertEqual(self.run_cli("test-alert", "--notify-command", str(self.notifier))[0], 0)
-        self.assertEqual(self.alerts(), ["claude-accounts|test alert from cm-claude-accounts"])
+        self.assertEqual(self.alerts(), [f"{accounts.notify_tag()}|test alert from cm-claude-accounts"])
         self.notifier.unlink()
         code, text = self.run_cli("test-alert", "--notify-command", str(self.notifier))
         self.assertEqual(code, 1)

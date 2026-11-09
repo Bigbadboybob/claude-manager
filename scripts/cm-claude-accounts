@@ -474,6 +474,12 @@ def describe_reset(resets_at: float | None, now: float) -> str:
     return f"resets in {left / 86400:.1f}d"
 
 
+def notify_tag() -> str:
+    """cm-notify labels every message "cm-manager"; the tag says which host sent it."""
+    host = socket.gethostname().split(".")[0]
+    return f"claude-accounts@{host}" if host else "claude-accounts"
+
+
 def notify(state: dict, paths: Paths, message: str, command: str) -> bool:
     """Send an operator alert; always log it. Messages name accounts, never tokens."""
     now = int(time.time())
@@ -483,7 +489,7 @@ def notify(state: dict, paths: Paths, message: str, command: str) -> bool:
     delivered, why = False, None
     try:
         result = subprocess.run([command, message], capture_output=True, timeout=30,
-                                env=dict(os.environ, CM_NOTIFY_TAG="claude-accounts"))
+                                env=dict(os.environ, CM_NOTIFY_TAG=notify_tag()))
         delivered = result.returncode == 0
         why = None if delivered else f"notifier exited {result.returncode}"
     except (OSError, subprocess.TimeoutExpired) as exc:
