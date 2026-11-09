@@ -425,6 +425,12 @@ stale in-memory `oauthAccount` (a written value held for 60 s here).
    `export` (see Multiple hosts); `auto` needs a reading for its target,
    honours `exclude`, and caps itself per day; `config`, `history`,
    `exclude`/`include` and `install` commands. 74 tests.
+   **Laptop run of cf0ff7a/14790a0 (2026-11-09, 18:10-18:58Z):** `install`
+   installed the script and enabled the timer; `config`, `history`, `export`
+   (4 accounts, no tokens) and a failing peer (tool absent on cm-sessions:
+   clean "export failed", poll unaffected) behaved as designed. With
+   cm-notify copied over (Owner-approved), `test-alert` and then the
+   undelivered 96% alert reached Telegram. Four clean polls.
    **Laptop run of 35ed90c (2026-11-09, 05:03-05:47Z, timer only):** a 429
    on the first call (9 min after the previous) was skipped with a 15-min
    backoff; then three clean calls 10 min apart. The undelivered 96% alert
