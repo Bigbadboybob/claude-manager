@@ -986,8 +986,8 @@ class PeerTests(AutoswitchHarness):
         del self.peer_data["cm-sessions"]  # now unreachable: the last good copy is kept
         code, text = self.run_cli("status")
         self.assertEqual(code, 0)
-        self.assertIn("peer cm-manager: cm-manager: export failed (exit 255)\n", text)
-        self.assertIn("peer cm-sessions: cm-sessions: export failed (exit 255); using its reading from", text)
+        self.assertIn("peer cm-manager: export failed (exit 255)\n", text)
+        self.assertIn("peer cm-sessions: export failed (exit 255); using its reading from", text)
         self.assertIn("week 30% (resets in 24.0h, binding)  [read 5m ago on cm-sessions]", text)
 
     def test_status_shows_peer_activity_and_peer_only_accounts(self):

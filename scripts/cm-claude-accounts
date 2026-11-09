@@ -875,7 +875,9 @@ def cmd_status(paths: Paths, state: dict, out, local: bool = False) -> int:
             print(f"peer {host}: active {active_email or data.get('active') or 'none'}", file=out)
         else:
             stale = f"; using its reading from {describe_age(now - entry['at'])}" if entry.get("at") else ""
-            print(f"peer {host}: {entry.get('error', 'not read')}{stale}", file=out)
+            error = entry.get("error", "not read")
+            error = error[len(host) + 2:] if error.startswith(f"{host}: ") else error
+            print(f"peer {host}: {error}{stale}", file=out)
     active = state.get("active")
     readings = state.get("usage") or {}
     if active in accounts and active in readings:
