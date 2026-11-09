@@ -363,8 +363,8 @@ WEEKLY_ONLY = usage(("weekly_all", None, 89, 3 * 86400, True),
                     ("weekly_scoped", "opus", 40, 3 * 86400, False))
 
 
-class PollTests(Harness):
-    """poll reads only the live login, never refreshes, and alerts once."""
+class PollHarness(Harness):
+    """Adds a fake usage endpoint and a real fake notifier script."""
 
     def setUp(self):
         super().setUp()
@@ -402,6 +402,10 @@ class PollTests(Harness):
                 text = path.read_text()
                 for token in self.tokens:
                     self.assertNotIn(token, text, path)
+
+
+class PollTests(PollHarness):
+    """poll reads only the live login, never refreshes, and alerts once."""
 
     def test_plan_without_a_5_hour_limit_is_read_from_the_limits_list(self):
         self.do_login("alice")
@@ -684,6 +688,111 @@ class PollTests(Harness):
         self.assertEqual(results["poll"][0], 0)
         self.assertEqual(self.usage_calls, ["sk-ant-oat-ACCESS-alice"])
         self.assertEqual(self.state()["usage"].keys(), {"alice-uuid-0000"})
+
+
+
+class AutoswitchTests(PollHarness):
+    """On threshold: suggest the account with most room; auto switches behind a flag."""
+
+    def setUp(self):
+        super().setUp()
+        self.capture_two()
+        self.do_login("carol")
+        self.run_cli("capture")
+        self.run_cli("switch", "alice@example.com")
+        self.usage[self.live_token()] = usage(("weekly_all", None, 95, 3 * 86400, True))
+
+    def set_reading(self, name, *limits, age=3600, **config):
+        state = self.state()
+        state.setdefault("usage", {})[f"{name}-uuid-0000"] = {
+            "at": int(time.time()) - age,
+            "limits": accounts.parse_limits(usage(*limits))}
+        if config:
+            state["config"] = config
+        self.paths.state.write_text(json.dumps(state))
+
+    def set_config(self, **config):
+        state = self.state()
+        state["config"] = config
+        self.paths.state.write_text(json.dumps(state))
+
+    def age_last_switch(self, seconds):
+        state = self.state()
+        for h in state["history"]:
+            if h["event"] == "switch":
+                h["at"] -= seconds
+        self.paths.state.write_text(json.dumps(state))
+
+    def test_suggests_the_account_with_most_room(self):
+        self.set_reading("bob", ("weekly_all", None, 40, 2 * 86400, True))
+        self.age_last_switch(31 * 60)  # so only the mode keeps it from switching
+        code, text = self.poll()  # carol has no reading: ranks after bob
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.alerts()), 1)
+        self.assertIn("95% of its week limit", self.alerts()[0])
+        self.assertIn("Suggest: cm-claude-accounts switch bob@example.com (week 40% 1.0h ago)",
+                      self.alerts()[0])
+        self.assertEqual(self.live_token(), "sk-ant-oat-ACCESS-alice")  # suggest never switches
+        self.assertIn("over threshold: week 95%. Suggest: cm-claude-accounts switch bob@example.com",
+                      self.run_cli("status")[1])
+
+    def test_a_passed_reset_counts_as_refilled(self):
+        self.set_reading("bob", ("weekly_all", None, 99, -60, True))
+        self.poll()
+        self.assertIn("switch bob@example.com (likely refilled)", self.alerts()[0])
+
+    def test_unread_account_is_suggested_when_known_ones_are_full(self):
+        self.set_reading("bob", ("weekly_all", None, 97, 86400, True))
+        self.poll()
+        self.assertIn("switch carol@example.com (no usage reading yet)", self.alerts()[0])
+
+    def test_no_room_anywhere_says_so(self):
+        self.set_reading("bob", ("weekly_all", None, 97, 86400, True))
+        self.set_reading("carol", ("session", None, 85, 3600, True))
+        self.poll()
+        self.assertIn("No other saved account has room", self.alerts()[0])
+
+    def test_expired_logins_are_never_suggested(self):
+        for name in ("bob", "carol"):
+            path = self.paths.accounts / f"{name}-uuid-0000.json"
+            rec = json.loads(path.read_text())
+            rec["claudeAiOauth"]["refreshTokenExpiresAt"] = int(time.time() * 1000) - 1000
+            path.write_text(json.dumps(rec))
+        self.poll()
+        self.assertTrue(any("No other saved account has room" in a for a in self.alerts()))
+
+    def test_off_alerts_without_advice(self):
+        self.set_config(autoswitch="off")
+        self.poll()
+        self.assertEqual(len(self.alerts()), 1)
+        self.assertNotIn("Suggest", self.alerts()[0])
+
+    def test_auto_switches_after_the_dwell_time(self):
+        self.set_reading("bob", ("weekly_all", None, 40, 2 * 86400, True), autoswitch="auto")
+        self.age_last_switch(31 * 60)
+        code, text = self.poll()
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.live()["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-bob")
+        self.assertEqual(self.live_email(), "bob@example.com")
+        self.assertEqual(self.state()["active"], "bob-uuid-0000")
+        self.assertEqual(self.state()["history"][-1]["reason"], "auto: week 95%")
+        self.assertEqual(len(self.alerts()), 1)
+        self.assertIn("switched alice@example.com (alice-uu) -> bob@example.com (bob-uuid) "
+                      "automatically (week 95%; target week 40% 1.0h ago)", self.alerts()[0])
+
+    def test_auto_waits_for_the_dwell_time(self):
+        self.set_reading("bob", ("weekly_all", None, 40, 2 * 86400, True), autoswitch="auto")
+        self.poll()  # the setUp switch to alice was moments ago
+        self.assertEqual(self.live_token(), "sk-ant-oat-ACCESS-alice")
+        self.assertIn("automatic switch waits until 30 min after the last switch", self.alerts()[0])
+
+    def test_auto_without_a_target_only_alerts(self):
+        self.set_reading("bob", ("weekly_all", None, 97, 86400, True), autoswitch="auto")
+        self.set_reading("carol", ("weekly_all", None, 97, 86400, True))
+        self.age_last_switch(31 * 60)
+        self.poll()
+        self.assertEqual(self.live_token(), "sk-ant-oat-ACCESS-alice")
+        self.assertIn("No other saved account has room", self.alerts()[0])
 
 
 if __name__ == "__main__":

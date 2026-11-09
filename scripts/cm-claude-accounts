@@ -485,7 +485,8 @@ def check_logins(state: dict, accounts: dict[str, dict], alert) -> None:
             sent[uuid] = {"at": int(now), "delivered": delivered}
 
 
-def check_limits(state: dict, uuid: str, record: dict, limits: list[dict], alert) -> None:
+def check_limits(state: dict, uuid: str, record: dict, limits: list[dict], alert,
+                 advice: str | None = None) -> None:
     """Alert once per limit per reset period when the active account crosses a threshold."""
     config = state.get("config") or {}
     sent = state.setdefault("limit_alerts", {})
@@ -504,8 +505,66 @@ def check_limits(state: dict, uuid: str, record: dict, limits: list[dict], alert
         if not alert_due(entry, now):
             continue
         delivered = alert(f"{label(record)} is at {limit['percent']:.0f}% of its "
-                          f"{limit_name(limit)} limit ({describe_reset(limit['resets_at'], now)})")
+                          f"{limit_name(limit)} limit ({describe_reset(limit['resets_at'], now)})"
+                          + (f". {advice}" if advice else ""))
         sent[key] = {"at": int(now), "resets_at": limit["resets_at"], "delivered": delivered}
+
+
+# --- autoswitch -----------------------------------------------------------------
+
+DEFAULT_MIN_DWELL_MINUTES = 30
+
+
+def over_threshold(limits: list[dict], config: dict, now: float) -> list[dict]:
+    """Limits at or over threshold whose reset has not passed."""
+    return [l for l in limits if l["percent"] >= threshold_for(l, config)
+            and not (l.get("resets_at") is not None and l["resets_at"] <= now)]
+
+
+def pick_target(state: dict, accounts: dict[str, dict], active: str | None,
+                now: float) -> tuple[str, str] | None:
+    """The saved account with the most room, from last readings (decision 3:
+    inactive accounts are never polled). A limit whose reset has passed counts
+    as empty. Accounts with no reading rank after any with known room.
+    Returns (accountUuid, why) or None."""
+    config = state.get("config") or {}
+    readings = state.get("usage") or {}
+    ranked = []
+    for uuid, rec in accounts.items():
+        if uuid == active or login_state(rec, now) in ("needs /login", "login expired"):
+            continue
+        reading = readings.get(uuid)
+        if not reading:
+            ranked.append(((1, 0.0), uuid, "no usage reading yet"))
+            continue
+        limits = reading.get("limits") or []
+        if over_threshold(limits, config, now):
+            continue
+        live = [l for l in limits if not (l.get("resets_at") is not None and l["resets_at"] <= now)]
+        worst = max(live, key=lambda l: l["percent"] / threshold_for(l, config), default=None)
+        if worst is None:
+            why = "likely refilled"
+        else:
+            why = f"{limit_name(worst)} {worst['percent']:.0f}% {describe_age(now - reading['at'])}"
+        ratio = worst["percent"] / threshold_for(worst, config) if worst else 0.0
+        ranked.append(((0, ratio), uuid, why))
+    if not ranked:
+        return None
+    _, uuid, why = min(ranked, key=lambda r: (r[0], label(accounts[r[1]])))
+    return uuid, why
+
+
+def switch_advice(state: dict, accounts: dict[str, dict], active: str, now: float) -> str:
+    target = pick_target(state, accounts, active, now)
+    if target is None:
+        return "No other saved account has room"
+    uuid, why = target
+    email = accounts[uuid]["oauthAccount"].get("emailAddress") or uuid
+    return f"Suggest: cm-claude-accounts switch {email} ({why})"
+
+
+def last_switch_at(state: dict) -> float:
+    return max((h["at"] for h in state.get("history", []) if h.get("event") == "switch"), default=0)
 
 
 def poll_failed(state: dict, reason: str, alert) -> int:
@@ -602,6 +661,14 @@ def cmd_status(paths: Paths, state: dict, out) -> int:
                          f"({describe_reset(reset, now)}{binding})")
         print(f"    {'; '.join(parts) or 'no limits reported'}  [read {describe_age(now - reading['at'])}]",
               file=out)
+    active = state.get("active")
+    config = state.get("config") or {}
+    if active in accounts and active in readings:
+        over = over_threshold(readings[active]["limits"], config, now)
+        if over:
+            names = ", ".join(f"{limit_name(l)} {l['percent']:.0f}%" for l in over)
+            print(f"over threshold: {names}. {switch_advice(state, accounts, active, now)}", file=out)
+    print(f"autoswitch: {config.get('autoswitch', 'suggest')}", file=out)
     poll = state.get("poll")
     if poll:
         result = "ok" if poll.get("ok") else poll.get("reason", "failed")
@@ -699,7 +766,30 @@ def cmd_poll(paths: Paths, state: dict, out, notify_command: str) -> int:
     except (AccountError, OSError, ValueError) as exc:
         print(f"warning: could not repair {paths.claude_json} ({exc})", file=sys.stderr)
 
-    check_limits(state, uuid, record, limits, alert)
+    config = state.get("config") or {}
+    mode = config.get("autoswitch", "suggest")
+    advice = None
+    over = over_threshold(limits, config, now)
+    if over and mode in ("suggest", "auto"):
+        target = pick_target(state, accounts, uuid, now)
+        dwell = config.get("min_dwell_minutes", DEFAULT_MIN_DWELL_MINUTES) * 60
+        since = now - last_switch_at(state)
+        if mode == "auto" and target and since >= dwell:
+            reason = ", ".join(f"{limit_name(l)} {l['percent']:.0f}%" for l in over)
+            try:
+                cmd_switch(paths, state, target[0], out)
+            except AccountError as exc:
+                advice = f"Automatic switch failed ({exc}). {switch_advice(state, accounts, uuid, now)}"
+            else:
+                state["history"][-1]["reason"] = f"auto: {reason}"
+                alert(f"switched {label(record)} -> {label(accounts[target[0]])} automatically "
+                      f"({reason}; target {target[1]})")
+                return 0
+        else:
+            advice = switch_advice(state, accounts, uuid, now)
+            if mode == "auto" and target:
+                advice += f"; automatic switch waits until {dwell // 60:.0f} min after the last switch"
+    check_limits(state, uuid, record, limits, alert, advice)
     summary = ", ".join(f"{limit_name(l)} {l['percent']:.0f}%" for l in limits)
     print(f"{label(record)}: {summary}", file=out)
     return 0

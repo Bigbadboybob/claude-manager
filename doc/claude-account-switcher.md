@@ -3,7 +3,9 @@
 Status: design 2026-10-22 from an Owner discussion on cm-sessions (branch
 `cm/claudelb`). Built so far: `capture` / `list` / `switch` / `remove`
 (real switch passed on the laptop 2026-11-07) and `poll` / `status` /
-`test-alert` (tested against fakes only; see [Operating it](#operating-it)).
+`test-alert` (real readings on the laptop 2026-11-09; Telegram delivery
+not yet proven) and autoswitch `suggest`/`auto` (fakes only); see
+[Operating it](#operating-it).
 Details still marked **verify** below are the ones validation did not settle.
 
 ## Goal
@@ -370,6 +372,21 @@ stale in-memory `oauthAccount` (a written value held for 60 s here).
    profile names the same account (otherwise it alerts). Not yet run
    against a real login.
 3. `suggest` autoswitch, then `auto` behind a config flag.
+   **Laptop run of `poll` (2026-11-09, 1213a47):** real readings for the
+   active account (week 96%, 5h 0%, `week:Fable` 0%); the credentials file
+   was unchanged across six polls. It found three bugs, fixed in 1213a47:
+   reset times jitter by under a second, model-scoped limits have an object
+   `scope`, and an undelivered alert was never retried.
+   **Built (2026-11-09), fakes only:** both modes inside `poll`. On a limit
+   at or over threshold, the target is the saved account with the most
+   room by its last reading (a limit whose reset has passed counts as
+   empty; accounts never read rank after any with known room; expired
+   logins never qualify). `suggest` (default) adds
+   `Suggest: cm-claude-accounts switch <email> (<why>)` to the threshold
+   alert, or "No other saved account has room"; `status` shows the same.
+   `auto` runs `switch` itself, at most once per `min_dwell_minutes`
+   (default 30) after any switch, records `reason: auto: …` in history and
+   alerts what it did. 45 tests.
 4. Laptop rollout, then cm-sessions and cm-manager (one host at a time,
    with Owner present for the per-account `/login`s).
 5. Optional: TUI dashboard panel; multi-host `switch`/`status` through CM.
@@ -408,5 +425,10 @@ journalctl --user -u cm-claude-accounts-poll.service -n 20   # last runs
 - **Thresholds:** `"config": {"thresholds": {"session": 80, "weekly": 90}}`
   in `state.json` (defaults shown); a key per limit `kind` overrides its
   family.
+- **Autoswitch:** `"config": {"autoswitch": "suggest"}` (default; also
+  `"off"` or `"auto"`) and `"min_dwell_minutes": 30`. `auto` moves every
+  session on the host on its own: turn it on only with Owner's say-so. Edit
+  `state.json` only while no `cm-claude-accounts` runs (stop the timer, or
+  hold the store's `lock` file).
 - `poll` exits 0 when it skips (access token expired or rejected: the next
   prompt in any session renews it) and 1 when it fails.
