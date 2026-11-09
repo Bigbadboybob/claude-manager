@@ -1,9 +1,10 @@
-# Claude account switcher (design, not yet built)
+# Claude account switcher
 
-Status: design draft 2026-10-22 from an Owner discussion on cm-sessions
-(branch `cm/claudelb`). Nothing is implemented. The laptop validation ran
-on 2026-10-22; see [Validation results](#validation-results-laptop-2026-10-22).
-Details still marked **verify** below are the ones it did not settle.
+Status: design 2026-10-22 from an Owner discussion on cm-sessions (branch
+`cm/claudelb`). Built so far: `capture` / `list` / `switch` / `remove`
+(real switch passed on the laptop 2026-11-07) and `poll` / `status` /
+`test-alert` (tested against fakes only; see [Operating it](#operating-it)).
+Details still marked **verify** below are the ones validation did not settle.
 
 ## Goal
 
@@ -360,10 +361,52 @@ stale in-memory `oauthAccount` (a written value held for 60 s here).
    refresh lock (paths, `stale:60000,update:5000`, owner record) and the
    same profile and usage endpoints as 2.1.308.
 2. `poll` + state + alerts + a systemd user timer (every ~5 min).
+   **Built (2026-11-09), fakes only:** `poll`, `status`, `test-alert`,
+   `deploy/cm-claude-accounts-poll.{service,timer}`; 33 tests. Beyond the
+   rules above, `poll` also saves the live login whenever a session has
+   refreshed it (confirmed with Anthropic, as in `switch`), so the saved
+   copy stays current and `switch` rarely refuses after idle time; and a
+   `/login` nobody captured is saved when Anthropic confirms it and the
+   profile names the same account (otherwise it alerts). Not yet run
+   against a real login.
 3. `suggest` autoswitch, then `auto` behind a config flag.
 4. Laptop rollout, then cm-sessions and cm-manager (one host at a time,
    with Owner present for the per-account `/login`s).
 5. Optional: TUI dashboard panel; multi-host `switch`/`status` through CM.
 
-Follow the repository workflow (branch, test, merge to `main`; no PRs) and
-add a short operator section to this doc once built.
+Follow the repository workflow (branch, test, merge to `main`; no PRs).
+
+## Operating it
+
+Per host, as the user who runs Claude Code. Never copy the store between
+hosts (see Multiple hosts).
+
+```bash
+install -m 0755 scripts/cm-claude-accounts ~/.local/bin/cm-claude-accounts
+cm-claude-accounts capture            # right after each /login
+cm-claude-accounts status             # dashboard: every account's last reading
+cm-claude-accounts switch <email>     # move every session on this host
+cm-claude-accounts test-alert         # check the alert path
+install -m 0644 deploy/cm-claude-accounts-poll.service \
+  deploy/cm-claude-accounts-poll.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now cm-claude-accounts-poll.timer
+journalctl --user -u cm-claude-accounts-poll.service -n 20   # last runs
+```
+
+- **Store:** `~/.config/cm-claude-accounts/` (0700): `accounts/<uuid>.json`
+  (saved logins, 0600), `state.json` (active account, readings, alert
+  bookkeeping, history; no tokens), `alerts.log` (every alert, delivered or
+  not).
+- **Alerts** run `~/.cm/bin/cm-notify "<message>"` with
+  `CM_NOTIFY_TAG=claude-accounts` (Telegram; needs `~/.cm/notify.env`).
+  Override with `--notify-command` or `"config": {"notify_command": ...}`
+  in `state.json`. A failed delivery is logged and shown by `status`.
+  Sent: active account at or over its threshold (once per limit per reset
+  period), a saved login that has expired, an active login that is not
+  saved, 3 failed polls in a row, and recovery after that.
+- **Thresholds:** `"config": {"thresholds": {"session": 80, "weekly": 90}}`
+  in `state.json` (defaults shown); a key per limit `kind` overrides its
+  family.
+- `poll` exits 0 when it skips (access token expired or rejected: the next
+  prompt in any session renews it) and 1 when it fails.

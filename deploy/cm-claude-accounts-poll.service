@@ -1,0 +1,12 @@
+# systemd USER unit: install to ~/.config/systemd/user/ (see
+# doc/claude-account-switcher.md, "Operating it").
+[Unit]
+Description=Read the active Claude account's usage limits and alert
+After=network-online.target
+ConditionPathExists=%h/.local/bin/cm-claude-accounts
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.local/bin/cm-claude-accounts poll
+TimeoutStartSec=2min
+UMask=0077

@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll Claude account usage every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+Unit=cm-claude-accounts-poll.service
+
+[Install]
+WantedBy=timers.target

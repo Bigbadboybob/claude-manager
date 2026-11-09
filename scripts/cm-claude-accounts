@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import fcntl
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import time
@@ -30,6 +32,10 @@ HISTORY_LIMIT = 200
 
 class AccountError(Exception):
     pass
+
+
+class TokenRejected(AccountError):
+    """Anthropic answered 401: the access token expired early or was revoked."""
 
 
 @dataclass(frozen=True)
@@ -235,7 +241,8 @@ def fetch_account_uuid(access_token: str) -> str:
         with urllib.request.urlopen(req, timeout=PROFILE_TIMEOUT_SECONDS) as resp:
             uuid = json.load(resp).get("account", {}).get("uuid")
     except urllib.error.HTTPError as exc:
-        raise AccountError(f"Anthropic rejected the current access token (HTTP {exc.code})") from None
+        error = TokenRejected if exc.code == 401 else AccountError
+        raise error(f"Anthropic rejected the current access token (HTTP {exc.code})") from None
     except (urllib.error.URLError, TimeoutError, ValueError) as exc:
         raise AccountError(f"could not reach Anthropic to confirm the account ({type(exc).__name__})") from None
     if not isinstance(uuid, str) or not uuid:
@@ -257,7 +264,8 @@ def identify(login: dict, accounts: dict[str, dict]) -> tuple[str, str]:
     try:
         return fetch_account_uuid(login["accessToken"]), "confirmed"
     except AccountError as exc:
-        raise AccountError(f"cannot confirm which account the current login belongs to: {exc}; "
+        # Keep the type: poll skips a rejected token instead of failing.
+        raise type(exc)(f"cannot confirm which account the current login belongs to: {exc}; "
                            "retry, or run /login for it and `capture`") from None
 
 
@@ -304,6 +312,182 @@ def persist_state(paths: Paths, state: dict) -> None:
     atomic_write(paths.state, state, indent=2)
 
 
+# --- usage -------------------------------------------------------------------
+
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+USAGE_TIMEOUT_SECONDS = 15
+# Percent at which the active account alerts, per limit kind (doc: 80% of the
+# 5-hour limit, 90% of a weekly one). Override in state.json "config".
+DEFAULT_THRESHOLDS = {"session": 80, "weekly": 90}
+FAILURE_ALERT_AFTER = 3
+DEFAULT_NOTIFY = Path.home() / ".cm/bin/cm-notify"
+
+
+def fetch_usage(access_token: str) -> dict:
+    """The data /usage shows. Read-only; never refreshes."""
+    req = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "User-Agent": "cm-claude-accounts",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=USAGE_TIMEOUT_SECONDS) as resp:
+            data = json.load(resp)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            raise TokenRejected("Anthropic rejected the current access token (HTTP 401)") from None
+        raise AccountError(f"usage request failed (HTTP {exc.code})") from None
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        raise AccountError(f"could not reach Anthropic for usage ({type(exc).__name__})") from None
+    if not isinstance(data, dict):
+        raise AccountError("usage response was not a JSON object")
+    return data
+
+
+def parse_time(value) -> float | None:
+    if isinstance(value, (int, float)):
+        return value / 1000 if value > 1e11 else float(value)
+    if isinstance(value, str) and value:
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def parse_limits(usage: dict) -> list[dict]:
+    """Normalize the response's limits list. Plans differ (some have no 5-hour
+    limit) and the format is undocumented, so skip anything unrecognized."""
+    out = []
+    raw = usage.get("limits")
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict) or not isinstance(item.get("kind"), str):
+                continue
+            percent = item.get("percent")
+            if not isinstance(percent, (int, float)) or isinstance(percent, bool):
+                continue
+            out.append({
+                "kind": item["kind"],
+                "scope": item.get("scope") or None,
+                "group": item.get("group") or None,
+                "percent": percent,
+                "active": item.get("is_active") is True,
+                "severity": item.get("severity") if isinstance(item.get("severity"), str) else None,
+                "resets_at": parse_time(item.get("resets_at")),
+            })
+        return out
+    # Older shape: fixed five_hour / seven_day objects.
+    for field, kind in (("five_hour", "session"), ("seven_day", "weekly_all")):
+        item = usage.get(field)
+        if isinstance(item, dict) and isinstance(item.get("utilization"), (int, float)):
+            out.append({"kind": kind, "scope": None, "group": None, "percent": item["utilization"],
+                        "active": False, "severity": None,
+                        "resets_at": parse_time(item.get("resets_at"))})
+    return out
+
+
+def limit_name(limit: dict) -> str:
+    kind = limit["kind"]
+    if kind == "session":
+        return "5h"
+    if kind == "weekly_all":
+        return "week"
+    if kind.startswith("weekly"):
+        return f"week:{limit['scope'] or limit.get('group') or kind}"
+    return kind if not limit["scope"] else f"{kind}:{limit['scope']}"
+
+
+def threshold_for(limit: dict, config: dict) -> float:
+    thresholds = {**DEFAULT_THRESHOLDS, **(config.get("thresholds") or {})}
+    family = "session" if limit["kind"] == "session" else "weekly"
+    return thresholds.get(limit["kind"], thresholds[family])
+
+
+def describe_reset(resets_at: float | None, now: float) -> str:
+    if resets_at is None:
+        return "reset ?"
+    left = resets_at - now
+    if left <= 0:
+        return "reset passed"
+    if left < 3600:
+        return f"resets in {left / 60:.0f}m"
+    if left < 86400:
+        return f"resets in {left / 3600:.1f}h"
+    return f"resets in {left / 86400:.1f}d"
+
+
+def notify(state: dict, paths: Paths, message: str, command: str) -> None:
+    """Send an operator alert; always log it. Messages name accounts, never tokens."""
+    now = int(time.time())
+    with open(paths.store / "alerts.log", "a") as log:
+        log.write(f"{datetime.fromtimestamp(now, timezone.utc).isoformat()} {message}\n")
+    os.chmod(paths.store / "alerts.log", 0o600)
+    delivered, why = False, None
+    try:
+        result = subprocess.run([command, message], capture_output=True, timeout=30,
+                                env=dict(os.environ, CM_NOTIFY_TAG="claude-accounts"))
+        delivered = result.returncode == 0
+        why = None if delivered else f"notifier exited {result.returncode}"
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        why = f"notifier failed ({type(exc).__name__})"
+    # The notifier's output may hold its own credentials; never keep it.
+    state["last_alert"] = {"at": now, "message": message, "delivered": delivered,
+                           **({"error": why} if why else {})}
+
+
+def check_logins(state: dict, accounts: dict[str, dict], alert) -> None:
+    """Alert once per account whose saved login has expired or been refused."""
+    sent = state.setdefault("login_alerts", {})
+    now = time.time()
+    for uuid, rec in accounts.items():
+        expires = rec["claudeAiOauth"].get("refreshTokenExpiresAt")
+        expired = isinstance(expires, (int, float)) and expires / 1000 <= now
+        if not (expired or rec.get("needs_login")):
+            sent.pop(uuid, None)
+            continue
+        if uuid not in sent:
+            sent[uuid] = int(now)
+            alert(f"{label(rec)} needs a new login: /login as it, then "
+                  "`cm-claude-accounts capture`")
+
+
+def check_limits(state: dict, uuid: str, record: dict, limits: list[dict], alert) -> None:
+    """Alert once per limit per reset period when the active account crosses a threshold."""
+    config = state.get("config") or {}
+    sent = state.setdefault("limit_alerts", {})
+    now = time.time()
+    for key in [k for k, v in sent.items() if v.get("resets_at") and v["resets_at"] <= now]:
+        del sent[key]
+    for limit in limits:
+        threshold = threshold_for(limit, config)
+        if limit["percent"] < threshold:
+            continue
+        key = (f"{uuid}:{limit['kind']}:{limit['scope'] or ''}:{limit.get('group') or ''}:"
+               f"{int(limit['resets_at'] or 0)}")
+        if key in sent:
+            continue
+        sent[key] = {"at": int(now), "resets_at": limit["resets_at"]}
+        alert(f"{label(record)} is at {limit['percent']:.0f}% of its {limit_name(limit)} "
+              f"limit ({describe_reset(limit['resets_at'], now)})")
+
+
+def poll_failed(state: dict, reason: str, alert) -> int:
+    poll = state.setdefault("poll", {})
+    poll.update(at=int(time.time()), ok=False, reason=reason)
+    poll["failures"] = poll.get("failures", 0) + 1
+    if poll["failures"] == FAILURE_ALERT_AFTER:
+        alert(f"usage poll failed {FAILURE_ALERT_AFTER} times in a row: {reason}")
+    return 1
+
+
+def poll_skipped(state: dict, reason: str) -> int:
+    """Not a failure: the next prompt from any session renews the token."""
+    poll = state.setdefault("poll", {})
+    poll.update(at=int(time.time()), ok=False, reason=reason, skipped=True)
+    return 0
+
+
 # --- commands ------------------------------------------------------------------
 
 def cmd_capture(paths: Paths, state: dict, out) -> int:
@@ -322,6 +506,24 @@ def cmd_capture(paths: Paths, state: dict, out) -> int:
     return 0
 
 
+def login_state(rec: dict, now: float) -> str:
+    expires = rec["claudeAiOauth"].get("refreshTokenExpiresAt")
+    if rec.get("needs_login"):
+        return "needs /login"
+    if isinstance(expires, (int, float)):
+        days = (expires / 1000 - now) / 86400
+        return f"login valid {days:.0f}d" if days > 0 else "login expired"
+    return "login expiry unknown"
+
+
+def describe_age(seconds: float) -> str:
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m ago"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f}h ago"
+    return f"{seconds / 86400:.1f}d ago"
+
+
 def cmd_list(paths: Paths, state: dict, out) -> int:
     accounts = load_accounts(paths)
     if not accounts:
@@ -331,17 +533,135 @@ def cmd_list(paths: Paths, state: dict, out) -> int:
     for uuid, rec in sorted(accounts.items(), key=lambda kv: label(kv[1])):
         oauth = rec["claudeAiOauth"]
         marker = "*" if uuid == state.get("active") else " "
-        expires = oauth.get("refreshTokenExpiresAt")
-        if rec.get("needs_login"):
-            login_state = "needs /login"
-        elif isinstance(expires, (int, float)):
-            days = (expires / 1000 - now) / 86400
-            login_state = f"login valid {days:.0f}d" if days > 0 else "login expired"
-        else:
-            login_state = "login expiry unknown"
         age = (now - rec.get("updated_at", now)) / 3600
         print(f"{marker} {label(rec):45} {oauth.get('subscriptionType', '?'):6} "
-              f"{login_state:20} saved {age:.1f}h ago", file=out)
+              f"{login_state(rec, now):20} saved {age:.1f}h ago", file=out)
+    return 0
+
+
+def cmd_status(paths: Paths, state: dict, out) -> int:
+    """Every account's last usage reading; inactive ones are never polled."""
+    accounts = load_accounts(paths)
+    if not accounts:
+        print("no saved accounts; run /login, then `capture`", file=out)
+        return 0
+    now = time.time()
+    readings = state.get("usage") or {}
+    for uuid, rec in sorted(accounts.items(), key=lambda kv: label(kv[1])):
+        active = uuid == state.get("active")
+        print(f"{'*' if active else ' '} {label(rec):45} "
+              f"{rec['claudeAiOauth'].get('subscriptionType', '?'):6} {login_state(rec, now)}", file=out)
+        reading = readings.get(uuid)
+        if not reading:
+            print("    no usage reading yet" + ("" if active else " (read only while active)"), file=out)
+            continue
+        parts = []
+        for limit in reading["limits"]:
+            reset = limit.get("resets_at")
+            if reset is not None and reset <= now:
+                parts.append(f"{limit_name(limit)} {limit['percent']:.0f}% -> likely refilled")
+                continue
+            binding = ", binding" if limit.get("active") else ""
+            parts.append(f"{limit_name(limit)} {limit['percent']:.0f}% "
+                         f"({describe_reset(reset, now)}{binding})")
+        print(f"    {'; '.join(parts) or 'no limits reported'}  [read {describe_age(now - reading['at'])}]",
+              file=out)
+    poll = state.get("poll")
+    if poll:
+        result = "ok" if poll.get("ok") else poll.get("reason", "failed")
+        failures = f" ({poll['failures']} failures in a row)" if poll.get("failures") else ""
+        print(f"last poll {describe_age(now - poll['at'])}: {result}{failures}", file=out)
+    else:
+        print("never polled; `poll` runs from the systemd timer", file=out)
+    alert = state.get("last_alert")
+    if alert:
+        sent = "sent" if alert.get("delivered") else f"NOT delivered ({alert.get('error')}); see alerts.log"
+        print(f"last alert {describe_age(now - alert['at'])}, {sent}: {alert['message']}", file=out)
+    return 0
+
+
+def cmd_poll(paths: Paths, state: dict, out, notify_command: str) -> int:
+    """Read the active account's usage, keep its saved login current, alert.
+
+    Never refreshes a token and never polls an inactive account's saved one.
+    """
+    def alert(message: str) -> None:
+        notify(state, paths, message, notify_command)
+        print(f"alert: {message}", file=out)
+
+    accounts = load_accounts(paths)
+    if not accounts:
+        print("no saved accounts; nothing to poll", file=out)
+        return 0
+    check_logins(state, accounts, alert)
+    login = read_login(paths)
+    expires = login.get("expiresAt")
+    if isinstance(expires, (int, float)) and expires / 1000 <= time.time():
+        print("skipped: the access token has expired; the next prompt in any session renews it",
+              file=out)
+        return poll_skipped(state, "access token expired")
+    uuid = next((u for u, rec in accounts.items()
+                 if rec["claudeAiOauth"].get("refreshToken") == login["refreshToken"]), None)
+    if uuid is None:
+        # A session refreshed the token (or someone ran /login): confirm the
+        # account and save the new copy, so a later `switch` can identify it.
+        try:
+            lock, login, uuid, how = identify_locked(paths, accounts)
+        except TokenRejected as exc:
+            print(f"skipped: {exc}", file=out)
+            return poll_skipped(state, "access token rejected")
+        except AccountError as exc:
+            return poll_failed(state, str(exc), alert)
+        unsaved = None
+        with lock:  # held briefly: alerts may block, so they run after it
+            try:
+                save_login(paths, accounts, uuid, login, read_profile(paths))
+            except AccountError as exc:
+                unsaved = exc
+        if unsaved:
+            if state.get("unsaved_alert") != uuid:
+                state["unsaved_alert"] = uuid
+                alert(f"the active login is account {uuid[:8]}, which is not saved; "
+                      "run `cm-claude-accounts capture`")
+            return poll_failed(state, str(unsaved), alert)
+        state.pop("unsaved_alert", None)
+        record_history(state, "poll-saved-login", account=uuid, identified_by=how)
+    if uuid != state.get("active"):
+        record_history(state, "external-login", account=uuid)
+        state["active"] = uuid
+    record = accounts[uuid]
+
+    try:
+        usage = fetch_usage(login["accessToken"])
+    except TokenRejected as exc:
+        print(f"skipped: {exc}", file=out)
+        return poll_skipped(state, "access token rejected")
+    except AccountError as exc:
+        return poll_failed(state, str(exc), alert)
+    limits = parse_limits(usage)
+    if not limits:
+        return poll_failed(state, "the usage response had no limits this tool understands", alert)
+
+    now = int(time.time())
+    previous = state.get("poll") or {}
+    if previous.get("failures", 0) >= FAILURE_ALERT_AFTER:
+        alert(f"usage poll recovered after {previous['failures']} failures")
+    state.setdefault("usage", {})[uuid] = {"at": now, "limits": limits}
+    state["poll"] = {"at": now, "ok": True, "account": uuid}
+
+    # Sessions rewrite ~/.claude.json and can restore a stale profile.
+    try:
+        profile = read_profile(paths)
+        if not profile or profile["accountUuid"] != uuid:
+            write_profile(paths, record["oauthAccount"])
+            record_history(state, "profile-repaired", account=uuid)
+            print(f"repaired the profile in {paths.claude_json}", file=out)
+    except (AccountError, OSError, ValueError) as exc:
+        print(f"warning: could not repair {paths.claude_json} ({exc})", file=sys.stderr)
+
+    check_limits(state, uuid, record, limits, alert)
+    summary = ", ".join(f"{limit_name(l)} {l['percent']:.0f}%" for l in limits)
+    print(f"{label(record)}: {summary}", file=out)
     return 0
 
 
@@ -407,7 +727,12 @@ def main(argv: list[str] | None = None, paths: Paths | None = None, out=None) ->
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("capture", help="save the current login (run right after /login)")
     sub.add_parser("list", help="saved accounts; * marks the active one")
-    sub.add_parser("status", help="same as list")
+    sub.add_parser("status", help="every account's last usage reading, poll health, last alert")
+    poll = sub.add_parser("poll", help="read the active account's usage and alert (run by the timer)")
+    test_alert = sub.add_parser("test-alert", help="send a test alert through the notifier")
+    for p in (poll, test_alert):
+        p.add_argument("--notify-command", help=f"alert command (default {DEFAULT_NOTIFY}, "
+                       "or config.notify_command in state.json)")
     switch = sub.add_parser("switch", help="make another saved account active")
     switch.add_argument("account", help="email or accountUuid prefix")
     remove = sub.add_parser("remove", help="delete a saved account")
@@ -422,8 +747,21 @@ def main(argv: list[str] | None = None, paths: Paths | None = None, out=None) ->
             try:
                 if args.command == "capture":
                     return cmd_capture(paths, state, out)
-                if args.command in ("list", "status"):
+                if args.command == "list":
                     return cmd_list(paths, state, out)
+                if args.command == "status":
+                    return cmd_status(paths, state, out)
+                if args.command in ("poll", "test-alert"):
+                    notify_command = (args.notify_command
+                                      or (state.get("config") or {}).get("notify_command")
+                                      or str(DEFAULT_NOTIFY))
+                    if args.command == "poll":
+                        return cmd_poll(paths, state, out, notify_command)
+                    notify(state, paths, "test alert from cm-claude-accounts", notify_command)
+                    delivered = state["last_alert"]["delivered"]
+                    print("test alert sent" if delivered else
+                          f"test alert NOT delivered ({state['last_alert']['error']})", file=out)
+                    return 0 if delivered else 1
                 if args.command == "switch":
                     return cmd_switch(paths, state, args.account, out)
                 return cmd_remove(paths, state, args.account, out)

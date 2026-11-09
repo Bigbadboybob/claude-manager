@@ -1,6 +1,7 @@
 """Account switching must follow Claude Code's files and lock, and never leak tokens."""
 
 import contextlib
+from datetime import datetime, timezone
 import importlib.machinery
 import importlib.util
 import io
@@ -42,7 +43,9 @@ def profile(name):
             "organizationUuid": f"{name}-org"}
 
 
-class AccountsTests(unittest.TestCase):
+class Harness(unittest.TestCase):
+    """Fake Claude files and a fake Anthropic profile endpoint."""
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -112,6 +115,8 @@ class AccountsTests(unittest.TestCase):
         self.do_login("bob")
         self.assertEqual(self.run_cli("capture")[0], 0)
 
+
+class AccountsTests(Harness):
     def test_capture_saves_by_uuid_privately(self):
         self.do_login("alice")
         code, text = self.run_cli("capture")
@@ -338,6 +343,291 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(self.run_cli("remove", "bob@example.com")[0], 1)
         self.assertEqual(self.run_cli("remove", "alice@example.com")[0], 0)
         self.assertFalse((self.paths.accounts / "alice-uuid-0000.json").exists())
+
+
+
+def iso_in(seconds):
+    return datetime.fromtimestamp(time.time() + seconds, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def usage(*limits, five_hour=None):
+    """The usage endpoint's shape (2026-11-07): a limits list; five_hour is
+    null on plans without a 5-hour limit."""
+    return {"five_hour": five_hour, "seven_day": None, "extra": {"ignored": True},
+            "limits": [{"kind": kind, "group": scope or "all", "scope": scope, "percent": pct,
+                        "is_active": active, "severity": "normal", "resets_at": iso_in(reset_in)}
+                       for kind, scope, pct, reset_in, active in limits]}
+
+
+WEEKLY_ONLY = usage(("weekly_all", None, 89, 3 * 86400, True),
+                    ("weekly_scoped", "opus", 40, 3 * 86400, False))
+
+
+class PollTests(Harness):
+    """poll reads only the live login, never refreshes, and alerts once."""
+
+    def setUp(self):
+        super().setUp()
+        root = self.paths.store.parent
+        self.sent = root / "sent.txt"
+        self.notifier = root / "notify.sh"
+        self.notifier.write_text(f'#!/bin/sh\nprintf "%s|%s\\n" "$CM_NOTIFY_TAG" "$1" >> {self.sent}\n')
+        self.notifier.chmod(0o700)
+        self.usage = {}  # access token -> usage response
+        self.usage_error = None
+        self.usage_calls = []
+
+        def fetch(token):
+            self.usage_calls.append(token)
+            if self.usage_error:
+                raise self.usage_error
+            if token not in self.usage:
+                raise accounts.TokenRejected("Anthropic rejected the current access token (HTTP 401)")
+            return self.usage[token]
+
+        self.enterContext(mock.patch.object(accounts, "fetch_usage", side_effect=fetch))
+
+    def poll(self):
+        return self.run_cli("poll", "--notify-command", str(self.notifier))
+
+    def alerts(self):
+        return self.sent.read_text().splitlines() if self.sent.exists() else []
+
+    def live_token(self):
+        return self.live()["claudeAiOauth"]["accessToken"]
+
+    def assert_no_tokens_on_disk(self):
+        for path in (self.paths.state, self.paths.store / "alerts.log", self.sent):
+            if path.exists():
+                text = path.read_text()
+                for token in self.tokens:
+                    self.assertNotIn(token, text, path)
+
+    def test_plan_without_a_5_hour_limit_is_read_from_the_limits_list(self):
+        self.do_login("alice")
+        self.run_cli("capture")
+        self.usage[self.live_token()] = WEEKLY_ONLY
+        code, text = self.poll()
+        self.assertEqual(code, 0, text)
+        reading = self.state()["usage"]["alice-uuid-0000"]
+        self.assertEqual([(l["kind"], l["scope"], l["percent"]) for l in reading["limits"]],
+                         [("weekly_all", None, 89), ("weekly_scoped", "opus", 40)])
+        self.assertEqual(self.alerts(), [])  # 89% < 90% weekly threshold
+        code, text = self.run_cli("status")
+        self.assertIn("week 89% (resets in 3.0d, binding)", text)
+        self.assertIn("week:opus 40%", text)
+        self.assertNotIn("5h", text)
+        self.assertIn("last poll 0m ago: ok", text)
+
+    def test_older_fixed_field_shape_still_parses(self):
+        limits = accounts.parse_limits({"five_hour": {"utilization": 12, "resets_at": iso_in(600)},
+                                        "seven_day": {"utilization": 50, "resets_at": None}})
+        self.assertEqual([(l["kind"], l["percent"]) for l in limits],
+                         [("session", 12), ("weekly_all", 50)])
+        self.assertEqual(accounts.parse_limits({"limits": [{"kind": "x"}, "junk", {"percent": 3}]}), [])
+
+    def test_threshold_alerts_once_per_reset_period(self):
+        self.do_login("alice")
+        self.run_cli("capture")
+        token = self.live_token()
+        self.usage[token] = usage(("session", None, 85, 3600, True), ("weekly_all", None, 50, 86400, False))
+        self.poll()
+        self.poll()
+        self.assertEqual(len(self.alerts()), 1)
+        self.assertIn("claude-accounts|alice@example.com (alice-uu) is at 85% of its 5h limit",
+                      self.alerts()[0])
+        # A new 5-hour window is a new period: alert again.
+        self.usage[token] = usage(("session", None, 81, 5 * 3600, True))
+        self.poll()
+        self.assertEqual(len(self.alerts()), 2)
+        self.assert_no_tokens_on_disk()
+
+    def test_thresholds_are_configurable(self):
+        self.do_login("alice")
+        self.run_cli("capture")
+        state = self.state()
+        state["config"] = {"thresholds": {"weekly": 85}}
+        self.paths.state.write_text(json.dumps(state))
+        self.usage[self.live_token()] = WEEKLY_ONLY
+        self.poll()
+        self.assertEqual(len(self.alerts()), 1)
+        self.assertIn("89% of its week limit", self.alerts()[0])
+
+    def test_expired_access_token_is_skipped_without_any_request(self):
+        self.do_login("alice")
+        self.run_cli("capture")
+        creds = self.live()
+        creds["claudeAiOauth"]["expiresAt"] = int(time.time() * 1000) - 1000
+        self.paths.credentials.write_text(json.dumps(creds))
+        before = self.paths.credentials.read_text()
+        self.fetches.clear()
+        code, text = self.poll()
+        self.assertEqual(code, 0)
+        self.assertIn("skipped", text)
+        self.assertEqual((self.usage_calls, self.fetches), ([], []))
+        self.assertEqual(self.paths.credentials.read_text(), before)  # never refreshed
+        self.assertEqual(self.state()["poll"]["reason"], "access token expired")
+
+    def test_rejected_token_is_a_skip_not_a_failure(self):
+        self.do_login("alice")
+        self.run_cli("capture")
+        for _ in range(4):
+            self.assertEqual(self.poll()[0], 0)
+        self.assertNotIn("failures", self.state()["poll"])
+        self.assertEqual(self.alerts(), [])
+
+    def test_a_session_refresh_is_saved_so_switch_can_identify_it_later(self):
+        self.capture_two()
+        self.run_cli("switch", "alice@example.com")
+        self.session_refresh("alice-2", owner="alice")
+        self.usage[self.live_token()] = WEEKLY_ONLY
+        self.fetches.clear()
+        self.assertEqual(self.poll()[0], 0)
+        # Confirmed with Anthropic outside Claude Code's lock, then saved.
+        self.assertEqual(self.fetches, [[False, False]])
+        saved = json.loads((self.paths.accounts / "alice-uuid-0000.json").read_text())
+        self.assertEqual(saved["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-alice-2")
+        # The token has since expired; switch identifies it by token, no network.
+        creds = self.live()
+        creds["claudeAiOauth"]["expiresAt"] = int(time.time() * 1000) - 1000
+        self.paths.credentials.write_text(json.dumps(creds))
+        saved["claudeAiOauth"]["expiresAt"] = creds["claudeAiOauth"]["expiresAt"]
+        self.paths.accounts.joinpath("alice-uuid-0000.json").write_text(json.dumps(saved))
+        code, text = self.run_cli("switch", "bob@example.com")
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.live()["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-bob")
+
+    def test_poll_repairs_a_stale_profile(self):
+        self.capture_two()
+        self.run_cli("switch", "alice@example.com")
+        cj = json.loads(self.paths.claude_json.read_text())
+        cj["oauthAccount"] = profile("bob")  # a session wrote its old profile back
+        self.paths.claude_json.write_text(json.dumps(cj))
+        self.usage[self.live_token()] = WEEKLY_ONLY
+        code, text = self.poll()
+        self.assertIn("repaired the profile", text)
+        self.assertEqual(self.live_email(), "alice@example.com")
+        self.assertEqual(json.loads(self.paths.claude_json.read_text())["numStartups"], 7)
+
+    def test_only_the_live_login_is_polled(self):
+        self.capture_two()  # bob active; alice's saved token must never be used
+        self.usage[self.live_token()] = WEEKLY_ONLY
+        self.usage["sk-ant-oat-ACCESS-alice"] = WEEKLY_ONLY
+        self.poll()
+        self.assertEqual(self.usage_calls, ["sk-ant-oat-ACCESS-bob"])
+        code, text = self.run_cli("status")
+        self.assertIn("no usage reading yet (read only while active)", text)
+
+    def test_inactive_account_whose_reset_passed_shows_likely_refilled(self):
+        self.capture_two()
+        self.run_cli("switch", "alice@example.com")
+        self.usage[self.live_token()] = usage(("weekly_all", None, 95, 1, True))
+        self.poll()
+        self.run_cli("switch", "bob@example.com")
+        time.sleep(1.1)
+        code, text = self.run_cli("status")
+        alice = text.split("alice@example.com", 1)[1].splitlines()[1]
+        self.assertIn("week 95% -> likely refilled", alice)
+
+    def test_repeated_failures_alert_once_then_recovery_alerts(self):
+        self.do_login("alice")
+        self.run_cli("capture")
+        self.usage[self.live_token()] = WEEKLY_ONLY
+        self.usage_error = accounts.AccountError("usage request failed (HTTP 500)")
+        for _ in range(5):
+            self.assertEqual(self.poll()[0], 1)
+        self.assertEqual(len(self.alerts()), 1)
+        self.assertIn("failed 3 times in a row: usage request failed (HTTP 500)", self.alerts()[0])
+        self.assertIn("5 failures in a row", self.run_cli("status")[1])
+        self.usage_error = None
+        self.assertEqual(self.poll()[0], 0)
+        self.assertIn("recovered after 5 failures", self.alerts()[1])
+
+    def test_expired_saved_login_alerts_once(self):
+        self.do_login("alice", tag="alice-old")
+        self.run_cli("capture")
+        saved = json.loads((self.paths.accounts / "alice-uuid-0000.json").read_text())
+        saved["claudeAiOauth"]["refreshTokenExpiresAt"] = int(time.time() * 1000) - 1000
+        self.paths.accounts.joinpath("alice-uuid-0000.json").write_text(json.dumps(saved))
+        self.do_login("bob")
+        self.run_cli("capture")
+        self.usage[self.live_token()] = WEEKLY_ONLY
+        self.poll()
+        self.poll()
+        self.assertEqual(len(self.alerts()), 1)
+        self.assertIn("alice@example.com (alice-uu) needs a new login", self.alerts()[0])
+
+    def test_new_login_is_saved_when_anthropic_confirms_its_profile(self):
+        self.capture_two()
+        self.do_login("carol")  # /login without `capture`
+        self.usage[self.live_token()] = WEEKLY_ONLY
+        self.assertEqual(self.poll()[0], 0)
+        self.assertEqual(self.state()["active"], "carol-uuid-0000")
+        self.assertTrue((self.paths.accounts / "carol-uuid-0000.json").exists())
+
+    def test_unsaved_login_with_a_mismatched_profile_alerts_and_saves_nothing(self):
+        self.capture_two()
+        self.do_login("carol")
+        cj = json.loads(self.paths.claude_json.read_text())
+        cj["oauthAccount"] = profile("bob")
+        self.paths.claude_json.write_text(json.dumps(cj))
+        lock_held = []
+        real_notify = accounts.notify
+
+        def checking_notify(*a):
+            lock_held.append(any(d.exists() for d in self.paths.refresh_locks))
+            real_notify(*a)
+
+        with mock.patch.object(accounts, "notify", checking_notify):
+            self.assertEqual(self.poll()[0], 1)
+            self.assertEqual(self.poll()[0], 1)
+        self.assertEqual(lock_held, [False])  # never alerts inside Claude Code's lock
+        self.assertFalse((self.paths.accounts / "carol-uuid-0000.json").exists())
+        self.assertEqual(len(self.alerts()), 1)
+        self.assertIn("account carol-uu, which is not saved", self.alerts()[0])
+
+    def test_missing_notifier_logs_the_alert_and_status_says_so(self):
+        self.do_login("alice")
+        self.run_cli("capture")
+        self.usage[self.live_token()] = usage(("session", None, 99, 600, True))
+        self.notifier.unlink()
+        self.assertEqual(self.poll()[0], 0)
+        log = (self.paths.store / "alerts.log").read_text()
+        self.assertIn("99% of its 5h limit", log)
+        self.assertEqual(stat.S_IMODE((self.paths.store / "alerts.log").stat().st_mode), 0o600)
+        self.assertIn("NOT delivered (notifier failed (FileNotFoundError))", self.run_cli("status")[1])
+        self.assert_no_tokens_on_disk()
+
+    def test_test_alert_reports_delivery(self):
+        self.assertEqual(self.run_cli("test-alert", "--notify-command", str(self.notifier))[0], 0)
+        self.assertEqual(self.alerts(), ["claude-accounts|test alert from cm-claude-accounts"])
+        self.notifier.unlink()
+        code, text = self.run_cli("test-alert", "--notify-command", str(self.notifier))
+        self.assertEqual(code, 1)
+        self.assertIn("NOT delivered", text)
+
+    def test_poll_waits_for_a_running_switch(self):
+        self.capture_two()
+        self.usage["sk-ant-oat-ACCESS-alice"] = WEEKLY_ONLY
+        self.usage["sk-ant-oat-ACCESS-bob"] = WEEKLY_ONLY
+        real_write = accounts.write_in_place
+        results = {}
+
+        def slow_write(path, data):
+            real_write(path, data)
+            poller = threading.Thread(target=lambda: results.setdefault("poll", self.poll()))
+            poller.start()
+            poller.join(0.5)
+            results["blocked"] = poller.is_alive()  # the store lock holds it back
+            results["thread"] = poller
+
+        with mock.patch.object(accounts, "write_in_place", slow_write):
+            self.assertEqual(self.run_cli("switch", "alice@example.com")[0], 0)
+        results["thread"].join(5)
+        self.assertTrue(results["blocked"])
+        self.assertEqual(results["poll"][0], 0)
+        self.assertEqual(self.usage_calls, ["sk-ant-oat-ACCESS-alice"])
+        self.assertEqual(self.state()["usage"].keys(), {"alice-uuid-0000"})
 
 
 if __name__ == "__main__":
