@@ -31,13 +31,15 @@ Pick the model too. Every spawn names one: the `model=` you pass, else the
 task's default (`metadata.models`, inherited by subtasks), else the compatible
 work-rule model, else the host's
 `[models]` engine default (Claude `claude-opus-5-5`, Codex `gpt-6.1-terra`, the best performance per dollar).
-**Delegate to Codex where you can; Claude subagents default to Sonnet**
-(Owner, 2026-11-07, staffing policy v10). Before staffing anything, ask
-whether Codex can do it:
+**Default to Codex Terra; Claude for leads and open design**
+(Owner, 2026-11-10, staffing policy v11). Before staffing anything, ask
+whether Codex can do it; usually it can:
 
-- **Codex Terra** (`type="codex", model="gpt-6.1-terra"`): well-specified
-  implementation, test writing, refactors with a clear target, and reviews
-  against a known checklist.
+- **Codex Terra** (`type="codex", model="gpt-6.1-terra"`, the default engine
+  and the `coding` / `math` / `metric` work rules): implementation, tests,
+  refactors, debugging, investigations, metrics, math checks and reviews.
+  For work that writes code, start a Codex Terra worker rather than a
+  Claude `Agent` subagent.
 - **Codex Luna** (`type="codex", model="gpt-6-luna"`, or `work_kind="busywork"`
   / `"fanout"`): simple work and wide fan-outs. That means mechanical edits,
   renames and reformatting, running and triaging known tests or scripts,
@@ -46,9 +48,9 @@ whether Codex can do it:
 - **Claude Code `Agent` subagents** (children inside your session): Sonnet by
   default (`model="sonnet"`). Use Opus only when the work needs real
   intelligence or attention to detail. Never use Fable.
-- **Full CM Claude sessions**: Opus by default (`claude-opus-5-5`, the host
-  default). They run longer and take on more involved work, so most end up
-  on Opus. Use Sonnet (`model="claude-sonnet-5-5"`) only for a session whose
+- **Full CM Claude sessions**: for leads and coordinators, open-ended design
+  or architecture (the `design` / `architecture` rules), and Owner-facing
+  judgment calls. Opus by default (`claude-opus-5-5`, the host default). Use Sonnet (`model="claude-sonnet-5-5"`) only for a session whose
   work is plainly simple or routine.
 Set a task default with `create_subtask(model=...)` so a whole subtree
 inherits it. Effort works the same way (`effort=`, default `xhigh`; levels
