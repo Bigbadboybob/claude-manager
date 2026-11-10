@@ -1496,6 +1496,17 @@ class UsageIntervalTests(HubHarness):
             self.poll()
             self.assertEqual(len(self.usage_calls), 2)
 
+    def test_log_line_says_when_the_reading_is_cached(self):
+        with mock.patch.object(accounts, "USAGE_INTERVAL_SECONDS", 9 * 60):
+            _, fresh = self.poll()
+            self.assertNotIn("cached", fresh)
+            state = self.state()
+            state["usage"]["alice-uuid-0000"]["at"] -= 3 * 60
+            self.paths.state.write_text(json.dumps(state))
+            _, cached = self.poll()
+            self.assertEqual(len(self.usage_calls), 1)
+            self.assertIn("(cached, read 3m ago)", cached)
+
     def test_check_in_continues_while_backing_off(self):
         self.usage_error = accounts.RateLimited("usage requests are rate limited (HTTP 429)")
         self.poll()

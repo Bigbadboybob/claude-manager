@@ -1870,6 +1870,9 @@ def decide(paths: Paths, state: dict, accounts: dict[str, dict], limits: list[di
                 advice += f"; {held}"
     check_limits(state, uuid, record, limits, alert, advice)
     summary = ", ".join(f"{limit_name(l)} {l['percent']:.0f}%" for l in limits)
+    read_at = ((state.get("usage") or {}).get(uuid) or {}).get("at")
+    if isinstance(read_at, (int, float)) and now - read_at >= 60:
+        summary += f" (cached, read {(now - read_at) / 60:.0f}m ago)"
     print(f"{label(record)}: {summary}", file=out)
     return False
 
