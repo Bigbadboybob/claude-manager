@@ -327,6 +327,132 @@ host).
 - Saved logins are secrets: never print them, never put them in the repo,
   logs, chat or task records. Mode 0700/0600 throughout.
 
+## Coordinator control plane (design delta, 2026-11-10)
+
+Owner's direction (brief: `~/.local/share/swarm-coord/account-coordinator/BRIEF.md`
+on cm-sessions): not a blind autoswitch but a control plane that an
+**account coordinator** agent on cm-manager drives. The coordinator (or
+Owner through it) decides which account each host uses and when it moves;
+switches stay rare (each drops every live session's prompt cache, and about
+1 in 20-30 sessions errors afterwards); accounts can be reserved; near a
+limit the coordinator stops non-critical work. Owner's only manual step is
+one `/login` per needed account per host, at the end. `auto` stays as a
+fallback a host uses only when told to.
+
+### Hub and check-in
+
+- **Hub** on cm-manager: `~/.config/cm-claude-accounts/hub/` (0700) holds
+  `desired.json` (per-host assignments, reservations, drains, policy, a
+  revision number), `reports/<host>.json` (each host's last check-in) and
+  `events.log`. Only hub commands write it, under `hub/lock`, and nothing
+  holds that lock across a network call.
+- **Check-in, outbound only.** Every host's timer runs `poll`, which ends
+  with `ssh -o BatchMode=yes cm-manager cm-claude-accounts hub checkin
+  <host>` carrying its `export` (accounts, logins' validity, readings,
+  active account, apply results, live sessions; never tokens) on stdin.
+  The reply is that host's desired entry plus the merged readings,
+  reservations and policy. The laptop needs no inbound SSH; cm-manager
+  checks in locally. Hub unreachable: keep the current account and the
+  last reply's policy, and say so in `status`.
+- **Cadence:** the timer moves to every 2 min so an assignment applies
+  within about 2 min everywhere; the usage request itself stays at most once
+  per 10 min (the 429 budget). The coordinator can also run a cloud host's
+  `poll` over ssh for an immediate apply.
+- **Applying.** A host's desired entry is `{account, mode}`:
+  - `pin`: converge to `account` (switch if different). If the account is
+    not saved on this host or its login expired, don't switch; report
+    `blocked: needs /login of <email> on <host>`.
+  - `auto`: the host may switch itself at threshold (today's `auto`), but
+    only to accounts not reserved for others and not draining.
+  - `manual` (default with no hub): never switch; suggest only.
+  Each switch keeps today's protocol (refresh lock, write-back), the
+  result goes into the next check-in, and the history records
+  `reason: hub rev N` / `auto: …`.
+
+### Coordinator commands (on cm-manager; `--json` on each for the agent)
+
+| Command | Effect |
+|---|---|
+| `hub status` | per host: active vs desired account, mode, last check-in age, apply result, live Claude sessions; per account: freshest reading and its age, reset times, hosts using it, hosts with a saved login, reserved/draining |
+| `hub assign <host> <account> [--pin\|--auto\|--manual]` | set a host's desired entry (`none` clears it); refused for an account reserved for another host or not saved on that host, unless `--force` |
+| `hub reserve <account> --for <host>[,..] [--note …]` / `hub release <account>` | keep an account for named hosts (or `nobody`); auto and drains never pick it for others |
+| `hub drain <account> [--dry-run]` | stop placing work on it and pin each host using it to the best other account (most room, saved on that host, not reserved or draining, fewest hosts already on it); prints the plan |
+| `hub undrain <account>` | allow it again |
+| `hub policy <key> <value>` | thresholds, default mode, dwell, daily cap, sweep on/off |
+| `hub history` | assignment changes, apply results, switches, sweeps |
+
+**Keeping switches rare:** a host moves only when the coordinator assigns
+it, a drain moves it, or (in `auto`) it crosses a threshold. Assigning the
+current account is a no-op. `hub status` shows each host's live session
+count, so the coordinator can move the host where a switch costs least.
+Dwell time and the daily cap still bound `auto`.
+
+**Priorities** stay with the coordinator: claudelb reports which hosts (and
+so which sessions) draw on each account; the coordinator tells
+non-critical sessions to stop through CM messaging. claudelb does not
+classify work.
+
+### Post-switch sweep and re-prompt
+
+For 30 minutes after any switch on a host, each check-in also runs a sweep
+on that host, through its own CM daemon (local operator socket, so it works
+on the laptop):
+
+1. List live Claude sessions (`list_sessions`) and find each transcript
+   (`resolve_authorized_session`).
+2. Re-prompt a session once if it is idle at its prompt and its last entry
+   is an API error message (`isApiErrorMessage`), whether the error came
+   after the switch (the 1-in-20-30 bug) or stopped it on the limit that
+   triggered the switch (`error: rate_limit`). The prompt is "Continue where
+   you left off (the Claude account was switched)", sent the way CM's
+   `send_input` submits.
+3. Never re-prompt the same error entry twice. Don't re-prompt on
+   `oauth_org_not_allowed` or `account_on_hold`: alert instead.
+
+Errors seen in cm-sessions transcripts over the last 14 days:
+`rate_limit` (429, 432 entries), `authentication_failed` ("Not logged in",
+22), `oauth_org_not_allowed` (403, 5), `account_on_hold` (3). The sweep
+matches the entry's shape, not the text, so it doesn't depend on the exact
+text of the post-switch bug.
+
+### The coordinator's own account
+
+The coordinator session runs with `CLAUDE_CONFIG_DIR=~/.claude-coordinator`
+(supported by Claude Code 2.1.322), so it has its own credentials file and
+refresh lock, and host-wide switches on cm-manager never touch it. claudelb
+gets `--claude-dir` to read that slot's usage and alert on it, and the hub
+reserves that account for `cm-manager:coordinator`. **Verify** on cm-manager
+that the variable moves `.credentials.json`, `.claude.json` and the refresh
+lock, before Owner's login for it.
+
+### Logins Owner does (once, at the end)
+
+One `/login` per account per host that may use it; an agent starts the
+session and runs `capture`, Owner only completes the browser step:
+
+- **laptop:** none (bender0, bender7, bender192801 and lklein9900 are
+  already saved);
+- **cm-sessions:** one per pool account it may use (up to 4);
+- **cm-manager:** one per pool account its continuous work may use (1-2),
+  plus 1 for the coordinator's own account.
+
+So 3-7 logins in all. Fewer (one per account) would need long-lived
+`claude setup-token` tokens shared across hosts. That breaks the
+"never share logins across hosts" rule, and it's unverified whether the usage
+endpoint accepts such tokens, so it is not planned.
+
+### Build order
+
+1. Hub store, `hub checkin`, `assign`/`status`, apply (`pin`/`manual`) on
+   hosts; 2-min timer with the 10-min usage budget.
+2. `reserve`/`release`, `drain`/`undrain`, `policy`, `history`; `auto`
+   honouring reservations and drains.
+3. Sweep and re-prompt (fake daemon and transcripts in tests).
+4. `--claude-dir` and the coordinator's own account.
+5. Real checks: the hub on cm-manager (script only: no login and no switch there),
+   then the laptop checking in to it (claudelb-local), then rollout with
+   Owner's logins.
+
 ## Plan
 
 ### 1. Validation on the laptop (do this first)
