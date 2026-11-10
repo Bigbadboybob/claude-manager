@@ -387,6 +387,8 @@ class PollHarness(Harness):
             return self.usage[token]
 
         self.enterContext(mock.patch.object(accounts, "fetch_usage", side_effect=fetch))
+        # Most tests read usage on every poll; UsageIntervalTests covers the cache.
+        self.enterContext(mock.patch.object(accounts, "USAGE_INTERVAL_SECONDS", 0))
 
     def poll(self):
         return self.run_cli("poll", "--notify-command", str(self.notifier))
@@ -1192,6 +1194,325 @@ class InstallTests(unittest.TestCase):
             code, _ = self.run_cli("install")
         self.assertEqual(code, 1)
         self.assertEqual(self.calls, [])
+
+
+def host_export(host, active=None, saved=(), **readings):
+    """Another host's check-in: saved accounts, readings as name=(age, *limits)."""
+    now = int(time.time())
+    accts = {}
+    for name in set(saved) | set(readings) | ({active} if active else set()):
+        reading = None
+        if name in readings:
+            age, *limits = readings[name]
+            reading = {"at": now - age, "limits": accounts.parse_limits(usage(*limits))}
+        accts[f"{name}-uuid-0000"] = {"email": f"{name}@example.com", "login": "login valid 20d",
+                                      "reading": reading}
+    return {"version": 1, "host": host, "at": now, "active": f"{active}-uuid-0000" if active else None,
+            "accounts": accts, "mode": "suggest", "apply": None, "events": [], "sessions": None, "poll": {}}
+
+
+class HubHarness(AutoswitchHarness):
+    """This harness is the laptop ("laptop"); a second store is the hub on cm-manager."""
+
+    def setUp(self):
+        super().setUp()
+        root = self.paths.store.parent
+        self.hub_paths = accounts.Paths(root / "hub-home/.claude", root / "hub-home/.claude.json",
+                                        root / "hub-home/store")
+        self.hub_down = False
+        self.checkins = []
+
+        def remote(hub, export):
+            self.checkins.append((hub, export))
+            if self.hub_down:
+                raise accounts.AccountError(f"{hub}: unreachable (TimeoutExpired)")
+            with accounts.Hub(self.hub_paths) as h:
+                return json.loads(json.dumps(accounts.hub_checkin(h, json.loads(json.dumps(export)))))
+
+        self.enterContext(mock.patch.object(accounts, "remote_checkin", side_effect=remote))
+        self.set_config(hub="cm-manager", host_name="laptop")
+
+    def hub(self, *argv, stdin=None):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(err), mock.patch.object(sys, "stdin", io.StringIO(stdin or "")):
+            code = accounts.main(["hub", *argv], paths=self.hub_paths, out=out)
+        text = out.getvalue() + err.getvalue()
+        for token in self.tokens:
+            self.assertNotIn(token, text)
+        return code, text
+
+    def other_host(self, export):
+        with accounts.Hub(self.hub_paths) as h:
+            accounts.hub_checkin(h, export)
+
+    def hub_files_have_no_tokens(self):
+        for path in self.hub_paths.store.rglob("*"):
+            if path.is_file():
+                text = path.read_text()
+                for token in self.tokens:
+                    self.assertNotIn(token, text, path)
+
+
+class HubTests(HubHarness):
+    def test_check_in_reports_without_tokens_and_status_shows_it(self):
+        code, text = self.poll()
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.checkins[0][0], "cm-manager")
+        code, text = self.hub("status")
+        self.assertEqual(code, 0)
+        self.assertIn("laptop         on alice@example.com; wants no assignment (manual); checked in 0m ago",
+                      text)
+        self.assertIn("alice@example.com              active on laptop; NO ROOM; saved on laptop", text)
+        self.assertIn("week 95% (resets in 3.0d, binding)  [read 0m ago on laptop]", text)
+        self.assertIn("1. trading system: live and real-money work", text)
+        view = json.loads(self.hub("status", "--json")[1])
+        self.assertEqual(view["hosts"]["laptop"]["active"], "alice-uuid-0000")
+        self.hub_files_have_no_tokens()
+        self.assertIn("hub cm-manager as laptop: checked in 0m ago, rev 0, no assignment (manual)",
+                      self.run_cli("status", "--local")[1])
+
+    def test_threshold_alerts_go_to_the_coordinator_not_owner(self):
+        self.poll()
+        self.assertEqual(self.alerts(), [])  # no Telegram
+        code, text = self.hub("alerts")
+        self.assertIn("alert       laptop       alice@example.com (alice-uu) is at 95% of its week limit", text)
+        self.poll()  # delivered once, not again
+        self.assertEqual(len(json.loads(self.hub("alerts", "--json")[1])), 1)
+
+    def test_alerts_wait_while_the_hub_is_down(self):
+        self.hub_down = True
+        code, text = self.poll()
+        self.assertEqual(code, 0)
+        self.assertIn("1 alert(s) waiting for the hub", self.run_cli("status", "--local")[1])
+        self.assertIn("hub cm-manager as laptop: cm-manager: unreachable", self.run_cli("status", "--local")[1])
+        self.hub_down = False
+        self.poll()
+        self.assertEqual(len(json.loads(self.hub("alerts", "--json")[1])), 1)
+        self.assertNotIn("waiting for the hub", self.run_cli("status", "--local")[1])
+
+    def test_login_problems_still_reach_owner(self):
+        path = self.paths.accounts / "carol-uuid-0000.json"
+        rec = json.loads(path.read_text())
+        rec["claudeAiOauth"]["refreshTokenExpiresAt"] = int(time.time() * 1000) - 1000
+        path.write_text(json.dumps(rec))
+        self.poll()
+        self.assertTrue(any("carol@example.com (carol-uu) needs a new login" in a for a in self.alerts()))
+
+    def test_pin_switches_once_and_reports(self):
+        self.poll()
+        code, text = self.hub("assign", "laptop", "bob@example.com")
+        self.assertEqual(code, 0, text)
+        self.assertIn("laptop: pin bob@example.com (rev 1; applies at its next check-in)", text)
+        code, text = self.poll()  # reports, gets rev 1, switches
+        self.assertIn("assignment rev 1: switched", text)
+        self.assertEqual(self.live()["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-bob")
+        self.assertEqual(self.state()["history"][-1]["reason"], "hub rev 1")
+        self.usage[self.live_token()] = usage(("weekly_all", None, 30, 3 * 86400, True))
+        self.poll()
+        self.assertEqual(self.state()["apply"]["result"], "ok")
+        text = self.hub("history")[1]
+        self.assertIn("laptop: pin bob@example.com", text)
+        self.assertIn("apply       laptop       rev 1: switched", text)
+        self.assertIn("active      laptop       alice@example.com -> bob@example.com", text)
+        self.assertEqual(self.hub("assign", "laptop", "bob")[1].strip(), "laptop: already pin bob@example.com")
+        self.hub_files_have_no_tokens()
+
+    def test_pin_converges_after_a_local_switch(self):
+        self.poll()
+        self.hub("assign", "laptop", "alice@example.com")
+        self.run_cli("switch", "carol@example.com")
+        self.poll()
+        self.assertEqual(self.live()["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-alice")
+
+    def test_pinned_host_never_autoswitches(self):
+        self.set_reading("bob", ("weekly_all", None, 10, 86400, True))
+        self.poll()
+        self.hub("assign", "laptop", "alice@example.com")
+        state = self.state()
+        state["config"]["autoswitch"] = "auto"  # local setting is ignored under a hub
+        self.paths.state.write_text(json.dumps(state))
+        self.age_last_switch(31 * 60)
+        self.poll()  # fetches the pin; a mode change applies from the next cycle
+        self.alerts_reset()
+        self.poll()
+        self.assertEqual(self.live_token(), "sk-ant-oat-ACCESS-alice")
+        self.assertIn("Pinned by the coordinator", self.hub("alerts")[1])
+
+    def test_hub_auto_mode_honours_reservations(self):
+        self.set_reading("bob", ("weekly_all", None, 10, 86400, True))
+        self.set_reading("carol", ("weekly_all", None, 50, 86400, True))
+        self.poll()
+        self.assertEqual(self.hub("reserve", "bob@example.com", "--for", "cm-manager", "--note", "coord")[0], 0)
+        self.hub("assign", "laptop", "alice@example.com", "--auto")
+        self.poll()  # picks up rev 2 (auto, bob reserved)
+        self.age_last_switch(31 * 60)
+        self.alerts_reset()
+        self.poll()
+        self.assertEqual(self.live()["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-carol")
+        self.assertIn("reserved for cm-manager (coord)", self.hub("status")[1])
+
+    def test_assign_refuses_unusable_targets_unless_forced(self):
+        self.poll()
+        self.other_host(host_export("cm-sessions", active="dave", saved=["dave"]))
+        cases = [(("ghost", "bob@example.com"), "has never checked in"),
+                 (("laptop", "dave@example.com"), "has no valid saved login on laptop"),
+                 (("laptop", "nobody@example.com"), "matches 0 accounts")]
+        for argv, why in cases:
+            code, text = self.hub("assign", *argv)
+            self.assertEqual(code, 1, argv)
+            self.assertIn(why, text)
+        self.hub("reserve", "bob", "--for", "cm-sessions")
+        code, text = self.hub("assign", "laptop", "bob")
+        self.assertIn("reserved for cm-sessions", text)
+        self.assertEqual(self.hub("assign", "laptop", "bob", "--force")[0], 0)
+        self.assertEqual(self.hub("assign", "laptop", "none")[0], 0)
+        self.assertNotIn("laptop", json.loads(self.hub("status", "--json")[1])["hosts"]["laptop"].get("desired") or {})
+
+    def test_forced_pin_to_an_account_missing_here_is_blocked_not_applied(self):
+        self.poll()
+        self.other_host(host_export("cm-sessions", active="dave", saved=["dave"]))
+        self.hub("assign", "laptop", "dave@example.com", "--force")
+        code, text = self.poll()
+        self.assertIn("blocked: dave@example.com is not saved on laptop; needs /login + capture", text)
+        self.assertEqual(self.live_token(), "sk-ant-oat-ACCESS-alice")
+        self.poll()
+        self.assertIn("last apply: blocked: dave@example.com is not saved on laptop", self.hub("status")[1])
+
+    def test_drain_moves_each_host_to_the_best_other_account(self):
+        self.set_reading("bob", ("weekly_all", None, 20, 86400, True))
+        self.set_reading("carol", ("weekly_all", None, 10, 86400, True))
+        self.poll()
+        # cm-sessions is already on carol, so the laptop goes to bob (fewest hosts).
+        self.other_host(host_export("cm-sessions", active="carol", saved=["alice", "bob", "carol"]))
+        code, text = self.hub("drain", "alice@example.com", "--dry-run")
+        self.assertEqual(code, 0, text)
+        self.assertIn("laptop: alice@example.com -> bob@example.com (20% worst limit)", text)
+        self.assertIn("dry run: nothing changed", text)
+        self.assertEqual(json.loads(self.hub("status", "--json")[1])["revision"], 0)
+        code, text = self.hub("drain", "alice@example.com")
+        self.assertEqual(code, 0, text)
+        self.poll()
+        self.assertEqual(self.live()["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-bob")
+        self.assertIn("DRAINING", self.hub("status")[1])
+        code, text = self.hub("assign", "cm-sessions", "alice")
+        self.assertIn("is draining", text)
+        self.hub("undrain", "alice")
+        self.assertEqual(self.hub("assign", "cm-sessions", "alice")[0], 0)
+
+    def test_drain_with_nowhere_to_go_says_so(self):
+        self.set_reading("bob", ("weekly_all", None, 97, 86400, True))
+        self.set_reading("carol", ("weekly_all", None, 97, 86400, True))
+        self.poll()
+        code, text = self.hub("drain", "alice")
+        self.assertEqual(code, 1)
+        self.assertIn("laptop: alice@example.com -> stays (no other usable account with room)", text)
+
+    def test_owner_hears_when_accounts_run_low_once(self):
+        notifier = self.notifier
+        self.hub("policy", "notify_command", str(notifier))
+        self.set_reading("bob", ("weekly_all", None, 97, 86400, True))
+        self.poll()  # alice 95, bob 97, carol unread: 1 of 3 has room
+        low = [a for a in self.alerts() if "running low" in a]
+        self.assertEqual(len(low), 1, self.alerts())
+        self.assertIn("Claude accounts running low: 1 of 3 have room (carol@example.com)", low[0])
+        self.poll()
+        self.assertEqual(len([a for a in self.alerts() if "running low" in a]), 1)
+        self.other_host(host_export("cm-sessions", active="carol", carol=(60, ("weekly_all", None, 99, 86400, True))))
+        low = [a for a in self.alerts() if "running low" in a]
+        self.assertEqual(len(low), 2)
+        self.assertIn("0 of 3 have room", low[1])
+
+    def test_policy_and_critical_list(self):
+        self.assertEqual(self.hub("policy", "default_mode", "auto")[0], 0)
+        self.assertEqual(self.hub("policy", "default_mode", "sometimes")[0], 1)
+        self.assertEqual(self.hub("policy", "thresholds.weekly", "95")[0], 0)
+        self.assertIn("thresholds.weekly      95", self.hub("policy")[1])
+        code, text = self.hub("critical", "add", "the F build")
+        self.assertIn("3. the F build", text)
+        code, text = self.hub("critical", "remove", "1")
+        self.assertNotIn("trading", text)
+        self.assertIn("2. the F build", text)
+        self.assertEqual(self.hub("critical", "remove", "9")[0], 1)
+        self.poll()  # policy default_mode reaches the host
+        self.assertEqual(self.state()["hub"]["reply"]["policy"]["default_mode"], "auto")
+
+    def test_checkin_refuses_a_mismatched_or_bad_export(self):
+        export = host_export("cm-sessions")
+        self.assertEqual(self.hub("checkin", "laptop", stdin=json.dumps(export))[0], 1)
+        self.assertEqual(self.hub("checkin", "cm-sessions", stdin="not json")[0], 1)
+        bad = dict(export, host="a;b")
+        self.assertEqual(self.hub("checkin", "a;b", stdin=json.dumps(bad))[0], 1)
+        code, text = self.hub("checkin", "cm-sessions", stdin=json.dumps(export))
+        self.assertEqual(code, 0, text)
+        self.assertEqual(json.loads(text)["version"], 1)
+
+    def test_coordinator_command_is_woken_per_alert(self):
+        wake = self.hub_paths.store.parent / "wake.txt"
+        script = self.hub_paths.store.parent / "wake.sh"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text(f'#!/bin/sh\nprintf "%s\\n" "$1" >> {wake}\n')
+        script.chmod(0o700)
+        self.hub("policy", "coordinator_command", str(script))
+        self.poll()  # gets the policy
+        self.alerts_reset()
+        self.hub_down = True
+        self.poll()  # queues an alert
+        export = self.export_now()
+        self.assertEqual(len(export["events"]), 1)
+        self.hub("checkin", "laptop", stdin=json.dumps(export))
+        self.assertIn("laptop: alice@example.com (alice-uu) is at 95%", wake.read_text())
+
+    def export_now(self):
+        return json.loads(self.run_cli("export")[1])
+
+    def test_peers_from_the_hub_reading_count_for_targets(self):
+        self.set_config(hub="cm-manager", host_name="laptop", autoswitch="suggest")
+        self.other_host(host_export("cm-sessions", active="carol", bob=(60, ("weekly_all", None, 5, 86400, True))))
+        self.poll()  # first check-in brings bob's reading
+        self.alerts_reset()
+        self.poll()
+        self.assertIn("switch bob@example.com (week 5% 1m ago on cm-sessions)", self.hub("alerts")[1])
+
+
+class UsageIntervalTests(HubHarness):
+    def test_usage_is_read_at_most_once_per_interval_while_check_ins_continue(self):
+        with mock.patch.object(accounts, "USAGE_INTERVAL_SECONDS", 9 * 60):
+            self.poll()
+            self.poll()
+            self.assertEqual(len(self.usage_calls), 1)
+            self.assertEqual(len(self.checkins), 2)
+            state = self.state()
+            state["usage"]["alice-uuid-0000"]["at"] -= 9 * 60
+            self.paths.state.write_text(json.dumps(state))
+            self.poll()
+            self.assertEqual(len(self.usage_calls), 2)
+
+    def test_check_in_continues_while_backing_off(self):
+        self.usage_error = accounts.RateLimited("usage requests are rate limited (HTTP 429)")
+        self.poll()
+        self.poll()  # backing off: no usage request, but it still checks in
+        self.assertEqual(len(self.usage_calls), 1)
+        self.assertEqual(len(self.checkins), 2)
+
+
+class RemoteCheckinTests(unittest.TestCase):
+    def test_ssh_carries_the_export_on_stdin(self):
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append((argv, kw))
+            return mock.Mock(returncode=0, stdout=json.dumps({"version": 1, "revision": 3}))
+
+        export = host_export("laptop")
+        with mock.patch.object(accounts.subprocess, "run", side_effect=fake_run):
+            reply = accounts.remote_checkin("cm-manager", export)
+        argv, kw = calls[0]
+        self.assertEqual(argv, ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "cm-manager",
+                                accounts.REMOTE_CHECKIN + " laptop"])
+        self.assertEqual(json.loads(kw["input"]), export)
+        self.assertEqual(reply["revision"], 3)
+        with self.assertRaises(accounts.AccountError):
+            accounts.remote_checkin("-oProxyCommand=x", export)
 
 
 if __name__ == "__main__":

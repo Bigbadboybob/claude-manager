@@ -343,6 +343,8 @@ UNDELIVERED_RETRY_SECONDS = 3600
 # this far from the alerted one is a new period.
 NEW_PERIOD_SECONDS = 3600
 DEFAULT_NOTIFY = Path.home() / ".cm/bin/cm-notify"
+# The timer runs every 2 min (hub check-ins); usage is read at most this often.
+USAGE_INTERVAL_SECONDS = 9 * 60
 
 
 def fetch_usage(access_token: str) -> dict:
@@ -474,6 +476,12 @@ def describe_reset(resets_at: float | None, now: float) -> str:
     return f"resets in {left / 86400:.1f}d"
 
 
+def log_alert(paths: Paths, message: str) -> None:
+    with open(paths.store / "alerts.log", "a") as log:
+        log.write(f"{datetime.fromtimestamp(time.time(), timezone.utc).isoformat()} {message}\n")
+    os.chmod(paths.store / "alerts.log", 0o600)
+
+
 def notify_tag() -> str:
     """cm-notify labels every message "cm-manager"; the tag says which host sent it."""
     host = socket.gethostname().split(".")[0]
@@ -483,9 +491,7 @@ def notify_tag() -> str:
 def notify(state: dict, paths: Paths, message: str, command: str) -> bool:
     """Send an operator alert; always log it. Messages name accounts, never tokens."""
     now = int(time.time())
-    with open(paths.store / "alerts.log", "a") as log:
-        log.write(f"{datetime.fromtimestamp(now, timezone.utc).isoformat()} {message}\n")
-    os.chmod(paths.store / "alerts.log", 0o600)
+    log_alert(paths, message)
     delivered, why = False, None
     try:
         result = subprocess.run([command, message], capture_output=True, timeout=30,
@@ -578,7 +584,7 @@ def pick_target(state: dict, accounts: dict[str, dict], active: str | None,
     config = state.get("config") or {}
     readings = merged_readings(state)
     busy = in_use_elsewhere(state, now)
-    excluded = set(config.get("exclude") or [])
+    excluded = set(config.get("exclude") or []) | unavailable_here(state)
     ranked = []
     for uuid, rec in accounts.items():
         if (uuid == active or uuid in excluded
@@ -640,8 +646,10 @@ def export_view(paths: Paths, state: dict) -> dict:
                      "login": login_state(rec, now),
                      "reading": readings.get(uuid)}
     poll = state.get("poll") or {}
-    return {"version": EXPORT_VERSION, "host": socket.gethostname(), "at": int(now),
-            "active": state.get("active"), "accounts": out,
+    return {"version": EXPORT_VERSION, "host": host_name(state), "at": int(now),
+            "active": state.get("active"), "accounts": out, "mode": effective_mode(state),
+            "apply": state.get("apply"), "events": list(state.get("hub_outbox") or []),
+            "sessions": state.get("sessions"),
             "poll": {k: poll[k] for k in ("at", "ok", "reason") if k in poll}}
 
 
@@ -704,6 +712,12 @@ def merged_readings(state: dict) -> dict[str, dict]:
     carries "host"."""
     merged = {uuid: dict(r) for uuid, r in (state.get("usage") or {}).items()
               if isinstance(r, dict) and "at" in r}
+    me = host_name(state)
+    for uuid, reading in ((last_hub_reply(state) or {}).get("readings") or {}).items():
+        if isinstance(reading, dict) and isinstance(reading.get("at"), (int, float)) \
+                and isinstance(reading.get("limits"), list) and reading.get("host") != me \
+                and (uuid not in merged or reading["at"] > merged[uuid]["at"]):
+            merged[uuid] = dict(reading)
     for host, entry in (state.get("peers") or {}).items():
         for uuid, info in ((entry.get("data") or {}).get("accounts") or {}).items():
             reading = info.get("reading") if isinstance(info, dict) else None
@@ -717,6 +731,11 @@ def merged_readings(state: dict) -> dict[str, dict]:
 
 def in_use_elsewhere(state: dict, now: float) -> dict[str, list[str]]:
     busy: dict[str, list[str]] = {}
+    me = host_name(state)
+    for host, info in ((last_hub_reply(state) or {}).get("hosts") or {}).items():
+        if host != me and isinstance(info, dict) and info.get("active") \
+                and now - info.get("at", 0) <= PEER_ACTIVE_FRESH_SECONDS:
+            busy.setdefault(info["active"], []).append(host)
     for host, entry in (state.get("peers") or {}).items():
         data = entry.get("data") or {}
         if data.get("active") and now - entry.get("at", 0) <= PEER_ACTIVE_FRESH_SECONDS:
@@ -765,6 +784,652 @@ def poll_skipped(state: dict, reason: str) -> int:
     poll = state.setdefault("poll", {})
     poll.update(at=int(time.time()), ok=False, reason=reason, skipped=True)
     return 0
+
+
+
+# --- hub: the coordinator's control plane -------------------------------------------
+#
+# cm-manager keeps the desired state (which account each host uses, reservations,
+# drains, policy) and every host's last report. Hosts check in over outbound ssh
+# from their own timer, so the laptop needs no inbound access. See
+# doc/claude-account-switcher.md, "Coordinator control plane".
+
+HUB_VERSION = 1
+HUB_TIMEOUT_SECONDS = 20
+HUB_OUTBOX_LIMIT = 50
+HUB_ALERTS_LIMIT = 2000
+HUB_REPORT_FRESH_SECONDS = 15 * 60
+REMOTE_CHECKIN = "python3 .local/bin/cm-claude-accounts hub checkin"
+MODES = ("pin", "auto", "manual")
+# Swarm-Coord for Owner, 2026-11-10; the coordinator edits it as Owner names priorities.
+DEFAULT_CRITICAL = ["trading system: live and real-money work", "the account coordinator itself"]
+DEFAULT_LOW_ROOM_ACCOUNTS = 1
+
+
+def host_name(state: dict) -> str:
+    name = (state.get("config") or {}).get("host_name")
+    return name or socket.gethostname().split(".")[0] or "host"
+
+
+def last_hub_reply(state: dict) -> dict | None:
+    hub = state.get("hub") or {}
+    return hub.get("reply") if isinstance(hub.get("reply"), dict) else None
+
+
+def effective_mode(state: dict) -> str:
+    """With a hub, its entry for this host rules (default manual); without
+    one, the local autoswitch setting. manual behaves like suggest."""
+    config = state.get("config") or {}
+    if config.get("hub"):
+        reply = last_hub_reply(state)
+        entry = (reply or {}).get("entry") or {}
+        mode = entry.get("mode") or ((reply or {}).get("policy") or {}).get("default_mode") or "manual"
+    else:
+        mode = config.get("autoswitch", "suggest")
+    return "suggest" if mode == "manual" else mode
+
+
+def unavailable_here(state: dict) -> set[str]:
+    """Accounts the hub says this host may not switch to: draining, or
+    reserved for other hosts."""
+    reply = last_hub_reply(state) or {}
+    me = host_name(state)
+    out = set(reply.get("draining") or [])
+    for uuid, res in (reply.get("reservations") or {}).items():
+        if me not in (res.get("for") or []):
+            out.add(uuid)
+    return out
+
+
+def hub_exchange(paths: Paths, state: dict, out) -> dict | None:
+    """Check in with the hub; returns its reply, or None with no hub or on
+    failure (the host then keeps its account)."""
+    hub = (state.get("config") or {}).get("hub")
+    if not hub:
+        return None
+    export = export_view(paths, state)
+    now = int(time.time())
+    try:
+        if hub == "local":
+            with Hub(paths) as h:
+                reply = hub_checkin(h, export)
+        else:
+            reply = remote_checkin(hub, export)
+    except AccountError as exc:
+        entry = state.setdefault("hub", {})
+        entry.update(ok=False, error=str(exc), tried_at=now)
+        print(f"hub check-in failed: {exc}", file=sys.stderr)
+        return None
+    state["hub"] = {"at": now, "ok": True, "reply": reply}
+    sent = {e.get("id") for e in export["events"]}
+    state["hub_outbox"] = [e for e in state.get("hub_outbox") or [] if e.get("id") not in sent]
+    return reply
+
+
+def remote_checkin(hub: str, export: dict) -> dict:
+    if not PEER_NAME.match(hub):
+        raise AccountError(f"hub {hub!r} is not a plain ssh host name")
+    try:
+        result = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", hub,
+             f"{REMOTE_CHECKIN} {export['host']}"],
+            input=json.dumps(export), capture_output=True, text=True, timeout=HUB_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AccountError(f"{hub}: unreachable ({type(exc).__name__})") from None
+    if result.returncode:
+        raise AccountError(f"{hub}: check-in failed (exit {result.returncode})")
+    try:
+        reply = json.loads(result.stdout)
+    except ValueError:
+        raise AccountError(f"{hub}: check-in reply was not JSON") from None
+    if not isinstance(reply, dict) or reply.get("version") != HUB_VERSION:
+        raise AccountError(f"{hub}: unsupported hub reply (update cm-claude-accounts there)")
+    return reply
+
+
+def apply_assignment(paths: Paths, state: dict, accounts: dict[str, dict], reply: dict, out) -> None:
+    """Converge on a pinned account. Each result goes to the hub next check-in."""
+    entry = reply.get("entry") or {}
+    target = entry.get("account")
+    if entry.get("mode") != "pin" or not target:
+        return
+    rev = reply.get("revision")
+    now = int(time.time())
+    me = host_name(state)
+    if target == state.get("active"):
+        state["apply"] = {"revision": rev, "account": target, "result": "ok", "at": now}
+        return
+    rec = accounts.get(target)
+    name = (rec["oauthAccount"].get("emailAddress") if rec else None) or entry.get("email") or target[:8]
+    if rec is None:
+        result = f"blocked: {name} is not saved on {me}; needs /login + capture"
+    elif login_state(rec, now) in ("needs /login", "login expired"):
+        result = f"blocked: {name}'s login on {me} has expired; needs /login + capture"
+    else:
+        try:
+            cmd_switch(paths, state, target, out)
+        except AccountError as exc:
+            result = f"failed: {exc}"
+        else:
+            state["history"][-1]["reason"] = f"hub rev {rev}"
+            result = "switched"
+    print(f"assignment rev {rev}: {result}", file=out)
+    state["apply"] = {"revision": rev, "account": target, "result": result, "at": now}
+
+
+class Hub:
+    """The hub's files, under its own lock. Never held across a network call."""
+
+    def __init__(self, paths: Paths):
+        self.paths = paths
+        self.dir = paths.store / "hub"
+
+    def __enter__(self) -> "Hub":
+        init_store(self.paths)
+        (self.dir / "reports").mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.dir, 0o700)
+        fd = os.open(self.dir / "lock", os.O_CREAT | os.O_RDWR, 0o600)
+        self.lock = os.fdopen(fd)
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+        self.desired = load_json(self.dir / "desired.json")
+        self.desired.setdefault("revision", 0)
+        for key in ("hosts", "reservations"):
+            self.desired.setdefault(key, {})
+        self.desired.setdefault("draining", [])
+        policy = self.desired.setdefault("policy", {})
+        policy.setdefault("critical", list(DEFAULT_CRITICAL))
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.lock.close()
+
+    def save(self, change: str | None = None) -> None:
+        if change:
+            self.desired["revision"] += 1
+            self.event("change", change)
+        atomic_write(self.dir / "desired.json", self.desired, indent=2)
+
+    def reports(self) -> dict[str, dict]:
+        out = {}
+        for path in sorted((self.dir / "reports").glob("*.json")):
+            try:
+                out[path.stem] = load_json(path)
+            except (AccountError, ValueError):
+                continue
+        return out
+
+    def event(self, kind: str, text: str, host: str | None = None, at: int | None = None) -> None:
+        path = self.dir / "events.jsonl"
+        with open(path, "a") as f:
+            f.write(json.dumps({"at": at or int(time.time()), "kind": kind, "host": host,
+                                "text": text}) + "\n")
+        os.chmod(path, 0o600)
+        if path.stat().st_size > 4 * 1024 * 1024:  # keep the newest lines
+            lines = path.read_text().splitlines()[-HUB_ALERTS_LIMIT:]
+            atomic_write_text(path, "\n".join(lines) + "\n")
+
+    def events(self) -> list[dict]:
+        try:
+            lines = (self.dir / "events.jsonl").read_text().splitlines()
+        except FileNotFoundError:
+            return []
+        out = []
+        for line in lines:
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                continue
+        return out
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.chmod(tmp, 0o600)
+    os.rename(tmp, path)
+
+
+def hub_readings(reports: dict[str, dict]) -> dict[str, dict]:
+    """Per account, the freshest reading any host reported, with that host."""
+    out: dict[str, dict] = {}
+    for host, rep in reports.items():
+        for uuid, info in ((rep.get("export") or {}).get("accounts") or {}).items():
+            reading = info.get("reading") if isinstance(info, dict) else None
+            if isinstance(reading, dict) and isinstance(reading.get("at"), (int, float)) \
+                    and isinstance(reading.get("limits"), list) \
+                    and (uuid not in out or reading["at"] > out[uuid]["at"]):
+                out[uuid] = {**reading, "host": host}
+    return out
+
+
+def hub_emails(reports: dict[str, dict]) -> dict[str, str]:
+    out = {}
+    for rep in reports.values():
+        for uuid, info in ((rep.get("export") or {}).get("accounts") or {}).items():
+            if isinstance(info, dict) and info.get("email"):
+                out[uuid] = info["email"]
+    return out
+
+
+def hub_checkin(hub: Hub, export: dict) -> dict:
+    host = export.get("host")
+    if not isinstance(host, str) or not PEER_NAME.match(host):
+        raise AccountError("check-in without a plain host name")
+    if export.get("version") != EXPORT_VERSION or not isinstance(export.get("accounts"), dict):
+        raise AccountError(f"{host}: unsupported export")
+    now = int(time.time())
+    reports = hub.reports()
+    previous = (reports.get(host) or {}).get("export") or {}
+    seen = set((reports.get(host) or {}).get("events_seen") or [])
+    new_events = [e for e in export.get("events") or []
+                  if isinstance(e, dict) and e.get("id") not in seen]
+    for e in new_events:
+        hub.event("alert", str(e.get("message"))[:1000], host=host, at=e.get("at"))
+    if previous.get("active") != export.get("active") and previous:
+        emails = hub_emails(reports)
+        hub.event("active", f"{emails.get(previous.get('active'), previous.get('active'))} -> "
+                            f"{emails.get(export.get('active'), export.get('active'))}", host=host)
+    if (export.get("apply") or {}) != (previous.get("apply") or {}) and export.get("apply"):
+        a = export["apply"]
+        hub.event("apply", f"rev {a.get('revision')}: {a.get('result')}", host=host)
+    report = {"at": now, "export": export,
+              "events_seen": sorted({e.get("id") for e in export.get("events") or []
+                                     if isinstance(e, dict) and isinstance(e.get("id"), int)})}
+    atomic_write(hub.dir / "reports" / f"{host}.json", report)
+    reports[host] = report
+    hub_check_low(hub, reports, now)
+    d = hub.desired
+    return {"version": HUB_VERSION, "revision": d["revision"], "host": host,
+            "entry": d["hosts"].get(host), "reservations": d["reservations"],
+            "draining": d["draining"], "policy": d["policy"],
+            "readings": hub_readings(reports),
+            "hosts": {h: {"active": (r.get("export") or {}).get("active"), "at": r.get("at")}
+                      for h, r in reports.items()}}
+
+
+def room_by_account(reports: dict[str, dict], policy: dict, now: float) -> dict[str, tuple[bool, str]]:
+    """Every account any host knows: (has room, why) from its freshest reading.
+    An account never read counts as having room ("not read yet")."""
+    config = {"thresholds": policy.get("thresholds") or {}}
+    readings = hub_readings(reports)
+    out = {}
+    for uuid in hub_emails(reports):
+        reading = readings.get(uuid)
+        if not reading:
+            out[uuid] = (True, "not read yet")
+            continue
+        over = over_threshold(reading["limits"], config, now, for_switch=True)
+        out[uuid] = (not over, ", ".join(f"{limit_name(l)} {l['percent']:.0f}%" for l in over) or "room")
+    return out
+
+
+def hub_check_low(hub: Hub, reports: dict[str, dict], now: float) -> None:
+    """Tell Owner when few accounts have room left (Owner's only routine alert)."""
+    policy = hub.desired["policy"]
+    room = room_by_account(reports, policy, now)
+    if not room:
+        return
+    with_room = sorted(u for u, (ok, _) in room.items() if ok)
+    limit = policy.get("low_room_accounts", DEFAULT_LOW_ROOM_ACCOUNTS)
+    state = hub.desired.setdefault("low_alert", {})
+    if len(with_room) > limit:
+        if state:
+            hub.desired["low_alert"] = {}
+            hub.save()
+        return
+    if state.get("count") is not None and len(with_room) >= state["count"] \
+            and now - state.get("at", 0) < 6 * 3600:
+        return
+    emails = hub_emails(reports)
+    full = "; ".join(f"{emails.get(u, u[:8])} {why}" for u, (ok, why) in sorted(room.items()) if not ok)
+    message = (f"Claude accounts running low: {len(with_room)} of {len(room)} have room"
+               + (f" ({', '.join(emails.get(u, u[:8]) for u in with_room)})" if with_room else "")
+               + f". Full: {full}")
+    command = policy.get("notify_command") or str(DEFAULT_NOTIFY)
+    scratch: dict = {}
+    delivered = notify(scratch, hub.paths, message, command)
+    hub.event("owner-alert", message + ("" if delivered else " (NOT delivered)"))
+    hub.desired["low_alert"] = {"count": len(with_room), "at": int(now), "delivered": delivered}
+    hub.save()
+
+
+def hub_resolve(reports: dict[str, dict], name: str) -> str:
+    emails = hub_emails(reports)
+    matches = [u for u, e in emails.items() if e.lower() == name.lower()] \
+        or [u for u in emails if u.startswith(name)]
+    if len(matches) != 1:
+        raise AccountError(f"{name!r} matches {len(matches)} accounts the hosts have reported")
+    return matches[0]
+
+
+def host_accounts(report: dict) -> dict[str, dict]:
+    return ((report or {}).get("export") or {}).get("accounts") or {}
+
+
+def usable_on(report: dict, uuid: str) -> bool:
+    info = host_accounts(report).get(uuid)
+    return isinstance(info, dict) and info.get("login") not in ("needs /login", "login expired")
+
+
+def hub_assign(hub: Hub, host: str, account: str | None, mode: str, force: bool) -> str:
+    reports = hub.reports()
+    if not PEER_NAME.match(host):
+        raise AccountError(f"{host!r} is not a plain host name")
+    if host not in reports and not force:
+        raise AccountError(f"{host} has never checked in; --force to assign anyway")
+    hosts = hub.desired["hosts"]
+    if account in (None, "none"):
+        if hosts.pop(host, None) is None:
+            return f"{host} had no assignment"
+        hub.save(f"{host}: assignment cleared")
+        return f"{host}: assignment cleared (the host keeps its current account, manual)"
+    uuid = hub_resolve(reports, account)
+    email = hub_emails(reports).get(uuid, uuid[:8])
+    if not force:
+        res = hub.desired["reservations"].get(uuid)
+        if res and host not in res.get("for", []):
+            raise AccountError(f"{email} is reserved for {', '.join(res['for']) or 'nobody'}; --force to override")
+        if uuid in hub.desired["draining"]:
+            raise AccountError(f"{email} is draining; undrain it first or --force")
+        if mode == "pin" and not usable_on(reports.get(host), uuid):
+            raise AccountError(f"{email} has no valid saved login on {host}; it needs /login + capture "
+                               "there first (--force to assign anyway)")
+    entry = {"account": uuid, "email": email, "mode": mode, "at": int(time.time())}
+    if {k: v for k, v in (hosts.get(host) or {}).items() if k != "at"} == \
+            {k: v for k, v in entry.items() if k != "at"}:
+        return f"{host}: already {mode} {email}"
+    hosts[host] = entry
+    hub.save(f"{host}: {mode} {email}")
+    return f"{host}: {mode} {email} (rev {hub.desired['revision']}; applies at its next check-in)"
+
+
+def drain_plan(hub: Hub, uuid: str, now: float) -> list[tuple[str, str | None, str]]:
+    """For each host on the account (active or assigned), the best other
+    account usable there: most room, fewest hosts already on it."""
+    reports = hub.reports()
+    d = hub.desired
+    readings = hub_readings(reports)
+    config = {"thresholds": d["policy"].get("thresholds") or {}}
+    on = {}
+    for host, rep in reports.items():
+        on[host] = (d["hosts"].get(host) or {}).get("account") or (rep.get("export") or {}).get("active")
+    load: dict[str, int] = {}
+    for acct in on.values():
+        if acct:
+            load[acct] = load.get(acct, 0) + 1
+    plan = []
+    for host in sorted(h for h, acct in on.items() if acct == uuid):
+        best = None
+        for cand in host_accounts(reports[host]):
+            if cand == uuid or cand in d["draining"] or not usable_on(reports[host], cand):
+                continue
+            res = d["reservations"].get(cand)
+            if res and host not in res.get("for", []):
+                continue
+            reading = readings.get(cand)
+            if reading and over_threshold(reading["limits"], config, now, for_switch=True):
+                continue
+            live = [l for l in (reading or {}).get("limits", [])
+                    if not (l.get("resets_at") is not None and l["resets_at"] <= now)]
+            ratio = max((l["percent"] / threshold_for(l, config) for l in live), default=0.0)
+            key = (0 if reading else 1, load.get(cand, 0), ratio, hub_emails(reports).get(cand, cand))
+            if best is None or key < best[0]:
+                best = (key, cand, "not read yet" if not reading else
+                        f"{max(live, key=lambda l: l['percent'] / threshold_for(l, config))['percent']:.0f}% "
+                        f"worst limit" if live else "likely refilled")
+        if best:
+            load[best[1]] = load.get(best[1], 0) + 1
+            plan.append((host, best[1], best[2]))
+        else:
+            plan.append((host, None, "no other usable account with room"))
+    return plan
+
+
+def fmt_reading(reading: dict | None, now: float) -> str:
+    return describe_reading(reading, now) if reading else "no reading yet"
+
+
+def hub_status_view(hub: Hub, now: float) -> dict:
+    reports = hub.reports()
+    d = hub.desired
+    emails = hub_emails(reports)
+    readings = hub_readings(reports)
+    room = room_by_account(reports, d["policy"], now)
+    hosts = {}
+    for host in sorted(set(reports) | set(d["hosts"])):
+        rep = reports.get(host) or {}
+        exp = rep.get("export") or {}
+        hosts[host] = {"active": exp.get("active"), "active_email": emails.get(exp.get("active")),
+                       "desired": d["hosts"].get(host), "mode": exp.get("mode"),
+                       "checked_in_at": rep.get("at"),
+                       "stale": not rep or now - rep.get("at", 0) > HUB_REPORT_FRESH_SECONDS,
+                       "apply": exp.get("apply"), "sessions": exp.get("sessions"),
+                       "saved": sorted(emails.get(u, u) for u in host_accounts(rep) if usable_on(rep, u))}
+    accts = {}
+    for uuid, email in sorted(emails.items(), key=lambda kv: kv[1]):
+        accts[uuid] = {"email": email, "reading": readings.get(uuid),
+                       "room": room.get(uuid, (True, ""))[0],
+                       "active_on": sorted(h for h, v in hosts.items() if v["active"] == uuid),
+                       "saved_on": sorted(h for h, rep in reports.items() if usable_on(rep, uuid)),
+                       "reserved_for": (d["reservations"].get(uuid) or {}).get("for"),
+                       "reservation_note": (d["reservations"].get(uuid) or {}).get("note"),
+                       "draining": uuid in d["draining"]}
+    return {"revision": d["revision"], "hosts": hosts, "accounts": accts,
+            "critical": d["policy"].get("critical", []),
+            "policy": {k: v for k, v in d["policy"].items() if k != "critical"}}
+
+
+def print_hub_status(view: dict, now: float, out) -> None:
+    print(f"hub revision {view['revision']}", file=out)
+    print("hosts:", file=out)
+    for host, h in view["hosts"].items():
+        desired = h["desired"]
+        want = f"{desired['mode']} {desired['email']}" if desired else "no assignment (manual)"
+        seen = describe_age(now - h["checked_in_at"]) if h["checked_in_at"] else "never"
+        stale = " STALE" if h["stale"] else ""
+        sessions = f", {h['sessions']['live']} live sessions" if isinstance(h.get("sessions"), dict) else ""
+        print(f"  {host:14} on {h['active_email'] or h['active'] or '?'}; wants {want}; "
+              f"checked in {seen}{stale}{sessions}", file=out)
+        if h["apply"] and h["apply"].get("result") not in ("ok", "switched"):
+            print(f"  {'':14} last apply: {h['apply']['result']}", file=out)
+    print("accounts:", file=out)
+    for uuid, a in view["accounts"].items():
+        tags = []
+        if a["active_on"]:
+            tags.append(f"active on {', '.join(a['active_on'])}")
+        if a["reserved_for"] is not None:
+            tags.append(f"reserved for {', '.join(a['reserved_for']) or 'nobody'}"
+                        + (f" ({a['reservation_note']})" if a["reservation_note"] else ""))
+        if a["draining"]:
+            tags.append("DRAINING")
+        if not a["room"]:
+            tags.append("NO ROOM")
+        tags.append(f"saved on {', '.join(a['saved_on']) or 'no host'}")
+        print(f"  {a['email']:30} {'; '.join(tags)}", file=out)
+        print(f"  {'':30} {fmt_reading(a['reading'], now)}", file=out)
+    print("critical work (keep running near a limit):", file=out)
+    for i, item in enumerate(view["critical"], 1):
+        print(f"  {i}. {item}", file=out)
+
+
+HUB_POLICY_KEYS = {
+    "default_mode": (lambda v: v if v in MODES else None),
+    "low_room_accounts": (lambda v: int(v) if v.isdigit() else None),
+    "notify_command": (lambda v: v or None),
+    "coordinator_command": (lambda v: v or None),
+}
+
+
+def cmd_hub(paths: Paths, args, out) -> int:
+    now = time.time()
+    if args.hub_command == "checkin":
+        try:
+            export = json.loads(sys.stdin.read())
+        except ValueError:
+            raise AccountError("check-in input was not JSON") from None
+        if not isinstance(export, dict):
+            raise AccountError("check-in input was not a JSON object")
+        if export.get("host") != args.host:
+            raise AccountError("check-in host does not match its export")
+        with Hub(paths) as hub:
+            reply = hub_checkin(hub, export)
+        json.dump(reply, out)
+        out.write("\n")
+        forward_alerts(paths, export, reply)
+        return 0
+    with Hub(paths) as hub:
+        if args.hub_command == "status":
+            view = hub_status_view(hub, now)
+            if args.json:
+                json.dump(view, out, indent=2)
+                out.write("\n")
+            else:
+                print_hub_status(view, now, out)
+            return 0
+        if args.hub_command == "assign":
+            mode = "auto" if args.auto else "manual" if args.manual else "pin"
+            print(hub_assign(hub, args.host, args.account, mode, args.force), file=out)
+            return 0
+        if args.hub_command in ("reserve", "release"):
+            uuid = hub_resolve(hub.reports(), args.account)
+            email = hub_emails(hub.reports()).get(uuid, uuid[:8])
+            if args.hub_command == "release":
+                if hub.desired["reservations"].pop(uuid, None) is None:
+                    print(f"{email} was not reserved", file=out)
+                    return 0
+                hub.save(f"released {email}")
+                print(f"released {email}", file=out)
+                return 0
+            hosts = [] if args.for_hosts == "nobody" else [h for h in args.for_hosts.split(",") if h]
+            if not all(PEER_NAME.match(h) for h in hosts):
+                raise AccountError("--for takes plain host names, comma-separated, or 'nobody'")
+            hub.desired["reservations"][uuid] = {"for": hosts, "note": args.note,
+                                                 "at": int(now)}
+            hub.save(f"reserved {email} for {', '.join(hosts) or 'nobody'}")
+            others = [h for h, e in hub.desired["hosts"].items()
+                      if e.get("account") == uuid and h not in hosts]
+            print(f"reserved {email} for {', '.join(hosts) or 'nobody'}"
+                  + (f"; still assigned to {', '.join(others)}: reassign or drain them" if others else ""),
+                  file=out)
+            return 0
+        if args.hub_command in ("drain", "undrain"):
+            uuid = hub_resolve(hub.reports(), args.account)
+            email = hub_emails(hub.reports()).get(uuid, uuid[:8])
+            if args.hub_command == "undrain":
+                if uuid in hub.desired["draining"]:
+                    hub.desired["draining"].remove(uuid)
+                    hub.save(f"undrained {email}")
+                print(f"{email} can take work again", file=out)
+                return 0
+            plan = drain_plan(hub, uuid, now)
+            emails = hub_emails(hub.reports())
+            for host, target, why in plan:
+                print(f"  {host}: {email} -> {emails.get(target, target) if target else 'stays'} ({why})",
+                      file=out)
+            if not plan:
+                print(f"  no host is on {email}", file=out)
+            if args.dry_run:
+                print("dry run: nothing changed", file=out)
+                return 0
+            if uuid not in hub.desired["draining"]:
+                hub.desired["draining"].append(uuid)
+            for host, target, _ in plan:
+                if target:
+                    hub.desired["hosts"][host] = {"account": target, "email": emails.get(target, target[:8]),
+                                                  "mode": "pin", "at": int(now)}
+            hub.save(f"draining {email}: " + ", ".join(
+                f"{h} -> {emails.get(t, t) if t else 'stays'}" for h, t, _ in plan))
+            stuck = [h for h, t, _ in plan if not t]
+            print(f"draining {email} (rev {hub.desired['revision']})"
+                  + (f"; no target for {', '.join(stuck)}" if stuck else ""), file=out)
+            return 0 if not stuck else 1
+        if args.hub_command == "policy":
+            policy = hub.desired["policy"]
+            if args.key is None:
+                for k in HUB_POLICY_KEYS:
+                    print(f"{k:22} {policy.get(k, '(default)')}", file=out)
+                for k, v in (policy.get("thresholds") or {}).items():
+                    print(f"{'thresholds.' + k:22} {v:g}", file=out)
+                return 0
+            if args.key.startswith("thresholds."):
+                kind = args.key.split(".", 1)[1]
+                if not re.fullmatch(r"[a-z_]+", kind):
+                    raise AccountError(f"{args.key}: not a limit kind")
+                th = policy.setdefault("thresholds", {})
+                if args.value == "default":
+                    th.pop(kind, None)
+                else:
+                    value = parse_threshold(args.value or "")
+                    if value is None:
+                        raise AccountError(f"{args.key}: invalid value {args.value!r}")
+                    th[kind] = value
+                if not th:
+                    policy.pop("thresholds")
+            elif args.key in HUB_POLICY_KEYS:
+                if args.value is None:
+                    print(f"{args.key} = {policy.get(args.key, '(default)')}", file=out)
+                    return 0
+                if args.value == "default":
+                    policy.pop(args.key, None)
+                else:
+                    value = HUB_POLICY_KEYS[args.key](args.value)
+                    if value is None:
+                        raise AccountError(f"{args.key}: invalid value {args.value!r}")
+                    policy[args.key] = value
+            else:
+                raise AccountError(f"unknown hub policy {args.key!r}")
+            hub.save(f"policy {args.key} = {args.value}")
+            print(f"{args.key} = {args.value}", file=out)
+            return 0
+        if args.hub_command == "critical":
+            items = hub.desired["policy"].setdefault("critical", [])
+            if args.action == "add":
+                if not args.text:
+                    raise AccountError("critical add needs a description")
+                items.append(args.text)
+                hub.save(f"critical + {args.text}")
+            elif args.action == "remove":
+                if not (args.text or "").isdigit() or not 1 <= int(args.text) <= len(items):
+                    raise AccountError("critical remove takes the item number shown by `hub critical`")
+                gone = items.pop(int(args.text) - 1)
+                hub.save(f"critical - {gone}")
+            for i, item in enumerate(items, 1):
+                print(f"{i}. {item}", file=out)
+            return 0
+        if args.hub_command in ("history", "alerts"):
+            events = hub.events()
+            if args.hub_command == "alerts":
+                events = [e for e in events if e.get("kind") in ("alert", "owner-alert")]
+            if args.since:
+                since = parse_time(args.since)
+                if since is None:
+                    raise AccountError("--since takes an ISO time such as 2026-11-10T06:00Z")
+                events = [e for e in events if e.get("at", 0) >= since]
+            events = events[-args.n:]
+            if args.json:
+                json.dump(events, out)
+                out.write("\n")
+                return 0
+            for e in events:
+                when = datetime.fromtimestamp(e.get("at", 0), timezone.utc).strftime("%Y-%m-%d %H:%MZ")
+                print(f"{when}  {e.get('kind'):11} {e.get('host') or '-':12} {e.get('text')}", file=out)
+            return 0
+    raise AccountError(f"unknown hub command {args.hub_command}")
+
+
+def forward_alerts(paths: Paths, export: dict, reply: dict) -> None:
+    """Run the policy's coordinator_command once per new alert (best effort),
+    so the coordinator wakes instead of waiting for its next look."""
+    command = (reply.get("policy") or {}).get("coordinator_command")
+    if not command or not export.get("events"):
+        return
+    for e in export["events"]:
+        try:
+            subprocess.run([command, f"{export['host']}: {e.get('message')}"], capture_output=True,
+                           timeout=30, env=dict(os.environ, CM_NOTIFY_TAG=notify_tag()))
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
 # --- commands ------------------------------------------------------------------
@@ -887,7 +1552,25 @@ def cmd_status(paths: Paths, state: dict, out, local: bool = False) -> int:
             advice = (f". {switch_advice(state, accounts, active, now)}"
                       if over_threshold(over, config, now, for_switch=True) else "")
             print(f"over threshold: {names}{advice}", file=out)
-    print(f"autoswitch: {config.get('autoswitch', 'suggest')}", file=out)
+    if config.get("hub"):
+        hub = state.get("hub") or {}
+        reply = last_hub_reply(state)
+        entry = (reply or {}).get("entry")
+        want = f"{entry['mode']} {entry.get('email') or entry.get('account')}" if entry else "no assignment (manual)"
+        if hub.get("ok"):
+            print(f"hub {config['hub']} as {host_name(state)}: checked in {describe_age(now - hub['at'])}, "
+                  f"rev {reply.get('revision')}, {want}", file=out)
+        else:
+            last = f"; last good check-in {describe_age(now - hub['at'])} ({want})" if hub.get("at") else ""
+            print(f"hub {config['hub']} as {host_name(state)}: {hub.get('error', 'never checked in')}{last}",
+                  file=out)
+        applied = state.get("apply")
+        if applied:
+            print(f"last assignment applied: rev {applied.get('revision')} {applied.get('result')}", file=out)
+        if state.get("hub_outbox"):
+            print(f"{len(state['hub_outbox'])} alert(s) waiting for the hub", file=out)
+    else:
+        print(f"autoswitch: {config.get('autoswitch', 'suggest')}", file=out)
     poll = state.get("poll")
     if poll:
         result = "ok" if poll.get("ok") else poll.get("reason", "failed")
@@ -902,31 +1585,21 @@ def cmd_status(paths: Paths, state: dict, out, local: bool = False) -> int:
     return 0
 
 
-def cmd_poll(paths: Paths, state: dict, out, notify_command: str) -> int:
-    """Read the active account's usage, keep its saved login current, alert.
-
-    Never refreshes a token and never polls an inactive account's saved one.
-    """
-    def alert(message: str) -> bool:
-        print(f"alert: {message}", file=out)
-        return notify(state, paths, message, notify_command)
-
-    accounts = load_accounts(paths)
-    if not accounts:
-        print("no saved accounts; nothing to poll", file=out)
-        return 0
-    check_logins(state, accounts, alert)
+def poll_usage(paths: Paths, state: dict, accounts: dict[str, dict], out, alert,
+               alert_owner) -> tuple[int, list[dict] | None]:
+    """Identify the live login (saving a refreshed one) and read its usage, at
+    most once per usage interval. Returns (exit code, limits or None)."""
     backoff_until = (state.get("poll") or {}).get("backoff_until", 0)
     if backoff_until > time.time():
         print(f"skipped: backing off after HTTP 429 for another "
               f"{(backoff_until - time.time()) / 60:.0f} min", file=out)
-        return 0
+        return 0, None
     login = read_login(paths)
     expires = login.get("expiresAt")
     if isinstance(expires, (int, float)) and expires / 1000 <= time.time():
         print("skipped: the access token has expired; the next prompt in any session renews it",
               file=out)
-        return poll_skipped(state, "access token expired")
+        return poll_skipped(state, "access token expired"), None
     uuid = next((u for u, rec in accounts.items()
                  if rec["claudeAiOauth"].get("refreshToken") == login["refreshToken"]), None)
     if uuid is None:
@@ -936,11 +1609,11 @@ def cmd_poll(paths: Paths, state: dict, out, notify_command: str) -> int:
             lock, login, uuid, how = identify_locked(paths, accounts)
         except TokenRejected as exc:
             print(f"skipped: {exc}", file=out)
-            return poll_skipped(state, "access token rejected")
+            return poll_skipped(state, "access token rejected"), None
         except RateLimited as exc:
-            return poll_rate_limited(state, exc, out)
+            return poll_rate_limited(state, exc, out), None
         except AccountError as exc:
-            return poll_failed(state, str(exc), alert)
+            return poll_failed(state, str(exc), alert), None
         unsaved = None
         with lock:  # held briefly: alerts may block, so they run after it
             try:
@@ -952,30 +1625,35 @@ def cmd_poll(paths: Paths, state: dict, out, notify_command: str) -> int:
             if not isinstance(entry, dict) or entry.get("account") != uuid:
                 entry = None
             if alert_due(entry, time.time()):
-                delivered = alert(f"the active login is account {uuid[:8]}, which is not saved; "
+                delivered = alert_owner(f"the active login is account {uuid[:8]}, which is not saved; "
                                   "run `cm-claude-accounts capture`")
                 state["unsaved_alert"] = {"account": uuid, "at": int(time.time()),
                                           "delivered": delivered}
-            return poll_failed(state, str(unsaved), alert)
+            return poll_failed(state, str(unsaved), alert), None
         state.pop("unsaved_alert", None)
         record_history(state, "poll-saved-login", account=uuid, identified_by=how)
     if uuid != state.get("active"):
         record_history(state, "external-login", account=uuid)
         state["active"] = uuid
     record = accounts[uuid]
+    reading = (state.get("usage") or {}).get(uuid)
+    interval = (state.get("config") or {}).get("usage_interval_minutes")
+    interval = interval * 60 if isinstance(interval, (int, float)) else USAGE_INTERVAL_SECONDS
+    if reading and reading.get("limits") and time.time() - reading["at"] < interval:
+        return 0, reading["limits"]  # read recently: spare the endpoint's budget
 
     try:
         usage = fetch_usage(login["accessToken"])
     except TokenRejected as exc:
         print(f"skipped: {exc}", file=out)
-        return poll_skipped(state, "access token rejected")
+        return poll_skipped(state, "access token rejected"), None
     except RateLimited as exc:
-        return poll_rate_limited(state, exc, out)
+        return poll_rate_limited(state, exc, out), None
     except AccountError as exc:
-        return poll_failed(state, str(exc), alert)
+        return poll_failed(state, str(exc), alert), None
     limits = parse_limits(usage)
     if not limits:
-        return poll_failed(state, "the usage response had no limits this tool understands", alert)
+        return poll_failed(state, "the usage response had no limits this tool understands", alert), None
 
     now = int(time.time())
     previous = state.get("poll") or {}
@@ -993,12 +1671,21 @@ def cmd_poll(paths: Paths, state: dict, out, notify_command: str) -> int:
             print(f"repaired the profile in {paths.claude_json}", file=out)
     except (AccountError, OSError, ValueError) as exc:
         print(f"warning: could not repair {paths.claude_json} ({exc})", file=sys.stderr)
+    return 0, limits
 
+
+def decide(paths: Paths, state: dict, accounts: dict[str, dict], limits: list[dict],
+           mode: str, out, alert) -> bool:
+    """Threshold alerts and, in auto, a switch. Returns whether it switched."""
     config = state.get("config") or {}
-    mode = config.get("autoswitch", "suggest")
+    now = int(time.time())
+    uuid = state["active"]
+    record = accounts[uuid]
     advice = None
     over = over_threshold(limits, config, now, for_switch=True)
-    if over and mode in ("suggest", "auto"):
+    if mode == "pin":
+        advice = "Pinned by the coordinator; it decides any switch"
+    elif over and mode in ("suggest", "auto"):
         refresh_peers(state)  # fresh readings from other hosts before choosing
         target = pick_target(state, accounts, uuid, now)
         dwell = config.get("min_dwell_minutes", DEFAULT_MIN_DWELL_MINUTES) * 60
@@ -1021,9 +1708,9 @@ def cmd_poll(paths: Paths, state: dict, out, notify_command: str) -> int:
                 advice = f"Automatic switch failed ({exc}). {switch_advice(state, accounts, uuid, now)}"
             else:
                 state["history"][-1]["reason"] = f"auto: {reason}"
-                alert(f"switched {label(record)} -> {label(accounts[target[0]])} automatically "
+                alert(f"{host_name(state)} switched {label(record)} -> {label(accounts[target[0]])} automatically "
                       f"({reason}; target {target[1]})")
-                return 0
+                return True
         else:
             advice = switch_advice(state, accounts, uuid, now)
             if held:
@@ -1031,7 +1718,7 @@ def cmd_poll(paths: Paths, state: dict, out, notify_command: str) -> int:
     check_limits(state, uuid, record, limits, alert, advice)
     summary = ", ".join(f"{limit_name(l)} {l['percent']:.0f}%" for l in limits)
     print(f"{label(record)}: {summary}", file=out)
-    return 0
+    return False
 
 
 CONFIG_KEYS = {
@@ -1043,6 +1730,9 @@ CONFIG_KEYS = {
     "auto_allow_unread": (lambda v: {"true": True, "false": False}.get(v), "false"),
     "switch_on_scoped": (lambda v: {"true": True, "false": False}.get(v), "false"),
     "notify_command": (lambda v: v or None, str(DEFAULT_NOTIFY)),
+    "hub": (lambda v: v if v == "local" or PEER_NAME.match(v) else None, "none"),
+    "host_name": (lambda v: v if PEER_NAME.match(v) else None, "this machine's short hostname"),
+    "usage_interval_minutes": (lambda v: int(v) if v.isdigit() else None, "9"),
     "peers": (lambda v: [h for h in v.split(",") if h] if all(
         PEER_NAME.match(h) for h in v.split(",") if h) else None, "none"),
 }
@@ -1189,8 +1879,46 @@ def cmd_install(out, timer: bool = True) -> int:
         systemctl("enable", "--now", UNITS[1])
     except (OSError, subprocess.CalledProcessError) as exc:
         raise AccountError(f"units copied, but systemctl failed ({exc})") from None
-    print(f"timer enabled: {UNITS[1]} (poll every 10 min)", file=out)
+    print(f"timer enabled: {UNITS[1]} (poll every 2 min; usage read every ~10 min)", file=out)
     return 0
+
+
+def cmd_poll(paths: Paths, state: dict, out, notify_command: str) -> int:
+    """Read the active account's usage, keep its saved login current, alert,
+    check in with the hub and apply its assignment.
+
+    Never refreshes a token and never polls an inactive account's saved one.
+    """
+    def alert_owner(message: str) -> bool:
+        print(f"alert: {message}", file=out)
+        return notify(state, paths, message, notify_command)
+
+    def alert(message: str) -> bool:
+        """With a hub, routine alerts go to the coordinator, not Owner."""
+        if not (state.get("config") or {}).get("hub"):
+            return alert_owner(message)
+        print(f"to coordinator: {message}", file=out)
+        log_alert(paths, f"(to coordinator) {message}")
+        seq = state.get("hub_outbox_seq", 0) + 1
+        state["hub_outbox_seq"] = seq
+        state.setdefault("hub_outbox", []).append({"id": seq, "at": int(time.time()), "message": message})
+        del state["hub_outbox"][:-HUB_OUTBOX_LIMIT]
+        return True
+
+    accounts = load_accounts(paths)
+    if not accounts:
+        print("no saved accounts; nothing to poll", file=out)
+        hub_exchange(paths, state, out)
+        return 0
+    check_logins(state, accounts, alert_owner)
+    code, limits = poll_usage(paths, state, accounts, out, alert, alert_owner)
+    mode = effective_mode(state)
+    if limits is not None and state.get("active") in accounts:
+        decide(paths, state, accounts, limits, mode, out, alert)
+    reply = hub_exchange(paths, state, out)
+    if reply is not None:
+        apply_assignment(paths, state, load_accounts(paths), reply, out)
+    return code
 
 
 def cmd_switch(paths: Paths, state: dict, target_name: str, out) -> int:
@@ -1269,6 +1997,42 @@ def main(argv: list[str] | None = None, paths: Paths | None = None, out=None) ->
         p.add_argument("account", help="email or accountUuid prefix")
     history = sub.add_parser("history", help="recent switches and other events")
     history.add_argument("-n", type=int, default=20)
+    hub = sub.add_parser("hub", help="the coordinator's control plane (run on the hub host)")
+    hsub = hub.add_subparsers(dest="hub_command", required=True)
+    p = hsub.add_parser("checkin", help="(hosts run this over ssh) report and get the assignment")
+    p.add_argument("host")
+    p = hsub.add_parser("status", help="every host and account")
+    p.add_argument("--json", action="store_true")
+    p = hsub.add_parser("assign", help="choose a host's account; ACCOUNT 'none' clears it")
+    p.add_argument("host")
+    p.add_argument("account")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--pin", action="store_true", help="switch to it and stay (default)")
+    g.add_argument("--auto", action="store_true", help="the host may switch itself at threshold")
+    g.add_argument("--manual", action="store_true", help="never switch; suggest only")
+    p.add_argument("--force", action="store_true")
+    p = hsub.add_parser("reserve", help="keep an account for named hosts")
+    p.add_argument("account")
+    p.add_argument("--for", dest="for_hosts", required=True, help="host[,host...] or 'nobody'")
+    p.add_argument("--note")
+    p = hsub.add_parser("release", help="undo reserve")
+    p.add_argument("account")
+    p = hsub.add_parser("drain", help="move every host off an account and keep work off it")
+    p.add_argument("account")
+    p.add_argument("--dry-run", action="store_true")
+    p = hsub.add_parser("undrain", help="let an account take work again")
+    p.add_argument("account")
+    p = hsub.add_parser("policy", help="show or set hub policy (VALUE 'default' resets)")
+    p.add_argument("key", nargs="?")
+    p.add_argument("value", nargs="?")
+    p = hsub.add_parser("critical", help="the critical-work list: list | add TEXT | remove N")
+    p.add_argument("action", nargs="?", choices=("list", "add", "remove"), default="list")
+    p.add_argument("text", nargs="?")
+    for name in ("history", "alerts"):
+        p = hsub.add_parser(name, help="hub events" if name == "history" else "alerts hosts sent the coordinator")
+        p.add_argument("-n", type=int, default=50)
+        p.add_argument("--since")
+        p.add_argument("--json", action="store_true")
     install = sub.add_parser("install", help="copy to ~/.local/bin and start the poll timer "
                              "(run from a checkout)")
     install.add_argument("--no-timer", action="store_true")
@@ -1286,6 +2050,14 @@ def main(argv: list[str] | None = None, paths: Paths | None = None, out=None) ->
         try:
             return cmd_install(out, timer=not args.no_timer)
         except (AccountError, OSError) as exc:
+            print(f"cm-claude-accounts: {exc}", file=sys.stderr)
+            return 1
+    if args.command == "hub":
+        # The hub has its own lock; a host's check-in must not wait on the
+        # hub host's own poll.
+        try:
+            return cmd_hub(paths, args, out)
+        except (AccountError, OSError, ValueError, KeyError) as exc:
             print(f"cm-claude-accounts: {exc}", file=sys.stderr)
             return 1
     if args.command == "export":
