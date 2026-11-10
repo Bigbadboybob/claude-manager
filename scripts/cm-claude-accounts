@@ -20,6 +20,7 @@ from pathlib import Path
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -785,6 +786,158 @@ def poll_skipped(state: dict, reason: str) -> int:
     poll.update(at=int(time.time()), ok=False, reason=reason, skipped=True)
     return 0
 
+
+
+# --- post-switch sweep ----------------------------------------------------------------
+#
+# About 1 in 20-30 sessions errors after a switch, and sessions that stopped on
+# the limit that caused it stay stopped. For a while after any switch, re-prompt
+# each idle Claude session whose last transcript entry is an API error, once per
+# switch, through this host's own CM daemon. Never bash shells, never sessions a
+# continuous task or workflow owns (their scheduler does), and Owner's own
+# sessions (no managing agent) only with `config sweep_owner_sessions true`.
+
+SWEEP_WINDOW_SECONDS = 30 * 60
+SWEEP_MAX_PER_RUN = 20
+# A session that stopped on a usage limit this long before the switch still counts.
+STOPPED_ON_LIMIT_LOOKBACK_SECONDS = 12 * 3600
+OWNER_ERRORS = {"oauth_org_not_allowed", "account_on_hold"}
+REPROMPT_TEXT = "Continue where you left off (the Claude account was switched)."
+TRANSCRIPT_TAIL_BYTES = 256 * 1024
+
+
+def daemon_rpc(method: str, params: dict, timeout: float = 10.0):
+    """One operator call to this host's CM daemon (the framing scripts/cm-op uses)."""
+    home = Path.home()
+    try:
+        token = (home / ".cm/operator-token").read_text().strip()
+        sock_path = os.environ.get("CM_DAEMON_SOCKET") or str(home / ".cm/daemon.sock")
+        with socket.socket(socket.AF_UNIX) as sock:
+            sock.settimeout(timeout)
+            sock.connect(sock_path)
+            req = json.dumps({"id": "cm-claude-accounts", "caller": {"token_id": token},
+                              "method": method, "params": params}).encode()
+            sock.sendall(struct.pack(">I", len(req)) + req)
+            header = sock.recv(4)
+            if len(header) < 4:
+                raise AccountError(f"CM daemon closed the connection on {method}")
+            length = struct.unpack(">I", header)[0]
+            buf = b""
+            while len(buf) < length:
+                chunk = sock.recv(length - len(buf))
+                if not chunk:
+                    break
+                buf += chunk
+    except (OSError, ValueError) as exc:
+        raise AccountError(f"CM daemon unavailable ({type(exc).__name__})") from None
+    try:
+        reply = json.loads(buf)
+    except ValueError:
+        raise AccountError(f"CM daemon sent a bad reply to {method}") from None
+    if not reply.get("ok", True) or reply.get("error"):
+        raise AccountError(f"CM daemon refused {method}: {(reply.get('error') or {}).get('code')}")
+    return reply.get("result")
+
+
+def last_transcript_entry(path: str) -> dict | None:
+    """The last user or assistant entry of a Claude transcript."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - TRANSCRIPT_TAIL_BYTES))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and entry.get("type") in ("user", "assistant"):
+            return entry
+    return None
+
+
+def claude_sessions(state: dict) -> list[dict] | None:
+    try:
+        result = daemon_rpc("list_sessions", {})
+    except AccountError:
+        state["sessions"] = None
+        return None
+    items = result.get("sessions") if isinstance(result, dict) else result
+    sessions = [i for i in items or [] if isinstance(i, dict) and i.get("type") == "claude-code"
+                and i.get("state") not in ("exited", "dead")]
+    state["sessions"] = {"at": int(time.time()), "live": len(sessions),
+                         "busy": sum(1 for i in sessions if not i.get("idle"))}
+    return sessions
+
+
+def sweep_eligible(item: dict, config: dict) -> bool:
+    if item.get("type") != "claude-code":
+        return False
+    if item.get("continuous_task_id") or item.get("workflow_run_id") or item.get("workflow_role"):
+        return False
+    if not item.get("managed_by_uid") and not config.get("sweep_owner_sessions"):
+        return False
+    return True
+
+
+def sweep(paths: Paths, state: dict, out, alert, alert_owner) -> None:
+    sessions = claude_sessions(state)
+    switched = last_switch_at(state)
+    now = time.time()
+    if sessions is None or not switched or now - switched > SWEEP_WINDOW_SECONDS \
+            or (state.get("config") or {}).get("sweep") is False:
+        return
+    done = state.setdefault("reprompted", {})
+    for key in [k for k, at in done.items() if now - at > 2 * 86400]:
+        del done[key]
+    prompted, owner = [], []
+    # Two switches can share a second; the count tells them apart.
+    switch_count = sum(1 for h in state.get("history", []) if h.get("event") == "switch")
+    for item in sessions:
+        uid = item.get("session_uid")
+        key = f"{uid}@{int(switched)}#{switch_count}"
+        if not uid or not item.get("idle") or key in done \
+                or not sweep_eligible(item, state.get("config") or {}):
+            continue
+        try:
+            info = daemon_rpc("resolve_authorized_session", {"session_uid": uid})
+        except AccountError:
+            continue
+        entry = last_transcript_entry((info or {}).get("transcript_path") or "")
+        if not entry or entry.get("type") != "assistant" or not entry.get("isApiErrorMessage"):
+            continue
+        at = parse_time(entry.get("timestamp"))
+        error = entry.get("error")
+        if at is None or (at < switched and not (
+                error == "rate_limit" and switched - at <= STOPPED_ON_LIMIT_LOOKBACK_SECONDS)):
+            continue
+        name = item.get("label") or uid
+        if error in OWNER_ERRORS:
+            done[key] = now
+            owner.append(f"{name} ({error})")
+            continue
+        if len(prompted) >= SWEEP_MAX_PER_RUN:
+            break
+        try:
+            daemon_rpc("send_input", {"session_uid": uid, "text": REPROMPT_TEXT, "submit": True})
+        except AccountError as exc:
+            print(f"warning: could not re-prompt {name}: {exc}", file=sys.stderr)
+            continue
+        done[key] = now
+        prompted.append(f"{name} ({error or 'error'})")
+        log_alert(paths, f"sweep: re-prompted {name} [{uid}] after {error or 'an API error'} "
+                         f"at {entry.get('timestamp')}")
+    me = host_name(state)
+    if prompted:
+        record_history(state, "sweep", reprompted=len(prompted), reason=", ".join(prompted)[:500])
+        alert(f"{me}: re-prompted {len(prompted)} session(s) stopped by an API error around the "
+              f"last switch: {', '.join(prompted)}")
+    if owner:
+        alert_owner(f"{me}: sessions refused by Anthropic for a billing or account problem, not "
+                    f"re-prompted: {', '.join(owner)}")
 
 
 # --- hub: the coordinator's control plane -------------------------------------------
@@ -1732,6 +1885,8 @@ CONFIG_KEYS = {
     "notify_command": (lambda v: v or None, str(DEFAULT_NOTIFY)),
     "hub": (lambda v: v if v == "local" or PEER_NAME.match(v) else None, "none"),
     "host_name": (lambda v: v if PEER_NAME.match(v) else None, "this machine's short hostname"),
+    "sweep": (lambda v: {"true": True, "false": False}.get(v), "true"),
+    "sweep_owner_sessions": (lambda v: {"true": True, "false": False}.get(v), "false"),
     "usage_interval_minutes": (lambda v: int(v) if v.isdigit() else None, "9"),
     "peers": (lambda v: [h for h in v.split(",") if h] if all(
         PEER_NAME.match(h) for h in v.split(",") if h) else None, "none"),
@@ -1915,6 +2070,7 @@ def cmd_poll(paths: Paths, state: dict, out, notify_command: str) -> int:
     mode = effective_mode(state)
     if limits is not None and state.get("active") in accounts:
         decide(paths, state, accounts, limits, mode, out, alert)
+    sweep(paths, state, out, alert, alert_owner)  # also counts live sessions for the report
     reply = hub_exchange(paths, state, out)
     if reply is not None:
         apply_assignment(paths, state, load_accounts(paths), reply, out)
@@ -1962,6 +2118,47 @@ def cmd_switch(paths: Paths, state: dict, target_name: str, out) -> int:
     else:
         print(f"switched {label(accounts[current])} -> {label(record)}", file=out)
     return 0
+
+
+def run_login_session(paths: Paths, out, claude_command: str = "claude") -> Path:
+    """Run Claude Code in a private scratch config directory so /login there
+    never touches this host's own login (its sessions keep running). Runs
+    without the store lock: it waits on a person."""
+    scratch = paths.store / "login-scratch"
+    init_store(paths)
+    shutil.rmtree(scratch, ignore_errors=True)
+    scratch.mkdir(mode=0o700)
+    print("Claude Code is starting in a scratch directory; this host's sessions are not affected.\n"
+          "Type /login, sign in as the account to add, then /exit.", file=out)
+    out.flush()
+    try:
+        subprocess.run([claude_command], env=dict(os.environ, CLAUDE_CONFIG_DIR=str(scratch)))
+    except OSError as exc:
+        shutil.rmtree(scratch, ignore_errors=True)
+        raise AccountError(f"could not start {claude_command} ({type(exc).__name__})") from None
+    return scratch
+
+
+def cmd_login_save(paths: Paths, state: dict, scratch: Path, out) -> int:
+    """Save the scratch directory's login, then delete the scratch copy."""
+    try:
+        scratch_paths = Paths(scratch, scratch / ".claude.json", paths.store)
+        try:
+            login = read_login(scratch_paths)
+        except AccountError:
+            raise AccountError("no login was made in the scratch session; run `login` again "
+                               "and type /login there") from None
+        accounts = load_accounts(paths)
+        uuid, how = identify(login, accounts)
+        if uuid == state.get("active"):
+            raise AccountError(f"{label(accounts[uuid])} is already this host's active login; "
+                               "nothing saved (its live copy stays authoritative)")
+        record = save_login(paths, accounts, uuid, login, read_profile(scratch_paths))
+        record_history(state, "login", account=uuid, identified_by=how)
+        print(f"saved {label(record)}; this host stays on its current account", file=out)
+        return 0
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def cmd_remove(paths: Paths, state: dict, name: str, out) -> int:
@@ -2033,6 +2230,9 @@ def main(argv: list[str] | None = None, paths: Paths | None = None, out=None) ->
         p.add_argument("-n", type=int, default=50)
         p.add_argument("--since")
         p.add_argument("--json", action="store_true")
+    login = sub.add_parser("login", help="add an account without moving this host: /login in a "
+                           "scratch Claude session, then save it")
+    login.add_argument("--claude-command", default="claude", help=argparse.SUPPRESS)
     install = sub.add_parser("install", help="copy to ~/.local/bin and start the poll timer "
                              "(run from a checkout)")
     install.add_argument("--no-timer", action="store_true")
@@ -2060,6 +2260,13 @@ def main(argv: list[str] | None = None, paths: Paths | None = None, out=None) ->
         except (AccountError, OSError, ValueError, KeyError) as exc:
             print(f"cm-claude-accounts: {exc}", file=sys.stderr)
             return 1
+    scratch = None
+    if args.command == "login":
+        try:
+            scratch = run_login_session(paths, out, args.claude_command)
+        except (AccountError, OSError) as exc:
+            print(f"cm-claude-accounts: {exc}", file=sys.stderr)
+            return 1
     if args.command == "export":
         # No store lock: two hosts reading each other while each holds its
         # own lock would wait on each other. state.json is replaced
@@ -2080,6 +2287,8 @@ def main(argv: list[str] | None = None, paths: Paths | None = None, out=None) ->
             try:
                 if args.command == "capture":
                     return cmd_capture(paths, state, out)
+                if args.command == "login":
+                    return cmd_login_save(paths, state, scratch, out)
                 if args.command == "list":
                     return cmd_list(paths, state, out)
                 if args.command == "status":

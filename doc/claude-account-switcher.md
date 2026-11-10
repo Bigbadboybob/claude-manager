@@ -406,8 +406,15 @@ on the laptop):
    triggered the switch (`error: rate_limit`). The prompt is "Continue where
    you left off (the Claude account was switched)", sent the way CM's
    `send_input` submits.
-3. Never re-prompt the same error entry twice. Don't re-prompt on
-   `oauth_org_not_allowed` or `account_on_hold`: alert instead.
+3. Once per session per switch, and every re-prompt is logged (alerts.log,
+   history, and a coordinator alert naming the sessions). Billing and
+   account-hold errors (`oauth_org_not_allowed`, `account_on_hold`) are
+   never re-prompted: they alert Owner.
+4. Only sessions an agent manages (`managed_by_uid` set). Never bash
+   shells, and never sessions a continuous task or workflow owns, since
+   their scheduler does. Owner's own sessions only with `config
+   sweep_owner_sessions true` (Swarm-Coord for Owner, 2026-11-10). At most
+   20 per run.
 
 Errors seen in cm-sessions transcripts over the last 14 days:
 `rate_limit` (429, 432 entries), `authentication_failed` ("Not logged in",
@@ -415,43 +422,103 @@ Errors seen in cm-sessions transcripts over the last 14 days:
 matches the entry's shape, not the text, so it doesn't depend on the exact
 text of the post-switch bug.
 
-### The coordinator's own account
+### Alerts with a hub (Swarm-Coord for Owner, 2026-11-10)
 
-The coordinator session runs with `CLAUDE_CONFIG_DIR=~/.claude-coordinator`
-(supported by Claude Code 2.1.322), so it has its own credentials file and
-refresh lock, and host-wide switches on cm-manager never touch it. claudelb
-gets `--claude-dir` to read that slot's usage and alert on it, and the hub
-reserves that account for `cm-manager:coordinator`. **Verify** on cm-manager
-that the variable moves `.credentials.json`, `.claude.json` and the refresh
-lock, before Owner's login for it.
+Per-host alerts (thresholds, poll failures, automatic switches, sweeps) go
+to the hub's alert log (`hub alerts`). If `hub policy coordinator_command`
+is set, the hub also runs that command once per alert to wake the
+coordinator. They queue on the host while the hub is unreachable. Owner's
+Telegram gets only what needs Owner: a saved login that expired or an
+active login that isn't saved, billing or hold refusals, and one hub alert
+when few accounts have room left anywhere (`hub policy low_room_accounts`,
+default 1; repeated only if it gets worse, or after 6 h).
 
-### Logins Owner does (once, at the end)
+### cm-manager's account
 
-One `/login` per account per host that may use it; an agent starts the
-session and runs `capture`, Owner only completes the browser step:
+Continuous tasks and the coordinator share cm-manager's one fixed account
+(Swarm-Coord for Owner, 2026-11-10): the hub pins cm-manager to it and
+reserves it for cm-manager, so no other host or drain takes it. No separate
+coordinator login. Risk: continuous work could use up the coordinator's
+room too. The coordinator watches that account first, and `hub critical`
+lists the coordinator as critical work.
 
-- **laptop:** none (bender0, bender7, bender192801 and lklein9900 are
-  already saved);
-- **cm-sessions:** one per pool account it may use (up to 4);
-- **cm-manager:** one per pool account its continuous work may use (1-2),
-  plus 1 for the coordinator's own account.
+### Logins without moving a host
 
-So 3-7 logins in all. Fewer (one per account) would need long-lived
-`claude setup-token` tokens shared across hosts. That breaks the
-"never share logins across hosts" rule, and it's unverified whether the usage
-endpoint accepts such tokens, so it is not planned.
+`cm-claude-accounts login` runs `claude` with `CLAUDE_CONFIG_DIR` set to a
+private scratch directory. There Owner types `/login` and completes the
+browser step, then `/exit`. The tool then saves that account (confirmed with
+Anthropic) and deletes the scratch copy. The host's own login is never
+touched, so its sessions keep running and keep their cache. Checked on
+cm-sessions (Claude Code 2.1.322): with `CLAUDE_CONFIG_DIR` set, Claude
+Code reads and writes `.claude.json` and the credentials inside that
+directory ("Not logged in" there, home files unchanged). The account each
+host is on now needs no login at all: `capture` saves it.
 
-### Build order
+Accounts seen on 2026-11-10: laptop has bender0, bender7, bender192801 and
+lklein9900 saved (active bender7); cm-sessions is on bender1@kleinatc.com;
+cm-manager is on bender192802@gmail.com. Neither cloud host has anything
+saved yet.
 
-1. Hub store, `hub checkin`, `assign`/`status`, apply (`pin`/`manual`) on
-   hosts; 2-min timer with the 10-min usage budget.
-2. `reserve`/`release`, `drain`/`undrain`, `policy`, `history`; `auto`
-   honouring reservations and drains.
-3. Sweep and re-prompt (fake daemon and transcripts in tests).
-4. `--claude-dir` and the coordinator's own account.
-5. Real checks: the hub on cm-manager (script only: no login and no switch there),
-   then the laptop checking in to it (claudelb-local), then rollout with
-   Owner's logins.
+So per host: **laptop** none. **cm-manager** none if its account is the
+one it's on now (capture), else 1. **cm-sessions** capture its current
+account, plus one scratch `login` for each other account it may use.
+
+### Build status
+
+1-2 (hub, check-in, apply, coordinator commands, alert routing): built,
+5fd01446. 3 (sweep): built. `login` (scratch-directory capture): built. 109 tests;
+the sweep, hub and alert-routing rules each fail a test when broken.
+The coordinator's separate config directory: dropped (cm-manager's one
+account serves both). Real checks happen at cutover, below.
+
+## Cutover runbook (target 2026-11-10 13:00Z)
+
+Owner's only part is the browser login in step 4. Agents do everything
+else. `claudelb` drives the cloud hosts (Owner approval for the cloud
+captures and logins is the cutover itself), and `claudelb-local` drives the
+laptop. Install everything from one commit, `<SHA>` below (the head of
+`cm/claudelb` at cutover).
+
+1. **Hub on cm-manager** (claudelb, over ssh; no login, no switch):
+   copy `scripts/cm-claude-accounts` and `deploy/` at `<SHA>` to
+   `~/.local/share/cm-claude-accounts/src/` (with an `OWNER.md`), then
+   `python3 ~/.local/share/cm-claude-accounts/src/scripts/cm-claude-accounts install --no-timer`,
+   `cm-claude-accounts config hub local`, `config host_name cm-manager`,
+   `hub policy notify_command ~/.cm/bin/cm-notify`, `hub status`
+   (creates the hub store; add an `OWNER.md` to
+   `~/.config/cm-claude-accounts/`).
+2. **Laptop** (claudelb-local): check out `<SHA>`, `install` (timer
+   already running), `config host_name laptop`, `config hub cm-manager`,
+   then `status` and confirm `hub cm-manager as laptop: checked in`.
+   On cm-manager: `hub assign laptop bender7@kleinatc.com --pin` (it's
+   already on it, so no switch).
+3. **Capture the cloud hosts' current logins** (claudelb; no switch, no
+   login): on cm-sessions and on cm-manager, `cm-claude-accounts capture`.
+   Then on each, `config host_name <host>`, `config hub cm-manager` (cm-manager: `local`),
+   `install` (starts the 2-min timer). `hub status` should show all three
+   hosts on their current accounts.
+4. **Owner's logins** (cm-sessions; repeat for each extra account it may
+   use): an agent starts a CM bash session on cm-sessions running
+   `cm-claude-accounts login`. Owner attaches, types `/login`, signs in as
+   that account in the browser, then `/exit`. The tool prints `saved <email>`.
+   If cm-manager's chosen account isn't the one it's on, do the same once
+   there.
+5. **Assignments** (claudelb on cm-manager): `hub reserve <cm-manager's account> --for cm-manager`,
+   `hub assign cm-manager <it> --pin`, `hub assign cm-sessions <its current account> --pin`
+   (nothing moves), any reservations Owner names. Leave `default_mode`
+   manual, so nothing switches until the coordinator decides.
+6. **Check:** `hub status` shows every host checked in within 2 min, each
+   apply `ok`, accounts saved where expected, no `NO ROOM` surprises.
+   `hub history` shows no switch. Each host's `status` names the hub.
+7. **Hand over** to the coordinator (Swarm-Coord): set `hub policy
+   coordinator_command <wake script>` once the coordinator exists; brief
+   it on `hub status --json`, `assign`, `drain`, `reserve`, `critical`,
+   `alerts`.
+
+**Rollback** per host: `cm-claude-accounts config hub default` (back to
+local suggest mode; the timer keeps reading usage), or `systemctl --user
+disable --now cm-claude-accounts-poll.timer`. Saved logins stay; nothing
+needs Owner.
 
 ## Plan
 
@@ -581,6 +648,8 @@ hosts (see Multiple hosts).
 ```bash
 scripts/cm-claude-accounts install    # from a checkout: ~/.local/bin + poll timer
 cm-claude-accounts capture            # right after each /login
+cm-claude-accounts login              # add an account without moving this host (scratch /login)
+cm-claude-accounts hub status         # on the hub (cm-manager): every host and account
 cm-claude-accounts status             # dashboard: every account's freshest reading
 cm-claude-accounts switch <email>     # move every session on this host
 cm-claude-accounts config             # list settings; `config KEY VALUE` changes one

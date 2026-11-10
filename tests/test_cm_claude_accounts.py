@@ -1399,6 +1399,15 @@ class HubTests(HubHarness):
         self.hub("undrain", "alice")
         self.assertEqual(self.hub("assign", "cm-sessions", "alice")[0], 0)
 
+    def test_drain_never_uses_an_account_reserved_for_others(self):
+        self.set_reading("bob", ("weekly_all", None, 10, 86400, True))
+        self.set_reading("carol", ("weekly_all", None, 60, 86400, True))
+        self.poll()
+        self.other_host(host_export("cm-sessions", active="dave", saved=["dave"]))
+        self.hub("reserve", "bob", "--for", "cm-sessions")
+        code, text = self.hub("drain", "alice", "--dry-run")
+        self.assertIn("laptop: alice@example.com -> carol@example.com", text)
+
     def test_drain_with_nowhere_to_go_says_so(self):
         self.set_reading("bob", ("weekly_all", None, 97, 86400, True))
         self.set_reading("carol", ("weekly_all", None, 97, 86400, True))
@@ -1513,6 +1522,254 @@ class RemoteCheckinTests(unittest.TestCase):
         self.assertEqual(reply["revision"], 3)
         with self.assertRaises(accounts.AccountError):
             accounts.remote_checkin("-oProxyCommand=x", export)
+
+
+def ts_iso(offset):
+    return datetime.fromtimestamp(time.time() + offset, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class SweepTests(AutoswitchHarness):
+    """After a switch, re-prompt idle agent sessions stopped by an API error, once."""
+
+    def setUp(self):
+        super().setUp()  # switched to alice moments ago
+        self.tdir = self.paths.store.parent / "transcripts"
+        self.tdir.mkdir()
+        self.sessions = []
+        self.sent_inputs = []
+        self.daemon_down = False
+
+        def rpc(method, params, timeout=10.0):
+            if self.daemon_down:
+                raise accounts.AccountError("CM daemon unavailable (FileNotFoundError)")
+            if method == "list_sessions":
+                return [dict(s) for s in self.sessions]
+            if method == "resolve_authorized_session":
+                return {"transcript_path": str(self.tdir / f"{params['session_uid']}.jsonl")}
+            if method == "send_input":
+                self.sent_inputs.append(params)
+                return {"ok": True}
+            raise AssertionError(method)
+
+        self.enterContext(mock.patch.object(accounts, "daemon_rpc", side_effect=rpc))
+
+    def session(self, uid, last=None, error="rate_limit", offset=60, idle=True, **fields):
+        item = {"session_uid": uid, "label": uid, "type": "claude-code", "state": "ready", "idle": idle,
+                "managed_by_uid": "ts-lead", "continuous_task_id": None, "workflow_run_id": None}
+        item.update(fields)
+        self.sessions.append(item)
+        lines = [{"type": "user", "message": {"content": "do work"}, "timestamp": ts_iso(-7200)}]
+        if last == "error":
+            lines.append({"type": "assistant", "isApiErrorMessage": True, "error": error,
+                          "uuid": f"e-{uid}", "timestamp": ts_iso(offset),
+                          "message": {"content": [{"type": "text", "text": "API Error"}]}})
+        elif last == "ok":
+            lines.append({"type": "assistant", "timestamp": ts_iso(offset),
+                          "message": {"content": [{"type": "text", "text": "done"}]}})
+        (self.tdir / f"{uid}.jsonl").write_text("\n".join(json.dumps(l) for l in lines) + "\n")
+
+    def prompted(self):
+        return [p["session_uid"] for p in self.sent_inputs]
+
+    def test_errored_agent_session_is_reprompted_once_and_logged(self):
+        self.session("w1", "error", "authentication_failed", offset=5)
+        self.poll()
+        self.assertEqual(self.prompted(), ["w1"])
+        self.assertEqual(self.sent_inputs[0]["text"], accounts.REPROMPT_TEXT)
+        self.assertTrue(self.sent_inputs[0]["submit"])
+        self.poll()
+        self.assertEqual(self.prompted(), ["w1"])  # once per switch
+        log = (self.paths.store / "alerts.log").read_text()
+        self.assertIn("sweep: re-prompted w1 [w1] after authentication_failed", log)
+        self.assertIn("re-prompted 1 session(s) stopped by an API error around the last switch: "
+                      "w1 (authentication_failed)", log)
+        self.assertEqual(self.state()["history"][-1]["event"], "sweep")
+        self.assertEqual(self.state()["sessions"]["live"], 1)
+
+    def test_stopped_on_the_limit_before_the_switch_counts_recently_only(self):
+        self.session("recent", "error", "rate_limit", offset=-3600)
+        self.session("old", "error", "rate_limit", offset=-20 * 3600)
+        self.session("other", "error", "authentication_failed", offset=-3600)
+        self.poll()
+        self.assertEqual(self.prompted(), ["recent"])
+
+    def test_busy_sessions_and_normal_endings_are_left_alone(self):
+        self.session("busy", "error", offset=5, idle=False)
+        self.session("fine", "ok", offset=5)
+        self.poll()
+        self.assertEqual(self.prompted(), [])
+
+    def test_shells_scheduler_owned_and_owner_sessions_are_never_prompted(self):
+        self.session("shell", "error", offset=5, type="bash")
+        self.session("cont", "error", offset=5, continuous_task_id="bug-triage")
+        self.session("wf", "error", offset=5, workflow_run_id="run-1")
+        self.session("owner", "error", offset=5, managed_by_uid=None)
+        self.poll()
+        self.assertEqual(self.prompted(), [])
+        self.assertEqual(self.run_cli("config", "sweep_owner_sessions", "true")[0], 0)
+        self.poll()
+        self.assertEqual(self.prompted(), ["owner"])
+
+    def test_billing_and_hold_errors_go_to_owner_not_reprompted(self):
+        self.session("held", "error", "account_on_hold", offset=5)
+        self.poll()
+        self.assertEqual(self.prompted(), [])
+        self.assertTrue(any("billing or account problem, not re-prompted: held (account_on_hold)" in a
+                            for a in self.alerts()))
+
+    def test_nothing_happens_outside_the_window_or_when_disabled(self):
+        self.session("w1", "error", offset=-60)
+        self.age_last_switch(31 * 60)
+        self.poll()
+        self.assertEqual(self.prompted(), [])
+        self.age_last_switch(-31 * 60)
+        self.run_cli("config", "sweep", "false")
+        self.poll()
+        self.assertEqual(self.prompted(), [])
+
+    def test_each_new_switch_allows_one_more(self):
+        self.session("w1", "error", offset=5)
+        self.poll()
+        self.run_cli("switch", "bob@example.com")
+        self.session_error_again("w1")
+        self.poll()
+        self.assertEqual(self.prompted(), ["w1", "w1"])
+
+    def session_error_again(self, uid):
+        path = self.tdir / f"{uid}.jsonl"
+        with open(path, "a") as f:
+            f.write(json.dumps({"type": "assistant", "isApiErrorMessage": True, "error": "rate_limit",
+                                "uuid": f"e2-{uid}", "timestamp": ts_iso(5),
+                                "message": {"content": [{"type": "text", "text": "API Error"}]}}) + "\n")
+
+    def test_daemon_down_does_not_break_poll(self):
+        self.daemon_down = True
+        self.session("w1", "error", offset=5)
+        code, text = self.poll()
+        self.assertEqual(code, 0, text)
+        self.assertIsNone(self.state()["sessions"])
+
+    def test_cap_per_run(self):
+        for i in range(accounts.SWEEP_MAX_PER_RUN + 3):
+            self.session(f"w{i}", "error", offset=5)
+        self.poll()
+        self.assertEqual(len(self.prompted()), accounts.SWEEP_MAX_PER_RUN)
+        self.poll()
+        self.assertEqual(len(self.prompted()), accounts.SWEEP_MAX_PER_RUN + 3)
+
+
+class DaemonRpcTests(unittest.TestCase):
+    def test_framing_token_and_errors(self):
+        import socket as socketlib
+        import struct
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = Path(tmp.name)
+        (home / ".cm").mkdir()
+        (home / ".cm/operator-token").write_text("tok-123\n")
+        sock_path = str(home / "d.sock")
+        server = socketlib.socket(socketlib.AF_UNIX)
+        server.bind(sock_path)
+        server.listen(2)
+        seen = []
+
+        def serve():
+            for reply in ({"ok": True, "result": [{"session_uid": "a"}]},
+                          {"ok": False, "error": {"code": "unauthorized", "message": "x"}}):
+                conn, _ = server.accept()
+                with conn:
+                    n = struct.unpack(">I", conn.recv(4))[0]
+                    data = b""
+                    while len(data) < n:
+                        data += conn.recv(n - len(data))
+                    seen.append(json.loads(data))
+                    body = json.dumps(reply).encode()
+                    conn.sendall(struct.pack(">I", len(body)) + body)
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        with mock.patch.dict(os.environ, {"HOME": str(home), "CM_DAEMON_SOCKET": sock_path}):
+            self.assertEqual(accounts.daemon_rpc("list_sessions", {}), [{"session_uid": "a"}])
+            with self.assertRaises(accounts.AccountError) as cm:
+                accounts.daemon_rpc("send_input", {"session_uid": "a"})
+            self.assertIn("unauthorized", str(cm.exception))
+        thread.join(5)
+        server.close()
+        self.assertEqual(seen[0]["caller"], {"token_id": "tok-123"})
+        self.assertEqual(seen[0]["method"], "list_sessions")
+        with mock.patch.dict(os.environ, {"HOME": str(home), "CM_DAEMON_SOCKET": str(home / "none.sock")}):
+            with self.assertRaises(accounts.AccountError):
+                accounts.daemon_rpc("list_sessions", {})
+
+
+class LoginTests(Harness):
+    """`login` adds an account in a scratch config dir; the host's login never moves."""
+
+    def setUp(self):
+        super().setUp()
+        self.do_login("alice")
+        self.run_cli("capture")
+        root = self.paths.store.parent
+        self.fake_claude = root / "fake-claude.sh"
+
+    def claude_that_logs_in_as(self, name):
+        oauth = login(f"scratch-{name}")
+        self.tokens.update({oauth["accessToken"], oauth["refreshToken"]})
+        self.anthropic[oauth["accessToken"]] = profile(name)["accountUuid"]
+        creds = json.dumps({"claudeAiOauth": oauth})
+        prof = json.dumps({"oauthAccount": profile(name), "numStartups": 1})
+        self.fake_claude.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s' '{creds}' > \"$CLAUDE_CONFIG_DIR/.credentials.json\"\n"
+            f"printf '%s' '{prof}' > \"$CLAUDE_CONFIG_DIR/.claude.json\"\n")
+        self.fake_claude.chmod(0o700)
+
+    def login_cli(self):
+        return self.run_cli("login", "--claude-command", str(self.fake_claude))
+
+    def test_saves_the_new_account_without_touching_the_host(self):
+        before = self.paths.credentials.read_bytes(), self.paths.claude_json.read_bytes()
+        self.claude_that_logs_in_as("bob")
+        code, text = self.login_cli()
+        self.assertEqual(code, 0, text)
+        self.assertIn("saved bob@example.com (bob-uuid); this host stays on its current account", text)
+        self.assertEqual((self.paths.credentials.read_bytes(), self.paths.claude_json.read_bytes()), before)
+        saved = json.loads((self.paths.accounts / "bob-uuid-0000.json").read_text())
+        self.assertEqual(saved["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-scratch-bob")
+        self.assertEqual(saved["oauthAccount"]["emailAddress"], "bob@example.com")
+        self.assertEqual(self.state()["active"], "alice-uuid-0000")
+        self.assertFalse((self.paths.store / "login-scratch").exists())
+        # and switching to it works
+        self.assertEqual(self.run_cli("switch", "bob@example.com")[0], 0)
+        self.assertEqual(self.live()["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-scratch-bob")
+
+    def test_no_login_made_is_an_error_and_cleans_up(self):
+        self.fake_claude.write_text("#!/bin/sh\nexit 0\n")
+        self.fake_claude.chmod(0o700)
+        code, text = self.login_cli()
+        self.assertEqual(code, 1)
+        self.assertIn("no login was made in the scratch session", text)
+        self.assertFalse((self.paths.store / "login-scratch").exists())
+
+    def test_the_active_account_is_not_overwritten(self):
+        self.claude_that_logs_in_as("alice")
+        code, text = self.login_cli()
+        self.assertEqual(code, 1)
+        self.assertIn("already this host's active login", text)
+        saved = json.loads((self.paths.accounts / "alice-uuid-0000.json").read_text())
+        self.assertEqual(saved["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-alice")
+        self.assertFalse((self.paths.store / "login-scratch").exists())
+
+    def test_runs_without_holding_the_store_lock(self):
+        flag = self.paths.store.parent / "lock-was-free"
+        lock = self.paths.store / "lock"
+        self.fake_claude.write_text(
+            "#!/bin/sh\n"
+            f"python3 -c 'import fcntl,os; fd=os.open(\"{lock}\", os.O_RDWR); "
+            f"fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB); open(\"{flag}\",\"w\")'\n")
+        self.fake_claude.chmod(0o700)
+        self.login_cli()
+        self.assertTrue(flag.exists(), "the store lock was held while claude ran")
 
 
 if __name__ == "__main__":
