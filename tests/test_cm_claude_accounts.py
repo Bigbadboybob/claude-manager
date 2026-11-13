@@ -1782,6 +1782,85 @@ class LoginTests(Harness):
         self.login_cli()
         self.assertTrue(flag.exists(), "the store lock was held while claude ran")
 
+    def test_login_into_a_folder_leaves_this_hosts_store_alone(self):
+        folder = self.paths.store.parent / "outgoing"
+        before = sorted(p.name for p in self.paths.accounts.iterdir())
+        self.claude_that_logs_in_as("alice")  # even this host's active account
+        code, text = self.run_cli("login", "--into", str(folder), "--claude-command", str(self.fake_claude))
+        self.assertEqual(code, 0, text)
+        self.claude_that_logs_in_as("bob")
+        code, text = self.run_cli("login", "--into", str(folder), "--claude-command", str(self.fake_claude))
+        self.assertEqual(code, 0, text)
+        self.assertEqual(sorted(p.name for p in (folder / "accounts").iterdir()),
+                         ["alice-uuid-0000.json", "bob-uuid-0000.json"])
+        self.assertEqual(sorted(p.name for p in self.paths.accounts.iterdir()), before)
+        self.assertEqual(oct((folder / "accounts").stat().st_mode & 0o777), "0o700")
+        self.assertFalse((folder / "login-scratch").exists())
+
+    def outgoing_with(self, *names):
+        folder = self.paths.store.parent / "outgoing"
+        for name in names:
+            self.claude_that_logs_in_as(name)
+            self.assertEqual(self.run_cli("login", "--into", str(folder),
+                                          "--claude-command", str(self.fake_claude))[0], 0)
+        return folder
+
+    def test_import_saves_logins_and_deletes_the_folder_but_never_the_active_one(self):
+        folder = self.outgoing_with("alice", "bob")
+        code, text = self.run_cli("import", str(folder))
+        self.assertEqual(code, 0, text)
+        self.assertIn("imported bob@example.com", text)
+        self.assertIn("skipped alice@example.com (alice-uu): it is this host's active login", text)
+        bob = json.loads((self.paths.accounts / "bob-uuid-0000.json").read_text())
+        self.assertEqual(bob["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-scratch-bob")
+        alice = json.loads((self.paths.accounts / "alice-uuid-0000.json").read_text())
+        self.assertEqual(alice["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-alice")
+        self.assertFalse(folder.exists())
+        self.assertEqual(self.run_cli("switch", "bob@example.com")[0], 0)
+
+    def test_switch_works_on_a_host_with_a_blank_login(self):
+        self.run_cli("import", str(self.outgoing_with("bob")))
+        blank = {"claudeAiOauth": {"accessToken": "", "refreshToken": "", "expiresAt": 0}}
+        self.paths.credentials.write_text(json.dumps(blank))
+        inode = self.paths.credentials.stat().st_ino
+        code, text = self.run_cli("switch", "bob@example.com")
+        self.assertEqual(code, 0, text)
+        self.assertIn("switched no login -> bob@example.com", text)
+        self.assertEqual(self.live()["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-scratch-bob")
+        self.assertEqual(self.paths.credentials.stat().st_ino, inode)
+        self.assertEqual(self.state()["active"], "bob-uuid-0000")
+        alice = json.loads((self.paths.accounts / "alice-uuid-0000.json").read_text())
+        self.assertEqual(alice["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-alice")
+
+    def test_transfer_sends_imports_then_deletes_and_keeps_the_folder_on_failure(self):
+        folder = self.outgoing_with("bob")
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return mock.Mock(returncode=self.fail_at if len(calls) == self.fail_step else 0,
+                             stdout="", stderr="boom")
+
+        self.fail_step, self.fail_at = 2, 1
+        with mock.patch.object(accounts.subprocess, "run", side_effect=fake_run):
+            code, text = self.run_cli("transfer", str(folder), "cm-sessions")
+        self.assertEqual(code, 1)
+        self.assertIn("failed at `scp`", text)
+        self.assertTrue((folder / "accounts" / "bob-uuid-0000.json").exists())
+
+        calls.clear()
+        self.fail_step = 0
+        with mock.patch.object(accounts.subprocess, "run", side_effect=fake_run):
+            code, text = self.run_cli("transfer", str(folder), "cm-sessions")
+        self.assertEqual(code, 0, text)
+        self.assertEqual([c[0] for c in calls], ["ssh", "scp", "ssh"])
+        remote = calls[0][-1].split()[-1].rsplit("/accounts", 1)[0]
+        self.assertTrue(remote.startswith(accounts.INCOMING_PREFIX))
+        self.assertEqual(calls[1][-1], f"cm-sessions:{remote}/accounts/")
+        self.assertEqual(calls[2][-1], f"{accounts.REMOTE_IMPORT} {remote}")
+        self.assertFalse(folder.exists())
+        self.assertEqual(self.run_cli("transfer", str(folder), "a;b")[0], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

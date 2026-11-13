@@ -40,6 +40,10 @@ class AccountError(Exception):
     pass
 
 
+class NoLogin(AccountError):
+    """The host's credentials file holds no login (blank or missing)."""
+
+
 class TokenRejected(AccountError):
     """Anthropic answered 401: the access token expired early or was revoked."""
 
@@ -121,7 +125,7 @@ def write_in_place(path: Path, data: dict) -> None:
 def read_login(paths: Paths) -> dict:
     oauth = load_json(paths.credentials).get("claudeAiOauth")
     if not isinstance(oauth, dict) or not oauth.get("refreshToken"):
-        raise AccountError("no Claude login in .credentials.json; run /login first")
+        raise NoLogin("no Claude login in .credentials.json; run /login first")
     return oauth
 
 
@@ -2083,11 +2087,23 @@ def cmd_poll(paths: Paths, state: dict, out, notify_command: str) -> int:
 def cmd_switch(paths: Paths, state: dict, target_name: str, out) -> int:
     accounts = load_accounts(paths)
     target = resolve(accounts, target_name)
-    lock, login, current, how = identify_locked(paths, accounts)
+    try:
+        lock, login, current, how = identify_locked(paths, accounts)
+    except NoLogin:
+        # A host with no login at all (logged out): nothing to write back.
+        lock, login, current, how = RefreshLock(paths).__enter__(), None, None, "no login"
+        try:
+            read_login(paths)
+        except NoLogin:
+            pass
+        else:
+            lock.__exit__(None, None, None)
+            raise AccountError("a login appeared while switching; try again") from None
     with lock:
-        save_login(paths, accounts, current, login, read_profile(paths))
-        if current != state.get("active"):
-            record_history(state, "external-login", account=current, identified_by=how)
+        if login is not None:
+            save_login(paths, accounts, current, login, read_profile(paths))
+            if current != state.get("active"):
+                record_history(state, "external-login", account=current, identified_by=how)
         state["active"] = current
         record = accounts[target]
         if current != target:
@@ -2119,7 +2135,8 @@ def cmd_switch(paths: Paths, state: dict, target_name: str, out) -> int:
     if current == target:
         print(f"already on {label(record)}", file=out)
     else:
-        print(f"switched {label(accounts[current])} -> {label(record)}", file=out)
+        before = label(accounts[current]) if current else "no login"
+        print(f"switched {before} -> {label(record)}", file=out)
     return 0
 
 
@@ -2162,6 +2179,61 @@ def cmd_login_save(paths: Paths, state: dict, scratch: Path, out) -> int:
         return 0
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+REMOTE_IMPORT = "python3 .local/bin/cm-claude-accounts import"
+INCOMING_PREFIX = ".config/cm-claude-accounts/incoming-"
+
+
+def cmd_transfer(folder: Path, host: str, out) -> int:
+    """Move the logins saved in FOLDER (by `login --into FOLDER`) to HOST's
+    store, then delete FOLDER. A login must live in one place only: a copy
+    left behind could refresh and lock the other out."""
+    if not PEER_NAME.match(host):
+        raise AccountError(f"bad host name {host!r}")
+    records = load_accounts(Paths(folder, folder / ".claude.json", folder))
+    if not records:
+        raise AccountError(f"no saved logins in {folder}; run `login --into {folder}` first")
+    remote = f"{INCOMING_PREFIX}{int(time.time())}-{os.getpid()}"
+    ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+    steps = [
+        ssh + [host, f"mkdir -m 700 -p {remote}/accounts"],
+        ["scp", "-q", "-p", "-o", "BatchMode=yes",
+         *[str(p) for p in sorted((folder / "accounts").glob("*.json"))], f"{host}:{remote}/accounts/"],
+        ssh + [host, f"{REMOTE_IMPORT} {remote}"],
+    ]
+    for argv in steps:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+        if result.stdout:
+            out.write(result.stdout)
+        if result.returncode != 0:
+            raise AccountError(f"transfer to {host} failed at `{argv[0]}` (exit {result.returncode}): "
+                               f"{result.stderr.strip()[-300:]}; {folder} is kept, nothing deleted here")
+    shutil.rmtree(folder)
+    print(f"moved {len(records)} login(s) to {host}; deleted {folder}", file=out)
+    return 0
+
+
+def cmd_import(paths: Paths, state: dict, folder: Path, out) -> int:
+    """Save logins another host sent (`transfer`) into this store, then
+    delete the incoming folder. The active account's live copy wins."""
+    records = load_accounts(Paths(folder, folder / ".claude.json", folder))
+    if not records:
+        raise AccountError(f"no logins in {folder}")
+    for uuid, record in records.items():
+        if not isinstance(record.get("claudeAiOauth"), dict) or not record["claudeAiOauth"].get("refreshToken"):
+            print(f"skipped {label(record)}: no login in the record", file=out)
+            continue
+        if uuid == state.get("active"):
+            print(f"skipped {label(record)}: it is this host's active login", file=out)
+            continue
+        record.pop("needs_login", None)
+        record["updated_at"] = int(time.time())
+        save_account(paths, record)
+        record_history(state, "import", account=uuid)
+        print(f"imported {label(record)}", file=out)
+    shutil.rmtree(folder)
+    return 0
 
 
 def cmd_remove(paths: Paths, state: dict, name: str, out) -> int:
@@ -2236,6 +2308,14 @@ def main(argv: list[str] | None = None, paths: Paths | None = None, out=None) ->
     login = sub.add_parser("login", help="add an account without moving this host: /login in a "
                            "scratch Claude session, then save it")
     login.add_argument("--claude-command", default="claude", help=argparse.SUPPRESS)
+    login.add_argument("--into", metavar="FOLDER",
+                       help="save into a separate folder (for `transfer` to another host), not this host's store")
+    transfer = sub.add_parser("transfer", help="move logins saved with `login --into FOLDER` to "
+                              "another host, then delete FOLDER")
+    transfer.add_argument("folder")
+    transfer.add_argument("host")
+    imp = sub.add_parser("import", help="save logins sent by `transfer` (run over ssh by it)")
+    imp.add_argument("folder")
     install = sub.add_parser("install", help="copy to ~/.local/bin and start the poll timer "
                              "(run from a checkout)")
     install.add_argument("--no-timer", action="store_true")
@@ -2263,7 +2343,20 @@ def main(argv: list[str] | None = None, paths: Paths | None = None, out=None) ->
         except (AccountError, OSError, ValueError, KeyError) as exc:
             print(f"cm-claude-accounts: {exc}", file=sys.stderr)
             return 1
+    if args.command == "transfer":
+        try:
+            return cmd_transfer(Path(args.folder).expanduser(), args.host, out)
+        except (AccountError, OSError, subprocess.TimeoutExpired) as exc:
+            print(f"cm-claude-accounts: {exc}", file=sys.stderr)
+            return 1
+    if args.command == "import":
+        # The folder is resolved against home: ssh runs the command there.
+        args.folder = str(Path.home() / Path(args.folder).expanduser()) \
+            if not Path(args.folder).expanduser().is_absolute() else str(Path(args.folder).expanduser())
     scratch = None
+    if args.command == "login" and args.into:
+        # A separate store: nothing here touches this host's own logins.
+        paths = Paths(paths.claude_dir, paths.claude_json, Path(args.into).expanduser().absolute())
     if args.command == "login":
         try:
             scratch = run_login_session(paths, out, args.claude_command)
@@ -2292,6 +2385,8 @@ def main(argv: list[str] | None = None, paths: Paths | None = None, out=None) ->
                     return cmd_capture(paths, state, out)
                 if args.command == "login":
                     return cmd_login_save(paths, state, scratch, out)
+                if args.command == "import":
+                    return cmd_import(paths, state, Path(args.folder), out)
                 if args.command == "list":
                     return cmd_list(paths, state, out)
                 if args.command == "status":
