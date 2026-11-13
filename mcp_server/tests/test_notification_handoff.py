@@ -14,6 +14,7 @@ from mcp_server.claude_channel import CHAT_CONTENT_MAX, ClaudeChannel, channel_c
 from mcp_server.native_claude import (
     ClaudeAdapter,
     argv_session_id,
+    is_bg_pty_host,
     background_match,
     channel_flag_present,
     recovery_record_state,
@@ -502,6 +503,13 @@ class ClaudeEvidenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(argv_session_id(["claude", "bg-pty-host", "--session-id", "new",
                                           "--fork-session", "--resume", "old"]), "new")
         self.assertIsNone(argv_session_id(["claude", "--fork-session", "--resume", "old"]))
+        retitled = ["claude bg-pty-host", "--bg-pty-host", "/tmp/p.sock", "324", "97", "--",
+                    "/x/versions/2.1.323", "--session-id", "new", "--fork-session", "--resume", "old"]
+        self.assertTrue(is_bg_pty_host(retitled))
+        self.assertEqual(argv_session_id(retitled), "new")
+        self.assertTrue(is_bg_pty_host(["claude", "bg-pty-host", "--session-id", "a"]))
+        self.assertFalse(is_bg_pty_host(["claude", "--session-id", "a"]))
+        self.assertFalse(is_bg_pty_host(["claude daemon", "run"]))
         self.assertEqual(argv_session_id(["claude", "--resume=old"]), "old")
         self.assertTrue(channel_flag_present(
             ["claude", "--dangerously-load-development-channels", "server:claude-manager"]))

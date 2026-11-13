@@ -401,6 +401,45 @@ fn proc_argv(pid: u32) -> io::Result<Vec<String>> {
         .collect()
 }
 
+/// The first arguments of a process, read from at most 4 KiB of its
+/// cmdline and decoded lossily. Enough to tell whether it could be a
+/// Claude bg-pty-host when its full argv is unreadable.
+fn argv_head(pid: u32) -> io::Result<Vec<String>> {
+    let file = fs::File::open(format!("/proc/{pid}/cmdline"))?;
+    let mut bytes = Vec::new();
+    file.take(4096).read_to_end(&mut bytes)?;
+    Ok(bytes
+        .split(|b| *b == 0)
+        .take(2)
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect())
+}
+
+/// Could a process with these leading arguments be a Claude bg-pty-host?
+fn could_be_host(head: &[String]) -> bool {
+    is_host_head(head)
+}
+
+/// Does this argv start like a Claude bg-pty-host? Two shapes:
+///   - `claude bg-pty-host …` as separate arguments;
+///   - `"claude bg-pty-host" --bg-pty-host …`: Claude 2.1.3xx rewrites its
+///     process title, so argv[0] is ONE string with a space. Missing this
+///     shape made every A-R background preflight on a live host answer
+///     "identity unavailable or ambiguous" (2026-11-13, Latent-Calibration).
+fn is_host_head(argv: &[String]) -> bool {
+    fn claude_exe(s: &str) -> bool {
+        let exe = Path::new(s).file_name().and_then(|s| s.to_str()).unwrap_or("");
+        exe == "claude" || exe.starts_with("claude-")
+    }
+    let Some(first) = argv.first() else { return false };
+    if claude_exe(first) && argv.get(1).map(String::as_str) == Some("bg-pty-host") {
+        return true;
+    }
+    let mut words = first.split_whitespace();
+    matches!((words.next(), words.next(), words.next()),
+        (Some(exe), Some("bg-pty-host"), None) if claude_exe(exe))
+}
+
 fn fresh_argv(argv: &[String]) -> bool {
     let Some(exe) = argv.first().and_then(|s| Path::new(s).file_name()).and_then(|s| s.to_str()) else { return false };
     (exe == "claude" || exe.starts_with("claude-")) && !argv.iter().skip(1).any(|arg| {
@@ -419,13 +458,7 @@ fn host_argv_matches(argv: &[String], id: &str) -> bool {
     if !exact_session_id(id) || argv.len() < 3 {
         return false;
     }
-    let exe = Path::new(&argv[0])
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    if !(exe == "claude" || exe.starts_with("claude-"))
-        || argv[1] != "bg-pty-host"
-    {
+    if !is_host_head(argv) {
         return false;
     }
     let mut ids = Vec::new();
@@ -463,7 +496,17 @@ fn host_proof(id: &str, holder_pid: Option<u32>) -> io::Result<BackgroundHost> {
         let argv = match proc_argv(pid) {
             Ok(argv) => argv,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
+            // An unrelated process whose argv we cannot fully read (over
+            // 64 KiB or not UTF-8) cannot be the host; skipping it keeps
+            // one runaway `git grep $(for-each-ref …)` from blocking every
+            // A-R on the box (2026-11-13). Only a process that LOOKS like
+            // a bg-pty-host stays fatal, since then the proof is unreadable.
+            Err(e) => {
+                if argv_head(pid).is_ok_and(|head| could_be_host(&head)) {
+                    return Err(e);
+                }
+                continue;
+            }
         };
         if !host_argv_matches(&argv, id) {
             continue;
@@ -1225,6 +1268,34 @@ pub(crate) fn status(uid: &str) -> Result<Value, (ErrorCode, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn an_unreadable_unrelated_argv_does_not_block_the_host_scan() {
+        let git = vec!["git".to_string(), "grep".to_string()];
+        assert!(!could_be_host(&git));
+        let host = vec!["/usr/bin/claude".to_string(), "bg-pty-host".to_string()];
+        assert!(could_be_host(&host));
+        let other_claude = vec!["claude".to_string(), "daemon".to_string()];
+        assert!(!could_be_host(&other_claude));
+        assert!(!could_be_host(&[]));
+        let titled = vec!["claude bg-pty-host".to_string(), "--bg-pty-host".to_string()];
+        assert!(could_be_host(&titled));
+    }
+
+    /// Claude 2.1.3xx's retitled host, argv copied from a live process.
+    #[test]
+    fn a_retitled_bg_pty_host_argv_matches_its_session() {
+        let id = "60a104c9-6d00-49b2-aa8d-9032bf9de50f";
+        let argv: Vec<String> = ["claude bg-pty-host", "--bg-pty-host", "/tmp/x/pty/60a104c9.sock",
+            "324", "97", "--", "/home/u/.local/share/claude/versions/2.1.323", "--session-id", id,
+            "--fork-session", "--resume", "/tmp/t.jsonl"].iter().map(|s| s.to_string()).collect();
+        assert!(host_argv_matches(&argv, id));
+        assert!(!host_argv_matches(&argv, "ae27c9c8-97ac-49fe-8cde-b39b646268e4"));
+        let spare: Vec<String> = ["claude bg-pty-host", "--bg-pty-host", "/tmp/s.sock", "200", "50",
+            "--", "/x/2.1.323", "--bg-spare"].iter().map(|s| s.to_string()).collect();
+        assert!(!host_argv_matches(&spare, id));
+    }
 
     struct FakeEffects {
         roster: Roster,

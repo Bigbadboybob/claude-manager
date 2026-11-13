@@ -189,6 +189,21 @@ def _is_cm_intermediary(argv: list[str]) -> bool:
     return head.startswith("python") and len(argv) > 1 and argv[1].endswith("mcp_proxy.py")
 
 
+def is_bg_pty_host(argv: list[str] | None) -> bool:
+    """A Claude bg-pty-host argv: `claude bg-pty-host ...`, or Claude
+    2.1.3xx's retitled form whose argv[0] is the one string
+    "claude bg-pty-host" followed by `--bg-pty-host`. Missing the retitled
+    form marked a session's own host as external_background and stalled
+    its notifications (2026-11-13)."""
+    if not argv:
+        return False
+    if "bg-pty-host" in argv:
+        return True
+    words = argv[0].split()
+    return (len(words) == 2 and words[1] == "bg-pty-host"
+            and os.path.basename(words[0]).startswith("claude"))
+
+
 def argv_session_id(argv: list[str] | None) -> str | None:
     if not argv:
         return None
@@ -460,7 +475,7 @@ class ClaudeAdapter:
             if self._bg_result:
                 sid = Path(self.transcript_path).stem
                 argv = claude_parent_argv() or []
-                owns_bg = "bg-pty-host" in argv and argv_session_id(argv) == sid
+                owns_bg = is_bg_pty_host(argv) and argv_session_id(argv) == sid
                 out["background_session_id"] = sid
                 out["background_state"] = self._bg_result.get("state")
                 if not owns_bg:
