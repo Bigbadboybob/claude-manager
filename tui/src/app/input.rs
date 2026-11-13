@@ -67,8 +67,13 @@ pub(super) enum InputMode {
     },
     /// Editing session settings.
     SessionSettings {
+        /// Positions are re-resolved from `session_uid` before every key
+        /// (see `refresh_session_settings_indices`): the sidebar re-sorts
+        /// `workspaces` on each task-feed update, so positions captured at
+        /// open can name a different session by the time the form saves.
         ws_index: usize,
         session_index: usize,
+        session_uid: String,
         name: String,
         idle_timeout: String,
         burst_threshold: String,
@@ -2833,6 +2838,35 @@ impl App {
     /// Open settings for whatever the cursor is focused on — a workspace
     /// (and its task) when on a header, a session (label / idle / hidden)
     /// when on a specific session.
+    /// Point an open session-settings form at its session's CURRENT
+    /// position. The form is keyed by uid; positions go stale whenever
+    /// the sidebar re-sorts (every task-feed update), and a save at a
+    /// stale position wrote the color, label, timers and global-perms
+    /// grant onto whichever session had moved there (Owner 2026-11-12:
+    /// recoloring RM-ES2 recolored RM-ES2-473). Returns false, closing
+    /// the form, when the session is gone.
+    pub(super) fn refresh_session_settings_indices(&mut self) -> bool {
+        let InputMode::SessionSettings { ws_index, session_index, session_uid, .. } = &mut self.input_mode else {
+            return true;
+        };
+        let found = self.workspaces.iter().enumerate().find_map(|(wi, w)| {
+            w.sessions.iter().position(|s| &s.uid == session_uid).map(|si| (wi, si))
+        });
+        match found {
+            Some((wi, si)) => {
+                *ws_index = wi;
+                *session_index = si;
+                true
+            }
+            None => {
+                self.input_mode = InputMode::Normal;
+                self.messages.settings_name = None;
+                self.set_status_msg("That session is gone; its settings were not saved");
+                false
+            }
+        }
+    }
+
     pub(super) fn open_session_settings(&mut self) {
         match self.cursor.clone() {
             Cursor::Session(wi, si) => {
@@ -2844,6 +2878,7 @@ impl App {
                         self.input_mode = InputMode::SessionSettings {
                             ws_index: wi,
                             session_index: si,
+                            session_uid: ts.uid.clone(),
                             name: ts.label.clone(),
                             idle_timeout: if timeout == 0 {
                                 DEFAULT_IDLE_TIMEOUT_SECS.to_string()
@@ -4069,6 +4104,9 @@ impl App {
                 return true;
             }
         }
+        if !self.refresh_session_settings_indices() {
+            return true;
+        }
         // Section ids for the workspace settings picker.
         let section_ids: Vec<String> = self.section_ids();
         let report_tasks = if matches!(self.input_mode, InputMode::NewSession { .. }) {
@@ -4144,6 +4182,7 @@ impl App {
             InputMode::SessionSettings {
                 ws_index,
                 session_index,
+                session_uid: _,
                 name,
                 idle_timeout,
                 burst_threshold,
@@ -7560,6 +7599,37 @@ mod input_handler_tests {
         assert!(
             super::resolve_session_by_ids(&workspaces, "ws-A", "uid-A1").is_none()
         );
+    }
+
+    #[test]
+    fn session_settings_follow_their_session_when_the_sidebar_resorts() {
+        // Owner 2026-11-12: recoloring RM-ES2 recolored RM-ES2-473. The form
+        // captured positions at open; a task-feed re-sort moved another
+        // session into them before Enter. The form now re-finds its uid.
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(), api_token: String::new(),
+            gcp_project: String::new(), gcp_zone: String::new(), repos: HashMap::new(),
+        });
+        app.workspaces = vec![
+            ws_fixture("ws-A", &[("uid-A1", "claude"), ("uid-A2", "claude")]),
+            ws_fixture("ws-B", &[("uid-B1", "claude"), ("uid-B2", "claude")]),
+        ];
+        app.cursor = Cursor::Session(0, 1);
+        app.open_session_settings();
+        app.workspaces.swap(0, 1); // the re-sort: (0, 1) is now uid-B2
+        assert!(app.refresh_session_settings_indices());
+        match &app.input_mode {
+            InputMode::SessionSettings { ws_index, session_index, session_uid, .. } => {
+                assert_eq!(session_uid, "uid-A2");
+                assert_eq!((*ws_index, *session_index), (1, 1));
+                assert_eq!(app.workspaces[*ws_index].sessions[*session_index].uid, "uid-A2");
+            }
+            _ => panic!("form closed"),
+        }
+        // The session is gone: the form closes instead of saving elsewhere.
+        app.workspaces[1].sessions.retain(|s| s.uid != "uid-A2");
+        assert!(!app.refresh_session_settings_indices());
+        assert!(matches!(app.input_mode, InputMode::Normal));
     }
 
     /// Build a `Workspace` with the requested `(uid, session_type)` sessions.
