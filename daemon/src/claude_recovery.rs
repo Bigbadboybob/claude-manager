@@ -140,10 +140,78 @@ where
     EffectOutcome::Revived
 }
 
+/// The effect order for a background host inside this session's own
+/// process tree: prove and stop the native session while the holder child
+/// still anchors its ancestry, prove it gone, then stop the holder and
+/// revive. Receipt phases keep their meanings (`reconcile` accepts each of
+/// them and re-proves the native stop), only their order differs:
+/// `confirmed` → `native_stop_ready` → `native_stopped` → `holder_stopped`
+/// → `revived` / `partial`.
+fn execute_in_tree_sequence<C, E>(
+    mut checkpoint: C,
+    mut effect: E,
+) -> EffectOutcome
+where
+    C: FnMut(&str) -> Result<(), String>,
+    E: FnMut(EffectStep) -> Result<(), String>,
+{
+    if let Err(e) = checkpoint("confirmed") {
+        return EffectOutcome::Unknown(e);
+    }
+    if let Err(e) = effect(EffectStep::PreHolderRecheck) {
+        return EffectOutcome::Unknown(e);
+    }
+    if let Err(e) = checkpoint("native_stop_ready") {
+        return EffectOutcome::Unknown(e);
+    }
+    if let Err(e) = effect(EffectStep::NativeStop) {
+        return EffectOutcome::Unknown(e);
+    }
+    if let Err(e) = effect(EffectStep::PostStopProof) {
+        return EffectOutcome::Unknown(e);
+    }
+    if let Err(e) = checkpoint("native_stopped") {
+        return EffectOutcome::Unknown(e);
+    }
+    if let Err(e) = effect(EffectStep::HolderKill) {
+        return EffectOutcome::Unknown(e);
+    }
+    if let Err(e) = checkpoint("holder_stopped") {
+        return EffectOutcome::Unknown(e);
+    }
+    if let Err(e) = effect(EffectStep::Revive) {
+        let _ = checkpoint("partial");
+        return EffectOutcome::Partial(e);
+    }
+    if let Err(e) = checkpoint("revived") {
+        return EffectOutcome::Unknown(e);
+    }
+    EffectOutcome::Revived
+}
+
+fn run_sequence<C, E>(in_session_tree: bool, checkpoint: C, effect: E) -> EffectOutcome
+where
+    C: FnMut(&str) -> Result<(), String>,
+    E: FnMut(EffectStep) -> Result<(), String>,
+{
+    if in_session_tree {
+        execute_in_tree_sequence(checkpoint, effect)
+    } else {
+        execute_effect_sequence(checkpoint, effect)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct BackgroundHost {
     pid: u32,
     start: u64,
+    /// The host descends from this session's own CM child. Claude 2.1.3xx
+    /// starts a `claude daemon run --origin transient` under the interactive
+    /// process, so its bg-pty-host lives inside the CM holder's tree. A
+    /// holder kill only SIGKILLs the child (the host is orphaned, not
+    /// stopped), so these hosts are stopped BEFORE the holder: see
+    /// `execute_in_tree_sequence`.
+    in_session_tree: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -474,7 +542,21 @@ fn host_argv_matches(argv: &[String], id: &str) -> bool {
     ids == [id]
 }
 
-fn host_proof(id: &str, holder_pid: Option<u32>) -> io::Result<BackgroundHost> {
+/// Which matching bg-pty-hosts count as this session's background host:
+/// `Some(false)` for one outside the CM holder (a detached native `/bg`),
+/// `Some(true)` for one under this session's own CM child (Claude's
+/// transient daemon), `None` for anything else inside the holder (another
+/// session's tree) or without a `claude daemon run` ancestor.
+fn accept_host(daemon_ancestor: bool, inside_holder: bool, under_child: bool) -> Option<bool> {
+    match (daemon_ancestor, inside_holder, under_child) {
+        (false, _, _) => None,
+        (true, false, _) => Some(false),
+        (true, true, true) => Some(true),
+        (true, true, false) => None,
+    }
+}
+
+fn host_proof(id: &str, holder_pid: Option<u32>, child: (u32, u64)) -> io::Result<BackgroundHost> {
     #[cfg(test)]
     if let Some(host) = tests::fake_host() { return Ok(host); }
     if !exact_session_id(id) {
@@ -514,12 +596,16 @@ fn host_proof(id: &str, holder_pid: Option<u32>) -> io::Result<BackgroundHost> {
         let (mut parent, start) = proc_parts(pid)?;
         let mut daemon_ancestor = false;
         let mut inside_holder = holder_pid == Some(pid);
+        let mut under_child = false;
         for _ in 0..MAX_ANCESTRY {
             if parent <= 1 {
                 break;
             }
             if holder_pid == Some(parent) {
                 inside_holder = true;
+            }
+            if child.0 != 0 && parent == child.0 {
+                under_child = proc_parts(parent)?.1 == child.1;
             }
             let parent_argv = proc_argv(parent)?;
             let exe = parent_argv
@@ -535,8 +621,8 @@ fn host_proof(id: &str, holder_pid: Option<u32>) -> io::Result<BackgroundHost> {
             }
             parent = proc_parts(parent)?.0;
         }
-        if daemon_ancestor && !inside_holder {
-            matches.push(BackgroundHost { pid, start });
+        if let Some(in_session_tree) = accept_host(daemon_ancestor, inside_holder, under_child) {
+            matches.push(BackgroundHost { pid, start, in_session_tree });
         }
     }
     if matches.len() != 1 {
@@ -624,6 +710,28 @@ fn validated_roster(roster: &Roster) -> io::Result<Vec<(&str, &str, &str)>> {
         validated.push((kind.unwrap(), row_id, path));
     }
     Ok(validated)
+}
+
+/// The job ID `claude stop` accepts for a native session: Claude 2.1.3xx
+/// answers "No job matching" for the full session UUID and wants the
+/// roster row's short `id` (the UUID's first 8 hex digits, e.g. `60a104c9`).
+/// Falls back to the full UUID when the roster has no such field (older
+/// versions accepted it).
+fn job_id_from_roster(roster: &Roster, id: &str) -> String {
+    roster
+        .rows
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|row| row.get("sessionId").and_then(Value::as_str) == Some(id))
+        .and_then(|row| row.get("id").and_then(Value::as_str))
+        .filter(|job| !job.is_empty() && id.starts_with(*job))
+        .unwrap_or(id)
+        .to_string()
+}
+
+fn native_job_id(cwd: &Path, id: &str) -> String {
+    roster(cwd).map(|r| job_id_from_roster(&r, id)).unwrap_or_else(|_| id.to_string())
 }
 
 fn roster_match(roster: &Roster, id: &str, cwd: &Path) -> io::Result<bool> {
@@ -1004,14 +1112,19 @@ pub(crate) fn preflight(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) -> Value
         }
         return json!({"status":"normal","identity":snap.identity,"message":"no exact native background session is present; captured identity is required for a guarded restart"});
     }
-    let host = match host_proof(&snap.identity.native_session_id, snap.identity.holder_pid) {
+    let host = match host_proof(&snap.identity.native_session_id, snap.identity.holder_pid, (snap.identity.child_pid, snap.identity.child_start_time)) {
         Ok(host) => host,
         Err(e) => return json!({"status":"unavailable","identity":Value::Null,"message":format!("background host evidence unavailable: {e}")}),
     };
     let mut identity = snap.identity;
     identity.background_pid = host.pid;
     identity.background_start_time = host.start;
-    json!({"status":"offer","identity":identity,"message":"Claude native background work is active; explicit confirmation is required"})
+    let message = if host.in_session_tree {
+        "Claude native background work is active in this session's own process tree; confirming stops it first, then restarts the session"
+    } else {
+        "Claude native background work is active; explicit confirmation is required"
+    };
+    json!({"status":"offer","identity":identity,"message":message})
 }
 
 fn identity_from_value(value: &Value) -> Result<Identity, String> {
@@ -1089,6 +1202,7 @@ pub(crate) fn confirm(
     };
     let (_reservation, crons, transcript) = reservation;
     let normal_restart = identity.background_pid == 0 && identity.background_start_time == 0;
+    let mut in_session_tree = false;
     if !normal_restart {
         let roster_before = roster(Path::new(&identity.canonical_cwd))
             .map_err(|e| (ErrorCode::Conflict, format!("Claude roster unavailable before effect: {e}")))?;
@@ -1097,17 +1211,19 @@ pub(crate) fn confirm(
         {
             return Err((ErrorCode::Conflict, "native background identity disappeared before effect".into()));
         }
-        let host = host_proof(&identity.native_session_id, identity.holder_pid)
+        let host = host_proof(&identity.native_session_id, identity.holder_pid, (identity.child_pid, identity.child_start_time))
             .map_err(|e| (ErrorCode::Conflict, format!("background host changed before effect: {e}")))?;
         if host.pid != identity.background_pid || host.start != identity.background_start_time {
             return Err((ErrorCode::Conflict, "background host identity changed before effect".into()));
         }
+        in_session_tree = host.in_session_tree;
     }
     revalidate_bound(state_arc, &identity)
         .map_err(|e| (ErrorCode::Conflict, e))?;
-    let outcome = execute_effect_sequence(
-        |phase| mark(&uid, &identity, phase),
-        |step| match step {
+    let outcome = run_sequence(
+        in_session_tree,
+        |phase: &str| mark(&uid, &identity, phase),
+        |step: EffectStep| match step {
             EffectStep::PreHolderRecheck => {
                 revalidate_bound(state_arc, &identity)?;
                 if normal_restart {
@@ -1120,7 +1236,7 @@ pub(crate) fn confirm(
                     }
                     return verify_no_native_background(&identity);
                 }
-                let host = host_proof(&identity.native_session_id, identity.holder_pid)
+                let host = host_proof(&identity.native_session_id, identity.holder_pid, (identity.child_pid, identity.child_start_time))
                     .map_err(|e| e.to_string())?;
                 if host.pid != identity.background_pid || host.start != identity.background_start_time {
                     return Err("holder/native identity changed before holder stop".into());
@@ -1144,7 +1260,7 @@ pub(crate) fn confirm(
                     .map_err(|e| format!("native identity unreadable after holder stop: {e}"))?;
                 let listed_after = roster_match(&roster_after, &identity.native_session_id, Path::new(&identity.canonical_cwd))
                     .map_err(|e| e.to_string())?;
-                let host_after = host_proof(&identity.native_session_id, identity.holder_pid)
+                let host_after = host_proof(&identity.native_session_id, identity.holder_pid, (identity.child_pid, identity.child_start_time))
                     .map_err(|e| e.to_string())?;
                 if !listed_after || host_after.pid != identity.background_pid || host_after.start != identity.background_start_time {
                     return Err("native identity changed after holder stop".into());
@@ -1157,7 +1273,9 @@ pub(crate) fn confirm(
                 }
                 #[cfg(test)]
                 if let Some(result) = tests::fake_stop() { return result; }
-                run_command(Path::new(&identity.canonical_cwd), &["stop", &identity.native_session_id])
+                let cwd = Path::new(&identity.canonical_cwd);
+                let job = native_job_id(cwd, &identity.native_session_id);
+                run_command(cwd, &["stop", &job])
                     .map(|_| ())
                     .map_err(|e| format!("native stop outcome is unknown: {e}"))
             }
@@ -1356,7 +1474,7 @@ mod tests {
             let state = archived_fixture(&uid, dir.path());
             FAKE.with(|f| *f.borrow_mut() = Some(FakeEffects {
                 roster: Roster { rows: json!([{"kind":"background", "sessionId":"123e4567-e89b-12d3-a456-426614174000", "cwd":dir.path()}]) },
-                host: BackgroundHost { pid: 123, start: 456 }, fail_phase:phase,
+                host: BackgroundHost { pid: 123, start: 456, in_session_tree: false }, fail_phase:phase,
                 fail_stop:stop_error, fail_proof:proof_error, fail_revive:revive_error, real_revive:false, stops:0, revives:0,
             }));
             let pre = preflight(&state, &uid);
@@ -1408,7 +1526,7 @@ mod tests {
             let old_pid = state.lock().unwrap().sessions[uid].pid;
             FAKE.with(|f| *f.borrow_mut() = Some(FakeEffects {
                 roster:Roster { rows:json!([{"kind":"background", "sessionId":native_id, "cwd":dir.path()}]) },
-                host:BackgroundHost { pid:123, start:456 }, fail_phase:None, fail_stop:false,
+                host:BackgroundHost { pid: 123, start: 456, in_session_tree: false }, fail_phase:None, fail_stop:false,
                 fail_proof:false, fail_revive:false, real_revive:true, stops:0, revives:0,
             }));
             crate::control::methods::recovery_test_restore_program(true);
@@ -1510,7 +1628,7 @@ mod tests {
         assert!(serialized["native_session_id"].is_null());
         assert_eq!(identity_from_value(&serialized).unwrap(), identity);
         FAKE.with(|f| *f.borrow_mut() = Some(FakeEffects {
-            roster:Roster { rows:json!([]) }, host:BackgroundHost { pid:1, start:1 },
+            roster:Roster { rows:json!([]) }, host:BackgroundHost { pid: 1, start: 1, in_session_tree: false },
             fail_phase:None, fail_stop:false, fail_proof:false, fail_revive:false, real_revive:false, stops:0, revives:0,
         }));
         assert!(verify_no_native_background(&identity).is_ok());
@@ -1549,7 +1667,7 @@ mod tests {
         state.sessions.insert(uid.into(), session);
         let state = Arc::new(Mutex::new(state));
         FAKE.with(|f| *f.borrow_mut() = Some(FakeEffects {
-            roster:Roster { rows:json!([]) }, host:BackgroundHost { pid:1, start:1 },
+            roster:Roster { rows:json!([]) }, host:BackgroundHost { pid: 1, start: 1, in_session_tree: false },
             fail_phase:None, fail_stop:false, fail_proof:false, fail_revive:false, real_revive:false, stops:0, revives:0,
         }));
         assert_eq!(preflight(&state, uid)["status"], "unavailable");
@@ -1603,7 +1721,7 @@ mod tests {
         let state = Arc::new(Mutex::new(state));
         FAKE.with(|f| *f.borrow_mut() = Some(FakeEffects {
             roster:Roster { rows:json!([{"kind":"interactive", "sessionId":native_id, "cwd":dir.path(), "pid":child_pid}]) },
-            host:BackgroundHost { pid:1, start:1 },
+            host:BackgroundHost { pid: 1, start: 1, in_session_tree: false },
             fail_phase:None, fail_stop:false, fail_proof:false, fail_revive:false, real_revive:false, stops:0, revives:0,
         }));
         let report = |jobs: Value| {
@@ -1668,6 +1786,98 @@ mod tests {
         assert!(gate.try_read().is_err(), "effect writer must fence new readers");
         drop(write);
         assert!(gate.try_read().is_ok());
+    }
+
+    #[test]
+    fn hosts_inside_the_holder_count_only_under_this_sessions_own_child() {
+        assert_eq!(accept_host(true, false, false), Some(false), "detached /bg host");
+        assert_eq!(accept_host(true, true, true), Some(true), "transient daemon under our child");
+        assert_eq!(accept_host(true, true, false), None, "another session's tree");
+        assert_eq!(accept_host(false, false, false), None, "no claude daemon ancestor");
+        assert_eq!(accept_host(false, true, true), None);
+    }
+
+    #[test]
+    fn claude_stop_gets_the_rosters_short_job_id() {
+        let id = "60a104c9-6d00-49b2-aa8d-9032bf9de50f";
+        let roster = Roster { rows: json!([
+            {"kind":"background","id":"60a104c9","sessionId":id,"cwd":"/w"},
+            {"kind":"background","id":"ae27c9c8","sessionId":"ae27c9c8-97ac-49fe-8cde-b39b646268e4","cwd":"/w"}]) };
+        assert_eq!(job_id_from_roster(&roster, id), "60a104c9");
+        let old = Roster { rows: json!([{"kind":"background","sessionId":id,"cwd":"/w"}]) };
+        assert_eq!(job_id_from_roster(&old, id), id, "no short id: full UUID");
+        let wrong = Roster { rows: json!([{"kind":"background","id":"ffffffff","sessionId":id,"cwd":"/w"}]) };
+        assert_eq!(job_id_from_roster(&wrong, id), id, "an id that is not this UUID's prefix is ignored");
+    }
+
+    /// An in-tree host is stopped and proven gone BEFORE the holder is
+    /// touched: a holder kill would only orphan it.
+    #[test]
+    fn in_tree_sequence_stops_native_work_before_the_holder() {
+        let mut checkpoints = Vec::new();
+        let mut effects = Vec::new();
+        let outcome = execute_in_tree_sequence(
+            |phase| { checkpoints.push(phase.to_string()); Ok(()) },
+            |step| { effects.push(step); Ok(()) },
+        );
+        assert_eq!(outcome, EffectOutcome::Revived);
+        assert_eq!(checkpoints, ["confirmed", "native_stop_ready", "native_stopped", "holder_stopped", "revived"]);
+        assert_eq!(effects, [EffectStep::PreHolderRecheck, EffectStep::NativeStop, EffectStep::PostStopProof, EffectStep::HolderKill, EffectStep::Revive]);
+    }
+
+    #[test]
+    fn in_tree_sequence_never_kills_the_holder_without_a_proven_stop() {
+        for failing in [EffectStep::PreHolderRecheck, EffectStep::NativeStop, EffectStep::PostStopProof] {
+            let mut effects = Vec::new();
+            let outcome = execute_in_tree_sequence(
+                |_| Ok(()),
+                |step| { effects.push(step); if step == failing { Err("injected".into()) } else { Ok(()) } },
+            );
+            assert!(matches!(outcome, EffectOutcome::Unknown(_)), "{failing:?}");
+            assert!(!effects.contains(&EffectStep::HolderKill), "{failing:?}: holder killed");
+            assert!(!effects.contains(&EffectStep::Revive), "{failing:?}: revived");
+        }
+        for phase in ["confirmed", "native_stop_ready", "native_stopped"] {
+            let mut effects = Vec::new();
+            let _ = execute_in_tree_sequence(
+                |p| if p == phase { Err("crash".into()) } else { Ok(()) },
+                |step| { effects.push(step); Ok(()) },
+            );
+            assert!(!effects.contains(&EffectStep::HolderKill), "{phase}: holder killed");
+        }
+    }
+
+    #[test]
+    fn confirm_recovers_an_in_tree_host_native_first() {
+        for (suffix, phase, stop_error, expected, receipt, stops, revives) in [
+            ("in-tree-success", None, false, "revived", "revived", 1, 1),
+            ("in-tree-stop-timeout", None, true, "unknown", "native_stop_ready", 1, 0),
+            // Distinguishes the order: the old sequence crashes here with
+            // the stop still undone (receipt `confirmed`, no stop).
+            ("in-tree-holder-checkpoint", Some("holder_stopped"), false, "unknown", "native_stopped", 1, 0),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let uid = format!("ts-recovery-{suffix}");
+            let _ = fs::remove_file(receipt_path(&uid).unwrap());
+            let state = archived_fixture(&uid, dir.path());
+            FAKE.with(|f| *f.borrow_mut() = Some(FakeEffects {
+                roster: Roster { rows: json!([{"kind":"background", "sessionId":"123e4567-e89b-12d3-a456-426614174000", "cwd":dir.path()}]) },
+                host: BackgroundHost { pid: 123, start: 456, in_session_tree: true }, fail_phase: phase,
+                fail_stop: stop_error, fail_proof: false, fail_revive: false, real_revive: false, stops: 0, revives: 0,
+            }));
+            let pre = preflight(&state, &uid);
+            assert_eq!(pre["status"], "offer", "{suffix}");
+            let result = confirm(&state, &pre["identity"], true).unwrap();
+            assert_eq!(result["status"], expected, "{suffix}");
+            assert_eq!(load_receipt(&uid).unwrap().unwrap().phase, receipt, "{suffix}");
+            FAKE.with(|f| {
+                let f = f.borrow();
+                let f = f.as_ref().unwrap();
+                assert_eq!((f.stops, f.revives), (stops, revives), "{suffix}");
+            });
+            FAKE.with(|f| *f.borrow_mut() = None);
+            let _ = fs::remove_file(receipt_path(&uid).unwrap());
+        }
     }
 
     #[test]
@@ -1839,7 +2049,7 @@ mod tests {
         fs::write(&path, b"").unwrap();
         FAKE.with(|f| *f.borrow_mut() = Some(FakeEffects {
             roster:Roster { rows:json!([{"kind":"background","sessionId":id,"cwd":dir.path()}]) },
-            host:BackgroundHost { pid:123,start:456 }, fail_phase:None, fail_stop:false,
+            host:BackgroundHost { pid: 123, start: 456, in_session_tree: false }, fail_phase:None, fail_stop:false,
             fail_proof:false, fail_revive:false, real_revive:false, stops:0, revives:0,
         }));
         let pre = preflight(&state, uid);
@@ -1881,7 +2091,7 @@ mod tests {
             "transcript_path":dir.path().join(format!("{native}.jsonl"))})).unwrap();
         FAKE.with(|f| *f.borrow_mut() = Some(FakeEffects {
             roster:Roster { rows:json!([{"kind":"background","sessionId":native,"cwd":dir.path()}]) },
-            host:BackgroundHost { pid:123,start:456 }, fail_phase:None, fail_stop:false,
+            host:BackgroundHost { pid: 123, start: 456, in_session_tree: false }, fail_phase:None, fail_stop:false,
             fail_proof:false, fail_revive:false, real_revive:false, stops:0, revives:0,
         }));
         let pre = preflight(&state, uid);
@@ -1926,7 +2136,7 @@ mod tests {
             "transcript_path":dir.path().join(format!("{native}.jsonl"))})).unwrap();
         FAKE.with(|f| *f.borrow_mut() = Some(FakeEffects {
             roster:Roster { rows:json!([{"kind":"background","sessionId":native,"cwd":dir.path()}]) },
-            host:BackgroundHost { pid:123,start:456 }, fail_phase:None, fail_stop:false,
+            host:BackgroundHost { pid: 123, start: 456, in_session_tree: false }, fail_phase:None, fail_stop:false,
             fail_proof:false, fail_revive:false, real_revive:false, stops:0, revives:0,
         }));
         let pre = preflight(&state, uid);
