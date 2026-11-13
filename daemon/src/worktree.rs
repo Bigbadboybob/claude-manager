@@ -392,6 +392,49 @@ pub fn resolve_base_commit(main_repo: &Path, base: &str) -> anyhow::Result<Strin
     anyhow::bail!("base '{}' does not resolve to a commit", base)
 }
 
+/// `git merge-base --is-ancestor <a> <b>` inside `repo`.
+fn is_ancestor(repo: &Path, a: &str, b: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", a, b])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// The newest trunk commit known locally: for `main` then `master`, the
+/// local branch or its `origin/` mirror, whichever contains the other
+/// (the remote when they have diverged is NOT assumed; local wins).
+/// No fetch: this runs on the spawn path.
+fn freshest_trunk(main_repo: &Path) -> Option<String> {
+    for cand in PROJECT_MAIN_CANDIDATES {
+        let local = rev_parse_commit(main_repo, cand);
+        let remote = rev_parse_commit(main_repo, &format!("origin/{}", cand));
+        match (local, remote) {
+            (Some(l), Some(r)) => {
+                return Some(if l != r && is_ancestor(main_repo, &l, &r) { r } else { l });
+            }
+            (Some(l), None) => return Some(l),
+            (None, Some(r)) => return Some(r),
+            (None, None) => {}
+        }
+    }
+    None
+}
+
+/// `Some(trunk_sha)` when the parent branch `b` (local ref, else
+/// `origin/<b>`) is a STRICT ancestor of the freshest trunk, i.e. it has
+/// no commits of its own and is merely behind. `None` when the parent has
+/// its own work, equals trunk, or anything fails to resolve: those keep
+/// the normal cut from the parent branch.
+fn fossil_parent_trunk(main_repo: &Path, b: &str) -> Option<String> {
+    let parent = rev_parse_commit(main_repo, b)
+        .or_else(|| rev_parse_commit(main_repo, &format!("origin/{}", b)))?;
+    let trunk = freshest_trunk(main_repo)?;
+    (parent != trunk && is_ancestor(main_repo, &parent, &trunk)).then_some(trunk)
+}
+
 /// Trunk refs `resolve_project_main` tries, in order. Local first
 /// (matching `resolve_base_commit`'s local-first rule: the operator's own
 /// commits are usually the point), then the remote-tracking mirror.
@@ -704,7 +747,34 @@ pub fn create_subtask_worktree(
     // pinned to exactly one commit (no `origin/<base>` second-guessing
     // of what the caller literally asked for).
     let start_branch = match start {
-        SubtaskStart::ParentBranch(b) => b,
+        SubtaskStart::ParentBranch(b) => {
+            // A parent branch with no work of its own (an ancestor of
+            // trunk) carries nothing trunk lacks, so cutting from it only
+            // makes the child stale: a task's `wip_branch` minted weeks ago
+            // and never committed to put workers 52k commits behind main
+            // (2026-11-13). Cut from the freshest trunk instead.
+            if let Some(trunk_sha) = fossil_parent_trunk(main_repo, b) {
+                let out = Command::new("git")
+                    .arg("-C")
+                    .arg(main_repo)
+                    .args(["worktree", "add"])
+                    .arg(&worktree_path)
+                    .args(["-b", branch_name, &trunk_sha])
+                    .output()?;
+                if out.status.success() {
+                    return Ok(worktree_path);
+                }
+                anyhow::bail!(
+                    "git worktree add failed for subtask branch {} at trunk {} (parent {} \
+                     has no commits beyond trunk): {}",
+                    branch_name,
+                    trunk_sha,
+                    b,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            b
+        }
         SubtaskStart::Base(b) => {
             let sha = resolve_base_commit(main_repo, b)?;
             let out = Command::new("git")
@@ -2401,6 +2471,48 @@ mod tests {
             // The second commit's file must NOT be present — proof the
             // cut really happened at `first`.
             assert!(wt.join("one.txt").exists());
+            assert!(!wt.join("two.txt").exists());
+        });
+    }
+
+    /// A parent branch with no commits of its own that has fallen behind
+    /// trunk (a task `wip_branch` minted weeks ago and never used) must
+    /// not make the subtask stale: the cut moves to trunk. 2026-11-13: an
+    /// RM-ES2 worker was cut 52,076 commits behind origin/main this way.
+    #[test]
+    fn create_subtask_worktree_fossil_parent_branch_cuts_from_trunk() {
+        with_home(|_home| {
+            let (_tmp, repo, first, second) = repo_with_history();
+            git(&repo, &["branch", "fossil", &first]);
+
+            let wt = create_subtask_worktree(
+                &repo,
+                "cm-sub/fossil-child-abc1234",
+                SubtaskStart::ParentBranch("fossil"),
+            )
+            .expect("cut");
+            assert_eq!(worktree_head_sha(&wt).as_deref(), Some(second.as_str()));
+            assert!(wt.join("two.txt").exists());
+        });
+    }
+
+    /// A parent branch WITH its own work keeps the normal cut, even when
+    /// it is behind trunk: that work is the point of a branch subtask.
+    #[test]
+    fn create_subtask_worktree_parent_with_own_work_keeps_parent_cut() {
+        with_home(|_home| {
+            let (_tmp, repo, first, _second) = repo_with_history();
+            git(&repo, &["checkout", "-q", "-b", "work", &first]);
+            let own = commit_file(&repo, "own.txt", "mine");
+            git(&repo, &["checkout", "-q", "main"]);
+
+            let wt = create_subtask_worktree(
+                &repo,
+                "cm-sub/work-child-abc1234",
+                SubtaskStart::ParentBranch("work"),
+            )
+            .expect("cut");
+            assert_eq!(worktree_head_sha(&wt).as_deref(), Some(own.as_str()));
             assert!(!wt.join("two.txt").exists());
         });
     }
