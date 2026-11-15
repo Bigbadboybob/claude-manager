@@ -3876,6 +3876,12 @@ pub(super) fn compute_session_state_and_idle(
     (state_str, idle)
 }
 
+/// Shared idle predicate for daemon-side background drivers, including
+/// ordinary session wake schedules. Keep the PTY-quiet threshold in one place.
+pub(crate) fn session_pty_idle_for_schedule(session: &crate::session::DaemonSession) -> bool {
+    compute_session_state_and_idle(session).1
+}
+
 // ============================================================
 // session.set_transcript_path (sub-2b-1 review #1)
 // ============================================================

@@ -1075,6 +1075,13 @@ pub fn dispatch_request(
             DispatchOutcome::Done(dispatch_continuous_force_done(state, req))
         }
 
+        // Phase 3 ordinary-session scheduled wakes. Session callers may
+        // manage their own schedules, or a descendant target under the same
+        // auth rule as send_input; global-perms callers may manage any live
+        // session. Operators are accepted for TUI/administrative clients.
+        "session_wake_schedule" => DispatchOutcome::Done(dispatch_session_wake_schedule(state, req)),
+        "session_wake_schedules" => DispatchOutcome::Done(dispatch_session_wake_schedules(state, req)),
+
         // Continuous Tasks Phase 3b (DESIGN_CONTINUOUS_TASKS.md §11) — the
         // stuck-story agent tools. Both are bimodal (Operator OR Session) like
         // `trigger`: the operator token is validated only for Operator frames
@@ -1688,6 +1695,23 @@ fn dispatch_continuous_delete(state: &Arc<Mutex<DaemonState>>, req: &Request) ->
         return resp;
     }
     match methods::continuous_delete(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_session_wake_schedule(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Some(resp) = reject_forged_operator(req) { return resp; }
+    let action = req.params.get("action").and_then(|v| v.as_str()).unwrap_or("create");
+    match crate::session_wake::handle(state, &req.caller, action, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_session_wake_schedules(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Some(resp) = reject_forged_operator(req) { return resp; }
+    match crate::session_wake::handle(state, &req.caller, "list", &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

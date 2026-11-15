@@ -148,3 +148,43 @@ queue after recording the handoff.
 null), `oldest_pending_at`, `oldest_item_age_seconds`, `last_wake`,
 `last_consume`, `wake_pending`, `wake_delivery`, `wake_error`, and the current
 coalescing `wake_id`.
+
+## Scheduled wake for any session
+
+Any live session can keep a daemon-owned wake schedule. Use
+`session_wake_schedule(action="create", interval_secs=21600)` for an interval
+or `daily_at="13:00Z"` for a UTC daily wake. `jitter_secs` adds bounded,
+deterministic jitter and `wake_message` supplies the short notice text. The
+schedule targets the caller by default; a global-permissions session or a
+parent may pass a live descendant's `session_uid`. Update and cancel with the
+same tool and `schedule_id`; read with `session_wake_schedules()`.
+
+Schedules are persisted in the daemon's `~/.cm/session-wake-schedules.json`
+store and survive a brain restart and respawn at the same uid. Delivery uses
+the native notification queue, with a marker of `[cm-schedule <id> <run>]`.
+Each run records `scheduled_at`, `delivered_at` (when queued), and an outcome:
+`delivered` or `missed` with `reason` (`session_dead`, `delivery_failed`,
+`stale`, or `brain_down`). A busy target does not drop a wake: the native queue
+holds the notification until the session can consume it. If the previous wake
+from this schedule has not produced a later completed turn, the next due slot
+is recorded as `coalesced` against that wake and is not published separately.
+After one full period without a later turn, the old wake is marked `missed` with
+`stale` and the next slot is published. Coalesced slots do not increment
+`missed_count`.
+
+A crash leaves a pending run that is retried once with the same dedupe key after
+restart, so elapsed intervals do not fan out into a burst. The scheduler keeps
+the schedule store in memory and checkpoints it only when state changes.
+
+The read shape is stable:
+
+```json
+{
+  "id": "wake-…", "session_uid": "ts-…",
+  "kind": {"type": "interval", "every_secs": 21600},
+  "enabled": true, "state": "active", "next_run": 1731675600.0,
+  "last_run": {"run_id": "…", "scheduled_at": 1731654000.0,
+    "delivered_at": 1731654000.2, "outcome": "delivered", "reason": null},
+  "missed_count": 0
+}
+```

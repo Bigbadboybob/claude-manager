@@ -105,6 +105,7 @@ pub mod reap_gate;
 pub mod resume_identity;
 pub mod rotation;
 pub mod session_crons;
+pub mod session_wake;
 pub mod handoff;
 pub mod reaper;
 pub mod reexec;
@@ -1313,6 +1314,20 @@ pub fn run() -> anyhow::Result<()> {
              so a daemon without it would persist Periodic continuous tasks but \
              never fire any of them",
             e,
+        )
+    })?;
+
+    // Ordinary-session schedules use the same durable native notification
+    // queue as monitor wakes.  This is separate from the continuous-task
+    // scheduler so existing continuous semantics remain unchanged.
+    let wake_scheduler = std::sync::Arc::new(
+        session_wake::WakeScheduler::new(std::sync::Arc::clone(&state)).map_err(|e| {
+            anyhow::anyhow!("cm-daemon: session wake scheduler store load failed: {e}")
+        })?,
+    );
+    wake_scheduler.start().map_err(|e| {
+        anyhow::anyhow!(
+            "cm-daemon: session wake scheduler thread spawn failed: {e}; refusing to start"
         )
     })?;
 
