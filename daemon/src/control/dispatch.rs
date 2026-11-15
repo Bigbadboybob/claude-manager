@@ -972,7 +972,7 @@ pub fn dispatch_request(
         }
         // Org model S2 (doc/org-model.md): members, teams, the roster and
         // adoption, proxied like items. Roster and adoption are Owner's.
-        "org.snapshot" | "org.member" | "org.team" | "org.roster" | "org.roster_apply"
+        "org.snapshot" | "org.continuous_status" | "org.member" | "org.team" | "org.roster" | "org.roster_apply"
         | "org.adopt" | "org.team_create" | "org.team_update" | "org.move" | "org.retire"
         | "org.reinstate" | "org.close_assistant" | "org.promote" | "org.rebind_main" | "org.hire"
         | "org.member_update" | "org.team_mark_continuous" => {

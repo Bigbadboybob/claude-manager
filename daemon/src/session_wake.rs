@@ -312,8 +312,22 @@ pub fn live_summary(session_uid: &str) -> Value {
     let missed: u64 = rows.iter().map(|s| s.missed_count).sum();
     let cadence = rows.iter().map(|s| cadence_secs(s)).min_by(f64::total_cmp);
     let schedule_kind = rows.first().map(|s| match s.kind { WakeKind::Interval { .. } => "interval", WakeKind::DailyAt { .. } => "daily_at" });
-    let health = if rows.is_empty() { "blocked" } else if missed > 0 { "missed" } else if next.is_some_and(|n| n <= now()) { "late" } else { "ok" };
+    let health = schedule_health(&rows, now());
     json!({"next_run":next,"last_run":last,"missed_count":missed,"health":health,"cadence_secs":cadence,"schedule_kind":schedule_kind})
+}
+
+fn schedule_health(rows: &[&WakeSchedule], now: f64) -> &'static str {
+    if rows.is_empty() { return "blocked"; }
+    let cadence = rows.iter().map(|s| cadence_secs(s)).min_by(f64::total_cmp).unwrap_or(86_400.0);
+    let recent_floor = now - cadence.max(1.0);
+    let recent_miss = rows.iter().flat_map(|s| s.runs.iter()).any(|run| {
+        run.scheduled_at >= recent_floor && run.outcome == "missed"
+    });
+    if recent_miss { return "missed"; }
+    if rows.iter().filter_map(|s| (s.next_run_at > 0.0).then_some(s.next_run_at)).any(|next| next < now - 300.0) {
+        return "late";
+    }
+    "ok"
 }
 
 pub fn handle(
@@ -994,5 +1008,20 @@ mod tests {
         s.state = "cancelled".into();
         s.next_run_at = 0.0;
         assert_eq!(public_schedule(&s)["next_run"], Value::Null);
+    }
+
+    #[test]
+    fn health_uses_recent_misses_and_grace_period() {
+        let mut s = schedule(WakeKind::Interval { every_secs: 10 }, 100.0);
+        assert_eq!(schedule_health(&[&s], 100.0), "ok");
+        s.next_run_at = 400.0;
+        assert_eq!(schedule_health(&[&s], 400.0), "ok");
+        s.next_run_at = 99.0;
+        assert_eq!(schedule_health(&[&s], 405.0), "late");
+        s.runs.push(WakeRun { run_id: "miss".into(), scheduled_at: 404.0, delivered_at: None, outcome: "missed".into(), reason: Some("session_dead".into()), coalesced_into: None });
+        assert_eq!(schedule_health(&[&s], 405.0), "missed");
+        s.runs[0].scheduled_at = 300.0;
+        s.next_run_at = 405.0;
+        assert_eq!(schedule_health(&[&s], 405.0), "ok");
     }
 }

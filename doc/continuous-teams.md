@@ -121,13 +121,20 @@ with live state from that lead's daemon-owned wake schedules and queues:
 }
 ```
 
-`health` is one of `ok`, `late`, `missed` or `blocked`. A missing lead,
-host mismatch, or unavailable schedule is `blocked`; queue rows retain the
+`health` is one of `ok`, `late`, `missed`, `blocked` or `unknown`. A missing
+lead on its host or an unavailable local schedule is `blocked`; an unreachable
+marker host is `unknown` until that host's projection is read. Queue rows retain the
 stable `queue_list()` fields and are filtered to queues bound to the lead (or
 explicit queue names in the marker). The Task sidebar renders the lead's
 sessions in the org section as a tinted box. Its header is `⟳ every 6h · next
 1h12m · ok`; a queue-only lead uses `⟳ queue · 3 pending · ok`. The legacy
 continuous column remains unchanged until phase 5.
+
+Live fields are refreshed even when the planning org version is unchanged.
+The laptop merges each marked team's projection from its `host_id` daemon;
+when that host is unreachable the team remains `unknown` rather than being
+reported as blocked. `org.continuous_status(team=...)` is the small direct
+read for a host-local dashboard or monitor.
 
 ## Phases
 

@@ -80,11 +80,64 @@ pub(super) fn owner_rpc(targets: &[(String, PathBuf, String)], method: &str, par
     Err(RpcFail { unsupported, message })
 }
 
+/// Read `org.snapshot` from every reachable host and merge each host's live
+/// continuous projection into the shared static snapshot. The planning API is
+/// central, but wake schedules and queues belong to the marker's host daemon.
+pub(super) fn owner_org_snapshot(targets: &[(String, PathBuf, String)], params: &Value) -> Result<Value, RpcFail> {
+    let mut errors = Vec::new();
+    let mut unsupported = !targets.is_empty();
+    let mut merged: Option<Value> = None;
+    for (host, socket, token) in targets {
+        match crate::client_session::rpc_messaging_board(socket, token, "org.snapshot", params.clone()) {
+            Ok(value) => {
+                if value["unchanged"] == true {
+                    continue;
+                }
+                if let Some(current) = merged.as_mut() {
+                    merge_org_live_teams(current, &value, host);
+                } else {
+                    merged = Some(value);
+                }
+            }
+            Err(e) => {
+                unsupported &= is_unsupported(&e);
+                errors.push(format!("{host}: {e}"));
+            }
+        }
+    }
+    if let Some(value) = merged {
+        return Ok(value);
+    }
+    let message = if errors.is_empty() { "No daemon is reachable".to_owned() } else { errors.join("; ") };
+    Err(RpcFail { unsupported, message })
+}
+
+fn merge_org_live_teams(base: &mut Value, candidate: &Value, host: &str) {
+    let Some(base_teams) = base.get_mut("teams").and_then(Value::as_array_mut) else { return; };
+    let Some(candidate_teams) = candidate.get("teams").and_then(Value::as_array) else { return; };
+    for candidate_team in candidate_teams {
+        let Some(marker) = candidate_team.get("continuous").filter(|v| v.is_object()) else { continue; };
+        if marker.get("host_id").and_then(Value::as_str) != Some(host) { continue; }
+        let Some(id) = candidate_team.get("id").and_then(Value::as_str) else { continue; };
+        if let Some(base_team) = base_teams.iter_mut().find(|team| team.get("id").and_then(Value::as_str) == Some(id)) {
+            base_team["continuous"] = marker.clone();
+        }
+    }
+}
+
 /// Run `owner_rpc` on a thread; the reply arrives on the returned channel.
 pub(super) fn spawn_owner_rpc(targets: Vec<(String, PathBuf, String)>, method: &'static str, params: Value) -> mpsc::Receiver<Result<Value, RpcFail>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(owner_rpc(&targets, method, &params));
+    });
+    rx
+}
+
+pub(super) fn spawn_owner_org_snapshot(targets: Vec<(String, PathBuf, String)>, params: Value) -> mpsc::Receiver<Result<Value, RpcFail>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(owner_org_snapshot(&targets, &params));
     });
     rx
 }
@@ -431,7 +484,7 @@ impl App {
             self.org.retry_at = Some(Instant::now() + ERROR_RETRY);
             return;
         }
-        self.org.rx = Some(spawn_owner_rpc(targets, "org.snapshot", params));
+        self.org.rx = Some(spawn_owner_org_snapshot(targets, params));
     }
 }
 
@@ -519,6 +572,25 @@ mod tests {
         assert_eq!(s.team("t1").unwrap().role_of("m1"), Some("primary"));
         st.accept(json!({"unchanged": true, "version": 7}));
         assert_eq!(st.live().unwrap().version, 7);
+    }
+
+    #[test]
+    fn remote_continuous_projection_is_merged_by_marker_host() {
+        let mut base = snapshot(7, vec![owner(), member("m1", "ep", Some("mem-owner"), Some("t1"), Some("ts-1-0"))], vec![team("t1", "Swarm", None, Some("m1"), &[("m1", "primary")])]);
+        base["teams"][0]["continuous"] = json!({"lead_member_id":"m1", "host_id":"cm-manager", "health":"unknown"});
+        let remote = json!({"version":7,"teams":[{"id":"t1","continuous":{"lead_member_id":"m1","host_id":"cm-manager","health":"ok","next_run":123.0}}]});
+        merge_org_live_teams(&mut base, &remote, "cm-manager");
+        assert_eq!(base["teams"][0]["continuous"]["health"], "ok");
+        assert_eq!(base["teams"][0]["continuous"]["next_run"], 123.0);
+    }
+
+    #[test]
+    fn remote_projection_does_not_overwrite_a_different_host() {
+        let mut base = snapshot(7, vec![owner()], vec![team("t1", "Swarm", None, None, &[])]);
+        base["teams"][0]["continuous"] = json!({"lead_member_id":"m1", "host_id":"cm-manager", "health":"unknown"});
+        let other = json!({"teams":[{"id":"t1","continuous":{"lead_member_id":"m1","host_id":"other","health":"ok"}}]});
+        merge_org_live_teams(&mut base, &other, "cm-manager");
+        assert_eq!(base["teams"][0]["continuous"]["health"], "unknown");
     }
 
     #[test]

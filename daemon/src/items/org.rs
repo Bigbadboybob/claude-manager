@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 pub const METHODS: &[&str] = &[
     "org.snapshot",
+    "org.continuous_status",
     "org.member",
     "org.team",
     "org.roster",
@@ -38,18 +39,29 @@ pub const METHODS: &[&str] = &[
 ];
 
 /// The read-only ones (restart-barrier classification).
-pub const READ_METHODS: &[&str] = &["org.snapshot", "org.member", "org.team", "org.roster"];
+pub const READ_METHODS: &[&str] = &["org.snapshot", "org.continuous_status", "org.member", "org.team", "org.roster"];
 
 pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
     let result = Ctx::capture(state, req).and_then(|ctx| {
         let p = params(&req.params)?;
         match req.method.as_str() {
             "org.snapshot" => {
-                let mut query = Vec::new();
-                if let Some(v) = p.get("since_version").and_then(Value::as_i64) {
-                    query.push(("since_version", v.to_string()));
+                // Live continuous fields change independently of the org
+                // version. Always fetch the full static snapshot so delta
+                // callers cannot retain a frozen schedule projection.
+                api(ctx.api.get("/org/snapshot", &[])).map(|v| decorate_snapshot(state, v))
+            }
+            "org.continuous_status" => {
+                let queues = live_queue_rows(state);
+                if let Some(marker) = p.get("continuous").cloned() {
+                    validate_continuous_marker(&marker)?;
+                    let team = decorate_team(state, json!({"continuous": marker}), &queues);
+                    Ok(team["continuous"].clone())
+                } else {
+                    let team = str_param(&p, "team")?.ok_or_else(|| bad("org.continuous_status needs team or continuous"))?;
+                    api(ctx.api.get(&format!("/org/teams/{}", encode(&team)), &[]))
+                        .map(|v| decorate_team(state, v, &queues)["continuous"].clone())
                 }
-                api(ctx.api.get("/org/snapshot", &query)).map(|v| decorate_snapshot(state, v))
             }
             "org.member" => member(state, &ctx, &p),
             "org.team" => {
@@ -173,8 +185,14 @@ fn decorate_team(state: &Arc<Mutex<DaemonState>>, mut team: Value, queue_rows: &
     let live = lead_uid.as_deref().map(crate::session_wake::live_summary).unwrap_or_else(|| json!({"next_run":null,"last_run":null,"missed_count":0,"health":"blocked"}));
     let host = marker["host_id"].as_str().unwrap_or("");
     let local_host = crate::host_id::HostId::local().to_string();
-    let mut live = live;
-    if !host.is_empty() && host != local_host && live["health"] == "ok" { live["health"] = Value::String("blocked".into()); }
+    let mut live = if host.is_empty() || host == local_host {
+        live
+    } else {
+        // This daemon cannot observe another host's session wake store. The
+        // TUI merges the same shape from the marker host; until then this is
+        // explicitly unknown, never a false blocked alarm.
+        json!({"next_run":null,"last_run":null,"missed_count":0,"health":"unknown","cadence_secs":null,"schedule_kind":null})
+    };
     if let Some(obj) = team.get_mut("continuous").and_then(Value::as_object_mut) {
         obj.insert("lead_session_uid".into(), lead_uid.clone().map(Value::String).unwrap_or(Value::Null));
         obj.insert("next_run".into(), live["next_run"].clone());
@@ -191,6 +209,7 @@ fn decorate_team(state: &Arc<Mutex<DaemonState>>, mut team: Value, queue_rows: &
             .collect::<HashSet<_>>();
         let queues = queue_rows
             .iter()
+            .filter(|_| host.is_empty() || host == local_host)
             .filter(|row| {
                 let name = row.get("queue").and_then(Value::as_str);
                 let consumer = row
@@ -900,7 +919,10 @@ pub fn member_for_session(state: &Arc<Mutex<DaemonState>>, uid: &str) -> RpcResu
     .ok_or_else(|| (ErrorCode::Internal, "daemon_id_unavailable: messaging store is not open".to_string()))?;
     let client = super::api::Api::from_config(&api_url, &api_token)?;
     match api(client.get("/org/members/by-pid", &[("pid", format!("agent:{daemon_id}:{uid}"))])) {
-        Ok(v) => Ok(Some(v)),
+        Ok(v) => {
+            let queues = live_queue_rows(state);
+            Ok(Some(decorate_team(state, v, &queues)))
+        }
         Err((ErrorCode::UnknownMethod, _)) => Ok(None),
         Err(e) => Err(e),
     }
@@ -1360,7 +1382,7 @@ mod tests {
         let _env = crate::test_support::env_lock();
         let root = tempfile::tempdir().unwrap();
         let (url, seen) = test_stub(|method, path, _| match (method, path) {
-            ("GET", "/org/snapshot?since_version=7") => (200, r#"{"unchanged":true,"version":7}"#.into()),
+            ("GET", "/org/snapshot") => (200, r#"{"unchanged":true,"version":7}"#.into()),
             ("GET", p) if p.starts_with("/org/members/by-pid?pid=") => (200, r#"{"member":null}"#.into()),
             ("POST", "/org/members/main/ep/move") => (200, r#"{"member":{"handle":"ep"}}"#.into()),
             ("GET", "/org/teams/swarm") => (404, r#"{"detail":"Not Found"}"#.into()),
@@ -1379,6 +1401,8 @@ mod tests {
         let err = call(&state, me, "org.team", json!({"team": "swarm"})).error.unwrap();
         assert!(matches!(err.code, ErrorCode::UnknownMethod) && err.message.starts_with("unsupported"));
         let seen = seen.lock().unwrap();
+        let (_, snapshot_path, _) = seen.iter().find(|(m, p, _)| m == "GET" && p.starts_with("/org/snapshot")).unwrap();
+        assert_eq!(snapshot_path, "/org/snapshot", "live fields force a full delta refresh");
         let (_, path, _) = seen.iter().find(|(_, p, _)| p.starts_with("/org/members/by-pid")).unwrap();
         assert_eq!(path, &format!("/org/members/by-pid?pid=agent%3A{d}%3Ame-uid"));
         let (_, _, body) = seen.iter().find(|(m, _, _)| m == "POST").unwrap();
@@ -1525,9 +1549,10 @@ mod tests {
     #[test]
     fn continuous_team_read_shape_has_live_fields() {
         let state = Arc::new(Mutex::new(DaemonState::default()));
+        let local_host = crate::host_id::HostId::local().to_string();
         let team = decorate_team(&state, json!({
             "id": "team-1", "lead_member_id": "mem-1",
-            "continuous": {"lead_member_id": "mem-1", "host_id": "local", "queues": ["momentum"]}
+            "continuous": {"lead_member_id": "mem-1", "host_id": local_host, "queues": ["momentum"]}
         }), &[json!({"queue":"momentum", "pending":3, "binding":{"consumer":"mem-1"}})]);
         assert_eq!(team["continuous"]["health"], "blocked");
         assert!(team["continuous"].get("next_run").is_some());
@@ -1535,6 +1560,18 @@ mod tests {
         assert!(team["continuous"].get("missed_count").is_some());
         assert_eq!(team["continuous"]["queues"][0]["pending"], 3);
         assert!(team["continuous"].get("cadence_secs").is_some());
+    }
+
+    #[test]
+    fn remote_marker_projection_is_unknown_until_remote_status_is_merged() {
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        let team = decorate_team(&state, json!({
+            "id": "team-remote", "lead_member_id": "mem-1",
+            "continuous": {"lead_member_id": "mem-1", "host_id": "remote-host"}
+        }), &[json!({"queue":"momentum", "pending":9, "binding":{"consumer":"mem-1"}})]);
+        assert_eq!(team["continuous"]["health"], "unknown");
+        assert_eq!(team["continuous"]["next_run"], Value::Null);
+        assert_eq!(team["continuous"]["queues"], json!([]));
     }
 
     fn marks(list: Value) -> Value {
