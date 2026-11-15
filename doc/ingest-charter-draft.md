@@ -78,9 +78,9 @@ reset. So:
   last.
 - Tell Owner as soon as a pool looks set to run out before its reset.
 - Usage source: the Oxylabs Dashboard API (`GET https://api.oxylabs.io/stats/v1/usage`)
-  once Owner obtains a key from Oxylabs support. The key lives in
-  `~/.config/oxylabs/dashboard-api-key` on cm-manager (0600), and nobody
-  prints it. Until the key arrives, and for any product the API does not
+  once Owner obtains a key from Oxylabs support (requested 2026-11-15). Owner
+  puts it in the predictionTrading `.env` on cm-manager as
+  `OXYLABS_DASHBOARD_API_KEY`, and nobody prints it. Until the key arrives, and for any product the API does not
   cover, Ingest counts proxied bytes per pool in the scrapers and keeps a
   wider margin. The following go to Owner first: a plan upgrade,
 overage, more IPs, or any new paid scraping service or provider.
