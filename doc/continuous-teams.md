@@ -70,6 +70,17 @@ triage and code bug hunt for the execution side.
 
 **Prob pipeline.** The same reliability team, for the prob pipeline side.
 
+**Latency optimization (new, Owner 2026-11-15).** A cross-functional
+team for **reception to signal emission**. That is everything on our end,
+from the moment we receive an article to the moment the signal is emitted.
+It works across the entire pipeline. It characterizes where the largest
+delays are and optimizes them down as far as possible. Publication to
+reception is out of scope, because that is scraper work and belongs to
+Ingest. Home org still to decide: its own org, or the execution pipeline.
+
+**Leads (Owner, 2026-11-15).** Every continuous team lead is Claude Opus,
+the Ingest lead included.
+
 **Retired.**
 
 - health-alert-triage: replaced by a scheduled check session.

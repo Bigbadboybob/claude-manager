@@ -1,8 +1,9 @@
 # Ingest org: charter draft
 
-Status: **draft v2.** It has Owner's first review folded in (Swarm-Coord,
-2026-11-06). No Ingest lead starts until Owner signs off and claudelb is
-ready. Lines marked **Owner:** are the decisions still open. Plan context:
+Status: **draft v3.** Owner answered the open questions 2026-11-15
+(Swarm-Coord). claudelb is ready. The one open item is the spend cap figure
+below. The lead launches once cm-manager has Codex (bender2, after its
+2026-11-15 23:27Z refill). Plan context:
 [continuous-teams.md](continuous-teams.md).
 
 ## Purpose
@@ -46,9 +47,10 @@ still sit in the continuous tasks' state and memory on cm-manager. They are
 rewritten when those tasks move to Ingest. Ten code paths still pause or
 retire blocked sources; changing them is Ingest's first backlog.
 
-**Owner:** is there a monthly spend cap for proxies and paid scraping
-services that Ingest may use without asking? Is there any hard line, such
-as never using logged-in accounts?
+**Spend cap (Owner, 2026-11-15):** yes, there is a monthly cap for proxies
+and paid scraping that Ingest may use without asking. Oxylabs is the main
+one. The figure is set from the current Oxylabs plan limits (pending: Owner
+or the dashboard supplies them). Spend beyond the cap goes to Owner.
 
 ## The scraping playbook
 
@@ -81,6 +83,7 @@ several items, and workers are reused.
 - Fixing a broken, blocked or degraded scraper, with any tool in the
   blockers section.
 - Re-enabling a source.
+- Adding a new source.
 - Scraper tuning for freshness, reliability and quality.
 
 ## What goes to Owner
@@ -88,8 +91,8 @@ several items, and workers are reused.
 - Retiring a source we want.
 - Spend beyond the cap above.
 
-**Owner:** do new sources need your OK, or can Ingest add any source the
-momentum work shows moves markets?
+**New sources (Owner, 2026-11-15):** Ingest adds them on its own. No Owner
+OK is needed.
 
 ## What gets relayed
 
@@ -101,7 +104,7 @@ momentum work shows moves markets?
 
 ## Priorities
 
-**Owner:** rank these, or add your own.
+Order confirmed by Owner, 2026-11-15.
 
 1. Sources the live trader depends on.
 2. Freshness: delay from published to stored.
@@ -111,8 +114,8 @@ momentum work shows moves markets?
 
 ## Done means
 
-**Owner:** what tells you Ingest is working? For example: no wanted source
-dark for more than N hours without an open item, or a weekly digest.
+Agreed with Owner, 2026-11-15: no wanted source is dark for more than N
+hours without an open item, and Ingest posts a weekly digest.
 
 ## Starting backlog
 
