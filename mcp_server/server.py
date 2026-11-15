@@ -966,6 +966,28 @@ def chat_monitors(action: str = "list", monitor_id: str | None = None,
 
 
 @mcp.tool()
+def session_wake_schedule(action: str = "create", session_uid: str | None = None,
+                          schedule_id: str | None = None, interval_secs: int | None = None,
+                          daily_at: str | None = None, jitter_secs: int = 0,
+                          wake_message: str | None = None, enabled: bool | None = None) -> dict:
+    """Create, update, or cancel a durable scheduled wake.
+
+    For create, use interval_secs or daily_at in UTC (for example
+    ``13:00Z``). The default target is your own session. A global-permissions
+    session, or a parent over its descendants, may pass session_uid.
+    """
+    params = {k: v for k, v in locals().items() if v is not None}
+    return control_client.call("session_wake_schedule", params)
+
+
+@mcp.tool()
+def session_wake_schedules(session_uid: str | None = None) -> dict:
+    """List durable scheduled wakes with last/next run and missed count."""
+    params = {} if session_uid is None else {"session_uid": session_uid}
+    return control_client.call("session_wake_schedules", params)
+
+
+@mcp.tool()
 def chat_follow(action: str = "get", scope: dict | None = None,
                 inbox: bool | None = None, wake: bool | None = None,
                 muted: bool | None = None, dnd: bool | None = None,

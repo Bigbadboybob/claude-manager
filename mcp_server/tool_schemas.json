@@ -1602,6 +1602,9 @@
     },
     "task": {
      "type": "string"
+    },
+    "team": {
+     "type": "string"
     }
    },
    "required": [
@@ -1924,6 +1927,43 @@
      "type": "string"
     },
     "task": {
+     "type": "string"
+    }
+   },
+   "required": []
+  },
+  "session_wake_schedule": {
+   "params": {
+    "action": {
+     "type": "string"
+    },
+    "daily_at": {
+     "type": "string"
+    },
+    "enabled": {
+     "type": "boolean"
+    },
+    "interval_secs": {
+     "type": "integer"
+    },
+    "jitter_secs": {
+     "type": "integer"
+    },
+    "schedule_id": {
+     "type": "string"
+    },
+    "session_uid": {
+     "type": "string"
+    },
+    "wake_message": {
+     "type": "string"
+    }
+   },
+   "required": []
+  },
+  "session_wake_schedules": {
+   "params": {
+    "session_uid": {
      "type": "string"
     }
    },

@@ -169,6 +169,7 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # index issues. No MCP tool routes it. Listed for dispatch-surface
     # alignment only.
     "continuous.dispatch_pending",
+    "session_wake_schedule", "session_wake_schedules",
     # Operator-only: create/repair a continuous task's `ct/<slug>` channel
     # (migration scripts). Listed for dispatch-surface alignment only.
     "continuous.ensure_channel",
