@@ -1353,11 +1353,14 @@ class PoolTests(HubHarness):
         self.assertTrue(cands[0][0][0])  # and bob only as a last resort
         self.assertIn("last resort; first reserved for cm-manager", self.hub("status")[1])
 
-    def test_a_pool_copy_of_an_account_a_host_holds_is_dropped(self):
+    def test_auto_never_lends_an_account_another_host_is_running_on(self):
         self.poll()
-        self.poll()
+        self.poll()  # bob and carol in the pool
         self.other_host({**host_export("cm-sessions", active="bob", saved=["bob"]), "last_switch_at": 0})
-        self.assertEqual(self.pool_uuids(), ["carol-uuid-0000"])
+        self.assertEqual(self.pool_uuids(), ["bob-uuid-0000", "carol-uuid-0000"])  # both logins kept
+        with accounts.Hub(self.hub_paths) as h:
+            cands = accounts.pool_candidates(h, "laptop", h.reports(), time.time())
+        self.assertEqual([c[1] for c in cands], ["carol-uuid-0000"])
 
     def test_a_logged_out_host_with_saved_accounts_still_takes_its_pin(self):
         self.poll()

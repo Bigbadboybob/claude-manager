@@ -1348,8 +1348,9 @@ def pool_take_returns(hub: Hub, host: str, export: dict, returning) -> list[str]
 def pool_settle(hub: Hub, host: str, export: dict, returned: list[str]) -> None:
     """Keep each login in one place. A lend this host confirmed (it now
     lists the account) is final; one it does not list went astray and goes
-    back to the pool. A pool copy of an account this host still holds (and
-    did not just return) is dropped: the host's copy is the live one."""
+    back to the pool. The pool may also hold a login of an account some host
+    has its own login for (each /login is a separate login): both are valid,
+    and automatic lending skips an account another host is running on."""
     lent = hub.pool_dir / "lent"
     held = set(export.get("accounts") or {}) | {export.get("active")}
     for path in sorted(lent.glob(f"*.{host}.json")) if lent.is_dir() else []:
@@ -1359,12 +1360,6 @@ def pool_settle(hub: Hub, host: str, export: dict, returned: list[str]) -> None:
         else:
             os.rename(path, hub.pool_dir / f"{uuid}.json")
             hub.event("pool", f"lend of {uuid[:8]} to {host} not confirmed; back in the pool", host=host)
-    if not pool_capable(export):
-        return  # an old host's copy is a separate login, not this one
-    for uuid in hub.pool():
-        if uuid in held and uuid not in returned:
-            (hub.pool_dir / f"{uuid}.json").unlink()
-            hub.event("pool", f"{uuid[:8]} is saved on {host}; dropped the pool's copy", host=host)
 
 
 def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -> list[tuple]:
@@ -1373,9 +1368,12 @@ def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -
     d = hub.desired
     config = {"thresholds": d["policy"].get("thresholds") or {}}
     readings = {**load_json(hub.dir / "readings.json"), **hub_readings(reports)}
+    running = {(r.get("export") or {}).get("active") for h, r in reports.items()
+               if h not in (host, POOL) and now - r.get("at", 0) <= HUB_REPORT_FRESH_SECONDS}
     out = []
     for uuid, rec in hub.pool().items():
-        if uuid in d["draining"] or login_state(rec, now) in ("needs /login", "login expired"):
+        if uuid in d["draining"] or uuid in running \
+                or login_state(rec, now) in ("needs /login", "login expired"):
             continue
         res = d["reservations"].get(uuid)
         last_resort = False
