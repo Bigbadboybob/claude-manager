@@ -16335,8 +16335,9 @@ pub fn continuous_dashboard(
     };
     let queue_rows = queues["queues"].as_array().cloned().unwrap_or_default();
     let wake_rows = wakes["schedules"].as_array().cloned().unwrap_or_default();
+    let team_rows = continuous_team_dashboard_rows(state_arc, &queue_rows, &wake_rows, api.as_ref());
     if let Some(tasks) = dashboard["tasks"].as_array_mut() {
-        for task in tasks {
+        for task in &mut *tasks {
             let queue_name = task
                 .pointer("/schedule/queue")
                 .and_then(Value::as_str);
@@ -16388,10 +16389,133 @@ pub fn continuous_dashboard(
                 .unwrap_or_default();
             task["open_items"] = json!(open_items);
         }
+        // Keep the original `tasks` projection usable by older clients while
+        // exposing org-model continuous teams to this dashboard too. Team
+        // rows have `kind=continuous_team` and are read-only (there is no
+        // legacy scheduler pause/drain action for them).
+        tasks.extend(team_rows.iter().cloned());
     }
     dashboard["queues"] = queues["queues"].clone();
     dashboard["wake_schedules"] = wakes["schedules"].clone();
+    dashboard["continuous_teams"] = json!(team_rows);
     Ok(dashboard)
+}
+
+/// Project CT-Wake's stable org-team marker into the dashboard row shape.
+/// `continuous` is an object on current APIs; accepting `true` keeps the
+/// projection tolerant of the marker's first rollout. The marker's `queues`
+/// are already filtered to the lead, so they are preferred over the global
+/// queue read. The global read remains a compatibility fallback for an API
+/// that only returned the static lead identity.
+fn continuous_team_dashboard_rows(
+    _state_arc: &Arc<Mutex<DaemonState>>,
+    queue_rows: &[Value],
+    wake_rows: &[Value],
+    api: Option<&crate::items::api::Api>,
+) -> Vec<Value> {
+    let snapshot = api.and_then(|client| client.get("/org/snapshot", &[]).ok());
+    let teams = snapshot
+        .as_ref()
+        .and_then(|v| v["teams"].as_array())
+        .cloned()
+        .unwrap_or_default();
+    teams
+        .iter()
+        .filter_map(|team| {
+            let marker = match team.get("continuous") {
+                Some(value @ Value::Object(_)) => value,
+                Some(Value::Bool(true)) => team,
+                _ => return None,
+            };
+            let id = team["id"].as_str().or_else(|| team["slug"].as_str())?;
+            let label = team["name"].as_str().or_else(|| team["slug"].as_str()).unwrap_or(id);
+            let lead_member = marker["lead_member_id"].as_str();
+            let lead_uid = marker["lead_session_uid"].as_str();
+            let lead_handle = marker["lead_handle"].as_str();
+            let mut bound_queues = marker["queues"].as_array().cloned().unwrap_or_default();
+            if bound_queues.is_empty() {
+                bound_queues = queue_rows
+                    .iter()
+                    .filter(|row| {
+                        let consumer = row.pointer("/binding/consumer").and_then(Value::as_str);
+                        consumer == lead_member || consumer == lead_handle
+                    })
+                    .cloned()
+                    .collect();
+            }
+            let schedules: Vec<Value> = wake_rows
+                .iter()
+                .filter(|row| lead_uid.is_some() && row["session_uid"].as_str() == lead_uid)
+                .cloned()
+                .collect();
+            let missed = marker["missed_count"].as_u64().or_else(|| {
+                schedules
+                    .iter()
+                    .map(|row| row["missed_count"].as_u64().unwrap_or(0))
+                    .sum::<u64>()
+                    .into()
+            }).unwrap_or(0);
+            let next_run = if marker["next_run"].is_null() {
+                schedules
+                    .iter()
+                    .filter_map(|row| row["next_run"].as_f64())
+                    .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(Value::from)
+                    .unwrap_or(Value::Null)
+            } else {
+                marker["next_run"].clone()
+            };
+            let last_run = if marker["last_run"].is_null() {
+                schedules
+                    .iter()
+                    .filter_map(|row| row["last_run"].as_object().cloned().map(Value::Object))
+                    .max_by(|a, b| {
+                        a["scheduled_at"]
+                            .as_f64()
+                            .unwrap_or(0.0)
+                            .partial_cmp(&b["scheduled_at"].as_f64().unwrap_or(0.0))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .unwrap_or(Value::Null)
+            } else {
+                marker["last_run"].clone()
+            };
+            let health = marker["health"].as_str().unwrap_or_else(|| if marker["blocked"] == true { "blocked" } else { "ok" });
+            let blocked = matches!(health, "blocked") || marker["blocked"] == true;
+            let board = team["board"].as_str().or_else(|| marker["board"].as_str());
+            let open_items = board
+                .and_then(|board| api.and_then(|client| client.get(&format!("/boards/{board}"), &[]).ok()))
+                .and_then(|value| value["items"].as_array().cloned())
+                .map(|items| items.into_iter().filter(|item| !matches!(item["status"].as_str(), Some("done" | "dropped"))).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let current_session_uid = marker["lead_session_uid"].clone();
+            let bound_queue = bound_queues.first().cloned().unwrap_or(Value::Null);
+            Some(json!({
+                "kind": "continuous_team",
+                "team_id": id,
+                "task_id": format!("team:{id}"),
+                "label": label,
+                "host_id": marker["host_id"],
+                "lead_member_id": lead_member,
+                "lead_handle": lead_handle,
+                "current_session_uid": current_session_uid,
+                "lead_session_uid": marker["lead_session_uid"],
+                "lead_alive": marker["lead_alive"],
+                "next_run": next_run,
+                "next_fire_at": next_run,
+                "last_run": last_run,
+                "missed_count": missed,
+                "missed_runs": missed,
+                "health": health,
+                "blocked_state": if blocked { Value::String("blocked".into()) } else { Value::Null },
+                "bound_queues": bound_queues,
+                "bound_queue": bound_queue,
+                "wake_schedules": schedules,
+                "open_items": open_items,
+                "continuous": marker,
+            }))
+        })
+        .collect()
 }
 
 /// `continuous.dispatch_pending` — read-only scan of every REVIEWABLE

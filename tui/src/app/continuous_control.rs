@@ -167,7 +167,48 @@ impl Menu {
                 }
             }
         }
+        // Org-model team rows are returned by every reachable daemon because
+        // the marker lives in the shared planning API. Keep one row per team,
+        // preferring the daemon whose host matches the marker's static host_id;
+        // legacy task rows remain one-per-host.
+        self.dedupe_team_rows();
         changed
+    }
+
+    fn dedupe_team_rows(&mut self) {
+        let mut chosen: HashMap<String, usize> = HashMap::new();
+        for (index, row) in self.rows.iter().enumerate() {
+            if row.task["kind"] != "continuous_team" {
+                continue;
+            }
+            let Some(team_id) = row.task["team_id"].as_str() else { continue };
+            let prefer = row.task["host_id"].as_str() == Some(row.host.as_str());
+            match chosen.get(team_id).copied() {
+                None => {
+                    chosen.insert(team_id.to_string(), index);
+                }
+                Some(previous) => {
+                    let previous_prefer = self.rows[previous].task["host_id"].as_str() == Some(self.rows[previous].host.as_str());
+                    if prefer && !previous_prefer {
+                        chosen.insert(team_id.to_string(), index);
+                    }
+                }
+            }
+        }
+        if chosen.is_empty() {
+            return;
+        }
+        self.rows = self
+            .rows
+            .drain(..)
+            .enumerate()
+            .filter(|(index, row)| {
+                row.task["kind"] != "continuous_team"
+                    || row.task["team_id"].as_str().and_then(|id| chosen.get(id).copied()) == Some(*index)
+            })
+            .map(|(_, row)| row)
+            .collect();
+        self.selected = self.selected.min(self.rows.len().saturating_sub(1));
     }
 
     pub fn key(&mut self, key: crossterm::event::KeyEvent) -> InputOutcome {
@@ -189,6 +230,10 @@ impl Menu {
             }
             KeyCode::Char('s') | KeyCode::Char('r') if !self.pending => {
                 if let Some(row) = self.rows.get(self.selected) {
+                    if row.task["kind"] == "continuous_team" {
+                        self.message = "Org continuous teams are lead-owned; use the lead or queue tools.".into();
+                        return InputOutcome::Consumed;
+                    }
                     let resume = key.code == KeyCode::Char('r');
                     let method = if resume {
                         "continuous.pause"
@@ -232,6 +277,14 @@ impl Menu {
             || self.awaiting_refresh.contains(&row.host)
         {
             return "Refreshing status";
+        }
+        if row.task["kind"] == "continuous_team" {
+            return match row.task["health"].as_str() {
+                Some("blocked") => "Blocked",
+                Some("late") => "Late",
+                Some("missed") => "Missed run",
+                _ => "Healthy",
+            };
         }
         match row
             .task
@@ -291,14 +344,18 @@ impl Menu {
                 }),
             ));
             if index == self.selected {
-                let lead = row.task["current_session_uid"].as_str().unwrap_or("—");
-                let next = row.task["next_fire_at"].as_u64().map(|n| n.to_string()).unwrap_or_else(|| "—".into());
-                let last = row.task.pointer("/last_run/status").and_then(Value::as_str).unwrap_or("—");
-                let last_at = row.task.pointer("/last_run/finished_at").or_else(|| row.task.pointer("/last_run/started_at")).and_then(Value::as_u64).map(|n| n.to_string()).unwrap_or_else(|| "—".into());
-                let missed = row.task["missed_runs"].as_u64().unwrap_or(0);
+                let lead = row.task["lead_session_uid"].as_str().or(row.task["current_session_uid"].as_str()).unwrap_or("—");
+                let next = row.task["next_run"].as_f64().or_else(|| row.task["next_fire_at"].as_f64()).map(|n| format!("{n:.0}")).unwrap_or_else(|| "—".into());
+                let last = row.task.pointer("/last_run/status").or_else(|| row.task.pointer("/last_run/outcome")).and_then(Value::as_str).unwrap_or("—");
+                let last_at = row.task.pointer("/last_run/finished_at").or_else(|| row.task.pointer("/last_run/started_at")).or_else(|| row.task.pointer("/last_run/scheduled_at")).and_then(Value::as_u64).map(|n| n.to_string()).unwrap_or_else(|| "—".into());
+                let missed = row.task["missed_runs"].as_u64().or_else(|| row.task["missed_count"].as_u64()).unwrap_or(0);
                 let blocked = row.task["blocked_state"].as_str().unwrap_or("ok");
                 lines.push(Line::from(format!("    lead {lead} · last {last} @ {last_at} · next {next} · missed {missed} · {blocked}")));
-                if let Some(queue) = row.task["bound_queue"].as_object() {
+                let queues = row.task["bound_queues"].as_array().cloned().unwrap_or_else(|| {
+                    row.task["bound_queue"].as_object().map(|queue| vec![Value::Object(queue.clone())]).unwrap_or_default()
+                });
+                for queue in queues {
+                    let Some(queue) = queue.as_object() else { continue };
                     lines.push(Line::from(format!(
                         "    queue {} · depth {} · oldest {}",
                         queue.get("queue").and_then(Value::as_str).unwrap_or("—"),
@@ -379,6 +436,22 @@ mod tests {
             "bound_queue": {"queue": "momentum", "pending": 2,
                 "oldest_item_age_seconds": 90.0},
             "open_items": [{"n": 12}]})
+    }
+
+    fn team_task() -> Value {
+        json!({
+            "kind": "continuous_team",
+            "task_id": "team:ingest",
+            "team_id": "ingest",
+            "label": "Ingest",
+            "health": "missed",
+            "lead_session_uid": "lead-1",
+            "next_run": 1731675600.0,
+            "last_run": {"outcome": "missed", "scheduled_at": 1731672000.0},
+            "missed_count": 2,
+            "bound_queues": [{"queue": "momentum", "pending": 3, "oldest_item_age_seconds": 7200.0}],
+            "open_items": [{"n": 8}],
+        })
     }
 
     #[test]
@@ -488,5 +561,42 @@ mod tests {
             .unwrap();
         menu.poll();
         assert_eq!(menu.status(&menu.rows[0]), "Stopped");
+    }
+
+    #[test]
+    fn continuous_control_renders_org_team_health_and_refuses_legacy_actions() {
+        let (mut menu, tx) = fixture();
+        let host = HostId::new("cm-manager");
+        tx.send(Update::Inventory(host.clone(), Ok(vec![team_task()])))
+            .unwrap();
+        menu.poll();
+        assert_eq!(menu.status(&menu.rows[0]), "Missed run");
+        menu.key(crossterm::event::KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(menu.commands.is_empty());
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| menu.draw(frame, frame.area())).unwrap();
+        let rendered: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        assert!(rendered.contains("Ingest"));
+        assert!(rendered.contains("Missed run"));
+        assert!(rendered.contains("queue momentum"));
+        assert!(rendered.contains("open board items 1"));
+    }
+
+    #[test]
+    fn continuous_control_dedupes_team_rows_across_hosts() {
+        let (mut menu, tx) = fixture();
+        let local = HostId::local();
+        let remote = HostId::new("sessions");
+        let mut local_row = team_task();
+        local_row["host_id"] = json!("sessions");
+        tx.send(Update::Inventory(local, Ok(vec![local_row]))).unwrap();
+        menu.poll();
+        let mut remote_row = team_task();
+        remote_row["host_id"] = json!("sessions");
+        tx.send(Update::Inventory(remote, Ok(vec![remote_row]))).unwrap();
+        menu.poll();
+        assert_eq!(menu.rows.iter().filter(|row| row.task["kind"] == "continuous_team").count(), 1);
+        assert_eq!(menu.rows[0].host.as_str(), "sessions");
     }
 }
