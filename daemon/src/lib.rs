@@ -1258,6 +1258,9 @@ pub fn run() -> anyhow::Result<()> {
         .persist_sessions_best_effort();
     messaging::delivery::spawn(&state);
     messaging::tasks::spawn(&state);
+    if let Err(e) = messaging::tasks::ensure_continuous_channel(&state) {
+        eprintln!("cm-daemon: could not ensure #continuous channel: {e}");
+    }
     items::start(&state);
     // #24: a rotation the previous brain left between stop and respawn
     // resumes its original transcript (after restore and adoption, so a

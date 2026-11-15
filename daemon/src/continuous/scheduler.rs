@@ -114,6 +114,8 @@ const QUEUE_DEPTH_MAX_STALE_SECS: u64 = 300;
 /// into a hot loop.
 const QUEUE_WAKE_SWEEP_SECS: u64 = 20;
 const QUEUE_WAKE_BACKOFF_CAP_SECS: u64 = 300;
+const CONTINUOUS_MONITOR_SECS: u64 = 30;
+const CONTINUOUS_QUEUE_AGE_SECS: f64 = 3600.0;
 
 /// How often (seconds) the auth/wedge pass re-reads a given task's transcript
 /// tail. The pass runs every tick (250 ms) but tail reads are file I/O +
@@ -289,6 +291,9 @@ pub struct ContinuousScheduler {
     /// Bound queues are intentionally handed from the legacy scheduler to the
     /// lead. Log that handoff once per queue, not once per scheduler tick.
     bound_queue_warnings: Mutex<HashSet<String>>,
+    continuous_alerts: Mutex<HashMap<String, String>>,
+    continuous_episodes: Mutex<HashMap<String, u64>>,
+    last_continuous_monitor: AtomicU64,
     /// Account-block/wedge transcript-probe throttle: `task_id -> last probe ts`
     /// ([`TAIL_PROBE_INTERVAL_SECS`]). In-memory only.
     probe_at: Mutex<HashMap<String, u64>>,
@@ -342,6 +347,7 @@ impl ContinuousScheduler {
     /// `0`. Mirrors `WorkflowPoller::new` but honors the config (the poller
     /// hardcodes its default) so lib.rs stays a plain `new()` + `start()`.
     pub fn new(state: Arc<Mutex<DaemonState>>) -> Self {
+        let (monitor_active, monitor_episodes) = load_monitor_latch();
         let configured = {
             let s = state.lock().unwrap_or_else(|p| p.into_inner());
             s.config.scheduler.tick_interval
@@ -362,6 +368,9 @@ impl ContinuousScheduler {
             queue_wake_retries: Mutex::new(HashMap::new()),
             last_queue_wake_sweep: AtomicU64::new(0),
             bound_queue_warnings: Mutex::new(HashSet::new()),
+            continuous_alerts: Mutex::new(monitor_active),
+            continuous_episodes: Mutex::new(monitor_episodes),
+            last_continuous_monitor: AtomicU64::new(0),
             probe_at: Mutex::new(HashMap::new()),
             evidence_warnings: Mutex::new(HashMap::new()),
             transient_pool: Mutex::new(HashMap::new()),
@@ -461,7 +470,14 @@ impl ContinuousScheduler {
         // Operator stop notices remain usable with scheduled fires disabled.
         // The notifier separately respects host restart drain/quiescence.
         let now = task::now_unix();
-        self.sweep_bound_queue_wakes(now);
+        let owns_continuous = {
+            let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            owns_continuous_scheduler(s.config.scheduler.enabled, s.draining)
+        };
+        if owns_continuous {
+            self.sweep_bound_queue_wakes(now);
+            self.monitor_continuous_health(now);
+        }
         crate::control::continuous_drain::queue_notices(&self.state, &task::load_all());
         // Master on/off (read under a brief lock). lib.rs still constructs +
         // starts the thread when disabled; the tick is just a no-op.
@@ -825,6 +841,176 @@ impl ContinuousScheduler {
                 retries.insert(queue.to_string(), (now.saturating_add(backoff), failures));
             }
         }
+    }
+
+    /// Daemon-side health monitor for the shared `#continuous` channel. The
+    /// alert map is a transition latch: each problem posts once, and a single
+    /// clear is posted when the condition disappears.
+    fn monitor_continuous_health(&self, now: u64) {
+        let previous = self.last_continuous_monitor.load(Ordering::Relaxed);
+        if now.saturating_sub(previous) < CONTINUOUS_MONITOR_SECS {
+            return;
+        }
+        self.last_continuous_monitor.store(now, Ordering::Relaxed);
+        let tasks = crate::continuous::task::load_all();
+        let mut current: HashMap<String, String> = HashMap::new();
+        for task in tasks {
+            let every = match &task.schedule {
+                Schedule::Periodic { every_secs } => Some(*every_secs),
+                Schedule::Consumer { window_secs, .. } => Some(*window_secs),
+                _ => None,
+            };
+            let run_status = task.last_run.as_ref().map(|run| run.status);
+            // `current_session_uid` is also populated for a persistent lead
+            // between runs. It is therefore not, by itself, proof that a run
+            // is in flight. A run is active while its durable record is
+            // Running; a pre-record spawn is the only case where a live
+            // current session supplies that proof.
+            let live_current_run = task.last_run.is_none()
+                && task.current_session_uid.as_deref().is_some_and(|uid| {
+                    self.state.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid)
+                });
+            if overdue_alerts_allowed(run_status, live_current_run) {
+                if let Some(period) = every.filter(|p| *p > 0) {
+                    if task.next_fire_at > 0 && now > task.next_fire_at {
+                        let late = now.saturating_sub(task.next_fire_at) > period / 2;
+                        if late {
+                            current.insert(
+                                format!("late:{}", task.task_id),
+                                format!("{} is late: next run was {}s ago", task.label, now - task.next_fire_at),
+                            );
+                        }
+                        if now.saturating_sub(task.next_fire_at) >= period {
+                            current.insert(
+                                format!("missed:{}", task.task_id),
+                                format!("{} missed a run (next run overdue by {}s)", task.label, now - task.next_fire_at),
+                            );
+                        }
+                    }
+                }
+            }
+            if task.account_blocked.is_some() || task.recovery_hold.is_some() {
+                current.insert(
+                    format!("blocked:{}", task.task_id),
+                    format!("{} is blocked and needs recovery", task.label),
+                );
+            }
+            if let Some(uid) = task.current_session_uid.as_deref() {
+                let live = self.state.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid);
+                if !live {
+                    current.insert(
+                        format!("lead:{}", task.task_id),
+                        format!("{} lead session {} is dead", task.label, uid),
+                    );
+                }
+            }
+        }
+        // Org-model continuous teams are lead-owned rather than legacy
+        // scheduler tasks. Their marker already contains the wake outcome;
+        // use that durable outcome instead of deriving missed runs from a
+        // task-local `next_fire_at`.
+        let mut marker_queue_names = HashSet::new();
+        for team in self.continuous_team_markers() {
+            let Some(marker) = continuous_team_marker(&team) else { continue };
+            let id = team["id"].as_str().or_else(|| team["slug"].as_str()).unwrap_or("team");
+            let label = team["name"].as_str().or_else(|| team["slug"].as_str()).unwrap_or(id);
+            let health = marker["health"].as_str().unwrap_or("");
+            if matches!(health, "late" | "missed") {
+                current.insert(
+                    format!("team:{id}:{health}"),
+                    format!("continuous team {label} is {health}"),
+                );
+            }
+            if marker["health"] == "blocked" || marker["blocked"] == true {
+                current.insert(
+                    format!("team:{id}:blocked"),
+                    format!("continuous team {label} is blocked"),
+                );
+            }
+            let lead_uid = marker["lead_session_uid"].as_str();
+            let lead_alive = marker["lead_alive"].as_bool().or_else(|| {
+                lead_uid.map(|uid| self.state.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid))
+            });
+            // A raw/static marker (or a remote/unknown projection) has no
+            // lead UID and must not be treated as a dead local lead. The
+            // daemon-side org projection supplies a resolved UID when this
+            // daemon owns the member; otherwise locality is ambiguous and we
+            // stay quiet rather than page on another host's lead.
+            if should_alert_missing_lead(&marker, lead_alive) {
+                current.insert(
+                    format!("team:{id}:lead"),
+                    format!("continuous team {label} lead is dead"),
+                );
+            }
+            if let Some(queues) = marker["queues"].as_array() {
+                for queue in queues {
+                    if queue["pending"].as_u64().unwrap_or(0) > 0
+                        && queue["oldest_item_age_seconds"].as_f64().unwrap_or(0.0) > CONTINUOUS_QUEUE_AGE_SECS
+                    {
+                        if let Some(name) = queue["queue"].as_str() {
+                            marker_queue_names.insert(name.to_string());
+                            current.insert(
+                                format!("team:{id}:queue:{name}"),
+                                format!("continuous team {label} queue {name} has an item waiting {:.0}m", queue["oldest_item_age_seconds"].as_f64().unwrap_or(0.0) / 60.0),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(client) = {
+            let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            crate::continuous::queue::QueueClient::from_overrides(Some(&s.config.api_url), Some(&s.config.api_token))
+        } {
+            if let Ok(snapshot) = client.list() {
+                for row in snapshot["queues"].as_array().into_iter().flatten() {
+                    if row["pending"].as_u64().unwrap_or(0) == 0 { continue; }
+                    // A marker team already reports its lead-filtered queue;
+                    // don't emit a second alert for the same bound queue.
+                    if row["binding"].is_object()
+                        && row["queue"].as_str().is_some_and(|name| marker_queue_names.contains(name))
+                    {
+                        continue;
+                    }
+                    let age = row["oldest_item_age_seconds"].as_f64().unwrap_or(0.0);
+                    if age > CONTINUOUS_QUEUE_AGE_SECS {
+                        if let Some(queue) = row["queue"].as_str() {
+                            current.insert(
+                                format!("queue:{queue}"),
+                                format!("queue {queue} has an item waiting {:.0}m", age / 60.0),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let mut alerts = self.continuous_alerts.lock().unwrap_or_else(|p| p.into_inner());
+        let old = alerts.clone();
+        let (raised, cleared) = monitor_alert_transitions(&old, &current);
+        let mut episodes = self.continuous_episodes.lock().unwrap_or_else(|p| p.into_inner());
+        for key in raised {
+            let body = &current[&key];
+            let episode = episodes.entry(key.clone()).or_default();
+            *episode = episode.saturating_add(1);
+            let _ = crate::messaging::tasks::post_continuous_notice(
+                &self.state,
+                &format!("continuous-alert:{key}:{episode}"),
+                &format!("[cm-continuous] {body}"),
+            );
+        }
+        for key in cleared {
+            let _ = crate::messaging::tasks::post_continuous_notice(
+                &self.state,
+                &format!("continuous-clear:{key}:{}", episodes.get(&key).copied().unwrap_or(1)),
+                &format!("[cm-continuous] cleared: {}", key),
+            );
+        }
+        save_monitor_latch(&current, &episodes);
+        *alerts = current;
+    }
+
+    fn continuous_team_markers(&self) -> Vec<serde_json::Value> {
+        crate::items::org::continuous_team_markers(&self.state)
     }
 
     /// Test-only: canned per-queue pending depths for the Consumer due-check
@@ -2718,6 +2904,68 @@ impl ContinuousScheduler {
     }
 }
 
+fn owns_continuous_scheduler(enabled: bool, draining: bool) -> bool {
+    // This is intentionally the same gate as the scheduler's fire path below:
+    // only the configured scheduler owner runs queue sweeps and health
+    // monitoring. Other daemons may expose the API but must stay observers.
+    enabled && !draining
+}
+
+fn overdue_alerts_allowed(run_status: Option<RunStatus>, live_current_run: bool) -> bool {
+    run_status != Some(RunStatus::Running) && !live_current_run
+}
+
+fn continuous_team_marker(team: &serde_json::Value) -> Option<&serde_json::Value> {
+    match team.get("continuous") {
+        Some(value @ serde_json::Value::Object(_)) => Some(value),
+        Some(serde_json::Value::Bool(true)) => Some(team),
+        _ => None,
+    }
+}
+
+fn should_alert_missing_lead(marker: &serde_json::Value, lead_alive: Option<bool>) -> bool {
+    marker["lead_session_uid"].as_str().is_some() && lead_alive == Some(false)
+}
+
+fn monitor_alert_transitions(
+    old: &HashMap<String, String>,
+    current: &HashMap<String, String>,
+) -> (Vec<String>, Vec<String>) {
+    let raised = current.keys().filter(|key| !old.contains_key(*key)).cloned().collect();
+    let cleared = old.keys().filter(|key| !current.contains_key(*key)).cloned().collect();
+    (raised, cleared)
+}
+
+fn monitor_latch_path() -> std::path::PathBuf {
+    crate::path::dot_cm_dir().join("continuous-monitor-latch.json")
+}
+
+fn load_monitor_latch() -> (HashMap<String, String>, HashMap<String, u64>) {
+    let value = std::fs::read(monitor_latch_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .unwrap_or_default();
+    let active = value["active"].as_object().map(|map| map.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect()).unwrap_or_default();
+    let episodes = value["episodes"].as_object().map(|map| map.iter().filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n))).collect()).unwrap_or_default();
+    (active, episodes)
+}
+
+fn save_monitor_latch(active: &HashMap<String, String>, episodes: &HashMap<String, u64>) {
+    let path = monitor_latch_path();
+    let Some(parent) = path.parent() else { return; };
+    let _ = std::fs::create_dir_all(parent);
+    let value = serde_json::json!({"active": active, "episodes": episodes});
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, value.to_string()).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        let _ = std::fs::rename(tmp, path);
+    }
+}
+
 fn scheduler_should_consume_queue(stats: &crate::continuous::queue::QueueStats) -> bool {
     stats.binding.is_none()
 }
@@ -3458,6 +3706,78 @@ mod tests {
         assert!(!scheduler_should_consume_queue(&bound));
         assert_eq!(queue_wake_backoff(1), QUEUE_WAKE_SWEEP_SECS * 2);
         assert_eq!(queue_wake_backoff(99), QUEUE_WAKE_BACKOFF_CAP_SECS);
+    }
+
+    #[test]
+    fn monitor_alert_transitions_raise_once_and_clear_once() {
+        let old = HashMap::new();
+        let current = HashMap::from([(String::from("late:one"), String::from("late"))]);
+        let (raised, cleared) = monitor_alert_transitions(&old, &current);
+        assert_eq!(raised, vec!["late:one"]);
+        assert!(cleared.is_empty());
+        let (raised, cleared) = monitor_alert_transitions(&current, &current);
+        assert!(raised.is_empty());
+        assert!(cleared.is_empty());
+        let (raised, cleared) = monitor_alert_transitions(&current, &HashMap::new());
+        assert!(raised.is_empty());
+        assert_eq!(cleared, vec!["late:one"]);
+    }
+
+    #[test]
+    fn monitor_does_not_mark_running_or_live_current_runs_late() {
+        assert!(!overdue_alerts_allowed(Some(RunStatus::Running), false));
+        // A persistent lead remains live between runs; once its last run is
+        // terminal, that session is not a current run and overdue math is
+        // allowed again.
+        assert!(overdue_alerts_allowed(Some(RunStatus::Done), false));
+        assert!(!overdue_alerts_allowed(None, true));
+        assert!(owns_continuous_scheduler(true, false));
+        assert!(!owns_continuous_scheduler(false, false));
+        assert!(!owns_continuous_scheduler(true, true));
+    }
+
+    #[test]
+    fn continuous_marker_health_is_detected_without_next_fire_math() {
+        let team = serde_json::json!({
+            "id": "ingest",
+            "continuous": {
+                "lead_member_id": "mem-ingest",
+                "lead_session_uid": "ts-ingest",
+                "health": "missed",
+                "queues": [{"queue": "momentum", "pending": 1, "oldest_item_age_seconds": 4000.0}]
+            }
+        });
+        let marker = continuous_team_marker(&team).expect("marker");
+        assert_eq!(marker["health"], "missed");
+        assert_eq!(marker["queues"][0]["queue"], "momentum");
+        assert!(continuous_team_marker(&serde_json::json!({"id":"ordinary"})).is_none());
+    }
+
+    #[test]
+    fn raw_marker_without_live_projection_does_not_page_dead_lead() {
+        let raw = serde_json::json!({
+            "id": "ingest",
+            "continuous": {"lead_member_id": "mem-ingest", "host_id": "cm-manager"}
+        });
+        let marker = continuous_team_marker(&raw).expect("marker");
+        assert!(marker["lead_session_uid"].is_null());
+        assert!(!should_alert_missing_lead(marker, None));
+    }
+
+    #[test]
+    fn monitor_latch_survives_restart_and_episode_keys_change() {
+        let _tmp = with_temp_home(|| {
+            let active = HashMap::from([(String::from("late:ingest"), String::from("old text"))]);
+            let episodes = HashMap::from([(String::from("late:ingest"), 3u64)]);
+            save_monitor_latch(&active, &episodes);
+            let (loaded_active, loaded_episodes) = load_monitor_latch();
+            assert_eq!(loaded_active, active);
+            assert_eq!(loaded_episodes, episodes);
+            let first = format!("continuous-alert:late:ingest:{}", loaded_episodes["late:ingest"] + 1);
+            let second = format!("continuous-alert:late:ingest:{}", loaded_episodes["late:ingest"] + 2);
+            assert_ne!(first, second);
+            assert!(monitor_latch_path().exists());
+        });
     }
 
     /// A compact-only fire (`FiredCompact`) advances like a success but floors

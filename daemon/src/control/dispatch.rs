@@ -339,6 +339,7 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "usage.read",
     "daemon.memory_snapshot",
     "continuous.list",
+    "continuous.dashboard",
     "continuous.context",
     "continuous.dispatch_pending",
     "queue.stats",
@@ -1053,6 +1054,7 @@ pub fn dispatch_request(
         "continuous.create" => DispatchOutcome::Done(dispatch_continuous_create(state, req)),
         "continuous.update" => DispatchOutcome::Done(dispatch_continuous_update(state, req)),
         "continuous.list" => DispatchOutcome::Done(dispatch_continuous_list(state, req)),
+        "continuous.dashboard" => DispatchOutcome::Done(dispatch_continuous_dashboard(state, req)),
         "continuous.dispatch_pending" => {
             DispatchOutcome::Done(dispatch_continuous_dispatch_pending(state, req))
         }
@@ -1578,6 +1580,16 @@ fn dispatch_continuous_list(state: &Arc<Mutex<DaemonState>>, req: &Request) -> R
         return resp;
     }
     match methods::continuous_list(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_continuous_dashboard(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(resp) = require_operator(req, "continuous.dashboard is Operator-callable only") {
+        return resp;
+    }
+    match methods::continuous_dashboard(state, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

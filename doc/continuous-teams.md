@@ -94,12 +94,29 @@ the Ingest lead included.
 - Each continuous team is a **boxed block with its own background tint**.
 - The box header reads `⟳ every 6h · next 1h12m · ok`, so the team is
   clearly marked at a glance.
-- An F9 page lists every continuous team with:
+- The continuous-teams dashboard is available from `Alt+C`, or from the F9
+  Global Settings dialog with `c`. It lists every continuous team with:
+  - its lead session;
   - last run and next run;
   - missed runs;
   - blocked state;
+  - bound queue depth and oldest item age;
   - open items.
-- A Luna monitor agent watches it and posts problems in `#continuous`.
+- The daemon also ensures a shared `#continuous` channel at startup. Its
+  monitor checks every 30 seconds and posts one alert, then one clear, for a
+  missed run, a run late by more than half its period, an old queue item (one
+  hour), or a dead lead. The monitor is deterministic daemon code; no Luna
+  session is needed for these checks. Its open-problem latch is persisted
+  under `~/.cm`; each re-raised episode gets a new notice key, so a problem
+  that clears and returns is visible again after a restart.
+
+Org-model continuous teams use the `continuous` marker on their team in
+`org.snapshot`. Its stable read shape carries `lead_member_id`,
+`host_id`, `lead_session_uid`, `next_run`, `last_run`,
+`missed_count`, `health` (`ok|late|missed|blocked`), cadence metadata,
+and `queues` filtered to that lead. The dashboard projects those teams
+alongside legacy continuous-task rows; their missed alerts come from the wake
+run's `missed` outcome, not from `next_fire_at` arithmetic.
 
 ### Continuous-team marker and live read
 
@@ -171,12 +188,15 @@ member's current main session and includes the pending depth. Further enqueues
 coalesce while the wake is pending. A missing main session or failed publish
 leaves `wake_pending` and `wake_error` visible for retry; items remain queued.
 
-Only the bound member may call `queue_claim` and `queue_ack`. Claims carry a
-lease and a claim token; an expired lease returns the item to `pending`, while
-an acknowledgement moves it to `consumed`. Unbound continuous-task queues use
-the existing scheduler claim/ack behavior unchanged. Binding a queue hands it
-from the legacy continuous orchestrator to the lead; the scheduler skips that
-queue after recording the handoff.
+Only the bound member may call `queue_claim` and `queue_ack`. A successful
+claim clears the coalesced `wake_pending` latch (even when other items remain
+pending), so a later enqueue can request the next wake; an empty queue also has
+no pending wake. Claims carry a lease and a claim token; an expired lease
+returns the item to `pending`, while an acknowledgement moves it to
+`consumed`. Unbound continuous-task queues use the existing scheduler
+claim/ack behavior unchanged. Binding a queue hands it from the legacy
+continuous orchestrator to the lead; the scheduler skips that queue after
+recording the handoff.
 
 `queue_list()` (and the `queue.list` RPC) returns one stable row per queue:
 `queue`, `pending`, `claimed`, `binding` (`consumer`, `bound_by`, `bound_at` or

@@ -309,6 +309,7 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "continuous.create",
     "continuous.update",
     "continuous.list",
+    "continuous.dashboard",
     "continuous.drain",
     "continuous.migration_preview",
     "continuous.reconcile",

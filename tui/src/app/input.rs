@@ -3121,6 +3121,19 @@ impl App {
             _ => {}
         }
         self.needs_redraw = true;
+        if let CrosstermEvent::Key(key) = event {
+            if self.global_settings.is_open() && key.code == KeyCode::Char('c') {
+                self.global_settings.close();
+                let preferred = self.active_session().and_then(|(_, session)| {
+                    session.continuous_task_id.clone().map(|id| (session.host_id.clone(), id))
+                });
+                self.view_mode = ViewMode::Sessions;
+                self.input_mode = InputMode::ContinuousControl(super::continuous_control::Menu::new(
+                    std::sync::Arc::clone(&self.host_pool), &self.hosts, preferred,
+                ));
+                return true;
+            }
+        }
         if self.global_settings.handle_event(event) { return true; }
         if self.availability_event(event) { return true; }
         if self.roster_event(event) { return true; }
