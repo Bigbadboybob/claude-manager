@@ -325,6 +325,48 @@ pub fn ensure_channel(
 /// lock; the first migration pass joined ~60 workers in one go and starved
 /// RPCs and replica sync for minutes (2026-09-14).
 const JOINS_PER_PASS: usize = 6;
+pub const CONTINUOUS_CHANNEL_PATH: &str = "continuous";
+
+/// Ensure the shared `#continuous` room exists. Creation is idempotent and
+/// coordinator-owned; replicas return the normal coordinator-required error
+/// and converge through messaging replication.
+pub fn ensure_continuous_channel(state: &Arc<Mutex<DaemonState>>) -> Result<(), ChatError> {
+    let handle = state.lock().unwrap_or_else(|p| p.into_inner()).messaging.clone();
+    let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(store) = slot.as_mut() else { return Ok(()); };
+    if store.channel_id_at_path(CONTINUOUS_CHANNEL_PATH).is_some() || store.messaging_frozen() {
+        return Ok(());
+    }
+    let params = json!({
+        "action": "create",
+        "path": CONTINUOUS_CHANNEL_PATH,
+        "name": "continuous",
+        "description": "Continuous-team health, missed runs and queue alerts.",
+        "request_id": "continuous-channel-v1",
+    });
+    match store.channel_action("owner", &params, &[]) {
+        Ok(_) => Ok(()),
+        Err(e) if e.code == "coordinator_required" => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Post one idempotent system notice to the shared monitor room.
+pub fn post_continuous_notice(
+    state: &Arc<Mutex<DaemonState>>,
+    key: &str,
+    body: &str,
+) -> Result<bool, ChatError> {
+    ensure_continuous_channel(state)?;
+    let handle = state.lock().unwrap_or_else(|p| p.into_inner()).messaging.clone();
+    let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(store) = slot.as_mut() else { return Ok(false); };
+    let Some(channel) = store.channel_id_at_path(CONTINUOUS_CHANNEL_PATH).map(str::to_owned) else {
+        return Ok(false);
+    };
+    store.post_system_notice(&channel, body, key)?;
+    Ok(true)
+}
 
 /// A replica join is an effect of a particular scheduler binding, not a naked
 /// (actor, params) request that can outlive adoption and join the old owner.

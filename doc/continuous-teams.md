@@ -94,12 +94,19 @@ the Ingest lead included.
 - Each continuous team is a **boxed block with its own background tint**.
 - The box header reads `⟳ every 6h · next 1h12m · ok`, so the team is
   clearly marked at a glance.
-- An F9 page lists every continuous team with:
+- The continuous-teams dashboard is available from `Alt+C`, or from the F9
+  Global Settings dialog with `c`. It lists every continuous team with:
+  - its lead session;
   - last run and next run;
   - missed runs;
   - blocked state;
+  - bound queue depth and oldest item age;
   - open items.
-- A Luna monitor agent watches it and posts problems in `#continuous`.
+- The daemon also ensures a shared `#continuous` channel at startup. Its
+  monitor checks every 30 seconds and posts one alert, then one clear, for a
+  missed run, a run late by more than half its period, an old queue item (one
+  hour), or a dead lead. The monitor is deterministic daemon code; no Luna
+  session is needed for these checks.
 
 ### Continuous-team marker and live read
 

@@ -329,6 +329,10 @@ impl GlobalSettings {
         self.dialog.is_some()
     }
 
+    pub(super) fn close(&mut self) {
+        self.dialog = None;
+    }
+
     pub(super) fn messages_sidebar_width(&self) -> u16 {
         self.saved.messages_sidebar_width
     }
@@ -531,6 +535,7 @@ impl GlobalSettings {
                 row_style(dialog.row == 3),
             ),
             Line::from("Read the live policy and how to choose models."),
+            Line::from("Continuous teams dashboard → (c)"),
             Line::from(""),
             Line::from("Live preview · Opacity unchanged."),
             Line::from("↑/↓ row · Home reset · Enter save · Esc cancel"),

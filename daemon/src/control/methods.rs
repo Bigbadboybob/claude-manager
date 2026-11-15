@@ -16309,6 +16309,91 @@ pub fn continuous_list(
     Ok(json!({ "tasks": items }))
 }
 
+/// Combined read for the continuous-teams dashboard. It deliberately keeps
+/// the existing `continuous.list` task rows and adds queue, scheduled-wake and
+/// open-item projections so older TUI clients can continue using the original
+/// method unchanged.
+pub fn continuous_dashboard(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+) -> MethodResult {
+    let mut dashboard = continuous_list(state_arc, params)?;
+    let queues = continuous_queue_client(state_arc)
+        .and_then(|client| client.list().map_err(|e| e.to_method_err()))
+        .unwrap_or_else(|_| json!({"queues": []}));
+    let wakes = crate::session_wake::handle(
+        state_arc,
+        &Caller::operator("continuous-dashboard"),
+        "list",
+        &json!({}),
+    )
+    .unwrap_or_else(|_| json!({"schedules": []}));
+    let now = crate::control::methods::now_unix_f64();
+    let api = {
+        let s = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        crate::items::api::Api::from_config(&s.config.api_url, &s.config.api_token).ok()
+    };
+    let queue_rows = queues["queues"].as_array().cloned().unwrap_or_default();
+    let wake_rows = wakes["schedules"].as_array().cloned().unwrap_or_default();
+    if let Some(tasks) = dashboard["tasks"].as_array_mut() {
+        for task in tasks {
+            let queue_name = task
+                .pointer("/schedule/queue")
+                .and_then(Value::as_str);
+            if let Some(queue) = queue_name {
+                task["bound_queue"] = queue_rows
+                    .iter()
+                    .find(|row| row["queue"].as_str() == Some(queue))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+            } else {
+                task["bound_queue"] = Value::Null;
+            }
+            let uid = task["current_session_uid"].as_str();
+            task["wake_schedules"] = Value::Array(
+                wake_rows
+                    .iter()
+                    .filter(|row| uid.is_some() && row["session_uid"].as_str() == uid)
+                    .cloned()
+                    .collect(),
+            );
+            let every = task
+                .pointer("/schedule/every_secs")
+                .and_then(Value::as_u64)
+                .or_else(|| task.pointer("/schedule/window_secs").and_then(Value::as_u64));
+            let next = task["next_fire_at"].as_u64().unwrap_or(0) as f64;
+            task["missed_runs"] = every
+                .filter(|_| next > 0.0 && now > next)
+                .map(|period| ((now - next) / period.max(1) as f64).floor() as u64 + 1)
+                .unwrap_or(0)
+                .into();
+            task["blocked_state"] = if task["account_blocked"].is_object()
+                || task["recovery_hold"].is_object()
+                || task["paused"] == true
+            {
+                json!("blocked")
+            } else {
+                Value::Null
+            };
+            let open_items = task["planning_task_id"]
+                .as_str()
+                .and_then(|ref_id| api.as_ref().and_then(|client| client.get(&format!("/boards/{ref_id}"), &[]).ok()))
+                .and_then(|board| board["items"].as_array().cloned())
+                .map(|items| {
+                    items
+                        .into_iter()
+                        .filter(|item| !matches!(item["status"].as_str(), Some("done" | "dropped")))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            task["open_items"] = json!(open_items);
+        }
+    }
+    dashboard["queues"] = queues["queues"].clone();
+    dashboard["wake_schedules"] = wakes["schedules"].clone();
+    Ok(dashboard)
+}
+
 /// `continuous.dispatch_pending` — read-only scan of every REVIEWABLE
 /// continuous task's `.<task>/index.yaml` for issues an operator has
 /// unblocked (blocked_reason cleared + a dated `OPERATOR <date>` comment)

@@ -66,7 +66,7 @@ impl Menu {
                 let pool = Arc::clone(&pool);
                 std::thread::spawn(move || loop {
                     let inventory =
-                        rpc(&pool, &host, "continuous.list", json!({})).and_then(|value| {
+                        rpc(&pool, &host, "continuous.dashboard", json!({})).and_then(|value| {
                             value
                                 .get("tasks")
                                 .and_then(Value::as_array)
@@ -259,7 +259,7 @@ impl Menu {
         );
         frame.render_widget(Clear, popup);
         let block = Block::default()
-            .title(" Continuous tasks · Alt+Shift+C ")
+            .title(" Continuous teams dashboard · Alt+C / F9 c ")
             .borders(Borders::ALL);
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
@@ -290,6 +290,25 @@ impl Menu {
                     theme::MUTED
                 }),
             ));
+            if index == self.selected {
+                let lead = row.task["current_session_uid"].as_str().unwrap_or("—");
+                let next = row.task["next_fire_at"].as_u64().map(|n| n.to_string()).unwrap_or_else(|| "—".into());
+                let last = row.task.pointer("/last_run/status").and_then(Value::as_str).unwrap_or("—");
+                let last_at = row.task.pointer("/last_run/finished_at").or_else(|| row.task.pointer("/last_run/started_at")).and_then(Value::as_u64).map(|n| n.to_string()).unwrap_or_else(|| "—".into());
+                let missed = row.task["missed_runs"].as_u64().unwrap_or(0);
+                let blocked = row.task["blocked_state"].as_str().unwrap_or("ok");
+                lines.push(Line::from(format!("    lead {lead} · last {last} @ {last_at} · next {next} · missed {missed} · {blocked}")));
+                if let Some(queue) = row.task["bound_queue"].as_object() {
+                    lines.push(Line::from(format!(
+                        "    queue {} · depth {} · oldest {}",
+                        queue.get("queue").and_then(Value::as_str).unwrap_or("—"),
+                        queue.get("pending").and_then(Value::as_u64).unwrap_or(0),
+                        queue.get("oldest_item_age_seconds").and_then(Value::as_f64).map(|n| format!("{n:.0}s")).unwrap_or_else(|| "—".into()),
+                    )));
+                }
+                let open = row.task["open_items"].as_array().map_or(0, Vec::len);
+                lines.push(Line::from(format!("    open board items {open}")));
+            }
         }
         if self.rows.is_empty() && self.message.is_empty() {
             lines.push(Line::from("No continuous tasks on connected hosts."));
@@ -354,7 +373,12 @@ mod tests {
     fn task(id: &str) -> Value {
         json!({"task_id": id, "paused": true, "current_session_uid": null,
             "admission_revision": 7, "drain": {"request_id": "request-7"},
-            "drain_status": {"state": "drained", "outstanding": []}})
+            "drain_status": {"state": "drained", "outstanding": []},
+            "last_run": {"status": "done"}, "next_fire_at": 1731675600,
+            "missed_runs": 0, "blocked_state": null,
+            "bound_queue": {"queue": "momentum", "pending": 2,
+                "oldest_item_age_seconds": 90.0},
+            "open_items": [{"n": 12}]})
     }
 
     #[test]
@@ -454,6 +478,8 @@ mod tests {
         assert!(rendered.contains("exited-task"));
         assert!(rendered.contains("Stopped"));
         assert!(rendered.contains("stop after current work"));
+        assert!(rendered.contains("queue momentum"));
+        assert!(rendered.contains("open board items 1"));
         tx.send(Update::Inventory(host.clone(), Err("unreachable".into())))
             .unwrap();
         menu.poll();
