@@ -1687,6 +1687,59 @@
     "project"
    ]
   },
+  "queue_ack": {
+   "params": {
+    "claim_token": {
+     "type": "string"
+    },
+    "ids": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "queue": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "ids",
+    "queue"
+   ]
+  },
+  "queue_bind": {
+   "params": {
+    "consumer": {
+     "type": "string"
+    },
+    "queue": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "consumer",
+    "queue"
+   ]
+  },
+  "queue_claim": {
+   "params": {
+    "claimed_by": {
+     "type": "string"
+    },
+    "lease_seconds": {
+     "type": "integer"
+    },
+    "max_items": {
+     "type": "integer"
+    },
+    "queue": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "queue"
+   ]
+  },
   "queue_depth": {
    "params": {
     "queue": {
@@ -1696,6 +1749,10 @@
    "required": [
     "queue"
    ]
+  },
+  "queue_list": {
+   "params": {},
+   "required": []
   },
   "read_last_turn": {
    "params": {
