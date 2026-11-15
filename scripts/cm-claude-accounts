@@ -1029,7 +1029,8 @@ def hub_exchange(paths: Paths, state: dict, out) -> dict | None:
     for uuid in reply.get("returned") or []:
         if uuid in returning and uuid != state.get("active"):
             (paths.accounts / f"{uuid}.json").unlink(missing_ok=True)
-            record_history(state, "returned-to-pool", account=uuid)
+            record_history(state, "returned-to-pool", account=uuid,
+                           email=returning[uuid]["oauthAccount"].get("emailAddress"))
             print(f"returned {label(returning[uuid])} to the pool", file=out)
     if isinstance(lend, dict) and valid_login_record(lend.get("record")):
         record = lend["record"]
@@ -1037,7 +1038,8 @@ def hub_exchange(paths: Paths, state: dict, out) -> dict | None:
         if uuid != state.get("active"):
             record.pop("needs_login", None)
             save_account(paths, record)
-            record_history(state, "borrowed", account=uuid, reason=lend.get("reason"))
+            record_history(state, "borrowed", account=uuid, reason=lend.get("reason"),
+                           email=record["oauthAccount"].get("emailAddress"))
             print(f"borrowed {label(record)} from the pool ({lend.get('reason')})", file=out)
             if lend.get("switch"):
                 try:
@@ -2221,8 +2223,13 @@ def cmd_exclude(paths: Paths, state: dict, name: str, exclude: bool, out) -> int
 def cmd_history(paths: Paths, state: dict, limit: int, out) -> int:
     accounts = load_accounts(paths)
 
+    known = {h["account"]: h["email"] for h in state.get("history") or []
+             if h.get("account") and h.get("email")}
+
     def name(uuid):
-        return label(accounts[uuid]) if uuid in accounts else str(uuid)[:8]
+        if uuid in accounts:
+            return label(accounts[uuid])
+        return f"{known[uuid]} ({uuid[:8]})" if uuid in known else str(uuid)[:8]
 
     events = state.get("history") or []
     if not events:
@@ -2475,7 +2482,7 @@ def cmd_import(paths: Paths, state: dict, folder: Path, out) -> int:
         record.pop("needs_login", None)
         record["updated_at"] = int(time.time())
         save_account(paths, record)
-        record_history(state, "import", account=uuid)
+        record_history(state, "import", account=uuid, email=record["oauthAccount"].get("emailAddress"))
         print(f"imported {label(record)}", file=out)
     shutil.rmtree(folder)
     return 0
