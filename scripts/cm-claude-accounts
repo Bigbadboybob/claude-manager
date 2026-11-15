@@ -1348,6 +1348,7 @@ POOL_READS_PER_RUN = 3
 POOL_REFRESHES_PER_RUN = 2
 POOL_REFRESH_BEFORE_SECONDS = 30 * 60
 POOL_RENEW_PAUSE_SECONDS = 6 * 3600
+DEFAULT_LEFTOVER_ROOM = 5.0  # percent left that a leftovers host looks for (Owner 11-15)
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"  # Claude Code 2.1.325
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
@@ -1554,6 +1555,8 @@ def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -
     readings = {**load_json(hub.dir / "readings.json"), **hub_readings(reports)}
     running = {(r.get("export") or {}).get("active") for h, r in reports.items()
                if h not in (host, POOL) and now - r.get("at", 0) <= HUB_REPORT_FRESH_SECONDS}
+    leftover_hosts = set(d["policy"].get("leftover_hosts") or [])
+    leftover_room = float(d["policy"].get("leftover_room", DEFAULT_LEFTOVER_ROOM))
     out = []
     for uuid, rec in hub.pool().items():
         if uuid in d["draining"] or uuid in running \
@@ -1586,10 +1589,20 @@ def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -
         # lost, so the account whose weekly limit resets soonest goes first.
         weekly = [l["resets_at"] for l in live if l.get("group") == "weekly" or l["kind"].startswith("weekly")]
         resets = min((r for r in weekly if r is not None), default=float("inf"))
+        # Owner 11-15: the laptop is rarely used ("I almost never do things
+        # locally"), so a leftovers host takes the account with the LEAST room
+        # that still has leftover_room% left, keeping roomy accounts for the
+        # cloud hosts; accounts with less than that rank after.
+        if host in leftover_hosts and reading:
+            blocking = [l for l in live if l["kind"] in ("session", "weekly_all")]
+            room = min((threshold_for(l, config) - l["percent"] for l in blocking), default=100.0)
+            order = (room < leftover_room, room if room >= leftover_room else -room)
+        else:
+            order = (False, 0.0)
         # An account reserved for this host is its next account (Owner 11-15:
         # "F finishes out bender7, then moves to bender4").
-        out.append(((last_resort, not mine, resets, ratio, rec["oauthAccount"].get("emailAddress") or uuid),
-                    uuid, why))
+        out.append(((last_resort, not mine, *order, resets, ratio,
+                     rec["oauthAccount"].get("emailAddress") or uuid), uuid, why))
     return sorted(out)
 
 
@@ -1849,6 +1862,8 @@ def print_hub_status(view: dict, now: float, out) -> None:
 HUB_POLICY_KEYS = {
     "default_mode": (lambda v: v if v in MODES else None),
     "low_room_accounts": (lambda v: int(v) if v.isdigit() else None),
+    "leftover_hosts": (lambda v: [h for h in v.split(",") if h] if v != "none" else []),
+    "leftover_room": (lambda v: float(v) if v.replace(".", "", 1).isdigit() else None),
     "notify_command": (lambda v: v or None),
     "coordinator_command": (lambda v: v or None),
     "pool": (lambda v: {"on": True, "off": False}.get(v)),

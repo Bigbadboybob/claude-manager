@@ -1531,6 +1531,19 @@ class PoolTests(HubHarness):
         self.assertEqual(self.live()["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-carol")
         self.assertIn("reserved for cm-sessions", self.state()["history"][-1]["reason"])
 
+    def test_a_leftovers_host_takes_the_least_room_above_five_percent(self):
+        self.set_reading("bob", ("weekly_all", None, 30, 2 * 86400, True), hub="cm-manager", host_name="laptop")
+        self.set_reading("carol", ("weekly_all", None, 92, 4 * 86400, True), hub="cm-manager", host_name="laptop")
+        self.usage[self.live_token()] = usage(("weekly_all", None, 50, 3 * 86400, True))
+        self.poll()
+        self.poll()  # bob and carol in the pool
+        self.hub("policy", "thresholds.weekly", "99")
+        self.assertEqual(self.candidates(), ["bob-uuid-0000", "carol-uuid-0000"])  # soonest reset
+        self.hub("policy", "leftover_hosts", "laptop")
+        self.assertEqual(self.candidates(), ["carol-uuid-0000", "bob-uuid-0000"])  # 7% left before 69%
+        self.hub("policy", "leftover_room", "10")
+        self.assertEqual(self.candidates(), ["bob-uuid-0000", "carol-uuid-0000"])  # carol is under 10%
+
     def test_a_blank_host_borrows_its_first_login(self):
         self.poll()
         self.poll()
