@@ -80,6 +80,28 @@ class QueueToolsRoutingTests(unittest.TestCase):
         self.assertEqual(captured["params"], {"queue": "q"})
         self.assertEqual(result["pending"], 3)
 
+    def test_bound_queue_tools_route_to_stable_rpc_names(self):
+        from mcp_server import server, control_client
+
+        calls = []
+
+        def fake_call(method, params, **kw):
+            calls.append((method, params))
+            return {"queue": "momentum", "items": [], "acked": 1, "queues": []}
+
+        with mock.patch.object(control_client, "call", side_effect=fake_call):
+            server.queue_bind("momentum", "momentum-detective")
+            server.queue_list()
+            server.queue_claim("momentum", max_items=4, claimed_by="lead#9", lease_seconds=120)
+            server.queue_ack("momentum", ["item-1"], claim_token="claim-1")
+
+        self.assertEqual([method for method, _ in calls], [
+            "queue.bind", "queue.list", "queue.claim", "queue.ack",
+        ])
+        self.assertEqual(calls[0][1], {"queue": "momentum", "consumer": "momentum-detective"})
+        self.assertEqual(calls[2][1]["lease_seconds"], 120)
+        self.assertEqual(calls[3][1]["claim_token"], "claim-1")
+
 
 if __name__ == "__main__":
     unittest.main()

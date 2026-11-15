@@ -2,6 +2,7 @@ import asyncio
 import json
 import uuid
 import asyncpg
+from datetime import datetime, timezone
 from dispatch.config import DB_DSN
 
 
@@ -1167,34 +1168,75 @@ async def enqueue_queue_item(
     """Insert one item. Returns {enqueued, deduped, id, depth} where `depth`
     is the queue's pending count after the call (deduped or not)."""
     async with pool.acquire() as conn:
-        item_id: str | None = None
-        deduped = False
-        try:
-            row = await conn.fetchrow(
-                """INSERT INTO queue_items (queue, payload, dedupe_key, source)
-                   VALUES ($1, $2, $3, $4)
-                   RETURNING id""",
-                queue, payload, dedupe_key, source,
+        async with conn.transaction():
+            item_id: str | None = None
+            deduped = False
+            try:
+                # A nested transaction is a savepoint: a dedupe collision must not
+                # abort the outer transaction that records the coalesced wake.
+                async with conn.transaction():
+                    row = await conn.fetchrow(
+                        """INSERT INTO queue_items (queue, payload, dedupe_key, source)
+                           VALUES ($1, $2, $3, $4)
+                           RETURNING id""",
+                        queue, payload, dedupe_key, source,
+                    )
+                    item_id = str(row["id"])
+            except asyncpg.UniqueViolationError:
+                # Same dedupe_key already pending/claimed in this queue — coalesce.
+                deduped = True
+            depth = await conn.fetchval(
+                "SELECT count(*) FROM queue_items WHERE queue = $1 AND state = 'pending'",
+                queue,
             )
-            item_id = str(row["id"])
-        except asyncpg.UniqueViolationError:
-            # Same dedupe_key already pending/claimed in this queue — coalesce.
-            deduped = True
-        depth = await conn.fetchval(
-            "SELECT count(*) FROM queue_items WHERE queue = $1 AND state = 'pending'",
-            queue,
-        )
-        return {
-            "enqueued": not deduped,
-            "deduped": deduped,
-            "id": item_id,
-            "depth": int(depth),
-        }
+            # Older isolated databases (and pre-037 deployments) have no binding
+            # table. Keep their queue wire shape and behavior unchanged.
+            has_bindings = await conn.fetchval("SELECT to_regclass('queue_bindings')")
+            binding = None
+            wake_requested = False
+            wake_id = None
+            if has_bindings:
+                binding = await conn.fetchrow(
+                    "SELECT consumer, wake_pending, wake_delivery, wake_id FROM queue_bindings WHERE queue=$1 FOR UPDATE",
+                    queue,
+                )
+                if binding and depth > 0 and (not binding["wake_pending"] or binding["wake_delivery"] == "failed"):
+                    await conn.execute(
+                        "UPDATE queue_bindings SET wake_pending=true, wake_delivery='pending', wake_id=gen_random_uuid(), wake_error=NULL WHERE queue=$1",
+                        queue,
+                    )
+                    wake_id = await conn.fetchval("SELECT wake_id FROM queue_bindings WHERE queue=$1", queue)
+                    wake_requested = True
+            result = {
+                "enqueued": not deduped,
+                "deduped": deduped,
+                "id": item_id,
+                "depth": int(depth),
+            }
+            if binding:
+                result.update({
+                    "bound_consumer": binding["consumer"],
+                    "wake_requested": wake_requested,
+                    "wake_pending": True,
+                    "wake_id": str(wake_id) if wake_requested and wake_id else None,
+                })
+            return result
 
 
 async def queue_stats(pool: asyncpg.Pool, queue: str) -> dict:
     """Pending/claimed counts + oldest pending timestamp for one queue."""
     async with pool.acquire() as conn:
+        # Releasing expired leases is deliberately done by readers/claimers,
+        # so a dead consumer cannot strand work until an operator intervenes.
+        has_bindings = await conn.fetchval("SELECT to_regclass('queue_bindings')")
+        async with conn.transaction():
+            if has_bindings:
+                await conn.execute(
+                    """UPDATE queue_items SET state='pending', claimed_at=NULL,
+                              claimed_by=NULL, claimed_consumer=NULL, claim_token=NULL,
+                              lease_until=NULL
+                       WHERE queue=$1 AND state='claimed' AND lease_until IS NOT NULL
+                         AND lease_until <= now()""", queue)
         row = await conn.fetchrow(
             """SELECT
                    count(*) FILTER (WHERE state = 'pending')  AS pending,
@@ -1204,12 +1246,112 @@ async def queue_stats(pool: asyncpg.Pool, queue: str) -> dict:
             queue,
         )
         oldest = row["oldest_pending_at"]
-        return {
+        result = {
             "queue": queue,
             "pending": int(row["pending"]),
             "claimed": int(row["claimed"]),
             "oldest_pending_at": oldest.isoformat() if oldest else None,
+            "oldest_item_age_seconds": max(0.0, (datetime.now(timezone.utc) - oldest).total_seconds()) if oldest else None,
         }
+        if has_bindings:
+            binding = await conn.fetchrow(
+                """SELECT consumer, bound_by, bound_at, last_wake_at,
+                          last_consume_at, wake_pending, wake_delivery, wake_error,
+                          wake_id
+                   FROM queue_bindings WHERE queue=$1""", queue)
+            result["binding"] = None
+            result["last_wake"] = None
+            result["last_consume"] = None
+            result["wake_pending"] = False
+            result["wake_delivery"] = None
+            result["wake_error"] = None
+            result["wake_id"] = None
+            if binding:
+                result["binding"] = {
+                    "consumer": binding["consumer"],
+                    "bound_by": binding["bound_by"],
+                    "bound_at": binding["bound_at"].isoformat(),
+                }
+                result["last_wake"] = binding["last_wake_at"].isoformat() if binding["last_wake_at"] else None
+                result["last_consume"] = binding["last_consume_at"].isoformat() if binding["last_consume_at"] else None
+                result["wake_pending"] = bool(binding["wake_pending"])
+                result["wake_delivery"] = binding["wake_delivery"]
+                result["wake_error"] = binding["wake_error"]
+                result["wake_id"] = str(binding["wake_id"]) if binding["wake_id"] else None
+        return result
+
+
+async def list_queue_stats(pool: asyncpg.Pool) -> list[dict]:
+    """Stable read shape for the dashboard: one row per known queue."""
+    async with pool.acquire() as conn:
+        has_bindings = await conn.fetchval("SELECT to_regclass('queue_bindings')")
+        query = ("SELECT queue FROM queue_items UNION SELECT queue FROM queue_bindings ORDER BY queue"
+                 if has_bindings else "SELECT DISTINCT queue FROM queue_items ORDER BY queue")
+        queues = await conn.fetch(query)
+    return [await queue_stats(pool, row["queue"]) for row in queues]
+
+
+class QueueBindingRefusal(ValueError):
+    """A caller tried to operate a queue bound to another member."""
+
+
+async def bind_queue(pool: asyncpg.Pool, queue: str, consumer: str, bound_by: str) -> dict:
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """INSERT INTO queue_bindings(queue, consumer, bound_by)
+                   VALUES ($1,$2,$3)
+                   ON CONFLICT (queue) DO UPDATE SET consumer=EXCLUDED.consumer,
+                     bound_by=EXCLUDED.bound_by, bound_at=now(), wake_error=NULL
+                   RETURNING queue, consumer, bound_by, bound_at, last_wake_at,
+                             last_consume_at, wake_pending, wake_delivery, wake_error, wake_id""",
+                queue, consumer, bound_by,
+            )
+            depth = await conn.fetchval(
+                "SELECT count(*) FROM queue_items WHERE queue=$1 AND state='pending'", queue
+            )
+            # Binding/rebinding with backlog must wake the newly bound lead;
+            # the native notification id coalesces any already pending event.
+            wake_requested = bool(depth)
+            if wake_requested:
+                await conn.execute(
+                    "UPDATE queue_bindings SET wake_pending=true, wake_delivery='pending', wake_id=gen_random_uuid() WHERE queue=$1",
+                    queue,
+                )
+                row = await conn.fetchrow(
+                    "SELECT queue, consumer, bound_by, bound_at, last_wake_at, last_consume_at, wake_pending, wake_delivery, wake_error, wake_id FROM queue_bindings WHERE queue=$1",
+                    queue,
+                )
+    return {
+        "queue": row["queue"], "consumer": row["consumer"],
+        "bound_by": row["bound_by"], "bound_at": row["bound_at"].isoformat(),
+        "last_wake": row["last_wake_at"].isoformat() if row["last_wake_at"] else None,
+        "last_consume": row["last_consume_at"].isoformat() if row["last_consume_at"] else None,
+        "wake_pending": bool(row["wake_pending"]), "wake_delivery": row["wake_delivery"],
+        "wake_error": row["wake_error"],
+        "wake_id": str(row["wake_id"]) if row["wake_id"] else None,
+        "wake_requested": wake_requested,
+    }
+
+
+async def record_queue_wake(pool: asyncpg.Pool, queue: str, *, delivered: bool,
+                            error: str | None = None) -> dict:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """UPDATE queue_bindings
+               SET last_wake_at=now(),
+                   wake_delivery=CASE WHEN $2 THEN 'delivered' ELSE 'failed' END,
+                   wake_error=$3
+               WHERE queue=$1
+               RETURNING last_wake_at, wake_pending, wake_delivery, wake_error""",
+            queue, delivered, error,
+        )
+    if not row:
+        return {"queue": queue, "recorded": False}
+    return {"queue": queue, "recorded": True,
+            "last_wake": row["last_wake_at"].isoformat() if row["last_wake_at"] else None,
+            "wake_pending": bool(row["wake_pending"]),
+            "wake_delivery": row["wake_delivery"], "wake_error": row["wake_error"]}
 
 
 class QueueRecoveryConflict(ValueError):
@@ -1258,27 +1400,70 @@ async def recover_queue_item(pool, queue: str, item_id: str,
             return {"recovered": True, "already_recovered": False, "id": item_id}
 
 
+async def _check_queue_consumer(conn, queue: str, consumer: str | None) -> bool:
+    """Check the optional 037 binding; return whether this is bound."""
+    has_bindings = await conn.fetchval("SELECT to_regclass('queue_bindings')")
+    if not has_bindings:
+        return False
+    binding = await conn.fetchrow("SELECT consumer FROM queue_bindings WHERE queue=$1", queue)
+    if binding and consumer != binding["consumer"]:
+        expected = binding["consumer"]
+        raise QueueBindingRefusal(
+            f"queue '{queue}' is bound to consumer '{expected}'; consumer '{consumer or 'unbound caller'}' may not consume it"
+        )
+    if binding and not consumer:
+        raise QueueBindingRefusal(
+            f"queue '{queue}' is bound to consumer '{binding['consumer']}'; a consumer identity is required"
+        )
+    return bool(binding)
+
+
 async def claim_queue_items(
     pool: asyncpg.Pool, queue: str, max_items: int, claimed_by: str,
+    *, consumer: str | None = None, lease_seconds: int = 300,
 ) -> list[dict]:
     """Atomically claim up to `max_items` oldest pending items
     (FOR UPDATE SKIP LOCKED — safe under concurrent claimers)."""
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """UPDATE queue_items
-               SET state = 'claimed', claimed_at = now(), claimed_by = $3
-               WHERE id IN (
-                   SELECT id FROM queue_items
-                   WHERE queue = $1 AND state = 'pending'
-                   ORDER BY enqueued_at
-                   LIMIT $2
-                   FOR UPDATE SKIP LOCKED
-               )
-               RETURNING id, payload, dedupe_key, source, enqueued_at""",
-            queue, max_items, claimed_by,
-        )
+      async with conn.transaction():
+        schema_v37 = bool(await conn.fetchval("SELECT to_regclass('queue_bindings')"))
+        bound = await _check_queue_consumer(conn, queue, consumer)
+        if schema_v37:
+            await conn.execute(
+                """UPDATE queue_items SET state='pending', claimed_at=NULL,
+                          claimed_by=NULL, claimed_consumer=NULL, claim_token=NULL,
+                          lease_until=NULL
+                   WHERE queue=$1 AND state='claimed' AND lease_until IS NOT NULL
+                     AND lease_until <= now()""", queue)
+        if schema_v37:
+            rows = await conn.fetch(
+                """UPDATE queue_items
+                   SET state='claimed', claimed_at=now(), claimed_by=$3,
+                       claimed_consumer=$4, claim_token=gen_random_uuid(),
+                       lease_until=now() + make_interval(secs => $5)
+                   WHERE id IN (
+                       SELECT id FROM queue_items WHERE queue=$1 AND state='pending'
+                       ORDER BY enqueued_at LIMIT $2 FOR UPDATE SKIP LOCKED)
+                   RETURNING id, payload, dedupe_key, source, enqueued_at,
+                             claim_token, lease_until""",
+                queue, max_items, claimed_by, consumer, lease_seconds,
+            )
+        else:
+            rows = await conn.fetch(
+                """UPDATE queue_items SET state='claimed', claimed_at=now(), claimed_by=$3
+                   WHERE id IN (
+                       SELECT id FROM queue_items WHERE queue=$1 AND state='pending'
+                       ORDER BY enqueued_at LIMIT $2 FOR UPDATE SKIP LOCKED)
+                   RETURNING id, payload, dedupe_key, source, enqueued_at""",
+                queue, max_items, claimed_by,
+            )
         # Preserve claim (oldest-first) order for the batch file.
         rows = sorted(rows, key=lambda r: r["enqueued_at"])
+        if bound:
+            await conn.execute(
+                "UPDATE queue_bindings SET last_consume_at=now(), wake_pending=false, wake_error=NULL WHERE queue=$1",
+                queue,
+            )
         return [
             {
                 "id": str(r["id"]),
@@ -1286,28 +1471,75 @@ async def claim_queue_items(
                 "dedupe_key": r["dedupe_key"],
                 "source": r["source"],
                 "enqueued_at": r["enqueued_at"].isoformat(),
+                "claim_token": str(r["claim_token"]) if schema_v37 and r["claim_token"] else None,
+                "lease_until": r["lease_until"].isoformat() if schema_v37 and r["lease_until"] else None,
             }
             for r in rows
         ]
 
 
-async def ack_queue_items(pool: asyncpg.Pool, queue: str, ids: list[str]) -> int:
+async def ack_queue_items(pool: asyncpg.Pool, queue: str, ids: list[str], *,
+                          consumer: str | None = None,
+                          claim_token: str | None = None) -> int:
     """claimed -> consumed for the given ids (scoped to `queue`). Returns the
     number of rows flipped; ids not in claimed state are ignored."""
     if not ids:
+        async with pool.acquire() as conn:
+            await _check_queue_consumer(conn, queue, consumer)
         return 0
     async with pool.acquire() as conn:
-        result = await conn.execute(
-            """UPDATE queue_items
-               SET state = 'consumed', consumed_at = now()
-               WHERE queue = $1 AND state = 'claimed' AND id = ANY($2::uuid[])""",
-            queue, ids,
-        )
+        async with conn.transaction():
+            schema_v37 = bool(await conn.fetchval("SELECT to_regclass('queue_bindings')"))
+            bound = await _check_queue_consumer(conn, queue, consumer)
+            if schema_v37 and bound and claim_token:
+                result = await conn.execute(
+                    """UPDATE queue_items SET state='consumed', consumed_at=now(),
+                              lease_until=NULL
+                       WHERE queue=$1 AND state='claimed' AND claimed_consumer=$2
+                         AND (lease_until IS NULL OR lease_until > now())
+                         AND claim_token=$3::uuid AND id=ANY($4::uuid[])""",
+                    queue, consumer, claim_token, ids,
+                )
+            elif schema_v37 and bound:
+                result = await conn.execute(
+                    """UPDATE queue_items SET state='consumed', consumed_at=now(),
+                              lease_until=NULL
+                       WHERE queue=$1 AND state='claimed' AND claimed_consumer=$2
+                         AND (lease_until IS NULL OR lease_until > now())
+                         AND id=ANY($3::uuid[])""",
+                    queue, consumer, ids,
+                )
+            else:
+                if schema_v37:
+                    result = await conn.execute(
+                        """UPDATE queue_items SET state='consumed', consumed_at=now(),
+                                  lease_until=NULL
+                           WHERE queue=$1 AND state='claimed' AND id=ANY($2::uuid[])""",
+                        queue, ids,
+                    )
+                else:
+                    result = await conn.execute(
+                        """UPDATE queue_items SET state='consumed', consumed_at=now()
+                           WHERE queue=$1 AND state='claimed' AND id=ANY($2::uuid[])""",
+                        queue, ids,
+                    )
+            if schema_v37 and bound and claim_token and int(result.split()[-1]) == 0:
+                still_claimed = await conn.fetchval(
+                    """SELECT count(*) FROM queue_items
+                       WHERE queue=$1 AND state='claimed' AND claimed_consumer=$2
+                         AND id=ANY($3::uuid[])""",
+                    queue, consumer, ids,
+                )
+                if still_claimed:
+                    raise QueueBindingRefusal(
+                        f"queue '{queue}' claim_token does not match the active lease"
+                    )
         return int(result.split()[-1])
 
 
 async def requeue_queue_items(
     pool: asyncpg.Pool, queue: str, ids: list[str] | None = None,
+    *, consumer: str | None = None,
 ) -> int:
     """claimed -> pending (recovery after a crashed/failed fire). Returns rows
     flipped.
@@ -1320,18 +1552,20 @@ async def requeue_queue_items(
     if ids is not None and not ids:
         return 0
     async with pool.acquire() as conn:
+        schema_v37 = bool(await conn.fetchval("SELECT to_regclass('queue_bindings')"))
+        await _check_queue_consumer(conn, queue, consumer)
+        reset = ("claimed_at=NULL, claimed_by=NULL, claimed_consumer=NULL, "
+                 "claim_token=NULL, lease_until=NULL") if schema_v37 else "claimed_at=NULL, claimed_by=NULL"
         if ids is not None:
             result = await conn.execute(
-                """UPDATE queue_items
-                   SET state = 'pending', claimed_at = NULL, claimed_by = NULL
-                   WHERE queue = $1 AND state = 'claimed' AND id = ANY($2::uuid[])""",
+                f"""UPDATE queue_items SET state='pending', {reset}
+                    WHERE queue=$1 AND state='claimed' AND id=ANY($2::uuid[])""",
                 queue, ids,
             )
         else:
             result = await conn.execute(
-                """UPDATE queue_items
-                   SET state = 'pending', claimed_at = NULL, claimed_by = NULL
-                   WHERE queue = $1 AND state = 'claimed'""",
+                f"""UPDATE queue_items SET state='pending', {reset}
+                    WHERE queue=$1 AND state='claimed'""",
                 queue,
             )
         return int(result.split()[-1])

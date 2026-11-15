@@ -37,9 +37,15 @@ pub struct QueueItem {
     #[serde(default)]
     pub source: Option<String>,
     pub enqueued_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_until: Option<String>,
 }
 
-/// `GET /queues/{queue}` — the Consumer due-check's input.
+/// `GET /queues/{queue}` — the Consumer due-check's input and the stable
+/// dashboard row. Binding/wake fields are optional so an older planning API
+/// remains wire-compatible with unbound continuous queues.
 #[derive(Clone, Debug, Deserialize)]
 pub struct QueueStats {
     pub pending: u64,
@@ -52,6 +58,22 @@ pub struct QueueStats {
     /// own `last_fired_at` (see `scheduler::collect_due`).
     #[serde(default)]
     pub oldest_pending_at: Option<String>,
+    #[serde(default)]
+    pub oldest_item_age_seconds: Option<f64>,
+    #[serde(default)]
+    pub binding: Option<serde_json::Value>,
+    #[serde(default)]
+    pub last_wake: Option<String>,
+    #[serde(default)]
+    pub last_consume: Option<String>,
+    #[serde(default)]
+    pub wake_pending: bool,
+    #[serde(default)]
+    pub wake_delivery: Option<String>,
+    #[serde(default)]
+    pub wake_error: Option<String>,
+    #[serde(default)]
+    pub wake_id: Option<String>,
 }
 
 impl QueueStats {
@@ -270,6 +292,25 @@ impl QueueClient {
             .map_err(|e| PlanningClientError::Transport(format!("decode stats: {}", e)))
     }
 
+    /// `GET /queues` — stable dashboard list shape.
+    pub fn list(&self) -> Result<serde_json::Value, PlanningClientError> {
+        self.get_json("/queues")
+    }
+
+    /// `PUT /queues/{queue}/binding` — bind/rebind to an org member.
+    pub fn bind(&self, queue: &str, consumer: &str, bound_by: &str) -> Result<serde_json::Value, PlanningClientError> {
+        self.put_json(&format!("/queues/{queue}/binding"), &serde_json::json!({
+            "consumer": consumer, "bound_by": bound_by
+        }))
+    }
+
+    /// Record the result of publishing the native coalesced wake.
+    pub fn record_wake(&self, queue: &str, delivered: bool, error: Option<&str>) -> Result<serde_json::Value, PlanningClientError> {
+        let mut body = serde_json::json!({"delivered": delivered});
+        if let Some(e) = error { body["error"] = serde_json::Value::String(e.to_string()); }
+        self.post_json(&format!("/queues/{queue}/wake"), &body)
+    }
+
     pub fn recover_item(&self, queue: &str, item_id: &str, claimed_by: &str, recovery_key: &str) -> Result<serde_json::Value, PlanningClientError> {
         self.post_json(&format!("/queues/{queue}/recover"), &serde_json::json!({"item_id":item_id,"claimed_by":claimed_by,"recovery_key":recovery_key}))
     }
@@ -282,7 +323,19 @@ impl QueueClient {
         max_items: u32,
         claimed_by: &str,
     ) -> Result<Vec<QueueItem>, PlanningClientError> {
-        let body = serde_json::json!({ "max_items": max_items, "claimed_by": claimed_by });
+        self.claim_for(queue, max_items, claimed_by, None, 300)
+    }
+
+    pub fn claim_for(
+        &self,
+        queue: &str,
+        max_items: u32,
+        claimed_by: &str,
+        consumer: Option<&str>,
+        lease_seconds: u32,
+    ) -> Result<Vec<QueueItem>, PlanningClientError> {
+        let mut body = serde_json::json!({ "max_items": max_items, "claimed_by": claimed_by, "lease_seconds": lease_seconds });
+        if let Some(c) = consumer { body["consumer"] = serde_json::Value::String(c.to_string()); }
         let v = self.post_json(&format!("/queues/{}/claim", queue), &body)?;
         let items = v.get("items").cloned().unwrap_or(serde_json::json!([]));
         serde_json::from_value(items)
@@ -291,9 +344,24 @@ impl QueueClient {
 
     /// `POST /queues/{queue}/ack` — claimed → consumed. Returns rows flipped.
     pub fn ack(&self, queue: &str, ids: &[String]) -> Result<u64, PlanningClientError> {
-        let body = serde_json::json!({ "ids": ids });
+        self.ack_for(queue, ids, None, None)
+    }
+
+    pub fn ack_for(&self, queue: &str, ids: &[String], consumer: Option<&str>, claim_token: Option<&str>) -> Result<u64, PlanningClientError> {
+        let mut body = serde_json::json!({ "ids": ids });
+        if let Some(c) = consumer { body["consumer"] = serde_json::Value::String(c.to_string()); }
+        if let Some(t) = claim_token { body["claim_token"] = serde_json::Value::String(t.to_string()); }
         let v = self.post_json(&format!("/queues/{}/ack", queue), &body)?;
         Ok(v.get("acked").and_then(|a| a.as_u64()).unwrap_or(0))
+    }
+
+    fn put_json(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value, PlanningClientError> {
+        let endpoint = format!("{}{}", self.api_url, path);
+        let response = match Self::agent().put(&endpoint).header("Authorization", &self.auth()).send_json(body) {
+            Ok(r) => r,
+            Err(e) => return Err(PlanningClientError::Transport(e.to_string())),
+        };
+        crate::planning_client::decode_json_response(response, "queue PUT response")
     }
 
     /// `POST /queues/{queue}/requeue` — claimed → pending (crash recovery).
@@ -410,6 +478,26 @@ mod tests {
         assert_eq!(method, "GET");
         assert_eq!(path, "/queues/q1");
         assert_eq!(cap.auth_header().as_deref(), Some("Bearer tok-q"));
+    }
+
+    #[test]
+    fn bound_stats_decode_stable_wake_shape() {
+        let stats: QueueStats = serde_json::from_str(
+            r#"{"queue":"momentum","pending":2,"claimed":0,
+                "oldest_pending_at":"2026-07-04T00:00:00+00:00",
+                "oldest_item_age_seconds":12.5,
+                "binding":{"consumer":"ingest","bound_by":"operator"},
+                "last_wake":"2026-07-04T00:00:02+00:00",
+                "last_consume":null,"wake_pending":true,
+                "wake_delivery":"failed","wake_error":"no live main",
+                "wake_id":"wake-1"}"#,
+        )
+        .expect("bound stats decode");
+        assert_eq!(stats.binding.as_ref().and_then(|v| v["consumer"].as_str()), Some("ingest"));
+        assert_eq!(stats.oldest_item_age_seconds, Some(12.5));
+        assert!(stats.wake_pending);
+        assert_eq!(stats.wake_delivery.as_deref(), Some("failed"));
+        assert_eq!(stats.wake_id.as_deref(), Some("wake-1"));
     }
 
     /// Wire-shape pin for `claim`: POST body carries max_items + claimed_by;

@@ -342,6 +342,7 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "continuous.context",
     "continuous.dispatch_pending",
     "queue.stats",
+    "queue.list",
     "owner_attention.list",
     // Org model S2 reads (planning API proxies; items::org::READ_METHODS).
     "org.snapshot",
@@ -1091,6 +1092,10 @@ pub fn dispatch_request(
         // gate); `queue.stats` is a read-only depth probe.
         "enqueue" => DispatchOutcome::Done(dispatch_enqueue(state, req)),
         "queue.stats" => DispatchOutcome::Done(dispatch_queue_stats(state, req)),
+        "queue.list" => DispatchOutcome::Done(dispatch_queue_list(state, req)),
+        "queue.bind" => DispatchOutcome::Done(dispatch_queue_bind(state, req)),
+        "queue.claim" => DispatchOutcome::Done(dispatch_queue_claim(state, req)),
+        "queue.ack" => DispatchOutcome::Done(dispatch_queue_ack(state, req)),
 
         _ => DispatchOutcome::Done(Response::err(
             req.id.clone(),
@@ -1758,6 +1763,38 @@ fn dispatch_queue_stats(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Respo
         return resp;
     }
     match methods::queue_stats(state, &req.caller, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_queue_list(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Some(resp) = reject_forged_operator(req) { return resp; }
+    match methods::queue_list(state, &req.caller, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_queue_bind(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Some(resp) = reject_forged_operator(req) { return resp; }
+    match methods::queue_bind(state, &req.caller, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_queue_claim(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Some(resp) = reject_forged_operator(req) { return resp; }
+    match methods::queue_claim(state, &req.caller, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_queue_ack(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Some(resp) = reject_forged_operator(req) { return resp; }
+    match methods::queue_ack(state, &req.caller, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }

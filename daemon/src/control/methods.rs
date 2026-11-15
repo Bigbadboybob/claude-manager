@@ -14326,6 +14326,82 @@ struct EnqueueParams {
     source: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct QueueBindParams {
+    queue: String,
+    consumer: String,
+}
+
+#[derive(Deserialize)]
+struct QueueClaimParams {
+    queue: String,
+    max_items: u32,
+    claimed_by: String,
+    #[serde(default)]
+    lease_seconds: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct QueueAckParams {
+    queue: String,
+    ids: Vec<String>,
+    #[serde(default)]
+    claim_token: Option<String>,
+}
+
+fn queue_member_identity(state_arc: &Arc<Mutex<DaemonState>>, caller: &Caller) -> (String, bool) {
+    match caller {
+        Caller::Operator(_) => ("operator".into(), true),
+        Caller::Session(s) => {
+            let global = state_arc.lock().unwrap_or_else(|p| p.into_inner())
+                .sessions.get(&s.session_uid).is_some_and(|sess| sess.global_perms);
+            let member = crate::items::org::cached_member(&s.session_uid);
+            let identity = member["id"].as_str().or_else(|| member["handle"].as_str())
+                .unwrap_or(&s.session_uid).to_string();
+            (identity, global)
+        }
+    }
+}
+
+fn queue_caller_matches(caller: &Caller, bound: &str) -> bool {
+    let Caller::Session(s) = caller else { return false; };
+    let member = crate::items::org::cached_member(&s.session_uid);
+    member["id"].as_str() == Some(bound)
+        || member["handle"].as_str().is_some_and(|h| h.eq_ignore_ascii_case(bound))
+        || bound == s.session_uid
+}
+
+fn queue_wake_after_enqueue(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    client: &crate::continuous::queue::QueueClient,
+    result: &Value,
+) {
+    let Some(queue) = result.get("queue").and_then(Value::as_str) else { return; };
+    let Some(consumer) = result.get("bound_consumer").and_then(Value::as_str) else { return; };
+    if result.get("wake_requested").and_then(Value::as_bool) != Some(true) { return; }
+    let uid = crate::items::org::cached_member_session(consumer).filter(|uid| {
+        state_arc.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid)
+    });
+    let (root, depth) = {
+        let s = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        (s.messaging_root.clone(), result.get("depth").and_then(Value::as_u64).unwrap_or(0))
+    };
+    let marker = format!("[cm-queue {queue}]");
+    let text = format!("{marker} Queue '{queue}' has {depth} pending item(s). Read the queue and claim work if it is yours.");
+    let wake_id = result.get("wake_id").and_then(Value::as_str)
+        .map(str::to_string).unwrap_or_else(|| format!("cm-queue-wake:{queue}"));
+    let has_uid = uid.is_some();
+    let delivery = match uid {
+        Some(uid) => crate::notifications::publish(&root, &uid, &wake_id, "cm", &text, &marker)
+            .map(|_| true).unwrap_or(false),
+        None => false,
+    };
+    let error = (!delivery).then_some(if !has_uid { "bound consumer has no live main session" } else { "native notification publish failed" });
+    if let Err(e) = client.record_wake(queue, delivery, error) {
+        eprintln!("cm-daemon: queue wake receipt for '{queue}' failed: {e:?}");
+    }
+}
+
 /// `enqueue(queue, payload, dedupe_key?, source?)` — buffer one item into a
 /// named queue (Operator + Session). Forwards the API's
 /// `{enqueued, deduped, id, depth}` verbatim. An empty/missing `source`
@@ -14354,9 +14430,13 @@ pub fn enqueue(
             Caller::Session(s) => format!("session:{}", s.session_uid),
         });
     let client = continuous_queue_client(state_arc)?;
-    client
+    let result = client
         .enqueue(&p.queue, &p.payload, p.dedupe_key.as_deref(), Some(&source))
-        .map_err(|e| e.to_method_err())
+        .map_err(|e| e.to_method_err())?;
+    let mut result = result;
+    result["queue"] = Value::String(p.queue.clone());
+    queue_wake_after_enqueue(state_arc, &client, &result);
+    Ok(result)
 }
 
 #[derive(Deserialize)]
@@ -14365,7 +14445,8 @@ struct QueueStatsParams {
 }
 
 /// `queue.stats(queue)` — read-only depth probe (Operator + Session):
-/// `{queue, pending, claimed, oldest_pending_at}`.
+/// `{queue, pending, claimed, oldest_pending_at, oldest_item_age_seconds,
+/// binding, last_wake, last_consume, wake_pending, wake_delivery, wake_error}`.
 pub fn queue_stats(
     state_arc: &Arc<Mutex<DaemonState>>,
     _caller: &Caller,
@@ -14382,7 +14463,97 @@ pub fn queue_stats(
         "pending": stats.pending,
         "claimed": stats.claimed,
         "oldest_pending_at": stats.oldest_pending_at,
+        "oldest_item_age_seconds": stats.oldest_item_age_seconds,
+        "binding": stats.binding,
+        "last_wake": stats.last_wake,
+        "last_consume": stats.last_consume,
+        "wake_pending": stats.wake_pending,
+        "wake_delivery": stats.wake_delivery,
+        "wake_error": stats.wake_error,
+        "wake_id": stats.wake_id,
     }))
+}
+
+/// `queue.list` — dashboard read path. The result shape is stable and includes
+/// binding, oldest age, wake/consume timestamps and wake-pending state.
+pub fn queue_list(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    _caller: &Caller,
+    _params: &Value,
+) -> MethodResult {
+    let client = continuous_queue_client(state_arc)?;
+    client.list().map_err(|e| e.to_method_err())
+}
+
+/// `queue.bind` — bind/rebind a queue to a durable member reference. The
+/// consumer itself, Owner/operator, or a global-perms orchestrator may do so.
+pub fn queue_bind(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    caller: &Caller,
+    params: &Value,
+) -> MethodResult {
+    let p: QueueBindParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("queue.bind params: {e}")))?;
+    crate::continuous::queue::validate_queue_name(&p.queue)
+        .map_err(|e| (ErrorCode::InvalidParams, format!("queue.bind: {e}")))?;
+    let (actor, global) = queue_member_identity(state_arc, caller);
+    let existing = continuous_queue_client(state_arc)?.stats(&p.queue)
+        .map_err(|e| e.to_method_err())?;
+    if let Some(bound) = existing.binding.as_ref().and_then(|v| v["consumer"].as_str()) {
+        let self_bind = queue_caller_matches(caller, bound);
+        if !global && actor != "operator" && !self_bind {
+            return Err((ErrorCode::Unauthorized,
+                format!("queue '{}' is bound to consumer '{}'; only that consumer, Owner/operator, or a global-perms orchestrator may rebind it", p.queue, bound)));
+        }
+    }
+    let client = continuous_queue_client(state_arc)?;
+    let mut result = client.bind(&p.queue, &p.consumer, &actor).map_err(|e| e.to_method_err())?;
+    result["queue"] = Value::String(p.queue.clone());
+    result["bound_consumer"] = Value::String(p.consumer.clone());
+    queue_wake_after_enqueue(state_arc, &client, &result);
+    Ok(result)
+}
+
+/// Bound-consumer claim/ack tools. Existing unbound continuous queues keep
+/// using `enqueue` + scheduler claim/ack unchanged.
+pub fn queue_claim(
+    state_arc: &Arc<Mutex<DaemonState>>, caller: &Caller, params: &Value,
+) -> MethodResult {
+    let p: QueueClaimParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("queue.claim params: {e}")))?;
+    let (consumer, _) = queue_member_identity(state_arc, caller);
+    if consumer == "operator" { return Err((ErrorCode::Unauthorized, "queue.claim requires the bound consumer session".into())); }
+    let client = continuous_queue_client(state_arc)?;
+    let stats = client.stats(&p.queue).map_err(|e| e.to_method_err())?;
+    let api_consumer = if let Some(bound) = stats.binding.as_ref().and_then(|v| v["consumer"].as_str()) {
+        if !queue_caller_matches(caller, bound) {
+            return Err((ErrorCode::Unauthorized, format!("queue '{}' is bound to consumer '{}'; only that consumer may claim", p.queue, bound)));
+        }
+        bound.to_string()
+    } else { consumer.clone() };
+    client.claim_for(&p.queue, p.max_items, &p.claimed_by, Some(&api_consumer), p.lease_seconds.unwrap_or(300))
+        .map(|items| json!({"queue": p.queue, "items": items, "consumer": consumer}))
+        .map_err(|e| e.to_method_err())
+}
+
+pub fn queue_ack(
+    state_arc: &Arc<Mutex<DaemonState>>, caller: &Caller, params: &Value,
+) -> MethodResult {
+    let p: QueueAckParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("queue.ack params: {e}")))?;
+    let (consumer, _) = queue_member_identity(state_arc, caller);
+    if consumer == "operator" { return Err((ErrorCode::Unauthorized, "queue.ack requires the bound consumer session".into())); }
+    let client = continuous_queue_client(state_arc)?;
+    let stats = client.stats(&p.queue).map_err(|e| e.to_method_err())?;
+    let api_consumer = if let Some(bound) = stats.binding.as_ref().and_then(|v| v["consumer"].as_str()) {
+        if !queue_caller_matches(caller, bound) {
+            return Err((ErrorCode::Unauthorized, format!("queue '{}' is bound to consumer '{}'; only that consumer may acknowledge", p.queue, bound)));
+        }
+        bound.to_string()
+    } else { consumer.clone() };
+    client.ack_for(&p.queue, &p.ids, Some(&api_consumer), p.claim_token.as_deref())
+        .map(|acked| json!({"queue": p.queue, "acked": acked, "consumer": consumer}))
+        .map_err(|e| e.to_method_err())
 }
 
 // ===================================================================

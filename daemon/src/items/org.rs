@@ -1012,6 +1012,21 @@ pub fn cached_member(uid: &str) -> Value {
     }
 }
 
+/// Resolve a durable member id or handle to its current main-session uid.
+/// The cache is fed by heartbeat replies and persisted across brain restarts;
+/// assistants and stale incarnations are never selected as queue consumers.
+pub fn cached_member_session(reference: &str) -> Option<String> {
+    let reference = reference.trim();
+    if reference.is_empty() { return None; }
+    let c = cache().lock().unwrap_or_else(|p| p.into_inner());
+    c.by_uid.iter().find_map(|(uid, member)| {
+        let matches = member["id"].as_str() == Some(reference)
+            || member["handle"].as_str().is_some_and(|h| h.eq_ignore_ascii_case(reference));
+        let main = member["acting_as"].as_str().unwrap_or("main") == "main";
+        (matches && main).then(|| uid.clone())
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn reset_cache_for_test() {
     *cache().lock().unwrap_or_else(|p| p.into_inner()) = MemberCache::default();

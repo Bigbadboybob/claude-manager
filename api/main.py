@@ -561,6 +561,7 @@ def _validate_queue_name(queue: str) -> None:
 
 
 @app.post("/queues/{queue}/items", dependencies=[Depends(verify_token)])
+@app.post("/queues/{queue}/enqueue", dependencies=[Depends(verify_token)])
 async def enqueue_queue_item(queue: str, body: dict, pool=Depends(get_pool)):
     """Enqueue one item: {payload, dedupe_key?, source?} ->
     {enqueued, deduped, id, depth}. A dedupe_key that collides with a
@@ -588,12 +589,43 @@ async def enqueue_queue_item(queue: str, body: dict, pool=Depends(get_pool)):
     )
 
 
+@app.get("/queues", dependencies=[Depends(verify_token)])
+async def list_queue_stats(pool=Depends(get_pool)):
+    """Stable dashboard read shape for every known queue."""
+    return {"queues": await db.list_queue_stats(pool)}
+
+
 @app.get("/queues/{queue}", dependencies=[Depends(verify_token)])
 async def get_queue_stats(queue: str, pool=Depends(get_pool)):
-    """{queue, pending, claimed, oldest_pending_at} — the daemon's Consumer
-    due-check polls this."""
+    """Queue depth plus binding, wake and consume metadata."""
     _validate_queue_name(queue)
     return await db.queue_stats(pool, queue)
+
+
+@app.put("/queues/{queue}/binding", dependencies=[Depends(verify_token)])
+async def bind_queue(queue: str, body: dict, pool=Depends(get_pool)):
+    """Bind/rebind a queue to a durable org member reference."""
+    _validate_queue_name(queue)
+    consumer = body.get("consumer")
+    bound_by = body.get("bound_by", "operator")
+    if not isinstance(consumer, str) or not consumer.strip() or len(consumer) > 256:
+        raise HTTPException(status_code=400, detail="consumer must be a non-empty member id or handle")
+    if not isinstance(bound_by, str) or not bound_by.strip() or len(bound_by) > 256:
+        raise HTTPException(status_code=400, detail="bound_by must be a non-empty audit identity")
+    return await db.bind_queue(pool, queue, consumer.strip(), bound_by.strip())
+
+
+@app.post("/queues/{queue}/wake", dependencies=[Depends(verify_token)])
+async def record_queue_wake(queue: str, body: dict, pool=Depends(get_pool)):
+    """Record native delivery of a coalesced queue wake."""
+    _validate_queue_name(queue)
+    delivered = body.get("delivered")
+    if not isinstance(delivered, bool):
+        raise HTTPException(status_code=400, detail="delivered must be a boolean")
+    error = body.get("error")
+    if error is not None and (not isinstance(error, str) or len(error) > 1024):
+        raise HTTPException(status_code=400, detail="error must be a string of at most 1024 characters")
+    return await db.record_queue_wake(pool, queue, delivered=delivered, error=error)
 
 
 @app.post("/queues/{queue}/recover", dependencies=[Depends(verify_token)])
@@ -625,7 +657,19 @@ async def claim_queue_batch(queue: str, body: dict, pool=Depends(get_pool)):
     claimed_by = body.get("claimed_by")
     if not isinstance(claimed_by, str) or not claimed_by:
         raise HTTPException(status_code=400, detail="claimed_by must be a non-empty string")
-    items = await db.claim_queue_items(pool, queue, max_items, claimed_by)
+    consumer = body.get("consumer")
+    if consumer is not None and (not isinstance(consumer, str) or not consumer):
+        raise HTTPException(status_code=400, detail="consumer must be a non-empty string")
+    lease_seconds = body.get("lease_seconds", 300)
+    if not isinstance(lease_seconds, int) or lease_seconds < 30 or lease_seconds > 86400:
+        raise HTTPException(status_code=400, detail="lease_seconds must be an int in [30, 86400]")
+    try:
+        items = await db.claim_queue_items(
+            pool, queue, max_items, claimed_by,
+            consumer=consumer, lease_seconds=lease_seconds,
+        )
+    except db.QueueBindingRefusal as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     return {"items": items}
 
 
@@ -637,8 +681,16 @@ async def ack_queue_batch(queue: str, body: dict, pool=Depends(get_pool)):
     ids = body.get("ids")
     if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
         raise HTTPException(status_code=400, detail="ids must be a list of strings")
+    consumer = body.get("consumer")
+    claim_token = body.get("claim_token")
+    if consumer is not None and (not isinstance(consumer, str) or not consumer):
+        raise HTTPException(status_code=400, detail="consumer must be a non-empty string")
+    if claim_token is not None and (not isinstance(claim_token, str) or not claim_token):
+        raise HTTPException(status_code=400, detail="claim_token must be a non-empty string")
     try:
-        acked = await db.ack_queue_items(pool, queue, ids)
+        acked = await db.ack_queue_items(pool, queue, ids, consumer=consumer, claim_token=claim_token)
+    except db.QueueBindingRefusal as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     except asyncpg.DataError:
         # Malformed UUIDs land here from the ::uuid[] cast — a client bug.
         raise HTTPException(status_code=400, detail="ids must be UUIDs")
@@ -682,7 +734,12 @@ async def requeue_queue_batch(queue: str, body: dict | None = None, pool=Depends
                    '(which re-pends any batch an in-flight fire just claimed)',
         )
     try:
-        requeued = await db.requeue_queue_items(pool, queue, ids)
+        consumer = body.get("consumer")
+        if consumer is not None and (not isinstance(consumer, str) or not consumer):
+            raise HTTPException(status_code=400, detail="consumer must be a non-empty string")
+        requeued = await db.requeue_queue_items(pool, queue, ids, consumer=consumer)
+    except db.QueueBindingRefusal as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     except asyncpg.DataError:
         raise HTTPException(status_code=400, detail="ids must be UUIDs")
     return {"requeued": requeued}

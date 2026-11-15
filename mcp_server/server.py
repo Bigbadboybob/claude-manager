@@ -5111,10 +5111,54 @@ def queue_depth(queue: str) -> dict:
 
     Returns:
         {"queue": str, "pending": int, "claimed": int,
-         "oldest_pending_at": str | None}. `pending` items await a batch
-        claim; `claimed` items are in (or stranded from) an in-flight batch.
+         "oldest_pending_at": str | None, "binding": object | None,
+         "oldest_item_age_seconds": float | None, "last_wake": str | None,
+         "last_consume": str | None, "wake_pending": bool}. `pending` items
+        await a batch claim; `claimed` items are in (or stranded from) an
+        in-flight batch.
     """
     return control_client.call("queue.stats", {"queue": queue})
+
+
+@mcp.tool()
+def queue_list() -> dict:
+    """List named queues with binding, depth, oldest age, wake and consume state.
+
+    The response is the stable dashboard shape: ``{"queues": [{queue,
+    pending, claimed, binding, oldest_pending_at, oldest_item_age_seconds,
+    last_wake, last_consume, wake_pending, wake_delivery, wake_error, wake_id}, ...]``.
+    """
+    return control_client.call("queue.list", {})
+
+
+@mcp.tool()
+def queue_bind(queue: str, consumer: str) -> dict:
+    """Bind or rebind a queue to an org member id or handle.
+
+    The member itself, Owner/operator, or a global-permissions orchestrator
+    may bind. The durable member reference survives replacement of its main
+    session; only that member may claim and acknowledge bound items.
+    """
+    return control_client.call("queue.bind", {"queue": queue, "consumer": consumer})
+
+
+@mcp.tool()
+def queue_claim(queue: str, max_items: int = 10, claimed_by: str = "",
+                lease_seconds: int = 300) -> dict:
+    """Claim items from a lead-bound queue under a renewable lease."""
+    params: dict = {"queue": queue, "max_items": max_items,
+                    "claimed_by": claimed_by or "mcp-consumer",
+                    "lease_seconds": lease_seconds}
+    return control_client.call("queue.claim", params)
+
+
+@mcp.tool()
+def queue_ack(queue: str, ids: list[str], claim_token: str = "") -> dict:
+    """Acknowledge items previously claimed by this bound consumer."""
+    params: dict = {"queue": queue, "ids": ids}
+    if claim_token:
+        params["claim_token"] = claim_token
+    return control_client.call("queue.ack", params)
 
 
 @mcp.tool()
