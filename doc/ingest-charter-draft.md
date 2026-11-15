@@ -55,9 +55,22 @@ freely, within its limits:
 | Datacenter proxies | 5 GB | 5 |
 | Residential proxies | 5 GB | rotating |
 
-The metered pools (datacenter, residential) are scarce, so Ingest prefers
-ISP proxies and keeps the 5 GB pools for sources that need them. It tracks
-monthly usage per pool. The following go to Owner first: a plan upgrade,
+**Never exceed a monthly limit (Owner, 2026-11-15).** If a pool goes over
+its limit, every scraper using that pool stops working until the monthly
+reset. So:
+
+- Prefer ISP proxies, which have no GB limit. Keep the 5 GB datacenter and
+  residential pools for sources that truly need them.
+- Before routing a source through a metered pool, estimate its monthly GB:
+  bytes per fetch times fetches per month. Record that estimate in the
+  playbook.
+- Track usage per pool against its limit, as a share of the month's budget
+  spent so far.
+- Keep headroom. When a pool reaches 70% of its limit, stop adding sources
+  to it. At 85%, move the heaviest non-essential sources off it, or slow
+  their fetch rate. Sources the live trader depends on keep their access
+  last.
+- Tell Owner as soon as a pool looks set to run out before its reset. The following go to Owner first: a plan upgrade,
 overage, more IPs, or any new paid scraping service or provider.
 
 ## The scraping playbook
