@@ -1495,6 +1495,27 @@ class PoolTests(HubHarness):
         self.assertIn("carol@example.com: the login was refused", self.hub("history")[1])
         self.files_outside_pool_have_no_tokens()
 
+    def test_renewals_stop_after_a_failure_that_is_not_a_refusal(self):
+        self.poll()
+        self.poll()
+        pool = self.hub_paths.store / "hub" / "pool"
+        for path in pool.glob("*.json"):
+            rec = json.loads(path.read_text())
+            rec["claudeAiOauth"]["expiresAt"] = int(time.time() * 1000) + 60_000
+            path.write_text(json.dumps(rec))
+        calls = []
+
+        def renew(oauth):
+            calls.append(oauth["refreshToken"])
+            raise accounts.AccountError("token refresh response was not understood")
+
+        with mock.patch.object(accounts, "refresh_login", side_effect=renew):
+            accounts.read_pool_usage(self.hub_paths, io.StringIO())
+            accounts.read_pool_usage(self.hub_paths, io.StringIO())
+        self.assertEqual(len(calls), 2)  # the first run's two, then paused
+        self.assertIn("pool renewals paused 6 h", self.hub("history")[1])
+        self.assertEqual(self.pool_uuids(), ["bob-uuid-0000", "carol-uuid-0000"])  # both back, not lost
+
     def test_a_blank_host_borrows_its_first_login(self):
         self.poll()
         self.poll()
@@ -1756,15 +1777,16 @@ class UsageIntervalTests(HubHarness):
             _, fresh = self.poll()
             self.assertNotIn("cached", fresh)
             state = self.state()
-            state["usage"]["alice-uuid-0000"]["at"] -= 70  # alice is at 95%: re-read after 100 s
+            state["usage"]["alice-uuid-0000"]["at"] -= 70  # alice is at 95%: re-read after 170 s
+            state.setdefault("config", {})["thresholds"] = {"weekly": 99}  # 95% is below the switch point
             self.paths.state.write_text(json.dumps(state))
             _, cached = self.poll()
             self.assertEqual(len(self.usage_calls), 1)
             self.assertIn("(cached, read 1m ago)", cached)
             state = self.state()
-            state["usage"]["alice-uuid-0000"]["at"] -= 60
+            state["usage"]["alice-uuid-0000"]["at"] -= 120
             self.paths.state.write_text(json.dumps(state))
-            self.poll()  # 130 s old and near the limit: read again, well before 9 min
+            self.poll()  # 190 s old and near the limit: read again, well before 9 min
             self.assertEqual(len(self.usage_calls), 2)
 
     def test_check_in_continues_while_backing_off(self):

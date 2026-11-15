@@ -352,7 +352,18 @@ DEFAULT_NOTIFY = Path.home() / ".cm/bin/cm-notify"
 # The timer runs every 2 min (hub check-ins); usage is read at most this often.
 USAGE_INTERVAL_SECONDS = 9 * 60
 NEAR_LIMIT_PERCENT = 95
-NEAR_LIMIT_INTERVAL_SECONDS = 100
+NEAR_LIMIT_INTERVAL_SECONDS = 170  # every other 2-min timer run: ~0.7% at 10%/h
+
+
+def near_switch_point(state: dict, reading: dict, now: float) -> bool:
+    """A limit between 95% and its switch point that has not reset: read
+    more often so the switch lands in time. Past the switch point fresh
+    numbers change nothing (claudelb-local, 11-15)."""
+    policy = (last_hub_reply(state) or {}).get("policy") or {}
+    config = {"thresholds": policy.get("thresholds") or (state.get("config") or {}).get("thresholds") or {}}
+    return any(NEAR_LIMIT_PERCENT <= l.get("percent", 0) < threshold_for(l, config)
+               for l in reading.get("limits") or []
+               if not (l.get("resets_at") is not None and l["resets_at"] <= now))
 
 
 def fetch_usage(access_token: str) -> dict:
@@ -1336,6 +1347,7 @@ POOL_READING_STALE_SECONDS = 3 * 3600
 POOL_READS_PER_RUN = 3
 POOL_REFRESHES_PER_RUN = 2
 POOL_REFRESH_BEFORE_SECONDS = 30 * 60
+POOL_RENEW_PAUSE_SECONDS = 6 * 3600
 TOKEN_URL = "https://platform.claude.com/v1/oauth/token"  # Claude Code 2.1.325
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
@@ -1390,6 +1402,7 @@ def read_pool_usage(paths: Paths, out) -> None:
         meta = load_json(hub.dir / "pool-reads.json")
         if meta.get("backoff_until", 0) > now:
             return
+        renew_ok = meta.get("renew_paused_until", 0) <= now
         cache = load_json(hub.dir / "readings.json")
         renew, read = [], []
         for uuid, rec in hub.pool().items():
@@ -1402,12 +1415,12 @@ def read_pool_usage(paths: Paths, out) -> None:
             elif stale:
                 read.append(((cache.get(uuid) or {}).get("at", 0), uuid, rec))
         jobs = []
-        for _, uuid in sorted(renew)[:POOL_REFRESHES_PER_RUN]:
+        for _, uuid in sorted(renew)[:POOL_REFRESHES_PER_RUN if renew_ok else 0]:
             os.rename(hub.pool_dir / f"{uuid}.json", renewing / f"{uuid}.json")
             jobs.append((uuid, load_json(renewing / f"{uuid}.json"), True))
         for _, uuid, rec in sorted(read)[:POOL_READS_PER_RUN]:
             jobs.append((uuid, rec, False))
-    readings, renewed, refused, backoff = {}, {}, {}, None
+    readings, renewed, refused, backoff, failed = {}, {}, {}, None, None
     for uuid, rec, renew_it in jobs:
         email = rec["oauthAccount"].get("emailAddress") or uuid[:8]
         oauth = rec["claudeAiOauth"]
@@ -1426,6 +1439,8 @@ def read_pool_usage(paths: Paths, out) -> None:
             print(f"pool login {email}: {exc}", file=out)
             continue
         except AccountError as exc:
+            if renew_it and uuid not in renewed:
+                failed = f"{email}: {exc}"  # the server may have rotated it: stop and look
             print(f"pool login {email}: {exc}", file=out)
             continue
         if limits:
@@ -1454,8 +1469,19 @@ def read_pool_usage(paths: Paths, out) -> None:
             if reading["at"] > (cache.get(uuid) or {}).get("at", 0):
                 cache[uuid] = reading
         atomic_write(hub.dir / "readings.json", cache)
+        meta = load_json(hub.dir / "pool-reads.json")
         if backoff:
-            atomic_write(hub.dir / "pool-reads.json", {"backoff_until": int(backoff)})
+            meta["backoff_until"] = int(backoff)
+        # Breaker (claudelb-local, 11-15): one bad renewal must not spread
+        # through the pool. A failure that is not a plain refusal, or two
+        # refusals in a row with no success, pauses renewals for 6 h.
+        meta["refusals_in_a_row"] = 0 if renewed else meta.get("refusals_in_a_row", 0) + len(refused)
+        if failed or meta["refusals_in_a_row"] >= 2:
+            meta["renew_paused_until"] = int(now + POOL_RENEW_PAUSE_SECONDS)
+            why = failed or f"{meta['refusals_in_a_row']} refusals in a row"
+            hub.event("owner-alert" if failed else "pool", f"pool renewals paused 6 h ({why})")
+            meta["refusals_in_a_row"] = 0
+        atomic_write(hub.dir / "pool-reads.json", meta)
 
 
 def pool_capable(export: dict) -> bool:
@@ -2198,7 +2224,7 @@ def poll_usage(paths: Paths, state: dict, accounts: dict[str, dict], out, alert,
     reading = (state.get("usage") or {}).get(uuid)
     interval = (state.get("config") or {}).get("usage_interval_minutes")
     interval = interval * 60 if isinstance(interval, (int, float)) else USAGE_INTERVAL_SECONDS
-    if reading and any(l.get("percent", 0) >= NEAR_LIMIT_PERCENT for l in reading.get("limits") or []):
+    if reading and near_switch_point(state, reading, time.time()):
         interval = min(interval, NEAR_LIMIT_INTERVAL_SECONDS)  # switches land at 99% (Owner 11-15)
     if reading and reading.get("limits") and time.time() - reading["at"] < interval:
         return 0, reading["limits"]  # read recently: spare the endpoint's budget
