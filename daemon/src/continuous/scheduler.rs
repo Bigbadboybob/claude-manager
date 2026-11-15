@@ -931,7 +931,12 @@ impl ContinuousScheduler {
             let lead_alive = marker["lead_alive"].as_bool().or_else(|| {
                 lead_uid.map(|uid| self.state.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid))
             });
-            if lead_alive == Some(false) || (lead_uid.is_none() && marker["lead_member_id"].is_string()) {
+            // A raw/static marker (or a remote/unknown projection) has no
+            // lead UID and must not be treated as a dead local lead. The
+            // daemon-side org projection supplies a resolved UID when this
+            // daemon owns the member; otherwise locality is ambiguous and we
+            // stay quiet rather than page on another host's lead.
+            if should_alert_missing_lead(&marker, lead_alive) {
                 current.insert(
                     format!("team:{id}:lead"),
                     format!("continuous team {label} lead is dead"),
@@ -1005,15 +1010,7 @@ impl ContinuousScheduler {
     }
 
     fn continuous_team_markers(&self) -> Vec<serde_json::Value> {
-        let (api_url, api_token) = {
-            let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            (s.config.api_url.clone(), s.config.api_token.clone())
-        };
-        let Ok(api) = crate::items::api::Api::from_config(&api_url, &api_token) else { return Vec::new() };
-        api.get("/org/snapshot", &[])
-            .ok()
-            .and_then(|v| v["teams"].as_array().cloned())
-            .unwrap_or_default()
+        crate::items::org::continuous_team_markers(&self.state)
     }
 
     /// Test-only: canned per-queue pending depths for the Consumer due-check
@@ -2926,6 +2923,10 @@ fn continuous_team_marker(team: &serde_json::Value) -> Option<&serde_json::Value
     }
 }
 
+fn should_alert_missing_lead(marker: &serde_json::Value, lead_alive: Option<bool>) -> bool {
+    marker["lead_session_uid"].as_str().is_some() && lead_alive == Some(false)
+}
+
 fn monitor_alert_transitions(
     old: &HashMap<String, String>,
     current: &HashMap<String, String>,
@@ -3750,6 +3751,17 @@ mod tests {
         assert_eq!(marker["health"], "missed");
         assert_eq!(marker["queues"][0]["queue"], "momentum");
         assert!(continuous_team_marker(&serde_json::json!({"id":"ordinary"})).is_none());
+    }
+
+    #[test]
+    fn raw_marker_without_live_projection_does_not_page_dead_lead() {
+        let raw = serde_json::json!({
+            "id": "ingest",
+            "continuous": {"lead_member_id": "mem-ingest", "host_id": "cm-manager"}
+        });
+        let marker = continuous_team_marker(&raw).expect("marker");
+        assert!(marker["lead_session_uid"].is_null());
+        assert!(!should_alert_missing_lead(marker, None));
     }
 
     #[test]

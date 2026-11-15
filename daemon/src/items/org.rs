@@ -163,6 +163,24 @@ fn decorate_snapshot(state: &Arc<Mutex<DaemonState>>, mut value: Value) -> Value
     value
 }
 
+/// Read and decorate the continuous-team projection for daemon-owned
+/// consumers such as the scheduler monitor. Keeping this beside
+/// `decorate_snapshot` is important: a raw planning `/org/snapshot` only has
+/// the static marker, while this projection resolves the lead's main session,
+/// wake summary and lead-filtered queues in the current daemon.
+pub(crate) fn continuous_team_markers(state: &Arc<Mutex<DaemonState>>) -> Vec<Value> {
+    let (api_url, api_token) = {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        (s.config.api_url.clone(), s.config.api_token.clone())
+    };
+    let Ok(api) = super::api::Api::from_config(&api_url, &api_token) else { return Vec::new() };
+    api.get("/org/snapshot", &[])
+        .ok()
+        .map(|value| decorate_snapshot(state, value))
+        .and_then(|value| value["teams"].as_array().cloned())
+        .unwrap_or_default()
+}
+
 fn live_queue_rows(state: &Arc<Mutex<DaemonState>>) -> Vec<Value> {
     crate::control::methods::queue_list(
         state,
