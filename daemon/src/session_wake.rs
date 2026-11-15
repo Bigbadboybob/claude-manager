@@ -467,6 +467,7 @@ pub fn handle(
 #[derive(Clone, Debug, Default)]
 struct TargetSnapshot {
     alive: bool,
+    turn_started_at: Option<f64>,
     completed_turn_at: Option<f64>,
     busy: bool,
 }
@@ -509,8 +510,11 @@ fn tick_store(
         if schedule.awaiting_completion {
             if let Some((_, delivered_at)) = latest_delivery(schedule) {
                 if target
-                    .completed_turn_at
-                    .is_some_and(|ended| ended > delivered_at)
+                    .turn_started_at
+                    .is_some_and(|started| started > delivered_at)
+                    && target
+                        .completed_turn_at
+                        .is_some_and(|ended| ended > delivered_at)
                 {
                     schedule.awaiting_completion = false;
                     schedule.awaiting_run_id = None;
@@ -698,6 +702,7 @@ impl WakeScheduler {
                     uid.clone(),
                     TargetSnapshot {
                         alive: !session.last_exit.kernel_set(),
+                        turn_started_at: agent.engine_turn_started_at.or(agent.latest_start_at),
                         completed_turn_at: agent.last_turn.ended_at,
                         busy: !pty_idle,
                     },
@@ -828,6 +833,7 @@ mod tests {
             15.0,
             TargetSnapshot {
                 alive: true,
+                turn_started_at: Some(10.0),
                 completed_turn_at: Some(15.0),
                 ..Default::default()
             },
