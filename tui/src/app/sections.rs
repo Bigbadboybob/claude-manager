@@ -98,7 +98,7 @@ impl App {
         rows: &'s [VisualItem],
         section_of: &dyn Fn(usize) -> Option<&'s str>,
     ) -> Vec<Option<Color>> {
-        if !self.tree_view() || self.sections.is_empty() {
+        if !self.tree_view() {
             return vec![None; rows.len()];
         }
         let mut sections: Vec<Option<&str>> = rows.iter().map(|row| match row {
@@ -126,8 +126,12 @@ impl App {
             } else {
                 sections[i]
             };
-            section.and_then(|id| self.section_by_id(id))
-                .map(|s| theme::sidebar_section_bg(s.color.as_deref(), self.global_settings.tint_strength()))
+            if matches!(row, VisualItem::ContinuousTeamHeader(_) | VisualItem::ContinuousTeamSession(..)) {
+                Some(theme::sidebar_section_bg(Some("magenta"), self.global_settings.tint_strength()))
+            } else {
+                section.and_then(|id| self.section_by_id(id))
+                    .map(|s| theme::sidebar_section_bg(s.color.as_deref(), self.global_settings.tint_strength()))
+            }
         }).collect()
     }
 

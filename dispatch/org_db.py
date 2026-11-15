@@ -316,7 +316,7 @@ async def _members(conn, where: str = "", *args) -> list[dict]:
 _TEAM_SELECT = """
 SELECT i.id, i.slug, i.name, i.kind, i.status, i.team_status, i.parent_team_id,
        i.lead_member_id, i.coordinator_task_id, i.shared_channel, i.charter,
-       i.standing_rules, i.org_id, i.team_revision,
+       i.standing_rules, i.continuous_marker, i.org_id, i.team_revision,
        coalesce(b.slug, rb.slug) AS board,
        (SELECT coalesce(jsonb_agg(jsonb_build_object('member_id', tm.member_id, 'role', tm.role)
                                   ORDER BY tm.since, tm.member_id), '[]'::jsonb)
@@ -344,6 +344,7 @@ def _shape_team(row) -> dict:
         "channel": r["shared_channel"],
         "charter": r["charter"],
         "standing_rules": r["standing_rules"] or [],
+        "continuous": r.get("continuous_marker"),
         "org_id": r["org_id"],
         "members": r["members"] or [],
         "revision": r["team_revision"],
@@ -1989,12 +1990,26 @@ async def create_team_conn(conn, actor: dict, *, name: str, slug=None, kind="tea
     return team_id
 
 
-TEAM_FIELDS = {"name", "parent_team_id", "lead", "charter", "standing_rules", "status"}
+TEAM_FIELDS = {"name", "parent_team_id", "lead", "charter", "standing_rules", "status", "continuous"}
+
+
+def _validate_continuous_marker(marker) -> None:
+    if marker is None:
+        return
+    if not isinstance(marker, dict):
+        raise _err(422, "invalid_field", "continuous must be an object or null")
+    for key in ("lead_member_id", "host_id"):
+        if not isinstance(marker.get(key), str) or not marker[key].strip():
+            raise _err(422, "invalid_field", f"continuous.{key} must be a non-empty string")
+    queues = marker.get("queues")
+    if queues is not None and (not isinstance(queues, list) or any(not isinstance(q, str) or not q.strip() for q in queues)):
+        raise _err(422, "invalid_field", "continuous.queues must be an array of queue names")
 
 
 async def team_update(pool, actor: dict, ref: str, changes: dict, *, reason=None,
                       expected_revision=None, request_id=None) -> dict:
-    _require_owner(actor, "editing a team")
+    if not (_is_owner(actor) or ((actor or {}).get("global_perms") and set(changes) <= {"continuous"})):
+        _require_owner(actor, "editing a team")
     unknown = set(changes) - TEAM_FIELDS
     if unknown or not changes:
         raise _err(422, "invalid_field", f"editable team fields: {sorted(TEAM_FIELDS)}")
@@ -2023,6 +2038,10 @@ async def team_update(pool, actor: dict, ref: str, changes: dict, *, reason=None
                     if changes["status"] not in TEAM_STATUSES:
                         raise _err(422, "invalid_field", f"status must be one of {sorted(TEAM_STATUSES)}")
                     sets["team_status"] = changes["status"]
+                if "continuous" in changes:
+                    marker = changes["continuous"]
+                    _validate_continuous_marker(marker)
+                    sets["continuous_marker"] = marker
                 if "parent_team_id" in changes:
                     parent = _uuid(changes["parent_team_id"], "parent_team_id")
                     if parent is not None and not await conn.fetchval(

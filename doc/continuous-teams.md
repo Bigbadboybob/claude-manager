@@ -101,6 +101,41 @@ the Ingest lead included.
   - open items.
 - A Luna monitor agent watches it and posts problems in `#continuous`.
 
+### Continuous-team marker and live read
+
+Owner/operator (or a session with global permissions) marks an ordinary org
+team with `org(action="mark_continuous", team="<id>",
+continuous={"lead_member_id":"mem_…", "host_id":"cm-manager"})`.
+The marker names the durable lead member and the host; it does not copy a
+schedule or queue state. `org.snapshot` and `org.team` decorate the marker
+with live state from that lead's daemon-owned wake schedules and queues:
+
+```json
+{
+  "lead_member_id": "mem_…", "host_id": "cm-manager",
+  "lead_session_uid": "ts-…", "next_run": 1731675600.0,
+  "last_run": {"outcome": "delivered", "scheduled_at": 1731654000.0},
+  "missed_count": 0, "health": "ok",
+  "queues": [{"queue": "momentum", "pending": 3, "claimed": 0,
+               "binding": {"consumer": "mem_…"}}]
+}
+```
+
+`health` is one of `ok`, `late`, `missed`, `blocked` or `unknown`. A missing
+lead on its host or an unavailable local schedule is `blocked`; an unreachable
+marker host is `unknown` until that host's projection is read. Queue rows retain the
+stable `queue_list()` fields and are filtered to queues bound to the lead (or
+explicit queue names in the marker). The Task sidebar renders the lead's
+sessions in the org section as a tinted box. Its header is `⟳ every 6h · next
+1h12m · ok`; a queue-only lead uses `⟳ queue · 3 pending · ok`. The legacy
+continuous column remains unchanged until phase 5.
+
+Live fields are refreshed even when the planning org version is unchanged.
+The laptop merges each marked team's projection from its `host_id` daemon;
+when that host is unreachable the team remains `unknown` rather than being
+reported as blocked. `org.continuous_status(team=...)` is the small direct
+read for a host-local dashboard or monitor.
+
 ## Phases
 
 1. **Clear the backlog.** Inventory the open items, branches and worktrees

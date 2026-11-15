@@ -172,6 +172,12 @@ workspace separators stay thin and dim. Filtering
 or scrolling away the heading does not remove a member's tint. Planning keeps
 its default background and the initiative coordinator `◆` glyph.
 
+Continuous org teams are an additional boxed block in this Task view. The
+block stays with the team's org placement, uses the same F9 tint strength, and
+contains the lead and its managed sessions. Its header is the live marker
+summary (`⟳ every 6h · next 1h12m · ok`, or `⟳ queue · 3 pending · ok`); the
+legacy continuous column is unchanged.
+
 Select a section heading and press **Alt+E** to change its color. The palette is
 red, orange, yellow, green, cyan, blue, magenta, and pink, plus the neutral default.
 The choice controls both the heading accent and its background tint.

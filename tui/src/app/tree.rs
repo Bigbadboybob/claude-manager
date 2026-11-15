@@ -418,6 +418,24 @@ impl App {
             }
             .hash(&mut h);
         }
+        if let Some(snap) = self.org_live() {
+            for team in &snap.teams {
+                team.id.hash(&mut h);
+                if let Some(marker) = &team.continuous {
+                    marker.lead_member_id.hash(&mut h);
+                    marker.host_id.hash(&mut h);
+                    marker.lead_session_uid.hash(&mut h);
+                    marker.next_run.map(f64::to_bits).hash(&mut h);
+                    marker.cadence_secs.map(f64::to_bits).hash(&mut h);
+                    marker.schedule_kind.hash(&mut h);
+                    marker.missed_count.hash(&mut h);
+                    marker.health.hash(&mut h);
+                    serde_json::to_string(&marker.queues).unwrap_or_default().hash(&mut h);
+                } else {
+                    0u8.hash(&mut h);
+                }
+            }
+        }
         hash_unordered(&self.sidebar_task_parents, &mut h);
         hash_unordered(&self.sidebar_done_task_ids, &mut h);
         // Open workspaces hash with their index: closing or removing one
@@ -621,7 +639,22 @@ impl App {
                 return cached.clone();
             }
         }
-        let members = self.continuous_members();
+        let mut members = self.continuous_members();
+        // Ordinary org-team leads and their managed sessions are hidden from
+        // the loose work tree and re-emitted in their continuous team box.
+        if let Some(snap) = self.org_live() {
+            for team in snap.teams.iter().filter(|t| t.continuous.is_some() && !t.archived()) {
+                let lead_uid = team.continuous.as_ref().and_then(|m| m.lead_member_id.as_deref()).and_then(|id| snap.member(id)).and_then(|m| m.main_uid());
+                for (wi, ws) in self.workspaces.iter().enumerate() {
+                    if ws.is_closed || self.is_past_workspace(wi) { continue; }
+                    for (si, ts) in ws.sessions.iter().enumerate() {
+                        let belongs = lead_uid.is_some_and(|uid| ts.uid == uid || ts.managed_by_uid.as_deref() == Some(uid))
+                            || (lead_uid.is_none() && ts.host_id.as_str() == team.continuous.as_ref().and_then(|m| m.host_id.as_deref()).unwrap_or(""));
+                        if belongs { members.insert((wi, si)); }
+                    }
+                }
+            }
+        }
         let f = self.forest(&members);
         let by_task = self.planning.divisions_by_task();
         let mut out = TaskTree {
@@ -704,6 +737,26 @@ impl App {
                 emit.out.items.push(VisualItem::Separator);
             }
             emit.entry(entry);
+        }
+        // Continuous org teams stay in the main Task sidebar as a boxed
+        // block; the legacy dedicated continuous column remains untouched.
+        if let Some(snap) = self.org_live() {
+            for team in snap.teams.iter().filter(|t| t.continuous.is_some() && !t.archived()) {
+                let mut rows = Vec::new();
+                let lead_uid = team.continuous.as_ref().and_then(|m| m.lead_member_id.as_deref()).and_then(|id| snap.member(id)).and_then(|m| m.main_uid());
+                for (wi, ws) in self.workspaces.iter().enumerate() {
+                    if ws.is_closed || self.is_past_workspace(wi) { continue; }
+                    for (si, ts) in ws.sessions.iter().enumerate() {
+                        let belongs = lead_uid.is_some_and(|uid| ts.uid == uid || ts.managed_by_uid.as_deref() == Some(uid))
+                            || (lead_uid.is_none() && ts.host_id.as_str() == team.continuous.as_ref().and_then(|m| m.host_id.as_deref()).unwrap_or(""));
+                        if belongs { rows.push((wi, si)); }
+                    }
+                }
+                if rows.is_empty() { continue; }
+                if !out.items.is_empty() && !matches!(out.items.last(), Some(VisualItem::SectionEnd)) { out.items.push(VisualItem::Separator); }
+                out.items.push(VisualItem::ContinuousTeamHeader(team.id.clone()));
+                out.items.extend(rows.into_iter().map(|(wi, si)| VisualItem::ContinuousTeamSession(wi, si)));
+            }
         }
         let cached = std::rc::Rc::new(out);
         *self.task_tree_cache.borrow_mut() = Some((cache_key, cached.clone()));

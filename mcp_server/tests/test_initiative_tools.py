@@ -91,6 +91,16 @@ class InitiativeToolsTests(unittest.TestCase):
             call.reset_mock()
             server.org(view="team", team="swarm")
             self.assertEqual(call.call_args.args[1], {"view": "team", "team": "swarm"})
+
+            call.reset_mock()
+            server.org(action="mark_continuous", team="ingest", continuous={
+                "lead_member_id": "mem_lead", "host_id": "cm-manager",
+            })
+            call.assert_called_once_with("org.team_mark_continuous", {
+                "team": "ingest", "continuous": {
+                    "lead_member_id": "mem_lead", "host_id": "cm-manager",
+                },
+            }, socket_path=self.route.path)
         with mock.patch.object(control_client, "resolve_socket_route",
                                return_value=control_client.SocketRoute(Path("/tmp/tui.sock"), False)):
             with self.assertRaises(RuntimeError):

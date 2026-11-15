@@ -80,11 +80,68 @@ pub(super) fn owner_rpc(targets: &[(String, PathBuf, String)], method: &str, par
     Err(RpcFail { unsupported, message })
 }
 
+/// Read `org.snapshot` from every reachable host and merge each host's live
+/// continuous projection into the shared static snapshot. The planning API is
+/// central, but wake schedules and queues belong to the marker's host daemon.
+pub(super) fn owner_org_snapshot(targets: &[(String, PathBuf, String)], params: &Value) -> Result<Value, RpcFail> {
+    let mut errors = Vec::new();
+    let mut unsupported = !targets.is_empty();
+    let mut merged: Option<Value> = None;
+    for (host, socket, token) in targets {
+        match crate::client_session::rpc_messaging_board(socket, token, "org.snapshot", params.clone()) {
+            Ok(value) => {
+                if value["unchanged"] == true {
+                    continue;
+                }
+                if let Some(current) = merged.as_mut() {
+                    merge_org_live_teams(current, &value, host);
+                } else {
+                    merged = Some(value);
+                }
+            }
+            Err(e) => {
+                unsupported &= is_unsupported(&e);
+                errors.push(format!("{host}: {e}"));
+            }
+        }
+    }
+    if let Some(value) = merged {
+        return Ok(value);
+    }
+    let message = if errors.is_empty() { "No daemon is reachable".to_owned() } else { errors.join("; ") };
+    Err(RpcFail { unsupported, message })
+}
+
+fn merge_org_live_teams(base: &mut Value, candidate: &Value, _host: &str) {
+    let Some(base_teams) = base.get_mut("teams").and_then(Value::as_array_mut) else { return; };
+    let Some(candidate_teams) = candidate.get("teams").and_then(Value::as_array) else { return; };
+    for candidate_team in candidate_teams {
+        let Some(marker) = candidate_team.get("continuous").filter(|v| v.is_object()) else { continue; };
+        let Some(id) = candidate_team.get("id").and_then(Value::as_str) else { continue; };
+        if let Some(base_team) = base_teams.iter_mut().find(|team| team.get("id").and_then(Value::as_str) == Some(id)) {
+            let current = base_team.get("continuous").filter(|v| v.is_object());
+            let candidate_has_lead = marker.get("lead_session_uid").and_then(Value::as_str).is_some_and(|uid| !uid.is_empty());
+            let current_has_lead = current.and_then(|v| v.get("lead_session_uid")).and_then(Value::as_str).is_some_and(|uid| !uid.is_empty());
+            if candidate_has_lead || !current_has_lead {
+                base_team["continuous"] = marker.clone();
+            }
+        }
+    }
+}
+
 /// Run `owner_rpc` on a thread; the reply arrives on the returned channel.
 pub(super) fn spawn_owner_rpc(targets: Vec<(String, PathBuf, String)>, method: &'static str, params: Value) -> mpsc::Receiver<Result<Value, RpcFail>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(owner_rpc(&targets, method, &params));
+    });
+    rx
+}
+
+pub(super) fn spawn_owner_org_snapshot(targets: Vec<(String, PathBuf, String)>, params: Value) -> mpsc::Receiver<Result<Value, RpcFail>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(owner_org_snapshot(&targets, &params));
     });
     rx
 }
@@ -176,8 +233,10 @@ pub(super) struct Team {
     pub kind: String,
     /// `active`, `standby` or `archived`.
     pub status: String,
+    pub org_id: Option<String>,
     pub parent_team_id: Option<String>,
     pub lead_member_id: Option<String>,
+    pub continuous: Option<ContinuousMarker>,
     /// The team's coordinator (initiative) task; the root of its task tree.
     pub coordinator_task_id: Option<String>,
     pub board: Option<String>,
@@ -188,6 +247,21 @@ pub(super) struct Team {
     pub standing_rules: Vec<Value>,
     pub members: Vec<TeamMembership>,
     pub revision: i64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub(super) struct ContinuousMarker {
+    pub lead_member_id: Option<String>,
+    pub host_id: Option<String>,
+    pub lead_session_uid: Option<String>,
+    pub next_run: Option<f64>,
+    pub cadence_secs: Option<f64>,
+    pub schedule_kind: Option<String>,
+    pub last_run: Option<Value>,
+    pub missed_count: u64,
+    pub health: String,
+    pub queues: Vec<Value>,
 }
 
 impl Team {
@@ -414,7 +488,7 @@ impl App {
             self.org.retry_at = Some(Instant::now() + ERROR_RETRY);
             return;
         }
-        self.org.rx = Some(spawn_owner_rpc(targets, "org.snapshot", params));
+        self.org.rx = Some(spawn_owner_org_snapshot(targets, params));
     }
 }
 
@@ -502,6 +576,25 @@ mod tests {
         assert_eq!(s.team("t1").unwrap().role_of("m1"), Some("primary"));
         st.accept(json!({"unchanged": true, "version": 7}));
         assert_eq!(st.live().unwrap().version, 7);
+    }
+
+    #[test]
+    fn resolved_projection_wins_even_when_marker_host_differs_from_target_name() {
+        let mut base = snapshot(7, vec![owner(), member("m1", "ep", Some("mem-owner"), Some("t1"), Some("ts-1-0"))], vec![team("t1", "Swarm", None, Some("m1"), &[("m1", "primary")])]);
+        base["teams"][0]["continuous"] = json!({"lead_member_id":"m1", "host_id":"manager", "health":"unknown"});
+        let remote = json!({"version":7,"teams":[{"id":"t1","continuous":{"lead_member_id":"m1","host_id":"manager","lead_session_uid":"ts-lead","health":"ok","next_run":123.0}}]});
+        merge_org_live_teams(&mut base, &remote, "local");
+        assert_eq!(base["teams"][0]["continuous"]["health"], "ok");
+        assert_eq!(base["teams"][0]["continuous"]["next_run"], 123.0);
+    }
+
+    #[test]
+    fn unresolved_projection_does_not_overwrite_a_resolved_one() {
+        let mut base = snapshot(7, vec![owner()], vec![team("t1", "Swarm", None, None, &[])]);
+        base["teams"][0]["continuous"] = json!({"lead_member_id":"m1", "host_id":"manager","lead_session_uid":"ts-lead","health":"ok"});
+        let other = json!({"teams":[{"id":"t1","continuous":{"lead_member_id":"m1","host_id":"manager","health":"unknown"}}]});
+        merge_org_live_teams(&mut base, &other, "sessions");
+        assert_eq!(base["teams"][0]["continuous"]["health"], "ok");
     }
 
     #[test]

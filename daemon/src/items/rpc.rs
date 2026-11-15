@@ -214,6 +214,7 @@ impl Ctx {
             "session_uid": self.uid,
             "daemon_id": if self.owner { Value::Null } else { json!(self.daemon_id) },
             "task_id": self.task_id,
+            "global_perms": self.global,
         });
         if self.s4_wire {
             if let Some(uid) = self.uid.as_ref() {

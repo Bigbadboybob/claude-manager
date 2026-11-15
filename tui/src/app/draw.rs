@@ -17,6 +17,46 @@ const ALERT_FRAME_MS: u128 = 120;
 /// through per frame is `theme::ALERT_RAINBOW`.
 const ALERT_PULSE: &[&str] = &["\u{00b7}", "\u{2022}", "\u{25cf}", "\u{25c9}", "\u{25cf}", "\u{2022}"];
 
+fn compact_duration(seconds: f64) -> String {
+    let mut whole = seconds.max(0.0).round() as u64;
+    let days = whole / 86_400;
+    whole %= 86_400;
+    let hours = whole / 3_600;
+    whole %= 3_600;
+    let minutes = whole / 60;
+    if days > 0 { return format!("{days}d{hours}h"); }
+    if hours > 0 {
+        return if minutes == 0 { format!("{hours}h") } else { format!("{hours}h{minutes:02}m") };
+    }
+    if minutes > 0 { return format!("{minutes}m"); }
+    "now".into()
+}
+
+pub(super) fn continuous_team_header(
+    name: &str,
+    marker: &crate::app::org_model::ContinuousMarker,
+    now: f64,
+) -> String {
+    let health = if marker.health.is_empty() { "blocked" } else { marker.health.as_str() };
+    if let Some(cadence) = marker.cadence_secs {
+        let next = marker.next_run.map(|at| compact_duration(at - now)).unwrap_or_else(|| "—".into());
+        return format!("⟳ every {} · next {} · {}", compact_duration(cadence), next, health);
+    }
+    let pending: u64 = marker.queues.iter().filter_map(|row| row.get("pending").and_then(serde_json::Value::as_u64)).sum();
+    if !marker.queues.is_empty() {
+        return format!("⟳ queue · {pending} pending · {health}");
+    }
+    format!("⟳ {name} · {health}")
+}
+
+pub(super) fn continuous_team_box_header(header: &str) -> String {
+    format!("╭─ {header} ─╮")
+}
+
+pub(super) const fn continuous_team_box_footer() -> &'static str {
+    "╰────────────────────╯"
+}
+
 /// Value spans for a color field in the A-e settings dialogs: the current
 /// swatch and its name, or "none". While focused, a hint names the key
 /// that opens the grid picker (`color_grid.rs`).
@@ -2000,7 +2040,7 @@ impl App {
 
         let initiative_markers = self.planning.initiative_markers();
         let section_backgrounds = self.sidebar_section_backgrounds(&visual, &section_of);
-        for (vi, background) in visual.iter().zip(section_backgrounds) {
+        for (row_index, (vi, background)) in visual.iter().zip(section_backgrounds).enumerate() {
             let first_item = items.len();
             match vi {
                 VisualItem::WorkspaceHeader(wi) => {
@@ -2109,7 +2149,8 @@ impl App {
 
                     items.push(ListItem::new(header_line).style(base_style));
                 }
-                VisualItem::Session(wi, si) => {
+                VisualItem::Session(wi, si) | VisualItem::ContinuousTeamSession(wi, si) => {
+                    let boxed = matches!(vi, VisualItem::ContinuousTeamSession(..));
                     let ws = &self.workspaces[*wi];
                     let ts = &ws.sessions[*si];
                     let is_selected = match &self.cursor {
@@ -2296,6 +2337,10 @@ impl App {
                         spans.push(Span::raw(" ".repeat(pad)));
                         spans.extend(super::agent_state::badge_spans(&b));
                     }
+                    if boxed {
+                        spans.insert(0, Span::styled("│ ", Style::default().fg(theme::HEADER)));
+                        spans.push(Span::styled(" │", Style::default().fg(theme::HEADER)));
+                    }
                     let line = Line::from(spans);
 
                     // Session accent falls back to the workspace accent so a
@@ -2326,7 +2371,14 @@ impl App {
                     } else {
                         Style::default().fg(theme::MUTED)
                     };
-                    items.push(ListItem::new(line).style(base_style));
+                    let mut lines = vec![line];
+                    if boxed {
+                        let last = visual.get(row_index + 1);
+                        if !matches!(last, Some(VisualItem::ContinuousTeamSession(..))) {
+                            lines.push(Line::from(Span::styled(continuous_team_box_footer(), Style::default().fg(theme::HEADER))));
+                        }
+                    }
+                    items.push(ListItem::new(lines).style(base_style));
                 }
                 VisualItem::Separator | VisualItem::SectionEnd => {
                     let (glyph, style) = if matches!(vi, VisualItem::SectionEnd) {
@@ -2483,6 +2535,12 @@ impl App {
                             .add_modifier(Modifier::BOLD),
                     )]);
                     items.push(ListItem::new(line));
+                }
+                VisualItem::ContinuousTeamHeader(team_id) => {
+                    let (name, marker) = self.org_live().and_then(|snap| snap.team(team_id)).map(|t| (t.name.clone(), t.continuous.clone())).unwrap_or_else(|| (team_id.clone(), None));
+                    let header = marker.as_ref().map(|m| continuous_team_header(&name, m, super::board::now_unix() as f64)).unwrap_or_else(|| format!("⟳ {name} · blocked"));
+                    let line = continuous_team_box_header(&header);
+                    items.push(ListItem::new(Line::from(Span::styled(line, Style::default().fg(theme::HEADER).add_modifier(Modifier::BOLD)))));
                 }
                 VisualItem::OrgHeader { key, depth } => {
                     items.push(ListItem::new(self.org_header_line(key, *depth, inner.width as usize)));
@@ -3947,6 +4005,40 @@ mod operator_question_tests {
             None
         );
         assert_eq!(App::extract_operator_question(None), None);
+    }
+}
+
+#[cfg(test)]
+mod continuous_team_sidebar_tests {
+    use super::*;
+    use crate::app::org_model::ContinuousMarker;
+
+    #[test]
+    fn schedule_header_uses_cadence_and_relative_next_time() {
+        let marker = ContinuousMarker {
+            cadence_secs: Some(21_600.0),
+            next_run: Some(4_320.0),
+            health: "ok".into(),
+            ..Default::default()
+        };
+        assert_eq!(continuous_team_header("Ingest", &marker, 0.0), "⟳ every 6h · next 1h12m · ok");
+    }
+
+    #[test]
+    fn queue_header_reports_pending_depth() {
+        let marker = ContinuousMarker {
+            queues: vec![serde_json::json!({"queue":"momentum","pending":3})],
+            health: "ok".into(),
+            ..Default::default()
+        };
+        assert_eq!(continuous_team_header("Ingest", &marker, 0.0), "⟳ queue · 3 pending · ok");
+    }
+
+    #[test]
+    fn boxed_block_has_top_and_bottom_edges() {
+        assert_eq!(continuous_team_box_header("⟳ every 6h · next 1h12m · ok"), "╭─ ⟳ every 6h · next 1h12m · ok ─╮");
+        assert!(continuous_team_box_footer().starts_with('╰'));
+        assert!(continuous_team_box_footer().ends_with('╯'));
     }
 }
 
