@@ -1354,6 +1354,7 @@ class PoolTests(HubHarness):
         self.assertIn("last resort; first reserved for cm-manager", self.hub("status")[1])
 
     def test_auto_never_lends_an_account_another_host_is_running_on(self):
+        self.set_reading("carol", ("weekly_all", None, 10, 86400, True), hub="cm-manager", host_name="laptop")
         self.poll()
         self.poll()  # bob and carol in the pool
         self.other_host({**host_export("cm-sessions", active="bob", saved=["bob"]), "last_switch_at": 0})
@@ -1402,6 +1403,43 @@ class PoolTests(HubHarness):
         self.assertNotIn("bob-uuid-0000", self.pool_uuids())
         self.assertIn("returned a login already lent to cm-sessions", self.hub("history")[1])
         self.files_outside_pool_have_no_tokens()
+
+    def test_auto_never_moves_a_host_onto_an_unread_account(self):
+        self.poll()
+        self.hub("assign", "laptop", "alice@example.com", "--auto")
+        code, text = self.poll()  # bob and carol go to the pool with no reading
+        self.assertEqual(self.live_token(), "sk-ant-oat-ACCESS-alice")
+        self.assertNotIn("borrowed", text)
+        self.assertEqual(self.hub("policy", "auto_allow_unread", "true")[0], 0)
+        self.poll()
+        self.assertNotEqual(self.live_token(), "sk-ant-oat-ACCESS-alice")
+
+    def test_the_hub_reads_pool_usage_with_valid_tokens_only(self):
+        self.poll()
+        self.poll()  # bob and carol in the pool
+        pool = self.hub_paths.store / "hub" / "pool"
+        for path in pool.glob("*.json"):
+            rec = json.loads(path.read_text())
+            rec["claudeAiOauth"]["expiresAt"] = int(time.time() * 1000) + (
+                3600_000 if "bob" in path.name else -1000)
+            path.write_text(json.dumps(rec))
+        self.usage["sk-ant-oat-ACCESS-bob"] = usage(("weekly_all", None, 20, 86400, True))
+        out = io.StringIO()
+        accounts.read_pool_usage(self.hub_paths, out)
+        self.assertIn("pool usage bob@example.com: week 20%", out.getvalue())
+        self.assertNotIn("carol", out.getvalue())  # expired access token: not read, never refreshed
+        cache = json.loads((self.hub_paths.store / "hub" / "readings.json").read_text())
+        self.assertEqual(cache["bob-uuid-0000"]["host"], "pool")
+
+    def test_a_new_login_is_noticed_during_a_usage_backoff(self):
+        self.poll()
+        state = self.state()
+        state.setdefault("poll", {})["backoff_until"] = int(time.time()) + 900
+        self.paths.state.write_text(json.dumps(state))
+        self.do_login("carol")  # someone runs /login on the host
+        code, text = self.poll()
+        self.assertIn("backing off", text)
+        self.assertEqual(self.state()["active"], "carol-uuid-0000")
 
     def test_a_blank_host_borrows_its_first_login(self):
         self.poll()

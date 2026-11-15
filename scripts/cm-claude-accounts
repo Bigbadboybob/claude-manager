@@ -1326,6 +1326,55 @@ def hub_checkin(hub: Hub, export: dict) -> dict:
 
 
 POOL_DWELL_SECONDS = DEFAULT_MIN_DWELL_MINUTES * 60
+POOL_READ_INTERVAL_SECONDS = 30 * 60
+POOL_READS_PER_RUN = 3
+
+
+def read_pool_usage(paths: Paths, out) -> None:
+    """On the hub host: read usage for a few pool logins per run, so lending
+    has real numbers. Uses a pool login's access token only while it is
+    still valid; never refreshes (no Claude Code holds a pool login, but a
+    refresh that rotates and then fails to save would lose it). The network
+    calls run outside the hub lock."""
+    now = time.time()
+    with Hub(paths) as hub:
+        if not hub.desired["policy"].get("pool"):
+            return
+        meta = load_json(hub.dir / "pool-reads.json")
+        if meta.get("backoff_until", 0) > now:
+            return
+        cache = load_json(hub.dir / "readings.json")
+        due = []
+        for uuid, rec in hub.pool().items():
+            expires = rec["claudeAiOauth"].get("expiresAt")
+            if not isinstance(expires, (int, float)) or expires / 1000 <= now + 60:
+                continue
+            if now - (cache.get(uuid) or {}).get("at", 0) < POOL_READ_INTERVAL_SECONDS:
+                continue
+            due.append(((cache.get(uuid) or {}).get("at", 0), uuid, rec["claudeAiOauth"]["accessToken"],
+                        rec["oauthAccount"].get("emailAddress") or uuid[:8]))
+    results, backoff = {}, None
+    for _, uuid, token, email in sorted(due)[:POOL_READS_PER_RUN]:
+        try:
+            limits = parse_limits(fetch_usage(token))
+        except RateLimited as exc:
+            backoff = now + max(exc.retry_after or 0, RATE_LIMIT_BACKOFF_SECONDS)
+            break
+        except AccountError as exc:
+            print(f"pool usage for {email}: {exc}", file=out)
+            continue
+        if limits:
+            results[uuid] = {"at": int(now), "limits": limits, "host": "pool"}
+            print(f"pool usage {email}: " + ", ".join(f"{limit_name(l)} {l['percent']:.0f}%"
+                                                      for l in limits), file=out)
+    with Hub(paths) as hub:
+        cache = load_json(hub.dir / "readings.json")
+        for uuid, reading in results.items():
+            if reading["at"] > (cache.get(uuid) or {}).get("at", 0):
+                cache[uuid] = reading
+        atomic_write(hub.dir / "readings.json", cache)
+        if backoff:
+            atomic_write(hub.dir / "pool-reads.json", {"backoff_until": int(backoff)})
 
 
 def pool_capable(export: dict) -> bool:
@@ -1410,6 +1459,8 @@ def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -
                 continue
             last_resort = True
         reading = readings.get(uuid)
+        if not reading and not d["policy"].get("auto_allow_unread"):
+            continue  # never move a host onto an account nobody has read (11-15 06:58Z)
         if reading and over_threshold(reading.get("limits") or [], config, now, for_switch=True):
             continue
         live = [l for l in (reading or {}).get("limits", [])
@@ -1679,6 +1730,7 @@ HUB_POLICY_KEYS = {
     "notify_command": (lambda v: v or None),
     "coordinator_command": (lambda v: v or None),
     "pool": (lambda v: {"on": True, "off": False}.get(v)),
+    "auto_allow_unread": (lambda v: {"true": True, "false": False}.get(v)),
 }
 
 
@@ -2012,11 +2064,6 @@ def poll_usage(paths: Paths, state: dict, accounts: dict[str, dict], out, alert,
                alert_owner) -> tuple[int, list[dict] | None]:
     """Identify the live login (saving a refreshed one) and read its usage, at
     most once per usage interval. Returns (exit code, limits or None)."""
-    backoff_until = (state.get("poll") or {}).get("backoff_until", 0)
-    if backoff_until > time.time():
-        print(f"skipped: backing off after HTTP 429 for another "
-              f"{(backoff_until - time.time()) / 60:.0f} min", file=out)
-        return 0, None
     login = read_login(paths)
     expires = login.get("expiresAt")
     if isinstance(expires, (int, float)) and expires / 1000 <= time.time():
@@ -2064,6 +2111,13 @@ def poll_usage(paths: Paths, state: dict, accounts: dict[str, dict], out, alert,
     interval = interval * 60 if isinstance(interval, (int, float)) else USAGE_INTERVAL_SECONDS
     if reading and reading.get("limits") and time.time() - reading["at"] < interval:
         return 0, reading["limits"]  # read recently: spare the endpoint's budget
+    # A 429 backoff stops usage reads only: a new login is still noticed above,
+    # so the hub never acts on a stale idea of which account is live.
+    backoff_until = (state.get("poll") or {}).get("backoff_until", 0)
+    if backoff_until > time.time():
+        print(f"skipped: backing off after HTTP 429 for another "
+              f"{(backoff_until - time.time()) / 60:.0f} min", file=out)
+        return 0, None
 
     try:
         usage = fetch_usage(login["accessToken"])
@@ -2363,6 +2417,11 @@ def cmd_poll(paths: Paths, state: dict, out, notify_command: str) -> int:
     reply = hub_exchange(paths, state, out)
     if reply is not None:
         apply_assignment(paths, state, load_accounts(paths), reply, out)
+    if (state.get("config") or {}).get("hub") == "local":
+        try:
+            read_pool_usage(paths, out)
+        except (AccountError, OSError, ValueError, KeyError) as exc:
+            print(f"pool usage read failed: {exc}", file=sys.stderr)
     return code
 
 
