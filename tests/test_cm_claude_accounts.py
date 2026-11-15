@@ -1516,6 +1516,21 @@ class PoolTests(HubHarness):
         self.assertIn("pool renewals paused 6 h", self.hub("history")[1])
         self.assertEqual(self.pool_uuids(), ["bob-uuid-0000", "carol-uuid-0000"])  # both back, not lost
 
+    def test_a_reserved_account_is_the_hosts_next_and_others_hand_it_over(self):
+        self.set_reading("bob", ("weekly_all", None, 10, 2 * 86400, True), hub="cm-manager", host_name="laptop")
+        self.set_reading("carol", ("weekly_all", None, 50, 86400, True), hub="cm-manager", host_name="laptop")
+        self.usage[self.live_token()] = usage(("weekly_all", None, 50, 3 * 86400, True))  # alice has room
+        self.poll()
+        self.poll()  # bob and carol in the pool
+        self.hub("reserve", "bob@example.com", "--for", "laptop")
+        self.assertEqual(self.candidates(), ["bob-uuid-0000", "carol-uuid-0000"])  # mine first, despite the reset
+        self.hub("release", "bob@example.com")
+        self.hub("reserve", "alice@example.com", "--for", "cm-sessions")
+        self.hub("assign", "laptop", "alice@example.com", "--auto", "--force")
+        self.poll()  # alice is reserved for another host: the laptop moves off it with room left
+        self.assertEqual(self.live()["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-carol")
+        self.assertIn("reserved for cm-sessions", self.state()["history"][-1]["reason"])
+
     def test_a_blank_host_borrows_its_first_login(self):
         self.poll()
         self.poll()

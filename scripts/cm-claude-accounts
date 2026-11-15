@@ -1561,7 +1561,8 @@ def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -
             continue
         res = d["reservations"].get(uuid)
         last_resort = False
-        if res and host not in res.get("for", []):
+        mine = bool(res and host in res.get("for", []))
+        if res and not mine:
             if not res.get("last_resort"):
                 continue
             last_resort = True
@@ -1585,7 +1586,10 @@ def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -
         # lost, so the account whose weekly limit resets soonest goes first.
         weekly = [l["resets_at"] for l in live if l.get("group") == "weekly" or l["kind"].startswith("weekly")]
         resets = min((r for r in weekly if r is not None), default=float("inf"))
-        out.append(((last_resort, resets, ratio, rec["oauthAccount"].get("emailAddress") or uuid), uuid, why))
+        # An account reserved for this host is its next account (Owner 11-15:
+        # "F finishes out bender7, then moves to bender4").
+        out.append(((last_resort, not mine, resets, ratio, rec["oauthAccount"].get("emailAddress") or uuid),
+                    uuid, why))
     return sorted(out)
 
 
@@ -1604,14 +1608,17 @@ def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: 
         config = {"thresholds": hub.desired["policy"].get("thresholds") or {}}
         reading = ((export.get("accounts") or {}).get(active) or {}).get("reading") or {}
         over = over_threshold(reading.get("limits") or [], config, now, for_switch=True) if active else []
-        needs = not active or over
+        res = hub.desired["reservations"].get(active) if active else None
+        taken = bool(res and host not in res.get("for", []) and not res.get("last_resort"))
+        needs = not active or over or taken  # an account reserved for others is handed over
         waited = now - (export.get("last_switch_at") or 0) >= POOL_DWELL_SECONDS
         capped = (export.get("auto_switches_24h") or 0) >= POOL_MAX_SWITCHES_PER_DAY
         if needs and waited and not capped:
             cands = pool_candidates(hub, host, reports, now)
             if cands:
                 _, target, why = cands[0]
-                what = ", ".join(f"{limit_name(l)} {l['percent']:.0f}%" for l in over) or "no login"
+                what = ", ".join(f"{limit_name(l)} {l['percent']:.0f}%" for l in over) \
+                    or ("reserved for " + ", ".join(res["for"]) if taken else "no login")
                 reason, switch = f"{what}; target {why}", True
     if not target:
         return None
