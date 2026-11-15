@@ -1321,7 +1321,9 @@ pub fn run() -> anyhow::Result<()> {
     // queue as monitor wakes.  This is separate from the continuous-task
     // scheduler so existing continuous semantics remain unchanged.
     let wake_scheduler = std::sync::Arc::new(
-        session_wake::WakeScheduler::new(std::sync::Arc::clone(&state)),
+        session_wake::WakeScheduler::new(std::sync::Arc::clone(&state)).map_err(|e| {
+            anyhow::anyhow!("cm-daemon: session wake scheduler store load failed: {e}")
+        })?,
     );
     wake_scheduler.start().map_err(|e| {
         anyhow::anyhow!(
