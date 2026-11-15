@@ -1,8 +1,7 @@
 # Ingest org: charter draft
 
 Status: **draft v3.** Owner answered the open questions 2026-11-15
-(Swarm-Coord). claudelb is ready. The one open item is the spend cap figure
-below. The lead launches once cm-manager has Codex (bender2, after its
+(Swarm-Coord). claudelb is ready. The lead launches once cm-manager has Codex (bender2, after its
 2026-11-15 23:27Z refill). Plan context:
 [continuous-teams.md](continuous-teams.md).
 
@@ -47,10 +46,19 @@ still sit in the continuous tasks' state and memory on cm-manager. They are
 rewritten when those tasks move to Ingest. Ten code paths still pause or
 retire blocked sources; changing them is Ingest's first backlog.
 
-**Spend cap (Owner, 2026-11-15):** yes, there is a monthly cap for proxies
-and paid scraping that Ingest may use without asking. Oxylabs is the main
-one. The figure is set from the current Oxylabs plan limits (pending: Owner
-or the dashboard supplies them). Spend beyond the cap goes to Owner.
+**Spend cap (Owner, 2026-11-15):** Ingest may use the current Oxylabs plan
+freely, within its limits:
+
+| Oxylabs product | Monthly limit | IPs |
+|---|---|---|
+| ISP proxies | no GB limit | 10 |
+| Datacenter proxies | 5 GB | 5 |
+| Residential proxies | 5 GB | rotating |
+
+The metered pools (datacenter, residential) are scarce, so Ingest prefers
+ISP proxies and keeps the 5 GB pools for sources that need them. It tracks
+monthly usage per pool. The following go to Owner first: a plan upgrade,
+overage, more IPs, or any new paid scraping service or provider.
 
 ## The scraping playbook
 
