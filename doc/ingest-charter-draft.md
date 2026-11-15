@@ -55,7 +55,6 @@ freely, within its limits:
 | ISP proxies | no GB limit | 10 |
 | Datacenter proxies | 5 GB | 5 |
 | Residential proxies | 5 GB | rotating |
-| Web Unblocker | 8 GB | n/a (fallback only, after a direct fetch fails) |
 
 **Never exceed a monthly limit (Owner, 2026-11-15).** If a pool goes over
 its limit, every scraper using that pool stops working until the monthly
@@ -152,6 +151,19 @@ Agreed with Owner, 2026-11-15: no wanted source is dark for more than 12
 hours without an open item, and Ingest posts a weekly digest.
 
 ## Starting backlog
+
+First items (Owner, 2026-11-15):
+
+- **Web Unblocker is cancelled.** Since about Oct 30 every request with our
+  user returned 429 "plan's quota has been reached", even with the
+  dashboard showing 1% used, and Owner cancelled the plan. Remove the
+  Unblocker fallback from Investing.com (Latest) and Lawfare, plus the
+  `OXYLABS_UNBLOCKER_ENDPOINT` env line and the `UnblockerSession` code if
+  nothing else uses it.
+- **Fix Investing.com (Latest)'s Cloudflare 403s directly.** The token mint
+  is blocked about 1 in 10 times, and each block disables the scraper for
+  1-2 h. No paid unblocker and no proxy unless the non-proxy options fail.
+
 
 The open items tagged `KEEP->Ingest` in the phase-1 inventory, mostly from
 scraper-triage and health-alert-triage.
