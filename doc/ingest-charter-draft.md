@@ -76,7 +76,13 @@ reset. So:
   to it. At 85%, move the heaviest non-essential sources off it, or slow
   their fetch rate. Sources the live trader depends on keep their access
   last.
-- Tell Owner as soon as a pool looks set to run out before its reset. The following go to Owner first: a plan upgrade,
+- Tell Owner as soon as a pool looks set to run out before its reset.
+- Usage source: the Oxylabs Dashboard API (`GET https://api.oxylabs.io/stats/v1/usage`)
+  once Owner obtains a key from Oxylabs support. The key lives in
+  `~/.config/oxylabs/dashboard-api-key` on cm-manager (0600), and nobody
+  prints it. Until the key arrives, and for any product the API does not
+  cover, Ingest counts proxied bytes per pool in the scrapers and keeps a
+  wider margin. The following go to Owner first: a plan upgrade,
 overage, more IPs, or any new paid scraping service or provider.
 
 ## The scraping playbook
@@ -141,7 +147,7 @@ Order confirmed by Owner, 2026-11-15.
 
 ## Done means
 
-Agreed with Owner, 2026-11-15: no wanted source is dark for more than N
+Agreed with Owner, 2026-11-15: no wanted source is dark for more than 12
 hours without an open item, and Ingest posts a weekly digest.
 
 ## Starting backlog
