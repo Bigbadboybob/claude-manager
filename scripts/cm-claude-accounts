@@ -14,6 +14,7 @@ import email.utils
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -1026,6 +1027,13 @@ def hub_exchange(paths: Paths, state: dict, out) -> dict | None:
     state["hub"] = {"at": now, "ok": True, "reply": reply}
     sent = {e.get("id") for e in export["events"]}
     state["hub_outbox"] = [e for e in state.get("hub_outbox") or [] if e.get("id") not in sent]
+    for uuid in reply.get("discard") or []:
+        if uuid in returning and uuid != state.get("active"):
+            (paths.accounts / f"{uuid}.json").unlink(missing_ok=True)
+            record_history(state, "discarded-stale-login", account=uuid,
+                           email=returning[uuid]["oauthAccount"].get("emailAddress"))
+            print(f"deleted a stale copy of {label(returning[uuid])}: the hub lent that login elsewhere",
+                  file=out)
     for uuid in reply.get("returned") or []:
         if uuid in returning and uuid != state.get("active"):
             (paths.accounts / f"{uuid}.json").unlink(missing_ok=True)
@@ -1268,9 +1276,10 @@ def hub_checkin(hub: Hub, export: dict) -> dict:
         raise AccountError(f"{host}: unsupported export")
     returning = export.pop("returning", None) or {}  # tokens: never written to a report
     now = int(time.time())
-    returned = pool_take_returns(hub, host, export, returning)
+    discard: list[str] = []
+    returned = pool_take_returns(hub, host, export, returning, discard)
     pool_settle(hub, host, export, returned)
-    for uuid in returned:  # the host deletes its copy on this reply
+    for uuid in returned + discard:  # the host deletes its copy on this reply
         reading = (export["accounts"].pop(uuid, None) or {}).get("reading")
         if isinstance(reading, dict) and isinstance(reading.get("at"), (int, float)):
             cache = load_json(hub.dir / "readings.json")
@@ -1306,7 +1315,7 @@ def hub_checkin(hub: Hub, export: dict) -> dict:
     reply = {"version": HUB_VERSION, "revision": d["revision"], "host": host,
              "entry": d["hosts"].get(host), "reservations": d["reservations"],
              "draining": d["draining"], "policy": d["policy"],
-             "readings": hub_readings(reports), "returned": returned,
+             "readings": hub_readings(reports), "returned": returned, "discard": discard,
              "hosts": {h: {"active": (r.get("export") or {}).get("active"), "at": r.get("at")}
                        for h, r in reports.items() if h != POOL}}
     if d["policy"].get("pool") and pool_capable(export):
@@ -1325,18 +1334,37 @@ def pool_capable(export: dict) -> bool:
     return "last_switch_at" in export
 
 
-def pool_take_returns(hub: Hub, host: str, export: dict, returning) -> list[str]:
+LENT_LEDGER_SECONDS = 60 * 86400
+
+
+def login_fingerprint(record: dict) -> str:
+    """Identifies one login (not the account) without keeping its token."""
+    token = record["claudeAiOauth"]["refreshToken"]
+    return hashlib.sha256(token.encode()).hexdigest()[:32]
+
+
+def pool_take_returns(hub: Hub, host: str, export: dict, returning,
+                      discard: list[str]) -> list[str]:
     """Store the logins a host hands back. The host deletes its copy once the
-    reply names them; until then its listing wins (see pool_settle)."""
+    reply names them (returned), or names them as stale (discard)."""
     out = []
     if not isinstance(returning, dict) or not hub.desired["policy"].get("pool"):
         return out
+    ledger = load_json(hub.dir / "lent-logins.json")
     entry = hub.desired["hosts"].get(host) or {}
     pinned = entry.get("account") if entry.get("mode") == "pin" else None
     for uuid, rec in returning.items():
         if not valid_login_record(rec) or rec["oauthAccount"]["accountUuid"] != uuid \
                 or uuid in (export.get("active"), pinned):
             continue  # a host keeps the account it is pinned to
+        lent = ledger.get(login_fingerprint(rec))
+        if lent and lent.get("host") != host:
+            # The same login was lent to another host after this one handed
+            # it in (its reply was lost): this copy is stale and must go.
+            discard.append(uuid)
+            hub.event("pool", f"{rec['oauthAccount'].get('emailAddress') or uuid[:8]}: {host} returned a "
+                              f"login already lent to {lent.get('host')}; told {host} to delete it", host=host)
+            continue
         rec.pop("needs_login", None)
         hub.pool_put(rec)
         hub.event("pool", f"{rec['oauthAccount'].get('emailAddress') or uuid[:8]} returned to the pool",
@@ -1425,6 +1453,10 @@ def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: 
     lent = hub.pool_dir / "lent"
     lent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.rename(hub.pool_dir / f"{target}.json", lent / f"{target}.{host}.json")
+    ledger = {fp: e for fp, e in load_json(hub.dir / "lent-logins.json").items()
+              if now - e.get("at", 0) < LENT_LEDGER_SECONDS}
+    ledger[login_fingerprint(record)] = {"account": target, "host": host, "at": int(now)}
+    atomic_write(hub.dir / "lent-logins.json", ledger)
     hub.event("pool", f"lent {record['oauthAccount'].get('emailAddress') or target[:8]} to {host} ({reason})",
               host=host)
     return {"record": record, "reason": reason, "switch": switch}

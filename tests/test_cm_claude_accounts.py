@@ -1384,6 +1384,25 @@ class PoolTests(HubHarness):
         self.assertNotIn("lend", reply)
         self.assertEqual(self.pool_uuids(), ["bob-uuid-0000", "carol-uuid-0000"])
 
+    def test_a_lost_reply_never_puts_one_login_on_two_hosts(self):
+        self.poll()
+        returning = accounts.spares_to_return(self.paths, self.state(), time.time())
+        self.poll()  # bob and carol go to the pool...
+        for uuid, rec in returning.items():  # ...but say the reply was lost: copies are back
+            (self.paths.accounts / f"{uuid}.json").write_text(json.dumps(rec))
+        sessions = {**host_export("cm-sessions", active="dave", saved=["dave"]), "last_switch_at": 0}
+        with accounts.Hub(self.hub_paths) as h:
+            h.desired["hosts"]["cm-sessions"] = {"account": "bob-uuid-0000", "email": "bob@example.com",
+                                                 "mode": "pin", "at": 0}
+            h.save("pin")
+            self.assertIn("lend", accounts.hub_checkin(h, sessions))  # bob's login goes to cm-sessions
+        code, text = self.poll()  # the laptop hands in its stale copy of that same login
+        self.assertIn("deleted a stale copy of bob@example.com", text)
+        self.assertNotIn("bob-uuid-0000", self.saved_here())
+        self.assertNotIn("bob-uuid-0000", self.pool_uuids())
+        self.assertIn("returned a login already lent to cm-sessions", self.hub("history")[1])
+        self.files_outside_pool_have_no_tokens()
+
     def test_a_blank_host_borrows_its_first_login(self):
         self.poll()
         self.poll()
