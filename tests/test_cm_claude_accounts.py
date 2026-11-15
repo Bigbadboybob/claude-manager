@@ -1359,6 +1359,16 @@ class PoolTests(HubHarness):
         self.other_host({**host_export("cm-sessions", active="bob", saved=["bob"]), "last_switch_at": 0})
         self.assertEqual(self.pool_uuids(), ["carol-uuid-0000"])
 
+    def test_a_logged_out_host_with_saved_accounts_still_takes_its_pin(self):
+        self.poll()
+        creds = self.live()
+        creds.pop("claudeAiOauth")
+        self.paths.credentials.write_text(json.dumps(creds))
+        self.hub("assign", "laptop", "bob@example.com")
+        code, text = self.poll()
+        self.assertEqual(code, 0, text)
+        self.assertIn("switched no login -> bob@example.com", text)
+
     def test_old_hosts_get_no_login_and_keep_the_pool_intact(self):
         self.poll()
         self.poll()

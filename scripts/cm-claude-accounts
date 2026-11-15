@@ -1329,10 +1329,12 @@ def pool_take_returns(hub: Hub, host: str, export: dict, returning) -> list[str]
     out = []
     if not isinstance(returning, dict) or not hub.desired["policy"].get("pool"):
         return out
+    entry = hub.desired["hosts"].get(host) or {}
+    pinned = entry.get("account") if entry.get("mode") == "pin" else None
     for uuid, rec in returning.items():
         if not valid_login_record(rec) or rec["oauthAccount"]["accountUuid"] != uuid \
-                or uuid == export.get("active"):
-            continue
+                or uuid in (export.get("active"), pinned):
+            continue  # a host keeps the account it is pinned to
         rec.pop("needs_login", None)
         hub.pool_put(rec)
         hub.event("pool", f"{rec['oauthAccount'].get('emailAddress') or uuid[:8]} returned to the pool",
@@ -2309,7 +2311,14 @@ def cmd_poll(paths: Paths, state: dict, out, notify_command: str) -> int:
             apply_assignment(paths, state, load_accounts(paths), reply, out)
         return 0
     check_logins(state, accounts, alert_owner)
-    code, limits = poll_usage(paths, state, accounts, out, alert, alert_owner)
+    try:
+        code, limits = poll_usage(paths, state, accounts, out, alert, alert_owner)
+    except NoLogin:
+        # Logged out (or never logged in): still check in, so an assignment
+        # or a pool lend can give this host its login.
+        print("no login here yet; checking in for an assignment", file=out)
+        state["active"] = None
+        code, limits = 0, None
     mode = effective_mode(state)
     if limits is not None and state.get("active") in accounts:
         decide(paths, state, accounts, limits, mode, out, alert)
