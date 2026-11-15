@@ -182,17 +182,9 @@ fn decorate_team(state: &Arc<Mutex<DaemonState>>, mut team: Value, queue_rows: &
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         s.sessions.values().find_map(|session| crate::assistants::of_session(session).filter(|m| m.member_id == member && m.acting_as == crate::assistants::MAIN).map(|_| session.uid.clone()))
     });
-    let live = lead_uid.as_deref().map(crate::session_wake::live_summary).unwrap_or_else(|| json!({"next_run":null,"last_run":null,"missed_count":0,"health":"blocked"}));
-    let host = marker["host_id"].as_str().unwrap_or("");
-    let local_host = crate::host_id::HostId::local().to_string();
-    let mut live = if host.is_empty() || host == local_host {
-        live
-    } else {
-        // This daemon cannot observe another host's session wake store. The
-        // TUI merges the same shape from the marker host; until then this is
-        // explicitly unknown, never a false blocked alarm.
-        json!({"next_run":null,"last_run":null,"missed_count":0,"health":"unknown","cadence_secs":null,"schedule_kind":null})
-    };
+    let mut live = lead_uid.as_deref()
+        .map(crate::session_wake::live_summary)
+        .unwrap_or_else(|| json!({"next_run":null,"last_run":null,"missed_count":0,"health":"unknown","cadence_secs":null,"schedule_kind":null}));
     if let Some(obj) = team.get_mut("continuous").and_then(Value::as_object_mut) {
         obj.insert("lead_session_uid".into(), lead_uid.clone().map(Value::String).unwrap_or(Value::Null));
         obj.insert("next_run".into(), live["next_run"].clone());
@@ -209,7 +201,7 @@ fn decorate_team(state: &Arc<Mutex<DaemonState>>, mut team: Value, queue_rows: &
             .collect::<HashSet<_>>();
         let queues = queue_rows
             .iter()
-            .filter(|_| host.is_empty() || host == local_host)
+            .filter(|_| lead_uid.is_some())
             .filter(|row| {
                 let name = row.get("queue").and_then(Value::as_str);
                 let consumer = row
@@ -221,7 +213,7 @@ fn decorate_team(state: &Arc<Mutex<DaemonState>>, mut team: Value, queue_rows: &
             })
             .cloned()
             .collect::<Vec<_>>();
-        if lead_uid.is_some() && live["health"] == "blocked" && !queues.is_empty() && (host.is_empty() || host == local_host) {
+        if lead_uid.is_some() && live["health"] == "blocked" && !queues.is_empty() {
             live["health"] = Value::String("ok".into());
         }
         obj.insert("health".into(), live["health"].clone());
@@ -1554,11 +1546,11 @@ mod tests {
             "id": "team-1", "lead_member_id": "mem-1",
             "continuous": {"lead_member_id": "mem-1", "host_id": local_host, "queues": ["momentum"]}
         }), &[json!({"queue":"momentum", "pending":3, "binding":{"consumer":"mem-1"}})]);
-        assert_eq!(team["continuous"]["health"], "blocked");
+        assert_eq!(team["continuous"]["health"], "unknown");
         assert!(team["continuous"].get("next_run").is_some());
         assert!(team["continuous"].get("last_run").is_some());
         assert!(team["continuous"].get("missed_count").is_some());
-        assert_eq!(team["continuous"]["queues"][0]["pending"], 3);
+        assert_eq!(team["continuous"]["queues"], json!([]));
         assert!(team["continuous"].get("cadence_secs").is_some());
     }
 
@@ -1572,6 +1564,28 @@ mod tests {
         assert_eq!(team["continuous"]["health"], "unknown");
         assert_eq!(team["continuous"]["next_run"], Value::Null);
         assert_eq!(team["continuous"]["queues"], json!([]));
+    }
+
+    #[test]
+    fn resolved_lead_is_local_even_when_marker_host_name_differs() {
+        let _env = crate::test_support::env_lock();
+        reset_cache_for_test();
+        absorb_reply(&json!({"org": {"members": {"lead-uid": {"id": "mem-1", "acting_as": "main"}}}}), 1_700_000_000.0);
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        let mut params = crate::session::SpawnParams::new("lead-uid", "lead", "/bin/sleep");
+        params.args = vec!["30".into()];
+        params.session_type = "codex".into();
+        let mut session = crate::session::DaemonSession::spawn(params).unwrap();
+        crate::assistants::stamp(&mut session.org, "mem-1", crate::assistants::MAIN, "test");
+        state.lock().unwrap().sessions.insert("lead-uid".into(), session);
+        let team = decorate_team(&state, json!({
+            "id": "team-manager", "lead_member_id": "mem-1",
+            "continuous": {"lead_member_id": "mem-1", "host_id": "manager"}
+        }), &[]);
+        assert_eq!(team["continuous"]["lead_session_uid"], "lead-uid");
+        assert_ne!(team["continuous"]["health"], "unknown");
+        state.lock().unwrap().sessions.get_mut("lead-uid").unwrap().kill().unwrap();
+        reset_cache_for_test();
     }
 
     fn marks(list: Value) -> Value {

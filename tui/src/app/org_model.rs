@@ -112,15 +112,19 @@ pub(super) fn owner_org_snapshot(targets: &[(String, PathBuf, String)], params: 
     Err(RpcFail { unsupported, message })
 }
 
-fn merge_org_live_teams(base: &mut Value, candidate: &Value, host: &str) {
+fn merge_org_live_teams(base: &mut Value, candidate: &Value, _host: &str) {
     let Some(base_teams) = base.get_mut("teams").and_then(Value::as_array_mut) else { return; };
     let Some(candidate_teams) = candidate.get("teams").and_then(Value::as_array) else { return; };
     for candidate_team in candidate_teams {
         let Some(marker) = candidate_team.get("continuous").filter(|v| v.is_object()) else { continue; };
-        if marker.get("host_id").and_then(Value::as_str) != Some(host) { continue; }
         let Some(id) = candidate_team.get("id").and_then(Value::as_str) else { continue; };
         if let Some(base_team) = base_teams.iter_mut().find(|team| team.get("id").and_then(Value::as_str) == Some(id)) {
-            base_team["continuous"] = marker.clone();
+            let current = base_team.get("continuous").filter(|v| v.is_object());
+            let candidate_has_lead = marker.get("lead_session_uid").and_then(Value::as_str).is_some_and(|uid| !uid.is_empty());
+            let current_has_lead = current.and_then(|v| v.get("lead_session_uid")).and_then(Value::as_str).is_some_and(|uid| !uid.is_empty());
+            if candidate_has_lead || !current_has_lead {
+                base_team["continuous"] = marker.clone();
+            }
         }
     }
 }
@@ -575,22 +579,22 @@ mod tests {
     }
 
     #[test]
-    fn remote_continuous_projection_is_merged_by_marker_host() {
+    fn resolved_projection_wins_even_when_marker_host_differs_from_target_name() {
         let mut base = snapshot(7, vec![owner(), member("m1", "ep", Some("mem-owner"), Some("t1"), Some("ts-1-0"))], vec![team("t1", "Swarm", None, Some("m1"), &[("m1", "primary")])]);
-        base["teams"][0]["continuous"] = json!({"lead_member_id":"m1", "host_id":"cm-manager", "health":"unknown"});
-        let remote = json!({"version":7,"teams":[{"id":"t1","continuous":{"lead_member_id":"m1","host_id":"cm-manager","health":"ok","next_run":123.0}}]});
-        merge_org_live_teams(&mut base, &remote, "cm-manager");
+        base["teams"][0]["continuous"] = json!({"lead_member_id":"m1", "host_id":"manager", "health":"unknown"});
+        let remote = json!({"version":7,"teams":[{"id":"t1","continuous":{"lead_member_id":"m1","host_id":"manager","lead_session_uid":"ts-lead","health":"ok","next_run":123.0}}]});
+        merge_org_live_teams(&mut base, &remote, "local");
         assert_eq!(base["teams"][0]["continuous"]["health"], "ok");
         assert_eq!(base["teams"][0]["continuous"]["next_run"], 123.0);
     }
 
     #[test]
-    fn remote_projection_does_not_overwrite_a_different_host() {
+    fn unresolved_projection_does_not_overwrite_a_resolved_one() {
         let mut base = snapshot(7, vec![owner()], vec![team("t1", "Swarm", None, None, &[])]);
-        base["teams"][0]["continuous"] = json!({"lead_member_id":"m1", "host_id":"cm-manager", "health":"unknown"});
-        let other = json!({"teams":[{"id":"t1","continuous":{"lead_member_id":"m1","host_id":"other","health":"ok"}}]});
-        merge_org_live_teams(&mut base, &other, "cm-manager");
-        assert_eq!(base["teams"][0]["continuous"]["health"], "unknown");
+        base["teams"][0]["continuous"] = json!({"lead_member_id":"m1", "host_id":"manager","lead_session_uid":"ts-lead","health":"ok"});
+        let other = json!({"teams":[{"id":"t1","continuous":{"lead_member_id":"m1","host_id":"manager","health":"unknown"}}]});
+        merge_org_live_teams(&mut base, &other, "sessions");
+        assert_eq!(base["teams"][0]["continuous"]["health"], "ok");
     }
 
     #[test]
