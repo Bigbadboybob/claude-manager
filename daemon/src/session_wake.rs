@@ -300,6 +300,22 @@ fn public_schedule(s: &WakeSchedule) -> Value {
     json!({"id":s.id,"session_uid":s.session_uid,"kind":s.kind,"jitter_secs":s.jitter_secs,"wake_message":s.wake_message,"enabled":s.enabled,"state":s.state,"created_at":s.created_at,"next_run":if s.enabled && s.state=="active" {Value::from(s.next_run_at)} else {Value::Null},"last_run":s.last_run,"missed_count":s.missed_count,"runs":s.runs})
 }
 
+/// Read-only live projection used by the org/team marker. It deliberately
+/// reads the already-loaded runtime store; the org sidebar must not introduce
+/// a disk poll or copy schedule state into the org record.
+pub fn live_summary(session_uid: &str) -> Value {
+    let Ok(runtime) = runtime() else { return json!({"next_run":null,"last_run":null,"missed_count":0,"health":"blocked"}); };
+    let store = runtime.store.lock().unwrap_or_else(|p| p.into_inner());
+    let rows: Vec<&WakeSchedule> = store.schedules.iter().filter(|s| s.enabled && s.state == "active" && s.session_uid == session_uid).collect();
+    let next = rows.iter().filter_map(|s| (s.next_run_at > 0.0).then_some(s.next_run_at)).min_by(f64::total_cmp);
+    let last = rows.iter().filter_map(|s| s.last_run.as_ref()).max_by(|a,b| a.scheduled_at.total_cmp(&b.scheduled_at));
+    let missed: u64 = rows.iter().map(|s| s.missed_count).sum();
+    let cadence = rows.iter().map(|s| cadence_secs(s)).min_by(f64::total_cmp);
+    let schedule_kind = rows.first().map(|s| match s.kind { WakeKind::Interval { .. } => "interval", WakeKind::DailyAt { .. } => "daily_at" });
+    let health = if rows.is_empty() { "blocked" } else if missed > 0 { "missed" } else if next.is_some_and(|n| n <= now()) { "late" } else { "ok" };
+    json!({"next_run":next,"last_run":last,"missed_count":missed,"health":health,"cadence_secs":cadence,"schedule_kind":schedule_kind})
+}
+
 pub fn handle(
     state_arc: &Arc<Mutex<DaemonState>>,
     caller: &Caller,

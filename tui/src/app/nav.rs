@@ -421,6 +421,10 @@ pub(super) enum VisualItem {
     /// group. Non-selectable. See
     /// DESIGN_CONTINUOUS_TASKS.md §12.
     ContinuousHeader,
+    /// A continuous org-model team block in the Task sidebar.
+    ContinuousTeamHeader(String),
+    /// A selectable session row inside a continuous org-model team block.
+    ContinuousTeamSession(usize, usize),
     /// Cloud-backtests group header, appended at the bottom of the
     /// continuous column when any backtest row is live. SELECTABLE
     /// (unlike `ContinuousHeader`) so Space/Enter can fold the group.
@@ -787,7 +791,7 @@ impl App {
                 || self.workspace_tasks(*wi).iter().any(|id| {
                     contains(id) || self.find_task_entry(id).is_some_and(|t| contains(&t.name))
                 }),
-            VisualItem::Session(wi, si) => self.workspaces.get(*wi).and_then(|w| w.sessions.get(*si)).is_some_and(|s| {
+            VisualItem::Session(wi, si) | VisualItem::ContinuousTeamSession(wi, si) => self.workspaces.get(*wi).and_then(|w| w.sessions.get(*si)).is_some_and(|s| {
                 contains(&s.label)
                     || s.task_id.as_deref().and_then(|id| self.find_task_entry(id)).is_some_and(|t| contains(&t.name))
             }),
@@ -798,14 +802,14 @@ impl App {
             VisualItem::BacktestFleet(stem) => contains(stem),
             VisualItem::BacktestRun { task_id, .. } => self.backtest_rows.iter().find(|r| r.task_id == *task_id).is_some_and(|r| contains(&r.label) || contains(task_id)),
             VisualItem::OrgHeader { key, .. } => contains(&self.org_header_text(key)),
-            VisualItem::ContinuousHeader | VisualItem::Separator | VisualItem::SectionEnd => false,
+            VisualItem::ContinuousHeader | VisualItem::ContinuousTeamHeader(_) | VisualItem::Separator | VisualItem::SectionEnd => false,
         }
     }
 
     pub(super) fn sidebar_cursor_index(&self, items: &[VisualItem]) -> Option<usize> {
         items.iter().position(|item| match (&self.cursor, item) {
             (Cursor::Workspace(a), VisualItem::WorkspaceHeader(b)) => a == b,
-            (Cursor::Session(a, b), VisualItem::Session(c, d)) => a == c && b == d,
+            (Cursor::Session(a, b), VisualItem::Session(c, d) | VisualItem::ContinuousTeamSession(c, d)) => a == c && b == d,
             (Cursor::Section(a), VisualItem::SectionHeader(b)) => a == b,
             (Cursor::Division(a), VisualItem::DivisionHeader(b)) => a == b,
             (Cursor::Org(a), VisualItem::OrgHeader { key: b, .. }) => a == b,
@@ -1466,7 +1470,7 @@ impl App {
         // cursor lives on a child session).
         let tree_rows = self.tree_view();
         let is_selectable = |item: &VisualItem| match item {
-            VisualItem::Session(_, _) => true,
+            VisualItem::Session(_, _) | VisualItem::ContinuousTeamSession(_, _) => true,
             VisualItem::WorkspaceHeader(wi) => self
                 .workspaces
                 .get(*wi)
@@ -1478,6 +1482,7 @@ impl App {
             // Continuous header is presentation-only, like
             // other decorative headers; skip it in cursor navigation.
             VisualItem::ContinuousHeader => false,
+            VisualItem::ContinuousTeamHeader(_) => false,
             // Team sub-view headers fold on Space/Enter.
             VisualItem::OrgHeader { .. } => true,
             // Backtest rows are all selectable — the header and fleet rows
@@ -1499,7 +1504,7 @@ impl App {
             .iter()
             .position(|item| match (&self.cursor, item) {
                 (Cursor::Workspace(wi), VisualItem::WorkspaceHeader(vwi)) => wi == vwi,
-                (Cursor::Session(wi, si), VisualItem::Session(vwi, vsi)) => {
+                (Cursor::Session(wi, si), VisualItem::Session(vwi, vsi) | VisualItem::ContinuousTeamSession(vwi, vsi)) => {
                     wi == vwi && si == vsi
                 }
                 (
@@ -1541,7 +1546,7 @@ impl App {
         }
 
         match &items[next as usize] {
-            VisualItem::Session(wi, si) => self.cursor = Cursor::Session(*wi, *si),
+            VisualItem::Session(wi, si) | VisualItem::ContinuousTeamSession(wi, si) => self.cursor = Cursor::Session(*wi, *si),
             VisualItem::WorkspaceHeader(wi) => self.cursor = Cursor::Workspace(*wi),
             VisualItem::BacktestHeader => {
                 self.cursor = Cursor::Backtest(BacktestCursor::Group);
@@ -1588,7 +1593,7 @@ impl App {
             self.visual_items()
         };
         for vi in main {
-            if let VisualItem::Session(wi, si) = vi {
+            if let VisualItem::Session(wi, si) | VisualItem::ContinuousTeamSession(wi, si) = vi {
                 rows.push((wi, si, false));
             }
         }

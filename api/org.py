@@ -179,6 +179,7 @@ class TeamCreateBody(_Strict):
 
 
 class TeamPatchBody(_Strict):
+    continuous: dict | None = None
     actor: Actor
     name: Short | None = None
     parent_team_id: Short | None = None

@@ -975,7 +975,7 @@ pub fn dispatch_request(
         "org.snapshot" | "org.member" | "org.team" | "org.roster" | "org.roster_apply"
         | "org.adopt" | "org.team_create" | "org.team_update" | "org.move" | "org.retire"
         | "org.reinstate" | "org.close_assistant" | "org.promote" | "org.rebind_main" | "org.hire"
-        | "org.member_update" => {
+        | "org.member_update" | "org.team_mark_continuous" => {
             DispatchOutcome::Done(crate::items::org::dispatch(state, req))
         }
         // Gate receipts (doc/gate-receipts.md §9): same proxy shape as items.

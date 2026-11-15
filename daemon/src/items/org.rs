@@ -34,6 +34,7 @@ pub const METHODS: &[&str] = &[
     "org.rebind_main",
     "org.hire",
     "org.member_update",
+    "org.team_mark_continuous",
 ];
 
 /// The read-only ones (restart-barrier classification).
@@ -48,12 +49,13 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
                 if let Some(v) = p.get("since_version").and_then(Value::as_i64) {
                     query.push(("since_version", v.to_string()));
                 }
-                api(ctx.api.get("/org/snapshot", &query))
+                api(ctx.api.get("/org/snapshot", &query)).map(|v| decorate_snapshot(state, v))
             }
             "org.member" => member(state, &ctx, &p),
             "org.team" => {
                 let team = str_param(&p, "team")?.ok_or_else(|| bad("org.team needs team"))?;
-                api(ctx.api.get(&format!("/org/teams/{}", encode(&team)), &[]))
+                let queues = live_queue_rows(state);
+                api(ctx.api.get(&format!("/org/teams/{}", encode(&team)), &[])).map(|v| decorate_team(state, v, &queues))
             }
             "org.roster" => {
                 owner_only(&ctx, "the roster")?;
@@ -68,6 +70,17 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
             "org.team_update" => {
                 let mut p = p;
                 let team = take_str(&mut p, "team")?.ok_or_else(|| bad("org.team_update needs team"))?;
+                api(ctx.api.patch(&format!("/org/teams/{}", encode(&team)), &with_actor(&ctx, p)))
+            }
+            "org.team_mark_continuous" => {
+                if !marker_authorized(&ctx) {
+                    return Err((ErrorCode::Unauthorized, "continuous team marking is Owner/operator or global-perms only".into()));
+                }
+                let mut p = p;
+                let team = take_str(&mut p, "team")?.ok_or_else(|| bad("org.team_mark_continuous needs team"))?;
+                let marker = p.remove("continuous").ok_or_else(|| bad("org.team_mark_continuous needs continuous"))?;
+                validate_continuous_marker(&marker)?;
+                p.insert("continuous".into(), marker);
                 api(ctx.api.patch(&format!("/org/teams/{}", encode(&team)), &with_actor(&ctx, p)))
             }
             "org.move" | "org.retire" | "org.reinstate" => {
@@ -105,6 +118,97 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
         },
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
+}
+
+fn marker_authorized(ctx: &Ctx) -> bool { marker_authorized_flags(ctx.owner, ctx.global) }
+fn marker_authorized_flags(owner: bool, global: bool) -> bool { owner || global }
+
+fn validate_continuous_marker(marker: &Value) -> RpcResult<()> {
+    if marker.is_null() { return Ok(()); }
+    let Some(obj) = marker.as_object() else { return Err(bad("continuous must be an object or null")); };
+    for key in ["lead_member_id", "host_id"] {
+        if obj.get(key).and_then(Value::as_str).is_none_or(str::is_empty) {
+            return Err(bad(format!("continuous.{key} must be a non-empty string")));
+        }
+    }
+    if let Some(queues) = obj.get("queues") {
+        if !queues.is_array() || queues.as_array().is_some_and(|xs| xs.iter().any(|q| !q.is_string())) {
+            return Err(bad("continuous.queues must be an array of queue names"));
+        }
+    }
+    Ok(())
+}
+
+fn decorate_snapshot(state: &Arc<Mutex<DaemonState>>, mut value: Value) -> Value {
+    if let Some(teams) = value.get_mut("teams").and_then(Value::as_array_mut) {
+        let queues = if teams.iter().any(|team| team.get("continuous").is_some_and(|v| v.is_object())) {
+            live_queue_rows(state)
+        } else {
+            Vec::new()
+        };
+        for team in teams.iter_mut() { *team = decorate_team(state, team.clone(), &queues); }
+    }
+    value
+}
+
+fn live_queue_rows(state: &Arc<Mutex<DaemonState>>) -> Vec<Value> {
+    crate::control::methods::queue_list(
+        state,
+        &crate::control::protocol::Caller::operator("org-live-read"),
+        &Value::Null,
+    )
+    .ok()
+    .and_then(|v| v.get("queues").cloned())
+    .and_then(|v| v.as_array().cloned())
+    .unwrap_or_default()
+}
+
+fn decorate_team(state: &Arc<Mutex<DaemonState>>, mut team: Value, queue_rows: &[Value]) -> Value {
+    let Some(marker) = team.get("continuous").cloned().filter(|v| v.is_object()) else { return team; };
+    let lead = marker["lead_member_id"].as_str().or_else(|| team["lead_member_id"].as_str()).map(str::to_owned);
+    let lead_uid = lead.as_deref().and_then(|member| {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        s.sessions.values().find_map(|session| crate::assistants::of_session(session).filter(|m| m.member_id == member && m.acting_as == crate::assistants::MAIN).map(|_| session.uid.clone()))
+    });
+    let live = lead_uid.as_deref().map(crate::session_wake::live_summary).unwrap_or_else(|| json!({"next_run":null,"last_run":null,"missed_count":0,"health":"blocked"}));
+    let host = marker["host_id"].as_str().unwrap_or("");
+    let local_host = crate::host_id::HostId::local().to_string();
+    let mut live = live;
+    if !host.is_empty() && host != local_host && live["health"] == "ok" { live["health"] = Value::String("blocked".into()); }
+    if let Some(obj) = team.get_mut("continuous").and_then(Value::as_object_mut) {
+        obj.insert("lead_session_uid".into(), lead_uid.clone().map(Value::String).unwrap_or(Value::Null));
+        obj.insert("next_run".into(), live["next_run"].clone());
+        obj.insert("last_run".into(), live["last_run"].clone());
+        obj.insert("missed_count".into(), live["missed_count"].clone());
+        obj.insert("cadence_secs".into(), live["cadence_secs"].clone());
+        obj.insert("schedule_kind".into(), live["schedule_kind"].clone());
+        let requested = marker
+            .get("queues")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<HashSet<_>>();
+        let queues = queue_rows
+            .iter()
+            .filter(|row| {
+                let name = row.get("queue").and_then(Value::as_str);
+                let consumer = row
+                    .get("binding")
+                    .and_then(|b| b.get("consumer"))
+                    .and_then(Value::as_str);
+                name.is_some_and(|n| requested.contains(n))
+                    || consumer.is_some_and(|c| Some(c) == lead.as_deref())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if lead_uid.is_some() && live["health"] == "blocked" && !queues.is_empty() && (host.is_empty() || host == local_host) {
+            live["health"] = Value::String("ok".into());
+        }
+        obj.insert("health".into(), live["health"].clone());
+        obj.insert("queues".into(), Value::Array(queues));
+    }
+    team
 }
 
 /// Whether the caller of `req` may control member `member_id`'s sessions,
@@ -1409,6 +1513,28 @@ mod tests {
 
     fn ws(id: &str, path: &str, org: Value) -> crate::manifest::ManifestWorkspace {
         serde_json::from_value(json!({"id": id, "worktree_path": path, "org": org, "sessions": []})).unwrap()
+    }
+
+    #[test]
+    fn continuous_marker_auth_is_owner_or_global_only() {
+        assert!(marker_authorized_flags(true, false));
+        assert!(marker_authorized_flags(false, true));
+        assert!(!marker_authorized_flags(false, false));
+    }
+
+    #[test]
+    fn continuous_team_read_shape_has_live_fields() {
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        let team = decorate_team(&state, json!({
+            "id": "team-1", "lead_member_id": "mem-1",
+            "continuous": {"lead_member_id": "mem-1", "host_id": "local", "queues": ["momentum"]}
+        }), &[json!({"queue":"momentum", "pending":3, "binding":{"consumer":"mem-1"}})]);
+        assert_eq!(team["continuous"]["health"], "blocked");
+        assert!(team["continuous"].get("next_run").is_some());
+        assert!(team["continuous"].get("last_run").is_some());
+        assert!(team["continuous"].get("missed_count").is_some());
+        assert_eq!(team["continuous"]["queues"][0]["pending"], 3);
+        assert!(team["continuous"].get("cadence_secs").is_some());
     }
 
     fn marks(list: Value) -> Value {

@@ -1666,6 +1666,7 @@ def org(
     items: list[int] | None = None,
     poc_of: str | None = None,
     hire: dict | None = None,
+    continuous: dict | None = None,
 ) -> dict:
     """Find your place in the org: your boss, your reports, your division.
 
@@ -1703,6 +1704,10 @@ def org(
         `main/<handle>`: profile, manager chain, reports and teams.
 
     Actions (your own task only):
+      - `action="mark_continuous", team=..., continuous={lead_member_id,
+        host_id, queues?}` marks an org team as continuous. This is an
+        Owner/operator or global-permissions operation; the daemon joins the
+        lead's live schedules and bound queue depths into org reads.
       - `action="set_lead", session_uid=None`: pin the lead of your task to
         `session_uid` (default: you). It must be a live claude/codex session
         bound to your task.
@@ -1766,6 +1771,15 @@ def org(
     approving the roster are Owner's, from the TUI; an agent's call is
     refused.
     """
+    if action == "mark_continuous":
+        if not team:
+            raise RuntimeError('org(action="mark_continuous") needs team')
+        route = control_client.resolve_socket_route()
+        if not route.chose_daemon:
+            raise RuntimeError("org needs the CM daemon (CM_DAEMON_SOCKET is not set)")
+        return control_client.call("org.team_mark_continuous", {
+            "team": team, "continuous": continuous,
+        }, socket_path=route.path)
     if action == "setup":
         session_uid = session_uid or session
         if not session_uid:

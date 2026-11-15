@@ -1513,6 +1513,9 @@
      },
      "type": "array"
     },
+    "continuous": {
+     "type": "object"
+    },
     "division": {
      "type": "string"
     },

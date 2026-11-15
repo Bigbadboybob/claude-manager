@@ -176,8 +176,10 @@ pub(super) struct Team {
     pub kind: String,
     /// `active`, `standby` or `archived`.
     pub status: String,
+    pub org_id: Option<String>,
     pub parent_team_id: Option<String>,
     pub lead_member_id: Option<String>,
+    pub continuous: Option<ContinuousMarker>,
     /// The team's coordinator (initiative) task; the root of its task tree.
     pub coordinator_task_id: Option<String>,
     pub board: Option<String>,
@@ -188,6 +190,21 @@ pub(super) struct Team {
     pub standing_rules: Vec<Value>,
     pub members: Vec<TeamMembership>,
     pub revision: i64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub(super) struct ContinuousMarker {
+    pub lead_member_id: Option<String>,
+    pub host_id: Option<String>,
+    pub lead_session_uid: Option<String>,
+    pub next_run: Option<f64>,
+    pub cadence_secs: Option<f64>,
+    pub schedule_kind: Option<String>,
+    pub last_run: Option<Value>,
+    pub missed_count: u64,
+    pub health: String,
+    pub queues: Vec<Value>,
 }
 
 impl Team {

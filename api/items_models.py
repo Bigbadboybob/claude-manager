@@ -27,6 +27,7 @@ class Actor(_Strict):
     session_uid: Short | None = None
     daemon_id: Short | None = None
     task_id: Short | None = None
+    global_perms: bool = False
 
 
 class AttributedActor(Actor):
