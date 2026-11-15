@@ -55,6 +55,7 @@ freely, within its limits:
 | ISP proxies | no GB limit | 10 |
 | Datacenter proxies | 5 GB | 5 |
 | Residential proxies | 5 GB | rotating |
+| Web Unblocker | 8 GB | n/a (fallback only, after a direct fetch fails) |
 
 **Never exceed a monthly limit (Owner, 2026-11-15).** If a pool goes over
 its limit, every scraper using that pool stops working until the monthly
