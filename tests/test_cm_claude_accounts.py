@@ -610,7 +610,7 @@ class PollTests(PollHarness):
         self.do_login("alice")
         self.run_cli("capture")
         token = self.live_token()
-        for stamp in ("2026-11-14T06:00:00.020Z", "2026-11-14T05:59:59.680Z"):
+        for stamp in ("2030-11-14T06:00:00.020Z", "2030-11-14T05:59:59.680Z"):
             self.usage[token] = {"five_hour": None, "limits": [
                 {"kind": "weekly_all", "group": "all", "scope": None, "percent": 96,
                  "is_active": True, "severity": "warning", "resets_at": stamp}]}
@@ -1251,6 +1251,137 @@ class HubHarness(AutoswitchHarness):
                 text = path.read_text()
                 for token in self.tokens:
                     self.assertNotIn(token, text, path)
+
+
+class PoolTests(HubHarness):
+    """Owner 2026-11-15: any account on any host. Logins live in the hub's pool
+    and are lent to one host at a time."""
+
+    def setUp(self):
+        super().setUp()
+        self.assertEqual(self.hub("policy", "pool", "on")[0], 0)
+        self.age_last_switch(31 * 60)
+
+    def pool_uuids(self):
+        with accounts.Hub(self.hub_paths) as h:
+            return sorted(h.pool())
+
+    def saved_here(self):
+        return sorted(p.stem for p in self.paths.accounts.glob("*.json"))
+
+    def files_outside_pool_have_no_tokens(self):
+        pool = self.hub_paths.store / "hub" / "pool"
+        for path in self.hub_paths.store.rglob("*"):
+            if path.is_file() and pool not in path.parents:
+                text = path.read_text()
+                for token in self.tokens:
+                    self.assertNotIn(token, text, path)
+        for path in pool.rglob("*.json"):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(pool.stat().st_mode), 0o700)
+
+    def test_spares_go_to_the_pool_and_tokens_stay_out_of_reports(self):
+        self.poll()  # learns the policy
+        code, text = self.poll()  # hands spares back
+        self.assertIn("returned bob@example.com (bob-uuid) to the pool", text)
+        self.assertEqual(self.saved_here(), ["alice-uuid-0000"])
+        self.assertEqual(self.pool_uuids(), ["bob-uuid-0000", "carol-uuid-0000"])
+        self.assertIn("saved on pool", self.hub("status")[1])
+        self.files_outside_pool_have_no_tokens()
+        self.assert_no_tokens_on_disk()
+
+    def test_a_just_used_account_is_kept_for_half_an_hour(self):
+        state = self.state()
+        for h in state["history"]:
+            if h["event"] == "switch":
+                h["at"] = int(time.time()) - 60  # alice became active a minute ago
+        self.paths.state.write_text(json.dumps(state))
+        self.poll()
+        self.poll()
+        previous = [h["previous"] for h in self.state()["history"] if h["event"] == "switch"][-1]
+        self.assertIn(previous, self.saved_here())
+
+    def test_auto_borrows_the_pool_account_with_most_room(self):
+        self.set_reading("bob", ("weekly_all", None, 40, 86400, True), hub="cm-manager", host_name="laptop")
+        self.set_reading("carol", ("weekly_all", None, 10, 86400, True), hub="cm-manager", host_name="laptop")
+        self.poll()
+        self.assertEqual(self.hub("assign", "laptop", "alice@example.com", "--auto")[0], 0)
+        self.poll()  # spares returned; alice is at 95%, so carol is lent and switched to
+        self.assertEqual(self.live()["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-carol")
+        self.assertEqual(self.pool_uuids(), ["bob-uuid-0000"])
+        self.assertTrue(self.state()["history"][-1]["reason"].startswith("auto (pool): week 95%"))
+        self.poll()  # confirms the lend
+        self.assertEqual(list((self.hub_paths.store / "hub/pool/lent").glob("*.json")), [])
+        self.assertIn("alice-uuid-0000", self.saved_here())  # kept 30 min after use
+        self.assertIn("lent carol@example.com to laptop", self.hub("history")[1])
+        self.files_outside_pool_have_no_tokens()
+        self.assert_no_tokens_on_disk()
+
+    def test_pin_to_a_pool_account_borrows_it(self):
+        self.poll()
+        self.poll()
+        code, text = self.hub("assign", "laptop", "bob@example.com")
+        self.assertEqual(code, 0, text)
+        code, text = self.poll()
+        self.assertIn("borrowed bob@example.com", text)
+        self.assertIn("assignment rev", text)
+        self.assertEqual(self.live()["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-bob")
+
+    def test_a_lend_the_host_never_saved_goes_back_to_the_pool(self):
+        self.poll()
+        self.poll()
+        self.hub("assign", "laptop", "bob@example.com")
+        with mock.patch.object(accounts, "save_account", side_effect=OSError("disk full")):
+            self.poll()
+        self.assertNotIn("bob-uuid-0000", self.pool_uuids())
+        self.poll()  # not listed by the host: the lend is undone, then made again
+        self.assertEqual(self.live()["claudeAiOauth"]["refreshToken"], "sk-ant-ort-REFRESH-bob")
+        self.assertIn("not confirmed; back in the pool", self.hub("history")[1])
+
+    def test_reservations_and_last_resort(self):
+        self.set_reading("bob", ("weekly_all", None, 10, 86400, True), hub="cm-manager", host_name="laptop")
+        self.set_reading("carol", ("weekly_all", None, 60, 86400, True), hub="cm-manager", host_name="laptop")
+        self.poll()
+        self.hub("assign", "laptop", "alice@example.com", "--auto")
+        self.hub("reserve", "bob@example.com", "--for", "cm-manager", "--last-resort")
+        self.hub("reserve", "carol@example.com", "--for", "cm-manager")
+        with mock.patch.object(accounts, "pool_lend", return_value=None):
+            self.poll()  # spares returned, nothing lent yet
+        with accounts.Hub(self.hub_paths) as h:
+            cands = accounts.pool_candidates(h, "laptop", h.reports(), time.time())
+        self.assertEqual([c[1] for c in cands], ["bob-uuid-0000"])  # carol is not allowed at all
+        self.assertTrue(cands[0][0][0])  # and bob only as a last resort
+        self.assertIn("last resort; first reserved for cm-manager", self.hub("status")[1])
+
+    def test_a_pool_copy_of_an_account_a_host_holds_is_dropped(self):
+        self.poll()
+        self.poll()
+        self.other_host({**host_export("cm-sessions", active="bob", saved=["bob"]), "last_switch_at": 0})
+        self.assertEqual(self.pool_uuids(), ["carol-uuid-0000"])
+
+    def test_old_hosts_get_no_login_and_keep_the_pool_intact(self):
+        self.poll()
+        self.poll()
+        old = host_export("cm-sessions", active="dave", saved=["dave", "carol"])
+        with accounts.Hub(self.hub_paths) as h:
+            h.desired["hosts"]["cm-sessions"] = {"account": "bob-uuid-0000", "email": "bob@example.com",
+                                                 "mode": "pin", "at": 0}
+            h.save("pin")
+            reply = accounts.hub_checkin(h, old)
+        self.assertNotIn("lend", reply)
+        self.assertEqual(self.pool_uuids(), ["bob-uuid-0000", "carol-uuid-0000"])
+
+    def test_a_blank_host_borrows_its_first_login(self):
+        self.poll()
+        self.poll()
+        for p in self.paths.accounts.glob("*.json"):
+            p.unlink()
+        creds = self.live()
+        creds.pop("claudeAiOauth")
+        self.paths.credentials.write_text(json.dumps(creds))
+        self.hub("assign", "laptop", "carol@example.com", "--force")
+        code, text = self.poll()
+        self.assertIn("switched no login -> carol@example.com", text)
 
 
 class HubTests(HubHarness):

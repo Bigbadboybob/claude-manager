@@ -655,6 +655,8 @@ def export_view(paths: Paths, state: dict) -> dict:
             "active": state.get("active"), "accounts": out, "mode": effective_mode(state),
             "apply": state.get("apply"), "events": list(state.get("hub_outbox") or []),
             "sessions": state.get("sessions"),
+            "last_switch_at": last_switch_at(state),
+            "auto_switches_24h": auto_switches_since(state, now - 86400),
             "poll": {k: poll[k] for k in ("at", "ok", "reason") if k in poll}}
 
 
@@ -1006,6 +1008,9 @@ def hub_exchange(paths: Paths, state: dict, out) -> dict | None:
         return None
     export = export_view(paths, state)
     now = int(time.time())
+    returning = spares_to_return(paths, state, now) if pool_on(state) else {}
+    if returning:
+        export["returning"] = returning
     try:
         if hub == "local":
             with Hub(paths) as h:
@@ -1017,10 +1022,61 @@ def hub_exchange(paths: Paths, state: dict, out) -> dict | None:
         entry.update(ok=False, error=str(exc), tried_at=now)
         print(f"hub check-in failed: {exc}", file=sys.stderr)
         return None
+    lend = reply.pop("lend", None)  # carries tokens: never kept in state
     state["hub"] = {"at": now, "ok": True, "reply": reply}
     sent = {e.get("id") for e in export["events"]}
     state["hub_outbox"] = [e for e in state.get("hub_outbox") or [] if e.get("id") not in sent]
+    for uuid in reply.get("returned") or []:
+        if uuid in returning and uuid != state.get("active"):
+            (paths.accounts / f"{uuid}.json").unlink(missing_ok=True)
+            record_history(state, "returned-to-pool", account=uuid)
+            print(f"returned {label(returning[uuid])} to the pool", file=out)
+    if isinstance(lend, dict) and valid_login_record(lend.get("record")):
+        record = lend["record"]
+        uuid = record["oauthAccount"]["accountUuid"]
+        if uuid != state.get("active"):
+            record.pop("needs_login", None)
+            save_account(paths, record)
+            record_history(state, "borrowed", account=uuid, reason=lend.get("reason"))
+            print(f"borrowed {label(record)} from the pool ({lend.get('reason')})", file=out)
+            if lend.get("switch"):
+                try:
+                    cmd_switch(paths, state, uuid, out)
+                except AccountError as exc:
+                    print(f"switch to the borrowed account failed: {exc}", file=sys.stderr)
+                else:
+                    state["history"][-1]["reason"] = f"auto (pool): {lend.get('reason')}"
     return reply
+
+
+POOL_RETURN_AFTER_SECONDS = 30 * 60
+
+
+def pool_on(state: dict) -> bool:
+    return bool(((last_hub_reply(state) or {}).get("policy") or {}).get("pool"))
+
+
+def valid_login_record(record) -> bool:
+    return (isinstance(record, dict) and isinstance(record.get("claudeAiOauth"), dict)
+            and bool(record["claudeAiOauth"].get("refreshToken"))
+            and isinstance(record.get("oauthAccount"), dict)
+            and isinstance(record["oauthAccount"].get("accountUuid"), str))
+
+
+def spares_to_return(paths: Paths, state: dict, now: float) -> dict[str, dict]:
+    """Saved logins this host is not using, for the hub's pool. An account
+    switched away from in the last half hour stays a while, so a session
+    still finishing on it never shares a login with another host."""
+    recent = {h.get("previous") for h in state.get("history", [])
+              if h.get("event") == "switch" and now - h.get("at", 0) < POOL_RETURN_AFTER_SECONDS}
+    recent |= {h.get("account") for h in state.get("history", [])
+               if h.get("event") in ("borrowed", "switch")
+               and now - h.get("at", 0) < POOL_RETURN_AFTER_SECONDS}
+    entry = (last_hub_reply(state) or {}).get("entry") or {}
+    if entry.get("mode") == "pin":
+        recent.add(entry.get("account"))  # about to switch to it
+    return {uuid: rec for uuid, rec in load_accounts(paths).items()
+            if uuid != state.get("active") and uuid not in recent and valid_login_record(rec)}
 
 
 def remote_checkin(hub: str, export: dict) -> dict:
@@ -1107,13 +1163,43 @@ class Hub:
         atomic_write(self.dir / "desired.json", self.desired, indent=2)
 
     def reports(self) -> dict[str, dict]:
+        """Every host's last report, plus POOL: a pseudo-host holding the
+        pool's logins (email, login state, last known reading; no tokens)."""
         out = {}
         for path in sorted((self.dir / "reports").glob("*.json")):
             try:
                 out[path.stem] = load_json(path)
             except (AccountError, ValueError):
                 continue
+        pool = self.pool()
+        if pool:
+            cache = load_json(self.dir / "readings.json")
+            now = time.time()
+            out[POOL] = {"at": int(now), "export": {"host": POOL, "active": None, "accounts": {
+                uuid: {"email": rec["oauthAccount"].get("emailAddress"),
+                       "login": login_state(rec, now), "reading": cache.get(uuid)}
+                for uuid, rec in pool.items()}}}
         return out
+
+    @property
+    def pool_dir(self) -> Path:
+        return self.dir / "pool"
+
+    def pool(self) -> dict[str, dict]:
+        out = {}
+        for path in sorted(self.pool_dir.glob("*.json")) if self.pool_dir.is_dir() else []:
+            try:
+                rec = load_json(path)
+            except (AccountError, ValueError):
+                continue
+            if valid_login_record(rec):
+                out[rec["oauthAccount"]["accountUuid"]] = rec
+        return out
+
+    def pool_put(self, record: dict) -> None:
+        (self.pool_dir / "lent").mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.pool_dir, 0o700)
+        atomic_write(self.pool_dir / f"{record['oauthAccount']['accountUuid']}.json", record)
 
     def event(self, kind: str, text: str, host: str | None = None, at: int | None = None) -> None:
         path = self.dir / "events.jsonl"
@@ -1137,6 +1223,9 @@ class Hub:
             except ValueError:
                 continue
         return out
+
+
+POOL = "(pool)"  # not a valid host name, so it never collides with one
 
 
 def atomic_write_text(path: Path, text: str) -> None:
@@ -1175,7 +1264,17 @@ def hub_checkin(hub: Hub, export: dict) -> dict:
         raise AccountError("check-in without a plain host name")
     if export.get("version") != EXPORT_VERSION or not isinstance(export.get("accounts"), dict):
         raise AccountError(f"{host}: unsupported export")
+    returning = export.pop("returning", None) or {}  # tokens: never written to a report
     now = int(time.time())
+    returned = pool_take_returns(hub, host, export, returning)
+    pool_settle(hub, host, export, returned)
+    for uuid in returned:  # the host deletes its copy on this reply
+        reading = (export["accounts"].pop(uuid, None) or {}).get("reading")
+        if isinstance(reading, dict) and isinstance(reading.get("at"), (int, float)):
+            cache = load_json(hub.dir / "readings.json")
+            if reading["at"] > (cache.get(uuid) or {}).get("at", 0):
+                cache[uuid] = {**reading, "host": host}
+                atomic_write(hub.dir / "readings.json", cache)
     reports = hub.reports()
     previous = (reports.get(host) or {}).get("export") or {}
     seen = set((reports.get(host) or {}).get("events_seen") or [])
@@ -1195,14 +1294,138 @@ def hub_checkin(hub: Hub, export: dict) -> dict:
                                      if isinstance(e, dict) and isinstance(e.get("id"), int)})}
     atomic_write(hub.dir / "reports" / f"{host}.json", report)
     reports[host] = report
+    cache = load_json(hub.dir / "readings.json")
+    for uuid, reading in hub_readings({h: r for h, r in reports.items() if h != POOL}).items():
+        if uuid not in cache or reading["at"] > cache[uuid].get("at", 0):
+            cache[uuid] = reading
+    atomic_write(hub.dir / "readings.json", cache)
     hub_check_low(hub, reports, now)
     d = hub.desired
-    return {"version": HUB_VERSION, "revision": d["revision"], "host": host,
-            "entry": d["hosts"].get(host), "reservations": d["reservations"],
-            "draining": d["draining"], "policy": d["policy"],
-            "readings": hub_readings(reports),
-            "hosts": {h: {"active": (r.get("export") or {}).get("active"), "at": r.get("at")}
-                      for h, r in reports.items()}}
+    reply = {"version": HUB_VERSION, "revision": d["revision"], "host": host,
+             "entry": d["hosts"].get(host), "reservations": d["reservations"],
+             "draining": d["draining"], "policy": d["policy"],
+             "readings": hub_readings(reports), "returned": returned,
+             "hosts": {h: {"active": (r.get("export") or {}).get("active"), "at": r.get("at")}
+                       for h, r in reports.items() if h != POOL}}
+    if d["policy"].get("pool") and pool_capable(export):
+        lend = pool_lend(hub, host, export, reports, now)
+        if lend:
+            reply["lend"] = lend
+    return reply
+
+
+POOL_DWELL_SECONDS = DEFAULT_MIN_DWELL_MINUTES * 60
+
+
+def pool_capable(export: dict) -> bool:
+    """Hosts on a version before the pool would keep a lent login in their
+    state file and never return one: they are left out of it."""
+    return "last_switch_at" in export
+
+
+def pool_take_returns(hub: Hub, host: str, export: dict, returning) -> list[str]:
+    """Store the logins a host hands back. The host deletes its copy once the
+    reply names them; until then its listing wins (see pool_settle)."""
+    out = []
+    if not isinstance(returning, dict) or not hub.desired["policy"].get("pool"):
+        return out
+    for uuid, rec in returning.items():
+        if not valid_login_record(rec) or rec["oauthAccount"]["accountUuid"] != uuid \
+                or uuid == export.get("active"):
+            continue
+        rec.pop("needs_login", None)
+        hub.pool_put(rec)
+        hub.event("pool", f"{rec['oauthAccount'].get('emailAddress') or uuid[:8]} returned to the pool",
+                  host=host)
+        out.append(uuid)
+    return out
+
+
+def pool_settle(hub: Hub, host: str, export: dict, returned: list[str]) -> None:
+    """Keep each login in one place. A lend this host confirmed (it now
+    lists the account) is final; one it does not list went astray and goes
+    back to the pool. A pool copy of an account this host still holds (and
+    did not just return) is dropped: the host's copy is the live one."""
+    lent = hub.pool_dir / "lent"
+    held = set(export.get("accounts") or {}) | {export.get("active")}
+    for path in sorted(lent.glob(f"*.{host}.json")) if lent.is_dir() else []:
+        uuid = path.name.split(".", 1)[0]
+        if uuid in held:
+            path.unlink()
+        else:
+            os.rename(path, hub.pool_dir / f"{uuid}.json")
+            hub.event("pool", f"lend of {uuid[:8]} to {host} not confirmed; back in the pool", host=host)
+    if not pool_capable(export):
+        return  # an old host's copy is a separate login, not this one
+    for uuid in hub.pool():
+        if uuid in held and uuid not in returned:
+            (hub.pool_dir / f"{uuid}.json").unlink()
+            hub.event("pool", f"{uuid[:8]} is saved on {host}; dropped the pool's copy", host=host)
+
+
+def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -> list[tuple]:
+    """Pool accounts this host may borrow, best first: not draining, not
+    reserved for others (a last-resort reservation ranks last), with room."""
+    d = hub.desired
+    config = {"thresholds": d["policy"].get("thresholds") or {}}
+    readings = {**load_json(hub.dir / "readings.json"), **hub_readings(reports)}
+    out = []
+    for uuid, rec in hub.pool().items():
+        if uuid in d["draining"] or login_state(rec, now) in ("needs /login", "login expired"):
+            continue
+        res = d["reservations"].get(uuid)
+        last_resort = False
+        if res and host not in res.get("for", []):
+            if not res.get("last_resort"):
+                continue
+            last_resort = True
+        reading = readings.get(uuid)
+        if reading and over_threshold(reading.get("limits") or [], config, now, for_switch=True):
+            continue
+        live = [l for l in (reading or {}).get("limits", [])
+                if not (l.get("resets_at") is not None and l["resets_at"] <= now)]
+        ratio = max((l["percent"] / threshold_for(l, config) for l in live), default=0.0) \
+            if reading else 0.5
+        why = "not read yet" if not reading else (
+            f"{limit_name(max(live, key=lambda l: l['percent'] / threshold_for(l, config)))} "
+            f"{max(l['percent'] for l in live):.0f}%" if live else "likely refilled")
+        out.append(((last_resort, ratio, rec["oauthAccount"].get("emailAddress") or uuid), uuid, why))
+    return sorted(out)
+
+
+def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: float) -> dict | None:
+    """Hand a pool login to a host that needs one: its pinned account, or in
+    auto mode a fresh account once its own is over threshold."""
+    entry = hub.desired["hosts"].get(host) or {}
+    active = export.get("active")
+    held = set(export.get("accounts") or {})
+    pool = hub.pool()
+    target, reason, switch = None, None, False
+    if entry.get("mode") == "pin" and entry.get("account") not in (None, active) \
+            and entry["account"] not in held and entry["account"] in pool:
+        target, reason = entry["account"], f"pinned (rev {hub.desired['revision']})"
+    elif entry.get("mode") == "auto":
+        config = {"thresholds": hub.desired["policy"].get("thresholds") or {}}
+        reading = ((export.get("accounts") or {}).get(active) or {}).get("reading") or {}
+        over = over_threshold(reading.get("limits") or [], config, now, for_switch=True) if active else []
+        needs = not active or over
+        waited = now - (export.get("last_switch_at") or 0) >= POOL_DWELL_SECONDS
+        capped = (export.get("auto_switches_24h") or 0) >= DEFAULT_MAX_AUTO_SWITCHES_PER_DAY
+        if needs and waited and not capped:
+            cands = pool_candidates(hub, host, reports, now)
+            if cands:
+                _, target, why = cands[0]
+                what = ", ".join(f"{limit_name(l)} {l['percent']:.0f}%" for l in over) or "no login"
+                reason, switch = f"{what}; target {why}", True
+    if not target:
+        return None
+    record = pool[target]
+    lent = hub.pool_dir / "lent"
+    lent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.rename(hub.pool_dir / f"{target}.json", lent / f"{target}.{host}.json")
+    hub.event("pool", f"lent {record['oauthAccount'].get('emailAddress') or target[:8]} to {host} ({reason})",
+              host=host)
+    return {"record": record, "reason": reason, "switch": switch}
 
 
 def room_by_account(reports: dict[str, dict], policy: dict, now: float) -> dict[str, tuple[bool, str]]:
@@ -1289,7 +1512,8 @@ def hub_assign(hub: Hub, host: str, account: str | None, mode: str, force: bool)
             raise AccountError(f"{email} is reserved for {', '.join(res['for']) or 'nobody'}; --force to override")
         if uuid in hub.desired["draining"]:
             raise AccountError(f"{email} is draining; undrain it first or --force")
-        if mode == "pin" and not usable_on(reports.get(host), uuid):
+        in_pool = hub.desired["policy"].get("pool") and usable_on(reports.get(POOL), uuid)
+        if mode == "pin" and not usable_on(reports.get(host), uuid) and not in_pool:
             raise AccountError(f"{email} has no valid saved login on {host}; it needs /login + capture "
                                "there first (--force to assign anyway)")
     entry = {"account": uuid, "email": email, "mode": mode, "at": int(time.time())}
@@ -1310,6 +1534,8 @@ def drain_plan(hub: Hub, uuid: str, now: float) -> list[tuple[str, str | None, s
     config = {"thresholds": d["policy"].get("thresholds") or {}}
     on = {}
     for host, rep in reports.items():
+        if host == POOL:
+            continue
         on[host] = (d["hosts"].get(host) or {}).get("account") or (rep.get("export") or {}).get("active")
     load: dict[str, int] = {}
     for acct in on.values():
@@ -1354,7 +1580,7 @@ def hub_status_view(hub: Hub, now: float) -> dict:
     readings = hub_readings(reports)
     room = room_by_account(reports, d["policy"], now)
     hosts = {}
-    for host in sorted(set(reports) | set(d["hosts"])):
+    for host in sorted((set(reports) | set(d["hosts"])) - {POOL}):
         rep = reports.get(host) or {}
         exp = rep.get("export") or {}
         hosts[host] = {"active": exp.get("active"), "active_email": emails.get(exp.get("active")),
@@ -1368,9 +1594,11 @@ def hub_status_view(hub: Hub, now: float) -> dict:
         accts[uuid] = {"email": email, "reading": readings.get(uuid),
                        "room": room.get(uuid, (True, ""))[0],
                        "active_on": sorted(h for h, v in hosts.items() if v["active"] == uuid),
-                       "saved_on": sorted(h for h, rep in reports.items() if usable_on(rep, uuid)),
+                       "saved_on": sorted(("pool" if h == POOL else h) for h, rep in reports.items()
+                                          if usable_on(rep, uuid)),
                        "reserved_for": (d["reservations"].get(uuid) or {}).get("for"),
                        "reservation_note": (d["reservations"].get(uuid) or {}).get("note"),
+                       "last_resort": bool((d["reservations"].get(uuid) or {}).get("last_resort")),
                        "draining": uuid in d["draining"]}
     return {"revision": d["revision"], "hosts": hosts, "accounts": accts,
             "critical": d["policy"].get("critical", []),
@@ -1396,7 +1624,8 @@ def print_hub_status(view: dict, now: float, out) -> None:
         if a["active_on"]:
             tags.append(f"active on {', '.join(a['active_on'])}")
         if a["reserved_for"] is not None:
-            tags.append(f"reserved for {', '.join(a['reserved_for']) or 'nobody'}"
+            tags.append(("last resort; first " if a.get("last_resort") else "")
+                        + f"reserved for {', '.join(a['reserved_for']) or 'nobody'}"
                         + (f" ({a['reservation_note']})" if a["reservation_note"] else ""))
         if a["draining"]:
             tags.append("DRAINING")
@@ -1415,6 +1644,7 @@ HUB_POLICY_KEYS = {
     "low_room_accounts": (lambda v: int(v) if v.isdigit() else None),
     "notify_command": (lambda v: v or None),
     "coordinator_command": (lambda v: v or None),
+    "pool": (lambda v: {"on": True, "off": False}.get(v)),
 }
 
 
@@ -1463,6 +1693,8 @@ def cmd_hub(paths: Paths, args, out) -> int:
                 raise AccountError("--for takes plain host names, comma-separated, or 'nobody'")
             hub.desired["reservations"][uuid] = {"for": hosts, "note": args.note,
                                                  "at": int(now)}
+            if args.last_resort:
+                hub.desired["reservations"][uuid]["last_resort"] = True
             hub.save(f"reserved {email} for {', '.join(hosts) or 'nobody'}")
             others = [h for h, e in hub.desired["hosts"].items()
                       if e.get("account") == uuid and h not in hosts]
@@ -1842,6 +2074,8 @@ def decide(paths: Paths, state: dict, accounts: dict[str, dict], limits: list[di
     over = over_threshold(limits, config, now, for_switch=True)
     if mode == "pin":
         advice = "Pinned by the coordinator; it decides any switch"
+    elif mode == "auto" and pool_on(state) and over:
+        advice = "The hub lends this host a pool account at its next check-in"
     elif over and mode in ("suggest", "auto"):
         refresh_peers(state)  # fresh readings from other hosts before choosing
         target = pick_target(state, accounts, uuid, now)
@@ -2070,7 +2304,9 @@ def cmd_poll(paths: Paths, state: dict, out, notify_command: str) -> int:
     accounts = load_accounts(paths)
     if not accounts:
         print("no saved accounts; nothing to poll", file=out)
-        hub_exchange(paths, state, out)
+        reply = hub_exchange(paths, state, out)
+        if reply is not None:  # a blank host can borrow its first login from the pool
+            apply_assignment(paths, state, load_accounts(paths), reply, out)
         return 0
     check_logins(state, accounts, alert_owner)
     code, limits = poll_usage(paths, state, accounts, out, alert, alert_owner)
@@ -2287,6 +2523,8 @@ def main(argv: list[str] | None = None, paths: Paths | None = None, out=None) ->
     p.add_argument("account")
     p.add_argument("--for", dest="for_hosts", required=True, help="host[,host...] or 'nobody'")
     p.add_argument("--note")
+    p.add_argument("--last-resort", action="store_true",
+                   help="other hosts may still borrow it from the pool when nothing else has room")
     p = hsub.add_parser("release", help="undo reserve")
     p.add_argument("account")
     p = hsub.add_parser("drain", help="move every host off an account and keep work off it")
