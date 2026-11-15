@@ -29,7 +29,8 @@ in bounds:
 
 - headers, user agents and browser fingerprints, rotated as needed;
 - other scraping libraries, browser impersonation and headless browsers;
-- proxies and IP rotation;
+- proxies and IP rotation, but only once the other options here fail
+  (see the spend cap);
 - other endpoints for the same content: RSS, sitemaps, AMP pages, APIs,
   mirrors and syndication partners;
 - request timing, caching headers and conditional requests;
@@ -59,7 +60,12 @@ freely, within its limits:
 its limit, every scraper using that pool stops working until the monthly
 reset. So:
 
-- Prefer ISP proxies, which have no GB limit. Keep the 5 GB datacenter and
+- **Proxies are a last resort (Owner, 2026-11-15).** If a source works
+  without a proxy, it gets no proxy. That includes direct fetches with the
+  right headers, timing or fingerprint, another endpoint, RSS, or an API.
+  A proxy is added only after the non-proxy options in the blockers section
+  have failed. The playbook records what was tried.
+- When a proxy is needed, prefer ISP proxies, which have no GB limit. Keep the 5 GB datacenter and
   residential pools for sources that truly need them.
 - Before routing a source through a metered pool, estimate its monthly GB:
   bytes per fetch times fetches per month. Record that estimate in the
