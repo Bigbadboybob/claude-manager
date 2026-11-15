@@ -122,3 +122,29 @@ the Ingest lead included.
 
 - cm-manager's Claude login must be restored before Opus leads can run.
 - Codex quota in cm-manager's pool is needed for the workers.
+
+## Lead-bound queue wake
+
+Named queues can be bound to a durable org member id or handle with
+`queue_bind(queue, consumer)`. The binding follows that member's replacement
+main session. The member itself, Owner/operator, or a global-permissions
+orchestrator may bind or rebind it; the binding records the actor.
+
+`enqueue` keeps the existing producer contract. For a bound queue, the first
+enqueue in a burst publishes one durable native `[cm-queue …]` wake to the
+member's current main session and includes the pending depth. Further enqueues
+coalesce while the wake is pending. A missing main session or failed publish
+leaves `wake_pending` and `wake_error` visible for retry; items remain queued.
+
+Only the bound member may call `queue_claim` and `queue_ack`. Claims carry a
+lease and a claim token; an expired lease returns the item to `pending`, while
+an acknowledgement moves it to `consumed`. Unbound continuous-task queues use
+the existing scheduler claim/ack behavior unchanged. Binding a queue hands it
+from the legacy continuous orchestrator to the lead; the scheduler skips that
+queue after recording the handoff.
+
+`queue_list()` (and the `queue.list` RPC) returns one stable row per queue:
+`queue`, `pending`, `claimed`, `binding` (`consumer`, `bound_by`, `bound_at` or
+null), `oldest_pending_at`, `oldest_item_age_seconds`, `last_wake`,
+`last_consume`, `wake_pending`, `wake_delivery`, `wake_error`, and the current
+coalescing `wake_id`.

@@ -109,6 +109,12 @@ const QUEUE_DEPTH_CACHE_TTL_SECS: u64 = 30;
 /// the full TTL, and a flapping API parked them indefinitely.
 const QUEUE_DEPTH_MAX_STALE_SECS: u64 = 300;
 
+/// Bound-queue native wakes are retried independently of producers. 20s keeps
+/// direct API producers responsive without turning a down API or absent lead
+/// into a hot loop.
+const QUEUE_WAKE_SWEEP_SECS: u64 = 20;
+const QUEUE_WAKE_BACKOFF_CAP_SECS: u64 = 300;
+
 /// How often (seconds) the auth/wedge pass re-reads a given task's transcript
 /// tail. The pass runs every tick (250 ms) but tail reads are file I/O +
 /// JSON parsing; per-task throttling keeps the steady-state cost at one small
@@ -277,6 +283,12 @@ pub struct ContinuousScheduler {
     /// the LAST GOOD snapshot across a fetch failure. In-memory only — a
     /// restart just re-polls.
     queue_depths: Mutex<HashMap<String, DepthCacheEntry>>,
+    /// Queue-wake sweep throttle/backoff: queue -> (next attempt, failures).
+    queue_wake_retries: Mutex<HashMap<String, (u64, u32)>>,
+    last_queue_wake_sweep: AtomicU64,
+    /// Bound queues are intentionally handed from the legacy scheduler to the
+    /// lead. Log that handoff once per queue, not once per scheduler tick.
+    bound_queue_warnings: Mutex<HashSet<String>>,
     /// Account-block/wedge transcript-probe throttle: `task_id -> last probe ts`
     /// ([`TAIL_PROBE_INTERVAL_SECS`]). In-memory only.
     probe_at: Mutex<HashMap<String, u64>>,
@@ -347,6 +359,9 @@ impl ContinuousScheduler {
             panic_record: Arc::new(Mutex::new(None)),
             stall_alerts: Mutex::new(HashMap::new()),
             queue_depths: Mutex::new(HashMap::new()),
+            queue_wake_retries: Mutex::new(HashMap::new()),
+            last_queue_wake_sweep: AtomicU64::new(0),
+            bound_queue_warnings: Mutex::new(HashSet::new()),
             probe_at: Mutex::new(HashMap::new()),
             evidence_warnings: Mutex::new(HashMap::new()),
             transient_pool: Mutex::new(HashMap::new()),
@@ -445,6 +460,8 @@ impl ContinuousScheduler {
     pub fn tick_once(&self) {
         // Operator stop notices remain usable with scheduled fires disabled.
         // The notifier separately respects host restart drain/quiescence.
+        let now = task::now_unix();
+        self.sweep_bound_queue_wakes(now);
         crate::control::continuous_drain::queue_notices(&self.state, &task::load_all());
         // Master on/off (read under a brief lock). lib.rs still constructs +
         // starts the thread when disabled; the tick is just a no-op.
@@ -457,8 +474,6 @@ impl ContinuousScheduler {
                 return;
             }
         }
-
-        let now = task::now_unix();
 
         // (a) RESTART RECONCILIATION — closes the Phase-2 in_flight-leak
         // residual. Runs BEFORE the load below so (c)/(d) see post-reconcile
@@ -644,6 +659,33 @@ impl ContinuousScheduler {
             entry.last_attempt_at = now;
             match fetched {
                 Ok(stats) => {
+                    if !scheduler_should_consume_queue(&stats) {
+                        let binding = stats.binding.as_ref().expect("bound queue has binding");
+                        let consumer = binding["consumer"].as_str().unwrap_or("unknown");
+                        let first = self
+                            .bound_queue_warnings
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(q.clone());
+                        if first {
+                            eprintln!(
+                                "cm-daemon: continuous scheduler skipping bound queue '{}' — \
+                                 handed to lead consumer '{}'",
+                                q, consumer,
+                            );
+                        }
+                        // A bound queue is no longer scheduler-owned. Do not
+                        // retain a depth snapshot that could fire it after a
+                        // transient API response, and do not turn this into a
+                        // per-tick error/backoff loop.
+                        entry.good = None;
+                        entry.last_error_log_at = 0;
+                        continue;
+                    }
+                    self.bound_queue_warnings
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&q);
                     let depth = QueueDepth {
                         pending: stats.pending,
                         oldest_pending_at: stats.oldest_pending_unix(),
@@ -684,6 +726,105 @@ impl ContinuousScheduler {
             }
         }
         out
+    }
+
+    /// Retry native wakes for producers that POST directly to the planning API
+    /// (or for an inline wake that ran while the lead was absent). The API's
+    /// `wake_id` is the durable coalescing key; the sweep never creates a
+    /// second wake for a still-pending burst.
+    fn sweep_bound_queue_wakes(&self, now: u64) {
+        let previous = self.last_queue_wake_sweep.load(Ordering::Relaxed);
+        if now.saturating_sub(previous) < QUEUE_WAKE_SWEEP_SECS {
+            return;
+        }
+        self.last_queue_wake_sweep.store(now, Ordering::Relaxed);
+
+        let (api_url, api_token) = {
+            let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            (s.config.api_url.clone(), s.config.api_token.clone())
+        };
+        let Ok(client) = crate::continuous::queue::QueueClient::from_overrides(
+            Some(&api_url), Some(&api_token),
+        ) else {
+            return;
+        };
+        let snapshot = match client.list() {
+            Ok(value) => value,
+            Err(e) => {
+                eprintln!("cm-daemon: bound queue wake sweep could not list queues: {}", e.to_method_err().1);
+                return;
+            }
+        };
+        let Some(queues) = snapshot["queues"].as_array() else { return; };
+        for row in queues {
+            if row["pending"].as_u64().unwrap_or(0) == 0
+                || row["wake_pending"] != true
+                || !matches!(row["wake_delivery"].as_str(), Some("pending" | "failed"))
+            {
+                continue;
+            }
+            let Some(queue) = row["queue"].as_str() else { continue; };
+            let Some(consumer) = row["binding"]["consumer"].as_str() else { continue; };
+            let Some(wake_id) = row["wake_id"].as_str() else { continue; };
+            {
+                let retries = self.queue_wake_retries.lock().unwrap_or_else(|p| p.into_inner());
+                if retries.get(queue).is_some_and(|(next, _)| *next > now) {
+                    continue;
+                }
+            }
+
+            let uid = crate::items::org::cached_member_session(consumer).filter(|uid| {
+                self.state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .sessions
+                    .contains_key(uid)
+            });
+            let has_uid = uid.is_some();
+            let root = self
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .messaging_root
+                .clone();
+            let marker = format!("[cm-queue {queue}]");
+            let text = format!(
+                "{marker} Queue '{queue}' has {} pending item(s). Read the queue and claim work if it is yours.",
+                row["pending"].as_u64().unwrap_or(0),
+            );
+            let delivered = match uid {
+                Some(uid) => crate::notifications::publish(
+                    &root,
+                    &uid,
+                    wake_id,
+                    "cm",
+                    &text,
+                    &marker,
+                )
+                .is_ok(),
+                None => false,
+            };
+            let receipt = client.record_wake(
+                queue,
+                delivered,
+                (!delivered).then_some(if has_uid {
+                    "native notification publish failed"
+                } else {
+                    "bound consumer has no live main session"
+                }),
+            );
+            if let Err(e) = receipt {
+                eprintln!("cm-daemon: bound queue wake receipt for '{}' failed: {}", queue, e.to_method_err().1);
+            }
+            let mut retries = self.queue_wake_retries.lock().unwrap_or_else(|p| p.into_inner());
+            if delivered {
+                retries.remove(queue);
+            } else {
+                let failures = retries.get(queue).map(|(_, n)| *n).unwrap_or(0).saturating_add(1);
+                let backoff = queue_wake_backoff(failures);
+                retries.insert(queue.to_string(), (now.saturating_add(backoff), failures));
+            }
+        }
     }
 
     /// Test-only: canned per-queue pending depths for the Consumer due-check
@@ -2577,6 +2718,16 @@ impl ContinuousScheduler {
     }
 }
 
+fn scheduler_should_consume_queue(stats: &crate::continuous::queue::QueueStats) -> bool {
+    stats.binding.is_none()
+}
+
+fn queue_wake_backoff(failures: u32) -> u64 {
+    QUEUE_WAKE_SWEEP_SECS
+        .saturating_mul(1u64 << failures.min(4))
+        .min(QUEUE_WAKE_BACKOFF_CAP_SECS)
+}
+
 /// A durable account block is active only while it still names the current
 /// `Running` run. Stale markers from an older terminal run are inert and the
 /// next successful fire clears them.
@@ -3292,6 +3443,21 @@ mod tests {
         assert_eq!(backoff_secs(100, 5), 3200);
         assert_eq!(backoff_secs(100, 6), BACKOFF_CAP_SECS); // 6400 -> capped
         assert_eq!(backoff_secs(100, 30), BACKOFF_CAP_SECS); // no overflow panic
+    }
+
+    #[test]
+    fn bound_queue_is_handed_to_lead_and_wake_retries_back_off() {
+        let unbound: crate::continuous::queue::QueueStats = serde_json::from_value(serde_json::json!({
+            "pending": 1, "claimed": 0, "oldest_pending_at": null
+        })).unwrap();
+        let bound: crate::continuous::queue::QueueStats = serde_json::from_value(serde_json::json!({
+            "pending": 1, "claimed": 0, "oldest_pending_at": null,
+            "binding": {"consumer": "ingest"}
+        })).unwrap();
+        assert!(scheduler_should_consume_queue(&unbound));
+        assert!(!scheduler_should_consume_queue(&bound));
+        assert_eq!(queue_wake_backoff(1), QUEUE_WAKE_SWEEP_SECS * 2);
+        assert_eq!(queue_wake_backoff(99), QUEUE_WAKE_BACKOFF_CAP_SECS);
     }
 
     /// A compact-only fire (`FiredCompact`) advances like a success but floors

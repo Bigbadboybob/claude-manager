@@ -342,6 +342,10 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # shared transport between producers and the consuming task.
     "enqueue",
     "queue.stats",
+    "queue.list",
+    "queue.bind",
+    "queue.claim",
+    "queue.ack",
     # Cloud auto-backtest: `backtest.submit` lands a kind='backtest' planning
     # row via the daemon's planning creds (propose_task-like openness: any
     # bound session may submit; the dispatcher gates execution), and
