@@ -40,6 +40,7 @@ in purpose, but deliberately **not** in mechanism (see below).
 3. **Inactive accounts show last-known usage (option "a").** The tool does
    not refresh inactive accounts' tokens or poll them. It shows the last
    reading taken while each account was active, plus its known reset times.
+   *Superseded for pool logins on 2026-11-15, see "Shared login pool".*
 4. Test and develop on the **laptop** first, not cm-sessions/cm-manager,
    so active sessions on the cloud hosts are not disturbed.
 
@@ -470,6 +471,50 @@ account, plus one scratch `login` for each other account it may use.
 the sweep, hub and alert-routing rules each fail a test when broken.
 The coordinator's separate config directory: dropped (cm-manager's one
 account serves both). Real checks happen at cutover, below.
+
+## Shared login pool (Owner, 2026-11-15)
+
+Owner, 2026-11-15:
+
+> Claude LB should have the ability to use any of the 20 accounts on any of
+> the machines, and then we'll set the rules around which accounts are gonna
+> be used where
+
+Owner chose a shared pool over logging each account in on every machine ("let's just do shared pool").
+
+Then:
+
+> Always use accounts up to 99%. Last 1% is margin for transfer. But never
+> leave accounts with >1% left.
+
+Owner's context: most accounts are full at any time, and about 3 accounts are burnt a day.
+
+**Mechanism** (`hub policy pool on`):
+
+- **Hosts hand unused logins to the hub.** The pool lives in `hub/pool/` on cm-manager (0700/0600; never in reports, state or events).
+- **The hub lends a login to one host at a time.** It lends when a host is pinned to that account, or, in auto mode, when the host's account reaches the switch point.
+- **A lend is final once the host lists the account.** A lend the host never confirms goes back to the pool.
+- **Stale copies are refused.** The hub keeps a fingerprint (a truncated sha256, never the token) of every login it lends. A returned copy of a login already lent to another host is refused, and that host deletes its copy.
+- **Recently used accounts stay put.** An account used in the last 30 min stays on its host.
+- **Separate logins can coexist.** Each `/login` creates a separate login, so the pool may hold one for an account that a host also holds its own login for. Automatic lending skips accounts that another host is running on.
+
+**Which account is lent:**
+
+- Only accounts with a usage reading are lent. A reading older than 3 h that has not passed a reset counts as no reading. (11-15 06:58Z incident: an unread account turned out to be rate limited, and about 14 sessions stopped.)
+- Only accounts below the switch point are lent. It is 99% for every limit (`hub policy thresholds.weekly 99`, `thresholds.session 99`).
+- Among those, the account whose weekly limit resets soonest goes first.
+- A host reads its usage every ~100 s once any limit is at 95% or more.
+- The dwell is 10 min, with at most 24 automatic switches a day.
+
+**Hub upkeep, replacing decision 3 for pool logins only:**
+
+- **Usage reads:** on its own poll, the hub reads usage for up to 3 pool logins per run, each at most every 30 min.
+- **Renewals:** it also renews up to 2 pool logins per run that expire within 30 min, using Claude Code's token endpoint, client ID and stored scopes. No Claude Code process holds a pool login, so the rotation cannot race anything.
+- **While renewing:** the login sits in `pool/renewing/`, where it cannot be lent.
+- **Refusals:** a refused renewal marks the login `needs_login`.
+- **Known gap:** a crash after the server rotated the token but before the new one is saved loses that login, which then needs a new `/login`.
+
+**Compliance note:** the pool stores and renews the subscription logins centrally, on Owner's own machines and for Owner's own accounts. See the quote from Anthropic's compliance page under "Background".
 
 ## Cutover runbook (target 2026-11-10 13:00Z)
 

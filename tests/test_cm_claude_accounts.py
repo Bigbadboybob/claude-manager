@@ -387,6 +387,9 @@ class PollHarness(Harness):
             return self.usage[token]
 
         self.enterContext(mock.patch.object(accounts, "fetch_usage", side_effect=fetch))
+        # Never reach Anthropic's token endpoint from a test.
+        self.enterContext(mock.patch.object(accounts, "refresh_login",
+                                            side_effect=accounts.AccountError("no token renewal in tests")))
         # Most tests read usage on every poll; UsageIntervalTests covers the cache.
         self.enterContext(mock.patch.object(accounts, "USAGE_INTERVAL_SECONDS", 0))
 
@@ -1302,7 +1305,7 @@ class PoolTests(HubHarness):
         self.assertIn(previous, self.saved_here())
 
     def test_auto_borrows_the_pool_account_with_most_room(self):
-        self.set_reading("bob", ("weekly_all", None, 40, 86400, True), hub="cm-manager", host_name="laptop")
+        self.set_reading("bob", ("weekly_all", None, 40, 2 * 86400, True), hub="cm-manager", host_name="laptop")
         self.set_reading("carol", ("weekly_all", None, 10, 86400, True), hub="cm-manager", host_name="laptop")
         self.poll()
         self.assertEqual(self.hub("assign", "laptop", "alice@example.com", "--auto")[0], 0)
@@ -1427,7 +1430,7 @@ class PoolTests(HubHarness):
         out = io.StringIO()
         accounts.read_pool_usage(self.hub_paths, out)
         self.assertIn("pool usage bob@example.com: week 20%", out.getvalue())
-        self.assertNotIn("carol", out.getvalue())  # expired access token: not read, never refreshed
+        self.assertNotIn("pool usage carol", out.getvalue())  # expired access token: never used to read
         cache = json.loads((self.hub_paths.store / "hub" / "readings.json").read_text())
         self.assertEqual(cache["bob-uuid-0000"]["host"], "pool")
 
@@ -1440,6 +1443,57 @@ class PoolTests(HubHarness):
         code, text = self.poll()
         self.assertIn("backing off", text)
         self.assertEqual(self.state()["active"], "carol-uuid-0000")
+
+    def candidates(self):
+        with accounts.Hub(self.hub_paths) as h:
+            return [c[1] for c in accounts.pool_candidates(h, "laptop", h.reports(), time.time())]
+
+    def test_the_account_resetting_soonest_goes_first(self):
+        # Owner 11-15: use every account to 99%; room left at a reset is lost.
+        self.set_reading("bob", ("weekly_all", None, 40, 5 * 86400, True), hub="cm-manager", host_name="laptop")
+        self.set_reading("carol", ("weekly_all", None, 80, 86400, True), hub="cm-manager", host_name="laptop")
+        self.poll()
+        self.poll()
+        self.assertEqual(self.candidates(), ["carol-uuid-0000", "bob-uuid-0000"])
+
+    def test_switch_point_is_99_percent_and_old_readings_do_not_count(self):
+        self.hub("policy", "thresholds.weekly", "99")
+        self.set_reading("bob", ("weekly_all", None, 98, 86400, True), hub="cm-manager", host_name="laptop")
+        self.set_reading("carol", ("weekly_all", None, 10, 2 * 86400, True), age=4 * 3600,
+                         hub="cm-manager", host_name="laptop")
+        self.poll()
+        self.poll()
+        self.assertEqual(self.candidates(), ["bob-uuid-0000"])  # 1-2% left still counts; carol's number is 4h old
+
+    def test_the_hub_renews_pool_logins_before_they_expire(self):
+        self.poll()
+        self.poll()
+        pool = self.hub_paths.store / "hub" / "pool"
+        for path in pool.glob("*.json"):
+            rec = json.loads(path.read_text())
+            rec["claudeAiOauth"]["expiresAt"] = int(time.time() * 1000) + 60_000  # expires in a minute
+            path.write_text(json.dumps(rec))
+        self.tokens.update(["sk-ant-oat-RENEWED-bob", "sk-ant-ort-RENEWED-bob"])
+
+        def renew(oauth):
+            if "bob" not in oauth["refreshToken"]:
+                raise accounts.TokenRejected("the login was refused (HTTP 400); it needs a new /login")
+            return {**oauth, "accessToken": "sk-ant-oat-RENEWED-bob", "refreshToken": "sk-ant-ort-RENEWED-bob",
+                    "expiresAt": int(time.time() * 1000) + 8 * 3600_000}
+
+        self.usage["sk-ant-oat-RENEWED-bob"] = usage(("weekly_all", None, 30, 86400, True))
+        out = io.StringIO()
+        with mock.patch.object(accounts, "refresh_login", side_effect=renew):
+            accounts.read_pool_usage(self.hub_paths, out)
+        self.assertIn("pool login renewed: bob@example.com", out.getvalue())
+        self.assertIn("pool usage bob@example.com: week 30%", out.getvalue())
+        with accounts.Hub(self.hub_paths) as h:
+            pool_now = h.pool()
+        self.assertEqual(pool_now["bob-uuid-0000"]["claudeAiOauth"]["refreshToken"], "sk-ant-ort-RENEWED-bob")
+        self.assertTrue(pool_now["carol-uuid-0000"].get("needs_login"))  # refused: never lent
+        self.assertEqual(list((pool / "renewing").glob("*")), [])
+        self.assertIn("carol@example.com: the login was refused", self.hub("history")[1])
+        self.files_outside_pool_have_no_tokens()
 
     def test_a_blank_host_borrows_its_first_login(self):
         self.poll()
@@ -1702,11 +1756,16 @@ class UsageIntervalTests(HubHarness):
             _, fresh = self.poll()
             self.assertNotIn("cached", fresh)
             state = self.state()
-            state["usage"]["alice-uuid-0000"]["at"] -= 3 * 60
+            state["usage"]["alice-uuid-0000"]["at"] -= 70  # alice is at 95%: re-read after 100 s
             self.paths.state.write_text(json.dumps(state))
             _, cached = self.poll()
             self.assertEqual(len(self.usage_calls), 1)
-            self.assertIn("(cached, read 3m ago)", cached)
+            self.assertIn("(cached, read 1m ago)", cached)
+            state = self.state()
+            state["usage"]["alice-uuid-0000"]["at"] -= 60
+            self.paths.state.write_text(json.dumps(state))
+            self.poll()  # 130 s old and near the limit: read again, well before 9 min
+            self.assertEqual(len(self.usage_calls), 2)
 
     def test_check_in_continues_while_backing_off(self):
         self.usage_error = accounts.RateLimited("usage requests are rate limited (HTTP 429)")

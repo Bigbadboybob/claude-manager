@@ -351,6 +351,8 @@ NEW_PERIOD_SECONDS = 3600
 DEFAULT_NOTIFY = Path.home() / ".cm/bin/cm-notify"
 # The timer runs every 2 min (hub check-ins); usage is read at most this often.
 USAGE_INTERVAL_SECONDS = 9 * 60
+NEAR_LIMIT_PERCENT = 95
+NEAR_LIMIT_INTERVAL_SECONDS = 100
 
 
 def fetch_usage(access_token: str) -> dict:
@@ -1325,51 +1327,130 @@ def hub_checkin(hub: Hub, export: dict) -> dict:
     return reply
 
 
-POOL_DWELL_SECONDS = DEFAULT_MIN_DWELL_MINUTES * 60
+# Accounts are used to 99% (Owner 11-15), so an account with little room
+# left can run out soon after a switch: a short dwell, more switches a day.
+POOL_DWELL_SECONDS = 10 * 60
+POOL_MAX_SWITCHES_PER_DAY = 24
 POOL_READ_INTERVAL_SECONDS = 30 * 60
+POOL_READING_STALE_SECONDS = 3 * 3600
 POOL_READS_PER_RUN = 3
+POOL_REFRESHES_PER_RUN = 2
+POOL_REFRESH_BEFORE_SECONDS = 30 * 60
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"  # Claude Code 2.1.325
+OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
+
+def refresh_login(oauth: dict) -> dict:
+    """Renew a login the way Claude Code does. Only ever called on a pool
+    login, which nothing else holds, so the rotation cannot race anyone."""
+    body = {"grant_type": "refresh_token", "refresh_token": oauth["refreshToken"],
+            "client_id": OAUTH_CLIENT_ID}
+    if oauth.get("scopes"):
+        body["scope"] = " ".join(oauth["scopes"])
+    req = urllib.request.Request(TOKEN_URL, data=json.dumps(body).encode(), method="POST", headers={
+        "Content-Type": "application/json", "User-Agent": "cm-claude-accounts"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.load(resp)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            raise RateLimited("token refresh rate limited (HTTP 429)", None) from None
+        if exc.code in (400, 401, 403):
+            raise TokenRejected(f"the login was refused (HTTP {exc.code}); it needs a new /login") from None
+        raise AccountError(f"token refresh failed (HTTP {exc.code})") from None
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        raise AccountError(f"could not reach Anthropic to renew a login ({type(exc).__name__})") from None
+    if not isinstance(data, dict) or not data.get("access_token") or not data.get("expires_in"):
+        raise AccountError("token refresh response was not understood")
+    now_ms = int(time.time() * 1000)
+    new = {**oauth, "accessToken": data["access_token"],
+           "refreshToken": data.get("refresh_token") or oauth["refreshToken"],
+           "expiresAt": now_ms + int(data["expires_in"]) * 1000}
+    if data.get("refresh_token_expires_in"):
+        new["refreshTokenExpiresAt"] = now_ms + int(data["refresh_token_expires_in"]) * 1000
+    if isinstance(data.get("scope"), str):
+        new["scopes"] = data["scope"].split()
+    return new
 
 
 def read_pool_usage(paths: Paths, out) -> None:
-    """On the hub host: read usage for a few pool logins per run, so lending
-    has real numbers. Uses a pool login's access token only while it is
-    still valid; never refreshes (no Claude Code holds a pool login, but a
-    refresh that rotates and then fails to save would lose it). The network
-    calls run outside the hub lock."""
+    """On the hub host, keep the pool's numbers current: renew a few logins
+    whose access token is about to expire, and read usage for a few whose
+    reading is old. A login being renewed sits in pool/renewing, where it
+    cannot be lent; network calls run outside the hub lock."""
     now = time.time()
     with Hub(paths) as hub:
         if not hub.desired["policy"].get("pool"):
             return
+        renewing = hub.pool_dir / "renewing"
+        renewing.mkdir(parents=True, exist_ok=True, mode=0o700)
+        for path in renewing.glob("*.json"):  # left by a crash: put it back
+            if now - path.stat().st_mtime > 600 and not (hub.pool_dir / path.name).exists():
+                os.rename(path, hub.pool_dir / path.name)
         meta = load_json(hub.dir / "pool-reads.json")
         if meta.get("backoff_until", 0) > now:
             return
         cache = load_json(hub.dir / "readings.json")
-        due = []
+        renew, read = [], []
         for uuid, rec in hub.pool().items():
+            if rec.get("needs_login"):
+                continue
             expires = rec["claudeAiOauth"].get("expiresAt")
-            if not isinstance(expires, (int, float)) or expires / 1000 <= now + 60:
-                continue
-            if now - (cache.get(uuid) or {}).get("at", 0) < POOL_READ_INTERVAL_SECONDS:
-                continue
-            due.append(((cache.get(uuid) or {}).get("at", 0), uuid, rec["claudeAiOauth"]["accessToken"],
-                        rec["oauthAccount"].get("emailAddress") or uuid[:8]))
-    results, backoff = {}, None
-    for _, uuid, token, email in sorted(due)[:POOL_READS_PER_RUN]:
+            stale = now - (cache.get(uuid) or {}).get("at", 0) >= POOL_READ_INTERVAL_SECONDS
+            if not isinstance(expires, (int, float)) or expires / 1000 <= now + POOL_REFRESH_BEFORE_SECONDS:
+                renew.append(((cache.get(uuid) or {}).get("at", 0), uuid))
+            elif stale:
+                read.append(((cache.get(uuid) or {}).get("at", 0), uuid, rec))
+        jobs = []
+        for _, uuid in sorted(renew)[:POOL_REFRESHES_PER_RUN]:
+            os.rename(hub.pool_dir / f"{uuid}.json", renewing / f"{uuid}.json")
+            jobs.append((uuid, load_json(renewing / f"{uuid}.json"), True))
+        for _, uuid, rec in sorted(read)[:POOL_READS_PER_RUN]:
+            jobs.append((uuid, rec, False))
+    readings, renewed, refused, backoff = {}, {}, {}, None
+    for uuid, rec, renew_it in jobs:
+        email = rec["oauthAccount"].get("emailAddress") or uuid[:8]
+        oauth = rec["claudeAiOauth"]
         try:
-            limits = parse_limits(fetch_usage(token))
+            if renew_it:
+                oauth = refresh_login(oauth)
+                renewed[uuid] = {**rec, "claudeAiOauth": oauth, "updated_at": int(time.time())}
+                print(f"pool login renewed: {email}", file=out)
+            limits = parse_limits(fetch_usage(oauth["accessToken"]))
         except RateLimited as exc:
             backoff = now + max(exc.retry_after or 0, RATE_LIMIT_BACKOFF_SECONDS)
-            break
+            continue
+        except TokenRejected as exc:
+            if renew_it and uuid not in renewed:
+                refused[uuid] = str(exc)
+            print(f"pool login {email}: {exc}", file=out)
+            continue
         except AccountError as exc:
-            print(f"pool usage for {email}: {exc}", file=out)
+            print(f"pool login {email}: {exc}", file=out)
             continue
         if limits:
-            results[uuid] = {"at": int(now), "limits": limits, "host": "pool"}
+            readings[uuid] = {"at": int(time.time()), "limits": limits, "host": "pool"}
             print(f"pool usage {email}: " + ", ".join(f"{limit_name(l)} {l['percent']:.0f}%"
                                                       for l in limits), file=out)
     with Hub(paths) as hub:
+        renewing = hub.pool_dir / "renewing"
+        for uuid, rec, renew_it in jobs:
+            if not renew_it:
+                continue
+            held = renewing / f"{uuid}.json"
+            record = renewed.get(uuid) or load_json(held)
+            if uuid in refused:
+                record["needs_login"] = True
+                hub.event("pool", f"{record['oauthAccount'].get('emailAddress') or uuid[:8]}: "
+                                  f"{refused[uuid]}")
+            if (hub.pool_dir / f"{uuid}.json").exists():
+                hub.event("pool", f"{uuid[:8]}: a host returned another login while this one "
+                                  "was renewed; kept the returned one")
+            else:
+                hub.pool_put(record)
+            held.unlink(missing_ok=True)
         cache = load_json(hub.dir / "readings.json")
-        for uuid, reading in results.items():
+        for uuid, reading in readings.items():
             if reading["at"] > (cache.get(uuid) or {}).get("at", 0):
                 cache[uuid] = reading
         atomic_write(hub.dir / "readings.json", cache)
@@ -1459,18 +1540,26 @@ def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -
                 continue
             last_resort = True
         reading = readings.get(uuid)
-        if not reading and not d["policy"].get("auto_allow_unread"):
-            continue  # never move a host onto an account nobody has read (11-15 06:58Z)
-        if reading and over_threshold(reading.get("limits") or [], config, now, for_switch=True):
-            continue
         live = [l for l in (reading or {}).get("limits", [])
                 if not (l.get("resets_at") is not None and l["resets_at"] <= now)]
+        if reading and live and now - reading.get("at", 0) > POOL_READING_STALE_SECONDS:
+            # Usage is per account and other logins of it may be in use
+            # elsewhere: an old number that has not reset yet is no number.
+            reading = None
+        if not reading and not d["policy"].get("auto_allow_unread"):
+            continue  # never move a host onto an account nobody has read (11-15 06:58Z)
+        if reading and over_threshold(live, config, now, for_switch=True):
+            continue
         ratio = max((l["percent"] / threshold_for(l, config) for l in live), default=0.0) \
             if reading else 0.5
         why = "not read yet" if not reading else (
             f"{limit_name(max(live, key=lambda l: l['percent'] / threshold_for(l, config)))} "
             f"{max(l['percent'] for l in live):.0f}%" if live else "likely refilled")
-        out.append(((last_resort, ratio, rec["oauthAccount"].get("emailAddress") or uuid), uuid, why))
+        # Owner 11-15: use every account to 99%; room left at a reset is
+        # lost, so the account whose weekly limit resets soonest goes first.
+        weekly = [l["resets_at"] for l in live if l.get("group") == "weekly" or l["kind"].startswith("weekly")]
+        resets = min((r for r in weekly if r is not None), default=float("inf"))
+        out.append(((last_resort, resets, ratio, rec["oauthAccount"].get("emailAddress") or uuid), uuid, why))
     return sorted(out)
 
 
@@ -1491,7 +1580,7 @@ def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: 
         over = over_threshold(reading.get("limits") or [], config, now, for_switch=True) if active else []
         needs = not active or over
         waited = now - (export.get("last_switch_at") or 0) >= POOL_DWELL_SECONDS
-        capped = (export.get("auto_switches_24h") or 0) >= DEFAULT_MAX_AUTO_SWITCHES_PER_DAY
+        capped = (export.get("auto_switches_24h") or 0) >= POOL_MAX_SWITCHES_PER_DAY
         if needs and waited and not capped:
             cands = pool_candidates(hub, host, reports, now)
             if cands:
@@ -2109,6 +2198,8 @@ def poll_usage(paths: Paths, state: dict, accounts: dict[str, dict], out, alert,
     reading = (state.get("usage") or {}).get(uuid)
     interval = (state.get("config") or {}).get("usage_interval_minutes")
     interval = interval * 60 if isinstance(interval, (int, float)) else USAGE_INTERVAL_SECONDS
+    if reading and any(l.get("percent", 0) >= NEAR_LIMIT_PERCENT for l in reading.get("limits") or []):
+        interval = min(interval, NEAR_LIMIT_INTERVAL_SECONDS)  # switches land at 99% (Owner 11-15)
     if reading and reading.get("limits") and time.time() - reading["at"] < interval:
         return 0, reading["limits"]  # read recently: spare the endpoint's budget
     # A 429 backoff stops usage reads only: a new login is still noticed above,
