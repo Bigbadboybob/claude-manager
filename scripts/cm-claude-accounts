@@ -977,6 +977,8 @@ MODES = ("pin", "auto", "manual")
 # Swarm-Coord for Owner, 2026-11-10; the coordinator edits it as Owner names priorities.
 DEFAULT_CRITICAL = ["trading system: live and real-money work", "the account coordinator itself"]
 DEFAULT_LOW_ROOM_ACCOUNTS = 1
+DEFAULT_SWITCH_ON_SCOPED = True
+DEFAULT_MIN_LEND_ROOM = 5.0
 
 
 def host_name(state: dict) -> str:
@@ -1325,9 +1327,12 @@ def hub_checkin(hub: Hub, export: dict) -> dict:
     atomic_write(hub.dir / "readings.json", cache)
     hub_check_low(hub, reports, now)
     d = hub.desired
+    reply_policy = {**d["policy"],
+                    "switch_on_scoped": d["policy"].get("switch_on_scoped", DEFAULT_SWITCH_ON_SCOPED),
+                    "min_lend_room": d["policy"].get("min_lend_room", DEFAULT_MIN_LEND_ROOM)}
     reply = {"version": HUB_VERSION, "revision": d["revision"], "host": host,
              "entry": d["hosts"].get(host), "reservations": d["reservations"],
-             "draining": d["draining"], "policy": d["policy"],
+             "draining": d["draining"], "policy": reply_policy,
              "readings": hub_readings(reports), "returned": returned, "discard": discard,
              "hosts": {h: {"active": (r.get("export") or {}).get("active"), "at": r.get("at")}
                        for h, r in reports.items() if h != POOL}}
@@ -1551,12 +1556,17 @@ def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -
     """Pool accounts this host may borrow, best first: not draining, not
     reserved for others (a last-resort reservation ranks last), with room."""
     d = hub.desired
-    config = {"thresholds": d["policy"].get("thresholds") or {}}
+    policy = d["policy"]
+    leftover_hosts = set(policy.get("leftover_hosts") or [])
+    leftover = host in leftover_hosts
+    config = {"thresholds": policy.get("thresholds") or {},
+              "switch_on_scoped": policy.get("switch_on_scoped", DEFAULT_SWITCH_ON_SCOPED)
+              and not leftover}
     readings = {**load_json(hub.dir / "readings.json"), **hub_readings(reports)}
     running = {(r.get("export") or {}).get("active") for h, r in reports.items()
                if h not in (host, POOL) and now - r.get("at", 0) <= HUB_REPORT_FRESH_SECONDS}
-    leftover_hosts = set(d["policy"].get("leftover_hosts") or [])
-    leftover_room = float(d["policy"].get("leftover_room", DEFAULT_LEFTOVER_ROOM))
+    leftover_room = float(policy.get("leftover_room", DEFAULT_LEFTOVER_ROOM))
+    min_lend_room = float(policy.get("min_lend_room", DEFAULT_MIN_LEND_ROOM))
     out = []
     for uuid, rec in hub.pool().items():
         if uuid in d["draining"] or uuid in running \
@@ -1580,11 +1590,14 @@ def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -
             continue  # never move a host onto an account nobody has read (11-15 06:58Z)
         if reading and over_threshold(live, config, now, for_switch=True):
             continue
-        ratio = max((l["percent"] / threshold_for(l, config) for l in live), default=0.0) \
+        counted = [l for l in live if l["kind"] in ("session", "weekly_all")
+                   or config.get("switch_on_scoped")]
+        ranked_limits = live if leftover else counted
+        ratio = max((l["percent"] / threshold_for(l, config) for l in ranked_limits), default=0.0) \
             if reading else 0.5
         why = "not read yet" if not reading else (
-            f"{limit_name(max(live, key=lambda l: l['percent'] / threshold_for(l, config)))} "
-            f"{max(l['percent'] for l in live):.0f}%" if live else "likely refilled")
+            f"{limit_name(max(ranked_limits, key=lambda l: l['percent'] / threshold_for(l, config)))} "
+            f"{max(l['percent'] for l in ranked_limits):.0f}%" if ranked_limits else "likely refilled")
         # Owner 11-15: use every account to 99%; room left at a reset is
         # lost, so the account whose weekly limit resets soonest goes first.
         weekly = [l["resets_at"] for l in live if l.get("group") == "weekly" or l["kind"].startswith("weekly")]
@@ -1593,15 +1606,20 @@ def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -
         # locally"), so a leftovers host takes the account with the LEAST room
         # that still has leftover_room% left, keeping roomy accounts for the
         # cloud hosts; accounts with less than that rank after.
-        if host in leftover_hosts and reading:
-            blocking = [l for l in live if l["kind"] in ("session", "weekly_all")]
-            room = min((threshold_for(l, config) - l["percent"] for l in blocking), default=100.0)
-            order = (room < leftover_room, room if room >= leftover_room else -room)
+        if leftover:
+            if reading:
+                blocking = [l for l in live if l["kind"] in ("session", "weekly_all")]
+                room = min((threshold_for(l, config) - l["percent"] for l in blocking), default=100.0)
+                order = (room < leftover_room, room if room >= leftover_room else -room, resets)
+            else:
+                order = (False, 0.0, resets)
         else:
-            order = (False, 0.0)
+            room = min((threshold_for(l, config) - l["percent"] for l in counted), default=100.0) \
+                if reading else 100.0
+            order = (room < min_lend_room, resets)
         # An account reserved for this host is its next account (Owner 11-15:
         # "F finishes out bender7, then moves to bender4").
-        out.append(((last_resort, not mine, *order, resets, ratio,
+        out.append(((last_resort, not mine, *order, ratio,
                      rec["oauthAccount"].get("emailAddress") or uuid), uuid, why))
     return sorted(out)
 
@@ -1618,7 +1636,10 @@ def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: 
             and entry["account"] not in held and entry["account"] in pool:
         target, reason = entry["account"], f"pinned (rev {hub.desired['revision']})"
     elif entry.get("mode") == "auto":
-        config = {"thresholds": hub.desired["policy"].get("thresholds") or {}}
+        policy = hub.desired["policy"]
+        config = {"thresholds": policy.get("thresholds") or {},
+                  "switch_on_scoped": policy.get("switch_on_scoped", DEFAULT_SWITCH_ON_SCOPED)
+                  and host not in set(policy.get("leftover_hosts") or [])}
         reading = ((export.get("accounts") or {}).get(active) or {}).get("reading") or {}
         over = over_threshold(reading.get("limits") or [], config, now, for_switch=True) if active else []
         res = hub.desired["reservations"].get(active) if active else None
@@ -1820,9 +1841,12 @@ def hub_status_view(hub: Hub, now: float) -> dict:
                        "reservation_note": (d["reservations"].get(uuid) or {}).get("note"),
                        "last_resort": bool((d["reservations"].get(uuid) or {}).get("last_resort")),
                        "draining": uuid in d["draining"]}
+    policy = {**d["policy"],
+              "switch_on_scoped": d["policy"].get("switch_on_scoped", DEFAULT_SWITCH_ON_SCOPED),
+              "min_lend_room": d["policy"].get("min_lend_room", DEFAULT_MIN_LEND_ROOM)}
     return {"revision": d["revision"], "hosts": hosts, "accounts": accts,
             "critical": d["policy"].get("critical", []),
-            "policy": {k: v for k, v in d["policy"].items() if k != "critical"}}
+            "policy": {k: v for k, v in policy.items() if k != "critical"}}
 
 
 def print_hub_status(view: dict, now: float, out) -> None:
@@ -1859,11 +1883,21 @@ def print_hub_status(view: dict, now: float, out) -> None:
         print(f"  {i}. {item}", file=out)
 
 
+def parse_policy_float(value: str):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if 0 <= number <= 100 else None
+
+
 HUB_POLICY_KEYS = {
     "default_mode": (lambda v: v if v in MODES else None),
     "low_room_accounts": (lambda v: int(v) if v.isdigit() else None),
     "leftover_hosts": (lambda v: [h for h in v.split(",") if h] if v != "none" else []),
     "leftover_room": (lambda v: float(v) if v.replace(".", "", 1).isdigit() else None),
+    "switch_on_scoped": (lambda v: {"true": True, "false": False}.get(v)),
+    "min_lend_room": parse_policy_float,
     "notify_command": (lambda v: v or None),
     "coordinator_command": (lambda v: v or None),
     "pool": (lambda v: {"on": True, "off": False}.get(v)),
@@ -2298,7 +2332,18 @@ def decide(paths: Paths, state: dict, accounts: dict[str, dict], limits: list[di
     uuid = state["active"]
     record = accounts[uuid]
     advice = None
-    over = over_threshold(limits, config, now, for_switch=True)
+    threshold_config = config
+    if mode == "auto" and pool_on(state):
+        policy = (last_hub_reply(state) or {}).get("policy") or {}
+        if policy:
+            threshold_config = {**config}
+            if "thresholds" in policy:
+                threshold_config["thresholds"] = policy["thresholds"]
+            if "switch_on_scoped" in policy:
+                threshold_config["switch_on_scoped"] = (
+                    policy["switch_on_scoped"]
+                    and host_name(state) not in set(policy.get("leftover_hosts") or []))
+    over = over_threshold(limits, threshold_config, now, for_switch=True)
     if mode == "pin":
         advice = "Pinned by the coordinator; it decides any switch"
     elif mode == "auto" and pool_on(state) and over:

@@ -1417,6 +1417,34 @@ class PoolTests(HubHarness):
         self.poll()
         self.assertNotEqual(self.live_token(), "sk-ant-oat-ACCESS-alice")
 
+    def prepare_auto_pool_with_scoped_reading(self):
+        self.set_reading("bob", ("weekly_all", None, 10, 2 * 86400, True))
+        self.set_reading("carol", ("weekly_all", None, 20, 3 * 86400, True))
+        self.poll()
+        self.poll()  # bob and carol go to the pool
+        self.hub("policy", "thresholds.weekly", "98")
+        self.hub("assign", "laptop", "alice@example.com", "--auto")
+        self.set_reading("alice", ("weekly_scoped", "Fable", 98, 2 * 86400, False))
+
+    def lend_for_current_export(self):
+        export = json.loads(self.run_cli("export")[1])
+        with accounts.Hub(self.hub_paths) as h:
+            return accounts.pool_lend(h, "laptop", export, h.reports(), time.time())
+
+    def test_auto_scoped_limit_lends_for_non_leftover_but_not_leftover(self):
+        self.prepare_auto_pool_with_scoped_reading()
+        self.assertEqual(self.hub("policy", "leftover_hosts", "laptop")[0], 0)
+        self.assertIsNone(self.lend_for_current_export())
+        self.assertEqual(self.hub("policy", "leftover_hosts", "default")[0], 0)
+        lend = self.lend_for_current_export()
+        self.assertIsNotNone(lend)
+        self.assertTrue(lend["switch"])
+
+    def test_auto_scoped_limit_can_be_disabled(self):
+        self.prepare_auto_pool_with_scoped_reading()
+        self.assertEqual(self.hub("policy", "switch_on_scoped", "false")[0], 0)
+        self.assertIsNone(self.lend_for_current_export())
+
     def test_the_hub_reads_pool_usage_with_valid_tokens_only(self):
         self.poll()
         self.poll()  # bob and carol in the pool
@@ -1464,6 +1492,26 @@ class PoolTests(HubHarness):
         self.poll()
         self.poll()
         self.assertEqual(self.candidates(), ["bob-uuid-0000"])  # 1-2% left still counts; carol's number is 4h old
+
+    def test_low_room_account_ranks_after_a_fresh_account(self):
+        self.hub("policy", "thresholds.weekly", "98")
+        self.set_reading("bob", ("weekly_all", None, 97, 1.4 * 86400, True),
+                         hub="cm-manager", host_name="laptop")
+        self.set_reading("carol", ("weekly_all", None, 0, 6.4 * 86400, True),
+                         hub="cm-manager", host_name="laptop")
+        self.poll()
+        self.poll()
+        self.assertEqual(self.candidates(), ["carol-uuid-0000", "bob-uuid-0000"])
+
+    def test_pool_candidates_exclude_a_full_scoped_limit(self):
+        self.hub("policy", "thresholds.weekly", "98")
+        self.set_reading("bob", ("weekly_scoped", "Fable", 98, 2 * 86400, False),
+                         hub="cm-manager", host_name="laptop")
+        self.set_reading("carol", ("weekly_all", None, 10, 3 * 86400, True),
+                         hub="cm-manager", host_name="laptop")
+        self.poll()
+        self.poll()
+        self.assertEqual(self.candidates(), ["carol-uuid-0000"])
 
     def test_the_hub_renews_pool_logins_before_they_expire(self):
         self.poll()
@@ -1736,6 +1784,17 @@ class HubTests(HubHarness):
         self.assertIn("0 of 3 have room", low[1])
 
     def test_policy_and_critical_list(self):
+        policy_text = self.hub("policy")[1]
+        self.assertIn("switch_on_scoped", policy_text)
+        self.assertIn("min_lend_room", policy_text)
+        status_policy = json.loads(self.hub("status", "--json")[1])["policy"]
+        self.assertTrue(status_policy["switch_on_scoped"])
+        self.assertEqual(status_policy["min_lend_room"], 5.0)
+        self.assertEqual(self.hub("policy", "switch_on_scoped", "false")[0], 0)
+        self.assertEqual(self.hub("policy", "min_lend_room", "7.5")[0], 0)
+        self.assertEqual(self.hub("policy", "switch_on_scoped", "maybe")[0], 1)
+        self.assertEqual(self.hub("policy", "min_lend_room", "-1")[0], 1)
+        self.assertEqual(self.hub("policy", "min_lend_room", "wat")[0], 1)
         self.assertEqual(self.hub("policy", "default_mode", "auto")[0], 0)
         self.assertEqual(self.hub("policy", "default_mode", "sometimes")[0], 1)
         self.assertEqual(self.hub("policy", "thresholds.weekly", "95")[0], 0)

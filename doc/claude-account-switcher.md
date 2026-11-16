@@ -379,7 +379,7 @@ fallback a host uses only when told to.
 | `hub reserve <account> --for <host>[,..] [--note …]` / `hub release <account>` | keep an account for named hosts (or `nobody`); auto and drains never pick it for others |
 | `hub drain <account> [--dry-run]` | stop placing work on it and pin each host using it to the best other account (most room, saved on that host, not reserved or draining, fewest hosts already on it); prints the plan |
 | `hub undrain <account>` | allow it again |
-| `hub policy <key> <value>` | thresholds, default mode, dwell, daily cap, sweep on/off |
+| `hub policy <key> <value>` | thresholds, default mode, dwell, daily cap, sweep on/off, scoped-limit switching and minimum pool lend room |
 | `hub history` | assignment changes, apply results, switches, sweeps |
 
 **Keeping switches rare:** a host moves only when the coordinator assigns
@@ -502,6 +502,8 @@ Owner's context: most accounts are full at any time, and about 3 accounts are bu
 
 - Only accounts with a usage reading are lent. A reading older than 3 h that has not passed a reset counts as no reading. (11-15 06:58Z incident: an unread account turned out to be rate limited, and about 14 sessions stopped.)
 - Only accounts below the switch point are lent. It is 99% for every limit (`hub policy thresholds.weekly 99`, `thresholds.session 99`).
+- The hub counts model-scoped limits at their family threshold by default (`hub policy switch_on_scoped false` disables that for non-leftover hosts).
+- Non-leftover hosts prefer accounts with at least 5% room on every counted limit (`hub policy min_lend_room <percent>`); a low-room account remains a last resort. Leftover-host ranking is unchanged.
 - Among those, the account whose weekly limit resets soonest goes first.
 - A host reads its usage every ~100 s once any limit is at 95% or more.
 - The dwell is 10 min, with at most 24 automatic switches a day.
