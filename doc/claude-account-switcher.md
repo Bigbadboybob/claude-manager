@@ -501,7 +501,7 @@ Owner's context: most accounts are full at any time, and about 3 accounts are bu
 **Which account is lent:**
 
 - Only accounts with a usage reading are lent. A reading older than 3 h that has not passed a reset counts as no reading. (11-15 06:58Z incident: an unread account turned out to be rate limited, and about 14 sessions stopped.)
-- Only accounts below the switch point are lent. It is 99% for every limit (`hub policy thresholds.weekly 99`, `thresholds.session 99`).
+- Only accounts below the switch point are lent. It is 98% for every limit (`hub policy thresholds.weekly 98`, `thresholds.session 98`; Owner 11-16: "switch right before we hit the limits").
 - The hub counts model-scoped limits at their family threshold by default (`hub policy switch_on_scoped false` disables that for non-leftover hosts).
 - Non-leftover hosts prefer accounts with at least 5% room on every counted limit (`hub policy min_lend_room <percent>`); a low-room account remains a last resort. Leftover-host ranking is unchanged.
 - Among those, the account whose weekly limit resets soonest goes first.
