@@ -929,8 +929,11 @@ impl Store {
             strv(&e["request"], "sha256").into(),
             strv(&e["request"], "origin_daemon_id").into(),
         );
+        let system_actor = e["actor"]["id"] == "system";
         if let Some(old) = self.requests.insert(key, value.clone()) {
-            if old != value {
+            // See preflight_projection: a System notice duplicated across
+            // hosts is tolerated, and the later (hub-ingested) copy wins.
+            if old != value && !system_actor {
                 return Err(err(
                     "idempotency_conflict",
                     "Duplicate request in retained history",

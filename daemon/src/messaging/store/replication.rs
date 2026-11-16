@@ -940,7 +940,13 @@ impl Store {
             required(&e["actor"], "id")?,
             required(&e["request"], "key")?
         );
-        if self.requests.contains_key(&key) {
+        // Daemon-generated System notices can share a request key across
+        // hosts (each daemon posts its own copy of a #continuous transition).
+        // That is a duplicate notice, not a client double-publish; refusing
+        // the hub's copy here stopped this replica's whole download
+        // (2026-11-16 #continuous wedge). Accept it; the local copy is set
+        // aside when the hub rejects its upload.
+        if self.requests.contains_key(&key) && e["actor"]["id"] != "system" {
             return Err(err(
                 "idempotency_conflict",
                 "A retained request already has a different event ID",
