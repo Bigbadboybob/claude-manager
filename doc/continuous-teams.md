@@ -1,9 +1,14 @@
 # Continuous tasks become continuous teams
 
 Status: plan agreed with Owner 2026-11-06. Phase 1 cleanup done (45 stale items
-closed, 623 merged branches deleted); kept items await their teams. Ingest
-charter draft is in [ingest-charter-draft.md](ingest-charter-draft.md), waiting
-for Owner. Nothing retired yet.
+closed, 623 merged branches deleted). Phase 3 CM features deployed 2026-11-16
+(brain 01bca590, API migrations 037/038). Phase 2 under way: the Ingest lead
+(Claude Opus, member `ingest`, division `ingest`, marked continuous) runs on
+cm-manager since 2026-11-16 00:06Z under charter
+[ingest-charter-draft.md](ingest-charter-draft.md) v3. scraper-triage is
+paused (Ingest's 6h sweep replaces it); the other Ingest orchestrators are
+paused as Ingest binds their queues. Latency optimization starts after
+phases 4 and 5.
 
 ## Why
 
@@ -77,6 +82,7 @@ It works across the entire pipeline. It characterizes where the largest
 delays are and optimizes them down as far as possible. Publication to
 reception is out of scope, because that is scraper work and belongs to
 Ingest. Home org still to decide: its own org, or the execution pipeline.
+Timing (Owner, 2026-11-16): stand it up after phases 4 and 5.
 
 **Leads (Owner, 2026-11-15).** Every continuous team lead is Claude Opus,
 the Ingest lead included.
@@ -169,6 +175,7 @@ read for a host-local dashboard or monitor.
 4. **Move the execution policy and prob pipeline teams.**
 5. **Retire** the continuous column and the old scheduler paths. Rewrite
    the docs on creating a continuous team.
+6. **Latency optimization team** (Owner, 2026-11-16: after phases 4 and 5).
 
 ## Prerequisites
 
