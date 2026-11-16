@@ -15,6 +15,10 @@ methods (daemon.restart, daemon.migrate_split, daemon.split_rollback)
 the connection dies at the exec — reported as `"exec": true`; poll
 daemon.health afterward (see HOWTO_HOLDER_BRAIN_SPLIT.md).
 
+Chat writes belong to the MCP chat tools. Do not use this operator-token
+helper for chat sends, reactions, edits, pins, renames, or other messaging
+writes from an agent session.
+
 `--batch` runs a JSON list of [method, params] calls in ONE invocation (one
 ssh round trip), a few at a time, and prints a JSON list of responses in the
 same order. A call that times out or fails to connect answers

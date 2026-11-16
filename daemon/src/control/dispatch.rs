@@ -413,6 +413,18 @@ pub fn dispatch_request(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
 ) -> DispatchOutcome {
+    dispatch_request_with_peer_pid(state, req, None)
+}
+
+/// Route a request while retaining transport-level peer credentials for the
+/// messaging authorization boundary. The PID is never read from the JSON
+/// request itself; callers that do not have a Unix peer (internal dispatch or
+/// TLS) pass `None` and preserve the existing fail-open behavior.
+pub fn dispatch_request_with_peer_pid(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+    peer_pid: Option<u32>,
+) -> DispatchOutcome {
     // Snapshot provenance before any operation or lifecycle gate. Failure to
     // take either short try-lock is merely unknown and never changes the RPC.
     let _s4 = crate::items::s4_attribution::begin(state, req);
@@ -424,6 +436,10 @@ pub fn dispatch_request(
         Ok(r) => r,
         Err(r) => return DispatchOutcome::Done(r),
     };
+    // A valid scoped board credential is a distinct Owner capability, not the
+    // host operator token. Preserve its existing web-backend path even when
+    // the backend process happens to have an agent-session ancestor.
+    let peer_pid = if delegated.is_some() { None } else { peer_pid };
     let req = delegated.as_ref().unwrap_or(req);
     // DESIGN_SEAMLESS_RESTART phase 2d (R2): in-flight mutation guard,
     // taken BEFORE the method body runs and dropped when this function
@@ -458,11 +474,11 @@ pub fn dispatch_request(
     match req.method.as_str() {
         "staffing.get" | "staffing.set" => DispatchOutcome::Done(crate::staffing::dispatch(state, req)),
         "owner.board_token" => DispatchOutcome::Done(super::board_token::manage(state, req)),
-        "messaging.sync" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
-        "messaging.open" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
-        "messaging.read" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "messaging.sync" => DispatchOutcome::Done(crate::messaging::rpc::dispatch_with_peer_pid(state, req, peer_pid)),
+        "messaging.open" => DispatchOutcome::Done(crate::messaging::rpc::dispatch_with_peer_pid(state, req, peer_pid)),
+        "messaging.read" => DispatchOutcome::Done(crate::messaging::rpc::dispatch_with_peer_pid(state, req, peer_pid)),
         "messaging.send" => {
-            let response = crate::messaging::rpc::dispatch(state, req);
+            let response = crate::messaging::rpc::dispatch_with_peer_pid(state, req, peer_pid);
             // Board freshness: a holder naming `#N` touches the item
             // (queued, best effort; never delays or changes the send).
             if let (true, Caller::Session(c), Some(reply)) = (response.ok, &req.caller, &response.result) {
@@ -470,18 +486,18 @@ pub fn dispatch_request(
             }
             DispatchOutcome::Done(response)
         }
-        "messaging.dms" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
-        "messaging.people" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
-        "messaging.channels" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
-        "messaging.pins" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
-        "messaging.norms" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
-        "messaging.monitor" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
-        "messaging.monitors" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
-        "messaging.follow" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
-        "messaging.availability" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
-        "messaging.counts" | "messaging.mark_read" | "messaging.react" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
-        "messaging.attention" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
-        "session.set_name" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "messaging.dms" => DispatchOutcome::Done(crate::messaging::rpc::dispatch_with_peer_pid(state, req, peer_pid)),
+        "messaging.people" => DispatchOutcome::Done(crate::messaging::rpc::dispatch_with_peer_pid(state, req, peer_pid)),
+        "messaging.channels" => DispatchOutcome::Done(crate::messaging::rpc::dispatch_with_peer_pid(state, req, peer_pid)),
+        "messaging.pins" => DispatchOutcome::Done(crate::messaging::rpc::dispatch_with_peer_pid(state, req, peer_pid)),
+        "messaging.norms" => DispatchOutcome::Done(crate::messaging::rpc::dispatch_with_peer_pid(state, req, peer_pid)),
+        "messaging.monitor" => DispatchOutcome::Done(crate::messaging::rpc::dispatch_with_peer_pid(state, req, peer_pid)),
+        "messaging.monitors" => DispatchOutcome::Done(crate::messaging::rpc::dispatch_with_peer_pid(state, req, peer_pid)),
+        "messaging.follow" => DispatchOutcome::Done(crate::messaging::rpc::dispatch_with_peer_pid(state, req, peer_pid)),
+        "messaging.availability" => DispatchOutcome::Done(crate::messaging::rpc::dispatch_with_peer_pid(state, req, peer_pid)),
+        "messaging.counts" | "messaging.mark_read" | "messaging.react" => DispatchOutcome::Done(crate::messaging::rpc::dispatch_with_peer_pid(state, req, peer_pid)),
+        "messaging.attention" => DispatchOutcome::Done(crate::messaging::rpc::dispatch_with_peer_pid(state, req, peer_pid)),
+        "session.set_name" => DispatchOutcome::Done(crate::messaging::rpc::dispatch_with_peer_pid(state, req, peer_pid)),
         // #28: spawn-time setup by the creator.
         "session.setup" => DispatchOutcome::Done(crate::spawn_setup::dispatch(state, req)),
         "sidebar.list" | "sidebar.assign" => {

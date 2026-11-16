@@ -5,9 +5,115 @@ use crate::{
 };
 use serde_json::{json, Value};
 use std::{
+    collections::HashSet,
+    fs,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
+
+const OPERATOR_AGENT_SESSION_MESSAGE: &str =
+    "operator-token chat writes are refused from agent sessions; use the MCP chat tools";
+
+/// Messaging mutations that can change shared chat state or state attributed
+/// to the authenticated actor. Read-only snapshots remain available to
+/// operator callers; these writes could otherwise impersonate Owner.
+fn operator_chat_write(req: &Request) -> bool {
+    match req.method.as_str() {
+        "messaging.send" | "messaging.react" | "session.set_name" => true,
+        "messaging.pins" => matches!(req.params["action"].as_str(), Some("set" | "remove")),
+        "messaging.channels" => matches!(
+            req.params["action"].as_str(),
+            Some("create" | "update" | "join" | "leave" | "add_member")
+        ),
+        "messaging.norms" => matches!(req.params["action"].as_str(), Some("publish" | "revert")),
+        "messaging.mark_read" => true,
+        "messaging.follow" => matches!(req.params["action"].as_str(), Some("set" | "remove")),
+        "messaging.monitor" => true,
+        "messaging.monitors" => matches!(
+            req.params["action"].as_str(),
+            Some("ack" | "cancel" | "cancel_all" | "dismiss")
+        ),
+        "messaging.availability" => matches!(req.params["action"].as_str(), Some("set")),
+        _ => false,
+    }
+}
+
+fn refuse_operator_chat_write(req: &Request, peer_pid: Option<u32>) -> bool {
+    matches!(req.caller, Caller::Operator(_))
+        && operator_chat_write(req)
+        && operator_peer_is_agent(peer_pid)
+}
+
+#[cfg(test)]
+fn refuse_operator_chat_write_at(
+    req: &Request,
+    peer_pid: Option<u32>,
+    proc_root: &std::path::Path,
+) -> bool {
+    matches!(req.caller, Caller::Operator(_))
+        && operator_chat_write(req)
+        && match peer_pid {
+            Some(pid) => match peer_has_agent_ancestor(pid, proc_root) {
+                Ok(found) => found,
+                Err(_) => false,
+            },
+            None => false,
+        }
+}
+
+/// Return whether an operator-token request came from a process in an agent
+/// session. Missing peer credentials and unreadable `/proc` state fail open;
+/// a warning makes that degraded check visible without locking Owner out.
+fn operator_peer_is_agent(peer_pid: Option<u32>) -> bool {
+    let Some(pid) = peer_pid else {
+        return false;
+    };
+    match peer_has_agent_ancestor(pid, std::path::Path::new("/proc")) {
+        Ok(found) => found,
+        Err(detail) => {
+            eprintln!(
+                "cm-daemon: warning: unable to inspect operator peer ancestry (pid {pid}): {detail}; allowing the chat write"
+            );
+            false
+        }
+    }
+}
+
+/// Walk a Linux process ancestry, looking for the agent-session marker in an
+/// ancestor's initial environment. This takes a proc root parameter so the
+/// security decision is unit-testable without mutating the test process's
+/// environment.
+fn peer_has_agent_ancestor(pid: u32, proc_root: &std::path::Path) -> Result<bool, String> {
+    let mut current = pid;
+    let mut seen = HashSet::new();
+    for _ in 0..64 {
+        if current == 0 || !seen.insert(current) {
+            return Err(format!("invalid or cyclic process ancestry at pid {current}"));
+        }
+        let dir = proc_root.join(current.to_string());
+        let environ = fs::read(dir.join("environ"))
+            .map_err(|e| format!("read {}: {e}", dir.join("environ").display()))?;
+        if environ
+            .split(|byte| *byte == 0)
+            .any(|entry| entry.starts_with(b"CM_TUI_SESSION_ID="))
+        {
+            return Ok(true);
+        }
+        let status = fs::read_to_string(dir.join("status"))
+            .map_err(|e| format!("read {}: {e}", dir.join("status").display()))?;
+        let ppid = status
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:").map(str::trim))
+            .ok_or_else(|| format!("{} has no PPid", dir.join("status").display()))?
+            .parse::<u32>()
+            .map_err(|e| format!("parse PPid for {}: {e}", dir.display()))?;
+        if ppid == 0 {
+            return Ok(false);
+        }
+        current = ppid;
+    }
+    Err("process ancestry exceeded 64 hops".into())
+}
 
 pub fn default_root() -> PathBuf {
     std::env::var_os("HOME")
@@ -72,10 +178,22 @@ pub fn project_names(state: &Arc<Mutex<DaemonState>>, store: &Store, persist: bo
     }
 }
 pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    dispatch_with_peer_pid(state, req, None)
+}
+
+/// Dispatch a messaging request with the PID of the Unix-socket peer, when
+/// the caller came through the daemon's local control socket. The PID is
+/// deliberately out-of-band: it is transport metadata, never caller-
+/// supplied wire data.
+pub fn dispatch_with_peer_pid(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+    peer_pid: Option<u32>,
+) -> Response {
     if let Caller::Session(c) = &req.caller {
         crate::maintenance::stamp_chat(state, &c.session_uid);
     }
-    match execute(state, req) {
+    match execute(state, req, peer_pid) {
         Ok(mut v) => {
             // Agents see why sync looks broken during a deploy or hub outage.
             if matches!(req.caller, Caller::Session(_)) && v.is_object() {
@@ -188,7 +306,11 @@ fn repair_legacy_binding(state: &Arc<Mutex<DaemonState>>, uid: &str) -> Result<(
     Ok(())
 }
 
-fn execute(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, ChatError> {
+fn execute(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+    peer_pid: Option<u32>,
+) -> Result<Value, ChatError> {
     // A readiness check must not take the delivery gate: plain sends are
     // deliberately allowed while another thread is publishing a wake.
     let handle = state.lock().unwrap_or_else(|p| p.into_inner()).messaging.clone();
@@ -201,7 +323,7 @@ fn execute(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, Chat
     // Opportunistic maintenance only. Deferred refresh is not an authority
     // fence; task monitor effects below use a locked authoritative view.
     super::tasks::refresh(state)?;
-    let mut result = execute_with_freshness(state, req, false)?;
+    let mut result = execute_with_freshness(state, req, false, peer_pid)?;
     if matches!(req.caller, Caller::Operator(_)) && req.params["claim_bell"] == true {
         let (handle, sync) = {
             let s = state.lock().unwrap_or_else(|p| p.into_inner());
@@ -299,6 +421,7 @@ fn execute_with_freshness(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
     caught_up: bool,
+    peer_pid: Option<u32>,
 ) -> Result<Value, ChatError> {
     let s4_snapshot = match &req.caller {
         Caller::Session(c) if req.method == "messaging.send" =>
@@ -310,6 +433,12 @@ fn execute_with_freshness(
             code: "unauthorized".into(),
             message: e.into(),
         })?;
+        if refuse_operator_chat_write(req, peer_pid) {
+            return Err(ChatError {
+                code: "unauthorized".into(),
+                message: OPERATOR_AGENT_SESSION_MESSAGE.into(),
+            });
+        }
     }
     let (handle, root, uid, kind, live, draining, graph, search_budget, s4_subject) = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
@@ -549,7 +678,7 @@ fn execute_with_freshness(
                 &json!({"interests":interest.into_iter().collect::<Vec<_>>()}),
                 history,
             )?;
-            return execute_with_freshness(state, req, true);
+            return execute_with_freshness(state, req, true, peer_pid);
         }
     }
     // These registry repairs may acquire DaemonState. Do them before taking
@@ -825,6 +954,92 @@ fn annotate_backfill(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn proc_fixture(root: &std::path::Path, pid: u32, environ: &[u8], ppid: u32) {
+        let dir = root.join(pid.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("environ"), environ).unwrap();
+        std::fs::write(dir.join("status"), format!("Name:\ttest\nPPid:\t{ppid}\n")).unwrap();
+    }
+
+    #[test]
+    fn operator_chat_write_is_refused_for_agent_ancestry() {
+        let proc_root = tempfile::tempdir().unwrap();
+        proc_fixture(
+            proc_root.path(),
+            42,
+            b"PATH=/bin\0CM_TUI_SESSION_ID=session-42\0",
+            7,
+        );
+        proc_fixture(proc_root.path(), 7, b"PATH=/bin\0", 0);
+        let req = Request {
+            id: "guard".into(),
+            caller: Caller::operator("operator-token"),
+            method: "messaging.send".into(),
+            params: json!({"channel":"general","body":"spoof"}),
+        };
+        assert!(refuse_operator_chat_write_at(&req, Some(42), proc_root.path()));
+    }
+
+    #[test]
+    fn operator_chat_write_without_agent_ancestry_is_allowed() {
+        let proc_root = tempfile::tempdir().unwrap();
+        proc_fixture(proc_root.path(), 42, b"PATH=/bin\0", 7);
+        proc_fixture(proc_root.path(), 7, b"PATH=/bin\0", 0);
+        let req = Request {
+            id: "guard".into(),
+            caller: Caller::operator("operator-token"),
+            method: "messaging.send".into(),
+            params: json!({"channel":"general","body":"owner"}),
+        };
+        assert!(!refuse_operator_chat_write_at(&req, Some(42), proc_root.path()));
+    }
+
+    #[test]
+    fn unreadable_operator_peer_ancestry_is_allowed() {
+        let proc_root = tempfile::tempdir().unwrap();
+        let req = Request {
+            id: "guard".into(),
+            caller: Caller::operator("operator-token"),
+            method: "messaging.send".into(),
+            params: json!({"channel":"general","body":"owner"}),
+        };
+        assert!(!refuse_operator_chat_write_at(&req, Some(42), proc_root.path()));
+    }
+
+    #[test]
+    fn operator_chat_write_guard_covers_mutations_but_not_reads() {
+        let writes = [
+            ("messaging.send", json!({})),
+            ("messaging.react", json!({})),
+            ("messaging.pins", json!({"action":"set"})),
+            ("messaging.channels", json!({"action":"update"})),
+            ("messaging.norms", json!({"action":"publish"})),
+            ("messaging.follow", json!({"action":"set"})),
+            ("messaging.monitor", json!({})),
+            ("messaging.monitors", json!({"action":"cancel"})),
+            ("messaging.availability", json!({"action":"set"})),
+            ("messaging.mark_read", json!({})),
+            ("session.set_name", json!({})),
+        ];
+        for (method, params) in writes {
+            let req = Request {
+                id: "guard".into(),
+                caller: Caller::operator("operator-token"),
+                method: method.into(),
+                params,
+            };
+            assert!(operator_chat_write(&req), "{method}");
+        }
+        let req = Request {
+            id: "guard".into(),
+            caller: Caller::operator("operator-token"),
+            method: "messaging.read".into(),
+            params: json!({"channel":"general"}),
+        };
+        assert!(!operator_chat_write(&req));
+    }
+
     #[test]
     fn forwarded_send_reports_submission_time_and_hub_delay() {
         let submitted = chrono::DateTime::parse_from_rfc3339("2026-10-06T15:00:00Z")
@@ -873,6 +1088,7 @@ mod tests {
                 method: format!("messaging.{method}"),
                 params: p,
             },
+            None,
         )
     }
     fn dispatched(state: &Arc<Mutex<DaemonState>>, caller: Caller, method: &str, p: Value) -> Value {
@@ -1473,12 +1689,12 @@ mod tests {
             params: json!({"uid":uid,"name":name,"expected_name_revision":rev,"request_id":format!("rename-{rev}")}),
         };
         assert_eq!(
-            execute(&state, &req("b", 1, "Other")).unwrap_err().code,
+            execute(&state, &req("b", 1, "Other"), None).unwrap_err().code,
             "unauthorized"
         );
-        execute(&state, &req("a", 1, "New Scout")).unwrap();
+        execute(&state, &req("a", 1, "New Scout"), None).unwrap();
         assert_eq!(
-            execute(&state, &req("a", 1, "Stale form"))
+            execute(&state, &req("a", 1, "Stale form"), None)
                 .unwrap_err()
                 .code,
             "idempotency_conflict"

@@ -1455,6 +1455,7 @@ fn handle_connection_with_timeouts(
     // timeout we asked for.
     let _ = stream.set_read_timeout(Some(read_timeout));
     let _ = stream.set_write_timeout(Some(write_timeout));
+    let peer_pid = peer_pid_of_stream(stream);
 
     let req = match control::wire::read_request(stream) {
         Ok(Some(req)) => req,
@@ -1484,7 +1485,7 @@ fn handle_connection_with_timeouts(
     // stream with a pre-built subscription (slice-10c-e-2
     // review-2 TOCTOU fix: subscription happens inside the same
     // lock as the ticket consume, not later in handle_attach_stream).
-    let outcome = control::dispatch::dispatch_request(&state, &req);
+    let outcome = control::dispatch::dispatch_request_with_peer_pid(&state, &req, peer_pid);
     match outcome {
         control::dispatch::DispatchOutcome::Done(response) => {
             if let Err(e) = control::wire::write_response_or_error(stream, &response) {
@@ -1534,6 +1535,33 @@ fn handle_connection_with_timeouts(
             control::stream::handle_events_subscribe_stream(stream, handle);
         }
     }
+}
+
+/// Read the connected Unix peer's PID. This is transport metadata used only
+/// for the operator-token messaging guard; any failure deliberately returns
+/// `None` so Owner's socket path remains available.
+fn peer_pid_of_stream(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::unix::io::AsRawFd;
+
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 || len < std::mem::size_of::<libc::ucred>() as libc::socklen_t || cred.pid <= 0 {
+        eprintln!(
+            "cm-daemon: warning: unable to read Unix control-socket peer credentials: {}; allowing operator request",
+            std::io::Error::last_os_error()
+        );
+        return None;
+    }
+    Some(cred.pid as u32)
 }
 
 #[cfg(test)]
