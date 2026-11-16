@@ -1784,6 +1784,33 @@ fn client_reader(
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .remove(id);
+                } else if e.code == "idempotency_conflict"
+                    && runtime
+                        .store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .as_ref()
+                        .is_some_and(|store| store.published_actor_is_system(id))
+                {
+                    // A daemon-generated System notice whose request key the
+                    // hub already holds (another host posted the same
+                    // notice) is a duplicate, not a client double-publish.
+                    // Halting the origin would block every queued message on
+                    // this host behind it (2026-11-16 #continuous wedge), so
+                    // set the duplicate aside and keep uploading.
+                    eprintln!("cm messaging: setting aside duplicate system notice {id}: {}", e.message);
+                    runtime
+                        .store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .as_mut()
+                        .unwrap()
+                        .reject_replication(id, "duplicate_system_notice")?;
+                    inflight
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(id);
+                    runtime.publish_to_sessions();
                 } else if matches!(
                     e.code.as_str(),
                     "unauthorized"

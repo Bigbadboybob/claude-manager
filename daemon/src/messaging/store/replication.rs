@@ -586,6 +586,11 @@ impl Store {
             json!({"status":"replicated","receipt":receipt}),
         )
     }
+    /// True when `id` is a locally published event whose actor is the
+    /// daemon itself (`system`), e.g. a #continuous monitor notice.
+    pub fn published_actor_is_system(&self, id: &str) -> bool {
+        self.published(id).is_some_and(|e| e.event["actor"]["id"] == "system")
+    }
     pub fn reject_replication(&mut self, id: &str, reason: &str) -> Result<()> {
         if self.replication.rejections.contains_key(id) {
             return Ok(());

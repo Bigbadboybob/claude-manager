@@ -909,76 +909,81 @@ impl ContinuousScheduler {
         // scheduler tasks. Their marker already contains the wake outcome;
         // use that durable outcome instead of deriving missed runs from a
         // task-local `next_fire_at`.
-        let mut marker_queue_names = HashSet::new();
-        for team in self.continuous_team_markers() {
-            let Some(marker) = continuous_team_marker(&team) else { continue };
-            let id = team["id"].as_str().or_else(|| team["slug"].as_str()).unwrap_or("team");
-            let label = team["name"].as_str().or_else(|| team["slug"].as_str()).unwrap_or(id);
-            let health = marker["health"].as_str().unwrap_or("");
-            if matches!(health, "late" | "missed") {
-                current.insert(
-                    format!("team:{id}:{health}"),
-                    format!("continuous team {label} is {health}"),
-                );
-            }
-            if marker["health"] == "blocked" || marker["blocked"] == true {
-                current.insert(
-                    format!("team:{id}:blocked"),
-                    format!("continuous team {label} is blocked"),
-                );
-            }
-            let lead_uid = marker["lead_session_uid"].as_str();
-            let lead_alive = marker["lead_alive"].as_bool().or_else(|| {
-                lead_uid.map(|uid| self.state.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid))
-            });
-            // A raw/static marker (or a remote/unknown projection) has no
-            // lead UID and must not be treated as a dead local lead. The
-            // daemon-side org projection supplies a resolved UID when this
-            // daemon owns the member; otherwise locality is ambiguous and we
-            // stay quiet rather than page on another host's lead.
-            if should_alert_missing_lead(&marker, lead_alive) {
-                current.insert(
-                    format!("team:{id}:lead"),
-                    format!("continuous team {label} lead is dead"),
-                );
-            }
-            if let Some(queues) = marker["queues"].as_array() {
-                for queue in queues {
-                    if queue["pending"].as_u64().unwrap_or(0) > 0
-                        && queue["oldest_item_age_seconds"].as_f64().unwrap_or(0.0) > CONTINUOUS_QUEUE_AGE_SECS
-                    {
-                        if let Some(name) = queue["queue"].as_str() {
-                            marker_queue_names.insert(name.to_string());
-                            current.insert(
-                                format!("team:{id}:queue:{name}"),
-                                format!("continuous team {label} queue {name} has an item waiting {:.0}m", queue["oldest_item_age_seconds"].as_f64().unwrap_or(0.0) / 60.0),
-                            );
+        // Team markers and planning-API queues are the same data on every
+        // daemon; only the messaging hub checks them, so two hosts never
+        // raise the same cross-host alert.
+        if crate::messaging::tasks::messaging_is_coordinator(&self.state) {
+            let mut marker_queue_names = HashSet::new();
+            for team in self.continuous_team_markers() {
+                let Some(marker) = continuous_team_marker(&team) else { continue };
+                let id = team["id"].as_str().or_else(|| team["slug"].as_str()).unwrap_or("team");
+                let label = team["name"].as_str().or_else(|| team["slug"].as_str()).unwrap_or(id);
+                let health = marker["health"].as_str().unwrap_or("");
+                if matches!(health, "late" | "missed") {
+                    current.insert(
+                        format!("team:{id}:{health}"),
+                        format!("continuous team {label} is {health}"),
+                    );
+                }
+                if marker["health"] == "blocked" || marker["blocked"] == true {
+                    current.insert(
+                        format!("team:{id}:blocked"),
+                        format!("continuous team {label} is blocked"),
+                    );
+                }
+                let lead_uid = marker["lead_session_uid"].as_str();
+                let lead_alive = marker["lead_alive"].as_bool().or_else(|| {
+                    lead_uid.map(|uid| self.state.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid))
+                });
+                // A raw/static marker (or a remote/unknown projection) has no
+                // lead UID and must not be treated as a dead local lead. The
+                // daemon-side org projection supplies a resolved UID when this
+                // daemon owns the member; otherwise locality is ambiguous and we
+                // stay quiet rather than page on another host's lead.
+                if should_alert_missing_lead(&marker, lead_alive) {
+                    current.insert(
+                        format!("team:{id}:lead"),
+                        format!("continuous team {label} lead is dead"),
+                    );
+                }
+                if let Some(queues) = marker["queues"].as_array() {
+                    for queue in queues {
+                        if queue["pending"].as_u64().unwrap_or(0) > 0
+                            && queue["oldest_item_age_seconds"].as_f64().unwrap_or(0.0) > CONTINUOUS_QUEUE_AGE_SECS
+                        {
+                            if let Some(name) = queue["queue"].as_str() {
+                                marker_queue_names.insert(name.to_string());
+                                current.insert(
+                                    format!("team:{id}:queue:{name}"),
+                                    format!("continuous team {label} queue {name} has an item waiting {:.0}m", queue["oldest_item_age_seconds"].as_f64().unwrap_or(0.0) / 60.0),
+                                );
+                            }
                         }
                     }
                 }
             }
-        }
-        if let Ok(client) = {
-            let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            crate::continuous::queue::QueueClient::from_overrides(Some(&s.config.api_url), Some(&s.config.api_token))
-        } {
-            if let Ok(snapshot) = client.list() {
-                for row in snapshot["queues"].as_array().into_iter().flatten() {
-                    if row["pending"].as_u64().unwrap_or(0) == 0 { continue; }
-                    // A marker team already reports its lead-filtered queue;
-                    // don't emit a second alert for the same bound queue.
-                    if row["binding"].is_object()
-                        && row["queue"].as_str().is_some_and(|name| marker_queue_names.contains(name))
-                    {
-                        continue;
-                    }
-                    let age = row["oldest_item_age_seconds"].as_f64().unwrap_or(0.0);
-                    if age > CONTINUOUS_QUEUE_AGE_SECS {
-                        if let Some(queue) = row["queue"].as_str() {
-                            current.insert(
-                                format!("queue:{queue}"),
-                                format!("queue {queue} has an item waiting {:.0}m", age / 60.0),
-                            );
+            if let Ok(client) = {
+                let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                crate::continuous::queue::QueueClient::from_overrides(Some(&s.config.api_url), Some(&s.config.api_token))
+            } {
+                if let Ok(snapshot) = client.list() {
+                    for row in snapshot["queues"].as_array().into_iter().flatten() {
+                        if row["pending"].as_u64().unwrap_or(0) == 0 { continue; }
+                        // A marker team already reports its lead-filtered queue;
+                        // don't emit a second alert for the same bound queue.
+                        if row["binding"].is_object()
+                            && row["queue"].as_str().is_some_and(|name| marker_queue_names.contains(name))
+                        {
+                            continue;
+                        }
+                        let age = row["oldest_item_age_seconds"].as_f64().unwrap_or(0.0);
+                        if age > CONTINUOUS_QUEUE_AGE_SECS {
+                            if let Some(queue) = row["queue"].as_str() {
+                                current.insert(
+                                    format!("queue:{queue}"),
+                                    format!("queue {queue} has an item waiting {:.0}m", age / 60.0),
+                                );
+                            }
                         }
                     }
                 }

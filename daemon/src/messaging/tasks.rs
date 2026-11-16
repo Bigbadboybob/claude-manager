@@ -364,8 +364,21 @@ pub fn post_continuous_notice(
     let Some(channel) = store.channel_id_at_path(CONTINUOUS_CHANNEL_PATH).map(str::to_owned) else {
         return Ok(false);
     };
-    store.post_system_notice(&channel, body, key)?;
+    // Several daemons run continuous schedulers (cm-manager and
+    // cm-sessions both do). Scope the idempotency key to this daemon so two
+    // hosts posting the same transition can never collide at the hub.
+    let key = format!("{}:{key}", store.daemon_id);
+    store.post_system_notice(&channel, body, &key)?;
     Ok(true)
+}
+
+/// Whether this daemon is the messaging coordinator (hub). The #continuous
+/// monitor's cross-host checks (org team markers and planning-API queues,
+/// which every daemon sees identically) run on the hub only.
+pub fn messaging_is_coordinator(state: &Arc<Mutex<DaemonState>>) -> bool {
+    let handle = state.lock().unwrap_or_else(|p| p.into_inner()).messaging.clone();
+    let slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+    slot.as_ref().is_some_and(|store| store.is_coordinator())
 }
 
 /// A replica join is an effect of a particular scheduler binding, not a naked
