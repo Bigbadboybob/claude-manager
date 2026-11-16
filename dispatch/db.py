@@ -1331,6 +1331,9 @@ async def bind_queue(pool: asyncpg.Pool, queue: str, consumer: str, bound_by: st
         "wake_error": row["wake_error"],
         "wake_id": str(row["wake_id"]) if row["wake_id"] else None,
         "wake_requested": wake_requested,
+        # The daemon's bind wake text reads `depth`; without it every bind
+        # wake announced "0 pending item(s)" over a real backlog.
+        "depth": int(depth),
     }
 
 

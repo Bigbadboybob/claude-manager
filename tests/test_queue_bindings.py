@@ -82,6 +82,13 @@ class QueueBindingTests(unittest.IsolatedAsyncioTestCase):
             await db.ack_queue_items(self.pool, "q", [item["id"]], consumer="ingest", claim_token=str(uuid.uuid4()))
         await db.ack_queue_items(self.pool, "q", [claimed[0]["id"]], consumer="ingest", claim_token=claimed[0]["claim_token"])
 
+    async def test_bind_over_backlog_reports_depth(self):
+        for i in range(3):
+            await db.enqueue_queue_item(self.pool, "backlog-q", {"i": i})
+        bound = await db.bind_queue(self.pool, "backlog-q", "ingest", "operator")
+        self.assertTrue(bound["wake_requested"])
+        self.assertEqual(bound["depth"], 3)
+
     async def test_failed_wake_can_be_retried_and_lease_expiry_requeues(self):
         await db.bind_queue(self.pool, "q", "ingest", "operator")
         await db.enqueue_queue_item(self.pool, "q", {"x": 1})
