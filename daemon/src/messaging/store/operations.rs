@@ -55,7 +55,7 @@ pub(super) fn finish_install(root: &Path) -> Result<()> {
     Ok(())
 }
 impl Store {
-    fn cm_root(&self) -> &Path {
+    pub(super) fn cm_root(&self) -> &Path {
         self.root.parent().unwrap().parent().unwrap()
     }
     pub fn messaging_frozen(&self) -> bool {
@@ -721,6 +721,7 @@ mod tests {
             task: None,
             present: true,
             kind: "agent".into(),
+            engine: None,
         }];
         let sent = source.send(&actor, "writer", "agent", &json!({"channel":"general","name":"Writer","body":"Already read","request_id":"read"}), &people).unwrap();
         let id = sent["event_id"].as_str().unwrap().to_owned();
@@ -750,15 +751,13 @@ mod tests {
         fs::write(path, bytes).unwrap();
         destination.sync_admin(&install, &[]).unwrap();
         destination.load_read("owner").unwrap();
-        assert!(destination.reads["owner"].ids.contains(&id));
+        assert!(destination.is_read("owner", &destination.published(&id).unwrap().event));
         assert!(destination
             .events
             .iter()
-            .any(|e| e.event["type"] == "read.ack"
-                && e.event["data"]["ids"]
-                    .as_array()
-                    .unwrap()
-                    .contains(&json!(id))));
+            .any(|e| e.event["type"] == "read.cursor"
+                && e.event["data"]["cursors"].as_object().unwrap().values().any(|c|c["event_id"]==id)));
+
     }
     #[test]
     fn messaging_handoff_preserves_ids_receipts_and_can_resume_both_endpoints() {
@@ -775,6 +774,7 @@ mod tests {
             task: None,
             present: true,
             kind: "agent".into(),
+            engine: None,
         };
         let request = json!({"channel":"general","name":"Builder","body":"Retained history","request_id":"original"});
         let sent = source

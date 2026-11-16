@@ -27,13 +27,32 @@ class ContinuousDrainToolsTests(unittest.TestCase):
                 server.checkpoint_continuous_drain("request-a", "checkpoint", True, True)
             call.assert_not_called()
 
+    def test_clear_hold_publishes_monitors_first_and_routes_to_the_daemon(self):
+        self.assertIn("continuous.self_clear_hold", control_client.DAEMON_METHODS)
+        events = []
+        with mock.patch.object(server.async_monitor, "persist_state", side_effect=lambda: events.append("persist")), mock.patch.object(control_client, "call", side_effect=lambda method, params: events.append((method, params))):
+            server.clear_continuous_hold("workers reported", dry_run=True)
+            server.clear_continuous_hold("settled")
+        self.assertEqual(events, [
+            "persist", ("continuous.self_clear_hold", {"reason": "workers reported", "dry_run": True}),
+            "persist", ("continuous.self_clear_hold", {"reason": "settled", "dry_run": False}),
+        ])
+        with mock.patch.object(server.async_monitor, "persist_state", side_effect=OSError("disk full")), mock.patch.object(control_client, "call") as call:
+            with self.assertRaises(OSError):
+                server.clear_continuous_hold("settled")
+            call.assert_not_called()
+
     def test_stop_hook_reports_continuation_when_it_resumes_agent_with_inbox(self):
         for messages in [[], ["monitor final report"]]:
             with self.subTest(messages=messages), mock.patch.dict(os.environ, {"CM_TUI_SESSION_ID": "ts-root"}), mock.patch.object(cm_stop_hook, "_drain_inbox", return_value=messages), mock.patch.object(control_client, "call", return_value={}) as call, mock.patch("sys.stdin", io.StringIO("{}")), mock.patch("sys.stdout", new_callable=io.StringIO) as output:
                 self.assertEqual(cm_stop_hook.main(), 0)
-                params = {"session_uid": "ts-root", "continuing": bool(messages)}
                 if messages:
                     self.assertEqual(json.loads(output.getvalue())["decision"], "block")
                 else:
                     self.assertEqual(output.getvalue(), "")
-                call.assert_called_once_with("session.turn_ended", params, timeout=cm_stop_hook.TURN_ENDED_TIMEOUT_S)
+                self.assertEqual(call.call_count, 1)
+                method, params = call.call_args.args
+                self.assertEqual(method, "session.agent_report")
+                self.assertEqual(params["session_uid"], "ts-root")
+                self.assertEqual(params["event"], "Stop")
+                self.assertEqual(params["payload"]["continuing"], bool(messages))

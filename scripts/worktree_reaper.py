@@ -32,6 +32,7 @@ import datetime as dt
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -110,6 +111,17 @@ class WorkspaceFacts:
     task_ids: set[str] = dataclasses.field(default_factory=set)
     pinned: bool = False
     continuous: bool = False
+    # doc/org-model.md §5, O5: a member's `home`/`stream` workspace, or a
+    # checkout a member's assistant worked in and was never deliberately
+    # closed from, is durable.
+    durable_kind: str | None = None
+    # A stream claimed for an assistant (`stream_of: assistant`) and when it
+    # was first seen with no live assistant (the daemon's `assistant_idle_since`).
+    assistant_stream: bool = False
+    stream_idle_since: float | None = None
+    # When an open assistant last had a live session here: +inf for a live
+    # session record, else the latest tombstone's `exited_at`.
+    assistant_seen: float | None = None
     open_workspace: bool = False
     manifest_activity: list[float] = dataclasses.field(default_factory=list)
 
@@ -262,6 +274,13 @@ class ScanContext:
     scope_guard: Callable[[ScanContext, Path], WorkspaceFacts] | None = None
     fetched_repos: dict[Path, bool] = dataclasses.field(default_factory=dict)
     landed_cache: dict[tuple[Path, str], LandedProof] = dataclasses.field(default_factory=dict)
+    # #109 fast path: a task-owned checkout whose tasks are all terminal, whose
+    # tree is clean and whose HEAD is proven in origin main is reaped after
+    # this many quiet days instead of `retention_days`. None disables it.
+    landed_retention_days: float | None = None
+    # The same fast path for an unowned checkout (no task to be terminal):
+    # clean, HEAD proven in origin main, quiet this many days. Off by default.
+    unowned_landed_retention_days: float | None = None
 
 
 def run(
@@ -319,6 +338,41 @@ def parse_timestamp(value: Any) -> float | None:
     return parsed.timestamp()
 
 
+DURABLE_KINDS = ("home", "stream")
+# O5: an assistant's checkout stays only while the assistant was live within
+# this window; after it, normal reaper rules apply (revive within it keeps it).
+ASSISTANT_RELEASE_S = 7 * 86400
+
+
+def record_org(record: dict) -> Any:
+    """A session record's org object: top level (daemon manifest) or on the
+    tombstone's full `entry` (TUI manifest)."""
+    org = record.get("org")
+    if org is None and isinstance(record.get("entry"), dict):
+        org = record["entry"].get("org")
+    return org
+
+
+def is_open_assistant(org: Any) -> bool:
+    """A record of a member's assistant (O5) that was not deliberately
+    closed (`assistant_closed_at`): its checkout stays."""
+    return (isinstance(org, dict) and org.get("acting_as") == "assistant"
+            and bool(org.get("member_id")) and not org.get("assistant_closed_at"))
+
+
+def assistant_protects(workspace: "WorkspaceFacts", now: float) -> bool:
+    """An assistant's checkout (O5) is protected while an assistant was live
+    in it within ASSISTANT_RELEASE_S, and a claimed stream also until the
+    daemon has watched it idle that long. After that the normal rules apply."""
+    recent = workspace.assistant_seen is not None and now - workspace.assistant_seen < ASSISTANT_RELEASE_S
+    if recent:
+        return True
+    if workspace.assistant_stream:
+        idle = workspace.stream_idle_since
+        return idle is None or now - idle < ASSISTANT_RELEASE_S
+    return False
+
+
 def iter_manifest_workspaces(data: dict[str, Any]) -> Iterable[dict[str, Any]]:
     raw = data.get("workspaces") or {}
     if isinstance(raw, dict):
@@ -327,13 +381,41 @@ def iter_manifest_workspaces(data: dict[str, Any]) -> Iterable[dict[str, Any]]:
         yield from (value for value in raw if isinstance(value, dict))
 
 
+def read_manifest_document(path: Path) -> Any:
+    """One manifest as a dict. The viewer's closed-workspace archive
+    (`tui-workspace-archive.jsonl`, one `{"workspace": {...}}` per line) reads
+    as a manifest whose workspaces are its records, so an archived workspace
+    keeps protecting its checkout exactly as it did in tui-sessions.json.
+    Unreadable archive lines are skipped."""
+    text = path.read_text()
+    if path.suffix != ".jsonl":
+        return json.loads(text)
+    workspaces: dict[str, Any] = {}
+    for line in text.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        workspace = record.get("workspace") if isinstance(record, dict) else None
+        if isinstance(workspace, dict) and isinstance(workspace.get("id"), str):
+            workspaces[workspace["id"]] = workspace
+    return {"workspaces": workspaces}
+
+
 def load_workspace_facts(manifest_paths: Iterable[Path]) -> dict[Path, WorkspaceFacts]:
     facts: dict[Path, WorkspaceFacts] = defaultdict(WorkspaceFacts)
+    # Daemon exits (`recently_exited`: daemon-tombstones.json, and older
+    # daemon-sessions.json files) are read after every workspace is known,
+    # so a record that names only its workspace id still finds its checkout.
+    exits: list[dict] = []
+    path_of: dict[str, Path] = {}
     for manifest_path in manifest_paths:
         try:
-            data = json.loads(manifest_path.read_text())
+            data = read_manifest_document(manifest_path)
         except (OSError, json.JSONDecodeError):
             continue
+        if isinstance(data, dict) and isinstance(data.get("recently_exited"), list):
+            exits.extend(r for r in data["recently_exited"] if isinstance(r, dict))
         bindings = data.get("bindings") or {}
         by_workspace: dict[str, set[str]] = defaultdict(set)
         if isinstance(bindings, dict):
@@ -348,23 +430,57 @@ def load_workspace_facts(manifest_paths: Iterable[Path]) -> dict[Path, Workspace
             current = facts[path]
             workspace_id = workspace.get("id")
             if isinstance(workspace_id, str):
+                path_of[workspace_id] = path
                 current.workspace_ids.add(workspace_id)
                 current.task_ids.update(by_workspace.get(workspace_id, set()))
             current.pinned = current.pinned or bool(workspace.get("pinned"))
+            org = workspace.get("org")
+            kind = org.get("workspace_kind") if isinstance(org, dict) else None
+            if kind == "stream" and org.get("stream_of") == "assistant":
+                current.assistant_stream = True
+                idle = org.get("assistant_idle_since")
+                if isinstance(idle, (int, float)):
+                    current.stream_idle_since = float(idle)
+            elif kind in DURABLE_KINDS:
+                current.durable_kind = current.durable_kind or kind
             current.open_workspace = current.open_workspace or not bool(workspace.get("is_closed"))
-            for record in list(workspace.get("sessions") or []) + list(workspace.get("tombstones") or []):
+            live_records = list(workspace.get("sessions") or [])
+            for record in live_records + list(workspace.get("tombstones") or []):
                 if not isinstance(record, dict):
                     continue
                 task_id = record.get("task_id")
                 if isinstance(task_id, str):
                     current.task_ids.add(task_id)
                 current.continuous = current.continuous or bool(record.get("continuous_task_id"))
+                if is_open_assistant(record_org(record)):
+                    # A session row is live unless it carries its exit.
+                    exited = record.get("exited_at")
+                    if exited is None and isinstance(record.get("last_exit"), dict):
+                        exited = record["last_exit"].get("exited_at")
+                    is_row = any(record is r for r in live_records)
+                    seen = math.inf if is_row and exited is None else parse_timestamp(exited)
+                    if seen is not None and (current.assistant_seen is None or seen > current.assistant_seen):
+                        current.assistant_seen = seen
                 # Closure/report timestamps are bookkeeping and are often bulk-updated.
                 # Only timestamps tied to the checkout's actual use belong in its clock.
                 for key in ("created_at", "last_input_at"):
                     stamp = parse_timestamp(record.get(key))
                     if stamp is not None:
                         current.manifest_activity.append(stamp)
+    # Only the assistant clock is read from daemon exits (O5): nothing else
+    # about a checkout's ownership changes with this source.
+    for record in exits:
+        if not is_open_assistant(record_org(record)):
+            continue
+        raw_path = record.get("worktree_path")
+        path = (Path(raw_path).resolve(strict=False) if isinstance(raw_path, str) and raw_path
+                else path_of.get(record.get("workspace_id")))
+        seen = parse_timestamp(record.get("exited_at"))
+        if path is None or seen is None:
+            continue
+        current = facts[path]
+        if current.assistant_seen is None or seen > current.assistant_seen:
+            current.assistant_seen = seen
     return dict(facts)
 
 
@@ -972,7 +1088,14 @@ def encode_claude_project_path(path: Path) -> str:
 def load_native_parent_links(
     claude_projects: Path,
     parent_candidates: Iterable[Path],
+    *,
+    candidate_projects_only: bool = False,
 ) -> tuple[dict[Path, NativeParentLink], set[Path], list[str]]:
+    """Links Claude's subagent metadata records from child worktrees to their
+    parent checkouts. `candidate_projects_only` reads only the project
+    directories of `parent_candidates`: the links are identical (a link needs
+    its parent among the candidates), but `native_roots` then covers only
+    those projects, so callers that need every native root must not set it."""
     encoded_candidates: dict[str, list[Path]] = defaultdict(list)
     for candidate in parent_candidates:
         resolved = candidate.resolve(strict=False)
@@ -981,7 +1104,14 @@ def load_native_parent_links(
     native_roots: set[Path] = set()
     warnings: list[str] = []
     try:
-        metadata_paths = claude_projects.glob("*/*/subagents/*.meta.json")
+        if candidate_projects_only:
+            metadata_paths = (
+                path
+                for project in sorted(encoded_candidates)
+                for path in (claude_projects / project).glob("*/subagents/*.meta.json")
+            )
+        else:
+            metadata_paths = claude_projects.glob("*/*/subagents/*.meta.json")
         for metadata_path in metadata_paths:
             try:
                 payload = json.loads(metadata_path.read_text())
@@ -1082,7 +1212,12 @@ def decision(
             return Decision(path, "protect", "cleanup_scope_changed", False, details=(str(exc),))
     if extra:
         workspace = dataclasses.replace(workspace, task_ids=workspace.task_ids | extra.task_ids,
-            pinned=workspace.pinned or extra.pinned, continuous=workspace.continuous or extra.continuous)
+            pinned=workspace.pinned or extra.pinned, continuous=workspace.continuous or extra.continuous,
+            durable_kind=workspace.durable_kind or extra.durable_kind,
+            assistant_stream=workspace.assistant_stream or extra.assistant_stream,
+            stream_idle_since=workspace.stream_idle_since or extra.stream_idle_since,
+            assistant_seen=max((v for v in (workspace.assistant_seen, extra.assistant_seen)
+                                if v is not None), default=None))
 
     parent_link = ctx.native_parents.get(resolved)
     common: dict[str, Any] = {
@@ -1095,6 +1230,10 @@ def decision(
         return Decision(path, "protect", "pinned_workspace", False, **common)
     if workspace.continuous:
         return Decision(path, "protect", "continuous_workspace", False, **common)
+    if workspace.durable_kind:
+        return Decision(path, "protect", f"{workspace.durable_kind}_workspace", False, **common)
+    if assistant_protects(workspace, ctx.now):
+        return Decision(path, "protect", "assistant_checkout", False, **common)
     if resolved in ctx.live_paths:
         return Decision(path, "protect", "live_session", False, **common)
     process_paths = process_references(ctx.root) if refresh_processes else ctx.process_paths
@@ -1169,7 +1308,9 @@ def decision(
             "threshold_days": threshold,
         }
     )
-    if age_days < threshold:
+    landed_days = ctx.unowned_landed_retention_days if unowned else ctx.landed_retention_days
+    landed_window = not immediate and landed_days is not None and landed_days < threshold
+    if age_days < threshold and not (landed_window and age_days >= landed_days):
         return Decision(path, "wait", below_retention_reason, False, **common)
 
     full_git_facts, full_error = inspect_git(path)
@@ -1195,7 +1336,8 @@ def decision(
     full_activity.extend(ctx.external_activity.get(resolved, ()))
     full_age_days = max(0.0, (ctx.now - max(full_activity)) / DAY)
     common["age_days"] = full_age_days
-    if full_age_days < threshold:
+    landed_only = full_age_days < threshold
+    if landed_only and not (landed_window and full_age_days >= landed_days):
         return Decision(path, "wait", below_retention_reason, False, **common)
     common.update(
         {
@@ -1240,6 +1382,21 @@ def decision(
     proof = landed_proof(ctx, git_facts)
     commit_detail = ("will create WIP commit before removal",) if git_facts.dirty_entries else ()
     common.update({"main_ref": proof.main_ref, "landed_reason": proof.reason})
+    if landed_only:
+        # Inside full retention: only a clean, landed checkout goes early.
+        if not proof.landed or git_facts.dirty_entries or not git_facts.branch:
+            why = (f"not landed: {proof.reason}" if not proof.landed
+                   else "dirty tree waits for full retention" if git_facts.dirty_entries
+                   else "detached HEAD waits for full retention")
+            return Decision(path, "wait", below_retention_reason, False, details=(why,), **common)
+        return Decision(
+            path,
+            "reap",
+            "unowned_and_landed" if unowned else "terminal_and_landed",
+            True,
+            details=archive_detail + discard_detail + standalone_detail,
+            **common,
+        )
     if unowned:
         reason = "unowned_inactive_auto_commit" if git_facts.dirty_entries else "unowned_inactive"
         return Decision(
@@ -1272,7 +1429,9 @@ def decision(
 def build_context(args: argparse.Namespace) -> tuple[ScanContext, list[str]]:
     root = args.root.expanduser().resolve(strict=False)
     cm_home = args.cm_home.expanduser().resolve(strict=False)
-    manifests = tuple(args.manifest or [cm_home / "daemon-sessions.json", cm_home / "tui-sessions.json"])
+    manifests = tuple(args.manifest or [cm_home / "daemon-sessions.json", cm_home / "tui-sessions.json",
+                                        cm_home / "daemon-tombstones.json",
+                                        cm_home / "tui-workspace-archive.jsonl"])
     workspace_facts = load_workspace_facts(path for path in manifests if path.is_file())
     tasks, task_ok, task_error = load_tasks(args.config.expanduser())
     live_paths, sessions_ok, session_error = load_live_paths(cm_home)
@@ -1294,6 +1453,8 @@ def build_context(args: argparse.Namespace) -> tuple[ScanContext, list[str]]:
             now=args.now if args.now is not None else dt.datetime.now(dt.UTC).timestamp(),
             retention_days=args.retention_days,
             unowned_retention_days=args.unowned_retention_days,
+            landed_retention_days=args.landed_retention_days or None,
+            unowned_landed_retention_days=args.unowned_landed_retention_days or None,
             workspaces=workspace_facts,
             tasks=tasks,
             tasks_by_branch=dict(tasks_by_branch),
@@ -1910,6 +2071,20 @@ def parser() -> argparse.ArgumentParser:
         default=7,
         help="retention for unowned worktrees; their branch and any safe WIP commit are preserved",
     )
+    result.add_argument(
+        "--landed-retention-days",
+        type=float,
+        default=1.0,
+        help="retention for a clean task-owned checkout whose HEAD is proven in origin main "
+             "and whose tasks are all terminal; 0 disables the fast path",
+    )
+    result.add_argument(
+        "--unowned-landed-retention-days",
+        type=float,
+        default=0.0,
+        help="the same fast path for a clean unowned checkout whose HEAD is proven in origin "
+             "main; 0 (the default) keeps unowned checkouts on --unowned-retention-days",
+    )
     result.add_argument("--max-removals", type=int, default=100, help="mass-event cap per apply run")
     result.add_argument(
         "--apply",
@@ -2034,6 +2209,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "policy": {
                         "retention_days": args.retention_days,
                         "unowned_retention_days": args.unowned_retention_days,
+                        "landed_retention_days": args.landed_retention_days,
+                        "unowned_landed_retention_days": args.unowned_landed_retention_days,
                         "terminal_statuses": sorted(TERMINAL_TASK_STATUSES),
                         "roots": [str(ctx.root) for ctx in contexts],
                         "artifact_root": str(args.artifact_root.expanduser().resolve(strict=False)),

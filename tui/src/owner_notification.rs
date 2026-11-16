@@ -9,7 +9,7 @@ use std::{
 
 pub enum Command {
     Present(Alert),
-    Acknowledge(HostId, Alert),
+    Acknowledge(HostId, String, Alert),
 }
 
 #[cfg(test)]
@@ -23,6 +23,7 @@ mod tests {
             message: "Review ready".into(),
             task_id: None,
             continuous_task_id: None,
+            ..Default::default()
         }
     }
     #[test]
@@ -62,6 +63,36 @@ mod tests {
     }
 
     #[test]
+    fn released_requests_arriving_together_become_one_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut worker = Delivery::new(dir.path().join("receipts.json"));
+        let released = |id: &str, label: &str| Alert {
+            label: label.into(),
+            released_at: Some("2026-10-06T21:00:00Z".into()),
+            ..alert(id)
+        };
+        worker.handle(Command::Present(released("r1", "Lane-A")));
+        worker.handle(Command::Present(released("r2", "Lane-B")));
+        worker.handle(Command::Present(released("r2", "Lane-B")));
+        let start = Instant::now();
+        let mut shown = Vec::new();
+        worker.flush_released(start, |a| { shown.push(a.message.clone()); Ok(()) });
+        assert!(shown.is_empty(), "inside the digest window");
+        worker.flush_released(start + RELEASE_DIGEST_WINDOW, |a| { shown.push(a.message.clone()); Ok(()) });
+        assert_eq!(shown, vec!["2 held requests released: Lane-A, Lane-B".to_string()]);
+        // Both are recorded: a reconnect replay shows nothing new.
+        worker.handle(Command::Present(released("r1", "Lane-A")));
+        assert!(worker.released.is_empty());
+        // A single release shows as itself; ordinary alerts are never delayed.
+        worker.handle(Command::Present(released("r3", "Lane-C")));
+        let mut single = Vec::new();
+        worker.flush_released(Instant::now() + RELEASE_DIGEST_WINDOW, |a| { single.push(a.message.clone()); Ok(()) });
+        assert_eq!(single, vec!["Review ready".to_string()]);
+        let mut direct = 0;
+        worker.present(&alert("plain"), |_| { direct += 1; Ok(()) });
+        assert_eq!(direct, 1);
+    }
+    #[test]
     #[ignore = "requires scripts/test-owner-desktop.py private notification bus"]
     fn owner_notification_desktop_transport() {
         assert_eq!(std::env::var("CM_TEST_OWNER_DESKTOP").as_deref(), Ok("1"));
@@ -78,11 +109,15 @@ mod tests {
     }
 }
 
+/// Legacy held requests released together after upgrade become one desktop popup.
+const RELEASE_DIGEST_WINDOW: Duration = Duration::from_secs(3);
+
 pub struct Delivery {
     seen: VecDeque<String>,
     path: PathBuf,
-    acknowledgements: Vec<(HostId, Alert)>,
+    acknowledgements: Vec<(HostId, String, Alert)>,
     retry_at: Instant,
+    released: Vec<(Alert, Instant)>,
 }
 
 impl Delivery {
@@ -99,24 +134,67 @@ impl Delivery {
             path,
             acknowledgements: Vec::new(),
             retry_at: Instant::now(),
+            released: Vec::new(),
         }
     }
 
     pub fn handle(&mut self, command: Command) {
         match command {
+            Command::Present(alert) if alert.released_at.is_some() => {
+                if !self.seen.contains(&alert.id) && !self.released.iter().any(|(a, _)| a.id == alert.id) {
+                    self.released.push((alert, Instant::now()));
+                }
+            }
             Command::Present(alert) => self.present(&alert, |a| {
                 crate::app::show_user_alert(&a.label, &a.message)
             }),
-            Command::Acknowledge(host, alert) => {
+            Command::Acknowledge(host, key, alert) => {
                 if !self
                     .acknowledgements
                     .iter()
-                    .any(|(h, a)| h == &host && a.id == alert.id)
+                    .any(|(h, k, a)| h == &host && k == &key && a.id == alert.id)
                 {
-                    self.acknowledgements.push((host, alert));
+                    self.acknowledgements.push((host, key, alert));
                 }
             }
         }
+    }
+
+    /// Show buffered released requests once the digest window has passed:
+    /// a single one as itself, several as one "N held requests released"
+    /// popup. Failures keep them buffered for the next flush.
+    fn flush_released(&mut self, now: Instant, show: impl FnOnce(&Alert) -> Result<(), String>) {
+        let Some(oldest) = self.released.iter().map(|(_, t)| *t).min() else {
+            return;
+        };
+        if now.duration_since(oldest) < RELEASE_DIGEST_WINDOW {
+            return;
+        }
+        let batch: Vec<Alert> = self.released.drain(..).map(|(a, _)| a).collect();
+        if batch.len() == 1 {
+            self.present(&batch[0], show);
+            return;
+        }
+        let mut labels: Vec<&str> = batch.iter().map(|a| a.label.as_str()).collect();
+        labels.dedup();
+        let digest = Alert {
+            id: format!("release-digest:{}", batch[0].id),
+            label: "Claude Manager".into(),
+            message: format!(
+                "{} held requests released: {}",
+                batch.len(),
+                labels.iter().take(5).copied().collect::<Vec<_>>().join(", ")
+            ),
+            ..Alert::default()
+        };
+        if let Err(e) = show(&digest) {
+            eprintln!("cm-tui: Owner release digest failed (sidebar alerts retained): {e}");
+            let now = Instant::now();
+            self.released = batch.into_iter().map(|a| (a, now)).collect();
+            return;
+        }
+        let ids: Vec<String> = batch.into_iter().map(|a| a.id).collect();
+        self.record_seen(&ids);
     }
 
     fn present(&mut self, alert: &Alert, show: impl FnOnce(&Alert) -> Result<(), String>) {
@@ -127,7 +205,11 @@ impl Delivery {
             eprintln!("cm-tui: Owner desktop notification failed (sidebar alert retained): {e}");
             return;
         }
-        self.seen.push_back(alert.id.clone());
+        self.record_seen(std::slice::from_ref(&alert.id));
+    }
+
+    fn record_seen(&mut self, ids: &[String]) {
+        self.seen.extend(ids.iter().cloned());
         while self.seen.len() > 4096 {
             self.seen.pop_front();
         }
@@ -147,11 +229,12 @@ impl Delivery {
     }
 
     pub fn flush(&mut self, pool: &HostPool) {
+        self.flush_released(Instant::now(), |a| crate::app::show_user_alert(&a.label, &a.message));
         if Instant::now() < self.retry_at || self.acknowledgements.is_empty() {
             return;
         }
         self.retry_at = Instant::now() + Duration::from_secs(5);
-        self.acknowledgements.retain(|(host, alert)| {
+        self.acknowledgements.retain(|(host, key, alert)| {
             let result = (|| -> anyhow::Result<()> {
                 let socket = pool
                     .for_host(host)?
@@ -161,7 +244,7 @@ impl Delivery {
                     &socket,
                     &pool.operator_token_for(host),
                     "owner_attention.ack",
-                    serde_json::json!({"session_uid": alert.session_uid, "alert_id": alert.id}),
+                    serde_json::json!({"session_uid": key, "alert_id": alert.id}),
                 )?;
                 Ok(())
             })();

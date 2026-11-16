@@ -5,7 +5,10 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-const CAPACITY: usize = 2 * 1024 * 1024;
+/// Room for the 1 MiB replay plus live output while a slow viewer catches
+/// up. Overflow forces a reattach (another full replay), so on a slow link a
+/// little more queue is cheaper than a reconnect.
+const CAPACITY: usize = 4 * 1024 * 1024;
 const BATCH_BYTES: usize = 64 * 1024;
 const BACKGROUND_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -73,6 +76,23 @@ impl OutputSender {
                 self.0 .1.notify_one();
             }
         }
+        true
+    }
+
+    /// Put `bytes` ahead of everything queued. For a screen-first attach:
+    /// the repaint is rendered after subscribing (outside the fanout lock),
+    /// and output that arrived meanwhile must follow it. Call before the
+    /// stream starts draining.
+    pub fn push_front(&self, bytes: &[u8]) -> bool {
+        let mut s = self.0 .0.lock().unwrap_or_else(|p| p.into_inner());
+        if s.dropped || s.overflow {
+            return false;
+        }
+        for chunk in bytes.chunks(BATCH_BYTES).rev() {
+            s.chunks.push_front(chunk.to_vec());
+        }
+        s.bytes += bytes.len();
+        self.0 .1.notify_one();
         true
     }
 
@@ -202,6 +222,20 @@ mod tests {
         );
         tx.set_background(false);
         assert_eq!(rx.recv_timeout(Duration::ZERO).unwrap(), b"draft");
+    }
+
+    #[test]
+    fn push_front_precedes_output_queued_earlier_even_after_close() {
+        let (tx, rx) = channel();
+        tx.push(b"live");
+        tx.close();
+        assert!(tx.push_front(&vec![b's'; BATCH_BYTES + 3]));
+        let mut got = Vec::new();
+        while let Ok(bytes) = rx.recv() {
+            got.extend(bytes);
+        }
+        assert_eq!(got.len(), BATCH_BYTES + 3 + 4);
+        assert!(got.ends_with(b"slive"));
     }
 
     #[test]

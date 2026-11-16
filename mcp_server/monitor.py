@@ -14,16 +14,74 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import time
 
 from mcp_server import control_client
+from mcp_server.session_kind import is_shell, shell_refusal
 from mcp_server.transcripts import claude_code as transcripts_claude
 from mcp_server.transcripts import codex as transcripts_codex
+from mcp_server.transcripts import stream as transcript_stream
 from mcp_server.transcripts.types import Role
 
 
-def _session_status(state: str, idle: bool, reported_done: bool = False) -> str:
+def engine_state(resolved: dict) -> dict | None:
+    """Authoritative engine state; explicit PTY/transcript fallbacks stay legacy."""
+    if is_shell(resolved):
+        return None
+    value = resolved.get("agent_state")
+    if not isinstance(value, dict) or value.get("source") in ("pty", "transcript"):
+        return None
+    return value
+
+
+def engine_turn_complete(resolved: dict) -> bool | None:
+    """A turn boundary or attention condition, never proof that work is done.
+
+    None selects the legacy quietness/transcript path. Unknown states hold.
+    Background work completes a turn watch only after a recorded turn end.
+    """
+    agent = engine_state(resolved)
+    if agent is None:
+        return None
+    state = agent.get("state")
+    if state in ("errored", "waiting-on-human", "exited"):
+        return True
+    if state not in ("idle", "working-background"):
+        return False
+    detail = agent.get("detail") or {}
+    if detail.get("input_pending") is True:
+        return False
+    if no_turn_at(agent) is not None:
+        return True
+    ended = _engine_end(agent)
+    start = agent.get("latest_start_at")
+    if start is not None:
+        # An expired delivery hold is idle, but the queued turn has not ended.
+        # turn_seq already advanced when input was accepted, before PTY delivery.
+        if type(start) not in (int, float) or not math.isfinite(start) or start < 0:
+            return False
+        if ended is None or ended < start:
+            return False
+    return state == "idle" or ended is not None
+
+
+def no_turn_at(agent: dict | None) -> float | None:
+    detail = (agent or {}).get("detail")
+    at = detail.get("no_turn_at") if isinstance(detail, dict) else None
+    return at if type(at) in (int, float) and math.isfinite(at) and at >= 0 else None
+
+
+def _engine_end(agent: dict) -> float | None:
+    last = agent.get("last_turn")
+    at = last.get("ended_at") if isinstance(last, dict) else None
+    return at if type(at) in (int, float) and math.isfinite(at) and at >= 0 else None
+
+
+def _session_status(
+    state: str, idle: bool, reported_done: bool = False, agent_state: dict | None = None
+) -> str:
     """Collapse the daemon's (state, idle, reported_done) triple into ONE
     unambiguous word. Agents routinely misread the raw signal because
     "idle" means three different things depending on `state`; this is the
@@ -58,6 +116,10 @@ def _session_status(state: str, idle: bool, reported_done: bool = False) -> str:
     "did it report before it died" is a separate field (see
     `_monitor_completed_entry`).
 
+    Engine `agent_state` overrides the PTY mapping, adding needs_human,
+    errored and unknown; background retains awaiting_input plus engine detail.
+    Explicit source=pty/transcript keeps the legacy mapping below.
+
     `state` and `idle` are still returned alongside `status` everywhere,
     so callers that want the raw signal keep it.
     """
@@ -65,6 +127,20 @@ def _session_status(state: str, idle: bool, reported_done: bool = False) -> str:
         return "exited"
     if reported_done:
         return "reported"
+    agent = engine_state({"agent_state": agent_state})
+    if agent is not None:
+        if not isinstance(agent.get("state"), str):
+            return "unknown"
+        return {
+            "working": "working",
+            "idle": "awaiting_input",
+            "working-background": "awaiting_input",
+            "waiting-on-human": "needs_human",
+            "errored": "errored",
+            "unknown": "unknown",
+            "starting": "starting",
+            "exited": "exited",
+        }.get(agent.get("state"), "unknown")
     if state == "pending":
         return "starting"
     return "awaiting_input" if idle else "working"
@@ -198,7 +274,7 @@ def last_completed_turn_fingerprint(engine: str, path: str | None) -> str | None
     return None
 
 
-def baseline_for(engine: str, tpath: str | None) -> dict | None:
+def baseline_for(engine: str, tpath: str | None, resolved: dict | None = None) -> dict | None:
     """A baseline pinned to the session's CURRENT completed work, or None
     when there is nothing to anchor on (no transcript, unreadable, no
     completed turn yet) — in which case the watch degrades to level
@@ -208,6 +284,9 @@ def baseline_for(engine: str, tpath: str | None) -> dict | None:
     monitor with it, and `_monitor_sessions` RE-arms with it every time a
     `until="final"` watch skips an interim turn end. Sync (file IO):
     callers offload via asyncio.to_thread where it matters."""
+    agent = engine_state(resolved or {})
+    if agent is not None:
+        return _agent_baseline(agent, baseline_for(engine, tpath))
     if engine == "claude-code":
         fp = last_completed_turn_fingerprint(engine, tpath)
         return {"kind": "turn", "value": fp} if fp is not None else None
@@ -217,6 +296,22 @@ def baseline_for(engine: str, tpath: str | None) -> dict | None:
         return {"kind": "size", "value": os.path.getsize(tpath)}
     except OSError:
         return None
+
+
+def _agent_baseline(agent: dict, legacy: dict | None) -> dict:
+    # Keep the pre-arm legacy edge for a brain rollback. Reading it only at
+    # arm/rearm avoids transcript polling while engine counters are available.
+    seq = agent.get("turn_seq")
+    if type(seq) is not int or seq < 0:
+        return {"kind": "agent", "value": None, "legacy": legacy}
+    # A watch armed mid-turn must observe this turn's end.
+    return {
+        "kind": "agent",
+        "value": seq - (agent.get("state") == "working"),
+        "ended_at": _engine_end(agent),
+        "no_turn_at": no_turn_at(agent),
+        "legacy": legacy,
+    }
 
 
 def report_anchor_for(resolved: dict) -> float | None:
@@ -246,13 +341,38 @@ def _report_is_new(resolved: dict, anchor: float | None) -> bool:
     return anchor is None or current != anchor
 
 
-def _edge_passed(baseline: dict, engine: str, tpath: str | None) -> bool:
+def _edge_passed(baseline: dict, engine: str, tpath: str | None,
+                 resolved: dict | None = None) -> bool:
     """True when the watched session has produced NEW completed work
     since `baseline` was captured at arm time. "turn" baselines compare
     the last-completed-turn fingerprint (claude-code); "size" baselines
     (codex — no turn parse) accept any transcript growth. Unknown
     baseline kinds fail open (level behavior)."""
     kind = baseline.get("kind")
+    if kind == "agent":
+        agent = engine_state(resolved or {})
+        if agent is None:
+            legacy = baseline.get("legacy")
+            # No transcript at arm time had level behavior before engine state.
+            return _edge_passed(legacy, engine, tpath) if isinstance(legacy, dict) else True
+        no_turn = no_turn_at(agent)
+        if no_turn is not None and "no_turn_at" in baseline:
+            previous = baseline["no_turn_at"]
+            return previous is None or no_turn > previous
+        seq = agent.get("turn_seq") if agent is not None else None
+        anchor = baseline.get("value")
+        if type(seq) is not int or type(anchor) is not int:
+            return False
+        if seq > anchor:
+            return True
+        # Old Claude launch settings have Stop but no prompt hook: native
+        # wakes can finish a real turn without advancing the start counter.
+        # A new engine end is exact evidence; heartbeat time is not.
+        if seq == anchor and "ended_at" in baseline:
+            ended = _engine_end(agent)
+            previous = baseline["ended_at"]
+            return ended is not None and (previous is None or ended > previous)
+        return False
     if kind == "turn":
         fp = last_completed_turn_fingerprint(engine, tpath)
         return fp is not None and fp != baseline.get("value")
@@ -278,10 +398,18 @@ def _read_all_messages(engine: str, path: str, generation: int):
     )
 
 
+def last_assistant_message(engine: str, path: str | None) -> dict | None:
+    """The transcript's last assistant message with visible text, read
+    backwards in bounded chunks."""
+    return transcript_stream.last_assistant(path, _parser_for(engine).render_message)
+
+
 def _last_assistant(messages) -> dict | None:
-    """The last assistant message in `messages` as a dict, or None."""
+    """The last assistant message with visible text in `messages` as a
+    dict, or None. Whitespace-only messages are skipped so an empty
+    trailing record never masks the real reply."""
     for m in reversed(messages):
-        if m.role == Role.ASSISTANT:
+        if m.role == Role.ASSISTANT and m.content.strip():
             return m.to_dict()
     return None
 
@@ -308,6 +436,8 @@ _EXIT_PROVENANCE_KEYS = (
     "reported_done",
     "reported_done_at",
     "report_reason",
+    "agent_state",
+    "pty_idle",
 )
 
 
@@ -331,11 +461,16 @@ def _monitor_completed_entry(
     `killed` / `killed_by` / `exited_at` — are carried onto the entry when
     present so the fire message can label a killed session as killed
     instead of presenting its last transcript line as a final report."""
+    no_turn = bool(exit_meta and no_turn_at(engine_state(exit_meta)) is not None
+                   and exit_meta.get("state") != "exited")
     last_message = None
-    if include_message and transcript_path is not None:
+    shell = engine == "bash" or bool(exit_meta and is_shell(exit_meta))
+    if include_message and transcript_path is not None and not no_turn and not shell:
         try:
-            msgs, _ = _read_all_messages(engine, transcript_path, generation)
-            last_message = _last_assistant(msgs)
+            # Backward scan, not a full parse: completions run in executor
+            # threads, and a whole large transcript per completion grew the
+            # MCP server to GBs (2026-10-13).
+            last_message = last_assistant_message(engine, transcript_path)
         except OSError:
             last_message = None
     entry = {
@@ -345,10 +480,56 @@ def _monitor_completed_entry(
         "idle": idle,
         "last_message": last_message,
     }
+    if shell:
+        entry.update(kind="shell", idle_source="pty")
+    if no_turn:
+        entry["completion_kind"] = "no_turn"
     for key in _EXIT_PROVENANCE_KEYS:
         if exit_meta and exit_meta.get(key) is not None:
             entry[key] = exit_meta[key]
     return entry
+
+
+# A rotation's stop (`killed_by` below) is followed by the same uid coming
+# back within seconds; past this grace the exit is treated as real.
+ROTATION_KILLER = "transcript-rotation"
+HANDOFF_KILLER = "handoff"
+# Stops after which CM brings the session straight back at the same uid:
+# a transcript rotation (#24) or an engine/model handoff (#25).
+RESPAWN_KILLERS = frozenset({ROTATION_KILLER, HANDOFF_KILLER})
+ROTATION_GRACE_S = 600.0
+
+
+def _rotation_turn(uid: str, resolved: dict, armed_at: float, absorbed: dict) -> bool:
+    """Whether the turn that just ended is one CM's own prompts caused, after
+    a transcript rotation (#24) or handoff (#25) that started after this
+    watch armed: the agent read CM's notice and stopped, which is not the
+    worker finishing its assignment. A rotation or repick absorbs one turn
+    end; an engine switch two (the handoff document, then the takeover)."""
+    for key in ("rotation", "handoff"):
+        record = resolved.get(key) or {}
+        started = record.get("started_at")
+        if not isinstance(started, (int, float)) or started < armed_at:
+            continue
+        allowed = 2 if record.get("kind") == "switch" else 1
+        mark = (key, started)
+        used = absorbed.get(uid, {}).get(mark, 0)
+        if used >= allowed:
+            continue
+        absorbed.setdefault(uid, {})[mark] = used + 1
+        return True
+    return False
+
+
+def _rotating(uid: str, resolved: dict, seen: dict) -> bool:
+    """Whether an exited `uid` is coming straight back (stopped by CM's
+    transcript rotation, #24, or a handoff, #25), for at most
+    ROTATION_GRACE_S after it was first seen so."""
+    if resolved.get("killed_by") not in RESPAWN_KILLERS:
+        seen.pop(uid, None)
+        return False
+    first = seen.setdefault(uid, time.monotonic())
+    return time.monotonic() - first < ROTATION_GRACE_S
 
 
 async def _monitor_sessions(
@@ -373,11 +554,18 @@ async def _monitor_sessions(
     keep the level-triggered behavior the blocking `wait_*` tools want
     (already-idle returns immediately).
 
+    Engine observations complete on idle/error/human wait, or background after
+    a recorded turn end. Working/starting/unknown do not complete regardless of
+    PTY quietness. Engine edges compare turn_seq; transcript reads supply only
+    the message. Old daemons and source=pty/transcript use the legacy rules below.
+
     A session "completes" by the same rule as `wait_for_session_idle`:
     it finishes its turn (ready + quiet -> `awaiting_input`), or it
     `exited`; a transcript-less pending+quiet session reports after
     `pending_idle_grace_s`. A bad/unauthorized uid is reported once with
     status="error" so a typo can't block the whole monitor.
+    Shells instead complete on PTY quiet or exit, without a transcript
+    grace period or assistant reply, and carry kind="shell", idle_source="pty".
 
     `until` selects WHAT counts as finished for each session:
 
@@ -393,9 +581,9 @@ async def _monitor_sessions(
         time it pauses" — the fan-out case where a worker ends its
         launch turn with background subagents still running, and an
         orchestrator reading that as completion is a live incident.
-        Note a session that can't report (bash, or any agent that never
-        calls the tool) completes only on exit, so pair final mode with
-        a `timeout_s` you're willing to wait.
+        An agent that never calls report_done completes only on exit;
+        shells refuse final mode, while turn_end waits for PTY quiet.
+        Pair final mode with a `timeout_s` you're willing to wait.
 
     mode="any" (default): return as soon as >=1 session completes. The
         `completed` batch may hold more than one if several finished in
@@ -440,6 +628,9 @@ async def _monitor_sessions(
     last_meta: dict[str, tuple[str, str | None, int]] = {}
     remaining = list(uids)
     completed: list[dict] = []
+    rotation_seen: dict[str, float] = {}
+    rotation_absorbed: dict[str, float] = {}
+    armed_at = time.time()
 
     while True:
         now = time.monotonic()
@@ -472,18 +663,41 @@ async def _monitor_sessions(
                 remaining.remove(uid)
                 continue
 
+            shell = is_shell(resolved)
+            if shell and final_mode:
+                return {**shell_refusal("monitor_sessions(until=final)"), "session_uid": uid}
+
             seen[uid] = True
             state = resolved.get("state", "pending")
-            idle = bool(resolved.get("idle", False))
+            idle = bool(resolved.get("pty_idle", resolved.get("idle", False)) if shell else resolved.get("idle", False))
             engine = resolved.get("engine", "claude-code")
-            tpath = resolved.get("transcript_path")
+            tpath = None if shell else resolved.get("transcript_path")
             gen = int(resolved.get("generation", 0))
             last_meta[uid] = (engine, tpath, gen)
 
             done = False
             status_override = None
-            if state == "exited":
+            engine_done = engine_turn_complete(resolved)
+            legacy_edge_passed = False
+            if engine_done is not None and baselines and uid in baselines:
+                if baselines[uid].get("kind") != "agent":
+                    # An MCP reconnect/source upgrade cannot compare engine
+                    # counters with an old transcript fingerprint. Honor a
+                    # watched turn's own first Stop before adopting counters.
+                    legacy_edge_passed = await asyncio.to_thread(
+                        _edge_passed, baselines[uid], engine, tpath
+                    )
+                    baselines[uid] = _agent_baseline(engine_state(resolved), baselines[uid])
+            if state == "exited" and _rotating(uid, resolved, rotation_seen):
+                # #24: a transcript rotation stops the process and brings
+                # it straight back at the same uid; that is not an exit.
+                done = False
+            elif state == "exited":
                 done = True
+            elif shell:
+                done = idle
+            elif engine_done is not None:
+                done = engine_done
             elif state == "ready" and idle:
                 done = True
             elif state == "ready":
@@ -518,14 +732,14 @@ async def _monitor_sessions(
             # Edge gate: an idle observation on the SAME turn that existed
             # when the watch was armed is not a completion.
             edge_ok = True
-            if done and state != "exited" and baselines:
+            if done and state != "exited" and baselines and not shell:
                 b = baselines.get(uid)
-                if b is not None and not await asyncio.to_thread(
-                    _edge_passed, b, engine, tpath
+                if b is not None and not legacy_edge_passed and not await asyncio.to_thread(
+                    _edge_passed, b, engine, tpath, resolved
                 ):
                     edge_ok = False
 
-            reported = bool(resolved.get("reported_done"))
+            reported = not shell and bool(resolved.get("reported_done"))
             if final_mode and state != "exited":
                 if _report_is_new(resolved, report_anchors.get(uid)):
                     # The report IS the edge. Deciding this off the
@@ -542,11 +756,11 @@ async def _monitor_sessions(
                     # stops the same idle state from being re-tested (and
                     # its transcript re-read) on every poll.
                     new_baseline = await asyncio.to_thread(
-                        baseline_for, engine, tpath
+                        baseline_for, engine, tpath, resolved
                     )
                     # Count only turns we can actually pin. A
-                    # transcript-less session — bash, or an agent still
-                    # coming up — has no turn boundary to re-arm against,
+                    # transcript-less agent still coming up has no
+                    # turn boundary to re-arm against,
                     # and incrementing per poll would make the count a
                     # poll counter.
                     if (
@@ -557,6 +771,14 @@ async def _monitor_sessions(
                         interim_turn_ends[uid] += 1
                     done = False
 
+            if (done and edge_ok and state != "exited" and not shell and not reported
+                    and _rotation_turn(uid, resolved, armed_at, rotation_absorbed)):
+                # #24: the turn the rotation's after-notice caused. Re-arm
+                # past it, like an interim turn in final mode.
+                new_baseline = await asyncio.to_thread(baseline_for, engine, tpath, resolved)
+                if new_baseline is not None:
+                    baselines[uid] = new_baseline
+                done = False
             if not edge_ok:
                 # Idle on the pre-arm turn: not a completion, keep waiting
                 # for the next edge.
@@ -570,10 +792,12 @@ async def _monitor_sessions(
                 # ended — a strictly weaker claim than the agent's own
                 # done report, so `reported` wins over it.
                 status_word = (
-                    _session_status(state, idle, True)
+                    _session_status(state, idle, True, resolved.get("agent_state"))
                     if reported
-                    else status_override or _session_status(state, idle)
+                    else status_override or _session_status(state, idle, False, resolved.get("agent_state"))
                 )
+                if shell:
+                    status_word = "exited" if state == "exited" else "quiet"
                 entry = await asyncio.to_thread(
                     _monitor_completed_entry, uid,
                     status_word,

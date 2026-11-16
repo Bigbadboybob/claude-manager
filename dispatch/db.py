@@ -2,6 +2,7 @@ import asyncio
 import json
 import uuid
 import asyncpg
+from datetime import datetime, timezone
 from dispatch.config import DB_DSN
 
 
@@ -41,6 +42,13 @@ def normalize_task_id(task_id: str) -> str:
 def _serialize(row: dict) -> dict:
     """Convert UUID and other non-JSON types to strings."""
     return {k: str(v) if isinstance(v, uuid.UUID) else v for k, v in row.items()}
+
+
+def _event_value(values: dict) -> dict:
+    """JSON-safe copy of an event's previous/new values. The jsonb codec uses
+    plain json.dumps, so a UUID (e.g. coordinator_task_id) or timestamp in an
+    audit row used to fail the whole update with a 500."""
+    return json.loads(json.dumps(values, default=str))
 
 
 async def _init_connection(conn: asyncpg.Connection) -> None:
@@ -163,7 +171,7 @@ TASK_ROW_SELECT = """SELECT t.*, i.slug AS initiative_slug, i.name AS initiative
                           CASE WHEN i.id IS NULL THEN NULL ELSE
                             jsonb_build_object('id', i.id, 'slug', i.slug,
                                                'name', i.name, 'status', i.status,
-                                               'color', i.color,
+                                               'color', i.color, 'kind', i.kind,
                                                'coordinator_task_id', i.coordinator_task_id) END AS initiative
                    FROM tasks t
                    LEFT JOIN initiatives i ON i.id = t.initiative_id"""
@@ -361,6 +369,16 @@ INITIATIVE_STATUSES = frozenset(
     {"draft", "active", "paused", "completed", "archived", "cancelled"}
 )
 INITIATIVE_PROJECT_STATUSES = frozenset({"proposed", "approved", "removed"})
+# A division is a permanent org unit: it never reaches a done state.
+INITIATIVE_KINDS = frozenset({"initiative", "division"})
+DIVISION_FORBIDDEN_STATUSES = frozenset({"completed", "archived"})
+
+
+def _check_initiative_kind(kind: str) -> None:
+    if kind not in INITIATIVE_KINDS:
+        raise ValueError(
+            f"invalid initiative kind: {kind!r} (expected one of {sorted(INITIATIVE_KINDS)})"
+        )
 
 
 def _initiative_ref(ref: str) -> tuple[str, str]:
@@ -407,7 +425,8 @@ async def get_initiative(pool: asyncpg.Pool, ref: str) -> dict | None:
 
 async def list_initiatives(
     pool: asyncpg.Pool, *, status: str | None = None,
-    project: str | None = None, include_archived: bool = False,
+    project: str | None = None, kind: str | None = None,
+    include_archived: bool = False,
 ) -> list[dict]:
     async with pool.acquire() as conn:
         conditions: list[str] = []
@@ -415,6 +434,13 @@ async def list_initiatives(
         if status:
             params.append(status)
             conditions.append(f"i.status = ${len(params)}")
+        if kind:
+            params.append(kind)
+            conditions.append(f"i.kind = ${len(params)}")
+        else:
+            # Taskless teams (org model S2) are listed only when asked for:
+            # older clients assume every initiative has a coordinator task.
+            conditions.append("i.kind <> 'team'")
         if project:
             params.append(project)
             conditions.append(
@@ -443,8 +469,9 @@ async def create_initiative(
     color: str | None = None, coordinator_task_id: str,
     coordinator_project: str | None = None, docs_path: str = "cm-initiative",
     shared_channel: str | None = None, metadata: dict | None = None,
-    actor: str = "owner",
+    actor: str = "owner", kind: str = "initiative",
 ) -> dict:
+    _check_initiative_kind(kind)
     coordinator_task_id = normalize_task_id(coordinator_task_id)
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -457,11 +484,11 @@ async def create_initiative(
             row = await conn.fetchrow(
                 """INSERT INTO initiatives
                     (slug, name, description, color, coordinator_task_id,
-                     coordinator_project, docs_path, shared_channel, metadata)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *""",
+                     coordinator_project, docs_path, shared_channel, metadata, kind)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *""",
                 slug, name, description, color, coordinator_task_id,
                 coordinator_project or task["project"], docs_path,
-                shared_channel, metadata,
+                shared_channel, metadata, kind,
             )
             # The coordinator is a normal task, but it is also the durable
             # anchor for this initiative. Attach it in the same transaction so
@@ -480,7 +507,7 @@ async def create_initiative(
                 """INSERT INTO initiative_events
                    (initiative_id, actor, event_type, new_value, reason)
                    VALUES ($1,$2,'created',$3,$4)""",
-                row["id"], actor, {"status": "draft", "slug": slug},
+                row["id"], actor, {"status": "draft", "slug": slug, "kind": kind},
                 "initiative created",
             )
         result = _serialize(dict(row))
@@ -494,8 +521,11 @@ async def update_initiative(
     reason: str | None = None, **fields,
 ) -> dict | None:
     allowed = {"name", "description", "color", "status", "coordinator_task_id",
-               "coordinator_project", "docs_path", "shared_channel", "metadata"}
+               "coordinator_project", "docs_path", "shared_channel", "metadata",
+               "kind"}
     fields = {key: value for key, value in fields.items() if key in allowed}
+    if "kind" in fields:
+        _check_initiative_kind(fields["kind"])
     if not fields:
         return await get_initiative(pool, ref)
     if "status" in fields and fields["status"] not in INITIATIVE_STATUSES:
@@ -512,6 +542,13 @@ async def update_initiative(
             )
             if not current:
                 return None
+            kind = fields.get("kind", current["kind"])
+            status = fields.get("status", current["status"])
+            if kind == "division" and status in DIVISION_FORBIDDEN_STATUSES:
+                raise ValueError(
+                    f"a division is permanent and cannot be {status}; "
+                    "pause or cancel it, or change its kind first"
+                )
             if "coordinator_task_id" in fields:
                 coordinator = await conn.fetchrow(
                     "SELECT id, initiative_id FROM tasks WHERE id = $1",
@@ -565,7 +602,8 @@ async def update_initiative(
                    VALUES ($1,$2,$3,$4,$5,$6)""",
                 current["id"], actor,
                 "status_changed" if "status" in fields else "updated",
-                {key: current[key] for key in fields}, fields, reason,
+                _event_value({key: current[key] for key in fields}),
+                _event_value(fields), reason,
             )
         result = _serialize(dict(row))
         result["projects"] = await _initiative_projects_conn(conn, result["id"])
@@ -645,7 +683,8 @@ async def update_initiative_project(
                     previous_value, new_value, reason)
                    VALUES ($1,$2,'project_updated',$3,$4,$5,$6)""",
                 initiative["id"], actor, project,
-                {key: current[key] for key in fields}, fields, reason,
+                _event_value({key: current[key] for key in fields}),
+                _event_value(fields), reason,
             )
         return _serialize(dict(row))
 
@@ -670,7 +709,7 @@ async def get_task(pool: asyncpg.Pool, task_id: str) -> dict | None:
             """SELECT t.*, CASE WHEN i.id IS NULL THEN NULL ELSE
                        jsonb_build_object('id', i.id, 'slug', i.slug,
                                           'name', i.name, 'status', i.status,
-                                          'color', i.color,
+                                          'color', i.color, 'kind', i.kind,
                                           'coordinator_task_id', i.coordinator_task_id) END AS initiative
                   FROM tasks t LEFT JOIN initiatives i ON i.id = t.initiative_id
                  WHERE t.id = $1""", task_id,
@@ -690,6 +729,128 @@ async def update_task(pool: asyncpg.Pool, task_id: str, **fields) -> dict | None
             task_id, *fields.values(),
         )
         return _serialize(dict(row)) if row else None
+
+
+async def set_task_lead(pool: asyncpg.Pool, task_id: str, session_uid: str | None) -> dict | None:
+    """Set or (with None) remove ``metadata.lead_session_uid`` in one statement.
+
+    Every other metadata key is preserved, unlike ``update_task``'s
+    whole-object replace. Returns the full task row, or None if missing.
+    """
+    task_id = normalize_task_id(task_id)
+    async with pool.acquire() as conn:
+        if session_uid is None:
+            updated = await conn.fetchval(
+                """UPDATE tasks SET metadata = COALESCE(metadata, '{}'::jsonb) - 'lead_session_uid',
+                                   updated_at = now()
+                   WHERE id = $1 RETURNING id""",
+                task_id,
+            )
+        else:
+            updated = await conn.fetchval(
+                """UPDATE tasks SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb),
+                                                         '{lead_session_uid}', to_jsonb($2::text), true),
+                                   updated_at = now()
+                   WHERE id = $1 RETURNING id""",
+                task_id, session_uid,
+            )
+    if not updated:
+        return None
+    return await get_task(pool, task_id)
+
+
+# Task launch defaults: ``metadata.<key>.<engine>`` for ``key`` in these.
+TASK_DEFAULT_KEYS = ("models", "efforts")
+
+
+async def set_task_default(pool: asyncpg.Pool, task_id: str, key: str, engine: str,
+                           value: str | None) -> dict | None:
+    """Set or (with None) remove ``metadata.<key>.<engine>`` in one statement.
+
+    ``key`` is ``models`` or ``efforts``. Every other metadata key, and the
+    other engine's default, is preserved; a ``<key>`` value that isn't an
+    object (a hand-edited row) is replaced rather than erroring, and an
+    emptied object is dropped. Returns the full task row, or None if missing.
+    """
+    if key not in TASK_DEFAULT_KEYS:
+        raise ValueError(f"unknown task default {key!r}")
+    task_id = normalize_task_id(task_id)
+    current = """CASE WHEN jsonb_typeof(metadata->$2::text) = 'object'
+                      THEN metadata->$2::text ELSE '{}'::jsonb END"""
+    async with pool.acquire() as conn:
+        if value is None:
+            updated = await conn.fetchval(
+                f"""UPDATE tasks SET metadata = CASE
+                           WHEN ({current} - $3::text) = '{{}}'::jsonb
+                           THEN COALESCE(metadata, '{{}}'::jsonb) - $2::text
+                           ELSE jsonb_set(metadata, ARRAY[$2::text], {current} - $3::text)
+                       END,
+                       updated_at = now()
+                   WHERE id = $1 RETURNING id""",
+                task_id, key, engine,
+            )
+        else:
+            updated = await conn.fetchval(
+                f"""UPDATE tasks SET metadata = jsonb_set(
+                           COALESCE(metadata, '{{}}'::jsonb), ARRAY[$2::text],
+                           {current} || jsonb_build_object($3::text, $4::text),
+                           true),
+                       updated_at = now()
+                   WHERE id = $1 RETURNING id""",
+                task_id, key, engine, value,
+            )
+    if not updated:
+        return None
+    return await get_task(pool, task_id)
+
+
+async def set_task_model(pool: asyncpg.Pool, task_id: str, engine: str, model: str | None) -> dict | None:
+    """``set_task_default`` for ``metadata.models.<engine>``."""
+    return await set_task_default(pool, task_id, "models", engine, model)
+
+
+async def resolve_task_default(pool: asyncpg.Pool, task_id: str, key: str,
+                               engine: str) -> dict | None:
+    """The nearest ``metadata.<key>.<engine>`` up the parent chain.
+
+    Returns ``{"value": str|None, "source_task_id": str|None}``, or None if
+    the task itself is missing. A non-object ``<key>`` counts as unset. The
+    walk stops at 64 levels and never revisits a task, so a parent cycle
+    can't loop.
+    """
+    if key not in TASK_DEFAULT_KEYS:
+        raise ValueError(f"unknown task default {key!r}")
+    task_id = normalize_task_id(task_id)
+    pick = """CASE WHEN jsonb_typeof(metadata->$2::text) = 'object'
+                   THEN metadata->$2::text->>$3::text END"""
+    async with pool.acquire() as conn:
+        exists = await conn.fetchval("SELECT 1 FROM tasks WHERE id = $1", task_id)
+        if not exists:
+            return None
+        row = await conn.fetchrow(
+            f"""WITH RECURSIVE chain(id, parent_task_id, value, depth, seen) AS (
+                   SELECT id, parent_task_id, {pick}, 0, ARRAY[id]
+                   FROM tasks WHERE id = $1
+                 UNION ALL
+                   SELECT t.id, t.parent_task_id, {pick.replace('metadata', 't.metadata')},
+                          c.depth + 1, c.seen || t.id
+                   FROM tasks t JOIN chain c ON t.id = c.parent_task_id
+                   WHERE c.depth < 64 AND NOT t.id = ANY(c.seen)
+               )
+               SELECT id, value FROM chain
+               WHERE value IS NOT NULL AND btrim(value) <> ''
+               ORDER BY depth LIMIT 1""",
+            task_id, key, engine,
+        )
+    if row is None:
+        return {"value": None, "source_task_id": None}
+    return {"value": row["value"].strip(), "source_task_id": str(row["id"])}
+
+
+async def resolve_task_model(pool: asyncpg.Pool, task_id: str, engine: str) -> dict | None:
+    """The nearest ``metadata.models.<engine>``: ``{"model", "source_task_id"}``."""
+    r = await resolve_task_default(pool, task_id, "models", engine)
+    return None if r is None else {"model": r["value"], "source_task_id": r["source_task_id"]}
 
 
 async def merge_task_metadata_backtest(
@@ -845,12 +1006,22 @@ async def delete_task(pool: asyncpg.Pool, task_id: str):
 
 
 async def list_projects(pool: asyncpg.Pool) -> list[dict]:
-    """Return distinct project names with their repo URLs."""
+    """One row per project: the repo most of its tasks carry.
+
+    A task can be filed into a project from another repo's checkout and
+    carry the wrong repo_url, so a project's repo is its most common
+    (repo_url, repo_branch) pair, the newest row breaking ties, never
+    whichever row a DISTINCT happens to return first.
+    """
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT DISTINCT project, repo_url FROM tasks
-               WHERE project IS NOT NULL
-               ORDER BY project""",
+            """SELECT DISTINCT ON (project) project, repo_url, repo_branch
+               FROM (SELECT project, repo_url, repo_branch,
+                            count(*) AS n, max(created_at) AS newest
+                       FROM tasks
+                      WHERE project IS NOT NULL AND repo_url <> ''
+                      GROUP BY project, repo_url, repo_branch) per_repo
+               ORDER BY project, n DESC, newest DESC""",
         )
         return [dict(r) for r in rows]
 
@@ -997,34 +1168,75 @@ async def enqueue_queue_item(
     """Insert one item. Returns {enqueued, deduped, id, depth} where `depth`
     is the queue's pending count after the call (deduped or not)."""
     async with pool.acquire() as conn:
-        item_id: str | None = None
-        deduped = False
-        try:
-            row = await conn.fetchrow(
-                """INSERT INTO queue_items (queue, payload, dedupe_key, source)
-                   VALUES ($1, $2, $3, $4)
-                   RETURNING id""",
-                queue, payload, dedupe_key, source,
+        async with conn.transaction():
+            item_id: str | None = None
+            deduped = False
+            try:
+                # A nested transaction is a savepoint: a dedupe collision must not
+                # abort the outer transaction that records the coalesced wake.
+                async with conn.transaction():
+                    row = await conn.fetchrow(
+                        """INSERT INTO queue_items (queue, payload, dedupe_key, source)
+                           VALUES ($1, $2, $3, $4)
+                           RETURNING id""",
+                        queue, payload, dedupe_key, source,
+                    )
+                    item_id = str(row["id"])
+            except asyncpg.UniqueViolationError:
+                # Same dedupe_key already pending/claimed in this queue — coalesce.
+                deduped = True
+            depth = await conn.fetchval(
+                "SELECT count(*) FROM queue_items WHERE queue = $1 AND state = 'pending'",
+                queue,
             )
-            item_id = str(row["id"])
-        except asyncpg.UniqueViolationError:
-            # Same dedupe_key already pending/claimed in this queue — coalesce.
-            deduped = True
-        depth = await conn.fetchval(
-            "SELECT count(*) FROM queue_items WHERE queue = $1 AND state = 'pending'",
-            queue,
-        )
-        return {
-            "enqueued": not deduped,
-            "deduped": deduped,
-            "id": item_id,
-            "depth": int(depth),
-        }
+            # Older isolated databases (and pre-037 deployments) have no binding
+            # table. Keep their queue wire shape and behavior unchanged.
+            has_bindings = await conn.fetchval("SELECT to_regclass('queue_bindings')")
+            binding = None
+            wake_requested = False
+            wake_id = None
+            if has_bindings:
+                binding = await conn.fetchrow(
+                    "SELECT consumer, wake_pending, wake_delivery, wake_id FROM queue_bindings WHERE queue=$1 FOR UPDATE",
+                    queue,
+                )
+                if binding and depth > 0 and (not binding["wake_pending"] or binding["wake_delivery"] == "failed"):
+                    await conn.execute(
+                        "UPDATE queue_bindings SET wake_pending=true, wake_delivery='pending', wake_id=gen_random_uuid(), wake_error=NULL WHERE queue=$1",
+                        queue,
+                    )
+                    wake_id = await conn.fetchval("SELECT wake_id FROM queue_bindings WHERE queue=$1", queue)
+                    wake_requested = True
+            result = {
+                "enqueued": not deduped,
+                "deduped": deduped,
+                "id": item_id,
+                "depth": int(depth),
+            }
+            if binding:
+                result.update({
+                    "bound_consumer": binding["consumer"],
+                    "wake_requested": wake_requested,
+                    "wake_pending": True,
+                    "wake_id": str(wake_id) if wake_requested and wake_id else None,
+                })
+            return result
 
 
 async def queue_stats(pool: asyncpg.Pool, queue: str) -> dict:
     """Pending/claimed counts + oldest pending timestamp for one queue."""
     async with pool.acquire() as conn:
+        # Releasing expired leases is deliberately done by readers/claimers,
+        # so a dead consumer cannot strand work until an operator intervenes.
+        has_bindings = await conn.fetchval("SELECT to_regclass('queue_bindings')")
+        async with conn.transaction():
+            if has_bindings:
+                await conn.execute(
+                    """UPDATE queue_items SET state='pending', claimed_at=NULL,
+                              claimed_by=NULL, claimed_consumer=NULL, claim_token=NULL,
+                              lease_until=NULL
+                       WHERE queue=$1 AND state='claimed' AND lease_until IS NOT NULL
+                         AND lease_until <= now()""", queue)
         row = await conn.fetchrow(
             """SELECT
                    count(*) FILTER (WHERE state = 'pending')  AS pending,
@@ -1034,12 +1246,115 @@ async def queue_stats(pool: asyncpg.Pool, queue: str) -> dict:
             queue,
         )
         oldest = row["oldest_pending_at"]
-        return {
+        result = {
             "queue": queue,
             "pending": int(row["pending"]),
             "claimed": int(row["claimed"]),
             "oldest_pending_at": oldest.isoformat() if oldest else None,
+            "oldest_item_age_seconds": max(0.0, (datetime.now(timezone.utc) - oldest).total_seconds()) if oldest else None,
         }
+        if has_bindings:
+            binding = await conn.fetchrow(
+                """SELECT consumer, bound_by, bound_at, last_wake_at,
+                          last_consume_at, wake_pending, wake_delivery, wake_error,
+                          wake_id
+                   FROM queue_bindings WHERE queue=$1""", queue)
+            result["binding"] = None
+            result["last_wake"] = None
+            result["last_consume"] = None
+            result["wake_pending"] = False
+            result["wake_delivery"] = None
+            result["wake_error"] = None
+            result["wake_id"] = None
+            if binding:
+                result["binding"] = {
+                    "consumer": binding["consumer"],
+                    "bound_by": binding["bound_by"],
+                    "bound_at": binding["bound_at"].isoformat(),
+                }
+                result["last_wake"] = binding["last_wake_at"].isoformat() if binding["last_wake_at"] else None
+                result["last_consume"] = binding["last_consume_at"].isoformat() if binding["last_consume_at"] else None
+                result["wake_pending"] = bool(binding["wake_pending"])
+                result["wake_delivery"] = binding["wake_delivery"]
+                result["wake_error"] = binding["wake_error"]
+                result["wake_id"] = str(binding["wake_id"]) if binding["wake_id"] else None
+        return result
+
+
+async def list_queue_stats(pool: asyncpg.Pool) -> list[dict]:
+    """Stable read shape for the dashboard: one row per known queue."""
+    async with pool.acquire() as conn:
+        has_bindings = await conn.fetchval("SELECT to_regclass('queue_bindings')")
+        query = ("SELECT queue FROM queue_items UNION SELECT queue FROM queue_bindings ORDER BY queue"
+                 if has_bindings else "SELECT DISTINCT queue FROM queue_items ORDER BY queue")
+        queues = await conn.fetch(query)
+    return [await queue_stats(pool, row["queue"]) for row in queues]
+
+
+class QueueBindingRefusal(ValueError):
+    """A caller tried to operate a queue bound to another member."""
+
+
+async def bind_queue(pool: asyncpg.Pool, queue: str, consumer: str, bound_by: str) -> dict:
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """INSERT INTO queue_bindings(queue, consumer, bound_by)
+                   VALUES ($1,$2,$3)
+                   ON CONFLICT (queue) DO UPDATE SET consumer=EXCLUDED.consumer,
+                     bound_by=EXCLUDED.bound_by, bound_at=now(), wake_error=NULL
+                   RETURNING queue, consumer, bound_by, bound_at, last_wake_at,
+                             last_consume_at, wake_pending, wake_delivery, wake_error, wake_id""",
+                queue, consumer, bound_by,
+            )
+            depth = await conn.fetchval(
+                "SELECT count(*) FROM queue_items WHERE queue=$1 AND state='pending'", queue
+            )
+            # Binding/rebinding with backlog must wake the newly bound lead;
+            # the native notification id coalesces any already pending event.
+            wake_requested = bool(depth)
+            if wake_requested:
+                await conn.execute(
+                    "UPDATE queue_bindings SET wake_pending=true, wake_delivery='pending', wake_id=gen_random_uuid() WHERE queue=$1",
+                    queue,
+                )
+                row = await conn.fetchrow(
+                    "SELECT queue, consumer, bound_by, bound_at, last_wake_at, last_consume_at, wake_pending, wake_delivery, wake_error, wake_id FROM queue_bindings WHERE queue=$1",
+                    queue,
+                )
+    return {
+        "queue": row["queue"], "consumer": row["consumer"],
+        "bound_by": row["bound_by"], "bound_at": row["bound_at"].isoformat(),
+        "last_wake": row["last_wake_at"].isoformat() if row["last_wake_at"] else None,
+        "last_consume": row["last_consume_at"].isoformat() if row["last_consume_at"] else None,
+        "wake_pending": bool(row["wake_pending"]), "wake_delivery": row["wake_delivery"],
+        "wake_error": row["wake_error"],
+        "wake_id": str(row["wake_id"]) if row["wake_id"] else None,
+        "wake_requested": wake_requested,
+        # The daemon's bind wake text reads `depth`; without it every bind
+        # wake announced "0 pending item(s)" over a real backlog.
+        "depth": int(depth),
+    }
+
+
+async def record_queue_wake(pool: asyncpg.Pool, queue: str, *, delivered: bool,
+                            error: str | None = None) -> dict:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """UPDATE queue_bindings
+               SET last_wake_at=now(),
+                   wake_delivery=CASE WHEN $2 THEN 'delivered' ELSE 'failed' END,
+                   wake_error=$3
+               WHERE queue=$1
+               RETURNING last_wake_at, wake_pending, wake_delivery, wake_error""",
+            queue, delivered, error,
+        )
+    if not row:
+        return {"queue": queue, "recorded": False}
+    return {"queue": queue, "recorded": True,
+            "last_wake": row["last_wake_at"].isoformat() if row["last_wake_at"] else None,
+            "wake_pending": bool(row["wake_pending"]),
+            "wake_delivery": row["wake_delivery"], "wake_error": row["wake_error"]}
 
 
 class QueueRecoveryConflict(ValueError):
@@ -1088,27 +1403,70 @@ async def recover_queue_item(pool, queue: str, item_id: str,
             return {"recovered": True, "already_recovered": False, "id": item_id}
 
 
+async def _check_queue_consumer(conn, queue: str, consumer: str | None) -> bool:
+    """Check the optional 037 binding; return whether this is bound."""
+    has_bindings = await conn.fetchval("SELECT to_regclass('queue_bindings')")
+    if not has_bindings:
+        return False
+    binding = await conn.fetchrow("SELECT consumer FROM queue_bindings WHERE queue=$1", queue)
+    if binding and consumer != binding["consumer"]:
+        expected = binding["consumer"]
+        raise QueueBindingRefusal(
+            f"queue '{queue}' is bound to consumer '{expected}'; consumer '{consumer or 'unbound caller'}' may not consume it"
+        )
+    if binding and not consumer:
+        raise QueueBindingRefusal(
+            f"queue '{queue}' is bound to consumer '{binding['consumer']}'; a consumer identity is required"
+        )
+    return bool(binding)
+
+
 async def claim_queue_items(
     pool: asyncpg.Pool, queue: str, max_items: int, claimed_by: str,
+    *, consumer: str | None = None, lease_seconds: int = 300,
 ) -> list[dict]:
     """Atomically claim up to `max_items` oldest pending items
     (FOR UPDATE SKIP LOCKED — safe under concurrent claimers)."""
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """UPDATE queue_items
-               SET state = 'claimed', claimed_at = now(), claimed_by = $3
-               WHERE id IN (
-                   SELECT id FROM queue_items
-                   WHERE queue = $1 AND state = 'pending'
-                   ORDER BY enqueued_at
-                   LIMIT $2
-                   FOR UPDATE SKIP LOCKED
-               )
-               RETURNING id, payload, dedupe_key, source, enqueued_at""",
-            queue, max_items, claimed_by,
-        )
+      async with conn.transaction():
+        schema_v37 = bool(await conn.fetchval("SELECT to_regclass('queue_bindings')"))
+        bound = await _check_queue_consumer(conn, queue, consumer)
+        if schema_v37:
+            await conn.execute(
+                """UPDATE queue_items SET state='pending', claimed_at=NULL,
+                          claimed_by=NULL, claimed_consumer=NULL, claim_token=NULL,
+                          lease_until=NULL
+                   WHERE queue=$1 AND state='claimed' AND lease_until IS NOT NULL
+                     AND lease_until <= now()""", queue)
+        if schema_v37:
+            rows = await conn.fetch(
+                """UPDATE queue_items
+                   SET state='claimed', claimed_at=now(), claimed_by=$3,
+                       claimed_consumer=$4, claim_token=gen_random_uuid(),
+                       lease_until=now() + make_interval(secs => $5)
+                   WHERE id IN (
+                       SELECT id FROM queue_items WHERE queue=$1 AND state='pending'
+                       ORDER BY enqueued_at LIMIT $2 FOR UPDATE SKIP LOCKED)
+                   RETURNING id, payload, dedupe_key, source, enqueued_at,
+                             claim_token, lease_until""",
+                queue, max_items, claimed_by, consumer, lease_seconds,
+            )
+        else:
+            rows = await conn.fetch(
+                """UPDATE queue_items SET state='claimed', claimed_at=now(), claimed_by=$3
+                   WHERE id IN (
+                       SELECT id FROM queue_items WHERE queue=$1 AND state='pending'
+                       ORDER BY enqueued_at LIMIT $2 FOR UPDATE SKIP LOCKED)
+                   RETURNING id, payload, dedupe_key, source, enqueued_at""",
+                queue, max_items, claimed_by,
+            )
         # Preserve claim (oldest-first) order for the batch file.
         rows = sorted(rows, key=lambda r: r["enqueued_at"])
+        if bound:
+            await conn.execute(
+                "UPDATE queue_bindings SET last_consume_at=now(), wake_pending=false, wake_error=NULL WHERE queue=$1",
+                queue,
+            )
         return [
             {
                 "id": str(r["id"]),
@@ -1116,28 +1474,75 @@ async def claim_queue_items(
                 "dedupe_key": r["dedupe_key"],
                 "source": r["source"],
                 "enqueued_at": r["enqueued_at"].isoformat(),
+                "claim_token": str(r["claim_token"]) if schema_v37 and r["claim_token"] else None,
+                "lease_until": r["lease_until"].isoformat() if schema_v37 and r["lease_until"] else None,
             }
             for r in rows
         ]
 
 
-async def ack_queue_items(pool: asyncpg.Pool, queue: str, ids: list[str]) -> int:
+async def ack_queue_items(pool: asyncpg.Pool, queue: str, ids: list[str], *,
+                          consumer: str | None = None,
+                          claim_token: str | None = None) -> int:
     """claimed -> consumed for the given ids (scoped to `queue`). Returns the
     number of rows flipped; ids not in claimed state are ignored."""
     if not ids:
+        async with pool.acquire() as conn:
+            await _check_queue_consumer(conn, queue, consumer)
         return 0
     async with pool.acquire() as conn:
-        result = await conn.execute(
-            """UPDATE queue_items
-               SET state = 'consumed', consumed_at = now()
-               WHERE queue = $1 AND state = 'claimed' AND id = ANY($2::uuid[])""",
-            queue, ids,
-        )
+        async with conn.transaction():
+            schema_v37 = bool(await conn.fetchval("SELECT to_regclass('queue_bindings')"))
+            bound = await _check_queue_consumer(conn, queue, consumer)
+            if schema_v37 and bound and claim_token:
+                result = await conn.execute(
+                    """UPDATE queue_items SET state='consumed', consumed_at=now(),
+                              lease_until=NULL
+                       WHERE queue=$1 AND state='claimed' AND claimed_consumer=$2
+                         AND (lease_until IS NULL OR lease_until > now())
+                         AND claim_token=$3::uuid AND id=ANY($4::uuid[])""",
+                    queue, consumer, claim_token, ids,
+                )
+            elif schema_v37 and bound:
+                result = await conn.execute(
+                    """UPDATE queue_items SET state='consumed', consumed_at=now(),
+                              lease_until=NULL
+                       WHERE queue=$1 AND state='claimed' AND claimed_consumer=$2
+                         AND (lease_until IS NULL OR lease_until > now())
+                         AND id=ANY($3::uuid[])""",
+                    queue, consumer, ids,
+                )
+            else:
+                if schema_v37:
+                    result = await conn.execute(
+                        """UPDATE queue_items SET state='consumed', consumed_at=now(),
+                                  lease_until=NULL
+                           WHERE queue=$1 AND state='claimed' AND id=ANY($2::uuid[])""",
+                        queue, ids,
+                    )
+                else:
+                    result = await conn.execute(
+                        """UPDATE queue_items SET state='consumed', consumed_at=now()
+                           WHERE queue=$1 AND state='claimed' AND id=ANY($2::uuid[])""",
+                        queue, ids,
+                    )
+            if schema_v37 and bound and claim_token and int(result.split()[-1]) == 0:
+                still_claimed = await conn.fetchval(
+                    """SELECT count(*) FROM queue_items
+                       WHERE queue=$1 AND state='claimed' AND claimed_consumer=$2
+                         AND id=ANY($3::uuid[])""",
+                    queue, consumer, ids,
+                )
+                if still_claimed:
+                    raise QueueBindingRefusal(
+                        f"queue '{queue}' claim_token does not match the active lease"
+                    )
         return int(result.split()[-1])
 
 
 async def requeue_queue_items(
     pool: asyncpg.Pool, queue: str, ids: list[str] | None = None,
+    *, consumer: str | None = None,
 ) -> int:
     """claimed -> pending (recovery after a crashed/failed fire). Returns rows
     flipped.
@@ -1150,18 +1555,20 @@ async def requeue_queue_items(
     if ids is not None and not ids:
         return 0
     async with pool.acquire() as conn:
+        schema_v37 = bool(await conn.fetchval("SELECT to_regclass('queue_bindings')"))
+        await _check_queue_consumer(conn, queue, consumer)
+        reset = ("claimed_at=NULL, claimed_by=NULL, claimed_consumer=NULL, "
+                 "claim_token=NULL, lease_until=NULL") if schema_v37 else "claimed_at=NULL, claimed_by=NULL"
         if ids is not None:
             result = await conn.execute(
-                """UPDATE queue_items
-                   SET state = 'pending', claimed_at = NULL, claimed_by = NULL
-                   WHERE queue = $1 AND state = 'claimed' AND id = ANY($2::uuid[])""",
+                f"""UPDATE queue_items SET state='pending', {reset}
+                    WHERE queue=$1 AND state='claimed' AND id=ANY($2::uuid[])""",
                 queue, ids,
             )
         else:
             result = await conn.execute(
-                """UPDATE queue_items
-                   SET state = 'pending', claimed_at = NULL, claimed_by = NULL
-                   WHERE queue = $1 AND state = 'claimed'""",
+                f"""UPDATE queue_items SET state='pending', {reset}
+                    WHERE queue=$1 AND state='claimed'""",
                 queue,
             )
         return int(result.split()[-1])

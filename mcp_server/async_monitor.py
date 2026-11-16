@@ -11,10 +11,11 @@ the shared native notification queue.
 
 Termination discipline (`until`):
   - "turn_end" (default) — the watch completes on the next completed
-    turn, exit, or eviction;
+    turn, exit, or eviction; shells complete on PTY quiet or exit,
+    without an assistant reply, regardless of transcript edge settings;
   - "final" — only an exit or the agent's own `report_done` counts.
     Interim turn ends re-arm the watch instead of firing it, which is
-    what makes a monitor safe to arm on a worker that pauses mid-task or
+    Shells refuse final watches. This makes a monitor safe to arm on a worker that pauses mid-task or
     ends a turn with background subagents still running.
 
 Delivery discipline:
@@ -35,11 +36,16 @@ import os
 import secrets
 import sys
 import time
+from pathlib import Path
 
 from mcp_server import control_client, monitor_state
+from mcp_server.session_kind import is_shell, shell_refusal
+from mcp_server.launch_confirmation import await_launch_confirmation
 from mcp_server.monitor import (
     _monitor_sessions,
     baseline_for,
+    engine_state,
+    engine_turn_complete,
     report_anchor_for,
     transcript_turn_complete,
 )
@@ -99,7 +105,7 @@ def persist_state() -> None:
 def _persist_best_effort() -> None:
     try:
         persist_state()
-    except (OSError, ValueError) as exc:
+    except (OSError, TypeError, ValueError) as exc:
         _log(f"durable monitor state unavailable ({type(exc).__name__}); drain remains blocked")
 
 
@@ -116,7 +122,7 @@ def _prune_finished() -> None:
         _MONITORS.pop(k, None)
 
 
-def _capture_baseline(uid: str) -> tuple[dict | None, bool, float | None]:
+def _capture_baseline(uid: str, *, until: str = "turn_end") -> tuple[dict | None, bool, float | None]:
     """One resolve of `uid` at ARM time. Returns (baseline-or-None,
     currently_at_prompt, report_anchor-or-None).
 
@@ -133,6 +139,10 @@ def _capture_baseline(uid: str) -> tuple[dict | None, bool, float | None]:
         )
     except (control_client.ControlError, control_client.TransportError):
         return None, False, None
+    if is_shell(resolved):
+        if until == "final":
+            raise RegistrationError("agent_only", shell_refusal("monitor_sessions(until=final)")["message"])
+        return None, False, None
     state = resolved.get("state", "pending")
     idle = bool(resolved.get("idle", False))
     engine = resolved.get("engine", "claude-code")
@@ -141,8 +151,10 @@ def _capture_baseline(uid: str) -> tuple[dict | None, bool, float | None]:
     # in its `until="final"` form: firing on it would wake the caller with
     # news it already had, so it is anchored (and the caller is TOLD).
     anchor = report_anchor_for(resolved)
+    if engine_state(resolved) is not None:
+        return baseline_for(engine, tpath, resolved), bool(engine_turn_complete(resolved)), anchor
     if state != "ready" or not tpath:
-        # Starting / transcript-less (bash): nothing to anchor an edge
+        # Starting / transcript-less agent: nothing to anchor an edge
         # on — level behavior, which is right for a fresh spawn (its
         # first completed turn should fire).
         return None, False, anchor
@@ -162,6 +174,8 @@ def register_monitor(
     timeout_s: float = DEFAULT_TIMEOUT_S,
     source: str = "explicit",
     edge: bool = True,
+    launch_receipt: dict | None = None,
+    launch_socket_path=None,
 ) -> dict:
     """Start a background watch on `session_uids`; returns immediately.
 
@@ -172,6 +186,8 @@ def register_monitor(
         completed turn, the default) or "final" (only an exit or an
         explicit `report_done`; interim turn ends re-arm the watch).
         `until="task_done"` is accepted as a synonym for "final".
+        Shells support only turn_end: wait for PTY quiet or exit without
+        an assistant reply, regardless of edge settings.
 
     Because agents reach for the axis they remember, `mode="final"` is
     accepted as sugar for `mode="any", until="final"` — the one-word
@@ -228,6 +244,21 @@ def register_monitor(
             "no_event_loop", "monitor registration requires a running loop"
         )
 
+    baselines: dict[str, dict] = {}
+    report_anchors: dict[str, float] = {}
+    already_idle: list[str] = []
+    already_reported: list[str] = []
+    for uid in uids:
+        baseline, at_prompt, anchor = _capture_baseline(uid, until=until)
+        if edge:
+            if baseline is not None:
+                baselines[uid] = baseline
+            if at_prompt:
+                already_idle.append(uid)
+            if anchor is not None:
+                report_anchors[uid] = anchor
+                already_reported.append(uid)
+
     # Auto-registrations dedupe per target set: prompting the same
     # worker again re-anchors the watch rather than stacking a second
     # (stale) monitor that would fire twice.
@@ -257,20 +288,6 @@ def register_monitor(
             "let some fire first",
         )
 
-    baselines: dict[str, dict] = {}
-    report_anchors: dict[str, float] = {}
-    already_idle: list[str] = []
-    already_reported: list[str] = []
-    if edge:
-        for uid in uids:
-            baseline, at_prompt, anchor = _capture_baseline(uid)
-            if baseline is not None:
-                baselines[uid] = baseline
-            if at_prompt:
-                already_idle.append(uid)
-            if anchor is not None:
-                report_anchors[uid] = anchor
-                already_reported.append(uid)
     if source == "auto":
         # A just-prompted worker is EXPECTED to still be at its prompt
         # (the PTY delivery has seconds of runway) — reporting it as
@@ -295,16 +312,20 @@ def register_monitor(
         "caller": caller,
         "state": "watching",
         "created_at": time.time(),
+        # Absolute, so a successor resuming the watch keeps the same budget.
+        "deadline_at": time.time() + max(1.0, min(timeout_s, 86400.0)),
         "result": None,
         "delivered": None,
         "baselines": baselines,
         "report_anchors": report_anchors,
+        "launch_receipt": launch_receipt,
+        "launch_socket_path": launch_socket_path,
         "task": None,
     }
     _MONITORS[monitor_id] = record
     try:
         persist_state()
-    except (OSError, ValueError) as exc:
+    except (OSError, TypeError, ValueError) as exc:
         _MONITORS.pop(monitor_id, None)
         raise RegistrationError("tracking_failed", "Could not persist the monitor obligation; no watch or notification was started.") from exc
     record["task"] = loop.create_task(
@@ -376,10 +397,23 @@ async def _run_monitor(record: dict, *, timeout_s: float) -> None:
     baselines = record.get("baselines")
     if not baselines and until != "final":
         baselines = None
-    deadline = time.monotonic() + max(1.0, min(timeout_s, 86400.0))
+    # A negative budget is an adopted watch whose deadline already passed.
+    budget = 0.0 if timeout_s < 0 else max(1.0, min(timeout_s, 86400.0))
+    deadline = time.monotonic() + budget
     try:
         result = None
-        while True:
+        launch = record.get("launch_receipt")
+        if launch is not None:
+            launch = await await_launch_confirmation(
+                record["watching"][0], launch, socket_path=record.get("launch_socket_path"),
+                timeout_s=min(360.0, max(0.0, deadline - time.monotonic())),
+            )
+            record["launch_receipt"] = launch
+            if not launch["submitted"]:
+                result = {"completed": [], "still_running": record["watching"],
+                          "timed_out": False, "submitted": False,
+                          "prompt_delivery": launch}
+        while result is None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 result = {
@@ -402,6 +436,9 @@ async def _run_monitor(record: dict, *, timeout_s: float) -> None:
                 # survive it (daemon-side persistence); retry.
                 _log(f"{monitor_id}: daemon unreachable ({e}); retrying")
                 await asyncio.sleep(5.0)
+        if launch is not None:
+            result["prompt_delivery"] = launch
+            result["submitted"] = launch["submitted"]
         record["result"] = result
         record["state"] = "fired"
         persist_state()
@@ -475,6 +512,9 @@ def _entry_lines(entry: dict) -> list[str]:
     continuation lines — so existing consumers keep parsing.
     """
     uid = entry.get("session_uid", "?")
+    if entry.get("kind") == "shell":
+        status = entry.get("status", "quiet")
+        return [f"- {uid} (shell {status}): PTY {status}; no assistant reply."]
     status = entry.get("status", "?")
     lm = entry.get("last_message") or {}
     content = (lm.get("content") or "").strip()
@@ -504,6 +544,8 @@ def _entry_lines(entry: dict) -> list[str]:
     else:
         lines.append(f"- {uid} ({status})")
 
+    if entry.get("completion_kind") == "no_turn":
+        lines.append("  no_turn: input was submitted, but no engine turn was observed; no new reply")
     reported = bool(entry.get("reported_done"))
     if reported:
         when = _fmt_exit_ts(entry.get("reported_done_at"))
@@ -526,6 +568,14 @@ def _entry_lines(entry: dict) -> list[str]:
             "  turn ended per transcript; PTY still active — background "
             "work may still be running"
         )
+    agent = engine_state(entry)
+    if agent is not None:
+        if agent.get("state") == "working-background":
+            lines.append("  foreground turn ended; background work is still running")
+        elif agent.get("state") == "waiting-on-human":
+            lines.append("  human input or permission needed; this is not a done report")
+        elif agent.get("state") == "errored":
+            lines.append("  the engine reported an error; inspect it before continuing")
     if not killed and not reported and entry.get("state") != "exited":
         lines.append(
             "  (no explicit done-report — this may be an interim turn, "
@@ -539,6 +589,20 @@ def _format_fire_message(record: dict, result: dict) -> str:
     marker (also used for delivery verification)."""
     lines: list[str] = []
     head = f"[cm-monitor {record['monitor_id']} fired]"
+    if result.get("error"):
+        return f"{head} Watch refused: {result.get('message', result['error'])}"
+    if result.get("submitted") is False and result.get("prompt_delivery"):
+        receipt = result["prompt_delivery"]
+        uncertainty = (
+            " The daemon lost the confirmation receipt after a restart or session change; "
+            "delivery is unknown, not failed."
+            if receipt.get("reason") == "confirmation_lost_or_session_replaced" else ""
+        )
+        return (f"{head} Initial prompt submission unconfirmed for "
+                f"{', '.join(record['watching'])}: {receipt.get('reason')}. "
+                f"{uncertainty} submitted=false means no confirmation, not proof of no delivery. "
+                "Inspect its state/transcript before "
+                "re-sending to avoid a duplicate prompt. No completion is claimed.")
     if record["note"]:
         head += f" {record['note']}"
     lines.append(head)
@@ -603,6 +667,12 @@ def _format_fire_message(record: dict, result: dict) -> str:
             "EXITED — there is no prompt left to send follow-ups to. Read "
             "what they left with read_last_turn, or start a fresh session.)"
         )
+    elif any(e.get("status") in ("needs_human", "errored") for e in done):
+        lines.append(
+            "(Async monitor notification. A watched session needs attention. "
+            "Inspect its agent_state and read_last_turn; a human wait or error "
+            "does not mean the work is finished.)"
+        )
     else:
         lines.append(
             "(Async monitor notification. The completed worker(s) are now "
@@ -633,8 +703,15 @@ async def _deliver_to_caller(record: dict, message: str) -> bool:
     # shutdown or cancellation racing the native consumer's claim.
     record["delivery_uncertain"] = True
     persist_state()
-    queue.publish(event_id, "session_monitor", message,
-                  f"[cm-monitor {record['monitor_id']}")
+    try:
+        queue.publish(event_id, "session_monitor", message,
+                      f"[cm-monitor {record['monitor_id']}")
+    except ValueError:
+        # The ID is already taken: a predecessor MCP process published this
+        # monitor's notice before handing the watch over. One monitor is one
+        # wake, so verify that notice instead of sending a second one.
+        if queue.get(event_id) is None:
+            raise
     deadline = time.monotonic() + VERIFY_WINDOW_S
     while time.monotonic() < deadline:
         event = queue.get(event_id)
@@ -746,10 +823,77 @@ def list_monitors() -> dict:
     out = []
     for m in _MONITORS.values():
         _refresh_delivery(m)
-        out.append({k: v for k, v in m.items() if k != "task"})
+        out.append({k: v for k, v in m.items() if k not in {"task", "launch_socket_path"}})
     try:
         persist_state()
         durable = monitor_state.read()
     except (OSError, ValueError):
         durable = {"available": False, "error": "Durable monitor journal is unreadable."}
     return {"monitors": out, "durable": durable}
+
+
+# ── Adoption across an MCP activation (doc/mcp-managed-activation.md §5) ──
+
+PREDECESSOR_EXIT_WAIT_S = 120.0
+ADOPT_ATTEMPTS = 5
+ADOPT_RETRY_S = 2.0
+
+
+async def adopt_predecessor(identity: tuple[int, str] | None = None) -> list[str]:
+    """Resume the watches of the MCP process this one replaced.
+
+    `identity` is the predecessor's (pid, start time), from the proxy's
+    CM_MCP_PREDECESSOR_PID/START by default; pid alone could name a reused
+    process. Waits for that process to exit first (its shutdown writes its
+    last journal state), then moves its unfinished records here in one
+    atomic journal write and restarts each watch from its ORIGINAL baseline
+    and deadline. A turn that ended during the swap is still a new edge
+    against that baseline, so it fires exactly once: the notice ID is the
+    monitor ID, and a predecessor's already-published notice is verified,
+    never duplicated (_deliver_to_caller)."""
+    from mcp_server import activation
+    identity = identity or activation.predecessor()
+    if not identity or not identity[1]:
+        return []
+    pid, start = identity
+    deadline = time.monotonic() + PREDECESSOR_EXIT_WAIT_S
+    while activation.process_alive(pid, start):
+        if time.monotonic() > deadline:
+            _log(f"predecessor {pid} still alive; not adopting its monitors")
+            return []
+        await asyncio.sleep(0.2)
+    taken = None
+    for attempt in range(ADOPT_ATTEMPTS):
+        try:
+            taken = await asyncio.to_thread(monitor_state.adopt, pid, start)
+            break
+        except (OSError, ValueError) as exc:
+            # A failed write changed nothing: the predecessor still owns its
+            # records, so retrying cannot duplicate them.
+            _log(f"could not adopt monitors from {pid} ({type(exc).__name__}); "
+                 f"attempt {attempt + 1}/{ADOPT_ATTEMPTS}")
+            await asyncio.sleep(ADOPT_RETRY_S)
+    if taken is None:
+        return []
+    loop = asyncio.get_running_loop()
+    for mid, saved in taken.items():
+        if mid in _MONITORS:
+            continue
+        record = {
+            "note": "", "source": "explicit", "result": None, "delivered": None,
+            "report_anchors": {}, "launch_receipt": None, "launch_socket_path": None,
+            **saved,
+            "caller": saved.get("caller") or _self_uid(),
+            "state": "watching",
+            "task": None,
+        }
+        record["baselines"] = record.get("baselines") or {}
+        remaining = float(record.get("deadline_at") or 0) - time.time()
+        _MONITORS[mid] = record
+        record["task"] = loop.create_task(
+            _run_monitor(record, timeout_s=remaining if remaining > 0 else -1.0),
+            name=f"cm-monitor-{mid}")
+    if taken:
+        _persist_best_effort()
+        _log(f"adopted {len(taken)} monitor(s) from predecessor {pid}")
+    return list(taken)

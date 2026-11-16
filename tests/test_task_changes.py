@@ -170,7 +170,8 @@ class TaskChangesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cache[a["id"]]["priority"], 7)
         self.assertEqual(cache[b["id"]]["name"], "b2")
         # Full row shape (what /tasks returns) travels in each change.
-        self.assertEqual(cache[a["id"]]["prompt"], "prompt a")
+        # (An old client's prompt arrives folded into the description.)
+        self.assertEqual(cache[a["id"]]["description"], "## Instructions\n\nprompt a")
         cursor = page["cursor"]
 
         # Several edits to one task collapse to one entry carrying the latest row.
@@ -326,6 +327,164 @@ class TaskChangesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.status_code, 200, r.text)
         page2 = await self.changes(page["cursor"], snap["epoch"])
         self.assertEqual(page2["changes"], [])
+
+    async def test_initiative_kind_migration_applies_twice(self):
+        coord = await self.create("pre-existing")
+        r = await self.client.post("/initiatives", json={
+            "name": "Old", "coordinator_task_id": coord["id"]})
+        self.assertEqual(r.status_code, 200, r.text)
+        migration = (ROOT / "sql" / "022_initiative_kind.sql").read_text()
+        async with self.pool.acquire() as conn:
+            await conn.execute(migration)
+            await conn.execute(migration)
+            kinds = await conn.fetch("SELECT kind FROM initiatives")
+            constraints = await conn.fetchval(
+                "SELECT count(*) FROM pg_constraint WHERE conname = 'initiatives_kind_check' "
+                "AND conrelid = 'initiatives'::regclass")
+        self.assertEqual([k["kind"] for k in kinds], ["initiative"])
+        self.assertEqual(constraints, 1)
+
+    async def test_division_kind_is_permanent_and_rides_task_rows(self):
+        await db.init_db(self.pool)  # migrations re-run on every API start
+        coord = await self.create("cto")
+        r = await self.client.post("/initiatives", json={
+            "name": "Trader", "coordinator_task_id": coord["id"], "kind": "bogus"})
+        self.assertEqual(r.status_code, 400, r.text)
+        r = await self.client.post("/initiatives", json={
+            "name": "Trader", "coordinator_task_id": coord["id"], "kind": "division"})
+        self.assertEqual(r.status_code, 200, r.text)
+        div = r.json()
+        self.assertEqual(div["kind"], "division")
+        # Existing (default) initiatives read back as kind 'initiative'.
+        other = await self.create("other-coord")
+        r = await self.client.post("/initiatives", json={
+            "name": "Plain", "coordinator_task_id": other["id"]})
+        self.assertEqual(r.json()["kind"], "initiative")
+        r = await self.client.get("/initiatives", params={"kind": "division"})
+        self.assertEqual([i["slug"] for i in r.json()], [div["slug"]])
+
+        # A subtask under the root inherits the division, and both task-row
+        # readers carry kind in the embedded initiative object.
+        r = await self.client.post(f"/initiatives/{div['id']}/projects", json={"project": "proj"})
+        r = await self.client.patch(f"/initiatives/{div['id']}/projects/proj",
+                                    json={"status": "approved"})
+        self.assertEqual(r.status_code, 200, r.text)
+        child = await self.create("report", parent_task_id=coord["id"])
+        self.assertEqual(child["initiative_id"], div["id"])
+        self.assertEqual((await self.client.get(f"/tasks/{child['id']}")).json()
+                         ["initiative"]["kind"], "division")
+        snap = await self.snapshot()
+        rows = {t["id"]: t for t in snap["tasks"]}
+        self.assertEqual(rows[child["id"]]["initiative"]["kind"], "division")
+
+        # Divisions have no done state.
+        r = await self.client.post(f"/initiatives/{div['id']}/approve")
+        self.assertEqual(r.status_code, 200, r.text)
+        r = await self.client.post(f"/initiatives/{div['id']}/complete")
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn("permanent", r.text)
+        r = await self.client.patch(f"/initiatives/{div['id']}", json={"status": "completed"})
+        self.assertEqual(r.status_code, 400, r.text)
+
+        # A kind change re-delivers member tasks through the feed.
+        r = await self.client.patch(f"/initiatives/{div['id']}", json={"kind": "initiative"})
+        self.assertEqual(r.status_code, 200, r.text)
+        page = await self.changes(snap["cursor"], snap["epoch"])
+        kinds = {c["task_id"]: c["task"]["initiative"]["kind"] for c in page["changes"]}
+        self.assertEqual(kinds, {coord["id"]: "initiative", child["id"]: "initiative"})
+        # A completed initiative cannot become a division.
+        r = await self.client.post(f"/initiatives/{div['id']}/complete")
+        self.assertEqual(r.status_code, 200, r.text)
+        r = await self.client.patch(f"/initiatives/{div['id']}", json={"kind": "division"})
+        self.assertEqual(r.status_code, 400, r.text)
+
+    async def test_set_task_lead_touches_only_its_key(self):
+        task = await self.create("led", metadata={"filer": {"session_uid": "ts-1-1"}})
+        r = await self.client.post(f"/tasks/{task['id']}/lead", json={"session_uid": "ts-2-0"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["metadata"], {"filer": {"session_uid": "ts-1-1"},
+                                                "lead_session_uid": "ts-2-0"})
+        r = await self.client.post(f"/tasks/{task['id']}/lead", json={"session_uid": None})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["metadata"], {"filer": {"session_uid": "ts-1-1"}})
+        bare = await self.create("bare")
+        r = await self.client.post(f"/tasks/{bare['id']}/lead", json={"session_uid": " ts-3-0 "})
+        self.assertEqual(r.json()["metadata"], {"lead_session_uid": "ts-3-0"})
+        r = await self.client.post(f"/tasks/{uuid.uuid4()}/lead", json={"session_uid": "x"})
+        self.assertEqual(r.status_code, 404, r.text)
+
+    async def test_task_model_default_is_atomic_and_inherited(self):
+        root = await self.create("root", metadata={"filer": {"session_uid": "ts-1-1"}})
+        mid = await self.create("mid", parent_task_id=root["id"])
+        leaf = await self.create("leaf", parent_task_id=mid["id"])
+
+        async def resolved(task, engine):
+            r = await self.client.get(f"/tasks/{task['id']}/model", params={"engine": engine})
+            self.assertEqual(r.status_code, 200, r.text)
+            return r.json()
+
+        self.assertEqual(await resolved(leaf, "codex"),
+                         {"engine": "codex", "model": None, "source_task_id": None,
+                          "effort": None, "effort_source_task_id": None})
+        r = await self.client.post(f"/tasks/{root['id']}/model",
+                                   json={"engine": "codex", "model": "gpt-6-luna"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["metadata"], {"filer": {"session_uid": "ts-1-1"},
+                                                "models": {"codex": "gpt-6-luna"}})
+        r = await self.client.post(f"/tasks/{root['id']}/model",
+                                   json={"engine": "claude", "model": "claude-opus-5-5"})
+        self.assertEqual(r.json()["metadata"]["models"],
+                         {"codex": "gpt-6-luna", "claude": "claude-opus-5-5"})
+        # The leaf inherits from the root, per engine.
+        self.assertEqual(await resolved(leaf, "codex"),
+                         {"engine": "codex", "model": "gpt-6-luna", "source_task_id": root["id"],
+                          "effort": None, "effort_source_task_id": None})
+        # The nearest ancestor wins.
+        await self.client.post(f"/tasks/{mid['id']}/model", json={"engine": "codex", "model": "gpt-6.1-sol"})
+        self.assertEqual((await resolved(leaf, "codex"))["source_task_id"], mid["id"])
+        self.assertEqual((await resolved(leaf, "claude"))["model"], "claude-opus-5-5")
+        # Clearing one engine keeps the other; clearing both drops the key.
+        r = await self.client.post(f"/tasks/{root['id']}/model", json={"engine": "codex", "model": None})
+        self.assertEqual(r.json()["metadata"]["models"], {"claude": "claude-opus-5-5"})
+        r = await self.client.post(f"/tasks/{root['id']}/model", json={"engine": "claude", "model": None})
+        self.assertEqual(r.json()["metadata"], {"filer": {"session_uid": "ts-1-1"}})
+        # Effort is its own slot: setting it leaves the model alone, and it
+        # inherits separately. Whitespace is trimmed before validation.
+        r = await self.client.post(f"/tasks/{root['id']}/model",
+                                   json={"engine": "codex", "model": " gpt-6-luna ", "effort": "high"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["metadata"]["models"], {"codex": "gpt-6-luna"})
+        self.assertEqual(r.json()["metadata"]["efforts"], {"codex": "high"})
+        r = await self.client.post(f"/tasks/{root['id']}/model", json={"engine": "codex", "effort": None})
+        self.assertNotIn("efforts", r.json()["metadata"])
+        self.assertEqual(r.json()["metadata"]["models"], {"codex": "gpt-6-luna"})
+        await self.client.post(f"/tasks/{mid['id']}/model", json={"engine": "claude", "effort": "max"})
+        got = await resolved(leaf, "claude")
+        self.assertEqual((got["effort"], got["effort_source_task_id"]), ("max", mid["id"]))
+        r = await self.client.post(f"/tasks/{root['id']}/model", json={"engine": "codex", "model": None})
+        # A hand-edited non-object `models` is replaced, not an error, and
+        # reads as unset.
+        await self.client.patch(f"/tasks/{root['id']}", json={"metadata": {"models": "oops"}})
+        self.assertEqual((await resolved(root, "codex"))["model"], None)
+        r = await self.client.post(f"/tasks/{root['id']}/model", json={"engine": "codex", "model": None})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertNotIn("models", r.json()["metadata"])
+        r = await self.client.post(f"/tasks/{root['id']}/model", json={"engine": "codex", "model": "gpt-6-luna"})
+        self.assertEqual(r.json()["metadata"]["models"], {"codex": "gpt-6-luna"})
+        await self.client.post(f"/tasks/{root['id']}/model", json={"engine": "codex", "model": None})
+        # A parent cycle can't loop the resolver.
+        await self.client.patch(f"/tasks/{root['id']}", json={"parent_task_id": leaf["id"]})
+        self.assertEqual((await resolved(root, "codex"))["source_task_id"], mid["id"])
+        # Bad input.
+        for body in ({"engine": "bash", "model": "x"}, {"engine": "codex", "model": "a b"},
+                     {"engine": "codex", "model": "-m"}, {"engine": "codex", "effort": "max"},
+                     {"engine": "claude", "effort": "extreme"}, {"engine": "codex"}):
+            r = await self.client.post(f"/tasks/{root['id']}/model", json=body)
+            self.assertEqual(r.status_code, 422, body)
+        r = await self.client.get(f"/tasks/{root['id']}/model", params={"engine": "bash"})
+        self.assertEqual(r.status_code, 422)
+        r = await self.client.get(f"/tasks/{uuid.uuid4()}/model", params={"engine": "codex"})
+        self.assertEqual(r.status_code, 404)
 
     async def test_expired_foreign_and_future_cursors_resnapshot(self):
         a = await self.create("a")
@@ -549,10 +708,10 @@ class TaskChangesTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_gzip_negotiation_on_list_and_feed(self):
         big = "x" * 4000
-        await self.create("a", prompt=big)
+        await self.create("a", description=big)
         r = await self.client.get("/tasks", headers={"Accept-Encoding": "gzip"})
         self.assertEqual(r.headers.get("content-encoding"), "gzip")
-        self.assertEqual(r.json()[0]["prompt"], big)
+        self.assertTrue(r.json()[0]["description"].startswith(big))
         raw = await self.client.get("/tasks", headers={"Accept-Encoding": "identity"})
         self.assertIsNone(raw.headers.get("content-encoding"))
 
@@ -586,6 +745,28 @@ class TaskChangesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({t["id"] for t in listed}, {a["id"], b["id"]})
         single = (await self.client.get(f"/tasks/{a['id']}")).json()
         self.assertEqual(single["status"], "archived")
+
+    async def test_projects_name_the_repo_most_rows_carry(self):
+        from unittest import mock
+        pt = "git@github.com:o/predictionTrading.git"
+        for n in range(3):
+            await self.create(f"pt{n}", project="predictionTrading", repo_url=pt,
+                              repo_branch="trunk")
+        # One stray row filed from another checkout, newest of all.
+        await self.create("stray", project="predictionTrading",
+                          repo_url="git@github.com:o/claude-manager.git")
+        with mock.patch.dict(api_main.REPOS, {}, clear=True):
+            listed = (await self.client.get("/projects")).json()
+        by_name = {p["name"]: p for p in listed}
+        self.assertEqual(by_name["predictionTrading"],
+                         {"name": "predictionTrading", "repo_url": pt, "repo_branch": "trunk"})
+        # The project record on the API host still wins over rows.
+        record = "https://github.com/o/predictionTrading.git"
+        with mock.patch.dict(api_main.REPOS, {"predictionTrading": record}, clear=True):
+            listed = (await self.client.get("/projects")).json()
+        by_name = {p["name"]: p for p in listed}
+        self.assertEqual(by_name["predictionTrading"]["repo_url"], record)
+        self.assertEqual(by_name["predictionTrading"]["repo_branch"], "main")
 
 
 if __name__ == "__main__":

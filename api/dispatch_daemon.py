@@ -6,7 +6,7 @@ import subprocess
 import time
 import uuid
 from datetime import datetime, timezone
-from dispatch import db
+from dispatch import db, task_text
 from dispatch.config import (
     GCP_PROJECT, GCP_ZONE, MAX_WORKERS, MANAGER_URL, API_TOKEN,
     MAX_BACKTEST_WORKERS, BACKTEST_VM_DEFAULTS, BACKTEST_SECRETS_PROJECT,
@@ -123,7 +123,7 @@ async def _assign_to_warm_vm(pool, task, warm_vm):
     logger.info(f"Assigning task {task['id']} to warm VM {warm_vm['vm_name']}")
 
     branch = task.get("wip_branch") or task["repo_branch"]
-    prompt = task.get("prompt") or ""
+    prompt = task_text.compose_brief(task.get("description"), task.get("prompt"), task.get("name"))
 
     try:
         if branch != "main":
@@ -534,8 +534,10 @@ def _launch_worker_sync(task, branch):
         task_id=str(task["id"]),
         repo_url=task["repo_url"],
         repo_branch=branch,
-        prompt=task["prompt"],
+        prompt=task_text.compose_brief(task.get("description"), task.get("prompt"),
+                                       task.get("name")),
         manager_callback_url=MANAGER_URL,
+        task_metadata=task.get("metadata"),
     )
 
 
@@ -545,7 +547,7 @@ def _launch_warm_vm_sync(wp, vm_name):
     The caller pre-generates ``vm_name`` and persists the warm_vms row so
     concurrent dispatchers can't race on the same instance name.
     """
-    from dispatch.vm import launch_worker
+    from dispatch.vm import claude_launch_metadata, launch_worker
     from pathlib import Path
 
     warm_startup = (Path(__file__).parent.parent / "worker" / "warm_startup.sh").read_text()
@@ -581,6 +583,7 @@ def _launch_warm_vm_sync(wp, vm_name):
             compute_v1.Items(key="manager-callback-url", value=MANAGER_URL),
             compute_v1.Items(key="api-token", value=API_TOKEN),
             compute_v1.Items(key="pool-id", value=str(wp["id"])),
+            *(compute_v1.Items(key=k, value=v) for k, v in claude_launch_metadata(None).items()),
         ]),
         service_accounts=[compute_v1.ServiceAccount(
             email="default",

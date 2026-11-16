@@ -1,0 +1,355 @@
+"""Request bodies for the items API (doc/items-board.md §6).
+
+Fields left out of a body are left unchanged; an explicit null clears.  The
+rules in `dispatch.items_rules` do the semantic validation, so these models
+only fix the wire shape.
+"""
+
+from typing import Annotated, Any
+
+from pydantic import BaseModel, ConfigDict, Field
+
+# Bounds keep oversized values a 422 rather than a driver error (int4 columns).
+ItemNumber = Annotated[int, Field(ge=1, le=2**31 - 1)]
+Short = Annotated[str, Field(max_length=200)]
+Reason = Annotated[str, Field(max_length=500)]
+When = Annotated[str, Field(max_length=64)]
+Seconds = Annotated[int, Field(ge=1, le=30 * 24 * 3600)]
+
+
+class _Strict(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class Actor(_Strict):
+    pid: str = Field(min_length=1, max_length=200)
+    name: Short | None = None
+    session_uid: Short | None = None
+    daemon_id: Short | None = None
+    task_id: Short | None = None
+    global_perms: bool = False
+
+
+class AttributedActor(Actor):
+    attribution: Any = None
+
+
+class Holder(_Strict):
+    pid: str = Field(min_length=1, max_length=200)
+    name: Short | None = None
+    session_uid: Short | None = None
+    daemon_id: Short | None = None
+    # owner | contributor | reviewer | approver (doc/org-model.md §7.2)
+    role: Short | None = None
+
+
+class AttributedHolder(Holder):
+    attribution: Any = None
+
+
+class ItemFields(_Strict):
+    title: str | None = None
+    status: str | None = None
+    note: str | None = None
+    group: str | None = None
+    holders: list[Holder] | None = Field(default=None, max_length=50)
+    blocked_by: list[ItemNumber] | None = Field(default=None, max_length=50)
+    blocked_on: str | None = None
+    check_back: When | None = None
+    eta: When | None = None
+    job: Short | None = None
+    links: list[str] | None = None
+    # Org model S3 (doc/org-model.md §7): the group by id (else `group` by
+    # name), a board-native item's description, the owning team.
+    group_id: Short | None = None
+    description: str | None = Field(default=None, max_length=20000)
+    team_id: Short | None = None
+    # Gate bindings (doc/gate-receipts.md §8); item_set only.
+    head: Short | None = None
+    mf: Short | None = None
+    ruling: Short | None = None
+    gate_class: Short | None = None
+
+
+class AttributedItemFields(ItemFields):
+    holders: list[AttributedHolder] | None = Field(default=None, max_length=50)
+
+
+class ItemSpec(ItemFields):
+    title: str
+
+
+class BoardResolveBody(_Strict):
+    task_id: Short | None = None
+    ref: Short | None = None
+
+
+class BoardPatchBody(_Strict):
+    actor: Actor
+    name: Short | None = None
+    orchestrator_pid: Short | None = None
+    steward_pid: Short | None = None
+    channel: Short | None = None
+    idle_s: Seconds | None = None
+    stale_s: Seconds | None = None
+    unassigned_s: Seconds | None = None
+    repush_s: Seconds | None = None
+    escalate_s: Seconds | None = None
+    digest_s: Seconds | None = None
+    stale_background_s: Seconds | None = None
+    nudge_grace_s: Seconds | None = None
+    holder_idle_enabled: bool | None = None
+    backlog_allowed: bool | None = None
+    launch_s: Seconds | None = None
+    max_active_per_holder: Annotated[int, Field(ge=1, le=50)] | None = None
+    check_back_max_s: Seconds | None = None
+    gate_default_class: Short | None = None
+    gate_editors: list[Short] | None = Field(default=None, max_length=20)
+    waiver_grantors: list[Short] | None = Field(default=None, max_length=20)
+
+
+class ItemsCreateBody(_Strict):
+    actor: Actor
+    items: list[ItemSpec] = Field(min_length=1, max_length=50)
+    request_id: Short | None = None
+
+
+class ItemsPatchBody(_Strict):
+    actor: AttributedActor
+    ns: list[ItemNumber] = Field(min_length=1, max_length=50)
+    set: AttributedItemFields = Field(default_factory=AttributedItemFields)
+    add_holders: list[AttributedHolder] | None = Field(default=None, max_length=50)
+    remove_holders: list[Short] | None = Field(default=None, max_length=50)
+    reason: Reason | None = None
+    # Per-item results: each item is written on its own (bulk edits).
+    each: bool = False
+    # A done item reopens only with reopen=true (Owner's writes imply it).
+    reopen: bool = False
+    # Compare-and-set: refused (409 status_changed) unless the item's status is this.
+    expect_status: Short | None = None
+    # Transfer ownership (one atomic write), and the role for add_holders.
+    owner: AttributedHolder | None = None
+    role: Short | None = None
+
+
+class PlaceBody(_Strict):
+    actor: Actor
+    board: Short
+    group: Short | None = None
+    group_id: Short | None = None
+    holder: Holder | None = None
+    role: Short | None = None
+    # Placed on another board: unplace there and place here, one step.
+    replace: bool = False
+    # A team (id or slug) instead of a holder (O8): the item goes to the
+    # team lead's main session, who hands it out.
+    team: Short | None = None
+
+
+class UnplaceBody(_Strict):
+    actor: Actor
+    reason: Reason | None = None
+
+
+class GroupCreateBody(_Strict):
+    actor: Actor
+    name: Short
+    kind: Short = "heading"
+    parent_group_id: Short | None = None
+    description: str | None = Field(default=None, max_length=20000)
+    goal: str | None = Field(default=None, max_length=20000)
+    ord: Annotated[int, Field(ge=-100000, le=100000)] | None = None
+
+
+class BoardJoinBody(_Strict):
+    """Add a session to a board (#28); the daemon checked the actor may edit it."""
+    actor: Actor
+    pid: Short
+    name: Short | None = None
+    group_id: Short | None = None
+    group: Short | None = None
+    reason: Short | None = None
+
+
+class BoardLeaveBody(_Strict):
+    """End a board membership (#28): the daemon says whether the actor can
+    still edit the board (`editor`), for the adder's case."""
+    actor: Actor
+    pid: Short
+    editor: bool = False
+    reason: Short | None = None
+
+
+class EpicPocBody(_Strict):
+    actor: Actor
+    member: Short
+    team_id: Short | None = None
+    request_id: Short | None = None
+
+
+class EpicStaffBody(_Strict):
+    actor: Actor
+    member: Short
+    as_: Short = Field(alias="as")
+    reason: Reason | None = None
+    request_id: Short | None = None
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+
+class EpicClosePlanBody(_Strict):
+    actor: Actor
+    outcome: Short
+
+
+class EpicCloseApplyBody(_Strict):
+    actor: Actor
+    revision: Annotated[int, Field(ge=0)]
+    choices: dict = Field(default_factory=dict)
+    request_id: Short | None = None
+
+
+class GroupPatchBody(_Strict):
+    actor: Actor
+    expected_revision: Annotated[int, Field(ge=0)] | None = None
+    name: Short | None = None
+    kind: Short | None = None
+    parent_group_id: Short | None = None
+    description: str | None = Field(default=None, max_length=20000)
+    goal: str | None = Field(default=None, max_length=20000)
+    ord: Annotated[int, Field(ge=-100000, le=100000)] | None = None
+
+
+class ItemsTouchBody(_Strict):
+    actor: Actor
+    ns: list[ItemNumber] = Field(min_length=1, max_length=50)
+    source: str = Field(default="chat", pattern="^[a-z_]{1,32}$")
+    message_id: Short | None = None
+    excerpt: str | None = Field(default=None, max_length=1000)
+
+
+class Suggest(_Strict):
+    keyword: str = Field(max_length=20)
+    status: str = Field(pattern="^(done|blocked)$")
+
+
+class ItemsChatTouchBody(_Strict):
+    actor: Actor
+    ns: list[ItemNumber] = Field(min_length=1, max_length=50)
+    channel: Short | None = None
+    source: str = Field(default="chat", pattern="^[a-z_]{1,32}$")
+    message_id: Short | None = None
+    excerpt: str | None = Field(default=None, max_length=1000)
+    suggest: Suggest | None = None
+
+
+class ItemResolveBody(_Strict):
+    actor: AttributedActor
+    action: str = Field(max_length=32)
+    kind: str | None = Field(default=None, max_length=64)
+    holders: list[AttributedHolder] | None = Field(default=None, max_length=50)
+    blocked_by: list[ItemNumber] | None = Field(default=None, max_length=50)
+    blocked_on: str | None = None
+    check_back: When | None = None
+    reason: Reason | None = None
+    message: str | None = Field(default=None, max_length=1000)
+    # apply: the suggested status being confirmed (refused if it changed).
+    to: str | None = Field(default=None, max_length=16)
+
+
+class HeartbeatBody(_Strict):
+    # Rows are validated one by one in dispatch.items_db.heartbeat: one bad
+    # row is clipped or dropped, never the whole host's beat.
+    host_label: str | None = None
+    sessions: list[dict] = Field(default_factory=list, max_length=2000)
+    exited: list[str] = Field(default_factory=list, max_length=2000)
+    acked_push_ids: list[Annotated[int, Field(ge=1)]] = Field(default_factory=list, max_length=1000)
+    # Org model (api/org.py): daemon capabilities (doc/org-model.md §12) and
+    # the home-workspace marks it applied. Daemons send them only once the
+    # API accepts them (this body forbids unknown fields).
+    capabilities: list[Annotated[str, Field(max_length=64)]] | None = Field(default=None, max_length=64)
+    acked_mark_ids: list[Annotated[int, Field(ge=1)]] = Field(default_factory=list, max_length=1000)
+
+
+class RosterCaller(_Strict):
+    # Internal daemon-stamped identity; shared bearer authenticates the host,
+    # not the individual actor. Never forward fields from tool arguments.
+    pid: str = Field(min_length=1, max_length=300)
+    daemon_id: str = Field(min_length=1, max_length=200)
+    session_uid: str | None = Field(default=None, max_length=200)
+    task_id: str | None = Field(default=None, max_length=200)
+    workspace_id: str | None = Field(default=None, max_length=200)
+    workspace_uids: list[Annotated[str, Field(min_length=1, max_length=200)]] = Field(default_factory=list, max_length=2000)
+    generation: int | None = Field(default=None, ge=0)
+    process_identity: int | None = Field(default=None, ge=0)
+    global_: bool = Field(default=False, alias="global")
+    owner: bool = False
+
+
+class RosterFilters(_Strict):
+    host: str | None = Field(default=None, min_length=1, max_length=200)
+    member: str | None = Field(default=None, min_length=1, max_length=200)
+    manager: str | None = Field(default=None, min_length=1, max_length=200)
+    state: str | None = Field(default=None, min_length=1, max_length=40)
+    task: str | None = Field(default=None, min_length=1, max_length=200)
+    include_exited: bool = False
+    limit: int = Field(default=100, ge=1, le=100)
+    cursor: str | None = Field(default=None, min_length=1, max_length=4096)
+
+
+class RosterBody(_Strict):
+    caller: RosterCaller
+    filters: RosterFilters
+
+
+class ItemReadBody(_Strict):
+    board: str | None = Field(default=None, min_length=1, max_length=120)
+    task_id: str | None = Field(default=None, min_length=1, max_length=200)
+    n: int = Field(strict=True, ge=1, le=2**31 - 1)
+    section: str = Field(default="summary", min_length=1, max_length=32)
+    field: str | None = Field(default=None, max_length=32)
+    index: int = Field(default=0, strict=True, ge=0, le=2**31 - 2)
+    offset: int = Field(default=0, strict=True, ge=0, le=2**31 - 2)
+
+
+# ---- gate receipts (doc/gate-receipts.md §9) -----------------------------------
+
+class ReceiptBody(_Strict):
+    actor: Actor
+    # The receipt's wire shape is checked by dispatch.gate_rules.normalize_receipt,
+    # which keeps failed, skipped and missing evidence instead of refusing it.
+    receipt: dict
+    request_id: Short | None = None
+
+
+class GrantBody(_Strict):
+    actor: Actor
+    kind: str = Field(default="waiver", max_length=16)
+    gate: str = Field(default="gate", max_length=40)
+    head: Short
+    base: Short | None = None
+    step: str = Field(max_length=40)
+    nodes: list[str] | None = Field(default=None, max_length=500)
+    cmd_digest: str | None = Field(default=None, max_length=80)
+    reason: Reason
+    risk: Reason
+    message_id: Short
+    message_check: dict = Field(default_factory=dict)
+
+
+class GrantUpdateBody(_Strict):
+    actor: Actor
+    revoke: bool = False
+    message_check: dict | None = None
+
+
+class ProfileBody(_Strict):
+    actor: Actor
+    profile: dict | None = None
+    reason: Reason
+    default: bool = False
+
+
+class RefreshBody(_Strict):
+    daemon_id: Short
+    checks: list[dict] = Field(default_factory=list, max_length=500)

@@ -165,6 +165,9 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
     cap_status: &crate::memory_cap::MemoryCapAvailability,
     host_pool: &crate::host_pool::HostPool,
     workspace_id: &str,
+    // The task's default model and effort, for a row with none recorded.
+    task_model: Option<&str>,
+    task_effort: Option<&str>,
 ) -> Option<String> {
     // 12e-r6 F2: fail fast on a non-local pinned host BEFORE
     // any other work. The respawn would build local mcp_config
@@ -246,7 +249,12 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
         Some(role),
         &ts.host_id,
         pre_spawn_transcript.as_deref(),
+        false, // workflow respawn is explicitly excluded
         false, // global_perms
+        ts.model.as_deref().or(task_model),
+        if ts.model.is_some() { ts.model_source.as_deref() } else { task_model.map(|_| "task") },
+        ts.effort.as_deref().or(task_effort),
+        if ts.effort.is_some() { ts.effort_source.as_deref() } else { task_effort.map(|_| "task") },
     ) {
         Some(Ok(s)) => s,
         Some(Err(e)) => {
@@ -547,28 +555,28 @@ impl App {
                     .and_then(|ts| ts.task_id.clone());
                 (wi, Some(si), task)
             }
-            Cursor::Workspace(wi) => (wi, None, None),
-            Cursor::Task { ws_idx, task_id } => {
-                // Focus on the first running session of the task so the
-                // launch modal can prefill a reasonable worker slot.
-                let si = self
-                    .workspaces
-                    .get(ws_idx)
-                    .and_then(|w| {
+            // The workspace row stands for its task (it replaced the task
+            // header, 2026-11-05): launch in that task's scope, focused on
+            // its first session so the modal can prefill a worker slot.
+            Cursor::Workspace(wi) => match self.workspace_task(wi) {
+                Some(task_id) => {
+                    let si = self.workspaces.get(wi).and_then(|w| {
                         w.sessions
                             .iter()
                             .position(|ts| ts.task_id.as_deref() == Some(task_id.as_str()))
                     });
-                (ws_idx, si, Some(task_id))
-            }
+                    (wi, si, Some(task_id))
+                }
+                None => (wi, None, None),
+            },
             Cursor::Backtest(_) => {
                 self.set_status_msg(
                     "Workflows run on local sessions — backtest runs are cloud-only",
                 );
                 return;
             }
-            Cursor::Section(_) => {
-                self.set_status_msg("Focus a session or task to launch a workflow");
+            Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => {
+                self.set_status_msg("Focus a session or workspace to launch a workflow");
                 return;
             }
         };
@@ -761,35 +769,44 @@ impl App {
         // unreachable; the TUI then observes the run via the existing
         // workflow event / manifest streams. Local A-f is unchanged
         // (host_id == local → the local socket, exactly as before).
-        let daemon_socket = match self.host_pool.for_host(&host_id) {
-            Ok(h) => match h.socket_path() {
-                Some(p) => p,
-                None => {
-                    self.set_status_msg("launch: daemon has no socket path");
-                    return;
+        // Resolving the socket can warm a cold tunnel and `start_workflow`
+        // has a 150 s budget, so both run on a worker (`background.rs`).
+        let pool = std::sync::Arc::clone(&self.host_pool);
+        let size = self.last_term_size;
+        let name = workflow_name.to_owned();
+        let started = self.run_in_background(Some(format!("start_workflow:{workspace_id}")), move || {
+            let socket = match pool.for_host(&host_id) {
+                Ok(h) => match h.socket_path() {
+                    Some(p) => p,
+                    None => {
+                        return Box::new(|app: &mut App| app.set_status_msg("launch: daemon has no socket path"))
+                            as super::background::Apply;
+                    }
+                },
+                Err(e) => {
+                    let msg = format!("launch: daemon unavailable: {e}");
+                    return Box::new(move |app: &mut App| app.set_status_msg(&msg));
                 }
-            },
-            Err(e) => {
-                self.set_status_msg(&format!("launch: daemon unavailable: {e}"));
-                return;
-            }
-        };
-        match crate::client_session::rpc_start_workflow(
-            &daemon_socket,
-            &self.host_pool.operator_token_for(&host_id),
-            workflow_name,
-            &worktree,
-            &workspace_id,
-            goal.as_deref(),
-            task_id.as_deref(),
-            &role_sessions,
-            &role_engines,
-            self.last_term_size,
-        ) {
-            Ok(run_id) => {
-                self.set_status_msg(&format!("Launched {} ({})", workflow_name, run_id))
-            }
-            Err(e) => self.set_status_msg(&format!("launch failed: {e}")),
+            };
+            let msg = match crate::client_session::rpc_start_workflow(
+                &socket,
+                &pool.operator_token_for(&host_id),
+                &name,
+                &worktree,
+                &workspace_id,
+                goal.as_deref(),
+                task_id.as_deref(),
+                &role_sessions,
+                &role_engines,
+                size,
+            ) {
+                Ok(run_id) => format!("Launched {} ({})", name, run_id),
+                Err(e) => format!("launch failed: {e}"),
+            };
+            Box::new(move |app: &mut App| app.set_status_msg(&msg))
+        });
+        if started {
+            self.set_status_msg(&format!("Launching {workflow_name}…"));
         }
     }
 
@@ -830,7 +847,7 @@ impl App {
             if let Some(slot) = self.workflow_runs.iter_mut().find(|r| r.run_id == run_id) {
                 *slot = updated;
             }
-            self.set_status_msg("Workflow paused (A-u to resume)");
+            self.set_status_msg("Workflow paused (A-U to resume)");
         }
     }
 
@@ -940,18 +957,13 @@ impl App {
                 .get(wi)
                 .and_then(|w| w.sessions.get(si))
                 .and_then(|s| s.workflow_run_id.clone()),
-            Cursor::Task { ws_idx, task_id } => {
-                // Return the first workflow run_id seen on any session tagged
-                // with this task. Usually unique per task.
-                self.workspaces.get(ws_idx).and_then(|w| {
-                    w.sessions
-                        .iter()
-                        .filter(|ts| ts.task_id.as_deref() == Some(task_id.as_str()))
-                        .find_map(|ts| ts.workflow_run_id.clone())
-                })
-            }
-            Cursor::Workspace(_) => None,
-            Cursor::Backtest(_) | Cursor::Section(_) => None,
+            // A workspace row: the first workflow run on any of its
+            // sessions (usually the only one).
+            Cursor::Workspace(wi) => self
+                .workspaces
+                .get(wi)
+                .and_then(|w| w.sessions.iter().find_map(|ts| ts.workflow_run_id.clone())),
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => None,
         }
     }
 }
@@ -1110,6 +1122,11 @@ mod stop_workflow_local_cleanup_tests {
 
     fn entry_with_workflow(run_id: Option<&str>) -> ManifestEntry {
         ManifestEntry {
+            org: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -1285,6 +1302,11 @@ mod rotation_binding_tests {
         workflow: Option<(&str, &str)>,
     ) -> TerminalSession {
         TerminalSession {
+            org: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             color: None,
             uid: "uid".into(),
             label: "test".into(),
@@ -1319,6 +1341,7 @@ mod rotation_binding_tests {
 
     fn ws_with(sessions: Vec<TerminalSession>) -> Workspace {
         Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-1".into(),

@@ -256,7 +256,7 @@ archive, startup script and service unit is retained in
 
 ## Explicit task cleanup
 
-The work-view completion dialog (Alt+d) can request immediate cleanup of the
+The work-view completion dialog (Alt+D) can request immediate cleanup of the
 selected task and tracked descendants on their hosts. Keep is the default;
 active/shared/pinned/continuous work remains protected. Jobs and results persist
 under `~/.cm/worktree-cleanup/`, independently of the laptop. The daemon embeds

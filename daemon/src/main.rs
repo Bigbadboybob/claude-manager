@@ -36,6 +36,10 @@ fn main() -> anyhow::Result<()> {
             cm_daemon::messaging::sync::stdio_bridge(&root)?;
             return Ok(());
         }
+        // The brain's daemon.log timestamping child (`log_pump`).
+        Some("--log-pump") => {
+            std::process::exit(cm_daemon::log_pump::run_pump(&args.next().unwrap_or_default()));
+        }
         Some("--verify-handoff") => {
             let fd_arg = args.next().unwrap_or_default();
             std::process::exit(cm_daemon::reexec::run_verify_handoff(&fd_arg));

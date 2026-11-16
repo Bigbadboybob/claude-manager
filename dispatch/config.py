@@ -14,6 +14,11 @@ GCP_PROJECT = os.getenv("CM_GCP_PROJECT", "claude-manager-prod")
 GCP_ZONE = os.getenv("CM_GCP_ZONE", "us-east4-a")
 VM_MACHINE_TYPE = os.getenv("CM_VM_MACHINE_TYPE", "e2-medium")
 VM_IMAGE_FAMILY = "cm-worker-base"
+# Cloud workers' Claude launch (CM never relies on the engine's defaults;
+# mirrors `[models] claude` / `[efforts] claude` in daemon.toml). A task's
+# own `metadata.models.claude` / `metadata.efforts.claude` wins.
+WORKER_CLAUDE_MODEL = os.getenv("CM_WORKER_CLAUDE_MODEL", "claude-opus-5-5")
+WORKER_CLAUDE_EFFORT = os.getenv("CM_WORKER_CLAUDE_EFFORT", "xhigh")
 VM_IMAGE_PROJECT = GCP_PROJECT
 
 # Database

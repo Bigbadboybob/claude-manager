@@ -11,14 +11,19 @@ import ctypes
 import fcntl
 import hashlib
 import json
+import math
 import os
 import tempfile
+import threading
 import time
 from contextlib import contextmanager, suppress
 from pathlib import Path
 
 TERMINAL = {"observed", "cancelled"}
 MAX_EVENTS = 512
+# A queue directory listing is reused only when taken this long after the
+# directory last changed (its mtime is a coarse, tick-granular stamp).
+DIR_SETTLE_NS = 1_000_000_000
 MAX_TEXT_BYTES = 65536
 # Submitted notices with no inbound observation for this long mark the
 # transport degraded (the daemon raises an Owner alert at its own horizon).
@@ -30,21 +35,44 @@ TAKEOVER_FRESH_S = 15.0
 HANDOFF_MIN_HOLD_S = 30.0
 
 
+def receipt_evidence_allowed(event: dict) -> bool:
+    """A legacy board label is shared across pushes, so it proves no receipt."""
+    if not isinstance(event.get("source"), str) or not event["source"].strip():
+        return False
+    if event.get("source") != "board":
+        return True
+    event_id, marker = event.get("id"), event.get("marker")
+    if not isinstance(event_id, str) or not event_id.startswith("board-push:") or not isinstance(marker, str):
+        return False
+    suffix = event_id.removeprefix("board-push:")
+    return bool(suffix and marker.startswith("[cm-board ") and marker.endswith(f" push:{suffix}]"))
+
+
 def delivery_health(events, now: float | None = None, threshold: float | None = None):
     """Submitted/uncertain notices newer than the latest observation that are
     still unobserved past `threshold`. A later observation proves the path
     works again, so older losses do not keep the session degraded forever."""
     now = time.time() if now is None else now
     threshold = UNOBSERVED_DEGRADED_S if threshold is None else threshold
+    def timestamp(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
+    for event in events:
+        created = event.get("created_at")
+        updated = event.get("updated_at", created)
+        if (not timestamp(created) or not timestamp(updated) or updated < created
+                or (event.get("status") == "observed" and updated > now)):
+            return {"unobserved": None, "oldest_unobserved_s": None,
+                    "stalled": False, "unobserved_markers": [], "chronology_unknown": True}
     last_observed = max(
         (e.get("updated_at", e.get("created_at", 0)) for e in events
-         if e.get("status") == "observed"),
+         if e.get("status") == "observed" and receipt_evidence_allowed(e)),
         default=0,
     )
     stalled = [
         e for e in events
-        if e.get("status") in {"submitted", "uncertain"}
-        and e.get("updated_at", e.get("created_at", 0)) > last_observed
+        if (e.get("status") == "submitting"
+            or (e.get("status") in {"submitted", "uncertain"}
+                and e.get("updated_at", e.get("created_at", 0)) > last_observed))
     ]
     oldest = min((e.get("updated_at", e.get("created_at", now)) for e in stalled), default=None)
     age = None if oldest is None else max(0.0, now - oldest)
@@ -53,6 +81,7 @@ def delivery_health(events, now: float | None = None, threshold: float | None = 
         "oldest_unobserved_s": None if age is None else round(age),
         "stalled": age is not None and age >= threshold,
         "unobserved_markers": [e.get("marker") for e in stalled],
+        "chronology_unknown": False,
     }
 
 
@@ -97,15 +126,84 @@ class Queue:
         finally:
             os.close(fd)
 
+    # Delivery hold (#24): while CM is about to rotate or hand off this
+    # session (it is due, or mid-rotation), new wakes stay pending so they
+    # reach the NEW process instead of racing the restart. The daemon writes
+    # `hold` (not *.json: never parsed as an event) with an expiry, so a
+    # daemon that dies mid-rotation cannot hold delivery for good.
+    HOLD_EXEMPT = frozenset({"rotation", "handoff"})
+
+    def hold_until(self, now: float | None = None) -> float | None:
+        """When the current hold ends, or None when nothing is held."""
+        path = self.path / "hold"
+        if not path.exists():  # the common case: a stat, no read
+            return None
+        try:
+            until = json.loads(path.read_text()).get("until")
+        except (OSError, ValueError, AttributeError):
+            return None
+        if isinstance(until, (int, float)) and until > (time.time() if now is None else now):
+            return float(until)
+        return None
+
+    def held(self, now: float | None = None) -> bool:
+        return self.hold_until(now) is not None
+
     def event_path(self, event_id: str) -> Path:
         return self.path / (hashlib.sha256(event_id.encode()).hexdigest() + ".json")
 
     def _events(self):
-        return [
-            json.loads(p.read_text())
-            for p in self.path.glob("*.json")
-            if p.name != "transport.json"
-        ]
+        """Every event file, parsed. Files are replaced atomically (a new
+        inode per write), so an unchanged (inode, size, mtime) is an
+        unchanged event and its cached parse is reused. Top-level copies are
+        returned (callers set fields on events, never inside nested ones).
+
+        Every write here is a rename into this directory, so an unchanged
+        directory (inode, mtime, ctime) also means an unchanged listing and
+        the per-file stats can be skipped. The consumer snapshots several
+        times a second over ~512 retained events (11 ms each, about 1% of a
+        core per session). Directory timestamps are coarse (one kernel tick),
+        so a listing is reused only if it was taken DIR_SETTLE_NS after the
+        directory last changed: a later rename then carries a newer stamp."""
+        cache = self.__dict__.setdefault("_event_cache", {})
+        checked = time.time_ns()
+        try:
+            d = os.stat(self.path)
+            dir_key = (d.st_ino, d.st_mtime_ns, d.st_ctime_ns)
+        except OSError:
+            d = dir_key = None
+        listing = self.__dict__.get("_listing")
+        if dir_key is not None and listing is not None and listing[0] == dir_key:
+            return [dict(hit[1]) for hit in listing[1]]
+        seen = set()
+        hits = []
+        try:
+            entries = list(os.scandir(self.path))
+        except FileNotFoundError:
+            entries = []
+        for entry in entries:
+            name = entry.name
+            if not name.endswith(".json") or name == "transport.json":
+                continue
+            try:
+                info = entry.stat()
+            except FileNotFoundError:
+                continue
+            key = (info.st_ino, info.st_size, info.st_mtime_ns)
+            seen.add(name)
+            hit = cache.get(name)
+            if hit is None or hit[0] != key:
+                try:
+                    hit = (key, json.loads((self.path / name).read_text()))
+                except FileNotFoundError:
+                    continue
+                cache[name] = hit
+            hits.append(hit)
+        for name in [n for n in cache if n not in seen]:
+            del cache[name]
+        settled = d is not None and checked - d.st_mtime_ns > DIR_SETTLE_NS
+        self.__dict__["_listing"] = (dir_key, hits) if settled else None
+        return [dict(hit[1]) for hit in hits]
 
     # Consumer handoff. A waiting consumer that proves it is attached to the
     # daemon-bound conversation files a request; the holder releases only with
@@ -130,8 +228,15 @@ class Queue:
                 claim = json.loads(path.read_text())
             except (OSError, ValueError):
                 continue
+            if not isinstance(claim, dict):
+                continue
             pid = claim.get("pid")
             if pid == os.getpid() or not isinstance(pid, int):
+                continue
+            requested_at = claim.get("requested_at")
+            if not isinstance(requested_at, (int, float)) or not 0 <= now - requested_at <= TAKEOVER_FRESH_S:
+                with suppress(OSError):
+                    path.unlink(missing_ok=True)
                 continue
             alive = True
             try:
@@ -140,7 +245,7 @@ class Queue:
                 alive = False
             except PermissionError:
                 pass
-            if not alive or now - claim.get("requested_at", 0) > TAKEOVER_FRESH_S:
+            if not alive:
                 with suppress(OSError):
                     path.unlink(missing_ok=True)
                 continue
@@ -213,6 +318,36 @@ class Queue:
         # Once claimed, cancellation cannot retract an accepted native event.
         return self.change(event_id, {"pending"}, status="cancelled")
 
+    def recovery_enabled(self):
+        try:
+            path = self.path.parent / "claude-limit-recovery-state"
+            if path.stat().st_size > 4096:
+                return None
+            state = json.loads(path.read_text())
+            return state.get("enabled") if state.get("version") == 1 and isinstance(state.get("enabled"), bool) else None
+        except (OSError, ValueError, AttributeError):
+            return None
+
+    def claim_recovery(self, event_id, binding):
+        # The config marker is checked under the same lock as the claim.
+        with self.locked():
+            path = self.event_path(event_id)
+            try:
+                event = json.loads(path.read_text())
+            except (OSError, ValueError):
+                return None
+            if event.get("status") != "pending":
+                return None
+            enabled = self.recovery_enabled()
+            if enabled is None:
+                return None
+            if not enabled:
+                event.update(status="cancelled", cancel_reason="recovery_disabled", updated_at=time.time())
+            else:
+                event.update(status="submitting", binding=binding, updated_at=time.time())
+            atomic_write(path, event)
+            return event if enabled else None
+
     def snapshot(self):
         with self.locked():
             events = self._events()
@@ -234,8 +369,10 @@ class Queue:
                 reasons.extend(transport.get("reasons") or [transport.get("reason") or "degraded"])
             if delivery["stalled"]:
                 reasons.append("unobserved_submissions")
+            if delivery["chronology_unknown"]:
+                reasons.append("untrusted_notification_chronology")
             # Never report a consumer as healthy while its submissions vanish.
-            if delivery["stalled"]:
+            if delivery["stalled"] or delivery["chronology_unknown"]:
                 transport["connected"] = False
             health = {
                 "status": ("degraded" if reasons else
@@ -246,7 +383,10 @@ class Queue:
             return {
                 "transport": transport,
                 "health": health,
-                "notifications": sorted(events, key=lambda e: e["created_at"]),
+                # CM is rotating or handing off this session: pending wakes
+                # wait for the new process (until this time at most).
+                "hold": {"until": hold} if (hold := self.hold_until()) else None,
+                "notifications": sorted(events, key=lambda e: e.get("created_at") if isinstance(e.get("created_at"), (int, float)) else 0),
             }
 
     def health(self, engine: str, state: str, **extra):
@@ -318,9 +458,27 @@ async def _diagnose(queue: Queue, adapter, events) -> dict:
             diag = {"diagnostics_error": type(exc).__name__}
     delivery = delivery_health(events)
     reasons = []
+    if delivery["chronology_unknown"]:
+        # A bad census cannot erase an existing degraded diagnosis.
+        try:
+            prior = json.loads((queue.path / "transport.json").read_text())
+            if prior.get("status") == "degraded":
+                reasons.extend(prior.get("reasons") or [prior.get("reason") or "degraded"])
+        except (OSError, ValueError, TypeError):
+            pass
+        reasons.append("untrusted_notification_chronology")
     if diag.get("blocked"):
         reasons.append(diag["blocked"])
     stale = list(diag.get("stale") or [])
+    # A positive record that this client only enqueues our notices is not a
+    # healthy in-pane resume. Stop claiming new work even if no successor has
+    # appeared; already-submitted/uncertain receipts remain untouched.
+    blocked = diag.get("blocked")
+    if delivery["chronology_unknown"]:
+        blocked = blocked or "untrusted_notification_chronology"
+    if "enqueued_unobserved" in stale and delivery["stalled"]:
+        blocked = blocked or "stale_channel"
+        reasons.append("stale_channel")
     # An in-pane resume or clear legitimately moves the bound transcript
     # away from this client's launch id while delivery keeps working, so a
     # mismatch alone is informational; with stalled work or other evidence
@@ -340,9 +498,9 @@ async def _diagnose(queue: Queue, adapter, events) -> dict:
         if delivery["unobserved"]:
             extra["unobserved"] = delivery["unobserved"]
             extra["oldest_unobserved_s"] = delivery["oldest_unobserved_s"]
-    degraded = diag.get("blocked") or (reasons and base == "ready")
+    degraded = blocked or (reasons and base == "ready")
     return {"status": "degraded" if degraded else base,
-            "extra": extra, "stale": stale, "blocked": diag.get("blocked")}
+            "extra": extra, "stale": stale, "blocked": blocked}
 
 
 async def _wait_for_lock(queue: Queue, adapter, fd: int):
@@ -380,12 +538,15 @@ async def _wait_for_lock(queue: Queue, adapter, fd: int):
         queue.withdraw_takeover()
 
 
-def _handoff_reason(queue: Queue, assessment: dict, held_for: float):
+def _handoff_reason(queue: Queue, adapter, assessment: dict, held_for: float):
     """Release only with this holder's own positive staleness evidence AND a
     fresh request from a consumer attached to the daemon-bound transcript."""
     if held_for < HANDOFF_MIN_HOLD_S or not assessment["stale"]:
         return None
-    if not queue.takeover_requests():
+    claims = queue.takeover_requests()
+    if hasattr(adapter, "valid_takeover_request"):
+        claims = [claim for claim in claims if adapter.valid_takeover_request(claim)]
+    if not claims:
         return None
     return assessment["stale"][0]
 
@@ -414,34 +575,65 @@ async def consume(queue: Queue, adapter):
                 queue.health(adapter.engine, assessment["status"],
                              **adapter.identity(), **assessment["extra"])
                 heartbeat = time.monotonic() + 5
-                handed_off = _handoff_reason(queue, assessment, time.monotonic() - acquired)
+                handed_off = _handoff_reason(queue, adapter, assessment, time.monotonic() - acquired)
                 if handed_off:
                     with suppress(AttributeError):
                         adapter.cm_handed_off_at = time.monotonic()
                     return handed_off
             # New wakes must not sit behind slow receipt checks for older input.
+            # The heartbeat's block can be stale: a new invalid observation
+            # can arrive between diagnoses. Check this snapshot before claims.
+            census_unknown = delivery_health(events)["chronology_unknown"]
             events.sort(key=lambda event: event["status"] != "pending")
+            held = queue.held()
             for event in events:
-                if event["version"] != 1 or event["recipient"] != queue.uid:
+                if (event.get("version") != 1 and not (event.get("version") == 2
+                        and event.get("source") == "claude-limit-recovery")) or event["recipient"] != queue.uid:
                     continue  # Never deliver an unknown envelope or another identity.
                 if event["status"] in {"submitted", "uncertain"}:
-                    if await adapter.observed(event):
+                    # Every poll: evidence is only searched in the window
+                    # (TAIL_WINDOW), so a skipped poll can let it scroll out
+                    # for good. _Tail makes each check an incremental read.
+                    if receipt_evidence_allowed(event) and await adapter.observed(event):
                         queue.change(
                             event["id"], {"submitted", "uncertain"}, status="observed"
                         )
                     continue
-                if event["status"] != "pending" or blocked:
+                if event["status"] != "pending" or blocked or census_unknown:
                     # A client known to drop these events keeps them pending
                     # (retractable, never ambiguously submitted).
                     continue
-                event = queue.change(
-                    event["id"],
-                    {"pending"},
-                    status="submitting",
-                    binding=adapter.identity(),
-                )
+                if held and event.get("source") not in Queue.HOLD_EXEMPT:
+                    # A rotation is due or running: the new process gets it.
+                    continue
+                # A Codex interrupt owns the relay's submission boundary.
+                # Leave the event pending rather than claiming it and then
+                # waiting behind that operation as an ambiguous submission.
+                if hasattr(adapter, "can_claim") and not adapter.can_claim():
+                    continue
+                recovery = event.get("source") == "claude-limit-recovery"
+                if recovery:
+                    check = await adapter.recovery_check(event) if hasattr(adapter, "recovery_check") else "unknown"
+                    if check == "superseded":
+                        queue.change(event["id"], {"pending"}, status="cancelled", cancel_reason="superseded")
+                        continue
+                    if check != "ready":
+                        continue
+                    event = queue.claim_recovery(event["id"], adapter.identity())
+                else:
+                    event = queue.change(event["id"], {"pending"}, status="submitting", binding=adapter.identity())
                 if not event or event["status"] != "submitting":
                     continue
+                if recovery:
+                    check = await adapter.recovery_check(event)
+                    enabled = queue.recovery_enabled()
+                    if check != "ready" or enabled is not True:
+                        if check == "superseded" or enabled is False:
+                            reason = "superseded" if check == "superseded" else "recovery_disabled"
+                            queue.change(event["id"], {"submitting"}, status="cancelled", cancel_reason=reason)
+                        else:
+                            queue.change(event["id"], {"submitting"}, status="pending")
+                        continue
                 try:
                     receipt = await adapter.send(event)
                 except NotSubmitted:
@@ -492,87 +684,216 @@ async def consume_supervised(queue: Queue, adapter, retry_s: float = 5):
             await asyncio.sleep(retry_s)
 
 
+# Receipt evidence is searched in the transcript's last TAIL_WINDOW bytes.
+TAIL_WINDOW = 2 * 1024 * 1024
+# Bytes compared at the file's head and just before the scanned offset to
+# detect a file rewritten in place (transcripts are append-only, so this only
+# guards odd writers; a new inode or a shrink is caught without reading).
+_FINGERPRINT = 4096
+# Transcripts tracked at once (one consumer watches a handful).
+_TAIL_FILES = 32
+
+
+class _Tail:
+    """Incremental view of one transcript's last TAIL_WINDOW bytes.
+
+    Only lines that could be receipt evidence are parsed and kept: every
+    evidence shape has an `"origin"` key (Claude) or names `cm_notification`
+    (Codex), so other lines are skipped with a substring check. Each refresh
+    reads only bytes appended since the last one, and an unchanged (inode,
+    size, mtime) reads nothing; a new inode, a shrink or changed bytes at the
+    head or before the offset (a rewrite) rescans the window."""
+
+    def __init__(self):
+        self.ino = None
+        self.seen = None         # (inode, size, mtime_ns) at the last refresh
+        self.offset = 0          # end of the last complete line scanned
+        self.head = b""          # the file's first bytes
+        self.fingerprint = b""   # the bytes just before `offset`
+        self.records = {}        # line start offset -> parsed candidate record
+        self.tail = None         # (start, record) for an unterminated last line
+
+    def _reset(self, ino):
+        self.ino, self.offset, self.head, self.fingerprint = ino, 0, b"", b""
+        self.records, self.tail = {}, None
+
+    def _read(self, stream, at, n, stats) -> bytes:
+        stream.seek(at)
+        data = stream.read(n)
+        stats["bytes_read"] = stats.get("bytes_read", 0) + len(data)
+        return data
+
+    def refresh(self, stream, stats) -> int:
+        """Bring the view up to date. Returns the bytes read."""
+        info = os.fstat(stream.fileno())
+        size = info.st_size
+        seen = (info.st_ino, size, info.st_mtime_ns)
+        if seen == self.seen:
+            return 0
+        self.seen = seen
+        if info.st_ino != self.ino or size < self.offset:
+            self._reset(info.st_ino)
+        elif self.offset and (
+                self._read(stream, 0, len(self.head), stats) != self.head
+                or self._read(stream, self.offset - len(self.fingerprint),
+                              len(self.fingerprint), stats) != self.fingerprint):
+            self._reset(info.st_ino)
+        window = max(0, size - TAIL_WINDOW)
+        start = max(self.offset, window)
+        data = self._read(stream, start, size - start, stats)
+        base = start
+        if start > self.offset:
+            # Starting mid-file past what was scanned: the first (possibly
+            # partial) line is outside the window, as a fresh scan from
+            # `window` has always treated it.
+            cut = data.find(b"\n")
+            data = b"" if cut < 0 else data[cut + 1:]
+            base = size - len(data)
+        self.tail = None
+        pos = base
+        for line in data.splitlines(keepends=True):
+            line_start, pos = pos, pos + len(line)
+            if b'"origin"' not in line and b"cm_notification" not in line:
+                continue
+            try:
+                item = json.loads(line)
+            except (ValueError, UnicodeError):
+                continue
+            if not isinstance(item, dict):
+                continue
+            if line.endswith(b"\n"):
+                self.records[line_start] = item
+            else:
+                self.tail = (line_start, item)
+        # Advance past complete lines only: an unterminated last line may
+        # still be being written and is read again next time.
+        last_newline = data.rfind(b"\n")
+        if last_newline >= 0:
+            self.offset = base + last_newline + 1
+            n = min(_FINGERPRINT, self.offset)
+            self.fingerprint = self._read(stream, self.offset - n, n, stats)
+            self.head = self._read(stream, 0, n, stats)
+        # Drop records that slid out of the window (a line starting exactly
+        # at the window edge was treated as partial by a fresh scan).
+        if window:
+            for at in [at for at in self.records if at <= window]:
+                del self.records[at]
+        return len(data)
+
+    def items(self):
+        for at in sorted(self.records):
+            yield self.records[at]
+        if self.tail is not None:
+            yield self.tail[1]
+
+
+_tails: dict[str, _Tail] = {}
+_tails_lock = threading.Lock()
+# Counters for tests and profiling: bytes_read across all refreshes.
+tail_stats: dict[str, int] = {}
+
+
+def _tail_items(path: str):
+    """The candidate evidence records in `path`'s window, refreshed with the
+    bytes appended since the last call. Raises OSError like open()."""
+    with _tails_lock, open(path, "rb") as stream:
+        tail = _tails.pop(path, None) or _Tail()
+        _tails[path] = tail  # most recently used last
+        while len(_tails) > _TAIL_FILES:
+            _tails.pop(next(iter(_tails)))
+        tail.refresh(stream, tail_stats)
+        return list(tail.items())
+
+
+# Key under which a cached record keeps its json.dumps results (records are
+# this module's own parses; the key cannot collide with transcript JSON).
+_DUMPS = "\0dumps"
+
+
+def _dumped(item: dict, field: str, key: str) -> str:
+    """json.dumps(item.get(field, {}).get(key)), computed once per record:
+    every poll checks each pending marker against the same few records."""
+    memo = item.setdefault(_DUMPS, {})
+    if (field, key) not in memo:
+        memo[(field, key)] = json.dumps(item.get(field, {}).get(key))
+    return memo[(field, key)]
+
+
+def _evidence(item: dict, engine: str, marker: str, binding: dict | None) -> bool:
+    """Whether one transcript record is positive receipt evidence for marker."""
+    if engine == "claude-code":
+        content = item.get("message", {})
+        origin = item.get("origin", {})
+        expected = binding or {}
+        channel_server = expected.get("channel_server")
+        if channel_server and expected.get("adapter") == "claude-mcp-channel-v1":
+            # Claude records idle events as meta user records and
+            # busy events as queued_command attachments. Require
+            # native origin; a user/assistant quoting <channel> or
+            # an enqueue record is not positive delivery evidence.
+            attachment = item.get("attachment", {})
+            return bool((
+                item.get("type") == "user"
+                and item.get("isMeta") is True
+                and content.get("role") == "user"
+                and origin == {"kind": "channel", "server": channel_server}
+                and marker in _dumped(item, "message", "content")
+            ) or (
+                item.get("type") == "attachment"
+                and attachment.get("type") == "queued_command"
+                and attachment.get("origin") == {"kind": "channel", "server": channel_server}
+                and marker in _dumped(item, "attachment", "prompt")
+            ))
+        if (
+            item.get("type") == "user"
+            and content.get("role") == "user"
+            and origin.get("kind") == "peer"
+            and origin.get("from") == "claude-manager"
+            and origin.get("selfSent") is True
+            and marker in _dumped(item, "message", "content")
+        ):
+            return True
+        # At a tool checkpoint Claude materializes the peer input
+        # as a queued_command attachment, not an idle user record.
+        # A queue-operation alone is never receipt evidence.
+        attachment = item.get("attachment", {})
+        origin = attachment.get("origin", {})
+        return bool(
+            item.get("type") == "attachment"
+            and attachment.get("type") == "queued_command"
+            and origin.get("kind") == "peer"
+            and origin.get("from") == "claude-manager"
+            and expected.get("peer_pid") is not None
+            and origin.get("verifiedPeerPid") == expected["peer_pid"]
+            and (
+                not expected.get("peer_start")
+                or str(origin.get("verifiedPeerProcStart"))
+                == expected["peer_start"]
+            )
+            and marker in _dumped(item, "attachment", "prompt")
+        )
+    if item.get("type") == "response_item":
+        payload = item.get("payload", {})
+        return bool(
+            payload.get("type") == "function_call_output"
+            and payload.get("name") == "cm_notification"
+            and marker in _dumped(item, "payload", "output")
+        )
+    return False
+
+
 def transcript_observed(
     path: str | None, engine: str, marker: str, binding: dict | None = None
 ) -> bool:
-    """Positive evidence only, in inbound records; assistant quotes don't count."""
+    """Positive evidence only, in inbound records; assistant quotes don't count.
+
+    Searches the transcript's last TAIL_WINDOW bytes, read incrementally
+    (see _Tail): repeated checks, for any number of markers, read only what
+    was appended since the previous one."""
     if not path or not marker:
         return False
     try:
-        with open(path, "rb") as stream:
-            stream.seek(0, 2)
-            start = max(0, stream.tell() - 2 * 1024 * 1024)
-            stream.seek(start)
-            if start:
-                stream.readline()
-            for line in stream:
-                try:
-                    item = json.loads(line)
-                except (ValueError, UnicodeError):
-                    continue
-                if engine == "claude-code":
-                    content = item.get("message", {})
-                    origin = item.get("origin", {})
-                    expected = binding or {}
-                    channel_server = expected.get("channel_server")
-                    if channel_server and expected.get("adapter") == "claude-mcp-channel-v1":
-                        # Claude records idle events as meta user records and
-                        # busy events as queued_command attachments. Require
-                        # native origin; a user/assistant quoting <channel> or
-                        # an enqueue record is not positive delivery evidence.
-                        attachment = item.get("attachment", {})
-                        if (
-                            item.get("type") == "user"
-                            and item.get("isMeta") is True
-                            and content.get("role") == "user"
-                            and origin == {"kind": "channel", "server": channel_server}
-                            and marker in json.dumps(content.get("content"))
-                        ) or (
-                            item.get("type") == "attachment"
-                            and attachment.get("type") == "queued_command"
-                            and attachment.get("origin") == {"kind": "channel", "server": channel_server}
-                            and marker in json.dumps(attachment.get("prompt"))
-                        ):
-                            return True
-                        continue
-                    if (
-                        item.get("type") == "user"
-                        and content.get("role") == "user"
-                        and origin.get("kind") == "peer"
-                        and origin.get("from") == "claude-manager"
-                        and origin.get("selfSent") is True
-                        and marker in json.dumps(content.get("content"))
-                    ):
-                        return True
-                    # At a tool checkpoint Claude materializes the peer input
-                    # as a queued_command attachment, not an idle user record.
-                    # A queue-operation alone is never receipt evidence.
-                    attachment = item.get("attachment", {})
-                    origin = attachment.get("origin", {})
-                    expected = binding or {}
-                    if (
-                        item.get("type") == "attachment"
-                        and attachment.get("type") == "queued_command"
-                        and origin.get("kind") == "peer"
-                        and origin.get("from") == "claude-manager"
-                        and expected.get("peer_pid") is not None
-                        and origin.get("verifiedPeerPid") == expected["peer_pid"]
-                        and (
-                            not expected.get("peer_start")
-                            or str(origin.get("verifiedPeerProcStart"))
-                            == expected["peer_start"]
-                        )
-                        and marker in json.dumps(attachment.get("prompt"))
-                    ):
-                        return True
-                elif item.get("type") == "response_item":
-                    payload = item.get("payload", {})
-                    if (
-                        payload.get("type") == "function_call_output"
-                        and payload.get("name") == "cm_notification"
-                        and marker in json.dumps(payload.get("output"))
-                    ):
-                        return True
+        items = _tail_items(path)
     except OSError:
-        pass
-    return False
+        return False
+    return any(_evidence(item, engine, marker, binding) for item in items)

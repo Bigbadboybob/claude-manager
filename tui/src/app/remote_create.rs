@@ -23,6 +23,9 @@ pub(super) struct RemoteCreateSpec {
     pub workspace_id: String,
     /// Captured at request time; the cursor may move while the host works.
     pub section: Option<String>,
+    /// Explicit model; `None` = the host's engine default.
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 pub(super) struct PreparedRemoteCreate {
@@ -30,6 +33,11 @@ pub(super) struct PreparedRemoteCreate {
     pub worktree_path: PathBuf,
     pub main_repo_path: Option<PathBuf>,
     pub resume_id: Option<String>,
+    /// The model the host spawned with.
+    pub model: Option<String>,
+    pub model_source: Option<String>,
+    pub effort: Option<String>,
+    pub effort_source: Option<String>,
 }
 
 pub(super) struct RemoteCreateFlight {
@@ -80,13 +88,16 @@ fn run_remote_create(
         rows,
         job.in_place,
         job.seed_from.as_deref(),
+        job.model.as_deref(),
+        job.effort.as_deref(),
         timeout,
     );
-    let (worktree_path, main_repo_path, resume_id) = match created {
+    let (worktree_path, main_repo_path, resume_id, (model, model_source, effort, effort_source)) = match created {
         Ok(r) => (
             PathBuf::from(r.worktree_path),
             r.main_repo_path.map(PathBuf::from),
             r.resume_id,
+            (r.model, r.model_source, r.effort, r.effort_source),
         ),
         // The daemon answered with a refusal: nothing was spawned.
         Err(e) if e.downcast_ref::<crate::client_session::DaemonRpcError>().is_some() => {
@@ -96,10 +107,9 @@ fn run_remote_create(
         Err(e) => {
             let found = crate::client_session::rpc_list_daemon_sessions(socket, &token)
                 .ok()
-                .and_then(|rows| rows.into_iter().find(|s| s.session_uid == job.uid))
-                .and_then(|s| s.worktree_path);
-            match found {
-                Some(path) => (PathBuf::from(path), None, None),
+                .and_then(|rows| rows.into_iter().find(|s| s.session_uid == job.uid));
+            match found.and_then(|s| Some((s.worktree_path?, (s.model, s.model_source, s.effort, s.effort_source)))) {
+                Some((path, settings)) => (PathBuf::from(path), None, None, settings),
                 None => return Err(discard(e)),
             }
         }
@@ -125,6 +135,10 @@ fn run_remote_create(
         worktree_path,
         main_repo_path,
         resume_id,
+        model,
+        model_source,
+        effort,
+        effort_source,
     })
 }
 
@@ -205,6 +219,11 @@ impl App {
     fn finish_remote_create(&mut self, spec: RemoteCreateSpec, prepared: PreparedRemoteCreate) {
         let session_type = spec.engine.as_session_type();
         let ts = TerminalSession {
+            org: None,
+            model: prepared.model.clone(),
+            model_source: prepared.model_source.clone(),
+            effort: prepared.effort.clone(),
+            effort_source: prepared.effort_source.clone(),
             color: None,
             uid: spec.uid,
             label: session_type.to_string(),
@@ -243,6 +262,7 @@ impl App {
             host_id: spec.host.clone(),
         };
         let ws = Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: spec.workspace_id,
@@ -316,6 +336,7 @@ mod tests {
             uid: "create-uid".into(),
             workspace_id: "create-ws".into(),
             section: None,
+            model: None, effort: None,
         }
     }
 

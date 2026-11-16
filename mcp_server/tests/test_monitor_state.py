@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 from unittest import mock
+from pathlib import Path
 
 from mcp_server import monitor_state
 from mcp_server.notifications import Queue
@@ -74,6 +75,19 @@ class MonitorStateTests(unittest.TestCase):
         retained = monitor_state.read()["producers"][monitor_state.PRODUCER_ID]["records"]["mon-a"]
         self.assertNotIn("task", retained)
         self.assertEqual(retained["result"], record["result"])
+
+    def test_path_values_are_normalized_at_journal_boundary(self):
+        path = Path("/tmp/cm-daemon.sock")
+        monitor_state.publish({"mon-a": self.record(launch_socket_path=path)})
+        persisted = monitor_state.read()["producers"][monitor_state.PRODUCER_ID]["records"]["mon-a"]
+        self.assertEqual(persisted["launch_socket_path"], str(path))
+
+        # A later producer write must also be able to rewrite the retained
+        # record. This covers a poisoned in-memory Path surviving into the
+        # next journal boundary.
+        monitor_state.publish({})
+        persisted = monitor_state.read()["producers"][monitor_state.PRODUCER_ID]["records"]["mon-a"]
+        self.assertEqual(persisted["launch_socket_path"], str(path))
 
     def test_verified_terminal_history_can_be_pruned(self):
         monitor_state.publish({"mon-a": self.record("delivered")})

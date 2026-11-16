@@ -95,6 +95,53 @@ class CleanupTests(unittest.TestCase):
         after = lineage.records()[before['id']]
         self.assertEqual(before['parents'], after['parents'])
 
+    def commit(self, *args, session=''):
+        env = {**os.environ, 'CM_TUI_SESSION_ID': session}
+        subprocess.run(['git', '-C', str(self.repo), 'commit', '-q', '--allow-empty', *args],
+                       check=True, capture_output=True, env=env)
+        return self.git(self.repo, 'log', '-1', '--format=%B')
+
+    def test_commit_trailer_hook_credits_the_authoring_session(self):
+        hook = self.repo / '.git/hooks/prepare-commit-msg'
+        hook.write_text('#!/bin/sh\nprintf "\\n[template]\\n" >> "$1"\n')
+        hook.chmod(0o755)
+        results = lineage.install_hooks(self.repo)
+        self.assertEqual([Path(r['hook']).name for r in results], ['post-checkout', 'prepare-commit-msg'])
+        lineage.install_hooks(self.repo)
+        self.assertEqual(hook.read_text().count(lineage.TRAILER_MARKER), 1)
+        message = self.commit('-m', 'feat: one', session='ts-author-1')
+        self.assertIn('[template]', message, 'the pre-existing hook still runs')
+        self.assertTrue(message.rstrip().endswith('CM-Session: ts-author-1'), message)
+        # An amend by another session keeps the author's trailer.
+        message = self.commit('--amend', '--no-edit', session='ts-lander-2')
+        self.assertIn('CM-Session: ts-author-1', message)
+        self.assertNotIn('ts-lander-2', message)
+        # Outside a session nothing is added.
+        self.assertNotIn('CM-Session', self.commit('-m', 'plain'))
+
+    def test_commit_trailer_hook_skips_merges_and_keeps_a_failing_hook(self):
+        lineage.install_trailer_hook(self.repo)
+        msg = self.base / 'MERGE_MSG'
+        msg.write_text('Merge branch x\n')
+        with patch.dict(os.environ, {'CM_TUI_SESSION_ID': 'ts-lander'}):
+            lineage.trailers([str(msg), 'merge'])
+            self.assertEqual(msg.read_text(), 'Merge branch x\n')
+            lineage.trailers([str(msg), 'message'])
+        self.assertIn('CM-Session: ts-lander', msg.read_text())
+        with patch.dict(os.environ, {'CM_TUI_SESSION_ID': 'ts-a', 'CM_MEMBER_ID': 'm-7'}):
+            self.assertEqual(lineage.commit_trailers(), ['CM-Session: ts-a', 'CM-Member: m-7'])
+
+        other = self.base / 'other'
+        other.mkdir()
+        self.git(other, 'init', '-b', 'main')
+        hook = other / '.git/hooks/prepare-commit-msg'
+        hook.write_text('#!/bin/sh\nexit 3\n')
+        hook.chmod(0o755)
+        lineage.install_trailer_hook(other)
+        proc = subprocess.run(['git', '-C', str(other), '-c', 'user.name=t', '-c', 'user.email=t@t',
+                               'commit', '-q', '--allow-empty', '-m', 'x'], capture_output=True)
+        self.assertNotEqual(proc.returncode, 0, 'a failing pre-existing hook still aborts the commit')
+
     def test_checkout_local_hooks_are_not_modified_or_claimed_as_tracked(self):
         hooks = self.repo / '.hooks'
         hooks.mkdir()
@@ -515,6 +562,48 @@ class CleanupTests(unittest.TestCase):
         facts = cleanup.scope_facts(self.context, row, {'task-1'}, 'task-1')
         self.assertEqual(facts.task_ids, {'task-1'})
 
+    def test_lineage_prune_drops_only_old_unreachable_records_of_gone_checkouts(self):
+        directory = self.cm / 'worktree-lineage'
+        kept_child = lineage.register(self.child('kept-child'), self.worktree, inherit_session=False)
+        leaf_path = self.child('gone-leaf')
+        leaf = lineage.register(leaf_path, self.worktree, inherit_session=False)
+        middle_path = self.child('gone-middle')
+        middle = lineage.register(middle_path, self.worktree, inherit_session=False)
+        grandchild = lineage.register(self.child('grandchild', middle_path), middle_path, inherit_session=False)
+        moved_path = self.child('moved')
+        moved = lineage.register(moved_path, self.worktree, inherit_session=False)
+        recent_path = self.child('gone-recent')
+        recent = lineage.register(recent_path, self.worktree, inherit_session=False)
+        for path in (leaf_path, middle_path, recent_path):
+            self.git(self.repo, 'worktree', 'remove', str(path))
+        self.git(self.repo, 'worktree', 'move', str(moved_path), str(self.root / 'moved-elsewhere'))
+        orphan_lock = directory / (str(uuid.uuid4()) + '.lock')
+        orphan_lock.touch()
+        hook_lock = directory / 'hook-0123.lock'
+        hook_lock.touch()
+        old = time.time() - 40 * 86400
+        for path in directory.iterdir():
+            if path.name != recent['id'] + '.json':
+                os.utime(path, (old, old))
+
+        before = sorted(p.name for p in directory.iterdir())
+        dry = lineage.prune(14)
+        self.assertEqual(sorted(p.name for p in directory.iterdir()), before)
+        self.assertEqual((dry['live'], dry['ancestors_kept'], dry['stamped_kept'], dry['recent_kept']), (3, 1, 1, 1))
+        self.assertEqual((dry['removed'], dry['orphan_locks_removed']), (1, 1))
+
+        self.assertEqual(lineage.prune(14, apply=True)['removed'], 1)
+        self.assertFalse((directory / (leaf['id'] + '.json')).exists())
+        self.assertFalse((directory / (leaf['id'] + '.lock')).exists())
+        self.assertFalse(orphan_lock.exists())
+        self.assertTrue(hook_lock.exists())
+        for row in (self.parent, kept_child, middle, grandchild, moved, recent):
+            self.assertTrue((directory / (row['id'] + '.json')).exists(), row['path'])
+        # The surviving descendant still inherits its removed parent's owners.
+        facts = cleanup.scope_facts(self.context, lineage.records()[grandchild['id']], {'task-1'}, 'task-1')
+        self.assertEqual(facts.task_ids, {'task-1'})
+        self.assertEqual(lineage.prune(14, apply=True)['removed'], 0)
+
     def test_symlink_checkout_is_rejected(self):
         link = self.root / 'alias'
         link.symlink_to(self.worktree)
@@ -539,6 +628,71 @@ class CleanupTests(unittest.TestCase):
             result = self.run_apply(self.job())
         self.assertFalse(result['results'][0]['removed'])
         self.assertIn('task_not_terminal', result['results'][0]['message'])
+
+    def test_apply_during_scan_is_accepted_and_runs_right_after_the_preview(self):
+        job = self.job()
+        job.update(phase='scanning', worktree_path=str(self.worktree))
+        cleanup.write_job(job)
+        with patch.object(cleanup, 'spawn') as spawn:
+            accepted = cleanup.request({'action': 'apply', 'id': job['id']})
+            again = cleanup.request({'action': 'apply', 'id': job['id']})
+        spawn.assert_not_called()  # the scanning worker carries on
+        self.assertEqual((accepted['phase'], accepted['apply_requested']), ('scanning', True))
+        self.assertTrue(again['apply_requested'])
+        with patch.object(cleanup, 'base_context', return_value=self.context), \
+                patch.object(reaper, 'refresh_dynamic_state'), \
+                patch.object(reaper, 'process_references', return_value={}):
+            cleanup.worker(job['id'])
+        done = cleanup.read_job(job['id'])
+        self.assertEqual(done['phase'], 'complete')
+        self.assertTrue(done['results'][0]['removed'])
+
+    def test_preview_keeps_an_apply_request_that_arrived_while_it_scanned(self):
+        job = self.job()
+        job.update(phase='scanning', worktree_path=str(self.worktree))
+        cleanup.write_job(job)
+        in_memory = dict(job)  # the worker's copy, read before the request
+        cleanup.request({'action': 'apply', 'id': job['id']})
+        with patch.object(cleanup, 'base_context', return_value=self.context):
+            cleanup.preview(in_memory)
+        saved = cleanup.read_job(job['id'])
+        self.assertEqual(saved['phase'], 'queued')
+        self.assertTrue(saved['apply_requested'])
+        self.assertTrue(saved['candidates'])
+
+    def test_fast_git_reads_match_git_for_linked_primary_and_detached_checkouts(self):
+        detached = self.root / 'detached'
+        self.git(self.repo, 'worktree', 'add', '--detach', str(detached))
+        for path in (self.repo, self.worktree, detached):
+            self.assertIsNotNone(lineage.git_dirs(path))
+            common = str(Path(self.git(path, 'rev-parse', '--path-format=absolute', '--git-common-dir')).resolve())
+            self.assertEqual(lineage.common_dir(path), common, path)
+            self.assertEqual(lineage.current_branch(path), self.git(path, 'branch', '--show-current'), path)
+        self.assertEqual(lineage.current_branch(detached), '')
+        # Anything unusual falls back to Git.
+        odd = self.base / 'odd'
+        odd.mkdir()
+        (odd / '.git').write_text('not a gitdir line\n')
+        self.assertIsNone(lineage.git_dirs(odd))
+
+    def test_inventory_skips_up_to_date_checkouts_without_running_git(self):
+        with patch.object(cleanup, 'base_context', return_value=self.context):
+            cleanup.inventory(self.context)  # first pass registers what is new
+            calls = []
+            real = lineage.git
+            with patch.object(lineage, 'git', side_effect=lambda *a: calls.append(a[1:]) or real(*a)):
+                records, warnings = cleanup.inventory(self.context)
+        self.assertEqual(warnings, [])
+        self.assertIn(self.parent['id'], records)
+        # Only the once-per-repository calls remain (worktree list, hook
+        # check); no per-checkout identity, branch or remote lookups.
+        per_checkout = [c for c in calls if '--absolute-git-dir' in c or c[:1] == ('branch',)
+                        or c[:2] == ('remote', 'get-url')]
+        self.assertEqual(per_checkout, [], f'per-checkout Git calls: {calls}')
+        # A new owner found for a checkout still re-registers it.
+        ctx = dataclasses.replace(self.context, workspaces={self.worktree: reaper.WorkspaceFacts(task_ids={'task-1', 'task-9'})})
+        records, _ = cleanup.inventory(ctx)
+        self.assertIn('task-9', records[self.parent['id']]['task_ids'])
 
     def test_preview_retry_and_worker_resume_are_idempotent(self):
         job = self.job()

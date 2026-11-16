@@ -17,31 +17,61 @@ const ALERT_FRAME_MS: u128 = 120;
 /// through per frame is `theme::ALERT_RAINBOW`.
 const ALERT_PULSE: &[&str] = &["\u{00b7}", "\u{2022}", "\u{25cf}", "\u{25c9}", "\u{25cf}", "\u{2022}"];
 
-/// Value spans for a color-picker field in the A-e settings dialogs: a
-/// "none" slot plus one swatch per `theme::USER_COLORS` entry, the current
-/// selection bracketed. Callers style their own label; a ←/→ hint is
-/// appended while the field is focused.
+fn compact_duration(seconds: f64) -> String {
+    let mut whole = seconds.max(0.0).round() as u64;
+    let days = whole / 86_400;
+    whole %= 86_400;
+    let hours = whole / 3_600;
+    whole %= 3_600;
+    let minutes = whole / 60;
+    if days > 0 { return format!("{days}d{hours}h"); }
+    if hours > 0 {
+        return if minutes == 0 { format!("{hours}h") } else { format!("{hours}h{minutes:02}m") };
+    }
+    if minutes > 0 { return format!("{minutes}m"); }
+    "now".into()
+}
+
+pub(super) fn continuous_team_header(
+    name: &str,
+    marker: &crate::app::org_model::ContinuousMarker,
+    now: f64,
+) -> String {
+    let health = if marker.health.is_empty() { "blocked" } else { marker.health.as_str() };
+    if let Some(cadence) = marker.cadence_secs {
+        let next = marker.next_run.map(|at| compact_duration(at - now)).unwrap_or_else(|| "—".into());
+        return format!("⟳ every {} · next {} · {}", compact_duration(cadence), next, health);
+    }
+    let pending: u64 = marker.queues.iter().filter_map(|row| row.get("pending").and_then(serde_json::Value::as_u64)).sum();
+    if !marker.queues.is_empty() {
+        return format!("⟳ queue · {pending} pending · {health}");
+    }
+    format!("⟳ {name} · {health}")
+}
+
+pub(super) fn continuous_team_box_header(header: &str) -> String {
+    format!("╭─ {header} ─╮")
+}
+
+pub(super) const fn continuous_team_box_footer() -> &'static str {
+    "╰────────────────────╯"
+}
+
+/// Value spans for a color field in the A-e settings dialogs: the current
+/// swatch and its name, or "none". While focused, a hint names the key
+/// that opens the grid picker (`color_grid.rs`).
 fn color_picker_spans(current: Option<&str>, focused: bool) -> Vec<Span<'static>> {
     let dim = Style::default().fg(theme::DIM);
     let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.push(Span::styled(
-        if current.is_none() { "[none]" } else { " none " },
-        if current.is_none() {
-            Style::default().fg(theme::TEXT)
-        } else {
-            dim
-        },
-    ));
-    for (name, color) in theme::USER_COLORS {
-        let marker = if current == Some(*name) {
-            "[\u{25a0}]"
-        } else {
-            " \u{25a0} "
-        };
-        spans.push(Span::styled(marker, Style::default().fg(*color)));
+    match current.and_then(|name| theme::user_color(name).map(|c| (name, c))) {
+        Some((name, color)) => {
+            spans.push(Span::styled("\u{2588}\u{2588} ", Style::default().fg(color)));
+            spans.push(Span::styled(name.to_string(), Style::default().fg(theme::TEXT)));
+        }
+        None => spans.push(Span::styled("none", dim)),
     }
     if focused {
-        spans.push(Span::styled("  \u{2190}/\u{2192}", dim));
+        spans.push(Span::styled("  Enter: pick", dim));
     }
     spans
 }
@@ -109,7 +139,7 @@ fn log_draw_section(section: &str, elapsed: std::time::Duration) {
 }
 
 impl App {
-    fn spinner_frame(&self) -> &'static str {
+    pub(super) fn spinner_frame(&self) -> &'static str {
         let elapsed = self.start_time.elapsed().as_millis();
         let idx = (elapsed / SPINNER_INTERVAL_MS) as usize % SPINNER_FRAMES.len();
         SPINNER_FRAMES[idx]
@@ -126,7 +156,7 @@ impl App {
     /// a bold bead that pulses small→large while its color cycles through the
     /// rainbow. Fully replaces the normal status indicator while the alert is
     /// pending — the animation *is* the signal.
-    fn alert_indicator(&self) -> (&'static str, Style) {
+    pub(super) fn alert_indicator(&self) -> (&'static str, Style) {
         let f = self.alert_frame() as usize;
         let glyph = ALERT_PULSE[f % ALERT_PULSE.len()];
         let color = theme::ALERT_RAINBOW[f % theme::ALERT_RAINBOW.len()];
@@ -134,9 +164,28 @@ impl App {
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
+        if self.roster.visible {
+            self.draw_roster(frame);
+            self.global_settings.draw(frame, frame.area());
+            self.draw_availability(frame, frame.area());
+            return;
+        }
+        if self.orgchart.visible {
+            self.draw_orgchart(frame);
+            self.global_settings.draw(frame, frame.area());
+            self.draw_availability(frame, frame.area());
+            return;
+        }
+        if self.board.visible {
+            self.draw_board(frame);
+            self.global_settings.draw(frame, frame.area());
+            self.draw_availability(frame, frame.area());
+            return;
+        }
         if self.messages.visible {
             self.draw_messages(frame);
             self.global_settings.draw(frame, frame.area());
+            self.draw_availability(frame, frame.area());
             return;
         }
         let area = frame.area();
@@ -228,7 +277,11 @@ impl App {
             }
             ViewMode::Planning => {
                 let t = std::time::Instant::now();
-                self.planning.draw(frame, content_area);
+                let strip = self.on_boards_height(content_area);
+                let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(strip)]).split(content_area);
+                self.planning.draw(frame, rows[0]);
+                self.draw_on_boards(frame, rows[1]);
+                self.draw_place(frame, rows[0]);
                 log_draw_section("planning", t.elapsed());
             }
         }
@@ -252,6 +305,8 @@ impl App {
             match &self.input_mode {
                 InputMode::ContinuousControl(menu) => menu.draw(frame, area),
                 InputMode::WorktreeCleanup(menu) => menu.draw(frame, area),
+                InputMode::ForkSession(form) => form.draw(frame, area),
+                InputMode::Handoff(form) => form.draw(frame, area),
                 InputMode::NewSession {
                     engine,
                     label_text,
@@ -314,13 +369,16 @@ impl App {
                     self.draw_transcript_picker(frame, area, candidates, *selected, target);
                 }
                 InputMode::WorkspaceSettings {
+                    workspace_id,
                     name,
                     color,
                     pinned,
                     section,
+                    tasks,
+                    task_at,
                     active_field,
-                    ..
                 } => {
+                    self.section_note = self.nested_section_label(workspace_id);
                     self.draw_workspace_settings(
                         frame,
                         area,
@@ -328,6 +386,8 @@ impl App {
                         color.as_deref(),
                         *pinned,
                         section.as_deref(),
+                        tasks,
+                        *task_at,
                         *active_field,
                     );
                 }
@@ -388,21 +448,11 @@ impl App {
                         goal,
                     );
                 }
-                InputMode::TaskSettings { name, color, section, active_field, .. } => {
-                    self.draw_task_settings(
-                        frame,
-                        area,
-                        name,
-                        color.as_deref(),
-                        section.as_deref(),
-                        *active_field,
-                    );
-                }
                 InputMode::WorkflowHistory { run_id } => {
                     self.draw_workflow_history(frame, area, run_id);
                 }
-                InputMode::PastWorkspacePicker { candidates, selected } => {
-                    self.draw_past_workspace_picker(frame, area, candidates, *selected);
+                InputMode::PastWorkspacePicker { candidates, query, selected } => {
+                    self.draw_past_workspace_picker(frame, area, candidates, query, *selected);
                 }
                 InputMode::SessionPalette { candidates, query, selected } => {
                     self.draw_session_palette(frame, area, candidates, query, *selected);
@@ -413,11 +463,12 @@ impl App {
                 InputMode::TaskPeek { lines, scroll, .. } => {
                     peek_max = Some(self.draw_task_peek(frame, area, lines, *scroll));
                 }
-                InputMode::Confirm { prompt, .. } => {
-                    self.draw_confirm(frame, area, prompt);
+                InputMode::Confirm { prompt, action } => {
+                    self.draw_confirm(frame, area, prompt, matches!(action, ConfirmAction::BackgroundRecovery { .. } | ConfirmAction::ReconcileBackground { .. }));
                 }
                 InputMode::Normal => {}
             }
+            self.draw_color_grid(frame, area);
             if let Some(m) = peek_max {
                 if let InputMode::TaskPeek { scroll, max_scroll, .. } = &mut self.input_mode {
                     *max_scroll = m;
@@ -432,64 +483,35 @@ impl App {
             Rect { width: terminal_width, ..area }
         } else { area };
         self.global_settings.draw(frame, settings_area);
+        self.draw_availability(frame, area);
     }
 
-    /// Minimal dialog for renaming a task from the sidebar.
-    fn draw_task_settings(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        name: &str,
-        color: Option<&str>,
-        section: Option<&str>,
-        active_field: u8,
-    ) {
-        let width = 60u16.min(area.width.saturating_sub(4));
-        let height = 9u16;
-        let x = (area.width.saturating_sub(width)) / 2;
-        let y = (area.height.saturating_sub(height)) / 2;
-        let dialog_area = Rect::new(x, y, width, height);
-
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::TEXT))
-            .title(" Task Settings ");
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
-
-        let dim = Style::default().fg(theme::DIM);
-        let white = Style::default().fg(theme::TEXT);
-        let name_cursor = if active_field == 0 { "\u{2588}" } else { "" };
-        let lines = vec![
-            Line::from(vec![
-                Span::styled("   Name: ", dim),
-                Span::styled(name, white),
-                Span::styled(name_cursor, white),
-            ]),
-            Line::from(""),
-            {
-                let mut spans = vec![Span::styled(
-                    "  Color: ",
-                    if active_field == 1 { white } else { dim },
-                )];
-                spans.extend(color_picker_spans(color, active_field == 1));
-                Line::from(spans)
-            },
-            Line::from(""),
-            self.section_picker_line("Section: ", section, active_field == 2),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Tab next \u{00b7} Enter save \u{00b7} Esc cancel",
-                dim,
-            )),
-        ];
-        frame.render_widget(Paragraph::new(lines), inner);
+    /// The Lead field's text: the pinned session's label, or what the
+    /// shared rule picks with no pin.
+    fn lead_label(&self, task: &super::input::WorkspaceTaskEdit) -> String {
+        match &task.lead {
+            Some(uid) => task
+                .lead_choices
+                .iter()
+                .find(|(u, _)| u == uid)
+                .map_or_else(|| uid.clone(), |(_, label)| label.clone()),
+            None => {
+                let rule = match self.all_leads().get(task.task_id.as_str()) {
+                    Some(super::tree::Lead::Session(uid)) => {
+                        task.lead_choices.iter().find(|(u, _)| u == uid).map(|(_, l)| l.clone())
+                    }
+                    Some(super::tree::Lead::Owner { stand_in }) => {
+                        Some(super::symbols::owner_label(*stand_in).to_owned())
+                    }
+                    _ => None,
+                };
+                format!("auto ({})", rule.as_deref().unwrap_or("no live agent"))
+            }
+        }
     }
 
     /// `<label>: <choice>` row for the sidebar-section picker on the
-    /// workspace / task settings forms. `auto` = inherit through the task
+    /// workspace settings form. `auto` = inherit through the task
     /// tree, `none` = explicitly loose, else the section name.
     fn section_picker_line(
         &self,
@@ -500,6 +522,11 @@ impl App {
         let dim = Style::default().fg(theme::DIM);
         let white = Style::default().fg(theme::TEXT);
         let mut spans = vec![Span::styled(label.to_string(), if focused { white } else { dim })];
+        // A nested workspace shows the section it inherits, read-only.
+        if let Some(note) = self.section_note.clone() {
+            spans.push(Span::styled(note, white));
+            return Line::from(spans);
+        }
         let value = self.section_choice_label(section);
         let value_style = match section {
             Some(id) if !id.is_empty() => self
@@ -580,9 +607,13 @@ impl App {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
-    fn draw_confirm(&self, frame: &mut Frame, area: Rect, prompt: &str) {
-        let width = 70u16.min(area.width.saturating_sub(4));
-        let height = 5u16;
+    fn draw_confirm(&self, frame: &mut Frame, area: Rect, prompt: &str, background: bool) {
+        let width = if background { 100 } else { 70 }.min(area.width.saturating_sub(4));
+        let height = if background {
+            let inner = usize::from(width.saturating_sub(2)).max(1);
+            let lines = prompt.lines().map(|line| 1 + unicode_width::UnicodeWidthStr::width(line).div_ceil(inner)).sum::<usize>();
+            u16::try_from(lines.saturating_add(6)).unwrap_or(u16::MAX).min(area.height.saturating_sub(2))
+        } else { 5 };
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -598,11 +629,10 @@ impl App {
 
         let dim = Style::default().fg(theme::DIM);
         let white = Style::default().fg(theme::TEXT);
-        let lines = vec![
-            Line::from(Span::styled(prompt.to_string(), white)),
-            Line::from(""),
-            Line::from(Span::styled("y/Enter confirm \u{00b7} n/Esc cancel", dim)),
-        ];
+        let mut lines: Vec<Line<'_>> = prompt.lines()
+            .map(|line| Line::from(Span::styled(line.to_owned(), white))).collect();
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(if background { "y confirm \u{00b7} n/Esc cancel" } else { "y/Enter confirm \u{00b7} n/Esc cancel" }, dim)));
         frame.render_widget(Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }), inner);
     }
 
@@ -620,7 +650,7 @@ impl App {
         active_field: u8,
     ) {
         let width = 60u16.min(area.width.saturating_sub(4));
-        let height = 15u16;
+        let height = 17u16;
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -694,6 +724,13 @@ impl App {
             engine_line.spans.push(Span::styled("  ←/→ change", dim));
         }
 
+        let reports_style = if active_field == 7 { highlight } else { white };
+        let reports_hint = match (&self.new_session_reports_to, active_field == 7) {
+            (crate::task_picker::ReportsTo::Standalone, true) => "  Enter or type to pick a task",
+            (crate::task_picker::ReportsTo::Task(_), true) => "  Enter change \u{00b7} Bksp standalone",
+            _ => "",
+        };
+
         let lines = vec![
             Line::from(vec![
                 Span::styled("    Repo: ", dim),
@@ -728,6 +765,12 @@ impl App {
                 Span::styled(host_hint, dim),
             ]),
             engine_line,
+            Line::from(vec![
+                Span::styled("Reports to: ", dim),
+                Span::styled(self.new_session_reports_to.label(), reports_style),
+                Span::styled(reports_hint, dim),
+            ]),
+            self.form_model.line("   Model: ", active_field == 8),
             Line::from(""),
             Line::from(Span::styled(
                 "Tab switch field \u{00b7} Enter start \u{00b7} Esc cancel",
@@ -736,6 +779,9 @@ impl App {
         ];
 
         frame.render_widget(Paragraph::new(lines), inner);
+        if let Some(picker) = &self.new_session_picker {
+            picker.draw(frame, dialog_area);
+        }
     }
 
     fn draw_new_terminal_dialog(
@@ -749,8 +795,8 @@ impl App {
         active_field: u8,
     ) {
         let width = 50u16.min(area.width.saturating_sub(4));
-        // +2 rows for the seed-from line, +1 for resume-from.
-        let height = 13u16;
+        // +2 rows for the seed-from line, +1 for resume-from, +1 model.
+        let height = 14u16;
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -848,6 +894,7 @@ impl App {
             Span::styled(resume_label, resume_style),
             Span::styled(resume_hint, dim),
         ]));
+        lines.push(self.form_model.line(" Model: ", active_field == 3));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "Tab field \u{00b7} j/k type \u{00b7} Enter start \u{00b7} Esc cancel",
@@ -910,7 +957,7 @@ impl App {
         let hidden_style = if active_field == 3 { white } else { dim };
         let notify_marker = if notify_on_idle { "[x]" } else { "[ ]" };
         let notify_style = if active_field == 4 { white } else { dim };
-        let perms_marker = if global_perms { "[x]" } else { "[ ]" };
+        let perms_marker = if session_type == "bash" { "[N/A]" } else if global_perms { "[x]" } else { "[ ]" };
         // Highlight the grant in yellow when on — it's a privileged,
         // cross-session capability, not a routine toggle.
         let perms_style = if active_field == 5 {
@@ -956,7 +1003,9 @@ impl App {
                 Span::styled("   Global perms: ", dim),
                 Span::styled(perms_marker, perms_style),
                 Span::styled(
-                    if active_field == 5 {
+                    if session_type == "bash" {
+                        "  shell terminal"
+                    } else if active_field == 5 {
                         "  Space — control ANY session"
                     } else {
                         ""
@@ -1094,10 +1143,13 @@ impl App {
         color: Option<&str>,
         pinned: bool,
         section: Option<&str>,
+        tasks: &[super::input::WorkspaceTaskEdit],
+        task_at: usize,
         active_field: u8,
     ) {
         let width = 60u16.min(area.width.saturating_sub(4));
-        let height = 11u16;
+        // The workspace's task adds its name, lead and default models.
+        let height = if tasks.is_empty() { 11u16 } else { 16u16 };
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -1121,7 +1173,7 @@ impl App {
         let name_cursor = if active_field == 0 { "\u{2588}" } else { "" };
         let pinned_marker = if pinned { "[x]" } else { "[ ]" };
         let pinned_style = if active_field == 2 { white } else { dim };
-        let lines = vec![
+        let mut lines = vec![
             Line::from(vec![
                 Span::styled("    Name: ", dim),
                 Span::styled(name, white),
@@ -1148,11 +1200,36 @@ impl App {
             Line::from(""),
             self.section_picker_line(" Section: ", section, active_field == 3),
             Line::from(""),
-            Line::from(Span::styled(
-                "Tab next \u{00b7} Enter save \u{00b7} Esc cancel  (branch unchanged)",
-                dim,
-            )),
         ];
+        if let Some(task) = tasks.get(task_at.min(tasks.len().saturating_sub(1))) {
+            let field = |n: u8| if active_field == n { white } else { dim };
+            let mut name_line = vec![
+                Span::styled("    Task: ", field(4)),
+                Span::styled(task.name.clone(), white),
+                Span::styled(if active_field == 4 { "\u{2588}" } else { "" }, white),
+            ];
+            // Several tasks share the checkout: ←/→ picks which one.
+            if tasks.len() > 1 {
+                name_line.push(Span::styled(
+                    format!("  {}/{}{}", task_at + 1, tasks.len(), if active_field == 4 { " \u{2190}/\u{2192}" } else { "" }),
+                    dim,
+                ));
+            }
+            lines.push(Line::from(name_line));
+            lines.push(Line::from(vec![
+                Span::styled("    Lead: ", field(5)),
+                Span::styled("\u{2605} ", Style::default().fg(theme::LEAD)),
+                Span::styled(self.lead_label(task), white),
+                Span::styled(if active_field == 5 { "  \u{2190}/\u{2192}" } else { "" }, dim),
+            ]));
+            lines.push(task.models.line(0, "  Claude: ", active_field == 6));
+            lines.push(task.models.line(1, "   Codex: ", active_field == 7));
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            "Tab next \u{00b7} Enter save \u{00b7} Esc cancel  (branch unchanged)",
+            dim,
+        )));
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
@@ -1180,6 +1257,20 @@ impl App {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border_color))
             .title(Span::styled(self.active_title(), title_style));
+
+        if let Some((_, ts)) = self.active_session() {
+            if let Some(health) = self.notification_health.get(&(ts.host_id.clone(), ts.uid.clone())) {
+                let warning = if health["reason"] == "external_background" {
+                    " Claude background session: notifications stalled · A-R to inspect "
+                } else {
+                    " Notifications stalled · A-R to inspect "
+                };
+                block = block.title_bottom(Line::from(Span::styled(
+                    warning,
+                    Style::default().fg(theme::ATTN),
+                )));
+            }
+        }
 
         // Scrollback cue: when the active session's viewport is scrolled up
         // (not showing the live tail), surface a right-aligned ATTN tag in
@@ -1408,15 +1499,17 @@ impl App {
             };
             // Idle age tints the needs-human ● and stale orchestrator labels.
             // Subtask labels retain their durable lifecycle color.
-            let idle_bucket = (ts.status == SessionStatus::Idle
-                && !ts.session.exited)
-                .then(|| idle_age_bucket_at(ts.idle_since, now));
+            let idle_bucket = self.display_idle_bucket(ts, now);
             let (indicator, indicator_style) = if self.reconnecting_sessions.contains(&ts.uid) {
                 ("\u{27f3}", Style::default().fg(theme::ATTN))
+            } else if ts.session_type == "bash" {
+                super::symbols::engine("bash")
             } else if ts.hidden {
                 (" ", Style::default())
+            } else if let Some(engine) = self.agent_indicator(ts) {
+                engine
             } else {
-                match ts.status {
+                match if self.display_running(ts) { SessionStatus::Running } else { SessionStatus::Idle } {
                     SessionStatus::Running => (spinner, Style::default().fg(theme::OK)),
                     // Idle splits three ways: ◉ (cyan) = a pending operator
                     // QUESTION the orchestrator parked (metadata.operator_question);
@@ -1444,8 +1537,10 @@ impl App {
                     }
                 }
             };
-            let (indicator, indicator_style) = if self.session_has_alert(&ts.uid) {
+            let (indicator, indicator_style) = if self.session_has_alert(&ts.uid, &ts.host_id) {
                 self.alert_indicator()
+            } else if self.owner_blocked_session(&ts.uid) {
+                self.owner_indicator()
             } else {
                 (indicator, indicator_style)
             };
@@ -1504,7 +1599,8 @@ impl App {
             } else if let Some(stage) = stage {
                 Style::default().fg(stage.color())
             } else if matches!(idle_bucket, Some(IdleAgeBucket::Stale))
-                && !self.session_has_alert(&ts.uid)
+                && !self.session_has_alert(&ts.uid, &ts.host_id)
+                && !self.owner_blocked_session(&ts.uid)
                 && !self.reconnecting_sessions.contains(&ts.uid)
             {
                 // Stale-idle rows fade like the main sidebar's — see the
@@ -1581,6 +1677,7 @@ impl App {
         }
         frame.render_stateful_widget(List::new(items).highlight_style(Style::default()), rows_area, &mut state);
         self.continuous_list_state = state;
+        self.continuous_page_rows = rows_area.height;
     }
 
     fn backtest_list_items(
@@ -1769,7 +1866,8 @@ impl App {
     pub(super) fn draw_session_list(&mut self, frame: &mut Frame, area: Rect) {
         let view_label = match self.sidebar_view {
             SidebarView::Status => " Sessions ",
-            SidebarView::Task => " Tasks ",
+            SidebarView::Team if self.org_live().is_some() => " Teams ",
+            SidebarView::Task | SidebarView::Team => " Workspaces ",
         };
         let view_label = if let Some(filter) = self.sidebar_filter.as_deref() {
             format!("{} · /{} ", view_label.trim(), filter)
@@ -1802,22 +1900,23 @@ impl App {
         // bottom rows of the list and indicators vanish).
         let help_entries: Vec<(&str, &str)> = if self.keybinding_helper_visible { vec![
             ("A-/    filter", "A-?  helper"),
-            ("A-j/k  nav", "A-d  done"),
+            ("A-j/k  nav", "A-D  done"),
             ("A-h/l  column", "A-x  delete"),
             ("A-a    attach", "A-v  view"),
             ("A-n    new ws", "A-r  refresh"),
             ("A-s    +session", "A-q  quit"),
             ("A-w    close sess", "A-y  history"),
-            ("A-W    close ws", "A-u  resume"),
+            ("A-W    close ws", "A-U  resume wf"),
             ("A-e    settings", "F9   global"),
             ("A-H    hide", "A-z  catalog"),
             ("A-f    workflow", "A-t  planning"),
             ("A-o    stop wf", "A-c  cont-col"),
             ("A-C    cont-stop", "A-,  activity"),
             ("A-b    snapshot", "A-g  attention"),
-            ("A-O    reopen ws", ""),
+            ("A-O    reopen ws", "A-F  fork task"),
             ("A-N    +section", "A-J/K sect order"),
-            ("PgUp/Dn scroll", ""),
+            ("PgUp/Dn scroll", "A-u/d half page"),
+            ("Spc    fold hdr", "F9   badges"),
             ("A-Ent  newline", "A-;  recent"),
             ("A-p    find", "A-i  info"),
             ("A-'    yank", "A-M  mouse"),
@@ -1832,31 +1931,116 @@ impl App {
         let help_entries = help_entries.into_iter().take(help_rows).collect::<Vec<_>>();
         let list_height = inner.height.saturating_sub(helper_height);
 
-        let visual = self.visual_items();
+        // Task sub-view: the nested work tree (app/tree.rs) and its row
+        // metadata, built once per frame. When the cursor has moved since
+        // the last draw (a jump, spawn, fork, restore or event) and a fold,
+        // folded section or filter hides its row, reveal it and rebuild.
+        // A draw with the cursor unmoved never undoes Owner's own filter
+        // or folds.
+        let moved = self.last_drawn_cursor.as_ref() != Some(&self.cursor);
+        self.last_drawn_cursor = Some(self.cursor.clone());
+        let mut tree = self.tree_view().then(|| self.task_tree_shared());
+        let mut visual = match &tree {
+            Some(t) => self.filter_visual_items(t.items.clone()),
+            None => self.visual_items(),
+        };
+        if moved && tree.is_some() && self.cursor_row_hidden(&visual) && self.reveal_cursor() {
+            let t = self.task_tree_shared();
+            visual = self.filter_visual_items(t.items.clone());
+            tree = Some(t);
+        }
+        let tree = tree;
         let mut items: Vec<ListItem> = Vec::new();
+        // A nested block renders inside its root block's section.
+        let block_root = |wi: usize| tree.as_ref().and_then(|t| t.block_root.get(&wi).copied()).unwrap_or(wi);
+        // The section a workspace's rows draw in (its root block's): the
+        // tree resolved them once per build, so a frame only looks them up.
+        let section_of =
+            |wi: usize| tree.as_ref().and_then(|t| t.section_of.get(&wi)).map(String::as_str);
         // Workspaces rendered inside a section get one extra leading space
-        // on every row (header, task subheaders, sessions, workflow
-        // headers) so the grouping reads at a glance. Resolved once per
+        // on every row (header, sessions, workflow headers) so the
+        // grouping reads at a glance. Resolved once per
         // frame; empty when no sections exist (byte-identical pre-feature
         // rendering).
         let in_section: HashSet<usize> = if self.sections.is_empty() {
             HashSet::new()
-        } else {
+        } else if tree.is_some() {
             visual
                 .iter()
                 .filter_map(|vi| match vi {
                     VisualItem::WorkspaceHeader(wi) => Some(*wi),
                     _ => None,
                 })
-                .filter(|wi| self.section_of_workspace(*wi).is_some())
+                .filter(|wi| section_of(*wi).is_some())
+                .collect()
+        } else {
+            let lookup = self.section_lookup();
+            visual
+                .iter()
+                .filter_map(|vi| match vi {
+                    VisualItem::WorkspaceHeader(wi) => Some(*wi),
+                    _ => None,
+                })
+                .filter(|wi| self.section_of_workspace_in(&lookup, block_root(*wi)).is_some())
                 .collect()
         };
         let indent = |wi: usize| -> &'static str {
             if in_section.contains(&wi) { " " } else { "" }
         };
+        // The focused row's group: its node and everything under it.
+        let focus = tree.as_ref().zip(self.cursor_node());
+        let in_group = |vi: &VisualItem| -> bool {
+            let Some((t, f)) = &focus else { return false };
+            t.rows.get(vi).and_then(|r| r.node.as_ref()).is_some_and(|n| t.within(n, f))
+        };
+        // Tree rows start with the sidebar's left-edge cell: a narrow strip
+        // there marks the focused group, clear of the row text (Owner,
+        // 2026-10-21: it replaces the group tint and the ancestor bar). No
+        // indent by depth: every block draws at the top-level indent, and
+        // the strip and the level marks carry the hierarchy.
+        let tree_prefix = |vi: &VisualItem, wi: usize| -> Vec<Span<'static>> {
+            let edge = if in_group(vi) {
+                Span::styled("\u{258f}", Style::default().fg(theme::TREE_FOCUS))
+            } else {
+                Span::raw(" ")
+            };
+            vec![edge, Span::raw(indent(wi))]
+        };
+        let fold_tail = |node: &super::tree::Node| -> String {
+            let Some((n, running, idle, alerting)) = tree.as_ref().and_then(|t| t.folded.get(node)) else {
+                return String::new();
+            };
+            let mut t = format!("  ({n})");
+            if *alerting > 0 {
+                t.push_str(&format!(" \u{2691}{alerting}"));
+            }
+            if *running > 0 {
+                t.push_str(&format!(" \u{283f}{running}"));
+            }
+            if *idle > 0 {
+                t.push_str(&format!(" \u{25cf}{idle}"));
+            }
+            t
+        };
+        // Leader marks: the lead of each task with subtasks, by level.
+        let marks = tree.as_ref().map_or_else(HashMap::new, |t| self.leader_marks(&t.org));
+        // Owner-led tasks (pinned, or standing in for a division root): their
+        // workspace header carries the level's leader mark with Owner's ♔
+        // beside it.
+        let owner_led = if tree.is_some() { self.owner_leads() } else { HashMap::new() };
+        let owner_mark = |task_id: &str| -> Option<Vec<Span<'static>>> {
+            owner_led.get(task_id)?;
+            let level = tree.as_ref().map_or(1, |t| t.org.level(task_id));
+            Some(vec![
+                Span::styled(super::tree::leader_glyph(level), Style::default().fg(theme::LEAD)),
+                Span::styled(super::symbols::OWNER, super::symbols::owner_style()),
+                Span::raw(" "),
+            ])
+        };
 
-        let section_backgrounds = self.sidebar_section_backgrounds(&visual);
-        for (vi, background) in visual.iter().zip(section_backgrounds) {
+        let initiative_markers = self.planning.initiative_markers();
+        let section_backgrounds = self.sidebar_section_backgrounds(&visual, &section_of);
+        for (row_index, (vi, background)) in visual.iter().zip(section_backgrounds).enumerate() {
             let first_item = items.len();
             match vi {
                 VisualItem::WorkspaceHeader(wi) => {
@@ -1874,29 +2058,85 @@ impl App {
 
                     // Reserve room for the tags so the name truncates before
                     // them (the pin glyph 📌 is double-width + a space).
+                    // A member session blocked on Owner marks the header too.
+                    let ws_owner_blocked = ws
+                        .sessions
+                        .iter()
+                        .any(|s| self.owner_blocked_session(&s.uid));
+                    // Task sub-view: the header stands for the workspace's
+                    // task — a fold glyph when blocks nest under it, the
+                    // folded rollup, Owner's lead mark and the initiative
+                    // marker of its (first) root task.
+                    let node = super::tree::Node::Workspace(*wi);
+                    let root_task = tree
+                        .as_ref()
+                        .and_then(|t| t.roots.get(wi))
+                        .and_then(|r| r.first())
+                        .cloned();
+                    let fold_glyph = match &tree {
+                        Some(t) if t.foldable.contains(wi) => {
+                            if self.tree_folded(&node) { "\u{25b8} " } else { "\u{25be} " }
+                        }
+                        _ => "",
+                    };
+                    let tail = fold_tail(&node);
+                    let owner = root_task.as_deref().and_then(|t| owner_mark(t));
+                    let initiative_marker = root_task
+                        .as_deref()
+                        .map_or("", |t| initiative_markers.get(t).copied().unwrap_or(""));
                     let max_name = (inner.width as usize)
                         .saturating_sub(2)
                         .saturating_sub(host_tag.chars().count())
-                        .saturating_sub(if ws.pinned { 3 } else { 0 });
+                        .saturating_sub(if ws.pinned { 3 } else { 0 })
+                        .saturating_sub(if ws_owner_blocked { 8 } else { 0 })
+                        .saturating_sub(fold_glyph.chars().count())
+                        .saturating_sub(tail.chars().count())
+                        .saturating_sub(initiative_marker.chars().count())
+                        .saturating_sub(owner.as_ref().map_or(0, |o| o.len()));
                     // Char-boundary-safe truncation — a raw `&ws.name[..n]` byte
                     // slice panics when the cut lands inside a multibyte char
                     // (e.g. '≤' in a workspace name). Matches the session/task
                     // name truncation sites below.
                     let name = crate::planning::truncate_with_ellipsis(&ws.name, max_name);
 
-                    let mut header_spans = vec![Span::raw(" "), Span::raw(indent(*wi))];
+                    let mut header_spans = tree_prefix(vi, *wi);
+                    header_spans.push(Span::raw(fold_glyph));
+                    header_spans.extend(owner.into_iter().flatten());
+                    if ws_owner_blocked {
+                        let (glyph, style) = self.owner_indicator();
+                        header_spans.push(Span::styled(format!("{glyph} "), style));
+                    }
                     if ws.pinned {
                         header_spans.push(Span::raw("\u{1f4cc} "));
                     }
+                    header_spans.push(Span::raw(initiative_marker));
                     header_spans.push(Span::raw(name));
+                    if ws_owner_blocked {
+                        header_spans.push(super::owner_blocked::owner_tag());
+                    }
                     if !host_tag.is_empty() {
                         header_spans.push(Span::styled(host_tag, Style::default().fg(theme::DIM)));
+                    }
+                    if !tail.is_empty() {
+                        header_spans.push(Span::styled(tail, Style::default().fg(theme::DIM)));
                     }
                     let header_line = Line::from(header_spans);
 
                     // The user accent tints unselected rows; selection keeps
                     // the White+BOLD highlight so the cursor stays obvious.
-                    let ws_accent = ws.color.as_deref().and_then(theme::user_color);
+                    // A workspace without its own colour takes the legacy
+                    // colour of its task (set on the old task subheader),
+                    // read from the cached tree, not a per-frame task scan.
+                    let ws_accent = ws
+                        .color
+                        .as_deref()
+                        .or_else(|| {
+                            tree.as_ref()
+                                .and_then(|t| t.roots.get(wi))?
+                                .iter()
+                                .find_map(|t| self.task_colors.get(t.as_str()).map(String::as_str))
+                        })
+                        .and_then(theme::user_color);
                     let base_style = if is_selected {
                         Style::default()
                             .fg(theme::TEXT)
@@ -1909,7 +2149,8 @@ impl App {
 
                     items.push(ListItem::new(header_line).style(base_style));
                 }
-                VisualItem::Session(wi, si) => {
+                VisualItem::Session(wi, si) | VisualItem::ContinuousTeamSession(wi, si) => {
+                    let boxed = matches!(vi, VisualItem::ContinuousTeamSession(..));
                     let ws = &self.workspaces[*wi];
                     let ts = &ws.sessions[*si];
                     let is_selected = match &self.cursor {
@@ -1926,9 +2167,7 @@ impl App {
 
                     // Idle-age bucket — colors the idle dot (afterglow /
                     // settled / stale) and, when stale, dims the whole row.
-                    let idle_bucket = (ts.status == SessionStatus::Idle
-                        && !ts.session.exited)
-                        .then(|| idle_age_bucket_at(ts.idle_since, now));
+                    let idle_bucket = self.display_idle_bucket(ts, now);
 
                     let (indicator, indicator_style) = if self
                         .reconnecting_sessions
@@ -1942,10 +2181,17 @@ impl App {
                         // for hidden sessions — a stuck stream is worth
                         // surfacing.
                         ("\u{27f3}", Style::default().fg(theme::ATTN))
+                    } else if ts.session_type == "bash" {
+                        super::symbols::engine("bash")
                     } else if ts.hidden {
                         (" ", Style::default())
+                    } else if let Some(engine) = self.agent_indicator(ts) {
+                        // Engine-reported state the PTY cannot express:
+                        // ◐ background work, ? waiting on a human,
+                        // ✗ errored, · unknown (never shown as idle).
+                        engine
                     } else {
-                        match ts.status {
+                        match if self.display_running(ts) { SessionStatus::Running } else { SessionStatus::Idle } {
                             SessionStatus::Running => {
                                 (spinner, Style::default().fg(theme::OK))
                             }
@@ -1966,8 +2212,15 @@ impl App {
                     // pending, the rainbow-heartbeat bead takes over the icon
                     // cell entirely (overriding even a hidden session's blank)
                     // — the whole point is to grab the eye regardless of status.
-                    let (indicator, indicator_style) = if self.session_has_alert(&ts.uid) {
+                    // Below a pending alert: work blocked on an Owner decision.
+                    let owner_blocked = self.owner_blocked_session(&ts.uid);
+                    let revive_failed = self.revive_failed.contains_key(&ts.uid);
+                    let (indicator, indicator_style) = if self.session_has_alert(&ts.uid, &ts.host_id) {
                         self.alert_indicator()
+                    } else if revive_failed {
+                        ("\u{2717}", Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD))
+                    } else if owner_blocked {
+                        self.owner_indicator()
                     } else {
                         (indicator, indicator_style)
                     };
@@ -2002,36 +2255,42 @@ impl App {
                             let full = format!("{} / {}", ws.name, ts.label);
                             crate::planning::truncate_with_ellipsis(&full, max_name)
                         }
-                        SidebarView::Task => {
-                            // Indent levels (Phase 6 deepened by 2 cells per tier
-                            // so workflow-participant nesting reads cleanly):
-                            //   - Workspace-level (no task): 2 spaces.
-                            //   - Task-scoped, no workflow:  4 spaces.
-                            //   - Workflow participant:      6 spaces, putting
-                            //     them visually inside the task they belong to.
+                        SidebarView::Team if tree.is_none() => format!("      {}", ts.label),
+                        SidebarView::Task | SidebarView::Team => {
+                            // Sessions sit directly under their workspace
+                            // (2 spaces); a workflow participant goes one
+                            // tier deeper, under its workflow header.
                             let in_active_wf = ts
                                 .workflow_run_id
                                 .as_deref()
                                 .is_some_and(|id| {
                                     self.workflow_runs.iter().any(|r| r.run_id == id)
                                 });
-                            if in_active_wf {
-                                format!("      {}", ts.label)
-                            } else if ts.task_id.is_some() {
-                                format!("    {}", ts.label)
-                            } else {
-                                format!("  {}", ts.label)
-                            }
+                            let pad = if in_active_wf { "    " } else { "  " };
+                            format!("{pad}{}", ts.label)
                         }
                     };
 
-                    let mut spans = vec![
-                        Span::raw(indent(*wi)),
-                        Span::styled(format!(" {} ", indicator), indicator_style),
-                    ];
+                    let mut spans = if tree.is_some() {
+                        let mut spans = tree_prefix(vi, *wi);
+                        spans.push(Span::styled(format!("{} ", indicator), indicator_style));
+                        spans
+                    } else {
+                        vec![
+                            Span::raw(indent(*wi)),
+                            Span::styled(format!(" {} ", indicator), indicator_style),
+                        ]
+                    };
+                    // The lead of a task with subtasks carries its level's
+                    // leader mark in front of its label (app/tree.rs).
+                    let mark = marks.get(&ts.uid).copied();
+                    let (display, lead_mark) = match (mark, display.find(|c: char| c != ' ')) {
+                        (Some(g), Some(at)) => (display[at..].to_string(), Some((display[..at].to_string(), g))),
+                        _ => (display, None),
+                    };
                     // Vertical line prefix for sessions inside a workflow group
                     // (only in task view where grouping makes sense visually).
-                    if in_active_workflow && self.sidebar_view == SidebarView::Task {
+                    if in_active_workflow && self.tree_view() {
                         spans.push(Span::styled(
                             "\u{2502} ",
                             Style::default().fg(theme::DIM),
@@ -2040,9 +2299,47 @@ impl App {
                     if let Some((badge, style)) = wf_badge {
                         spans.push(Span::styled(badge, style));
                     }
-                    spans.push(Span::raw(display));
+                    if let Some((pad, glyph)) = lead_mark {
+                        spans.push(Span::raw(pad));
+                        spans.push(Span::styled(format!("{glyph} "), Style::default().fg(theme::LEAD)));
+                    }
+                    let mut tail: Vec<Span> = Vec::new();
+                    if owner_blocked {
+                        tail.push(super::owner_blocked::owner_tag());
+                    }
+                    if revive_failed {
+                        tail.push(Span::styled(
+                            " revive failed",
+                            Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD),
+                        ));
+                    } else if let Some(note) = super::model::exit_note(ts.preserved_last_exit.as_ref()) {
+                        tail.push(Span::styled(format!(" {note}"), Style::default().fg(theme::DIM)));
+                    }
                     if self.sidebar_view == SidebarView::Status && ts.host_id == cm_daemon::host_id::HostId::local() {
-                        spans.push(Span::styled(" ⌂", Style::default().fg(theme::DIM)));
+                        tail.push(Span::styled(" ⌂", Style::default().fg(theme::DIM)));
+                    }
+                    // Live activity badge (agent_state.rs), right-aligned,
+                    // at most BADGE_MAX cells. The name has priority: a row
+                    // too narrow for both drops the badge, never cuts the
+                    // name for it. Rows that already carry a status
+                    // (hidden, owner-blocked, revive failed) show none.
+                    let width = |v: &[Span]| v.iter().map(|s| s.width()).sum::<usize>();
+                    let room = (inner.width as usize).saturating_sub(width(&spans) + width(&tail));
+                    let label_w = display.chars().count();
+                    let badge = (!ts.hidden && !owner_blocked && !revive_failed)
+                        .then(|| self.row_badge(ts))
+                        .flatten()
+                        .filter(|b| super::agent_state::badge_fits(room, label_w, b));
+                    spans.push(Span::raw(display));
+                    spans.extend(tail);
+                    if let Some(b) = badge {
+                        let pad = room - label_w - super::agent_state::badge_width(&b);
+                        spans.push(Span::raw(" ".repeat(pad)));
+                        spans.extend(super::agent_state::badge_spans(&b));
+                    }
+                    if boxed {
+                        spans.insert(0, Span::styled("│ ", Style::default().fg(theme::HEADER)));
+                        spans.push(Span::styled(" │", Style::default().fg(theme::HEADER)));
                     }
                     let line = Line::from(spans);
 
@@ -2059,20 +2356,29 @@ impl App {
                             .fg(theme::TEXT)
                             .add_modifier(Modifier::BOLD)
                     } else if matches!(idle_bucket, Some(IdleAgeBucket::Stale))
-                        && !self.session_has_alert(&ts.uid)
+                        && !self.session_has_alert(&ts.uid, &ts.host_id)
+                        && !owner_blocked
                         && !self.reconnecting_sessions.contains(&ts.uid)
                     {
                         // Stale-idle rows (idle > 30 min) fade out label and
                         // all — they're background noise; a pending alert or
                         // an in-flight reconnect still gets full styling, and
                         // the selection branch above keeps the cursor legible.
-                        Style::default().fg(theme::DIM)
+                        // A user accent fades instead of turning grey.
+                        Style::default().fg(accent.map_or(theme::DIM, theme::faded))
                     } else if let Some(c) = accent {
                         Style::default().fg(c)
                     } else {
                         Style::default().fg(theme::MUTED)
                     };
-                    items.push(ListItem::new(line).style(base_style));
+                    let mut lines = vec![line];
+                    if boxed {
+                        let last = visual.get(row_index + 1);
+                        if !matches!(last, Some(VisualItem::ContinuousTeamSession(..))) {
+                            lines.push(Line::from(Span::styled(continuous_team_box_footer(), Style::default().fg(theme::HEADER))));
+                        }
+                    }
+                    items.push(ListItem::new(lines).style(base_style));
                 }
                 VisualItem::Separator | VisualItem::SectionEnd => {
                     let (glyph, style) = if matches!(vi, VisualItem::SectionEnd) {
@@ -2105,7 +2411,7 @@ impl App {
                     // when the group reads as one unit).
                     let agg_alerting = ws.sessions.iter().any(|ts| {
                         ts.workflow_run_id.as_deref() == Some(run_id.as_str())
-                            && self.session_has_alert(&ts.uid)
+                            && self.session_has_alert(&ts.uid, &ts.host_id)
                     });
                     let (agg_indicator, agg_style) = if agg_alerting {
                         self.alert_indicator()
@@ -2122,57 +2428,50 @@ impl App {
                             _ => "",
                         })
                         .unwrap_or("");
-                    let line = Line::from(vec![
-                        Span::raw(indent(*ws_idx)),
-                        Span::styled(format!(" {} ", agg_indicator), agg_style),
-                        Span::styled(
+                    let mut lead_in = if tree.is_some() {
+                        let mut spans = tree_prefix(vi, *ws_idx);
+                        spans.push(Span::styled(format!("{} ", agg_indicator), agg_style));
+                        spans
+                    } else {
+                        vec![Span::raw(indent(*ws_idx)), Span::styled(format!(" {} ", agg_indicator), agg_style)]
+                    };
+                    let line = Line::from({
+                        lead_in.push(Span::styled(
                             format!("\u{256d}\u{2500} {}{}", name, paused_suffix),
                             Style::default().fg(theme::HEADER),
-                        ),
-                    ]);
+                        ));
+                        lead_in
+                    });
                     items.push(ListItem::new(line));
                 }
-                VisualItem::TaskHeader { ws_idx, task_id } => {
-                    let is_selected = match &self.cursor {
-                        Cursor::Task { ws_idx: cwi, task_id: ctid } => {
-                            cwi == ws_idx && ctid == task_id
-                        }
-                        _ => false,
-                    };
-                    let name = self
-                        .tasks
-                        .iter()
-                        .find(|t| t.task_id.as_deref() == Some(task_id.as_str()))
-                        .map(|t| t.name.clone())
-                        .unwrap_or_else(|| "task".into());
-                    let initiative_marker = self.planning.task_initiative_marker(task_id);
+                // Division header: `▾ ◆ Name`, `▸ ◆ Name (n) ⠿r ●i` folded,
+                // in the initiative's colour (else HEADER), bold.
+                VisualItem::DivisionHeader(key) => {
+                    let is_selected = matches!(&self.cursor, Cursor::Division(cid) if cid == key);
+                    let id = &key.id;
+                    let division = tree.as_ref().and_then(|t| t.divisions.get(id)).cloned();
+                    let node = super::tree::Node::Division(key.clone());
+                    let glyph = if self.tree_folded(&node) { "\u{25b8}" } else { "\u{25be}" };
+                    let tail = fold_tail(&node);
+                    let prefix = tree_prefix(vi, usize::MAX);
+                    // Led by Owner when its root task is.
+                    let owner = self.planning.division_root(id).and_then(|root| owner_mark(&root));
                     let max_name = (inner.width as usize)
-                        .saturating_sub(4 + initiative_marker.chars().count());
+                        .saturating_sub(5 + tail.chars().count() + owner.as_ref().map_or(0, |o| o.len()));
+                    let name = division.as_ref().map_or_else(|| "division".to_string(), |d| d.name.clone());
                     let name = crate::planning::truncate_with_ellipsis(&name, max_name);
-                    // Style lives on the ListItem so selection highlight can
-                    // override. Using Span::styled with a fixed color here
-                    // would mask the base_style on selection.
-                    let task_accent = self
-                        .task_colors
-                        .get(task_id.as_str())
-                        .map(String::as_str)
-                        .and_then(theme::user_color);
+                    let accent = division.as_ref().and_then(|d| d.color.as_deref()).and_then(theme::user_color);
                     let base_style = if is_selected {
-                        Style::default()
-                            .fg(theme::TEXT)
-                            .add_modifier(Modifier::BOLD)
-                    } else if let Some(c) = task_accent {
-                        Style::default().fg(c)
+                        Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(theme::HEADER)
+                        Style::default().fg(accent.unwrap_or(theme::HEADER)).add_modifier(Modifier::BOLD)
                     };
-                    let line = Line::from(vec![
-                        Span::raw(indent(*ws_idx)),
-                        Span::raw("  "),
-                        Span::raw(initiative_marker),
-                        Span::raw(name),
-                    ]);
-                    items.push(ListItem::new(line).style(base_style));
+                    let mut spans = prefix;
+                    spans.push(Span::raw(format!("{glyph} \u{25c6} ")));
+                    spans.extend(owner.into_iter().flatten());
+                    spans.push(Span::raw(name));
+                    spans.push(Span::styled(tail, Style::default().fg(theme::DIM)));
+                    items.push(ListItem::new(Line::from(spans)).style(base_style));
                 }
                 // Sidebar section header: `▾ Name` unfolded, `▸ Name (n)`
                 // with a running/idle rollup when folded. Colored by the
@@ -2182,7 +2481,10 @@ impl App {
                     let Some(sec) = self.section_by_id(id) else {
                         continue;
                     };
-                    let (n, running, idle) = self.section_rollup(id);
+                    let (n, running, idle) = match &tree {
+                        Some(t) => self.section_rollup_in(id, t),
+                        None => self.section_rollup(id),
+                    };
                     let glyph = if sec.folded { "\u{25b8}" } else { "\u{25be}" };
                     let tail = if sec.folded {
                         let mut t = format!("  ({})", n);
@@ -2234,6 +2536,15 @@ impl App {
                     )]);
                     items.push(ListItem::new(line));
                 }
+                VisualItem::ContinuousTeamHeader(team_id) => {
+                    let (name, marker) = self.org_live().and_then(|snap| snap.team(team_id)).map(|t| (t.name.clone(), t.continuous.clone())).unwrap_or_else(|| (team_id.clone(), None));
+                    let header = marker.as_ref().map(|m| continuous_team_header(&name, m, super::board::now_unix() as f64)).unwrap_or_else(|| format!("⟳ {name} · blocked"));
+                    let line = continuous_team_box_header(&header);
+                    items.push(ListItem::new(Line::from(Span::styled(line, Style::default().fg(theme::HEADER).add_modifier(Modifier::BOLD)))));
+                }
+                VisualItem::OrgHeader { key, depth } => {
+                    items.push(ListItem::new(self.org_header_line(key, *depth, inner.width as usize)));
+                }
                 VisualItem::BacktestHeader
                 | VisualItem::BacktestFleet(_)
                 | VisualItem::BacktestRun { .. } => {}
@@ -2259,6 +2570,7 @@ impl App {
             &mut state,
         );
         self.sidebar_list_state = state;
+        self.sidebar_page_rows = list_height;
 
         if helper_height > 0 {
             let help_y = inner.y + inner.height.saturating_sub(helper_height);
@@ -2357,21 +2669,22 @@ impl App {
             return;
         }
 
-        let running = self
-            .tasks
-            .iter()
-            .filter(|t| matches!(self.task_status(t), TaskStatus::Running))
-            .count();
-        let blocked = self
-            .tasks
-            .iter()
-            .filter(|t| matches!(self.task_status(t), TaskStatus::Blocked))
-            .count();
-        let backlog = self
-            .tasks
-            .iter()
-            .filter(|t| matches!(self.task_status(t), TaskStatus::Backlog))
-            .count();
+        // One pass, each task's workspace found by id (a `task_status`
+        // per task scanned every workspace, every frame).
+        let mut by_id: HashMap<&str, &Workspace> = HashMap::new();
+        for w in &self.workspaces {
+            by_id.entry(w.id.as_str()).or_insert(w);
+        }
+        let (mut running, mut blocked, mut backlog) = (0, 0, 0);
+        for t in &self.tasks {
+            let ws = t.workspace_id.as_deref().and_then(|id| by_id.get(id).copied());
+            match Self::task_status_in(t, ws) {
+                TaskStatus::Running => running += 1,
+                TaskStatus::Blocked => blocked += 1,
+                TaskStatus::Backlog => backlog += 1,
+                TaskStatus::Done => {}
+            }
+        }
 
         let conn_indicator = if self.connected { "\u{25cf}" } else { "\u{25cb}" };
         let conn_color = if self.connected {
@@ -2389,6 +2702,17 @@ impl App {
         } else {
             String::new()
         };
+        // A workspace (Task sub-view) or division header is a tree row: say
+        // so, since keys typed there reach no terminal.
+        let center = if center.is_empty()
+            && self.view_mode == ViewMode::Sessions
+            && (matches!(self.cursor, Cursor::Division(_) | Cursor::Org(_))
+                || (matches!(self.cursor, Cursor::Workspace(_)) && self.workspace_header_is_tree_row()))
+        {
+            "Space/Enter fold \u{00b7} headers don't send keys to a terminal".to_string()
+        } else {
+            center
+        };
 
         let mouse_off = !self.mouse_capture_enabled;
         let mouse_indicator = if mouse_off { " [mouse off] " } else { "" };
@@ -2402,26 +2726,32 @@ impl App {
         let mut n_running = 0usize;
         let mut n_idle = 0usize;
         let mut n_alert = 0usize;
+        let mut n_waiting = 0usize;
+        let mut n_errored = 0usize;
         let mut any_afterglow = false;
         let now = Instant::now();
         for ws in self.workspaces.iter().filter(|w| !w.is_closed) {
             for ts in &ws.sessions {
-                if self.session_has_alert(&ts.uid) {
+                if self.session_has_alert(&ts.uid, &ts.host_id) {
                     // An alerting session counts ONLY as an alert — it's
                     // already asking for a human, whatever its status.
                     n_alert += 1;
                     continue;
                 }
-                if ts.session.exited {
+                if ts.session.exited || ts.session_type == "bash" {
                     continue;
                 }
-                match ts.status {
-                    SessionStatus::Running => n_running += 1,
-                    SessionStatus::Idle => {
+                // Engine-reported state wins; waiting-on-human and errored
+                // get their own clusters, background work counts as running.
+                match self.agent_activity(ts) {
+                    Some(super::agent_state::Activity::Waiting) => n_waiting += 1,
+                    Some(super::agent_state::Activity::Errored) => n_errored += 1,
+                    Some(super::agent_state::Activity::Unknown) => {}
+                    _ if self.display_running(ts)
+                        || self.agent_activity(ts) == Some(super::agent_state::Activity::Background) => n_running += 1,
+                    _ => {
                         n_idle += 1;
-                        if idle_age_bucket_at(ts.idle_since, now)
-                            == IdleAgeBucket::Afterglow
-                        {
+                        if self.display_idle_bucket(ts, now) == Some(IdleAgeBucket::Afterglow) {
                             any_afterglow = true;
                         }
                     }
@@ -2446,21 +2776,53 @@ impl App {
                 Style::default().fg(idle_color),
             ));
         }
+        if n_waiting > 0 {
+            rollup.push(Span::styled(
+                format!("?{} ", n_waiting),
+                Style::default().fg(theme::ATTN).add_modifier(Modifier::BOLD),
+            ));
+        }
+        if n_errored > 0 {
+            rollup.push(Span::styled(
+                format!("\u{2717}{} ", n_errored),
+                Style::default().fg(theme::ERROR),
+            ));
+        }
         if n_alert > 0 {
             rollup.push(Span::styled(
                 format!("\u{2691}{} ", n_alert),
                 Style::default().fg(theme::ATTN),
             ));
         }
+        // Background worktree cleanups (Alt+D / Alt+Shift+w reap).
+        if let Some(progress) = self.cleanup_progress() {
+            rollup.push(Span::styled(format!("\u{27f2} {progress} "), Style::default().fg(theme::MUTED)));
+        }
+        // A CM maintenance notice (deploy/restart) is in force somewhere.
+        if let Some(span) = self.maintenance.status_span() {
+            rollup.push(span);
+        }
+        // Sessions holding an item blocked on an Owner decision, across
+        // every board (one per session, however many items it holds).
+        let n_owner = self.owner_blocked.session_count();
+        if n_owner > 0 {
+            rollup.push(Span::styled(
+                format!("\u{25c6}{} OWNER ", n_owner),
+                super::owner_blocked::owner_style(),
+            ));
+        }
 
         let left1 = format!(" {} ", conn_indicator);
         let left2 = "claude-manager ";
+        // Owner availability (F7), e.g. `● focused 14m`; absent while unset.
+        let availability = self.availability.status_span();
+        let availability_width = availability.as_ref().map_or(0, |s| s.content.chars().count() as u16);
         let right = format!(" {}r {}b {}q ", running, blocked, backlog);
 
         // Width math from the ACTUAL span contents (every glyph used here is
         // single-cell, so char count == display width) — no hardcoded
         // left-side constant to drift out of sync.
-        let left_used = (left1.chars().count() + left2.chars().count()) as u16;
+        let left_used = (left1.chars().count() + left2.chars().count()) as u16 + availability_width;
         let right_width = right.chars().count() as u16;
         let center_width = center.chars().count() as u16;
         let mouse_width = mouse_indicator.chars().count() as u16;
@@ -2476,13 +2838,22 @@ impl App {
         } else {
             (rollup, rollup_width)
         };
-        let pad = area.width.saturating_sub(fixed + rollup_width);
+        // Owner's unread DMs / mentions (`✉2 @1 F8`), bottom right. Takes
+        // only spare room: shortens to the glyph, then disappears, rather
+        // than pushing anything else off the bar.
+        let unread = super::unread::indicator_variants(self.unread.dms, self.unread.mentions)
+            .into_iter()
+            .find(|v| fixed + rollup_width + v.chars().count() as u16 <= area.width)
+            .unwrap_or_default();
+        let unread_width = unread.chars().count() as u16;
+        let pad = area.width.saturating_sub(fixed + rollup_width + unread_width);
         let pad_left = pad / 2;
         let pad_right = pad - pad_left;
 
         let mut spans = vec![
             Span::styled(left1, Style::default().fg(conn_color)),
             Span::styled(left2, Style::default().fg(theme::DIM)),
+            availability.unwrap_or_else(|| Span::raw("")),
             Span::styled(
                 mouse_indicator,
                 Style::default().fg(theme::BADGE_FG).bg(theme::ATTN).add_modifier(Modifier::BOLD),
@@ -2499,6 +2870,12 @@ impl App {
         ];
         spans.extend(rollup);
         spans.push(Span::styled(right, Style::default().fg(theme::DIM)));
+        if !unread.is_empty() {
+            spans.push(Span::styled(
+                unread,
+                Style::default().fg(theme::BADGE_FG).bg(theme::ATTN).add_modifier(Modifier::BOLD),
+            ));
+        }
 
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
@@ -2669,11 +3046,14 @@ impl App {
                 } else {
                     cand.preview.clone()
                 };
-                let tag = match cand.bound_to.as_deref() {
+                let mut tag = match cand.bound_to.as_deref() {
                     Some("") => " (this)".to_string(),
                     Some(label) => format!(" [{}]", label),
                     None => String::new(),
                 };
+                if let Some(to) = cand.rotated_to.as_deref() {
+                    tag.push_str(&format!(" (rotated \u{2192} {})", transcripts::short_id(to)));
+                }
                 let tag_len = tag.chars().count();
                 let budget = preview_budget.saturating_sub(tag_len);
                 if preview.chars().count() > budget {
@@ -2729,14 +3109,20 @@ impl App {
         frame: &mut Frame,
         area: Rect,
         candidates: &[PastCandidate],
+        query: &str,
         selected: usize,
     ) {
-        let total = candidates.len();
+        // Same filtered view the handler indexes; `selected` points into it.
+        let filtered = past_workspace_match_indices(query, candidates);
+        let total = filtered.len();
+        let selected = selected.min(total.saturating_sub(1));
         let width = area.width.min(80).max(40);
-        // Dialog chrome: 2 border rows + 1 blank + 1 footer line.
-        // Below that, each candidate (or scroll-indicator) takes one row.
-        let max_dialog_height = area.height.saturating_sub(2).max(7);
-        let desired_height = (total as u16).saturating_add(4).max(7);
+        // Dialog chrome: 2 border rows + query line + blank + blank +
+        // footer line. Below that, each candidate (or scroll-indicator)
+        // takes one row. Sized off the UNFILTERED count so the dialog
+        // doesn't jump around while typing.
+        let max_dialog_height = area.height.saturating_sub(2).max(9);
+        let desired_height = (candidates.len() as u16).saturating_add(6).max(9);
         let height = desired_height.min(max_dialog_height);
         let x = area.x + (area.width.saturating_sub(width)) / 2;
         let y = area.y + (area.height.saturating_sub(height)) / 2;
@@ -2745,7 +3131,7 @@ impl App {
         frame.render_widget(Clear, dialog);
 
         let inner_height = height.saturating_sub(2) as usize;
-        let footer_rows = 2; // blank + key-hint line
+        let footer_rows = 4; // query + blank on top, blank + key-hint below
         let list_budget = inner_height.saturating_sub(footer_rows).max(1);
         let needs_scroll = total > list_budget;
         // Reserve one line each for "↑ N more" / "↓ N more" when scrolling.
@@ -2773,8 +3159,17 @@ impl App {
         let dim = Style::default().fg(theme::DIM);
         let mut lines: Vec<Line> = Vec::new();
 
+        lines.push(Line::from(vec![
+            Span::styled("> ", dim),
+            Span::styled(query.to_string(), Style::default().fg(theme::TEXT)),
+            Span::styled("\u{2588}", Style::default().fg(theme::TEXT)),
+            Span::styled(format!("   {} of {}", total, candidates.len()), dim),
+        ]));
+        lines.push(Line::from(""));
         if candidates.is_empty() {
             lines.push(Line::from(Span::styled("No past workspaces.", dim)));
+        } else if filtered.is_empty() {
+            lines.push(Line::from(Span::styled("(no matches)", dim)));
         } else {
             if needs_scroll {
                 if above > 0 {
@@ -2787,7 +3182,7 @@ impl App {
                 }
             }
             for idx in offset..end {
-                let cand = &candidates[idx];
+                let cand = &candidates[filtered[idx]];
                 let is_active = idx == selected;
                 let cursor = if is_active { "\u{25b8} " } else { "  " };
                 let path_repr = cand
@@ -2835,6 +3230,9 @@ impl App {
                         Style::default().fg(theme::ERROR),
                     ));
                 }
+                if let Some(note) = cand.note {
+                    spans.push(Span::styled(format!("  {note}"), Style::default().fg(theme::DIM)));
+                }
                 lines.push(Line::from(spans));
             }
             if needs_scroll {
@@ -2850,7 +3248,7 @@ impl App {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "\u{2191}\u{2193} select   Enter: reopen   Esc: cancel",
+            "type to filter   \u{2191}\u{2193}/C-j/C-k select   Enter: reopen   Esc: clear/close",
             dim,
         )));
 
@@ -3607,6 +4005,40 @@ mod operator_question_tests {
             None
         );
         assert_eq!(App::extract_operator_question(None), None);
+    }
+}
+
+#[cfg(test)]
+mod continuous_team_sidebar_tests {
+    use super::*;
+    use crate::app::org_model::ContinuousMarker;
+
+    #[test]
+    fn schedule_header_uses_cadence_and_relative_next_time() {
+        let marker = ContinuousMarker {
+            cadence_secs: Some(21_600.0),
+            next_run: Some(4_320.0),
+            health: "ok".into(),
+            ..Default::default()
+        };
+        assert_eq!(continuous_team_header("Ingest", &marker, 0.0), "⟳ every 6h · next 1h12m · ok");
+    }
+
+    #[test]
+    fn queue_header_reports_pending_depth() {
+        let marker = ContinuousMarker {
+            queues: vec![serde_json::json!({"queue":"momentum","pending":3})],
+            health: "ok".into(),
+            ..Default::default()
+        };
+        assert_eq!(continuous_team_header("Ingest", &marker, 0.0), "⟳ queue · 3 pending · ok");
+    }
+
+    #[test]
+    fn boxed_block_has_top_and_bottom_edges() {
+        assert_eq!(continuous_team_box_header("⟳ every 6h · next 1h12m · ok"), "╭─ ⟳ every 6h · next 1h12m · ok ─╮");
+        assert!(continuous_team_box_footer().starts_with('╰'));
+        assert!(continuous_team_box_footer().ends_with('╯'));
     }
 }
 

@@ -10,6 +10,7 @@ fn fixture() -> (tempfile::TempDir, Store, Vec<Person>) {
             name: format!("{uid} agent"),
             session_uid: uid.into(),
             kind: "agent".into(),
+            engine: None,
             present: true,
             task: None,
         })

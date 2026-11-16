@@ -1,0 +1,9 @@
+[Unit]
+Description=Prune claude-manager deploy backups older than a week
+ConditionPathExists=/usr/local/sbin/cm-prune-backups
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cm-prune-backups
+Nice=10
+IOSchedulingClass=idle

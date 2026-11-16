@@ -406,6 +406,35 @@ impl Default for SchedulerConfig {
 /// Parsed `daemon.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DaemonConfig {
+    /// Automatically resume a Claude session once after a proven subscription
+    /// limit clears. Set false and reload config to disable new attempts.
+    #[serde(default = "default_claude_limit_recovery")]
+    pub claude_limit_recovery: bool,
+    /// Press Escape (never an option) on Claude's usage-limit menu after a
+    /// grace, so sessions do not park on it. Independent of
+    /// `claude_limit_recovery`, which alone decides whether a session is
+    /// resumed. Set false and reload config to stop new Escapes.
+    #[serde(default = "default_claude_limit_menu_clear")]
+    pub claude_limit_menu_clear: bool,
+    /// Reloadable allocator maintenance. Interval zero disables periodic runs.
+    #[serde(default)]
+    pub memory: MemoryConfig,
+    /// Opt-in S4 display evidence on supported daemon writes. Hot reloadable;
+    /// disabling does not cancel writes that already captured evidence.
+    #[serde(default)]
+    pub s4_min_write: bool,
+    /// Accounted search-cache bytes, including an in-progress build. Zero
+    /// disables search. Applied on the next messaging RPC after config reload.
+    #[serde(default = "default_chat_search_budget_bytes")]
+    pub chat_search_budget_bytes: usize,
+    /// Project Claude presence into the legacy idle boolean. Disable and call
+    /// daemon.reload_config to restore PTY-based idle while keeping agent_state.
+    #[serde(default = "default_presence_idle_enabled")]
+    pub presence_idle_enabled: bool,
+    /// Gate workflow transcript-idle transitions on engine state after rollout
+    /// soak. Hot reloadable; off until deliberately enabled.
+    #[serde(default)]
+    pub workflow_state_gate: bool,
     /// Absolute path to `mcp_server/server.py`. The daemon
     /// injects this into every agent's `CM_MCP_SERVER` env so
     /// the agent's MCP runtime knows where to find the
@@ -480,7 +509,97 @@ pub struct DaemonConfig {
     /// logged and nothing was pushed.
     #[serde(default)]
     pub notify_command: Option<String>,
+    /// Launch Codex sessions with `--no-alt-screen` (inline mode) so their
+    /// history lands in the viewer's scrollback. Default on; set `false` and
+    /// `daemon.reload_config` if inline rendering misbehaves. Takes effect on
+    /// the next Codex spawn or A-R revive, never on a running session.
+    #[serde(default = "default_codex_inline_scrollback")]
+    pub codex_inline_scrollback: bool,
+    /// `[models]` — the engine default models every spawn falls back to
+    /// when neither the caller nor the task names one, plus the presets
+    /// the TUI offers (`crate::models`). CM never relies on an engine's
+    /// own default. Applies to the next spawn; `daemon.reload_config`
+    /// picks up edits.
+    #[serde(default)]
+    pub models: crate::models::ModelConfig,
+    /// `[transcript_rotation]` — move an oversized Claude conversation to a
+    /// fresh transcript at a safe idle point (#24, `crate::rotation`).
+    #[serde(default)]
+    pub transcript_rotation: TranscriptRotationConfig,
 }
+
+/// GNU allocator maintenance; defaults are an explicit operator policy, not a
+/// measured guarantee of reclaimed bytes or maximum pause time.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryConfig {
+    pub trim_interval_secs: u32,
+    pub trim_min_free_bytes: u64,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self { trim_interval_secs: 600, trim_min_free_bytes: 1 << 30 }
+    }
+}
+
+/// `[transcript_rotation]` in `daemon.toml`. Claude Code replays and keeps
+/// the whole transcript file in memory on every resume, and compaction never
+/// shrinks it, so a long-lived session slows to a crawl (a 1.67 GB file left
+/// one idling at ~50% CPU). Past either threshold the daemon forks the
+/// session into a fresh transcript at the next safe boundary.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TranscriptRotationConfig {
+    /// Default on.
+    #[serde(default = "default_rotation_enabled")]
+    pub enabled: bool,
+    /// Transcript size that triggers a rotation. Default 800 MB (the first
+    /// release; to be lowered once big rotations are timed in production).
+    #[serde(default = "default_rotation_max_bytes")]
+    pub max_bytes: u64,
+    /// Compaction count that triggers a rotation (a long session can pass
+    /// it while still small). 0 disables the count, the first release's
+    /// default: only the size threshold rotates for now.
+    #[serde(default = "default_rotation_max_compactions")]
+    pub max_compactions: u64,
+    /// The session must have been idle this long, with nothing in flight.
+    /// Default 300 s.
+    #[serde(default = "default_rotation_idle_secs")]
+    pub idle_secs: u64,
+    /// Owner must not have viewed or typed in the session for this long
+    /// (the viewer reports a shown session every 5 minutes). Default 600 s.
+    /// Keystrokes since the agent's last turn ended (a possible unsent
+    /// draft) block it until a new turn starts, however long ago.
+    #[serde(default = "default_rotation_owner_quiet_secs")]
+    pub owner_quiet_secs: u64,
+    /// How often the policy checks. Default 300 s.
+    #[serde(default = "default_rotation_check_secs")]
+    pub check_secs: u64,
+}
+
+impl Default for TranscriptRotationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_rotation_enabled(),
+            max_bytes: default_rotation_max_bytes(),
+            max_compactions: default_rotation_max_compactions(),
+            idle_secs: default_rotation_idle_secs(),
+            owner_quiet_secs: default_rotation_owner_quiet_secs(),
+            check_secs: default_rotation_check_secs(),
+        }
+    }
+}
+
+fn default_rotation_enabled() -> bool { true }
+fn default_rotation_max_bytes() -> u64 { 800 * 1000 * 1000 }
+fn default_rotation_max_compactions() -> u64 { 0 }
+fn default_rotation_idle_secs() -> u64 { 300 }
+fn default_rotation_owner_quiet_secs() -> u64 { 600 }
+fn default_rotation_check_secs() -> u64 { 300 }
+
+fn default_presence_idle_enabled() -> bool { true }
+fn default_chat_search_budget_bytes() -> usize { 512 * 1024 * 1024 }
+fn default_codex_inline_scrollback() -> bool { true }
 
 impl DaemonConfig {
     /// Effective clone directory: the configured `repos_dir`, or the
@@ -500,6 +619,13 @@ impl DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            claude_limit_recovery: true,
+            claude_limit_menu_clear: default_claude_limit_menu_clear(),
+            memory: MemoryConfig::default(),
+            s4_min_write: false,
+            chat_search_budget_bytes: default_chat_search_budget_bytes(),
+            presence_idle_enabled: default_presence_idle_enabled(),
+            workflow_state_gate: false,
             mcp_server_path: String::new(),
             api_url: String::new(),
             api_token: String::new(),
@@ -512,9 +638,15 @@ impl Default for DaemonConfig {
             repos: Vec::new(),
             scheduler: SchedulerConfig::default(),
             notify_command: None,
+            codex_inline_scrollback: true,
+            models: crate::models::ModelConfig::default(),
+            transcript_rotation: TranscriptRotationConfig::default(),
         }
     }
 }
+
+fn default_claude_limit_recovery() -> bool { true }
+fn default_claude_limit_menu_clear() -> bool { true }
 
 /// Errors surfaced by `DaemonConfig::load_or_default`.
 #[derive(Debug)]
@@ -529,6 +661,9 @@ pub enum ConfigError {
         path: PathBuf,
         mode: u32,
     },
+    /// A value parsed but is unusable (e.g. a `[models]` entry that
+    /// isn't a safe model string).
+    Invalid(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -536,6 +671,7 @@ impl std::fmt::Display for ConfigError {
         match self {
             ConfigError::Io(e) => write!(f, "daemon.toml I/O error: {}", e),
             ConfigError::Parse(e) => write!(f, "daemon.toml parse error: {}", e),
+            ConfigError::Invalid(e) => write!(f, "daemon.toml invalid value: {}", e),
             ConfigError::InsecurePermsWithSecret { path, mode } => write!(
                 f,
                 "daemon.toml at {} is world- or group-readable \
@@ -574,6 +710,7 @@ pub fn load_or_default(path: &Path) -> Result<DaemonConfig, ConfigError> {
 
     let cfg: DaemonConfig =
         toml::from_str(&contents).map_err(ConfigError::Parse)?;
+    cfg.models.validate().map_err(ConfigError::Invalid)?;
 
     // Security gate: world- or group-readable file + non-empty
     // api_token = bearer-leak risk. Refuse to load.
@@ -684,6 +821,7 @@ mode = "ssh-trust"
         let tmp = tempfile::tempdir().expect("tempdir");
         let missing = tmp.path().join("does-not-exist.toml");
         let cfg = load_or_default(&missing).expect("missing file is OK");
+        assert!(!cfg.s4_min_write, "S4 evidence defaults off");
         assert_eq!(cfg.mcp_server_path, "");
         assert_eq!(cfg.api_url, "");
         assert_eq!(cfg.api_token, "");
@@ -786,6 +924,14 @@ mode = "ssh-trust"
     #[test]
     fn serde_round_trip() {
         let original = DaemonConfig {
+            claude_limit_recovery: true,
+            claude_limit_menu_clear: false,
+            memory: MemoryConfig::default(),
+            s4_min_write: true,
+            transcript_rotation: Default::default(),
+            chat_search_budget_bytes: 128 * 1024 * 1024,
+            presence_idle_enabled: false,
+            workflow_state_gate: true,
             mcp_server_path: "/opt/x.py".into(),
             api_url: "http://h:8000".into(),
             api_token: "tok".into(),
@@ -803,11 +949,17 @@ mode = "ssh-trust"
             }],
             scheduler: SchedulerConfig::default(),
             notify_command: None,
+            codex_inline_scrollback: true,
+            models: Default::default(),
         };
         let toml_text = toml::to_string(&original).expect("ser");
         let reparsed: DaemonConfig =
             toml::from_str(&toml_text).expect("de");
+        assert!(reparsed.s4_min_write);
         assert_eq!(reparsed.mcp_server_path, original.mcp_server_path);
+        assert_eq!(reparsed.presence_idle_enabled, original.presence_idle_enabled);
+        assert_eq!(reparsed.claude_limit_menu_clear, original.claude_limit_menu_clear);
+        assert_eq!(reparsed.workflow_state_gate, original.workflow_state_gate);
         assert_eq!(reparsed.api_url, original.api_url);
         assert_eq!(reparsed.api_token, original.api_token);
         assert_eq!(reparsed.log_path, original.log_path);

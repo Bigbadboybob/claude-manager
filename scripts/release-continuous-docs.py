@@ -4,7 +4,8 @@
 Reproduces the layout at `~/.cm/docs/continuous-tasks/` (repo docs + doc/ +
 doc/messaging/ + mcp_server/AGENT_GUIDE.md + scripts/cm-op) with a hash-verified
 `documentation-release.json`, and installs the runtime guidance the agents
-actually read: `~/.cm/policies/continuous-review-routing.md` and, when
+actually read: the shared policies under `~/.cm/policies/`
+(`continuous-review-routing.md`, `orchestration.md`) and, when
 `--mcp-guide` is given, `/opt/cm-daemon/mcp_server/AGENT_GUIDE.md` (sudo).
 Previous copies are backed up under `~/.cm/audits/docs-release-<stamp>/before/`
 on the target host.
@@ -25,8 +26,11 @@ import tarfile
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 BUNDLE = "~/.cm/docs/continuous-tasks"
-POLICY_SRC = "doc/continuous-review-routing.md"
-POLICY_DST = "~/.cm/policies/continuous-review-routing.md"
+# (repo source, deployed path) for every shared policy agents read at runtime.
+POLICIES = [
+    ("doc/continuous-review-routing.md", "~/.cm/policies/continuous-review-routing.md"),
+    ("doc/ORCHESTRATION.md", "~/.cm/policies/orchestration.md"),
+]
 GUIDE_SRC = "mcp_server/AGENT_GUIDE.md"
 GUIDE_DST = "/opt/cm-daemon/mcp_server/AGENT_GUIDE.md"
 
@@ -65,7 +69,7 @@ def main():
         "status": "installed_and_hash_verified",
         "bundle": BUNDLE.replace("~", "/home/lucas"),
         "bundle_files": {f: sha(REPO / f) for f in files},
-        "runtime_guidance": {POLICY_DST.replace("~", "/home/lucas"): sha(REPO / POLICY_SRC)},
+        "runtime_guidance": {dst.replace("~", "/home/lucas"): sha(REPO / src) for src, dst in POLICIES},
         "backups": f"/home/lucas/.cm/audits/docs-release-{stamp}/before",
         "activation": "No daemon/session restart for docs and policy. Existing MCP connections keep the guide text they loaded; new connections load the new guide.",
     }
@@ -79,30 +83,38 @@ def main():
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for f in files:
             tar.add(REPO / f, arcname=f"bundle/{f}")
-        tar.add(REPO / POLICY_SRC, arcname="policy/continuous-review-routing.md")
+        for src, dst in POLICIES:
+            tar.add(REPO / src, arcname=f"policy/{pathlib.PurePosixPath(dst).name}")
         tar.add(REPO / GUIDE_SRC, arcname="guide/AGENT_GUIDE.md")
         info = tarfile.TarInfo("manifest.json")
         data = json.dumps(manifest, indent=1).encode()
         info.size = len(data)
         tar.addfile(info, io.BytesIO(data))
+    names = [pathlib.PurePosixPath(dst).name for _, dst in POLICIES]
+    backup_policies = "\n".join(
+        f"[ -f {dst} ] && cp -a {dst} $AUD/before/{n} || true" for (_, dst), n in zip(POLICIES, names)
+    )
+    install_policies = "\n".join(f"cp $AUD/stage/policy/{n} {dst}" for (_, dst), n in zip(POLICIES, names))
+    policy_dsts = [dst for _, dst in POLICIES]
     installer = f"""
 set -euo pipefail
 STAMP={stamp}
 AUD=~/.cm/audits/docs-release-$STAMP; mkdir -p $AUD/before $AUD/stage
 tar -xzf - -C $AUD/stage
 [ -d {BUNDLE} ] && cp -a {BUNDLE} $AUD/before/continuous-tasks || true
-[ -f {POLICY_DST} ] && cp -a {POLICY_DST} $AUD/before/continuous-review-routing.md || true
+{backup_policies}
 mkdir -p {BUNDLE} ~/.cm/policies
 cp -a $AUD/stage/bundle/. {BUNDLE}/
 cp $AUD/stage/manifest.json {BUNDLE}/documentation-release.json
-cp $AUD/stage/policy/continuous-review-routing.md {POLICY_DST}
+{install_policies}
 chmod +x {BUNDLE}/scripts/cm-op
 python3 - <<'EOF'
 import json,hashlib,os
 m=json.load(open(os.path.expanduser('{BUNDLE}/documentation-release.json')))
 bad=[f for f,h in m['bundle_files'].items() if hashlib.sha256(open(os.path.expanduser('{BUNDLE}/'+f),'rb').read()).hexdigest()!=h]
-p=os.path.expanduser('{POLICY_DST}')
-if hashlib.sha256(open(p,'rb').read()).hexdigest()!=m['runtime_guidance'][p]: bad.append(p)
+for p in {policy_dsts!r}:
+    p=os.path.expanduser(p)
+    if hashlib.sha256(open(p,'rb').read()).hexdigest()!=m['runtime_guidance'][p]: bad.append(p)
 print('hash-verified' if not bad else 'MISMATCH '+str(bad)); raise SystemExit(1 if bad else 0)
 EOF
 """

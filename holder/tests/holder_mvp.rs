@@ -265,6 +265,8 @@ fn hello_negotiates_and_status_answers() {
     assert_eq!(hello.proto, ch::PROTO_VERSION_MAX);
     assert_eq!(hello.epoch, 1);
     assert_eq!(hello.session_count, 0);
+    // doc/org-model.md §12: the holder reports what it preserves.
+    assert_eq!(hello.capabilities, vec![cm_holder_proto::org::ORG_PRESERVE_V1.to_string()]);
 
     let (f, _) = brain.request(verbs::STATUS, serde_json::json!({}));
     let st: ch::StatusReplyBody = f.parse_body().unwrap();
@@ -1242,6 +1244,32 @@ fn deploy_verbs_arm_disarm_and_survive_to_the_supervisor() {
         h.take_armed_deploy(),
         Some(ArmedDeploy::UsePrevious)
     ));
+}
+
+#[test]
+fn armed_deploy_survives_brain_close_with_unread_holder_reply() {
+    use cm_holder::holder::ArmedDeploy;
+    let (join, mut brain) = start(Holder::new(test_config()));
+    brain.hello();
+    let pin = std::fs::File::open("/bin/true").unwrap();
+    ch::send_frame_blocking(brain.fd.as_fd(), &Frame::new(
+        verbs::RESTART_BRAIN, Some(700), 1, serde_json::json!({}),
+    ), &[pin.as_raw_fd()]).unwrap();
+    assert_eq!(brain.wait_reply(700).0.v, verbs::OK);
+    // Leave a complete reply in the brain's kernel receive queue. Its close
+    // then produces ECONNRESET on the holder, exactly like the old brain's
+    // exit(0) racing an unsolicited ping after a successful deploy arm.
+    brain.send(verbs::STATUS, serde_json::json!({}));
+    let mut pfd = libc::pollfd {
+        fd: brain.fd.as_raw_fd(), events: libc::POLLIN, revents: 0,
+    };
+    assert!(unsafe { libc::poll(&mut pfd, 1, 2000) } > 0);
+    assert_ne!(pfd.revents & libc::POLLIN, 0);
+    drop(brain);
+    let (mut holder, outcome) = join.join().unwrap();
+    assert_eq!(outcome, ServeOutcome::BrainEof, "reset is peer close, not malformed protocol");
+    assert!(matches!(holder.take_armed_deploy(), Some(ArmedDeploy::NewPin(_))));
+    assert!(holder.take_armed_deploy().is_none());
 }
 
 /// Review F1: once `split_rollback` is ARMED, the holder must never

@@ -160,16 +160,62 @@ fn output_text(resp: &Response) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// The S0b org object a skew session is spawned with (doc/org-model.md
+/// §12): keys no build knows yet, and an occupancy generation distinct
+/// from the transcript generation (0 here).
+fn skew_org() -> serde_json::Value {
+    serde_json::json!({
+        "member_id": "m-skew",
+        "occupancy_generation": 5,
+        "acting_as": "main",
+        "from_a_later_stage": {"nested": [1, 2]},
+    })
+}
+
+/// Whether the serving brain implements the S0b bridge, and the org
+/// object it reports for `uid`. A pre-feature brain ignores the spawn's
+/// `org` and reports none — nothing breaks, nothing is preserved.
+fn served_org(socket: &Path, token: &str, uid: &str) -> (bool, Option<serde_json::Value>) {
+    let health = round_trip(socket, &operator_request(token, "daemon.health", serde_json::json!({})))
+        .ok()
+        .and_then(|r| r.result)
+        .unwrap_or_default();
+    let bridge = health
+        .pointer("/capabilities/brain")
+        .and_then(|v| v.as_array())
+        .is_some_and(|caps| caps.iter().any(|c| c == "org_preserve_v1"));
+    let rows = round_trip(socket, &operator_request(token, "list_sessions", serde_json::json!({})))
+        .ok()
+        .and_then(|r| r.result)
+        .unwrap_or_default();
+    let org = rows
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|row| row.get("session_uid").and_then(|v| v.as_str()) == Some(uid))
+        .and_then(|row| row.get("org").cloned())
+        .filter(|v| !v.is_null());
+    eprintln!("holder_skew_e2e: {uid}: brain org bridge={bridge}, served org={org:?}");
+    (bridge, org)
+}
+
+/// The cells skip without their binaries (they are matrix-driven), but a
+/// skip is not a pass: under `CM_SKEW_REQUIRED=1` (the matrix sets it) a
+/// missing variable fails the test.
+fn skip_or_fail(why: &str) {
+    if std::env::var_os("CM_SKEW_REQUIRED").is_some_and(|v| v == "1") {
+        panic!("holder_skew_e2e: {why}, and CM_SKEW_REQUIRED=1: a skipped cell is not a pass");
+    }
+    eprintln!("holder_skew_e2e: {why} — skipping (run scripts/holder-skew-matrix to exercise the matrix)");
+}
+
 #[test]
 fn skew_pair_clears_the_compat_floor() {
     let (Some(holder_bin), Some(brain_bin)) = (
         std::env::var_os("CM_SKEW_HOLDER_BIN"),
         std::env::var_os("CM_SKEW_BRAIN_BIN"),
     ) else {
-        eprintln!(
-            "holder_skew_e2e: CM_SKEW_HOLDER_BIN/CM_SKEW_BRAIN_BIN unset — \
-             skipping (run scripts/holder-skew-matrix to exercise the matrix)"
-        );
+        skip_or_fail("CM_SKEW_HOLDER_BIN/CM_SKEW_BRAIN_BIN unset");
         return;
     };
     assert!(
@@ -250,6 +296,7 @@ fn skew_pair_clears_the_compat_floor() {
                 "workspace_id": "ws-skew",
                 "worktree_path": home.to_string_lossy(),
                 "label": "skew-bash",
+                "org": skew_org(),
                 "argv": ["bash", "--norc"],
                 "working_dir": home.to_string_lossy(),
                 "session_type": "bash",
@@ -319,6 +366,28 @@ fn skew_pair_clears_the_compat_floor() {
     );
     assert_eq!(proc_starttime(bash_pid), Some(bash_start), "child disturbed");
     assert_eq!(proc_ppid(bash_pid), Some(holder_pid));
+    // S0b: an org-capable brain re-adopts the session with its org object
+    // intact (it rides daemon-sessions.json, whatever the holder's age),
+    // and advertises org_preserve_v1 only when the holder reports it too.
+    let (bridge, org) = served_org(&socket, &token, uid);
+    if bridge {
+        assert_eq!(org, Some(skew_org()), "org lost across the brain restart\n{}", guard.log_tail());
+        let health = round_trip(&socket, &operator_request(&token, "daemon.health", serde_json::json!({})))
+            .unwrap()
+            .result
+            .unwrap();
+        let caps = &health["capabilities"];
+        let has = |role: &str| {
+            caps[role].as_array().map(|c| c.iter().any(|c| c == "org_preserve_v1"))
+        };
+        // A null role list does not constrain (no pin configured).
+        let expected = has("brain") == Some(true)
+            && has("holder") == Some(true)
+            && has("rollback_pin") != Some(false);
+        assert_eq!(has("advertised"), Some(expected), "advertised = brain ∩ holder ∩ rollback_pin: {caps}");
+    } else {
+        assert!(org.is_none(), "a pre-feature brain reports no org");
+    }
     let send = round_trip(
         &socket,
         &operator_request(
@@ -388,10 +457,7 @@ fn reverse_migration_manifest_boots_the_target_monolith() {
         std::env::var_os("CM_SKEW_BRAIN_BIN"),
         std::env::var_os("CM_SKEW_MONOLITH_BIN"),
     ) else {
-        eprintln!(
-            "holder_skew_e2e: CM_SKEW_MONOLITH_BIN (with HOLDER/BRAIN) unset — \
-             skipping the V9 cell (run scripts/holder-skew-matrix)"
-        );
+        skip_or_fail("CM_SKEW_MONOLITH_BIN (with HOLDER/BRAIN) unset");
         return;
     };
     for b in [&holder_bin, &brain_bin, &monolith_bin] {
@@ -463,6 +529,7 @@ fn reverse_migration_manifest_boots_the_target_monolith() {
                 "workspace_id": "ws-skew-v9",
                 "worktree_path": home.to_string_lossy(),
                 "label": "skew-v9-bash",
+                "org": skew_org(),
                 "argv": ["bash", "--norc"],
                 "working_dir": home.to_string_lossy(),
                 "session_type": "bash",
@@ -526,6 +593,12 @@ fn reverse_migration_manifest_boots_the_target_monolith() {
         "the session child survived the reverse migration into the baseline image"
     );
     assert_eq!(proc_ppid(bash_pid), Some(root_pid), "parent unchanged");
+    // S0b: the holder's reverse-migration manifest carries the org object;
+    // an org-capable target monolith serves it, an older one ignores it.
+    let (bridge, org) = served_org(&socket, &token, uid);
+    if bridge {
+        assert_eq!(org, Some(skew_org()), "org lost across the reverse migration\n{}", guard.log_tail());
+    }
 
     // PTY continuity through the OLD image's adopted reader.
     let send = round_trip(

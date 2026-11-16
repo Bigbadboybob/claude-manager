@@ -318,6 +318,7 @@ pub fn build_last_exit_since(
     let memory_cap_kill =
         is_cap_kill(probe.kill_status.as_deref(), signal, operator_kill_requested);
     LastExit {
+        killed_by: None,
         code,
         memory_cap_kill,
         kills_file_offset: probe.kills_file_offset,

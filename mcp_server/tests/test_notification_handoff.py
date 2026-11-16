@@ -14,7 +14,10 @@ from mcp_server.claude_channel import CHAT_CONTENT_MAX, ClaudeChannel, channel_c
 from mcp_server.native_claude import (
     ClaudeAdapter,
     argv_session_id,
+    is_bg_pty_host,
+    background_match,
     channel_flag_present,
+    recovery_record_state,
 )
 from mcp_server.notifications import Queue, consume, delivery_health
 
@@ -54,10 +57,61 @@ class Fixture:
 
 
 def ev(id, status, at):
-    return {"id": id, "status": status, "created_at": at, "updated_at": at, "marker": f"[m {id}]"}
+    return {"id": id, "source": "fixture", "status": status, "created_at": at, "updated_at": at, "marker": f"[m {id}]"}
 
 
 class DeliveryHealthTests(unittest.TestCase):
+    def test_recovery_record_rechecks_exact_failure_and_later_input(self):
+        sid = "93686392-56ae-455c-803d-6ce59cc55e29"
+        rid = "e3c16692-eddd-4ec9-9fd5-282de7a3de11"
+        record = {"type":"assistant", "sessionId":sid, "uuid":rid, "error":"rate_limit",
+                  "isApiErrorMessage":True, "message":{"model":"<synthetic>"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / f"{sid}.jsonl"
+            def write(*rows):
+                path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            write(record, {"type":"system", "subtype":"turn_duration"})
+            self.assertEqual(recovery_record_state(path, sid, rid), "ready")
+            write(record, {"type":"user", "message":{"content":"resume"}})
+            self.assertEqual(recovery_record_state(path, sid, rid), "superseded")
+            write(record, {"type":"queue-operation", "operation":"enqueue"})
+            self.assertEqual(recovery_record_state(path, sid, rid), "superseded")
+            path.write_text(json.dumps(record))
+            self.assertEqual(recovery_record_state(path, sid, rid), "unknown")
+            write(record)
+            self.assertEqual(recovery_record_state(path, sid, "123e4567-e89b-12d3-a456-426614174000"), "superseded")
+    def test_untrusted_chronology_degrades_both_surfaces_without_rewriting_receipts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            q = Queue("s", Path(tmp))
+            adapter = Fixture("same")
+            with mock.patch.object(notifications.time, "time", return_value=1000):
+                q.publish("one", "chat", "[one] wake", "[one]")
+                q.change("one", {"pending"}, status="observed")
+            path = q.event_path("one")
+            good = json.loads(path.read_text())
+            for created, updated in [(None, 2000), (2100, 2000), (1000, 3000)]:
+                event = dict(good, created_at=created, updated_at=updated)
+                notifications.atomic_write(path, event)
+                before = path.read_bytes()
+                with mock.patch.object(notifications.time, "time", return_value=2500):
+                    q.health("claude-code", "degraded", reason="channels_disabled", reasons=["channels_disabled"])
+                    health = q.snapshot()["health"]
+                    self.assertEqual(health["status"], "degraded")
+                    self.assertIsNone(health["unobserved"])
+                    self.assertIn("untrusted_notification_chronology", health["reasons"])
+                    diagnosis = asyncio.run(notifications._diagnose(q, adapter, [event]))
+                    self.assertEqual(diagnosis["status"], "degraded")
+                    self.assertIn("channels_disabled", diagnosis["extra"]["reasons"])
+                    self.assertIn("untrusted_notification_chronology", diagnosis["extra"]["reasons"])
+                self.assertEqual(path.read_bytes(), before)
+            for created, updated, now in [(1000, 1000, 2500), (1000, 3000, 3000)]:
+                event = dict(good, created_at=created, updated_at=updated)
+                notifications.atomic_write(path, event)
+                with mock.patch.object(notifications.time, "time", return_value=now):
+                    q.health("claude-code", "ready")
+                    self.assertEqual(q.snapshot()["health"]["status"], "ready")
+                    self.assertEqual(asyncio.run(notifications._diagnose(q, adapter, [event]))["status"], "ready")
+
     def test_stall_is_measured_from_the_latest_observation(self):
         now = 10_000.0
         self.assertFalse(delivery_health([ev("a", "submitted", now - 10)], now)["stalled"])
@@ -67,6 +121,40 @@ class DeliveryHealthTests(unittest.TestCase):
         recovered = delivery_health([ev("a", "submitted", now - 400), ev("b", "observed", now - 5)], now)
         self.assertFalse(recovered["stalled"])
         self.assertEqual(recovered["unobserved"], 0)
+        self.assertFalse(delivery_health([ev("x", "submitting", now - 299)], now)["stalled"])
+        self.assertTrue(delivery_health([ev("x", "submitting", now - 301), ev("y", "observed", now - 1)], now)["stalled"])
+
+    def test_legacy_board_observation_cannot_mask_later_stall(self):
+        now = 10_000.0
+        legacy = dict(ev("board-push:1", "observed", now - 1), source="board", marker="[cm-board sfd]")
+        stuck = ev("later", "submitted", now - 400)
+        self.assertTrue(delivery_health([legacy, stuck], now)["stalled"])
+        legacy["marker"] = "[cm-board sfd push:1]"
+        self.assertFalse(delivery_health([legacy, stuck], now)["stalled"])
+
+    def test_persisted_legacy_observation_stays_untrusted_after_queue_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            q = Queue("s", root)
+            with mock.patch.object(notifications.time, "time", return_value=1000):
+                q.publish("later", "chat", "[later] wake", "[later]")
+                q.change("later", {"pending"}, status="submitted")
+            with mock.patch.object(notifications.time, "time", return_value=1900):
+                q.publish("board-push:1", "board", "[cm-board sfd] old", "[cm-board sfd]")
+                q.change("board-push:1", {"pending"}, status="observed")
+            saved = q.event_path("board-push:1").read_bytes()
+            with mock.patch.object(notifications.time, "time", return_value=2000):
+                q.health("claude-code", "ready")
+                self.assertEqual(q.snapshot()["health"]["status"], "degraded")
+                reopened = Queue("s", root)
+                self.assertEqual(reopened.snapshot()["health"]["status"], "degraded")
+            self.assertEqual(q.event_path("board-push:1").read_bytes(), saved)
+            with mock.patch.object(notifications.time, "time", return_value=2100):
+                marker = "[cm-board sfd push:2]"
+                q.publish("board-push:2", "board", f"new {marker}", marker)
+                q.change("board-push:2", {"pending"}, status="observed")
+                q.health("claude-code", "ready")
+                self.assertEqual(Queue("s", root).snapshot()["health"]["status"], "ready")
 
     def test_snapshot_reports_degraded_not_connected_while_submissions_vanish(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -142,6 +230,144 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
         notifications.atomic_write(self.queue.takeover_path(os.getppid()),
                                    dict(claim, pid=os.getppid(), requested_at=time.time()))
 
+    async def test_recovery_consumer_rechecks_after_claim_and_supersedes_without_send(self):
+        notifications.atomic_write(self.queue.path.parent / "claude-limit-recovery-state", {"version":1, "enabled":True})
+        self.queue.publish("recover", "claude-limit-recovery", "[recover] continue", "[recover]")
+        adapter = Fixture("current")
+        adapter.recovery_check = mock.AsyncMock(side_effect=["ready", "superseded"])
+        self.run_consumer(adapter)
+        await eventually(lambda: self.queue.get("recover")["status"] == "cancelled")
+        self.assertEqual(self.queue.get("recover")["cancel_reason"], "superseded")
+        self.assertEqual(adapter.sent, [])
+
+    async def test_real_adapter_rechecks_live_scope_before_claim(self):
+        sid = "93686392-56ae-455c-803d-6ce59cc55e29"
+        rid = "e3c16692-eddd-4ec9-9fd5-282de7a3de11"
+        path = Path(self.tmp.name) / f"{sid}.jsonl"
+        path.write_text(json.dumps({"type":"assistant", "sessionId":sid, "uuid":rid,
+                                    "error":"rate_limit", "isApiErrorMessage":True,
+                                    "message":{"model":"<synthetic>"}}) + "\n")
+        event = {"id":f"claude-limit:{sid}:{rid}", "recovery_scope":{"manager":"manager", "generation":7}}
+        base = {"transcript_path":str(path), "claude_recovery_eligible":True, "managed_by_uid":"manager",
+                "generation":7, "workflow_run_id":None, "continuous_task_id":None}
+        adapter = ClaudeAdapter(self.queue.uid)
+        with mock.patch.object(adapter, "live", return_value=True), mock.patch.object(control_client, "call", return_value=base) as call:
+            self.assertEqual(await adapter.recovery_check(event), "ready")
+            for changed in ({"managed_by_uid":None}, {"managed_by_uid":"other"},
+                            {"workflow_run_id":"run"}, {"continuous_task_id":"ct"},
+                            {"generation":8}, {"claude_recovery_eligible":False}):
+                call.return_value = dict(base, **changed)
+                self.assertEqual(await adapter.recovery_check(event), "superseded", changed)
+
+    async def test_recovery_disable_cancels_pending_without_send(self):
+        notifications.atomic_write(self.queue.path.parent / "claude-limit-recovery-state", {"version":1, "enabled":False})
+        self.queue.publish("recover", "claude-limit-recovery", "[recover] continue", "[recover]")
+        adapter = Fixture("current")
+        adapter.recovery_check = mock.AsyncMock(return_value="ready")
+        self.run_consumer(adapter)
+        await eventually(lambda: self.queue.get("recover")["status"] == "cancelled")
+        self.assertEqual(self.queue.get("recover")["cancel_reason"], "recovery_disabled")
+        self.assertEqual(adapter.sent, [])
+
+    async def test_recovery_event_sends_once_when_both_guards_pass(self):
+        notifications.atomic_write(self.queue.path.parent / "claude-limit-recovery-state", {"version":1, "enabled":True})
+        self.queue.publish("recover", "claude-limit-recovery", "[recover] continue", "[recover]")
+        adapter = Fixture("current")
+        adapter.recovery_check = mock.AsyncMock(return_value="ready")
+        self.run_consumer(adapter)
+        await eventually(lambda: self.queue.get("recover")["status"] == "submitted")
+        self.assertEqual(adapter.sent, ["recover"])
+
+    async def test_v1_consumer_skips_v2_then_upgraded_consumer_claims_it(self):
+        notifications.atomic_write(self.queue.path.parent / "claude-limit-recovery-state", {"version":1, "enabled":True})
+        self.queue.publish("recover-v2", "claude-limit-recovery", "[recover] continue", "[recover]")
+        event = self.queue.get("recover-v2")
+        event["version"] = 2
+        notifications.atomic_write(self.queue.event_path("recover-v2"), event)
+        self.queue.publish("ordinary", "chat", "[ordinary] wake", "[ordinary]")
+        old = Fixture("old")
+        # The old v1 loop's version guard and generic claim, copied from 2921a6e.
+        for event in self.queue.snapshot()["notifications"]:
+            if event["version"] != 1 or event["recipient"] != self.queue.uid:
+                continue
+            if event["status"] != "pending":
+                continue
+            claimed = self.queue.change(event["id"], {"pending"}, status="submitting", binding=old.identity())
+            receipt = await old.send(claimed)
+            self.queue.change(event["id"], {"submitting"}, status="submitted", receipt=receipt)
+        self.assertEqual(old.sent, ["ordinary"])
+        self.assertEqual(self.queue.get("recover-v2")["status"], "pending")
+        self.assertFalse(notifications.delivery_health(self.queue.snapshot()["notifications"])["chronology_unknown"])
+        new = Fixture("upgraded")
+        new.recovery_check = mock.AsyncMock(return_value="ready")
+        self.run_consumer(new)
+        await eventually(lambda: self.queue.get("recover-v2")["status"] == "submitted")
+        self.assertEqual(new.sent, ["recover-v2"])
+
+    async def test_upgraded_consumer_rejects_v2_other_sources_and_preserves_crash_receipt(self):
+        self.queue.publish("other", "chat", "[other] wake", "[other]")
+        other = self.queue.get("other"); other["version"] = 2
+        notifications.atomic_write(self.queue.event_path("other"), other)
+        self.queue.publish("crashed", "claude-limit-recovery", "[crashed] wake", "[crashed]")
+        crashed = self.queue.get("crashed"); crashed["version"] = 2; crashed["status"] = "submitting"
+        notifications.atomic_write(self.queue.event_path("crashed"), crashed)
+        adapter = Fixture("upgraded")
+        adapter.recovery_check = mock.AsyncMock(return_value="ready")
+        self.run_consumer(adapter)
+        await eventually(lambda: self.queue.get("crashed")["status"] == "uncertain")
+        self.assertEqual(self.queue.get("other")["status"], "pending")
+        self.assertEqual(adapter.sent, [])
+
+    async def test_unknown_chronology_holds_pending_until_census_is_trustworthy(self):
+        adapter = Fixture("old")
+        self.queue.publish("previous", "chat", "[previous] wake", "[previous]")
+        self.queue.change("previous", {"pending"}, status="uncertain")
+        previous = self.queue.event_path("previous").read_bytes()
+        self.queue.publish("observation", "chat", "[observation] wake", "[observation]")
+        self.queue.change("observation", {"pending"}, status="observed")
+        observation = self.queue.get("observation")
+        observation["updated_at"] = time.time() + 3600
+        notifications.atomic_write(self.queue.event_path("observation"), observation)
+        self.queue.publish("new", "chat", "[new] wake", "[new]")
+        pending = self.queue.event_path("new").read_bytes()
+        self.queue.health("claude-code", "degraded", reason="external_background", reasons=["external_background"])
+        self.run_consumer(adapter)
+        await eventually(lambda: "untrusted_notification_chronology" in self.queue.snapshot()["health"]["reasons"])
+        await asyncio.sleep(0.2)
+        self.assertEqual(adapter.sent, [])
+        self.assertEqual(self.queue.event_path("new").read_bytes(), pending)
+        self.assertEqual(self.queue.event_path("previous").read_bytes(), previous)
+        observation["updated_at"] = time.time()
+        notifications.atomic_write(self.queue.event_path("observation"), observation)
+        await eventually(lambda: adapter.sent == ["new"], timeout=8)
+        self.assertEqual(self.queue.event_path("previous").read_bytes(), previous)
+
+    async def test_invalid_observation_arriving_after_healthy_heartbeat_blocks_claim(self):
+        adapter = Fixture("same")
+        healthy = asyncio.Event()
+        original_health = self.queue.health
+        def signal_health(*args, **kwargs):
+            result = original_health(*args, **kwargs)
+            if args[1] == "ready":
+                healthy.set()
+            return result
+        with mock.patch.object(self.queue, "health", side_effect=signal_health):
+            self.run_consumer(adapter)
+            await asyncio.wait_for(healthy.wait(), 3)
+            self.queue.publish("observation", "chat", "[observation] wake", "[observation]")
+            self.queue.change("observation", {"pending"}, status="observed")
+            observation = self.queue.get("observation")
+            observation["updated_at"] = time.time() + 3600
+            notifications.atomic_write(self.queue.event_path("observation"), observation)
+            self.queue.publish("new", "chat", "[new] wake", "[new]")
+            before = self.queue.event_path("new").read_bytes()
+            await asyncio.sleep(0.3)  # before the five-second next heartbeat
+            self.assertEqual(adapter.sent, [])
+            self.assertEqual(self.queue.event_path("new").read_bytes(), before)
+            observation["updated_at"] = time.time()
+            notifications.atomic_write(self.queue.event_path("observation"), observation)
+            await eventually(lambda: adapter.sent == ["new"], timeout=8)
+
     async def test_stale_holder_hands_off_to_live_waiter(self):
         old = Fixture("old", stale=["transcript_mismatch"])
         first = self.run_consumer(old, loop=False)
@@ -171,6 +397,22 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(5.5)
         self.assertFalse(second.done(), "evidence alone is not a successor")
 
+    async def test_stale_holder_with_no_successor_holds_new_pending_without_replay(self):
+        old = Fixture("old", stale=["enqueued_unobserved"])
+        self.queue.publish("previous", "chat", "wake [cm-chat previous]", "[cm-chat previous]")
+        self.queue.change("previous", {"pending"}, status="submitted")
+        # change() supplies its own updated_at; seed the old receipt directly.
+        event = self.queue.get("previous")
+        event["updated_at"] = time.time() - 400
+        event["created_at"] = event["updated_at"]
+        notifications.atomic_write(self.queue.event_path("previous"), event)
+        self.queue.publish("new", "chat", "wake [cm-chat new]", "[cm-chat new]")
+        self.run_consumer(old)
+        await asyncio.sleep(.2)
+        self.assertEqual(old.sent, [])
+        self.assertEqual(self.queue.get("previous")["status"], "submitted")
+        self.assertEqual(self.queue.get("new")["status"], "pending")
+
     async def test_handed_off_consumer_does_not_reclaim_without_its_own_claim(self):
         old = Fixture("old", stale=["transcript_mismatch"])
         self.run_consumer(old)
@@ -187,11 +429,87 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ClaudeEvidenceTests(unittest.IsolatedAsyncioTestCase):
+    def test_takeover_request_rechecks_peer_process_and_parent_binding(self):
+        adapter = ClaudeAdapter("uid")
+        adapter.transcript_path = "/tmp/bound.jsonl"
+        claim = {"pid": 123, "session_id": "bound", "transcript_path": adapter.transcript_path, "peer_start": "42"}
+        with mock.patch("mcp_server.native_claude._start", return_value="42"), \
+             mock.patch("mcp_server.native_claude.claude_parent_argv", return_value=["claude", "--resume", "bound"]):
+            self.assertTrue(adapter.valid_takeover_request(claim))
+            self.assertFalse(adapter.valid_takeover_request(dict(claim, peer_start="old")))
+            self.assertFalse(adapter.valid_takeover_request(dict(claim, session_id="other")))
+            self.assertFalse(adapter.valid_takeover_request(dict(claim, transcript_path="/tmp/other.jsonl")))
+        with mock.patch("mcp_server.native_claude._start", return_value="42"), \
+             mock.patch("mcp_server.native_claude.claude_parent_argv", return_value=None):
+            self.assertFalse(adapter.valid_takeover_request(claim))
+
+    def test_background_roster_requires_exact_native_id_and_workspace(self):
+        sid = "650fb958-1e42-4428-b4aa-33e4f7061ba5"
+        rows = [{"kind": "background", "sessionId": sid, "cwd": "/tmp/work", "state": "busy"}]
+        self.assertEqual(background_match(rows, sid, "/tmp/work"), rows[0])
+        self.assertIsNone(background_match(rows, sid[:8], "/tmp/work"))
+        self.assertIsNone(background_match(rows, sid, "/tmp/other"))
+        self.assertIsNone(background_match(rows + rows, sid, "/tmp/work"))
+        self.assertIsNone(background_match(rows + [{"kind":"background", "sessionId":sid, "cwd":"/tmp/other"}], sid, "/tmp/work"))
+        self.assertIsNone(background_match(None, sid, "/tmp/work"))
+
+    async def test_old_channel_with_inherited_bound_id_is_detected_and_pending_held(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = "1cd328c6-b3cf-4f72-a4e4-13cf2a505443"
+            new = "650fb958-1e42-4428-b4aa-33e4f7061ba5"
+            project = Path(tmp)
+            markers = [f"[cm-chat {i}]" for i in range(3)]
+            (project / f"{old}.jsonl").write_text("".join(json.dumps(x) + "\n" for x in [
+                {"type": "continued-in", "continuedInSessionId": new},
+                *[{"type": "queue-operation", "operation": "enqueue", "content": m} for m in markers],
+            ]))
+            (project / f"{new}.jsonl").write_text("")
+            events = [ev(str(i), "submitted", time.time() - 400) for i in range(3)]
+            for event, marker in zip(events, markers): event["marker"] = marker
+            roster = [{"kind": "background", "sessionId": new, "cwd": os.getcwd(), "state": "busy"}]
+            with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": new}), \
+                 mock.patch("mcp_server.native_claude.claude_parent_argv", return_value=["claude", "--resume", old]), \
+                 mock.patch("mcp_server.native_claude.background_roster", new=mock.AsyncMock(return_value=roster)), \
+                 mock.patch.object(control_client, "call", return_value={"transcript_path": str(project / f"{new}.jsonl")}):
+                adapter = ClaudeAdapter("uid")
+                diag = await adapter.diagnostics(events)
+                self.assertEqual(diag["own_session_id"], old)
+                self.assertEqual(diag["blocked"], "external_background")
+                self.assertIn("enqueued_unobserved", diag["stale"])
+                with tempfile.TemporaryDirectory() as root:
+                    result = await notifications._diagnose(Queue("uid", Path(root)), adapter, events)
+                self.assertEqual(result["status"], "degraded")
+                self.assertEqual(result["blocked"], "external_background")
+
+    async def test_background_probe_cache_follows_binding(self):
+        first = "650fb958-1e42-4428-b4aa-33e4f7061ba5"
+        second = "1cd328c6-b3cf-4f72-a4e4-13cf2a505443"
+        roster = [{"kind": "background", "sessionId": first, "cwd": os.getcwd()}]
+        events = [ev("one", "submitted", time.time() - 400)]
+        with mock.patch("mcp_server.native_claude.claude_parent_argv", return_value=["claude"]), \
+             mock.patch("mcp_server.native_claude.background_roster", new=mock.AsyncMock(return_value=roster)) as probe, \
+             mock.patch.object(control_client, "call", side_effect=[
+                 {"transcript_path": f"/tmp/{first}.jsonl"},
+                 {"transcript_path": f"/tmp/{second}.jsonl"},
+             ]):
+            adapter = ClaudeAdapter("uid")
+            self.assertEqual((await adapter.diagnostics(events))["blocked"], "external_background")
+            adapter.resolve_after = 0
+            self.assertNotIn("blocked", await adapter.diagnostics(events))
+            self.assertEqual(probe.await_count, 2)
+
     def test_argv_parsing(self):
         self.assertEqual(argv_session_id(["claude", "--session-id", "abc"]), "abc")
         self.assertEqual(argv_session_id(["claude", "bg-pty-host", "--session-id", "new",
                                           "--fork-session", "--resume", "old"]), "new")
         self.assertIsNone(argv_session_id(["claude", "--fork-session", "--resume", "old"]))
+        retitled = ["claude bg-pty-host", "--bg-pty-host", "/tmp/p.sock", "324", "97", "--",
+                    "/x/versions/2.1.323", "--session-id", "new", "--fork-session", "--resume", "old"]
+        self.assertTrue(is_bg_pty_host(retitled))
+        self.assertEqual(argv_session_id(retitled), "new")
+        self.assertTrue(is_bg_pty_host(["claude", "bg-pty-host", "--session-id", "a"]))
+        self.assertFalse(is_bg_pty_host(["claude", "--session-id", "a"]))
+        self.assertFalse(is_bg_pty_host(["claude daemon", "run"]))
         self.assertEqual(argv_session_id(["claude", "--resume=old"]), "old")
         self.assertTrue(channel_flag_present(
             ["claude", "--dangerously-load-development-channels", "server:claude-manager"]))
@@ -218,6 +536,62 @@ class ClaudeEvidenceTests(unittest.IsolatedAsyncioTestCase):
             write([{"type": "continued-in", "continuedInSessionId": "new"}])
             self.assertEqual(ClaudeAdapter.stale_evidence(str(path), markers), ["continued_in"])
 
+    def test_own_transcript_evidence_parses_only_candidate_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.jsonl"
+            markers = ["[cm-chat a]", "[cm-chat b]", "[cm-chat c]"]
+            enq = lambda m: {"type": "queue-operation", "operation": "enqueue",
+                             "content": f"<channel>{m} hint</channel>"}
+            turn = {"type": "assistant", "message": {"content": "x" * 4000}}
+            records = []
+            for m in markers:
+                records += [turn] * 50 + [enq(m)]
+            path.write_text("".join(json.dumps(r) + "\n" for r in records) + "{broken\n")
+            real = json.loads
+            parsed = []
+
+            def counting(s, *a, **k):
+                parsed.append(s)
+                return real(s, *a, **k)
+
+            with mock.patch("mcp_server.native_claude.json.loads", counting):
+                self.assertEqual(ClaudeAdapter.stale_evidence(str(path), markers),
+                                 ["enqueued_unobserved"])
+            self.assertEqual(len(parsed), len(markers), "assistant turns are never parsed")
+            # The tail still starts on a line boundary once the file exceeds it.
+            with mock.patch("mcp_server.native_claude.TAIL_BYTES", 4000 * 50 + 300):
+                self.assertEqual(ClaudeAdapter.stale_evidence(str(path), markers), [])
+
+    def test_own_evidence_rereads_only_a_changed_transcript(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.jsonl"
+            markers = ["[cm-chat a]", "[cm-chat b]", "[cm-chat c]"]
+            enq = lambda m: json.dumps({"type": "queue-operation", "operation": "enqueue",
+                                        "content": f"<channel>{m} hint</channel>"}) + "\n"
+            path.write_text("".join(enq(m) for m in markers))
+            adapter = ClaudeAdapter("uid")
+            reads = []
+            real = ClaudeAdapter.stale_evidence
+
+            def counting(own, marks):
+                reads.append(own)
+                return real(own, marks)
+
+            with mock.patch.object(ClaudeAdapter, "stale_evidence", staticmethod(counting)):
+                self.assertEqual(adapter.own_evidence(str(path), markers), ["enqueued_unobserved"])
+                self.assertEqual(adapter.own_evidence(str(path), markers), ["enqueued_unobserved"])
+                self.assertEqual(len(reads), 1, "an unchanged transcript is not read again")
+                self.assertEqual(adapter.own_evidence(str(path), markers[:2]), [])
+                self.assertEqual(len(reads), 2, "new markers re-evaluate")
+                with path.open("a") as out:
+                    out.write(json.dumps({"type": "queue-operation", "operation": "dequeue"}) + "\n")
+                self.assertEqual(adapter.own_evidence(str(path), markers), [])
+                self.assertEqual(len(reads), 3, "an appended transcript is read again")
+                path.unlink()
+                self.assertEqual(adapter.own_evidence(str(path), markers), [])
+                self.assertEqual(adapter.own_evidence(str(path), markers), [])
+                self.assertEqual(len(reads), 5, "a missing file is never cached")
+
     async def test_fork_leaves_old_consumer_stale_and_new_one_live(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
@@ -232,10 +606,16 @@ class ClaudeEvidenceTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsNone(await old.takeover_claim())
                 self.assertTrue(diag["transcript_mismatch"])
                 self.assertEqual(diag["stale"], ["transcript_mismatch", "continued_in"])
-                with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "new"}):
+                with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "new"}), \
+                     mock.patch("mcp_server.native_claude.claude_parent_argv", return_value=["claude", "--resume", "new"]):
                     new = ClaudeAdapter("uid")
                     self.assertEqual((await new.diagnostics([]))["stale"], [])
                     self.assertEqual((await new.takeover_claim())["session_id"], "new")
+
+                with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "new"}), \
+                     mock.patch("mcp_server.native_claude.claude_parent_argv", return_value=None):
+                    unknown = ClaudeAdapter("uid")
+                    self.assertIsNone(await unknown.takeover_claim(), "inherited ID alone cannot authorize handoff")
 
     async def test_channels_disabled_client_keeps_notices_pending_and_reports_degraded(self):
         for argv, blocked in ((["claude", "bg-pty-host", "--session-id", "x"], True),
@@ -322,18 +702,100 @@ class SlimReadTests(unittest.TestCase):
         self.assertEqual(slim["monitor_status"], {"unacknowledged": 2, "recently_expired": [{"id": "w1"}]})
         self.assertEqual(slim["view"], "slim")
 
-    def test_tool_strips_view_before_the_daemon_and_defaults_to_full(self):
+    def test_inbox_defaults_to_slim_newest_first_and_history_to_full_oldest_first(self):
         with mock.patch.object(control_client, "call", return_value=json.loads(json.dumps(self.FULL))) as call:
-            full = server.chat_read(inbox=True, unread_only=True)
-            self.assertIn("norms", full)
-            slim = server.chat_read(inbox=True, unread_only=True, view="slim")
+            slim = server.chat_read(inbox=True, unread_only=True)
             self.assertNotIn("view", call.call_args.args[1])
             self.assertEqual(call.call_args.args[1], {"inbox": True, "unread_only": True,
                                                       "time_basis": "created", "freshness": "cached",
-                                                      "limit": 50, "dms": False, "newest_first": False})
+                                                      "limit": 50, "dms": False, "newest_first": True,
+                                                      "mark_read": True, "mentions_only": False})
             self.assertEqual(slim["view"], "slim")
+            full = server.chat_read(inbox=True, unread_only=True, view="full", newest_first=False)
+            self.assertIn("norms", full)
+            self.assertFalse(call.call_args.args[1]["newest_first"])
+            history = server.chat_read(channel="general")
+            self.assertIn("norms", history)
+            self.assertFalse(call.call_args.args[1]["newest_first"])
+            server.chat_read(dms=True)
+            self.assertTrue(call.call_args.args[1]["newest_first"])
             with self.assertRaises(ValueError):
                 server.chat_read(inbox=True, view="tiny")
+
+    def test_slim_read_keeps_unacknowledged_norms_and_outbox(self):
+        full = json.loads(json.dumps(self.FULL))
+        full["context_status"] = {"stale_scopes": ["global"], "ack_with": {"norms_seen": {"global": "r2"}},
+                                  "current": {"global": "r2"}}
+        full["outbox"] = {"pending_sync": 2, "oldest_age_s": 900}
+        slim = server.slim_read_result(full)
+        self.assertEqual(slim["norms"], {"text": "long"})
+        self.assertEqual(slim["context_status"]["ack_with"], {"norms_seen": {"global": "r2"}})
+        self.assertNotIn("current", slim["context_status"])
+        self.assertEqual(slim["outbox"]["pending_sync"], 2)
+
+    def test_mark_read_before_passes_through_and_returns_the_summary(self):
+        reply = {"marked": 40, "monitors_advanced": 1, "before": "2026-10-06T12:00:00Z",
+                 "scope": "inbox", "sync": {"enabled": True, "connected": True}, "cache": {}}
+        with mock.patch.object(control_client, "call", return_value=reply) as call:
+            out = server.chat_read(inbox=True, mark_read_before="2026-10-06T12:00:00Z")
+        self.assertEqual(call.call_args.args[1]["mark_read_before"], "2026-10-06T12:00:00Z")
+        self.assertEqual(out, {"marked": 40, "monitors_advanced": 1, "before": "2026-10-06T12:00:00Z",
+                               "scope": "inbox", "view": "slim"})
+
+
+class SlimEnvelopeTests(unittest.TestCase):
+    SEND = {
+        "cache": {"checkpoint": {"through": 1}}, "connection": "connected",
+        "context_status": {"stale_scopes": [], "changed": False, "current": {"global": "r"}},
+        "coordinator_position": {"p": 1}, "position": {"p": 2}, "items": None,
+        "event": {"id": "e1", "created_at": "2026-10-06T19:29:27.705Z", "conversation_id": "c1",
+                  "body": "hi", "data": {"reply_to": "e0", "thread_root": "e0", "metadata_seen": {"x": 1}}},
+        "event_id": "e1", "created_at": "2026-10-06T19:29:27.705Z", "name": "msgfix",
+        "name_publication": "published", "notification": [{"recipient": "ts-1", "status": "pending"}],
+        "operation": {"request_id": "r"}, "replication": "pending_sync",
+        "monitor_status": {"active": 0, "unacknowledged": 0, "recently_expired": []},
+        "mentions_resolved": [{"token": "@lane", "id": "agent:x", "name": "lane", "source": "body"}],
+        "warnings": [{"code": "unresolved_body_mention", "token": "@nobody"}],
+        "outbox": {"pending_sync": 1, "oldest_age_s": 3},
+        "sync": {"enabled": True, "connected": True, "error": None, "pending": 1, "role": "replica"},
+    }
+
+    def test_send_slim_keeps_what_the_sender_acts_on(self):
+        with mock.patch.object(control_client, "call", return_value=json.loads(json.dumps(self.SEND))) as call:
+            slim = server.chat_send(body="hi", request_id="r", channel="general")
+            self.assertNotIn("view", call.call_args.args[1])
+            full = server.chat_send(body="hi", request_id="r", channel="general", view="full")
+        self.assertEqual(full, self.SEND)
+        self.assertEqual(slim, {
+            "event_id": "e1", "created_at": "2026-10-06T19:29:27.705Z", "conversation_id": "c1",
+            "reply_to": "e0", "thread": "e0", "name": "msgfix", "replication": "pending_sync",
+            "notification": self.SEND["notification"], "mentions_resolved": self.SEND["mentions_resolved"],
+            "warnings": self.SEND["warnings"], "outbox": self.SEND["outbox"], "view": "slim"})
+        self.assertLess(len(json.dumps(slim)), len(json.dumps(self.SEND)) / 2)
+
+    def test_slim_surfaces_sync_trouble_and_pending_name(self):
+        reply = json.loads(json.dumps(self.SEND))
+        reply["sync"].update(connected=False, error="storage_error: connection reset")
+        reply["connection"] = "offline"
+        reply["name_publication"] = "pending"
+        with mock.patch.object(control_client, "call", return_value=reply):
+            slim = server.chat_send(body="hi", request_id="r", channel="general")
+        self.assertEqual(slim["sync"], {"connected": False, "error": "storage_error: connection reset",
+                                        "pending": 1, "handoff_paused": None})
+        self.assertEqual(slim["connection"], "offline")
+        self.assertEqual(slim["name_publication"], "pending")
+
+    def test_people_and_channels_keep_items_and_cursor(self):
+        reply = {"items": [{"id": "agent:x", "name": "lane", "present": True}], "next_cursor": None,
+                 "cache": {}, "sync": {"enabled": True, "connected": True}, "space_id": "s",
+                 "daemon_id": "d", "monitor_status": {"unacknowledged": 0},
+                 "context_status": {"stale_scopes": []}, "coverage": "complete"}
+        with mock.patch.object(control_client, "call", return_value=reply):
+            people = server.chat_people(query="lane")
+            channels = server.chat_channels(action="list")
+        expected = {"items": reply["items"], "view": "slim"}
+        self.assertEqual(people, expected)
+        self.assertEqual(channels, expected)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-//! Session + workspace lifecycle: daemon spawn/attach plumbing, create/close/tombstone, planning launch, daemon state pushes.
+//! Session + workspace lifecycle: daemon spawn/attach plumbing, create/close/tombstone, task-bound launch (A-n "Reports to"), daemon state pushes.
 
 use super::*;
 
@@ -41,6 +41,56 @@ pub(crate) fn guard_local_host_only(
     )))
 }
 
+/// The manifest entry a remote `session.revive` restores from: the
+/// tombstone's full entry when it saved one, else one rebuilt from its
+/// fields. Same uid, label, task and transcript; the exit is cleared.
+pub(crate) fn remote_revive_entry(
+    tomb: &SessionTombstone,
+    host: &cm_daemon::host_id::HostId,
+) -> cm_daemon::manifest::ManifestEntry {
+    let mut entry = tomb.entry.clone().unwrap_or_else(|| cm_daemon::manifest::ManifestEntry {
+        org: None,
+        model: None,
+        model_source: None,
+        effort: None,
+        effort_source: None,
+        transcript_path: None,
+        reported_done_at: None,
+        report_reason: None,
+        memory_cap_soft_bytes: None,
+        memory_cap_hard_bytes: None,
+        cgroup_prefix: None,
+        uid: tomb.uid.clone(),
+        managed_by_uid: tomb.managed_by_uid.clone(),
+        generation: tomb.generation,
+        label: tomb.label.clone(),
+        session_type: tomb.session_type.clone(),
+        transcript_id: tomb.last_transcript_id.clone(),
+        hidden: false,
+        idle_timeout_secs: super::model::DEFAULT_IDLE_TIMEOUT_SECS,
+        burst_threshold: 0,
+        workflow_run_id: None,
+        workflow_role: None,
+        continuous_task_id: None,
+        task_id: tomb.task_id.clone(),
+        notify_on_idle: false,
+        color: None,
+        global_perms: false,
+        seeded_from_snapshot: None,
+        last_exit: None,
+        host_id: host.clone(),
+    });
+    entry.uid = tomb.uid.clone();
+    if entry.transcript_id.is_none() {
+        entry.transcript_id = tomb.last_transcript_id.clone();
+    }
+    entry.last_exit = None;
+    entry.reported_done_at = None;
+    entry.report_reason = None;
+    entry.host_id = host.clone();
+    entry
+}
+
 /// migrate-tui-local Issue 1: attach to a daemon session whose
 /// UID the daemon already knows. This is the manifest-restore
 /// path on TUI startup: the daemon + its PTY children survive
@@ -71,6 +121,31 @@ pub(crate) fn try_attach_via_daemon_with_deps(
     host_id: &cm_daemon::host_id::HostId,
     transcript_path: Option<&str>,
 ) -> anyhow::Result<Session> {
+    attach_via_daemon(
+        host_pool, session_uid, workspace_id, worktree_path, session_type, label, cols, rows,
+        task_id, workflow_run_id, workflow_role, host_id, transcript_path, Default::default(),
+    )
+}
+
+/// [`try_attach_via_daemon_with_deps`]; `how` can ask for a screen-first
+/// attach (see `Session::history_deferred`) or resume a pane's terminal.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attach_via_daemon(
+    host_pool: &crate::host_pool::HostPool,
+    session_uid: &str,
+    workspace_id: &str,
+    worktree_path: &Path,
+    session_type: &str,
+    label: &str,
+    cols: u16,
+    rows: u16,
+    task_id: Option<&str>,
+    workflow_run_id: Option<&str>,
+    workflow_role: Option<&str>,
+    host_id: &cm_daemon::host_id::HostId,
+    transcript_path: Option<&str>,
+    how: crate::client_session::AttachHow,
+) -> anyhow::Result<Session> {
     let internal_session_type = normalize_session_type_to_internal(session_type);
     let wire_session_type = match internal_session_type {
         "claude" => "claude-code",
@@ -99,9 +174,14 @@ pub(crate) fn try_attach_via_daemon_with_deps(
     // ITS `CM_OPERATOR_TOKEN` (a remote one is unrelated to ours).
     let operator_token_id = host_pool.operator_token_for(host_id);
     let cs_config = crate::client_session::ClientSessionConfig {
+        model: None,
+        model_source: None,
+        effort: None,
+        effort_source: None,
         daemon_socket: &daemon_socket,
         operator_token_id: &operator_token_id,
         uid: session_uid,
+        auto_place_owner: false,
         workspace_id,
         label,
         session_type: wire_session_type,
@@ -123,7 +203,8 @@ pub(crate) fn try_attach_via_daemon_with_deps(
         // grant; nothing is spawned here so the field is inert.
         global_perms: false,
     };
-    let session = crate::session::Session::new_attached_existing_with_context(cs_config, true)?;
+    let session =
+        crate::session::Session::new_attached_existing_with_context(cs_config, true, how)?;
     // Legacy daemons may ignore attach dimensions; keep the asynchronous kick.
     session.resize(cols, rows);
 
@@ -278,10 +359,21 @@ pub(crate) fn try_spawn_via_daemon_with_deps(
     // the daemon's `resolve_authorized_session` flips ready
     // immediately and MCP `read_session_output` can serve.
     transcript_path: Option<&str>,
+    auto_place_owner: bool,
     // Global-permissions grant applied at spawn — see
     // `ClientSessionConfig::global_perms` for the contract and the
     // respawn-at-same-uid incident it closes.
     global_perms: bool,
+    // The caller's model choice (explicit form field, the row's recorded
+    // model, or the task default). `None` takes the configured engine
+    // default: CM never leaves the model to the engine.
+    model: Option<&str>,
+    // Where `model` came from (`ModelSource::as_str`), recorded with it.
+    model_source: Option<&str>,
+    // The reasoning effort and its source, like `model`. `None` takes the
+    // configured default.
+    effort: Option<&str>,
+    effort_source: Option<&str>,
 ) -> Option<anyhow::Result<Session>> {
     // 10f: daemon-eligibility is now driven solely by
     // session_type. Pre-flip a `CM_USE_DAEMON_SOCKET` opt-in
@@ -310,6 +402,8 @@ pub(crate) fn try_spawn_via_daemon_with_deps(
         }
         _ => None,
     };
+    let resolved_model = spawn_model(internal_session_type, model);
+    let resolved_effort = spawn_effort(internal_session_type, effort);
     let argv_result = match internal_session_type {
         "claude" => crate::mcp_config::build_args(
             crate::mcp_config::SpawnTarget::Daemon,
@@ -317,6 +411,8 @@ pub(crate) fn try_spawn_via_daemon_with_deps(
             session_uid,
             workflow_meta.clone(),
             resume_session_id,
+            resolved_model.as_deref().unwrap_or_default(),
+            resolved_effort.as_deref().unwrap_or_default(),
         ),
         "codex" => crate::mcp_config::build_args(
             crate::mcp_config::SpawnTarget::Daemon,
@@ -324,6 +420,8 @@ pub(crate) fn try_spawn_via_daemon_with_deps(
             session_uid,
             workflow_meta.clone(),
             resume_session_id,
+            resolved_model.as_deref().unwrap_or_default(),
+            resolved_effort.as_deref().unwrap_or_default(),
         ),
         "bash" => Ok(("/bin/bash".to_string(), Vec::new())),
         _ => return None,
@@ -413,6 +511,7 @@ pub(crate) fn try_spawn_via_daemon_with_deps(
         daemon_socket: &daemon_socket,
         operator_token_id: &operator_token_id,
         uid: session_uid,
+        auto_place_owner,
         workspace_id,
         label,
         session_type: wire_session_type,
@@ -437,11 +536,127 @@ pub(crate) fn try_spawn_via_daemon_with_deps(
         workflow_run_id,
         workflow_role,
         global_perms,
+        model: resolved_model.as_deref(),
+        model_source: match (model, resolved_model.is_some()) {
+            (_, false) => None,
+            (Some(_), true) => model_source,
+            (None, true) => Some(cm_daemon::models::ModelSource::Engine.as_str()),
+        },
+        effort: resolved_effort.as_deref(),
+        effort_source: match (effort, resolved_effort.is_some()) {
+            (_, false) => None,
+            (Some(_), true) => effort_source,
+            (None, true) => Some(cm_daemon::models::ModelSource::Engine.as_str()),
+        },
     };
     Some(crate::session::Session::new_attached(cs_config))
 }
 
+/// The effort a TUI spawn of `session_type` runs: the caller's choice,
+/// else the configured default. `None` for bash.
+pub(crate) fn spawn_effort(session_type: &str, chosen: Option<&str>) -> Option<String> {
+    let engine = normalize_session_type_to_internal(session_type);
+    if !cm_daemon::models::takes_model(engine) {
+        return None;
+    }
+    match chosen.map(str::trim).filter(|e| !e.is_empty()) {
+        Some(e) => Some(e.to_ascii_lowercase()),
+        None => cm_daemon::models::default_effort(engine),
+    }
+}
+
+/// The model a TUI spawn of `session_type` runs: the caller's choice, else
+/// the configured engine default (`[models]` in tui-settings.toml). `None`
+/// for bash, which has no model.
+pub(crate) fn spawn_model(session_type: &str, chosen: Option<&str>) -> Option<String> {
+    let engine = normalize_session_type_to_internal(session_type);
+    if !cm_daemon::models::takes_model(engine) {
+        return None;
+    }
+    match chosen.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(m) => Some(m.to_string()),
+        None => cm_daemon::models::default_model(engine),
+    }
+}
+
+/// One-time offer (Owner, 2026-11-05): workspaces whose agents went before
+/// the last-agent close shipped still hold only bash panes. Asked once,
+/// this long after start so sessions have attached; the marker file records
+/// that it was asked, whatever the answer.
+pub(crate) const BASH_SWEEP_DELAY: Duration = Duration::from_secs(20);
+
+pub(crate) fn bash_sweep_marker() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join(".cm/bash-only-sweep-asked")
+}
+
+/// Who ended a workspace's last agent: Owner (A-w, asked first) or an
+/// agent's kill (closed without asking).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LastAgentClose {
+    Owner,
+    AgentKill,
+}
+
+/// A bash-pane check for `App::check_and_close_workspace`: the daemon uids
+/// asked about, and the busy ones as `(uid, command)` (Err: no answer).
+pub(crate) struct LastAgentVerdict {
+    pub(crate) ws_id: String,
+    pub(crate) trigger: LastAgentClose,
+    pub(crate) checked: Vec<String>,
+    pub(crate) busy: Result<Vec<(String, String)>, String>,
+}
+
 impl App {
+    /// The task's default model or effort for `session_type` (its own,
+    /// else inherited from its nearest ancestor).
+    pub(crate) fn task_default(
+        &self,
+        task_id: &str,
+        session_type: &str,
+        setting: cm_daemon::models::Setting,
+    ) -> Option<String> {
+        let engine = normalize_session_type_to_internal(session_type);
+        self.planning.task_default(task_id, engine, setting).map(|(v, _)| v)
+    }
+
+    /// The A-e task form's model slots: the task's own defaults, and what
+    /// each would inherit (its parent's, else the engine default).
+    pub(super) fn task_models_edit(&self, task_id: &str) -> super::model_field::TaskModelsEdit {
+        use cm_daemon::models::Setting;
+        let own = self.planning.task_own(task_id, Setting::Model);
+        let own_efforts = self.planning.task_own(task_id, Setting::Effort);
+        let parent = self.planning.task_parent_id(task_id);
+        let engines = super::model_field::TASK_MODEL_ENGINES;
+        super::model_field::TaskModelsEdit::with_efforts(
+            engines.map(|e| own.get(e).cloned()),
+            engines.map(|e| parent.as_deref().and_then(|p| self.task_default(p, e, Setting::Model))),
+            engines.map(|e| own_efforts.get(e).cloned()),
+            engines.map(|e| parent.as_deref().and_then(|p| self.task_default(p, e, Setting::Effort))),
+        )
+    }
+
+    /// The task's inherited default model or effort per engine.
+    pub(crate) fn task_defaults(
+        &self,
+        task_id: &str,
+        setting: cm_daemon::models::Setting,
+    ) -> std::collections::BTreeMap<String, String> {
+        ["claude", "codex"]
+            .into_iter()
+            .filter_map(|e| Some((e.to_string(), self.task_default(task_id, e, setting)?)))
+            .collect()
+    }
+
+    /// A Model field (with its Effort) prefilled from the task's defaults.
+    pub(crate) fn model_field_for_task(&self, session_type: &str, task_id: Option<&str>) -> super::model_field::ModelField {
+        use cm_daemon::models::Setting;
+        super::model_field::ModelField::for_task(
+            session_type,
+            task_id.map(|t| self.task_defaults(t, Setting::Model)).unwrap_or_default(),
+            task_id.map(|t| self.task_defaults(t, Setting::Effort)).unwrap_or_default(),
+        )
+    }
+
     /// Slice 10c-e-3: opt-in daemon spawn branch.
     ///
     /// When `CM_USE_DAEMON_SOCKET=1`, route the spawn through the
@@ -515,6 +730,7 @@ impl App {
         // path for resume/restore flows. Fresh A-n / A-s
         // spawns pass `None`.
         transcript_path: Option<&str>,
+        auto_place_owner: bool,
         // Global-permissions grant applied AT SPAWN (see
         // `ClientSessionConfig::global_perms`). Restore / revive
         // pass the manifest entry's grant so a respawn-at-same-uid
@@ -522,7 +738,18 @@ impl App {
         // escalation-checked) agent request; fresh A-n / A-s
         // spawns pass `false`.
         global_perms: bool,
+        // Explicit or recorded model; `None` = this task's default
+        // (inherited through its parents), else the engine default.
+        model: Option<&str>,
+        // Explicit or recorded effort, resolved the same way.
+        effort: Option<&str>,
     ) -> Option<anyhow::Result<Session>> {
+        use cm_daemon::models::Setting;
+        let resume = resume_session_id.map(|id| (worktree_path, transcript_path, id));
+        let (model, model_source) = self.pick_spawn_setting(Setting::Model, session_type, model, task_id, resume);
+        let (effort, effort_source) = self.pick_spawn_setting(Setting::Effort, session_type, effort, task_id, resume);
+        let model = model.as_deref();
+        let effort = effort.as_deref();
         // migrate-tui-local: thin wrapper around the free
         // `try_spawn_via_daemon_with_deps` helper so workflow
         // respawn paths (which don't have `&App`) can share the
@@ -545,8 +772,58 @@ impl App {
             workflow_role,
             host_id,
             transcript_path,
+            auto_place_owner,
             global_perms,
+            model,
+            model_source,
+            effort,
+            effort_source,
         )
+    }
+
+    /// Resolve a TUI-composed spawn's model and where it came from: the
+    /// caller's model (`explicit` for a new spawn, `recorded` for a
+    /// resume) → when resuming, the model the conversation's transcript
+    /// names (`transcript`) → the task default (inherited) → the engine
+    /// default. A resume that falls back to a default is
+    /// `default_on_resume`: the conversation may have run another model.
+    /// The effort resolves the same way.
+    pub(crate) fn pick_spawn_setting(
+        &self,
+        setting: cm_daemon::models::Setting,
+        session_type: &str,
+        given: Option<&str>,
+        task_id: Option<&str>,
+        resume: Option<(&Path, Option<&str>, &str)>,
+    ) -> (Option<String>, Option<&'static str>) {
+        use cm_daemon::models::ModelSource;
+        let engine = normalize_session_type_to_internal(session_type);
+        if !cm_daemon::models::takes_model(engine) {
+            return (None, None);
+        }
+        if let Some(m) = given.map(str::trim).filter(|m| !m.is_empty()) {
+            let src = if resume.is_some() { ModelSource::Recorded } else { ModelSource::Explicit };
+            return (Some(m.to_string()), Some(src.as_str()));
+        }
+        if let Some((worktree, path, id)) = resume {
+            let file = cm_daemon::models::session_transcript(engine, Some(worktree), path, Some(id));
+            if let Some(m) = file.and_then(|f| setting.from_transcript(engine, &f)) {
+                return (Some(m), Some(ModelSource::Transcript.as_str()));
+            }
+        }
+        // The shared resolver replaces a task value the engine can't take
+        // (a codex `max` effort) with the config default, reported as
+        // `task_invalid_fallback`, instead of spawning with it.
+        let task = task_id.and_then(|t| self.task_default(t, session_type, setting));
+        let (m, src) = match setting.resolve(engine, None, task.as_deref().map(|v| (v, ModelSource::Task))) {
+            Ok(Some((m, src))) => (Some(m), src),
+            _ => (None, ModelSource::Engine),
+        };
+        let src = match src {
+            ModelSource::Task | ModelSource::Engine if resume.is_some() => ModelSource::DefaultOnResume,
+            src => src,
+        };
+        (m, Some(src.as_str()))
     }
 
     /// List all .jsonl file stems in the Claude project directory for a worktree.
@@ -701,6 +978,10 @@ impl App {
         }
 
         self.workspaces[wi].is_closed = false;
+        // Owner's reopen claims the workspace: it is no longer an agent
+        // wrapper to auto-close, and no sweep may hide it again this run.
+        self.auto_close_workspaces.remove(ws_id);
+        self.user_reopened.insert(ws_id.to_string());
 
         let bound_done: Vec<String> = self
             .tasks
@@ -782,12 +1063,17 @@ impl App {
         // Restore INTO this workspace → use the workspace's host (not the
         // global active_host, which could mismatch the worktree's host).
         let active_host = self.workspaces[wi].host_id.clone();
-        // migrate-tui-local Issue C: the daemon-routed spawn
-        // below sends local-only paths (worktree + per-session
-        // MCP config under `~/.cm/mcp/...`). A non-local active
-        // host would route those at a daemon that can't read
-        // them. Fail fast with the shared helper — same shape
-        // every other entry point uses.
+        // A remote workspace's sessions live on their host: revive each
+        // tombstone there (same uid, label, task and transcript), as
+        // remote A-R does. The local spawn below sends local-only paths.
+        if active_host != cm_daemon::host_id::HostId::local() {
+            self.start_remote_restore(wi);
+            self.cursor = Cursor::Workspace(wi);
+            self.clamp_cursor();
+            return;
+        }
+        // Below this point the spawn sends local-only paths (worktree +
+        // per-session MCP config); the guard keeps that invariant explicit.
         if let Err(e) = guard_local_host_only(
             &active_host,
             "A-O restore-tombstones-for-workspace",
@@ -806,6 +1092,12 @@ impl App {
 
         for tomb in tombstones {
             let session_uid = new_session_uid();
+            // #24: a moved Claude conversation restores the newest session
+            // in its `continued-in` chain, and the row binds to it.
+            let followed_resume: Option<String> = (tomb.session_type == "claude")
+                .then(|| Some((worktree.as_deref()?, tomb.last_transcript_id.as_deref()?)))
+                .flatten()
+                .and_then(|(wt, id)| super::persist::follow_claude_id(wt, id));
             let result = match tomb.session_type.as_str() {
                 "claude" | "codex" | "bash" => {
                     // migrate-tui-local: route restored claude/codex/bash
@@ -828,7 +1120,6 @@ impl App {
                     // no transcript, so `resume` and
                     // `pre_spawn_transcript` resolve to None
                     // naturally.
-                    let resume = tomb.last_transcript_id.as_deref();
                     let session_type = tomb.session_type.as_str();
                     let Some(wt_path) = worktree.as_deref() else {
                         self.set_status_msg(
@@ -837,6 +1128,7 @@ impl App {
                         failed.push(tomb);
                         continue;
                     };
+                    let resume = followed_resume.as_deref().or(tomb.last_transcript_id.as_deref());
                     // migrate-tui-local Issue 3: claude tombstone
                     // restores have a deterministic transcript
                     // path (worktree + transcript_id); hand it
@@ -871,7 +1163,10 @@ impl App {
                         None,
                         &active_host,
                         pre_spawn_transcript.as_deref(),
+                        false, // restore/revive is not a fresh owner placement
                         false, // global_perms
+                        tomb.entry.as_ref().and_then(|e| e.model.as_deref()),
+                        tomb.entry.as_ref().and_then(|e| e.effort.as_deref()),
                     ) {
                         Some(Ok(s)) => Ok(s),
                         Some(Err(e)) => {
@@ -928,7 +1223,7 @@ impl App {
                     // Codex the live id is rebound by the detector when the
                     // post-resume rollout appears in `pending_jsonl_files`.
                     if tomb.session_type == "claude" {
-                        ts.transcript_id = tomb.last_transcript_id.clone();
+                        ts.transcript_id = followed_resume.clone().or_else(|| tomb.last_transcript_id.clone());
                     }
                     self.workspaces[wi].sessions.push(ts);
                     restored += 1;
@@ -967,6 +1262,7 @@ impl App {
         self.tombstone_and_remove(wi, |_| true);
         if let Some(ws) = self.workspaces.get_mut(wi) {
             ws.is_closed = true;
+            self.user_reopened.remove(&ws.id);
         }
         // Persist again in case `is_closed` flipped after the helper
         // already saved (cheap, just rewrites the same JSON).
@@ -1020,6 +1316,11 @@ impl App {
         // Resurrect INTO this workspace → use the workspace's host (not the
         // global active_host).
         let active_host = self.workspaces[wi].host_id.clone();
+        // A remote workspace's designer tombstones stay listed: the reopen's
+        // restore prompt revives them on their host with the others.
+        if active_host != cm_daemon::host_id::HostId::local() {
+            return 0;
+        }
         // migrate-tui-local Issue C: the resurrect path resolves a
         // claude transcript path on the local filesystem and
         // hands it (plus the workspace's worktree) to the daemon.
@@ -1065,6 +1366,8 @@ impl App {
                 .or_else(|| self.workspaces[wi].worktree_path.clone());
             let label = tomb.label.clone();
             let task_id = tomb.task_id.clone();
+            let tomb_model = tomb.entry.as_ref().and_then(|e| e.model.clone());
+            let tomb_effort = tomb.entry.as_ref().and_then(|e| e.effort.clone());
 
             let Some(wt_path) = worktree_path.as_deref() else {
                 // No worktree — can't daemon-spawn. Leave tombstone
@@ -1098,7 +1401,10 @@ impl App {
                 None,
                 &active_host,
                 pre_spawn_transcript.as_deref(),
+                false, // transcript resume is not a fresh owner placement
                 false, // global_perms
+                tomb_model.as_deref(),
+                tomb_effort.as_deref(),
             ) {
                 Some(Ok(s)) => {
                     let mut ts = make_simple_session_with_uid(
@@ -1132,33 +1438,20 @@ impl App {
         let (wi, si) = match &self.cursor {
             Cursor::Session(wi, si) => (*wi, *si),
             Cursor::Workspace(wi) => {
-                let wi = *wi;
-                if self.workspaces.get(wi).map_or(false, |w| w.sessions.len() == 1) {
-                    (wi, 0)
-                } else {
-                    return;
-                }
-            }
-            Cursor::Task { ws_idx, task_id } => {
-                // Toggle hidden on every session belonging to the task.
+                // Toggle hidden on every session of the workspace (the task
+                // header it replaced did this for its task's sessions).
                 // Uses the majority-hidden state as the "current" so one
                 // keypress always flips everything in unison.
-                let wi = *ws_idx;
-                let tid = task_id.clone();
+                let wi = *wi;
                 let Some(ws) = self.workspaces.get_mut(wi) else {
                     return;
                 };
-                let matching: Vec<&mut TerminalSession> = ws
-                    .sessions
-                    .iter_mut()
-                    .filter(|ts| ts.task_id.as_deref() == Some(tid.as_str()))
-                    .collect();
-                if matching.is_empty() {
+                if ws.sessions.is_empty() {
                     return;
                 }
-                let hidden_count = matching.iter().filter(|ts| ts.hidden).count();
-                let new_hidden = hidden_count * 2 < matching.len();
-                for ts in matching {
+                let hidden_count = ws.sessions.iter().filter(|ts| ts.hidden).count();
+                let new_hidden = hidden_count * 2 < ws.sessions.len();
+                for ts in &mut ws.sessions {
                     ts.hidden = new_hidden;
                 }
                 self.save_session_manifest();
@@ -1167,7 +1460,7 @@ impl App {
             }
             // Backtest rows have no hidden bit — the group folds instead;
             // section headers likewise.
-            Cursor::Backtest(_) | Cursor::Section(_) => return,
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => return,
         };
         if let Some(ts) = self
             .workspaces
@@ -1192,8 +1485,12 @@ impl App {
             }
         };
 
+        self.new_session_reports_to = Default::default();
+        self.new_session_picker = None;
+        let engine = self.global_settings.staffing.engine();
+        self.form_model = super::model_field::ModelField::new(engine.as_session_type());
         self.input_mode = InputMode::NewSession {
-            engine: LaunchEngine::default(),
+            engine,
             label_text: String::new(),
             branch_text: String::new(),
             idle_timeout_text: DEFAULT_IDLE_TIMEOUT_SECS.to_string(),
@@ -1209,8 +1506,8 @@ impl App {
     }
 
     /// Enter input mode to add a terminal session to the active workspace.
-    /// If the cursor is inside a task scope, the new session inherits that
-    /// task_id so it appears under the task subheader.
+    /// The new session inherits the task of the cursor's row: a session's
+    /// task, or the workspace's task on its header.
     pub(super) fn start_new_terminal_session(&mut self) {
         let wi = match self.active_workspace_index() {
             Some(wi) => wi,
@@ -1219,16 +1516,19 @@ impl App {
                 return;
             }
         };
-        let task_id = self.cursor_task_id();
+        let task_id = self.cursor_scope_task_id();
         // Capture workspace_id (stable) instead of the index — backend
         // events fired while the form is open can reorder workspaces,
         // and a stored index would silently target the wrong workspace
         // by submit time.
         let workspace_id = self.workspaces[wi].id.clone();
         self.session_form_host = Some(self.workspaces[wi].host_id.clone());
+        let engine = self.global_settings.staffing.engine();
+        self.form_model =
+            self.model_field_for_task(engine.as_session_type(), task_id.as_deref());
         self.input_mode = InputMode::NewTerminalSession {
             workspace_id,
-            session_type: LaunchEngine::default().as_session_type().to_string(),
+            session_type: engine.as_session_type().to_string(),
             task_id,
             seed_from: None,
             resume_from: None,
@@ -1288,6 +1588,43 @@ impl App {
                     uid, e,
                 );
             }
+        }
+    }
+
+    /// Close-path kill. Nothing follows at the same uid, so a remote kill
+    /// runs on a worker instead of this input thread (a slow link made each
+    /// A-w wait out the 5 s RPC budget). Local kills stay synchronous: the
+    /// socket is on this machine and callers' ordering expectations hold.
+    pub(crate) fn kill_daemon_session_for_close(
+        host_pool: &std::sync::Arc<crate::host_pool::HostPool>,
+        ts: &TerminalSession,
+    ) {
+        // A local non-assistant keeps today's synchronous kill. An assistant
+        // (by its row's stamp) closes through `org.close_assistant`, which
+        // waits on the planning API, so it runs off the input thread on any
+        // host (O5).
+        if ts.session.daemon_session_uid.is_none()
+            || (ts.host_id == cm_daemon::host_id::HostId::local() && !is_open_assistant_row(ts))
+        {
+            Self::kill_daemon_session_if_attached(host_pool, ts);
+            return;
+        }
+        let pool = std::sync::Arc::clone(host_pool);
+        let host = ts.host_id.clone();
+        let uid = ts.session.daemon_session_uid.clone().unwrap_or_default();
+        let spawned = std::thread::Builder::new()
+            .name("cm-close-kill".into())
+            .spawn(move || {
+                let Some(socket) = pool.for_host(&host).ok().and_then(|h| h.socket_path()) else {
+                    eprintln!("cm-tui: A-w kill_session({uid}) skipped — host {} has no live socket", host.as_str());
+                    return;
+                };
+                if let Err(e) = crate::client_session::close_session_deliberately(&socket, &pool.operator_token_for(&host), &uid) {
+                    eprintln!("cm-tui: A-w kill_session({uid}) failed: {e} (orphan child will be reaped when it exits)");
+                }
+            });
+        if spawned.is_err() {
+            Self::kill_daemon_session_if_attached(host_pool, ts);
         }
     }
 
@@ -1542,16 +1879,8 @@ impl App {
     /// 5s-tick lag spike (reconcile_tasks fires this on every
     /// `TasksUpdated` event); now non-blocking on the main thread.
     pub(crate) fn push_task_tree_to_daemon(&self) {
-        let tasks: Vec<(String, Option<String>, Option<String>)> = self
-            .tasks
-            .iter()
-            .filter_map(|t| {
-                t.task_id.as_ref().map(|id| {
-                    (id.clone(), t.parent_task_id.clone(), t.workspace_id.clone())
-                })
-            })
-            .collect();
-        let workspaces: Vec<(String, Option<String>)> = self
+        let tasks = self.task_tree_push_entries();
+        let workspaces: Vec<(String, Option<String>, u64)> = self
             .workspaces
             .iter()
             .map(|w| {
@@ -1560,12 +1889,42 @@ impl App {
                     w.worktree_path
                         .as_ref()
                         .map(|p| p.display().to_string()),
+                    cm_daemon::org_bridge::binding_epoch(w.org.as_ref()).unwrap_or(0),
                 )
             })
             .collect();
         let hosts: Vec<cm_daemon::host_id::HostId> =
             self.hosts.hosts.iter().map(|h| h.id.clone()).collect();
         self.push_worker.push_task_tree(tasks, workspaces, hosts);
+    }
+
+    /// The `task.update_tree` rows: the sidebar's running/blocked tasks with
+    /// their workspaces, then the parent edge of every other subtask in the
+    /// last planning snapshot (done, backlog, draft, archived). The daemon's
+    /// descendant-scope checks walk this tree; pre-fix it carried only the
+    /// sidebar rows, so a finished subtask fell out of its parent's scope.
+    /// Top-level tasks outside the sidebar are left out: a task the tree
+    /// doesn't know already reads as top-level.
+    pub(crate) fn task_tree_push_entries(&self) -> Vec<(String, Option<String>, Option<String>)> {
+        let mut entries: Vec<(String, Option<String>, Option<String>)> = self
+            .tasks
+            .iter()
+            .filter_map(|t| {
+                t.task_id.as_ref().map(|id| {
+                    (id.clone(), t.parent_task_id.clone(), t.workspace_id.clone())
+                })
+            })
+            .collect();
+        let pushed: std::collections::HashSet<String> =
+            entries.iter().map(|(id, _, _)| id.clone()).collect();
+        let mut subtasks: Vec<(String, Option<String>, Option<String>)> = self
+            .planning_task_edges()
+            .filter(|(id, _)| !pushed.contains(*id))
+            .map(|(id, parent)| (id.to_string(), Some(parent.to_string()), None))
+            .collect();
+        subtasks.sort();
+        entries.extend(subtasks);
+        entries
     }
 
     /// Register a just-minted subtask with its host daemon SYNCHRONOUSLY
@@ -1589,6 +1948,7 @@ impl App {
         parent_task_id: &str,
         workspace_id: &str,
         worktree_path: Option<&std::path::Path>,
+        workspace_kind: Option<&str>,
     ) -> Result<(), String> {
         let daemon_socket = self
             .host_pool
@@ -1607,6 +1967,7 @@ impl App {
             parent_task_id,
             workspace_id,
             worktree_path,
+            workspace_kind,
         )
         .map_err(|e| e.to_string())
     }
@@ -1662,7 +2023,7 @@ impl App {
                     // for rationale. Bulk-cleanup paths (task close,
                     // workspace teardown) flow through here too.
                     if kill {
-                        Self::kill_daemon_session_if_attached(&pool, &ws.sessions[i]);
+                        Self::kill_daemon_session_for_close(&pool, &ws.sessions[i]);
                     }
                     Self::tombstone_session(ws, i);
                     ws.sessions[i].session.exited = true;
@@ -1733,9 +2094,10 @@ impl App {
                         // sessions need an explicit kill_session
                         // RPC because Drop is detach-only by
                         // design.
-                        Self::kill_daemon_session_if_attached(&pool, &ws.sessions[si]);
+                        Self::kill_daemon_session_for_close(&pool, &ws.sessions[si]);
                         Self::tombstone_session(ws, si);
                         let closed_uid = ws.sessions[si].uid.clone();
+                        let was_agent = ws.sessions[si].session_type != "bash";
                         ws.sessions.remove(si);
                         if ws.sessions.is_empty() {
                             self.cursor = Cursor::Workspace(wi);
@@ -1748,38 +2110,51 @@ impl App {
                         self.forget_reconnect_state(&closed_uid);
                         self.save_session_manifest();
                         self.set_status_msg("Session closed");
+                        if was_agent {
+                            self.after_agent_gone(wi, LastAgentClose::Owner);
+                        }
                     }
                 }
             }
             Cursor::Workspace(wi) => {
-                if let Some(ws) = self.workspaces.get_mut(wi) {
-                    if ws.sessions.len() == 1 {
-                        // Same operator-kill semantics as the
-                        // Session-cursor arm above.
-                        Self::kill_daemon_session_if_attached(&pool, &ws.sessions[0]);
-                        Self::tombstone_session(ws, 0);
-                        let closed_uid = ws.sessions[0].uid.clone();
-                        ws.sessions.remove(0);
-                        self.cursor = Cursor::Workspace(wi);
-                        // Cancel any reconnect/reattach for the closed session.
-                        self.forget_reconnect_state(&closed_uid);
-                        self.save_session_manifest();
-                        self.set_status_msg("Session closed");
+                let task = self.workspace_task(wi);
+                let Some(ws) = self.workspaces.get_mut(wi) else { return };
+                if ws.sessions.len() == 1 {
+                    // Same operator-kill semantics as the
+                    // Session-cursor arm above.
+                    Self::kill_daemon_session_for_close(&pool, &ws.sessions[0]);
+                    Self::tombstone_session(ws, 0);
+                    let closed_uid = ws.sessions[0].uid.clone();
+                    let was_agent = ws.sessions[0].session_type != "bash";
+                    ws.sessions.remove(0);
+                    self.cursor = Cursor::Workspace(wi);
+                    // Cancel any reconnect/reattach for the closed session.
+                    self.forget_reconnect_state(&closed_uid);
+                    self.save_session_manifest();
+                    self.set_status_msg("Session closed");
+                    if was_agent {
+                        self.after_agent_gone(wi, LastAgentClose::Owner);
                     }
-                }
-            }
-            Cursor::Task { ws_idx, task_id } => {
-                // Close every session belonging to the task. The task remains
-                // in the sidebar (as an empty subheader) until A-x removes it.
-                // Tombstone each so `read_session_output` keeps working.
-                if ws_idx < self.workspaces.len() {
-                    let target = task_id.clone();
-                    let removed = self.tombstone_and_remove(ws_idx, |ts| {
+                } else if ws.sessions.len() > 1 {
+                    // The workspace row stands for its task (it replaced the
+                    // task header, 2026-11-05): close every session of that
+                    // task. Shells and other tasks' sessions stay. Tombstone
+                    // each so `read_session_output` keeps working.
+                    let Some(target) = task else {
+                        self.set_status_msg(
+                            "Focus a session to close it (A-W closes the workspace)",
+                        );
+                        return;
+                    };
+                    let removed = self.tombstone_and_remove(wi, |ts| {
                         ts.task_id.as_deref() == Some(target.as_str())
                     });
                     if removed > 0 {
                         // Helper already saved the manifest.
                         self.set_status_msg(&format!("Closed {} session(s)", removed));
+                        self.after_agent_gone(wi, LastAgentClose::Owner);
+                    } else {
+                        self.set_status_msg("No session of this workspace's task to close");
                     }
                 }
             }
@@ -1791,6 +2166,12 @@ impl App {
             }
             Cursor::Section(_) => {
                 self.set_status_msg("A section has no session to close (A-x deletes the section)");
+            }
+            Cursor::Division(_) => {
+                self.set_status_msg("A division header has no session to close");
+            }
+            Cursor::Org(_) => {
+                self.set_status_msg("A team or member header has no session to close");
             }
         }
     }
@@ -1862,6 +2243,9 @@ impl App {
         idle_timeout_secs: u16,
         seed_from: Option<&str>,
         in_place: bool,
+        // The form's explicit Model; `None` = engine default.
+        model: Option<&str>,
+        effort: Option<&str>,
     ) {
         // Host-picker (A-n): the host is now an explicit per-A-n choice on the
         // form (defaulting to `active_host`), passed in as `chosen_host` —
@@ -1891,6 +2275,7 @@ impl App {
                 idle_timeout_secs,
                 seed_from,
                 in_place,
+                model, effort,
             );
             return;
         }
@@ -2015,7 +2400,10 @@ impl App {
             None,
             &active_host,
             pre_spawn_transcript.as_deref(),
+            true, // fresh A-n, including a seeded snapshot clone
             false, // global_perms
+            model,
+            effort,
         ) {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
@@ -2042,6 +2430,11 @@ impl App {
         };
 
         let ts = TerminalSession {
+            org: None,
+            model: s.spawn_model.clone(),
+            model_source: s.spawn_model_source.clone(),
+            effort: s.spawn_effort.clone(),
+            effort_source: s.spawn_effort_source.clone(),
             color: None,
             uid: session_uid,
             label: session_type.to_string(),
@@ -2082,6 +2475,7 @@ impl App {
             host_id: active_host.clone(),
         };
         let ws = Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: workspace_id_pre,
@@ -2149,6 +2543,8 @@ impl App {
         idle_timeout_secs: u16,
         seed_from: Option<&str>,
         in_place: bool,
+        model: Option<&str>,
+        effort: Option<&str>,
     ) {
         let slug = worktree::slugify(label);
         if slug.is_empty() {
@@ -2173,6 +2569,7 @@ impl App {
             uid: new_session_uid(),
             workspace_id: new_workspace_id(),
             section,
+            model: model.map(str::to_owned), effort: effort.map(str::to_owned),
         });
     }
 
@@ -2184,8 +2581,8 @@ impl App {
     /// resurrects dead sessions).
     ///
     /// A LIVE session is a forced RESTART: the daemon child is killed
-    /// (`kill_live_session_for_restart` — kill RPC + bounded reap wait),
-    /// then the same revive flow runs. The use case is picking up a new
+    /// (kill RPC + bounded reap wait, on the `restart.rs` worker), then
+    /// the same revive flow runs. The use case is picking up a new
     /// agent binary / model without losing the conversation: the old
     /// process predates the update and only a respawn-resumed replaces it.
     ///
@@ -2199,6 +2596,79 @@ impl App {
     /// `session.revive` (same-uid resumed respawn composed daemon-side)
     /// and then ride the existing deferred-reattach machinery to rebind
     /// the slot once the spawn lands.
+    /// Alt+T: move the focused Claude session's conversation to a fresh
+    /// transcript at the same session (#24). Owner asked, so the daemon
+    /// does it now rather than waiting for an idle point; the session comes
+    /// back in place.
+    /// Alt+T: ask before moving the focused Claude session to a fresh
+    /// transcript (it restarts in place), naming the session and its size.
+    pub(super) fn rotate_active_session(&mut self) {
+        let Cursor::Session(wi, si) = self.cursor.clone() else {
+            self.set_status_msg("Focus a Claude or Codex session to rotate its transcript");
+            return;
+        };
+        let Some(ts) = self.workspaces.get(wi).and_then(|w| w.sessions.get(si)) else { return };
+        if !matches!(ts.session_type.as_str(), "claude" | "codex") {
+            self.set_status_msg("Only Claude and Codex sessions rotate their transcript");
+            return;
+        }
+        if ts.session.exited {
+            self.set_status_msg("The session is not running; A-R revives it");
+            return;
+        }
+        let size = self
+            .transcript_bytes(ts)
+            .map(super::agent_state::short_size)
+            .unwrap_or_else(|| "size unknown".into());
+        let prompt = format!(
+            "Rotate '{}' ({size} transcript) now? It restarts in place, continuing from its latest \
+             compaction in a fresh transcript. [y/N]",
+            sanitize_for_display(&ts.label)
+        );
+        self.input_mode = InputMode::Confirm { prompt, action: ConfirmAction::RotateTranscript { uid: ts.uid.clone() } };
+    }
+
+    /// The confirmed Alt+T: a forced rotation (the idle and Owner-quiet waits
+    /// are skipped; anything in flight still refuses).
+    pub(super) fn rotate_session(&mut self, uid: &str) {
+        let Some(ts) = self.workspaces.iter().flat_map(|w| w.sessions.iter()).find(|s| s.uid == uid) else {
+            self.set_status_msg("Session no longer in the sidebar");
+            return;
+        };
+        let (uid, host) = (ts.uid.clone(), ts.host_id.clone());
+        let socket = match self.host_pool.for_host(&host).ok().and_then(|h| h.socket_path()) {
+            Some(socket) => socket,
+            None => {
+                self.set_status_msg(&format!("Host `{}` not reachable", host.as_str()));
+                return;
+            }
+        };
+        let token = self.host_pool.operator_token_for(&host);
+        self.set_status_msg("Moving the conversation to a fresh transcript…");
+        self.run_in_background(Some(format!("rotate:{uid}")), move || {
+            let result = crate::client_session::rpc_rotate_transcript(&socket, &token, &uid, true);
+            Box::new(move |app: &mut App| match result {
+                Ok(v) if v["armed"] == true => app.set_status_msg(&format!(
+                    "Rotation armed: it starts as soon as the current turn ends ({}); new messages wait for it",
+                    v["deferred"].as_str().unwrap_or("busy")
+                )),
+                Ok(v) => {
+                    let from = v.pointer("/rotation/from_bytes").and_then(|b| b.as_u64()).unwrap_or(0);
+                    app.set_status_msg(&format!(
+                        "Rotating ({} transcript); the session restarts in place and says so in its first message",
+                        super::agent_state::short_size(from)
+                    ));
+                }
+                // #114: a rotation already running is progress, not an error.
+                Err(e) if e.to_string().contains(super::restart::ROTATION_BUSY) => app.set_status_msg(&format!(
+                    "Already rotating: {}",
+                    super::restart::rotation_progress(&e.to_string())
+                )),
+                Err(e) => app.set_status_msg(&format!("Rotation refused: {e}")),
+            })
+        });
+    }
+
     pub(super) fn revive_active_session(&mut self) {
         let (wi, si) = match self.cursor.clone() {
             Cursor::Session(wi, si) => (wi, si),
@@ -2219,7 +2689,7 @@ impl App {
         let Some(ts) = ws.sessions.get(si) else { return };
         if ts.workflow_run_id.is_some() {
             self.set_status_msg(
-                "Workflow participant — the workflow owns its lifecycle (A-u resumes the run)",
+                "Workflow participant — the workflow owns its lifecycle (A-U resumes the run)",
             );
             return;
         }
@@ -2229,69 +2699,38 @@ impl App {
             );
             return;
         }
-        let Some(wt_path) = ws.worktree_path.clone() else {
+        // A rotation or handoff stopped it: the row only looks live (it is
+        // waiting for the respawn), so revive rather than kill, and let the
+        // daemon decide. It refuses while CM is still bringing the session
+        // back (the row then keeps waiting) and revives one the rotation or
+        // handoff left down.
+        let in_respawn_gap = self.respawning.remove(&ts.uid).is_some();
+        if ws.worktree_path.is_none() {
             self.set_status_msg("Workspace has no worktree path — can't revive");
             return;
-        };
-        // A LIVE session is a forced restart: kill the daemon child and
-        // wait for the reaper to clear the uid, then fall through to the
-        // normal dead-session revive below. Without the wait, the local
-        // live-uid probe would re-attach to the dying child and the
-        // remote `session.revive` would return Conflict (still running).
-        let was_live = !ts.session.exited;
-        if was_live && !self.kill_live_session_for_restart(wi, si) {
+        }
+        // A LIVE session is a forced restart: kill the daemon child and wait
+        // for the reaper to clear the uid, then revive. A remote revive is an
+        // RPC too. Both run on a worker (`restart.rs`), never this input
+        // thread: over a slow link they took minutes and froze every pane.
+        let was_live = !ts.session.exited && !in_respawn_gap;
+        if in_respawn_gap {
+            let uid = ts.uid.clone();
+            self.pending_remote_reattach.retain(|p| p.entry.uid != uid);
+        }
+        if was_live || ts.host_id != cm_daemon::host_id::HostId::local()
+            || matches!(ts.session_type.as_str(), "claude" | "claude-code") {
+            self.start_restart(wi, si, was_live);
             return;
         }
+        self.respawn_local_session(wi, si, false);
+    }
+
+    /// Local A-R: one-slot rerun of the startup restore. `was_live` means
+    /// the restart worker already killed the old child.
+    pub(super) fn respawn_local_session(&mut self, wi: usize, si: usize, was_live: bool) {
         let ws = &self.workspaces[wi];
         let ts = &ws.sessions[si];
-
-        let local = cm_daemon::host_id::HostId::local();
-        if ts.host_id != local {
-            // Remote: daemon-side same-uid revive, then the standard
-            // deferred-reattach flow rebinds the slot.
-            let ws_id = ws.id.clone();
-            let host_id = ts.host_id.clone();
-            let mut entry = ts.to_manifest_entry();
-            entry.last_exit = None;
-            let socket = self
-                .host_pool
-                .for_host(&host_id)
-                .ok()
-                .and_then(|h| h.socket_path());
-            let Some(socket) = socket else {
-                self.set_status_msg(&format!(
-                    "Host `{}` unreachable — can't revive",
-                    host_id.as_str(),
-                ));
-                return;
-            };
-            if let Err(e) = crate::client_session::rpc_session_revive(
-                &socket,
-                &self.host_pool.operator_token_for(&host_id),
-                &entry,
-                &ws_id,
-                &wt_path.to_string_lossy(),
-            ) {
-                self.set_status_msg(&format!("Revive failed: {e}"));
-                return;
-            }
-            {
-                let ts = &mut self.workspaces[wi].sessions[si];
-                ts.session.exited = false;
-                ts.set_status(SessionStatus::Idle);
-                ts.preserved_last_exit = None;
-            }
-            self.requeue_remote_reconnect(wi, si, "A-R revive");
-            self.save_session_manifest();
-            self.set_status_msg(&format!(
-                "Session {} on `{}` — reattaching…",
-                if was_live { "restarted" } else { "revived" },
-                host_id.as_str(),
-            ));
-            return;
-        }
-
-        // Local: one-slot rerun of the startup restore.
         let mut entry = ts.to_manifest_entry();
         entry.last_exit = None;
         let (cols, rows) = self.last_term_size;
@@ -2300,7 +2739,7 @@ impl App {
         // path, whose own RPC then surfaces the real error.
         let live_uids = self
             .host_pool
-            .for_host(&local)
+            .for_host(&cm_daemon::host_id::HostId::local())
             .ok()
             .and_then(|h| h.socket_path())
             .and_then(|socket| {
@@ -2317,6 +2756,7 @@ impl App {
         };
         match spawned {
             Some((mut fresh, outcome)) => {
+                self.revive_failed.remove(&fresh.uid);
                 // Same post-swap kick as the workflow respawn path: force
                 // the daemon PTY to the pane size so the pane repaints.
                 fresh.session.resize(cols, rows);
@@ -2335,83 +2775,22 @@ impl App {
                 });
             }
             None => {
-                self.set_status_msg(
-                    "Revive failed — could not respawn the session (see stderr log)",
-                );
+                let uid = self.workspaces[wi].sessions[si].uid.clone();
+                self.note_revive_failure(&uid, "could not respawn the session (details in the TUI log)");
             }
         }
     }
 
-    /// A-R on a LIVE session — the kill half of a forced restart.
-    /// `kill_session` SIGKILLs via pidfd and returns before the reaper
-    /// runs, so after the RPC we poll the daemon registry until the uid
-    /// is gone (the reaper's on_exit removes it); only then can the
-    /// revive flow treat the session as exited. On success the uid is
-    /// also marked in `restart_suppressed_exit_uids` so the kill's own
-    /// `ManifestDiff::Exited` broadcast — applied only after this
-    /// synchronous flow returns, when the slot already holds the revived
-    /// incarnation — doesn't stamp `preserved_last_exit` on (or prune)
-    /// the new row.
-    ///
-    /// Returns false (with a status message) when the session isn't
-    /// daemon-owned (cloud SSH / backtest-watch views have no daemon
-    /// child to kill), the kill RPC fails, or the uid doesn't clear
-    /// within the bounded wait.
-    fn kill_live_session_for_restart(&mut self, wi: usize, si: usize) -> bool {
-        let (daemon_uid, host_id) = {
-            let Some(ts) =
-                self.workspaces.get(wi).and_then(|w| w.sessions.get(si))
-            else {
-                return false;
-            };
-            let Some(uid) = ts.session.daemon_session_uid.clone() else {
-                self.set_status_msg(
-                    "Not a daemon-owned session — A-R can't force-restart it",
-                );
-                return false;
-            };
-            (uid, ts.host_id.clone())
-        };
-        let socket = self
-            .host_pool
-            .for_host(&host_id)
-            .ok()
-            .and_then(|h| h.socket_path());
-        let Some(socket) = socket else {
-            self.set_status_msg(&format!(
-                "Host `{}` unreachable — can't restart",
-                host_id.as_str(),
-            ));
-            return false;
-        };
-        let token_owned = self.host_pool.operator_token_for(&host_id);
-        let token = token_owned.as_str();
-        if let Err(e) = crate::client_session::rpc_kill_session(
-            &socket,
-            token,
-            &daemon_uid,
-        ) {
-            self.set_status_msg(&format!("Restart kill failed: {e}"));
-            return false;
-        }
-        // Bounded reap wait: SIGKILL → reaper on_exit is normally
-        // milliseconds; 2s covers a loaded box. A-R is an explicit
-        // keystroke, so briefly blocking the UI thread is acceptable
-        // (every RPC in this flow is synchronous anyway).
-        for _ in 0..40 {
-            match crate::client_session::rpc_list_session_uids(&socket, token)
-            {
-                Ok(uids) if !uids.contains(&daemon_uid) => {
-                    self.restart_suppressed_exit_uids.insert(daemon_uid);
-                    return true;
-                }
-                _ => std::thread::sleep(std::time::Duration::from_millis(50)),
-            }
-        }
-        self.set_status_msg(
-            "Killed the session but it hasn't exited yet — press A-R again",
-        );
-        false
+    /// A failed A-R keeps its row: exit prunes skip it, the row shows
+    /// `✗ revive failed`, and the error stays in the status line. Pre-fix a
+    /// forced restart whose revive failed (its worktree had been deleted)
+    /// lost the row to the next exit prune and the error to a transient
+    /// status line Owner never saw (2026-10-08).
+    pub(super) fn note_revive_failure(&mut self, uid: &str, error: &str) {
+        eprintln!("cm-tui: revive of {uid} failed: {error}");
+        self.revive_failed.insert(uid.to_owned(), error.to_owned());
+        self.set_status_msg(&format!("Revive failed: {error} — the row is kept; fix and press A-R again"));
+        self.needs_redraw = true;
     }
 
     pub(super) fn attach_active(&mut self) {
@@ -2523,7 +2902,10 @@ impl App {
                     // attach_active is a fresh spawn — post-spawn
                     // detector will discover the transcript path.
                     None,
+                    true, // fresh attach-active agent spawn
                     false, // global_perms
+                    None,
+                    None,
                 ) {
                     Some(Ok(s)) => Some(make_simple_session_with_uid(
                         session_uid,
@@ -2658,6 +3040,7 @@ impl App {
             Some(i) => i,
             None => {
                 let ws = Workspace {
+                    org: None,
                     color: None,
                     pinned: false,
                     id: new_workspace_id(),
@@ -2687,8 +3070,8 @@ impl App {
     }
 
     /// Spawn a session on an existing workspace by type ("claude" / "codex" / "bash").
-    /// If `task_id` is Some, the new session is tagged with that task so it
-    /// appears under the corresponding task subheader.
+    /// If `task_id` is Some, the new session is tagged with that task (it
+    /// shows under its workspace like any other session).
     pub(super) fn spawn_session_on_workspace(
         &mut self,
         workspace_id: &str,
@@ -2696,6 +3079,9 @@ impl App {
         task_id: Option<String>,
         seed_from: Option<&str>,
         resume_from: Option<&str>,
+        // The form's Model field; `None` = task default, else engine default.
+        model: Option<&str>,
+        effort: Option<&str>,
     ) {
         // Host is a property of the WORKSPACE, not the global active_host
         // (which only seeds NEW workspaces). The spawn host is resolved and
@@ -2775,6 +3161,7 @@ impl App {
                 task_id,
                 seed_from,
                 resume_from,
+                model, effort,
             );
             return;
         }
@@ -2889,7 +3276,10 @@ impl App {
             None,
             &spawn_host,
             pre_spawn_transcript.as_deref(),
+            true, // fresh A-s agent spawn, including a seeded clone
             false, // global_perms
+            model,
+            effort,
         ) {
             Some(Ok(s)) => Ok(s),
             Some(Err(e)) => {
@@ -2991,63 +3381,52 @@ impl App {
         task_id: Option<String>,
         seed_from: Option<&str>,
         resume_from: Option<&str>,
+        model: Option<&str>,
+        effort: Option<&str>,
     ) {
-        let socket = match self
-            .host_pool
-            .for_host(host)
-            .ok()
-            .and_then(|h| h.socket_path())
-        {
-            Some(s) => s,
-            None => {
-                self.set_status_msg(&format!(
-                    "Remote host `{}` not reachable (no live socket)",
-                    host.as_str()
-                ));
-                return;
-            }
-        };
-
+        // An unconfigured host fails now. Warming its tunnel, the add RPC
+        // and the attach run on a worker (`restart.rs`): over a slow link
+        // they held keyboard input to every pane.
+        if let Err(e) = self.host_pool.for_host(host) {
+            self.set_status_msg(&format!("Remote host `{}` not reachable ({e})", host.as_str()));
+            return;
+        }
         let (cols, rows) = self.last_term_size;
-        let workspace_id = self.workspaces[ws_index].id.clone();
-        let session_uid = new_session_uid();
-        let op_token_owned = self.host_pool.operator_token_for(host);
-        let op_token = op_token_owned.as_str();
-        // Daemon WIRE engine ("claude" → "claude-code").
-        let wire_engine = match session_type {
-            "claude" => "claude-code",
-            other => other,
-        };
-
-        let res = match crate::client_session::rpc_add_session_with_resume(
-            &socket,
-            op_token,
-            &session_uid,
-            &workspace_id,
-            session_type,
-            wire_engine,
-            task_id.as_deref(),
+        self.start_remote_add(super::restart::RemoteAdd {
+            host: host.clone(),
+            workspace_id: self.workspaces[ws_index].id.clone(),
+            uid: new_session_uid(),
+            session_type: session_type.to_owned(),
+            task_id,
+            seed_from: seed_from.map(str::to_owned),
+            resume_from: resume_from.map(str::to_owned),
+            model: model.map(str::to_owned), effort: effort.map(str::to_owned),
             cols,
             rows,
-            resume_from,
-            seed_from,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                self.set_status_msg(&format!("Remote add_session failed: {}", e));
-                return;
-            }
-        };
+        });
+    }
 
+    /// The UI-thread half of remote A-s: bind the attached session (or
+    /// queue the reattach of a resumed one) into its workspace.
+    pub(super) fn finish_remote_add(
+        &mut self,
+        job: super::restart::RemoteAdd,
+        res: crate::client_session::AddSessionResult,
+        restored_entry: Option<cm_daemon::manifest::ManifestEntry>,
+        session: Result<Session, String>,
+    ) {
+        let host = &job.host;
+        let session_type = job.session_type.as_str();
         // The original identity may belong to another workspace/task. A picker
         // selection must not reparent it to the row that opened the dialog.
-        let workspace_id = res.workspace_id.clone().unwrap_or(workspace_id);
+        let workspace_id = res.workspace_id.clone().unwrap_or_else(|| job.workspace_id.clone());
         let ws_index = match self.workspaces.iter().position(|w| w.id == workspace_id && w.host_id == *host) {
             Some(i) => i,
             None => {
                 let i = self.workspaces.len();
                 let path = PathBuf::from(&res.worktree_path);
                 self.workspaces.push(Workspace {
+                    org: None,
                     id: workspace_id.clone(),
                     name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| workspace_id.clone()),
                     worktree_path: Some(path), host_id: host.clone(),
@@ -3058,71 +3437,35 @@ impl App {
                 i
             }
         };
-        let mut restored_entry = res.entry;
-        if let Some(e) = restored_entry.as_mut() {
-            e.host_id = host.clone();
-            e.session_type = normalize_session_type_to_internal(&e.session_type).to_string();
-        }
-        let task_id = restored_entry.as_ref().map(|e| e.task_id.clone()).unwrap_or(task_id);
-        let label = restored_entry.as_ref().map(|e| e.label.as_str()).unwrap_or(session_type);
-        let worktree_path = PathBuf::from(&res.worktree_path);
-        let session = match try_attach_via_daemon_with_deps(
-            &self.host_pool,
-            &res.session_uid,
-            &workspace_id,
-            &worktree_path,
-            session_type,
-            label,
-            cols,
-            rows,
-            task_id.as_deref(),
-            restored_entry.as_ref().and_then(|e| e.workflow_run_id.as_deref()),
-            restored_entry.as_ref().and_then(|e| e.workflow_role.as_deref()),
-            host,
-            None,
-        ) {
+        let session = match session {
             Ok(s) => s,
             Err(e) => {
-                if resume_from.is_some() {
-                    self.set_status_msg(&format!("Session resumed; attach will retry: {}", e));
-                    if let Some(entry) = restored_entry {
-                        self.forget_reconnect_state(&entry.uid);
-                        self.pending_remote_reattach.push(super::remote::PendingRemoteReattach::new(workspace_id.clone(), entry.clone()));
-                        self.skipped_manifest_entries.entry(workspace_id.clone()).or_default().push(entry);
-                        self.workspaces[ws_index].is_closed = false;
-                    }
-                    self.save_session_manifest();
-                    return;
+                // Only a resume reaches here: the worker kills a fresh
+                // session whose attach failed.
+                self.set_status_msg(&format!("Session resumed; attach will retry: {}", e));
+                if let Some(entry) = restored_entry {
+                    self.forget_reconnect_state(&entry.uid);
+                    self.pending_remote_reattach.push(super::remote::PendingRemoteReattach::new(workspace_id.clone(), entry.clone()));
+                    self.skipped_manifest_entries.entry(workspace_id.clone()).or_default().push(entry);
+                    self.workspaces[ws_index].is_closed = false;
                 }
-                // The daemon already started the session into the existing
-                // worktree. Mirror `ClientSession::new`'s cleanup contract:
-                // best-effort kill before bubbling so we don't leak a live,
-                // headless, unattached session on the remote host. Log the
-                // cleanup error separately; the original attach error wins.
-                if let Err(cleanup_err) = crate::client_session::rpc_kill_session(
-                    &socket,
-                    op_token,
-                    &res.session_uid,
-                ) {
-                    eprintln!(
-                        "add_remote_session cleanup: kill_session({}) failed \
-                         after attach error: {}",
-                        res.session_uid, cleanup_err,
-                    );
-                }
-                self.set_status_msg(&format!("Remote attach failed: {}", e));
+                self.save_session_manifest();
                 return;
             }
         };
-
+        let task_id = restored_entry.as_ref().map(|e| e.task_id.clone()).unwrap_or(job.task_id.clone());
         let ts = if let Some(entry) = restored_entry {
             Self::build_remote_terminal_session(&entry, session)
         } else {
             let mut ts = make_simple_session_with_uid(res.session_uid, session_type, session_type, session, None);
             ts.task_id = task_id;
-            ts.transcript_id = if session_type == "claude" || seed_from.is_none() { res.resume_id } else { None };
-            ts.seeded_from_snapshot = seed_from.map(str::to_owned);
+            ts.transcript_id = if session_type == "claude" || job.seed_from.is_none() { res.resume_id } else { None };
+            ts.seeded_from_snapshot = job.seed_from.clone();
             ts.host_id = host.clone();
+            ts.model = res.model.clone();
+            ts.model_source = res.model_source.clone();
+            ts.effort = res.effort.clone();
+            ts.effort_source = res.effort_source.clone();
             ts
         };
         self.workspaces[ws_index].is_closed = false;
@@ -3140,23 +3483,28 @@ impl App {
         self.workspaces[ws_index].sessions.push(ts);
         self.cursor = Cursor::Session(ws_index, si);
         self.save_session_manifest();
-        let action = if resume_from.is_some() { "Resumed" } else { "Started" };
+        let action = if job.resume_from.is_some() { "Resumed" } else { "Started" };
         self.set_status_msg(&format!("{} {} on `{}`", action, label, host.as_str()));
     }
 
-    /// Mark the first task bound to the active workspace as done via the API.
-    /// Does nothing if the workspace has zero or multiple bound tasks (ambiguous).
+    /// Mark the task of the cursor's row done via the API: a session's
+    /// task, or on a workspace row the workspace's task. Refuses when
+    /// several unrelated tasks share the workspace (ambiguous).
     pub(super) fn mark_active_done(&mut self) {
+        let task = self.cursor_scope_task_id();
+        self.mark_done_in_workspace(task);
+    }
+
+    /// [`App::mark_active_done`] for an explicit task of the cursor's
+    /// workspace (the A-d cleanup dialog's choice); `None` resolves it
+    /// from the workspace's bound tasks.
+    pub(super) fn mark_done_in_workspace(&mut self, scoped_tid: Option<String>) {
         let Some(wi) = self.active_workspace_index() else {
             return;
         };
 
-        // Task-scoped: if the cursor is on a task header, or on a session
-        // tagged with a task, mark THAT task done (and close only its
-        // sessions). If the cursor is workspace-scoped, fall back to the
-        // old "single bound task" logic.
-        let scoped_tid = self.cursor_task_id();
-
+        // Task-scoped: mark THAT task done (and close only its sessions).
+        // Otherwise fall back to the workspace's single bound task.
         let ws_id = self.workspaces[wi].id.clone();
         let tid = match scoped_tid {
             Some(t) => t,
@@ -3168,7 +3516,9 @@ impl App {
                     .filter_map(|t| t.task_id.clone())
                     .collect();
                 if bound.len() > 1 {
-                    self.set_status_msg("Multiple tasks bound — pick one (A-d on its header)");
+                    self.set_status_msg(
+                        "Several tasks share this workspace — A-D on one of their sessions",
+                    );
                     return;
                 }
                 match bound.into_iter().next() {
@@ -3206,9 +3556,12 @@ impl App {
         // workspace-level sessions in the same workspace stay running.
         // Tombstone each so post-done `read_session_output` keeps working.
         // Helper persists the manifest before returning.
+        // A member's assistant is only unassigned, never closed (O5,
+        // doc/org-model.md §4.3); read from its row's stamp so the input
+        // thread never waits on a daemon.
         let target = tid.clone();
         self.tombstone_and_remove(wi, |ts| {
-            ts.task_id.as_deref() == Some(target.as_str())
+            ts.task_id.as_deref() == Some(target.as_str()) && !is_open_assistant_row(ts)
         });
         // Spent-workspace cleanup is no longer a per-site call here: the
         // task was just marked Done locally, so `is_past_workspace` hides
@@ -3224,7 +3577,7 @@ impl App {
     /// P1 (Feature 3), hoisted: soft-close every "spent" workspace so none
     /// lingers after its work finishes. Originally this ran as per-site
     /// `maybe_reap_spent_workspace(wi)` calls at two specific teardown sites
-    /// (A-d `mark_active_done`, the manifest `Exited`-diff prune) — every
+    /// (A-D `mark_active_done`, the manifest `Exited`-diff prune) — every
     /// other way a session could end (daemon-side kills seen only as attach
     /// EOF, exits missed while the TUI was down or the tunnel disconnected,
     /// a task flipping terminal AFTER its sessions were already gone, an
@@ -3260,6 +3613,203 @@ impl App {
         attach_pending
             .extend(self.attaching.values().map(|p| p.ws_id().to_string()));
         attach_pending
+    }
+
+    /// Owner rule (2026-11-05): a workspace whose last Claude/Codex session
+    /// is gone closes, unless a bash pane in it is running something. An
+    /// Owner A-w close of that agent asks first (`ConfirmAction::
+    /// CloseAfterLastAgent`); an agent's kill closes it straight away.
+    /// Pre-fix a leftover idle bash pane counted as a session and pinned
+    /// the workspace on the sidebar indefinitely.
+    pub(crate) fn after_agent_gone(&mut self, wi: usize, trigger: LastAgentClose) {
+        let Some(ws) = self.workspaces.get(wi) else { return };
+        if !self.last_agent_gone(ws) {
+            return;
+        }
+        match trigger {
+            LastAgentClose::Owner => {
+                if matches!(self.input_mode, InputMode::Normal) {
+                    self.input_mode = InputMode::Confirm {
+                        prompt: format!(
+                            "Close workspace \"{}\" too? Idle bash panes close with it.",
+                            ws.name,
+                        ),
+                        action: ConfirmAction::CloseAfterLastAgent { ws_id: ws.id.clone() },
+                    };
+                }
+            }
+            LastAgentClose::AgentKill => {
+                let focused = matches!(self.cursor, Cursor::Workspace(c) | Cursor::Session(c, _) if c == wi);
+                if !focused && !self.user_reopened.contains(&ws.id) {
+                    let id = ws.id.clone();
+                    self.check_and_close_workspace(&id, trigger);
+                }
+            }
+        }
+    }
+
+    /// No live agent left and nothing that respawns its own sessions:
+    /// every row is a bash pane or an exited agent; not pinned, not a cloud
+    /// worker, no workflow or continuous session.
+    fn last_agent_gone(&self, ws: &Workspace) -> bool {
+        !ws.is_closed && !ws.is_cloud && !ws.pinned
+            && ws.sessions.iter().all(|ts| {
+                ts.workflow_run_id.is_none()
+                    && ts.continuous_task_id.is_none()
+                    && (ts.session_type == "bash" || ts.session.exited || ts.preserved_last_exit.is_some())
+            })
+            && !self.tasks.iter().any(|t| t.workspace_id.as_deref() == Some(ws.id.as_str()) && t.is_continuous)
+    }
+
+    /// The one-time startup offer behind `bash_sweep_due`: list workspaces
+    /// that once had an agent (a closed agent session or a bound task), have
+    /// none live now, and still hold bash panes, and ask Owner once to close
+    /// them. Each yes goes through `check_and_close_workspace`, so a busy
+    /// pane still keeps its workspace.
+    pub(crate) fn maybe_offer_bash_only_sweep(&mut self) {
+        if !self.bash_sweep_due.is_some_and(|due| Instant::now() >= due)
+            || !matches!(self.input_mode, InputMode::Normal)
+            || !self.attach_pending_ws_ids().is_empty()
+        {
+            return;
+        }
+        self.bash_sweep_due = None;
+        let marker = bash_sweep_marker();
+        if let Err(e) = std::fs::write(&marker, b"asked\n") {
+            eprintln!("cm-tui: bash-only sweep marker {} not written: {e}", marker.display());
+        }
+        let ws_ids = self.bash_only_workspaces();
+        if ws_ids.is_empty() {
+            return;
+        }
+        self.input_mode = InputMode::Confirm {
+            prompt: format!(
+                "Close {} workspace{} whose agents are gone and that hold only bash panes? \
+                 A pane running something keeps its workspace. (Asked once.)",
+                ws_ids.len(),
+                if ws_ids.len() == 1 { "" } else { "s" },
+            ),
+            action: ConfirmAction::CloseBashOnlyWorkspaces { ws_ids },
+        };
+    }
+
+    pub(crate) fn bash_only_workspaces(&self) -> Vec<String> {
+        self.workspaces
+            .iter()
+            .filter(|ws| {
+                self.last_agent_gone(ws)
+                    && ws.sessions.iter().any(|ts| ts.session_type == "bash" && !ts.session.exited)
+                    && (ws.sessions.iter().any(|ts| ts.session_type != "bash")
+                        || ws.tombstones.iter().any(|t| t.session_type != "bash")
+                        || self.tasks.iter().any(|t| t.workspace_id.as_deref() == Some(ws.id.as_str())))
+            })
+            .map(|ws| ws.id.clone())
+            .collect()
+    }
+
+    /// Ask each remaining pane's daemon whether it is busy (off the input
+    /// thread), then close in `drain_last_agent_closes`. Every row goes in
+    /// the question, agents too, so a row the viewer thinks exited but the
+    /// daemon still runs keeps the workspace open.
+    pub(crate) fn check_and_close_workspace(&mut self, ws_id: &str, trigger: LastAgentClose) {
+        let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id) else { return };
+        let mut by_host: HashMap<crate::hosts::HostId, Vec<String>> = HashMap::new();
+        for ts in &ws.sessions {
+            if ts.session.exited {
+                continue;
+            }
+            match ts.session.daemon_session_uid.clone() {
+                Some(uid) => by_host.entry(ts.host_id.clone()).or_default().push(uid),
+                None => {
+                    // A viewer-local pane has no daemon to ask: keep it.
+                    let verdict = LastAgentVerdict {
+                        ws_id: ws_id.to_string(),
+                        trigger,
+                        checked: Vec::new(),
+                        busy: Err(format!("{} is a viewer-local pane", ts.label)),
+                    };
+                    let _ = self.last_agent_close_tx.send(verdict);
+                    return;
+                }
+            }
+        }
+        let tx = self.last_agent_close_tx.clone();
+        let pool = std::sync::Arc::clone(&self.host_pool);
+        let ws_id = ws_id.to_string();
+        let ask = move || -> Result<(Vec<String>, Vec<(String, String)>), String> {
+            let mut checked = Vec::new();
+            let mut busy = Vec::new();
+            for (host, uids) in by_host {
+                let socket = pool.for_host(&host).ok().and_then(|h| h.socket_path())
+                    .ok_or_else(|| format!("host {} is not reachable", host.as_str()))?;
+                let shells = crate::client_session::rpc_shell_busy(&socket, &pool.operator_token_for(&host), &uids)
+                    .map_err(|e| format!("host {}: {e}", host.as_str()))?;
+                for uid in uids {
+                    let row = shells.get(&uid);
+                    // A uid missing from the answer is not known to be idle.
+                    if row.and_then(|r| r["busy"].as_bool()).unwrap_or(true) {
+                        let command = row.and_then(|r| r["command"].as_str()).unwrap_or("unknown");
+                        busy.push((uid.clone(), command.to_string()));
+                    }
+                    checked.push(uid);
+                }
+            }
+            Ok((checked, busy))
+        };
+        let spawned = std::thread::Builder::new().name("cm-last-agent-close".into()).spawn({
+            let tx = tx.clone();
+            let ws_id = ws_id.clone();
+            move || {
+                let (checked, busy) = match ask() {
+                    Ok((c, b)) => (c, Ok(b)),
+                    Err(e) => (Vec::new(), Err(e)),
+                };
+                let _ = tx.send(LastAgentVerdict { ws_id, trigger, checked, busy });
+            }
+        });
+        if spawned.is_err() {
+            let _ = tx.send(LastAgentVerdict { ws_id, trigger, checked: Vec::new(), busy: Err("no thread".into()) });
+        }
+    }
+
+    /// Apply the answers from `check_and_close_workspace`. The workspace is
+    /// re-checked: a new agent, a new pane the daemon was not asked about,
+    /// or a busy pane keeps it open; Owner hears why when they asked.
+    pub(crate) fn drain_last_agent_closes(&mut self) {
+        while let Ok(v) = self.last_agent_close_rx.try_recv() {
+            let Some(wi) = self.workspaces.iter().position(|w| w.id == v.ws_id) else { continue };
+            let ws = &self.workspaces[wi];
+            let name = ws.name.clone();
+            let unasked = ws.sessions.iter().any(|ts| {
+                !ts.session.exited
+                    && ts.session.daemon_session_uid.as_ref().is_some_and(|u| !v.checked.contains(u))
+            });
+            let kept = match (&v.busy, self.last_agent_gone(ws), unasked) {
+                (Err(e), ..) => Some(format!("couldn't check its bash panes ({e})")),
+                (_, false, _) | (_, _, true) => Some("it has a new session".to_string()),
+                (Ok(busy), ..) => busy.first().map(|(uid, command)| {
+                    let label = ws.sessions.iter().find(|ts| ts.session.daemon_session_uid.as_deref() == Some(uid.as_str()))
+                        .map_or(uid.as_str(), |ts| ts.label.as_str());
+                    format!("{label} is running {command}")
+                }),
+            };
+            if let Some(why) = kept {
+                eprintln!("cm-tui: kept workspace `{name}` open after its last agent went: {why}");
+                if v.trigger == LastAgentClose::Owner {
+                    self.set_status_msg(&format!("Kept \"{name}\" open: {why}"));
+                }
+                continue;
+            }
+            self.tombstone_and_remove(wi, |_| true);
+            let ws = &mut self.workspaces[wi];
+            ws.is_closed = true;
+            self.user_reopened.remove(&v.ws_id);
+            self.save_session_manifest();
+            self.clamp_cursor();
+            self.needs_redraw = true;
+            eprintln!("cm-tui: closed workspace `{name}` — its last agent is gone");
+            self.set_status_msg(&format!("Closed \"{name}\": its last agent is gone (A-O reopens)"));
+        }
     }
 
     /// Kill-time close for an adoption-created agent workspace: the
@@ -3304,6 +3854,7 @@ impl App {
 
     fn agent_workspace_can_close(&self, ws: &Workspace) -> bool {
         !ws.is_closed && !ws.is_cloud && !ws.pinned && ws.sessions.is_empty()
+            && !self.user_reopened.contains(&ws.id)
             && (self.auto_close_workspaces.contains(&ws.id) || ws.name.starts_with("agent: "))
     }
 
@@ -3320,9 +3871,8 @@ impl App {
         // which is reaped as soon as they navigate away.
         let cursor_wi = match &self.cursor {
             Cursor::Workspace(wi) | Cursor::Session(wi, _) => *wi,
-            Cursor::Task { ws_idx, .. } => *ws_idx,
             // Not on any workspace — nothing to exempt from the sweep.
-            Cursor::Backtest(_) | Cursor::Section(_) => usize::MAX,
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => usize::MAX,
         };
 
         let mut changed = false;
@@ -3331,7 +3881,7 @@ impl App {
                 continue;
             }
             let ws = &self.workspaces[wi];
-            if attach_pending.contains(ws.id.as_str()) {
+            if attach_pending.contains(ws.id.as_str()) || self.user_reopened.contains(&ws.id) {
                 continue;
             }
             if self.agent_workspace_can_close(ws) || Self::workspace_is_spent(ws, &self.tasks) {
@@ -3414,10 +3964,11 @@ impl App {
     }
 
     /// Delete whatever the cursor resolves to:
-    ///   - Cursor::Task → delete just that task (close its sessions, remove
-    ///     from backend + local TaskEntry). The workspace, worktree, and any
-    ///     other tasks / workspace-level sessions survive.
-    ///   - Cursor::Session on a task-tagged session → same as Cursor::Task.
+    ///   - Cursor::Session on a task-tagged session → delete just that task
+    ///     (close its sessions, remove from backend + local TaskEntry). The
+    ///     workspace, worktree, and any other tasks / workspace-level
+    ///     sessions survive. (The task header that also did this is gone,
+    ///     2026-11-05.)
     ///   - Otherwise → delete the whole workspace: close sessions, remove
     ///     worktree + branch, delete any bound tasks from the API.
     pub(super) fn delete_active(&mut self) {
@@ -3525,7 +4076,7 @@ impl App {
             .map(|ts| ts.uid.clone())
             .collect();
         for ts in &self.workspaces[wi].sessions {
-            Self::kill_daemon_session_if_attached(&pool, ts);
+            Self::kill_daemon_session_for_close(&pool, ts);
         }
         self.workspaces.remove(wi);
         // Cancel reconnect/reattach for every session in the deleted
@@ -3541,7 +4092,8 @@ impl App {
         self.set_status_msg("Deleted");
     }
 
-    /// Launch a task from the planning view.
+    /// Launch a task-bound session in a new workspace: the A-n "Reports
+    /// to" path (app/reports_to.rs). Planning never launches (O7).
     pub(super) fn launch_from_plan(
         &mut self,
         project: &str,
@@ -3561,12 +4113,16 @@ impl App {
         // sentinel: run in the main repo in-place (no worktree, no
         // `cm/<slug>` branch).
         in_place: bool,
-        // Agent engine picked in the launch dialog — internal
+        // Agent engine picked in the A-n dialog — internal
         // session-type vocabulary ("claude" | "codex"). Defaults to
-        // "codex" in the UI; never "bash" (a planning launch always
+        // "codex" in the UI; never "bash" (a task-bound launch always
         // delivers the task prompt to an agent).
         engine: &str,
         chosen_host: &cm_daemon::host_id::HostId,
+        // The dialog's explicit Model; `None` = the task default, else the
+        // engine default.
+        model: Option<&str>,
+        effort: Option<&str>,
     ) {
         let active_host = chosen_host.clone();
         let repo_url = match self.config.repos.get(project) {
@@ -3585,6 +4141,7 @@ impl App {
             in_place, engine: engine.into(), host: active_host.clone(),
             repo_url: repo_url.clone(), uid: session_uid.clone(),
             workspace_id: workspace_id_pre.clone(), start_branch: start_branch.map(str::to_owned),
+            model: model.map(str::to_owned), effort: effort.map(str::to_owned),
         };
         if active_host != cm_daemon::host_id::HostId::local() {
             self.start_remote_plan_launch(spec);
@@ -3652,7 +4209,10 @@ impl App {
             // launch_from_plan is a fresh spawn — post-spawn
             // detector will discover the transcript path.
             None,
+            true, // fresh plan-launched agent
             false, // global_perms
+            model,
+            effort,
         ) {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
@@ -3674,6 +4234,7 @@ impl App {
             session: new_sess,
             pending: Some(pending),
             remote_branch: None,
+            model: None, effort: None,
         });
     }
 
@@ -3683,7 +4244,7 @@ impl App {
         prepared: super::plan_launch::PreparedPlanLaunch,
     ) {
         let super::plan_launch::PreparedPlanLaunch {
-            main_repo, worktree_path, session: new_sess, pending, remote_branch,
+            main_repo, worktree_path, session: new_sess, pending, remote_branch, model, effort,
         } = prepared;
         let project = spec.project.as_str();
         let slug = spec.slug.as_str();
@@ -3718,6 +4279,12 @@ impl App {
         );
         ts.task_id = Some(task_id.to_string());
         ts.host_id = active_host.clone();
+        if model.is_some() {
+            ts.model = model;
+        }
+        if effort.is_some() {
+            ts.effort = effort;
+        }
         if !prompt.trim().is_empty() {
             ts.pending_prompt = Some(PendingWrite::wait_for_quiet(
                 prompt.to_string(),
@@ -3729,6 +4296,7 @@ impl App {
         }
 
         let ws = Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: workspace_id_pre,
@@ -3827,52 +4395,87 @@ impl App {
     /// and cloud workspaces (those have no worktree to share).
     /// Explicit cross-host launches create a separate checkout and session.
     /// No files, task binding, or running conversation are moved by this action.
-    pub(super) fn new_workspace_on_host(&mut self, source_id: &str, host: &cm_daemon::host_id::HostId, engine: &str, seed_from: Option<&str>) -> Option<String> {
-        let source = self.workspaces.iter().find(|ws| ws.id == source_id)?;
+    /// The create RPC (it provisions a checkout) and the attach run on a
+    /// worker (`background.rs`); `then` runs with the new workspace id once
+    /// it is in the sidebar (A-f uses it to launch the workflow there).
+    pub(super) fn new_workspace_on_host(
+        &mut self,
+        source_id: &str,
+        host: &cm_daemon::host_id::HostId,
+        engine: &str,
+        seed_from: Option<&str>,
+        then: Option<Box<dyn FnOnce(&mut App, String) + Send>>,
+        // Explicit model and effort; `None` = the host's defaults.
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) {
+        let Some(source) = self.workspaces.iter().find(|ws| ws.id == source_id) else { return };
         let Some(repo) = source.repo_url.clone() else {
-            self.set_status_msg("Workspace has no repository configured"); return None;
+            self.set_status_msg("Workspace has no repository configured"); return;
         };
         let name = format!("{}-{}", source.name, host);
         let section = self.workspace_sections.get(source_id).cloned();
         let uid = new_session_uid();
         let ws_id = new_workspace_id();
         let slug = format!("{}-{}", worktree::slugify(&name), ws_id.trim_start_matches("ws-"));
-        let Some(socket) = self.host_pool.live_socket_path(host) else {
-            self.set_status_msg(&format!("Host `{}` is unavailable", host)); return None;
-        };
-        let token = self.host_pool.operator_token_for(host);
         let (cols, rows) = self.last_term_size;
-        let result = match crate::client_session::rpc_create_session_with_options(&socket, &token,
-            &uid, &ws_id, engine, if engine == "claude" { "claude-code" } else { engine },
-            &repo, None, &slug, None, cols, rows, false, seed_from) {
-            Ok(result) => result,
-            Err(e) => { self.set_status_msg(&format!("New workspace: {}", e)); return None; }
-        };
-        let path = PathBuf::from(&result.worktree_path);
-        let session = match try_attach_via_daemon_with_deps(&self.host_pool, &uid, &ws_id,
-            &path, engine, engine, cols, rows, None, None, None, host, None) {
-            Ok(session) => session,
-            Err(e) => {
-                let _ = crate::client_session::rpc_kill_session(&socket, &token, &uid);
-                self.set_status_msg(&format!("Attach: {}", e)); return None;
-            }
-        };
-        let mut ts = make_simple_session_with_uid(uid, engine, engine, session, None);
-        ts.host_id = host.clone();
-        ts.seeded_from_snapshot = seed_from.map(str::to_owned);
-        if engine == "claude" { ts.transcript_id = result.resume_id; }
-        let wi = self.workspaces.len();
-        self.workspaces.push(Workspace {
-            id: ws_id.clone(), name, color: None, pinned: false, is_closed: false,
-            is_cloud: false, repo_url: Some(repo), worktree_path: Some(path),
-            main_repo_path: result.main_repo_path.map(PathBuf::from), worker_vm: None,
-            worker_zone: None, host_id: host.clone(), sessions: vec![ts], tombstones: vec![],
+        let pool = std::sync::Arc::clone(&self.host_pool);
+        let host = host.clone();
+        let engine = engine.to_owned();
+        let seed_from = seed_from.map(str::to_owned);
+        let model = model.map(str::to_owned);
+        let effort = effort.map(str::to_owned);
+        let started = self.run_in_background(Some(format!("new_workspace:{source_id}:{host}")), move || {
+            let fail = |msg: String| -> super::background::Apply { Box::new(move |app: &mut App| app.set_status_msg(&msg)) };
+            let Some(socket) = pool.live_socket_path(&host) else {
+                return fail(format!("Host `{}` is unavailable", host));
+            };
+            let token = pool.operator_token_for(&host);
+            let result = match crate::client_session::rpc_create_session_with_options(&socket, &token,
+                &uid, &ws_id, &engine, if engine == "claude" { "claude-code" } else { &engine },
+                &repo, None, &slug, None, cols, rows, false, seed_from.as_deref(), model.as_deref(),
+                effort.as_deref()) {
+                Ok(result) => result,
+                Err(e) => return fail(format!("New workspace: {}", e)),
+            };
+            let path = PathBuf::from(&result.worktree_path);
+            let session = match try_attach_via_daemon_with_deps(&pool, &uid, &ws_id,
+                &path, &engine, &engine, cols, rows, None, None, None, &host, None) {
+                Ok(session) => session,
+                Err(e) => {
+                    let _ = crate::client_session::rpc_kill_session(&socket, &token, &uid);
+                    return fail(format!("Attach: {}", e));
+                }
+            };
+            Box::new(move |app: &mut App| {
+                let mut ts = make_simple_session_with_uid(uid, &engine, &engine, session, None);
+                ts.host_id = host.clone();
+                ts.seeded_from_snapshot = seed_from;
+                ts.model = result.model;
+                ts.model_source = result.model_source;
+                ts.effort = result.effort;
+                ts.effort_source = result.effort_source;
+                if engine == "claude" { ts.transcript_id = result.resume_id; }
+                let wi = app.workspaces.len();
+                app.workspaces.push(Workspace {
+                    org: None,
+                    id: ws_id.clone(), name, color: None, pinned: false, is_closed: false,
+                    is_cloud: false, repo_url: Some(repo), worktree_path: Some(path),
+                    main_repo_path: result.main_repo_path.map(PathBuf::from), worker_vm: None,
+                    worker_zone: None, host_id: host.clone(), sessions: vec![ts], tombstones: vec![],
+                });
+                if let Some(section) = section { app.workspace_sections.insert(ws_id.clone(), section); }
+                app.cursor = Cursor::Session(wi, 0);
+                app.save_session_manifest();
+                app.set_status_msg(&format!("Created new workspace on {}", host));
+                if let Some(then) = then {
+                    then(app, ws_id);
+                }
+            })
         });
-        if let Some(section) = section { self.workspace_sections.insert(ws_id.clone(), section); }
-        self.cursor = Cursor::Session(wi, 0);
-        self.save_session_manifest();
-        self.set_status_msg(&format!("Created new workspace on {}", host));
-        Some(ws_id)
+        if started {
+            self.set_status_msg("Creating the workspace…");
+        }
     }
 
     pub(super) fn alternate_form_host(&self, workspace_id: &str) -> Option<cm_daemon::host_id::HostId> {
@@ -3890,182 +4493,6 @@ impl App {
 
     pub(super) fn default_launch_host(&self) -> cm_daemon::host_id::HostId {
         self.hosts.default_host().expect("validated hosts config").id.clone()
-    }
-
-    pub(super) fn collect_workspace_candidates(&self) -> Vec<WorkspaceCandidate> {
-        self.workspaces
-            .iter()
-            .filter(|w| !w.is_closed && w.worktree_path.is_some())
-            .map(|w| WorkspaceCandidate {
-                workspace_id: w.id.clone(),
-                name: w.name.clone(),
-                repo_url: w.repo_url.clone(),
-            })
-            .collect()
-    }
-
-    /// Spawn a new agent session (`engine`: claude | codex) in an existing
-    /// workspace and bind the given task to it. No new worktree — the
-    /// workspace already has one.
-    pub(super) fn launch_into_workspace(
-        &mut self,
-        workspace_id: &str,
-        task_id: &str,
-        task_title: &str,
-        task_repo_url: &str,
-        project: &str,
-        prompt: &str,
-        // Sub-2a Finding #2: parent edge from the planning row.
-        // See `launch_from_plan` for the full backstory.
-        parent_task_id: Option<&str>,
-        // Agent engine picked in the workspace picker — internal
-        // session-type vocabulary ("claude" | "codex").
-        engine: &str,
-    ) {
-        // Planning A-l into an existing workspace → use THAT workspace's host
-        // (not the global active_host — the old read mistagged a session when
-        // the global differed from the workspace's worktree host). The guard
-        // then correctly fail-fasts on a remote workspace (TUI-initiated remote
-        // launch isn't supported yet — local-only paths can't be sent remote).
-        let active_host = self
-            .workspaces
-            .iter()
-            .find(|w| w.id == workspace_id)
-            .map(|w| w.host_id.clone())
-            .unwrap_or_else(cm_daemon::host_id::HostId::local);
-        if let Err(e) = guard_local_host_only(
-            &active_host,
-            "A-l launch-into-workspace",
-        ) {
-            self.set_status_msg(&format!("{}", e));
-            return;
-        }
-        let Some(wi) = self.workspace_index_by_id(workspace_id) else {
-            self.set_status_msg("Workspace no longer exists");
-            return;
-        };
-        let Some(worktree_path) = self.workspaces[wi].worktree_path.clone() else {
-            self.set_status_msg("Workspace has no worktree");
-            return;
-        };
-
-        let (cols, rows) = self.last_term_size;
-        // Pre-generate UID so the per-session MCP config carries the
-        // matching CM_TUI_SESSION_ID. Phase 1 "MCP-everywhere" — without
-        // this, a session launched into an existing workspace can't call
-        // any orchestration tool.
-        let session_uid = new_session_uid();
-        // Engine-specific transcript baseline — see `launch_from_plan`.
-        let pending = if engine == "codex" {
-            Self::list_codex_sessions(&worktree_path)
-        } else {
-            Self::list_jsonl_files(&worktree_path)
-        };
-        let workspace_id_owned = workspace_id.to_string();
-        let new_sess = match self.try_spawn_via_daemon(
-            &session_uid,
-            &workspace_id_owned,
-            &worktree_path,
-            engine,
-            task_title,
-            None,
-            cols,
-            rows,
-            Some(task_id),
-            None,
-            None,
-            &active_host,
-            // launch_into_workspace is a fresh spawn — post-
-            // spawn detector handles the transcript path.
-            None,
-            false, // global_perms
-        ) {
-            Some(Ok(s)) => s,
-            Some(Err(e)) => {
-                self.set_status_msg(&format!("Launch: {}", e));
-                return;
-            }
-            None => {
-                self.set_status_msg(&format!(
-                    "Internal: try_spawn_via_daemon returned None for daemon-eligible '{}'",
-                    engine,
-                ));
-                return;
-            }
-        };
-        let mut ts = make_simple_session_with_uid(
-            session_uid,
-            task_title,
-            engine,
-            new_sess,
-            Some(pending),
-        );
-        ts.task_id = Some(task_id.to_string());
-        ts.host_id = active_host.clone();
-        if !prompt.trim().is_empty() {
-            ts.pending_prompt = Some(PendingWrite::wait_for_quiet(
-                prompt.to_string(),
-                false,
-                Duration::from_secs(1),
-                Duration::from_secs(2),
-                Duration::from_secs(60),
-            ));
-        }
-        let si = self.workspaces[wi].sessions.len();
-        self.workspaces[wi].sessions.push(ts);
-
-        // The task may be in backlog (not yet in self.tasks because
-        // reconcile only pulls running/blocked). Upsert a stub with
-        // the workspace binding set; a later reconcile will fill in
-        // the remaining API fields without clobbering workspace_id.
-        if let Some(task) = self
-            .tasks
-            .iter_mut()
-            .find(|t| t.task_id.as_deref() == Some(task_id))
-        {
-            task.workspace_id = Some(workspace_id.to_string());
-        } else {
-            self.tasks.push(TaskEntry {
-                task_id: Some(task_id.to_string()),
-                name: task_title.to_string(),
-                api_status: TaskStatus::Running,
-                repo_url: Some(task_repo_url.to_string()),
-                prompt: Some(prompt.to_string()),
-                wip_branch: None,
-                session_id: None,
-                blocked_at: None,
-                is_cloud: false,
-                is_continuous: false,
-                workspace_id: Some(workspace_id.to_string()),
-                // Same race fix as `launch_from_plan` — pin the
-                // project synchronously from the planning row so
-                // an early `create_subtask` inherits it.
-                project: Some(project.to_string()),
-                // Sub-2a Finding #2: pin the parent edge so the
-                // first `push_task_tree_to_daemon` publishes the
-                // correct subtask edge — pre-fix `None` here
-                // showed the subtask as top-level on the daemon
-                // until reconcile patched it.
-                parent_task_id: parent_task_id.map(str::to_string),
-                worktree_mode: WorktreeMode::Inherit,
-                metadata: None,
-            });
-        }
-        self.cursor = Cursor::Session(wi, si);
-        self.view_mode = ViewMode::Sessions;
-
-        let mut fields = std::collections::HashMap::new();
-        fields.insert(
-            "status".to_string(),
-            serde_json::Value::String("running".to_string()),
-        );
-        self.backend
-            .update_plan_task(task_id.to_string(), fields);
-        self.save_session_manifest();
-        // Sub-2a Finding #1: same as `launch_from_plan`,
-        // a launch may have inserted a new TaskEntry.
-        self.push_state_to_daemon();
-        self.set_status_msg("Task launched into workspace");
     }
 
     /// Clear a task's workspace binding. Task status is left alone.
@@ -4174,6 +4601,7 @@ impl App {
             None => {
                 let main_repo = repo_url.as_deref().and_then(worktree::find_local_repo);
                 let ws = Workspace {
+                    org: None,
                     color: None,
                     pinned: false,
                     id: new_workspace_id(),
@@ -4238,36 +4666,6 @@ impl App {
         } else {
             self.set_status_msg("Reopened — A-s to add session");
         }
-    }
-
-    pub(super) fn unlaunch_task(&mut self, task_id: &str) {
-        let mut fields = std::collections::HashMap::new();
-        fields.insert("status".to_string(), serde_json::Value::String("backlog".to_string()));
-        self.backend.update_plan_task(task_id.to_string(), fields);
-
-        let ws_id = self
-            .tasks
-            .iter_mut()
-            .find(|t| t.task_id.as_deref() == Some(task_id))
-            .and_then(|t| {
-                t.api_status = TaskStatus::Backlog;
-                t.workspace_id.take()
-            });
-
-        if let Some(ws_id) = ws_id {
-            if let Some(wi) = self.workspaces.iter().position(|w| w.id == ws_id) {
-                // Tombstone each session before dropping so post-unlaunch
-                // `read_session_output` works for the closed sessions.
-                // Helper persists the manifest internally.
-                self.tombstone_and_remove(wi, |_| true);
-                if let Some(ws) = self.workspaces.get_mut(wi) {
-                    ws.is_closed = true;
-                }
-            }
-        }
-        self.save_session_manifest();
-        self.clamp_cursor();
-        self.set_status_msg("Task unlaunched \u{2192} backlog");
     }
 }
 
@@ -4431,7 +4829,6 @@ mod slice_12e_tests {
     // `cycle_active_host_single_host_shows_hint` exercised `A-H` /
     // `cycle_active_host`, both removed in DESIGN_REMOVE_GLOBAL_HOST.md Phase D.
     // Host is now a per-workspace attribute — see
-    // `launch_into_workspace_guards_on_workspace_host_not_global` and
     // `a_n_form_defaults_host_to_local`.)
 
     /// An explicitly configured local default remains supported.
@@ -4469,6 +4866,7 @@ mod slice_12e_tests {
         app.start_new_session();
         assert!(matches!(&app.input_mode, InputMode::NewSession { host_id, .. } if *host_id == HostId::new("manager")));
         app.workspaces.push(Workspace {
+            org: None,
             id:"ws-remote".into(), name:"remote".into(), color:None, pinned:false, is_closed:false, is_cloud:false,
             repo_url:Some("https://github.com/a/b".into()), worktree_path:Some(PathBuf::from("/remote/worktree")),
             main_repo_path:None, worker_vm:None, worker_zone:None, host_id:HostId::new("manager"),
@@ -4530,7 +4928,6 @@ mod slice_12e_tests {
     // pinned the `ts.host_id = self.active_host.clone()` injection at the A-n /
     // A-s / A-f call sites. New sessions now inherit host from their WORKSPACE
     // (DESIGN_REMOVE_GLOBAL_HOST.md Phases A–C); see
-    // `launch_into_workspace_guards_on_workspace_host_not_global` and
     // `a_n_submit_routes_by_chosen_host`.)
 
     /// Hosting does not add rows or reorder sessions in the status view.
@@ -4563,6 +4960,7 @@ mod slice_12e_tests {
             ts.host_id = HostId::new(*host_name);
             ts.status = SessionStatus::Idle;
             let ws = Workspace {
+                org: None,
                 color: None,
                 pinned: false,
                 id: format!("ws-{}", i),
@@ -4594,6 +4992,7 @@ mod slice_12e_tests {
         let (mut single_app, _tmp2) =
             build_app_with_hosts(&[("local", true)], &guard2);
         single_app.workspaces.push(Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-only".into(),
@@ -4667,6 +5066,7 @@ mod slice_12e_tests {
                 ts
             };
             Workspace {
+                org: None,
                 color: None,
                 pinned: false,
                 id: "ws-0".into(),
@@ -5203,6 +5603,7 @@ mod slice_12e_tests {
         );
         caller_ts.host_id = HostId::local();
         app.workspaces.push(Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-local-caller".into(),
@@ -5466,6 +5867,7 @@ mod slice_12e_tests {
         );
         caller_ts.host_id = HostId::new("manager");
         app.workspaces.push(Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-mgr-caller".into(),
@@ -5489,6 +5891,8 @@ mod slice_12e_tests {
             None,
             None,
             false,
+            None,
+            None,
         );
         match result {
             Err(e) => {
@@ -5781,6 +6185,11 @@ mod slice_12e_tests {
         // be skipped + preserved).
         let mut workspaces = HashMap::new();
         let local_entry = ManifestEntry {
+            org: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -5808,6 +6217,11 @@ mod slice_12e_tests {
             host_id: HostId::local(),
         };
         let remote_entry = ManifestEntry {
+            org: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -5835,6 +6249,7 @@ mod slice_12e_tests {
             global_perms: false,
         };
         let ws = ManifestWorkspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-acc".into(),
@@ -5854,6 +6269,9 @@ mod slice_12e_tests {
         let manifest = Manifest {
             messaging_names: Default::default(),
             task_colors: Default::default(),
+            folded_tasks: Default::default(),
+            folded_divisions: Default::default(),
+            folded_org: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             agent_task_edges: HashMap::new(),
@@ -6030,6 +6448,7 @@ remote_socket = "/remote/manager.sock"
             workspaces.insert(
                 id.to_string(),
                 ManifestWorkspace {
+                    org: None,
                     color: None,
                     pinned: false,
                     id: id.to_string(),
@@ -6050,6 +6469,9 @@ remote_socket = "/remote/manager.sock"
         let on_disk = Manifest {
             messaging_names: Default::default(),
             task_colors: Default::default(),
+            folded_tasks: Default::default(),
+            folded_divisions: Default::default(),
+            folded_org: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             agent_task_edges: HashMap::new(),
@@ -6087,6 +6509,7 @@ remote_socket = "/remote/manager.sock"
         // Mimic the clobber trigger: a single fresh workspace lands in live
         // state (as adoption would mint) and a save fires BEFORE restore.
         app.workspaces.push(Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-fresh-adopted".into(),
@@ -6141,7 +6564,7 @@ remote_socket = "/remote/manager.sock"
         drop(guard);
     }
 
-    /// 12e-r7 F2: `launch_from_plan` (planning A-l, creating
+    /// 12e-r7 F2: `launch_from_plan` (A-n "Reports to", creating
     /// a new workspace + worktree) MUST call the shared
     /// guard BEFORE worktree creation. Same orphan-disk
     /// rationale as round-6 F1 for `create_local_session`.
@@ -6151,63 +6574,12 @@ remote_socket = "/remote/manager.sock"
         let (mut app, tmp) = build_app_with_hosts(&[("local", false), ("manager", true)], &guard);
         app.config.repos.insert("example".into(), "https://github.com/example/example.git".into());
         app.launch_from_plan("example", "fresh-task", "prompt", None, false, "task-1", None,
-            false, "codex", &HostId::new("manager"));
+            false, "codex", &HostId::new("manager"), None,
+            None,);
         assert!(app.workspaces.is_empty());
         assert!(!tmp.path().join(".cm/worktrees").exists());
         app.start_new_session();
         assert!(matches!(&app.input_mode, InputMode::NewSession { host_id, .. } if *host_id == HostId::new("manager")));
-    }
-
-    /// 12e-r7 F2: `launch_into_workspace` (planning A-l,
-    /// reusing an existing workspace) MUST call the shared
-    /// guard at the top. Same shape as round-6 F1 for
-    /// `spawn_session_on_workspace`.
-    #[test]
-    fn launch_into_workspace_fails_fast_for_non_local_active_host() {
-        let src = crate::app::APP_SRC_FOR_SCAN;
-        let sig = "fn launch_into_workspace(";
-        let start = src.find(sig).expect("must find sig");
-        let rest = &src[start..];
-        let end = rest[1..]
-            .find("\n    fn ")
-            .into_iter()
-            .chain(rest[1..].find("\n    pub fn "))
-            .chain(rest[1..].find("\n    pub(crate) fn "))
-            .chain(rest[1..].find("\n    pub(super) fn "))
-            .chain(rest[1..].find("\n#[cfg(test)]"))
-            .min()
-            .map(|i| 1 + i)
-            .unwrap_or(rest.len());
-        let body = &rest[..end];
-
-        assert!(
-            body.contains(
-                "guard_local_host_only(\n            &active_host,\n            \"A-l launch-into-workspace\",\n        )",
-            ) || body.contains(
-                "guard_local_host_only(&active_host, \"A-l launch-into-workspace\")",
-            ),
-            "launch_into_workspace must call \
-             guard_local_host_only at the top (12e-r7 F2); \
-             body:\n{}",
-            body,
-        );
-
-        // Ordering: guard MUST precede the workspace lookup
-        // + any spawn work. The guard short-circuits the
-        // function on non-local active_host.
-        // migrate-tui-local: the spawn call shape moved from
-        // `self.spawn_agent_session(` (local PTY) to
-        // `self.try_spawn_via_daemon(` (daemon RPC).
-        let guard_idx = body
-            .find("guard_local_host_only(")
-            .expect("guard call not found");
-        let spawn_idx = body
-            .find("self.try_spawn_via_daemon(")
-            .expect("try_spawn_via_daemon call not found");
-        assert!(
-            guard_idx < spawn_idx,
-            "guard must precede try_spawn_via_daemon",
-        );
     }
 
     /// 12e-r4 F1.2: `spawn_managed_session` MUST take the
@@ -7213,10 +7585,10 @@ mod migrate_tui_local_tests {
         );
         // The A-R path rides spawn_restored_session (so it inherits the
         // pin above) — keep it that way.
-        let revive = fn_body("fn revive_active_session(");
+        let revive = fn_body("fn respawn_local_session(");
         assert!(
             revive.contains("self.spawn_restored_session(&entry, ws, (cols, rows), &live_uids)"),
-            "revive_active_session must respawn through spawn_restored_session; body:\n{revive}",
+            "respawn_local_session must respawn through spawn_restored_session; body:\n{revive}",
         );
 
         // (2) agent-requested grant rides the spawn, not a second RPC.
@@ -7265,32 +7637,33 @@ mod migrate_tui_local_tests {
             "the pre-fix diff-gated `perms_change` path must be gone; arm:\n{arm}",
         );
         assert!(
-            arm.contains("self.set_session_global_perms(&uid, value)"),
+            arm.contains("self.set_session_global_perms(&uid, value, local_changed)"),
             "the settings save must call set_session_global_perms; arm:\n{arm}",
         );
 
         // (4) no silent local-only success when the host isn't live.
         let setter = fn_body("fn set_session_global_perms(");
         assert!(
-            !setter.contains("if let Some(socket) = self.host_pool.live_socket_path("),
+            !setter.contains("if let Some(socket) = pool.live_socket_path("),
             "set_session_global_perms must not silently skip the daemon when the \
              socket isn't live; body:\n{setter}",
         );
         assert!(
-            setter.contains("self.host_pool.live_socket_path(&host).ok_or_else("),
+            setter.contains("pool\n                .live_socket_path(&host)\n                .ok_or_else("),
             "a not-live host socket must be an error; body:\n{setter}",
         );
-        // And the push precedes the local mutation (a failed RPC must
-        // not leave the TUI's view diverged from the daemon's).
-        let push_idx = setter
-            .find("rpc_set_global_perms(")
-            .expect("setter pushes to the daemon");
-        let local_idx = setter
+        assert!(setter.contains("rpc_set_global_perms("), "setter pushes to the daemon");
+        // And the local row changes only after the daemon accepted (a failed
+        // RPC must not leave the TUI's view diverged from the daemon's).
+        let finish = fn_body("fn finish_global_perms(");
+        let accepted_idx = finish.find("Ok(ack) => ack").expect("finish matches the push result");
+        let local_idx = finish
             .find(".global_perms = value;")
-            .expect("setter updates the local row");
+            .expect("finish updates the local row");
+        assert!(accepted_idx < local_idx, "the local row update follows an accepted push");
         assert!(
-            push_idx < local_idx,
-            "daemon push must precede the local row update",
+            !setter.contains(".global_perms = value;"),
+            "the setter itself never touches the row before the daemon answers",
         );
     }
 
@@ -7531,9 +7904,10 @@ mod migrate_tui_local_tests {
     /// the cursor's task scope through to `App::launch_workflow`
     /// so the daemon records `DaemonSession.task_id` for fresh
     /// participants. Pre-fix the handler hardcoded `None`, so
-    /// an A-f on a `Cursor::Task` (tasked planning workspace,
-    /// or tasked focused session) silently lost the task scope
-    /// and reproduced the Issue G failure for the UI path.
+    /// an A-f on a task row (then a task header, now the
+    /// workspace row of a tasked workspace, or a tasked focused
+    /// session) silently lost the task scope and reproduced the
+    /// Issue G failure for the UI path.
     ///
     /// Pinned at four points:
     ///   1. `InputMode::WorkflowLaunchConfirm` carries a
@@ -7541,7 +7915,7 @@ mod migrate_tui_local_tests {
     ///   2. `InputMode::WorkflowPicker` carries a
     ///      `cursor_task_id` field.
     ///   3. `open_workflow_launch` captures
-    ///      `cursor_task_id` from `Cursor::Task { task_id, .. }`.
+    ///      `cursor_task_id` from the workspace row's task.
     ///   4. The `SubmitAction::LaunchWorkflow` handler at the
     ///      App level passes the captured value to
     ///      `self.launch_workflow(...)` — NOT a hardcoded
@@ -7592,7 +7966,7 @@ mod migrate_tui_local_tests {
         );
 
         // 3. open_workflow_launch captures cursor_task_id from
-        // Cursor::Task.
+        // the workspace row's task.
         let open_idx = src
             .find("fn open_workflow_launch(&mut self)")
             .expect("open_workflow_launch must exist");
@@ -7608,8 +7982,7 @@ mod migrate_tui_local_tests {
             .map(|i| 1 + i)
             .unwrap_or(open_rest.len());
         let open_body = &open_rest[..open_end];
-        // Three-arm destructure (Session/Workspace/Task) — all
-        // three branches must yield a (wi, focused_si,
+        // Every cursor arm must yield a (wi, focused_si,
         // cursor_task_id) triple.
         assert!(
             open_body.contains("let (wi, focused_si, cursor_task_id)"),
@@ -7618,12 +7991,12 @@ mod migrate_tui_local_tests {
              cursor (Issue I); body excerpt:\n{}",
             &open_body[..open_body.len().min(2000)],
         );
-        // The Cursor::Task arm yields Some(task_id) for the
-        // task scope.
+        // The workspace row yields Some(task_id) for its task's
+        // scope.
         assert!(
-            open_body.contains("Cursor::Task { ws_idx, task_id }")
-                && open_body.contains("(ws_idx, si, Some(task_id))"),
-            "the Cursor::Task arm of open_workflow_launch MUST \
+            open_body.contains("Cursor::Workspace(wi) => match self.workspace_task(wi)")
+                && open_body.contains("(wi, si, Some(task_id))"),
+            "the Cursor::Workspace arm of open_workflow_launch MUST \
              yield `Some(task_id)` so the daemon records the \
              task scope (Issue I); body excerpt:\n{}",
             &open_body[..open_body.len().min(2000)],
@@ -7959,7 +8332,7 @@ mod migrate_tui_local_tests {
 }
 
 #[cfg(test)]
-mod revive_session_tests {
+pub(crate) mod revive_session_tests {
     //! A-R (`revive_active_session`) behavior pins: the guards that keep
     //! revive scoped to genuinely-dead, non-workflow sessions, and the
     //! remote branch's fail-closed handling when the host daemon can't be
@@ -7969,7 +8342,7 @@ mod revive_session_tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn dummy_ts(uid: &str, exited: bool, host: cm_daemon::host_id::HostId) -> TerminalSession {
+    pub(crate) fn dummy_ts(uid: &str, exited: bool, host: cm_daemon::host_id::HostId) -> TerminalSession {
         let mut session = crate::session::Session::new(
             "/bin/true",
             &[],
@@ -7982,6 +8355,11 @@ mod revive_session_tests {
         .expect("dummy session");
         session.exited = exited;
         TerminalSession {
+            org: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             color: None,
             uid: uid.into(),
             label: "claude".into(),
@@ -8023,6 +8401,7 @@ mod revive_session_tests {
             repos: HashMap::new(),
         });
         app.workspaces.push(Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-revive".into(),
@@ -8051,6 +8430,294 @@ mod revive_session_tests {
             .unwrap_or_default()
     }
 
+    /// Apply A-R / A-O worker results, as the main loop does each tick.
+    fn settle_restarts(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !app.restarts.is_empty() || !app.restores.is_empty() {
+            assert!(Instant::now() < deadline, "restart worker never finished");
+            std::thread::sleep(Duration::from_millis(10));
+            app.drain_restarts();
+        }
+    }
+
+    /// A host that accepts connections and never answers: Owner's link on
+    /// 2026-10-16, where every RPC ran out its full budget.
+    fn silent_host() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("silent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for conn in listener.incoming() {
+                held.push(conn);
+            }
+        });
+        (dir, socket)
+    }
+
+    fn app_on_silent_host(ts_uid: &str) -> (App, tempfile::TempDir) {
+        let slow = cm_daemon::host_id::HostId::new("slow");
+        let (dir, socket) = silent_host();
+        let mut app = app_with_session(dummy_ts(ts_uid, true, slow.clone()));
+        app.workspaces[0].host_id = slow.clone();
+        app.host_pool = std::sync::Arc::new(
+            crate::host_pool::HostPool::from_config(&hosts_with(&slow, socket)).expect("pool"),
+        );
+        (app, dir)
+    }
+
+    /// 2026-10-16: A-R over a slow link froze keyboard input to every pane
+    /// while its RPCs ran out their budgets on the input thread. It now
+    /// returns at once; the outcome lands on a later tick.
+    #[test]
+    fn a_r_on_a_silent_host_returns_at_once_and_reports_the_failure_later() {
+        let (mut app, _dir) = app_on_silent_host("ts-aaaaaaaaaaaaaa0b-0");
+        let started = Instant::now();
+        app.revive_active_session();
+        assert!(started.elapsed() < Duration::from_millis(500), "A-R blocked input for {:?}", started.elapsed());
+        assert!(status_text(&app).starts_with("Reviving"), "{}", status_text(&app));
+        app.revive_active_session();
+        assert!(status_text(&app).contains("already in progress"), "{}", status_text(&app));
+        settle_restarts(&mut app);
+        assert!(status_text(&app).starts_with("Revive failed"), "{}", status_text(&app));
+        assert!(app.workspaces[0].sessions[0].session.exited);
+        assert!(app.pending_remote_reattach.is_empty());
+    }
+
+    /// How the scripted host answers `kill_session`.
+    #[derive(Clone, Copy)]
+    enum KillReply {
+        /// The kill lands but the reply never arrives (Owner's slow link).
+        Lost,
+        /// A second A-R: the first one's kill already landed.
+        AlreadyExited,
+    }
+
+    /// A host that kills, lists nothing, and answers `session.revive` with
+    /// `revive_ok`. Returns how many revives it served.
+    fn scripted_host(
+        kill: KillReply,
+        revive_ok: bool,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use cm_daemon::control::protocol::{ErrorBody, ErrorCode, Response};
+        use cm_daemon::control::wire;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("scripted.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let revives = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = std::sync::Arc::clone(&revives);
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut stream) = conn else { return };
+                let Ok(Some(req)) = wire::read_request(&mut stream) else { continue };
+                let error = |message: &str| Response {
+                    id: req.id.clone(),
+                    ok: false,
+                    result: None,
+                    error: Some(ErrorBody { code: ErrorCode::NotFound, message: message.into() }),
+                };
+                let ok = |result| Response { id: req.id.clone(), ok: true, result: Some(result), error: None };
+                let resp = match (req.method.as_str(), kill) {
+                    ("kill_session", KillReply::Lost) => continue,
+                    ("kill_session", KillReply::AlreadyExited) => error("session already exited"),
+                    ("list_sessions", _) => ok(serde_json::json!([])),
+                    ("session.revive", _) => {
+                        served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if revive_ok { ok(serde_json::json!({})) } else { error("no transcript") }
+                    }
+                    _ => error("unexpected method"),
+                };
+                let _ = wire::write_response(&mut stream, &resp);
+            }
+        });
+        (dir, socket, revives)
+    }
+
+    fn live_app_on(socket: std::path::PathBuf, uid: &str) -> App {
+        let host = cm_daemon::host_id::HostId::new("scripted");
+        let mut app = app_with_session(dummy_ts(uid, false, host.clone()));
+        app.workspaces[0].host_id = host.clone();
+        app.workspaces[0].sessions[0].session.daemon_session_uid = Some(uid.into());
+        app.host_pool = std::sync::Arc::new(
+            crate::host_pool::HostPool::from_config(&hosts_with(&host, socket)).expect("pool"),
+        );
+        app
+    }
+
+    /// 2026-10-18, Swarm-Coord: A-R's kill landed but its reply was lost, so
+    /// the restart gave up with the session dead behind a live-looking row,
+    /// and every later A-R failed on "already exited". Both now revive.
+    #[test]
+    fn a_r_revives_when_the_kill_reply_is_lost_or_the_session_already_exited() {
+        for (kill, uid) in [
+            (KillReply::Lost, "ts-aaaaaaaaaaaaaa13-0"),
+            (KillReply::AlreadyExited, "ts-aaaaaaaaaaaaaa14-0"),
+        ] {
+            let (_dir, socket, revives) = scripted_host(kill, true);
+            let mut app = live_app_on(socket, uid);
+            app.revive_active_session();
+            assert!(status_text(&app).starts_with("Restarting"), "{}", status_text(&app));
+            settle_restarts(&mut app);
+            assert!(status_text(&app).contains("restarted"), "{}", status_text(&app));
+            assert_eq!(revives.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(!app.workspaces[0].sessions[0].session.exited);
+        }
+    }
+
+    /// A restart that gives up after its exit was suppressed shows the row
+    /// as exited, so the next A-R revives instead of killing a dead uid.
+    #[test]
+    fn a_failed_restart_whose_exit_was_suppressed_leaves_the_row_exited() {
+        let uid = "ts-aaaaaaaaaaaaaa15-0";
+        let (_dir, socket, revives) = scripted_host(KillReply::AlreadyExited, false);
+        let mut app = live_app_on(socket, uid);
+        app.revive_active_session();
+        // The Exited diff consumed the marker while the worker ran.
+        assert!(app.restart_suppressed_exit_uids.remove(uid));
+        settle_restarts(&mut app);
+        assert!(status_text(&app).starts_with("Revive failed"), "{}", status_text(&app));
+        assert_eq!(revives.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(app.workspaces[0].sessions[0].session.exited);
+        assert!(app.restart_suppressed_exit_uids.is_empty());
+    }
+
+    /// A-w on a remote session: the row closes at once; the kill RPC runs
+    /// on a worker.
+    #[test]
+    fn closing_a_remote_session_on_a_silent_host_returns_at_once() {
+        let (mut app, _dir) = app_on_silent_host("ts-aaaaaaaaaaaaaa0d-0");
+        app.workspaces[0].sessions[0].session.exited = false;
+        app.workspaces[0].sessions[0].session.daemon_session_uid = Some("ts-aaaaaaaaaaaaaa0d-0".into());
+        let started = Instant::now();
+        app.close_active_session();
+        assert!(started.elapsed() < Duration::from_millis(500), "A-w blocked input for {:?}", started.elapsed());
+        assert!(app.workspaces[0].sessions.is_empty());
+        assert_eq!(app.workspaces[0].tombstones.len(), 1);
+    }
+
+    /// Remote A-s: the add RPC and the attach run on a worker.
+    #[test]
+    fn adding_a_session_on_a_silent_host_returns_at_once() {
+        let (mut app, _dir) = app_on_silent_host("ts-aaaaaaaaaaaaaa0e-0");
+        let host = app.workspaces[0].host_id.clone();
+        let started = Instant::now();
+        app.add_remote_session(&host, 0, "codex", None, None, None, None, None);
+        assert!(started.elapsed() < Duration::from_millis(500), "A-s blocked input for {:?}", started.elapsed());
+        assert!(status_text(&app).starts_with("Starting codex on `slow`"), "{}", status_text(&app));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !app.remote_adds.is_empty() {
+            assert!(Instant::now() < deadline, "add worker never finished");
+            std::thread::sleep(Duration::from_millis(10));
+            app.drain_restarts();
+        }
+        assert!(status_text(&app).starts_with("Remote add_session failed"), "{}", status_text(&app));
+        assert_eq!(app.workspaces[0].sessions.len(), 1, "no row for a failed add");
+    }
+
+    fn assert_prompt(started: Instant, what: &str) {
+        assert!(started.elapsed() < Duration::from_millis(500), "{what} blocked input for {:?}", started.elapsed());
+    }
+
+    /// A-f's `start_workflow` has a 150 s budget; on a silent host it used
+    /// to hold input for all of it.
+    #[test]
+    fn a_f_on_a_silent_host_returns_at_once() {
+        let (mut app, _dir) = app_on_silent_host("ts-aaaaaaaaaaaaaa0f-0");
+        app.workspaces[0].sessions[0].session.exited = false;
+        let id = app.workspaces[0].id.clone();
+        let started = Instant::now();
+        app.launch_workflow_via_daemon(&id, "feedback", &[], None, None);
+        assert_prompt(started, "A-f");
+        assert!(status_text(&app).starts_with("Launching feedback"), "{}", status_text(&app));
+        app.launch_workflow_via_daemon(&id, "feedback", &[], None, None);
+        assert!(status_text(&app).contains("Already in progress"), "{}", status_text(&app));
+    }
+
+    /// A-e's global-perms save: the row changes only after the daemon
+    /// answers, and a failure says so.
+    #[test]
+    fn global_perms_save_on_a_silent_host_returns_at_once_and_leaves_the_row_unchanged() {
+        let (mut app, _dir) = app_on_silent_host("ts-aaaaaaaaaaaaaa10-0");
+        app.workspaces[0].sessions[0].session.exited = false;
+        let started = Instant::now();
+        app.set_session_global_perms("ts-aaaaaaaaaaaaaa10-0", true, true);
+        assert_prompt(started, "global-perms save");
+        assert!(status_text(&app).contains("applying global permissions"), "{}", status_text(&app));
+        assert!(!app.workspaces[0].sessions[0].global_perms, "not granted before the daemon answers");
+        app.settle_background();
+        assert!(status_text(&app).contains("global-perms change failed"), "{}", status_text(&app));
+        assert!(!app.workspaces[0].sessions[0].global_perms, "a failed push leaves the row as it was");
+    }
+
+    /// A-s → Resume on a remote workspace lists its transcripts over the
+    /// link; a failure returns to the form with what was typed.
+    #[test]
+    fn transcript_picker_on_a_silent_host_returns_at_once_and_restores_the_form() {
+        let (mut app, _dir) = app_on_silent_host("ts-aaaaaaaaaaaaaa11-0");
+        let id = app.workspaces[0].id.clone();
+        let started = Instant::now();
+        app.open_transcript_picker(TranscriptPickTarget::NewTerminalSession {
+            workspace_id: id.clone(),
+            session_type: "claude".into(),
+            task_id: None,
+            existing_seed_from: None,
+            existing_resume_from: None,
+        });
+        assert_prompt(started, "the transcript picker");
+        assert!(status_text(&app).starts_with("Loading transcripts"), "{}", status_text(&app));
+        app.settle_background();
+        assert!(status_text(&app).starts_with("Transcript catalog"), "{}", status_text(&app));
+        assert!(
+            matches!(&app.input_mode, InputMode::NewTerminalSession { workspace_id, .. } if *workspace_id == id),
+            "back on the A-s form",
+        );
+    }
+
+    /// A cross-host new workspace provisions a checkout before replying.
+    #[test]
+    fn new_workspace_on_a_silent_host_returns_at_once() {
+        let (mut app, _dir) = app_on_silent_host("ts-aaaaaaaaaaaaaa12-0");
+        app.workspaces[0].repo_url = Some("https://example.invalid/repo".into());
+        let id = app.workspaces[0].id.clone();
+        let host = app.workspaces[0].host_id.clone();
+        let started = Instant::now();
+        app.new_workspace_on_host(&id, &host, "bash", None, None, None, None);
+        assert_prompt(started, "new workspace on host");
+        assert!(status_text(&app).starts_with("Creating the workspace"), "{}", status_text(&app));
+        assert_eq!(app.workspaces.len(), 1, "nothing added until the host answers");
+    }
+
+    /// The same for A-O on a remote workspace: its revives run serially,
+    /// one RPC budget each.
+    #[test]
+    fn a_o_on_a_silent_host_returns_at_once_and_keeps_the_tombstones_listed() {
+        let (mut app, _dir) = app_on_silent_host("ts-aaaaaaaaaaaaaa0c-0");
+        let ws = &mut app.workspaces[0];
+        ws.sessions.clear();
+        ws.tombstones = vec![SessionTombstone {
+            entry: None,
+            uid: "ts-dead-2".into(),
+            managed_by_uid: None,
+            label: "worker".into(),
+            session_type: "codex".into(),
+            task_id: None,
+            last_transcript_id: Some("tid".into()),
+            worktree_path: Some(std::env::temp_dir()),
+            generation: 0,
+            exited_at: 1.0,
+        }];
+        let id = app.workspaces[0].id.clone();
+        let started = Instant::now();
+        app.restore_tombstones_for_workspace(&id);
+        assert!(started.elapsed() < Duration::from_millis(500), "A-O blocked input for {:?}", started.elapsed());
+        assert!(status_text(&app).starts_with("Restoring 1 session on `slow`"), "{}", status_text(&app));
+        assert_eq!(app.workspaces[0].tombstones.len(), 1, "listed while the revive is in flight");
+        settle_restarts(&mut app);
+        let status = status_text(&app);
+        assert!(status.starts_with("Restored 0/1 session on `slow`"), "{status}");
+        assert_eq!(app.workspaces[0].tombstones.len(), 1);
+    }
+
     /// A-R on a LIVE session is a forced restart: kill the daemon child,
     /// then revive. The kill step needs a daemon binding to target — a
     /// live session without one (this fixture; e.g. a cloud SSH view) is
@@ -8070,7 +8737,7 @@ mod revive_session_tests {
     }
 
     /// Workflow participants are workflow-engine-owned; revive refuses
-    /// them and points at A-u (resume the run) instead.
+    /// them and points at A-U (resume the run) instead.
     #[test]
     fn revive_refuses_workflow_participant() {
         let mut ts =
@@ -8107,6 +8774,136 @@ mod revive_session_tests {
             app.workspaces[0].sessions[0].session.exited,
             "slot left as-is",
         );
+    }
+
+    fn hosts_with(remote: &cm_daemon::host_id::HostId, socket: std::path::PathBuf) -> crate::hosts::HostsConfig {
+        crate::hosts::HostsConfig {
+            hosts: vec![
+                crate::hosts::HostConfig {
+                    id: cm_daemon::host_id::HostId::local(),
+                    transport: crate::hosts::HostTransport::Unix {
+                        socket: std::env::temp_dir().join("cm-restore-test-nonexistent-local.sock"),
+                    },
+                    default: true,
+                    operator_token: None,
+                    operator_token_file: None,
+                },
+                crate::hosts::HostConfig {
+                    id: remote.clone(),
+                    transport: crate::hosts::HostTransport::Unix { socket },
+                    default: false,
+                    operator_token: None,
+                    operator_token_file: None,
+                },
+            ],
+        }
+    }
+
+    /// 2026-10-12: A-O on a cloud workspace failed with "not yet supported"
+    /// and the emptied workspace was auto-closed seconds later. Remote
+    /// restore now revives each tombstone at its own uid on the owning
+    /// daemon, queues the reattach, reopens its done task, and the
+    /// reopened workspace survives the sweeps.
+    #[test]
+    fn remote_restore_revives_tombstones_on_their_host_and_the_workspace_stays_open() {
+        let _home = crate::test_support::home_lock();
+        let (socket, worktree, daemon, stop, handle) =
+            crate::client_session::tests::start_test_daemon("ws-cloud");
+        let sessions = cm_daemon::host_id::HostId::new("sessions");
+        let mut app = app_with_session(dummy_ts("ts-aaaaaaaaaaaaaa09-0", true, sessions.clone()));
+        app.host_pool = std::sync::Arc::new(
+            crate::host_pool::HostPool::from_config(&hosts_with(&sessions, socket.clone())).expect("pool"),
+        );
+        let uid = crate::client_session::tests::test_uid();
+        let ws = &mut app.workspaces[0];
+        ws.id = "ws-cloud".into();
+        ws.name = "Native-Rollout-Perf".into();
+        ws.host_id = sessions.clone();
+        ws.worktree_path = Some(worktree.clone());
+        ws.sessions.clear();
+        ws.is_closed = true;
+        ws.tombstones = vec![SessionTombstone {
+            entry: None,
+            uid: uid.clone(),
+            managed_by_uid: None,
+            label: "Native-Rollout-Perf".into(),
+            session_type: "bash".into(),
+            task_id: Some("fb838659".into()),
+            last_transcript_id: None,
+            worktree_path: Some(worktree.clone()),
+            generation: 0,
+            exited_at: 1.0,
+        }];
+        app.auto_close_workspaces.insert("ws-cloud".into());
+
+        assert!(app.reopen_workspace_by_id("ws-cloud"));
+        assert!(!app.auto_close_workspaces.contains("ws-cloud"), "a reopen claims the workspace");
+        app.restore_tombstones_for_workspace("ws-cloud");
+        settle_restarts(&mut app);
+
+        let status = status_text(&app);
+        assert!(status.starts_with("Restored 1/1 session on `sessions`"), "{status}");
+        assert!(app.workspaces[0].tombstones.is_empty());
+        assert_eq!(app.pending_remote_reattach.len(), 1, "the row binds through deferred reattach");
+        assert_eq!(app.pending_remote_reattach[0].ws_id(), "ws-cloud");
+        {
+            let d = daemon.lock().unwrap();
+            let revived = d.sessions.get(&uid).expect("revived at the SAME uid on its host");
+            assert_eq!(revived.task_id.as_deref(), Some("fb838659"));
+        }
+
+        // Neither sweep closes it: not with the reattach pending, and not
+        // after it (the reopen is Owner's claim) — even off the cursor.
+        app.cursor = Cursor::Section("elsewhere".into());
+        app.reap_spent_workspaces();
+        assert!(!app.workspaces[0].is_closed);
+        app.pending_remote_reattach.clear();
+        app.reap_spent_workspaces();
+        assert!(!app.close_agent_marker_if_empty(0));
+        assert!(!app.workspaces[0].is_closed, "a reopened workspace is never auto-closed");
+
+        let _ = crate::client_session::rpc_kill_session(&socket, "op-test", &uid);
+        crate::client_session::tests::stop_test_daemon(&socket, stop, handle);
+    }
+
+    /// A failed remote revive keeps the tombstone listed and says why.
+    #[test]
+    fn remote_restore_failure_keeps_tombstones_and_reports_them() {
+        let ghost = cm_daemon::host_id::HostId::new("ghost");
+        let mut app = app_with_session(dummy_ts("ts-aaaaaaaaaaaaaa0a-0", true, ghost.clone()));
+        app.host_pool = std::sync::Arc::new(
+            crate::host_pool::HostPool::from_config(&hosts_with(
+                &ghost,
+                std::env::temp_dir().join("cm-restore-test-nonexistent-ghost.sock"),
+            ))
+            .expect("pool"),
+        );
+        let ws = &mut app.workspaces[0];
+        ws.host_id = ghost.clone();
+        ws.sessions.clear();
+        ws.tombstones = vec![SessionTombstone {
+            entry: None,
+            uid: "ts-dead-1".into(),
+            managed_by_uid: None,
+            label: "worker".into(),
+            session_type: "codex".into(),
+            task_id: None,
+            last_transcript_id: Some("tid".into()),
+            worktree_path: None,
+            generation: 0,
+            exited_at: 1.0,
+        }];
+        let id = app.workspaces[0].id.clone();
+        app.restore_tombstones_for_workspace(&id);
+        settle_restarts(&mut app);
+        let status = status_text(&app);
+        assert!(status.starts_with("Restored 0/1 session on `ghost`"), "{status}");
+        assert!(status.contains("failed (still listed, A-O retries): worker:"), "{status}");
+        assert_eq!(app.workspaces[0].tombstones.len(), 1);
+        assert!(app.pending_remote_reattach.is_empty());
+        let entry = remote_revive_entry(&app.workspaces[0].tombstones[0], &ghost);
+        assert_eq!((entry.uid.as_str(), entry.transcript_id.as_deref()), ("ts-dead-1", Some("tid")));
+        assert!(entry.last_exit.is_none());
     }
 
     /// Remote branch, fail-closed: when the `session.revive` RPC can't
@@ -8147,6 +8944,7 @@ mod revive_session_tests {
             crate::host_pool::HostPool::from_config(&hosts).expect("pool"),
         );
         app.revive_active_session();
+        settle_restarts(&mut app);
         assert!(
             status_text(&app).starts_with("Revive failed"),
             "RPC failure surfaced, got: {}",
@@ -8181,6 +8979,7 @@ mod spent_workspace_tests {
 
     fn ws(name: &str) -> Workspace {
         Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: format!("ws-{}", name.replace(' ', "-")),
@@ -8467,4 +9266,15 @@ mod spent_workspace_tests {
         assert!(!app.workspaces[3].is_closed);
         assert_eq!(app.tasks.len(), 4);
     }
+}
+
+/// A row the daemon stamped as a member's (durable) assistant and that was
+/// not closed: finishing its task leaves it running (O5). Workers of a
+/// continuous member and member-less rows return false.
+pub(crate) fn is_open_assistant_row(ts: &TerminalSession) -> bool {
+    ts.org.as_ref().is_some_and(|o| {
+        o.get("acting_as").and_then(|v| v.as_str()) == Some("assistant")
+            && o.get("member_id").and_then(|v| v.as_str()).is_some_and(|m| !m.is_empty())
+            && !o.contains_key("assistant_closed_at")
+    })
 }

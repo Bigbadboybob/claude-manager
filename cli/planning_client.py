@@ -71,22 +71,27 @@ class PlanningClient:
         description: str = "",
         prompt: str = "",
         repo_url: str | None = None,
+        repo_branch: str = "main",
         difficulty: int | None = None,
         depends: list[str] | None = None,
         metadata: dict | None = None,
         initiative_id: str | None = None,
+        parent_task_id: str | None = None,
     ) -> dict:
-        """Create a task with source='claude' in draft status."""
+        """File a task with source='claude' into the project's backlog.
+
+        `prompt` is a deprecated alias: the API folds it into the description
+        (doc/org-model.md §13.2)."""
         if not repo_url:
             repo_url = _detect_repo_url()
 
         body = {
             "repo_url": repo_url,
-            "repo_branch": "main",
+            "repo_branch": repo_branch,
             "name": name,
             "project": project,
             "description": description,
-            "prompt": prompt or name,
+            "prompt": prompt,
             "source": "claude",
             "is_cloud": False,
             "priority": 0,
@@ -99,6 +104,8 @@ class PlanningClient:
             body["metadata"] = metadata
         if initiative_id:
             body["initiative_id"] = initiative_id
+        if parent_task_id:
+            body["parent_task_id"] = parent_task_id
 
         r = self._client.client.post("/tasks", json=body)
         return _response_json(r)
@@ -127,10 +134,13 @@ class PlanningClient:
 
     def list_initiatives(self, status: str | None = None,
                          project: str | None = None,
-                         include_archived: bool = False) -> list[dict]:
+                         include_archived: bool = False,
+                         kind: str | None = None) -> list[dict]:
         params = {"include_archived": include_archived}
         if status:
             params["status"] = status
+        if kind:
+            params["kind"] = kind
         if project:
             params["project"] = project
         r = self._client.client.get("/initiatives", params=params)

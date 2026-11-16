@@ -11,7 +11,7 @@ pub(super) struct Binding {
     dev: u64,
     ino: u64,
 }
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Scan {
     binding: Option<Binding>,
     offset: u64,

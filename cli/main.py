@@ -63,7 +63,7 @@ def cli():
 
 @cli.command()
 @click.option("--repo", "-r", required=True, help="Repo name or URL")
-@click.option("--prompt", "-p", required=True, help="Task prompt")
+@click.option("--prompt", "-p", required=True, help="Task brief (stored as the description)")
 @click.option("--branch", "-b", default="main", help="Branch to clone")
 @click.option("--priority", default=0, help="Priority (lower = higher)")
 @click.option("--prompt-file", type=click.Path(exists=True), help="Read prompt from file")
@@ -79,6 +79,13 @@ def add(repo, prompt, branch, priority, prompt_file):
     click.echo(f"  Prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
 
 
+def _brief(task: dict) -> str:
+    """One line for a task: its description, else its name (doc/org-model.md
+    §13.2: the API returns `prompt: ""`, and old rows may hold NULL)."""
+    text = task.get("description") or task.get("name") or task.get("prompt") or ""
+    return " ".join(text.split())
+
+
 @cli.command()
 def backlog():
     """List backlog tasks."""
@@ -90,7 +97,8 @@ def backlog():
     click.echo(f"  {'#':<10} {'Pri':<5} {'Task':<50} {'Repo':<20} {'Added'}")
     click.echo(f"  {'─'*10} {'─'*5} {'─'*50} {'─'*20} {'─'*8}")
     for t in tasks:
-        prompt_short = t["prompt"][:47] + "..." if len(t["prompt"]) > 50 else t["prompt"]
+        text = _brief(t)
+        prompt_short = text[:47] + "..." if len(text) > 50 else text
         repo_short = t["repo_url"].split("/")[-1].replace(".git", "")
         click.echo(
             f"  {short_id(t['id']):<10} {t['priority']:<5} "
@@ -109,7 +117,8 @@ def queue():
     click.echo(f"  {'#':<10} {'Task':<55} {'Repo':<20} {'Waiting'}")
     click.echo(f"  {'─'*10} {'─'*55} {'─'*20} {'─'*8}")
     for t in tasks:
-        prompt_short = t["prompt"][:52] + "..." if len(t["prompt"]) > 55 else t["prompt"]
+        text = _brief(t)
+        prompt_short = text[:52] + "..." if len(text) > 55 else text
         repo_short = t["repo_url"].split("/")[-1].replace(".git", "")
         click.echo(
             f"  {short_id(t['id']):<10} {prompt_short:<55} "
@@ -164,11 +173,11 @@ def done(task_id):
 
 @cli.command()
 @click.argument("task_id")
-@click.option("--prompt", "-p", help="New prompt")
+@click.option("--prompt", "-p", help="New brief (replaces the description)")
 @click.option("--priority", type=int, help="New priority")
 @click.option("--prompt-file", type=click.Path(exists=True), help="Read new prompt from file")
 def edit(task_id, prompt, priority, prompt_file):
-    """Edit a backlog task's prompt or priority."""
+    """Edit a backlog task's brief (its description) or priority."""
     if prompt_file:
         prompt = open(prompt_file).read()
     client = get_client()
@@ -181,7 +190,7 @@ def edit(task_id, prompt, priority, prompt_file):
         return
     updates = {}
     if prompt is not None:
-        updates["prompt"] = prompt
+        updates["description"] = prompt
     if priority is not None:
         updates["priority"] = priority
     if not updates:
@@ -235,7 +244,7 @@ def workers():
     for w in ws:
         click.echo(
             f"  {w['worker_vm']:<25} {w['status']:<10} "
-            f"{w['prompt']:<40} {w['ttyd_url'] or 'pending'}"
+            f"{(w.get('prompt') or ''):<40} {w['ttyd_url'] or 'pending'}"
         )
 
 

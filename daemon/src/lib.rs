@@ -54,11 +54,24 @@
 #![cfg(target_os = "linux")]
 
 pub mod adopt;
+pub mod allocator_tuning;
+pub mod assistants;
+pub mod agent_state;
 pub mod attach;
 pub mod attach_output;
+pub mod capabilities;
+/// The org-model preservation object and capability names, shared with the
+/// holder (doc/org-model.md §12).
+pub use cm_holder_proto::org as org_bridge;
 pub mod claude_trust;
 pub mod claude_channels;
+pub mod claude_presence;
+mod claude_wait;
+pub mod claude_recovery;
+pub mod claude_account_recovery;
+pub mod claude_limit_menu;
 pub mod codex_trust;
+pub mod codex_recovery;
 pub mod config;
 pub mod env_sanitize;
 pub mod fanout_persist;
@@ -67,29 +80,54 @@ pub mod continuous;
 pub mod control;
 pub mod holder_mode;
 pub mod host_id;
+pub mod items;
+pub mod keys;
+pub mod usage;
+pub mod worktree_watch;
+pub mod maintenance;
 pub mod manifest;
 pub mod messaging;
+mod memory_snapshot;
+mod memory_trim;
 pub mod mcp_config;
 pub mod migrate;
+pub mod models;
 pub mod notify;
+pub mod org;
 pub mod owner_attention;
+pub mod owner_availability;
 pub mod sidebar;
 pub mod path;
 pub mod planning_client;
+pub mod pty_input;
 pub mod reader_gate;
 pub mod reap_gate;
 pub mod resume_identity;
+pub mod rotation;
+pub mod session_crons;
+pub mod session_wake;
+pub mod handoff;
 pub mod reaper;
 pub mod reexec;
 pub mod reexec_manifest;
 pub mod restart_coordinator;
+pub mod screen_replay;
+pub mod log_pump;
+pub mod health;
 pub mod session;
+pub mod task_parent_refresh;
+pub mod lifecycle_guard;
 pub mod terminal_sweep;
 pub mod session_watch;
+pub mod spawn_setup;
 pub mod state;
+pub mod staffing;
 pub mod notifications;
+pub mod owner_notifications;
+pub mod owner_alert_relay;
 pub mod transcript_detect;
 pub mod transcript_catalog;
+pub mod transcript_chain;
 pub mod workflow;
 pub mod worktree;
 pub mod worktree_cleanup;
@@ -410,6 +448,7 @@ pub fn run_daemon_preflight() -> i32 {
 }
 
 pub fn run() -> anyhow::Result<()> {
+    let startup_at = std::time::Instant::now();
     // Deterministic comm regardless of how we were exec'd: a
     // /proc/self/fd or execveat(AT_EMPTY_PATH) exec (re-exec deploys,
     // holder spawns, the phase-7 reverse migration) derives comm from
@@ -424,6 +463,10 @@ pub fn run() -> anyhow::Result<()> {
             0,
         );
     }
+
+    // Before the first thread: an arena cap does not merge arenas that
+    // already exist (#105, `allocator_tuning`).
+    let allocator = allocator_tuning::apply();
 
     // FIRST, before anything reads env or spawns: scrub Claude-session
     // identity vars inherited from a launcher that ran inside a claude
@@ -544,32 +587,8 @@ pub fn run() -> anyhow::Result<()> {
     // current stderr and keeps it. Runs AFTER config load (the path comes
     // from it) and before anything spawns.
     if !daemon_config.log_path.is_empty() {
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&daemon_config.log_path)
-        {
-            Ok(f) => {
-                use std::os::fd::AsRawFd;
-                // SAFETY: duplicating an owned, open fd onto our own
-                // stdio slots; `f` closing afterwards leaves the dups
-                // intact.
-                unsafe {
-                    libc::dup2(f.as_raw_fd(), 1);
-                    libc::dup2(f.as_raw_fd(), 2);
-                }
-                eprintln!(
-                    "cm-daemon: stdout/stderr → {} (daemon.toml log_path)",
-                    daemon_config.log_path,
-                );
-            }
-            Err(e) => {
-                eprintln!(
-                    "cm-daemon: could not open log_path {}: {} — keeping current stderr",
-                    daemon_config.log_path, e,
-                );
-            }
-        }
+        // Every line gets a timestamp on the way (`log_pump`).
+        log_pump::install(&daemon_config.log_path);
     }
 
     // Arm the worktree disk guard (`[scheduler] max_worktrees`). Enforcement
@@ -726,7 +745,10 @@ pub fn run() -> anyhow::Result<()> {
     // 12f: stash the loaded config so `start_session`'s
     // env-injection step can read it (mcp_server_path /
     // api_url / api_token).
+    crate::mcp_config::set_codex_inline_scrollback(daemon_config.codex_inline_scrollback);
+    crate::models::set_models(daemon_config.models.clone());
     initial_state.config = daemon_config;
+    memory_trim::start(initial_state.config.memory.clone());
     // Phase 3b: the dev flag (read once above) and the listener's
     // raw fd — the latter is MANIFEST INPUT ONLY (see the field doc):
     // `reexec::perform_reexec` copies the number into the FD
@@ -877,7 +899,9 @@ pub fn run() -> anyhow::Result<()> {
         initial_state.seed_recently_exited_from_sidecar(&sidecar);
     }
     let state = std::sync::Arc::new(std::sync::Mutex::new(initial_state));
-    if let Err(e) = messaging::rpc::initialize(&state) {
+    // Stall ticker, attach-burst summaries, disk alert (`health`).
+    health::spawn(std::sync::Arc::clone(&state));
+    if let Err(e) = messaging::startup::start(&state) {
         eprintln!("cm-daemon: messaging unavailable: {e}");
     }
 
@@ -1183,7 +1207,11 @@ pub fn run() -> anyhow::Result<()> {
                     // Phase 4g (audit gap 2): the non-spawning half of
                     // restore — see the outcome comment above. The
                     // children are alive; only derived maps are rebuilt.
-                    control::methods::rehydrate_derived_state(&state);
+                    let manifest = control::methods::rehydrate_derived_state(&state);
+                    // The handoff record carries no model: take each
+                    // adopted session's from the registry, else its
+                    // transcript.
+                    control::methods::backfill_session_models(&state, manifest.as_ref());
                 }
                 reexec::HandoffOutcome::TerminalFallback { killed, total } => {
                     eprintln!(
@@ -1202,6 +1230,25 @@ pub fn run() -> anyhow::Result<()> {
     }
     } // !holder_active
 
+    // doc/org-model.md §12: record this generation's capabilities (by its
+    // lineage and epoch) so a later brain can vouch for it as its rollback
+    // pin. After adoption/handoff, so a monolith's reexec_generation is set;
+    // off the boot path (it hashes the binary).
+    {
+        let epoch = crate::capabilities::current_epoch(&state.lock().unwrap_or_else(|p| p.into_inner()));
+        let _ = std::thread::Builder::new()
+            .name("cm-capabilities".into())
+            .spawn(move || crate::capabilities::record_boot(epoch));
+    }
+
+    // Restore only after all holder/re-exec adoption and fresh restoration.
+    // Starting the tick earlier could overwrite the sidecar with an empty registry.
+    if let Err(e) = agent_state::restore(&state.lock().unwrap_or_else(|p| p.into_inner())) {
+        eprintln!("cm-daemon: could not restore agent state: {e}");
+    }
+    agent_state::start(&state)?;
+
+    state.lock().unwrap_or_else(|p| p.into_inner()).messaging_registry_restored = true;
     if let Err(e) = messaging::rpc::initialize(&state) {
         eprintln!("cm-daemon: messaging pending: {e}");
     }
@@ -1210,8 +1257,20 @@ pub fn run() -> anyhow::Result<()> {
     state.lock().unwrap_or_else(|p| p.into_inner())
         .persist_sessions_best_effort();
     messaging::delivery::spawn(&state);
-    messaging::sync::start(&state);
     messaging::tasks::spawn(&state);
+    if let Err(e) = messaging::tasks::ensure_continuous_channel(&state) {
+        eprintln!("cm-daemon: could not ensure #continuous channel: {e}");
+    }
+    items::start(&state);
+    // #24: a rotation the previous brain left between stop and respawn
+    // resumes its original transcript (after restore and adoption, so a
+    // session that did come back is seen as live).
+    rotation::recover_inflight(&state);
+    rotation::start_policy(&state);
+    handoff::start_worker(&state);
+    usage::start(&state);
+    staffing::start(&state);
+    worktree_watch::start(&state);
 
     // Spawn the workflow on_idle poller — the daemon's SOLE workflow driver
     // since Phase 4 (the TUI is a pure observer). It fires transitions,
@@ -1261,6 +1320,20 @@ pub fn run() -> anyhow::Result<()> {
         )
     })?;
 
+    // Ordinary-session schedules use the same durable native notification
+    // queue as monitor wakes.  This is separate from the continuous-task
+    // scheduler so existing continuous semantics remain unchanged.
+    let wake_scheduler = std::sync::Arc::new(
+        session_wake::WakeScheduler::new(std::sync::Arc::clone(&state)).map_err(|e| {
+            anyhow::anyhow!("cm-daemon: session wake scheduler store load failed: {e}")
+        })?,
+    );
+    wake_scheduler.start().map_err(|e| {
+        anyhow::anyhow!(
+            "cm-daemon: session wake scheduler thread spawn failed: {e}; refusing to start"
+        )
+    })?;
+
     // Spawn the terminal-task session sweep. A task reaching `done`/`archived`
     // by ANY route must close the workers it still owns; before this existed
     // only the `mark_subtask_done` MCP path did, so tasks finished through the
@@ -1281,8 +1354,25 @@ pub fn run() -> anyhow::Result<()> {
         );
     }
 
+    // Planning parent edges for tasks no TUI push carries (a headless host),
+    // so the descendant-scope checks know a done subtask's parent without any
+    // HTTP on the dispatch path. Non-fatal, like the sweep: without it scope
+    // falls back to the pushed tree alone.
+    let parent_refresher = std::sync::Arc::new(task_parent_refresh::TaskParentRefresher::new(
+        std::sync::Arc::clone(&state),
+    ));
+    if let Err(e) = parent_refresher.start() {
+        eprintln!(
+            "cm-daemon: task parent refresh thread spawn failed: {e}; continuing \
+             without it — on a host no TUI pushes to, done subtasks fall out of \
+             their parent's scope"
+        );
+    }
+
     worktree_cleanup::bootstrap();
 
+    eprintln!("cm-daemon: allocator: {allocator}");
+    eprintln!("cm-daemon: rpc ready after {:.3}s ({})", startup_at.elapsed().as_secs_f64(), path.display());
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {

@@ -1501,6 +1501,12 @@ fn reexec_full_record_and_dead_record_tombstone() {
     // off (the daemon never opens it — it only echoes the path).
     let transcript_path = sb.home.join("fake-transcript.jsonl");
     std::fs::write(&transcript_path, "{}\n").expect("touch transcript");
+    // Readline is the test agent's PTY stand-in. Accept the agent keyboard
+    // Enter too, so PRE/POST prove execution rather than pasted-body echo.
+    let inputrc = sb.home.join("agent.inputrc");
+    std::fs::write(&inputrc, r#""\e[13u": accept-line
+"\e[13;1u": accept-line
+"#).expect("agent readline bindings");
     let start = round_trip(
         &sb.socket,
         &operator_request(
@@ -1510,17 +1516,19 @@ fn reexec_full_record_and_dead_record_tombstone() {
                 "uid": uid_a,
                 "workspace_id": "ws-reexec-e2e",
                 "worktree_path": sb.home.to_string_lossy(),
-                "label": "identity-bash",
+                "label": "identity-agent",
                 "argv": ["bash", "--norc"],
                 "working_dir": sb.home.to_string_lossy(),
-                "session_type": "bash",
+                "session_type": "claude-code",
+                "model": "claude-opus-5-5",
+                "effort": "low",
                 "task_id": "task-e2e-identity",
                 "managed_by_uid": "ts-e2ed-parent",
                 "global_perms": true,
                 "transcript_path": transcript_path.to_string_lossy(),
                 "cols": 120,
                 "rows": 40,
-                "env": {}
+                "env": {"INPUTRC": inputrc.to_string_lossy()}
             }),
         ),
     )
@@ -1544,7 +1552,7 @@ fn reexec_full_record_and_dead_record_tombstone() {
             "send_input",
             serde_json::json!({
                 "session_uid": uid_a,
-                "text": "echo PRE-A-OK",
+                "text": "printf 'PRE-A-%s\\n' OK",
                 "submit": true
             }),
         ),
@@ -1572,6 +1580,18 @@ fn reexec_full_record_and_dead_record_tombstone() {
             },
         );
     }
+
+    // The fake agent can execute the command before asynchronous delivery's
+    // verification finishes. Drain its possible recovery Enter before marking
+    // done, so later delivery cannot legitimately supersede the report.
+    wait_for(
+        Instant::now() + Duration::from_secs(20),
+        "PRE A delivery verification to finish",
+        &sb.guard,
+        || sb.guard.log_tail()
+            .contains(&format!("agent prompt delivered for {uid_a}:"))
+            .then_some(()),
+    );
 
     // The agent's own final report, via the wire (Session-caller
     // frame — report_done is Session-callable only). AFTER the PRE
@@ -1875,8 +1895,8 @@ fn reexec_full_record_and_dead_record_tombstone() {
     let s = |k: &str| {
         row_a.get(k).and_then(|v| v.as_str()).map(|s| s.to_string())
     };
-    assert_eq!(s("label").as_deref(), Some("identity-bash"), "row A: {}", row_a);
-    assert_eq!(s("type").as_deref(), Some("bash"), "row A: {}", row_a);
+    assert_eq!(s("label").as_deref(), Some("identity-agent"), "row A: {}", row_a);
+    assert_eq!(s("type").as_deref(), Some("claude-code"), "row A: {}", row_a);
     assert_eq!(
         s("task_id").as_deref(),
         Some("task-e2e-identity"),
@@ -2019,7 +2039,7 @@ fn reexec_full_record_and_dead_record_tombstone() {
             "send_input",
             serde_json::json!({
                 "session_uid": uid_a,
-                "text": "echo POST-A-OK",
+                "text": "printf 'POST-A-%s\\n' OK",
                 "submit": true
             }),
         ),

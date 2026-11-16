@@ -1,5 +1,5 @@
 from datetime import datetime
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class TaskCreate(BaseModel):
@@ -38,6 +38,9 @@ class TaskUpdate(BaseModel):
     priority: int | None = None
     name: str | None = None
     prompt: str | None = None
+    # Correctable: a task filed from a checkout of another repo inherited
+    # that repo's URL, and every subtask/worktree minted from it followed.
+    repo_url: str | None = None
     repo_branch: str | None = None
     worker_vm: str | None = None
     worker_zone: str | None = None
@@ -61,6 +64,73 @@ class TaskUpdate(BaseModel):
     # Free-form JSONB bag. PATCH replaces the whole object — callers that
     # want to merge should read first and re-send the merged dict.
     metadata: dict | None = None
+    # Org model S3 (doc/org-model.md §7.1): who caused this write (a session's
+    # actor, stamped by its daemon), and the trigger of a `blocked` write. A
+    # placed task's status write becomes the matching item transition.
+    actor: dict | None = None
+    reason: str | None = None
+    blocked_by: list[int] | None = None
+
+
+# A model string is opaque: only non-empty and argv-safe (mirrors
+# daemon/src/models.rs::validate_model). Unknown models fail in the engine.
+MODEL_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._\-:/@+\[\]]{0,127}$"
+MODEL_ENGINES = ("claude", "codex")
+
+
+# CM's effort levels (daemon/src/models.rs::EFFORTS); codex has no "max".
+EFFORT_PATTERN = r"^(low|medium|high|xhigh|max)$"
+
+
+def _strip_or_none(value):
+    """Trim a string field; an emptied one means "clear" (None)."""
+    if isinstance(value, str):
+        return value.strip() or None
+    return value
+
+
+class TaskModelUpdate(BaseModel):
+    """Set (or with null, clear) a task's default model and/or effort for
+    one engine.
+
+    Stored at ``metadata.models.<engine>`` / ``metadata.efforts.<engine>``;
+    subtasks inherit them. Only the fields sent are touched, so
+    ``{"engine": "codex", "effort": "high"}`` keeps the codex model.
+    """
+
+    engine: str = Field(pattern=r"^(claude|codex)$")
+    model: str | None = Field(default=None, pattern=MODEL_PATTERN)
+    effort: str | None = Field(default=None, pattern=EFFORT_PATTERN)
+
+    @field_validator("model", "effort", mode="before")
+    @classmethod
+    def _trim(cls, value):
+        return _strip_or_none(value)
+
+    @field_validator("effort")
+    @classmethod
+    def _codex_has_no_max(cls, value, info):
+        if value == "max" and info.data.get("engine") == "codex":
+            raise ValueError("codex has no max effort; its highest is xhigh")
+        return value
+
+
+class TaskModelResolution(BaseModel):
+    """The default model and effort a task's sessions get for one engine."""
+
+    engine: str
+    # None: neither the task nor any ancestor sets one (use the engine default).
+    model: str | None = None
+    # The task (this one or an ancestor) whose metadata supplied ``model``.
+    source_task_id: str | None = None
+    effort: str | None = None
+    effort_source_task_id: str | None = None
+
+
+class TaskLeadUpdate(BaseModel):
+    """Pin (or with null, clear) ``metadata.lead_session_uid`` on a task."""
+
+    session_uid: str | None = Field(default=None, max_length=128)
 
 
 class BacktestPhaseUpdate(BaseModel):
@@ -117,7 +187,15 @@ class TaskResponse(BaseModel):
     repo_url: str
     repo_branch: str
     name: str | None
+    # Deprecated (doc/org-model.md §13.2): always "", never an echo, so an old
+    # composer that joins description + prompt delivers the brief once. The
+    # description is the whole brief; the column keeps the original text.
     prompt: str | None
+
+    @field_validator("prompt", mode="after")
+    @classmethod
+    def _no_prompt(cls, value):
+        return ""
     status: str
     priority: int
     worker_vm: str | None
@@ -143,6 +221,13 @@ class TaskResponse(BaseModel):
     initiative: dict | None = None
     # Free-form JSONB bag. Reads come back as a dict (or None).
     metadata: dict | None = None
+    # Org facts on a single-task read (GET /tasks/{id}): {team, lead_member,
+    # members}. Null in lists and the change feed.
+    org: dict | None = None
+    # Org model S3: where the task is placed ({board, board_id, n, status,
+    # group_id, group}), null when it isn't; and its description revision.
+    placement: dict | None = None
+    description_rev: int = 0
 
     class Config:
         from_attributes = True
@@ -180,6 +265,8 @@ class InitiativeCreate(BaseModel):
     docs_path: str = "cm-initiative"
     shared_channel: str | None = None
     metadata: dict | None = None
+    # 'initiative' (has a done state) or 'division' (a permanent org unit).
+    kind: str = "initiative"
 
 
 class InitiativeUpdate(BaseModel):
@@ -192,6 +279,7 @@ class InitiativeUpdate(BaseModel):
     docs_path: str | None = None
     shared_channel: str | None = None
     metadata: dict | None = None
+    kind: str | None = None
     reason: str | None = None
 
 
@@ -214,8 +302,10 @@ class InitiativeResponse(BaseModel):
     name: str
     description: str
     status: str
+    kind: str = "initiative"
     color: str | None = None
-    coordinator_task_id: str
+    # Null for a taskless team (kind 'team', org model S2).
+    coordinator_task_id: str | None = None
     coordinator_project: str | None = None
     docs_path: str
     shared_channel: str | None = None
@@ -226,3 +316,11 @@ class InitiativeResponse(BaseModel):
     updated_at: datetime
     projects: list[dict] = Field(default_factory=list)
     task_counts: dict[str, int] = Field(default_factory=dict)
+    # Team fields (org model S2, sql/028).
+    parent_team_id: str | None = None
+    lead_member_id: str | None = None
+    charter: str = ""
+    standing_rules: list = Field(default_factory=list)
+    team_status: str = "active"
+    org_id: str = "main"
+    team_revision: int = 0

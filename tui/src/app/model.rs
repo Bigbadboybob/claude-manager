@@ -106,6 +106,16 @@ pub struct TerminalSession {
     /// or propagated from a global caller via `start_session`.
     /// Persisted in the manifest. Off by default (safe baseline).
     pub global_perms: bool,
+    /// The model this session was spawned with (`None` for bash, or a row
+    /// restored from a manifest older than the field). Persisted in the
+    /// manifest so revive / restart reuse it.
+    pub model: Option<String>,
+    /// Where `model` came from (`ModelSource::as_str`; `None` if unknown).
+    pub model_source: Option<String>,
+    /// The reasoning effort the session runs at, recorded with `model`.
+    pub effort: Option<String>,
+    /// Where `effort` came from (the same sources as `model_source`).
+    pub effort_source: Option<String>,
     /// Marker that an Enter keystroke is queued to be written to the PTY at
     /// or after `fire_at`. Used to introduce a deliberate gap between the body
     /// of a multi-KB workflow prompt and the trailing Enter so the receiving
@@ -145,6 +155,10 @@ pub struct TerminalSession {
     /// clobber the field to `None` and the named acceptance
     /// criterion would fail.
     pub preserved_last_exit: Option<cm_daemon::manifest::LastExit>,
+    /// Read-through copy of `ManifestEntry.org` (doc/org-model.md §12):
+    /// opaque, loaded with the entry and written back unchanged, like
+    /// `preserved_last_exit`.
+    pub org: Option<cm_daemon::org_bridge::OrgObject>,
     /// 12b (Phase 3): tags the in-memory session with the host
     /// its daemon runs on. Read through from `ManifestEntry.host_id`
     /// on load; new sessions get the active host
@@ -154,6 +168,17 @@ pub struct TerminalSession {
     /// right daemon. For now (12b is plumbing-only), the field is
     /// populated but no consumer reads it.
     pub host_id: crate::hosts::HostId,
+}
+
+/// Why a session's exit happened, when it was tidy-up rather than a failure:
+/// the daemon's terminal-task sweep closes a done task's idle workers and
+/// names itself in `killed_by`. Without the note the row looks like a crash.
+pub(crate) fn exit_note(last_exit: Option<&cm_daemon::manifest::LastExit>) -> Option<&'static str> {
+    last_exit?
+        .killed_by
+        .as_deref()
+        .filter(|who| who.starts_with("terminal-task-sweep"))
+        .map(|_| "closed: task done")
 }
 
 impl TerminalSession {
@@ -217,6 +242,10 @@ impl TerminalSession {
             notify_on_idle: self.notify_on_idle,
             color: self.color.clone(),
             global_perms: self.global_perms,
+            model: self.model.clone(),
+            model_source: self.model_source.clone(),
+            effort: self.effort.clone(),
+            effort_source: self.effort_source.clone(),
             seeded_from_snapshot: self.seeded_from_snapshot.clone(),
             // Read-modify-write the daemon-owned `last_exit`. The TUI
             // never inspects or mutates it — just hands it back
@@ -226,6 +255,7 @@ impl TerminalSession {
             // Round-trip the host_id from the in-memory session so a
             // remote-pinned entry stays pinned to its host.
             host_id: self.host_id.clone(),
+            org: self.org.clone(),
         }
     }
 }
@@ -307,6 +337,10 @@ pub struct Workspace {
     /// settings. Cascades to sessions without their own color. Persisted
     /// in `ManifestWorkspace`.
     pub color: Option<String>,
+    /// The workspace's org object (`ManifestWorkspace.org`,
+    /// doc/org-model.md §12): its `workspace_kind` and `binding_epoch`.
+    /// Round-tripped through the manifest; echoed in `task.update_tree`.
+    pub org: Option<cm_daemon::org_bridge::OrgObject>,
     /// Pinned workspaces sort to the top of the sidebar, ahead of the
     /// status-ranked rest. Toggled in A-e settings; persisted in
     /// `ManifestWorkspace`.
@@ -359,6 +393,8 @@ pub struct TaskEntry {
     pub name: String,
     pub api_status: TaskStatus,
     pub repo_url: Option<String>,
+    /// The task's brief: its description plus any legacy prompt the
+    /// description lacks (`planning::task_brief`). The name is historical.
     pub prompt: Option<String>,
     pub wip_branch: Option<String>,
     pub session_id: Option<String>,
@@ -499,6 +535,11 @@ pub(super) fn make_simple_session_with_uid(
     pending_jsonl_files: Option<Vec<String>>,
 ) -> TerminalSession {
     TerminalSession {
+        org: None,
+        model: session.spawn_model.clone(),
+        model_source: session.spawn_model_source.clone(),
+        effort: session.spawn_effort.clone(),
+        effort_source: session.spawn_effort_source.clone(),
         color: None,
         uid,
         label: label.to_string(),
@@ -612,6 +653,11 @@ mod manifest_entry_seeded_from_tests {
     #[test]
     fn seeded_from_snapshot_round_trips() {
         let entry = ManifestEntry {
+            org: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -664,6 +710,11 @@ mod manifest_entry_seeded_from_tests {
     #[test]
     fn none_does_not_serialize() {
         let entry = ManifestEntry {
+            org: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -731,6 +782,11 @@ mod manifest_entry_seeded_from_tests {
         // the round-trip preserves the flag so the toast renders
         // correctly post-restart.
         let entry = ManifestEntry {
+            org: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -755,6 +811,7 @@ mod manifest_entry_seeded_from_tests {
             global_perms: false,
             seeded_from_snapshot: None,
             last_exit: Some(cm_daemon::manifest::LastExit {
+                killed_by: None,
                 code: Some(137),
                 memory_cap_kill: true,
                 kills_file_offset: Some(0),
@@ -794,12 +851,18 @@ mod manifest_entry_seeded_from_tests {
     fn last_exit_survives_load_mutate_save_reload_cycle() {
         // Initial state, as a manifest written by the daemon.
         let stored_exit = cm_daemon::manifest::LastExit {
+            killed_by: None,
             code: Some(137),
             memory_cap_kill: true,
             kills_file_offset: Some(0),
             exited_at: 1_700_000_000.0,
         };
         let initial = ManifestEntry {
+            org: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -851,6 +914,11 @@ mod manifest_entry_seeded_from_tests {
         // the pre-fix `last_exit: None`, the assertion at the end of
         // this test would fail.
         let rebuilt = ManifestEntry {
+            org: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -912,6 +980,11 @@ mod transcript_rebind_tests {
             crate::session::Session::new("/bin/true", &[], 80, 24, None, HashMap::new(), None)
                 .expect("session for test");
         TerminalSession {
+            org: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             color: None,
             uid: "uid".into(),
             label: "test".into(),
@@ -1074,6 +1147,7 @@ mod worktree_mode_tests {
 
     fn ws(worktree: Option<&str>, main: Option<&str>) -> Workspace {
         Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "w".into(),

@@ -1,0 +1,1166 @@
+"""Items API against a real Postgres (doc/items-board.md §6).
+
+The database tests run when CM_ITEMS_TEST_DSN names a scratch database they may
+wipe, e.g. a private cluster:
+
+    initdb -D ~/.local/share/<lane>/pg -A trust -U postgres
+    pg_ctl -D ~/.local/share/<lane>/pg -o "-k <dir> -c listen_addresses='' -p 55432" start
+    createdb -h <dir> -p 55432 -U postgres items_test
+    CM_ITEMS_TEST_DSN=postgresql://postgres@/items_test?host=<dir>&port=55432 pytest …
+
+Without it only the migration text checks run.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import unittest
+import uuid
+from unittest import mock
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+os.environ.setdefault("CM_DB_DSN", "postgres://stub")
+os.environ.setdefault("CM_API_TOKEN", "stub")
+
+from dispatch import db, items_db  # noqa: E402
+
+ROOT = Path(__file__).parents[2]
+DSN = os.environ.get("CM_ITEMS_TEST_DSN")
+TOKEN = {"Authorization": f"Bearer {os.environ['CM_API_TOKEN']}"}
+
+
+def agent(name, daemon="d1"):
+    return {"pid": f"agent:{daemon}:{name}-uid", "name": name,
+            "session_uid": f"{name}-uid", "daemon_id": daemon}
+
+
+ORCH = agent("orch")
+LANE = agent("lane")
+
+
+class MigrationText(unittest.TestCase):
+    def test_migration_is_rerunnable_ddl_only(self):
+        text = (ROOT / "sql" / "017_items.sql").read_text()
+        for table in ("boards", "items", "item_holders", "item_deps", "item_events",
+                      "item_flags", "session_states", "item_pushes"):
+            self.assertIn(f"CREATE TABLE IF NOT EXISTS {table} ", text)
+        body = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("--"))
+        self.assertNotIn("UPDATE ", body)
+        self.assertNotIn("INSERT ", body)
+        self.assertNotIn("task_changes", body)
+        self.assertNotRegex(body, r"CREATE (UNIQUE )?INDEX (?!IF NOT EXISTS)")
+
+    def test_migration_number_is_unique(self):
+        for n in ("017", "018"):
+            self.assertEqual(len(list((ROOT / "sql").glob(f"{n}_*.sql"))), 1)
+        text = (ROOT / "sql" / "018_item_requests.sql").read_text()
+        self.assertIn("CREATE TABLE IF NOT EXISTS item_requests", text)
+
+
+@unittest.skipUnless(DSN, "set CM_ITEMS_TEST_DSN to a scratch Postgres database")
+class ItemsApiDb(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        import httpx
+        from fastapi import FastAPI
+
+        from api.items import router
+
+        self.pool = await __import__("asyncpg").create_pool(
+            DSN, min_size=1, max_size=4, init=db._init_connection)
+        async with self.pool.acquire() as conn:
+            await conn.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+        await db.init_db(self.pool)
+        await db.init_db(self.pool)  # migrations must re-run cleanly
+        app = FastAPI()
+        app.state.pool = self.pool
+        app.include_router(router)
+        self.http = httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                      base_url="http://t", headers=TOKEN)
+        self.root = await self._task("root")
+        self.board = (await self.post("/boards/resolve", {"task_id": self.root})).json()
+        self.ref = self.board["slug"]
+
+    async def asyncTearDown(self):
+        await self.http.aclose()
+        await self.pool.close()
+
+    async def _task(self, name, parent=None, initiative=None) -> str:
+        async with self.pool.acquire() as conn:
+            return str(await conn.fetchval(
+                """INSERT INTO tasks (repo_url, prompt, name, parent_task_id, initiative_id)
+                   VALUES ('r', 'p', $1, $2, $3) RETURNING id""",
+                name, uuid.UUID(parent) if parent else None,
+                uuid.UUID(initiative) if initiative else None,
+            ))
+
+    async def post(self, path, body):
+        return await self.http.post(path, json=body)
+
+    async def test_item_read_exact_number_is_bounded_and_detail_is_retrievable(self):
+        await self.create("unrelated-one", "target", "unrelated-three")
+        description = ("🔬quoted\n" * 900) + "END"
+        async with self.pool.acquire() as conn:
+            item_id = await conn.fetchval("SELECT id FROM items WHERE board_id=$1 AND number=2",
+                                          uuid.UUID(self.board["id"]))
+            first_id = await conn.fetchval("SELECT id FROM items WHERE board_id=$1 AND number=1",
+                                           uuid.UUID(self.board["id"]))
+            third_id = await conn.fetchval("SELECT id FROM items WHERE board_id=$1 AND number=3",
+                                           uuid.UUID(self.board["id"]))
+            await conn.execute("INSERT INTO item_deps(item_id,blocker_id) VALUES($1,$2),($3,$1)",
+                               item_id, first_id, third_id)
+            await conn.execute("UPDATE items SET description=$2, note=$3, archived_at=now() WHERE id=$1",
+                               item_id, description, "n" * 2000)
+            await conn.execute("DELETE FROM item_holders WHERE item_id=$1", item_id)
+            await conn.executemany(
+                "INSERT INTO item_holders(item_id,pid,name,role,attribution) VALUES($1,$2,$3,'reviewer',$4)",
+                [(item_id, f"agent:d:{i}", f"holder-{i}", {"proof": "p" * 6000}) for i in range(8)])
+            await conn.execute("""INSERT INTO item_events(board_id,item_id,item_number,actor_pid,type,new)
+                VALUES($1,$2,2,'owner','updated',$3)""", uuid.UUID(self.board["id"]), item_id,
+                {"evidence": "q" * 7000})
+            await conn.execute("INSERT INTO item_flags(item_id,kind) VALUES($1,'stale')", item_id)
+            await conn.executemany(
+                "INSERT INTO items(board_id,number,title,status) VALUES($1,$2,$3,'active')",
+                [(uuid.UUID(self.board["id"]), n, "unrelated-" + str(n)) for n in range(4, 504)])
+        with mock.patch.object(items_db, "_load_items", side_effect=AssertionError("whole board loaded")), \
+             mock.patch.object(items_db, "_board_header", side_effect=AssertionError("whole board header loaded")):
+            response = await self.post("/items/read", {"board": self.ref, "n": 2})
+            self.assertEqual(response.status_code, 200, response.text)
+            summary = response.json()
+            self.assertEqual(summary["item"]["title"], "target")
+            self.assertTrue(summary["item"]["truncated"]["description"])
+            self.assertTrue(summary["item"]["truncated"]["note"])
+            self.assertTrue(summary["item"]["holders_more"])
+            self.assertEqual(len(summary["item"]["holders"]), 5)
+            self.assertEqual([f["kind"] for f in summary["item"]["flags"]], ["stale"])
+            self.assertEqual(summary["item"]["blocked_by"], [1])
+            self.assertEqual(summary["item"]["blocks"], [3])
+            self.assertNotIn("unrelated-one", response.text)
+            self.assertLess(len(response.content), 12000)
+
+            async def collect(section, **extra):
+                offset, pieces = 0, []
+                while True:
+                    r = await self.post("/items/read", {"board": self.ref, "n": 2,
+                        "section": section, "offset": offset, **extra})
+                    self.assertEqual(r.status_code, 200, r.text)
+                    page = r.json()
+                    self.assertLessEqual(len(page["data"]), 2048)
+                    self.assertLess(len(r.content), 15000)
+                    pieces.append(page["data"])
+                    if page["next_offset"] is None:
+                        return "".join(pieces), page
+                    offset = page["next_offset"]
+
+            full_description, _ = await collect("text", field="description")
+            self.assertEqual(full_description, description)
+            holder, holder_page = await collect("holders", index=0)
+            self.assertEqual(json.loads(holder)["attribution"]["proof"], "p" * 6000)
+            self.assertEqual(holder_page["next_index"], 1)
+            event, event_page = await collect("history", index=0)
+            self.assertEqual(json.loads(event)["new"]["evidence"], "q" * 7000)
+            self.assertEqual(event_page["next_index"], 1)
+            record, _ = await collect("record")
+            self.assertEqual(json.loads(record)["note"], "n" * 2000)
+            flag, _ = await collect("flags", index=0)
+            self.assertEqual(json.loads(flag)["kind"], "stale")
+            blocker, _ = await collect("blocked_by", index=0)
+            self.assertEqual(json.loads(blocker)["n"], 1)
+
+    async def test_item_read_uses_linked_task_title_and_description(self):
+        await self.create("old-title")
+        task = await self._task("live-task-title")
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE tasks SET description=$2, description_rev=7 WHERE id=$1",
+                               uuid.UUID(task), "task description")
+            await conn.execute("UPDATE items SET task_id=$1, description='old text' WHERE board_id=$2 AND number=1",
+                               uuid.UUID(task), uuid.UUID(self.board["id"]))
+        r = await self.post("/items/read", {"board": self.ref, "n": 1})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["item"]["title"], "live-task-title")
+        self.assertEqual(r.json()["item"]["description"], "task description")
+        self.assertEqual(r.json()["item"]["description_rev"], 7)
+        r = await self.post("/items/read", {"board": self.ref, "n": 1,
+                                           "section": "text", "field": "description"})
+        self.assertEqual(r.json()["data"], "task description")
+
+    async def test_item_read_missing_invalid_and_any_board_reader(self):
+        await self.create("only")
+        for body in ({"board": self.ref, "n": 0}, {"board": self.ref, "n": True},
+                     {"board": self.ref, "n": 1, "section": "text", "field": "bad"},
+                     {"board": self.ref, "n": 1, "section": "history", "offset": -1}):
+            r = await self.post("/items/read", body)
+            self.assertEqual(r.status_code, 422, r.text)
+        for body in ({"board": self.ref, "n": 999}, {"board": "no-such-board", "n": 1}):
+            r = await self.post("/items/read", body)
+            self.assertEqual(r.status_code, 404, r.text)
+        r = await self.http.post("/items/read", json={"board": self.ref, "n": 1}, headers={"Authorization": "Bearer wrong"})
+        self.assertEqual(r.status_code, 401)
+        # The existing board read policy permits any authenticated session to
+        # read an explicit board; no edit membership is required.
+        r = await self.post("/items/read", {"board": self.ref, "n": 1})
+        self.assertEqual(r.status_code, 200, r.text)
+        with mock.patch.object(items_db, "_board_header", side_effect=AssertionError("whole board header loaded")):
+            r = await self.post("/items/read", {"task_id": self.root, "n": 1})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["item"]["title"], "only")
+        r = await self.post("/items/read", {"board": self.ref, "task_id": self.root, "n": 1})
+        self.assertEqual(r.status_code, 422, r.text)
+        r = await self.post("/items/read", {"task_id": str(uuid.uuid4()), "n": 1})
+        self.assertEqual(r.status_code, 404, r.text)
+
+    async def create(self, *specs, actor=ORCH, ok=True):
+        r = await self.post(f"/boards/{self.ref}/items", {
+            "actor": actor,
+            "items": [s if isinstance(s, dict) else {"title": s} for s in specs],
+        })
+        if ok:
+            self.assertEqual(r.status_code, 200, r.text)
+        return r
+
+    async def patch(self, ns, actor=ORCH, ok=True, **kw):
+        body = {"actor": actor, "ns": ns if isinstance(ns, list) else [ns]}
+        for key in ("add_holders", "remove_holders", "reason", "reopen", "expect_status"):
+            if key in kw:
+                body[key] = kw.pop(key)
+        body["set"] = kw
+        r = await self.http.patch(f"/boards/{self.ref}/items", json=body)
+        if ok:
+            self.assertEqual(r.status_code, 200, r.text)
+        return r
+
+    async def read(self, **params):
+        r = await self.http.get(f"/boards/{self.ref}", params=params)
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    async def fetch(self, sql, *args):
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(sql, *args)
+
+    # ---- reopen guard (2026-10-24, sejd #1665 / #1643 / #1505) ----------
+    async def test_a_done_item_reopens_only_on_purpose_on_every_write_route(self):
+        await self.create({"title": "gate", "holders": [LANE]}, {"title": "other", "holders": [LANE]})
+        await self.patch(1, actor=LANE, status="done")
+        # The incident write: done -> blocked from a stale read.
+        r = await self.patch(1, ok=False, status="blocked", blocked_on="renewal", check_back="2h",
+                             reason="post-outage renewal; trigger met")
+        self.assertEqual(r.status_code, 409, r.text)
+        detail = r.json()["detail"]
+        self.assertEqual((detail["code"], detail["closed_by"], detail["current_status"]),
+                         ("reopen_required", "lane", "done"))
+        # Bulk, all-or-nothing (the default): one done item refuses the whole
+        # write, so #2 is unchanged.
+        r = await self.patch([2, 1], ok=False, note="bulk note", status="active")
+        self.assertEqual(r.status_code, 409)
+        items = {i["n"]: i for i in (await self.read())["items"]}
+        self.assertNotEqual(items[2]["note"], "bulk note")
+        # Bulk with each=True: per-item results, #2 applied, #1 refused.
+        r = await self.http.patch(f"/boards/{self.ref}/items", json={
+            "actor": ORCH, "ns": [2, 1], "each": True, "set": {"note": "each note", "status": "active"}})
+        self.assertEqual(r.status_code, 200, r.text)
+        results = {x["n"]: x for x in r.json()["results"]}
+        self.assertTrue(results[2]["ok"])
+        self.assertEqual(results[1]["error"]["code"], "reopen_required")
+        # expect_status: a compare-and-set against the status read.
+        r = await self.http.patch(f"/boards/{self.ref}/items", json={
+            "actor": ORCH, "ns": [2], "expect_status": "blocked", "set": {"note": "x"}})
+        self.assertEqual((r.status_code, r.json()["detail"]["code"]), (409, "status_changed"))
+        r = await self.http.patch(f"/boards/{self.ref}/items", json={
+            "actor": ORCH, "ns": [2], "expect_status": "active", "set": {"note": "cas ok"}})
+        self.assertEqual(r.status_code, 200, r.text)
+        # reopen=true reopens and is recorded.
+        r = await self.http.patch(f"/boards/{self.ref}/items", json={
+            "actor": ORCH, "ns": [1], "reopen": True,
+            "set": {"status": "blocked", "blocked_on": "regression", "check_back": "1h"}})
+        self.assertEqual(r.status_code, 200, r.text)
+        ev = await self.fetch("SELECT new FROM item_events WHERE item_number = 1 AND type = 'updated' "
+                              "ORDER BY id DESC LIMIT 1")
+        self.assertEqual(ev[0]["new"]["reopened"], "reopen=true")
+        # Owner's route (the TUI acts as owner) reopens without the flag.
+        await self.patch(1, actor=LANE, status="done")
+        await self.patch(1, actor={"pid": "owner", "name": "Owner"}, status="active")
+        self.assertEqual({i["n"]: i for i in (await self.read())["items"]}[1]["status"], "active")
+        # A closer recorded before sql/025 is read from the item's history.
+        await self.patch(1, actor=LANE, status="done")
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE items SET closed_by = NULL WHERE number = 1")
+        r = await self.patch(1, ok=False, status="active")
+        self.assertIn("closed by lane at", r.json()["detail"]["message"])
+
+    # ---- boards ---------------------------------------------------------
+    async def test_task_board_is_shared_by_the_subtree(self):
+        self.assertEqual(self.ref, f"task-{self.root[:8]}")
+        self.assertEqual(self.board["name"], "root")
+        child = await self._task("child", parent=self.root)
+        grandchild = await self._task("gc", parent=child)
+        again = (await self.post("/boards/resolve", {"task_id": grandchild})).json()
+        self.assertEqual(again["id"], self.board["id"])
+        self.assertEqual(len(await self.fetch("SELECT 1 FROM boards")), 1)
+
+    async def test_initiative_board(self):
+        coord = await self._task("coord")
+        async with self.pool.acquire() as conn:
+            ini = await conn.fetchval(
+                """INSERT INTO initiatives (slug, name, coordinator_task_id)
+                   VALUES ('sfd', 'Swarm Focused Design', $1) RETURNING id""",
+                uuid.UUID(coord))
+        lane = await self._task("lane", initiative=str(ini))
+        sub = await self._task("sub", parent=lane)
+        b = (await self.post("/boards/resolve", {"task_id": sub})).json()
+        self.assertEqual((b["slug"], b["name"]), ("sfd", "Swarm Focused Design"))
+        self.assertEqual(b["initiative_id"], str(ini))
+        by_ref = (await self.post("/boards/resolve", {"ref": "sfd"})).json()
+        self.assertEqual(by_ref["id"], b["id"])
+
+    async def test_unknown_task_and_board_are_404(self):
+        r = await self.post("/boards/resolve", {"task_id": str(uuid.uuid4())})
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["detail"]["code"], "not_found")
+        self.assertEqual((await self.http.get("/boards/nope")).status_code, 404)
+
+    async def test_auth_required(self):
+        r = await self.http.get(f"/boards/{self.ref}", headers={"Authorization": "Bearer x"})
+        self.assertEqual(r.status_code, 401)
+
+    async def test_patch_board_settings(self):
+        r = await self.http.patch(f"/boards/{self.ref}", json={
+            "actor": {"pid": "owner"}, "idle_s": 600, "holder_idle_enabled": True})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["settings"]["idle_s"], 600)
+        self.assertTrue(r.json()["settings"]["holder_idle_enabled"])
+        bad = await self.http.patch(f"/boards/{self.ref}", json={
+            "actor": {"pid": "owner"}, "stale_s": 0})
+        self.assertEqual(bad.status_code, 422)
+        events = await self.fetch("SELECT type, new FROM item_events")
+        self.assertEqual(events[0]["type"], "board_updated")
+
+    async def test_delete_board_refuses_open_items_then_cascades(self):
+        await self.create("a", "b")
+        r = await self.http.delete(f"/boards/{self.ref}")
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["detail"]["code"], "board_not_empty")
+        self.assertEqual(r.json()["detail"]["open_items"], [1, 2])
+        await self.patch([1, 2], status="done")
+        r = await self.http.delete(f"/boards/{self.ref}")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["items"], 2)
+        for table in ("boards", "items", "item_events", "item_holders", "item_pushes"):
+            self.assertEqual(await self.fetch(f"SELECT 1 FROM {table}"), [], table)
+        self.assertEqual((await self.http.delete(f"/boards/{self.ref}")).status_code, 404)
+
+    # ---- writes ---------------------------------------------------------
+    async def test_numbering_persists_and_concurrent_creates_never_collide(self):
+        await self.create("a", "b")
+        results = await asyncio.gather(*(self.create(f"c{i}") for i in range(6)))
+        ns = sorted(r.json()["items"][0]["n"] for r in results)
+        self.assertEqual(ns, [3, 4, 5, 6, 7, 8])
+        rows = await self.fetch("SELECT next_number FROM boards")
+        self.assertEqual(rows[0]["next_number"], 9)
+
+    async def test_create_with_request_id_replays_instead_of_duplicating(self):
+        body = {"actor": ORCH, "items": [{"title": "a"}, {"title": "b"}], "request_id": "rq-1"}
+        first = await self.post(f"/boards/{self.ref}/items", body)
+        await self.patch(1, note="edited since")
+        again = await self.post(f"/boards/{self.ref}/items", body)
+        self.assertEqual(again.status_code, 200, again.text)
+        self.assertTrue(again.json()["replayed"])
+        self.assertEqual([i["n"] for i in again.json()["items"]], [1, 2])
+        self.assertEqual(again.json()["items"][0]["note"], "edited since")
+        self.assertNotIn("replayed", first.json())
+        self.assertEqual(len(await self.fetch("SELECT 1 FROM items")), 2)
+        other = await self.post(f"/boards/{self.ref}/items", {**body, "request_id": "rq-2"})
+        self.assertEqual([i["n"] for i in other.json()["items"]], [3, 4])
+
+    async def test_concurrent_retries_with_one_request_id_create_once(self):
+        body = {"actor": ORCH, "items": [{"title": "a"}], "request_id": "rq-c"}
+        replies = await asyncio.gather(*(self.post(f"/boards/{self.ref}/items", body)
+                                         for _ in range(4)))
+        self.assertEqual({r.json()["items"][0]["n"] for r in replies}, {1})
+        self.assertEqual(len(await self.fetch("SELECT 1 FROM items")), 1)
+
+    async def test_failed_batch_writes_nothing(self):
+        r = await self.create("ok", {"title": "bad", "blocked_by": [42]}, ok=False)
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["detail"]["code"], "invalid_blocker")
+        self.assertEqual(await self.fetch("SELECT 1 FROM items"), [])
+        self.assertEqual((await self.fetch("SELECT next_number FROM boards"))[0][0], 1)
+
+    async def test_cycle_refused_over_http(self):
+        await self.create("a", "b")
+        await self.patch(2, blocked_by=[1])
+        r = await self.patch(1, blocked_by=[2], ok=False)
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["detail"], {"code": "cycle", "message": "cycle: 1→2→1",
+                                              "cycle": [1, 2, 1]})
+        deps = await self.fetch("SELECT * FROM item_deps")
+        self.assertEqual(len(deps), 1)
+
+    async def test_waiting_requires_eta(self):
+        await self.create("job")
+        r = await self.patch(1, status="waiting", ok=False)
+        self.assertEqual(r.json()["detail"]["code"], "eta_required")
+        r = await self.patch(1, status="waiting", eta="40m")
+        self.assertIsNotNone(r.json()["items"][0]["eta_at"])
+
+    async def test_done_cascade_persists_unblock_push_and_history(self):
+        await self.create("a", {"title": "b", "holders": [LANE]})
+        await self.patch(2, blocked_by=[1])
+        r = await self.patch(1, status="done", note="abc123")
+        self.assertEqual(r.json()["unblocked"], [2])
+        self.assertEqual(await self.fetch("SELECT * FROM item_deps"), [])
+        status = await self.fetch("SELECT number, status, clock_reset_at, closed_at FROM items ORDER BY number")
+        self.assertEqual([(s["number"], s["status"]) for s in status], [(1, "done"), (2, "active")])
+        self.assertIsNotNone(status[1]["clock_reset_at"])
+        self.assertIsNotNone(status[0]["closed_at"])
+        pushes = await self.fetch("SELECT kind, daemon_id, session_uid FROM item_pushes ORDER BY id")
+        self.assertEqual([p["kind"] for p in pushes], ["assigned", "unblocked"])
+        self.assertEqual(pushes[1]["session_uid"], "lane-uid")
+        types = [e["type"] for e in await self.fetch(
+            "SELECT type FROM item_events WHERE item_number = 2 ORDER BY id")]
+        self.assertEqual(types, ["created", "updated", "unblocked"])
+
+    async def test_drop_flags_dependent_and_resolve_repoints(self):
+        await self.create("a", "b", "c")
+        await self.patch(2, blocked_by=[1])
+        await self.patch(1, status="dropped", reason="superseded by 3")
+        board = await self.read()
+        self.assertEqual([(f["n"], f["kind"]) for f in board["flags"]], [(2, "blocker_dropped")])
+        self.assertEqual(board["board"]["health"]["unresolved"], 1)
+        r = await self.post(f"/boards/{self.ref}/items/2/resolve", {
+            "actor": ORCH, "action": "block", "blocked_by": [3]})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["flags_resolved"], ["blocker_dropped"])
+        self.assertEqual(r.json()["item"]["blocked_by"], [3])
+        board = await self.read()
+        self.assertEqual(board["flags"], [])
+        flag = (await self.fetch("SELECT resolution, resolved_by FROM item_flags"))[0]
+        self.assertEqual((flag["resolution"], flag["resolved_by"]), ("block", ORCH["pid"]))
+
+    async def test_holders_add_remove_and_reopen(self):
+        await self.create("a")
+        await self.patch(1, add_holders=[LANE])
+        await self.patch(1, remove_holders=[ORCH["pid"]])
+        holders = await self.fetch("SELECT pid FROM item_holders")
+        self.assertEqual([h["pid"] for h in holders], [LANE["pid"]])
+        await self.patch(1, status="done")
+        await self.patch(1, status="active", reopen=True)
+        row = (await self.fetch("SELECT closed_at, status FROM items"))[0]
+        self.assertIsNone(row["closed_at"])
+        self.assertEqual(row["status"], "active")
+
+    async def test_s4_old_holder_replacement_preserves_existing_evidence(self):
+        attribution = {"member_id": "mem_a", "acting_as": "assistant",
+                       "provenance": "o5-spawn-stamp", "as_of":"spawn", "verified": False}
+        await self.create({"title": "a", "holders": [LANE]})
+        await self.patch(1, add_holders=[{**LANE, "attribution": attribution}])
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE item_holders SET member_id='mem_a', via_member_id='mem_v'")
+        # Old clients omit attribution; replacement/reorder cannot erase it.
+        await self.patch(1, holders=[LANE, ORCH])
+        await self.patch(1, holders=[ORCH, LANE])
+        await self.patch(1, holders=[{**ORCH, "role":"owner"}, {**LANE, "role":"contributor"}])
+        rows = await self.fetch("SELECT pid,member_id,via_member_id,attribution FROM item_holders ORDER BY pid")
+        by_pid = {r["pid"]: r for r in rows}
+        self.assertEqual(by_pid[LANE["pid"]]["member_id"], "mem_a")
+        self.assertEqual(by_pid[LANE["pid"]]["via_member_id"], "mem_v")
+        self.assertEqual(by_pid[LANE["pid"]]["attribution"]["provenance"], "o5-spawn-stamp")
+        self.assertIsNone(by_pid[ORCH["pid"]]["attribution"])
+        await self.patch(1, holders=[ORCH])
+        rows = await self.fetch("SELECT pid,attribution FROM item_holders")
+        self.assertEqual([r["pid"] for r in rows], [ORCH["pid"]])
+        events = await self.fetch("SELECT holder_attributions FROM item_events WHERE holder_attributions IS NOT NULL")
+        self.assertTrue(any(any(h["pid"] == LANE["pid"] and h["attribution"]["member_id"] == "mem_a"
+                                for h in row["holder_attributions"]) for row in events))
+
+    async def test_s4_item_actor_attribution_is_event_evidence(self):
+        await self.create("a")
+        claim = {"member_id":"mem_a", "acting_as":"main", "provenance":"central-open-main",
+                 "org_version": 7, "daemon_id":"d1", "verified":True}
+        await self.patch(1, actor={**ORCH, "attribution":claim}, note="evidence")
+        rows = await self.fetch("SELECT actor_pid,actor_attribution FROM item_events WHERE type='updated'")
+        self.assertTrue(any(r["actor_pid"] == ORCH["pid"] and r["actor_attribution"]
+                            and r["actor_attribution"]["member_id"] == "mem_a" for r in rows))
+
+    async def test_s4_rollback_old_writer_loses_current_but_not_event_evidence(self):
+        claim = {"member_id":"mem_a", "acting_as":"assistant", "provenance":"o5-spawn-stamp",
+                 "as_of":"spawn", "verified":False}
+        await self.create({"title":"a", "holders":[LANE]})
+        await self.patch(1, add_holders=[{**LANE, "attribution":claim}])
+        # Reproduce a2029aba's holder rewrite, which knows only these columns.
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                rows = await conn.fetch("SELECT item_id,pid,session_uid,daemon_id,name,added_at,role FROM item_holders")
+                await conn.execute("DELETE FROM item_holders")
+                for row in rows:
+                    await conn.execute("""INSERT INTO item_holders
+                        (item_id,pid,session_uid,daemon_id,name,added_at,role)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7)""", *row.values())
+        self.assertIsNone((await self.fetch("SELECT attribution FROM item_holders"))[0]["attribution"])
+        events = await self.fetch("SELECT holder_attributions FROM item_events WHERE holder_attributions IS NOT NULL")
+        self.assertTrue(any(any(h["pid"] == LANE["pid"] and h["attribution"]["member_id"] == "mem_a"
+                                for h in row["holder_attributions"]) for row in events))
+
+    async def test_s4_bad_optional_evidence_is_unknown_without_rejecting_write(self):
+        await self.create({"title":"a", "holders":[LANE]})
+        good = {"member_id":"mem_a", "acting_as":"assistant", "provenance":"o5-spawn-stamp",
+                "as_of":"spawn", "verified":False}
+        await self.patch(1, add_holders=[{**LANE, "attribution":good}])
+        # An old writer omits the field: preserve existing evidence.
+        await self.patch(1, holders=[LANE])
+        self.assertIsNotNone((await self.fetch("SELECT attribution FROM item_holders"))[0]["attribution"])
+        bad = ["malformed", {"provenance":"unknown"},
+               {"member_id":"", "acting_as":"assistant", "provenance":"central-open-main", "verified":True},
+               {"member_id":"mem_a", "acting_as":"assistant", "provenance":"o5-spawn-stamp", "as_of":"spawn", "verified":True},
+               {"member_id":"mem_a", "acting_as":"main", "provenance":"central-open-main", "verified":True,
+                "daemon_id":"wrong", "org_version":7}]
+        for claim in bad:
+            await self.patch(1, holders=[{**LANE, "attribution":claim}], note="kept working")
+            self.assertIsNone((await self.fetch("SELECT attribution FROM item_holders"))[0]["attribution"])
+
+    @unittest.skipUnless(os.environ.get("CM_S4_HOLDER_PROOF"), "requires isolated Rust wire fixture")
+    async def test_s4_contended_holder_wire_clears_persisted_evidence(self):
+        import json
+        fixtures = json.loads(Path(os.environ["CM_S4_HOLDER_PROOF"]).read_text())
+        self.assertEqual(len(fixtures), 3)
+        state_busy, cache_busy, old_wire = fixtures
+        self.assertEqual(state_busy["pid"], cache_busy["pid"])
+        self.assertEqual(state_busy["pid"], old_wire["pid"])
+        self.assertNotIn("attribution", old_wire)
+        good = {"member_id":"mem_a", "acting_as":"assistant", "provenance":"o5-spawn-stamp",
+                "as_of":"spawn", "verified":False}
+        await self.create({"title":"a", "holders":[old_wire]})
+        for holder in (state_busy, cache_busy):
+            await self.patch(1, add_holders=[{**old_wire, "attribution":good}])
+            before = (await self.fetch("SELECT attribution FROM item_holders"))[0]["attribution"]
+            self.assertEqual(before["member_id"], "mem_a")
+            self.assertEqual(holder["attribution"], {"provenance":"unknown"})
+            await self.patch(1, holders=[holder])
+            self.assertIsNone((await self.fetch("SELECT attribution FROM item_holders"))[0]["attribution"])
+        # A genuine old-wire writer is different: absence preserves evidence.
+        await self.patch(1, add_holders=[{**old_wire, "attribution":good}])
+        await self.patch(1, holders=[old_wire])
+        self.assertEqual((await self.fetch("SELECT attribution FROM item_holders"))[0]["attribution"]["member_id"], "mem_a")
+
+    async def test_s4_old_minimal_owner_transfer_preserves_existing_identity(self):
+        await self.create("a")
+        await self.patch(1, add_holders=[LANE])
+        url = f"/boards/{self.ref}/items"
+        r = await self.http.patch(url, json={"actor":ORCH, "ns":[1], "set":{}, "owner":{"pid":LANE["pid"]}})
+        self.assertEqual(r.status_code, 200, r.text)
+        rows = await self.fetch("SELECT pid,name,session_uid,daemon_id FROM item_holders WHERE pid=$1", LANE["pid"])
+        self.assertEqual((rows[0]["name"], rows[0]["session_uid"], rows[0]["daemon_id"]),
+                         (LANE["name"], LANE["session_uid"], LANE["daemon_id"]))
+        r = await self.http.patch(url, json={"actor":ORCH, "ns":[1], "set":{}, "owner":ORCH})
+        self.assertEqual(r.status_code, 200, r.text)
+        rows = await self.fetch("SELECT name,session_uid,daemon_id FROM item_holders WHERE pid=$1", ORCH["pid"])
+        self.assertEqual((rows[0]["name"], rows[0]["session_uid"], rows[0]["daemon_id"]),
+                         (ORCH["name"], ORCH["session_uid"], ORCH["daemon_id"]))
+
+    async def test_s4_evidence_only_does_not_change_status_or_actionable_clock(self):
+        await self.create({"title":"a", "holders":[LANE]})
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE items SET status='open', actionable_at='2020-01-01T00:00:00Z'")
+        before = (await self.fetch("SELECT status,actionable_at FROM items"))[0]
+        claim = {"member_id":"mem_a", "acting_as":"assistant", "provenance":"o5-spawn-stamp",
+                 "as_of":"spawn", "verified":False}
+        await self.patch(1, holders=[{**LANE, "attribution":claim}])
+        after = (await self.fetch("SELECT status,actionable_at FROM items"))[0]
+        self.assertEqual((after["status"], after["actionable_at"]), (before["status"], before["actionable_at"]))
+        await self.patch(1, add_holders=[ORCH])
+        self.assertEqual((await self.fetch("SELECT status FROM items"))[0]["status"], "active")
+
+    async def test_nudge_resolve_snoozes_and_pushes(self):
+        await self.create({"title": "a", "holders": [LANE]})
+        async with self.pool.acquire() as conn:
+            await conn.execute("INSERT INTO item_flags (item_id, kind) SELECT id, 'stale' FROM items")
+        r = await self.post(f"/boards/{self.ref}/items/1/resolve", {
+            "actor": ORCH, "action": "nudge"})
+        self.assertEqual(r.json()["flags_resolved"], ["stale"])
+        flag = (await self.fetch("SELECT snooze_until, raised_at FROM item_flags"))[0]
+        self.assertGreater(flag["snooze_until"] - flag["raised_at"], timedelta(seconds=7000))
+        kinds = [p["kind"] for p in await self.fetch("SELECT kind FROM item_pushes ORDER BY id")]
+        self.assertEqual(kinds, ["assigned", "nudge"])
+
+    async def test_null_holders_clears_over_http(self):
+        await self.create("a")
+        r = await self.patch(1, holders=None)
+        self.assertEqual(r.json()["items"][0]["holders"], [])
+        self.assertEqual(r.json()["items"][0]["status"], "open")
+        self.assertEqual(await self.fetch("SELECT 1 FROM item_holders"), [])
+
+    async def test_second_dropped_blocker_persists_flag_detail(self):
+        await self.create("a", "b", "c")
+        await self.patch(2, blocked_by=[1, 3])
+        await self.patch(1, status="dropped")
+        await self.patch(3, status="dropped")
+        flags = await self.fetch("SELECT detail FROM item_flags WHERE resolved_at IS NULL")
+        self.assertEqual([f["detail"] for f in flags], [{"blockers": [1, 3]}])
+
+    async def test_out_of_range_inputs_are_422_not_500(self):
+        await self.create("a", "b")
+        cases = [
+            self.post(f"/boards/{self.ref}/items/{2**40}/resolve", {"actor": ORCH, "action": "drop"}),
+            self.patch(2, blocked_by=[2**40], ok=False),
+            self.patch([2**31], note="x", ok=False),
+            self.patch(2, note="x", reason="r" * 501, ok=False),
+            self.post(f"/boards/{self.ref}/items/1/resolve",
+                      {"actor": ORCH, "action": "nudge", "message": "m" * 1001}),
+            self.http.patch(f"/boards/{self.ref}", json={
+                "actor": {"pid": "owner"}, "orchestrator_pid": "p" * 201}),
+            self.http.patch(f"/boards/{self.ref}", json={
+                "actor": {"pid": "owner"}, "idle_s": 2**40}),
+        ]
+        for r in await asyncio.gather(*cases):
+            self.assertEqual(r.status_code, 422, r.text)
+
+    # ---- heartbeat -------------------------------------------------------
+    async def beat(self, sessions, daemon="d1", **kw):
+        r = await self.post(f"/hosts/{daemon}/heartbeat", {"host_label": "sessions",
+                                                           "sessions": sessions, **kw})
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def row(self, name, state="idle", daemon="d1", **kw):
+        return {"pid": f"agent:{daemon}:{name}-uid", "session_uid": f"{name}-uid",
+                "task_id": self.root, "name": name, "engine": "codex", "state": state,
+                "state_age_s": 600, **kw}
+
+    async def test_heartbeat_upserts_states_with_server_clock(self):
+        await self.beat([self.row("lane", idle_for_s=600, age_s=3600,
+                                  agent_state={"state": "idle"})])
+        row = (await self.fetch("SELECT * FROM session_states"))[0]
+        now = datetime.now(timezone.utc)
+        self.assertEqual((row["state"], row["host_label"], str(row["task_id"])),
+                         ("idle", "sessions", self.root))
+        self.assertAlmostEqual((now - row["state_since"]).total_seconds(), 600, delta=5)
+        self.assertAlmostEqual((now - row["started_at"]).total_seconds(), 3600, delta=5)
+        self.assertIsNone(row["exited_at"])
+        self.assertEqual(row["agent_state"], {"state": "idle"})
+        await self.beat([self.row("lane", state="working", state_age_s=5)])
+        row = (await self.fetch("SELECT state, started_at FROM session_states"))[0]
+        self.assertEqual(row["state"], "working")
+        self.assertIsNotNone(row["started_at"])  # kept when a beat omits age_s
+
+    async def test_recorded_model_is_bounded_and_old_writer_clears_it(self):
+        await self.beat([self.row("lane", recorded_model="m" * 250,
+                                  recorded_model_source="explicit", member_id="mem_child", acting_as="assistant")])
+        row = (await self.fetch("SELECT recorded_model, recorded_model_source, roster_stamp_member, roster_stamp_role, roster_stamp_as_of, reported_at FROM session_states"))[0]
+        self.assertEqual(row["recorded_model"], "m" * 200)
+        self.assertEqual(row["recorded_model_source"], "explicit")
+        self.assertEqual((row["roster_stamp_member"], row["roster_stamp_role"]), ("mem_child", "assistant"))
+        self.assertEqual(row["roster_stamp_as_of"], row["reported_at"])
+        await self.beat([self.row("lane")])
+        row = (await self.fetch("SELECT recorded_model, recorded_model_source, roster_stamp_member, roster_stamp_role, roster_stamp_as_of FROM session_states"))[0]
+        self.assertIsNone(row["recorded_model"])
+        self.assertIsNone(row["recorded_model_source"])
+        self.assertIsNone(row["roster_stamp_member"])
+        self.assertIsNone(row["roster_stamp_role"])
+        self.assertIsNone(row["roster_stamp_as_of"])
+
+    async def test_missing_from_snapshot_is_exited_and_revival_clears_it(self):
+        await self.beat([self.row("lane"), self.row("orch")])
+        await self.beat([self.row("orch")])
+        rows = {r["pid"]: r for r in await self.fetch("SELECT * FROM session_states")}
+        self.assertIsNotNone(rows["agent:d1:lane-uid"]["exited_at"])
+        self.assertEqual(rows["agent:d1:lane-uid"]["state"], "exited")
+        self.assertIsNone(rows["agent:d1:orch-uid"]["exited_at"])
+        await self.beat([self.row("orch"), self.row("lane")])
+        row = (await self.fetch("SELECT exited_at FROM session_states WHERE pid = 'agent:d1:lane-uid'"))[0]
+        self.assertIsNone(row["exited_at"])
+
+    async def test_other_daemons_rows_untouched_and_foreign_pids_refused(self):
+        await self.beat([self.row("x", daemon="d2")], daemon="d2")
+        await self.beat([])
+        row = (await self.fetch("SELECT exited_at FROM session_states"))[0]
+        self.assertIsNone(row["exited_at"])
+        reply = await self.beat([self.row("y", daemon="d2"), self.row("ok")])
+        self.assertEqual(reply["dropped_sessions"],
+                         [{"pid": "agent:d2:y-uid", "reason": "pid does not belong to this daemon"}])
+        self.assertEqual(len(await self.fetch("SELECT 1 FROM session_states WHERE daemon_id = 'd1'")), 1)
+
+    async def test_one_bad_row_is_clipped_or_dropped_not_the_whole_beat(self):
+        long = {**self.row("lane"), "name": "n" * 500, "engine": "e" * 90, "state_age_s": "soon"}
+        reply = await self.beat([long, {"pid": 7}, self.row("orch")], host_label="h" * 300)
+        self.assertEqual(len(reply["dropped_sessions"]), 1)
+        rows = {r["pid"]: r for r in await self.fetch("SELECT * FROM session_states")}
+        self.assertEqual(len(rows["agent:d1:lane-uid"]["name"]), 200)
+        self.assertEqual(len(rows["agent:d1:lane-uid"]["engine"]), 40)
+        self.assertIsNone(rows["agent:d1:lane-uid"]["state_since"])
+        self.assertEqual(len(rows["agent:d1:orch-uid"]["host_label"]), 200)
+
+    async def test_unacked_push_is_given_up_after_max_attempts(self):
+        await self.create({"title": "a", "holders": [LANE]})
+        for _ in range(items_db.MAX_PUSH_ATTEMPTS):
+            self.assertEqual(len((await self.beat([]))["pushes"]), 1)
+        self.assertEqual((await self.beat([]))["pushes"], [])
+        row = (await self.fetch("SELECT delivered_at, dropped_reason, attempts FROM item_pushes"))[0]
+        self.assertIsNotNone(row["delivered_at"])
+        self.assertEqual(row["dropped_reason"], f"not acked after {items_db.MAX_PUSH_ATTEMPTS} attempts")
+
+    async def test_stuck_pushes_do_not_starve_newer_ones(self):
+        with mock.patch.object(items_db, "MAX_PUSHES_PER_BEAT", 2):
+            for i in range(3):
+                await self.create({"title": f"t{i}", "holders": [LANE]})
+            first = [p["id"] for p in (await self.beat([]))["pushes"]]
+            self.assertEqual(len(first), 2)
+            for _ in range(items_db.MAX_PUSH_ATTEMPTS):
+                await self.beat([])
+            later = [p["id"] for p in (await self.beat([]))["pushes"]]
+            self.assertTrue(later and not set(later) & set(first))
+
+    async def test_pushes_are_returned_until_acked(self):
+        await self.create({"title": "a", "holders": [LANE]})
+        await self.beat([])
+        reply = await self.beat([], daemon="d1")
+        pushes = reply["pushes"]
+        self.assertEqual([(p["kind"], p["session_uid"], p["board"]) for p in pushes],
+                         [("assigned", "lane-uid", self.ref)])
+        self.assertTrue(pushes[0]["text"].startswith(f"[cm-board {self.ref}]"))
+        again = await self.beat([])
+        self.assertEqual([p["id"] for p in again["pushes"]], [pushes[0]["id"]])
+        # Another daemon cannot ack it.
+        await self.beat([], daemon="d2", acked_push_ids=[pushes[0]["id"]])
+        self.assertEqual(len((await self.beat([]))["pushes"]), 1)
+        done = await self.beat([], acked_push_ids=[pushes[0]["id"]])
+        self.assertEqual(done["pushes"], [])
+
+    # ---- reads ----------------------------------------------------------
+    async def test_read_version_holder_state_and_closed_strip(self):
+        await self.create({"title": "a", "group": "RL", "holders": [LANE]}, "b")
+        board = await self.read()
+        version = board["board"]["version"]
+        self.assertGreater(version, 0)
+        # Account-limit presentation is refreshed on unchanged item versions
+        # so a resolved banner clears without a board write.
+        self.assertEqual(await self.read(since_version=version),
+                         {"unchanged": True, "version": version, "account_limits": []})
+        await self.beat([self.row("lane", engine="claude-code", state="errored",
+                                   agent_state={"source": "presence",
+                                                "detail": {"error_kind": "rate_limit",
+                                                           "resumes_at": (datetime.now(timezone.utc) + timedelta(minutes=15)).timestamp()},
+                                                "last_turn": {"status": "failed"}})])
+        limited = await self.read(since_version=version)
+        self.assertEqual(limited["version"], version)
+        self.assertEqual(limited["account_limits"][0]["attribution"],
+                         "historical / attribution unknown")
+        await self.beat([self.row("lane")])
+        self.assertEqual(await self.read(since_version=version),
+                         {"unchanged": True, "version": version, "account_limits": []})
+        # The banner fixture is only for the unchanged-read transition; clear
+        # its heartbeat row before the pre-existing holder-state insert below.
+        await self.pool.execute("DELETE FROM session_states WHERE pid = $1", LANE["pid"])
+        lane_state = board["items"][1]["holders"][0]["state"]
+        self.assertEqual(lane_state["state"], "unknown")  # no heartbeat yet
+        now = datetime.now(timezone.utc)
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO session_states (pid, daemon_id, session_uid, task_id, name,
+                                               state, state_since, reported_at)
+                   VALUES ($1, 'd1', 'lane-uid', $2, 'lane', 'idle', $3, $4)""",
+                LANE["pid"], uuid.UUID(self.root), now - timedelta(minutes=24), now)
+        await self.patch(2, status="done")
+        board = await self.read(history=5)
+        self.assertGreater(board["board"]["version"], version)
+        live = board["items"]
+        self.assertEqual([i["n"] for i in live], [1])  # grouped, closed item left
+        st = live[0]["holders"][0]["state"]
+        self.assertEqual(st["state"], "idle")
+        self.assertGreaterEqual(st["for_s"], 24 * 60)
+        self.assertEqual([i["n"] for i in board["recently_closed"]], [2])
+        self.assertEqual(live[0]["history"][-1]["type"], "created")
+        orch = board["board"]["orchestrator"]
+        self.assertEqual(orch["pid"], LANE["pid"])  # only live session on the root task
+        self.assertEqual(board["free_capacity"], [])  # lane holds an active item
+        await self.patch(1, status="done")
+        board = await self.read()
+        # Lane holds nothing now, but it is the board's orchestrator, which is
+        # never capacity (doc/strict-boards.md §4.2).
+        self.assertEqual(board["free_capacity"], [])
+
+    async def test_explicit_scheduling_nulls_obey_strict_rules_and_are_atomic(self):
+        r = await self.http.patch(f"/boards/{self.ref}", json={
+            "actor": {"pid": "owner"}, "backlog_allowed": False})
+        self.assertEqual(r.status_code, 200, r.text)
+        await self.create({"title": "blocked", "holders": [LANE]},
+                          {"title": "job", "holders": [LANE]})
+        await self.patch(1, actor=LANE, status="blocked", blocked_on="await review", check_back="2h")
+        await self.patch(2, actor=LANE, status="active", job="batch", eta="2h")
+
+        before = {i["n"]: i for i in (await self.read())["items"]}
+        await self.patch(1, actor=LANE, note="omitted check-back")
+        await self.patch(2, actor=LANE, note="omitted job and eta")
+        current = {i["n"]: i for i in (await self.read())["items"]}
+        self.assertEqual(current[1]["check_back_at"], before[1]["check_back_at"])
+        self.assertEqual((current[2]["eta_at"], current[2]["job"]),
+                         (before[2]["eta_at"], before[2]["job"]))
+
+        for n, field, code in ((1, "check_back", "check_back_required"),
+                               (2, "eta", "eta_required")):
+            r = await self.patch(n, actor=LANE, ok=False, note="must roll back", **{field: None})
+            self.assertEqual((r.status_code, r.json()["detail"]["code"]), (422, code), r.text)
+        current = {i["n"]: i for i in (await self.read())["items"]}
+        self.assertEqual((current[1]["check_back_at"], current[1]["note"]),
+                         (before[1]["check_back_at"], "omitted check-back"))
+        self.assertEqual((current[2]["eta_at"], current[2]["job"], current[2]["note"]),
+                         (before[2]["eta_at"], "batch", "omitted job and eta"))
+
+        # An atomic bulk call must not commit its earlier successful item.
+        r = await self.patch([2, 1], actor=LANE, ok=False, note="bulk must roll back", check_back=None)
+        self.assertEqual((r.status_code, r.json()["detail"]["code"]), (422, "check_back_required"), r.text)
+        current = {i["n"]: i for i in (await self.read())["items"]}
+        self.assertEqual(current[2]["note"], "omitted job and eta")
+
+        await self.patch(1, actor=LANE, status="active", check_back=None)
+        await self.patch(2, actor=LANE, job=None)
+        current = {i["n"]: i for i in (await self.read())["items"]}
+        self.assertIsNone(current[1]["check_back_at"])
+        self.assertEqual((current[2]["eta_at"], current[2]["job"]), (before[2]["eta_at"], None))
+        await self.patch(2, actor=LANE, eta=None)
+        current = {i["n"]: i for i in (await self.read())["items"]}
+        self.assertEqual((current[2]["eta_at"], current[2]["job"]), (None, None))
+
+        # A permissive board allows clearing the check-back while still blocked.
+        r = await self.http.patch(f"/boards/{self.ref}", json={
+            "actor": {"pid": "owner"}, "backlog_allowed": True})
+        self.assertEqual(r.status_code, 200, r.text)
+        await self.patch(1, actor=LANE, status="blocked", blocked_on="await review", check_back="2h")
+        await self.patch(1, actor=LANE, check_back=None)
+        item = next(i for i in (await self.read())["items"] if i["n"] == 1)
+        self.assertEqual((item["status"], item["blocked_on"], item["check_back_at"]),
+                         ("blocked", "await review", None))
+
+    async def test_strict_board_setting_refusals_job_and_capacity(self):
+        now = datetime.now(timezone.utc)
+
+        async def live(who, state, engine="codex"):
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """INSERT INTO session_states (pid, daemon_id, session_uid, task_id, name,
+                                                   engine, state, state_since, reported_at)
+                       VALUES ($1, 'd1', $2, $3, $4, $5, $6, $7, $7)""",
+                    who["pid"], who["session_uid"], uuid.UUID(self.root), who["name"],
+                    engine, state, now)
+
+        steward, busy, spare, sh = agent("steward"), agent("busy"), agent("spare"), agent("sh")
+        await live(ORCH, "working")
+        for who, st, engine in ((steward, "idle", "codex"), (busy, "working", "codex"),
+                                (spare, "idle", "claude-code"), (sh, "idle", "bash")):
+            await live(who, st, engine)
+        r = await self.http.patch(f"/boards/{self.ref}", json={
+            "actor": {"pid": "owner"}, "orchestrator_pid": ORCH["pid"]})
+        self.assertEqual(r.status_code, 200, r.text)
+        # Only Owner or the orchestrator makes a board strict.
+        r = await self.http.patch(f"/boards/{self.ref}",
+                                  json={"actor": LANE, "backlog_allowed": False})
+        self.assertEqual(r.status_code, 403, r.text)
+        r = await self.http.patch(f"/boards/{self.ref}", json={
+            "actor": ORCH, "backlog_allowed": False, "steward_pid": steward["pid"],
+            "launch_s": 600, "max_active_per_holder": 3})
+        self.assertEqual(r.status_code, 200, r.text)
+        settings = r.json()["settings"]
+        self.assertEqual((settings["backlog_allowed"], settings["launch_s"],
+                          settings["max_active_per_holder"], settings["check_back_max_s"]),
+                         (False, 600, 3, 259200))
+        # A member cannot take the board over: naming itself orchestrator,
+        # making it strict, or loosening its caps (review of 94eedeb).
+        for change in ({"orchestrator_pid": LANE["pid"]}, {"steward_pid": LANE["pid"]},
+                       {"backlog_allowed": True}, {"launch_s": 86400}, {"idle_s": 86400},
+                       {"check_back_max_s": 2592000}, {"max_active_per_holder": 50},
+                       {"orchestrator_pid": LANE["pid"], "backlog_allowed": True}):
+            r = await self.http.patch(f"/boards/{self.ref}", json={"actor": LANE, **change})
+            self.assertEqual(r.status_code, 403, (change, r.text))
+        settings = (await self.read())["board"]["settings"]
+        self.assertEqual((settings["orchestrator_pid"], settings["backlog_allowed"],
+                          settings["launch_s"]), (ORCH["pid"], False, 600))
+        # Ungoverned settings stay open to members.
+        r = await self.http.patch(f"/boards/{self.ref}", json={"actor": LANE, "stale_s": 9000})
+        self.assertEqual(r.status_code, 200, r.text)
+        r = await self.create({"title": "later", "holders": []}, ok=False)
+        self.assertEqual((r.status_code, r.json()["detail"]["code"]), (422, "holder_required"))
+        await self.create({"title": "bench", "holders": [LANE]})
+        r = await self.patch(1, actor=LANE, ok=False, status="waiting", eta="40m")
+        self.assertEqual((r.status_code, r.json()["detail"]["code"]), (422, "waiting_not_allowed"))
+        await self.patch(1, actor=LANE, eta="40m", job="pins L3")
+        board = await self.read()
+        (it,) = board["items"]
+        self.assertEqual((it["status"], it["job"]), ("active", "pins L3"))
+        self.assertIsNotNone(it["actionable_at"])
+        # Free capacity: no bash pane, orchestrator or steward; a working
+        # session holding nothing is untracked, not free.
+        self.assertEqual([r["name"] for r in board["free_capacity"]], ["spare"])
+        self.assertEqual([r["name"] for r in board["untracked"]], ["busy"])
+        self.assertEqual(board["launch"], {"unlaunched": [], "free": ["spare"]})
+
+    async def test_orchestrator_auto_pick_skips_bash_and_prefers_recent_agents(self):
+        now = datetime.now(timezone.utc)
+
+        async def state(name, engine, since_min, started_min, last_turn_min=None):
+            agent = None
+            if last_turn_min is not None:
+                ended = (now - timedelta(minutes=last_turn_min)).timestamp()
+                agent = {"last_turn": {"ended_at": ended}}
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """INSERT INTO session_states (pid, daemon_id, session_uid, task_id, name,
+                                                   engine, state, state_since, started_at,
+                                                   agent_state, reported_at)
+                       VALUES ($1, 'd1', $2, $3, $4, $5, 'idle', $6, $7, $8, $9)""",
+                    f"agent:d1:{name}", name, uuid.UUID(self.root), name, engine,
+                    now - timedelta(minutes=since_min), now - timedelta(minutes=started_min),
+                    agent, now)
+
+        # The newest-started session is a bash pane: never the orchestrator.
+        await state("shell", "bash", 1, 1)
+        await state("old-codex", "codex", 50, 300)
+        await state("busy-claude", "claude-code", 5, 200)
+        self.assertEqual((await self.read())["board"]["orchestrator"]["name"], "busy-claude")
+        # A more recent turn end wins over an older state change.
+        await state("fresh-turn", "codex", 90, 250, last_turn_min=2)
+        self.assertEqual((await self.read())["board"]["orchestrator"]["name"], "fresh-turn")
+        # An unknown engine loses to any live Claude/Codex session, however
+        # recent its activity, and wins only when none is live.
+        await state("mystery", None, 0, 0)
+        self.assertEqual((await self.read())["board"]["orchestrator"]["name"], "fresh-turn")
+        async with self.pool.acquire() as conn:
+            await conn.execute("DELETE FROM session_states WHERE engine IN ('codex', 'claude-code')")
+        self.assertEqual((await self.read())["board"]["orchestrator"]["name"], "mystery")
+        async with self.pool.acquire() as conn:
+            await conn.execute("DELETE FROM session_states WHERE engine IS NULL")
+        self.assertIsNone((await self.read())["board"]["orchestrator"])
+
+    async def test_blocked_on_owner_pushes_orchestrator_and_is_listed(self):
+        orch = {"pid": "agent:d1:orch-uid", "name": "orch", "session_uid": "orch-uid",
+                "daemon_id": "d1"}
+        await self.beat([{**self.row("orch"), "engine": "codex"}])
+        await self.create({"title": "gpu", "holders": [LANE]}, {"title": "other", "holders": [LANE]})
+        r = await self.patch(1, actor=LANE, status="blocked_on_owner", blocked_on="approve 8xH100?")
+        self.assertEqual(r.json()["items"][0]["status"], "blocked_on_owner")
+        pushes = await self.fetch("SELECT kind, session_uid, text FROM item_pushes WHERE kind = 'owner_blocked'")
+        self.assertEqual([(p["session_uid"]) for p in pushes], ["orch-uid"])
+        self.assertIn('#1 "gpu" is blocked on Owner: approve 8xH100?', pushes[0]["text"])
+        board = await self.read()
+        self.assertEqual(board["board"]["health"]["blocked_on_owner"], 1)
+        self.assertEqual(board["board"]["health"]["owner_items"], [1])
+        listed = (await self.http.get("/items/owner-blocked")).json()
+        self.assertEqual([(i["board"], i["n"], i["decision"]) for i in listed],
+                         [(self.ref, 1, "approve 8xH100?")])
+        self.assertEqual(listed[0]["holders"][0]["session_uid"], "lane-uid")
+        # Only Owner clears it; the holder gets 403.
+        r = await self.patch(1, actor=LANE, status="active", ok=False)
+        self.assertEqual((r.status_code, r.json()["detail"]["code"]), (403, "owner_only"))
+        await self.patch(1, actor={"pid": "owner", "name": "Owner"}, status="active")
+        pushes = await self.fetch("SELECT text FROM item_pushes WHERE kind = 'owner_blocked' ORDER BY id")
+        self.assertIn("no longer blocked on Owner (Owner; now active)", pushes[-1]["text"])
+        self.assertEqual((await self.http.get("/items/owner-blocked")).json(), [])
+        # The orchestrator's own change is not pushed back to it.
+        await self.patch(2, actor={"pid": "owner"}, status="blocked_on_owner")
+        n = len(await self.fetch("SELECT 1 FROM item_pushes WHERE kind = 'owner_blocked'"))
+        await self.patch(2, actor=orch, note="noted", ok=True)
+        self.assertEqual(len(await self.fetch("SELECT 1 FROM item_pushes WHERE kind = 'owner_blocked'")), n)
+
+    async def test_touch_endpoint_records_chat_refs_without_changing_the_item(self):
+        await self.create({"title": "a", "holders": [LANE], "note": "keep"}, {"title": "b"})
+        before = (await self.fetch("SELECT touched_at FROM items WHERE number = 1"))[0]["touched_at"]
+        r = await self.post(f"/boards/{self.ref}/items/touch", {
+            "actor": LANE, "ns": [1, 2, 99], "source": "chat", "message_id": "m-1", "excerpt": "see #1"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["touched"], [1])
+        self.assertEqual({s["n"]: s["reason"] for s in r.json()["skipped"]}, {2: "not_holder", 99: "not_found"})
+        row = (await self.fetch("SELECT touched_at, status, note FROM items WHERE number = 1"))[0]
+        self.assertGreater(row["touched_at"], before)
+        self.assertEqual((row["status"], row["note"]), ("active", "keep"))
+        (event,) = await self.fetch("SELECT type, new FROM item_events WHERE type = 'chat_ref'")
+        self.assertEqual(event["new"], {"message_id": "m-1", "excerpt": "see #1"})
+        bad = await self.post(f"/boards/{self.ref}/items/touch", {"actor": LANE, "ns": [1], "source": "Chat!"})
+        self.assertEqual(bad.status_code, 422)
+
+    async def test_chat_touch_resolves_the_board_and_applies_the_sender_rules(self):
+        # 2026-10-20 (Board-Steward via Swarm-Coord): holders, the steward and
+        # the orchestrator refresh #N; #N resolves on the channel's board,
+        # else on the one board the sender may refresh it on.
+        steward = {"pid": "agent:d1:steward", "name": "steward"}
+        other_root = await self._task("other")
+        other = (await self.post("/boards/resolve", {"task_id": other_root})).json()
+        await self.create({"title": "a", "holders": [LANE]}, {"title": "b"})
+        r = await self.post(f"/boards/{other['slug']}/items",
+                            {"actor": ORCH, "items": [{"title": "x", "holders": [LANE]}]})
+        self.assertEqual(r.status_code, 200, r.text)
+
+        async def touch(actor, ns, channel=None):
+            r = await self.post("/items/chat-touch", {"actor": actor, "ns": ns, "channel": channel,
+                                                      "message_id": "m", "excerpt": "e"})
+            self.assertEqual(r.status_code, 200, r.text)
+            return r.json()
+
+        # LANE holds #1 on both boards: ambiguous without a bound channel.
+        got = await touch(LANE, [1])
+        self.assertEqual((got["touched"], got["skipped"]), ({}, [{"n": 1, "reason": "ambiguous"}]))
+        refused = await self.http.patch(f"/boards/{self.ref}", json={
+            "actor": LANE, "steward_pid": LANE["pid"]})
+        self.assertEqual(refused.status_code, 403, refused.text)
+        r = await self.http.patch(f"/boards/{self.ref}", json={
+            "actor": {"pid": "owner"}, "steward_pid": steward["pid"], "channel": "#proj/sfd"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["settings"]["channel"], "proj/sfd")
+        self.assertEqual(r.json()["settings"]["steward_pid"], steward["pid"])
+        got = await touch(LANE, [1, 2], channel="proj/sfd")
+        self.assertEqual(got["touched"], {self.ref: [1]})
+        self.assertEqual(got["skipped"], [{"n": 2, "reason": "not_holder", "board": self.ref}])
+        # The steward's post about any item of its board is history, but only
+        # a holder's touch resets the clock (review of f24e170).
+        before = (await self.fetch("SELECT touched_at FROM items WHERE number = 2"))[0]["touched_at"]
+        got = await touch(steward, [2])
+        self.assertEqual(got["touched"], {self.ref: [2]})
+        after = (await self.fetch("SELECT touched_at FROM items WHERE number = 2"))[0]["touched_at"]
+        self.assertEqual(after, before, "no clock reset")
+        # Anyone else's mention is only a reference.
+        stranger = {"pid": "agent:d1:stranger", "name": "s"}
+        got = await touch(stranger, [2], channel="proj/sfd")
+        self.assertEqual(got["touched"], {})
+        got = await touch(stranger, [2])
+        self.assertEqual(got["skipped"], [{"n": 2, "reason": "not_found"}])
+        events = await self.fetch("SELECT item_number, actor_pid FROM item_events WHERE type = 'chat_ref' ORDER BY id")
+        self.assertEqual([(e["item_number"], e["actor_pid"]) for e in events],
+                         [(1, LANE["pid"]), (2, steward["pid"])])
+
+    async def test_bulk_edit_each_returns_a_result_per_item(self):
+        await self.create("a", "b", "c", actor=LANE)
+        await self.patch(3, actor=LANE, status="done")
+        r = await self.http.patch(f"/boards/{self.ref}/items", json={
+            "actor": LANE, "ns": [1, 2, 99, 3], "set": {"status": "blocked_on_owner"},
+            "each": True})
+        self.assertEqual(r.status_code, 200, r.text)
+        results = {x["n"]: x for x in r.json()["results"]}
+        self.assertFalse(results[99]["ok"])
+        self.assertEqual(results[99]["error"]["code"], "not_found")
+        self.assertFalse(results[1]["ok"], "blocked_on_owner needs the decision named")
+        r = await self.http.patch(f"/boards/{self.ref}/items", json={
+            "actor": LANE, "ns": [1, 2, 99], "set": {"status": "waiting", "eta": "40m"},
+            "each": True})
+        body = r.json()
+        self.assertEqual([x["ok"] for x in body["results"]], [True, True, False])
+        self.assertEqual(sorted(i["n"] for i in body["items"]), [1, 2])
+        statuses = {i["n"]: i["status"] for i in (await self.read())["items"]}
+        self.assertEqual((statuses[1], statuses[2]), ("waiting", "waiting"))
+        # Without each, one refused item still refuses the whole call.
+        r = await self.http.patch(f"/boards/{self.ref}/items", json={
+            "actor": LANE, "ns": [1, 99], "set": {"status": "active"}})
+        self.assertEqual(r.status_code, 404)
+
+    async def test_bulk_each_reports_a_lost_database_per_item(self):
+        import asyncpg
+
+        await self.create("a", "b", "c", actor=LANE)
+        real = items_db.update_items
+        calls = []
+
+        async def flaky(pool, ref, actor, ns, fields, **kw):
+            calls.append(ns[0])
+            if ns[0] == 2:
+                raise asyncpg.exceptions.ConnectionDoesNotExistError("connection was closed")
+            return await real(pool, ref, actor, ns, fields, **kw)
+
+        with mock.patch.object(items_db, "update_items", flaky):
+            r = await self.http.patch(f"/boards/{self.ref}/items", json={
+                "actor": LANE, "ns": [1, 2, 3], "set": {"note": "wave"}, "each": True})
+        self.assertEqual(r.status_code, 200, r.text)
+        results = r.json()["results"]
+        self.assertEqual([x["ok"] for x in results], [True, False, False])
+        self.assertEqual({x["error"]["code"] for x in results[1:]}, {"db_unavailable"})
+        self.assertEqual(calls, [1, 2], "nothing after the lost connection is attempted")
+        notes = {i["n"]: i["note"] for i in (await self.read())["items"]}
+        self.assertEqual((notes[1], notes[2], notes[3]), ("wave", None, None))
+
+        async def boom(pool, ref, actor, ns, fields, **kw):
+            if ns[0] == 1:
+                raise RuntimeError("unexpected")
+            return await real(pool, ref, actor, ns, fields, **kw)
+
+        with mock.patch.object(items_db, "update_items", boom):
+            r = await self.http.patch(f"/boards/{self.ref}/items", json={
+                "actor": LANE, "ns": [1, 3], "set": {"note": "x"}, "each": True})
+        self.assertEqual([x["ok"] for x in r.json()["results"]], [False, True])
+        self.assertEqual(r.json()["results"][0]["error"]["code"], "internal")
+
+    async def test_chat_touch_keyword_suggests_and_apply_confirms(self):
+        await self.create("fuse", actor=LANE)
+        r = await self.post("/items/chat-touch", {
+            "actor": LANE, "ns": [1], "message_id": "m-1", "excerpt": "#1 DONE",
+            "suggest": {"keyword": "DONE", "status": "done"}})
+        self.assertEqual(r.status_code, 200, r.text)
+        item = next(i for i in (await self.read())["items"] if i["n"] == 1)
+        self.assertEqual(item["status"], "active")
+        self.assertIn("suggested_transition", item["flags"])
+        bad = await self.post("/items/chat-touch", {
+            "actor": LANE, "ns": [1], "suggest": {"keyword": "DONE", "status": "dropped"}})
+        self.assertEqual(bad.status_code, 422, "only done or blocked can be suggested")
+        two = await self.post("/items/chat-touch", {
+            "actor": LANE, "ns": [1, 2], "suggest": {"keyword": "DONE", "status": "done"}})
+        self.assertEqual(two.status_code, 422, "a suggestion is for exactly one item")
+        r = await self.post(f"/boards/{self.ref}/items/1/resolve", {"actor": LANE, "action": "apply",
+                                                                   "to": "blocked"})
+        self.assertEqual(r.status_code, 409, "a stale target is refused")
+        r = await self.post(f"/boards/{self.ref}/items/1/resolve", {"actor": LANE, "action": "apply",
+                                                                   "to": "done"})
+        self.assertEqual(r.status_code, 200, r.text)
+        closed = (await self.read())["recently_closed"]
+        self.assertEqual(closed[0]["status"], "done")
+
+    async def test_chat_touch_counts_the_picked_orchestrator(self):
+        now = datetime.now(timezone.utc)
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO session_states (pid, daemon_id, session_uid, task_id, name, engine,
+                                               state, state_since, reported_at)
+                   VALUES ('agent:d1:coord', 'd1', 'coord', $1, 'coord', 'codex', 'idle', $2, $2)""",
+                uuid.UUID(self.root), now)
+        await self.create({"title": "a"})
+        coord = {"pid": "agent:d1:coord", "name": "coord", "task_id": self.root}
+        # Not a candidate without a bound channel: the candidate set is the
+        # explicit holder, steward or orchestrator only.
+        r = await self.post("/items/chat-touch", {"actor": coord, "ns": [1]})
+        self.assertEqual(r.json()["skipped"], [{"n": 1, "reason": "not_found"}], r.text)
+        # Through the bound channel the picked orchestrator counts, and may
+        # name the steward.
+        r = await self.http.patch(f"/boards/{self.ref}", json={"actor": coord, "channel": "c"})
+        self.assertEqual(r.status_code, 200, r.text)
+        r = await self.post("/items/chat-touch", {"actor": coord, "ns": [1], "channel": "c"})
+        self.assertEqual(r.json()["touched"], {self.ref: [1]}, r.text)
+        r = await self.http.patch(f"/boards/{self.ref}", json={"actor": coord, "steward_pid": "agent:d1:s"})
+        self.assertEqual(r.status_code, 200, r.text)
+
+    async def test_answer_resolves_blocked_on_owner(self):
+        await self.create({"title": "gpu", "holders": [LANE]})
+        await self.patch(1, actor=LANE, status="blocked_on_owner", blocked_on="approve?")
+        r = await self.post(f"/boards/{self.ref}/items/1/resolve",
+                            {"actor": LANE, "action": "answer", "message": "yes, 4 GPUs"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual((r.json()["item"]["status"], r.json()["item"]["note"]),
+                         ("active", "Owner: yes, 4 GPUs"))
+
+    async def test_archived_items_leave_the_board_but_stay_searchable(self):
+        await self.create({"title": "fuse SEJD", "note": "PR-ready"}, "other")
+        await self.patch(1, status="done")
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE items SET archived_at = now() WHERE number = 1")
+        board = await self.read()
+        self.assertEqual(board["recently_closed"], [])
+        self.assertNotIn("archived", board)
+        board = await self.read(archived="true", q="sejd")
+        self.assertEqual([i["n"] for i in board["archived"]], [1])
+        self.assertEqual(board["items"], [])
+
+    async def test_held_items_and_board_list(self):
+        await self.create({"title": "a", "holders": [LANE]}, {"title": "b", "holders": [LANE]})
+        await self.patch(2, status="done")
+        r = await self.http.get("/items", params={"holder_pid": LANE["pid"]})
+        self.assertEqual(r.json(), [{"board": self.ref, "n": 1, "title": "a", "status": "active"}])
+        boards = (await self.http.get("/boards", params={"open_only": "true"})).json()
+        self.assertEqual([b["slug"] for b in boards], [self.ref])
+
+
+if __name__ == "__main__":
+    unittest.main()

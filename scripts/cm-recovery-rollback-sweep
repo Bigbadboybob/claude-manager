@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Move v2 recovery envelopes out of notification queues before rollback."""
+import argparse
+import datetime
+import fcntl
+import json
+import os
+from pathlib import Path
+import socket
+import sys
+
+
+SOURCE = "claude-limit-recovery"
+LABEL = "tool: cm-recovery-rollback-sweep"
+
+
+def disabled(root):
+    try:
+        data = json.loads((root / "notifications" / "claude-limit-recovery-state").read_text())
+        return data.get("version") == 1 and data.get("enabled") is False
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def sync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def prepare_backup(path):
+    path.mkdir(mode=0o700, exist_ok=True)
+    label = path / "OWNER.md"
+    if label.is_symlink():
+        raise ValueError("backup OWNER.md is a symlink")
+    if label.exists():
+        if LABEL not in label.read_text():
+            raise ValueError("existing backup has no matching OWNER.md")
+    elif any(path.iterdir()):
+        raise ValueError("existing backup is not empty and has no OWNER.md")
+    else:
+        label.write_text(f"# Owner\n- {LABEL}\n- host: {socket.gethostname()}\n"
+                         f"- session: {os.environ.get('CM_TUI_SESSION_ID', 'operator')}\n"
+                         f"- created: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n"
+                         "- purpose: preserved v2 Claude recovery envelopes moved before rollback\n"
+                         "- keep: all moved event files and receipts for operator review\n"
+                         "- delete-after: explicit operator disposition\n")
+        sync_dir(path)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=Path.home() / ".cm", help="CM state root")
+    parser.add_argument("--backup", type=Path, help="backup directory outside notifications (required with --apply)")
+    parser.add_argument("--apply", action="store_true", help="move files; default only lists them")
+    args = parser.parse_args()
+    queues = (args.root / "notifications").resolve()
+    backup = args.backup.resolve() if args.backup else None
+    if args.apply and backup is None:
+        parser.error("--apply requires --backup")
+    if backup is not None and (backup == queues or queues in backup.parents or backup in queues.parents):
+        parser.error("backup must be outside the notification tree")
+    if not queues.is_dir():
+        print(f"notification directory unavailable: {queues}", file=sys.stderr)
+        return 1
+    if args.apply and not disabled(args.root):
+        print("recovery disabled marker not confirmed; reload with recovery disabled first", file=sys.stderr)
+        return 1
+    failures = 0
+    for queue in sorted(queues.iterdir()):
+        if queue.is_symlink():
+            print(f"{queue.name}: symlink in notification tree; skipped", file=sys.stderr)
+            failures += 1
+            continue
+        if not queue.is_dir():
+            continue
+        try:
+            fd = os.open(queue / "queue.lock", os.O_RDWR | os.O_NOFOLLOW)
+        except OSError as exc:
+            print(f"{queue.name}: cannot lock queue: {exc}", file=sys.stderr)
+            failures += 1
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            for path in sorted(queue.glob("*.json")):
+                if path.name == "transport.json":
+                    continue
+                try:
+                    if path.is_symlink():
+                        raise ValueError("event is a symlink")
+                    event = json.loads(path.read_text())
+                    if not isinstance(event, dict):
+                        raise ValueError("event is not an object")
+                    if event.get("version") != 2 or event.get("source") != SOURCE:
+                        continue
+                    event_id, status = event.get("id"), event.get("status")
+                    if not isinstance(event_id, str) or not event_id or not isinstance(status, str) or not status:
+                        raise ValueError("v2 recovery event missing id or status")
+                    print(f"{queue.name} {event_id} {status} {path.name}")
+                    if status == "submitting":
+                        print(f"{queue.name} {event_id}: in flight; skipped", file=sys.stderr)
+                        failures += 1
+                        continue
+                    if args.apply:
+                        if not disabled(args.root):
+                            raise ValueError("recovery disabled marker no longer confirmed")
+                        prepare_backup(backup)
+                        dest_dir = backup / queue.name
+                        if dest_dir.is_symlink():
+                            raise ValueError("backup queue directory is a symlink")
+                        dest_dir.mkdir(mode=0o700, exist_ok=True)
+                        dest = dest_dir / path.name
+                        # Link without replacement, then unlink while queue.lock
+                        # is held; a crash leaves at least one copy intact.
+                        try:
+                            os.link(path, dest, follow_symlinks=False)
+                            sync_dir(dest_dir)
+                        except FileExistsError:
+                            if dest.is_symlink() or not os.path.samefile(path, dest):
+                                raise
+                        path.unlink()
+                        sync_dir(queue)
+                except (OSError, ValueError, AttributeError) as exc:
+                    print(f"{queue.name}/{path.name}: {exc}", file=sys.stderr)
+                    failures += 1
+        finally:
+            os.close(fd)
+    if not args.apply:
+        print("dry run: no files moved")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

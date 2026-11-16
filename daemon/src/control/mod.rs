@@ -18,12 +18,16 @@
 //!     slice 4 (`server.rs` + `queue.rs` relocation) lands here.
 
 pub mod auth;
+mod board_token;
 mod codex_delivery;
+pub mod prompt_delivery;
 pub mod continuous_drain;
 pub mod dispatch;
 pub mod methods;
 pub mod operator;
 pub mod protocol;
+pub mod send_key;
+pub(crate) mod session_launch;
 pub mod stream;
 pub mod tls;
 pub mod wire;

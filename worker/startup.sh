@@ -16,7 +16,9 @@ META_HEADER="Metadata-Flavor: Google"
 TASK_ID=$(curl -sf "$META_URL/task-id" -H "$META_HEADER")
 REPO_URL=$(curl -sf "$META_URL/repo-url" -H "$META_HEADER")
 REPO_BRANCH=$(curl -sf "$META_URL/repo-branch" -H "$META_HEADER")
-TASK_PROMPT=$(curl -sf "$META_URL/task-prompt" -H "$META_HEADER")
+# The dispatcher puts the task's brief here; it may be absent or empty
+# (doc/org-model.md §13 S0a), in which case the description below is used.
+TASK_PROMPT=$(curl -sf "$META_URL/task-prompt" -H "$META_HEADER" || echo "")
 MANAGER_URL=$(curl -sf "$META_URL/manager-callback-url" -H "$META_HEADER" || echo "")
 API_TOKEN=$(curl -sf "$META_URL/api-token" -H "$META_HEADER" || echo "")
 
@@ -40,6 +42,9 @@ if [ -n "$MANAGER_URL" ] && [ -n "$API_TOKEN" ]; then
     TASK_JSON=$(curl -sf "$MANAGER_URL/tasks/$TASK_ID" \
         -H "Authorization: Bearer $API_TOKEN" || echo "{}")
     SESSION_ID=$(echo "$TASK_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('session_id') or '')" 2>/dev/null || echo "")
+    if [ -z "$TASK_PROMPT" ]; then
+        TASK_PROMPT=$(echo "$TASK_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('description') or '')" 2>/dev/null || echo "")
+    fi
 fi
 echo "[cm-worker] Session ID: ${SESSION_ID:-none}"
 
@@ -98,6 +103,15 @@ echo "export CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_OAUTH_TOKEN" >> "$WORKER_HOME/.bash
 # ---------------------------------------------------------------------------
 # Restore session if resuming (cm push -> cloud)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Claude's model and effort (CM never relies on the engine's defaults).
+# Dispatch passes the task's own default, else the configured one; a resumed
+# session keeps what its transcript ran on unless the task names one.
+# ---------------------------------------------------------------------------
+CLAUDE_MODEL=$(curl -sf "$META_URL/claude-model" -H "$META_HEADER" || echo "claude-opus-5-5")
+CLAUDE_MODEL_SOURCE=$(curl -sf "$META_URL/claude-model-source" -H "$META_HEADER" || echo "config")
+CLAUDE_EFFORT=$(curl -sf "$META_URL/claude-effort" -H "$META_HEADER" || echo "xhigh")
+CLAUDE_EFFORT_SOURCE=$(curl -sf "$META_URL/claude-effort-source" -H "$META_HEADER" || echo "config")
 CLAUDE_ARGS="--dangerously-skip-permissions --permission-mode bypassPermissions"
 
 if [ -n "$SESSION_ID" ]; then
@@ -111,7 +125,22 @@ if [ -n "$SESSION_ID" ]; then
     chown -R worker:worker "$WORKER_HOME/.claude/projects"
     CLAUDE_ARGS="$CLAUDE_ARGS --resume $SESSION_ID"
     echo "[cm-worker] Will resume session $SESSION_ID"
+    TRANSCRIPT="$WORKER_HOME/.claude/projects/-workspace/$SESSION_ID.jsonl"
+    if [ -f "$TRANSCRIPT" ]; then
+        # requestedModel keeps a context suffix (claude-opus-5-5[1m]) that
+        # message.model drops; older transcripts only have message.model.
+        LAST_TURN=$(grep '"type":"assistant"' "$TRANSCRIPT" | grep -v '"model":"<synthetic>"' | tail -1)
+        RAN_MODEL=$(printf '%s' "$LAST_TURN" | grep -o '"requestedModel":"[]A-Za-z0-9._:/@+[-]*"' | head -1 | cut -d'"' -f4)
+        [ -n "$RAN_MODEL" ] || RAN_MODEL=$(printf '%s' "$LAST_TURN" | grep -o '"model":"[A-Za-z0-9._:/@+-]*"' | head -1 | cut -d'"' -f4)
+        RAN_EFFORT=$(grep '"type":"assistant"' "$TRANSCRIPT" | grep -o '"effort":"[a-z]*"' | tail -1 | cut -d'"' -f4)
+        [ "$CLAUDE_MODEL_SOURCE" != "task" ] && [ -n "$RAN_MODEL" ] && CLAUDE_MODEL="$RAN_MODEL"
+        [ "$CLAUDE_EFFORT_SOURCE" != "task" ] && [ -n "$RAN_EFFORT" ] && CLAUDE_EFFORT="$RAN_EFFORT"
+    fi
 fi
+case "$CLAUDE_MODEL" in ""|-*|*[!A-Za-z0-9._:/@+\[\]-]*) CLAUDE_MODEL="claude-opus-5-5" ;; esac
+case "$CLAUDE_EFFORT" in low|medium|high|xhigh|max) ;; *) CLAUDE_EFFORT="xhigh" ;; esac
+CLAUDE_ARGS="$CLAUDE_ARGS --model $CLAUDE_MODEL --effort $CLAUDE_EFFORT"
+echo "[cm-worker] Claude model $CLAUDE_MODEL, effort $CLAUDE_EFFORT"
 
 # ---------------------------------------------------------------------------
 # Start Claude Code in tmux

@@ -31,8 +31,8 @@ pub(crate) fn new_section_id() -> String {
     format!("sec-{:x}", nanos)
 }
 
-/// Step a section CHOICE one slot for the ←/→ pickers on the workspace /
-/// task settings forms. The cycle is `None` (auto: inherit through the task
+/// Step a section CHOICE one slot for the ←/→ picker on the workspace
+/// settings form. The cycle is `None` (auto: inherit through the task
 /// tree) → `Some("")` (explicitly loose) → each section id in display
 /// order → back to `None`. An unknown stored id behaves like `None` so the
 /// picker recovers from a deleted section.
@@ -72,30 +72,52 @@ fn inherited_parent_task(task: &TaskEntry) -> Option<String> {
         .map(str::to_string)
 }
 
+/// What section inheritance reads, indexed once ([`App::section_lookup`])
+/// so that resolving a workspace costs its task chain rather than a scan of
+/// every workspace: the laptop keeps thousands of closed ones, and the
+/// sidebar resolves a section for each visible block.
+pub(crate) struct SectionLookup<'a> {
+    /// The first workspace with each id.
+    workspace: HashMap<&'a str, usize>,
+    /// Work-list rows (indices into `App::tasks`) bound to each workspace.
+    tasks_by_workspace: HashMap<&'a str, Vec<usize>>,
+    /// Work-list rows by task id, in list order.
+    tasks_by_id: HashMap<&'a str, Vec<usize>>,
+    /// Workspaces with a session on each task, in workspace order.
+    session_workspaces: HashMap<&'a str, Vec<usize>>,
+}
+
 impl App {
     /// Resolve each displayed row independently so filtering or scrolling away
     /// a section heading cannot lose its tint. Only gaps within the same
     /// section share the surface; boundaries and loose rows stay transparent.
-    pub(super) fn sidebar_section_backgrounds(&self, rows: &[VisualItem]) -> Vec<Option<Color>> {
-        if self.sidebar_view != SidebarView::Task || self.sections.is_empty() {
+    /// `section_of` is the section a workspace's rows draw in: its root
+    /// block's, as the work tree resolved it.
+    pub(super) fn sidebar_section_backgrounds<'s>(
+        &self,
+        rows: &'s [VisualItem],
+        section_of: &dyn Fn(usize) -> Option<&'s str>,
+    ) -> Vec<Option<Color>> {
+        if !self.tree_view() {
             return vec![None; rows.len()];
         }
-        let mut workspace_sections = HashMap::new();
-        for row in rows {
-            if let VisualItem::WorkspaceHeader(wi) | VisualItem::Session(wi, _)
-                | VisualItem::TaskHeader { ws_idx: wi, .. }
-                | VisualItem::WorkflowHeader { ws_idx: wi, .. } = row
-            {
-                workspace_sections.entry(*wi).or_insert_with(|| self.section_of_workspace(*wi));
-            }
-        }
-        let sections: Vec<Option<&str>> = rows.iter().map(|row| match row {
+        let mut sections: Vec<Option<&str>> = rows.iter().map(|row| match row {
             VisualItem::SectionHeader(id) => Some(id.as_str()),
             VisualItem::WorkspaceHeader(wi) | VisualItem::Session(wi, _)
-            | VisualItem::TaskHeader { ws_idx: wi, .. }
-            | VisualItem::WorkflowHeader { ws_idx: wi, .. } => workspace_sections[wi].as_deref(),
+            | VisualItem::WorkflowHeader { ws_idx: wi, .. } => section_of(*wi),
             _ => None,
         }).collect();
+        // A division header sits inside the section of the rows before it.
+        for i in 0..rows.len() {
+            if matches!(rows[i], VisualItem::DivisionHeader(_)) {
+                sections[i] = rows[..i]
+                    .iter()
+                    .zip(&sections[..i])
+                    .rev()
+                    .find(|(r, _)| !matches!(r, VisualItem::Separator))
+                    .and_then(|(r, s)| (!matches!(r, VisualItem::SectionEnd)).then_some(*s).flatten());
+            }
+        }
         rows.iter().enumerate().map(|(i, row)| {
             let section = if matches!(row, VisualItem::Separator) {
                 let before = i.checked_sub(1).and_then(|i| sections[i]);
@@ -104,8 +126,12 @@ impl App {
             } else {
                 sections[i]
             };
-            section.and_then(|id| self.section_by_id(id))
-                .map(|s| theme::sidebar_section_bg(s.color.as_deref(), self.global_settings.tint_strength()))
+            if matches!(row, VisualItem::ContinuousTeamHeader(_) | VisualItem::ContinuousTeamSession(..)) {
+                Some(theme::sidebar_section_bg(Some("magenta"), self.global_settings.tint_strength()))
+            } else {
+                section.and_then(|id| self.section_by_id(id))
+                    .map(|s| theme::sidebar_section_bg(s.color.as_deref(), self.global_settings.tint_strength()))
+            }
         }).collect()
     }
 
@@ -139,14 +165,57 @@ impl App {
     /// Resolve the section a workspace renders under: the explicit
     /// assignment when present (a `SECTION_NONE` sentinel resolves to loose),
     /// else inherited through the task tree, else `None` (loose).
+    /// Builds the index each call; resolve many workspaces with
+    /// [`App::section_of_workspace_in`] and one [`App::section_lookup`].
     pub(crate) fn section_of_workspace(&self, wi: usize) -> Option<String> {
+        self.section_of_workspace_in(&self.section_lookup(), wi)
+    }
+
+    /// [`App::section_of_workspace`] against a prebuilt index.
+    pub(crate) fn section_of_workspace_in(&self, lookup: &SectionLookup<'_>, wi: usize) -> Option<String> {
         let ws = self.workspaces.get(wi)?;
         let mut seen = HashSet::new();
-        self.section_of_workspace_id(&ws.id, &mut seen)
+        self.section_of_workspace_id(lookup, &ws.id, &mut seen)
+    }
+
+    /// Index what section inheritance reads: one pass over the workspaces
+    /// and the work list.
+    pub(crate) fn section_lookup(&self) -> SectionLookup<'_> {
+        let mut lookup = SectionLookup {
+            workspace: HashMap::new(),
+            tasks_by_workspace: HashMap::new(),
+            tasks_by_id: HashMap::new(),
+            session_workspaces: HashMap::new(),
+        };
+        for (wi, ws) in self.workspaces.iter().enumerate() {
+            // Only a workspace's sessions are read once it is found, so a
+            // closed one without sessions (thousands, kept for A-O) resolves
+            // exactly as a missing one.
+            if ws.is_closed && ws.sessions.is_empty() {
+                continue;
+            }
+            lookup.workspace.entry(ws.id.as_str()).or_insert(wi);
+            for tid in ws.sessions.iter().filter_map(|s| s.task_id.as_deref()) {
+                let homes = lookup.session_workspaces.entry(tid).or_default();
+                if homes.last() != Some(&wi) {
+                    homes.push(wi);
+                }
+            }
+        }
+        for (i, t) in self.tasks.iter().enumerate() {
+            if let Some(ws) = t.workspace_id.as_deref() {
+                lookup.tasks_by_workspace.entry(ws).or_default().push(i);
+            }
+            if let Some(id) = t.task_id.as_deref() {
+                lookup.tasks_by_id.entry(id).or_default().push(i);
+            }
+        }
+        lookup
     }
 
     fn section_of_workspace_id(
         &self,
+        lookup: &SectionLookup<'_>,
         ws_id: &str,
         seen: &mut HashSet<String>,
     ) -> Option<String> {
@@ -166,35 +235,55 @@ impl App {
         // A cloud session can be adopted before the planning task's workspace
         // binding arrives; its retained task_id is still a valid membership
         // edge.
-        let workspace = self.workspaces.iter().find(|w| w.id == ws_id);
-        for task in self.tasks.iter().filter(|t| {
-            t.workspace_id.as_deref() == Some(ws_id)
-                || t.task_id.as_deref().is_some_and(|tid| {
-                    workspace.is_some_and(|w| {
-                        w.sessions.iter().any(|s| s.task_id.as_deref() == Some(tid))
-                    })
-                })
-        }) {
-            let Some(parent_id) = inherited_parent_task(task) else {
+        let workspace = lookup.workspace.get(ws_id).map(|&wi| &self.workspaces[wi]);
+        let session_tasks: Vec<&str> = workspace
+            .into_iter()
+            .flat_map(|w| &w.sessions)
+            .filter_map(|s| s.task_id.as_deref())
+            .collect();
+        // The work-list rows bound to the workspace or to one of its
+        // sessions' tasks, in list order.
+        let mut rows: Vec<usize> = lookup.tasks_by_workspace.get(ws_id).cloned().unwrap_or_default();
+        for tid in &session_tasks {
+            rows.extend(lookup.tasks_by_id.get(tid).into_iter().flatten());
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        let mut parent_ids: Vec<String> =
+            rows.iter().filter_map(|&i| inherited_parent_task(&self.tasks[i])).collect();
+        // `self.tasks` drops terminal tasks. A live session bound to a done
+        // task (a long-lived lead, e.g. F-Lead on "F-Plan-Lead") inherits
+        // through the planning snapshot's parent edge instead, so its block
+        // keeps its section after a viewer restart.
+        for tid in session_tasks {
+            if lookup.tasks_by_id.contains_key(tid) {
                 continue;
-            };
-            let bound_parent = self
-                .tasks
-                .iter()
-                .find(|t| t.task_id.as_deref() == Some(parent_id.as_str()))
-                .and_then(|t| t.workspace_id.as_deref());
+            }
+            if let Some(Some(parent)) = self.planning_task_parent(tid) {
+                if !parent_ids.contains(&parent) {
+                    parent_ids.push(parent);
+                }
+            }
+        }
+        for parent_id in parent_ids {
+            let bound_parent = lookup
+                .tasks_by_id
+                .get(parent_id.as_str())
+                .and_then(|rows| rows.first())
+                .and_then(|&i| self.tasks[i].workspace_id.as_deref());
             let parent_workspaces = bound_parent.into_iter().chain(
-                self.workspaces.iter().filter(|w| {
-                    w.sessions
-                        .iter()
-                        .any(|s| s.task_id.as_deref() == Some(parent_id.as_str()))
-                }).map(|w| w.id.as_str()),
+                lookup
+                    .session_workspaces
+                    .get(parent_id.as_str())
+                    .into_iter()
+                    .flatten()
+                    .map(|&wi| self.workspaces[wi].id.as_str()),
             );
             for parent_ws in parent_workspaces {
                 if parent_ws == ws_id {
                     continue;
                 }
-                if let Some(sid) = self.section_of_workspace_id(parent_ws, seen) {
+                if let Some(sid) = self.section_of_workspace_id(lookup, parent_ws, seen) {
                     return Some(sid);
                 }
             }
@@ -208,9 +297,12 @@ impl App {
     pub(crate) fn cursor_section_id(&self) -> Option<String> {
         match &self.cursor {
             Cursor::Section(id) => Some(id.clone()),
-            Cursor::Workspace(wi) | Cursor::Session(wi, _) => self.section_of_workspace(*wi),
-            Cursor::Task { ws_idx, .. } => self.section_of_workspace(*ws_idx),
-            Cursor::Backtest(_) => None,
+            // A nested row belongs to the section its root block is drawn in.
+            Cursor::Workspace(wi) | Cursor::Session(wi, _) => {
+                let root = self.task_tree_shared().block_root.get(wi).copied().unwrap_or(*wi);
+                self.section_of_workspace(root)
+            }
+            Cursor::Backtest(_) | Cursor::Division(_) | Cursor::Org(_) => None,
         }
     }
 
@@ -318,29 +410,25 @@ impl App {
     /// Visible member workspaces of a section, for the folded header's
     /// rollup and the A-i peek.
     pub(crate) fn section_members(&self, id: &str) -> Vec<usize> {
-        let members = self.continuous_members();
-        self.task_view_visible_workspaces(&members)
-            .into_iter()
-            .filter(|wi| self.section_of_workspace(*wi).as_deref() == Some(id))
-            .collect()
+        self.section_members_in(id, &self.task_tree_shared())
+    }
+
+    /// `section_members` from an already-built tree, which resolved each
+    /// visible workspace's section (a nested block's is its root
+    /// block's).
+    pub(super) fn section_members_in(&self, id: &str, tree: &super::tree::TaskTree) -> Vec<usize> {
+        tree.section_members.get(id).cloned().unwrap_or_default()
     }
 
     /// `(workspaces, running, idle)` counts for a section's folded header.
     pub(crate) fn section_rollup(&self, id: &str) -> (usize, usize, usize) {
-        let members = self.section_members(id);
-        let mut running = 0;
-        let mut idle = 0;
-        for wi in &members {
-            for ts in &self.workspaces[*wi].sessions {
-                if ts.session.exited {
-                    continue;
-                }
-                match ts.status {
-                    SessionStatus::Running => running += 1,
-                    SessionStatus::Idle => idle += 1,
-                }
-            }
-        }
+        self.section_rollup_in(id, &self.task_tree_shared())
+    }
+
+    /// `section_rollup` against an already-built tree (one per frame).
+    pub(super) fn section_rollup_in(&self, id: &str, tree: &super::tree::TaskTree) -> (usize, usize, usize) {
+        let members = self.section_members_in(id, tree);
+        let (_, running, idle, _) = self.rollup(members.iter().flat_map(|wi| &self.workspaces[*wi].sessions));
         (members.len(), running, idle)
     }
 }
@@ -371,11 +459,12 @@ mod section_choice_tests {
 }
 
 #[cfg(test)]
-mod layout_tests {
+pub(crate) mod layout_tests {
     use super::*;
 
-    fn bare_ws(id: &str) -> Workspace {
+    pub(crate) fn bare_ws(id: &str) -> Workspace {
         Workspace {
+            org: None,
             id: id.to_string(),
             name: id.to_string(),
             is_closed: false,
@@ -393,7 +482,7 @@ mod layout_tests {
         }
     }
 
-    fn task(id: &str, ws: &str, parent: Option<&str>) -> TaskEntry {
+    pub(crate) fn task(id: &str, ws: &str, parent: Option<&str>) -> TaskEntry {
         TaskEntry {
             task_id: Some(id.to_string()),
             name: id.to_string(),
@@ -413,7 +502,7 @@ mod layout_tests {
         }
     }
 
-    fn test_app() -> App {
+    pub(crate) fn test_app() -> App {
         let _g = crate::test_support::home_lock();
         let tmp = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("HOME");
@@ -510,17 +599,30 @@ mod layout_tests {
         assert_eq!(layout(&app), ["#s1", "a", "b", "c", "d"]);
         assert_eq!(app.section_of_workspace(1).as_deref(), Some("s1"), "b inherits via tb→ta");
         assert_eq!(app.section_of_workspace(2), None, "explicit none beats inheritance");
-        assert_eq!(app.section_rollup("s1").0, 2);
+        // c's task reports to ta, so its block nests under a's in the work
+        // tree (app/tree.rs) and follows a's section there.
+        assert_eq!(app.section_rollup("s1").0, 3);
     }
 
-    fn add_task_session(app: &mut App, wi: usize, tid: &str) {
+    /// The tint test's fixture without nesting: two top-level blocks in s1
+    /// (a, b), one in s2 (c), and d loose.
+    fn flat_sectioned_app() -> App {
+        let mut app = sectioned_app();
+        for t in &mut app.tasks {
+            t.parent_task_id = None;
+        }
+        app.workspace_sections.insert("b".into(), "s1".into());
+        app
+    }
+
+    pub(crate) fn add_task_session(app: &mut App, wi: usize, tid: &str) {
         let session = Session::new("/bin/true", &[], 80, 24, None, HashMap::new(), None).unwrap();
         let mut ts = make_simple_session_with_uid(format!("uid-{tid}"), tid, "codex", session, None);
         ts.task_id = Some(tid.into());
         app.workspaces[wi].sessions.push(ts);
     }
 
-    fn sidebar_buffer(app: &mut App, height: u16) -> ratatui::buffer::Buffer {
+    pub(crate) fn sidebar_buffer(app: &mut App, height: u16) -> ratatui::buffer::Buffer {
         use ratatui::{backend::TestBackend, Terminal};
         app.keybinding_helper_visible = false;
         let mut terminal = Terminal::new(TestBackend::new(40, height)).unwrap();
@@ -530,7 +632,7 @@ mod layout_tests {
 
     #[test]
     fn sidebar_tint_covers_section_members_but_not_boundaries_or_loose_rows() {
-        let mut app = sectioned_app();
+        let mut app = flat_sectioned_app();
         app.sections[0].color = Some("blue".into());
         app.sections.push(SidebarSection {
             id: "s2".into(), name: "Second".into(), color: Some("blue".into()), folded: false,
@@ -538,28 +640,30 @@ mod layout_tests {
         app.workspace_sections.insert("c".into(), "s2".into());
         add_task_session(&mut app, 0, "ta");
         add_task_session(&mut app, 1, "tb");
-        app.cursor = Cursor::Task { ws_idx: 1, task_id: "tb".into() };
+        app.cursor = Cursor::Workspace(1);
         let buffer = sidebar_buffer(&mut app, 24);
         let blue = theme::sidebar_section_bg(Some("blue"), 2.0);
-        // Header, workspace, task, session, internal gap, inherited workspace/task/session.
-        for y in 1..=8 {
+        // Header, workspace, session, internal gap, second workspace/session.
+        // The focused group (b's header and session) keeps the section
+        // tint: only its left-edge strip marks it.
+        for y in 1..=6 {
             for x in 1..=38 {
                 assert_eq!(buffer[(x, y)].bg, blue, "section cell ({x}, {y})");
             }
             assert_eq!(buffer[(0, y)].bg, Color::Reset, "border stays clear");
         }
-        assert!(buffer[(4, 7)].modifier.contains(Modifier::BOLD), "selected task stays bold");
-        for y in [9, 12, 13, 14] {
+        assert!(buffer[(4, 5)].modifier.contains(Modifier::BOLD), "selected workspace stays bold");
+        for y in [7, 10, 11, 12] {
             assert_eq!(buffer[(38, y)].bg, Color::Reset, "section boundaries and loose rows");
         }
-        for y in [9, 12] {
+        for y in [7, 10] {
             assert_eq!(buffer[(2, y)].symbol(), "━");
             assert_eq!(buffer[(2, y)].fg, theme::SECTION_BOUNDARY);
             assert!(buffer[(2, y)].modifier.contains(Modifier::BOLD));
         }
-        assert_eq!(buffer[(2, 5)].symbol(), "─", "internal workspace divider stays thin");
-        assert_eq!(buffer[(2, 5)].fg, theme::DIM);
-        assert_eq!(buffer[(38, 10)].bg, blue, "same-colored next section still has a clear boundary");
+        assert_eq!(buffer[(2, 4)].symbol(), "─", "internal workspace divider stays thin");
+        assert_eq!(buffer[(2, 4)].fg, theme::DIM);
+        assert_eq!(buffer[(38, 8)].bg, blue, "same-colored next section still has a clear boundary");
 
         app.sections[0].folded = true;
         app.cursor = Cursor::Section("s1".into());
@@ -579,15 +683,17 @@ mod layout_tests {
         add_task_session(&mut app, 1, "tb");
         app.cursor = Cursor::Session(1, 0);
         let neutral = theme::sidebar_section_bg(None, 2.0);
+        // The selected session's group keeps its section's tint.
+        let lifted = neutral;
         let buffer = sidebar_buffer(&mut app, 5);
         assert!(app.sidebar_list_state.offset() > 0, "section heading scrolled away");
-        assert_eq!(buffer[(38, 3)].bg, neutral, "selected inherited session keeps tint");
+        assert_eq!(buffer[(38, 3)].bg, lifted, "selected inherited session keeps tint");
 
         app.sidebar_filter = Some("tb".into());
         app.sidebar_list_state = Default::default();
         let buffer = sidebar_buffer(&mut app, 10);
-        assert_eq!(buffer[(38, 1)].bg, neutral, "filtered task keeps tint without its heading");
-        assert_eq!(buffer[(38, 2)].bg, neutral, "filtered session keeps tint without its heading");
+        assert_eq!(buffer[(38, 1)].bg, lifted, "filtered workspace (its task matches) keeps tint without its heading");
+        assert_eq!(buffer[(38, 2)].bg, lifted, "filtered session keeps tint without its heading");
         assert_eq!(buffer[(38, 3)].bg, Color::Reset, "empty space stays transparent");
     }
 
@@ -597,10 +703,11 @@ mod layout_tests {
         app.workspaces.truncate(2);
         app.cursor = Cursor::Section("s1".into());
         let buffer = sidebar_buffer(&mut app, 10);
-        assert_eq!(buffer[(2, 5)].symbol(), "━");
-        assert_eq!(buffer[(2, 5)].fg, theme::SECTION_BOUNDARY);
-        assert_eq!(buffer[(38, 5)].bg, Color::Reset);
-        assert_eq!(buffer[(2, 6)].symbol(), " ");
+        // Header, a, b (nested under a), then the rule.
+        assert_eq!(buffer[(2, 4)].symbol(), "━");
+        assert_eq!(buffer[(2, 4)].fg, theme::SECTION_BOUNDARY);
+        assert_eq!(buffer[(38, 4)].bg, Color::Reset);
+        assert_eq!(buffer[(2, 5)].symbol(), " ");
 
         app.sections[0].folded = true;
         let buffer = sidebar_buffer(&mut app, 10);
@@ -620,6 +727,7 @@ mod layout_tests {
         for _ in 0..30 { app.handle_event(&key(KeyCode::Left)); }
         let buffer = sidebar_buffer(&mut app, 20);
         assert_eq!(buffer[(38, 1)].bg, Color::Reset, "zero disables tint");
+        // Header, a, b and c (nested under a), then the rule.
         assert_eq!(buffer[(2, 5)].symbol(), "━", "closing rule survives tint off");
         app.handle_event(&key(KeyCode::Esc));
         assert_eq!(sidebar_buffer(&mut app, 20)[(38, 1)].bg, original);
@@ -660,15 +768,40 @@ mod layout_tests {
         assert_eq!(app.section_of_workspace(1), None);
     }
 
+    /// Laptop diag 2026-11-05: F-Lead (its own host, no explicit section)
+    /// runs on its done task, which `self.tasks` drops, so after a viewer
+    /// restart its block lost the section it inherits through that task's
+    /// parent. The planning snapshot's parent edge carries it.
     #[test]
-    fn task_section_save_survives_cursor_change_and_missing_binding() {
+    fn a_live_session_on_a_done_task_inherits_through_its_planning_parent() {
         let mut app = sectioned_app();
-        app.tasks[1].workspace_id = None;
-        app.cursor = Cursor::Task { ws_idx: 1, task_id: "tb".into() };
+        let mut f = bare_ws("f");
+        f.host_id = cm_daemon::host_id::HostId::new("f");
+        app.workspaces.push(f);
+        add_task_session(&mut app, 4, "t-done");
+        assert_eq!(app.section_of_workspace(4), None, "no parent edge known yet");
+        // The full planning snapshot (done tasks included) names tb as the
+        // parent; b inherits s1 through ta.
+        app.sidebar_task_parents.insert("t-done".into(), Some("tb".into()));
+        assert_eq!(app.section_of_workspace(4).as_deref(), Some("s1"));
+        assert_eq!(layout(&app), ["#s1", "a", "b", "c", "f", "d"]);
+        app.workspace_sections.insert("f".into(), SECTION_NONE.into());
+        assert_eq!(app.section_of_workspace(4), None, "an explicit choice still wins");
+    }
+
+    /// The Section field moved from the task subheader's form to the
+    /// workspace's (2026-11-05); a save with the task's fields present
+    /// still lands on the workspace the form opened on.
+    #[test]
+    fn workspace_section_save_with_a_task_survives_cursor_change() {
+        let mut app = flat_sectioned_app();
+        app.workspace_sections.remove("b");
+        app.cursor = Cursor::Workspace(1);
         app.open_session_settings();
-        let InputMode::TaskSettings { section, name, .. } = &mut app.input_mode else { panic!("task settings"); };
+        let InputMode::WorkspaceSettings { section, tasks, .. } = &mut app.input_mode else { panic!("workspace settings"); };
+        assert_eq!(tasks.iter().map(|t| t.task_id.as_str()).collect::<Vec<_>>(), ["tb"]);
         *section = Some("s1".into());
-        name.clear(); // Only the section changes; no API rename is needed.
+        tasks[0].name.clear(); // Only the section changes; no API rename is needed.
         app.workspaces.swap(1, 3);
         app.cursor = Cursor::Workspace(0);
         app.handle_input_event(&CrosstermEvent::Key(crossterm::event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
@@ -678,7 +811,9 @@ mod layout_tests {
 
     #[test]
     fn workspace_section_save_survives_reorder() {
-        let mut app = sectioned_app();
+        // b top-level: a nested workspace's section is its root's (not saved).
+        let mut app = flat_sectioned_app();
+        app.workspace_sections.remove("b");
         app.cursor = Cursor::Workspace(1);
         app.open_session_settings();
         let InputMode::WorkspaceSettings { section, .. } = &mut app.input_mode else { panic!("workspace settings"); };
@@ -693,7 +828,8 @@ mod layout_tests {
     fn folded_section_hides_members_but_keeps_header() {
         let mut app = sectioned_app();
         app.sections[0].folded = true;
-        assert_eq!(layout(&app), ["#s1", "c", "d"]);
+        // c nests under a (its task reports to ta), so it folds away too.
+        assert_eq!(layout(&app), ["#s1", "d"]);
         // Space on the header unfolds it again.
         app.cursor = Cursor::Section("s1".into());
         assert!(app.toggle_section_fold());
@@ -733,7 +869,7 @@ mod layout_tests {
         assert_eq!(app.cursor_section_id().as_deref(), Some("s1"));
         app.cursor = Cursor::Workspace(1); // b, inherited
         assert_eq!(app.cursor_section_id().as_deref(), Some("s1"));
-        app.cursor = Cursor::Task { ws_idx: 0, task_id: "ta".into() };
+        app.cursor = Cursor::Workspace(0); // a, explicit
         assert_eq!(app.cursor_section_id().as_deref(), Some("s1"));
         app.cursor = Cursor::Workspace(3); // d, loose
         assert_eq!(app.cursor_section_id(), None);

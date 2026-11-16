@@ -18,13 +18,19 @@ from fastapi.responses import JSONResponse
 from api.auth import verify_token
 from api.models import (
     TaskCreate, TaskUpdate, TaskResponse, ArtifactCreate, ArtifactResponse,
-    BacktestPhaseUpdate, InitiativeCreate, InitiativeUpdate,
+    BacktestPhaseUpdate, TaskLeadUpdate, TaskModelUpdate, TaskModelResolution,
+    InitiativeCreate, InitiativeUpdate,
     InitiativeProjectCreate, InitiativeProjectUpdate, InitiativeResponse,
     TaskChangesResponse,
 )
 from api.dispatch_daemon import dispatch_loop, warm_pool_loop
+from api.board_engine import board_loop
+from api.items import router as items_router
+from api.staffing import router as staffing_router
+from api.continuous_registration import router as continuous_registration_router
+from api.org import router as org_router
 from api.task_changes import ChangeBroker, change_log_maintenance_loop
-from dispatch import db
+from dispatch import db, org_db, task_text
 from dispatch.config import DB_DSN, REPOS
 
 logging.basicConfig(level=logging.INFO)
@@ -96,14 +102,16 @@ async def lifespan(app: FastAPI):
     app.state.change_prune_task = asyncio.create_task(
         change_log_maintenance_loop(app.state.pool)
     )
+    # Work-item flags, orchestrator pushes, escalation, close-out.
+    app.state.board_task = asyncio.create_task(board_loop(app.state.pool))
     logger.info("API server started")
     yield
     # Shutdown
     for task in (app.state.dispatch_task, app.state.warm_pool_task,
-                 app.state.change_prune_task):
+                 app.state.change_prune_task, app.state.board_task):
         task.cancel()
     for task in (app.state.dispatch_task, app.state.warm_pool_task,
-                 app.state.change_prune_task):
+                 app.state.change_prune_task, app.state.board_task):
         try:
             await task
         except asyncio.CancelledError:
@@ -123,6 +131,10 @@ app = FastAPI(title="Claude Manager", lifespan=lifespan)
 # Level 5 keeps the (event-loop-blocking) compression of a full snapshot in
 # the tens of milliseconds; the incremental feed makes snapshots rare anyway.
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
+app.include_router(items_router)
+app.include_router(staffing_router)
+app.include_router(continuous_registration_router)
+app.include_router(org_router)
 
 
 @app.exception_handler(RequestValidationError)
@@ -255,9 +267,8 @@ async def _validate_task_initiative(
 # else in TaskUpdate maps to a NOT NULL column; an explicit null there is
 # a client bug and we reject it with 400 rather than letting Postgres
 # raise a generic 500.
-# Note: ``prompt`` is column-nullable but treated as a string downstream
-# (cli list views, /workers preview, dispatch_daemon), so allowing null
-# would just shift the 500 from Postgres to a TypeError elsewhere.
+# ``prompt`` is deprecated (doc/org-model.md §13.2): a PATCH prompt is
+# ignored or refused before it reaches the column, never written as null.
 NULLABLE_TASK_FIELDS = frozenset({
     "name",
     "worker_vm", "worker_zone", "ttyd_url",
@@ -273,7 +284,16 @@ BACKTEST_DEFAULT_SCRIPT = "analysis.backtests.backtest_actrader_grid"
 
 @app.post("/tasks", response_model=TaskResponse, dependencies=[Depends(verify_token)])
 async def create_task(body: TaskCreate, pool=Depends(get_pool)):
+    # One brief per task (doc/org-model.md §13.2): an old client's prompt is
+    # folded into the description unless the description already says it.
+    # The column still records what was sent. Like the 027 backfill, not for
+    # continuous rows (their contract lives on the continuous record and must
+    # never become an auto-delivered brief) or backtests (a synthesized
+    # prompt nothing delivers).
     prompt = body.prompt or ""
+    description = body.description
+    if body.kind not in task_text.UNFOLDED_KINDS:
+        description = task_text.fold_prompt(body.description, prompt, body.name)
     initiative_id = body.initiative_id
     project = body.project
     if body.parent_task_id and "initiative_id" not in body.model_fields_set:
@@ -315,7 +335,7 @@ async def create_task(body: TaskCreate, pool=Depends(get_pool)):
     task = await db.add_task(
         pool, body.repo_url, body.repo_branch, prompt, body.priority,
         status=body.status, project=project, slug=slug, name=body.name,
-        description=body.description, difficulty=body.difficulty,
+        description=description, difficulty=body.difficulty,
         depends=body.depends, source=body.source, is_cloud=is_cloud,
         kind=body.kind,
         parent_task_id=body.parent_task_id, worktree_mode=body.worktree_mode,
@@ -416,7 +436,14 @@ async def list_task_changes(
 
 @app.get("/tasks/{task_id}", response_model=TaskResponse, dependencies=[Depends(verify_token)])
 async def get_task(task_id: str, pool=Depends(get_pool)):
-    return await _get_task_or_error(pool, task_id)
+    task = await _get_task_or_error(pool, task_id)
+    # Org facts (team, lead member, members working on it) for get_task and
+    # A-i. Best-effort: a failure here never hides the task.
+    try:
+        task["org"] = await org_db.task_org(pool, task)
+    except Exception:  # noqa: BLE001
+        logger.exception("task org facts failed for %s", task_id)
+    return task
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +483,10 @@ def _read_continuous_states() -> list[dict]:
             # Missing dir / half-written file — skip; the view is best-effort.
             continue
     return states
+
+
+# The org roster reads continuous records too (api/org.py).
+app.state.read_continuous_states = _read_continuous_states
 
 
 def _shape_subtask(t: dict) -> dict:
@@ -530,6 +561,7 @@ def _validate_queue_name(queue: str) -> None:
 
 
 @app.post("/queues/{queue}/items", dependencies=[Depends(verify_token)])
+@app.post("/queues/{queue}/enqueue", dependencies=[Depends(verify_token)])
 async def enqueue_queue_item(queue: str, body: dict, pool=Depends(get_pool)):
     """Enqueue one item: {payload, dedupe_key?, source?} ->
     {enqueued, deduped, id, depth}. A dedupe_key that collides with a
@@ -557,12 +589,43 @@ async def enqueue_queue_item(queue: str, body: dict, pool=Depends(get_pool)):
     )
 
 
+@app.get("/queues", dependencies=[Depends(verify_token)])
+async def list_queue_stats(pool=Depends(get_pool)):
+    """Stable dashboard read shape for every known queue."""
+    return {"queues": await db.list_queue_stats(pool)}
+
+
 @app.get("/queues/{queue}", dependencies=[Depends(verify_token)])
 async def get_queue_stats(queue: str, pool=Depends(get_pool)):
-    """{queue, pending, claimed, oldest_pending_at} — the daemon's Consumer
-    due-check polls this."""
+    """Queue depth plus binding, wake and consume metadata."""
     _validate_queue_name(queue)
     return await db.queue_stats(pool, queue)
+
+
+@app.put("/queues/{queue}/binding", dependencies=[Depends(verify_token)])
+async def bind_queue(queue: str, body: dict, pool=Depends(get_pool)):
+    """Bind/rebind a queue to a durable org member reference."""
+    _validate_queue_name(queue)
+    consumer = body.get("consumer")
+    bound_by = body.get("bound_by", "operator")
+    if not isinstance(consumer, str) or not consumer.strip() or len(consumer) > 256:
+        raise HTTPException(status_code=400, detail="consumer must be a non-empty member id or handle")
+    if not isinstance(bound_by, str) or not bound_by.strip() or len(bound_by) > 256:
+        raise HTTPException(status_code=400, detail="bound_by must be a non-empty audit identity")
+    return await db.bind_queue(pool, queue, consumer.strip(), bound_by.strip())
+
+
+@app.post("/queues/{queue}/wake", dependencies=[Depends(verify_token)])
+async def record_queue_wake(queue: str, body: dict, pool=Depends(get_pool)):
+    """Record native delivery of a coalesced queue wake."""
+    _validate_queue_name(queue)
+    delivered = body.get("delivered")
+    if not isinstance(delivered, bool):
+        raise HTTPException(status_code=400, detail="delivered must be a boolean")
+    error = body.get("error")
+    if error is not None and (not isinstance(error, str) or len(error) > 1024):
+        raise HTTPException(status_code=400, detail="error must be a string of at most 1024 characters")
+    return await db.record_queue_wake(pool, queue, delivered=delivered, error=error)
 
 
 @app.post("/queues/{queue}/recover", dependencies=[Depends(verify_token)])
@@ -594,7 +657,19 @@ async def claim_queue_batch(queue: str, body: dict, pool=Depends(get_pool)):
     claimed_by = body.get("claimed_by")
     if not isinstance(claimed_by, str) or not claimed_by:
         raise HTTPException(status_code=400, detail="claimed_by must be a non-empty string")
-    items = await db.claim_queue_items(pool, queue, max_items, claimed_by)
+    consumer = body.get("consumer")
+    if consumer is not None and (not isinstance(consumer, str) or not consumer):
+        raise HTTPException(status_code=400, detail="consumer must be a non-empty string")
+    lease_seconds = body.get("lease_seconds", 300)
+    if not isinstance(lease_seconds, int) or lease_seconds < 30 or lease_seconds > 86400:
+        raise HTTPException(status_code=400, detail="lease_seconds must be an int in [30, 86400]")
+    try:
+        items = await db.claim_queue_items(
+            pool, queue, max_items, claimed_by,
+            consumer=consumer, lease_seconds=lease_seconds,
+        )
+    except db.QueueBindingRefusal as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     return {"items": items}
 
 
@@ -606,8 +681,16 @@ async def ack_queue_batch(queue: str, body: dict, pool=Depends(get_pool)):
     ids = body.get("ids")
     if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
         raise HTTPException(status_code=400, detail="ids must be a list of strings")
+    consumer = body.get("consumer")
+    claim_token = body.get("claim_token")
+    if consumer is not None and (not isinstance(consumer, str) or not consumer):
+        raise HTTPException(status_code=400, detail="consumer must be a non-empty string")
+    if claim_token is not None and (not isinstance(claim_token, str) or not claim_token):
+        raise HTTPException(status_code=400, detail="claim_token must be a non-empty string")
     try:
-        acked = await db.ack_queue_items(pool, queue, ids)
+        acked = await db.ack_queue_items(pool, queue, ids, consumer=consumer, claim_token=claim_token)
+    except db.QueueBindingRefusal as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     except asyncpg.DataError:
         # Malformed UUIDs land here from the ::uuid[] cast — a client bug.
         raise HTTPException(status_code=400, detail="ids must be UUIDs")
@@ -651,7 +734,12 @@ async def requeue_queue_batch(queue: str, body: dict | None = None, pool=Depends
                    '(which re-pends any batch an in-flight fire just claimed)',
         )
     try:
-        requeued = await db.requeue_queue_items(pool, queue, ids)
+        consumer = body.get("consumer")
+        if consumer is not None and (not isinstance(consumer, str) or not consumer):
+            raise HTTPException(status_code=400, detail="consumer must be a non-empty string")
+        requeued = await db.requeue_queue_items(pool, queue, ids, consumer=consumer)
+    except db.QueueBindingRefusal as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     except asyncpg.DataError:
         raise HTTPException(status_code=400, detail="ids must be UUIDs")
     return {"requeued": requeued}
@@ -743,6 +831,123 @@ async def update_backtest_phase(task_id: str, body: BacktestPhaseUpdate,
     return updated
 
 
+@app.post("/tasks/{task_id}/lead", response_model=TaskResponse,
+          dependencies=[Depends(verify_token)])
+async def set_task_lead(task_id: str, body: TaskLeadUpdate, pool=Depends(get_pool)):
+    """Pin the task's lead session (``metadata.lead_session_uid``), or clear it with null.
+
+    One server-side statement that touches only that key, so the TUI's Lead
+    field and the ``org(action="set_lead")`` tool never clobber
+    ``metadata.filer`` or anything else (``PATCH /tasks/{id}`` replaces the
+    whole bag). Whether the uid is live and bound to the task is the readers'
+    concern: the shared lead rule ignores a pin that isn't. ``"owner"`` pins
+    Owner as the task's lead (``cm_daemon::org::task_lead``).
+    """
+    task = await _get_task_or_error(pool, task_id)
+    uid = (body.session_uid or "").strip() or None
+    # "owner" (any case) means Owner leads the task; stored in one spelling.
+    if uid is not None and uid.lower() == "owner":
+        uid = "owner"
+    updated = await db.set_task_lead(pool, str(task["id"]), uid)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return updated
+
+
+LEAD_PIN_KEY = "lead_session_uid"
+
+
+def _keep_lead_pin(task: dict, new_metadata: dict | None) -> dict | None:
+    """A metadata PATCH replaces the whole bag, but never the lead pin:
+    ``metadata.lead_session_uid`` changes only through ``POST /tasks/{id}/lead``
+    (the A-e Lead field, ``org(action="set_lead")``), which enforces who may
+    set or clear an Owner pin. The stored pin is carried into the new bag; a
+    bag naming a different pin is refused. Re-sending the same pin is fine.
+    """
+    old = task.get("metadata") or {}
+    if isinstance(old, str):
+        try:
+            old = json.loads(old) or {}
+        except ValueError:
+            old = {}
+    pin = old.get(LEAD_PIN_KEY) if isinstance(old, dict) else None
+    if new_metadata is not None and LEAD_PIN_KEY in new_metadata and new_metadata[LEAD_PIN_KEY] != pin:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "metadata.lead_session_uid can't be set through PATCH; use "
+                "POST /tasks/{id}/lead (org(action=\"set_lead\") for agents, A-e Lead for Owner)"
+            ),
+        )
+    if pin is None:
+        return new_metadata
+    merged = dict(new_metadata or {})
+    merged[LEAD_PIN_KEY] = pin
+    return merged
+
+
+@app.post("/tasks/{task_id}/model", response_model=TaskResponse,
+          dependencies=[Depends(verify_token)])
+async def set_task_model(task_id: str, body: TaskModelUpdate, pool=Depends(get_pool)):
+    """Set a task's default model and/or effort for one engine; null (or
+    an empty string) clears one.
+
+    Touches only ``metadata.models.<engine>`` / ``metadata.efforts.<engine>``
+    for the fields sent (``PATCH`` replaces the whole bag). Subtasks inherit
+    them: see ``GET /tasks/{id}/model``.
+    """
+    task = await _get_task_or_error(pool, task_id)
+    sent = body.model_fields_set & {"model", "effort"}
+    if not sent:
+        raise HTTPException(status_code=422, detail="send model and/or effort")
+    updated = None
+    for field, key in (("model", "models"), ("effort", "efforts")):
+        if field in sent:
+            updated = await db.set_task_default(pool, str(task["id"]), key, body.engine,
+                                                getattr(body, field))
+            if not updated:
+                raise HTTPException(status_code=404, detail="Task not found")
+    return updated
+
+
+@app.get("/tasks/{task_id}/model", response_model=TaskModelResolution,
+         dependencies=[Depends(verify_token)])
+async def resolve_task_model(task_id: str, engine: str = Query(..., pattern=r"^(claude|codex)$"),
+                             pool=Depends(get_pool)):
+    """The default model and effort for ``engine`` on this task: its own
+    ``metadata.models.<engine>`` / ``metadata.efforts.<engine>``, else the
+    nearest ancestor's, each resolved on its own. A value is null when none
+    sets one; callers then use their config default.
+    """
+    task = await _get_task_or_error(pool, task_id)
+    model = await db.resolve_task_default(pool, str(task["id"]), "models", engine)
+    effort = await db.resolve_task_default(pool, str(task["id"]), "efforts", engine)
+    if model is None or effort is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {
+        "engine": engine,
+        "model": model["value"],
+        "source_task_id": model["source_task_id"],
+        "effort": effort["value"],
+        "effort_source_task_id": effort["source_task_id"],
+    }
+
+
+def _drop_redundant_prompt(task: dict, fields: dict) -> None:
+    """A PATCH prompt is ignored when it adds nothing to the description that
+    will be stored; a real one is refused, since a person typed it
+    (doc/org-model.md §13.2)."""
+    prompt = fields.pop("prompt")
+    description = fields["description"] if "description" in fields else task.get("description")
+    name = fields["name"] if "name" in fields else task.get("name")
+    if not task_text.prompt_is_redundant(prompt, description, name):
+        raise HTTPException(status_code=409, detail={
+            "code": "prompt_deprecated",
+            "message": "put instructions in the description: tasks no longer "
+                       "have a separate prompt",
+        })
+
+
 @app.patch("/tasks/{task_id}", response_model=TaskResponse, dependencies=[Depends(verify_token)])
 async def update_task(task_id: str, body: TaskUpdate, pool=Depends(get_pool)):
     task = await _get_task_or_error(pool, task_id)
@@ -753,6 +958,8 @@ async def update_task(task_id: str, body: TaskUpdate, pool=Depends(get_pool)):
     # both into "missing", which made nullable columns un-clearable once set.
     dumped = body.model_dump(exclude_unset=True)
     fields = {k: dumped[k] for k in body.model_fields_set if k in dumped}
+    if "prompt" in fields:
+        _drop_redundant_prompt(task, fields)
 
     bad = sorted(
         k for k, v in fields.items()
@@ -766,8 +973,48 @@ async def update_task(task_id: str, body: TaskUpdate, pool=Depends(get_pool)):
             ),
         )
 
+    # Not columns: who wrote it, and a blocked write's trigger.
+    actor = fields.pop("actor", None) or {"pid": "system:legacy-task-write",
+                                          "name": "legacy task write"}
+    if not actor.get("pid"):
+        raise HTTPException(status_code=400, detail="actor.pid is required")
+    reason = fields.pop("reason", None)
+    blocked_by = fields.pop("blocked_by", None)
     if not fields:
         return task
+
+    # A placed task's status and description go through its item (§7.1).
+    if task.get("placement"):
+        from dispatch import placement
+        from dispatch.items_rules import ItemsError
+        try:
+            if "status" in fields:
+                await placement.translate_task_status(
+                    pool, task, fields["status"], actor, reason=reason,
+                    blocked_by=blocked_by)
+                # While the mirror's gate is closed (or CM_ORG_MIRROR=0) the
+                # task row takes the write as it always did; open, the item
+                # transition just mirrored it.
+                # `archived` archives the link too, so nothing mirrors it.
+                if fields["status"] != "archived" and await placement.mirror_is_open(pool, task_id):
+                    fields.pop("status")
+            if "description" in fields and fields["description"] != task.get("description"):
+                await placement.task_description_changed(pool, task, fields.pop("description"),
+                                                         actor)
+        except ItemsError as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail()) from exc
+        if not fields:
+            return await _get_task_or_error(pool, task_id)
+    elif "description" in fields and fields["description"] != task.get("description"):
+        fields["description_rev"] = (task.get("description_rev") or 0) + 1
+
+    if "metadata" in fields:
+        fields["metadata"] = _keep_lead_pin(task, fields["metadata"])
+        if task.get("placement") and isinstance(fields["metadata"], dict):
+            # The mirror's marks stay while the task is placed.
+            for key in ("terminal_via", "dropped"):
+                if key in (task.get("metadata") or {}):
+                    fields["metadata"].setdefault(key, task["metadata"][key])
 
     # Reparenting inherits the new parent's initiative (and project, if the
     # task has none), mirroring create_task. Without this, moving a standalone
@@ -840,17 +1087,19 @@ async def list_projects(pool=Depends(get_pool)):
     # proposed from a different repo's context, e.g. an agent running in the
     # claude-manager repo proposing a predictionTrading task — that row carries
     # the WRONG repo_url). So the tasks-table value is only a fallback.
-    seen = {}
-    for r in rows:
-        if r["project"] not in seen:
-            seen[r["project"]] = r["repo_url"]
+    # list_projects already picks each project's most common repo.
+    seen = {r["project"]: {"repo_url": r["repo_url"],
+                           "repo_branch": r["repo_branch"] or "main"}
+            for r in rows}
     # Authoritative override: ~/.cm/projects/<name>/repo_url is the canonical
     # clone URL for a project (REPOS, discovered at daemon start). This is what
-    # submit_backtest resolves against, so it must be right regardless of what
-    # stray tasks carry.
+    # submit_backtest and propose_task resolve against, so it must be right
+    # regardless of what stray tasks carry.
     for name, url in REPOS.items():
-        seen[name] = url
-    return [{"name": name, "repo_url": url} for name, url in seen.items()]
+        prior = seen.get(name)
+        branch = prior["repo_branch"] if prior and prior["repo_url"] == url else "main"
+        seen[name] = {"repo_url": url, "repo_branch": branch}
+    return [{"name": name, **repo} for name, repo in seen.items()]
 
 
 # ---------------------------------------------------------------------------
@@ -869,6 +1118,7 @@ async def create_initiative(body: InitiativeCreate, pool=Depends(get_pool)):
             color=body.color, coordinator_task_id=body.coordinator_task_id,
             coordinator_project=body.coordinator_project, docs_path=body.docs_path,
             shared_channel=body.shared_channel, metadata=body.metadata,
+            kind=body.kind,
         )
     except db.InvalidTaskId as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -883,11 +1133,13 @@ async def create_initiative(body: InitiativeCreate, pool=Depends(get_pool)):
 async def list_initiatives(
     status: str | None = Query(None),
     project: str | None = Query(None),
+    kind: str | None = Query(None),
     include_archived: bool = Query(False),
     pool=Depends(get_pool),
 ):
     return await db.list_initiatives(
-        pool, status=status, project=project, include_archived=include_archived,
+        pool, status=status, project=project, kind=kind,
+        include_archived=include_archived,
     )
 
 
@@ -922,6 +1174,17 @@ async def update_initiative(
     return updated
 
 
+async def _transition_initiative(initiative: dict, status: str, reason: str, pool) -> dict:
+    # An illegal transition (including completing a permanent division) is a
+    # client error, not a 500.
+    try:
+        return await db.update_initiative(
+            pool, initiative["id"], status=status, actor="owner", reason=reason,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/initiatives/{initiative_ref}/approve", response_model=InitiativeResponse,
           dependencies=[Depends(verify_token)])
 async def approve_initiative(initiative_ref: str, pool=Depends(get_pool)):
@@ -932,30 +1195,21 @@ async def approve_initiative(initiative_ref: str, pool=Depends(get_pool)):
             status_code=400,
             detail="approve at least one initiative project before activation",
         )
-    return await db.update_initiative(
-        pool, initiative["id"], status="active", actor="owner",
-        reason="Owner approved initiative",
-    )
+    return await _transition_initiative(initiative, "active", "Owner approved initiative", pool)
 
 
 @app.post("/initiatives/{initiative_ref}/pause", response_model=InitiativeResponse,
           dependencies=[Depends(verify_token)])
 async def pause_initiative(initiative_ref: str, pool=Depends(get_pool)):
     initiative = await _initiative_or_404(pool, initiative_ref)
-    return await db.update_initiative(
-        pool, initiative["id"], status="paused", actor="owner",
-        reason="Owner paused initiative",
-    )
+    return await _transition_initiative(initiative, "paused", "Owner paused initiative", pool)
 
 
 @app.post("/initiatives/{initiative_ref}/complete", response_model=InitiativeResponse,
           dependencies=[Depends(verify_token)])
 async def complete_initiative(initiative_ref: str, pool=Depends(get_pool)):
     initiative = await _initiative_or_404(pool, initiative_ref)
-    return await db.update_initiative(
-        pool, initiative["id"], status="completed", actor="owner",
-        reason="Owner completed initiative",
-    )
+    return await _transition_initiative(initiative, "completed", "Owner completed initiative", pool)
 
 
 @app.post("/initiatives/{initiative_ref}/projects",
@@ -1018,7 +1272,7 @@ async def list_workers(pool=Depends(get_pool)):
             "worker_vm": t["worker_vm"],
             "status": t["status"],
             "ttyd_url": t["ttyd_url"],
-            "prompt": t["prompt"][:80],
+            "prompt": task_text.compose_brief(t["description"], t["prompt"], t["name"])[:80],
         }
         for t in tasks
         if t["status"] in ("running", "blocked") and t["worker_vm"]

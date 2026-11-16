@@ -84,6 +84,144 @@ class WorktreeReaperTests(unittest.TestCase):
         self.assertEqual(result.reason, "terminal_and_inactive")
         self.assertEqual(result.landed_reason, "head_is_ancestor")
 
+    def test_landed_clean_checkout_of_a_done_task_is_reaped_after_one_day(self) -> None:
+        # #109: a done task's checkout whose HEAD is in origin main no longer
+        # waits the full 7 days.
+        def decide(age_days, *, landed_days=1.0, status="done"):
+            context = self.context(status=status)
+            context.now = time.time() + age_days * reaper.DAY
+            context.landed_retention_days = landed_days
+            return reaper.decision(self.worktree, context)
+
+        fast = decide(2)
+        self.assertTrue(fast.eligible)
+        self.assertEqual((fast.reason, fast.landed_reason), ("terminal_and_landed", "head_is_ancestor"))
+        self.assertEqual(decide(0.5).reason, "below_retention", "still inside the landed window")
+        self.assertEqual(decide(2, landed_days=None).reason, "below_retention", "fast path disabled")
+        self.assertEqual(decide(2, status="running").reason, "task_not_terminal")
+        self.assertEqual(decide(8).reason, "terminal_and_inactive", "full retention is unchanged")
+
+        (self.worktree / "NOTES.md").write_text("dirty\n")
+        dirty = decide(2)
+        self.assertEqual(dirty.reason, "below_retention")
+        self.assertIn("dirty tree waits for full retention", dirty.details)
+        self.git(self.worktree, "commit", "-am", "unlanded work")
+        unlanded = decide(2)
+        self.assertEqual(unlanded.reason, "below_retention")
+        self.assertTrue(any(d.startswith("not landed:") for d in unlanded.details), unlanded.details)
+        self.assertEqual(decide(8).reason, "terminal_and_inactive", "unlanded work still goes at 7 days")
+
+    def test_unowned_landed_fast_path_is_opt_in_and_needs_a_clean_landed_head(self) -> None:
+        # #109: 17 unowned checkouts (22.6 GiB) on cm-sessions were landed and
+        # clean but waited the full unowned retention.
+        def decide(age_days, *, landed_days=1.0):
+            context = self.context(task_owned=False)
+            context.unowned_retention_days = 7
+            context.now = time.time() + age_days * reaper.DAY
+            context.unowned_landed_retention_days = landed_days
+            return reaper.decision(self.worktree, context)
+
+        fast = decide(2)
+        self.assertTrue(fast.eligible)
+        self.assertEqual((fast.reason, fast.landed_reason), ("unowned_and_landed", "head_is_ancestor"))
+        self.assertEqual(decide(2, landed_days=None).reason, "unowned_below_retention", "off by default")
+        self.assertEqual(decide(0.5).reason, "unowned_below_retention")
+        self.assertEqual(decide(8).reason, "unowned_inactive", "full retention is unchanged")
+        (self.worktree / "NOTES.md").write_text("dirty\n")
+        self.assertIn("dirty tree waits for full retention", decide(2).details)
+        self.git(self.worktree, "commit", "-am", "unlanded work")
+        self.assertFalse(decide(2).eligible)
+        self.assertEqual(reaper.parser().parse_args([]).unowned_landed_retention_days, 0.0)
+
+    def test_durable_workspaces_and_open_assistants_checkouts_are_protected(self) -> None:
+        # doc/org-model.md §5, O5: a member's home/stream workspace, or a
+        # checkout an assistant was live in within 7 days, survives a done
+        # task. A closed assistant, or one dead longer (any death path: plain
+        # kill, crash, memory cap, natural exit), leaves the normal rules.
+        manifest = self.base / "daemon-sessions.json"
+        day = 86400.0
+
+        def decide(org, record_org, *, exited_days_ago=None, live=False, tui_shape=False):
+            record = {"uid": "u", "task_id": "task-1"}
+            if tui_shape:
+                record["entry"] = {"org": record_org}
+            else:
+                record["org"] = record_org
+            if exited_days_ago is not None:
+                record["exited_at"] = self.now - exited_days_ago * day
+            ws = {"id": "ws", "worktree_path": str(self.worktree), "org": org,
+                  "sessions": [record] if live else [], "tombstones": [] if live else [record]}
+            manifest.write_text(reaper.json.dumps({"workspaces": {"ws": ws}}))
+            facts = reaper.load_workspace_facts([manifest])[self.worktree.resolve()]
+            context = self.context()
+            context.workspaces = {self.worktree.resolve(): facts}
+            return reaper.decision(self.worktree, context)
+
+        open_assistant = {"member_id": "mem_ep", "acting_as": "assistant"}
+        closed = {**open_assistant, "assistant_closed_at": "2026-10-25T12:00:00Z"}
+        worker = {"member_id": "mem_bt", "acting_as": "worker"}
+        claimed = {"workspace_kind": "stream", "stream_of": "assistant"}
+        self.assertEqual(decide({"workspace_kind": "stream"}, None).reason, "stream_workspace")
+        self.assertEqual(decide({"workspace_kind": "home"}, None).reason, "home_workspace")
+        # An open assistant dead 2 days (daemon and TUI manifest shapes).
+        self.assertEqual(decide(None, open_assistant, exited_days_ago=2).reason, "assistant_checkout")
+        self.assertEqual(decide(None, open_assistant, exited_days_ago=2, tui_shape=True).reason,
+                         "assistant_checkout")
+        # Dead 8 days: normal rules, unclassified or claimed stream alike.
+        self.assertTrue(decide(None, open_assistant, exited_days_ago=8).eligible)
+        stale = {**claimed, "assistant_idle_since": self.now - 8 * day}
+        self.assertTrue(decide(stale, open_assistant, exited_days_ago=8).eligible)
+        # A claimed stream the daemon has watched idle only 3 days stays.
+        recent = {**claimed, "assistant_idle_since": self.now - 3 * day}
+        self.assertEqual(decide(recent, open_assistant, exited_days_ago=8).reason, "assistant_checkout")
+        # Closed, a worker, nobody's: normal rules.
+        self.assertTrue(decide({"workspace_kind": "ephemeral"}, closed, exited_days_ago=1).eligible)
+        self.assertTrue(decide({"workspace_kind": "ephemeral"}, worker, exited_days_ago=1).eligible)
+        self.assertTrue(decide({"workspace_kind": "ephemeral"}, None).eligible)
+        self.assertTrue(reaper.is_open_assistant(open_assistant))
+        self.assertFalse(reaper.is_open_assistant(closed))
+        self.assertFalse(reaper.is_open_assistant(worker))
+        self.assertFalse(reaper.is_open_assistant({"acting_as": "main", "member_id": "mem_ep"}))
+
+    def test_daemon_only_host_exits_in_daemon_tombstones_protect_an_assistants_checkout(self) -> None:
+        # cm-sessions keeps no workspace tombstones in daemon-sessions.json:
+        # exits go to daemon-tombstones.json. Fixtures copy the live shapes.
+        fixtures = Path(__file__).parent / "fixtures" / "o5_reaper"
+        day = 86400.0
+
+        def decide(exited_days_ago, *, by_path=True, org_key=True):
+            sessions = (fixtures / "daemon-sessions.json").read_text().replace("WORKTREE", str(self.worktree))
+            tombs = reaper.json.loads((fixtures / "daemon-tombstones.json").read_text())
+            rec = tombs["recently_exited"][0]
+            rec["exited_at"] = self.now - exited_days_ago * day
+            rec["worktree_path"] = str(self.worktree) if by_path else None
+            if not org_key:
+                rec.pop("org")
+            (self.base / "daemon-sessions.json").write_text(sessions)
+            (self.base / "daemon-tombstones.json").write_text(reaper.json.dumps(tombs))
+            facts = reaper.load_workspace_facts([self.base / "daemon-sessions.json",
+                                                 self.base / "daemon-tombstones.json"])
+            context = self.context()
+            context.workspaces = {self.worktree.resolve(): facts[self.worktree.resolve()]}
+            return reaper.decision(self.worktree, context)
+
+        self.assertEqual(decide(2).reason, "assistant_checkout", "crashed 2 days ago: kept")
+        self.assertEqual(decide(2, by_path=False).reason, "assistant_checkout", "found by workspace id")
+        self.assertTrue(decide(8).eligible, "dead 8 days: normal rules")
+        self.assertTrue(decide(2, org_key=False).eligible, "a member-less exit changes nothing")
+
+    def test_viewer_workspace_archive_still_protects_its_checkout(self) -> None:
+        # #109: the TUI moves long-closed workspaces from tui-sessions.json to
+        # tui-workspace-archive.jsonl. Their tombstones must still bind tasks.
+        archive = self.base / "tui-workspace-archive.jsonl"
+        ws = {"id": "ws-arch", "worktree_path": str(self.worktree), "is_closed": True,
+              "tombstones": [{"uid": "u", "task_id": "task-live", "continuous_task_id": "ct"}]}
+        archive.write_text("{broken\n" + reaper.json.dumps({"v": 1, "archived_at": 1.0, "workspace": ws}) + "\n")
+        facts = reaper.load_workspace_facts([archive])[self.worktree.resolve()]
+        self.assertIn("task-live", facts.task_ids)
+        self.assertTrue(facts.continuous)
+        self.assertIn("ws-arch", facts.workspace_ids)
+
     def test_nonterminal_and_young_unowned_worktrees_fail_closed(self) -> None:
         running = reaper.decision(self.worktree, self.context(status="running"))
         self.assertFalse(running.eligible)

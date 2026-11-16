@@ -7,6 +7,10 @@ pub(super) enum InputMode {
     /// Normal operation — keys go to terminal or app navigation.
     Normal,
     ContinuousControl(super::continuous_control::Menu),
+    /// A-F: fork the focused session's conversation into a new task.
+    ForkSession(super::fork::ForkForm),
+    /// Alt+Shift+E (#25): hand the session over to another engine/model.
+    Handoff(super::handoff::HandoffForm),
     WorktreeCleanup(super::worktree_cleanup::Menu),
     /// Configuring a new workspace and its initial agent session.
     NewSession {
@@ -42,8 +46,8 @@ pub(super) enum InputMode {
     NewTerminalSession {
         workspace_id: String,
         session_type: String,
-        /// Task scope inherited from the cursor when A-s was pressed. None =
-        /// workspace-level session (no task subheader).
+        /// Task scope inherited from the cursor when A-s was pressed (a
+        /// session's task, or the workspace row's task). None = no task.
         task_id: Option<String>,
         /// `Some(snapshot_name)` when the session should be cloned from
         /// that agent-memory snapshot. Cleared whenever `session_type`
@@ -63,8 +67,13 @@ pub(super) enum InputMode {
     },
     /// Editing session settings.
     SessionSettings {
+        /// Positions are re-resolved from `session_uid` before every key
+        /// (see `refresh_session_settings_indices`): the sidebar re-sorts
+        /// `workspaces` on each task-feed update, so positions captured at
+        /// open can name a different session by the time the form saves.
         ws_index: usize,
         session_index: usize,
+        session_uid: String,
         name: String,
         idle_timeout: String,
         burst_threshold: String,
@@ -74,7 +83,7 @@ pub(super) enum InputMode {
         /// can prompt/read/control ANY session, not just descendants.
         global_perms: bool,
         /// Accent color for this session's sidebar row — a `USER_COLORS`
-        /// name, cycled with Space/←/→. `None` = inherit workspace color.
+        /// name, picked in the color grid. `None` = inherit workspace color.
         color: Option<String>,
         /// Read-only provenance: name of the agent-memory snapshot this
         /// session was cloned from, if any. Surfaced at the bottom of the
@@ -103,7 +112,10 @@ pub(super) enum InputMode {
         target: TranscriptPickTarget,
     },
     /// Workspace settings: display label (branch and worktree path stay
-    /// the same), accent color, the pinned flag, and the sidebar section.
+    /// the same), accent color, the pinned flag, the sidebar section and,
+    /// when tasks are bound, the workspace's task: its name, lead and
+    /// default models (the task header whose form had them is gone,
+    /// 2026-11-05).
     WorkspaceSettings {
         workspace_id: String,
         name: String,
@@ -116,7 +128,13 @@ pub(super) enum InputMode {
         /// auto (inherit through the task tree), `Some("")` = loose,
         /// `Some(id)` = that section.
         section: Option<String>,
-        /// 0 = name, 1 = color, 2 = pinned, 3 = section
+        /// The tasks the workspace row stands for (`App::workspace_tasks`);
+        /// empty for a taskless workspace.
+        tasks: Vec<WorkspaceTaskEdit>,
+        /// Which of `tasks` the task fields show (←/→ on the Task field).
+        task_at: usize,
+        /// 0 = name, 1 = color, 2 = pinned, 3 = section; with a task also
+        /// 4 = task name, 5 = lead, 6/7 = default claude/codex model
         active_field: u8,
     },
     /// Create (`section_id == None`) or edit a sidebar section: name and
@@ -173,22 +191,6 @@ pub(super) enum InputMode {
         /// input so it doesn't linger across mode transitions.
         status_msg: Option<String>,
     },
-    /// Task settings: rename (updates the `name` field via the planning
-    /// API and the local TaskEntry so the sidebar subheader refreshes)
-    /// plus the accent color (stored TUI-side in `App::task_colors`).
-    TaskSettings {
-        task_id: String,
-        workspace_id: String,
-        name: String,
-        /// Accent color (`USER_COLORS` name) for the sidebar task header.
-        color: Option<String>,
-        /// Sidebar section choice for the task's WORKSPACE (sections group
-        /// workspaces; a task row is just the handiest place to set it).
-        /// Same encoding as `WorkspaceSettings::section`.
-        section: Option<String>,
-        /// 0 = name, 1 = color, 2 = section
-        active_field: u8,
-    },
     /// Picking which workflow to launch when more than one is defined.
     WorkflowPicker {
         // Stable workspace id captured at modal-open. Re-resolved to a current
@@ -200,8 +202,9 @@ pub(super) enum InputMode {
         names: Vec<String>,
         selected: usize,
         /// migrate-tui-local Issue I: the task scope the launch
-        /// descends from, captured at A-f time from
-        /// `Cursor::Task { task_id, .. }`. Threaded through to
+        /// descends from, captured at A-f time from the cursor's
+        /// row (a session's task, or the workspace row's task).
+        /// Threaded through to
         /// `LaunchWorkflow` so the controller's
         /// `spawn_workflow_session` records the daemon-side
         /// `DaemonSession.task_id` at spawn time. `None` for
@@ -234,9 +237,12 @@ pub(super) enum InputMode {
     /// Picker over past workspaces (closed or all-tasks-done) so the user
     /// can reopen one without cluttering the sidebar. Opened via A-O from
     /// Sessions view. Carries the candidate list up-front instead of
-    /// recomputing on every input event.
+    /// recomputing on every input event. `query` is the type-to-filter
+    /// text; `selected` indexes the FILTERED view
+    /// ([`past_workspace_match_indices`]), not `candidates`.
     PastWorkspacePicker {
         candidates: Vec<PastCandidate>,
+        query: String,
         selected: usize,
     },
     /// Fuzzy-find palette over sessions + workspace headers (A-p,
@@ -264,7 +270,7 @@ pub(super) enum InputMode {
         max_scroll: u16,
     },
     /// Generic y/N confirmation overlay. The action runs only on `y`/`Y`/Enter;
-    /// `n`/`N`/Esc cancels. Used to gate destructive keys (A-d, A-x).
+    /// `n`/`N`/Esc cancels. Used to gate destructive keys (A-D, A-x).
     Confirm {
         prompt: String,
         action: ConfirmAction,
@@ -282,6 +288,48 @@ pub struct PastCandidate {
     pub worktree_exists: Option<bool>,
     /// Latest tombstone `exited_at` if any — used to sort most-recent first.
     pub last_exited_at: f64,
+    /// Lowercased search fields, computed once at modal open so filtering
+    /// 2,700+ rows per keystroke is a pure in-memory scan: workspace name,
+    /// bound task names + wip branches, worktree path, session/tombstone
+    /// labels, host.
+    pub search_fields: Vec<String>,
+    /// Why the workspace's last session closed, when that explains it
+    /// ("closed: task done"); shown beside the name.
+    pub note: Option<&'static str>,
+}
+
+impl PastCandidate {
+    /// Builds `search_fields` from raw (non-lowercased) values, dropping
+    /// empties.
+    pub fn search_fields_from<'a>(fields: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+        fields
+            .into_iter()
+            .filter(|f| !f.is_empty())
+            .map(|f| f.to_lowercase())
+            .collect()
+    }
+}
+
+/// A-O picker filter: case-insensitive substring over each candidate's
+/// `search_fields`. Same ranking as the A-p palette (prefix matches —
+/// any field STARTING with the query — first, then substring matches),
+/// each group keeping the candidates' newest-first order. Empty query =
+/// everything. Returns indices into `candidates`.
+pub(crate) fn past_workspace_match_indices(query: &str, candidates: &[PastCandidate]) -> Vec<usize> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return (0..candidates.len()).collect();
+    }
+    rank_prefix_then_substring(candidates.len(), |i| {
+        let fields = &candidates[i].search_fields;
+        if fields.iter().any(|f| f.starts_with(&q)) {
+            Some(true)
+        } else if fields.iter().any(|f| f.contains(&q)) {
+            Some(false)
+        } else {
+            None
+        }
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -295,6 +343,16 @@ pub enum ConfirmAction {
     /// tombstoned sessions. Y respawns one session per tombstone (claude
     /// /codex resume via `--resume`, bash starts fresh in the worktree).
     RestoreTombstones { ws_id: String },
+    /// Y/n after A-w closed a workspace's last agent: close the workspace
+    /// too (its idle bash panes with it; a busy one keeps it open).
+    CloseAfterLastAgent { ws_id: String },
+    /// The one-time startup offer (`maybe_offer_bash_only_sweep`).
+    CloseBashOnlyWorkspaces { ws_ids: Vec<String> },
+    /// Alt+T (#24): move this session's conversation to a fresh transcript.
+    RotateTranscript { uid: String },
+    /// Explicit operator authorization for this exact background identity.
+    BackgroundRecovery { uid: String, host: crate::hosts::HostId, identity: serde_json::Value, prompt: String },
+    ReconcileBackground { uid: String, host: crate::hosts::HostId, identity: serde_json::Value, prompt: String },
 }
 
 /// Per-role slot in the launch modal. The user cycles through `options` with
@@ -395,7 +453,7 @@ pub(crate) struct InputCtx<'a> {
     /// apply — cycling is then a no-op.
     pub host_ids: &'a [cm_daemon::host_id::HostId],
     /// Sidebar section ids in display order, for the ←/→ section picker
-    /// on the workspace / task settings forms (`cycle_section_choice`).
+    /// on the workspace settings form (`cycle_section_choice`).
     pub section_ids: &'a [String],
 }
 
@@ -425,9 +483,32 @@ pub(crate) enum InputOutcome {
 /// themselves never see `&mut App`.
 #[derive(Debug, Clone)]
 pub(crate) enum SubmitAction {
+    /// A-F form submitted; the form itself rides in the replaced input mode.
+    ForkSession,
+    /// Alt+T confirmed: rotate `uid`'s transcript now.
+    RotateTranscript { uid: String },
+    BackgroundRecovery { uid: String, host: crate::hosts::HostId, identity: serde_json::Value, prompt: String },
+    ReconcileBackground { uid: String, host: crate::hosts::HostId, identity: serde_json::Value, prompt: String },
+    /// Alt+Shift+E form submitted (the form rides in the replaced mode).
+    Handoff,
     /// Submit attempted but the inputs produced no work to do (e.g.
     /// empty workspace name, no workflow selected). Modal still closes.
     None,
+    /// A-n with "Reports to" set: create the workspace's task under
+    /// `parent`, then launch it task-bound (see
+    /// `App::create_reporting_workspace`).
+    CreateReportingWorkspace {
+        engine: LaunchEngine,
+        repo_url: String,
+        label: String,
+        branch: Option<String>,
+        in_place: bool,
+        host_id: cm_daemon::host_id::HostId,
+        parent: crate::task_picker::TaskChoice,
+        /// Explicit Model field value; `None` = task default, else engine default.
+        model: Option<String>,
+        effort: Option<String>,
+    },
     CreateLocalSession {
         engine: LaunchEngine,
         repo_url: String,
@@ -443,6 +524,9 @@ pub(crate) enum SubmitAction {
         /// create path pins the new workspace to THIS host — local →
         /// existing local create path, remote → `create_remote_session`.
         host_id: cm_daemon::host_id::HostId,
+        /// Explicit Model field value; `None` = engine default.
+        model: Option<String>,
+        effort: Option<String>,
     },
     SpawnSessionOnWorkspace {
         workspace_id: String,
@@ -452,6 +536,10 @@ pub(crate) enum SubmitAction {
         /// proper-resume: resume this transcript instead of starting a
         /// fresh conversation (see `InputMode::NewTerminalSession`).
         resume_from: Option<String>,
+        /// Explicit Model field value; `None` = the recorded model of a
+        /// resumed row, else the task default, else the engine default.
+        model: Option<String>,
+        effort: Option<String>,
     },
     /// Open the snapshot catalog in picker mode from the A-n form. Carries
     /// the form state so the catalog can re-open the form (with seed_from
@@ -516,6 +604,8 @@ pub(crate) enum SubmitAction {
         color: Option<String>,
         pinned: bool,
         section: Option<String>,
+        /// Changes to the workspace's tasks (only those that changed).
+        tasks: Vec<TaskSettingsSave>,
     },
     /// Create (`section_id == None`) or update a sidebar section.
     SaveSection {
@@ -539,13 +629,6 @@ pub(crate) enum SubmitAction {
     /// to be wired up later.
     SnapshotPicked {
         name: String,
-    },
-    SaveTaskName {
-        task_id: String,
-        workspace_id: String,
-        name: String,
-        color: Option<String>,
-        section: Option<String>,
     },
     EnterWorkflowLaunchConfirm {
         ws_id: String,
@@ -586,6 +669,14 @@ pub(crate) enum SubmitAction {
     RestoreTombstones {
         ws_id: String,
     },
+    /// Confirmed Y on "Close workspace … too?" after A-w.
+    CloseAfterLastAgent {
+        ws_id: String,
+    },
+    /// Confirmed Y on the one-time bash-only sweep.
+    CloseBashOnlyWorkspaces {
+        ws_ids: Vec<String>,
+    },
 }
 
 pub(crate) struct NewSessionMut<'a> {
@@ -597,6 +688,12 @@ pub(crate) struct NewSessionMut<'a> {
     pub seed_from: &'a mut Option<String>,
     pub host_id: &'a mut cm_daemon::host_id::HostId,
     pub active_field: &'a mut u8,
+    /// Field 7. `report_tasks` are the picker's candidates.
+    pub reports_to: &'a mut crate::task_picker::ReportsTo,
+    pub picker: &'a mut Option<crate::task_picker::TaskPicker>,
+    pub report_tasks: &'a [crate::task_picker::TaskChoice],
+    /// Field 8 (`App::form_model`).
+    pub model: &'a mut super::model_field::ModelField,
 }
 
 pub(crate) struct NewTerminalSessionMut<'a> {
@@ -606,9 +703,12 @@ pub(crate) struct NewTerminalSessionMut<'a> {
     pub seed_from: &'a mut Option<String>,
     pub resume_from: &'a mut Option<String>,
     pub active_field: &'a mut u8,
+    /// Field 3 (`App::form_model`).
+    pub model: &'a mut super::model_field::ModelField,
 }
 
 pub(crate) struct SessionSettingsMut<'a> {
+    pub is_shell: bool,
     pub ws_index: usize,
     pub session_index: usize,
     pub name: &'a mut String,
@@ -627,7 +727,41 @@ pub(crate) struct WorkspaceSettingsMut<'a> {
     pub color: &'a mut Option<String>,
     pub pinned: &'a mut bool,
     pub section: &'a mut Option<String>,
+    pub tasks: &'a mut Vec<WorkspaceTaskEdit>,
+    pub task_at: &'a mut usize,
     pub active_field: &'a mut u8,
+}
+
+/// The A-e workspace form's fields for one task the workspace row stands
+/// for (they were the task header's form until 2026-11-05).
+#[derive(Debug, Clone)]
+pub(crate) struct WorkspaceTaskEdit {
+    pub task_id: String,
+    /// The task's name as edited, and as it was when the form opened.
+    pub name: String,
+    pub orig_name: String,
+    /// Lead session pin: None = the rule's choice (`app/tree.rs`).
+    pub lead: Option<String>,
+    /// `(uid, label)` of the sessions that can be pinned.
+    pub lead_choices: Vec<(String, String)>,
+    /// The pin when the form opened; a save changes it only if it moved.
+    pub lead_pinned: Option<String>,
+    /// The task's own default models and efforts.
+    pub models: super::model_field::TaskModelsEdit,
+}
+
+/// One task's changes from the A-e workspace form.
+#[derive(Debug, Clone)]
+pub(crate) struct TaskSettingsSave {
+    pub task_id: String,
+    /// The new name, when it changed (an emptied name keeps the old one).
+    pub name: Option<String>,
+    /// `Some(pin)` when the lead pin changed (`Some(None)` clears it).
+    pub lead: Option<Option<String>>,
+    /// Changed default models, `(engine, Some(model) | None = clear)`.
+    pub models: Vec<(String, Option<String>)>,
+    /// Changed default efforts, the same shape.
+    pub efforts: Vec<(String, Option<String>)>,
 }
 
 pub(crate) struct SectionSettingsMut<'a> {
@@ -916,15 +1050,6 @@ impl SnapshotCatalogMut<'_> {
     }
 }
 
-pub(crate) struct TaskSettingsMut<'a> {
-    pub task_id: &'a str,
-    pub workspace_id: &'a str,
-    pub name: &'a mut String,
-    pub color: &'a mut Option<String>,
-    pub section: &'a mut Option<String>,
-    pub active_field: &'a mut u8,
-}
-
 pub(crate) struct WorkflowLaunchConfirmMut<'a> {
     pub ws_id: &'a str,
     pub workflow_name: &'a str,
@@ -956,7 +1081,46 @@ pub(crate) fn handle_new_session(
     let CrosstermEvent::Key(key) = event else {
         return InputOutcome::Consumed;
     };
-    const FIELD_COUNT: u8 = 7; // repo, label, branch, idle, seed-from, host, engine
+    const FIELD_COUNT: u8 = 9; // repo, label, branch, idle, seed-from, host, engine, reports-to, model
+    use crate::task_picker::{PickerKey, ReportsTo, TaskPicker};
+    if let Some(picker) = state.picker.as_mut() {
+        match picker.key(*key) {
+            PickerKey::Open => {}
+            PickerKey::Cancelled => *state.picker = None,
+            PickerKey::Picked(choice) => {
+                *state.reports_to = ReportsTo::Task(choice);
+                *state.picker = None;
+            }
+        }
+        return InputOutcome::Consumed;
+    }
+    if *state.active_field == 8 && state.model.key(*key) {
+        return InputOutcome::Consumed;
+    }
+    if *state.active_field == 7 {
+        let plain = !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Enter => {
+                *state.picker =
+                    Some(TaskPicker::new(" Reports to ", state.report_tasks.to_vec(), String::new()));
+                return InputOutcome::Consumed;
+            }
+            KeyCode::Char(c) if plain => {
+                *state.picker =
+                    Some(TaskPicker::new(" Reports to ", state.report_tasks.to_vec(), c.to_string()));
+                return InputOutcome::Consumed;
+            }
+            KeyCode::Backspace | KeyCode::Delete => {
+                *state.reports_to = ReportsTo::Standalone;
+                return InputOutcome::Consumed;
+            }
+            KeyCode::Esc if *state.reports_to != ReportsTo::Standalone => {
+                *state.reports_to = ReportsTo::Standalone;
+                return InputOutcome::Consumed;
+            }
+            _ => {}
+        }
+    }
     match key.code {
         KeyCode::Esc => {
             // Esc on the seed-from field with a value clears the
@@ -1019,6 +1183,7 @@ pub(crate) fn handle_new_session(
             *state.engine = state.engine.cycle();
             // A snapshot is specific to its engine, as in the A-s form.
             *state.seed_from = None;
+            state.model.retarget(state.engine.as_session_type());
             InputOutcome::Consumed
         }
         KeyCode::Enter if *state.active_field == 4 => {
@@ -1038,6 +1203,11 @@ pub(crate) fn handle_new_session(
             })
         }
         KeyCode::Enter => {
+            let model = match state.model.value() {
+                Ok(m) => m,
+                Err(e) => return InputOutcome::Status(e),
+            };
+            let effort = state.model.effort_value();
             if !state.label_text.trim().is_empty() {
                 // Branch field semantics:
                 //   "."   → in-place: run in the main repo, no worktree/branch.
@@ -1054,6 +1224,27 @@ pub(crate) fn handle_new_session(
                     .idle_timeout_text
                     .parse::<u16>()
                     .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
+                if let ReportsTo::Task(parent) = state.reports_to.clone() {
+                    // The reporting workspace launches as a planning task
+                    // (task row first, then a task-bound spawn), which has no
+                    // snapshot seeding.
+                    if state.seed_from.is_some() {
+                        return InputOutcome::Status(
+                            "Seed from and Reports to can't be combined; clear one (Esc on the field)"
+                                .into(),
+                        );
+                    }
+                    return InputOutcome::Submit(SubmitAction::CreateReportingWorkspace {
+                        engine: *state.engine,
+                        repo_url: state.repo_url.clone(),
+                        label: state.label_text.clone(),
+                        branch,
+                        in_place,
+                        host_id: state.host_id.clone(),
+                        parent,
+                        model, effort,
+                    });
+                }
                 InputOutcome::Submit(SubmitAction::CreateLocalSession {
                     engine: *state.engine,
                     repo_url: state.repo_url.clone(),
@@ -1063,6 +1254,7 @@ pub(crate) fn handle_new_session(
                     seed_from: state.seed_from.clone(),
                     in_place,
                     host_id: state.host_id.clone(),
+                    model, effort,
                 })
             } else {
                 // Empty Name field: pre-fix this was a silent no-op (Enter did
@@ -1112,10 +1304,25 @@ pub(crate) fn handle_new_terminal_session(
     let CrosstermEvent::Key(key) = event else {
         return InputOutcome::Consumed;
     };
-    // Three fields: 0 = session type, 1 = seed-from, 2 = resume-from.
-    // Tab/BackTab cycle between them; j/k cycle the session type when
-    // field 0 is active (within-field). j/k on the picker fields are
-    // no-ops (would conflict with the picker selection later).
+    if *state.active_field == 0 && key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd')) {
+        let types = ["claude", "codex", "bash"];
+        let current = types.iter().position(|t| *t == state.session_type.as_str()).unwrap_or(0);
+        let next = if key.code == KeyCode::Char('u') { current.saturating_sub(1) } else { (current + 1).min(types.len() - 1) };
+        if next != current {
+            *state.session_type = types[next].to_owned();
+            *state.seed_from = None;
+            *state.resume_from = None;
+            state.model.retarget(state.session_type);
+        }
+        return InputOutcome::Consumed;
+    }
+    // Four fields: 0 = session type, 1 = seed-from, 2 = resume-from,
+    // 3 = model. Tab/BackTab cycle between them; j/k cycle the session
+    // type when field 0 is active (within-field). j/k on the picker
+    // fields are no-ops (would conflict with the picker selection later).
+    if *state.active_field == 3 && state.model.key(*key) {
+        return InputOutcome::Consumed;
+    }
     match (key.code, *state.active_field) {
         (KeyCode::Esc, 1) if state.seed_from.is_some() => {
             *state.seed_from = None;
@@ -1127,11 +1334,11 @@ pub(crate) fn handle_new_terminal_session(
         }
         (KeyCode::Esc, _) => InputOutcome::Cancel,
         (KeyCode::Tab, _) => {
-            *state.active_field = (*state.active_field + 1) % 3;
+            *state.active_field = (*state.active_field + 1) % 4;
             InputOutcome::Consumed
         }
         (KeyCode::BackTab, _) => {
-            *state.active_field = (*state.active_field + 2) % 3;
+            *state.active_field = (*state.active_field + 3) % 4;
             InputOutcome::Consumed
         }
         (KeyCode::Char('j') | KeyCode::Down, 0) => {
@@ -1145,6 +1352,7 @@ pub(crate) fn handle_new_terminal_session(
             // longer applies.
             *state.seed_from = None;
             *state.resume_from = None;
+            state.model.retarget(state.session_type);
             InputOutcome::Consumed
         }
         (KeyCode::Char('k') | KeyCode::Up, 0) => {
@@ -1155,6 +1363,7 @@ pub(crate) fn handle_new_terminal_session(
             };
             *state.seed_from = None;
             *state.resume_from = None;
+            state.model.retarget(state.session_type);
             InputOutcome::Consumed
         }
         (KeyCode::Enter, 1) => {
@@ -1189,12 +1398,18 @@ pub(crate) fn handle_new_terminal_session(
             )
         }
         (KeyCode::Enter, _) => {
+            let model = match state.model.value() {
+                Ok(m) => m,
+                Err(e) => return InputOutcome::Status(e),
+            };
+            let effort = state.model.effort_value();
             InputOutcome::Submit(SubmitAction::SpawnSessionOnWorkspace {
                 workspace_id: state.workspace_id.to_string(),
                 session_type: state.session_type.clone(),
                 task_id: state.task_id.clone(),
                 seed_from: state.seed_from.clone(),
                 resume_from: state.resume_from.clone(),
+                model, effort,
             })
         }
         _ => InputOutcome::Consumed,
@@ -1213,16 +1428,28 @@ pub(crate) fn handle_session_settings(
         KeyCode::Esc => InputOutcome::Cancel,
         KeyCode::Tab => {
             *state.active_field = (*state.active_field + 1) % 8;
+            if state.is_shell && matches!(*state.active_field, 5 | 7) {
+                *state.active_field = (*state.active_field + 1) % 8;
+            }
             InputOutcome::Consumed
         }
         KeyCode::BackTab => {
             *state.active_field = (*state.active_field + 7) % 8;
+            if state.is_shell && matches!(*state.active_field, 5 | 7) {
+                *state.active_field = (*state.active_field + 7) % 8;
+            }
             InputOutcome::Consumed
         }
         // proper-resume: the Transcript field opens the picker; the
         // pick applies the bind itself (the form's other edits are
         // saved on the form's own Enter — save first if you changed
         // them).
+        KeyCode::Enter if state.is_shell && *state.active_field == 7 => {
+            InputOutcome::Status("Shells have no agent transcript".into())
+        }
+        KeyCode::Char(' ') if state.is_shell && *state.active_field == 5 => {
+            InputOutcome::Status("Agent permissions do not apply to a shell".into())
+        }
         KeyCode::Enter if *state.active_field == 7 => {
             InputOutcome::Submit(SubmitAction::OpenTranscriptPickerForSession {
                 ws_index: state.ws_index,
@@ -1239,14 +1466,6 @@ pub(crate) fn handle_session_settings(
         }
         KeyCode::Char(' ') if *state.active_field == 5 => {
             *state.global_perms = !*state.global_perms;
-            InputOutcome::Consumed
-        }
-        KeyCode::Char(' ') | KeyCode::Right if *state.active_field == 6 => {
-            *state.color = theme::cycle_user_color(state.color.as_deref(), true);
-            InputOutcome::Consumed
-        }
-        KeyCode::Left if *state.active_field == 6 => {
-            *state.color = theme::cycle_user_color(state.color.as_deref(), false);
             InputOutcome::Consumed
         }
         KeyCode::Enter => {
@@ -1315,10 +1534,25 @@ pub(crate) fn handle_workspace_settings(
     let CrosstermEvent::Key(key) = event else {
         return InputOutcome::Consumed;
     };
+    // Fields 4-7 (task name, lead, default models) exist only when the
+    // workspace has a task.
+    let fields: u8 = if state.tasks.is_empty() { 4 } else { 8 };
+    let at = (*state.task_at).min(state.tasks.len().saturating_sub(1));
+    if matches!(*state.active_field, 6 | 7) {
+        if let Some(task) = state.tasks.get_mut(at) {
+            if task.models.key(*state.active_field as usize - 6, *key) {
+                return InputOutcome::Consumed;
+            }
+        }
+    }
     match key.code {
         KeyCode::Esc => InputOutcome::Cancel,
-        KeyCode::Tab | KeyCode::BackTab => {
-            *state.active_field = (*state.active_field + 1) % 4;
+        KeyCode::Tab => {
+            *state.active_field = (*state.active_field + 1) % fields;
+            InputOutcome::Consumed
+        }
+        KeyCode::BackTab => {
+            *state.active_field = (*state.active_field + fields - 1) % fields;
             InputOutcome::Consumed
         }
         KeyCode::Char(' ') | KeyCode::Right if *state.active_field == 3 => {
@@ -1331,31 +1565,80 @@ pub(crate) fn handle_workspace_settings(
                 cycle_section_choice(state.section.as_deref(), ctx.section_ids, false);
             InputOutcome::Consumed
         }
-        KeyCode::Char(' ') | KeyCode::Right if *state.active_field == 1 => {
-            *state.color = theme::cycle_user_color(state.color.as_deref(), true);
-            InputOutcome::Consumed
-        }
-        KeyCode::Left if *state.active_field == 1 => {
-            *state.color = theme::cycle_user_color(state.color.as_deref(), false);
-            InputOutcome::Consumed
-        }
         KeyCode::Char(' ') if *state.active_field == 2 => {
             *state.pinned = !*state.pinned;
             InputOutcome::Consumed
         }
-        KeyCode::Enter => InputOutcome::Submit(SubmitAction::SaveWorkspaceSettings {
-            workspace_id: state.workspace_id.to_string(),
-            name: state.name.trim().to_string(),
-            color: state.color.clone(),
-            pinned: *state.pinned,
-            section: state.section.clone(),
-        }),
+        // Several tasks share the checkout: ←/→ on the Task field picks
+        // which one the task fields edit. Each keeps its own edits.
+        KeyCode::Left | KeyCode::Right if *state.active_field == 4 && state.tasks.len() > 1 => {
+            let n = state.tasks.len();
+            *state.task_at = if key.code == KeyCode::Left { (at + n - 1) % n } else { (at + 1) % n };
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(' ') | KeyCode::Right | KeyCode::Left if *state.active_field == 5 => {
+            // auto, then each pinnable session, wrapping.
+            let Some(task) = state.tasks.get_mut(at) else {
+                return InputOutcome::Consumed;
+            };
+            let n = task.lead_choices.len() + 1;
+            let cur = task
+                .lead
+                .as_deref()
+                .and_then(|uid| task.lead_choices.iter().position(|(u, _)| u == uid))
+                .map_or(0, |i| i + 1);
+            let next = if key.code == KeyCode::Left { (cur + n - 1) % n } else { (cur + 1) % n };
+            task.lead = next.checked_sub(1).map(|i| task.lead_choices[i].0.clone());
+            InputOutcome::Consumed
+        }
+        KeyCode::Enter => {
+            let mut tasks = Vec::new();
+            for task in state.tasks.iter() {
+                let models = match task.models.changes() {
+                    Ok(m) => m,
+                    Err(e) => return InputOutcome::Status(e),
+                };
+                let efforts = task.models.effort_changes();
+                let name = task.name.trim();
+                let name = (!name.is_empty() && name != task.orig_name).then(|| name.to_string());
+                let lead = (task.lead != task.lead_pinned).then(|| task.lead.clone());
+                if name.is_some() || lead.is_some() || !models.is_empty() || !efforts.is_empty() {
+                    tasks.push(TaskSettingsSave {
+                        task_id: task.task_id.clone(),
+                        name,
+                        lead,
+                        models,
+                        efforts,
+                    });
+                }
+            }
+            InputOutcome::Submit(SubmitAction::SaveWorkspaceSettings {
+                workspace_id: state.workspace_id.to_string(),
+                name: state.name.trim().to_string(),
+                color: state.color.clone(),
+                pinned: *state.pinned,
+                section: state.section.clone(),
+                tasks,
+            })
+        }
         KeyCode::Backspace if *state.active_field == 0 => {
             state.name.pop();
             InputOutcome::Consumed
         }
         KeyCode::Char(c) if *state.active_field == 0 => {
             state.name.push(c);
+            InputOutcome::Consumed
+        }
+        KeyCode::Backspace if *state.active_field == 4 => {
+            if let Some(task) = state.tasks.get_mut(at) {
+                task.name.pop();
+            }
+            InputOutcome::Consumed
+        }
+        KeyCode::Char(c) if *state.active_field == 4 => {
+            if let Some(task) = state.tasks.get_mut(at) {
+                task.name.push(c);
+            }
             InputOutcome::Consumed
         }
         _ => InputOutcome::Consumed,
@@ -1761,57 +2044,6 @@ pub(crate) fn handle_save_snapshot(
     }
 }
 
-pub(crate) fn handle_task_settings(
-    state: TaskSettingsMut<'_>,
-    ctx: InputCtx<'_>,
-    event: &CrosstermEvent,
-) -> InputOutcome {
-    let CrosstermEvent::Key(key) = event else {
-        return InputOutcome::Consumed;
-    };
-    match key.code {
-        KeyCode::Esc => InputOutcome::Cancel,
-        KeyCode::Tab | KeyCode::BackTab => {
-            *state.active_field = (*state.active_field + 1) % 3;
-            InputOutcome::Consumed
-        }
-        KeyCode::Char(' ') | KeyCode::Right if *state.active_field == 2 => {
-            *state.section =
-                cycle_section_choice(state.section.as_deref(), ctx.section_ids, true);
-            InputOutcome::Consumed
-        }
-        KeyCode::Left if *state.active_field == 2 => {
-            *state.section =
-                cycle_section_choice(state.section.as_deref(), ctx.section_ids, false);
-            InputOutcome::Consumed
-        }
-        KeyCode::Char(' ') | KeyCode::Right if *state.active_field == 1 => {
-            *state.color = theme::cycle_user_color(state.color.as_deref(), true);
-            InputOutcome::Consumed
-        }
-        KeyCode::Left if *state.active_field == 1 => {
-            *state.color = theme::cycle_user_color(state.color.as_deref(), false);
-            InputOutcome::Consumed
-        }
-        KeyCode::Enter => InputOutcome::Submit(SubmitAction::SaveTaskName {
-            task_id: state.task_id.to_string(),
-            workspace_id: state.workspace_id.to_string(),
-            name: state.name.trim().to_string(),
-            color: state.color.clone(),
-            section: state.section.clone(),
-        }),
-        KeyCode::Backspace if *state.active_field == 0 => {
-            state.name.pop();
-            InputOutcome::Consumed
-        }
-        KeyCode::Char(c) if *state.active_field == 0 => {
-            state.name.push(c);
-            InputOutcome::Consumed
-        }
-        _ => InputOutcome::Consumed,
-    }
-}
-
 /// Create / edit a sidebar section: name (field 0) + color (field 1).
 /// Enter with an empty name on CREATE is refused with a status hint; on
 /// edit an empty name keeps the old one (matches the other settings forms).
@@ -1827,14 +2059,6 @@ pub(crate) fn handle_section_settings(
         KeyCode::Esc => InputOutcome::Cancel,
         KeyCode::Tab | KeyCode::BackTab => {
             *state.active_field = (*state.active_field + 1) % 2;
-            InputOutcome::Consumed
-        }
-        KeyCode::Char(' ') | KeyCode::Right if *state.active_field == 1 => {
-            *state.color = theme::cycle_user_color(state.color.as_deref(), true);
-            InputOutcome::Consumed
-        }
-        KeyCode::Left if *state.active_field == 1 => {
-            *state.color = theme::cycle_user_color(state.color.as_deref(), false);
             InputOutcome::Consumed
         }
         KeyCode::Enter => {
@@ -1999,8 +2223,14 @@ pub(crate) fn handle_workflow_picker(
     }
 }
 
+/// A-O past-workspace picker. Type-to-filter like the A-p palette: plain
+/// chars (including j/k/q) edit the query, Backspace deletes, movement
+/// rides Up/Down, Tab/BackTab and Ctrl-j/Ctrl-k. Esc clears a non-empty
+/// query first and closes on an empty one. Enter reopens the selected row
+/// of the CURRENT filtered view; with no matches it does nothing.
 pub(crate) fn handle_past_workspace_picker(
     candidates: &[PastCandidate],
+    query: &mut String,
     selected: &mut usize,
     _ctx: InputCtx<'_>,
     event: &CrosstermEvent,
@@ -2008,28 +2238,62 @@ pub(crate) fn handle_past_workspace_picker(
     let CrosstermEvent::Key(key) = event else {
         return InputOutcome::Consumed;
     };
+    let filtered = past_workspace_match_indices(query, candidates);
+    let flen = filtered.len();
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let down = |selected: &mut usize| {
+        if flen > 0 {
+            *selected = (*selected + 1).min(flen) % flen;
+        }
+    };
+    let up = |selected: &mut usize| {
+        if flen > 0 {
+            *selected = if *selected == 0 { flen - 1 } else { (*selected - 1).min(flen - 1) };
+        }
+    };
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => InputOutcome::Cancel,
-        KeyCode::Enter => match candidates.get(*selected) {
-            Some(c) => InputOutcome::Submit(SubmitAction::ReopenPastWorkspace {
-                ws_id: c.ws_id.clone(),
+        KeyCode::Esc => {
+            if query.is_empty() {
+                InputOutcome::Cancel
+            } else {
+                query.clear();
+                *selected = 0;
+                InputOutcome::Consumed
+            }
+        }
+        KeyCode::Enter => match filtered.get(*selected).or(filtered.first()) {
+            Some(&ci) => InputOutcome::Submit(SubmitAction::ReopenPastWorkspace {
+                ws_id: candidates[ci].ws_id.clone(),
             }),
-            None => InputOutcome::Cancel,
+            None => InputOutcome::Consumed,
         },
-        KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
-            if !candidates.is_empty() {
-                *selected = (*selected + 1) % candidates.len();
+        KeyCode::Down | KeyCode::Tab => {
+            down(selected);
+            InputOutcome::Consumed
+        }
+        KeyCode::Up | KeyCode::BackTab => {
+            up(selected);
+            InputOutcome::Consumed
+        }
+        // Ctrl-j / Ctrl-k mirror Down / Up; MUST precede the Char(c) arm.
+        KeyCode::Char('j') if ctrl => {
+            down(selected);
+            InputOutcome::Consumed
+        }
+        KeyCode::Char('k') if ctrl => {
+            up(selected);
+            InputOutcome::Consumed
+        }
+        KeyCode::Backspace => {
+            if query.pop().is_some() {
+                *selected = 0;
             }
             InputOutcome::Consumed
         }
-        KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
-            if !candidates.is_empty() {
-                *selected = if *selected == 0 {
-                    candidates.len() - 1
-                } else {
-                    *selected - 1
-                };
-            }
+        KeyCode::Char(c) if !ctrl && !alt => {
+            query.push(c);
+            *selected = 0;
             InputOutcome::Consumed
         }
         _ => InputOutcome::Consumed,
@@ -2229,6 +2493,11 @@ pub(crate) fn handle_confirm(
     let CrosstermEvent::Key(key) = event else {
         return InputOutcome::Consumed;
     };
+    // A background host can contain active work. Enter alone is not an
+    // authorization to stop it, even though older confirmation dialogs accept it.
+    if matches!(action, ConfirmAction::BackgroundRecovery { .. } | ConfirmAction::ReconcileBackground { .. }) && key.code == KeyCode::Enter {
+        return InputOutcome::Consumed;
+    }
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
             let submit = match action.clone() {
@@ -2241,6 +2510,11 @@ pub(crate) fn handle_confirm(
                 ConfirmAction::RestoreTombstones { ws_id } => {
                     SubmitAction::RestoreTombstones { ws_id }
                 }
+                ConfirmAction::CloseAfterLastAgent { ws_id } => SubmitAction::CloseAfterLastAgent { ws_id },
+                ConfirmAction::CloseBashOnlyWorkspaces { ws_ids } => SubmitAction::CloseBashOnlyWorkspaces { ws_ids },
+                ConfirmAction::RotateTranscript { uid } => SubmitAction::RotateTranscript { uid },
+                ConfirmAction::BackgroundRecovery { uid, host, identity, prompt } => SubmitAction::BackgroundRecovery { uid, host, identity, prompt },
+                ConfirmAction::ReconcileBackground { uid, host, identity, prompt } => SubmitAction::ReconcileBackground { uid, host, identity, prompt },
             };
             InputOutcome::Submit(submit)
         }
@@ -2307,14 +2581,17 @@ fn last_assistant_message_text(
     messages
         .into_iter()
         .rev()
-        .find(|m| m.role == crate::agent::Role::Assistant)
+        .find(|m| m.role == crate::agent::Role::Assistant && !m.content.trim().is_empty())
         .map(|m| m.content)
         .ok_or_else(|| "Yank: no assistant messages in transcript yet".to_string())
 }
 
 impl App {
     pub fn is_input_mode(&self) -> bool {
-        self.global_settings.is_open() || !matches!(self.input_mode, InputMode::Normal)
+        self.global_settings.is_open()
+            || self.availability.is_open()
+            || self.board.visible
+            || !matches!(self.input_mode, InputMode::Normal)
     }
 
     /// Body of `SubmitAction::SaveSnapshot`. Resolves the focused session's
@@ -2521,9 +2798,24 @@ impl App {
         };
     }
 
-    /// Open settings for whatever the cursor is focused on — a workspace
-    /// (rename) when on a header, a session (label / idle / hidden) when on
-    /// a specific session.
+    /// The A-e workspace form's fields for one of its tasks.
+    fn workspace_task_edit(&self, task_id: &str) -> WorkspaceTaskEdit {
+        let name = self
+            .find_task_entry(task_id)
+            .map(|t| t.name.clone())
+            .unwrap_or_default();
+        let (lead_choices, lead_pinned) = self.lead_choices(task_id);
+        WorkspaceTaskEdit {
+            task_id: task_id.to_string(),
+            orig_name: name.clone(),
+            name,
+            lead: lead_pinned.clone(),
+            lead_choices,
+            lead_pinned,
+            models: self.task_models_edit(task_id),
+        }
+    }
+
     /// A-N: open the create-section form.
     fn open_new_section(&mut self) {
         self.input_mode = InputMode::SectionSettings {
@@ -2543,6 +2835,38 @@ impl App {
         }
     }
 
+    /// Open settings for whatever the cursor is focused on — a workspace
+    /// (and its task) when on a header, a session (label / idle / hidden)
+    /// when on a specific session.
+    /// Point an open session-settings form at its session's CURRENT
+    /// position. The form is keyed by uid; positions go stale whenever
+    /// the sidebar re-sorts (every task-feed update), and a save at a
+    /// stale position wrote the color, label, timers and global-perms
+    /// grant onto whichever session had moved there (Owner 2026-11-12:
+    /// recoloring RM-ES2 recolored RM-ES2-473). Returns false, closing
+    /// the form, when the session is gone.
+    pub(super) fn refresh_session_settings_indices(&mut self) -> bool {
+        let InputMode::SessionSettings { ws_index, session_index, session_uid, .. } = &mut self.input_mode else {
+            return true;
+        };
+        let found = self.workspaces.iter().enumerate().find_map(|(wi, w)| {
+            w.sessions.iter().position(|s| &s.uid == session_uid).map(|si| (wi, si))
+        });
+        match found {
+            Some((wi, si)) => {
+                *ws_index = wi;
+                *session_index = si;
+                true
+            }
+            None => {
+                self.input_mode = InputMode::Normal;
+                self.messages.settings_name = None;
+                self.set_status_msg("That session is gone; its settings were not saved");
+                false
+            }
+        }
+    }
+
     pub(super) fn open_session_settings(&mut self) {
         match self.cursor.clone() {
             Cursor::Session(wi, si) => {
@@ -2554,6 +2878,7 @@ impl App {
                         self.input_mode = InputMode::SessionSettings {
                             ws_index: wi,
                             session_index: si,
+                            session_uid: ts.uid.clone(),
                             name: ts.label.clone(),
                             idle_timeout: if timeout == 0 {
                                 DEFAULT_IDLE_TIMEOUT_SECS.to_string()
@@ -2579,35 +2904,27 @@ impl App {
             }
             Cursor::Workspace(wi) => {
                 if let Some(ws) = self.workspaces.get(wi) {
+                    // The workspace row stands for its tasks: their name,
+                    // lead and default models edit here too.
+                    let task_ids = self.workspace_tasks(wi);
+                    // A task colour from the task-header era prefills a
+                    // workspace without a colour of its own.
+                    let color = ws
+                        .color
+                        .clone()
+                        .or_else(|| task_ids.iter().find_map(|t| self.task_colors.get(t).cloned()));
+                    let tasks = task_ids.iter().map(|t| self.workspace_task_edit(t)).collect();
                     self.input_mode = InputMode::WorkspaceSettings {
                         workspace_id: ws.id.clone(),
                         name: ws.name.clone(),
-                        color: ws.color.clone(),
+                        color,
                         pinned: ws.pinned,
                         section: self.workspace_sections.get(&ws.id).cloned(),
+                        tasks,
+                        task_at: 0,
                         active_field: 0,
                     };
                 }
-            }
-            Cursor::Task { task_id, ws_idx } => {
-                let current_name = self
-                    .tasks
-                    .iter()
-                    .find(|t| t.task_id.as_deref() == Some(task_id.as_str()))
-                    .map(|t| t.name.clone())
-                    .unwrap_or_default();
-                let current_color = self.task_colors.get(&task_id).cloned();
-                let Some(ws) = self.workspaces.get(ws_idx) else { return; };
-                let workspace_id = ws.id.clone();
-                let current_section = self.workspace_sections.get(&workspace_id).cloned();
-                self.input_mode = InputMode::TaskSettings {
-                    task_id,
-                    workspace_id,
-                    name: current_name,
-                    color: current_color,
-                    section: current_section,
-                    active_field: 0,
-                };
             }
             Cursor::Backtest(_) => {
                 self.set_status_msg(
@@ -2624,6 +2941,12 @@ impl App {
                     };
                 }
             }
+            Cursor::Division(_) => {
+                self.set_status_msg("Divisions are edited in planning (update_initiative) — Space/Enter folds");
+            }
+            Cursor::Org(_) => {
+                self.set_status_msg("Members and teams are edited in the roster (F6, then R) — Space/Enter folds");
+            }
         }
     }
 
@@ -2631,6 +2954,15 @@ impl App {
     /// status message when no past workspaces exist instead of an empty
     /// modal. Most-recent (latest tombstone) first.
     fn open_past_workspace_picker(&mut self) {
+        // ws_id -> bound tasks, built once so the per-workspace search
+        // fields don't rescan `tasks` for each of 2,700+ candidates.
+        let mut tasks_by_ws: std::collections::HashMap<&str, Vec<&TaskEntry>> =
+            std::collections::HashMap::new();
+        for t in &self.tasks {
+            if let Some(wid) = t.workspace_id.as_deref() {
+                tasks_by_ws.entry(wid).or_default().push(t);
+            }
+        }
         let mut candidates: Vec<PastCandidate> = self
             .workspaces
             .iter()
@@ -2643,15 +2975,40 @@ impl App {
                     .map(|t| t.exited_at)
                     .fold(0.0f64, f64::max);
                 let worktree_exists = ws.local_worktree_exists();
+                let path_str = ws
+                    .worktree_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let bound = tasks_by_ws.get(ws.id.as_str());
+                let search_fields = PastCandidate::search_fields_from(
+                    std::iter::once(ws.name.as_str())
+                        .chain(bound.into_iter().flatten().flat_map(|t| {
+                            std::iter::once(t.name.as_str()).chain(t.wip_branch.as_deref())
+                        }))
+                        .chain(std::iter::once(path_str.as_str()))
+                        .chain(ws.sessions.iter().map(|s| s.label.as_str()))
+                        .chain(ws.tombstones.iter().map(|t| t.label.as_str()))
+                        .chain(std::iter::once(ws.host_id.as_str())),
+                );
+                let note = ws
+                    .tombstones
+                    .iter()
+                    .max_by(|a, b| a.exited_at.total_cmp(&b.exited_at))
+                    .and_then(|t| t.entry.as_ref())
+                    .and_then(|e| super::model::exit_note(e.last_exit.as_ref()));
                 PastCandidate {
                     ws_id: ws.id.clone(),
                     display: ws.name.clone(),
                     worktree_path: ws.worktree_path.clone(),
                     worktree_exists,
                     last_exited_at,
+                    search_fields,
+                    note,
                 }
             })
             .collect();
+        candidates.extend(self.archived_past_candidates());
         if candidates.is_empty() {
             self.set_status_msg("No past workspaces");
             return;
@@ -2663,6 +3020,7 @@ impl App {
         });
         self.input_mode = InputMode::PastWorkspacePicker {
             candidates,
+            query: String::new(),
             selected: 0,
         };
     }
@@ -2697,6 +3055,20 @@ impl App {
             Some((_, ts)) if ts.session_type == "bash" => {
                 Err("Yank: bash sessions have no transcript".to_string())
             }
+            // The reader only sees THIS machine's ~/.claude / ~/.codex, so a
+            // session on another host (cm-sessions, manager) used to fall
+            // through to an empty read and a misleading "no assistant
+            // messages yet". Say what is actually wrong.
+            Some((_, ts)) if ts.host_id != crate::hosts::HostId::local() => Err(format!(
+                "Yank: '{}' runs on host '{}'; its transcript is not on this machine \
+                 (use read_last_turn, or Shift+drag to copy from the pane)",
+                ts.label,
+                ts.host_id.as_str(),
+            )),
+            Some((_, ts)) if ts.transcript_id.is_none() => Err(format!(
+                "Yank: '{}' has no transcript bound yet (A-e -> Transcript binds one)",
+                ts.label,
+            )),
             Some((ws, ts)) => match ws.worktree_path.as_deref() {
                 None => Err(
                     "Yank: workspace has no worktree — transcript path unknown"
@@ -2737,8 +3109,36 @@ impl App {
             }
         }
 
+        match event {
+            CrosstermEvent::FocusGained => {
+                self.focused = true;
+                return false;
+            }
+            CrosstermEvent::FocusLost => {
+                self.focused = false;
+                return false;
+            }
+            _ => {}
+        }
         self.needs_redraw = true;
+        if let CrosstermEvent::Key(key) = event {
+            if self.global_settings.is_open() && key.code == KeyCode::Char('c') {
+                self.global_settings.close();
+                let preferred = self.active_session().and_then(|(_, session)| {
+                    session.continuous_task_id.clone().map(|id| (session.host_id.clone(), id))
+                });
+                self.view_mode = ViewMode::Sessions;
+                self.input_mode = InputMode::ContinuousControl(super::continuous_control::Menu::new(
+                    std::sync::Arc::clone(&self.host_pool), &self.hosts, preferred,
+                ));
+                return true;
+            }
+        }
         if self.global_settings.handle_event(event) { return true; }
+        if self.availability_event(event) { return true; }
+        if self.roster_event(event) { return true; }
+        if self.orgchart_event(event) { return true; }
+        if self.board_event(event) { return true; }
         // Alt+M toggles mouse capture, including while Messages is open.
         // Terminals may report shifted letters as uppercase or lowercase + Shift.
         if let CrosstermEvent::Key(key) = event {
@@ -2798,7 +3198,11 @@ impl App {
             }
         }
         if let CrosstermEvent::Key(key) = event {
-            if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('t') {
+            // Alt+t (not Alt+Shift+t, which is #24's transcript rotation).
+            if key.modifiers.contains(KeyModifiers::ALT)
+                && !key.modifiers.contains(KeyModifiers::SHIFT)
+                && key.code == KeyCode::Char('t')
+            {
                 self.view_mode = match self.view_mode {
                     ViewMode::Sessions => {
                         // Refresh planning tasks when switching to planning view.
@@ -2848,72 +3252,18 @@ impl App {
 
         // Delegate to planning view when in Planning mode.
         if self.view_mode == ViewMode::Planning {
-            // Keep planning's workspace picker in sync with the current
-            // set of open workspaces before it sees the event.
-            let candidates = self.collect_workspace_candidates();
-            self.planning.set_launch_hosts(
-                self.hosts.hosts.iter().map(|h| h.id.clone()).collect(),
-                self.default_launch_host(),
-            );
-            self.planning.set_workspace_candidates(candidates);
+            // Planning is the backlog only (doc/org-model.md §13.4, O7):
+            // A-f places on a board; sessions start from the Sessions view.
+            if self.place_event(event) {
+                self.needs_redraw = true;
+                return true;
+            }
             let action = self.planning.handle_event(event);
             match action {
                 PlanAction::Consumed => return true,
                 PlanAction::Ignored => return false,
-                PlanAction::LaunchTask {
-                    project,
-                    slug,
-                    prompt,
-                    branch,
-                    autostart,
-                    task_id,
-                    parent_task_id,
-                    in_place,
-                    engine,
-                    host_id,
-                } => {
-                    self.launch_from_plan(
-                        &project,
-                        &slug,
-                        &prompt,
-                        branch.as_deref(),
-                        autostart,
-                        &task_id,
-                        parent_task_id.as_deref(),
-                        in_place,
-                        engine.as_session_type(),
-                        &host_id,
-                    );
-                    return true;
-                }
-                PlanAction::LaunchTaskIntoWorkspace {
-                    workspace_id,
-                    task_id,
-                    task_title,
-                    task_repo_url,
-                    project,
-                    prompt,
-                    parent_task_id,
-                    engine,
-                } => {
-                    self.launch_into_workspace(
-                        &workspace_id,
-                        &task_id,
-                        &task_title,
-                        &task_repo_url,
-                        &project,
-                        &prompt,
-                        parent_task_id.as_deref(),
-                        engine.as_session_type(),
-                    );
-                    return true;
-                }
                 PlanAction::UnbindTask { task_id } => {
                     self.unbind_task_from_workspace(&task_id);
-                    return true;
-                }
-                PlanAction::UnlaunchTask { task_id } => {
-                    self.unlaunch_task(&task_id);
                     return true;
                 }
                 PlanAction::ReopenTask { task_id } => {
@@ -2987,8 +3337,12 @@ impl App {
             }
         }
 
-        // If in input mode, handle input events.
+        // If in input mode, handle input events. The color grid sits over
+        // an A-e form and takes its keys first.
         if self.is_input_mode() {
+            if let Some(handled) = self.color_grid_event(event) {
+                return handled;
+            }
             return self.handle_input_event(event);
         }
 
@@ -3069,10 +3423,11 @@ impl App {
                         return true;
                     }
                     KeyCode::Char('v') => {
-                        self.sidebar_view = match self.sidebar_view {
-                            SidebarView::Status => SidebarView::Task,
-                            SidebarView::Task => SidebarView::Status,
-                        };
+                        self.sidebar_view = self.next_sidebar_view();
+                        if self.sidebar_view == SidebarView::Team {
+                            self.org_refresh_soon();
+                        }
+                        self.clamp_cursor();
                         self.save_session_manifest();
                         return true;
                     }
@@ -3101,12 +3456,26 @@ impl App {
                         self.attach_active();
                         return true;
                     }
-                    KeyCode::Char('d') => {
+                    // A-D: mark the task done (offers worktree cleanup).
+                    // Terminals report Shift either in the char case or as
+                    // a modifier — accept both. Plain A-d pages down.
+                    KeyCode::Char('D') | KeyCode::Char('d')
+                        if key.code == KeyCode::Char('D')
+                            || key.modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
                         if matches!(self.cursor, Cursor::Section(_)) {
                             self.set_status_msg("A section is not a task — nothing to mark done");
                             return true;
                         }
                         self.open_worktree_completion(true);
+                        return true;
+                    }
+                    // A-u / A-d: page the focused sidebar column by half its
+                    // visible rows (vim Ctrl-u / Ctrl-d).
+                    KeyCode::Char('d') => {
+                        let prev = self.cursor_session_uid();
+                        self.page_sidebar(1);
+                        self.note_session_focus_change(prev);
                         return true;
                     }
                     KeyCode::Char('x') => {
@@ -3137,6 +3506,16 @@ impl App {
                         self.revive_active_session();
                         return true;
                     }
+                    // #24: Alt+T moves the focused Claude session to a fresh
+                    // transcript at the same session (Shift baked in or not).
+                    KeyCode::Char('T') => {
+                        self.rotate_active_session();
+                        return true;
+                    }
+                    KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        self.rotate_active_session();
+                        return true;
+                    }
                     KeyCode::Char('r')
                         if key.modifiers.contains(KeyModifiers::SHIFT) =>
                     {
@@ -3145,10 +3524,11 @@ impl App {
                     }
                     KeyCode::Char('r') => {
                         self.backend.refresh();
-                        // Outer-buffer clearing cannot reconstruct a Codex
-                        // screen missing from the daemon's bounded replay tail.
+                        // Outer-buffer clearing cannot reconstruct an agent
+                        // screen missing from the daemon's bounded replay tail;
+                        // a resize pulse makes Codex / Claude Code redraw it.
                         if let Some(ts) = self.active_session_mut() {
-                            if ts.session_type == "codex" {
+                            if crate::session::repaints_on_resize(&ts.session_type) {
                                 ts.session.request_repaint();
                             }
                         }
@@ -3169,6 +3549,16 @@ impl App {
                         } else {
                             self.set_status_msg("Refreshing + redrawing...");
                         }
+                        return true;
+                    }
+                    // #25: Alt+Shift+E hands the session over to another
+                    // engine/model (Shift baked in or not).
+                    KeyCode::Char('E') => {
+                        self.open_handoff();
+                        return true;
+                    }
+                    KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        self.open_handoff();
                         return true;
                     }
                     KeyCode::Char('e') => {
@@ -3243,12 +3633,36 @@ impl App {
                         self.reorder_section_key(-1);
                         return true;
                     }
+                    // A-F (Alt+Shift+f): fork the focused session into a new
+                    // task. Shift folded into the char or reported as a
+                    // modifier — accept both, ahead of A-f (workflow launch).
+                    KeyCode::Char('F') => {
+                        self.open_fork_session();
+                        return true;
+                    }
+                    KeyCode::Char('f')
+                        if key.modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
+                        self.open_fork_session();
+                        return true;
+                    }
                     KeyCode::Char('f') => {
                         self.open_workflow_launch();
                         return true;
                     }
-                    KeyCode::Char('u') => {
+                    // A-U: resume a paused workflow (Shift as char case or
+                    // modifier).
+                    KeyCode::Char('U') | KeyCode::Char('u')
+                        if key.code == KeyCode::Char('U')
+                            || key.modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
                         self.resume_workflow_for_cursor();
+                        return true;
+                    }
+                    KeyCode::Char('u') => {
+                        let prev = self.cursor_session_uid();
+                        self.page_sidebar(-1);
+                        self.note_session_focus_change(prev);
                         return true;
                     }
                     // A-O (Alt+Shift+O): open the past-workspaces picker.
@@ -3296,14 +3710,21 @@ impl App {
         // Space/Enter are free to fold/unfold (matching the planning view's
         // Space-fold idiom). Guarded on the cursor so a stray Space while a
         // real session is focused still reaches its terminal below.
+        // Workspace and division headers of the work tree (app/tree.rs)
+        // are pure tree rows too: Space/Enter fold them, and no other key
+        // reaches a terminal from them.
         if let CrosstermEvent::Key(key) = event {
-            if matches!(self.cursor, Cursor::Backtest(_) | Cursor::Section(_))
+            let header = matches!(
+                self.cursor,
+                Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_)
+            ) || (matches!(self.cursor, Cursor::Workspace(_)) && self.workspace_header_is_tree_row());
+            if header
                 && matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter)
                 && !key
                     .modifiers
                     .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
             {
-                if !self.toggle_backtest_fold() {
+                if !self.toggle_backtest_fold() && !self.toggle_tree_fold() {
                     self.toggle_section_fold();
                 }
                 return true;
@@ -3319,6 +3740,7 @@ impl App {
                             use alacritty_terminal::grid::Scroll;
                             ts.session.term.lock().scroll_display(Scroll::PageUp);
                         }
+                        self.load_deferred_history();
                         return true;
                     }
                     KeyCode::PageDown => {
@@ -3350,6 +3772,7 @@ impl App {
                             use alacritty_terminal::grid::Scroll;
                             ts.session.term.lock().scroll_display(Scroll::PageUp);
                         }
+                        self.load_deferred_history();
                         return true;
                     }
                     KeyCode::PageDown if key.modifiers.is_empty() => {
@@ -3526,6 +3949,19 @@ impl App {
             return true;
         }
 
+        // Alternate-screen apps that don't track the mouse (Codex launched
+        // before inline mode, less, vim): CM has no scrollback to move there,
+        // so turn the wheel into the app's own scroll keys.
+        if !ts.session.exited {
+            if let Some(bytes) =
+                alt_screen_wheel_bytes(me.kind, term_mode, ts.session_type == "codex")
+            {
+                let _ = ts.session.write(&bytes);
+                ts.last_write_at = Some(Instant::now());
+                return true;
+            }
+        }
+
         use alacritty_terminal::grid::Scroll;
         use alacritty_terminal::index::{Column, Point as GridPoint, Side};
         use alacritty_terminal::selection::{Selection, SelectionType};
@@ -3534,6 +3970,7 @@ impl App {
         match me.kind {
             MouseEventKind::ScrollUp => {
                 ts.session.term.lock().scroll_display(Scroll::Delta(3));
+                self.load_deferred_history();
                 true
             }
             MouseEventKind::ScrollDown => {
@@ -3589,6 +4026,48 @@ impl App {
         if !matches!(event, CrosstermEvent::Key(_)) {
             return true;
         }
+        // List-style modals use the same bounded half-page chords as the sidebar.
+        // Text-entry modes retain their own input handling.
+        if let CrosstermEvent::Key(key) = event {
+            if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd')) {
+                let down = key.code == KeyCode::Char('d');
+                let term_rows = self.last_term_size.1 as usize;
+                let advance = |selected: &mut usize, count: usize, visible: usize| {
+                    let step = (visible / 2).max(1);
+                    *selected = if down { selected.saturating_add(step).min(count.saturating_sub(1)) } else { selected.saturating_sub(step) };
+                };
+                let handled = match &mut self.input_mode {
+                    InputMode::TranscriptPicker { candidates, selected, .. } => {
+                        advance(selected, candidates.len(), term_rows.saturating_sub(8).min(candidates.len())); true
+                    }
+                    InputMode::WorkflowPicker { names, selected, .. } => {
+                        advance(selected, names.len(), term_rows.saturating_sub(7).min(names.len())); true
+                    }
+                    InputMode::SnapshotCatalog { snapshots, selected, mode: CatalogMode::Browse, .. } => {
+                        advance(selected, snapshots.len(), term_rows.min(28).saturating_sub(5).min(snapshots.len())); true
+                    }
+                    InputMode::WorkflowLaunchConfirm { slots, active_slot, .. } if *active_slot < slots.len() => {
+                        advance(active_slot, slots.len(), term_rows.saturating_sub(8).min(slots.len())); true
+                    }
+                    InputMode::TaskPeek { scroll, max_scroll, .. } => {
+                        let height = (term_rows * 6 / 10).max(8).min(term_rows.saturating_sub(2).max(1));
+                        let step = (height.saturating_sub(2) / 2).max(1) as u16;
+                        *scroll = if down { scroll.saturating_add(step).min(*max_scroll) } else { scroll.saturating_sub(step) }; true
+                    }
+                    InputMode::PastWorkspacePicker { candidates, query, selected } => {
+                        let count = past_workspace_match_indices(query, candidates).len();
+                        advance(selected, count, term_rows.saturating_sub(8).min(count)); true
+                    }
+                    InputMode::SessionPalette { candidates, query, selected } => {
+                        let displays: Vec<&str> = candidates.iter().map(|c| c.display.as_str()).collect();
+                        let count = palette_match_indices(query, &displays).len().min(PALETTE_MAX_RESULTS);
+                        advance(selected, count, term_rows.saturating_sub(8).min(count)); true
+                    }
+                    _ => false,
+                };
+                if handled { return true; }
+            }
+        }
         let urls = sorted_repo_urls(&self.config.repos);
         // Configured hosts (local + any hosts.toml entries) in config order,
         // for the A-n host picker. Cloned per keystroke; the list is tiny
@@ -3625,11 +4104,40 @@ impl App {
                 }
             }
         }
-        // Section ids for the workspace / task settings pickers.
+        // A nested workspace's section comes from its root block: the A-e
+        // Section field shows that and does not cycle.
+        if let CrosstermEvent::Key(key) = event {
+            let section_field = match &self.input_mode {
+                InputMode::WorkspaceSettings { workspace_id, active_field: 3, .. } => Some(workspace_id.clone()),
+                _ => None,
+            };
+            if section_field.is_some_and(|id| self.nested_section_label(&id).is_some())
+                && matches!(key.code, KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right)
+            {
+                return true;
+            }
+        }
+        if !self.refresh_session_settings_indices() {
+            return true;
+        }
+        // Section ids for the workspace settings picker.
         let section_ids: Vec<String> = self.section_ids();
+        let report_tasks = if matches!(self.input_mode, InputMode::NewSession { .. }) {
+            self.reports_to_choices()
+        } else {
+            Vec::new()
+        };
         let outcome = match &mut self.input_mode {
             InputMode::WorktreeCleanup(menu) => match event {
                 CrosstermEvent::Key(key) => menu.key(*key),
+                _ => InputOutcome::Consumed,
+            },
+            InputMode::ForkSession(form) => match event {
+                CrosstermEvent::Key(key) => form.key(*key),
+                _ => InputOutcome::Consumed,
+            },
+            InputMode::Handoff(form) => match event {
+                CrosstermEvent::Key(key) => form.key(*key),
                 _ => InputOutcome::Consumed,
             },
             InputMode::ContinuousControl(menu) => match event {
@@ -3656,6 +4164,10 @@ impl App {
                     seed_from,
                     host_id,
                     active_field,
+                    reports_to: &mut self.new_session_reports_to,
+                    picker: &mut self.new_session_picker,
+                    report_tasks: &report_tasks,
+                    model: &mut self.form_model,
                 },
                 InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                 event,
@@ -3675,6 +4187,7 @@ impl App {
                     seed_from,
                     resume_from,
                     active_field,
+                    model: &mut self.form_model,
                 },
                 InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                 event,
@@ -3682,6 +4195,7 @@ impl App {
             InputMode::SessionSettings {
                 ws_index,
                 session_index,
+                session_uid: _,
                 name,
                 idle_timeout,
                 burst_threshold,
@@ -3691,10 +4205,11 @@ impl App {
                 color,
                 seeded_from_snapshot: _,
                 transcript_id: _,
-                session_type: _,
+                session_type,
                 active_field,
             } => handle_session_settings(
                 SessionSettingsMut {
+                    is_shell: session_type.as_str() == "bash",
                     ws_index: *ws_index,
                     session_index: *session_index,
                     name,
@@ -3715,6 +4230,8 @@ impl App {
                 color,
                 pinned,
                 section,
+                tasks,
+                task_at,
                 active_field,
             } => handle_workspace_settings(
                 WorkspaceSettingsMut {
@@ -3723,6 +4240,8 @@ impl App {
                     color,
                     pinned,
                     section,
+                    tasks,
+                    task_at,
                     active_field,
                 },
                 InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
@@ -3777,20 +4296,6 @@ impl App {
                 InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                 event,
             ),
-            InputMode::TaskSettings { task_id, workspace_id, name, color, section, active_field } => {
-                handle_task_settings(
-                    TaskSettingsMut {
-                        task_id: task_id.as_str(),
-                        workspace_id: workspace_id.as_str(),
-                        name,
-                        color,
-                        section,
-                        active_field,
-                    },
-                    InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
-                    event,
-                )
-            }
             InputMode::WorkflowLaunchConfirm {
                 ws_id,
                 workflow_name,
@@ -3830,9 +4335,10 @@ impl App {
             InputMode::WorkflowHistory { run_id: _ } => {
                 handle_workflow_history(InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids }, event)
             }
-            InputMode::PastWorkspacePicker { candidates, selected } => {
+            InputMode::PastWorkspacePicker { candidates, query, selected } => {
                 handle_past_workspace_picker(
                     candidates,
+                    query,
                     selected,
                     InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
                     event,
@@ -3903,6 +4409,18 @@ impl App {
                 // chosen name. Other submits (and a no-target catalog)
                 // go through the normal path.
                 let old = std::mem::replace(&mut self.input_mode, InputMode::Normal);
+                if let InputMode::ForkSession(form) = old {
+                    if matches!(action, SubmitAction::ForkSession) {
+                        self.submit_fork(form);
+                    }
+                    return true;
+                }
+                if let InputMode::Handoff(form) = old {
+                    if matches!(action, SubmitAction::Handoff) {
+                        self.submit_handoff(form);
+                    }
+                    return true;
+                }
                 if let InputMode::WorktreeCleanup(menu) = old {
                     if matches!(action, SubmitAction::CompleteWithCleanup) { self.complete_with_cleanup(menu); }
                     return true;
@@ -3962,9 +4480,58 @@ impl App {
         self.input_mode = rebuild_form_from_picker(target, name);
     }
 
+    /// Apply one task's changes from the A-e workspace form.
+    fn save_task_settings(&mut self, task: TaskSettingsSave) {
+        let TaskSettingsSave { task_id, name, lead, models, efforts } = task;
+        // Each changed default goes through `POST /tasks/{id}/model`,
+        // which touches only `metadata.models.<engine>` (or
+        // `metadata.efforts.<engine>`).
+        use cm_daemon::models::Setting;
+        let changed = models
+            .into_iter()
+            .map(|c| (Setting::Model, c))
+            .chain(efforts.into_iter().map(|c| (Setting::Effort, c)));
+        for (setting, (engine, value)) in changed {
+            self.backend.set_task_default(task_id.clone(), engine, setting, value);
+        }
+        // The lead pin goes through its own endpoint, which changes only
+        // that metadata key. Applied locally at once so the ★ moves now;
+        // the API row confirms it.
+        if let Some(pin) = lead {
+            let previous = self.set_local_lead_pin(&task_id, pin.clone());
+            self.backend.set_task_lead(task_id.clone(), pin, previous);
+        }
+        if let Some(name) = name {
+            if let Some(entry) = self
+                .tasks
+                .iter_mut()
+                .find(|t| t.task_id.as_deref() == Some(task_id.as_str()))
+            {
+                entry.name = name.clone();
+            }
+            let mut fields = HashMap::new();
+            fields.insert("name".to_string(), serde_json::Value::String(name));
+            self.backend.update_plan_task(task_id, fields);
+        }
+    }
+
     pub(super) fn apply_submit_action(&mut self, action: SubmitAction) {
         match action {
             SubmitAction::None => {}
+            SubmitAction::CreateReportingWorkspace {
+                engine,
+                repo_url,
+                label,
+                branch,
+                in_place,
+                host_id,
+                parent,
+                model, effort,
+            } => {
+                self.create_reporting_workspace(
+                    engine, &repo_url, &label, branch, in_place, host_id, parent, model, effort,
+                );
+            }
             SubmitAction::CreateLocalSession {
                 engine,
                 repo_url,
@@ -3974,6 +4541,7 @@ impl App {
                 seed_from,
                 in_place,
                 host_id,
+                model, effort,
             } => {
                 self.create_local_session(
                     &host_id,
@@ -3984,6 +4552,7 @@ impl App {
                     idle_timeout_secs,
                     seed_from.as_deref(),
                     in_place,
+                    model.as_deref(), effort.as_deref(),
                 );
             }
             SubmitAction::SpawnSessionOnWorkspace {
@@ -3992,9 +4561,10 @@ impl App {
                 task_id,
                 seed_from,
                 resume_from,
+                model, effort,
             } => {
                 if let Some(host) = self.alternate_form_host(&workspace_id) {
-                    self.new_workspace_on_host(&workspace_id, &host, &session_type, seed_from.as_deref());
+                    self.new_workspace_on_host(&workspace_id, &host, &session_type, seed_from.as_deref(), None, model.as_deref(), effort.as_deref());
                     return;
                 }
                 self.spawn_session_on_workspace(
@@ -4003,6 +4573,7 @@ impl App {
                     task_id,
                     seed_from.as_deref(),
                     resume_from.as_deref(),
+                    model.as_deref(), effort.as_deref(),
                 );
             }
             SubmitAction::OpenSnapshotPickerForNewSession {
@@ -4108,39 +4679,16 @@ impl App {
                 self.save_session_manifest();
                 match perms_push {
                     Some((uid, value, local_changed)) => {
-                        match self.set_session_global_perms(&uid, value) {
-                            Ok(ack) => {
-                                // `changed` = the DAEMON moved; a re-assert
-                                // that converged a drifted daemon reads as
-                                // a grant/revoke too, so the operator sees
-                                // it took effect.
-                                let daemon_moved = ack.changed.unwrap_or(local_changed);
-                                let msg = match (value, daemon_moved || local_changed) {
-                                    (true, true) => {
-                                        "Settings saved — global permissions GRANTED"
-                                    }
-                                    (false, true) => {
-                                        "Settings saved — global permissions revoked"
-                                    }
-                                    (true, false) => {
-                                        "Settings saved — global permissions re-asserted (already granted)"
-                                    }
-                                    (false, false) => "Settings saved",
-                                };
-                                self.set_status_msg(msg);
-                            }
-                            Err(e) => self.set_status_msg(&format!(
-                                "Settings saved, but global-perms change failed: {}",
-                                e,
-                            )),
-                        }
+                        self.set_session_global_perms(&uid, value, local_changed);
                     }
                     None => self.set_status_msg("Settings saved"),
                 }
             }
-            SubmitAction::SaveWorkspaceSettings { workspace_id, name, color, pinned, section } => {
+            SubmitAction::SaveWorkspaceSettings { workspace_id, name, color, pinned, section, tasks } => {
                 let mut pinned_changed = false;
-                if self.workspaces.iter().any(|w| w.id == workspace_id) {
+                // A nested workspace's section is its root block's.
+                let nested = self.nested_section_label(&workspace_id).is_some();
+                if !nested && self.workspaces.iter().any(|w| w.id == workspace_id) {
                     // Sidecar map, not a Workspace field — write it before
                     // the save below so one manifest write carries both.
                     match section {
@@ -4166,10 +4714,29 @@ impl App {
                         pinned_changed = true;
                     }
                 }
+                // The colour lives on the workspace now: drop the legacy
+                // task colours it replaces (the form prefilled from them).
+                // Another workspace showing the same task (a shared task on
+                // two hosts) keeps that colour as its own.
+                if let Some(wi) = self.workspaces.iter().position(|w| w.id == workspace_id) {
+                    for t in self.workspace_tasks(wi) {
+                        let Some(c) = self.task_colors.remove(&t) else { continue };
+                        let others: Vec<usize> = (0..self.workspaces.len())
+                            .filter(|&wj| wj != wi && self.workspaces[wj].color.is_none())
+                            .filter(|&wj| self.workspace_tasks(wj).contains(&t))
+                            .collect();
+                        for wj in others {
+                            self.workspaces[wj].color = Some(c.clone());
+                        }
+                    }
+                }
                 if pinned_changed {
                     self.resort_workspaces_for_pin();
                 }
                 self.save_session_manifest();
+                for task in tasks {
+                    self.save_task_settings(task);
+                }
                 self.set_status_msg("Workspace settings saved");
             }
             SubmitAction::SaveSnapshot {
@@ -4193,40 +4760,6 @@ impl App {
                 // emits it.
                 let _ = name;
             }
-            SubmitAction::SaveTaskName { task_id, workspace_id, name, color, section } => {
-                // Color rides the local manifest sidecar, not the API row —
-                // apply it regardless of whether the rename half is valid.
-                match color {
-                    Some(c) => {
-                        self.task_colors.insert(task_id.clone(), c);
-                    }
-                    None => {
-                        self.task_colors.remove(&task_id);
-                    }
-                }
-                // Capture the workspace at modal-open: neither cursor movement
-                // nor a delayed task binding may redirect the section change.
-                if self.workspaces.iter().any(|w| w.id == workspace_id) {
-                    match section {
-                        Some(sid) => { self.workspace_sections.insert(workspace_id, sid); }
-                        None => { self.workspace_sections.remove(&workspace_id); }
-                    }
-                }
-                self.save_session_manifest();
-                if !name.is_empty() {
-                    if let Some(task) = self
-                        .tasks
-                        .iter_mut()
-                        .find(|t| t.task_id.as_deref() == Some(task_id.as_str()))
-                    {
-                        task.name = name.clone();
-                    }
-                    let mut fields = HashMap::new();
-                    fields.insert("name".to_string(), serde_json::Value::String(name));
-                    self.backend.update_plan_task(task_id, fields);
-                }
-                self.set_status_msg("Task settings saved");
-            }
             SubmitAction::EnterWorkflowLaunchConfirm {
                 ws_id,
                 focused_si,
@@ -4248,9 +4781,10 @@ impl App {
                 cursor_task_id,
             } => {
                 if let Some(host) = self.alternate_form_host(&ws_id) {
-                    if let Some(new_id) = self.new_workspace_on_host(&ws_id, &host, "bash", None) {
-                        self.launch_workflow_via_daemon(&new_id, &workflow_name, &slots, goal, None);
-                    }
+                    let launch: Box<dyn FnOnce(&mut App, String) + Send> = Box::new(move |app, new_id| {
+                        app.launch_workflow_via_daemon(&new_id, &workflow_name, &slots, goal, None);
+                    });
+                    self.new_workspace_on_host(&ws_id, &host, "bash", None, Some(launch), None, None);
                     return;
                 }
 
@@ -4258,7 +4792,7 @@ impl App {
                 // carry the cursor's task scope (captured at
                 // observation time in `open_workflow_launch` per
                 // Issue I). When the cursor was on a tasked
-                // session or `Cursor::Task`, the daemon records
+                // session or workspace row, the daemon records
                 // the participant's task_id at spawn time —
                 // matching the MCP-launched path. When the
                 // cursor was workspace-scope (no task), this is
@@ -4280,6 +4814,8 @@ impl App {
                 );
             }
             SubmitAction::CompleteWithCleanup => {}, // handled with the captured completion menu
+            SubmitAction::ForkSession => {}, // handled with the captured fork form
+            SubmitAction::Handoff => {}, // handled with the captured handoff form
             SubmitAction::MarkActiveDone => self.mark_active_done(),
             SubmitAction::DeleteActive => self.delete_active(),
             SubmitAction::SaveSection { section_id, name, color } => match section_id {
@@ -4300,11 +4836,23 @@ impl App {
             }
             SubmitAction::StopWorkflow { run_id } => self.stop_workflow_run(&run_id),
             SubmitAction::ReopenPastWorkspace { ws_id } => {
+                self.unarchive_workspace(&ws_id);
                 self.reopen_workspace_by_id(&ws_id);
+            }
+            SubmitAction::CloseAfterLastAgent { ws_id } => {
+                self.check_and_close_workspace(&ws_id, lifecycle::LastAgentClose::Owner);
+            }
+            SubmitAction::CloseBashOnlyWorkspaces { ws_ids } => {
+                for ws_id in ws_ids {
+                    self.check_and_close_workspace(&ws_id, lifecycle::LastAgentClose::Owner);
+                }
             }
             SubmitAction::RestoreTombstones { ws_id } => {
                 self.restore_tombstones_for_workspace(&ws_id);
             }
+            SubmitAction::RotateTranscript { uid } => self.rotate_session(&uid),
+            SubmitAction::BackgroundRecovery { uid, host, identity, prompt } => self.start_background_recovery(uid, host, identity, prompt),
+            SubmitAction::ReconcileBackground { uid, host, identity, prompt } => self.start_background_reconcile(uid, host, identity, prompt),
             SubmitAction::PaletteJump { target } => {
                 self.apply_palette_jump(target);
             }
@@ -4380,6 +4928,11 @@ mod yank_clipboard_tests {
         )
         .expect("session for test");
         TerminalSession {
+            org: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             color: None,
             uid: "yank-uid".into(),
             label: "yank-test".into(),
@@ -4512,6 +5065,7 @@ mod yank_clipboard_tests {
         parser.advance(&mut *term, "héllo world".as_bytes());
         drop(term);
         app.workspaces = vec![Workspace {
+            org: None,
             id: "mouse-ws".into(), name: "mouse".into(), is_closed: false, is_cloud: false,
             repo_url: None, worktree_path: None, main_repo_path: None,
             worker_vm: None, worker_zone: None, host_id: crate::hosts::HostId::local(),
@@ -4521,6 +5075,43 @@ mod yank_clipboard_tests {
         app.view_mode = ViewMode::Sessions;
         app.last_term_size = (80, 24);
         app
+    }
+
+    #[test]
+    fn yank_names_remote_and_unbound_sessions_instead_of_empty_transcript() {
+        with_temp_home(|_| {
+            let mut app = mouse_app(false);
+            app.workspaces[0].worktree_path = Some(PathBuf::from("/tmp/yankrepo"));
+            app.yank_last_assistant_message();
+            let msg = app.status_msg.as_ref().map(|s| s.0.clone()).unwrap_or_default();
+            assert!(msg.contains("no transcript bound"), "{msg}");
+
+            let ts = &mut app.workspaces[0].sessions[0];
+            ts.transcript_id = Some("01a114a8-0000".into());
+            ts.host_id = crate::hosts::HostId::new("sessions");
+            app.yank_last_assistant_message();
+            let msg = app.status_msg.as_ref().map(|s| s.0.clone()).unwrap_or_default();
+            assert!(msg.contains("runs on host 'sessions'"), "{msg}");
+        });
+    }
+
+    #[test]
+    fn wheel_over_alt_screen_codex_without_mouse_tracking_pages_its_transcript() {
+        with_temp_home(|_| {
+            let mut app = mouse_app(false);
+            {
+                let ts = &mut app.workspaces[0].sessions[0];
+                let mut parser: alacritty_terminal::vte::ansi::Processor =
+                    alacritty_terminal::vte::ansi::Processor::new();
+                // Codex 0.160.1 alternate screen: ?1049h + ?1007h, no mouse modes.
+                parser.advance(&mut *ts.session.term.lock(), b"\x1b[?1049h\x1b[?1007h");
+            }
+            mouse(&mut app, MouseEventKind::ScrollUp, 5, KeyModifiers::empty());
+            assert!(
+                app.workspaces[0].sessions[0].last_write_at.is_some(),
+                "the wheel must reach an alt-screen Codex as PageUp, not scroll empty scrollback",
+            );
+        });
     }
 
     fn mouse(app: &mut App, kind: MouseEventKind, column: u16, modifiers: KeyModifiers) {
@@ -4606,6 +5197,7 @@ mod past_workspace_reopen_tests {
         app.workspaces.clear();
         app.tasks.clear();
         app.workspaces.push(Workspace {
+            org: None,
             id: "ws-past-worker".into(),
             name: "past-worker".into(),
             is_closed: true,
@@ -4680,6 +5272,54 @@ mod past_workspace_reopen_tests {
         assert_picker_evidence(&mut app, Some(true));
         assert!(app.reopen_workspace_by_id("ws-past-worker"));
         assert!(!app.workspaces[0].is_closed);
+    }
+
+    #[test]
+    fn picker_search_fields_cover_task_branch_path_labels_and_host() {
+        let mut app = closed_workspace("sessions", Some(PathBuf::from("/srv/wt/cm-sub-alpha")));
+        app.tasks.push(TaskEntry {
+            task_id: Some("t1".into()),
+            name: "Fix Login Flow".into(),
+            api_status: TaskStatus::Done,
+            repo_url: None,
+            prompt: None,
+            wip_branch: Some("cm/login-fix".into()),
+            session_id: None,
+            blocked_at: None,
+            is_cloud: false,
+            is_continuous: false,
+            workspace_id: Some("ws-past-worker".into()),
+            project: None,
+            parent_task_id: None,
+            worktree_mode: WorktreeMode::Inherit,
+            metadata: None,
+        });
+        app.workspaces[0].tombstones.push(SessionTombstone {
+            entry: None,
+            uid: "ts-1".into(),
+            managed_by_uid: None,
+            label: "Reviewer-Bot".into(),
+            session_type: "codex".into(),
+            task_id: None,
+            last_transcript_id: None,
+            worktree_path: None,
+            generation: 0,
+            exited_at: 1.0,
+        });
+        app.open_past_workspace_picker();
+        let InputMode::PastWorkspacePicker { candidates, query, selected } = &app.input_mode else {
+            panic!("expected past-workspace picker");
+        };
+        assert!(query.is_empty());
+        assert_eq!(*selected, 0);
+        for q in ["past-worker", "login flow", "cm/login-fix", "cm-sub-alpha", "reviewer", "SESSIONS"] {
+            assert_eq!(
+                past_workspace_match_indices(q, candidates),
+                vec![0],
+                "query {q:?} should match"
+            );
+        }
+        assert!(past_workspace_match_indices("nope", candidates).is_empty());
     }
 
     #[test]
@@ -4766,6 +5406,7 @@ mod input_handler_tests {
             new_session_state("hello", "", "2", "", 1);
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -4774,6 +5415,9 @@ mod input_handler_tests {
                 seed_from: &mut None,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Esc),
@@ -4789,6 +5433,7 @@ mod input_handler_tests {
             new_session_state("foo", "", "2", "", 1);
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -4797,6 +5442,9 @@ mod input_handler_tests {
                 seed_from: &mut None,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Backspace),
@@ -4811,6 +5459,7 @@ mod input_handler_tests {
             new_session_state("my-task", "feat/x", "10", "https://github.com/a/b", 1);
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -4819,6 +5468,9 @@ mod input_handler_tests {
                 seed_from: &mut None,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Enter),
@@ -4833,7 +5485,10 @@ mod input_handler_tests {
                 seed_from,
                 in_place,
                 host_id,
+                model, effort,
             }) => {
+                assert_eq!(model, None, "an untouched Model field leaves resolution to the spawn");
+                assert_eq!(effort, None, "an untouched Effort leaves resolution to the spawn");
                 assert_eq!(engine, LaunchEngine::Codex);
                 assert_eq!(repo_url, "https://github.com/a/b");
                 assert_eq!(label, "my-task");
@@ -4858,6 +5513,7 @@ mod input_handler_tests {
                 new_session_state("my-task", raw, "10", "https://github.com/a/b", 1);
             let outcome = handle_new_session(
                 NewSessionMut {
+                    model: &mut Default::default(),
                     engine: &mut LaunchEngine::default(),
                     label_text: &mut label,
                     branch_text: &mut branch,
@@ -4866,6 +5522,9 @@ mod input_handler_tests {
                     seed_from: &mut None,
                     host_id: &mut host,
                     active_field: &mut active,
+                    reports_to: &mut Default::default(),
+                    picker: &mut None,
+                    report_tasks: &[],
                 },
                 ctx_no_repos(),
                 &key(KeyCode::Enter),
@@ -4886,6 +5545,7 @@ mod input_handler_tests {
             new_session_state("my-task", "./foo", "10", "https://github.com/a/b", 1);
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -4894,6 +5554,9 @@ mod input_handler_tests {
                 seed_from: &mut None,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Enter),
@@ -4918,6 +5581,7 @@ mod input_handler_tests {
             new_session_state("   ", "", "2", "", 1);
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -4926,6 +5590,9 @@ mod input_handler_tests {
                 seed_from: &mut None,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Enter),
@@ -4946,6 +5613,7 @@ mod input_handler_tests {
             new_session_state("", "", "2", "", 2);
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -4954,6 +5622,9 @@ mod input_handler_tests {
                 seed_from: &mut None,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Char('x')),
@@ -4970,6 +5641,7 @@ mod input_handler_tests {
             new_session_state("", "", "2", "b", 0);
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -4978,6 +5650,9 @@ mod input_handler_tests {
                 seed_from: &mut None,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             InputCtx { repo_urls: &urls, host_ids: &[], section_ids: &[] },
             &key(KeyCode::Right),
@@ -4988,23 +5663,98 @@ mod input_handler_tests {
 
     // ── NewSession seed-from (chunk 5) ────────────────────────────
 
+    /// Field 7 "Reports to": Enter (or typing) opens the task picker, a pick
+    /// sets the parent, and the submit becomes a reporting-workspace create.
     #[test]
-    fn new_session_tab_cycles_through_seven_fields() {
-        // The engine picker is field 6; both directions wrap through every field.
+    fn new_session_reports_to_picks_a_parent_and_submits_it() {
+        use crate::task_picker::{ReportsTo, TaskChoice, TaskPicker};
+        let tasks = vec![
+            TaskChoice { task_id: "t-cto".into(), name: "Execution policy".into() },
+            TaskChoice { task_id: "t-doc".into(), name: "Docs".into() },
+        ];
+        let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
+            new_session_state("probe", "", "2", "git@x:r.git", 7);
+        let mut seed: Option<String> = None;
+        let mut reports_to = ReportsTo::Standalone;
+        let mut picker: Option<TaskPicker> = None;
+        let mut press = |code: KeyCode,
+                         active: &mut u8,
+                         seed: &mut Option<String>,
+                         reports_to: &mut ReportsTo,
+                         picker: &mut Option<TaskPicker>| {
+            handle_new_session(
+                NewSessionMut {
+                    model: &mut Default::default(),
+                    engine: &mut LaunchEngine::default(),
+                    label_text: &mut label,
+                    branch_text: &mut branch,
+                    idle_timeout_text: &mut timeout,
+                    repo_url: &mut repo,
+                    seed_from: seed,
+                    host_id: &mut host,
+                    active_field: active,
+                    reports_to,
+                    picker,
+                    report_tasks: &tasks,
+                },
+                ctx_no_repos(),
+                &key(code),
+            )
+        };
+        // Typing on the field opens the picker seeded with the key.
+        assert_consumed(&press(KeyCode::Char('d'), &mut active, &mut seed, &mut reports_to, &mut picker));
+        assert_eq!(picker.as_ref().map(|p| p.query.as_str()), Some("d"));
+        assert_consumed(&press(KeyCode::Enter, &mut active, &mut seed, &mut reports_to, &mut picker));
+        assert!(picker.is_none());
+        assert_eq!(reports_to.parent_task_id(), Some("t-doc"));
+        // Backspace on the field returns to Standalone; Enter reopens the picker.
+        assert_consumed(&press(KeyCode::Backspace, &mut active, &mut seed, &mut reports_to, &mut picker));
+        assert_eq!(reports_to, ReportsTo::Standalone);
+        press(KeyCode::Enter, &mut active, &mut seed, &mut reports_to, &mut picker);
+        press(KeyCode::Enter, &mut active, &mut seed, &mut reports_to, &mut picker);
+        assert_eq!(reports_to.parent_task_id(), Some("t-cto"));
+        // Enter on another field submits a reporting workspace.
+        active = 1;
+        match press(KeyCode::Enter, &mut active, &mut seed, &mut reports_to, &mut picker) {
+            InputOutcome::Submit(SubmitAction::CreateReportingWorkspace { label, parent, .. }) => {
+                assert_eq!(label, "probe");
+                assert_eq!(parent.task_id, "t-cto");
+            }
+            other => panic!("expected CreateReportingWorkspace, got {other:?}"),
+        }
+        // A seed can't ride a reporting workspace.
+        seed = Some("snap".into());
+        assert!(matches!(
+            press(KeyCode::Enter, &mut active, &mut seed, &mut reports_to, &mut picker),
+            InputOutcome::Status(_)
+        ));
+        // Standalone keeps today's create.
+        seed = None;
+        reports_to = ReportsTo::Standalone;
+        assert!(matches!(
+            press(KeyCode::Enter, &mut active, &mut seed, &mut reports_to, &mut picker),
+            InputOutcome::Submit(SubmitAction::CreateLocalSession { .. })
+        ));
+    }
+
+    #[test]
+    fn new_session_tab_cycles_through_nine_fields() {
+        // Engine is field 6, Reports to field 7; both directions wrap through every field.
         let (mut label, mut branch, mut timeout, mut repo, mut host, mut active) =
             new_session_state("", "", "", "", 0);
         let mut seed: Option<String> = None;
-        for (code, expected) in [1, 2, 3, 4, 5, 6, 0]
+        for (code, expected) in [1, 2, 3, 4, 5, 6, 7, 8, 0]
             .into_iter()
             .map(|field| (KeyCode::Tab, field))
             .chain(
-                [6, 5, 4, 3, 2, 1, 0]
+                [8, 7, 6, 5, 4, 3, 2, 1, 0]
                     .into_iter()
                     .map(|field| (KeyCode::BackTab, field)),
             )
         {
             handle_new_session(
                 NewSessionMut {
+                    model: &mut Default::default(),
                     engine: &mut LaunchEngine::default(),
                     label_text: &mut label,
                     branch_text: &mut branch,
@@ -5013,6 +5763,9 @@ mod input_handler_tests {
                     seed_from: &mut seed,
                     host_id: &mut host,
                     active_field: &mut active,
+                    reports_to: &mut Default::default(),
+                    picker: &mut None,
+                    report_tasks: &[],
                 },
                 ctx_no_repos(),
                 &key(code),
@@ -5028,6 +5781,7 @@ mod input_handler_tests {
         let mut seed: Option<String> = None;
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5036,6 +5790,9 @@ mod input_handler_tests {
                 seed_from: &mut seed,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Enter),
@@ -5074,6 +5831,7 @@ mod input_handler_tests {
         let mut seed: Option<String> = Some("reviewer".into());
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5082,6 +5840,9 @@ mod input_handler_tests {
                 seed_from: &mut seed,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Esc),
@@ -5098,6 +5859,7 @@ mod input_handler_tests {
         let mut seed: Option<String> = None;
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5106,6 +5868,9 @@ mod input_handler_tests {
                 seed_from: &mut seed,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Esc),
@@ -5120,6 +5885,7 @@ mod input_handler_tests {
         let mut seed: Option<String> = Some("reviewer-strict".into());
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5128,6 +5894,9 @@ mod input_handler_tests {
                 seed_from: &mut seed,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Enter),
@@ -5153,6 +5922,7 @@ mod input_handler_tests {
         ] {
             let outcome = handle_new_session(
                 NewSessionMut {
+                    model: &mut Default::default(),
                     engine: &mut engine,
                     label_text: &mut label,
                     branch_text: &mut branch,
@@ -5161,6 +5931,9 @@ mod input_handler_tests {
                     seed_from: &mut seed,
                     host_id: &mut host,
                     active_field: &mut active,
+                    reports_to: &mut Default::default(),
+                    picker: &mut None,
+                    report_tasks: &[],
                 },
                 ctx_no_repos(),
                 &key(code),
@@ -5171,6 +5944,7 @@ mod input_handler_tests {
         }
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut engine,
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5179,6 +5953,9 @@ mod input_handler_tests {
                 seed_from: &mut seed,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Enter),
@@ -5200,6 +5977,7 @@ mod input_handler_tests {
             new_session_state("task", "feat/x", "12", "https://github.com/a/b", 4);
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::Codex,
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5208,6 +5986,9 @@ mod input_handler_tests {
                 seed_from: &mut Some("prior-codex-seed".into()),
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Enter),
@@ -5266,6 +6047,7 @@ mod input_handler_tests {
         let mut press = |code: KeyCode, host: &mut cm_daemon::host_id::HostId| {
             handle_new_session(
                 NewSessionMut {
+                    model: &mut Default::default(),
                     engine: &mut LaunchEngine::default(),
                     label_text: &mut label,
                     branch_text: &mut branch,
@@ -5274,6 +6056,9 @@ mod input_handler_tests {
                     seed_from: &mut None,
                     host_id: host,
                     active_field: &mut active,
+                    reports_to: &mut Default::default(),
+                    picker: &mut None,
+                    report_tasks: &[],
                 },
                 InputCtx { repo_urls: &[], host_ids: &hosts, section_ids: &[] },
                 &key(code),
@@ -5305,6 +6090,7 @@ mod input_handler_tests {
         // Cycle to the remote host, then submit from the host field.
         handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5313,12 +6099,16 @@ mod input_handler_tests {
                 seed_from: &mut None,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             InputCtx { repo_urls: &[], host_ids: &hosts, section_ids: &[] },
             &key(KeyCode::Right),
         );
         let outcome = handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5327,6 +6117,9 @@ mod input_handler_tests {
                 seed_from: &mut None,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             InputCtx { repo_urls: &[], host_ids: &hosts, section_ids: &[] },
             &key(KeyCode::Enter),
@@ -5347,6 +6140,7 @@ mod input_handler_tests {
             new_session_state("task", "", "2", "https://github.com/a/b", 5);
         handle_new_session(
             NewSessionMut {
+                model: &mut Default::default(),
                 engine: &mut LaunchEngine::default(),
                 label_text: &mut label,
                 branch_text: &mut branch,
@@ -5355,6 +6149,9 @@ mod input_handler_tests {
                 seed_from: &mut None,
                 host_id: &mut host,
                 active_field: &mut active,
+                reports_to: &mut Default::default(),
+                picker: &mut None,
+                report_tasks: &[],
             },
             ctx_no_repos(),
             &key(KeyCode::Right),
@@ -5372,6 +6169,7 @@ mod input_handler_tests {
         let mut active = 0u8;
         let outcome = handle_new_terminal_session(
             NewTerminalSessionMut {
+                model: &mut Default::default(),
                 workspace_id: "ws-7",
                 session_type: &mut session_type,
                 task_id: &task_id,
@@ -5394,6 +6192,7 @@ mod input_handler_tests {
         let mut active = 0u8;
         let outcome = handle_new_terminal_session(
             NewTerminalSessionMut {
+                model: &mut Default::default(),
                 workspace_id: "ws-4",
                 session_type: &mut session_type,
                 task_id: &task_id,
@@ -5429,6 +6228,7 @@ mod input_handler_tests {
         let mut active = 0u8;
         let outcome = handle_new_terminal_session(
             NewTerminalSessionMut {
+                model: &mut Default::default(),
                 workspace_id: "ws-0",
                 session_type: &mut session_type,
                 task_id: &task_id,
@@ -5455,6 +6255,7 @@ mod input_handler_tests {
         let mut active = 0u8;
         handle_new_terminal_session(
             NewTerminalSessionMut {
+                model: &mut Default::default(),
                 workspace_id: "ws-0",
                 session_type: &mut session_type,
                 task_id: &task_id,
@@ -5475,10 +6276,11 @@ mod input_handler_tests {
         let task_id = None;
         let mut seed: Option<String> = None;
         let mut active = 0u8;
-        // proper-resume: three fields now (type, seed, resume).
-        for expected in [1u8, 2, 0] {
+        // Four fields: type, seed, resume, model.
+        for expected in [1u8, 2, 3, 0] {
             handle_new_terminal_session(
                 NewTerminalSessionMut {
+                    model: &mut Default::default(),
                     workspace_id: "ws-0",
                     session_type: &mut session_type,
                     task_id: &task_id,
@@ -5501,6 +6303,7 @@ mod input_handler_tests {
         let mut active = 1u8;
         let outcome = handle_new_terminal_session(
             NewTerminalSessionMut {
+                model: &mut Default::default(),
                 workspace_id: "ws-0",
                 session_type: &mut session_type,
                 task_id: &task_id,
@@ -5522,6 +6325,7 @@ mod input_handler_tests {
         let mut active = 1u8;
         let outcome = handle_new_terminal_session(
             NewTerminalSessionMut {
+                model: &mut Default::default(),
                 workspace_id: "ws-9",
                 session_type: &mut session_type,
                 task_id: &task_id,
@@ -5561,6 +6365,7 @@ mod input_handler_tests {
         let mut active = 1u8;
         let outcome = handle_new_terminal_session(
             NewTerminalSessionMut {
+                model: &mut Default::default(),
                 workspace_id: "ws-0",
                 session_type: &mut session_type,
                 task_id: &task_id,
@@ -5583,6 +6388,7 @@ mod input_handler_tests {
         let mut active = 0u8;
         let outcome = handle_new_terminal_session(
             NewTerminalSessionMut {
+                model: &mut Default::default(),
                 workspace_id: "ws-1",
                 session_type: &mut session_type,
                 task_id: &task_id,
@@ -5674,6 +6480,7 @@ mod input_handler_tests {
         macro_rules! st {
             () => {
                 NewTerminalSessionMut {
+                    model: &mut Default::default(),
                     workspace_id: "ws-1",
                     session_type: &mut st,
                     task_id: &None,
@@ -5719,8 +6526,8 @@ mod input_handler_tests {
             handle_new_terminal_session(st!(), ctx_no_repos(), &key(KeyCode::Enter)),
             InputOutcome::Consumed
         ));
-        // Tab wraps over three fields.
-        field = 2;
+        // Tab wraps over four fields (bash shows the Model row as n/a).
+        field = 3;
         handle_new_terminal_session(st!(), ctx_no_repos(), &key(KeyCode::Tab));
         assert_eq!(field, 0);
     }
@@ -5730,8 +6537,8 @@ mod input_handler_tests {
     #[test]
     fn transcript_picker_keys_and_settings_entry() {
         let cands = vec![
-            TranscriptCandidate { id: "id-a".into(), modified: std::time::UNIX_EPOCH, size_bytes: 1, preview: String::new(), bound_to: None },
-            TranscriptCandidate { id: "id-b".into(), modified: std::time::UNIX_EPOCH, size_bytes: 1, preview: String::new(), bound_to: Some(String::new()) },
+            TranscriptCandidate { id: "id-a".into(), modified: std::time::UNIX_EPOCH, size_bytes: 1, preview: String::new(), bound_to: None, rotated_to: None },
+            TranscriptCandidate { id: "id-b".into(), modified: std::time::UNIX_EPOCH, size_bytes: 1, preview: String::new(), bound_to: Some(String::new()), rotated_to: None },
         ];
         let key = |c: KeyCode| CrosstermEvent::Key(KeyEvent::new(c, KeyModifiers::NONE));
         let mut sel = 0usize;
@@ -5761,6 +6568,7 @@ mod input_handler_tests {
         macro_rules! ss {
             () => {
                 SessionSettingsMut {
+                    is_shell: false,
                     ws_index: 3,
                     session_index: 1,
                     name: &mut name,
@@ -6365,6 +7173,30 @@ mod input_handler_tests {
     }
 
     #[test]
+    fn shell_settings_skip_and_refuse_agent_actions() {
+        let (mut name, mut idle, mut burst, mut hidden, mut notify, mut active) = session_settings_state(4);
+        let mut gp = false;
+        let mut color = None;
+        macro_rules! settings {
+            () => { SessionSettingsMut {
+                is_shell: true, ws_index: 0, session_index: 0,
+                name: &mut name, idle_timeout: &mut idle, burst_threshold: &mut burst,
+                hidden: &mut hidden, notify_on_idle: &mut notify,
+                global_perms: &mut gp, color: &mut color, active_field: &mut active,
+            } };
+        }
+        handle_session_settings(settings!(), ctx_no_repos(), &key(KeyCode::Tab));
+        assert_eq!(active, 6, "skip agent permissions");
+        handle_session_settings(settings!(), ctx_no_repos(), &key(KeyCode::Tab));
+        assert_eq!(active, 0, "skip transcript picker");
+        active = 5;
+        assert!(matches!(handle_session_settings(settings!(), ctx_no_repos(), &key(KeyCode::Char(' '))), InputOutcome::Status(_)));
+        assert!(!gp);
+        active = 7;
+        assert!(matches!(handle_session_settings(settings!(), ctx_no_repos(), &key(KeyCode::Enter)), InputOutcome::Status(_)));
+    }
+
+    #[test]
     fn session_settings_tab_cycles_active_field() {
         let (mut name, mut idle, mut burst, mut hidden, mut notify, mut active) =
             session_settings_state(0);
@@ -6372,6 +7204,7 @@ mod input_handler_tests {
             let mut color: Option<String> = None;
         let outcome = handle_session_settings(
             SessionSettingsMut {
+                is_shell: false,
                 ws_index: 1,
                 session_index: 2,
                 name: &mut name,
@@ -6398,6 +7231,7 @@ mod input_handler_tests {
             let mut color: Option<String> = None;
         let outcome = handle_session_settings(
             SessionSettingsMut {
+                is_shell: false,
                 ws_index: 0,
                 session_index: 0,
                 name: &mut name,
@@ -6425,6 +7259,7 @@ mod input_handler_tests {
         hidden = false;
         let outcome = handle_session_settings(
             SessionSettingsMut {
+                is_shell: false,
                 ws_index: 0,
                 session_index: 0,
                 name: &mut name,
@@ -6451,6 +7286,7 @@ mod input_handler_tests {
             let mut color: Option<String> = None;
         let outcome = handle_session_settings(
             SessionSettingsMut {
+                is_shell: false,
                 ws_index: 4,
                 session_index: 9,
                 name: &mut name,
@@ -6489,6 +7325,38 @@ mod input_handler_tests {
         }
     }
 
+    #[test]
+    fn session_settings_zero_burst_uses_global_default() {
+        let (mut name, mut idle, mut burst, mut hidden, mut notify, mut active) =
+            session_settings_state(0);
+        burst = String::new();
+        let mut gp = false;
+        let mut color: Option<String> = None;
+        let outcome = handle_session_settings(
+            SessionSettingsMut {
+                is_shell: false,
+                ws_index: 0,
+                session_index: 0,
+                name: &mut name,
+                idle_timeout: &mut idle,
+                burst_threshold: &mut burst,
+                hidden: &mut hidden,
+                notify_on_idle: &mut notify,
+                global_perms: &mut gp,
+                color: &mut color,
+                active_field: &mut active,
+            },
+            ctx_no_repos(),
+            &key(KeyCode::Enter),
+        );
+        match outcome {
+            InputOutcome::Submit(SubmitAction::SaveSessionSettings { burst_threshold, .. }) => {
+                assert_eq!(burst_threshold, 3);
+            }
+            other => panic!("expected SaveSessionSettings, got {:?}", other),
+        }
+    }
+
     // ── WorkspaceSettings ─────────────────────────────────────────
 
     #[test]
@@ -6503,6 +7371,8 @@ mod input_handler_tests {
                 color: &mut color,
                 pinned: &mut pinned,
                 section: &mut section,
+                tasks: &mut Vec::new(),
+                task_at: &mut 0,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -6524,6 +7394,8 @@ mod input_handler_tests {
                 color: &mut color,
                 pinned: &mut pinned,
                 section: &mut section,
+                tasks: &mut Vec::new(),
+                task_at: &mut 0,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -6545,6 +7417,8 @@ mod input_handler_tests {
                 color: &mut color,
                 pinned: &mut pinned,
                 section: &mut section,
+                tasks: &mut Vec::new(),
+                task_at: &mut 0,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -6579,6 +7453,8 @@ mod input_handler_tests {
                 color: &mut color,
                 pinned: &mut pinned,
                 section: &mut section,
+                tasks: &mut Vec::new(),
+                task_at: &mut 0,
                 active_field: &mut active,
             },
             ctx_no_repos(),
@@ -6738,12 +7614,44 @@ mod input_handler_tests {
         );
     }
 
+    #[test]
+    fn session_settings_follow_their_session_when_the_sidebar_resorts() {
+        // Owner 2026-11-12: recoloring RM-ES2 recolored RM-ES2-473. The form
+        // captured positions at open; a task-feed re-sort moved another
+        // session into them before Enter. The form now re-finds its uid.
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(), api_token: String::new(),
+            gcp_project: String::new(), gcp_zone: String::new(), repos: HashMap::new(),
+        });
+        app.workspaces = vec![
+            ws_fixture("ws-A", &[("uid-A1", "claude"), ("uid-A2", "claude")]),
+            ws_fixture("ws-B", &[("uid-B1", "claude"), ("uid-B2", "claude")]),
+        ];
+        app.cursor = Cursor::Session(0, 1);
+        app.open_session_settings();
+        app.workspaces.swap(0, 1); // the re-sort: (0, 1) is now uid-B2
+        assert!(app.refresh_session_settings_indices());
+        match &app.input_mode {
+            InputMode::SessionSettings { ws_index, session_index, session_uid, .. } => {
+                assert_eq!(session_uid, "uid-A2");
+                assert_eq!((*ws_index, *session_index), (1, 1));
+                assert_eq!(app.workspaces[*ws_index].sessions[*session_index].uid, "uid-A2");
+            }
+            _ => panic!("form closed"),
+        }
+        // The session is gone: the form closes instead of saving elsewhere.
+        app.workspaces[1].sessions.retain(|s| s.uid != "uid-A2");
+        assert!(!app.refresh_session_settings_indices());
+        assert!(matches!(app.input_mode, InputMode::Normal));
+    }
+
     /// Build a `Workspace` with the requested `(uid, session_type)` sessions.
     /// Bash sessions are used (no transcript, no PTY work) so the helper
     /// can synthesize them cheaply for resolver-only tests.
     fn ws_fixture(id: &str, sessions: &[(&str, &str)]) -> Workspace {
         use std::collections::HashMap;
         let mut out = Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: id.to_string(),
@@ -6771,6 +7679,11 @@ mod input_handler_tests {
             )
             .expect("dummy session for fixture");
             out.sessions.push(TerminalSession {
+                org: None,
+                model: None,
+                model_source: None,
+                effort: None,
+                effort_source: None,
                 color: None,
                 uid: (*uid).into(),
                 label: (*uid).into(),
@@ -7393,102 +8306,136 @@ mod input_handler_tests {
         );
     }
 
-    // ── TaskSettings ──────────────────────────────────────────────
+    // ── WorkspaceSettings: the task fields ────────────────────────
+    // The task subheader's form merged into the workspace's (2026-11-05):
+    // fields 4-7 (task name, lead, default models) edit the task the
+    // workspace row stands for.
 
-    #[test]
-    fn task_settings_backspace_pops_name() {
-        let task_id = "task-id-1".to_string();
-        let mut name = "abc".to_string();
-        let (mut color, mut active) = (None::<String>, 0u8);
+    fn task_edit(id: &str, name: &str) -> WorkspaceTaskEdit {
+        WorkspaceTaskEdit {
+            task_id: id.to_string(),
+            name: name.to_string(),
+            orig_name: name.to_string(),
+            lead: None,
+            lead_choices: vec![("owner".into(), "Owner".into()), ("ts-1-0".into(), "agent".into())],
+            lead_pinned: None,
+            models: Default::default(),
+        }
+    }
+
+    fn workspace_form(
+        tasks: &mut Vec<WorkspaceTaskEdit>,
+        task_at: &mut usize,
+        active: &mut u8,
+        keys: &[KeyCode],
+    ) -> InputOutcome {
+        let mut name = "ws".to_string();
+        let (mut color, mut pinned) = (None::<String>, false);
         let mut section: Option<String> = None;
-        let outcome = handle_task_settings(
-            TaskSettingsMut {
-                task_id: task_id.as_str(),
-                workspace_id: "ws-task",
-                name: &mut name,
-                color: &mut color,
-                section: &mut section,
-                active_field: &mut active,
-            },
-            ctx_no_repos(),
-            &key(KeyCode::Backspace),
-        );
-        assert_consumed(&outcome);
-        assert_eq!(name, "ab");
+        let mut outcome = InputOutcome::Consumed;
+        for code in keys {
+            outcome = handle_workspace_settings(
+                WorkspaceSettingsMut {
+                    workspace_id: "ws-task",
+                    name: &mut name,
+                    color: &mut color,
+                    pinned: &mut pinned,
+                    section: &mut section,
+                    tasks: &mut *tasks,
+                    task_at: &mut *task_at,
+                    active_field: &mut *active,
+                },
+                ctx_no_repos(),
+                &key(*code),
+            );
+        }
+        outcome
     }
 
     #[test]
-    fn task_settings_enter_submits_save_task_name() {
-        let task_id = "task-id-1".to_string();
-        let mut name = " new name ".to_string();
-        let (mut color, mut active) = (Some("cyan".to_string()), 0u8);
-        let mut section: Option<String> = None;
-        let outcome = handle_task_settings(
-            TaskSettingsMut {
-                task_id: task_id.as_str(),
-                workspace_id: "ws-task",
-                name: &mut name,
-                color: &mut color,
-                section: &mut section,
-                active_field: &mut active,
-            },
-            ctx_no_repos(),
-            &key(KeyCode::Enter),
+    fn workspace_settings_tab_reaches_the_task_fields_only_with_a_task() {
+        let (mut at, mut active) = (0usize, 3u8);
+        workspace_form(&mut Vec::new(), &mut at, &mut active, &[KeyCode::Tab]);
+        assert_eq!(active, 0, "no task: four fields, wrapping");
+        let mut tasks = vec![task_edit("t1", "one")];
+        let mut active = 3u8;
+        workspace_form(&mut tasks, &mut at, &mut active, &[KeyCode::Tab]);
+        assert_eq!(active, 4, "the task name follows the section");
+        workspace_form(&mut tasks, &mut at, &mut active, &[KeyCode::Tab; 4]);
+        assert_eq!(active, 0, "eight fields, wrapping");
+    }
+
+    #[test]
+    fn workspace_settings_edits_and_saves_the_task_name_and_lead() {
+        let mut tasks = vec![task_edit("t1", "abc")];
+        let (mut at, mut active) = (0usize, 4u8);
+        workspace_form(
+            &mut tasks,
+            &mut at,
+            &mut active,
+            &[KeyCode::Backspace, KeyCode::Char('z'), KeyCode::Tab, KeyCode::Right],
         );
-        match outcome {
-            InputOutcome::Submit(SubmitAction::SaveTaskName { task_id, name, color, .. }) => {
-                assert_eq!(task_id, "task-id-1");
-                assert_eq!(name, "new name");
-                assert_eq!(color.as_deref(), Some("cyan"));
+        assert_eq!(tasks[0].name, "abz");
+        assert_eq!(tasks[0].lead.as_deref(), Some("owner"), "→ from auto: Owner first");
+        match workspace_form(&mut tasks, &mut at, &mut active, &[KeyCode::Enter]) {
+            InputOutcome::Submit(SubmitAction::SaveWorkspaceSettings { tasks, .. }) => {
+                assert_eq!(tasks.len(), 1);
+                assert_eq!(tasks[0].task_id, "t1");
+                assert_eq!(tasks[0].name.as_deref(), Some("abz"));
+                assert_eq!(tasks[0].lead, Some(Some("owner".to_string())));
             }
-            other => panic!("expected SaveTaskName, got {:?}", other),
+            other => panic!("expected SaveWorkspaceSettings, got {:?}", other),
         }
     }
 
     #[test]
-    fn task_settings_space_cycles_color_on_color_field() {
-        let task_id = "task-id-1".to_string();
-        let mut name = "abc".to_string();
-        let (mut color, mut active) = (None::<String>, 1u8);
-        let mut section: Option<String> = None;
-        let outcome = handle_task_settings(
-            TaskSettingsMut {
-                task_id: task_id.as_str(),
-                workspace_id: "ws-task",
-                name: &mut name,
-                color: &mut color,
-                section: &mut section,
-                active_field: &mut active,
-            },
-            ctx_no_repos(),
-            &key(KeyCode::Char(' ')),
-        );
-        assert_consumed(&outcome);
-        // First cycle step lands on the first palette entry; name untouched
-        // (the space must NOT be typed into the name field).
-        assert_eq!(color.as_deref(), Some(theme::USER_COLORS[0].0));
-        assert_eq!(name, "abc");
+    fn workspace_settings_saves_no_task_change_when_nothing_changed() {
+        let mut tasks = vec![task_edit("t1", "abc")];
+        let (mut at, mut active) = (0usize, 0u8);
+        match workspace_form(&mut tasks, &mut at, &mut active, &[KeyCode::Enter]) {
+            InputOutcome::Submit(SubmitAction::SaveWorkspaceSettings { tasks, .. }) => {
+                assert!(tasks.is_empty(), "an untouched task is not saved");
+            }
+            other => panic!("expected SaveWorkspaceSettings, got {:?}", other),
+        }
     }
 
     #[test]
-    fn user_color_cycle_roundtrips_through_none() {
-        // Forward through every palette slot and back to None.
-        let mut cur: Option<String> = None;
-        for (name, _) in theme::USER_COLORS {
-            cur = theme::cycle_user_color(cur.as_deref(), true);
-            assert_eq!(cur.as_deref(), Some(*name));
+    fn workspace_settings_left_right_on_the_task_field_picks_a_co_tenant_task() {
+        let mut tasks = vec![task_edit("t1", "one"), task_edit("t2", "two")];
+        let (mut at, mut active) = (0usize, 4u8);
+        workspace_form(&mut tasks, &mut at, &mut active, &[KeyCode::Right, KeyCode::Char('!')]);
+        assert_eq!(at, 1);
+        assert_eq!((tasks[0].name.as_str(), tasks[1].name.as_str()), ("one", "two!"));
+        workspace_form(&mut tasks, &mut at, &mut active, &[KeyCode::Right]);
+        assert_eq!(at, 0, "wraps");
+        workspace_form(&mut tasks, &mut at, &mut active, &[KeyCode::Left]);
+        assert_eq!(at, 1);
+        match workspace_form(&mut tasks, &mut at, &mut active, &[KeyCode::Enter]) {
+            InputOutcome::Submit(SubmitAction::SaveWorkspaceSettings { tasks, .. }) => {
+                let ids: Vec<&str> = tasks.iter().map(|t| t.task_id.as_str()).collect();
+                assert_eq!(ids, ["t2"], "only the edited task");
+                assert_eq!(tasks[0].name.as_deref(), Some("two!"));
+            }
+            other => panic!("expected SaveWorkspaceSettings, got {:?}", other),
         }
-        cur = theme::cycle_user_color(cur.as_deref(), true);
-        assert_eq!(cur, None);
-        // One step back from None lands on the last palette entry.
-        cur = theme::cycle_user_color(cur.as_deref(), false);
-        assert_eq!(cur.as_deref(), Some(theme::USER_COLORS[theme::USER_COLORS.len() - 1].0));
-        // Unknown stored names behave like None (palette drift recovery).
-        assert_eq!(
-            theme::cycle_user_color(Some("mauve-nonexistent"), true).as_deref(),
-            Some(theme::USER_COLORS[0].0)
-        );
-        assert_eq!(theme::user_color("mauve-nonexistent"), None);
+        // With one task, ←/→ on the name field do nothing.
+        let mut one = vec![task_edit("t1", "one")];
+        let mut at = 0usize;
+        workspace_form(&mut one, &mut at, &mut active, &[KeyCode::Right]);
+        assert_eq!((at, one[0].name.as_str()), (0, "one"));
+    }
+
+    #[test]
+    fn workspace_settings_space_on_color_field_is_left_to_the_grid() {
+        // The App-level color grid opens on this key before the form
+        // handler sees it (`color_grid.rs`); the handler itself must neither
+        // cycle the color nor type the space into a name.
+        let mut tasks = vec![task_edit("t1", "abc")];
+        let (mut at, mut active) = (0usize, 1u8);
+        workspace_form(&mut tasks, &mut at, &mut active, &[KeyCode::Char(' ')]);
+        assert_eq!(tasks[0].name, "abc");
+        assert_eq!(active, 1);
     }
 
     // ── WorkflowLaunchConfirm ─────────────────────────────────────
@@ -7851,6 +8798,26 @@ mod input_handler_tests {
     // ── Confirm ───────────────────────────────────────────────────
 
     #[test]
+    fn background_recovery_requires_explicit_y_and_preserves_identity() {
+        let host = crate::hosts::HostId::new("sessions");
+        let identity = serde_json::json!({"uid":"ts-x","native_id":"exact", "pid":42});
+        let action = ConfirmAction::BackgroundRecovery { uid: "ts-x".into(), host: host.clone(), identity: identity.clone(), prompt: "details".into() };
+        assert_consumed(&handle_confirm(&action, ctx_no_repos(), &key(KeyCode::Enter)));
+        assert_cancel(&handle_confirm(&action, ctx_no_repos(), &key(KeyCode::Esc)));
+        match handle_confirm(&action, ctx_no_repos(), &key(KeyCode::Char('y'))) {
+            InputOutcome::Submit(SubmitAction::BackgroundRecovery { uid, host: got_host, identity: got, .. }) => {
+                assert_eq!(uid, "ts-x");
+                assert_eq!(got_host, host);
+                assert_eq!(got, identity);
+            }
+            other => panic!("expected confirmed recovery, got {other:?}"),
+        }
+        let reconcile = ConfirmAction::ReconcileBackground { uid: "ts-x".into(), host, identity, prompt: "details".into() };
+        assert_consumed(&handle_confirm(&reconcile, ctx_no_repos(), &key(KeyCode::Enter)));
+        assert!(matches!(handle_confirm(&reconcile, ctx_no_repos(), &key(KeyCode::Char('y'))), InputOutcome::Submit(SubmitAction::ReconcileBackground { .. })));
+    }
+
+    #[test]
     fn confirm_y_submits_mark_done() {
         let outcome = handle_confirm(
             &ConfirmAction::MarkDone,
@@ -7911,5 +8878,170 @@ mod input_handler_tests {
             }
             other => panic!("expected StopWorkflow, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod past_workspace_search_tests {
+    //! A-O picker type-to-filter: matcher ranking + key handling.
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn cand(id: &str, fields: &[&str]) -> PastCandidate {
+        PastCandidate {
+            ws_id: id.into(),
+            display: id.into(),
+            worktree_path: None,
+            worktree_exists: None,
+            last_exited_at: 0.0,
+            search_fields: PastCandidate::search_fields_from(fields.iter().copied()),
+            note: None,
+        }
+    }
+
+    /// Newest-first order, as `open_past_workspace_picker` sorts them.
+    fn cands() -> Vec<PastCandidate> {
+        vec![
+            cand("ws-newest", &["Billing-api", "local"]),
+            cand("ws-mid", &["scraper", "/home/x/wt/api-gateway", "sessions"]),
+            cand("ws-old", &["api-docs", "sessions"]),
+            cand("ws-oldest", &["notes", "local"]),
+        ]
+    }
+
+    fn ev(code: KeyCode, mods: KeyModifiers) -> CrosstermEvent {
+        CrosstermEvent::Key(KeyEvent::new(code, mods))
+    }
+
+    fn press(
+        c: &[PastCandidate],
+        q: &mut String,
+        sel: &mut usize,
+        code: KeyCode,
+        mods: KeyModifiers,
+    ) -> InputOutcome {
+        handle_past_workspace_picker(
+            c,
+            q,
+            sel,
+            InputCtx { repo_urls: &[], host_ids: &[], section_ids: &[] },
+            &ev(code, mods),
+        )
+    }
+
+    fn reopened(o: InputOutcome) -> Option<String> {
+        match o {
+            InputOutcome::Submit(SubmitAction::ReopenPastWorkspace { ws_id }) => Some(ws_id),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn empty_query_keeps_everything_newest_first() {
+        assert_eq!(past_workspace_match_indices("", &cands()), vec![0, 1, 2, 3]);
+        assert_eq!(past_workspace_match_indices("   ", &cands()), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn prefix_ranks_first_then_substring_each_newest_first() {
+        // "api": ws-old has a field starting with it (prefix); ws-newest
+        // ("billing-api") and ws-mid (path) only contain it.
+        assert_eq!(past_workspace_match_indices("api", &cands()), vec![2, 0, 1]);
+        // Case-insensitive on both sides; host matches too.
+        assert_eq!(past_workspace_match_indices("SESSIONS", &cands()), vec![1, 2]);
+        assert!(past_workspace_match_indices("zzz", &cands()).is_empty());
+    }
+
+    #[test]
+    fn filter_scales_to_thousands_of_rows() {
+        let many: Vec<PastCandidate> = (0..3000)
+            .map(|i| {
+                let name = format!("workspace-{i}");
+                cand(&format!("ws-{i}"), &[name.as_str(), "sessions"])
+            })
+            .collect();
+        let hits = past_workspace_match_indices("workspace-299", &many);
+        // workspace-299 and workspace-2990..2999, all prefix, in input order.
+        assert_eq!(hits.len(), 11);
+        assert_eq!(hits[0], 299);
+        assert!(hits.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn typing_edits_query_including_letters_that_used_to_be_keys() {
+        let c = cands();
+        let (mut q, mut sel) = (String::new(), 2usize);
+        for ch in ['q', 'j', 'k'] {
+            assert!(matches!(
+                press(&c, &mut q, &mut sel, KeyCode::Char(ch), KeyModifiers::empty()),
+                InputOutcome::Consumed
+            ));
+        }
+        assert_eq!(q, "qjk");
+        assert_eq!(sel, 0, "typing resets the selection");
+        // Shifted chars type too; Alt-chords don't.
+        press(&c, &mut q, &mut sel, KeyCode::Char('X'), KeyModifiers::SHIFT);
+        press(&c, &mut q, &mut sel, KeyCode::Char('z'), KeyModifiers::ALT);
+        assert_eq!(q, "qjkX");
+        press(&c, &mut q, &mut sel, KeyCode::Backspace, KeyModifiers::empty());
+        assert_eq!(q, "qjk");
+    }
+
+    #[test]
+    fn esc_clears_query_first_then_closes() {
+        let c = cands();
+        let (mut q, mut sel) = ("api".to_string(), 1usize);
+        assert!(matches!(
+            press(&c, &mut q, &mut sel, KeyCode::Esc, KeyModifiers::empty()),
+            InputOutcome::Consumed
+        ));
+        assert!(q.is_empty());
+        assert_eq!(sel, 0);
+        assert!(matches!(
+            press(&c, &mut q, &mut sel, KeyCode::Esc, KeyModifiers::empty()),
+            InputOutcome::Cancel
+        ));
+    }
+
+    #[test]
+    fn movement_wraps_within_filtered_view_and_enter_reopens_it() {
+        let c = cands();
+        let (mut q, mut sel) = ("api".to_string(), 0usize); // view: [2, 0, 1]
+        let none = KeyModifiers::empty();
+        press(&c, &mut q, &mut sel, KeyCode::Down, none);
+        assert_eq!(sel, 1);
+        press(&c, &mut q, &mut sel, KeyCode::Char('j'), KeyModifiers::CONTROL);
+        assert_eq!(sel, 2);
+        press(&c, &mut q, &mut sel, KeyCode::Down, none);
+        assert_eq!(sel, 0, "wraps at the filtered length, not the full list");
+        press(&c, &mut q, &mut sel, KeyCode::Up, none);
+        assert_eq!(sel, 2);
+        press(&c, &mut q, &mut sel, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(sel, 1);
+        assert_eq!(q, "api", "Ctrl-j/k move, they don't type");
+        assert_eq!(
+            reopened(press(&c, &mut q, &mut sel, KeyCode::Enter, none)).as_deref(),
+            Some("ws-newest")
+        );
+    }
+
+    #[test]
+    fn enter_with_no_matches_stays_open() {
+        let c = cands();
+        let (mut q, mut sel) = ("zzz".to_string(), 0usize);
+        assert!(matches!(
+            press(&c, &mut q, &mut sel, KeyCode::Enter, KeyModifiers::empty()),
+            InputOutcome::Consumed
+        ));
+    }
+
+    #[test]
+    fn enter_with_empty_query_reopens_newest() {
+        let c = cands();
+        let (mut q, mut sel) = (String::new(), 0usize);
+        assert_eq!(
+            reopened(press(&c, &mut q, &mut sel, KeyCode::Enter, KeyModifiers::empty())).as_deref(),
+            Some("ws-newest")
+        );
     }
 }

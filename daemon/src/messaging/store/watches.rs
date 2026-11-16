@@ -160,11 +160,21 @@ impl Store {
         if !self.visible(actor, cid) {
             return false;
         }
+        if !self.scope_matches_conversation(actor, scope, cid) {
+            return false;
+        }
+        if let Some(root) = &scope.thread {
+            if event["id"] != *root && event["data"]["thread_root"] != *root {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Caller has already established visibility for this conversation.
+    pub(super) fn scope_matches_conversation(&self, actor: &str, scope: &Scope, cid: &str) -> bool {
         if let Some(path) = &scope.channel {
-            let actual = self
-                .channels
-                .iter()
-                .find_map(|(p, id)| (id == cid).then_some(p));
+            let actual = self.channel_path_of(cid);
             if !actual.is_some_and(|actual| {
                 path == "*"
                     || actual == path
@@ -186,11 +196,6 @@ impl Store {
                 return false;
             }
         }
-        if let Some(root) = &scope.thread {
-            if event["id"] != *root && event["data"]["thread_root"] != *root {
-                return false;
-            }
-        }
         true
     }
 
@@ -208,6 +213,7 @@ impl Store {
         clock: DateTime<Utc>,
     ) -> Result<bool> {
         if monitor.state != "active"
+            || !self.task_monitor_current(actor, monitor)
             || actor == "owner" && self.sync_enabled() && !self.is_coordinator()
         {
             return Ok(false);
@@ -224,10 +230,7 @@ impl Store {
         let high = monitor.closing_fence.unwrap_or(self.position);
         let mut changed = high != monitor.scanned || expired;
         let scanned = monitor.scanned;
-        for e in self
-            .events
-            .iter()
-            .filter(|e| e.position > scanned && e.position <= high)
+        for e in self.events_between(scanned,high).iter()
         {
             if self.monitor_matches(actor, monitor, e) {
                 monitor.hits = monitor
@@ -254,28 +257,35 @@ impl Store {
     pub fn advance_monitors_at(&mut self, clock: DateTime<Utc>) -> Result<()> {
         let owners: Vec<_> = self.personal.keys().cloned().collect();
         for actor in owners {
-            let mut state = self.personal_state(&actor);
-            let mut changed = false;
-            for monitor in state.monitors.values_mut() {
-                changed |= self.scan_monitor(&actor, monitor, clock)?;
+            let mut updates = BTreeMap::new();
+            for (id, monitor) in &self.personal[&actor].monitors {
+                if monitor.state != "active" {
+                    continue;
+                }
+                let mut candidate = monitor.clone();
+                if self.scan_monitor(&actor, &mut candidate, clock)? {
+                    updates.insert(id.clone(), candidate);
+                }
             }
-            if changed {
-                self.save_personal(state)?;
+            if !updates.is_empty() {
+                self.save_monitor_updates(&actor, updates)?;
             }
         }
         Ok(())
     }
 
+    fn monitor_unseen_count(&self, actor: &str, m: &Monitor) -> usize {
+        // A hit the reader has already read (an inbox page acknowledged, or a
+        // bulk mark_read_before) is not outstanding, even before the monitor's
+        // own result receipt is acknowledged: the two ack systems used to be
+        // independent, so reading never lowered this count.
+        self.visible_conversations(actor).into_iter()
+            .flat_map(|(cid, _)|self.message_candidates(actor,cid,None,false,true,false))
+            .filter(|e| e.position > m.acknowledged && e.position <= m.hit_high && self.monitor_matches(actor,m,e)).count()
+    }
+
     fn monitor_summary(&self, actor: &str, m: &Monitor) -> Value {
-        let unseen = self
-            .events
-            .iter()
-            .filter(|e| {
-                e.position > m.acknowledged
-                    && e.position <= m.hit_high
-                    && self.monitor_matches(actor, m, e)
-            })
-            .count();
+        let unseen = self.monitor_unseen_count(actor, m);
         let delivery = actor
             .strip_prefix(&format!("agent:{}:", self.daemon_id))
             .map(|uid| super::super::delivery::monitor_status(&self.root, uid, &m.id))
@@ -363,6 +373,13 @@ impl Store {
 
     pub fn monitors(&mut self, actor: &str, p: &Value) -> Result<Value> {
         let action = p["action"].as_str().unwrap_or("list");
+        // Check before receipts, replay, scans or acknowledgment writes. A
+        // task's cached subscription is not proof of current scheduler authority.
+        if let Some(m) = self.personal.get(actor).and_then(|s| s.monitors.get(strv(p, "monitor_id"))) {
+            if action != "cancel_all" && !self.task_monitor_current(actor, m) {
+                return Err(err("stale_binding", "Task subscription authority changed or is busy; retry after reconciliation"));
+            }
+        }
         let mutation = ["ack", "cancel", "cancel_all", "dismiss"].contains(&action);
         let op = if mutation {
             let op = self.personal_request(actor, p, &format!("monitors.{action}"))?;
@@ -380,6 +397,7 @@ impl Store {
                 .monitors
                 .values()
                 .filter(|m| m.state != "dismissed")
+                .filter(|m| self.task_monitor_current(actor, m))
                 .map(|m| self.monitor_summary(actor, m))
                 .collect();
             return self.directory_page(actor, p, items);
@@ -573,13 +591,22 @@ impl Store {
     }
 
     pub fn monitor_status(&self, actor: &str) -> Value {
-        let state = self.personal_state(actor);
-        let summaries: Vec<_> = state
-            .monitors
-            .values()
-            .filter(|m| m.state != "dismissed")
-            .map(|m| self.monitor_summary(actor, m))
-            .collect();
+        let Some(state) = self.personal.get(actor) else {
+            return json!({"recently_expired":[],"active":0,"unacknowledged":0,"badges":0});
+        };
+        // Every chat response needs these counts, not the rich summaries'
+        // delivery receipts (which load the recipient's queue for each watch).
+        let mut active = 0;
+        let mut unacknowledged = 0u64;
+        let mut badges = 0u64;
+        for m in state.monitors.values().filter(|m| m.state != "dismissed" && self.task_monitor_current(actor, m)) {
+            active += usize::from(m.state == "active");
+            let unseen = self.monitor_unseen_count(actor, m) as u64;
+            unacknowledged += unseen;
+            if m.notify != "none" {
+                badges += unseen;
+            }
+        }
         // Expiry is silent by design (no wake); surface recent expiries on
         // every messaging response so an agent can re-arm a lapsed watch.
         let horizon = Utc::now() - chrono::Duration::hours(24);
@@ -587,6 +614,7 @@ impl Store {
             .monitors
             .values()
             .filter(|m| m.state == "expired")
+            .filter(|m| self.task_monitor_current(actor, m))
             .filter_map(|m| {
                 let at = parse_time(m.expires_at.as_deref()?).ok()?;
                 (at >= horizon).then(|| (at, json!({"id":m.id,"scope":m.scope,"mode":m.mode,"expired_at":m.expires_at})))
@@ -594,6 +622,6 @@ impl Store {
             .collect();
         expired.sort_by(|a, b| b.0.cmp(&a.0));
         let recently_expired: Vec<_> = expired.into_iter().take(5).map(|(_, v)| v).collect();
-        json!({"recently_expired":recently_expired,"active":summaries.iter().filter(|m|m["state"] == "active").count(),"unacknowledged":summaries.iter().filter_map(|m|m["unacknowledged"].as_u64()).sum::<u64>(),"badges":summaries.iter().filter(|m|m["notify"] != "none").filter_map(|m|m["unacknowledged"].as_u64()).sum::<u64>()})
+        json!({"recently_expired":recently_expired,"active":active,"unacknowledged":unacknowledged,"badges":badges})
     }
 }

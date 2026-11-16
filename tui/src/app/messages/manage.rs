@@ -335,6 +335,8 @@ impl App {
                 "messaging.follow",
                 json!({"action":"get","scope":scope,"claim_bell":true}),
             );
+        } else if self.messages.target["mentions"] == true {
+            self.messaging_request("mentions_list", json!({}));
         } else {
             self.messaging_request("messaging.read", self.messages.query());
         }
@@ -496,7 +498,7 @@ impl App {
             }
         } else if method == "messaging.monitor" {
             self.messages.mode.clear();
-            self.messages.target = json!({"monitors":true});
+            self.messages.set_target(json!({"monitors":true}));
             self.messages.management.view = "monitors".into();
             self.messages.saved.management.forms.remove("monitor_form");
             self.messages.persist();
@@ -716,7 +718,7 @@ impl App {
             if let Some(p) = self.messages.saved.management.pending.clone() {
                 if p.method == "messaging.norms" {
                     let scope = p.params["scope"].as_str().unwrap_or("global");
-                    self.messages.target = json!({"norms":true,"norms_scope":scope});
+                    self.messages.set_target(json!({"norms":true,"norms_scope":scope}));
                     if let Some(id) = scope.strip_prefix("channel:") {
                         self.messages.target["norms_channel"] = json!(id);
                         self.messages.target["norms_label"] = json!(format!("{} norms", self.messages.conversation_label(&json!(id))));
@@ -801,6 +803,13 @@ impl App {
             self.messages.keep_management_form();
             return true;
         }
+        if matches!(self.messages.mode.as_str(), "norm_preview" | "norm_conflict")
+            && key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd'))
+        {
+            let step = (self.messages.timeline_size.1 / 2).max(1);
+            self.messages.body_scroll = if key.code == KeyCode::Char('u') { self.messages.body_scroll.saturating_sub(step) } else { self.messages.body_scroll.saturating_add(step).min(self.messages.body_max_scroll) };
+            return true;
+        }
         if matches!(
             self.messages.mode.as_str(),
             "norm_preview" | "norm_conflict"
@@ -839,7 +848,7 @@ impl App {
         }
         if key.code == KeyCode::Char('N') {
             if let Some(channel) = self.messages.current_channel().cloned() {
-                self.messages.target = json!({"norms":true,"norms_scope":format!("channel:{}", channel["id"].as_str().unwrap()),"norms_label":format!("#{} norms",channel["path"].as_str().unwrap()),"norms_channel":channel["id"]});
+                self.messages.set_target(json!({"norms":true,"norms_scope":format!("channel:{}", channel["id"].as_str().unwrap()),"norms_label":format!("#{} norms",channel["path"].as_str().unwrap()),"norms_channel":channel["id"]}));
                 self.messages.pane = 1;
                 self.messages.page_cursor = Value::Null;
                 self.messaging_refresh_target();
@@ -847,7 +856,7 @@ impl App {
             }
         }
         if key.code == KeyCode::Char('b') && self.messages.target["norms_channel"].is_string() {
-            self.messages.target = json!({"conversation":self.messages.target["norms_channel"]});
+            self.messages.set_target(json!({"conversation":self.messages.target["norms_channel"]}));
             self.messages.page_cursor = Value::Null;
             self.messaging_refresh_target();
             return true;
@@ -872,7 +881,7 @@ impl App {
         if key.code == KeyCode::Char('f') {
             self.messages.management.paging = false;
             self.messages.management.scope = self.messages.scope_input();
-            self.messages.target = json!({"preferences":true});
+            self.messages.set_target(json!({"preferences":true}));
             self.messages.pane = 1;
             self.messaging_refresh_target();
             return true;
@@ -881,6 +890,19 @@ impl App {
             return false;
         }
         let in_norms = self.messages.target["norms"] == true;
+        if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd')) {
+            let step = (self.messages.timeline_size.1 as usize / 2).max(1);
+            if in_norms && self.messages.management.view != "history" {
+                self.messages.body_scroll = if key.code == KeyCode::Char('u') { self.messages.body_scroll.saturating_sub(step as u16) } else { self.messages.body_scroll.saturating_add(step as u16).min(self.messages.body_max_scroll) };
+            } else {
+                let count = if in_norms { self.messages.management.history.len() }
+                    else if self.messages.target["preferences"] == true { self.messages.management.prefs["rules"].as_array().map_or(0, Vec::len) }
+                    else if self.messages.management.view == "results" { self.messages.management.result["items"].as_array().map_or(0, Vec::len) }
+                    else { self.messages.management.monitors.len() };
+                self.messages.management.selected = if key.code == KeyCode::Char('u') { self.messages.management.selected.saturating_sub(step) } else { self.messages.management.selected.saturating_add(step).min(count.saturating_sub(1)) };
+            }
+            return true;
+        }
         match key.code {
             KeyCode::Char('j') | KeyCode::Down
                 if !in_norms || self.messages.management.view == "history" =>
@@ -984,7 +1006,7 @@ impl App {
                         .get(self.messages.management.selected)
                         .cloned()
                     {
-                        self.messages.target = json!({"conversation":hit["conversation_id"]});
+                        self.messages.set_target(json!({"conversation":hit["conversation_id"]}));
                         self.messages.filter = json!({"thread":hit["id"]});
                         self.messages.page_cursor = Value::Null;
                         self.messaging_refresh_target();
@@ -1110,6 +1132,7 @@ impl App {
         let style = Style::default().fg(theme::CHAT_TEXT).bg(theme::CHAT_PANEL);
         let inner = area.inner(ratatui::layout::Margin::new(1, 1));
         let width = inner.width.max(1) as usize;
+        m.timeline_size = (inner.width, inner.height);
         if m.mode == "norm_edit" {
             let d = m.draft();
             let (lines, row, col) = wrap_draft(&d.body, d.cursor, width);
@@ -1369,6 +1392,8 @@ impl App {
         };
         let lines = wrap_readable(&text, width);
         let max_scroll = lines.len().saturating_sub(inner.height as usize);
+        m.body_max_scroll = max_scroll.min(u16::MAX as usize) as u16;
+        m.body_scroll = m.body_scroll.min(m.body_max_scroll);
         let scroll = if list {
             let marker = lines.iter().position(|l| l.starts_with('›')).unwrap_or(0);
             marker
@@ -1452,6 +1477,7 @@ mod tests {
         assert_eq!(a.messages.draft().body,"Shared convention");
         key(&mut a,KeyCode::Esc,KeyModifiers::NONE);
         a.messages.target = json!({"channel":"work"});
+        a.messages.pane = 0; // In the conversation pane N steps to the previous mention.
         key(&mut a,KeyCode::Char('N'),KeyModifiers::NONE);
         assert_eq!(a.messages.norms_scope(),"channel:cid");
         assert_eq!(a.messages.target_label(),"#work norms");

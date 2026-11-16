@@ -1,0 +1,859 @@
+"""Item write rules (doc/items-board.md §2), exercised without Postgres."""
+
+from __future__ import annotations
+
+import unittest
+from datetime import datetime, timedelta, timezone
+
+from dispatch.items_rules import BoardTx, Item, ItemsError, parse_when
+
+NOW = datetime(2026, 10, 6, 12, 0, tzinfo=timezone.utc)
+
+
+def agent(name, daemon="d1"):
+    return {"pid": f"agent:{daemon}:{name}-uid", "name": name,
+            "session_uid": f"{name}-uid", "daemon_id": daemon}
+
+
+ORCH = agent("orch")
+LANE = agent("lane")
+OTHER = agent("other", daemon="d2")
+OWNER = {"pid": "owner", "name": "Owner"}
+
+
+def board(**over):
+    b = {"id": "b-1", "slug": "sfd", "next_number": 1, "idle_s": 1200, "stale_s": 7200,
+         "unassigned_s": 300, "repush_s": 1800, "escalate_s": 3600, "digest_s": 300}
+    b.update(over)
+    return b
+
+
+class Board:
+    """Carries state across transactions the way items_db reloads it."""
+
+    def __init__(self):
+        self.board = board()
+        self.items: dict[int, Item] = {}
+
+    def tx(self, actor=ORCH, now=NOW) -> BoardTx:
+        return BoardTx(self.board, self.items, actor, now)
+
+    def create(self, *specs, actor=ORCH):
+        tx = self.tx(actor)
+        tx.create([s if isinstance(s, dict) else {"title": s} for s in specs])
+        return tx
+
+    def set(self, ns, actor=ORCH, now=NOW, **fields):
+        tx = self.tx(actor, now)
+        add = fields.pop("add_holders", None)
+        remove = fields.pop("remove_holders", None)
+        reason = fields.pop("reason", None)
+        reopen = fields.pop("reopen", False)
+        expect = fields.pop("expect_status", None)
+        tx.update(ns if isinstance(ns, list) else [ns], fields,
+                  add_holders=add, remove_holders=remove, reason=reason, reopen=reopen,
+                  expect_status=expect)
+        return tx
+
+    def __getitem__(self, n) -> Item:
+        return self.items[n]
+
+
+class NumberingAndDefaults(unittest.TestCase):
+    def test_numbers_are_sequential_and_never_reused(self):
+        b = Board()
+        tx = b.create("a", "b", "c")
+        self.assertEqual(tx.created, [1, 2, 3])
+        self.assertTrue(tx.board_changed)
+        self.assertEqual(b.create("d").created, [4])
+        self.assertEqual(b.board["next_number"], 5)
+
+    def test_default_holder_is_the_caller_and_status_active(self):
+        b = Board()
+        b.create("x", actor=LANE)
+        self.assertEqual([h["pid"] for h in b[1].holders], [LANE["pid"]])
+        self.assertEqual(b[1].status, "active")
+        self.assertEqual(b[1].created_by, LANE["pid"])
+
+    def test_owner_or_empty_holders_make_it_open(self):
+        b = Board()
+        b.create("x", actor=OWNER)
+        b.create({"title": "y", "holders": []})
+        self.assertEqual(b[1].status, "open")
+        self.assertEqual(b[2].status, "open")
+        self.assertEqual(b[2].holders, [])
+
+    def test_holder_none_opens_and_adding_a_holder_activates(self):
+        b = Board()
+        b.create("x")
+        b.set(1, holders=[])
+        self.assertEqual(b[1].status, "open")
+        b.set(1, add_holders=[LANE])
+        self.assertEqual(b[1].status, "active")
+
+    def test_explicit_null_holders_clears(self):
+        b = Board()
+        b.create("x")
+        tx = b.tx()
+        tx.update([1], {"holders": None})
+        self.assertEqual(b[1].holders, [])
+        self.assertEqual(b[1].status, "open")
+
+    def test_last_holder_leaving_blocked_or_waiting_keeps_status(self):
+        b = Board()
+        b.create("a", "b", "c")
+        b.set(2, blocked_by=[1])
+        tx = b.set(2, holders=[])
+        self.assertEqual((b[2].status, b[2].blocked_by), ("blocked", {1}))
+        self.assertTrue(tx.warnings)
+        b.set(3, eta="2h")
+        b.set(3, remove_holders=[ORCH["pid"]])
+        self.assertEqual(b[3].status, "waiting")
+        self.assertIsNotNone(b[3].eta_at)
+
+    def test_out_of_range_blocker_refused(self):
+        b = Board()
+        b.create("a", "b")
+        for bad in ([2**31], [0], [True]):
+            with self.assertRaises(ItemsError) as cm:
+                b.set(2, blocked_by=bad)
+            self.assertEqual(cm.exception.status, 422)
+
+    def test_title_is_required_and_bounded(self):
+        b = Board()
+        with self.assertRaises(ItemsError) as cm:
+            b.create({"title": "   "})
+        self.assertEqual(cm.exception.code, "invalid_field")
+        with self.assertRaises(ItemsError):
+            b.create("x" * 201)
+
+    def test_note_is_one_line(self):
+        b = Board()
+        b.create({"title": "x", "note": "line one\nline two"})
+        self.assertEqual(b[1].note, "line one line two")
+
+    def test_unknown_status_refused(self):
+        b = Board()
+        b.create("x")
+        with self.assertRaises(ItemsError) as cm:
+            b.set(1, status="finished")
+        self.assertEqual(cm.exception.code, "invalid_status")
+        self.assertEqual(cm.exception.status, 422)
+
+    def test_missing_item_is_404(self):
+        with self.assertRaises(ItemsError) as cm:
+            Board().set(9, note="x")
+        self.assertEqual(cm.exception.status, 404)
+
+
+class Blockers(unittest.TestCase):
+    def setUp(self):
+        self.b = Board()
+        self.b.create("a", "b", "c")
+
+    def test_blocked_by_sets_blocked(self):
+        tx = self.b.set(2, blocked_by=[1])
+        self.assertEqual(self.b[2].status, "blocked")
+        self.assertEqual(self.b[2].blocked_by, {1})
+        self.assertIn(2, tx.deps_changed)
+
+    def test_blocker_must_exist_and_be_open(self):
+        for bad in ([9], [2]):
+            with self.assertRaises(ItemsError) as cm:
+                self.b.set(2, blocked_by=bad)
+            self.assertEqual(cm.exception.code, "invalid_blocker")
+        self.b.set(1, status="done")
+        with self.assertRaises(ItemsError) as cm:
+            self.b.set(2, blocked_by=[1])
+        self.assertEqual(cm.exception.code, "invalid_blocker")
+
+    def test_direct_cycle_refused_with_path(self):
+        self.b.set(2, blocked_by=[1])
+        with self.assertRaises(ItemsError) as cm:
+            self.b.set(1, blocked_by=[2])
+        self.assertEqual(cm.exception.status, 409)
+        self.assertEqual(cm.exception.code, "cycle")
+        self.assertEqual(cm.exception.message, "cycle: 1→2→1")
+
+    def test_long_cycle_refused(self):
+        self.b.set(2, blocked_by=[1])
+        self.b.set(3, blocked_by=[2])
+        with self.assertRaises(ItemsError) as cm:
+            self.b.set(1, blocked_by=[3])
+        self.assertEqual(cm.exception.message, "cycle: 1→3→2→1")
+
+    def test_diamond_is_not_a_cycle(self):
+        self.b.create("d")
+        self.b.set(2, blocked_by=[1])
+        self.b.set(3, blocked_by=[1])
+        self.b.set(4, blocked_by=[2, 3])
+        self.assertEqual(self.b[4].blocked_by, {2, 3})
+
+    def test_blocked_by_with_a_non_blocked_status_refused(self):
+        with self.assertRaises(ItemsError):
+            self.b.set(2, blocked_by=[1], status="active")
+
+    def test_leaving_blocked_clears_blockers(self):
+        self.b.set(2, blocked_by=[1])
+        tx = self.b.set(2, status="active")
+        self.assertEqual(self.b[2].blocked_by, set())
+        self.assertIn(2, tx.deps_changed)
+
+    def test_clearing_blocked_by_returns_to_active(self):
+        self.b.set(2, blocked_by=[1])
+        self.b.set(2, blocked_by=[])
+        self.assertEqual(self.b[2].status, "active")
+
+    def test_blocked_on_text_needs_no_item_and_warns_when_bare(self):
+        self.b.set(2, blocked_on="EP GO")
+        self.assertEqual(self.b[2].status, "blocked")
+        tx = self.b.set(3, status="blocked")
+        self.assertTrue(tx.warnings)
+
+
+class DoneAndDropped(unittest.TestCase):
+    def setUp(self):
+        self.b = Board()
+        self.b.create("a")
+        self.b.create({"title": "b", "holders": [LANE]})
+        self.b.set(2, blocked_by=[1])
+
+    def test_done_unblocks_dependent_and_pushes_its_holders(self):
+        later = NOW + timedelta(minutes=5)
+        tx = self.b.set(1, now=later, status="done")
+        dep = self.b[2]
+        self.assertEqual(dep.status, "active")
+        self.assertEqual(dep.blocked_by, set())
+        self.assertEqual(dep.clock_reset_at, later)
+        self.assertEqual(self.b[1].closed_at, later)
+        self.assertEqual(tx.unblocked, [2])
+        self.assertIn(2, tx.deps_changed)
+        self.assertEqual([(p["kind"], p["pid"]) for p in tx.pushes], [("unblocked", LANE["pid"])])
+        self.assertIn("#2", tx.pushes[0]["text"])
+        self.assertIn("unblocked", [e["type"] for e in tx.events])
+
+    def test_done_with_another_blocker_left_stays_blocked(self):
+        self.b.create("c")
+        self.b.set(2, blocked_by=[1, 3])
+        tx = self.b.set(1, status="done")
+        self.assertEqual(self.b[2].status, "blocked")
+        self.assertEqual(self.b[2].blocked_by, {3})
+        self.assertEqual(tx.unblocked, [])
+        self.assertEqual(tx.pushes, [])
+
+    def test_done_does_not_unblock_a_free_text_block(self):
+        self.b.set(2, blocked_by=[1], blocked_on="JP review")
+        self.b.set(1, status="done")
+        self.assertEqual(self.b[2].status, "blocked")
+        self.assertEqual(self.b[2].blocked_by, set())
+
+    def test_done_resolves_own_flags_as_closed(self):
+        tx0 = self.b.tx()
+        tx0.raise_flag(self.b[1], "stale")
+        tx = self.b.set(1, status="done")
+        self.assertEqual(self.b[1].open_flags, {})
+        self.assertEqual(tx.flags_resolved[0]["resolution"], "closed")
+
+    def test_dropped_flags_dependent_and_keeps_edge(self):
+        tx = self.b.set(1, status="dropped", reason="superseded")
+        self.assertEqual(self.b[2].blocked_by, {1})
+        self.assertIn("blocker_dropped", self.b[2].open_flags)
+        self.assertEqual(tx.flags_raised[0]["detail"], {"blockers": [1]})
+        self.assertEqual(self.b[2].status, "blocked")
+
+    def test_second_dropped_blocker_updates_flag_detail(self):
+        self.b.create("c")
+        self.b.set(2, blocked_by=[1, 3])
+        self.b.set(1, status="dropped")
+        tx = self.b.set(3, status="dropped")
+        self.assertEqual(self.b[2].open_flags["blocker_dropped"]["detail"], {"blockers": [1, 3]})
+        self.assertEqual(tx.flags_detail, [{"n": 2, "kind": "blocker_dropped",
+                                            "detail": {"blockers": [1, 3]}}])
+        self.assertEqual(tx.flags_raised, [])
+
+    def test_repointing_clears_blocker_dropped(self):
+        self.b.create("c")
+        self.b.set(1, status="dropped")
+        tx = self.b.set(2, blocked_by=[3])
+        self.assertNotIn("blocker_dropped", self.b[2].open_flags)
+        self.assertEqual(tx.flags_resolved[-1]["resolution"], "cleared")
+
+    def test_reopening_dropped_blocker_clears_flag(self):
+        self.b.set(1, status="dropped")
+        self.b.set(1, status="active")
+        self.assertNotIn("blocker_dropped", self.b[2].open_flags)
+
+    def test_dropped_then_done_unblocks(self):
+        self.b.set(1, status="dropped")
+        self.b.set(1, status="done")
+        self.assertEqual(self.b[2].status, "active")
+        self.assertNotIn("blocker_dropped", self.b[2].open_flags)
+
+    def test_reopen_clears_closed_and_archived(self):
+        self.b.set(1, status="done")
+        self.b[1].archived_at = NOW
+        self.b.set(1, status="active", reopen=True)
+        self.assertIsNone(self.b[1].closed_at)
+        self.assertIsNone(self.b[1].archived_at)
+
+
+class ReopenGuard(unittest.TestCase):
+    """A done item reopens only on purpose (sejd 2026-10-24: #1665, #1643 and
+    #1505 were each a done → blocked write from a stale read or none)."""
+
+    def setUp(self):
+        self.b = Board()
+        self.b.create({"title": "gate", "holders": [LANE]}, {"title": "dep", "holders": [LANE]})
+        self.closed_at = NOW + timedelta(minutes=1)
+        self.b.set(1, actor=LANE, now=self.closed_at, status="done")
+        self.later = NOW + timedelta(minutes=6)
+
+    def refused(self, **fields):
+        with self.assertRaises(ItemsError) as cm:
+            self.b.set(1, actor=OTHER, now=self.later, **fields)
+        self.assertEqual(cm.exception.code, "reopen_required")
+        self.assertEqual(self.b[1].status, "done")
+        return cm.exception.detail()
+
+    def test_the_three_incident_shapes_are_refused_naming_closer_and_time(self):
+        # #1665: a ~5 min old read, blocked with a check-back renewal.
+        detail = self.refused(status="blocked", blocked_on="post-outage renewal",
+                              check_back="2h", reason="post-outage renewal; trigger met")
+        self.assertIn(f"closed by lane at {self.closed_at.isoformat()}", detail["message"])
+        self.assertIn('item_set(1, "blocked", ..., reopen=True)', detail["message"])
+        self.assertEqual((detail["closed_by"], detail["would_be"]), ("lane", "blocked"))
+        # #1643: no read at all, written from someone's chat post.
+        self.refused(status="blocked", blocked_by=[2])
+        # #1505: 5 s after the close.
+        with self.assertRaises(ItemsError):
+            self.b.set(1, actor=ORCH, now=self.closed_at + timedelta(seconds=5),
+                       status="blocked", blocked_on="EP GO", check_back="1h")
+        # Any non-done status counts, dropped included (also via item_resolve).
+        self.refused(status="active")
+        self.refused(status="dropped")
+        with self.assertRaises(ItemsError) as cm:
+            self.b.tx(OTHER, self.later).resolve(1, "drop", reason="stale")
+        self.assertEqual(cm.exception.code, "reopen_required")
+
+    def test_writes_that_keep_it_done_still_work(self):
+        self.b.set(1, actor=OTHER, now=self.later, note="SHA abc123")
+        self.b.set(1, actor=OTHER, now=self.later, status="done", note="re-confirmed")
+        self.assertEqual((self.b[1].status, self.b[1].note), ("done", "re-confirmed"))
+
+    def test_reopen_true_reopens_and_is_recorded(self):
+        tx = self.b.set(1, actor=OTHER, now=self.later, status="blocked", blocked_on="regression",
+                        check_back="1h", reopen=True)
+        self.assertEqual((self.b[1].status, self.b[1].closed_at), ("blocked", None))
+        (ev,) = [e for e in tx.events if e["type"] == "updated"]
+        self.assertEqual(ev["new"]["reopened"], "reopen=true")
+        self.assertEqual(ev["prev"]["status"], "done")
+
+    def test_owner_reopens_without_the_flag(self):
+        tx = self.b.set(1, actor=OWNER, now=self.later, status="active")
+        self.assertEqual(self.b[1].status, "active")
+        (ev,) = [e for e in tx.events if e["type"] == "updated"]
+        self.assertEqual(ev["new"]["reopened"], "owner")
+
+    def test_expect_status_is_a_compare_and_set(self):
+        # Mismatch: read blocked, the item is done now.
+        with self.assertRaises(ItemsError) as cm:
+            self.b.set(1, actor=OTHER, now=self.later, status="blocked", blocked_by=[2],
+                       expect_status="blocked", reopen=True)
+        self.assertEqual((cm.exception.code, cm.exception.detail()["current_status"]),
+                         ("status_changed", "done"))
+        # Match.
+        self.b.set(2, actor=LANE, now=self.later, note="still on it", expect_status="active")
+        self.assertEqual(self.b[2].note, "still on it")
+        with self.assertRaises(ItemsError) as cm:
+            self.b.set(2, actor=LANE, expect_status="later")
+        self.assertEqual(cm.exception.code, "invalid_status")
+
+    def test_a_list_write_is_refused_whole(self):
+        # The database rolls back the whole refused transaction (#2's change
+        # too); test_items_api covers that and the per-item each=True mode.
+        with self.assertRaises(ItemsError) as cm:
+            self.b.set([2, 1], actor=OTHER, now=self.later, status="active", note="bulk")
+        self.assertEqual(cm.exception.code, "reopen_required")
+
+
+class Waiting(unittest.TestCase):
+    def setUp(self):
+        self.b = Board()
+        self.b.create("job")
+
+    def test_waiting_requires_eta(self):
+        with self.assertRaises(ItemsError) as cm:
+            self.b.set(1, status="waiting")
+        self.assertEqual(cm.exception.code, "eta_required")
+
+    def test_eta_implies_waiting_and_stores_times(self):
+        self.b.set(1, eta="40m")
+        it = self.b[1]
+        self.assertEqual(it.status, "waiting")
+        self.assertEqual(it.eta_at, NOW + timedelta(minutes=40))
+        self.assertEqual(it.waiting_set_at, NOW)
+
+    def test_waiting_keeps_eta_on_later_edits_and_clears_on_leaving(self):
+        self.b.set(1, status="waiting", eta="1h30m")
+        self.b.set(1, note="still running")
+        self.assertEqual(self.b[1].status, "waiting")
+        self.b.set(1, status="active")
+        self.assertIsNone(self.b[1].eta_at)
+        self.assertIsNone(self.b[1].waiting_set_at)
+
+    def test_an_active_item_may_carry_an_eta_other_statuses_may_not(self):
+        # 2026-10-20 (Board-Steward): active + eta = working, expected by then.
+        self.b.set(1, status="active", eta="40m")
+        it = self.b[1]
+        self.assertEqual((it.status, it.eta_at), ("active", NOW + timedelta(minutes=40)))
+        self.b.set(1, note="halfway")
+        self.assertEqual(self.b[1].eta_at, NOW + timedelta(minutes=40), "kept on later edits")
+        with self.assertRaises(ItemsError) as cm:
+            self.b.set(1, status="blocked", blocked_on="GPU", eta="1h")
+        self.assertEqual(cm.exception.code, "invalid_field")
+        self.b.set(1, status="blocked", blocked_on="GPU")
+        self.assertIsNone(self.b[1].eta_at, "leaving active clears it")
+        # waiting -> active without a new eta drops the waiting eta.
+        self.b.set(1, status="waiting", eta="1h")
+        self.b.set(1, status="active")
+        self.assertIsNone(self.b[1].eta_at)
+
+    def test_parse_when_forms(self):
+        self.assertEqual(parse_when("2h", NOW, "eta"), NOW + timedelta(hours=2))
+        self.assertEqual(parse_when("1d", NOW, "eta"), NOW + timedelta(days=1))
+        self.assertEqual(parse_when("2026-10-07T00:00:00Z", NOW, "eta"),
+                         datetime(2026, 10, 7, tzinfo=timezone.utc))
+        with self.assertRaises(ItemsError):
+            parse_when("soon", NOW, "eta")
+
+
+class TouchEventsAndPushes(unittest.TestCase):
+    def test_any_members_write_touches_the_item(self):
+        b = Board()
+        b.create({"title": "x", "holders": [LANE]})
+        later = NOW + timedelta(hours=1)
+        b.set(1, actor=ORCH, now=later, group="RL")  # the orchestrator, not the holder
+        self.assertEqual(b[1].touched_at, later)
+        even_later = later + timedelta(hours=1)
+        b.set(1, actor=OTHER, now=even_later, blocked_on="EP GO", check_back="2h")
+        self.assertEqual(b[1].touched_at, even_later)
+
+    def test_update_event_records_only_changed_fields(self):
+        b = Board()
+        b.create("x")
+        tx = b.set(1, note="n", group="g", reason="why")
+        (event,) = tx.events
+        self.assertEqual(event["type"], "updated")
+        gid = b[1].group_id  # the new heading "g" (org model S3: groups are rows)
+        self.assertEqual(event["prev"], {"note": None, "group": None, "group_id": None})
+        self.assertEqual(event["new"], {"note": "n", "group": "g", "group_id": gid})
+        self.assertEqual(event["reason"], "why")
+
+    def test_noop_update_is_a_touch_event(self):
+        b = Board()
+        b.create({"title": "x", "note": "n"})
+        later = NOW + timedelta(minutes=5)
+        tx = b.set(1, now=later, note="n")
+        self.assertEqual([e["type"] for e in tx.events], ["touched"])
+        self.assertEqual(b[1].touched_at, later)
+
+    def test_chat_touch_only_resets_the_clock_of_open_items_the_sender_holds(self):
+        b = Board()
+        b.create({"title": "mine", "holders": [LANE], "note": "keep"}, {"title": "theirs", "holders": [OTHER]},
+                 {"title": "closed", "holders": [LANE]})
+        b.set(3, actor=LANE, status="done")
+        later = NOW + timedelta(hours=3)
+        tx = BoardTx(b.board, b.items, LANE, later)
+        touched, skipped = tx.touch([1, 2, 3, 9], source="chat", message_id="m1", excerpt="x" * 500)
+        self.assertEqual(touched, [1])
+        self.assertEqual({s["n"]: s["reason"] for s in skipped}, {2: "not_holder", 3: "closed", 9: "not_found"})
+        self.assertEqual((b[1].touched_at, b[1].status, b[1].note), (later, "active", "keep"))
+        (event,) = tx.events
+        self.assertEqual(event["type"], "chat_ref")
+        self.assertEqual(event["new"]["message_id"], "m1")
+        self.assertEqual(len(event["new"]["excerpt"]), 200)
+
+    def test_nudge_resolve_touches(self):
+        b = Board()
+        b.create({"title": "x", "holders": [LANE]})
+        later = NOW + timedelta(hours=1)
+        BoardTx(b.board, b.items, ORCH, later).resolve(1, "nudge")
+        self.assertEqual(b[1].touched_at, later)
+
+    def test_assigned_push_only_when_someone_else_adds_you(self):
+        b = Board()
+        tx = b.create({"title": "x", "holders": [LANE, ORCH]})
+        self.assertEqual([p["pid"] for p in tx.pushes], [LANE["pid"]])
+        self.assertEqual(tx.pushes[0]["kind"], "assigned")
+        self.assertEqual(tx.pushes[0]["daemon_id"], "d1")
+        tx = b.set(1, actor=OTHER, add_holders=[OTHER])
+        self.assertEqual(tx.pushes, [])
+
+    def test_no_push_to_a_holder_without_a_session(self):
+        b = Board()
+        tx = b.create({"title": "x", "holders": [{"pid": "owner"}]})
+        self.assertEqual(tx.pushes, [])
+
+    def test_batch_update_applies_to_each(self):
+        b = Board()
+        b.create("a", "b")
+        b.set([1, 2], status="done")
+        self.assertEqual({b[1].status, b[2].status}, {"done"})
+
+
+class BlockedOnOwner(unittest.TestCase):
+    def setUp(self):
+        self.b = Board()
+        self.b.create({"title": "gpu budget", "holders": [LANE]})
+
+    def test_holder_sets_it_naming_the_decision(self):
+        tx = self.b.set(1, actor=LANE, status="blocked_on_owner", blocked_on="approve 8xH100?")
+        it = self.b[1]
+        self.assertEqual((it.status, it.blocked_on), ("blocked_on_owner", "approve 8xH100?"))
+        self.assertEqual(tx.owner_transitions, [(1, True)])
+
+    def test_holder_must_name_the_decision(self):
+        with self.assertRaises(ItemsError) as cm:
+            self.b.set(1, actor=LANE, status="blocked_on_owner")
+        self.assertEqual(cm.exception.code, "decision_required")
+
+    def test_others_cannot_set_it_but_owner_can_without_text(self):
+        with self.assertRaises(ItemsError) as cm:
+            self.b.set(1, actor=OTHER, status="blocked_on_owner", blocked_on="x")
+        self.assertEqual((cm.exception.status, cm.exception.code), (403, "owner_only"))
+        self.b.set(1, actor=OWNER, status="blocked_on_owner")
+        self.assertEqual(self.b[1].status, "blocked_on_owner")
+
+    def test_only_owner_clears_it(self):
+        self.b.set(1, actor=LANE, status="blocked_on_owner", blocked_on="approve?")
+        attempts = [(LANE, {"status": "active"}), (ORCH, {"status": "done"}),
+                    (LANE, {"status": "dropped"}), (ORCH, {"status": "blocked", "blocked_on": "y"})]
+        for actor, fields in attempts:
+            with self.assertRaises(ItemsError) as cm:
+                self.b.set(1, actor=actor, **fields)
+            self.assertEqual(cm.exception.code, "owner_only", fields)
+        # Notes and holders stay editable without clearing it.
+        self.b.set(1, actor=LANE, note="still waiting")
+        self.assertEqual(self.b[1].status, "blocked_on_owner")
+        tx = self.b.set(1, actor=OWNER, status="active")
+        self.assertEqual(self.b[1].status, "active")
+        self.assertIsNone(self.b[1].blocked_on)
+        self.assertEqual(tx.owner_transitions, [(1, False)])
+
+    def test_answer_records_owners_answer_and_resumes(self):
+        self.b.set(1, actor=LANE, status="blocked_on_owner", blocked_on="approve?")
+        tx = self.b.tx(LANE)
+        tx.resolve(1, "answer", message="approved, use 4 not 8")
+        it = self.b[1]
+        self.assertEqual(it.status, "active")
+        self.assertEqual(it.note, "Owner: approved, use 4 not 8")
+        self.assertIn("answer: approved, use 4 not 8", [e["reason"] for e in tx.events])
+        self.assertEqual(tx.owner_transitions, [(1, False)])
+        with self.assertRaises(ItemsError):
+            self.b.tx(LANE).resolve(1, "answer", message="again")
+        with self.assertRaises(ItemsError):
+            self.b.set(1, actor=LANE, status="blocked_on_owner", blocked_on="next?")
+            self.b.tx(LANE).resolve(1, "answer", message="")
+
+    def test_blocked_by_is_not_allowed_with_it(self):
+        self.b.create("other")
+        with self.assertRaises(ItemsError):
+            self.b.set(1, actor=LANE, status="blocked_on_owner", blocked_on="x", blocked_by=[2])
+
+
+class Resolve(unittest.TestCase):
+    def setUp(self):
+        self.b = Board()
+        self.b.create({"title": "x", "holders": [LANE]}, "y")
+        tx = self.b.tx()
+        tx.raise_flag(self.b[1], "holder_idle")
+        tx.raise_flag(self.b[1], "stale")
+
+    def test_nudge_pushes_holder_and_snoozes_by_threshold(self):
+        tx = self.b.tx()
+        resolved = tx.resolve(1, "nudge", kind="holder_idle", message="status?")
+        self.assertEqual(resolved, ["holder_idle"])
+        self.assertEqual(tx.flags_resolved[0]["snooze_until"], NOW + timedelta(seconds=1200))
+        self.assertEqual(tx.pushes[0]["kind"], "nudge")
+        self.assertIn("status?", tx.pushes[0]["text"])
+        self.assertIn("stale", self.b[1].open_flags)
+
+    def test_nudge_without_holder_refused(self):
+        self.b.set(1, holders=[])
+        with self.assertRaises(ItemsError) as cm:
+            self.b.tx().resolve(1, "nudge")
+        self.assertEqual(cm.exception.code, "no_holders")
+
+    def test_reassign_replaces_holders_and_resolves_all(self):
+        tx = self.b.tx()
+        resolved = tx.resolve(1, "reassign", holders=[OTHER])
+        self.assertEqual(sorted(resolved), ["holder_idle", "stale"])
+        self.assertEqual([h["pid"] for h in self.b[1].holders], [OTHER["pid"]])
+        self.assertEqual(tx.pushes[0]["kind"], "assigned")
+
+    def test_block_on_text_needs_check_back(self):
+        with self.assertRaises(ItemsError) as cm:
+            self.b.tx().resolve(1, "block", blocked_on="EP GO")
+        self.assertEqual(cm.exception.code, "check_back_required")
+        self.b.tx().resolve(1, "block", blocked_on="EP GO", check_back="2h")
+        self.assertEqual(self.b[1].status, "blocked")
+        self.assertEqual(self.b[1].check_back_at, NOW + timedelta(hours=2))
+
+    def test_block_by_item(self):
+        self.b.tx().resolve(1, "block", blocked_by=[2])
+        self.assertEqual(self.b[1].blocked_by, {2})
+
+    def test_drop(self):
+        tx = self.b.tx()
+        tx.resolve(1, "drop", reason="Owner ruled no")
+        self.assertEqual(self.b[1].status, "dropped")
+        self.assertEqual(self.b[1].open_flags, {})
+        self.assertEqual({f["resolution"] for f in tx.flags_resolved}, {"drop"})
+
+    def test_launch_is_daemon_side(self):
+        with self.assertRaises(ItemsError):
+            self.b.tx().resolve(1, "launch")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class SuggestedTransitions(unittest.TestCase):
+    """Board-Steward's keyword hints: a suggestion to confirm, never a change."""
+
+    STEWARD = agent("steward", daemon="d3")
+
+    def setUp(self):
+        self.b = Board()
+        self.b.board["steward_pid"] = self.STEWARD["pid"]
+        self.b.create("fuse SEJD", actor=LANE)
+
+    def touch(self, actor=LANE, keyword="DONE", status="done"):
+        tx = self.b.tx(actor)
+        tx.touch([1], source="chat", message_id="m-1", excerpt="#1 DONE",
+                 any_item=actor is not LANE, suggest={"keyword": keyword, "status": status})
+        return tx
+
+    def test_a_keyword_raises_a_quiet_suggestion_and_changes_nothing(self):
+        tx = self.touch()
+        it = self.b[1]
+        self.assertEqual(it.status, "active", "never applied automatically")
+        self.assertEqual(it.open_flags["suggested_transition"]["detail"],
+                         {"to": "done", "keyword": "DONE", "by": "lane", "message_id": "m-1"})
+        # The holder posted it; the steward is the one who hears.
+        self.assertEqual([p["pid"] for p in tx.pushes], [self.STEWARD["pid"]])
+        self.assertIn('item_resolve(1, "apply", to="done")', tx.pushes[0]["text"])
+
+    def test_apply_confirms_and_dismiss_rejects(self):
+        self.touch()
+        tx = self.b.tx(self.STEWARD)
+        with self.assertRaises(ItemsError):
+            tx.resolve(1, "apply")  # must name the target it confirms
+        self.assertEqual(tx.resolve(1, "apply", to="done"), ["suggested_transition"])
+        self.assertEqual(self.b[1].status, "done")
+        b = Board()
+        b.create("x", actor=LANE)
+        b.tx(LANE).touch([1], source="chat", suggest={"keyword": "STOP", "status": "blocked"})
+        b.tx(LANE).resolve(1, "dismiss")
+        self.assertEqual((b[1].status, b[1].open_flags), ("active", {}))
+        with self.assertRaises(ItemsError):
+            b.tx(LANE).resolve(1, "apply", to="blocked")
+
+    def test_any_status_change_settles_it_and_a_matching_status_raises_none(self):
+        self.touch(keyword="STOP", status="blocked")
+        self.b.set(1, actor=LANE, status="waiting", eta="40m")
+        self.assertNotIn("suggested_transition", self.b[1].open_flags)
+        self.b.set(1, actor=LANE, status="blocked", blocked_on="EP GO", check_back="1h")
+        self.touch(keyword="STOP", status="blocked")
+        self.assertNotIn("suggested_transition", self.b[1].open_flags)
+
+    def test_a_non_holder_steward_post_suggests_but_resets_no_clock(self):
+        before = self.b[1].touched_at
+        later = NOW + timedelta(hours=1)
+        tx = BoardTx(self.b.board, self.b.items, self.STEWARD, later)
+        tx.touch([1], source="chat", any_item=True, suggest={"keyword": "GREEN", "status": "done"})
+        self.assertEqual(self.b[1].touched_at, before)
+        self.assertIn("suggested_transition", self.b[1].open_flags)
+        self.assertEqual([p["pid"] for p in tx.pushes], [LANE["pid"]])
+
+
+class SuggestionReview(unittest.TestCase):
+    """Review of 4194a21."""
+
+    STEWARD = agent("steward", daemon="d3")
+
+    def setUp(self):
+        self.b = Board()
+        self.b.board["steward_pid"] = self.STEWARD["pid"]
+        self.b.create("fuse SEJD", actor=LANE)
+
+    def post(self, keyword, status, actor=None):
+        tx = self.b.tx(actor or LANE)
+        tx.touch([1], source="chat", any_item=actor is not None,
+                 suggest={"keyword": keyword, "status": status})
+        return tx
+
+    def test_a_changed_target_is_raised_afresh_and_apply_checks_it(self):
+        self.post("GREEN", "done")
+        tx = self.post("STOP", "blocked")
+        flag = self.b[1].open_flags["suggested_transition"]
+        self.assertEqual(flag["detail"]["to"], "blocked")
+        self.assertEqual([f["resolution"] for f in tx.flags_resolved], ["superseded"])
+        self.assertEqual(len(tx.pushes), 1, "the new target gets its own push")
+        with self.assertRaises(ItemsError) as cm:
+            self.b.tx(self.STEWARD).resolve(1, "apply", to="done")  # what the first push said
+        self.assertEqual(cm.exception.code, "suggestion_changed")
+        self.assertEqual(self.b[1].status, "active")
+        # The same target again refreshes the detail without a second push.
+        again = self.post("STOP", "blocked")
+        self.assertEqual(again.pushes, [])
+
+    def test_a_dismissed_target_stays_quiet_until_status_or_head_moves(self):
+        self.post("DONE", "done")
+        self.b.tx(self.STEWARD).resolve(1, "dismiss")
+        self.post("DONE", "done")
+        self.assertNotIn("suggested_transition", self.b[1].open_flags)
+        self.post("STOP", "blocked")
+        self.assertIn("suggested_transition", self.b[1].open_flags, "another target is news")
+        self.b.tx(self.STEWARD).resolve(1, "dismiss")
+        self.b[1].gate_head = "b" * 40  # a new head
+        self.post("DONE", "done")
+        self.assertIn("suggested_transition", self.b[1].open_flags)
+        self.b.tx(self.STEWARD).resolve(1, "dismiss")
+        self.b.set(1, actor=LANE, status="waiting", eta="1h")  # a status move
+        self.post("DONE", "done")
+        self.assertIn("suggested_transition", self.b[1].open_flags)
+
+    def test_items_blocked_on_owner_get_no_suggestion(self):
+        self.b.set(1, actor=LANE, status="blocked_on_owner", blocked_on="approve 8xH100?")
+        self.post("DONE", "done")
+        self.post("STOP", "blocked", actor=self.STEWARD)
+        self.assertNotIn("suggested_transition", self.b[1].open_flags)
+
+
+class StrictBoard(unittest.TestCase):
+    """backlog_allowed: false (doc/strict-boards.md §2): new non-conforming
+    intent is refused, naming the conforming call; releases are accepted."""
+
+    def setUp(self):
+        self.b = Board()
+        self.b.board.update(backlog_allowed=False, launch_s=900, check_back_max_s=259200)
+        self.b.create({"title": "job", "holders": [LANE]})
+
+    def refused(self, code, fn, *a, **kw):
+        with self.assertRaises(ItemsError) as cm:
+            fn(*a, **kw)
+        self.assertEqual(cm.exception.code, code)
+        return str(cm.exception.detail()["message"])
+
+    def test_waiting_is_refused_with_the_conforming_call(self):
+        msg = self.refused("waiting_not_allowed", self.b.set, 1, actor=LANE,
+                           status="waiting", eta="40m")
+        self.assertIn('item_set(1, "active", eta="40m", job="...")', msg)
+        self.assertIn("blocked_by=[m]", msg)
+        self.assertEqual(self.b[1].status, "active")
+
+    def test_a_bare_eta_keeps_it_active_and_a_job_needs_an_eta(self):
+        self.b.set(1, actor=LANE, eta="40m", job="pins L3 pid 41")
+        self.assertEqual((self.b[1].status, self.b[1].job), ("active", "pins L3 pid 41"))
+        self.assertIsNotNone(self.b[1].eta_at)
+        self.b.create({"title": "other", "holders": [LANE]})
+        msg = self.refused("eta_required", self.b.set, 2, actor=LANE, job="cell C2")
+        self.assertIn('item_set(2, "active", eta="40m", job="cell C2")', msg)
+        # Clearing the eta while the job stays is refused too.
+        self.refused("eta_required", self.b.set, 1, actor=LANE, eta=None)
+
+    def test_job_is_active_only_and_cleared_on_leaving_active(self):
+        self.b.set(1, actor=LANE, eta="40m", job="j")
+        self.b.set(1, actor=LANE, status="done")
+        self.assertIsNone(self.b[1].job)
+        self.b.create({"title": "x", "holders": [LANE]})
+        self.refused("invalid_field", self.b.set, 2, actor=LANE, status="blocked",
+                     blocked_on="EP", check_back="1h", job="j")
+
+    def test_open_and_unheld_new_items_are_refused(self):
+        msg = self.refused("holder_required", self.b.create, {"title": "later", "holders": []})
+        self.assertIn("propose_task", msg)
+        self.assertIn('item_resolve(n, "launch")', msg)
+        self.refused("holder_required", self.b.create, {"title": "x", "status": "active",
+                                                        "holders": []}, actor=LANE)
+        self.refused("holder_required", self.b.set, 1, status="open")
+        # An unheld item blocked on another is allowed: its trigger reaches someone.
+        # (A refused create is rolled back in the database; here it stays in
+        # the dict, so look the new item up by the number it got.)
+        n = self.b.create({"title": "queued", "holders": [], "blocked_by": [1]}).created[0]
+        self.assertEqual((self.b[n].status, self.b[n].holders), ("blocked", []))
+
+    def test_a_holders_own_write_marks_it_launched_and_an_assignment_does_not(self):
+        mine = self.b.create("self-claimed", actor=LANE).created[0]
+        self.assertEqual((self.b[mine].actionable_at, self.b[mine].launched_at), (NOW, NOW))
+        later = NOW + timedelta(minutes=5)
+        n = self.b.create({"title": "for other", "holders": [OTHER]}).created[0]
+        self.assertEqual((self.b[n].actionable_at, self.b[n].launched_at), (NOW, None))
+        self.b.set(n, actor=ORCH, now=later, note="please start")
+        self.assertIsNone(self.b[n].launched_at, "the orchestrator's note is not the holder on it")
+        self.b.set(n, actor=OTHER, now=later, eta="40m", job="bench")
+        self.assertEqual(self.b[n].launched_at, later)
+        tx = self.b.tx(OTHER, NOW + timedelta(minutes=9))
+        tx.touch([n], source="chat")
+        self.assertEqual(self.b[n].launched_at, NOW + timedelta(minutes=9))
+
+    def test_owners_add_is_active_and_unheld_for_the_orchestrator_to_assign(self):
+        for spec in ("plain", {"title": "alt+b a", "status": "open", "holders": []}):
+            tx = self.b.create(spec, actor=OWNER)
+            n = tx.created[0]
+            self.assertEqual((self.b[n].status, self.b[n].holders, self.b[n].actionable_at),
+                             ("active", [], NOW))
+            self.assertTrue(any("unlaunched" in w for w in tx.warnings), tx.warnings)
+        # Only creation: Owner setting an existing item open is still refused.
+        self.refused("holder_required", self.b.set, 1, actor=OWNER, status="open")
+
+    def test_a_handback_is_accepted_and_stays_active_unheld(self):
+        tx = self.b.set(1, actor=LANE, holders=[])
+        self.assertEqual((self.b[1].status, self.b[1].holders), ("active", []))
+        self.assertTrue(any("unlaunched" in w for w in tx.warnings), tx.warnings)
+        self.assertEqual(self.b[1].actionable_at, NOW)
+
+    def test_blocked_needs_a_concrete_trigger(self):
+        msg = self.refused("trigger_required", self.b.set, 1, actor=LANE, status="blocked")
+        self.assertIn("blocked_by=[m]", msg)
+        msg = self.refused("check_back_required", self.b.set, 1, actor=LANE,
+                           status="blocked", blocked_on="EP GO")
+        self.assertIn('check_back="4h"', msg)
+        self.b.set(1, actor=LANE, blocked_on="EP GO", check_back="4h")
+        self.assertEqual(self.b[1].status, "blocked")
+        # Dropping the check-back off a text block is refused as well.
+        self.refused("check_back_required", self.b.set, 1, actor=LANE, check_back=None)
+        msg = self.refused("check_back_too_far", self.b.set, 1, actor=LANE, check_back="4d")
+        self.assertIn("72h", msg)
+
+    def test_an_unblock_leaves_an_unheld_item_active_and_starts_the_clock(self):
+        self.b.create({"title": "next", "holders": [], "blocked_by": [1]})
+        later = NOW + timedelta(hours=1)
+        self.b.set(1, actor=LANE, now=later, status="done")
+        self.assertEqual((self.b[2].status, self.b[2].actionable_at), ("active", later))
+
+    def test_legacy_items_stay_editable_with_a_warning(self):
+        legacy = Item(n=9, title="old", status="waiting", holders=[LANE], touched_at=NOW,
+                      eta_at=NOW + timedelta(hours=1), waiting_set_at=NOW)
+        self.b.items[9] = legacy
+        tx = self.b.set(9, actor=LANE, note="still parked")
+        self.assertEqual(legacy.status, "waiting")
+        self.assertTrue(any("item_set(n, \"active\"" in w for w in tx.warnings), tx.warnings)
+        # A bare eta converts it to the conforming shape.
+        self.b.set(9, actor=LANE, eta="2h", job="bench")
+        self.assertEqual(legacy.status, "active")
+
+    def test_other_boards_keep_todays_contract(self):
+        b = Board()
+        b.create({"title": "x", "holders": [LANE]})
+        b.set(1, actor=LANE, eta="40m")
+        self.assertEqual(b[1].status, "waiting")
+        b.set(1, actor=LANE, status="active", eta=None)
+        b.set(1, actor=ORCH, holders=[])
+        self.assertEqual(b[1].status, "open")
+        b.set(1, actor=ORCH, status="active", holders=[LANE], job="no eta needed here")
+        self.assertEqual(b[1].job, "no eta needed here")
+        b.create({"title": "y", "holders": []})
+        self.assertEqual(b[2].status, "open")

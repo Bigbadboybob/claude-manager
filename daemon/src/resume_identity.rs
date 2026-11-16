@@ -47,15 +47,42 @@ pub struct Record {
     #[serde(default)]
     pub transcript_ids: BTreeSet<String>,
 }
+/// #25: one engine handoff of a CM session (same uid, another engine).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Handoff {
+    pub uid: String,
+    pub from_engine: String,
+    pub from_id: String,
+    pub to_engine: String,
+    pub to_id: String,
+    /// The handoff document the outgoing agent wrote.
+    pub file: String,
+    pub at: f64,
+}
 #[derive(Default, Serialize, Deserialize)]
 pub struct History {
     records: BTreeMap<String, Record>,
     #[serde(default)]
     preferences: BTreeMap<String, Preferences>,
+    /// #24 rotation lineage: superseded transcript id → the id it rotated
+    /// to. CM never writes into Claude's own files, so this is the only
+    /// record that a rotated transcript moved on (the A-s Resume picker
+    /// labels it, `transcript_catalog::rotated_lineage_in`).
+    #[serde(default)]
+    rotated: BTreeMap<String, String>,
+    /// #25 engine handoffs, keyed by the transcript id handed off from.
+    #[serde(default)]
+    handoffs: BTreeMap<String, Handoff>,
     #[serde(skip)]
     loaded: bool,
+    /// Something changed since the file was last read or written. `persist`
+    /// runs on every `save_daemon_sessions`, under the daemon state lock. It
+    /// used to pretty-print the whole history (1 MB, 734 records against 79
+    /// live sessions on cm-sessions, 2026-11-05) just to compare it with the
+    /// last write. Now an unchanged history costs one comparison per live
+    /// record (#109).
     #[serde(skip)]
-    last_saved: String,
+    dirty: bool,
 }
 impl History {
     fn load(&mut self, state: &DaemonState) -> std::io::Result<()> {
@@ -66,9 +93,9 @@ impl History {
             match std::fs::read_to_string(path) {
                 Ok(text) => {
                     *self = serde_json::from_str(&text)?;
-                    self.last_saved = text;
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // The first persist creates the file, as it always did.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.dirty = true,
                 Err(e) => return Err(e),
             }
         }
@@ -86,6 +113,11 @@ impl History {
                 record.entry.transcript_id = old.entry.transcript_id.clone();
                 record.entry.transcript_path = old.entry.transcript_path.clone();
             }
+            // The identity's org object (its member id, doc/org-model.md
+            // §12) outlives a record that was rebuilt without one.
+            if record.entry.org.is_none() {
+                record.entry.org = old.entry.org.clone();
+            }
         }
         if let Some(id) = &record.entry.transcript_id {
             record.transcript_ids.insert(id.clone());
@@ -93,12 +125,22 @@ impl History {
         if let Some(p) = self.preferences.get(&record.entry.uid) {
             p.apply(&mut record.entry);
         }
+        // Compared as JSON values: the types have no PartialEq, and a value
+        // comparison ignores map order. A record that fails to serialize
+        // counts as changed.
+        let same = self.records.get(&record.entry.uid).is_some_and(|old| {
+            matches!((serde_json::to_value(old), serde_json::to_value(&record)), (Ok(a), Ok(b)) if a == b)
+        });
+        self.dirty |= !same;
         self.records.insert(record.entry.uid.clone(), record);
     }
     fn overlay(&self, e: &mut ManifestEntry) {
         if let Some(old) = self.records.get(&e.uid) {
             Preferences::from_entry(&old.entry).apply(e);
             e.generation = e.generation.max(old.entry.generation);
+            if e.org.is_none() {
+                e.org = old.entry.org.clone();
+            }
         }
         if let Some(p) = self.preferences.get(&e.uid) {
             p.apply(e);
@@ -159,10 +201,10 @@ pub fn persist(state: &DaemonState) -> std::io::Result<()> {
     let Some(path) = path(state) else {
         return Ok(());
     };
-    let text = serde_json::to_string_pretty(&*h)?;
-    if h.last_saved != text {
+    if h.dirty {
+        let text = serde_json::to_string_pretty(&*h)?;
         crate::state::write_json_atomic(&path, &text, true)?;
-        h.last_saved = text;
+        h.dirty = false;
     }
     Ok(())
 }
@@ -181,6 +223,7 @@ pub fn save_preferences(state: &DaemonState, preferences: Vec<Preferences>) -> s
                     p.apply(&mut r.entry);
                 }
                 h.preferences.insert(p.uid.clone(), p);
+                h.dirty = true;
             }
         }
     }
@@ -194,6 +237,47 @@ pub fn remember(state: &DaemonState, r: Record) -> std::io::Result<()> {
     h.load(state)?;
     h.remember(r);
     Ok(())
+}
+/// #24: record that transcript `from` rotated to `to`, durably.
+pub fn record_rotation(state: &DaemonState, from: &str, to: &str) -> std::io::Result<()> {
+    {
+        let mut h = state
+            .resume_history
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        h.load(state)?;
+        h.rotated.insert(from.to_string(), to.to_string());
+        h.dirty = true;
+    }
+    persist(state)
+}
+/// #25: record an engine handoff, durably. A session that never bound a
+/// transcript has nothing to label, so it is kept under its uid.
+/// #25: whether a handoff from transcript `from_id` (or, with no
+/// transcript, of `uid`) completed and was recorded.
+pub fn handoff_recorded(state: &DaemonState, uid: &str, from_id: &str) -> bool {
+    let mut hist = state
+        .resume_history
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if hist.load(state).is_err() {
+        return false;
+    }
+    let key = if from_id.is_empty() { format!("uid:{uid}") } else { from_id.to_string() };
+    hist.handoffs.get(&key).is_some_and(|h| h.uid == uid)
+}
+pub fn record_handoff(state: &DaemonState, h: Handoff) -> std::io::Result<()> {
+    {
+        let mut hist = state
+            .resume_history
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        hist.load(state)?;
+        let key = if h.from_id.is_empty() { format!("uid:{}", h.uid) } else { h.from_id.clone() };
+        hist.handoffs.insert(key, h);
+        hist.dirty = true;
+    }
+    persist(state)
 }
 pub fn lookup_uid(state: &DaemonState, uid: &str) -> std::io::Result<Option<Record>> {
     let mut h = state
@@ -318,6 +402,7 @@ pub fn resolve_and_claim(
                 "generation": t.generation, "task_id": t.task_id,
                 "managed_by_uid": t.managed_by_uid, "global_perms": t.global_perms,
                 "workflow_run_id": t.workflow_run_id, "workflow_role": t.workflow_role,
+                "org": t.org,
             }))
             .map_err(|e| (ErrorCode::Internal, e.to_string()))?;
             candidates.insert(
@@ -360,6 +445,9 @@ pub fn resolve_and_claim(
     }
     let record = candidates.into_values().next();
     if let Some(r) = &record {
+        if let Some(reason) = crate::claude_recovery::admission_refusal(&r.entry.uid) {
+            return Err((ErrorCode::Conflict, reason));
+        }
         if s.sessions.contains_key(&r.entry.uid) {
             return Err((
                 ErrorCode::Conflict,
@@ -385,6 +473,9 @@ pub fn resolve_and_claim(
 
 pub fn claim_uid(state: &Arc<Mutex<DaemonState>>, uid: &str) -> Result<Claim, Failure> {
     let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(reason) = crate::claude_recovery::admission_refusal(uid) {
+        return Err((ErrorCode::Conflict, reason));
+    }
     let key = ("uid".into(), uid.to_string());
     if s.sessions.contains_key(uid) || !s.resume_claims.insert(key.clone()) {
         return Err((
@@ -419,6 +510,41 @@ mod tests {
         }
     }
     #[test]
+    fn persist_rewrites_the_archive_only_when_something_changed() {
+        use std::os::unix::fs::MetadataExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = DaemonState::new();
+        s.daemon_sessions_path = Some(tmp.path().join("daemon-sessions.json"));
+        let archive = path(&s).unwrap();
+        let ino = || std::fs::metadata(&archive).unwrap().ino();
+        persist(&s).unwrap();
+        let created = ino();
+        persist(&s).unwrap();
+        assert_eq!(ino(), created, "unchanged history is not rewritten");
+        remember(&s, record("ts-abc-0", "thread-a")).unwrap();
+        persist(&s).unwrap();
+        let first = ino();
+        assert_ne!(first, created);
+        remember(&s, record("ts-abc-0", "thread-a")).unwrap();
+        persist(&s).unwrap();
+        assert_eq!(ino(), first, "an identical record changes nothing");
+        let mut changed = record("ts-abc-0", "thread-a");
+        changed.entry.label = "Renamed".into();
+        remember(&s, changed).unwrap();
+        persist(&s).unwrap();
+        let second = ino();
+        assert_ne!(second, first);
+        record_rotation(&s, "thread-a", "thread-b").unwrap();
+        assert_ne!(ino(), second, "a rotation is written at once");
+        let third = ino();
+        // A restarted daemon reads the file and has nothing new to write.
+        let mut restarted = DaemonState::new();
+        restarted.daemon_sessions_path = s.daemon_sessions_path.clone();
+        persist(&restarted).unwrap();
+        assert_eq!(ino(), third);
+        assert_eq!(lookup_uid(&restarted, "ts-abc-0").unwrap().unwrap().entry.label, "Renamed");
+    }
+    #[test]
     fn resume_identity_survives_closed_rows_tombstone_eviction_and_restart() {
         let tmp = tempfile::tempdir().unwrap();
         let mut s = DaemonState::new();
@@ -440,6 +566,45 @@ mod tests {
         assert_eq!(recovered.worktree_path, original.worktree_path);
         // Messaging ids are daemon-id + this UID; no person is minted on Resume.
         assert_eq!(recovered.entry.uid, "ts-abc-0");
+    }
+    /// #24: rotation lineage is durable and readable by the transcript
+    /// catalog from the archive file alone (the TUI reads it locally).
+    #[test]
+    fn rotation_lineage_persists_for_the_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cm = tmp.path().join(".cm");
+        std::fs::create_dir_all(&cm).unwrap();
+        let mut s = DaemonState::new();
+        s.daemon_sessions_path = Some(cm.join("daemon-sessions.json"));
+        remember(&s, record("ts-abc-0", "old-id")).unwrap();
+        record_rotation(&s, "old-id", "new-id").unwrap();
+        let lineage = crate::transcript_catalog::rotated_lineage_in(tmp.path());
+        assert_eq!(lineage.get("old-id").map(String::as_str), Some("new-id"));
+        // A later persist keeps it.
+        persist(&s).unwrap();
+        assert_eq!(crate::transcript_catalog::rotated_lineage_in(tmp.path()).len(), 1);
+    }
+    /// S0b (doc/org-model.md §12): a resumed identity keeps its org
+    /// object (its member id) across a restart, and a later record rebuilt
+    /// without one does not erase it.
+    #[test]
+    fn resume_identity_keeps_the_org_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = DaemonState::new();
+        s.daemon_sessions_path = Some(tmp.path().join("daemon-sessions.json"));
+        let mut original = record("ts-org-0", "thread-o");
+        original.entry.org = Some(crate::manifest::tests::bridge_org());
+        remember(&s, original.clone()).unwrap();
+        remember(&s, record("ts-org-0", "thread-o")).unwrap();
+        persist(&s).unwrap();
+        let mut restarted = DaemonState::new();
+        restarted.daemon_sessions_path = s.daemon_sessions_path.clone();
+        let state = Arc::new(Mutex::new(restarted));
+        let (_claim, recovered) = resolve_and_claim(&state, "codex", "thread-o").unwrap();
+        let entry = recovered.unwrap().entry;
+        assert_eq!(entry.org, original.entry.org);
+        assert_eq!(entry.org.as_ref().unwrap()["member_id"], "m-7");
+        assert_eq!(entry.generation, 42, "the transcript generation is untouched");
     }
     #[test]
     fn resume_identity_claims_reject_simultaneous_resumes_and_release_on_failure() {

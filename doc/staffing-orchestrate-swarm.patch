@@ -1,0 +1,9 @@
+--- a/orchestrate-swarm/SKILL.md
++++ b/orchestrate-swarm/SKILL.md
+@@ -19,2 +19,4 @@
+-1. Engine: Codex for hard, technical, low-volume work; Claude (with up to
+-   ~6 native subagents) for broader or higher-volume work.
++1. Engine: read `ping().staffing` for Owner's live policy. Omit `type`
++   and pass `work_kind` to `start_session` to use it. Explicit type/model
++   wins, then strong preference, work rule, lean preference, default.
++   Read any returned `staffing_note`; preferences can expire or change.

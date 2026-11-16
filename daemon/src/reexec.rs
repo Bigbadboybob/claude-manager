@@ -988,6 +988,8 @@ pub(crate) fn persist_all_checked(
             }
         }
     }
+    crate::agent_state::save_checked(state)
+        .map_err(|e| anyhow::anyhow!("checked persist of agent state failed: {e}"))?;
     fsync_state_tree(&crate::workflow::run::runs_dir(), "workflow-runs")?;
     fsync_state_tree(
         &crate::continuous::task::tasks_dir(),
@@ -1497,6 +1499,8 @@ pub(crate) fn session_record_for(
                     }
                 }
             }),
+            // doc/org-model.md §12: the org object rides the handoff.
+            org: s.org.clone(),
         })
     }
 }
@@ -2301,14 +2305,23 @@ fn adopted_meta_from_record(
         workspace_id: rec.workspace_id.clone(),
         managed_by_uid: rec.managed_by_uid.clone(),
         task_id: rec.task_id.clone(),
-        transcript_path: rec.transcript_path.clone(),
+        transcript_path: crate::transcript_chain::followed_path(&rec.session_type, rec.transcript_path.as_deref())
+            .or_else(|| rec.transcript_path.clone()),
         memory_cap_soft_bytes: rec.memory_cap_soft_bytes,
         memory_cap_hard_bytes: rec.memory_cap_hard_bytes,
         cgroup_prefix: rec.cgroup_prefix.clone().map(PathBuf::from),
         workflow_run_id: rec.workflow_run_id.clone(),
         workflow_role: rec.workflow_role.clone(),
         continuous_task_id: rec.continuous_task_id.clone(),
+        // The handoff record has no model; `backfill_session_models` (run
+        // right after the handoff) restores it from the durable registry,
+        // else from the transcript.
+        model: None,
+        model_source: None,
+        effort: None,
+        effort_source: None,
         global_perms: rec.global_perms,
+        org: rec.org.clone(),
         generation: rec.generation,
         last_activity_at: cell(rec.last_activity_age_s),
         last_input_at: cell(rec.last_input_age_s),
@@ -2496,6 +2509,7 @@ fn swap_exit_tombstone(
         }
     });
     crate::state::ExitedTombstone {
+        startup_failure: None,
         session_uid: rec.uid.clone(),
         transcript_path: rec.transcript_path.clone(),
         generation: rec.generation,
@@ -2504,6 +2518,13 @@ fn swap_exit_tombstone(
         task_id: rec.task_id.clone(),
         managed_by_uid: rec.managed_by_uid.clone(),
         continuous_task_id: rec.continuous_task_id.clone(),
+        // The handoff record has no model; `backfill_session_models` (run
+        // right after the handoff) restores it from the durable registry,
+        // else from the transcript.
+        model: None,
+        model_source: None,
+        effort: None,
+        effort_source: None,
         label: rec.title.clone(),
         workflow_run_id: rec.workflow_run_id.clone(),
         workflow_role: rec.workflow_role.clone(),
@@ -2518,6 +2539,7 @@ fn swap_exit_tombstone(
         // status was reconstructed (waitid at commit) — never lost.
         incarnation: None,
         status_lost: false,
+        org: rec.org.clone(),
     }
 }
 
@@ -2791,12 +2813,10 @@ fn rehydrate_transaction(
             })?;
         // Seed before any thread exists (the reader starts at commit),
         // so the carried tail precedes the kernel-buffered bytes.
-        if let Some(ring) = rings_dir
-            .as_deref()
-            .and_then(|d| crate::fanout_persist::take_ring(d, &rec.uid))
-        {
-            build.seed_replay(&ring);
-        }
+        // The keyboard mode comes with it (send_key encodes by it).
+        let ring = rings_dir.as_deref().and_then(|d| crate::fanout_persist::take_ring(d, &rec.uid));
+        let keyboard = rings_dir.as_deref().and_then(|d| crate::fanout_persist::take_keyboard(d, &rec.uid));
+        build.seed_adopted(ring.as_deref(), keyboard);
         builds.push((i, build, checkpoint));
     }
     if let Some(d) = rings_dir.as_deref() {
@@ -2884,6 +2904,7 @@ fn rehydrate_transaction(
                 mw.sessions.iter_mut().find(|e| e.uid == rec.uid)
             {
                 entry.last_exit = Some(crate::manifest::LastExit {
+                    killed_by: None,
                     code: status.code,
                     memory_cap_kill: false,
                     kills_file_offset: None,
@@ -3597,6 +3618,7 @@ mod tests {
             pidfd: 31,
             cgroup_prefix: Some("/sys/fs/cgroup/x".into()),
             watcher_checkpoint: None,
+            org: None,
         };
         let meta = adopted_meta_from_record(&rec, anchor, None);
         assert_eq!(meta.title, "my worker");
@@ -3687,6 +3709,7 @@ mod tests {
             pidfd: 41,
             cgroup_prefix: None,
             watcher_checkpoint: None,
+            org: None,
         };
 
         // Report (age 5) is newer than the last input (age 30):
@@ -3710,6 +3733,40 @@ mod tests {
         let tomb = swap_exit_tombstone(&rec, None, 1_700_000_200.0);
         assert_eq!(tomb.reported_done_at, None, "superseded report dropped");
         assert_eq!(tomb.report_reason, None);
+    }
+
+    /// S0b (doc/org-model.md §12): the org object rides the in-place
+    /// handoff unchanged — live session → SessionRecord → wire bytes →
+    /// adopted meta, and onto a swap tombstone — with the transcript
+    /// `generation` (7) and `org.occupancy_generation` (11) kept apart.
+    /// A record from a pre-feature writer (no `org` key) still parses.
+    #[test]
+    fn s0b_org_rides_the_reexec_handoff() {
+        let org = crate::manifest::tests::bridge_org();
+        let mut sp = crate::session::SpawnParams::new("ts-s0b-reexec", "s0b", "/bin/sleep");
+        sp.args = vec!["120".into()];
+        sp.org = Some(org.clone());
+        let mut sess = crate::session::DaemonSession::spawn(sp).expect("spawn");
+        sess.generation = 7;
+        assert_eq!(sess.to_manifest_entry().org.as_ref(), Some(&org));
+
+        let rec = session_record_for("ts-s0b-reexec", &sess, Instant::now()).expect("record");
+        let wire: SessionRecord =
+            serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+        assert_eq!(wire.org.as_ref(), Some(&org));
+        let meta = adopted_meta_from_record(&wire, Instant::now(), None);
+        assert_eq!(meta.org.as_ref(), Some(&org));
+        assert_eq!(meta.generation, 7);
+        assert_eq!(meta.org.as_ref().unwrap()["occupancy_generation"], 11);
+        let tomb = swap_exit_tombstone(&wire, None, 1.0);
+        assert_eq!(tomb.org.as_ref(), Some(&org));
+        assert_eq!(tomb.generation, 7);
+
+        let mut legacy = serde_json::to_value(&rec).unwrap();
+        legacy.as_object_mut().unwrap().remove("org");
+        let legacy: SessionRecord = serde_json::from_value(legacy).expect("pre-feature record");
+        assert!(legacy.org.is_none());
+        assert!(adopted_meta_from_record(&legacy, Instant::now(), None).org.is_none());
     }
 
     // ---------------------------------------------------------------
@@ -4047,6 +4104,7 @@ mod tests {
             pidfd: 51,
             cgroup_prefix: None,
             watcher_checkpoint: None,
+            org: None,
         }
     }
 
@@ -4224,6 +4282,7 @@ mod tests {
             pidfd: 61,
             cgroup_prefix: Some("cm-cap-4d".into()),
             watcher_checkpoint,
+            org: None,
         }
     }
 

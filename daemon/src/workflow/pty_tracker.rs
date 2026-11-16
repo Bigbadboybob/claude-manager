@@ -231,6 +231,58 @@ impl PtyModeTracker {
         self.term.grid().display_iter().map(|cell| cell.c).collect()
     }
 
+    /// Current visible grid as one string per screen row, top to bottom
+    /// (trailing blanks kept). For matches that depend on row order and on
+    /// what is drawn at the bottom of the screen.
+    pub fn visible_lines(&self) -> Vec<String> {
+        use alacritty_terminal::index::{Column, Line};
+        let grid = self.term.grid();
+        (0..grid.screen_lines())
+            .map(|row| {
+                let line = Line(row as i32);
+                (0..grid.columns()).map(|col| grid[line][Column(col)].c).collect()
+            })
+            .collect()
+    }
+
+    /// Codex's empty composer at its input cursor. Accept its observed ghost
+    /// placeholder, never arbitrary text/history that happens to contain `›`.
+    pub(crate) fn codex_recovery_composer_ready(&self) -> bool {
+        use alacritty_terminal::index::Column;
+        let grid = self.term.grid();
+        let cursor = grid.cursor.point;
+        if cursor.line.0 < 0 || cursor.column.0 > 5
+            || !self.term.mode().contains(TermMode::SHOW_CURSOR)
+        { return false; }
+        let row: String = (0..grid.columns()).map(|c| grid[cursor.line][Column(c)].c).collect();
+        matches!(row.trim(), "›" | "› Ask Codex to do anything")
+            && row.chars().take(cursor.column.0).collect::<String>().trim() == "›"
+    }
+
+    /// Only the empty Claude composer is safe for an automatic resume.
+    /// History, selections and partially typed text never authorize input.
+    pub(crate) fn claude_recovery_composer_ready(&self) -> bool {
+        use alacritty_terminal::index::Column;
+        let grid = self.term.grid();
+        let cursor = grid.cursor.point;
+        if cursor.line.0 < 0 || cursor.column.0 > 5
+            || !self.term.mode().contains(TermMode::SHOW_CURSOR) { return false; }
+        let row: String = (0..grid.columns()).map(|c| grid[cursor.line][Column(c)].c).collect();
+        row.trim() == "❯" && row.chars().take(cursor.column.0).collect::<String>().trim() == "❯"
+    }
+
+    /// Positive evidence of text at the Claude composer, not merely an
+    /// unrecognised or incomplete screen.
+    pub(crate) fn claude_recovery_composer_has_draft(&self) -> bool {
+        use alacritty_terminal::index::Column;
+        let grid = self.term.grid();
+        let cursor = grid.cursor.point;
+        if cursor.line.0 < 0 || cursor.column.0 < 2
+            || !self.term.mode().contains(TermMode::SHOW_CURSOR) { return false; }
+        let row: String = (0..grid.columns()).map(|c| grid[cursor.line][Column(c)].c).collect();
+        row.trim_start().strip_prefix('❯').is_some_and(|rest| !rest.trim().is_empty())
+    }
+
     /// Enter encoding for the current mode (see [`enter_bytes_for_mode`]).
     pub fn enter_bytes(&self) -> &'static [u8] {
         enter_bytes_for_mode(self.term_mode())

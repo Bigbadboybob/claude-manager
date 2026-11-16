@@ -46,6 +46,8 @@
 //! This is enforced by code structure: `collect_snapshots` returns
 //! `Vec<TickSnapshot>` only, no guard.
 
+mod snapshots;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -140,6 +142,9 @@ pub enum SkipReason {
     /// Gate ran, idle predicate ran, but the agent isn't idle since
     /// baseline. Most common steady-state skip.
     NotIdle,
+    /// The optional engine gate observed foreground/background work or a
+    /// human wait. Transcript completion cannot override that observation.
+    EngineStateBlocked,
     /// Active role has no static `on_idle` transition and is idle, but
     /// the idle-nudge backstop already fired at this exact assistant-turn
     /// count. Debounced so the async history-append lag window can't
@@ -205,11 +210,8 @@ struct TickSnapshot {
     workflow_name: String,
     active_role: Option<String>,
     paused: bool,
-    /// Cloned `WorkflowRun` for the resolver to read (role_baselines,
-    /// role_plans, goal, history). Cheap clone — `WorkflowRun` is
-    /// small and the poller fires at most one transition per run
-    /// per tick.
-    run: WorkflowRun,
+    /// Share the disk-validated run; histories can be large even when idle.
+    run: Arc<WorkflowRun>,
     /// Worktree path for the run's workspace, if known.
     /// `state.workspaces.get(&run.task_key).worktree_path`. None
     /// during sub-2b-3's async-detector window (R8 from prior
@@ -229,6 +231,7 @@ struct TickSnapshot {
     /// poller). Captured here so the apply phase doesn't re-walk the
     /// session maps under the lock.
     active_session_daemon_owned: bool,
+    engine_state_blocked: bool,
     /// Snapshot of the workflow definition, if loaded. Cloned
     /// because the apply phase may run under a fresh state lock
     /// in [`fire_static_transition`] and we don't want to re-lookup
@@ -291,6 +294,16 @@ pub struct WorkflowPoller {
     /// Phase 3: PTY-quiet window (ms) the delivery drainer requires before
     /// writing a body. Production = 2000; tests set 0 to bypass the gate.
     finalize_quiet_ms: AtomicU64,
+    /// Metadata is refreshed outside the registry lock at every read phase.
+    file_snapshots: Mutex<snapshots::RunSnapshots>,
+    /// The tick's opening refresh. When it found no active run, every later
+    /// phase of the tick reuses it instead of re-checking each run on disk;
+    /// otherwise only the first phase does, and the rest refresh as before.
+    /// cm-sessions holds 361 runs, all Done/Detached, so five refreshes per
+    /// 250 ms tick cost ~14k stat calls/s and 8–19% of a core for no work
+    /// (2026-11-05). A run started or reactivated mid-tick is seen at the
+    /// next tick's opening refresh.
+    tick_runs: Mutex<Option<TickRuns>>,
     /// P-A (criterion #4): per-run hash of the last broadcast snapshot. The
     /// poller reads every run from disk each tick, so broadcasting a fresh
     /// snapshot whenever a run's serialized form changes makes ALL daemon-driven
@@ -338,6 +351,22 @@ pub fn resolve_existing_sid(session_type: &str, transcript_path: &str) -> Option
     }
 }
 
+/// A tick's opening refresh (see `WorkflowPoller::tick_runs`). `quiet`: no
+/// run was active, so the whole tick reuses it; otherwise only the next
+/// read does.
+struct TickRuns {
+    runs: Vec<snapshots::Snapshot>,
+    quiet: bool,
+}
+
+/// Ends a tick (see `WorkflowPoller::tick_runs`).
+struct TickGuard<'a>(&'a Mutex<Option<TickRuns>>);
+impl Drop for TickGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
+
 impl WorkflowPoller {
     /// Construct without starting the loop thread. Tests use this
     /// to drive `poll_once` manually.
@@ -353,6 +382,8 @@ impl WorkflowPoller {
             finalize_trackers: Mutex::new(std::collections::HashMap::new()),
             finalize_gap_ms: AtomicU64::new(crate::workflow::finalize::DEFAULT_ENTER_GAP_MS),
             finalize_quiet_ms: AtomicU64::new(2_000),
+            file_snapshots: Mutex::new(snapshots::RunSnapshots::default()),
+            tick_runs: Mutex::new(None),
             last_broadcast_hashes: Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -432,6 +463,7 @@ impl WorkflowPoller {
         self.shutdown.store(true, Ordering::SeqCst);
         let handle = self.handle.lock().unwrap().take();
         if let Some(h) = handle {
+            h.thread().unpark();
             // Ignore join errors — a panicked poll iteration would
             // have already been caught by `catch_unwind` inside the
             // loop, so a panic at the join boundary would be a bug
@@ -464,6 +496,7 @@ impl WorkflowPoller {
     ///    `workflow_transition` calls — the same handler MCP
     ///    callers use.
     pub fn poll_once(&self) -> Vec<Decision> {
+        let _tick = self.begin_tick();
         // Phase 4 (P1): bridge each daemon-launched participant's detected
         // transcript sid into its run binding's `current_session_id`, so the
         // idle gate has a transcript to read. Must run BEFORE the gate
@@ -478,10 +511,12 @@ impl WorkflowPoller {
         // `resolve_authorized_session` can serve it.
         self.sync_participant_transcript_paths();
 
-        // Phase 1: collect snapshots under the lock. Pure read.
+        // Refresh disk before taking the registry lock, including SID changes
+        // made by the preceding phase. Only join to session state under lock.
+        let runs = self.refresh_runs();
         let snapshots = {
             let s = self.state.lock().unwrap();
-            collect_snapshots(&s)
+            collect_snapshots(&s, &runs)
         }; // lock dropped here — transcript I/O happens lock-free
 
         // Phase 2: evaluate each snapshot lock-free.
@@ -598,19 +633,42 @@ impl WorkflowPoller {
         decisions
     }
 
+    fn refresh_runs(&self) -> Vec<snapshots::Snapshot> {
+        {
+            let mut tick = self.tick_runs.lock().unwrap_or_else(|p| p.into_inner());
+            match tick.take() {
+                Some(TickRuns { runs, quiet: true }) => {
+                    *tick = Some(TickRuns { runs: runs.clone(), quiet: true });
+                    return runs;
+                }
+                Some(TickRuns { runs, quiet: false }) => return runs,
+                None => {}
+            }
+        }
+        self.file_snapshots.lock().unwrap_or_else(|p| p.into_inner())
+            .refresh(&crate::workflow::run::runs_dir())
+    }
+
+    /// Open a tick with one refresh (see `tick_runs`). The guard drops any
+    /// unused result when the tick ends, including by panic.
+    fn begin_tick(&self) -> TickGuard<'_> {
+        *self.tick_runs.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        let runs = self.refresh_runs();
+        let quiet = runs.iter().all(|r| !r.run.is_active());
+        *self.tick_runs.lock().unwrap_or_else(|p| p.into_inner()) = Some(TickRuns { runs, quiet });
+        TickGuard(&self.tick_runs)
+    }
+
     /// Broadcast a state snapshot for every run whose serialized form changed
-    /// since the last broadcast. Single chokepoint: the poller re-reads all
-    /// runs from disk each tick, so this captures BOTH poller-driven advances
+    /// since the last broadcast. Refresh disk metadata here, after all writes
+    /// earlier in this tick, so this captures BOTH poller-driven advances
     /// (transitions, finalization) AND handler-driven mutations
     /// (`workflow_transition` / `workflow_done` writing state.json). Dedup by
     /// hash keeps the steady state quiet — a run that didn't change isn't
     /// re-broadcast. A run that vanished from disk has its hash reaped so a
     /// future re-creation with the same id still broadcasts.
     fn broadcast_changed_snapshots(&self) {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let runs = crate::workflow::run::load_all();
+        let runs = self.refresh_runs();
         let watcher = {
             let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
             s.workflow_event_watcher.clone()
@@ -620,23 +678,15 @@ impl WorkflowPoller {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let mut seen = std::collections::HashSet::new();
-        for run in runs {
+        for snapshot in runs {
+            let run = snapshot.run;
             seen.insert(run.run_id.clone());
-            // Hash the serialized run; serialization is deterministic for an
-            // unchanged on-disk run (the poller doesn't rewrite unchanged runs),
-            // so the hash is stable until a real state change.
-            let serialized = match serde_json::to_string(&run) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            let mut hasher = DefaultHasher::new();
-            serialized.hash(&mut hasher);
-            let h = hasher.finish();
+            let Some(h) = snapshot.broadcast_hash else { continue; };
             if hashes.get(&run.run_id) == Some(&h) {
                 continue; // unchanged — already broadcast
             }
             hashes.insert(run.run_id.clone(), h);
-            watcher.broadcast_snapshot(run);
+            watcher.broadcast_snapshot((*run).clone());
         }
         hashes.retain(|id, _| seen.contains(id));
     }
@@ -662,10 +712,11 @@ impl WorkflowPoller {
     /// `transcript_path` would rebind to the wrong file). Persistent roles never
     /// `/clear`, so their `transcript_path` stays valid for the whole run.
     fn sync_role_session_ids(&self) {
+        let runs = self.refresh_runs();
         let candidates = {
             let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             let mut out = Vec::new();
-            for run in crate::workflow::run::load_all().iter().filter(|r| r.is_active()) {
+            for run in runs.iter().map(|r| &r.run).filter(|r| r.is_active()) {
                 for (role, b) in &run.role_sessions {
                     // Let the fresh-reset RebindPending path own a fresh role's sid.
                     let fresh_in_flight = run
@@ -751,10 +802,10 @@ impl WorkflowPoller {
     /// skipped: its detector still runs at spawn and owns the rollout path.
     /// Idempotent; never overwrites an already-set path.
     fn sync_participant_transcript_paths(&self) {
-        let runs = crate::workflow::run::load_all();
+        let runs = self.refresh_runs();
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let crate::state::DaemonState { sessions, workspaces, .. } = &mut *state;
-        for run in runs.iter().filter(|r| r.is_active()) {
+        for run in runs.iter().map(|r| &r.run).filter(|r| r.is_active()) {
             for b in run.role_sessions.values() {
                 let (Some(sid), Some(uid)) =
                     (b.current_session_id.as_deref(), b.daemon_session_uid.as_deref())
@@ -789,10 +840,10 @@ impl WorkflowPoller {
             role_engines: BTreeMap<String, Engine>,
         }
         // Collect work + resolve session/worktree under the lock (pure read).
+        let runs = self.refresh_runs();
         let work: Vec<Work> = {
             let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            crate::workflow::run::load_all()
-                .into_iter()
+            runs.iter().map(|r| &r.run)
                 // Running AND not paused — NOT `is_active()`, which also
                 // matches Paused. A paused run (e.g. the user typed into the
                 // participant session) must NOT get /clear/body/Enter shoved
@@ -1031,6 +1082,9 @@ impl WorkflowPoller {
                 reason: SkipReason::NoHistoryEntry,
             };
         };
+        if snap.engine_state_blocked {
+            return Decision::Skip { run_id: snap.run_id.clone(), reason: SkipReason::EngineStateBlocked };
+        }
         let fire = crate::workflow::transcript::assistant_turn_completed_since(
             &engine, worktree, sid, baseline,
         );
@@ -1306,27 +1360,54 @@ impl WorkflowPoller {
             let target = Duration::from_micros(tick_micros);
             let elapsed = tick_start.elapsed();
             if elapsed < target {
-                let remaining = target - elapsed;
-                // Sleep in small chunks so shutdown latency is
-                // bounded by ~MIN_TICK_INTERVAL_MICROS rather than
-                // the full tick. This matters for the
-                // `shutdown_latency_bounded` test under a 250ms
-                // production interval — a single `sleep(target)`
-                // would otherwise make T5 require a faster tick to
-                // pass.
-                let chunk = Duration::from_micros(MIN_TICK_INTERVAL_MICROS);
-                let mut left = remaining;
-                while left > Duration::ZERO {
-                    if self.shutdown.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    let sleep_for = if left < chunk { left } else { chunk };
-                    std::thread::sleep(sleep_for);
-                    left = left.saturating_sub(sleep_for);
+                // Park for the rest of the tick; `shutdown` unparks this
+                // thread, so shutdown latency stays short without waking
+                // every millisecond (the old 1ms sleep chunks cost ~1000
+                // wakeups/s, about 1% of a core on an idle host).
+                if park_until_shutdown(&self.shutdown, tick_start + target) {
+                    return;
                 }
             }
         }
     }
+}
+
+/// Park the loop thread until `deadline`, returning early (true) once
+/// `shutdown` is set. Spurious wakeups re-check the flag and park again.
+pub(crate) fn park_until_shutdown(shutdown: &AtomicBool, deadline: Instant) -> bool {
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::park_timeout(deadline - now);
+    }
+}
+
+fn workflow_engine_blocks(state: &DaemonState, run: &WorkflowRun) -> bool {
+    if !state.config.workflow_state_gate {
+        return false;
+    }
+    let session = run
+        .active_role
+        .as_ref()
+        .and_then(|role| run.role_sessions.get(role))
+        .and_then(|binding| binding.daemon_session_uid.as_ref())
+        .and_then(|uid| state.sessions.get(uid));
+    session.is_some_and(|session| {
+        let agent = crate::agent_state::current(session);
+        agent.source.engine_reported()
+            && (agent.detail.confirmed_turn_open == Some(true)
+                || matches!(
+                agent.state,
+                crate::agent_state::State::Working
+                    | crate::agent_state::State::WorkingBackground
+                    | crate::agent_state::State::WaitingOnHuman
+            ))
+    })
 }
 
 /// 10d-2c-2-2-b reviewer-fix: build per-run snapshots from
@@ -1347,27 +1428,23 @@ impl WorkflowPoller {
 ///      poller returns `Skip{NoHistoryEntry}` forever even after
 ///      disk has the entry.
 ///
-/// Both make the daemon poller functionally inert for actual
-/// workflows. Fix: read disk on every `poll_once` via `load_all()`
-/// (which the TUI's controller already uses for the same reason).
-/// The cost is 1 readdir + N `state.json` reads per tick (~250ms
-/// production interval, typically 1-5 active runs); negligible.
-///
-/// Lock contention: `load_all`'s deserialize takes its own
-/// per-file flocks via the file-system layer (state.json.lock).
-/// If a handler-side `modify` is mid-flight, the disk read sees
-/// the pre-modify or post-modify state but never torn — flock
-/// guarantees atomic visibility.
+/// Both make the daemon poller functionally inert for actual workflows.
+/// The caller refreshes a poller-owned file snapshot cache at every phase
+/// boundary. Unchanged files reuse parsed history, while external launches,
+/// history appends and transitions remain visible. Disk discovery/parsing is
+/// outside the registry lock. Supported writers atomically replace state.json;
+/// unlike load_one/modify, load_all never took the per-run flock. Mutation
+/// helpers still reload authoritative state under flock and check preconditions.
 ///
 /// The `state` parameter is still needed for the read-side gate
 /// inputs (`state.sessions`, `state.workspaces`,
 /// `state.workflow_definitions`, `state.tui_sessions`) — those
 /// ARE properly daemon-owned. Only `workflow_runs` was the
 /// non-authoritative cache.
-fn collect_snapshots(state: &DaemonState) -> Vec<TickSnapshot> {
-    let runs = crate::workflow::run::load_all();
+fn collect_snapshots(state: &DaemonState, runs: &[snapshots::Snapshot]) -> Vec<TickSnapshot> {
     runs
         .iter()
+        .map(|snapshot| &snapshot.run)
         .filter(|run| run.is_active())
         .map(|run| {
             // Per-role session_type, derived by walking BOTH
@@ -1396,6 +1473,7 @@ fn collect_snapshots(state: &DaemonState) -> Vec<TickSnapshot> {
             // `resolve_role_session_context` (tag fallbacks) still serve engine
             // + worktree derivation below; only the FIRE gate is uid-based.
             let active_session_daemon_owned = daemon_owns_run(state, run);
+            let engine_state_blocked = workflow_engine_blocks(state, run);
 
             // Worktree resolution via session tags, NOT
             // `run.task_key`. The session bound to this run +
@@ -1439,6 +1517,7 @@ fn collect_snapshots(state: &DaemonState) -> Vec<TickSnapshot> {
                 worktree_path,
                 role_session_types,
                 active_session_daemon_owned,
+                engine_state_blocked,
                 workflow,
             }
         })
@@ -1990,11 +2069,39 @@ mod tests {
         let elapsed = t0.elapsed();
         assert!(
             elapsed < Duration::from_millis(200),
-            "shutdown took {:?} — flag should be checked at sleep-chunk granularity \
-             (~1ms), not full tick boundary; if this regresses, the run_loop's \
-             chunked-sleep got removed",
+            "shutdown took {:?} — shutdown must unpark the loop thread rather \
+             than wait out the tick",
             elapsed,
         );
+    }
+
+    /// The loop parks for the whole tick instead of waking every millisecond,
+    /// so shutdown must unpark it: with a long tick, a missing unpark would
+    /// hold `shutdown` for the full interval.
+    #[test]
+    fn shutdown_unparks_a_long_tick() {
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        let poller = Arc::new(WorkflowPoller::new(state));
+        poller.set_tick_interval_for_test(30_000_000); // 30s
+        poller.start().expect("spawn poller thread under test load");
+        std::thread::sleep(Duration::from_millis(100)); // let it park
+        let t0 = Instant::now();
+        poller.shutdown();
+        assert!(t0.elapsed() < Duration::from_secs(2), "shutdown took {:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn park_until_shutdown_waits_out_the_deadline_or_the_flag() {
+        let flag = AtomicBool::new(false);
+        let t0 = Instant::now();
+        assert!(!park_until_shutdown(&flag, t0 + Duration::from_millis(30)));
+        assert!(t0.elapsed() >= Duration::from_millis(30));
+        std::thread::current().unpark(); // a stray token is not a deadline
+        let t1 = Instant::now();
+        assert!(!park_until_shutdown(&flag, t1 + Duration::from_millis(30)));
+        assert!(t1.elapsed() >= Duration::from_millis(30));
+        flag.store(true, Ordering::SeqCst);
+        assert!(park_until_shutdown(&flag, Instant::now() + Duration::from_secs(30)));
     }
 
     /// T4 part A: `panic_payload_to_string` recovers the message
@@ -2225,6 +2332,7 @@ mod tests {
                     activation_prompt: Some("worker start".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
+                    model: None, effort: None,
                 },
             );
             roles.insert(
@@ -2237,6 +2345,7 @@ mod tests {
                     ),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
+                    model: None, effort: None,
                 },
             );
             s.workflow_definitions.insert(
@@ -2276,8 +2385,82 @@ mod tests {
         // binding so the new uid-based gate fires.
         bind_daemon_uid_to_role("r1", "worker", "ts-worker");
 
-        let poller = WorkflowPoller::new(state);
+        let poller = WorkflowPoller::new(Arc::clone(&state));
         poller.set_disable_apply_for_test(true);
+        // A complete transcript cannot override current engine activity.
+        for status in [crate::agent_state::PresenceStatus::Busy,
+            crate::agent_state::PresenceStatus::Shell, crate::agent_state::PresenceStatus::Waiting] {
+            {
+                let mut st = state.lock().unwrap();
+                st.config.workflow_state_gate = true;
+                let session = &st.sessions["ts-worker"];
+                let mut cell = session.agent_state.lock().unwrap();
+                let now = crate::agent_state::unix_now();
+                cell.inputs.presence = Some(crate::agent_state::PresenceObs {
+                    valid: true, status, observed_at: now, status_updated_at: Some(now), native_session_id: None,
+                    engine_version: None, waiting_for: None, main_turn_open: Some(true),
+                    transcript_error: None, transcript_end: None, transcript_evidence_path: None, wait_resolution: None,
+                });
+            }
+            let blocked = poller.poll_once();
+            assert!(matches!(blocked.as_slice(), [Decision::Skip {
+                reason: SkipReason::EngineStateBlocked, .. }]), "{blocked:?}");
+        }
+        // Unknown without an actual hook keeps the legacy transcript gate.
+        // With a confirmed unresolved hook, end_turn alone cannot advance it.
+        let ended = crate::workflow::history::iso8601_to_ms("2026-10-07T00:00:00Z").unwrap() as f64 / 1000.0;
+        {
+            let mut st = state.lock().unwrap();
+            let session = st.sessions.get_mut("ts-worker").unwrap();
+            session.transcript_path = Some(proj.join("sid-worker.jsonl").to_string_lossy().into_owned());
+            let mut cell = session.agent_state.lock().unwrap();
+            cell.inputs.presence.as_mut().unwrap().valid = false;
+            cell.inputs.latest_start = Some(ended - 2.0);
+            cell.inputs.hooks.stop_at = Some(ended - 100.0);
+        }
+        assert!(matches!(poller.poll_once().as_slice(), [Decision::ActivateStatic { .. }]));
+        state.lock().unwrap().sessions["ts-worker"].agent_state.lock().unwrap().inputs.hooks.prompt_at = Some(ended - 2.0);
+        for (sid, stamp, settled, expected) in [
+            ("sid-worker", "2026-10-07T00:00:00Z", false, false),
+            ("foreign", "2026-10-07T00:00:00Z", true, false),
+            ("sid-worker", "2026-10-06T00:00:00Z", true, false),
+            ("sid-worker", "2026-10-07T00:00:00Z", true, false),
+        ] {
+            let assistant = serde_json::json!({"type":"assistant", "sessionId":"sid-worker", "timestamp":"2026-10-07T00:00:00Z",
+                "message":{"role":"assistant", "stop_reason":"end_turn", "content":[{"type":"text", "text":"done"}]}});
+            let mut transcript = format!("{assistant}\n");
+            if settled {
+                transcript += &format!("{}\n", serde_json::json!({"type":"system", "subtype":"turn_duration", "sessionId":sid, "timestamp":stamp}));
+            }
+            std::fs::write(proj.join("sid-worker.jsonl"), transcript).unwrap();
+            let decisions = poller.poll_once();
+            if expected {
+                assert!(matches!(decisions.as_slice(), [Decision::ActivateStatic { .. }]), "{decisions:?}");
+            } else {
+                assert!(matches!(decisions.as_slice(), [Decision::Skip { reason: SkipReason::EngineStateBlocked, .. }]), "{decisions:?}");
+            }
+        }
+        // Actual production Reader samples restore progress only when process
+        // and native identity validate the timestamped settled boundary.
+        for (native, process_valid, expected) in [
+            ("foreign", true, false), ("sid-worker", false, false), ("sid-worker", true, true),
+        ] {
+            let observed = crate::claude_presence::fixture_observation(&proj.join("sid-worker.jsonl"), native,
+                process_valid, crate::agent_state::unix_now());
+            state.lock().unwrap().sessions["ts-worker"].agent_state.lock().unwrap().inputs.presence = Some(observed);
+            let decisions = poller.poll_once();
+            assert_eq!(matches!(decisions.as_slice(), [Decision::ActivateStatic { .. }]), expected, "{decisions:?}");
+        }
+        std::fs::write(proj.join("sid-worker.jsonl"), serde_json::json!({"type":"assistant", "sessionId":"sid-worker",
+            "timestamp":"2026-10-07T00:00:00Z", "isApiErrorMessage":true, "error":"api_error",
+            "message":{"role":"assistant", "stop_reason":"end_turn", "content":[{"type":"text", "text":"done"}]}}).to_string()).unwrap();
+        let observed = crate::claude_presence::fixture_observation(&proj.join("sid-worker.jsonl"), "sid-worker", true,
+            crate::agent_state::unix_now());
+        state.lock().unwrap().sessions["ts-worker"].agent_state.lock().unwrap().inputs.presence = Some(observed);
+        assert!(matches!(poller.poll_once().as_slice(), [Decision::ActivateStatic { .. }]),
+            "ordinary errored workflow semantics are unchanged once bound evidence resolves Unknown");
+        // Rollout flag off restores the underlying transcript predicate.
+        state.lock().unwrap().config.workflow_state_gate = false;
         let decisions = poller.poll_once();
         assert_eq!(decisions.len(), 1, "expected one decision for r1");
         match &decisions[0] {
@@ -2339,9 +2522,9 @@ mod tests {
             s.workspaces.insert("ws-1".to_string(), ws);
             // All-claude feedback (reviewer fresh) — simplest transcript dir.
             let mut roles = BTreeMap::new();
-            roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
-            roles.insert("reviewer".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Fresh, activation_prompt: Some("review".to_string()), subsequent_activation_prompt: None, needs_mcp: false });
-            roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("manage".to_string()), subsequent_activation_prompt: None, needs_mcp: false });
+            roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+            roles.insert("reviewer".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Fresh, activation_prompt: Some("review".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+            roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("manage".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
             s.base_workflow_definitions.insert("feedback".to_string(), Workflow {
                 name: "feedback".to_string(), description: String::new(), roles,
                 role_order: vec!["worker".into(), "reviewer".into(), "manager".into()],
@@ -2500,19 +2683,19 @@ mod tests {
             let mut roles = BTreeMap::new();
             roles.insert("worker".to_string(), Role {
                 engine: Engine::ClaudeCode, context: Context::Persistent,
-                activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false,
+                activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None, effort: None,
             });
             roles.insert("reviewer".to_string(), Role {
                 engine: Engine::ClaudeCode, context: Context::Fresh,
                 activation_prompt: Some("Review this: {{ roles.worker.last_message }}".to_string()),
-                subsequent_activation_prompt: None, needs_mcp: false,
+                subsequent_activation_prompt: None, needs_mcp: false, model: None, effort: None,
             });
             // Manager exists so the reviewer HAS an on_idle transition — that
             // way the reviewer's inert gate reports NoTranscriptId (sid unbound),
             // not NoOnIdleTransition. Manager itself is never reached in this test.
             roles.insert("manager".to_string(), Role {
                 engine: Engine::ClaudeCode, context: Context::Persistent,
-                activation_prompt: Some("decide".to_string()), subsequent_activation_prompt: None, needs_mcp: false,
+                activation_prompt: Some("decide".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None, effort: None,
             });
             s.workflow_definitions.insert("feedback".to_string(), Workflow {
                 name: "feedback".to_string(), description: String::new(), roles,
@@ -2641,12 +2824,12 @@ mod tests {
             let mut roles = BTreeMap::new();
             roles.insert("worker".to_string(), Role {
                 engine: Engine::ClaudeCode, context: Context::Persistent,
-                activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false,
+                activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None, effort: None,
             });
             roles.insert("reviewer".to_string(), Role {
                 engine: Engine::ClaudeCode, context: Context::Fresh,
                 activation_prompt: Some("review".to_string()),
-                subsequent_activation_prompt: None, needs_mcp: false,
+                subsequent_activation_prompt: None, needs_mcp: false, model: None, effort: None,
             });
             s.workflow_definitions.insert("feedback".to_string(), Workflow {
                 name: "feedback".to_string(), description: String::new(), roles,
@@ -2787,6 +2970,7 @@ mod tests {
                     activation_prompt: Some("manager first".to_string()),
                     subsequent_activation_prompt: Some("decide and CALL the tool".to_string()),
                     needs_mcp: false,
+                    model: None, effort: None,
                 },
             );
             s.workflow_definitions.insert(
@@ -3091,6 +3275,7 @@ mod tests {
                     activation_prompt: Some("w".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
+                    model: None, effort: None,
                 },
             );
             roles.insert(
@@ -3101,6 +3286,7 @@ mod tests {
                     activation_prompt: Some("r".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
+                    model: None, effort: None,
                 },
             );
             s.workflow_definitions.insert(
@@ -3237,6 +3423,7 @@ mod tests {
                     activation_prompt: Some("worker".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
+                    model: None, effort: None,
                 },
             );
             roles.insert(
@@ -3247,6 +3434,7 @@ mod tests {
                     activation_prompt: Some("review".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
+                    model: None, effort: None,
                 },
             );
             // reviewer → worker on_idle so the active role
@@ -3524,6 +3712,138 @@ mod tests {
             }
             WorkflowWatchMsg::Event(_) => panic!("expected Snapshot"),
         }
+    }
+
+    fn with_cache_test_home(test: impl FnOnce(&Path)) {
+        let _guard = crate::test_support::env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        struct RestoreHome(Option<std::ffi::OsString>);
+        impl Drop for RestoreHome {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(home) => std::env::set_var("HOME", home),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+        let _restore = RestoreHome(std::env::var_os("HOME"));
+        std::env::set_var("HOME", tmp.path());
+        test(tmp.path());
+    }
+
+    #[test]
+    fn poller_cache_refreshes_each_phase_outside_state_and_sees_same_tick_writes() {
+        with_cache_test_home(|root| {
+            use crate::workflow::events::WorkflowWatchMsg;
+            let state = make_state_with_one_active_run("cache-phases");
+            let mut session = crate::session::DaemonSession::spawn(
+                crate::session::SpawnParams::new("cache-worker", "cache-test", "/bin/cat")
+            ).unwrap();
+            session.transcript_path = Some(root.join("sid-cache.jsonl").to_string_lossy().into_owned());
+            state.lock().unwrap().sessions.insert("cache-worker".into(), session);
+            crate::workflow::run::modify("cache-phases", |run| {
+                let worker = run.role_sessions.get_mut("worker").unwrap();
+                worker.daemon_session_uid = Some("cache-worker".into());
+                worker.current_session_id = None;
+            }).unwrap();
+            let (rx, _sub) = state.lock().unwrap().workflow_event_watcher.subscribe();
+            let poller = WorkflowPoller::new(state.clone());
+            let phases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = phases.clone();
+            let registry = state.clone();
+            poller.file_snapshots.lock().unwrap().before_refresh = Some(Box::new(move || {
+                assert!(registry.try_lock().is_ok(), "disk refresh must not hold the registry mutex");
+                count.fetch_add(1, Ordering::SeqCst);
+            }));
+            poller.set_pre_apply_hook_for_test(|_| {
+                // Phase one wrote the sid. A transition between snapshot and
+                // apply must then be seen by finalization and broadcasting.
+                crate::workflow::run::modify("cache-phases", |run| {
+                    assert_eq!(run.role_sessions["worker"].current_session_id.as_deref(), Some("sid-cache"));
+                    run.activate_role("reviewer".into(),
+                        crate::workflow::run::TriggerKind::StaticIdle { from_role: "worker".into() }, 0, 0);
+                }).unwrap();
+            });
+            poller.poll_once();
+            assert_eq!(phases.load(Ordering::SeqCst), 5);
+            let cache = poller.file_snapshots.lock().unwrap();
+            assert_eq!((cache.parses, cache.fingerprints), (3, 3), "initial, SID write, transition");
+            match rx.try_recv().unwrap() {
+                WorkflowWatchMsg::Snapshot(run) => {
+                    assert_eq!(run.active_role.as_deref(), Some("reviewer"));
+                    assert_eq!(run.history.len(), 2);
+                    assert_eq!(run.role_sessions["worker"].current_session_id.as_deref(), Some("sid-cache"));
+                }
+                _ => panic!("expected snapshot after same-tick mutations"),
+            }
+        });
+    }
+
+    #[test]
+    fn poller_cache_broadcasts_reactivation_and_recreation_not_formatting_changes() {
+        with_cache_test_home(|_| {
+            use crate::workflow::{events::WorkflowWatchMsg, run::RunStatus};
+            let state = make_state_with_one_active_run("cache-broadcast");
+            crate::workflow::run::modify("cache-broadcast", |run| run.status = RunStatus::Done).unwrap();
+            let (rx, _sub) = state.lock().unwrap().workflow_event_watcher.subscribe();
+            let poller = WorkflowPoller::new(state);
+            assert!(poller.poll_once().is_empty());
+            assert!(matches!(rx.try_recv().unwrap(), WorkflowWatchMsg::Snapshot(_)));
+            assert!(poller.poll_once().is_empty());
+            assert!(rx.try_recv().is_err());
+            assert_eq!(poller.file_snapshots.lock().unwrap().parses, 1);
+            let path = crate::workflow::run::run_dir("cache-broadcast").join("state.json");
+            let terminal = crate::workflow::run::load_one("cache-broadcast").unwrap();
+            std::fs::write(&path, serde_json::to_vec(&terminal).unwrap()).unwrap();
+            poller.poll_once();
+            assert!(rx.try_recv().is_err(), "semantically identical JSON does not broadcast");
+            for terminal_status in [RunStatus::Done, RunStatus::Detached] {
+                crate::workflow::run::modify("cache-broadcast", |run| run.status = terminal_status.clone()).unwrap();
+                poller.poll_once();
+                while rx.try_recv().is_ok() {}
+                let active = crate::workflow::run::modify("cache-broadcast", |run| run.status = RunStatus::Running).unwrap();
+                assert!(!poller.poll_once().is_empty(), "a reactivated terminal run must become visible");
+                match rx.try_recv().unwrap() {
+                    WorkflowWatchMsg::Snapshot(run) => assert_eq!(run.status, RunStatus::Running),
+                    _ => panic!("expected active snapshot"),
+                }
+                std::fs::remove_file(&path).unwrap();
+                assert!(poller.poll_once().is_empty());
+                assert!(poller.last_broadcast_hashes.lock().unwrap().is_empty());
+                crate::workflow::run::save(&active).unwrap();
+                assert!(!poller.poll_once().is_empty());
+                assert!(matches!(rx.try_recv().unwrap(), WorkflowWatchMsg::Snapshot(_)),
+                    "recreation broadcasts even with the same semantic hash");
+            }
+        });
+    }
+
+    #[test]
+    fn poller_quiet_tick_reads_the_runs_once_and_still_sees_reactivation() {
+        with_cache_test_home(|_| {
+            use crate::workflow::run::RunStatus;
+            let state = make_state_with_one_active_run("quiet-tick");
+            crate::workflow::run::modify("quiet-tick", |run| run.status = RunStatus::Done).unwrap();
+            let poller = WorkflowPoller::new(state);
+            let refreshes = || poller.file_snapshots.lock().unwrap().refreshes;
+            assert!(poller.poll_once().is_empty());
+            assert_eq!(refreshes(), 1, "a tick with only terminal runs refreshes once");
+            assert!(poller.poll_once().is_empty());
+            assert_eq!(refreshes(), 2);
+            assert!(poller.tick_runs.lock().unwrap().is_none(), "nothing outlives the tick");
+
+            crate::workflow::run::modify("quiet-tick", |run| run.status = RunStatus::Running).unwrap();
+            let before = refreshes();
+            assert!(!poller.poll_once().is_empty(), "the next tick sees the reactivated run");
+            // Live work: the opening refresh serves the first phase and the
+            // others re-check disk, as each phase did before.
+            assert_eq!(refreshes() - before, 5);
+
+            crate::workflow::run::modify("quiet-tick", |run| run.status = RunStatus::Detached).unwrap();
+            let before = refreshes();
+            assert!(poller.poll_once().is_empty());
+            assert_eq!(refreshes() - before, 1);
+        });
     }
 
     /// Phase 4 acceptance #3 — the RESTART-RESUME leg. After a mid-run daemon
@@ -3884,6 +4204,7 @@ to = "reviewer"
                     activation_prompt: Some("worker prompt".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
+                    model: None, effort: None,
                 },
             );
             roles.insert(
@@ -3894,6 +4215,7 @@ to = "reviewer"
                     activation_prompt: Some("review".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
+                    model: None, effort: None,
                 },
             );
             s.workflow_definitions.insert(
@@ -4036,6 +4358,7 @@ to = "reviewer"
                 activation_prompt: Some(p.to_string()),
                 subsequent_activation_prompt: None,
                 needs_mcp: false,
+                model: None, effort: None,
             };
             let mut roles = BTreeMap::new();
             roles.insert("worker".to_string(), make_role("w"));
@@ -4168,6 +4491,7 @@ to = "reviewer"
                 activation_prompt: Some(p.to_string()),
                 subsequent_activation_prompt: None,
                 needs_mcp: false,
+                model: None, effort: None,
             };
             let mut roles = BTreeMap::new();
             roles.insert("worker".to_string(), make_role("w"));
@@ -4317,6 +4641,7 @@ to = "reviewer"
                 activation_prompt: Some(prompt.to_string()),
                 subsequent_activation_prompt: None,
                 needs_mcp: false,
+                model: None, effort: None,
             };
             let mut old_roles = BTreeMap::new();
             old_roles.insert("worker".to_string(), make_role("w"));
@@ -4372,6 +4697,7 @@ to = "reviewer"
                 activation_prompt: Some(prompt.to_string()),
                 subsequent_activation_prompt: None,
                 needs_mcp: false,
+                model: None, effort: None,
             };
             let mut new_roles = BTreeMap::new();
             new_roles.insert("worker".to_string(), make_role("w"));
@@ -4468,6 +4794,7 @@ to = "reviewer"
                 activation_prompt: Some(prompt.to_string()),
                 subsequent_activation_prompt: None,
                 needs_mcp: false,
+                model: None, effort: None,
             };
             let mut roles = BTreeMap::new();
             roles.insert("worker".to_string(), make_role("w"));
@@ -4514,6 +4841,7 @@ to = "reviewer"
                 activation_prompt: Some(prompt.to_string()),
                 subsequent_activation_prompt: None,
                 needs_mcp: false,
+                model: None, effort: None,
             };
             let mut roles = BTreeMap::new();
             roles.insert("worker".to_string(), make_role("w"));
@@ -4584,6 +4912,7 @@ to = "reviewer"
                     activation_prompt: Some("ignored".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
+                    model: None, effort: None,
                 },
             );
             // Reviewer has NO activation_prompt — daemon must
@@ -4596,6 +4925,7 @@ to = "reviewer"
                     activation_prompt: None,
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
+                    model: None, effort: None,
                 },
             );
             s.workflow_definitions.insert(
@@ -4772,6 +5102,7 @@ to = "reviewer"
                     activation_prompt: Some("w".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
+                    model: None, effort: None,
                 },
             );
             roles.insert(
@@ -4782,6 +5113,7 @@ to = "reviewer"
                     activation_prompt: Some("r".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
+                    model: None, effort: None,
                 },
             );
             s.workflow_definitions.insert(
@@ -4901,6 +5233,7 @@ to = "reviewer"
                     activation_prompt: Some(r.to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
+                    model: None, effort: None,
                 });
             }
             s.workflow_definitions.insert("feedback".to_string(), Workflow {
@@ -5028,6 +5361,7 @@ to = "reviewer"
                     activation_prompt: Some(r.to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
+                    model: None, effort: None,
                 });
             }
             s.workflow_definitions.insert("feedback".to_string(), Workflow {
@@ -5164,6 +5498,7 @@ to = "reviewer"
                     activation_prompt: Some(r.to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
+                    model: None, effort: None,
                 });
             }
             s.workflow_definitions.insert("feedback".to_string(), Workflow {
@@ -5317,6 +5652,7 @@ to = "reviewer"
                     activation_prompt: Some("w".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
+                    model: None, effort: None,
                 },
             );
             roles.insert(
@@ -5327,6 +5663,7 @@ to = "reviewer"
                     activation_prompt: Some("r".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
+                    model: None, effort: None,
                 },
             );
             s.workflow_definitions.insert(

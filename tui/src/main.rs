@@ -32,6 +32,7 @@ mod terminal_widget;
 #[cfg(test)]
 mod test_support;
 mod theme;
+mod task_picker;
 mod tls_dialer;
 mod workflow;
 mod workflow_watch;
@@ -48,6 +49,7 @@ use crossterm::event::{
     PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
     EnableBracketedPaste, DisableBracketedPaste,
     EnableMouseCapture, DisableMouseCapture,
+    EnableFocusChange, DisableFocusChange,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -165,6 +167,9 @@ fn main() -> anyhow::Result<()> {
         EnterAlternateScreen,
         EnableBracketedPaste,
         EnableMouseCapture,
+        // Focus reports let background polls (the org model) pause while
+        // the viewer's terminal is in the background.
+        EnableFocusChange,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         )
@@ -210,6 +215,7 @@ fn main() -> anyhow::Result<()> {
         PopKeyboardEnhancementFlags,
         DisableBracketedPaste,
         DisableMouseCapture,
+        DisableFocusChange,
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
@@ -383,6 +389,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         let t = Instant::now();
         app.drain_plan_launches();
         app.drain_remote_creates();
+        app.drain_restarts();
+        app.drain_background();
+        app.drain_fork_flights();
         app.drain_image_pastes();
         app.drain_attach_results();
         log_slow_phase("drain_attach_results", t.elapsed());
@@ -394,6 +403,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         let t = Instant::now();
         app.maybe_adopt_daemon_sessions();
         log_slow_phase("maybe_adopt_daemon_sessions", t.elapsed());
+        // Close workspaces whose last agent went, once their bash panes
+        // answered (`check_and_close_workspace`).
+        app.drain_last_agent_closes();
+        app.maybe_offer_bash_only_sweep();
 
         // 11d: drain WorkflowWatchEvent frames from the
         // events.subscribe consumer. Same shape as the
@@ -415,6 +428,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         // only on an actual bucket change.
         app.tick_idle_ages();
         app.messaging_tick();
+        app.availability_tick();
+        app.staffing_tick();
+        app.board_tick();
+        app.orgchart_tick();
+        app.org_tick();
+        app.roster_tick();
+        app.place_tick();
+        app.owner_blocked_tick();
+        app.maintenance_tick();
+        app.unread_tick();
 
         // Kitty graphics passthrough: answer pane queries and send image
         // bytes. Runs every tick (replies must not wait for a redraw), and

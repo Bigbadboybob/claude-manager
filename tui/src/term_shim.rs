@@ -109,6 +109,13 @@ const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 /// at build time so a drift is impossible to miss.
 pub(crate) const MAX_INPUT_FRAME_BYTES: usize = 64 * 1024;
 
+/// One frame off an attach stream: JSON, or a raw data frame (output bytes
+/// as-is, sent when the attach asked for `binary`).
+enum Frame {
+    Json(StreamFrame),
+    Raw(Vec<u8>),
+}
+
 /// Reader FSM state. Persists across `next_frame` calls so a
 /// `WouldBlock` partway through a frame doesn't lose bytes.
 enum ReadState {
@@ -152,6 +159,8 @@ pub struct StreamReader<R: Read> {
     /// True once any terminating frame arrives or the underlying
     /// stream signals EOF — subsequent `read` calls return `Ok(0)`.
     eof: bool,
+    /// Negotiated attach liveness; updated as inbound bytes arrive.
+    progress: Option<std::sync::Arc<std::sync::Mutex<std::time::Instant>>>,
 }
 
 /// Stream-side representation of a session exit. Carries more than
@@ -191,7 +200,12 @@ impl<R: Read> StreamReader<R> {
             pending_pos: 0,
             child_event: None,
             eof: false,
+            progress: None,
         }
+    }
+
+    pub fn set_progress(&mut self, progress: std::sync::Arc<std::sync::Mutex<std::time::Instant>>) {
+        self.progress = Some(progress);
     }
 
     /// Drain any pending child event from a previously-consumed
@@ -233,13 +247,34 @@ impl<R: Read> StreamReader<R> {
     ///     preserves state for resumption; `UnexpectedEof` with
     ///     `filled > 0` is the torn-frame signal; other errors are
     ///     forwarded as-is.
-    fn next_frame(&mut self) -> io::Result<Option<StreamFrame>> {
+    fn next_frame(&mut self) -> io::Result<Option<Frame>> {
         // Drive state out of `self` so we can mutably borrow
         // `self.inner` alongside the state without aliasing.
         let mut state = std::mem::replace(&mut self.state, ReadState::fresh());
-        let outcome = drive_read_fsm(&mut state, &mut self.inner);
+        let outcome = drive_read_fsm(&mut state, &mut ProgressReader {
+            inner: &mut self.inner,
+            progress: self.progress.as_ref(),
+        });
         self.state = state;
         outcome
+    }
+}
+
+/// Count partial frames too: a slow but progressing frame is not a stall.
+struct ProgressReader<'a, R> {
+    inner: &'a mut R,
+    progress: Option<&'a std::sync::Arc<std::sync::Mutex<std::time::Instant>>>,
+}
+
+impl<R: Read> Read for ProgressReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            if let Some(progress) = self.progress {
+                *progress.lock().unwrap_or_else(|p| p.into_inner()) = std::time::Instant::now();
+            }
+        }
+        Ok(n)
     }
 }
 
@@ -250,7 +285,7 @@ impl<R: Read> StreamReader<R> {
 fn drive_read_fsm<R: Read>(
     state: &mut ReadState,
     inner: &mut R,
-) -> io::Result<Option<StreamFrame>> {
+) -> io::Result<Option<Frame>> {
     loop {
         match state {
             ReadState::ReadingPrefix { buf, filled } => {
@@ -322,11 +357,15 @@ fn drive_read_fsm<R: Read>(
                     }
                 }
                 // Body complete — parse, reset state, and return.
-                let body_owned = std::mem::take(body);
+                let mut body_owned = std::mem::take(body);
                 *state = ReadState::fresh();
+                if body_owned.first() == Some(&cm_daemon::control::wire::RAW_DATA_TAG) {
+                    body_owned.drain(..1);
+                    return Ok(Some(Frame::Raw(body_owned)));
+                }
                 let frame: StreamFrame = serde_json::from_slice(&body_owned)
                     .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-                return Ok(Some(frame));
+                return Ok(Some(Frame::Json(frame)));
             }
         }
     }
@@ -408,6 +447,20 @@ impl<R: Read> Read for StreamReader<R> {
                     return Ok(0);
                 }
             };
+            let frame = match frame {
+                Frame::Json(frame) => frame,
+                Frame::Raw(bytes) => {
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    self.pending = bytes;
+                    self.pending_pos = 0;
+                    let to_copy = self.pending.len().min(buf.len());
+                    buf[..to_copy].copy_from_slice(&self.pending[..to_copy]);
+                    self.pending_pos = to_copy;
+                    return Ok(to_copy);
+                }
+            };
             match frame.kind {
                 StreamKind::Data => {
                     if let Some(b64) = frame.payload.get("bytes").and_then(Value::as_str) {
@@ -448,14 +501,24 @@ impl<R: Read> Read for StreamReader<R> {
                         .get("memory_cap_kill")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
+                    // #24/#25: CM stopped it to bring it straight back at
+                    // the same uid (a transcript rotation or a handoff).
+                    // The viewer keeps the slot and reattaches, exactly as
+                    // after a transport death.
+                    let respawning = frame
+                        .payload
+                        .get("killed_by")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_respawn_killer);
                     self.child_event = Some(ChildEvent::Exited {
                         code,
                         memory_cap_kill,
                         // Structured `End` frame → a genuine
                         // daemon-side child exit, NOT a transport
                         // death. The exit handler tears the session
-                        // down normally (no reconnect).
-                        transport_eof: false,
+                        // down normally (no reconnect) — unless CM
+                        // is respawning it.
+                        transport_eof: respawning,
                     });
                     self.eof = true;
                     return Ok(0);
@@ -489,19 +552,18 @@ impl<R: Read> Read for StreamReader<R> {
                         ),
                     ));
                 }
+                // Negotiated attach heartbeat has no terminal bytes.
+                StreamKind::Heartbeat => continue,
                 // 10e-b: `ManifestSnapshot` and `ManifestDiff`
                 // belong to the `manifest.watch` stream, NOT the
                 // PTY-attach stream this `term_shim` decodes.
                 // Reaching this arm means the wrong stream is
                 // wired to this reader — surface as malformed.
-                // 10e-b r1: `Heartbeat` likewise — manifest.watch
-                // sends them on idle, but PTY attach never does.
                 // 11b: `WorkflowEventStateSnapshot` /
                 // `WorkflowEvent` belong to `events.subscribe`,
                 // same rationale.
                 StreamKind::ManifestSnapshot
                 | StreamKind::ManifestDiff
-                | StreamKind::Heartbeat
                 | StreamKind::WorkflowEventStateSnapshot
                 | StreamKind::WorkflowEvent => {
                     self.eof = true;
@@ -755,6 +817,18 @@ impl<W: Write> Write for StreamWriter<W> {
     }
 }
 
+/// `killed_by` values of the stops after which CM brings a session straight
+/// back at the same uid: a transcript rotation (#24) and a handoff (#25).
+pub fn is_respawn_killer(killed_by: &str) -> bool {
+    matches!(killed_by, "transcript-rotation" | "handoff")
+}
+
+/// Whether `killed_by` is the daemon saying a rotation or handoff that stopped
+/// the session failed and left it down (it is NOT coming back by itself).
+pub fn is_respawn_failure(killed_by: &str) -> bool {
+    matches!(killed_by, "transcript-rotation failed" | "handoff failed")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -902,7 +976,62 @@ mod tests {
         )
     }
 
+    #[test]
+    fn attach_heartbeat_refreshes_progress_without_terminal_output() {
+        let mut source = ScriptedReader::new();
+        source.push_bytes(frame_bytes(StreamKind::Heartbeat, Value::Null));
+        source.push_block();
+        let old = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(old));
+        let mut reader = StreamReader::new(source);
+        reader.set_progress(progress.clone());
+        assert_eq!(reader.read(&mut [0u8; 8]).unwrap_err().kind(), ErrorKind::WouldBlock);
+        assert!(*progress.lock().unwrap() > old);
+        assert!(reader.take_child_event().is_none());
+    }
+
+    #[test]
+    fn partial_attach_frame_refreshes_progress() {
+        let mut source = ScriptedReader::new();
+        source.push_bytes(vec![0, 0]);
+        source.push_block();
+        let old = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(old));
+        let mut reader = StreamReader::new(source);
+        reader.set_progress(progress.clone());
+        assert_eq!(reader.read(&mut [0u8; 8]).unwrap_err().kind(), ErrorKind::WouldBlock);
+        assert!(*progress.lock().unwrap() > old);
+    }
+
     // --- StreamReader: blocking-style happy path -------------------
+
+    #[test]
+    fn reader_takes_raw_and_json_data_frames_in_order_across_partial_reads() {
+        let mut wire = Vec::new();
+        cm_daemon::control::wire::write_raw_data_frame(&mut wire, b"raw one ").unwrap();
+        wire.extend(data_frame(b"json two "));
+        cm_daemon::control::wire::write_raw_data_frame(&mut wire, b"").unwrap();
+        cm_daemon::control::wire::write_raw_data_frame(&mut wire, &[b'{'; 70_000]).unwrap();
+        let mut scripted = ScriptedReader::new();
+        // Split every frame boundary and body across tiny reads.
+        for chunk in wire.chunks(3) {
+            scripted.push_bytes(chunk.to_vec());
+        }
+        let mut r = StreamReader::new(scripted);
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        let mut expected = b"raw one json two ".to_vec();
+        expected.extend([b'{'; 70_000]);
+        assert_eq!(got, expected, "a raw body starting with '{{' is still raw");
+    }
 
     #[test]
     fn reader_zero_length_buf_returns_zero_without_consuming() {
@@ -1015,6 +1144,17 @@ mod tests {
             }
         );
         assert!(r.take_child_event().is_none());
+    }
+
+    #[test]
+    fn a_rotation_or_handoff_stop_reads_as_a_reconnect_not_an_exit() {
+        for (killed_by, respawning) in [("transcript-rotation", true), ("handoff", true), ("operator", false)] {
+            let wire = frame_bytes(StreamKind::End, serde_json::json!({ "exit_code": 143, "killed_by": killed_by }));
+            let mut r = StreamReader::new(Cursor::new(wire));
+            assert_eq!(r.read(&mut [0u8; 8]).unwrap(), 0);
+            let Some(ChildEvent::Exited { transport_eof, .. }) = r.take_child_event() else { panic!("exit event") };
+            assert_eq!(transport_eof, respawning, "{killed_by}");
+        }
     }
 
     #[test]

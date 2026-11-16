@@ -207,6 +207,21 @@ struct StartSessionParams {
     /// (e.g. `systemd-run --user --scope -- claude ...` for a
     /// memory-capped session) are baked in by the caller.
     argv: Vec<String>,
+    /// The model a claude / codex argv selects. Required for agents
+    /// (see [`start_session_model`]) and recorded on the session so a
+    /// revive, resume or restore reuses it. Must be absent for bash.
+    #[serde(default)]
+    model: Option<String>,
+    /// Where `model` came from (`crate::models::ModelSource::as_str`),
+    /// recorded with it. Optional: an unknown source is recorded as none.
+    #[serde(default)]
+    model_source: Option<String>,
+    /// The reasoning effort the session runs at, recorded with `model`.
+    #[serde(default)]
+    effort: Option<String>,
+    /// Where `effort` came from (the same sources as `model_source`).
+    #[serde(default)]
+    effort_source: Option<String>,
     /// Working directory for the spawned child. Pre-resolved to an
     /// absolute path on the TUI side so the daemon doesn't reach
     /// for `worktree_path` from its manifest snapshot — the caller
@@ -346,6 +361,10 @@ struct StartSessionParams {
     /// the workflow tags. See DESIGN_CONTINUOUS_TASKS.md §6.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     continuous_task_id: Option<String>,
+    /// The org-model preservation object (doc/org-model.md §12) carried
+    /// by restore/revive from the persisted entry; opaque here.
+    #[serde(default)]
+    org: Option<cm_holder_proto::org::OrgObject>,
     /// Global-permissions grant for the spawned session. The TUI
     /// (operator caller) sets this when the human marks a session
     /// global; `mcp_start_session` (agent caller) gates it behind
@@ -498,6 +517,86 @@ impl SpawnedChild {
     }
 }
 
+/// The model gate every spawn passes: CM never leaves a claude or codex
+/// session on its engine's default model. An agent spawn must name its
+/// model — in `params.model`, in its argv (`--model` / `-m`), or both, in
+/// which case they must agree — and that model is what gets recorded.
+/// A spawn route that forgets the model fails here, loudly, rather than
+/// quietly launching on whatever the engine picks. Bash takes no model.
+fn start_session_model(
+    session_type: &str,
+    declared: Option<&str>,
+    argv: &[String],
+) -> Result<Option<String>, (ErrorCode, String)> {
+    let invalid = |m: String| (ErrorCode::InvalidParams, m);
+    let declared = declared.filter(|m| !m.trim().is_empty());
+    if !crate::models::takes_model(session_type) {
+        return match declared {
+            Some(_) => Err(invalid(format!("model applies to claude and codex sessions, not '{session_type}'"))),
+            None => Ok(None),
+        };
+    }
+    let in_argv = crate::models::argv_model(session_type, argv);
+    let model = match (declared, in_argv) {
+        (Some(d), Some(a)) => {
+            let d = crate::models::validate_model(d).map_err(invalid)?;
+            if d != a {
+                return Err(invalid(format!(
+                    "model '{d}' does not match the argv's model '{a}'"
+                )));
+            }
+            d
+        }
+        (Some(m), None) | (None, Some(m)) => crate::models::validate_model(m).map_err(invalid)?,
+        (None, None) => {
+            return Err(invalid(format!(
+                "a {session_type} spawn must name its model (`model` or the argv's model flag); \
+                 CM never relies on the engine's default model. A viewer older than the \
+                 daemon sends neither: update the TUI."
+            )))
+        }
+    };
+    Ok(Some(model))
+}
+
+/// The effort gate, beside [`start_session_model`]: an agent spawn must
+/// name its reasoning effort in `params.effort`, in its argv (`--effort`
+/// / codex's `model_reasoning_effort` override), or both, agreeing. Bash
+/// takes none.
+fn start_session_effort(
+    session_type: &str,
+    declared: Option<&str>,
+    argv: &[String],
+) -> Result<Option<String>, (ErrorCode, String)> {
+    let invalid = |m: String| (ErrorCode::InvalidParams, m);
+    let declared = declared.filter(|e| !e.trim().is_empty());
+    if !crate::models::takes_model(session_type) {
+        return match declared {
+            Some(_) => Err(invalid(format!("effort applies to claude and codex sessions, not '{session_type}'"))),
+            None => Ok(None),
+        };
+    }
+    let in_argv = crate::models::argv_effort(session_type, argv);
+    let effort = match (declared, in_argv.as_deref()) {
+        (Some(d), Some(a)) => {
+            let d = crate::models::validate_effort(session_type, d).map_err(invalid)?;
+            if d != a {
+                return Err(invalid(format!("effort '{d}' does not match the argv's effort '{a}'")));
+            }
+            d
+        }
+        (Some(e), None) | (None, Some(e)) => crate::models::validate_effort(session_type, e).map_err(invalid)?,
+        (None, None) => {
+            return Err(invalid(format!(
+                "a {session_type} spawn must name its effort (`effort` or the argv's effort flag); \
+                 CM never relies on the engine's default effort. A viewer older than the \
+                 daemon sends neither: update the TUI."
+            )))
+        }
+    };
+    Ok(Some(effort))
+}
+
 pub fn start_session(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
@@ -518,13 +617,54 @@ pub fn start_session(
 /// Surface kept `pub(crate)` so the focused failure-injection test
 /// in this file's `tests` module can reach it without exposing the
 /// injection to external callers.
+/// The org object recorded for `uid` (doc/org-model.md §12): its
+/// persisted manifest entry, else its exit tombstone, else its resume
+/// identity. `None` for a uid nothing has recorded one for.
+pub(crate) fn persisted_org(
+    state: &DaemonState,
+    uid: &str,
+) -> Option<cm_holder_proto::org::OrgObject> {
+    state
+        .workspaces
+        .values()
+        .flat_map(|w| w.sessions.iter())
+        .find(|e| e.uid == uid)
+        .and_then(|e| e.org.clone())
+        .or_else(|| state.exited_tombstone(uid).and_then(|t| t.org.clone()))
+        .or_else(|| {
+            crate::resume_identity::lookup_uid(state, uid)
+                .ok()
+                .flatten()
+                .and_then(|r| r.entry.org)
+        })
+}
+
 pub(crate) fn start_session_with_spawn_fn(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
     watcher_spawn_fn: crate::session_watch::WatcherSpawnFn,
 ) -> MethodResult {
+    start_session_with_origin(state_arc, params, watcher_spawn_fn, false)
+}
+
+fn start_session_with_origin(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    watcher_spawn_fn: crate::session_watch::WatcherSpawnFn,
+    local_mcp_spawn: bool,
+) -> MethodResult {
     let p: StartSessionParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.uid);
+    let _recovery_read = (!crate::claude_recovery::internal_active(&p.uid)
+        && !crate::claude_recovery::read_context_active(&p.uid))
+        .then(|| recovery_gate.read().unwrap_or_else(|p| p.into_inner()));
+    if let Some(reason) = crate::claude_recovery::admission_refusal(&p.uid) {
+        return Err((ErrorCode::Conflict, reason));
+    }
+    if !crate::claude_recovery::internal_active(&p.uid) && crate::claude_recovery::has_pending_input(&p.uid) {
+        return Err((ErrorCode::Conflict, "session has accepted input still being delivered".into()));
+    }
 
     // Serialize the entire spawn/registry insertion with retirement of both
     // this UID and its manager. A late child cannot appear after drain proof.
@@ -533,7 +673,9 @@ pub(crate) fn start_session_with_spawn_fn(
     fence_uids.sort_unstable();
     fence_uids.dedup();
     let fences: Vec<_> = fence_uids.iter().map(|uid| crate::continuous::retirement::gate(uid)).collect();
-    let _permits: Vec<_> = fences.iter().map(|g| g.read().unwrap_or_else(|p| p.into_inner())).collect();
+    let _permits: Vec<_> = fence_uids.iter().zip(&fences)
+        .filter(|(uid, _)| !(**uid == p.uid.as_str() && crate::claude_recovery::internal_active(&p.uid)))
+        .map(|(_, g)| g.read().unwrap_or_else(|p| p.into_inner())).collect();
     for uid in &fence_uids {
         crate::continuous::retirement::ensure_open(uid)
             .map_err(|e| (ErrorCode::Conflict, e.to_string()))?;
@@ -574,6 +716,9 @@ pub(crate) fn start_session_with_spawn_fn(
             ),
         ));
     }
+
+    let model = start_session_model(&p.session_type, p.model.as_deref(), &p.argv)?;
+    let effort = start_session_effort(&p.session_type, p.effort.as_deref(), &p.argv)?;
 
     // Sub-2b-3 review-4 #1: reject partial cap tuples at the
     // entry point. The cap triple `(memory_cap_bytes,
@@ -724,6 +869,36 @@ pub(crate) fn start_session_with_spawn_fn(
     // Phase-1 continuous wire field: carry the continuous-task tag
     // onto the DaemonSession. `None` for ordinary spawns.
     spawn_params.continuous_task_id = p.continuous_task_id.clone();
+    // doc/org-model.md §12: a respawn at an existing uid keeps its org
+    // object even when the caller doesn't send one (TUI startup restore and
+    // local A-R go through `rpc_start_session_full`, and older TUIs never
+    // know the field).
+    spawn_params.org = {
+        let st = state_arc.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut org = p.org.clone().or_else(|| persisted_org(&st, &session_uid));
+        // O5: an agent spawned by a member's session (main or assistant)
+        // is that member's assistant (its checkout is claimed as a `stream`
+        // once the spawn succeeded, below). A continuous member's spawns are
+        // workers: attributed only. A fork arrives already stamped from its
+        // source.
+        crate::assistants::stamp_spawn(
+            &st, &session_uid, p.managed_by_uid.as_deref(), &p.session_type, &mut org);
+        org
+    };
+    spawn_params.model_source = model.as_ref().and(
+        p.model_source
+            .as_deref()
+            .and_then(crate::models::ModelSource::parse)
+            .map(|src| src.as_str().to_string()),
+    );
+    spawn_params.model = model;
+    spawn_params.effort_source = effort.as_ref().and(
+        p.effort_source
+            .as_deref()
+            .and_then(crate::models::ModelSource::parse)
+            .map(|src| src.as_str().to_string()),
+    );
+    spawn_params.effort = effort;
     // Global-perms grant. This RPC is operator-only (the TUI), so
     // the value is trusted here — the human (or a TUI flow acting
     // for the human) is the authority on who gets global perms. The
@@ -1205,6 +1380,11 @@ pub(crate) fn start_session_with_spawn_fn(
     let mut session = pending
         .arm(Some(on_exit), pre_ack)
         .map_err(|e| (ErrorCode::Internal, format!("arm reaper: {}", e)))?;
+    if local_mcp_spawn && p.managed_by_uid.is_some() && p.workflow_run_id.is_none()
+        && p.continuous_task_id.is_none() && matches!(p.session_type.as_str(), "codex" | "claude-code")
+    {
+        session.s4_spawn_origin = Some((session.pid, session.holder_incarnation, session.generation, session.org.clone()));
+    }
     // Slice 10d watcher-fix: stash the watcher handle on the
     // registry-resident session at the same instant we insert
     // it. The drop-on-detach contract documented on the field
@@ -1219,6 +1399,13 @@ pub(crate) fn start_session_with_spawn_fn(
         session.title = name.name.clone();
     }
     state.sessions.insert(session_uid.clone(), session);
+    // O5: the spawn succeeded, so an assistant's ephemeral checkout becomes a
+    // `stream` of its member's office (a failed spawn leaves it as it was).
+    let claim = state.sessions.get(&session_uid)
+        .and_then(|s| crate::assistants::stamped_member(s.org.as_ref()).map(|m| (m, s.workspace_id.clone())));
+    if let Some((member, ws_id)) = claim {
+        crate::assistants::claim_workspace(&mut state, &ws_id, &member);
+    }
     // P0 session durability (S1): persist the registry now that the
     // new session is live, so a daemon restart can restore it. Covers
     // every production spawn — `mcp_start_session` and
@@ -1313,11 +1500,15 @@ pub(crate) fn start_session_with_spawn_fn(
                 let st = state_arc.lock().unwrap_or_else(|e| e.into_inner());
                 (st.config.api_url.clone(), st.config.api_token.clone())
             };
+            // The spawned session is the actor: on a placed, unheld task's
+            // item it becomes the owner (doc/org-model.md §7.1).
+            let actor = crate::items::rpc::session_actor(state_arc, &session_uid);
             spawn_task_status_promotion(
                 task_id,
                 session_uid.clone(),
                 api_url_cfg,
                 api_token_cfg,
+                actor,
             );
         }
     }
@@ -1363,6 +1554,9 @@ pub(crate) fn start_session_with_spawn_fn(
 /// `session.rs::arm_reaper`), so `build_last_exit` reads a
 /// populated kernel slot.
 pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
+    // #24: an exit ends a pending rotation's arm and wake hold (a rotation's
+    // or handoff's own stop is theirs; they respawn the uid).
+    crate::rotation::on_session_exit(uid);
     // Holder-split provenance (DESIGN_HOLDER_BRAIN_SPLIT § Exit
     // provenance): in holder mode the exit observer stashed the
     // HOLDER's authoritative info — `waitid`-time timestamp and the
@@ -1434,6 +1628,8 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
             .or_else(|| memory_cap_kill.then(|| MEMORY_CAP_KILLER.to_string()));
         let report = sess.reported_done();
         crate::state::ExitedTombstone {
+            startup_failure: super::prompt_delivery::startup_failure(sess,
+                last_exit_opt.as_ref().and_then(|e| e.code), exited_at, killed),
             session_uid: uid.to_string(),
             transcript_path: sess.transcript_path.clone(),
             generation: sess.generation,
@@ -1442,6 +1638,10 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
             task_id: sess.task_id.clone(),
             managed_by_uid: sess.managed_by_uid.clone(),
             continuous_task_id: sess.continuous_task_id.clone(),
+            model: sess.model.clone(),
+            model_source: sess.model_source.clone(),
+            effort: sess.effort.clone(),
+            effort_source: sess.effort_source.clone(),
             label: sess.title.clone(),
             workflow_run_id: sess.workflow_run_id.clone(),
             workflow_role: sess.workflow_role.clone(),
@@ -1456,12 +1656,20 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
             // idempotency key a redelivered exit_event matches.
             incarnation: holder_exit.as_ref().map(|h| h.incarnation),
             status_lost: false,
+            org: sess.org.clone(),
         }
     });
     // Continuous Tasks Phase 3b completion signal (b): capture this session's
     // continuous-task tag BEFORE the registry remove (after which `get(uid)`
     // sees None) so a CLEAN exit of a continuous-task session can clear its
     // ACTIVE run below.
+    // The exit record carries the same attribution as the tombstone, so a
+    // viewer can say why a row closed ("closed: task done") instead of
+    // showing what looks like a crash.
+    let last_exit_opt = last_exit_opt.map(|mut le| {
+        le.killed_by = tombstone.as_ref().and_then(|t| t.killed_by.clone());
+        le
+    });
     let continuous_task_id = state
         .sessions
         .get(uid)
@@ -1773,10 +1981,235 @@ struct SendInputParams {
     /// the agent to receive the prompt as a submission).
     #[serde(default = "default_submit")]
     submit: bool,
+    #[serde(default)]
+    expected_pid: Option<i64>,
+    #[serde(default)]
+    expected_incarnation: Option<u64>,
 }
 
 fn default_submit() -> bool {
     true
+}
+
+/// Interrupt an exact Codex incarnation through its owning relay. A transport
+/// failure is ambiguous: the relay may have acted before the reply was lost.
+pub fn interrupt_session(state_arc: &Arc<Mutex<DaemonState>>, params: &Value, caller_uid: Option<&str>) -> MethodResult {
+    use std::io::{BufRead, BufReader, Read, Write};
+    #[cfg(target_os = "linux")]
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    let uid = params["session_uid"].as_str().filter(|s| !s.is_empty())
+        .ok_or((ErrorCode::InvalidParams, "missing session_uid".into()))?;
+    let request_id = params["request_id"].as_str().filter(|s| !s.is_empty() && s.len() <= 200)
+        .ok_or((ErrorCode::InvalidParams, "request_id is required (max 200 bytes)".into()))?;
+    let note = params["note"].as_str().filter(|s| !s.trim().is_empty() && s.len() <= 4096)
+        .ok_or((ErrorCode::InvalidParams, "note is required (max 4096 bytes)".into()))?;
+    if let Some(caller) = caller_uid {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let decision = crate::control::auth::check_session_caller(&state, caller, uid);
+        return_auth_error_if_denied_with_state(decision, caller, uid, Some(&state))?;
+    }
+    let lifecycle = crate::claude_recovery::lifecycle_gate(uid);
+    let lifecycle_guard = lifecycle.try_write().map_err(|_| (ErrorCode::Conflict, "session lifecycle is reserved".into()))?;
+    let (root, pid, incarnation, thread_id, engine) = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(caller) = caller_uid {
+            let decision = crate::control::auth::check_session_caller(&state, caller, uid);
+            return_auth_error_if_denied_with_state(decision, caller, uid, Some(&state))?;
+        }
+        let session = state.sessions.get(uid).ok_or((ErrorCode::NotFound, "session not found".into()))?;
+        if !matches!(session.session_type.as_str(), "codex" | "claude-code") || session.last_exit.kernel_set() {
+            return Err((ErrorCode::Conflict, "interrupt requires a live agent session".into()));
+        }
+        let thread = session.transcript_path.as_deref().and_then(crate::session::transcript_id_from_path);
+        (state.messaging_root.clone(), session.pid, session.holder_incarnation, thread, session.session_type.clone())
+    };
+    if let Some(prior) = interrupt_receipt(&root, uid, note, request_id)? {
+        return Ok(prior);
+    }
+    if engine == "claude-code" {
+        drop(lifecycle_guard);
+        return interrupt_claude(state_arc, uid, note, request_id, caller_uid, &root, pid as i64, incarnation);
+    }
+    let thread_id = thread_id.ok_or((ErrorCode::Conflict, "native thread identity is unavailable".into()))?;
+    let registry = crate::notifications::directory(&root, uid).join("interrupt-control");
+    let endpoint: Value = std::fs::metadata(&registry).ok().filter(|m| m.len() <= 4096)
+        .and_then(|_| std::fs::read(&registry).ok()).and_then(|v| serde_json::from_slice(&v).ok())
+        .ok_or((ErrorCode::Conflict, "interrupt relay is unavailable".into()))?;
+    let socket = endpoint["socket"].as_str().ok_or((ErrorCode::Conflict, "interrupt relay is unavailable".into()))?;
+    let mut stream = UnixStream::connect(socket).map_err(|_| (ErrorCode::Conflict, "interrupt relay is unavailable".into()))?;
+    // The registry is a hint, not authority: the connected peer must be the
+    // exact registered session process before it receives the request.
+    #[cfg(target_os = "linux")]
+    {
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let ok = unsafe { libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(), &mut len) } == 0;
+        if !ok || cred.pid as i64 != pid as i64 {
+            return Err((ErrorCode::Conflict, "interrupt relay process does not match session".into()));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    return Err((ErrorCode::Conflict, "Codex interrupt requires Linux peer credentials".into()));
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(25)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+    let request = json!({"session_uid": uid, "request_id": request_id, "note": note,
+                         "thread_id": thread_id, "pid": pid, "incarnation": incarnation});
+    let outcome = (|| -> std::io::Result<Value> {
+        writeln!(stream, "{}", request)?;
+        let mut reply = String::new();
+        BufReader::new(stream).take(16384).read_line(&mut reply)?;
+        serde_json::from_str(&reply).map_err(std::io::Error::other)
+    })();
+    Ok(outcome.unwrap_or_else(|_| json!({"status":"uncertain", "reason":"relay_reply_lost"})))
+}
+
+fn interrupt_receipt(root: &std::path::Path, uid: &str, note: &str, request_id: &str) -> Result<Option<Value>, (ErrorCode, String)> {
+    use sha2::{Digest, Sha256};
+    let path = crate::notifications::directory(root, uid)
+        .join(format!("interrupt-{:x}.receipt", Sha256::digest(request_id.as_bytes())));
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 65536) {
+        return Ok(Some(json!({"status":"uncertain","reason":"receipt_unreadable"})));
+    }
+    let old: Value = match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| (ErrorCode::Conflict, "interrupt receipt unreadable".into()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Ok(Some(json!({"status":"uncertain","reason":"receipt_unreadable"}))),
+    };
+    if old["identity"]["session_uid"] != uid || old["identity"]["note"] != note
+        || old["identity"]["request_id"] != request_id {
+        return Err((ErrorCode::Conflict, "request_id conflict".into()));
+    }
+    Ok(Some(old.get("result").filter(|r| !r.is_null()).cloned()
+        .unwrap_or_else(|| json!({"status":"uncertain","reason":"operation_interrupted"}))))
+}
+
+#[cfg(test)]
+mod interrupt_receipt_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn ambiguous_receipt_survives_a_new_incarnation_and_conflicts_do_not_replay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crate::notifications::directory(tmp.path(), "target");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("interrupt-{:x}.receipt", Sha256::digest(b"stable")));
+        crate::messaging::atomic_replace(&path, &json!({"identity": {
+            "session_uid":"target", "request_id":"stable", "note":"stop", "pid": 1,
+            "incarnation": 7, "thread_id":"old-thread"}, "result": null})).unwrap();
+        assert_eq!(interrupt_receipt(tmp.path(), "target", "stop", "stable").unwrap().unwrap()["status"], "uncertain");
+        assert_eq!(interrupt_receipt(tmp.path(), "target", "other", "stable").unwrap_err().0, ErrorCode::Conflict);
+        assert!(interrupt_receipt(tmp.path(), "target", "stop", "new").unwrap().is_none());
+    }
+
+    #[test]
+    fn interrupt_refuses_a_socket_owned_by_a_different_process() {
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = DaemonState::new();
+        state.messaging_root = tmp.path().to_path_buf();
+        let mut spawn = crate::session::SpawnParams::new("target", "target", "/bin/sh");
+        spawn.args = vec!["-c".into(), "sleep 30".into()];
+        spawn.session_type = "codex".into();
+        spawn.transcript_path = Some("/tmp/rollout-2026-10-29T19-32-57-01a18926-b5b3-72b2-97c8-63a73a45e13c.jsonl".into());
+        state.sessions.insert("target".into(), crate::session::DaemonSession::spawn(spawn).unwrap());
+        let state = Arc::new(Mutex::new(state));
+        let path = tmp.path().join("foreign.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let dir = crate::notifications::directory(tmp.path(), "target");
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::messaging::atomic_replace(&dir.join("interrupt-control"), &json!({"socket":path})).unwrap();
+        let request = json!({"session_uid":"target","note":"stop","request_id":"stable"});
+        assert_eq!(interrupt_session(&state, &request, Some("not-authorized")).unwrap_err().0, ErrorCode::Unauthorized);
+        let error = interrupt_session(&state, &request, None).unwrap_err();
+        assert_eq!(error.0, ErrorCode::Conflict);
+        let (mut peer, _) = listener.accept().unwrap();
+        let mut bytes = Vec::new();
+        peer.read_to_end(&mut bytes).unwrap();
+        assert!(bytes.is_empty(), "no command or note reaches the wrong process");
+        state.lock().unwrap().sessions.get_mut("target").unwrap().kill().unwrap();
+    }
+
+    #[test]
+    fn claude_without_a_fresh_turn_end_is_uncertain_and_not_replayed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("input");
+        let mut state = DaemonState::new();
+        state.messaging_root = tmp.path().to_path_buf();
+        let mut spawn = crate::session::SpawnParams::new("claude-target", "target", "/bin/sh");
+        spawn.args = vec!["-c".into(), format!("stty raw -echo; exec cat > '{}'", out.display())];
+        spawn.session_type = "claude-code".into();
+        state.sessions.insert("claude-target".into(), crate::session::DaemonSession::spawn(spawn).unwrap());
+        let state = Arc::new(Mutex::new(state));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let request = json!({"session_uid":"claude-target","note":"stop","request_id":"stable"});
+        let first = interrupt_session(&state, &request, None).unwrap();
+        assert_eq!(first["status"], "uncertain");
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(!bytes.is_empty(), "one Escape was sent");
+        let second = interrupt_session(&state, &request, None).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(std::fs::read(&out).unwrap(), bytes, "retry must not send another key or prompt");
+        state.lock().unwrap().sessions.get_mut("claude-target").unwrap().kill().unwrap();
+    }
+}
+
+fn interrupt_claude(state: &Arc<Mutex<DaemonState>>, uid: &str, note: &str, request_id: &str,
+    caller_uid: Option<&str>, root: &std::path::Path, pid: i64, incarnation: Option<u64>) -> MethodResult {
+    use sha2::{Digest, Sha256};
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|p| p.into_inner());
+    let dir = crate::notifications::directory(root, uid);
+    std::fs::create_dir_all(&dir).map_err(|e| (ErrorCode::Internal, e.to_string()))?;
+    let path = dir.join(format!("interrupt-{:x}.receipt", Sha256::digest(request_id.as_bytes())));
+    let identity = json!({"session_uid":uid,"note":note,"request_id":request_id,"pid":pid,"incarnation":incarnation});
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let old: Value = serde_json::from_slice(&bytes).map_err(|_| (ErrorCode::Conflict, "interrupt receipt unreadable".into()))?;
+            if old["identity"]["session_uid"] != uid || old["identity"]["note"] != note
+                || old["identity"]["request_id"] != request_id {
+                return Err((ErrorCode::Conflict, "request_id conflict".into()));
+            }
+            return Ok(old.get("result").filter(|r| !r.is_null()).cloned()
+                .unwrap_or_else(|| json!({"status":"uncertain","reason":"operation_interrupted"})));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Ok(json!({"status":"uncertain","reason":"receipt_unreadable"})),
+    }
+    crate::messaging::atomic_replace(&path, &json!({"identity":identity,"result":null}))
+        .map_err(|e| (ErrorCode::Internal, e.to_string()))?;
+    let before = now_unix_f64();
+    let escape = super::send_key::send_bound_escape(state, &json!({"session_uid":uid,"pid":pid,"incarnation":incarnation}), Some(uid));
+    let mut result = json!({"status":"uncertain","reason":"interrupt_unconfirmed"});
+    if escape.is_ok() {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < end {
+            let ready = {
+                let st = state.lock().unwrap_or_else(|p| p.into_inner());
+                st.sessions.get(uid).is_some_and(|s| {
+                    if s.pid as i64 != pid || s.holder_incarnation != incarnation || s.last_exit.kernel_set() { return false; }
+                    let a = crate::agent_state::current(s);
+                    a.state == crate::agent_state::State::Idle && a.last_turn.ended_at.is_some_and(|t| t >= before)
+                })
+            };
+            if ready {
+                let text = format!("[cm] Stop: {}. Do not resume the interrupted work; wait for new instructions.", note.trim());
+                let queued = send_input(state, &json!({"session_uid":uid,"text":text,
+                    "expected_pid":pid,"expected_incarnation":incarnation}), caller_uid);
+                result = if queued.is_ok() { json!({"status":"uncertain","reason":"stop_queued_unconfirmed"}) }
+                         else { json!({"status":"uncertain","reason":"stop_not_queued"}) };
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    if crate::messaging::atomic_replace(&path, &json!({"identity":identity,"result":result})).is_err() {
+        return Ok(json!({"status":"uncertain","reason":"receipt_write_failed"}));
+    }
+    Ok(result)
 }
 
 /// Write `params.text` to the target session's PTY.
@@ -1814,15 +2247,23 @@ pub fn send_input(
         ));
     }
     if !p.submit {
-        // Phase-1 parity with the TUI: only submit=true is
-        // wired. A typing path (no Enter) would need different
-        // semantics around buffering / pending_clear and isn't
-        // needed by any current MCP caller.
-        return Err((
-            ErrorCode::InvalidParams,
-            "submit=false is not yet supported (matches TUI parity)".into(),
-        ));
+        return Err((ErrorCode::InvalidParams,
+            "submit=false is not yet supported (matches TUI parity)".into()));
     }
+
+    // Acquire outside DaemonState, and keep through queueing, so a recovery
+    // cannot report success while a newly accepted prompt is still pending.
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.session_uid);
+    let _recovery_read = recovery_gate.try_write().map_err(|_| (
+        ErrorCode::Conflict, "session lifecycle is reserved for background recovery".into()
+    ))?;
+    let input_gate = crate::continuous::retirement::gate(&p.session_uid);
+    let _input_admission = input_gate.try_read().map_err(|_| (
+        ErrorCode::Conflict, "session input is reserved for recovery or retirement".into()
+    ))?;
+    crate::continuous::retirement::ensure_open(&p.session_uid)
+        .map_err(|e| (ErrorCode::Conflict, e.to_string()))?;
+    let _input_unit = crate::continuous::retirement::input_unit(&p.session_uid);
 
     // Sub-2a Finding #2 TOCTOU fix: auth + Arc clone happen in
     // ONE critical section so the target session can't be
@@ -1838,7 +2279,7 @@ pub fn send_input(
     // invariant in one place so future input paths can't skip
     // it. Also read the session_type so we can pick the right
     // SUBMIT encoding below (see the agent/bash branch).
-    let (handle, fanout, is_agent) = {
+    let (handle, fanout, is_agent, accepted_pid, accepted_incarnation, pending) = {
         let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         // Session-caller auth: under the same lock that does
         // the target lookup. Operator callers (`caller_uid:
@@ -1857,6 +2298,9 @@ pub fn send_input(
                 format!("session '{}' not in daemon registry", p.session_uid),
             )
         })?;
+        if p.expected_pid.is_some_and(|pid| session.pid as i64 != pid || session.holder_incarnation != p.expected_incarnation) {
+            return Err((ErrorCode::Conflict, "session incarnation changed".into()));
+        }
         // Liveness gate: a session whose child has exited has a
         // dead PTY. Surface Conflict for TUI parity. `try_wait`
         // drains the reaper's mpsc channel (side-effectful on
@@ -1872,7 +2316,17 @@ pub fn send_input(
         }
         // claude-code / codex run a kitty-keyboard TUI; bash is a raw shell.
         let is_agent = session.session_type != "bash";
-        (session.input_handle(), session.fanout.clone(), is_agent)
+        let pending = is_agent.then(|| crate::claude_recovery::reserve_pending_input(&p.session_uid));
+        (session.input_handle(), session.fanout.clone(), is_agent, session.pid, session.holder_incarnation, pending)
+    };
+    // The target's checkout vanished (an agent removed its own worktree):
+    // re-create it before delivering, so the turn's tools have a cwd again.
+    let healed = heal_missing_session_worktree(state_arc, &p.session_uid);
+    let with_heal = |mut reply: Value| {
+        if let (Some(obj), Some(Value::Object(extra))) = (reply.as_object_mut(), healed.clone()) {
+            obj.extend(extra);
+        }
+        reply
     };
 
     // SUBMIT encoding depends on the target's input mode:
@@ -1891,20 +2345,74 @@ pub fn send_input(
     if is_agent {
         // Input was delivered NOW — flip idle false synchronously even though
         // the PTY write is deferred to the delivery thread (which stamps too).
-        handle.stamp_activity();
-        spawn_agent_prompt_delivery(handle, fanout, p.session_uid.clone(), p.text, false, Some(Arc::clone(state_arc)));
-        Ok(json!({ "ok": true, "delivery": "agent-kitty-async" }))
+        let handle = handle.prepare_agent_input(&p.text);
+        let state = Arc::clone(state_arc);
+        let uid = p.session_uid.clone();
+        let text = p.text;
+        std::thread::Builder::new().name(format!("cm-daemon-agent-prompt-{uid}"))
+            .spawn(move || {
+                let _pending = pending;
+                #[cfg(test)]
+                test_pause_queued_input(&uid);
+                let current = state.lock().unwrap_or_else(|p| p.into_inner()).sessions.get(&uid)
+                    .is_some_and(|s| s.pid == accepted_pid && s.holder_incarnation == accepted_incarnation && !s.last_exit.kernel_set());
+                if !current { return; }
+                deliver_agent_body_confirmed(&state, &handle, &fanout, &uid, &text, false, "prompt");
+            }).map_err(|e| (ErrorCode::Internal, format!("could not queue agent prompt: {e}")))?;
+        Ok(with_heal(json!({ "ok": true, "delivery": "agent-kitty-async" })))
     } else {
         let mut payload = p.text.into_bytes();
-        payload.push(b'\n'); // submit=false is rejected above, so always Enter
+        payload.push(b'\n');
         handle.write_and_stamp(&payload).map_err(|e| {
             (
                 ErrorCode::Internal,
                 format!("send_input write to PTY: {}", e),
             )
         })?;
-        Ok(json!({ "ok": true }))
+        Ok(with_heal(json!({ "ok": true, "kind": "shell", "submitted": p.submit })))
     }
+}
+
+#[cfg(test)]
+fn queued_input_test_hooks() -> &'static Mutex<std::collections::HashMap<String, Arc<dyn Fn() + Send + Sync>>> {
+    static HOOKS: std::sync::OnceLock<Mutex<std::collections::HashMap<String, Arc<dyn Fn() + Send + Sync>>>> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+#[cfg(test)]
+pub(crate) fn set_queued_input_test_hook(uid: &str, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+    let mut hooks = queued_input_test_hooks().lock().unwrap();
+    if let Some(hook) = hook { hooks.insert(uid.into(), hook); } else { hooks.remove(uid); }
+}
+#[cfg(test)]
+fn test_pause_queued_input(uid: &str) {
+    let hook = queued_input_test_hooks().lock().unwrap().get(uid).cloned();
+    if let Some(hook) = hook { hook(); }
+}
+
+/// A live session's workspace checkout is missing on disk (typically an
+/// agent ran `git worktree remove` on its own cwd): re-create it from its
+/// branch with the same healer `start_session` uses. Returns the fields to
+/// report (`worktree_recreated` / `worktree_warning`), or None when the
+/// checkout is there. Cheap when healthy: one `stat`, no Git.
+pub(crate) fn heal_missing_session_worktree(state_arc: &Arc<Mutex<DaemonState>>, uid: &str) -> Option<Value> {
+    let (ws_id, path, task_id) = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let sess = state.sessions.get(uid)?;
+        let ws = state.workspaces.get(&sess.workspace_id)?;
+        (sess.workspace_id.clone(), ws.worktree_path.clone()?, sess.task_id.clone())
+    };
+    if path.is_dir() {
+        return None;
+    }
+    let mut extra = serde_json::Map::new();
+    match ensure_ready_worktree(state_arc, &ws_id, &path, task_id.as_deref()) {
+        Ok(report) => report.decorate(&mut extra),
+        Err((_, message)) => {
+            eprintln!("cm-daemon: session {uid}: missing worktree {} not re-created: {message}", path.display());
+            extra.insert("worktree_warning".into(), json!(message));
+        }
+    }
+    Some(Value::Object(extra))
 }
 
 // ============================================================
@@ -1994,7 +2502,21 @@ pub fn kill_session(
     let p: KillSessionParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("kill_session params: {}", e)))?;
 
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.session_uid);
+    let _recovery_read = recovery_gate.try_write().map_err(|_| (
+        ErrorCode::Conflict, "session lifecycle is reserved for background recovery".into()
+    ))?;
+    if let Some(reason) = crate::claude_recovery::admission_refusal(&p.session_uid) {
+        return Err((ErrorCode::Conflict, reason));
+    }
+    if crate::claude_recovery::has_pending_input(&p.session_uid) {
+        return Err((ErrorCode::Conflict, "session has accepted input still being delivered".into()));
+    }
+
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    if crate::claude_recovery::has_pending_input(&p.session_uid) {
+        return Err((ErrorCode::Conflict, "session has accepted input still being delivered".into()));
+    }
     // Sub-2a Finding #2 TOCTOU fix: auth + lookup happen in one
     // critical section so a non-descendant target can't slip in
     // (or out) between authorize-time and signal-time.
@@ -2006,6 +2528,16 @@ pub fn kill_session(
         );
         return_auth_error_if_denied_with_state(decision, cuid, &p.session_uid, Some(&state))?;
     }
+    // O5: an agent's kill of a member's assistant ends it like a close: its
+    // tombstone stops protecting its checkout and a stream it claimed goes
+    // back to `ephemeral`; the dispatcher hands its holds back. Operator kills
+    // (A-R restarts, workflow fresh-role respawns, A-w's fallback) stay plain
+    // kills and are covered by the 7-day stream release.
+    let ended_assistant = if caller_uid.is_some() && state.sessions.contains_key(&p.session_uid) {
+        crate::assistants::end_assistant(&mut state, &p.session_uid)
+    } else {
+        None
+    };
     // 10e-a r1 F2: do NOT remove the session from the registry
     // here. Pre-r1 we removed-then-Drop'd, which fired SIGKILL
     // via the dropped session's pidfd — but the reaper's on_exit
@@ -2067,8 +2599,75 @@ pub fn kill_session(
     // route (TUI A-w, `resolve_stuck`, the continuous scheduler's watchdog).
     let killer = caller_uid.unwrap_or(OPERATOR_KILLER).to_string();
     state.record_kill_request(&p.session_uid, &killer, now_unix_f64());
+    if ended_assistant.is_some() {
+        state.persist_sessions_best_effort();
+    }
 
-    Ok(json!({ "ok": true }))
+    let mut out = json!({ "ok": true });
+    if let Some((member_id, released)) = ended_assistant {
+        out["assistant_ended"] = json!({"member_id": member_id, "workspace_released": released});
+    }
+    Ok(out)
+}
+
+/// Kill `uid` on the daemon's own behalf, attributed to `who` (e.g. the
+/// transcript rotation's `transcript-rotation`), through the same exit
+/// pipeline an operator kill uses. A missing session is a no-op.
+pub(crate) fn kill_with_attribution(state_arc: &Arc<Mutex<DaemonState>>, uid: &str, who: &str) {
+    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(session) = state.sessions.get_mut(uid) else { return };
+    session.last_exit.mark_operator_kill_requested();
+    session.set_kill_attribution(who);
+    let _ = session.kill();
+    state.record_kill_request(uid, who, now_unix_f64());
+}
+
+/// Kill only the exact daemon incarnation captured by native background
+/// recovery. All identity and lifecycle checks happen under the same state
+/// mutex as the pidfd/holder signal, closing the rebind-before-kill window.
+pub(crate) fn kill_with_recovery_identity(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    identity: &crate::claude_recovery::Identity,
+    who: &str,
+) -> Result<(), String> {
+    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    crate::claude_recovery::validate_holder_effect(&state, identity)?;
+    let session = state.sessions.get_mut(&identity.uid).ok_or_else(|| "session exited before holder stop".to_string())?;
+    if session.workspace_id != identity.workspace_id
+        || session.task_id != identity.task_id
+        || session.generation != identity.transcript_generation
+        || session.holder_incarnation != identity.holder_incarnation
+        || session.pid as u32 != identity.child_pid
+        || session.workflow_run_id.is_some()
+        || session.continuous_task_id.is_some()
+    {
+        return Err("session identity or lifecycle changed before holder stop".into());
+    }
+    let start = crate::adopt::proc_starttime(session.pid as libc::pid_t)
+        .map_err(|e| format!("child identity unreadable before holder stop: {e}"))?;
+    if start != identity.child_start_time {
+        return Err("child PID/start changed before holder stop".into());
+    }
+    session.last_exit.mark_operator_kill_requested();
+    session.set_kill_attribution(who);
+    session.kill().map_err(|e| format!("holder signal outcome unknown: {e}"))?;
+    state.record_kill_request(&identity.uid, who, now_unix_f64());
+    Ok(())
+}
+
+/// Deliver `prompt` to an agent session as one submitted message, waiting
+/// for a fresh spawn's startup first (`fresh_spawn`), with delivery
+/// confirmation. The daemon's own sends (rotation notices) use it.
+pub(crate) fn deliver_agent_prompt(
+    handle: crate::session::InputHandle,
+    fanout: std::sync::Arc<crate::session::PtyByteFanout>,
+    session_uid: String,
+    prompt: String,
+    fresh_spawn: bool,
+    strict_ready: bool,
+    state: Arc<Mutex<DaemonState>>,
+) {
+    spawn_agent_prompt_delivery(handle, fanout, session_uid, prompt, fresh_spawn, strict_ready, Some(state));
 }
 
 /// Attribution recorded for a kill that came in on the OPERATOR route
@@ -2271,6 +2870,9 @@ pub fn read_session_output(
 /// honors them as documented above (no-ops for now).
 #[derive(Deserialize, Default)]
 struct ListSessionsParams {
+    /// Agent callers omit shells; operators keep terminal discovery.
+    #[serde(default)]
+    include_shells: Option<bool>,
     /// Future-proofs the wire signature for slice 10e
     /// (manifest ownership flip). Sub-1 accepts but ignores.
     #[serde(default)]
@@ -2313,6 +2915,29 @@ pub fn list_sessions(
         serde_json::from_value(params.clone())
             .map_err(|e| (ErrorCode::InvalidParams, format!("list_sessions params: {}", e)))?
     };
+    let include_shells = p.include_shells.unwrap_or(caller_uid.is_none());
+    // Org-report visibility is a read-only widening of the default scope.
+    // Snapshot the caller's global grant first, then make one batched API
+    // request before taking the registry lock used to build the rows.  An API
+    // outage leaves this `None`, which deliberately preserves today's scope.
+    let caller_is_global_snapshot = caller_uid
+        .and_then(|cuid| {
+            state_arc
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .sessions
+                .get(cuid)
+                .map(|s| s.global_perms)
+        })
+        .unwrap_or(false);
+    let org_read_members = if p.task_id.is_none()
+        && caller_uid.is_some()
+        && !caller_is_global_snapshot
+    {
+        crate::items::org::read_scope_members(state_arc, caller_uid.unwrap(), p.include_exited)
+    } else {
+        None
+    };
     let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
 
     // Global-permissions grant: a global caller sees EVERY session
@@ -2323,7 +2948,7 @@ pub fn list_sessions(
     let caller_is_global = caller_uid
         .and_then(|cuid| state.sessions.get(cuid))
         .map(|s| s.global_perms)
-        .unwrap_or(false);
+        .unwrap_or(caller_is_global_snapshot);
 
     // Sub-2a Finding #3: authorize the requested task scope
     // BEFORE iterating. Mirrors
@@ -2356,8 +2981,8 @@ pub fn list_sessions(
                     ));
                 }
                 Some(own_task) => {
-                    if !crate::control::auth::task_is_self_or_descendant_of(
-                        &state.task_tree,
+                    if !crate::control::auth::task_in_scope(
+                        &state,
                         req_task,
                         own_task,
                     ) {
@@ -2407,8 +3032,8 @@ pub fn list_sessions(
             return match scope_task.as_deref() {
                 Some(scope) => task_id
                     .map(|t| {
-                        crate::control::auth::task_is_self_or_descendant_of(
-                            &state.task_tree,
+                        crate::control::auth::task_in_scope(
+                            &state,
                             t,
                             scope,
                         )
@@ -2417,14 +3042,14 @@ pub fn list_sessions(
                 None => true,
             };
         }
-        match (scope_task.as_deref(), caller_uid) {
+        let legacy = match (scope_task.as_deref(), caller_uid) {
             // Explicit scope (param OR caller's task): include
             // only sessions whose task_id is self-or-descendant
             // of the scope. Mirrors TUI's `Some(scope) =>` arm.
             (Some(scope), _) => task_id
                 .map(|t| {
-                    crate::control::auth::task_is_self_or_descendant_of(
-                        &state.task_tree,
+                    crate::control::auth::task_in_scope(
+                        &state,
                         t,
                         scope,
                     )
@@ -2438,12 +3063,26 @@ pub fn list_sessions(
             }
             // No scope, Operator caller: every session.
             (None, None) => true,
+        };
+        if legacy {
+            return true;
         }
+        // A lead's org-chain read is additive only for the default listing
+        // (no explicit task filter).  The target must carry the same member
+        // attribution the API checked in the batch response.
+        org_read_members.as_ref().is_some_and(|allowed| {
+            state
+                .sessions
+                .get(uid)
+                .and_then(crate::assistants::of_session)
+                .is_some_and(|m| allowed.contains(&m.member_id))
+        })
     };
 
     // Daemon-owned sessions (live PTY in `state.sessions`).
     for (uid, session) in state.sessions.iter() {
-        if !should_include(uid, session.task_id.as_deref()) {
+        if (!include_shells && session.session_type == "bash")
+            || !should_include(uid, session.task_id.as_deref()) {
             continue;
         }
         // Sub-2b-1 review-r#3 #1: single helper computes
@@ -2452,7 +3091,9 @@ pub fn list_sessions(
         // `wait_for_session_idle` (which polls list_sessions) and
         // `read_session_output` (which resolves via
         // resolve_authorized_session) agree.
-        let (state_str, idle) = compute_session_state_and_idle(session);
+        let (state_str, pty_idle) = compute_session_state_and_idle(session);
+        let agent_state = crate::agent_state::current(session);
+        let idle = agent_state.compatibility_idle(pty_idle, state.config.presence_idle_enabled);
         // UX item 4a: the agent's own done signal, so a listing caller can
         // tell "delivered its final report" from "idle mid-workflow" without
         // reading the transcript and pattern-matching for a verdict line.
@@ -2462,12 +3103,22 @@ pub fn list_sessions(
             "label": session.title,
             "name_revision": state.messaging_names.get(uid).map(|n|n.revision),
             "type": session.session_type,
+            "kind": if session.session_type == "bash" { "shell" } else { "agent" },
+            "model": session.model,
+            "model_source": session.model_source,
+            "effort": session.effort,
+            "effort_source": session.effort_source,
             "state": state_str,
             "idle": idle,
+            "pty_idle": pty_idle,
+            "agent_state": agent_state,
             "reported_done": report.is_some(),
             "reported_done_at": report.as_ref().map(|r| r.at_unix),
             "report_reason": report.as_ref().and_then(|r| r.reason.clone()),
             "managed_by_uid": session.managed_by_uid,
+            // O5: whom the session works for, `{member_id, acting_as}`
+            // (`main` by the member cache, `assistant` by its stamp) or null.
+            "member": crate::assistants::wire(uid, session.org.as_ref()),
             // Global-permissions grant — surfaced so an agent (and
             // the grouped MCP view) can tell which sessions are
             // privileged orchestrators.
@@ -2484,6 +3135,18 @@ pub fn list_sessions(
             "workflow_run_id": session.workflow_run_id,
             "workflow_role": session.workflow_role,
             "continuous_task_id": session.continuous_task_id,
+            // doc/org-model.md §12: the opaque org object, so an adopting
+            // TUI can round-trip it into its manifest. Absent when unset.
+            "org": session.org,
+            // #24: the transcript's size (the rotation policy's input) and
+            // the latest rotation, if any.
+            "transcript_bytes": session
+                .transcript_path
+                .as_deref()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len()),
+            "rotation": crate::rotation::status(uid),
+            "handoff": crate::handoff::status(uid),
             "worktree_path": state
                 .workspaces
                 .get(&session.workspace_id)
@@ -2531,6 +3194,7 @@ pub fn list_sessions(
         return Ok(Value::Array(sessions));
     }
     for (uid, snap) in state.tui_sessions.iter() {
+        if !include_shells && snap.session_type.as_deref() == Some("bash") { continue; }
         if state.sessions.contains_key(uid) {
             continue;
         }
@@ -2555,6 +3219,7 @@ pub fn list_sessions(
         sessions.push(json!({
             "session_uid": uid,
             "label": snap.label.clone().unwrap_or_default(),
+            "kind": if snap.session_type.as_deref() == Some("bash") { "shell" } else { "agent" },
             "type": snap.session_type.clone().unwrap_or_else(|| "claude-code".into()),
             "state": "ready",
             "idle": false,
@@ -2585,13 +3250,13 @@ pub fn list_sessions(
             if state.sessions.contains_key(uid) || state.tui_sessions.contains_key(uid) {
                 continue;
             }
-            let include = match (scope_task.as_deref(), caller_uid) {
+            let legacy_include = match (scope_task.as_deref(), caller_uid) {
                 (Some(scope), _) => tomb
                     .task_id
                     .as_deref()
                     .map(|t| {
-                        crate::control::auth::task_is_self_or_descendant_of(
-                            &state.task_tree,
+                        crate::control::auth::task_in_scope(
+                            &state,
                             t,
                             scope,
                         )
@@ -2607,16 +3272,28 @@ pub fn list_sessions(
                 .is_allow(),
                 (None, None) => true,
             };
-            if !include {
+            let include = legacy_include || org_read_members.as_ref().is_some_and(|allowed| {
+                crate::assistants::membership(uid, tomb.org.as_ref())
+                    .is_some_and(|m| allowed.contains(&m.member_id))
+            });
+            if !include || (!include_shells && tomb.session_type == "bash") {
                 continue;
             }
             sessions.push(json!({
                 "session_uid": uid,
                 "label": tomb.label,
                 "type": tomb.session_type,
+                "kind": if tomb.session_type == "bash" { "shell" } else { "agent" },
+                "model": tomb.model,
+                "model_source": tomb.model_source,
+                "effort": tomb.effort,
+                "effort_source": tomb.effort_source,
                 "state": "exited",
                 "idle": true,
+                "pty_idle": true,
+                "agent_state": {"state": "exited"},
                 "managed_by_uid": tomb.managed_by_uid,
+                "member": crate::assistants::wire(uid, tomb.org.as_ref()),
                 "workspace_id": tomb.workspace_id,
                 "task_id": tomb.task_id,
                 "continuous_task_id": tomb.continuous_task_id,
@@ -2625,6 +3302,7 @@ pub fn list_sessions(
                 "worktree_path": tomb.worktree_path,
                 // UX item 3b: how it ended, not just that it ended.
                 "exited_at": tomb.exited_at,
+                "startup_failure": tomb.startup_failure,
                 "killed": tomb.killed,
                 "killed_by": tomb.killed_by,
                 // UX item 4a: and whether it finished before ending.
@@ -2700,6 +3378,26 @@ struct ResolveAuthorizedSessionParams {
     session_uid: String,
 }
 
+fn resolve_read_decision(
+    state: &DaemonState,
+    caller_uid: &str,
+    target_uid: &str,
+) -> crate::control::auth::AuthDecision {
+    if state.sessions.contains_key(target_uid) {
+        crate::control::auth::check_session_caller(state, caller_uid, target_uid)
+    } else if let Some(tomb) = state.exited_tombstone(target_uid) {
+        crate::control::auth::check_session_caller_for_exited(
+            state,
+            caller_uid,
+            target_uid,
+            tomb.task_id.as_deref(),
+            &tomb.workspace_id,
+        )
+    } else {
+        crate::control::auth::check_session_caller(state, caller_uid, target_uid)
+    }
+}
+
 /// Resolve a session's transcript metadata for the Python MCP
 /// tool's two-step read pattern. See module-level doc above for
 /// the why; this is just the wire shape implementation.
@@ -2716,35 +3414,76 @@ pub fn resolve_authorized_session(
             )
         })?;
 
-    // Sub-2a Finding #2 TOCTOU shape: auth + read-target happen
-    // in one critical section. Target lookup happens AFTER auth
-    // passes so a deny decision doesn't leak metadata via timing
-    // on the existence check.
-    let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(cuid) = caller_uid {
-        // Auth against the LIVE session if present, else its read-after-exit
-        // TOMBSTONE (same descendant-task/workspace scope rule applies to a dead
-        // target), else the live path which yields TargetNotInRegistry for a
-        // genuinely-unknown uid.
-        let decision = if state.sessions.contains_key(&p.session_uid) {
-            crate::control::auth::check_session_caller(&state, cuid, &p.session_uid)
-        } else if let Some(tomb) = state.exited_tombstone(&p.session_uid) {
-            crate::control::auth::check_session_caller_for_exited(
-                &state,
+    // Keep the ordinary task/workspace decision local and cheap.  If it
+    // denies, release the registry lock before asking the planning API for
+    // the same manager-chain read authority used by session handoff.  An API
+    // failure falls back to this denial, so the old scope remains fail-closed.
+    let (initial_decision, initial_caller_identity) = if let Some(cuid) = caller_uid {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            resolve_read_decision(&state, cuid, &p.session_uid),
+            crate::items::org::caller_identity(&state, cuid),
+        )
+    } else {
+        (crate::control::auth::AuthDecision::Allow, None)
+    };
+    let org_identity = if !initial_decision.is_allow() {
+        caller_uid.and_then(|cuid| {
+            crate::items::org::read_authorized_target(
+                state_arc,
                 cuid,
                 &p.session_uid,
-                tomb.task_id.as_deref(),
-                &tomb.workspace_id,
             )
-        } else {
-            crate::control::auth::check_session_caller(&state, cuid, &p.session_uid)
-        };
-        return_auth_error_if_denied_with_state(decision, cuid, &p.session_uid, Some(&state))?;
+        })
+    } else {
+        None
+    };
+    if !initial_decision.is_allow() && org_identity.is_none() {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let decision = caller_uid
+            .map(|cuid| resolve_read_decision(&state, cuid, &p.session_uid))
+            .unwrap_or(crate::control::auth::AuthDecision::Allow);
+        if let Some(cuid) = caller_uid {
+            return_auth_error_if_denied_with_state(
+                decision,
+                cuid,
+                &p.session_uid,
+                Some(&state),
+            )?;
+        }
+    }
+    let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(cuid) = caller_uid {
+        let current_caller_identity = crate::items::org::caller_identity(&state, cuid);
+        if current_caller_identity != initial_caller_identity {
+            return Err((
+                ErrorCode::Unauthorized,
+                "caller session changed during read authorization; retry".into(),
+            ));
+        }
+        let current_decision = resolve_read_decision(&state, cuid, &p.session_uid);
+        let attribution_changed = org_identity.as_ref().is_some_and(|granted| {
+            crate::items::org::target_identity(&state, &p.session_uid).as_ref() != Some(granted)
+        });
+        // Re-check the current target after the API call.  A reused UID may
+        // now name a different task/member/transcript; the old grant cannot
+        // authorize that replacement.  If the current task scope itself now
+        // allows the target, the ordinary scope is sufficient.
+        if attribution_changed || org_identity.is_none() {
+            return_auth_error_if_denied_with_state(
+                current_decision,
+                cuid,
+                &p.session_uid,
+                Some(&state),
+            )?;
+        }
     }
     // Auth passed (or Operator caller). Resolve the target: live session first,
     // then a recently-exited tombstone (read-after-exit), else NotFound.
     if let Some(session) = state.sessions.get(&p.session_uid) {
-        let (state_str, idle) = compute_session_state_and_idle(session);
+        let (state_str, pty_idle) = compute_session_state_and_idle(session);
+        let agent_state = crate::agent_state::current(session);
+        let idle = agent_state.compatibility_idle(pty_idle, state.config.presence_idle_enabled);
         // Sub-2b-1 review-r#2 #2: surface the generation counter
         // so the Python `read_session_output` tool's cursor
         // (`v1:<generation>:<offset>`) resets when the underlying
@@ -2756,9 +3495,22 @@ pub fn resolve_authorized_session(
         Ok(json!({
             "state": state_str,
             "engine": engine_str(&session.session_type),
+            "kind": if session.session_type == "bash" { "shell" } else { "agent" },
             "transcript_path": session.transcript_path.clone(),
             "generation": session.generation,
+            "managed_by_uid": session.managed_by_uid,
+            "workflow_run_id": session.workflow_run_id,
+            "continuous_task_id": session.continuous_task_id,
+            "claude_recovery_eligible": engine_str(&session.session_type) == "claude-code"
+                && session.managed_by_uid.is_some() && session.workflow_run_id.is_none()
+                && session.continuous_task_id.is_none() && !session.last_exit.kernel_set()
+                && !state.restarting && !state.draining && state.config.claude_limit_recovery
+                && !crate::rotation::in_progress(&p.session_uid) && !crate::handoff::in_progress(&p.session_uid),
             "idle": idle,
+            "pty_idle": pty_idle,
+            "agent_state": agent_state,
+            "prompt_delivery": session.prompt_delivery.as_ref().map(|ticket|
+                ticket.lock().unwrap_or_else(|p| p.into_inner()).clone()),
             // Hook-derived turn-boundary signal (S3): null = no hook
             // data, true = last turn-end postdates last input (at the
             // prompt regardless of PTY spinner noise), false = a turn
@@ -2767,6 +3519,9 @@ pub fn resolve_authorized_session(
             "reported_done": report.is_some(),
             "reported_done_at": report.as_ref().map(|r| r.at_unix),
             "report_reason": report.as_ref().and_then(|r| r.reason.clone()),
+            // #24: monitors absorb the turn CM's own after-notice causes.
+            "rotation": crate::rotation::status(&p.session_uid),
+            "handoff": crate::handoff::status(&p.session_uid),
         }))
     } else if let Some(tomb) = state.exited_tombstone(&p.session_uid) {
         // Read-after-exit: the session left the registry but its transcript
@@ -2781,12 +3536,16 @@ pub fn resolve_authorized_session(
         Ok(json!({
             "state": "exited",
             "engine": engine_str(&tomb.session_type),
+            "kind": if tomb.session_type == "bash" { "shell" } else { "agent" },
             "transcript_path": tomb.transcript_path.clone(),
             "generation": tomb.generation,
             "continuous_task_id": tomb.continuous_task_id,
             "idle": true,
+            "pty_idle": true,
+            "agent_state": {"state": "exited"},
             "semantic_idle": true,
             "exited_at": tomb.exited_at,
+                "startup_failure": tomb.startup_failure,
             "killed": tomb.killed,
             "killed_by": tomb.killed_by.clone(),
             // UX item 4a: did it finish, or just stop? A tombstoned report
@@ -2808,8 +3567,94 @@ pub fn resolve_authorized_session(
 // ============================================================
 
 #[derive(Deserialize)]
+struct SessionAgentReportParams {
+    session_uid: String,
+    #[serde(flatten)]
+    report: crate::agent_state::Report,
+}
+
+/// Agent sources may publish only their own state. Operator access is retained
+/// for diagnostics; normal control scope never grants the right to forge a
+/// descendant's engine observations.
+pub fn session_agent_report(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
+    if params.to_string().len() > 256 * 1024 {
+        return Err((ErrorCode::InvalidParams, "agent report exceeds 256 KiB".into()));
+    }
+    let p: SessionAgentReportParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("session.agent_report params: {e}")))?;
+    if caller_uid.is_some_and(|uid| uid != p.session_uid) {
+        return Err((ErrorCode::Unauthorized, "session.agent_report is self-only".into()));
+    }
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.session_uid);
+    let _recovery_read = recovery_gate.read().unwrap_or_else(|p| p.into_inner());
+    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    if state.restarting {
+        return Err((ErrorCode::Conflict, "brain restart in progress; retry the latest report".into()));
+    }
+    let session = state.sessions.get(&p.session_uid)
+        .ok_or_else(|| (ErrorCode::NotFound, format!("session '{}' not in daemon registry", p.session_uid)))?;
+    if session.last_exit.kernel_set() {
+        return Err((ErrorCode::Conflict, "session has exited".into()));
+    }
+    let native_codex = session.session_type == "codex";
+    let correct_engine = match &p.report {
+        crate::agent_state::Report::Hook { .. } => session.session_type == "claude-code",
+        crate::agent_state::Report::Snapshot { .. } => native_codex,
+    };
+    if !correct_engine {
+        return Err((ErrorCode::InvalidParams, "report kind does not match the session engine".into()));
+    }
+    // Permission hooks inherit the parent's CM identity in nested engines.
+    // They cannot rebind the main transcript or report a different conversation.
+    if let crate::agent_state::Report::Hook {
+        event: crate::agent_state::HookEvent::PermissionRequest | crate::agent_state::HookEvent::Notification,
+        payload,
+    } = &p.report {
+        let bound = session.transcript_path.as_deref().map(std::path::Path::new);
+        let foreign = payload.agent_id.is_some()
+            || bound.is_some_and(|path| payload.session_id.as_deref().is_some_and(|id|
+                path.file_stem().and_then(|s| s.to_str()) != Some(id))
+                || payload.transcript_path.as_deref().is_some_and(|reported| std::path::Path::new(reported) != path));
+        if foreign {
+            return Ok(json!({"ok":true,"applied":false,"agent_state":crate::agent_state::current(session)}));
+        }
+    }
+    // Establish a pre-report baseline even if the periodic tick has not run yet.
+    crate::agent_state::recompute_and_publish(&state, &p.session_uid);
+    let continuing = matches!(&p.report, crate::agent_state::Report::Hook {
+        event: crate::agent_state::HookEvent::Stop, payload,
+    } if payload.continuing);
+    let applied = session.agent_state.lock().unwrap_or_else(|p| p.into_inner())
+        .apply(p.report, crate::agent_state::unix_now())
+        .map_err(|e| (ErrorCode::InvalidParams, e))?;
+    if applied.accepted {
+        if applied.started || continuing { session.stamp_engine_activity(); }
+        if applied.ended { session.stamp_turn_end(); }
+        rebind_reported_transcript(&mut state, &p.session_uid, applied.transcript_path.as_deref());
+        crate::agent_state::recompute_and_publish(&state, &p.session_uid);
+    }
+    let agent_state = crate::agent_state::current(&state.sessions[&p.session_uid]);
+    drop(state);
+    if applied.accepted && native_codex && applied.refresh_rollout {
+        crate::transcript_detect::observe_codex_rollout_once(state_arc, &p.session_uid, &mut false);
+    }
+    // #24: a due rotation starts right at the turn end, before the next
+    // wake (messages, a finished background job) starts another turn.
+    if applied.accepted && applied.ended && !continuing {
+        crate::rotation::on_turn_end(state_arc, &p.session_uid);
+    }
+    Ok(json!({"ok": true, "applied": applied.accepted, "agent_state": agent_state}))
+}
+
+#[derive(Deserialize)]
 struct SessionTurnEndedParams {
     session_uid: String,
+    #[serde(default)]
+    observed_at: Option<f64>,
     /// Stop-hook inbox messages resume the turn; invalidate old idle/done
     /// signals instead of advertising a boundary while those messages run.
     #[serde(default)]
@@ -2848,6 +3693,8 @@ pub fn session_turn_ended(
                 format!("session.turn_ended params: {}", e),
             )
         })?;
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.session_uid);
+    let _recovery_read = recovery_gate.read().unwrap_or_else(|p| p.into_inner());
     let mut state = state_arc.lock().unwrap_or_else(|p2| p2.into_inner());
     if let Some(cuid) = caller_uid {
         let decision = crate::control::auth::check_session_caller(
@@ -2863,12 +3710,49 @@ pub fn session_turn_ended(
             format!("session '{}' not in daemon registry", p.session_uid),
         )
     })?;
-    if p.continuing {
+    if session.session_type == "claude-code" {
+        let applied = session.agent_state.lock().unwrap_or_else(|p| p.into_inner()).apply(
+                crate::agent_state::Report::Hook {
+                    event: crate::agent_state::HookEvent::Stop,
+                    payload: crate::agent_state::HookPayload {
+                        observed_at: p.observed_at,
+                        continuing: p.continuing,
+                        ..Default::default()
+                    },
+                },
+                crate::agent_state::unix_now(),
+            ).map_err(|e| (ErrorCode::InvalidParams, e))?;
+        if applied.accepted && (applied.started || p.continuing) {
+            session.stamp_engine_activity();
+        }
+        if applied.ended {
+            session.stamp_turn_end();
+        }
+    } else if p.continuing {
         session.input_handle().stamp_activity();
     } else {
         session.stamp_turn_end();
     }
     let native_codex = session.session_type == "codex";
+    let ended = !p.continuing;
+    rebind_reported_transcript(&mut state, &p.session_uid, p.transcript_path.as_deref());
+    crate::agent_state::recompute_and_publish(&state, &p.session_uid);
+    drop(state);
+    if ended {
+        crate::rotation::on_turn_end(state_arc, &p.session_uid);
+    }
+    if native_codex {
+        // The native launcher reports the selected thread immediately. The
+        // existing /proc ownership check validates its exact rollout before
+        // persisting/broadcasting the resume identity.
+        crate::transcript_detect::observe_codex_rollout_once(state_arc, &p.session_uid, &mut false);
+    }
+    Ok(json!({ "ok": true }))
+}
+
+
+fn rebind_reported_transcript(state: &mut DaemonState, session_uid: &str, reported: Option<&str>) {
+    let Some(session) = state.sessions.get(session_uid) else { return; };
     // fix-stale-resume: refresh the recorded resume key from the hook's
     // report. Unlike `session.set_transcript_path` (Operator-only, because
     // the TUI is authoritative for path conventions) this is a SELF-report
@@ -2877,9 +3761,7 @@ pub fn session_turn_ended(
     // the directory check below bounds WHICH file may be claimed. Without
     // that second check a session could name another session's transcript
     // and turn its own `read_session_output` into a cross-session read.
-    let reported = p
-        .transcript_path
-        .as_deref()
+    let reported = reported
         .map(str::trim)
         .filter(|s| !s.is_empty());
     if let Some(reported) = reported {
@@ -2893,11 +3775,13 @@ pub fn session_turn_ended(
             .zip(std::path::Path::new(reported).parent())
             .is_some_and(|(dir, parent)| dir == parent);
         let changed = contained
-            && session.transcript_path.as_deref() != Some(reported);
+            && session.transcript_path.as_deref() != Some(reported)
+            // #114: never back onto the transcript a rotation is moving it off.
+            && !crate::rotation::refuses_restamp(session_uid, reported);
         if changed {
             let reported = reported.to_string();
             let mut entry = None;
-            if let Some(session) = state.sessions.get_mut(&p.session_uid) {
+            if let Some(session) = state.sessions.get_mut(session_uid) {
                 // Mirror `set_transcript_path`: a real rotation bumps the
                 // generation so an agent's read cursor is invalidated.
                 session.generation = session.generation.saturating_add(1);
@@ -2911,18 +3795,10 @@ pub fn session_turn_ended(
             // manifest row (what A-R and a user-owned restore resume
             // from) follows the in-pane `/resume` within one turn.
             if let Some(entry) = entry {
-                broadcast_transcript_updated(&state, &p.session_uid, entry);
+                broadcast_transcript_updated(state, session_uid, entry);
             }
         }
     }
-    drop(state);
-    if native_codex {
-        // The native launcher reports the selected thread immediately. The
-        // existing /proc ownership check validates its exact rollout before
-        // persisting/broadcasting the resume identity.
-        crate::transcript_detect::observe_codex_rollout_once(state_arc, &p.session_uid, &mut false);
-    }
-    Ok(json!({ "ok": true }))
 }
 
 /// Sub-2b-1 (review #2): PTY-quiet threshold for daemon-side
@@ -3000,6 +3876,12 @@ pub(super) fn compute_session_state_and_idle(
     (state_str, idle)
 }
 
+/// Shared idle predicate for daemon-side background drivers, including
+/// ordinary session wake schedules. Keep the PTY-quiet threshold in one place.
+pub(crate) fn session_pty_idle_for_schedule(session: &crate::session::DaemonSession) -> bool {
+    compute_session_state_and_idle(session).1
+}
+
 // ============================================================
 // session.set_transcript_path (sub-2b-1 review #1)
 // ============================================================
@@ -3059,6 +3941,16 @@ pub fn set_transcript_path(
             ErrorCode::InvalidParams,
             "transcript_path must be non-empty".into(),
         ));
+    }
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.session_uid);
+    let _recovery_read = (!crate::claude_recovery::internal_active(&p.session_uid))
+        .then(|| recovery_gate.read().unwrap_or_else(|p| p.into_inner()));
+    if let Some(reason) = crate::claude_recovery::admission_refusal(&p.session_uid) {
+        return Err((ErrorCode::Conflict, reason));
+    }
+    // #114: a fork being verified is never bound back to its source.
+    if crate::rotation::refuses_restamp(&p.session_uid, &p.transcript_path) {
+        return Ok(json!({ "ok": true, "ignored": "the session is being rotated off that transcript" }));
     }
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     let session = state.sessions.get_mut(&p.session_uid).ok_or_else(|| {
@@ -3133,7 +4025,7 @@ pub(crate) fn transcript_updated_entry(s: &crate::session::DaemonSession) -> Val
 /// critical section — `ManifestWatcher::broadcast` is non-blocking
 /// (bounded channels, drops on a stalled consumer), so holding the
 /// lock across it is the same cost as the existing `Exited` path.
-fn broadcast_transcript_updated(state: &DaemonState, uid: &str, entry: Value) {
+pub(crate) fn broadcast_transcript_updated(state: &DaemonState, uid: &str, entry: Value) {
     state
         .manifest_watcher
         .broadcast(crate::manifest::ManifestDiff::Updated {
@@ -3203,6 +4095,7 @@ pub fn set_workflow_context(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
 ) -> MethodResult {
+    let _binding = crate::continuous::adoption::binding_lock();
     let p: SetWorkflowContextParams = serde_json::from_value(params.clone())
         .map_err(|e| {
             (
@@ -3230,6 +4123,13 @@ pub fn set_workflow_context(
                 .into(),
         ));
     }
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.uid);
+    let _recovery_read = recovery_gate.try_read().map_err(|_| (
+        ErrorCode::Conflict, "session is reserved for background recovery".into()
+    ))?;
+    if let Some(reason) = crate::claude_recovery::admission_refusal(&p.uid) {
+        return Err((ErrorCode::Conflict, reason));
+    }
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     let session = match state.sessions.get_mut(&p.uid) {
         Some(s) => s,
@@ -3244,8 +4144,25 @@ pub fn set_workflow_context(
             }));
         }
     };
+    crate::continuous::adoption::session_available(&p.uid)?;
+    if session.continuous_task_id.is_some() && p.workflow_run_id.is_some() {
+        return Err((ErrorCode::Conflict, "session belongs to a continuous task".into()));
+    }
+    // A top-level operator spawn may be tagged as a workflow participant
+    // immediately after creation. Consume the pending Owner-placement intent
+    // before the next heartbeat so a transient workflow tag can never turn
+    // into a later auto-hire when the run is cleared.
+    if p.workflow_run_id.is_some() {
+        if let Some(org) = session.org.as_mut() {
+            org.remove(crate::assistants::AUTO_PLACE_OWNER);
+        }
+    }
     session.workflow_run_id = p.workflow_run_id;
     session.workflow_role = p.workflow_role;
+    // Persist both the workflow tag and the consumed placement intent while
+    // the same state lock is held. A crash before the next heartbeat must not
+    // revive a workflow participant as a fresh Owner hire.
+    state.persist_sessions_best_effort();
     Ok(json!({
         "ok": true,
         "daemon_owned": true,
@@ -3380,12 +4297,7 @@ pub fn set_global_perms(
 fn engine_str(session_type: &str) -> &'static str {
     match session_type {
         "codex" => "codex",
-        // The TUI's helper defaults to "claude-code" for
-        // anything not "codex" — `bash` sessions return
-        // "claude-code" too (they have no transcript so the
-        // engine field is moot; Python tool short-circuits on
-        // `transcript_path: None`). Preserve that quirk so
-        // wire shapes match byte-for-byte.
+        "bash" => "bash",
         _ => "claude-code",
     }
 }
@@ -3465,6 +4377,11 @@ struct TaskUpdateTreeWorkspaceEntry {
     /// workspaces that haven't been spawned into yet.
     #[serde(default)]
     worktree_path: Option<String>,
+    /// The `org.binding_epoch` the pushing TUI knows for this workspace
+    /// (doc/org-model.md §12). Older TUIs send none (0): their snapshot
+    /// cannot change a centrally bound workspace's relations.
+    #[serde(default)]
+    binding_epoch: u64,
 }
 
 pub fn task_update_tree(
@@ -3478,15 +4395,44 @@ pub fn task_update_tree(
     // distinguish "tree pushed and target genuinely out of scope"
     // from "tree hasn't been pushed yet" — see `DaemonState::task_tree_pushed`.
     state.task_tree_pushed = true;
+    // doc/org-model.md §12, the binding_epoch guard: a centrally bound
+    // workspace's task relations change only through a push that knows
+    // its current epoch. `held` = such workspaces this push is stale for.
+    let pushed_epochs: std::collections::HashMap<&str, u64> = p
+        .workspaces
+        .iter()
+        .map(|w| (w.workspace_id.as_str(), w.binding_epoch))
+        .collect();
+    let held: std::collections::HashSet<String> = state
+        .workspaces
+        .iter()
+        .filter_map(|(id, ws)| {
+            let stored = cm_holder_proto::org::binding_epoch(ws.org.as_ref())?;
+            (pushed_epochs.get(id.as_str()).copied().unwrap_or(0) < stored).then(|| id.clone())
+        })
+        .collect();
+    let held_relations: Vec<(String, String)> = state
+        .task_workspaces
+        .iter()
+        .filter(|(_, ws)| held.contains(*ws))
+        .map(|(t, ws)| (t.clone(), ws.clone()))
+        .collect();
     // Replace, not merge. The TUI sends the full tree on every
     // update; partial updates aren't a thing (see module doc).
     state.task_tree.clear();
     state.task_workspaces.clear();
     for entry in p.tasks {
         if let Some(ws) = entry.workspace_id.clone() {
-            state.task_workspaces.insert(entry.task_id.clone(), ws);
+            // A stale snapshot cannot bind a task to a held workspace.
+            if !held.contains(&ws) {
+                state.task_workspaces.insert(entry.task_id.clone(), ws);
+            }
         }
         state.task_tree.insert(entry.task_id, entry.parent_task_id);
+    }
+    // …nor unbind or rebind the tasks a held workspace already has.
+    for (task_id, ws) in held_relations {
+        state.task_workspaces.insert(task_id, ws);
     }
     // Re-apply agent-minted task edges over the fresh snapshot
     // (fix-start-session; see `DaemonState::agent_task_edges`).
@@ -3550,7 +4496,9 @@ pub fn task_update_tree(
         // owns the source of truth" rule) and accept the daemon-
         // discovered-path-cleared edge case. Tracked as a wire-
         // shape follow-up.
-        entry.worktree_path = ws_entry.worktree_path.map(std::path::PathBuf::from);
+        if !held.contains(&ws_entry.workspace_id) {
+            entry.worktree_path = ws_entry.worktree_path.map(std::path::PathBuf::from);
+        }
     }
     // GC workspaces that fell out of the TUI's push AND have no
     // live daemon-owned session anchoring them. Without this,
@@ -3576,10 +4524,12 @@ pub fn task_update_tree(
     // durable anchor that keeps the workspace alive until its agent spawns.
     let bound_ws_ids: std::collections::HashSet<String> =
         state.bindings.values().cloned().collect();
-    state.workspaces.retain(|ws_id, _| {
+    state.workspaces.retain(|ws_id, ws| {
         pushed_ws_ids.contains(ws_id)
             || live_ws_ids.contains(ws_id)
             || bound_ws_ids.contains(ws_id)
+            // A centrally bound workspace is never GC'd by a TUI snapshot.
+            || crate::state::binding_guarded(ws)
     });
     Ok(json!({
         "ok": true,
@@ -3628,6 +4578,11 @@ struct RegisterAgentSubtaskParams {
     /// leave the existing entry alone.
     #[serde(default)]
     worktree_path: Option<String>,
+    /// The TUI's `workspace_kind` for the subtask's workspace
+    /// (doc/org-model.md §12): `ephemeral` for a branch-mode mint. Set
+    /// only on a workspace that has no kind yet.
+    #[serde(default)]
+    workspace_kind: Option<String>,
 }
 
 pub fn register_agent_subtask(
@@ -3652,6 +4607,17 @@ pub fn register_agent_subtask(
                 ..Default::default()
             });
         entry.worktree_path = Some(std::path::PathBuf::from(path));
+    }
+    if let Some(kind) = p.workspace_kind.filter(|k| !k.is_empty()) {
+        if let Some(ws) = state.workspaces.get_mut(&p.workspace_id) {
+            if cm_holder_proto::org::workspace_kind(ws.org.as_ref()).is_none() {
+                cm_holder_proto::org::set(
+                    &mut ws.org,
+                    cm_holder_proto::org::WORKSPACE_KIND,
+                    Value::String(kind),
+                );
+            }
+        }
     }
     // `record_agent_task_edge` seeds BOTH the durable overlay and the
     // immediate `task_tree` edge the descendant walk reads.
@@ -3689,6 +4655,18 @@ pub fn register_agent_subtask(
 // parity, pinned by a test). This is Operator-only.
 
 pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
+    // Read the already-open store without projecting names or touching disk.
+    // Drop this lock before taking state again: delivery can hold the store
+    // while it needs state, and health must not wait on that path.
+    let messaging = state_arc.lock().unwrap_or_else(|p| p.into_inner()).messaging.clone();
+    let (messaging_sync, messaging_sync_state) = match messaging.try_lock() {
+        Ok(slot) => match slot.as_ref() {
+            Some(store) => (Some(store.sync_status()), "ready"),
+            None => (None, "starting"),
+        },
+        Err(std::sync::TryLockError::WouldBlock) => (None, "busy"),
+        Err(std::sync::TryLockError::Poisoned(_)) => (None, "unavailable"),
+    };
     // Holder-split (phase 4): the holder status round-trip runs
     // BEFORE the state lock — a channel wait under the lock would be
     // a convoy (and a holder that doesn't answer means this brain is
@@ -3710,6 +4688,11 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         None => (false, "preflight has not run".to_string()),
     };
     let total = state.sessions.len();
+    let mut sessions_by_state = std::collections::BTreeMap::<String, usize>::new();
+    for session in state.sessions.values() {
+        let state = crate::agent_state::current(session);
+        *sessions_by_state.entry(state.state.as_str().to_string()).or_default() += 1;
+    }
     // A session with no transcript has never reported a turn-end, which is
     // exactly the shape the incident produced. Surfacing the split makes
     // "restored 19, none of them ready" legible at a glance.
@@ -3718,16 +4701,19 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         .values()
         .filter(|s| s.transcript_path.is_some())
         .count();
-    // H3: drain visibility. `sessions_mid_turn` counts sessions whose
-    // semantic-idle signal says a turn is IN FLIGHT (input newer than
-    // the last turn-end self-report). Sessions without the signal
-    // (bash, codex, pre-hook spawns → `semantic_idle() == None`) are
-    // not counted — the drain wait protects hook-reporting claude
-    // sessions, the ones with conversations to lose.
+    // Engine work includes live background work. Legacy sessions retain their
+    // semantic-idle rule; terminal repainting cannot hide engine activity.
     let mid_turn = state
         .sessions
         .values()
-        .filter(|s| s.semantic_idle() == Some(false))
+        .filter(|s| {
+            let agent = crate::agent_state::current(s);
+            if agent.source.engine_reported() {
+                matches!(agent.state, crate::agent_state::State::Working | crate::agent_state::State::WorkingBackground)
+            } else {
+                s.semantic_idle() == Some(false)
+            }
+        })
         .count();
     // DESIGN_HOLDER_BRAIN_SPLIT phase 4: the full split health
     // surface (C14 shipped the `split` bit with the cm-redeploy
@@ -3769,6 +4755,12 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
             ),
             None => (None, None, None, None, None),
         };
+    // doc/org-model.md §12: refresh the heartbeat's cached pin status
+    // from this round trip, then report each role and the intersection.
+    if let Some(pin) = previous_pin {
+        crate::capabilities::note_previous_pin(pin);
+    }
+    let capabilities = crate::capabilities::report(previous_pin);
     Ok(json!({
         "ok": true,
         "split": split,
@@ -3781,11 +4773,18 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         "brain_restarts": brain_restarts,
         "holder_pings_unanswered": pings_unanswered,
         "previous_pin": previous_pin,
+        // doc/org-model.md §12: each role's list and their intersection.
+        "capabilities": capabilities,
+        "s4_min_write": state.config.s4_min_write,
         "holder_status_error": holder_status_err,
         "mcp_ok": mcp_ok,
         "mcp_detail": mcp_detail,
+        "messaging_sync": messaging_sync,
+        "messaging_sync_state": messaging_sync_state,
+        "owner_notifications": state.owner_notifications.health(),
         "sessions": total,
         "sessions_with_transcript": with_transcript,
+        "sessions_by_state": sessions_by_state,
         "workspaces": state.workspaces.len(),
         "draining": state.draining,
         // DESIGN_SEAMLESS_RESTART phase 2d: a restart attempt is in
@@ -3848,12 +4847,29 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
 
 pub fn reload_config(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
     let path = crate::config::default_config_path();
-    let new_cfg = crate::config::load_or_default(&path).map_err(|e| {
+    let mut new_cfg = crate::config::load_or_default(&path).map_err(|e| {
         (
             ErrorCode::Internal,
             format!("daemon.reload_config: {}", e),
         )
     })?;
+
+    // Admission holds the matching read side through a recovery write. A
+    // completed disable therefore cannot race a later automatic prompt.
+    // Keep the journal transaction outermost: the recovery worker holds this
+    // gate before taking the config read lock during an admitted attempt.
+    let _recovery_journal = crate::claude_account_recovery::journal_gate().lock().unwrap_or_else(|p| p.into_inner());
+    let _recovery_config = crate::claude_account_recovery::config_gate().write().unwrap_or_else(|p| p.into_inner());
+    let mut warnings = Vec::new();
+    if let Err(e) = crate::claude_account_recovery::configure_inner(state_arc, new_cfg.claude_limit_recovery) {
+        let root = state_arc.lock().unwrap_or_else(|p| p.into_inner()).messaging_root.clone();
+        let marker_confirmed = crate::notifications::recovery_disabled_confirmed(&root);
+        new_cfg.claude_limit_recovery = false;
+        let warning = format!("Claude recovery disabled after configuration failure: {e}; disabled marker {}",
+            if marker_confirmed { "confirmed" } else { "could not be confirmed" });
+        eprintln!("cm-daemon: reload_config: {warning}");
+        warnings.push(warning);
+    }
 
     const RESTART_ONLY: &[&str] = &["auth", "tls"];
 
@@ -3879,10 +4895,24 @@ pub fn reload_config(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
             let mut applied = new_cfg.clone();
             applied.auth = st.config.auth.clone();
             applied.tls = st.config.tls.clone();
+            crate::mcp_config::set_codex_inline_scrollback(applied.codex_inline_scrollback);
+            crate::models::set_models(applied.models.clone());
+            if st.config.s4_min_write != applied.s4_min_write
+                || st.config.api_url != applied.api_url || st.config.api_token != applied.api_token {
+                crate::items::s4_attribution::invalidate_config_epoch();
+            }
+            // Serialize trim policy publication with periodic admission. This
+            // short control lock is never held by allocator calls and the trim
+            // worker never takes the daemon state lock.
+            crate::memory_trim::reload(applied.memory.clone());
             st.config = applied;
         }
         (changed, requires_restart)
     };
+
+    if changed.iter().any(|k| matches!(k.as_str(), "s4_min_write" | "api_url" | "api_token")) {
+        crate::items::heartbeat::poke();
+    }
 
     // Re-derive the startup artifacts whose inputs moved. IO happens
     // outside the state lock; results are assigned under it.
@@ -3950,6 +4980,7 @@ pub fn reload_config(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         "requires_restart": requires_restart,
         "mcp_preflight": mcp_preflight,
         "workflow_definitions_reloaded": workflow_defs_reloaded,
+        "warnings": warnings,
     }))
 }
 
@@ -4225,6 +5256,14 @@ struct StartWorkflowParams {
     /// identical to the TOML default.
     #[serde(default)]
     role_engines: Option<std::collections::BTreeMap<String, String>>,
+    /// Per-role model override for fresh spawns, like `role_engines`.
+    /// Absent → the role's TOML `model` (when its engine is used) → the
+    /// task default → the engine default.
+    #[serde(default)]
+    role_models: Option<std::collections::BTreeMap<String, String>>,
+    /// Per-role effort override for fresh spawns, like `role_models`.
+    #[serde(default)]
+    role_efforts: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// Phase 4 §D: daemon-side `start_workflow`. Spawns each role's participant
@@ -4240,6 +5279,7 @@ pub fn start_workflow(
     caller: &Caller,
     params: &Value,
 ) -> MethodResult {
+    let _binding = crate::continuous::adoption::binding_lock();
     use crate::workflow::run::{MessageBaseline, RoleBinding};
     use crate::workflow::toml_schema::Engine;
 
@@ -4323,8 +5363,8 @@ pub fn start_workflow(
                 let task_id = match p.task_id.clone() {
                     Some(req_task) => {
                         let ok = own_task.as_deref().map_or(false, |own| {
-                            crate::control::auth::task_is_self_or_descendant_of(
-                                &state.task_tree,
+                            crate::control::auth::task_in_scope(
+                                &state,
                                 &req_task,
                                 own,
                             )
@@ -4424,6 +5464,20 @@ pub fn start_workflow(
     // pre-save failure never orphans a tag on a pre-existing session.
     let role_sessions_param: std::collections::BTreeMap<String, String> =
         p.role_sessions.clone().unwrap_or_default();
+    // Retain reservations through validation, run persistence and tagging.
+    // Nonblocking acquisition avoids lock inversion with the binding mutex.
+    let bound_recovery_uids: std::collections::BTreeSet<_> = role_sessions_param.values().cloned().collect();
+    let bound_recovery_gates: Vec<_> = bound_recovery_uids.iter()
+        .map(|uid| crate::claude_recovery::lifecycle_gate(uid)).collect();
+    let mut _bound_recovery_reads = Vec::new();
+    for (uid, gate) in bound_recovery_uids.iter().zip(&bound_recovery_gates) {
+        _bound_recovery_reads.push(gate.try_read().map_err(|_| (
+            ErrorCode::Conflict, format!("session '{uid}' is reserved for background recovery")
+        ))?);
+        if let Some(reason) = crate::claude_recovery::admission_refusal(uid) {
+            return Err((ErrorCode::Conflict, reason));
+        }
+    }
     let mut bound_bindings: std::collections::BTreeMap<String, RoleBinding> =
         std::collections::BTreeMap::new();
     let mut bound_baselines: std::collections::BTreeMap<String, MessageBaseline> =
@@ -4520,6 +5574,10 @@ pub fn start_workflow(
                         ),
                     ));
                 };
+                crate::continuous::adoption::session_available(uid)?;
+                if session.continuous_task_id.is_some() {
+                    return Err((ErrorCode::Conflict, "session belongs to a continuous task".into()));
+                }
                 // (6) the bound session's engine matches the role's TOML engine.
                 if normalize_engine(&session.session_type)
                     != normalize_engine(role.engine.as_session_type())
@@ -4570,18 +5628,8 @@ pub fn start_workflow(
                 // run — either would let the OTHER run's poller keep driving
                 // this PTY after we overwrote its tags (two pollers, one agent).
                 //
-                // TOCTOU (deferred — out of Phase 1 scope): this check reads
-                // `all_runs` under the lock, but the bound session is tagged only
-                // AFTER `save` (the tag-after-save acceptance criterion releases
-                // the lock in between). Two concurrent `start_workflow` RPCs both
-                // binding the SAME uid could each pass this check before either
-                // tags, yielding two active runs whose `daemon_session_uid` point
-                // at one PTY. A reservation that closed the window would conflict
-                // with tag-after-save, and the realistic trigger (two
-                // simultaneous deliberate binds of one live session on a
-                // mostly-single-operator daemon) is narrow. The doc's Phase-1 bar
-                // is the rejection check itself (implemented + tested); closing
-                // the race is left to a follow-up.
+                // The shared binding mutex spans validation, durable run save,
+                // and session tagging; adoption cannot race this binding.
                 for run in all_runs.iter().filter(|r| r.is_active()) {
                     if run
                         .role_sessions
@@ -4720,6 +5768,35 @@ pub fn start_workflow(
                 Engine::Codex => "codex",
             },
         };
+        let toml_engine = match role.engine {
+            Engine::ClaudeCode => "claude-code",
+            Engine::Codex => "codex",
+        };
+        let explicit_model = p
+            .role_models
+            .as_ref()
+            .and_then(|m| m.get(role_name))
+            .cloned()
+            .or_else(|| role.model.clone().filter(|_| session_type == toml_engine));
+        let explicit_effort = p
+            .role_efforts
+            .as_ref()
+            .and_then(|m| m.get(role_name))
+            .cloned()
+            .or_else(|| role.effort.clone().filter(|_| session_type == toml_engine));
+        let (role_model, role_effort) = match resolve_spawn_pick(
+            state_arc,
+            session_type,
+            explicit_model.as_deref(),
+            explicit_effort.as_deref(),
+            task_id.as_deref(),
+        ) {
+            Ok(m) => m,
+            Err((c, m)) => {
+                cleanup_spawned(&spawned_uids);
+                return Err((c, format!("start_workflow role '{}': {}", role_name, m)));
+            }
+        };
         let uid = new_daemon_minted_session_uid();
         // P-3: the cap for THIS participant. Prefer the caller session's
         // inherited cap (Session caller); otherwise fall back to the
@@ -4745,6 +5822,8 @@ pub fn start_workflow(
                 &uid,
                 Some(&wf_meta),
                 configured_mcp_server_path.as_deref(),
+                role_model.as_ref().map(|(m, _)| m.as_str()),
+                role_effort.as_ref().map(|(e, _)| e.as_str()),
             ) {
                 Ok(v) => v,
                 Err(e) => {
@@ -4787,6 +5866,7 @@ pub fn start_workflow(
         full.insert("worktree_path".into(), Value::String(worktree.clone()));
         full.insert("env".into(), Value::Object(env_obj));
         full.insert("session_type".into(), Value::String(session_type.to_string()));
+        insert_pick(&mut full, &role_model, &role_effort);
         full.insert("workflow_run_id".into(), Value::String(run_id.clone()));
         full.insert("workflow_role".into(), Value::String(role_name.clone()));
         if let Some(tid) = task_id.clone() {
@@ -4968,6 +6048,7 @@ pub fn start_workflow(
         let mut diffs: Vec<crate::manifest::ManifestDiff> = Vec::new();
         for (uid, role) in &bound_uid_roles {
             if let Some(s) = state.sessions.get_mut(uid) {
+                s.org.as_mut().map(|org| org.remove(crate::assistants::AUTO_PLACE_OWNER));
                 s.workflow_run_id = Some(run_id.clone());
                 s.workflow_role = Some(role.clone());
                 diffs.push(crate::manifest::ManifestDiff::Updated {
@@ -4982,6 +6063,9 @@ pub fn start_workflow(
                     }),
                 });
             }
+        }
+        if !bound_uid_roles.is_empty() {
+            state.persist_sessions_best_effort();
         }
         (
             state.workflow_event_watcher.clone(),
@@ -5197,8 +6281,8 @@ pub fn list_workflows(
             }
             Some(own) => {
                 let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-                if !crate::control::auth::task_is_self_or_descendant_of(
-                    &state.task_tree,
+                if !crate::control::auth::task_in_scope(
+                    &state,
                     req,
                     own,
                 ) {
@@ -5355,8 +6439,8 @@ fn list_workflows_visible_daemon(
             Some(req) => {
                 let resolved_tid = resolve_run_task_id(state, run);
                 match resolved_tid {
-                    Some(rid) => crate::control::auth::task_is_self_or_descendant_of(
-                        &state.task_tree,
+                    Some(rid) => crate::control::auth::task_in_scope(
+                        &state,
                         &rid,
                         req,
                     ),
@@ -5375,8 +6459,8 @@ fn list_workflows_visible_daemon(
     let Some(rid) = resolved_tid else {
         return false;
     };
-    if !crate::control::auth::task_is_self_or_descendant_of(
-        &state.task_tree,
+    if !crate::control::auth::task_in_scope(
+        &state,
         &rid,
         own,
     ) {
@@ -5385,8 +6469,8 @@ fn list_workflows_visible_daemon(
     // If explicit_scope is set, the run's task must also be
     // self-or-descendant of that scope.
     if let Some(req) = explicit_scope {
-        return crate::control::auth::task_is_self_or_descendant_of(
-            &state.task_tree,
+        return crate::control::auth::task_in_scope(
+            &state,
             &rid,
             req,
         );
@@ -5408,8 +6492,8 @@ fn workflow_run_authorized_daemon(
     let Some(rid) = resolve_run_task_id(state, run) else {
         return false;
     };
-    crate::control::auth::task_is_self_or_descendant_of(
-        &state.task_tree,
+    crate::control::auth::task_in_scope(
+        &state,
         &rid,
         own,
     )
@@ -5549,12 +6633,12 @@ struct ProposeTaskParams {
     description: String,
     #[serde(default)]
     prompt: String,
-    /// Git remote URL the task is for. The Python tool today
-    /// auto-detects via `git remote get-url origin` if missing;
-    /// the daemon doesn't know the agent's cwd, so we require
-    /// the caller to send it. The Python tool wrapper is
-    /// responsible for inferring + filling this when the agent
-    /// omitted it.
+    /// The CALLER's checkout (`git remote get-url origin`, detected by
+    /// the Python tool). Only a fallback: the row gets the target
+    /// project's repo, and the caller's only when the caller works in
+    /// that same project and the project has no known repo yet
+    /// (`resolve_propose_repo`).
+    #[serde(default)]
     repo_url: String,
     #[serde(default)]
     difficulty: Option<i32>,
@@ -5562,6 +6646,77 @@ struct ProposeTaskParams {
     depends: Option<Vec<String>>,
     #[serde(default)]
     initiative_id: Option<String>,
+    /// Reporting line: a task id, or `"me"` for the caller's own task. Sets
+    /// the new row's `parent_task_id` (the API applies its usual initiative
+    /// inheritance/validation). Absent = a top-level draft, as before.
+    #[serde(default)]
+    reports_to: Option<String>,
+    /// Default model for the new task (`metadata.models.<engine>`), which
+    /// its sessions and subtasks inherit. The slot is `model_engine`, else
+    /// the filing agent's own engine.
+    #[serde(default)]
+    model: Option<String>,
+    /// Default reasoning effort for the new task (`metadata.efforts.<engine>`), in the same slot as `model`.
+    #[serde(default)]
+    effort: Option<String>,
+    #[serde(default)]
+    model_engine: Option<String>,
+}
+
+/// The repo a task proposed into `project` is stamped with. The project's
+/// own repo (its record, else the repo most of its rows carry) always wins.
+/// A project with no repo yet takes the caller's checkout when the caller's
+/// task is in that same project, or when the caller has no task at all (a
+/// new project filed from its own checkout; logged as a warning). A tasked
+/// caller from another project is refused: a guessed repo propagates to
+/// every subtask and minted worktree.
+fn resolve_propose_repo(
+    creds: &PlanningApiCreds,
+    project: &str,
+    caller_repo_url: &str,
+    caller_task_id: Option<&str>,
+) -> Result<crate::planning_client::ProjectRepo, (ErrorCode, String)> {
+    let projects = api_list_projects(creds).map_err(|e| e.to_method_err())?;
+    if let Some(repo) = crate::planning_client::project_repo(&projects, project) {
+        return Ok(repo);
+    }
+    let caller_project = match caller_task_id {
+        None => None,
+        Some(id) => match api_get_task(creds, id) {
+            Ok(row) => row.get("project").and_then(Value::as_str).map(str::to_string),
+            Err(PlanningClientError::ApiError { status: 404, .. }) => None,
+            Err(e) => return Err(e.to_method_err()),
+        },
+    };
+    let caller_repo_url = caller_repo_url.trim();
+    let caller_repo = || crate::planning_client::ProjectRepo {
+        repo_url: caller_repo_url.to_string(),
+        repo_branch: "main".to_string(),
+    };
+    if !caller_repo_url.is_empty() && caller_project.as_deref() == Some(project) {
+        return Ok(caller_repo());
+    }
+    if !caller_repo_url.is_empty() && caller_task_id.is_none() {
+        eprintln!(
+            "cm-daemon: propose_task: project '{}' has no known repo and the caller has no \
+             task; stamping the caller's checkout {} (a new project?)",
+            project, caller_repo_url,
+        );
+        return Ok(caller_repo());
+    }
+    Err((
+        ErrorCode::InvalidParams,
+        format!(
+            "propose_task: project '{}' has no known repo (no project record and no \
+             tasks yet), and the caller's own project is {}, so its checkout can't \
+             stand in. Check the name with list_projects, file from a session working \
+             in '{}', or add ~/.cm/projects/{}/repo_url on the planning API host",
+            project,
+            caller_project.map(|p| format!("'{}'", p)).unwrap_or_else(|| "unknown".into()),
+            project,
+            project,
+        ),
+    ))
 }
 
 pub fn propose_task(
@@ -5583,44 +6738,65 @@ pub fn propose_task(
             "propose_task: 'name' is required and non-empty".into(),
         ));
     }
-    if p.repo_url.trim().is_empty() {
-        return Err((
-            ErrorCode::InvalidParams,
-            "propose_task: 'repo_url' is required (the Python tool wrapper \
-             should auto-detect via `git remote get-url origin` and forward; \
-             daemon doesn't know the agent's cwd)".into(),
-        ));
-    }
     // 12f F2: pass daemon.toml-sourced credentials as
     // overrides. Empty fields fall through to env in the
     // resolver — preserves the local-workstation case
     // (daemon launched from a shell with CM_API_URL /
     // CM_API_TOKEN exported, no daemon.toml on disk).
     let machine = local_machine_hostname();
-    let (metadata, api_url_cfg, api_token_cfg) = {
+    let (metadata, api_url_cfg, api_token_cfg, parent_task_id, caller_task_id) = {
         let st = state_arc.lock().expect("state mutex");
+        let caller_task_id = caller_uid
+            .and_then(|cuid| st.lookup_session_any(cuid))
+            .and_then(|view| view.task_id);
+        let parent_task_id = match p.reports_to.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(me) if me.eq_ignore_ascii_case("me") => Some(
+                caller_uid
+                    .and_then(|cuid| st.lookup_session_any(cuid))
+                    .and_then(|view| view.task_id)
+                    .ok_or((
+                        ErrorCode::InvalidParams,
+                        "propose_task: reports_to=\"me\" needs a caller bound to a task \
+                         (ping().task_id is null); pass a task id or omit reports_to"
+                            .to_string(),
+                    ))?,
+            ),
+            Some(task) => Some(task.to_string()),
+        };
+        let filer = filer_metadata(&st, caller_uid, machine.as_deref(), "mcp.propose_task");
+        let mut metadata = json!({});
+        let (models, efforts) =
+            filed_task_defaults(p.model.as_deref(), p.effort.as_deref(), p.model_engine.as_deref())?;
+        if let Some(models) = models {
+            metadata[crate::models::TASK_MODELS_METADATA_KEY] = models;
+        }
+        if let Some(efforts) = efforts {
+            metadata[crate::models::TASK_EFFORTS_METADATA_KEY] = efforts;
+        }
+        metadata["filer"] = filer;
         (
-            json!({
-                "filer": filer_metadata(
-                    &st,
-                    caller_uid,
-                    machine.as_deref(),
-                    "mcp.propose_task",
-                ),
-            }),
+            metadata,
             st.config.api_url.clone(),
             st.config.api_token.clone(),
+            parent_task_id,
+            caller_task_id,
         )
     };
+    let creds =
+        PlanningApiCreds::from_config(&api_url_cfg, &api_token_cfg).map_err(|e| e.to_method_err())?;
+    let repo = resolve_propose_repo(&creds, &p.project, &p.repo_url, caller_task_id.as_deref())?;
     let req = crate::planning_client::ProposeTaskRequest {
         project: &p.project,
         name: &p.name,
         description: &p.description,
         prompt: &p.prompt,
-        repo_url: &p.repo_url,
+        repo_url: &repo.repo_url,
+        repo_branch: &repo.repo_branch,
         difficulty: p.difficulty,
         depends: p.depends.as_deref(),
         initiative_id: p.initiative_id.as_deref(),
+        parent_task_id: parent_task_id.as_deref(),
         metadata: Some(&metadata),
     };
     let api_url_override = if api_url_cfg.is_empty() {
@@ -5639,6 +6815,16 @@ pub fn propose_task(
         api_token_override,
     ) {
         Ok(task) => {
+            // A reporting line wins: the overlay edge then mirrors the
+            // planning row's real parent instead of contradicting it.
+            if let Some(parent) = parent_task_id.as_deref() {
+                if let Some(new_task_id) = task.get("id").and_then(Value::as_str) {
+                    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                    state.record_agent_task_edge(new_task_id, parent);
+                    state.persist_sessions_best_effort();
+                }
+                return Ok(task);
+            }
             // fix-start-session: a task an agent just proposed is that
             // agent's own work — record the daemon-side creator edge so a
             // follow-up `start_session(task_id=<proposed>)` (and the
@@ -6958,8 +8144,10 @@ pub fn workflow_reject_finding(
 
 #[derive(Deserialize)]
 struct McpStartSessionParams {
-    #[serde(rename = "type")]
+    #[serde(default, rename = "type")]
     type_: String,
+    #[serde(default)]
+    work_kind: Option<String>,
     label: String,
     /// Initial prompt for the child. ux-5c: when this is absent or
     /// blank AND the spawn is task-bound AND the child is an agent
@@ -6992,6 +8180,19 @@ struct McpStartSessionParams {
     /// passed (the child spawns in the caller's workspace regardless).
     #[serde(default)]
     allow_shared_workspace: bool,
+    /// The child's model. Absent → the bound task's default (inherited
+    /// from its ancestors) → the engine default from `daemon.toml`
+    /// `[models]`. Rejected for bash.
+    #[serde(default)]
+    model: Option<String>,
+    /// The child's reasoning effort, resolved like `model`.
+    #[serde(default)]
+    effort: Option<String>,
+    /// #28: the chat name the creator gives the child, claimed right after
+    /// the spawn and BEFORE its first prompt is delivered, so the child
+    /// cannot race a first claim of its own (reported as `name_setup`).
+    #[serde(default)]
+    name: Option<String>,
 }
 
 /// Kitty keyboard Enter (CSI 13 u). codex and claude-code both enable the
@@ -7017,6 +8218,12 @@ const AGENT_PROMPT_SETTLE: std::time::Duration = std::time::Duration::from_milli
 /// case proceeds the moment the modes appear (~1-2s); this bound only
 /// caps pathological cold starts.
 const AGENT_MODE_WAIT_FRESH: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// A resumed Claude session may load a very large transcript after its input
+/// modes appear. Strict handoff delivery waits for real readiness for up to
+/// three minutes and refuses to type after the bound instead of losing the
+/// notice during that load.
+const AGENT_RESUME_READY_MAX: std::time::Duration = std::time::Duration::from_secs(3 * 60);
 
 /// Poll cadence for the mode-await loop.
 const AGENT_MODE_POLL: std::time::Duration = std::time::Duration::from_millis(150);
@@ -7136,6 +8343,148 @@ mod operator_quiet_tests {
     use super::await_operator_quiet;
     use crate::session::InputHandle;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn s4_existing_input_unit_finishes_enter_with_queued_writer() {
+        let _serial = crate::writer_gate::TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let uid = format!("ts-{}-0", uuid::Uuid::new_v4().simple());
+        let gate = crate::continuous::retirement::gate(&uid);
+        let (handle, writes) = InputHandle::test_handle_capturing();
+        let handle = handle.test_with_uid(&uid);
+        let fanout = std::sync::Arc::new(crate::session::PtyByteFanout::new(64));
+        let (body_tx, body_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let delivery_uid = uid.clone();
+        let delivery = std::thread::spawn(move || {
+            super::TEST_AFTER_AGENT_BODY.with(|h| *h.borrow_mut() = Some(Box::new(move || {
+                body_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            })));
+            let ok = super::deliver_agent_body_inner(&handle, &fanout, &delivery_uid, "prompt", false,
+                "test", None, None, None);
+            super::TEST_AFTER_AGENT_BODY.with(|h| *h.borrow_mut() = None);
+            ok
+        });
+        body_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let write_gate = gate.clone();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _guard = write_gate.write().unwrap();
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while gate.try_read().is_ok() && Instant::now() < deadline { std::thread::yield_now(); }
+        assert!(gate.try_read().is_err(), "writer must be queued behind the delivery unit");
+        resume_tx.send(()).unwrap();
+        assert!(delivery.join().unwrap());
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        writer.join().unwrap();
+        assert!(writes.lock().unwrap().len() >= 2, "body and Enter both reached the writer");
+    }
+
+    #[test]
+    fn recovery_waits_for_complete_prompt_body_and_enter() {
+        let _serial = crate::writer_gate::TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let uid = format!("ts-{}-0", uuid::Uuid::new_v4().simple());
+        let (handle, writes) = InputHandle::test_handle_capturing();
+        let handle = handle.test_with_uid(&uid);
+        let fanout = std::sync::Arc::new(crate::session::PtyByteFanout::new(64));
+        let (body_tx, body_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let delivery_uid = uid.clone();
+        let delivery = std::thread::spawn(move || {
+            super::TEST_AFTER_AGENT_BODY.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                body_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })));
+            let mut launch = crate::control::prompt_delivery::LaunchWrite { written_at:None, enter:Vec::new() };
+            let ok = super::deliver_agent_body_inner(&handle, &fanout, &delivery_uid, "prompt", false,
+                "test", None, None, Some(&mut launch));
+            super::TEST_AFTER_AGENT_BODY.with(|hook| *hook.borrow_mut() = None);
+            ok
+        });
+        body_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let identity = crate::claude_recovery::Identity {
+            uid:uid.clone(), task_id:None, workspace_id:"w".into(), canonical_cwd:"/tmp".into(),
+            daemon_id:"d".into(), native_session_id:"123e4567-e89b-12d3-a456-426614174000".into(),
+            transcript_generation:0, holder_incarnation:None, holder_pid:None, holder_start_time:None,
+            child_pid:1, child_start_time:1, background_pid:2, background_start_time:2,
+        };
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let recovery = std::thread::spawn(move || {
+            let state = std::sync::Arc::new(std::sync::Mutex::new(crate::state::DaemonState::new()));
+            started_tx.send(()).unwrap();
+            let result = crate::claude_recovery::confirm(&state, &serde_json::to_value(identity).unwrap(), true);
+            done_tx.send(result).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(done_rx.recv_timeout(Duration::from_millis(150)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+        release_tx.send(()).unwrap();
+        assert!(delivery.join().unwrap());
+        assert!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
+        recovery.join().unwrap();
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 2);
+        assert!(writes[0].1.windows(6).any(|w| w == b"prompt"));
+        assert!(!writes[1].1.is_empty(), "Enter must land before the recovery gate releases");
+    }
+
+    #[test]
+    fn restart_door_does_not_hold_session_admission() {
+        let _serial = crate::writer_gate::TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let uid = format!("ts-{}-1", uuid::Uuid::new_v4().simple());
+        let pause = crate::writer_gate::request_pause();
+        let (handle, _) = InputHandle::test_handle_capturing();
+        let handle = handle.test_with_uid(&uid);
+        let fanout = std::sync::Arc::new(crate::session::PtyByteFanout::new(64));
+        let (at_door_tx, at_door_rx) = std::sync::mpsc::channel();
+        let delivery_uid = uid.clone();
+        let delivery = std::thread::spawn(move || {
+            super::TEST_BEFORE_INPUT_UNIT.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                at_door_tx.send(()).unwrap();
+            })));
+            let mut launch = crate::control::prompt_delivery::LaunchWrite { written_at:None, enter:Vec::new() };
+            let ok = super::deliver_agent_body_inner(&handle, &fanout, &delivery_uid, "prompt", false,
+                "test", None, None, Some(&mut launch));
+            super::TEST_BEFORE_INPUT_UNIT.with(|hook| *hook.borrow_mut() = None);
+            ok
+        });
+        at_door_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let gate = crate::continuous::retirement::gate(&uid);
+        let writer = gate.try_write().expect("restart-parked delivery must not hold UID gate");
+        drop(writer);
+        drop(pause);
+        assert!(delivery.join().unwrap());
+    }
+
+    #[test]
+    fn launch_ignores_terminal_replies_but_defers_for_typing() {
+        let _serial = crate::writer_gate::TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let (handle, writes) = InputHandle::test_handle_capturing();
+        for reply in [b"\x1b[6;20;10t".as_slice(), b"\x1b[4;480;800t",
+            b"\x1bP>|kitty(0.39.1)\x1b\\", b"\x1b[A", b"\x1b[13;20R",
+            b"\x1b[?1;2c", b"\x1b[?1u", b"\x1b[<64;10;20M"] {
+            handle.write_and_stamp_operator(reply).unwrap();
+            assert!(handle.operator_quiet_for().is_none(), "{reply:?}");
+        }
+        handle.write_and_stamp_operator(b"typed draft").unwrap();
+        assert!(handle.operator_quiet_for().is_some());
+        let typed = Instant::now();
+        writes.lock().unwrap().clear();
+        let mut launch = crate::control::prompt_delivery::LaunchWrite { written_at: None, enter: Vec::new() };
+        let fanout = std::sync::Arc::new(crate::session::PtyByteFanout::new(64));
+        assert!(super::deliver_agent_body_inner(&handle, &fanout, "launch", "prompt", false,
+            "test launch", None, None, Some(&mut launch)));
+        let written = launch.written_at.unwrap();
+        assert!(written.duration_since(typed) >= super::OPERATOR_QUIET_WINDOW);
+        let captured = writes.lock().unwrap();
+        assert_eq!(captured.len(), 2, "defer then write body/Enter instead of cancelling");
+        assert!(captured[0].1.windows(6).any(|w| w == b"prompt"));
+    }
 
     #[test]
     fn codex_delivery_recovery_enter_preserves_new_operator_draft() {
@@ -7425,6 +8774,20 @@ fn agent_paste_payload(body: &str) -> Vec<u8> {
     }
 }
 
+fn reserve_detached_delivery(
+    state: &Arc<Mutex<DaemonState>>, handle: &crate::session::InputHandle, uid: &str,
+) -> Result<crate::claude_recovery::PendingInput, String> {
+    let gate = crate::claude_recovery::lifecycle_gate(uid);
+    let _guard = gate.try_write().map_err(|_| "session lifecycle is reserved".to_string())?;
+    if let Some(reason) = crate::claude_recovery::admission_refusal(uid) { return Err(reason); }
+    let state = state.lock().unwrap_or_else(|p| p.into_inner());
+    let session = state.sessions.get(uid).ok_or_else(|| "session disappeared".to_string())?;
+    if !handle.belongs_to(session) || session.last_exit.kernel_set() {
+        return Err("session was replaced or exited".into());
+    }
+    Ok(crate::claude_recovery::reserve_pending_input(uid))
+}
+
 /// Deliver a prompt to a kitty-TUI agent (codex or claude-code) on a
 /// detached thread: mode-await, write the body, gap, write Enter, verify.
 /// Async so callers return promptly (stays under the Python MCP 30s call
@@ -7453,17 +8816,191 @@ fn spawn_agent_prompt_delivery(
     session_uid: String,
     prompt: String,
     fresh_spawn: bool,
+    strict_ready: bool,
     confirm_state: Option<Arc<Mutex<DaemonState>>>,
 ) {
+    let pending = match confirm_state.as_ref() {
+        Some(state) => match reserve_detached_delivery(state, &handle, &session_uid) {
+            Ok(pending) => Some(pending),
+            Err(reason) => { eprintln!("cm-daemon: prompt for {session_uid} not queued: {reason}"); return; }
+        },
+        None => None,
+    };
+    let handle = handle.prepare_agent_input(&prompt);
     let _ = std::thread::Builder::new()
         .name(format!("cm-daemon-agent-prompt-{}", session_uid))
         .spawn(move || {
+            let _pending = pending;
+            #[cfg(test)]
+            test_pause_queued_input(&session_uid);
             if let Some(state) = confirm_state {
-                deliver_agent_body_confirmed(&state, &handle, &fanout, &session_uid, &prompt, fresh_spawn, "prompt");
+                if strict_ready {
+                    deliver_agent_body_confirmed_with(&state, &handle, &fanout, &session_uid, &prompt, fresh_spawn, true, "prompt");
+                } else {
+                    deliver_agent_body_confirmed(&state, &handle, &fanout, &session_uid, &prompt, fresh_spawn, "prompt");
+                }
             } else {
                 deliver_agent_body(&handle, &fanout, &session_uid, &prompt, fresh_spawn, "prompt");
             }
         });
+}
+
+fn spawn_initial_prompt_delivery(
+    state: Arc<Mutex<DaemonState>>,
+    handle: crate::session::InputHandle,
+    fanout: Arc<crate::session::PtyByteFanout>,
+    uid: String,
+    body: String,
+    ticket: super::prompt_delivery::Ticket,
+) {
+    use super::prompt_delivery::{self as delivery, Baseline, Check, LaunchWrite};
+    let pending = match reserve_detached_delivery(&state, &handle, &uid) {
+        Ok(pending) => pending,
+        Err(reason) => { delivery::finish(&ticket, Err("session_unavailable")); eprintln!("cm-daemon: initial prompt for {uid} not queued: {reason}"); return; }
+    };
+    let result_ticket = Arc::clone(&ticket);
+    let spawned = std::thread::Builder::new()
+        .name(format!("cm-launch-confirm-{uid}"))
+        .spawn(move || {
+            let _pending = pending;
+            #[cfg(test)]
+            test_pause_queued_input(&uid);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut launch = LaunchWrite {
+                    written_at: None,
+                    enter: Vec::new(),
+                };
+                let mut captured = None;
+                let mut transcript = None;
+                let mut before_write = || {
+                    captured = {
+                        let state = state.lock().unwrap_or_else(|p| p.into_inner());
+                        state.sessions.get(&uid).map(|s| {
+                            let cell = s.agent_state.lock().unwrap_or_else(|p| p.into_inner());
+                            (
+                                s.pid,
+                                s.generation,
+                                Baseline::capture(&cell.inputs, now_unix_f64()),
+                            )
+                        })
+                    };
+                    transcript = super::codex_delivery::DeliveryEvidence::capture_launch(
+                        &state, &uid, &body,
+                    );
+                    let mut receipt = ticket.lock().unwrap_or_else(|p| p.into_inner());
+                    receipt.attempts = 1;
+                    receipt.turn_seq_before = captured.as_ref().map(|(_, _, baseline)| baseline.turn_seq);
+                };
+                if !deliver_agent_body_inner(
+                    &handle,
+                    &fanout,
+                    &uid,
+                    &body,
+                    true,
+                    "initial prompt",
+                    None,
+                    Some(&mut before_write),
+                    Some(&mut launch),
+                ) {
+                    delivery::finish(&ticket, Err("write_failed_or_cancelled"));
+                    return;
+                }
+                let Some((pid, generation, baseline)) = captured else {
+                    delivery::finish(&ticket, Err("session_gone"));
+                    return;
+                };
+                if body.trim_start().starts_with('/') {
+                    delivery::delivered_command(&ticket);
+                    return;
+                }
+                let transcript = std::cell::RefCell::new(transcript);
+                let generation = std::cell::Cell::new(generation);
+                let check = || {
+                    {
+                        let state = state.lock().unwrap_or_else(|p| p.into_inner());
+                        let Some(s) = state.sessions.get(&uid) else {
+                            return Check::Stop("session_gone");
+                        };
+                        if s.pid != pid
+                            || s.last_exit.kernel_set()
+                            || !s
+                                .prompt_delivery
+                                .as_ref()
+                                .is_some_and(|t| Arc::ptr_eq(t, &ticket))
+                        {
+                            return Check::Stop("session_replaced_or_exited");
+                        }
+                        if s.generation != generation.get() {
+                            generation.set(s.generation);
+                            return Check::Deferred;
+                        }
+                        let mut cell = s.agent_state.lock().unwrap_or_else(|p| p.into_inner());
+                        if let Some(source) = baseline.confirmed_for(&mut cell.inputs, s.transcript_path.as_deref()) {
+                            return Check::Confirmed(source);
+                        }
+                    }
+                    if let Some(evidence) = transcript.borrow_mut().as_mut() {
+                        use super::codex_delivery::Observation;
+                        match evidence.observe(&state, &uid, &body) {
+                            Observation::Accepted => return Check::Confirmed("transcript"),
+                            // Evidence may be coalesced or the hook may lag
+                            // the transcript. Stop retrying, but keep watching.
+                            Observation::Active => return Check::Deferred,
+                            Observation::Gone => return Check::Stop("session_gone"),
+                            Observation::Unknown => return Check::Deferred,
+                            Observation::Pending => {}
+                        }
+                    }
+                    if crate::writer_gate::pause_requested() { Check::Deferred } else { Check::Pending }
+                };
+                delivery::confirm(
+                    &ticket,
+                    &check,
+                    || {
+                        match check() {
+                            Check::Pending => {}
+                            other => return other,
+                        }
+                        // Keep the observed encoding. Never type a new
+                        // escape sequence into a composer using raw Enter.
+                        let since = launch.written_at.expect("body was written");
+                        match handle.write_recovery_enter(&launch.enter, since) {
+                            Ok(true) => Check::Pending,
+                            Ok(false) => Check::Deferred,
+                            Err(_) => Check::Stop("retry_write_failed"),
+                        }
+                    },
+                    delivery::RETRY_AFTER,
+                    delivery::CONFIRM_MAX.saturating_sub(launch.written_at.unwrap().elapsed()),
+                    std::time::Duration::from_millis(200),
+                );
+            }));
+            if result.is_err() {
+                delivery::finish(&ticket, Err("confirmation_worker_failed"));
+            }
+            let receipt = ticket.lock().unwrap_or_else(|p| p.into_inner());
+            eprintln!(
+                "cm-daemon: initial prompt {uid}: submitted={} attempts={} source={:?} reason={:?}",
+                receipt.submitted, receipt.attempts, receipt.confirmed_by, receipt.reason
+            );
+        });
+    if spawned.is_err() {
+        delivery::finish(&result_ticket, Err("confirmation_worker_unavailable"));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn recovery_test_queue_initial(
+    state: Arc<Mutex<DaemonState>>, uid: &str,
+) -> super::prompt_delivery::Ticket {
+    let (handle, fanout) = {
+        let state = state.lock().unwrap();
+        let session = &state.sessions[uid];
+        (session.input_handle(), Arc::clone(&session.fanout))
+    };
+    let ticket = super::prompt_delivery::Receipt::pending();
+    spawn_initial_prompt_delivery(state, handle, fanout, uid.to_string(), "initial".into(), Arc::clone(&ticket));
+    ticket
 }
 
 /// Confirmation runs for fresh/resumed launches, persistent fires and
@@ -7492,8 +9029,21 @@ fn deliver_agent_body_confirmed(
     fresh: bool,
     what: &str,
 ) -> bool {
+    deliver_agent_body_confirmed_with(state, handle, fanout, uid, body, fresh, false, what)
+}
+
+fn deliver_agent_body_confirmed_with(
+    state: &Arc<Mutex<DaemonState>>,
+    handle: &crate::session::InputHandle,
+    fanout: &Arc<crate::session::PtyByteFanout>,
+    uid: &str,
+    body: &str,
+    fresh: bool,
+    strict_ready: bool,
+    what: &str,
+) -> bool {
     let mut evidence = None;
-    let wrote = deliver_agent_body_guarded(handle, fanout, uid, body, fresh, what, None,
+    let wrote = deliver_agent_body_guarded_with(handle, fanout, uid, body, fresh, strict_ready, what, None,
         Some(&mut || { evidence = super::codex_delivery::DeliveryEvidence::capture(state, uid, body); }));
     if wrote {
         if let Some(mut evidence) = evidence {
@@ -7618,6 +9168,48 @@ fn deliver_agent_body_guarded(
     notice: Option<&super::continuous_drain::NoticeBinding<'_>>,
     before_write: Option<&mut dyn FnMut()>,
 ) -> bool {
+    deliver_agent_body_guarded_with(handle, fanout, session_uid, body_text, fresh_spawn, false, what, notice, before_write)
+}
+
+fn deliver_agent_body_guarded_with(
+    handle: &crate::session::InputHandle,
+    fanout: &std::sync::Arc<crate::session::PtyByteFanout>,
+    session_uid: &str,
+    body_text: &str,
+    fresh_spawn: bool,
+    strict_ready: bool,
+    what: &str,
+    notice: Option<&super::continuous_drain::NoticeBinding<'_>>,
+    before_write: Option<&mut dyn FnMut()>,
+) -> bool {
+    deliver_agent_body_inner_with(handle, fanout, session_uid, body_text, fresh_spawn, strict_ready, what, notice, before_write, None)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_AFTER_AGENT_BODY: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+    static TEST_BEFORE_INPUT_UNIT: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn deliver_agent_body_inner(
+    handle: &crate::session::InputHandle,
+    fanout: &Arc<crate::session::PtyByteFanout>,
+    session_uid: &str, body_text: &str, fresh_spawn: bool, what: &str,
+    notice: Option<&super::continuous_drain::NoticeBinding<'_>>,
+    before_write: Option<&mut dyn FnMut()>,
+    launch: Option<&mut super::prompt_delivery::LaunchWrite>,
+) -> bool {
+    deliver_agent_body_inner_with(handle, fanout, session_uid, body_text, fresh_spawn, false, what, notice, before_write, launch)
+}
+
+fn deliver_agent_body_inner_with(
+    handle: &crate::session::InputHandle,
+    fanout: &Arc<crate::session::PtyByteFanout>,
+    session_uid: &str, body_text: &str, fresh_spawn: bool, strict_ready: bool, what: &str,
+    notice: Option<&super::continuous_drain::NoticeBinding<'_>>,
+    before_write: Option<&mut dyn FnMut()>,
+    mut launch: Option<&mut super::prompt_delivery::LaunchWrite>,
+) -> bool {
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::Instant;
     // Own the fanout subscription for the life of THIS delivery rather
@@ -7625,7 +9217,7 @@ fn deliver_agent_body_guarded(
     // receiver until the session exits, so a chatty orchestrator's
     // repeated `send_input`s would strand one thread per call. Dropping
     // `rx` on return lets the fanout's next push reap the slot.
-    if fanout.snapshot_since(None).closed { return false; }
+    if fanout.is_closed() { return false; }
     let rx = fanout.subscribe();
     let mut tracker = crate::workflow::pty_tracker::PtyModeTracker::with_size(80, 24);
     // Drain PTY bytes into the tracker for `dur`, so both the observed
@@ -7651,15 +9243,31 @@ fn deliver_agent_body_guarded(
             }
         }
     };
-    let wait = if fresh_spawn {
+    let started = Instant::now();
+    let deadline = started + if strict_ready {
+        AGENT_RESUME_READY_MAX
+    } else if fresh_spawn {
         AGENT_MODE_WAIT_FRESH
     } else {
         AGENT_PROMPT_SETTLE
     };
-    let started = Instant::now();
-    let deadline = started + wait;
     let mut observed = false;
+    let mut answered_model_switch = false;
     loop {
+        if strict_ready && !answered_model_switch {
+            let screen = tracker.visible_text();
+            if crate::claude_channels::model_switch_prompt(&screen) {
+                let since = Instant::now();
+                if handle.write_and_stamp(b"1").is_err() {
+                    return false;
+                }
+                if !matches!(handle.write_recovery_enter(tracker.enter_bytes(), since), Ok(true)) {
+                    return false;
+                }
+                answered_model_switch = true;
+                eprintln!("cm-daemon: agent {} for {} accepted the Claude model-switch confirmation", what, session_uid);
+            }
+        }
         if tracker.composer_ready() {
             observed = true;
             break;
@@ -7672,6 +9280,10 @@ fn deliver_agent_body_guarded(
         }
     }
     let mode_wait_ms = started.elapsed().as_millis();
+    if strict_ready && !observed {
+        eprintln!("cm-daemon: agent {} for {} never reached composer readiness within {}s; prompt not typed", what, session_uid, AGENT_RESUME_READY_MAX.as_secs());
+        return false;
+    }
     // Modes on != composer ready. The agent paints its UI right after
     // enabling them, and a paste landing mid-render is dropped, so wait
     // for the PTY to go quiet before writing. Bounded, and skipped
@@ -7682,12 +9294,7 @@ fn deliver_agent_body_guarded(
         let settle_started = Instant::now();
         // A fresh spawn has a whole UI to mount; a live target painted
         // long ago and only needs its current burst (if any) to finish.
-        let settle_deadline = settle_started
-            + if fresh_spawn {
-                AGENT_RENDER_SETTLE_MAX
-            } else {
-                AGENT_RENDER_QUIET * 2
-            };
+        let settle_deadline = if strict_ready { deadline } else { settle_started + if fresh_spawn { AGENT_RENDER_SETTLE_MAX } else { AGENT_RENDER_QUIET * 2 } };
         let paint_floor = bytes_seen + AGENT_PAINT_MIN_BYTES;
         loop {
             let painted = !fresh_spawn || bytes_seen >= paint_floor;
@@ -7695,6 +9302,10 @@ fn deliver_agent_body_guarded(
                 break;
             }
             if Instant::now() >= settle_deadline {
+                if strict_ready {
+                    eprintln!("cm-daemon: agent {} for {} did not settle after composer readiness within {}s; prompt not typed", what, session_uid, AGENT_RESUME_READY_MAX.as_secs());
+                    return false;
+                }
                 break;
             }
             if !drain_for(&mut tracker, &mut bytes_seen, AGENT_MODE_POLL) {
@@ -7745,9 +9356,22 @@ fn deliver_agent_body_guarded(
         if handle.operator_quiet_for().is_some_and(|quiet| quiet < OPERATOR_QUIET_WINDOW) { return false; }
         Some(guard)
     } else { None };
-    if fanout.snapshot_since(None).closed { return false; }
+    if fanout.is_closed() { return false; }
+    // Reserve the UID for the complete body → Enter unit. The nested input
+    // writes reuse this thread-scoped permit, avoiding a recursive read lock
+    // when a recovery writer is already queued.
+    // Enter the restart unit first: a newly paused unit must not hold the
+    // UID read gate while parked at the global restart door.
+    #[cfg(test)]
+    TEST_BEFORE_INPUT_UNIT.with(|hook| { if let Some(hook) = hook.borrow_mut().as_mut() { hook(); } });
     let _unit = crate::writer_gate::unit_permit();
+    let input_gate = crate::continuous::retirement::gate(session_uid);
+    let _input_permit = input_gate.read().unwrap_or_else(|p| p.into_inner());
+    if crate::continuous::retirement::ensure_open(session_uid).is_err() { return false; }
+    let _input_unit = crate::continuous::retirement::input_unit(session_uid);
     if let Some(before_write) = before_write { before_write(); }
+    let handle = handle.clone().prepare_agent_input(body);
+    if let Some(launch) = launch.as_mut() { launch.written_at = Some(Instant::now()); }
     if let Err(e) = handle.write_and_stamp(&payload) {
         eprintln!(
             "cm-daemon: agent {} body write failed for {}: {}",
@@ -7755,6 +9379,8 @@ fn deliver_agent_body_guarded(
         );
         return false;
     }
+    #[cfg(test)]
+    TEST_AFTER_AGENT_BODY.with(|hook| { if let Some(hook) = hook.borrow_mut().as_mut() { hook(); } });
     // Step boundary: body landed. Under a restart pause, complete the
     // Enter promptly rather than park mid-prompt: the gap is drained in
     // short slices so a pause landing MID-gap is observed within one
@@ -7785,6 +9411,7 @@ fn deliver_agent_body_guarded(
     } else {
         AGENT_KITTY_ENTER
     };
+    if let Some(launch) = launch.as_mut() { launch.enter = enter.to_vec(); }
     if let Err(e) = handle.write_and_stamp(enter) {
         eprintln!(
             "cm-daemon: agent {} Enter write failed for {}: {}",
@@ -7792,6 +9419,10 @@ fn deliver_agent_body_guarded(
         );
         return false;
     }
+    handle.note_agent_submitted();
+    // Initial launches use engine evidence and exactly one guarded retry.
+    // PTY output can be a startup redraw, so it cannot acknowledge this prompt.
+    if launch.is_some() { return true; }
     // Verify: a PTY still quiet a full window after the Enter means the
     // submit didn't take (mode flipped inside the gap, byte swallowed
     // mid-redraw, ...). Re-send Enter once with a freshly-read mode.
@@ -7850,6 +9481,7 @@ fn deliver_agent_body_guarded(
             );
             return false;
         }
+        handle.note_agent_submitted();
     }
     // Positive delivery log (the failure mode this path exists for is
     // "writes succeed but the agent never submits" — invisible without
@@ -7925,9 +9557,17 @@ fn spawn_persistent_prompt_delivery(
     compact: bool,
     state: Arc<Mutex<DaemonState>>,
 ) {
+    let pending = match reserve_detached_delivery(&state, &handle, &session_uid) {
+        Ok(pending) => pending,
+        Err(reason) => { eprintln!("cm-daemon: persistent prompt for {session_uid} not queued: {reason}"); return; }
+    };
+    let handle = handle.prepare_agent_input(if compact { "/compact" } else { &prompt });
     let _ = std::thread::Builder::new()
         .name(format!("cm-daemon-persistent-prompt-{}", session_uid))
         .spawn(move || {
+            let _pending = pending;
+            #[cfg(test)]
+            test_pause_queued_input(&session_uid);
             if compact {
                 // Auto-compact: `/compact` SUMMARIZES the conversation and
                 // continues on the condensed context — bounding unbounded
@@ -7993,18 +9633,32 @@ enum WorkspaceResolution {
 /// Everything `mint_task_workspace` needs that lives behind the state
 /// lock, snapshotted so the mint itself runs unlocked.
 struct MintContext {
+    /// Strong-operator launch: use this exact local repository, never search or clone.
+    explicit_repo: Option<PathBuf>,
     /// A retained binding must recover its prior branch, never mint empty work.
     recover_existing: bool,
-    /// The caller workspace's repo + main checkout. Used only when the
-    /// task's own `repo_url` matches, so a caller in repo A can't drag a
-    /// task in repo B into A's checkout.
-    caller_repo_url: Option<String>,
-    caller_main_repo: Option<PathBuf>,
+    /// The caller's (or fork source's) checkout paths: its main repo and
+    /// worktree. Tried first as the task repo's clone, but only when its
+    /// origin really is the task's repo, so a caller in repo A can't drag
+    /// a task in repo B into A's checkout.
+    caller_paths: Vec<PathBuf>,
+    /// Main repos and worktrees of the host's other workspaces: where
+    /// [`crate::worktree::locate_repo_clone`] looks next.
+    workspace_paths: Vec<PathBuf>,
     repos_dir: PathBuf,
     allow_clone: bool,
     allow_entries: Vec<(String, String)>,
     api_url: String,
     api_token: String,
+    /// Cut point for a fresh mint (`None` = the project's trunk). Set by
+    /// `session.fork` into a never-run task with `base="source"`.
+    base: Option<String>,
+}
+
+/// A workspace's checkout paths (main repo, worktree), for locating a
+/// repo's local clone.
+fn workspace_paths_of(ws: &crate::manifest::ManifestWorkspace) -> Vec<PathBuf> {
+    ws.main_repo_path.iter().chain(ws.worktree_path.iter()).cloned().collect()
 }
 
 /// Result of minting a workspace for a workspace-less task.
@@ -8018,6 +9672,9 @@ struct MintedWorkspace {
     /// directory, zero-commit-decoy warnings, …) — relayed on the
     /// response as `worktree_recreated` / `worktree_warning`.
     worktree_report: WorktreeCheckReport,
+    /// `ctx.base` named a commit of the caller's repo and the task is in
+    /// another one, so the cut fell back to that repo's trunk.
+    base_downgraded: bool,
 }
 
 /// What the pre-spawn worktree check found, for the agent-facing
@@ -8123,60 +9780,63 @@ fn mint_task_workspace(
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    let repo_url = field("repo_url")
-        .or_else(|| ctx.caller_repo_url.clone())
-        .ok_or((
-            ErrorCode::Conflict,
-            format!(
-                "task '{}' has neither a workspace nor a repo_url, so there is nothing \
-                 to cut a worktree from{}",
-                task_id,
-                override_hint()
-            ),
-        ))?;
+    // The task's repo: its row, else its project's. Never the caller's
+    // checkout, which may be another repo entirely.
+    let repo_url = if let Some(repo) = &ctx.explicit_repo {
+        crate::worktree::origin_url(repo).unwrap_or_else(|| repo.to_string_lossy().into_owned())
+    } else { match field("repo_url") {
+        Some(url) => url,
+        None => field("project")
+            .and_then(|pj| {
+                let projects = api_list_projects(&creds).ok()?;
+                crate::planning_client::project_repo(&projects, &pj)
+            })
+            .map(|r| r.repo_url)
+            .ok_or((
+                ErrorCode::Conflict,
+                format!(
+                    "task '{}' has neither a workspace nor a repo_url (nor a project with \
+                     a known repo), so there is nothing to cut a worktree from{}",
+                    task_id,
+                    override_hint()
+                ),
+            ))?,
+    }};
     let task_name = field("name").unwrap_or_else(|| task_id.to_string());
 
-    // Main repo. The caller's own is preferred — it's the checkout this
-    // orchestrator is already working in — but ONLY when the task names
-    // the same repo; otherwise resolve the task's repo on the daemon's
-    // filesystem the way `create_subtask` does.
-    let caller_repo_matches = ctx.caller_repo_url.as_deref() == Some(repo_url.as_str());
-    let main_repo = match ctx.caller_main_repo.clone().filter(|_| caller_repo_matches) {
-        Some(mr) => mr,
-        None => {
-            let allowlist: Vec<crate::worktree::RepoAllow> = ctx
-                .allow_entries
-                .iter()
-                .map(|(n, u)| crate::worktree::RepoAllow { name: n, url: u })
-                .collect();
-            crate::worktree::resolve_repo(
-                &repo_url,
-                &ctx.repos_dir,
-                ctx.allow_clone,
-                &allowlist,
-            )
-            .map_err(|e| {
-                let detail = match e {
-                    crate::worktree::RepoResolveError::NotPermitted(name) => format!(
-                        "repo '{}' is not resolvable on this daemon host",
-                        name
-                    ),
-                    crate::worktree::RepoResolveError::CloneFailed { repo, detail } => {
-                        format!("clone of repo '{}' failed: {}", repo, detail)
-                    }
-                };
-                (
-                    ErrorCode::Conflict,
-                    format!(
-                        "task '{}' has no workspace and one could not be minted: {}{}",
-                        task_id,
-                        detail,
-                        override_hint()
-                    ),
-                )
-            })?
-        }
-    };
+    // Main repo: a local clone of the TASK's repo, verified by origin. The
+    // caller's own checkout is tried first (it's usually the right one),
+    // then the host's other workspaces, ~/code/projects and ~/.cm/repos.
+    let caller_main = ctx.caller_paths.iter().find_map(|p| crate::worktree::main_checkout_of(p));
+    let mut candidates: Vec<PathBuf> = caller_main.iter().cloned().collect();
+    candidates.extend(ctx.workspace_paths.iter().filter_map(|p| crate::worktree::main_checkout_of(p)));
+    let allowlist: Vec<crate::worktree::RepoAllow> = ctx
+        .allow_entries
+        .iter()
+        .map(|(n, u)| crate::worktree::RepoAllow { name: n, url: u })
+        .collect();
+    let main_repo = if let Some(repo) = &ctx.explicit_repo { repo.clone() } else { crate::worktree::locate_repo_clone(
+        &repo_url,
+        &candidates,
+        &ctx.repos_dir,
+        ctx.allow_clone,
+        &allowlist,
+    )
+    .map_err(|detail| {
+        (
+            ErrorCode::Conflict,
+            format!(
+                "task '{}' has no workspace and one could not be minted: {}{}",
+                task_id,
+                detail,
+                override_hint()
+            ),
+        )
+    })? };
+    // A cut point from the caller's checkout (fork base=source) only means
+    // something in that same repo; in another one the cut is its trunk.
+    let base = ctx.base.as_deref().filter(|_| caller_main.as_deref() == Some(main_repo.as_path()));
+    let base_downgraded = ctx.base.is_some() && base.is_none();
 
     // Cut the worktree. `mint_task_worktree` resolves the project's trunk
     // to a concrete sha FIRST, so an unresolvable main (or a git failure)
@@ -8196,12 +9856,12 @@ fn mint_task_workspace(
             "Task '{}' retains a workspace binding but its prior local branch could not be verified; reconcile the existing checkout before relaunching.", task_id
         )));
     }
-    let minted = crate::worktree::mint_task_worktree(
-        &main_repo,
-        task_id,
-        &task_name,
-        wip_branch_hint.as_deref(),
-    )
+    let mint = if ctx.explicit_repo.is_some() {
+        crate::worktree::mint_task_worktree_at_verified
+    } else {
+        crate::worktree::mint_task_worktree_at
+    };
+    let minted = mint(&main_repo, task_id, &task_name, wip_branch_hint.as_deref(), base)
         .map_err(|e| {
             (
                 ErrorCode::Conflict,
@@ -8232,7 +9892,16 @@ fn mint_task_workspace(
             .or_else(|| state.bindings.get(task_id))
             .cloned()
         {
-            if state.workspaces.contains_key(&existing) {
+            if let Some(workspace) = state.workspaces.get(&existing) {
+                // The operator supplies an exact local repository. Another
+                // launch may have bound this task while our git/API work ran;
+                // never pair its workspace ID with our different checkout.
+                if ctx.explicit_repo.is_some()
+                    && workspace.worktree_path.as_ref() != Some(&minted.worktree_path)
+                {
+                    return Err((ErrorCode::Conflict,
+                        "task workspace changed during operator mint; inspect the binding before a new request".into()));
+                }
                 eprintln!(
                     "cm-daemon: mcp_start_session mint for task {} raced another \
                      mint; adopting workspace {}",
@@ -8246,6 +9915,7 @@ fn mint_task_workspace(
                         recreated: minted.recreated,
                         warnings: minted.warnings,
                     },
+                    base_downgraded,
                 });
             }
         }
@@ -8256,6 +9926,18 @@ fn mint_task_workspace(
             .or_else(|| state.bindings.get(task_id))
             .cloned()
             .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+        // A minted task worktree is ephemeral (doc/org-model.md §12). A
+        // re-registered identity (this id was the task's workspace before
+        // its checkout was reaped) keeps the org object it already had, so a
+        // kind set centrally (`home`) or a binding epoch survives the
+        // re-mint. One that has no org object yet, i.e. a workspace from
+        // before S0b being re-minted, is relabelled `ephemeral`: it is a
+        // task-derived `cm-sub/...` checkout, which is what that kind means.
+        let org = state
+            .workspaces
+            .get(&workspace_id)
+            .and_then(|w| w.org.clone())
+            .or_else(crate::manifest::ephemeral_workspace_org);
         state.workspaces.insert(
             workspace_id.clone(),
             crate::manifest::ManifestWorkspace {
@@ -8264,6 +9946,7 @@ fn mint_task_workspace(
                 repo_url: Some(repo_url.clone()),
                 worktree_path: Some(minted.worktree_path.clone()),
                 main_repo_path: Some(main_repo.clone()),
+                org,
                 ..Default::default()
             },
         );
@@ -8320,6 +10003,7 @@ fn mint_task_workspace(
             recreated: minted.recreated,
             warnings: minted.warnings,
         },
+        base_downgraded,
     })
 }
 
@@ -8371,25 +10055,44 @@ fn ensure_ready_worktree(
             state.config.api_token.clone(),
         )
     };
-    let url_resolved: Option<PathBuf> = ws_repo_url.as_deref().and_then(|u| {
-        // Never clone on this path — empty allowlist + allow_clone=false
-        // makes this "find on disk / reuse a prior clone" only.
-        crate::worktree::resolve_repo(u, &repos_dir, false, &[]).ok()
+    // The task's planning row, best-effort: its repo decides which clone
+    // may heal the checkout, and its `wip_branch` is a branch hint.
+    let task_row: Option<Value> = task_id.and_then(|tid| {
+        let creds = PlanningApiCreds::from_config(&api_url, &api_token).ok()?;
+        api_get_task(&creds, tid).ok()
     });
-    // Candidate main repos, most specific first. When the workspace row
-    // itself doesn't say, any repo that still LISTS the path as a
-    // (prunable) worktree is the owner.
+    let row_field = |k: &str| {
+        task_row
+            .as_ref()
+            .and_then(|row| row.get(k))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let task_repo_url = row_field("repo_url");
+    // Never clone on this path — empty allowlist + allow_clone=false makes
+    // this "find on disk / reuse a prior clone" only.
+    let resolve_local =
+        |u: &str| crate::worktree::resolve_repo(u, &repos_dir, false, &[]).ok();
+    let ws_url_resolved: Option<PathBuf> = ws_repo_url.as_deref().and_then(resolve_local);
+    let task_url_resolved: Option<PathBuf> = task_repo_url.as_deref().and_then(resolve_local);
+    // Every main repo the daemon knows, most specific first, UNFILTERED:
+    // git's own registration of the path is ground truth about where the
+    // checkout lives, so it outranks a planning row whose repo_url may be
+    // the wrong one.
     let mut candidates: Vec<PathBuf> = Vec::new();
     for c in ws_main_repo
         .iter()
-        .chain(url_resolved.iter())
+        .chain(ws_url_resolved.iter())
+        .chain(task_url_resolved.iter())
         .chain(other_main_repos.iter())
     {
         if c.is_dir() && !candidates.contains(c) {
             candidates.push(c.clone());
         }
     }
-    let main_repo = candidates
+    let registered = candidates
         .iter()
         .find(|r| crate::worktree::branch_for_worktree_dir(r, working_dir).is_some()
             && crate::worktree::registered_branch_for_path(r, working_dir).is_some())
@@ -8398,9 +10101,23 @@ fn ensure_ready_worktree(
                 .iter()
                 .find(|r| crate::worktree::registered_branch_for_path(r, working_dir).is_some())
         })
-        .or_else(|| ws_main_repo.as_ref().filter(|r| r.is_dir()))
-        .or_else(|| url_resolved.as_ref().filter(|r| r.is_dir()))
         .cloned();
+    // Nothing registered the path: only then does the task's repo decide,
+    // so a recorded checkout of some other repo can't rebuild it.
+    let of_task_repo = |r: &PathBuf| {
+        r.is_dir()
+            && task_repo_url
+                .as_deref()
+                .is_none_or(|u| crate::worktree::checkout_is_repo(r, u))
+    };
+    let main_repo = registered.or_else(|| {
+        ws_main_repo
+            .iter()
+            .chain(ws_url_resolved.iter())
+            .chain(task_url_resolved.iter())
+            .find(|r| of_task_repo(r))
+            .cloned()
+    });
     let Some(main_repo) = main_repo else {
         if working_dir.is_dir() {
             // A real directory that the daemon can't tie to any repo (a
@@ -8420,12 +10137,12 @@ fn ensure_ready_worktree(
             ErrorCode::Conflict,
             format!(
                 "worktree {} for workspace '{}' does not exist on disk and cannot be \
-                 re-created: the daemon has no main repo to re-create it from \
-                 (workspace main_repo_path={:?}, repo_url={:?}) — refusing to spawn a \
+                 re-created: the daemon has no local clone of the task's repo to re-create \
+                 it from (task repo_url={:?}, workspace repo_url={:?}) — refusing to spawn a \
                  session into a nonexistent cwd",
                 working_dir.display(),
                 workspace_id,
-                ws_main_repo,
+                task_repo_url,
                 ws_repo_url,
             ),
         ));
@@ -8434,15 +10151,7 @@ fn ensure_ready_worktree(
     // Best-effort `wip_branch` hint from the planning row. It ranks LAST
     // in the heal's branch resolution (it is sometimes a zero-commit
     // decoy), so a failed lookup costs nothing but a cross-check.
-    let wip_branch_hint: Option<String> = task_id.and_then(|tid| {
-        let creds = PlanningApiCreds::from_config(&api_url, &api_token).ok()?;
-        let row = api_get_task(&creds, tid).ok()?;
-        row.get("wip_branch")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    });
+    let wip_branch_hint: Option<String> = row_field("wip_branch");
 
     let health = crate::worktree::ensure_worktree_materialized(
         &main_repo,
@@ -8479,13 +10188,111 @@ fn ensure_ready_worktree(
     Ok(report)
 }
 
+/// O5: a worktree-cap refusal names the caller's member's idle assistants,
+/// with how to reuse (`send_input`) or close (`close_assistant`) them.
+pub(crate) fn with_cap_hint(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    caller_uid: Option<&str>,
+    result: MethodResult,
+) -> MethodResult {
+    result.map_err(|(code, message)| {
+        if !message.contains("worktree limit reached") {
+            return (code, message);
+        }
+        let hint = caller_uid.and_then(|uid| {
+            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            crate::assistants::cap_hint(&state, uid)
+        });
+        (code, format!("{message}{}", hint.unwrap_or_default()))
+    })
+}
+
 pub fn mcp_start_session(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
     caller_uid: Option<&str>,
 ) -> MethodResult {
-    let p: McpStartSessionParams = serde_json::from_value(params.clone())
+    with_cap_hint(state_arc, caller_uid, mcp_start_session_inner(state_arc, params, caller_uid))
+}
+
+fn mcp_start_session_inner(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
+    start_agent_with_context(state_arc, params, caller_uid, None)
+}
+
+/// Only the strong-operator session.launch entry point supplies this context.
+/// It bypasses Session context resolution, not the common spawn/prompt funnel.
+pub(crate) struct OperatorLaunchContext {
+    pub uid: String,
+    pub repo_path: PathBuf,
+    pub base: Option<String>,
+    pub managed_by_uid: Option<String>,
+}
+
+pub(crate) fn operator_launch_agent(
+    state: &Arc<Mutex<DaemonState>>, params: &Value, context: &OperatorLaunchContext,
+) -> MethodResult {
+    start_agent_with_context(state, params, None, Some(context))
+}
+
+fn operator_workspace_resolution(
+    state: &Arc<Mutex<DaemonState>>, task_id: &str, context: &OperatorLaunchContext,
+) -> Result<WorkspaceResolution, (ErrorCode, String)> {
+    let (bound, config, recover_existing) = {
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+        let id = st.task_workspaces.get(task_id).or_else(|| st.bindings.get(task_id));
+        let bound = id.and_then(|id| st.workspaces.get(id).map(|ws| (id.clone(), ws.clone())));
+        let recover = id.is_some() && bound.is_none();
+        (bound, st.config.clone(), recover)
+    };
+    if let Some((id, workspace)) = bound {
+        let path = workspace.worktree_path.ok_or((ErrorCode::Conflict, "bound workspace has no worktree path".into()))?;
+        // Only a genuinely missing checkout may use the retained main repo
+        // for recovery. A present unmanaged/dangling/wrong-repo path fails closed.
+        let repo = match std::fs::symlink_metadata(&path) {
+            Ok(_) => crate::worktree::main_checkout_of(&path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
+                workspace.main_repo_path.and_then(|p| crate::worktree::main_checkout_of(&p)),
+            Err(_) => None,
+        }.and_then(|p| std::fs::canonicalize(p).ok());
+        if repo.as_ref() != Some(&context.repo_path) {
+            return Err((ErrorCode::Conflict, "task's bound workspace does not belong to repo_path; reconcile the binding first".into()));
+        }
+        // A stale local binding must not let an invalid task bypass validation.
+        let creds = PlanningApiCreds::from_config(&config.api_url, &config.api_token)
+            .map_err(|e| (ErrorCode::Conflict, format!("planning API required: {e:?}")))?;
+        api_get_task(&creds, task_id).map_err(|e| e.to_method_err())?;
+        return Ok(WorkspaceResolution::Ready { workspace_id: id, working_dir: path, shared_with_caller: false });
+    }
+    Ok(WorkspaceResolution::Mint { task_id: task_id.into(), ctx: MintContext {
+        explicit_repo: Some(context.repo_path.clone()), recover_existing,
+        caller_paths: vec![context.repo_path.clone()], workspace_paths: Vec::new(),
+        repos_dir: config.repos_dir_or_default(), allow_clone: false, allow_entries: Vec::new(),
+        api_url: config.api_url, api_token: config.api_token, base: context.base.clone(),
+    }})
+}
+
+fn start_agent_with_context(
+    state_arc: &Arc<Mutex<DaemonState>>, params: &Value, caller_uid: Option<&str>,
+    operator_launch: Option<&OperatorLaunchContext>,
+) -> MethodResult {
+    let mut p: McpStartSessionParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("mcp_start_session params: {}", e)))?;
+    let staffing = {
+        let s = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let snapshot = s.staffing.lock().unwrap_or_else(|p| p.into_inner())
+            .snapshot.clone();
+        snapshot
+    };
+    let mut selection = staffing.policy.select(
+        params.get("type").and_then(Value::as_str),
+        p.model.as_deref().filter(|s| !s.trim().is_empty()),
+        p.work_kind.as_deref(), chrono::Utc::now(),
+    ).map_err(|e| (ErrorCode::InvalidParams, e))?;
+    p.type_ = selection.engine;
     // H3: drain gate FIRST — while the operator is draining for a
     // restart, minting new sessions is exactly what must not happen
     // (they'd be killed moments later, possibly before first turn).
@@ -8562,7 +10369,12 @@ pub fn mcp_start_session(
         cap_inherit,
         caller_cols,
         caller_rows,
-    ) = {
+        launch_grant,
+        s4_supported_caller,
+    ) = if let Some(context) = operator_launch {
+        let task_id = p.task_id.as_deref().ok_or((ErrorCode::InvalidParams, "operator launch requires task_id".into()))?;
+        (operator_workspace_resolution(state_arc, task_id, context)?, None, None, 80u16, 24u16, None, false)
+    } else {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         let cuid = caller_uid.ok_or((
             ErrorCode::Unauthorized,
@@ -8590,8 +10402,13 @@ pub fn mcp_start_session(
         }
         // Task auth: if caller supplied a task_id, it must be
         // self-or-descendant of caller's task. Taskless caller +
-        // explicit task_id → Unauthorized.
-        if let Some(req_task) = p.task_id.as_deref() {
+        // explicit task_id → Unauthorized. Unless the caller holds a
+        // launch grant for it: the owner-role holder of the task's board
+        // item may launch for it from anywhere (doc/org-model.md §7.4).
+        let granted = p.task_id.as_deref().and_then(|req| {
+            crate::items::grants::find(&state.launch_grants, cuid, req).cloned()
+        });
+        if let Some(req_task) = p.task_id.as_deref().filter(|_| granted.is_none()) {
             match caller.task_id.as_deref() {
                 None => {
                     return Err((
@@ -8603,8 +10420,8 @@ pub fn mcp_start_session(
                     ));
                 }
                 Some(own) => {
-                    if !crate::control::auth::task_is_self_or_descendant_of(
-                        &state.task_tree,
+                    if !crate::control::auth::task_in_scope(
+                        &state,
                         req_task,
                         own,
                     ) {
@@ -8723,9 +10540,10 @@ pub fn mcp_start_session(
                 WorkspaceResolution::Mint {
                     task_id: req_task.to_string(),
                     ctx: MintContext {
+                        explicit_repo: None,
                         recover_existing,
-                        caller_repo_url: caller_ws.and_then(|w| w.repo_url.clone()),
-                        caller_main_repo: caller_ws.and_then(|w| w.main_repo_path.clone()),
+                        caller_paths: caller_ws.map(workspace_paths_of).unwrap_or_default(),
+                        workspace_paths: state.workspaces.values().flat_map(workspace_paths_of).collect(),
                         repos_dir: state.config.repos_dir_or_default(),
                         allow_clone: state.config.allow_clone,
                         allow_entries: state
@@ -8736,6 +10554,7 @@ pub fn mcp_start_session(
                             .collect(),
                         api_url: state.config.api_url.clone(),
                         api_token: state.config.api_token.clone(),
+                        base: None,
                     },
                 }
             }
@@ -8800,6 +10619,10 @@ pub fn mcp_start_session(
             cap_inherit,
             caller.last_cols,
             caller.last_rows,
+            granted,
+            // A normal MCP spawn by a continuous member is an O5 worker;
+            // scheduler/Fresh launches use their separate internal path.
+            caller.workflow_run_id.is_none(),
         )
     };
 
@@ -8838,6 +10661,11 @@ pub fn mcp_start_session(
                 )
             }
         };
+
+    if let Some(context) = operator_launch {
+        crate::worktree::verify_task_worktree_repo(&context.repo_path, &working_dir)
+            .map_err(|e| (ErrorCode::Conflict, e.to_string()))?;
+    }
 
     // ux-5c: resolve the task binding BEFORE the spawn so the
     // auto-delivery lookup and the response can both use it.
@@ -8888,7 +10716,7 @@ pub fn mcp_start_session(
                     Some(row) => {
                         let field =
                             |k: &str| row.get(k).and_then(|v| v.as_str()).unwrap_or("");
-                        compose_task_launch_prompt(field("description"), field("prompt"))
+                        compose_task_launch_prompt(field("description"), field("prompt"), field("name"))
                     }
                     None => task_autodelivery_prompt(state_arc, tid),
                 };
@@ -8900,6 +10728,28 @@ pub fn mcp_start_session(
             None => (None, "none"),
         },
     };
+
+    // Explicit model → task default → staffing rule → config default.
+    // Effort keeps its existing resolution order. Like the
+    // prompt lookup, the planning round trip happens before the slot is
+    // claimed.
+    let (resolved_model, resolved_effort) = resolve_spawn_pick_with_rule(
+        state_arc,
+        &p.type_,
+        p.model.as_deref(),
+        p.effort.as_deref(),
+        task_id_for_spawn.as_deref(),
+        selection.rule_model.as_deref(),
+    )?;
+    if let (Some(rule), Some((model, crate::models::ModelSource::Task))) =
+        (selection.rule_model.as_deref(), resolved_model.as_ref())
+    {
+        if model != rule {
+            let note = format!("Staffing: task default model {model} overrides work-rule model {rule}. Model precedence: {}. Engine precedence: {}.",
+                crate::staffing::MODEL_PRECEDENCE, crate::staffing::PRECEDENCE);
+            selection.note = Some(selection.note.map_or_else(|| note.clone(), |old| format!("{old} {note}")));
+        }
+    }
 
     // Sub-2b-3 review-7: per-worktree slot wraps
     // {pre-snapshot + spawn + detect}, not just {detect}.
@@ -9009,7 +10859,7 @@ pub fn mcp_start_session(
     // Generate a fresh uid in the TUI format. Same generator
     // shape as `tui/src/app.rs::new_session_uid` —
     // `ts-<nanos>-<counter>`.
-    let session_uid = new_daemon_minted_session_uid();
+    let session_uid = operator_launch.map(|c| c.uid.clone()).unwrap_or_else(new_daemon_minted_session_uid);
 
     // Build raw argv via the daemon-local mcp_config helper.
     // Writes the per-session claude.json (claude) or builds
@@ -9030,6 +10880,8 @@ pub fn mcp_start_session(
         None,
         configured_mcp_server_path.as_deref(),
         None, // fresh agent spawn — never a resume
+        resolved_model.as_ref().map(|(m, _)| m.as_str()),
+        resolved_effort.as_ref().map(|(e, _)| e.as_str()),
     )
     .map_err(|e| (ErrorCode::Internal, format!("build_args: {}", e)))?;
 
@@ -9083,6 +10935,7 @@ pub fn mcp_start_session(
     );
     full_params.insert("env".into(), Value::Object(env_obj));
     full_params.insert("session_type".into(), Value::String(p.type_.clone()));
+    insert_pick(&mut full_params, &resolved_model, &resolved_effort);
     // H1 (restart hardening): a fresh claude spawn carries a daemon-minted
     // `--session-id` pin — stamp the matching transcript path NOW so the
     // session is resumable from birth (claude creates `<pin>.jsonl` at
@@ -9104,7 +10957,7 @@ pub fn mcp_start_session(
     // 80×24 serde fallback.
     full_params.insert("cols".into(), Value::Number(caller_cols.into()));
     full_params.insert("rows".into(), Value::Number(caller_rows.into()));
-    if let Some(cuid) = caller_uid {
+    if let Some(cuid) = operator_launch.and_then(|c| c.managed_by_uid.as_deref()).or(caller_uid) {
         full_params.insert("managed_by_uid".into(), Value::String(cuid.to_string()));
     }
     if let Some(tid) = task_id_for_spawn.as_deref() {
@@ -9142,35 +10995,19 @@ pub fn mcp_start_session(
         );
     }
 
-    let start_result = start_session(state_arc, &Value::Object(full_params))?;
+    let start_result = start_session_with_origin(state_arc, &Value::Object(full_params),
+        crate::session_watch::default_watcher_spawn_fn(), s4_supported_caller)?;
 
-    // Sub-2b-3 review-fix #2: deliver `prompt` if supplied.
-    // Pre-fix this was logged-and-dropped — silent contract
-    // break with the Python MCP tool which advertises prompt
-    // delivery. Look up the new session's InputHandle and
-    // write the prompt through the shared `write_and_stamp`
-    // helper (same path the attach-stream Input frame handler
-    // uses).
-    //
-    // Engine-specific submission:
-    //   - claude-code / bash: body + `\n`, synchronous, with
-    //     kill-on-failure (no half-initialized session).
-    //   - codex: a bare `\n` does NOT submit codex's
-    //     kitty-keyboard TUI, and a multi-line body without
-    //     bracketed paste submits at the first newline. The
-    //     daemon has no `Term` to read codex's live mode, so it
-    //     delivers asynchronously assuming codex's always-on
-    //     modes (bracketed paste + kitty Enter) with a settle/
-    //     gap delay — see `spawn_agent_prompt_delivery`. This
-    //     is the daemon-side stand-in for the TUI's mode-aware
-    //     `PendingWrite::wait_for_quiet` drainer, which isn't
-    //     relocated daemon-side.
-    //
-    // ux-5c: `effective_prompt` is either the caller's own prompt or
-    // the bound task's stored prompt (see the resolution block above).
-    // Both go through this identical delivery path — an auto-delivered
-    // task prompt is indistinguishable, from the child's side, from one
-    // the caller typed.
+    // #28: the creator's name for the child lands before the child has a
+    // prompt to act on, so its own first chat_send can never claim the same
+    // first revision (msgfix: two first claims conflict at the hub).
+    let name_setup = p.name.as_deref().map(str::trim).filter(|n| !n.is_empty())
+        .filter(|_| p.type_ != "bash")
+        .map(|name| crate::spawn_setup::claim_name(state_arc, &session_uid, name));
+
+    // Delivery stays asynchronous so the control RPC remains short. The MCP
+    // tool polls the per-launch receipt before claiming the prompt started.
+    let mut prompt_ticket = None;
     if let Some(prompt) = effective_prompt.as_deref() {
         if !prompt.is_empty() {
             let handle_opt = {
@@ -9209,24 +11046,17 @@ pub fn mcp_start_session(
                 ));
             };
             if is_tui_agent {
-                // codex and claude-code both run kitty-keyboard TUIs: a bare
-                // newline in the composer does NOT submit, and a multi-line
-                // body delivered without bracketed-paste markers splits into
-                // premature submissions. The TUI handles this via its
-                // mode-aware drainer; the daemon has no `Term` to read the
-                // live terminal mode, so we deliver asynchronously assuming
-                // the modes these agents always enable (BRACKETED_PASTE +
-                // kitty), with a timing gap so they're active before the
-                // bytes land. See `spawn_agent_prompt_delivery`. Returns
-                // immediately; the transcript detector binds once the agent
-                // runs the turn.
-                spawn_agent_prompt_delivery(
-                    handle,
-                    fanout,
-                    session_uid.clone(),
-                    prompt.to_string(),
-                    true,
-                    Some(Arc::clone(state_arc)),
+                let ticket = super::prompt_delivery::Receipt::pending();
+                {
+                    let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(session) = state.sessions.get_mut(&session_uid) {
+                        session.prompt_delivery = Some(Arc::clone(&ticket));
+                    }
+                }
+                prompt_ticket = Some(Arc::clone(&ticket));
+                spawn_initial_prompt_delivery(
+                    Arc::clone(state_arc), handle, fanout, session_uid.clone(),
+                    prompt.to_string(), ticket,
                 );
             } else {
                 // claude-code / bash: body + newline, synchronous, with
@@ -9314,6 +11144,9 @@ pub fn mcp_start_session(
     }
 
     // ux-1c / ux-5c: enrich the agent-facing return.
+    if p.type_ != "bash" {
+        crate::staffing::record_spawn(state_arc, caller_uid, staffing.version);
+    }
     //
     // Pre-fix the caller got `{"session_uid": ...}` and had to guess
     // where the child actually landed — a `start_session(task_id=…)`
@@ -9328,7 +11161,18 @@ pub fn mcp_start_session(
     // (`session_uid` + optional `cgroup_path`) is untouched — this
     // decorates only the value `mcp_start_session` hands back.
     let mut response = start_result;
+    if let Some(named) = name_setup {
+        response["name_setup"] = named;
+    }
     if let Some(obj) = response.as_object_mut() {
+        obj.insert("kind".into(), json!(if p.type_ == "bash" { "shell" } else { "agent" }));
+        if p.type_ != "bash" {
+            obj.insert("staffing_version".into(), json!(staffing.version));
+            if let Some(note) = selection.note {
+                obj.insert("staffing_note".into(), json!(note));
+            }
+        }
+        obj.insert("session_type".into(), json!(p.type_));
         obj.insert(
             "worktree_path".into(),
             Value::String(working_dir.to_string_lossy().into_owned()),
@@ -9337,6 +11181,11 @@ pub fn mcp_start_session(
             obj.insert("task_id".into(), Value::String(tid.to_string()));
         }
         obj.insert("prompt_source".into(), Value::String(prompt_source.to_string()));
+        insert_pick(obj, &resolved_model, &resolved_effort);
+        if let Some(ticket) = &prompt_ticket {
+            let receipt = ticket.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            obj.insert("prompt_delivery".into(), json!(receipt));
+        }
         // Reaped-worktree heal: say what was re-created and relay any
         // zero-commit-decoy / wip_branch-mismatch warnings. Nothing is
         // written on the healthy path.
@@ -9371,6 +11220,10 @@ pub fn mcp_start_session(
             );
         }
     }
+    // Logged once the spawn has happened, like the §6.3 bootstrap rules.
+    if let (Some(grant), Some(uid)) = (&launch_grant, caller_uid) {
+        crate::items::grants::log_use(grant, uid);
+    }
     Ok(response)
 }
 
@@ -9389,7 +11242,11 @@ fn live_workspace_co_tenants(
         .sessions
         .iter()
         .filter(|(uid, s)| s.workspace_id == workspace_id && uid.as_str() != exclude_uid)
-        .map(|(uid, s)| json!({ "session_uid": uid, "label": s.title }))
+        .map(|(uid, s)| {
+            let mut peer = json!({ "session_uid": uid, "label": s.title });
+            if s.session_type == "bash" { peer["kind"] = json!("shell"); }
+            peer
+        })
         .collect();
     out.sort_by(|a, b| a["session_uid"].as_str().cmp(&b["session_uid"].as_str()));
     out
@@ -9434,7 +11291,7 @@ fn task_autodelivery_prompt(
         }
     };
     let field = |k: &str| row.get(k).and_then(|v| v.as_str()).unwrap_or("");
-    compose_task_launch_prompt(field("description"), field("prompt"))
+    compose_task_launch_prompt(field("description"), field("prompt"), field("name"))
 }
 
 /// Daemon-side twin of `tui/src/planning.rs::compose_launch_prompt`,
@@ -9448,7 +11305,10 @@ fn task_autodelivery_prompt(
 /// title at a fresh agent would be noise. `None` means "spawn
 /// promptless", which is exactly the pre-ux-5c behavior.
 ///
-/// Precedence otherwise matches the operator path:
+/// The description is the task's brief (doc/org-model.md §13.2). A legacy
+/// `prompt` is added only when it says something the description does not:
+/// one that is empty, equal to the name, or contained in the description is
+/// skipped, so a backfilled row is delivered once. Otherwise:
 ///   - both present  → `"{description}\n\n---\n\n{prompt}"`
 ///   - only prompt   → prompt verbatim
 ///   - only descr.   → description verbatim
@@ -9458,9 +11318,12 @@ fn task_autodelivery_prompt(
 /// over-long task prompt is truncated at a char boundary with a visible
 /// marker rather than rejected, since rejecting would fail a spawn the
 /// caller never asked to carry a prompt at all.
-fn compose_task_launch_prompt(description: &str, prompt: &str) -> Option<String> {
+fn compose_task_launch_prompt(description: &str, prompt: &str, name: &str) -> Option<String> {
     let description = description.trim();
-    let prompt = prompt.trim();
+    let mut prompt = prompt.trim();
+    if prompt == name.trim() || description.contains(prompt) {
+        prompt = "";
+    }
     let composed = if !description.is_empty() && !prompt.is_empty() {
         format!("{}\n\n---\n\n{}", description, prompt)
     } else if !prompt.is_empty() {
@@ -9549,6 +11412,13 @@ struct CreateSessionParams {
     /// Planning task uid this session is bound to. `None` for taskless.
     #[serde(default)]
     task_id: Option<String>,
+    /// The session's model. Absent → the task default → the engine
+    /// default (`crate::models`).
+    #[serde(default)]
+    model: Option<String>,
+    /// The session's reasoning effort, resolved like `model`.
+    #[serde(default)]
+    effort: Option<String>,
     #[serde(default = "default_cols")]
     cols: u16,
     #[serde(default = "default_rows")]
@@ -9570,6 +11440,13 @@ struct AddSessionParams {
     engine: String,
     #[serde(default)]
     task_id: Option<String>,
+    /// The session's model. Absent → (a resume's recorded model →) the
+    /// task default → the engine default.
+    #[serde(default)]
+    model: Option<String>,
+    /// The session's reasoning effort, resolved like `model`.
+    #[serde(default)]
+    effort: Option<String>,
     #[serde(default = "default_cols")]
     cols: u16,
     #[serde(default = "default_rows")]
@@ -9594,7 +11471,35 @@ struct AddSessionParams {
 /// workspace auto-registers via `start_session`'s `worktree_path`
 /// branch) and `None` for `add_session` (whose workspace is already
 /// known). Remote sessions are uncapped — no memory-cap triple is set.
+#[allow(clippy::too_many_arguments)]
 fn compose_daemon_spawn_params(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    uid: &str,
+    workspace_id: &str,
+    label: &str,
+    engine: &str,
+    working_dir: &std::path::Path,
+    task_id: Option<&str>,
+    cols: u16,
+    rows: u16,
+    auto_register_worktree: Option<&std::path::Path>,
+    resume_session_id: Option<&str>,
+    model: &Resolved,
+    effort: &Resolved,
+) -> MethodResult {
+    compose_daemon_spawn_params_launch(
+        state_arc, uid, workspace_id, label, engine, working_dir, task_id, cols, rows,
+        auto_register_worktree, resume_session_id, false, model, effort,
+    )
+}
+
+/// [`compose_daemon_spawn_params`] that can FORK the resumed Claude
+/// conversation instead (`fork = true`, #24 transcript rotation): the argv
+/// is `--resume <id> --fork-session --session-id <pin>`, so the session
+/// continues in a new transcript holding only the chain after the last
+/// compact boundary, and its transcript_path is the pinned new file.
+#[allow(clippy::too_many_arguments)]
+fn compose_daemon_spawn_params_launch(
     state_arc: &Arc<Mutex<DaemonState>>,
     uid: &str,
     workspace_id: &str,
@@ -9610,6 +11515,12 @@ fn compose_daemon_spawn_params(
     // `None` is a fresh spawn. Only restore passes `Some`; every other
     // caller passes `None`.
     resume_session_id: Option<&str>,
+    fork: bool,
+    // The resolved model and effort with their sources
+    // (`resolve_spawn_pick`); required for claude and codex, `None` for
+    // bash. Recorded on the session.
+    model: &Resolved,
+    effort: &Resolved,
 ) -> MethodResult {
     // P-2: prefer the daemon's configured `mcp_server_path` so the
     // written MCP config points at the server on the daemon's host.
@@ -9629,6 +11540,14 @@ fn compose_daemon_spawn_params(
     // visible fresh start instead. Only claude is checked: codex resume
     // writes a NEW rollout file and is rebound by the detector, so its id
     // has no such file to look for.
+    // #24: every daemon resume composes here (restore, revive,
+    // session.revive, A-s Resume): a superseded Claude transcript resumes
+    // the newest session in its `continued-in` chain.
+    let followed = match (resume_session_id, engine) {
+        (Some(id), "claude-code") => crate::transcript_chain::resolve_claude_resume(uid, working_dir, id),
+        _ => None,
+    };
+    let resume_session_id = followed.as_ref().map(|f| f.id.as_str()).or(resume_session_id);
     let resume_session_id = match (resume_session_id, engine) {
         (Some(id), "claude-code") => {
             let exists = crate::transcript_detect::claude_transcript_path(working_dir, id)
@@ -9646,12 +11565,21 @@ fn compose_daemon_spawn_params(
         }
         (other, _) => other,
     };
-    let (program, argv_tail, pinned_session_id) = crate::mcp_config::build_args(
+    // #24/#25: Claude forks pin the new session id; a Codex fork (`codex
+    // fork <id>`) writes a new rollout the detector binds after the spawn.
+    let launch = match (resume_session_id, fork && matches!(engine, "claude-code" | "codex")) {
+        (Some(id), true) => crate::mcp_config::Launch::Fork(id),
+        (Some(id), false) => crate::mcp_config::Launch::Resume(id),
+        (None, _) => crate::mcp_config::Launch::Fresh,
+    };
+    let (program, argv_tail, pinned_session_id) = crate::mcp_config::build_launch_args(
         engine,
         uid,
         None,
         configured_mcp_server_path.as_deref(),
-        resume_session_id,
+        launch,
+        model.as_ref().map(|(m, _)| m.as_str()),
+        effort.as_ref().map(|(e, _)| e.as_str()),
     )
     .map_err(|e| (ErrorCode::Internal, format!("build_args: {}", e)))?;
     let mut argv = Vec::with_capacity(argv_tail.len() + 1);
@@ -9678,6 +11606,7 @@ fn compose_daemon_spawn_params(
     );
     full.insert("env".into(), Value::Object(env_obj));
     full.insert("session_type".into(), Value::String(engine.to_string()));
+    insert_pick(&mut full, model, effort);
     // H1 (restart hardening): same eager transcript stamp as
     // `mcp_start_session` — a fresh claude spawn's pin IS its transcript
     // identity, so record it before the child even starts. Resumes keep
@@ -9693,10 +11622,15 @@ fn compose_daemon_spawn_params(
             );
         }
     }
-    if engine == "codex" {
+    if engine == "codex" && !fork {
         if let Some(path) = resume_session_id.and_then(crate::transcript_detect::codex_transcript_path) {
             full.insert("transcript_path".into(), json!(path));
         }
+    }
+    // A followed chain names its file exactly (it may sit in another
+    // project directory).
+    if let (Some(f), None) = (&followed, pinned_session_id.as_deref()) {
+        full.insert("transcript_path".into(), json!(f.path.to_string_lossy()));
     }
     full.insert("cols".into(), Value::Number(cols.into()));
     full.insert("rows".into(), Value::Number(rows.into()));
@@ -9762,6 +11696,16 @@ fn compose_continuous_spawn_params(
     cols: u16,
     rows: u16,
 ) -> MethodResult {
+    // The continuous task's own model/effort → its planning task's default
+    // → the config default.
+    let configured = crate::continuous::task::load_one(continuous_task_id);
+    let (model, effort) = resolve_spawn_pick(
+        state_arc,
+        engine,
+        configured.as_ref().and_then(|t| t.model.as_deref()),
+        configured.as_ref().and_then(|t| t.effort.as_deref()),
+        task_id,
+    )?;
     let mut full = compose_daemon_spawn_params(
         state_arc,
         uid,
@@ -9774,6 +11718,8 @@ fn compose_continuous_spawn_params(
         rows,
         Some(working_dir),
         None, // a continuous fire is a fresh conversation, never a resume
+        &model,
+        &effort,
     )?;
     // A continuous fire has no launching caller to inherit a cap from (the
     // scheduler tick / Operator run_now is headless), so derive it from config:
@@ -10007,9 +11953,13 @@ pub fn rehydrate_derived_state(
         }
     };
 
+    // doc/org-model.md §12: no re-inference for a centrally bound
+    // workspace (`binding_epoch` on the persisted row; the live row is
+    // checked again under the lock below).
     let derived_bindings: Vec<(String, String)> = manifest
         .workspaces
         .iter()
+        .filter(|(_, ws)| !crate::state::binding_guarded(ws))
         .flat_map(|(ws_id, ws)| {
             ws.sessions
                 .iter()
@@ -10050,9 +12000,25 @@ pub fn rehydrate_derived_state(
             .filter(|(ws_id, _)| !st.workspaces.contains_key(*ws_id))
             .count();
         for (ws_id, ws) in &manifest.workspaces {
-            st.workspaces
+            let live = st
+                .workspaces
                 .entry(ws_id.clone())
                 .or_insert_with(|| ws.clone());
+            // The org object is daemon-recorded (workspace kind, binding
+            // epoch): a TUI-loaded row without one takes the persisted one.
+            if live.org.is_none() {
+                live.org = ws.org.clone();
+            }
+        }
+        // Bindings the TUI-file load inferred for a workspace that the merge
+        // above just showed to be centrally bound are not recorded truth:
+        // drop them (doc/org-model.md §12).
+        let inferred = std::mem::take(&mut st.inferred_bindings);
+        for (task_id, ws_id) in inferred {
+            let guarded = st.workspaces.get(&ws_id).is_some_and(crate::state::binding_guarded);
+            if guarded && st.bindings.get(&task_id) == Some(&ws_id) {
+                st.bindings.remove(&task_id);
+            }
         }
         // Explicit persisted bindings first (recorded truth), then the
         // sessions-derived reconstruction — same precedence
@@ -10063,6 +12029,9 @@ pub fn rehydrate_derived_state(
                 .or_insert_with(|| ws_id.clone());
         }
         for (task_id, ws_id) in derived_bindings {
+            if st.workspaces.get(&ws_id).is_some_and(crate::state::binding_guarded) {
+                continue;
+            }
             st.bindings.entry(task_id).or_insert(ws_id);
         }
         for (child, parent) in tree_edges {
@@ -10120,6 +12089,171 @@ pub fn rehydrate_derived_state(
 /// DESIGN_SEAMLESS_RESTART phase 4g (audit gap 2): the NON-SPAWNING half of
 /// this function lives in [`rehydrate_derived_state`], which the re-exec
 /// Adopted path also calls — see its docs.
+/// A recorded setting and its source on a live session.
+fn session_slot(
+    s: &mut crate::session::DaemonSession,
+    setting: crate::models::Setting,
+) -> (&mut Option<String>, &mut Option<String>) {
+    match setting {
+        crate::models::Setting::Model => (&mut s.model, &mut s.model_source),
+        crate::models::Setting::Effort => (&mut s.effort, &mut s.effort_source),
+    }
+}
+
+/// A recorded setting and its source on an exit tombstone.
+fn tomb_slot(
+    t: &mut crate::state::ExitedTombstone,
+    setting: crate::models::Setting,
+) -> (&mut Option<String>, &mut Option<String>) {
+    match setting {
+        crate::models::Setting::Model => (&mut t.model, &mut t.model_source),
+        crate::models::Setting::Effort => (&mut t.effort, &mut t.effort_source),
+    }
+}
+
+/// A recorded setting and its source on a registry entry.
+fn entry_slot(e: &crate::manifest::ManifestEntry, setting: crate::models::Setting) -> Option<(&str, Option<&str>)> {
+    let (v, src) = match setting {
+        crate::models::Setting::Model => (&e.model, &e.model_source),
+        crate::models::Setting::Effort => (&e.effort, &e.effort_source),
+    };
+    Some((v.as_deref()?, src.as_deref()))
+}
+
+/// [`entry_slot`], mutably.
+fn entry_slot_mut(
+    e: &mut crate::manifest::ManifestEntry,
+    setting: crate::models::Setting,
+) -> (&mut Option<String>, &mut Option<String>) {
+    match setting {
+        crate::models::Setting::Model => (&mut e.model, &mut e.model_source),
+        crate::models::Setting::Effort => (&mut e.effort, &mut e.effort_source),
+    }
+}
+
+/// Record the real model and effort of every live session (and exit
+/// tombstone) that has none: the durable registry's record of it
+/// (`manifest`), else the value its transcript names (source
+/// `transcript`). Runs once after adoption (holder adopt-at-boot,
+/// monolith re-exec), so sessions carried across a deploy from before CM
+/// recorded them keep theirs on the next revive. A session with neither is
+/// left unrecorded: recording a default would claim something its live
+/// process isn't running, and its next resume resolves one
+/// (`default_on_resume`, logged). Returns how many values were recorded.
+pub fn backfill_session_models(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    manifest: Option<&crate::manifest::Manifest>,
+) -> usize {
+    use crate::models::Setting;
+    let entries: std::collections::HashMap<&str, &crate::manifest::ManifestEntry> = manifest
+        .map(|m| m.workspaces.values().flat_map(|ws| ws.sessions.iter()).map(|e| (e.uid.as_str(), e)).collect())
+        .unwrap_or_default();
+    // Fill from the registry under the lock; collect the rest for a
+    // lock-free transcript read.
+    let mut from_registry = 0usize;
+    let mut wanted: Vec<(Setting, String, String, Option<String>, Option<std::path::PathBuf>)> = Vec::new();
+    {
+        let mut st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let worktrees: std::collections::HashMap<String, std::path::PathBuf> = st
+            .workspaces
+            .iter()
+            .filter_map(|(id, ws)| Some((id.clone(), ws.worktree_path.clone()?)))
+            .collect();
+        for setting in [Setting::Model, Setting::Effort] {
+            for s in st.sessions.values_mut() {
+                if !crate::models::takes_model(&s.session_type) {
+                    continue;
+                }
+                let (uid, engine, path) = (s.uid.clone(), s.session_type.clone(), s.transcript_path.clone());
+                let wt = worktrees.get(&s.workspace_id).cloned();
+                let (value, source) = session_slot(s, setting);
+                if value.is_some() {
+                    continue;
+                }
+                if let Some((v, src)) = entries.get(uid.as_str()).and_then(|e| entry_slot(e, setting)) {
+                    *value = Some(v.to_string());
+                    *source = src.map(str::to_string);
+                    from_registry += 1;
+                } else {
+                    wanted.push((setting, uid, engine, path, wt));
+                }
+            }
+            for t in st.recently_exited.iter_mut() {
+                if !crate::models::takes_model(&t.session_type) {
+                    continue;
+                }
+                let (uid, engine, path) = (t.session_uid.clone(), t.session_type.clone(), t.transcript_path.clone());
+                let wt = t.worktree_path.clone().map(std::path::PathBuf::from)
+                    .or_else(|| worktrees.get(&t.workspace_id).cloned());
+                let (value, source) = tomb_slot(t, setting);
+                if value.is_some() {
+                    continue;
+                }
+                if let Some((v, src)) = entries.get(uid.as_str()).and_then(|e| entry_slot(e, setting)) {
+                    *value = Some(v.to_string());
+                    *source = src.map(str::to_string);
+                    from_registry += 1;
+                } else {
+                    wanted.push((setting, uid, engine, path, wt));
+                }
+            }
+        }
+    }
+    // This runs before the brain serves. Each read is a bounded tail of
+    // one transcript, but there can be dozens of multi-GB ones, so they
+    // run on a few threads.
+    let read = |(setting, uid, engine, path, worktree): &(Setting, String, String, Option<String>, Option<std::path::PathBuf>)| {
+        let id = path.as_deref().and_then(crate::session::transcript_id_from_path);
+        let file = crate::models::session_transcript(engine, worktree.as_deref(), path.as_deref(), id.as_deref())?;
+        Some((*setting, uid.clone(), setting.from_transcript(engine, &file)?))
+    };
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let found: Vec<(Setting, String, String)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..wanted.len().min(BACKFILL_READERS))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut out = Vec::new();
+                    while let Some(w) = wanted.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+                        out.extend(read(w));
+                    }
+                    out
+                })
+            })
+            .collect();
+        workers.into_iter().flat_map(|w| w.join().unwrap_or_default()).collect()
+    });
+    let from_transcript = found.len();
+    if from_registry + from_transcript > 0 {
+        let mut st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let source = Some(crate::models::ModelSource::Transcript.as_str().to_string());
+        for (setting, uid, v) in found {
+            if let Some(s) = st.sessions.get_mut(&uid) {
+                let (value, src) = session_slot(s, setting);
+                if value.is_none() {
+                    *value = Some(v.clone());
+                    *src = source.clone();
+                }
+            }
+            for t in st.recently_exited.iter_mut().filter(|t| t.session_uid == uid) {
+                let (value, src) = tomb_slot(t, setting);
+                if value.is_none() {
+                    *value = Some(v.clone());
+                    *src = source.clone();
+                }
+            }
+        }
+        st.persist_sessions_best_effort();
+        eprintln!(
+            "cm-daemon: recorded {} model/effort value(s) of adopted sessions ({} from the registry, {} from transcripts)",
+            from_registry + from_transcript, from_registry, from_transcript,
+        );
+    }
+    from_registry + from_transcript
+}
+
+/// Transcript readers for [`backfill_session_models`].
+const BACKFILL_READERS: usize = 8;
+
 pub fn restore_sessions(state_arc: &Arc<Mutex<DaemonState>>) {
     // The NON-SPAWNING half (shared with the re-exec Adopted path — see
     // `rehydrate_derived_state`): read the durable registry and rebuild the
@@ -10187,9 +12321,14 @@ pub fn restore_sessions(state_arc: &Arc<Mutex<DaemonState>>) {
         total,
         path.display(),
     );
+    let task_models = prefetch_task_models(
+        state_arc,
+        targets.iter().filter_map(|(_, wt, e)| restore_needs_task_model(wt, e)).collect(),
+        RESTORE_TASK_MODEL_BUDGET,
+    );
     let mut restored = 0usize;
     for (ws_id, worktree, e) in targets {
-        match restore_one_session(state_arc, &ws_id, &worktree, &e) {
+        match restore_one_session_with(state_arc, &ws_id, &worktree, &e, Some(&task_models)) {
             Ok(_) => restored += 1,
             Err((_code, msg)) => eprintln!(
                 "cm-daemon: restore of session {} failed: {} — skipping \
@@ -10199,6 +12338,26 @@ pub fn restore_sessions(state_arc: &Arc<Mutex<DaemonState>>) {
         }
     }
     eprintln!("cm-daemon: restored {}/{} session(s)", restored, total);
+}
+
+/// The `(task_id, engine)` whose defaults a restored session needs: one
+/// with no recorded model (or effort) whose transcript (if resuming) names
+/// none either. Most sessions resolve locally and need no API call.
+fn restore_needs_task_model(
+    worktree: &std::path::Path,
+    e: &crate::manifest::ManifestEntry,
+) -> Option<(String, &'static str)> {
+    use crate::models::Setting;
+    let key = crate::models::engine_key(&e.session_type)?;
+    let task = e.task_id.as_deref().filter(|t| !t.trim().is_empty())?;
+    let transcript = e.transcript_id.as_deref().and_then(|id| {
+        crate::models::session_transcript(&e.session_type, Some(worktree), e.transcript_path.as_deref(), Some(id))
+    });
+    let needs = |setting: Setting| {
+        let recorded = recorded_slot(setting, &e.session_type, entry_slot(e, setting)).is_some();
+        !recorded && !transcript.as_deref().is_some_and(|p| setting.from_transcript(&e.session_type, p).is_some())
+    };
+    (needs(Setting::Model) || needs(Setting::Effort)).then(|| (task.to_string(), key))
 }
 
 /// Restore-scope predicate (the part that needs no disk IO): a still-live,
@@ -10238,24 +12397,91 @@ fn continuous_restorable(task_id: &str) -> bool {
 /// identity (`global_perms`, `managed_by_uid`), claude's explicit
 /// `transcript_path` (resume continues the same file), and the re-applied
 /// memory cap (graceful-degrade to uncapped if the cgroup prefix is gone).
+#[cfg(test)]
 fn compose_restore_params(
     state_arc: &Arc<Mutex<DaemonState>>,
     workspace_id: &str,
     worktree: &std::path::Path,
     e: &crate::manifest::ManifestEntry,
 ) -> MethodResult {
+    compose_restore_params_with(state_arc, workspace_id, worktree, e, None)
+}
+
+/// [`compose_restore_params`] with an optional prefetched task-model cache
+/// (startup restore); `None` looks the task default up live.
+#[cfg(test)]
+fn compose_restore_params_with(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    workspace_id: &str,
+    worktree: &std::path::Path,
+    e: &crate::manifest::ManifestEntry,
+    task_models: Option<&TaskModelCache>,
+) -> MethodResult {
+    compose_restore_params_launch(state_arc, workspace_id, worktree, e, task_models, false)
+}
+
+/// [`compose_restore_params_with`] that forks a Claude resume into a fresh
+/// transcript (`fork`, #24).
+fn compose_restore_params_launch(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    workspace_id: &str,
+    worktree: &std::path::Path,
+    e: &crate::manifest::ManifestEntry,
+    task_models: Option<&TaskModelCache>,
+    fork: bool,
+) -> MethodResult {
     crate::continuous::retirement::ensure_open(&e.uid).map_err(|err| (ErrorCode::Conflict, err.to_string()))?;
+    let mut continuous = TaskDefaults::default();
     if let Some(id) = &e.continuous_task_id {
         let t = crate::continuous::task::load_one(id).ok_or((ErrorCode::Conflict, "Continuous task disappeared; cannot restore its old session.".into()))?;
         if t.engine.as_session_type() != e.session_type || (t.current_session_uid.as_deref() != Some(&e.uid) && t.in_flight.as_ref().map(|f| f.session_uid.as_str()) != Some(&e.uid)) {
             return Err((ErrorCode::Conflict, "Stale continuous session identity or engine; restore is refused.".into()));
         }
+        continuous = TaskDefaults { model: t.model.clone(), effort: t.effort.clone(), timed_out: false };
     }
     // S3 (resume): a persisted transcript_id means "continue this
     // conversation" — the argv gets `--resume <id>` (claude) / the `resume`
     // subcommand (codex). `None` → fresh spawn (a session that never bound a
     // transcript falls back to fresh; never blocks — decision 3).
-    let resume = e.transcript_id.as_deref();
+    // #24: a Claude transcript that moved to a fresh session ("Resume from
+    // summary" wrote `continued-in` into it) resumes the newest session in
+    // its chain, never the superseded file; the session's transcript_path
+    // below is that file, so the row rebinds.
+    let followed = match (e.session_type.as_str(), e.transcript_id.as_deref()) {
+        ("claude-code", Some(id)) => crate::transcript_chain::resolve_claude_resume(&e.uid, worktree, id),
+        _ => None,
+    };
+    let resume = followed.as_ref().map(|f| f.id.as_str()).or(e.transcript_id.as_deref());
+    // The recorded model → (resuming) the transcript's → the continuous
+    // task's or task default → the engine default.
+    let transcript = resume.map(|id| {
+        crate::models::session_transcript(&e.session_type, Some(worktree), e.transcript_path.as_deref(), Some(id))
+    });
+    let mut task_defaults_for = || {
+        let task = match (crate::models::engine_key(&e.session_type), e.task_id.as_deref()) {
+            (Some(key), Some(task)) if !task.trim().is_empty() => match task_models {
+                Some(cache) => cache.get(&(task.to_string(), key)).cloned().unwrap_or_default(),
+                None => task_defaults(state_arc, Some(task), &e.session_type),
+            },
+            _ => TaskDefaults::default(),
+        };
+        // The continuous task's own settings win over its planning task's.
+        TaskDefaults {
+            model: continuous.model.clone().or(task.model),
+            effort: continuous.effort.clone().or(task.effort),
+            timed_out: task.timed_out,
+        }
+    };
+    let (model, effort) = resolve_respawn_pick(
+        &e.uid,
+        &e.session_type,
+        None,
+        None,
+        entry_slot(e, crate::models::Setting::Model),
+        entry_slot(e, crate::models::Setting::Effort),
+        transcript.as_ref().map(|t| t.as_deref()),
+        &mut task_defaults_for,
+    )?;
     // DESIGN_SEAMLESS_RESTART phase 4f (codex lineage): a codex resume id
     // persisted by a pre-4f daemon is the FULL rollout stem
     // (`rollout-<ts>-<uuid>`), which `codex resume` doesn't recognize.
@@ -10270,7 +12496,7 @@ fn compose_restore_params(
             _ => None,
         };
     let resume = normalized_codex_resume.as_deref().or(resume);
-    let mut params = compose_daemon_spawn_params(
+    let mut params = compose_daemon_spawn_params_launch(
         state_arc,
         &e.uid,
         workspace_id,
@@ -10285,6 +12511,9 @@ fn compose_restore_params(
         // restart (headless hosts have no tui-sessions.json to reload it).
         Some(worktree),
         resume,
+        fork,
+        &model,
+        &effort,
     )?;
     if let Value::Object(m) = &mut params {
         // A restore (and `session.revive`, which rides this composer)
@@ -10305,13 +12534,18 @@ fn compose_restore_params(
         if let Some(ct) = &e.continuous_task_id {
             m.insert("continuous_task_id".into(), Value::String(ct.clone()));
         }
+        // doc/org-model.md §12: the restored/revived session keeps its org
+        // object.
+        if let Some(org) = &e.org {
+            m.insert("org".into(), Value::Object(org.clone()));
+        }
         // claude resume continues the SAME transcript file: set transcript_path
         // explicitly so resolve_authorized_session reports `ready` at once and
         // the persist hook re-records the (unchanged) transcript_id. A detector
         // can't help here — the file pre-exists, so a new-file scan never binds
         // it. (Codex resume writes a NEW rollout, so it relies on the detector
         // armed after spawn instead.)
-        if e.session_type == "claude-code" {
+        if e.session_type == "claude-code" && !fork {
             if let Some(id) = resume {
                 if let Some(tp) =
                     crate::transcript_detect::claude_transcript_path(worktree, id)
@@ -10395,6 +12629,53 @@ fn restore_one_session(
     worktree: &std::path::Path,
     e: &crate::manifest::ManifestEntry,
 ) -> MethodResult {
+    restore_one_session_with(state_arc, workspace_id, worktree, e, None)
+}
+
+fn restore_one_session_with(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    workspace_id: &str,
+    worktree: &std::path::Path,
+    e: &crate::manifest::ManifestEntry,
+    task_models: Option<&TaskModelCache>,
+) -> MethodResult {
+    restore_one_session_launch(state_arc, workspace_id, worktree, e, task_models, false)
+}
+
+/// [`restore_one_session_with`] that can fork a Claude resume into a fresh
+/// transcript (#24 rotation): same uid, same identity, new file.
+#[cfg(test)]
+thread_local! {
+    static RECOVERY_TEST_RESTORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static RECOVERY_TEST_TRANSCRIPT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn recovery_test_restore_program(enabled: bool) {
+    RECOVERY_TEST_RESTORE.with(|value| value.set(enabled));
+}
+#[cfg(test)]
+pub(crate) fn recovery_test_transcript(path: Option<PathBuf>) {
+    RECOVERY_TEST_TRANSCRIPT.with(|value| *value.borrow_mut() = path);
+}
+
+pub(crate) fn restore_one_session_launch(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    workspace_id: &str,
+    worktree: &std::path::Path,
+    e: &crate::manifest::ManifestEntry,
+    task_models: Option<&TaskModelCache>,
+    fork: bool,
+) -> MethodResult {
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&e.uid);
+    let _recovery_read = (!crate::claude_recovery::internal_active(&e.uid)
+        && !crate::claude_recovery::read_context_active(&e.uid))
+        .then(|| recovery_gate.read().unwrap_or_else(|p| p.into_inner()));
+    let _recovery_context = if !crate::claude_recovery::read_context_active(&e.uid) {
+        Some(crate::claude_recovery::read_context(&e.uid))
+    } else { None };
+    if let Some(reason) = crate::claude_recovery::admission_refusal(&e.uid) {
+        return Err((ErrorCode::Conflict, reason));
+    }
     let resume = e.transcript_id.as_deref();
 
     // Snapshot existing transcript ids BEFORE the spawn so the detector armed
@@ -10412,7 +12693,17 @@ fn restore_one_session(
         None => Vec::new(),
     };
 
-    let params = compose_restore_params(state_arc, workspace_id, worktree, e)?;
+    // Revive / A-R / startup restore into a checkout that is gone (an agent
+    // removed its own worktree): re-create it from its branch first, and
+    // report it, instead of spawning into a missing cwd.
+    let worktree_report = ensure_ready_worktree(state_arc, workspace_id, worktree, e.task_id.as_deref())?;
+    let params = compose_restore_params_launch(state_arc, workspace_id, worktree, e, task_models, fork)?;
+    #[cfg(test)]
+    let mut params = params;
+    #[cfg(test)]
+    if RECOVERY_TEST_RESTORE.with(|value| value.get()) {
+        params["argv"] = json!(["/bin/sleep", "60"]);
+    }
     {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         // Explicit Resume already checked the archive. Startup restore can
@@ -10422,7 +12713,10 @@ fn restore_one_session(
             entry: e.clone(), transcript_ids: Default::default(),
         }) { eprintln!("cm-daemon: restore identity archive: {err}"); }
     }
-    let result = start_session(state_arc, &params)?;
+    let mut result = start_session(state_arc, &params)?;
+    if let Some(obj) = result.as_object_mut() {
+        worktree_report.decorate(obj);
+    }
     {
         let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(sess) = state.sessions.get_mut(&e.uid) {
@@ -10433,11 +12727,27 @@ fn restore_one_session(
                 });
             }
         }
+        // #24: a resume that followed a `continued-in` chain rebinds the
+        // row to the session it actually resumed, and tells viewers.
+        let mut stored = e.clone();
+        let rebound = state.sessions.get(&e.uid).and_then(|sess| {
+            let path = sess.transcript_path.clone()?;
+            let id = crate::session::transcript_id_from_path(&path)?;
+            (e.session_type == "claude-code" && Some(id.as_str()) != e.transcript_id.as_deref())
+                .then(|| (id, path, transcript_updated_entry(sess)))
+        });
+        if let Some((id, path, _)) = &rebound {
+            stored.transcript_id = Some(id.clone());
+            stored.transcript_path = Some(path.clone());
+        }
         if let Some(ws) = state.workspaces.get_mut(workspace_id) {
             ws.sessions.retain(|old| old.uid != e.uid);
-            ws.sessions.push(e.clone());
+            ws.sessions.push(stored);
         }
         state.persist_sessions_best_effort();
+        if let Some((_, _, entry)) = rebound {
+            broadcast_transcript_updated(&state, &e.uid, entry);
+        }
     }
 
     // Arm a transcript detector so the session's transcript binds + persists.
@@ -10509,6 +12819,24 @@ struct ReviveSessionParams {
     managed_by_uid: Option<String>,
     #[serde(default)]
     global_perms: Option<bool>,
+    /// The model to relaunch with. Absent → the session's recorded model
+    /// → (resuming) its transcript's → its task default → the engine
+    /// default.
+    #[serde(default)]
+    model: Option<String>,
+    /// Where the caller's `model` came from (the viewer's recorded source).
+    #[serde(default)]
+    model_source: Option<String>,
+    /// The reasoning effort the session runs at, recorded with `model`.
+    #[serde(default)]
+    effort: Option<String>,
+    /// Where `effort` came from (the same sources as `model_source`).
+    #[serde(default)]
+    effort_source: Option<String>,
+    /// The caller's copy of the session's org object (doc/org-model.md
+    /// §12), used only when the daemon's own record has none.
+    #[serde(default)]
+    org: Option<cm_holder_proto::org::OrgObject>,
 }
 
 /// `session.revive` — re-spawn one exited session at its same uid,
@@ -10518,12 +12846,63 @@ struct ReviveSessionParams {
 /// Spawn mechanics are exactly [`restore_one_session`]'s: argv/env
 /// rebuilt via `compose_restore_params`, mem-cap re-applied when its
 /// cgroup prefix survives, transcript detector armed for codex/fresh.
+/// The model and effort a revive relaunches with, merged onto `entry`:
+/// the entry's own record, else the exit tombstone's; then the caller's
+/// value (`given`, model then effort: the viewer's record, or an explicit
+/// change) wins. The same value keeps its recorded source unless the
+/// caller sends one; a different value without a source is the caller's
+/// explicit choice. Whatever stays unset is resolved by
+/// `compose_restore_params` (transcript, then default).
+fn merge_revive_settings(
+    entry: &mut crate::manifest::ManifestEntry,
+    tomb: Option<&crate::state::ExitedTombstone>,
+    given: [(Option<&str>, Option<&str>); 2],
+) {
+    use crate::models::Setting;
+    for (setting, (given, given_source)) in [Setting::Model, Setting::Effort].into_iter().zip(given) {
+        let (tomb_value, tomb_source) = match (setting, tomb) {
+            (_, None) => (None, None),
+            (Setting::Model, Some(t)) => (t.model.clone(), t.model_source.clone()),
+            (Setting::Effort, Some(t)) => (t.effort.clone(), t.effort_source.clone()),
+        };
+        let (value, source) = entry_slot_mut(entry, setting);
+        if value.is_none() {
+            *value = tomb_value;
+            *source = tomb_source;
+        }
+        let Some(v) = given.map(str::trim).filter(|v| !v.is_empty()) else { continue };
+        let v = match setting {
+            Setting::Model => v.to_string(),
+            Setting::Effort => v.to_ascii_lowercase(),
+        };
+        let given_source = given_source
+            .and_then(crate::models::ModelSource::parse)
+            .map(|s| s.as_str().to_string());
+        if value.as_deref() != Some(v.as_str()) {
+            *source = Some(given_source.unwrap_or_else(|| "explicit".into()));
+        } else if given_source.is_some() {
+            *source = given_source;
+        }
+        *value = Some(v);
+    }
+}
+
 pub fn revive_session(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
 ) -> MethodResult {
     let p: ReviveSessionParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
+    let recovery_gate = crate::claude_recovery::lifecycle_gate(&p.uid);
+    let _recovery_read = (!crate::claude_recovery::internal_active(&p.uid))
+        .then(|| recovery_gate.read().unwrap_or_else(|p| p.into_inner()));
+    let _recovery_context = crate::claude_recovery::read_context(&p.uid);
+    if let Some(reason) = crate::claude_recovery::admission_refusal(&p.uid) {
+        return Err((ErrorCode::Conflict, reason));
+    }
+    if !crate::claude_recovery::internal_active(&p.uid) && crate::claude_recovery::has_pending_input(&p.uid) {
+        return Err((ErrorCode::Conflict, "session has accepted input still being delivered".into()));
+    }
 
     // H3: drain gate — a revive during drain would mint a child the
     // imminent restart immediately kills (and, pre-H1, could lose).
@@ -10541,6 +12920,18 @@ pub fn revive_session(
                 format!(
                     "session '{}' is still running — revive applies only to an \
                      exited session (kill it first to force a restart)",
+                    p.uid
+                ),
+            ));
+        }
+        // A rotation or handoff stopped it and brings it straight back: a
+        // revive now would race (and could duplicate) that respawn.
+        if crate::rotation::in_progress(&p.uid) || crate::handoff::in_progress(&p.uid) {
+            return Err((
+                ErrorCode::Conflict,
+                format!(
+                    "session '{}' is being restarted by CM (transcript rotation or handoff) \
+                     and comes straight back",
                     p.uid
                 ),
             ));
@@ -10657,6 +13048,10 @@ pub fn revive_session(
                 workflow_run_id: None,
                 workflow_role: None,
                 continuous_task_id: None,
+                model: tomb.as_ref().and_then(|t| t.model.clone()),
+                model_source: tomb.as_ref().and_then(|t| t.model_source.clone()),
+                effort: tomb.as_ref().and_then(|t| t.effort.clone()),
+                effort_source: tomb.as_ref().and_then(|t| t.effort_source.clone()),
                 task_id: tomb.as_ref().and_then(|t| t.task_id.clone()),
                 notify_on_idle: false,
                 color: None,
@@ -10670,8 +13065,14 @@ pub fn revive_session(
                 transcript_path: None,
                 reported_done_at: None,
                 report_reason: None,
+                org: tomb.as_ref().and_then(|t| t.org.clone()),
             },
         };
+        // A revive keeps the org object (doc/org-model.md §12) whichever
+        // record it started from.
+        if entry.org.is_none() {
+            entry.org = tomb.as_ref().and_then(|t| t.org.clone());
+        }
         // The tombstone snapshots the transcript as a PATH at exit time —
         // derive the resume key from it when the manifest entry lacks one
         // (e.g. the detector bound after the last manifest persist).
@@ -10698,11 +13099,19 @@ pub fn revive_session(
         if p.transcript_id.is_some() {
             entry.transcript_id = p.transcript_id.clone();
         }
+        merge_revive_settings(
+            &mut entry,
+            tomb.as_ref(),
+            [(p.model.as_deref(), p.model_source.as_deref()), (p.effort.as_deref(), p.effort_source.as_deref())],
+        );
         if p.managed_by_uid.is_some() {
             entry.managed_by_uid = p.managed_by_uid.clone();
         }
         if let Some(gp) = p.global_perms {
             entry.global_perms = gp;
+        }
+        if entry.org.is_none() {
+            entry.org = p.org.clone();
         }
         entry.last_exit = None;
         (ws_id, worktree, entry)
@@ -10990,7 +13399,7 @@ fn arm_continuous_fire(
     started_at: u64,
 ) -> crate::continuous::task::TryModifyOutcome<FireAbort> {
     crate::continuous::task::try_modify(&snapshot.task_id, |t| {
-        if t.paused || t.drain.is_some() {
+        if t.adoption_pending.is_some() || t.paused || t.drain.is_some() {
             return Err(FireAbort::Paused);
         }
         if t.recovery_hold.is_some() || t.account_blocked.is_some() || t.retirement.is_some() || t.recovery.is_some() { return Err(FireAbort::RecoveryHeld); }
@@ -11392,8 +13801,8 @@ pub fn trigger(
             let own_task = sess.and_then(|x| x.task_id.clone());
             let size = sess.map(|x| (x.last_cols, x.last_rows));
             let ok = own_task.as_deref().map_or(false, |own| {
-                crate::control::auth::task_is_self_or_descendant_of(
-                    &state.task_tree,
+                crate::control::auth::task_in_scope(
+                    &state,
                     &p.task_id,
                     own,
                 )
@@ -11417,8 +13826,8 @@ pub fn trigger(
         format!("trigger: continuous task '{}' not found", p.task_id),
     ))?;
 
-    // A paused task doesn't fire — a clean skip, not an error.
-    if task.paused {
+    // A paused or incompletely adopted task cannot reach any executor.
+    if task.paused || task.adoption_pending.is_some() {
         return Ok(json!({ "fired": false, "reason": "paused" }));
     }
 
@@ -11480,6 +13889,14 @@ pub fn trigger(
     };
 
     let is_persistent = task.run_mode == crate::continuous::task::RunMode::Persistent;
+
+    // #24: a transcript rotation has stopped the orchestrator and brings it
+    // back at the same uid. Its absence is not death: a fire now would mint a
+    // second orchestrator. Skip as busy (scheduled fires, queue admission and
+    // run_now all come through here).
+    if task.current_session_uid.as_deref().is_some_and(crate::rotation::in_progress) {
+        return Ok(json!({ "fired": false, "reason": "busy", "detail": "transcript rotation in progress" }));
+    }
 
     // PERSISTENT liveness + delivery-handle resolution (the ONLY DaemonState lock
     // the executor takes before a spawn/PTY write; dropped immediately). For a
@@ -11776,6 +14193,7 @@ pub fn trigger(
                     session_uid.clone(),
                     resolved_prompt.clone(),
                     true,
+                    false,
                     Some(Arc::clone(state_arc)),
                 );
             }
@@ -11914,6 +14332,82 @@ struct EnqueueParams {
     source: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct QueueBindParams {
+    queue: String,
+    consumer: String,
+}
+
+#[derive(Deserialize)]
+struct QueueClaimParams {
+    queue: String,
+    max_items: u32,
+    claimed_by: String,
+    #[serde(default)]
+    lease_seconds: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct QueueAckParams {
+    queue: String,
+    ids: Vec<String>,
+    #[serde(default)]
+    claim_token: Option<String>,
+}
+
+fn queue_member_identity(state_arc: &Arc<Mutex<DaemonState>>, caller: &Caller) -> (String, bool) {
+    match caller {
+        Caller::Operator(_) => ("operator".into(), true),
+        Caller::Session(s) => {
+            let global = state_arc.lock().unwrap_or_else(|p| p.into_inner())
+                .sessions.get(&s.session_uid).is_some_and(|sess| sess.global_perms);
+            let member = crate::items::org::cached_member(&s.session_uid);
+            let identity = member["id"].as_str().or_else(|| member["handle"].as_str())
+                .unwrap_or(&s.session_uid).to_string();
+            (identity, global)
+        }
+    }
+}
+
+fn queue_caller_matches(caller: &Caller, bound: &str) -> bool {
+    let Caller::Session(s) = caller else { return false; };
+    let member = crate::items::org::cached_member(&s.session_uid);
+    member["id"].as_str() == Some(bound)
+        || member["handle"].as_str().is_some_and(|h| h.eq_ignore_ascii_case(bound))
+        || bound == s.session_uid
+}
+
+fn queue_wake_after_enqueue(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    client: &crate::continuous::queue::QueueClient,
+    result: &Value,
+) {
+    let Some(queue) = result.get("queue").and_then(Value::as_str) else { return; };
+    let Some(consumer) = result.get("bound_consumer").and_then(Value::as_str) else { return; };
+    if result.get("wake_requested").and_then(Value::as_bool) != Some(true) { return; }
+    let uid = crate::items::org::cached_member_session(consumer).filter(|uid| {
+        state_arc.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid)
+    });
+    let (root, depth) = {
+        let s = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        (s.messaging_root.clone(), result.get("depth").and_then(Value::as_u64).unwrap_or(0))
+    };
+    let marker = format!("[cm-queue {queue}]");
+    let text = format!("{marker} Queue '{queue}' has {depth} pending item(s). Read the queue and claim work if it is yours.");
+    let wake_id = result.get("wake_id").and_then(Value::as_str)
+        .map(str::to_string).unwrap_or_else(|| format!("cm-queue-wake:{queue}"));
+    let has_uid = uid.is_some();
+    let delivery = match uid {
+        Some(uid) => crate::notifications::publish(&root, &uid, &wake_id, "cm", &text, &marker)
+            .map(|_| true).unwrap_or(false),
+        None => false,
+    };
+    let error = (!delivery).then_some(if !has_uid { "bound consumer has no live main session" } else { "native notification publish failed" });
+    if let Err(e) = client.record_wake(queue, delivery, error) {
+        eprintln!("cm-daemon: queue wake receipt for '{queue}' failed: {e:?}");
+    }
+}
+
 /// `enqueue(queue, payload, dedupe_key?, source?)` — buffer one item into a
 /// named queue (Operator + Session). Forwards the API's
 /// `{enqueued, deduped, id, depth}` verbatim. An empty/missing `source`
@@ -11942,9 +14436,13 @@ pub fn enqueue(
             Caller::Session(s) => format!("session:{}", s.session_uid),
         });
     let client = continuous_queue_client(state_arc)?;
-    client
+    let result = client
         .enqueue(&p.queue, &p.payload, p.dedupe_key.as_deref(), Some(&source))
-        .map_err(|e| e.to_method_err())
+        .map_err(|e| e.to_method_err())?;
+    let mut result = result;
+    result["queue"] = Value::String(p.queue.clone());
+    queue_wake_after_enqueue(state_arc, &client, &result);
+    Ok(result)
 }
 
 #[derive(Deserialize)]
@@ -11953,7 +14451,8 @@ struct QueueStatsParams {
 }
 
 /// `queue.stats(queue)` — read-only depth probe (Operator + Session):
-/// `{queue, pending, claimed, oldest_pending_at}`.
+/// `{queue, pending, claimed, oldest_pending_at, oldest_item_age_seconds,
+/// binding, last_wake, last_consume, wake_pending, wake_delivery, wake_error}`.
 pub fn queue_stats(
     state_arc: &Arc<Mutex<DaemonState>>,
     _caller: &Caller,
@@ -11970,7 +14469,97 @@ pub fn queue_stats(
         "pending": stats.pending,
         "claimed": stats.claimed,
         "oldest_pending_at": stats.oldest_pending_at,
+        "oldest_item_age_seconds": stats.oldest_item_age_seconds,
+        "binding": stats.binding,
+        "last_wake": stats.last_wake,
+        "last_consume": stats.last_consume,
+        "wake_pending": stats.wake_pending,
+        "wake_delivery": stats.wake_delivery,
+        "wake_error": stats.wake_error,
+        "wake_id": stats.wake_id,
     }))
+}
+
+/// `queue.list` — dashboard read path. The result shape is stable and includes
+/// binding, oldest age, wake/consume timestamps and wake-pending state.
+pub fn queue_list(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    _caller: &Caller,
+    _params: &Value,
+) -> MethodResult {
+    let client = continuous_queue_client(state_arc)?;
+    client.list().map_err(|e| e.to_method_err())
+}
+
+/// `queue.bind` — bind/rebind a queue to a durable member reference. The
+/// consumer itself, Owner/operator, or a global-perms orchestrator may do so.
+pub fn queue_bind(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    caller: &Caller,
+    params: &Value,
+) -> MethodResult {
+    let p: QueueBindParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("queue.bind params: {e}")))?;
+    crate::continuous::queue::validate_queue_name(&p.queue)
+        .map_err(|e| (ErrorCode::InvalidParams, format!("queue.bind: {e}")))?;
+    let (actor, global) = queue_member_identity(state_arc, caller);
+    let existing = continuous_queue_client(state_arc)?.stats(&p.queue)
+        .map_err(|e| e.to_method_err())?;
+    if let Some(bound) = existing.binding.as_ref().and_then(|v| v["consumer"].as_str()) {
+        let self_bind = queue_caller_matches(caller, bound);
+        if !global && actor != "operator" && !self_bind {
+            return Err((ErrorCode::Unauthorized,
+                format!("queue '{}' is bound to consumer '{}'; only that consumer, Owner/operator, or a global-perms orchestrator may rebind it", p.queue, bound)));
+        }
+    }
+    let client = continuous_queue_client(state_arc)?;
+    let mut result = client.bind(&p.queue, &p.consumer, &actor).map_err(|e| e.to_method_err())?;
+    result["queue"] = Value::String(p.queue.clone());
+    result["bound_consumer"] = Value::String(p.consumer.clone());
+    queue_wake_after_enqueue(state_arc, &client, &result);
+    Ok(result)
+}
+
+/// Bound-consumer claim/ack tools. Existing unbound continuous queues keep
+/// using `enqueue` + scheduler claim/ack unchanged.
+pub fn queue_claim(
+    state_arc: &Arc<Mutex<DaemonState>>, caller: &Caller, params: &Value,
+) -> MethodResult {
+    let p: QueueClaimParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("queue.claim params: {e}")))?;
+    let (consumer, _) = queue_member_identity(state_arc, caller);
+    if consumer == "operator" { return Err((ErrorCode::Unauthorized, "queue.claim requires the bound consumer session".into())); }
+    let client = continuous_queue_client(state_arc)?;
+    let stats = client.stats(&p.queue).map_err(|e| e.to_method_err())?;
+    let api_consumer = if let Some(bound) = stats.binding.as_ref().and_then(|v| v["consumer"].as_str()) {
+        if !queue_caller_matches(caller, bound) {
+            return Err((ErrorCode::Unauthorized, format!("queue '{}' is bound to consumer '{}'; only that consumer may claim", p.queue, bound)));
+        }
+        bound.to_string()
+    } else { consumer.clone() };
+    client.claim_for(&p.queue, p.max_items, &p.claimed_by, Some(&api_consumer), p.lease_seconds.unwrap_or(300))
+        .map(|items| json!({"queue": p.queue, "items": items, "consumer": consumer}))
+        .map_err(|e| e.to_method_err())
+}
+
+pub fn queue_ack(
+    state_arc: &Arc<Mutex<DaemonState>>, caller: &Caller, params: &Value,
+) -> MethodResult {
+    let p: QueueAckParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("queue.ack params: {e}")))?;
+    let (consumer, _) = queue_member_identity(state_arc, caller);
+    if consumer == "operator" { return Err((ErrorCode::Unauthorized, "queue.ack requires the bound consumer session".into())); }
+    let client = continuous_queue_client(state_arc)?;
+    let stats = client.stats(&p.queue).map_err(|e| e.to_method_err())?;
+    let api_consumer = if let Some(bound) = stats.binding.as_ref().and_then(|v| v["consumer"].as_str()) {
+        if !queue_caller_matches(caller, bound) {
+            return Err((ErrorCode::Unauthorized, format!("queue '{}' is bound to consumer '{}'; only that consumer may acknowledge", p.queue, bound)));
+        }
+        bound.to_string()
+    } else { consumer.clone() };
+    client.ack_for(&p.queue, &p.ids, Some(&api_consumer), p.claim_token.as_deref())
+        .map(|acked| json!({"queue": p.queue, "acked": acked, "consumer": consumer}))
+        .map_err(|e| e.to_method_err())
 }
 
 // ===================================================================
@@ -12081,6 +14670,10 @@ pub fn report_done(
                 ),
             )
         })?;
+        if session.session_type == "bash" {
+            return Err((ErrorCode::InvalidParams,
+                "agent_only: report_done requires an agent; bash is a shell, whose commands complete by exiting".into()));
+        }
         let out = (
             session.stamp_reported_done(p.reason.clone()),
             session.continuous_task_id.clone(),
@@ -12221,12 +14814,14 @@ pub fn continuous_force_done(
     _state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
 ) -> MethodResult {
+    let _binding = crate::continuous::adoption::binding_lock();
     let p: ForceDoneParams = serde_json::from_value(params.clone()).map_err(|e| {
         (
             ErrorCode::InvalidParams,
             format!("continuous.force_done params: {}", e),
         )
     })?;
+    crate::continuous::adoption::ensure_available(&p.task_id)?;
     crate::continuous::task::validate_task_id(&p.task_id)
         .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.force_done: {}", e)))?;
     crate::continuous::task::load_one(&p.task_id).ok_or((
@@ -12924,6 +15519,7 @@ pub(crate) fn spawn_investigator(
             uid.clone(),
             prompt,
             true,
+            false,
             Some(Arc::clone(state_arc)),
         );
     }
@@ -13030,6 +15626,13 @@ struct ContinuousCreateParams {
     /// Wire engine: `"claude"`|`"codex"`|`"bash"` (default `codex` for NEW tasks).
     #[serde(default = "default_continuous_create_engine")]
     engine: crate::continuous::task::Engine,
+    /// The orchestrator's model. Absent: the planning task's default, else
+    /// the engine default, resolved at each spawn.
+    #[serde(default)]
+    model: Option<String>,
+    /// The orchestrator's reasoning effort, resolved like `model`.
+    #[serde(default)]
+    effort: Option<String>,
     /// `"fresh"`|`"persistent"` (default `fresh`; persistent is a Phase-3 no-op).
     #[serde(default)]
     run_mode: crate::continuous::task::RunMode,
@@ -13107,8 +15710,10 @@ pub fn continuous_create(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
 ) -> MethodResult {
+    let _binding = crate::continuous::adoption::binding_lock();
     let p: ContinuousCreateParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.create params: {}", e)))?;
+    crate::continuous::adoption::ensure_available(&p.task_id)?;
 
     let messaging=crate::messaging::tasks::configuration(state_arc,p.messaging.as_ref().unwrap_or(&Value::Null))
         .map_err(|e|(ErrorCode::InvalidParams,e.to_string()))?;
@@ -13138,6 +15743,8 @@ pub fn continuous_create(
         crate::config::validate_mem_cap_bytes(v)
             .map_err(|e| (ErrorCode::InvalidParams, format!("mem_cap_bytes: {}", e)))?;
     }
+    let model = continuous_model_param(p.engine.as_session_type(), p.model.as_deref())?;
+    let effort = continuous_effort_param(p.engine.as_session_type(), p.effort.as_deref())?;
 
     // Worktree slug defaults to the (already allowlist-validated) task_id. A
     // caller-supplied slug feeds `<repo>-<slug>` + `cm/<slug>`, so guard it
@@ -13242,6 +15849,8 @@ pub fn continuous_create(
         p.default_prompt.clone(),
     );
     task.planning_task_id = p.planning_task_id.clone();
+    task.model = model;
+    task.effort = effort;
     task.task_channel = p.task_channel.unwrap_or(if messaging.is_some() {
         crate::continuous::task::TaskChannelPolicy::Manual
     } else {
@@ -13313,7 +15922,7 @@ pub fn continuous_create(
     // Task channel: create/attach + bind now when the messaging coordinator is
     // reachable; otherwise the refresh loop converges on it. Never fatal — the
     // record is already durable.
-    let channel = match crate::messaging::tasks::ensure_for_task(state_arc, &p.task_id) {
+    let channel = match crate::messaging::tasks::ensure_for_task_locked(state_arc, &p.task_id, &_binding, None) {
         Ok(report) => json!({
             "channel_id": report.channel_id,
             "path": report.path,
@@ -13338,9 +15947,43 @@ pub fn continuous_create(
 /// (task_id, engine, run_mode, workspace, worktree, repo) are intentionally
 /// absent: changing them would require recreating the worktree / respawning
 /// the session, which is `delete` + `create`'s job, not an in-place update.
+/// A continuous task's `model` param: validated, `None` for empty. Bash
+/// orchestrators take none.
+fn continuous_model_param(
+    session_type: &str,
+    model: Option<&str>,
+) -> Result<Option<String>, (ErrorCode, String)> {
+    let Some(m) = model.filter(|m| !m.trim().is_empty()) else { return Ok(None) };
+    if !crate::models::takes_model(session_type) {
+        return Err((ErrorCode::InvalidParams, format!("model applies to claude and codex, not {session_type}")));
+    }
+    crate::models::validate_model(m).map(Some).map_err(|e| (ErrorCode::InvalidParams, format!("model: {e}")))
+}
+
+/// A continuous task's `effort` param, like [`continuous_model_param`].
+fn continuous_effort_param(
+    session_type: &str,
+    effort: Option<&str>,
+) -> Result<Option<String>, (ErrorCode, String)> {
+    let Some(e) = effort.filter(|e| !e.trim().is_empty()) else { return Ok(None) };
+    if !crate::models::takes_model(session_type) {
+        return Err((ErrorCode::InvalidParams, format!("effort applies to claude and codex, not {session_type}")));
+    }
+    crate::models::validate_effort(session_type, e)
+        .map(Some)
+        .map_err(|e| (ErrorCode::InvalidParams, format!("effort: {e}")))
+}
+
 #[derive(Deserialize)]
 struct ContinuousUpdateParams {
     task_id: String,
+    /// New model for the next spawn; `""` clears it (back to the task /
+    /// engine default). A live session keeps its model until respawned.
+    #[serde(default)]
+    model: Option<String>,
+    /// New effort for the next spawn; `""` clears it, like `model`.
+    #[serde(default)]
+    effort: Option<String>,
     #[serde(default)]
     default_prompt: Option<String>,
     #[serde(default)]
@@ -13398,21 +16041,32 @@ pub fn continuous_update(
     _state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
 ) -> MethodResult {
+    let _binding = crate::continuous::adoption::binding_lock();
     if params.get("engine").is_some() {
         return Err((ErrorCode::InvalidParams, "Use continuous.migrate_engine to change engines after draining and retiring the old session.".into()));
     }
     let p: ContinuousUpdateParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.update params: {}", e)))?;
+    crate::continuous::adoption::ensure_available(&p.task_id)?;
     crate::continuous::task::validate_task_id(&p.task_id)
         .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.update: {}", e)))?;
-    if crate::continuous::task::load_one(&p.task_id).is_none() {
+    let Some(existing) = crate::continuous::task::load_one(&p.task_id) else {
         return Err((
             ErrorCode::NotFound,
             format!("continuous.update: task '{}' not found", p.task_id),
         ));
-    }
+    };
+    let model_update = match p.model.as_deref() {
+        None => None,
+        Some(m) => Some(continuous_model_param(existing.engine.as_session_type(), Some(m))?),
+    };
+    let effort_update = match p.effort.as_deref() {
+        None => None,
+        Some(e) => Some(continuous_effort_param(existing.engine.as_session_type(), Some(e))?),
+    };
     let _lifecycle = crate::continuous::task::lock_lifecycle(&p.task_id)
         .map_err(|e| (ErrorCode::Internal, format!("continuous.update lock: {e}")))?;
+    crate::continuous::adoption::ensure_available(&p.task_id)?;
     if let Some(dp) = &p.default_prompt {
         if dp.trim().is_empty() {
             return Err((
@@ -13469,6 +16123,14 @@ pub fn continuous_update(
         if let Some(v) = &p.label {
             t.label = v.clone();
             updated.push("label");
+        }
+        if let Some(v) = &model_update {
+            t.model = v.clone();
+            updated.push("model");
+        }
+        if let Some(v) = &effort_update {
+            t.effort = v.clone();
+            updated.push("effort");
         }
         if let Some(v) = p.compact_every {
             // 0 disables (the fire check requires n > 0); store None so the
@@ -13630,6 +16292,8 @@ pub fn continuous_list(
                 // the exact seq/uid and when positive recovery proof must be
                 // newer than. `null` outside an account-block episode.
                 "account_blocked": t.account_blocked,
+                "adoption_pending": t.adoption_pending,
+                "adoption_receipt": t.adoption_receipt,
                 "recovery_hold": t.recovery_hold,
                 "recovery": t.recovery,
                 "retirement": t.retirement,
@@ -13643,6 +16307,215 @@ pub fn continuous_list(
         })
         .collect();
     Ok(json!({ "tasks": items }))
+}
+
+/// Combined read for the continuous-teams dashboard. It deliberately keeps
+/// the existing `continuous.list` task rows and adds queue, scheduled-wake and
+/// open-item projections so older TUI clients can continue using the original
+/// method unchanged.
+pub fn continuous_dashboard(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+) -> MethodResult {
+    let mut dashboard = continuous_list(state_arc, params)?;
+    let queues = continuous_queue_client(state_arc)
+        .and_then(|client| client.list().map_err(|e| e.to_method_err()))
+        .unwrap_or_else(|_| json!({"queues": []}));
+    let wakes = crate::session_wake::handle(
+        state_arc,
+        &Caller::operator("continuous-dashboard"),
+        "list",
+        &json!({}),
+    )
+    .unwrap_or_else(|_| json!({"schedules": []}));
+    let now = crate::control::methods::now_unix_f64();
+    let api = {
+        let s = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        crate::items::api::Api::from_config(&s.config.api_url, &s.config.api_token).ok()
+    };
+    let queue_rows = queues["queues"].as_array().cloned().unwrap_or_default();
+    let wake_rows = wakes["schedules"].as_array().cloned().unwrap_or_default();
+    let team_rows = continuous_team_dashboard_rows(state_arc, &queue_rows, &wake_rows, api.as_ref());
+    if let Some(tasks) = dashboard["tasks"].as_array_mut() {
+        for task in &mut *tasks {
+            let queue_name = task
+                .pointer("/schedule/queue")
+                .and_then(Value::as_str);
+            if let Some(queue) = queue_name {
+                task["bound_queue"] = queue_rows
+                    .iter()
+                    .find(|row| row["queue"].as_str() == Some(queue))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+            } else {
+                task["bound_queue"] = Value::Null;
+            }
+            let uid = task["current_session_uid"].as_str();
+            task["wake_schedules"] = Value::Array(
+                wake_rows
+                    .iter()
+                    .filter(|row| uid.is_some() && row["session_uid"].as_str() == uid)
+                    .cloned()
+                    .collect(),
+            );
+            let every = task
+                .pointer("/schedule/every_secs")
+                .and_then(Value::as_u64)
+                .or_else(|| task.pointer("/schedule/window_secs").and_then(Value::as_u64));
+            let next = task["next_fire_at"].as_u64().unwrap_or(0) as f64;
+            task["missed_runs"] = every
+                .filter(|_| next > 0.0 && now > next)
+                .map(|period| ((now - next) / period.max(1) as f64).floor() as u64 + 1)
+                .unwrap_or(0)
+                .into();
+            task["blocked_state"] = if task["account_blocked"].is_object()
+                || task["recovery_hold"].is_object()
+                || task["paused"] == true
+            {
+                json!("blocked")
+            } else {
+                Value::Null
+            };
+            let open_items = task["planning_task_id"]
+                .as_str()
+                .and_then(|ref_id| api.as_ref().and_then(|client| client.get(&format!("/boards/{ref_id}"), &[]).ok()))
+                .and_then(|board| board["items"].as_array().cloned())
+                .map(|items| {
+                    items
+                        .into_iter()
+                        .filter(|item| !matches!(item["status"].as_str(), Some("done" | "dropped")))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            task["open_items"] = json!(open_items);
+        }
+        // Keep the original `tasks` projection usable by older clients while
+        // exposing org-model continuous teams to this dashboard too. Team
+        // rows have `kind=continuous_team` and are read-only (there is no
+        // legacy scheduler pause/drain action for them).
+        tasks.extend(team_rows.iter().cloned());
+    }
+    dashboard["queues"] = queues["queues"].clone();
+    dashboard["wake_schedules"] = wakes["schedules"].clone();
+    dashboard["continuous_teams"] = json!(team_rows);
+    Ok(dashboard)
+}
+
+/// Project CT-Wake's stable org-team marker into the dashboard row shape.
+/// `continuous` is an object on current APIs; accepting `true` keeps the
+/// projection tolerant of the marker's first rollout. The marker's `queues`
+/// are already filtered to the lead, so they are preferred over the global
+/// queue read. The global read remains a compatibility fallback for an API
+/// that only returned the static lead identity.
+fn continuous_team_dashboard_rows(
+    _state_arc: &Arc<Mutex<DaemonState>>,
+    queue_rows: &[Value],
+    wake_rows: &[Value],
+    api: Option<&crate::items::api::Api>,
+) -> Vec<Value> {
+    let snapshot = api.and_then(|client| client.get("/org/snapshot", &[]).ok());
+    let teams = snapshot
+        .as_ref()
+        .and_then(|v| v["teams"].as_array())
+        .cloned()
+        .unwrap_or_default();
+    teams
+        .iter()
+        .filter_map(|team| {
+            let marker = match team.get("continuous") {
+                Some(value @ Value::Object(_)) => value,
+                Some(Value::Bool(true)) => team,
+                _ => return None,
+            };
+            let id = team["id"].as_str().or_else(|| team["slug"].as_str())?;
+            let label = team["name"].as_str().or_else(|| team["slug"].as_str()).unwrap_or(id);
+            let lead_member = marker["lead_member_id"].as_str();
+            let lead_uid = marker["lead_session_uid"].as_str();
+            let lead_handle = marker["lead_handle"].as_str();
+            let mut bound_queues = marker["queues"].as_array().cloned().unwrap_or_default();
+            if bound_queues.is_empty() {
+                bound_queues = queue_rows
+                    .iter()
+                    .filter(|row| {
+                        let consumer = row.pointer("/binding/consumer").and_then(Value::as_str);
+                        consumer == lead_member || consumer == lead_handle
+                    })
+                    .cloned()
+                    .collect();
+            }
+            let schedules: Vec<Value> = wake_rows
+                .iter()
+                .filter(|row| lead_uid.is_some() && row["session_uid"].as_str() == lead_uid)
+                .cloned()
+                .collect();
+            let missed = marker["missed_count"].as_u64().or_else(|| {
+                schedules
+                    .iter()
+                    .map(|row| row["missed_count"].as_u64().unwrap_or(0))
+                    .sum::<u64>()
+                    .into()
+            }).unwrap_or(0);
+            let next_run = if marker["next_run"].is_null() {
+                schedules
+                    .iter()
+                    .filter_map(|row| row["next_run"].as_f64())
+                    .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(Value::from)
+                    .unwrap_or(Value::Null)
+            } else {
+                marker["next_run"].clone()
+            };
+            let last_run = if marker["last_run"].is_null() {
+                schedules
+                    .iter()
+                    .filter_map(|row| row["last_run"].as_object().cloned().map(Value::Object))
+                    .max_by(|a, b| {
+                        a["scheduled_at"]
+                            .as_f64()
+                            .unwrap_or(0.0)
+                            .partial_cmp(&b["scheduled_at"].as_f64().unwrap_or(0.0))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .unwrap_or(Value::Null)
+            } else {
+                marker["last_run"].clone()
+            };
+            let health = marker["health"].as_str().unwrap_or_else(|| if marker["blocked"] == true { "blocked" } else { "ok" });
+            let blocked = matches!(health, "blocked") || marker["blocked"] == true;
+            let board = team["board"].as_str().or_else(|| marker["board"].as_str());
+            let open_items = board
+                .and_then(|board| api.and_then(|client| client.get(&format!("/boards/{board}"), &[]).ok()))
+                .and_then(|value| value["items"].as_array().cloned())
+                .map(|items| items.into_iter().filter(|item| !matches!(item["status"].as_str(), Some("done" | "dropped"))).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let current_session_uid = marker["lead_session_uid"].clone();
+            let bound_queue = bound_queues.first().cloned().unwrap_or(Value::Null);
+            Some(json!({
+                "kind": "continuous_team",
+                "team_id": id,
+                "task_id": format!("team:{id}"),
+                "label": label,
+                "host_id": marker["host_id"],
+                "lead_member_id": lead_member,
+                "lead_handle": lead_handle,
+                "current_session_uid": current_session_uid,
+                "lead_session_uid": marker["lead_session_uid"],
+                "lead_alive": marker["lead_alive"],
+                "next_run": next_run,
+                "next_fire_at": next_run,
+                "last_run": last_run,
+                "missed_count": missed,
+                "missed_runs": missed,
+                "health": health,
+                "blocked_state": if blocked { Value::String("blocked".into()) } else { Value::Null },
+                "bound_queues": bound_queues,
+                "bound_queue": bound_queue,
+                "wake_schedules": schedules,
+                "open_items": open_items,
+                "continuous": marker,
+            }))
+        })
+        .collect()
 }
 
 /// `continuous.dispatch_pending` — read-only scan of every REVIEWABLE
@@ -13698,7 +16571,7 @@ pub(crate) fn capture_drain_sessions(
 ) -> Vec<crate::continuous::drain::SessionObservation> {
     use crate::continuous::drain::SessionObservation;
     let Some(drain) = task.drain.as_ref() else { return Vec::new(); };
-    let mut codex_checks = Vec::new();
+    let mut transcript_checks = Vec::new();
     let mut sessions = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
         let mut uids = std::collections::HashSet::new();
@@ -13735,12 +16608,20 @@ pub(crate) fn capture_drain_sessions(
             let orchestrator = drain.session_uid.as_deref() == Some(&uid);
             if let Some(s) = state.sessions.get(&uid) {
                 let done = s.reported_done();
-                if s.session_type == "codex" {
-                    if let (Some(path), Some(report)) = (&s.transcript_path, &done) {
-                        codex_checks.push((uid.clone(), path.clone(), report.at_unix));
-                    }
-                }
                 let end = *s.last_turn_end_at.lock().unwrap_or_else(|p| p.into_inner());
+                let agent = crate::agent_state::current(s);
+                if let Some(report) = &done {
+                    let after = report.at_unix.max(agent.latest_start_at.unwrap_or(0.0));
+                    let finished = if s.session_type == "codex" {
+                        crate::continuous::completion::codex_drain_relay_finished_after(
+                            &s.agent_state.lock().unwrap_or_else(|p| p.into_inner()), after, now_unix_f64())
+                    } else if s.session_type == "claude-code" && agent.source.engine_reported() {
+                        crate::continuous::completion::claude_drain_state_finished_after(&agent, after, now_unix_f64(),
+                            s.agent_state.lock().unwrap_or_else(|p| p.into_inner()).inputs.delivery
+                                .as_ref().is_some_and(|d| d.local_command))
+                    } else { Some(end.is_some_and(|e| e >= report.at_instant)) };
+                    transcript_checks.push((uid.clone(), s.session_type.clone(), s.transcript_path.clone(), after, finished));
+                }
                 observations.push(SessionObservation {
                     session_uid: uid,
                     orchestrator,
@@ -13750,9 +16631,7 @@ pub(crate) fn capture_drain_sessions(
                     last_input_at: s.last_input_at.lock().unwrap_or_else(|p| p.into_inner())
                         .map(|at| now_unix_f64() - at.elapsed().as_secs_f64()),
                     failed: s.last_exit.operator_kill_requested(),
-                    final_turn_ended: done
-                        .as_ref()
-                        .is_some_and(|r| end.is_some_and(|e| e >= r.at_instant)),
+                    final_turn_ended: false,
                 });
             } else if let Some(tomb) = state.exited_tombstone(&uid) {
                 observations.push(SessionObservation {
@@ -13770,9 +16649,13 @@ pub(crate) fn capture_drain_sessions(
         observations.sort_by(|a, b| a.session_uid.cmp(&b.session_uid));
         observations
     };
-    for (uid, path, after) in codex_checks {
+    for (uid, engine, path, after, finished) in transcript_checks {
         if let Some(session) = sessions.iter_mut().find(|s| s.session_uid == uid) {
-            session.final_turn_ended = crate::continuous::completion::codex_turn_finished_after(&path, after);
+            session.final_turn_ended = finished.unwrap_or_else(|| path.is_some_and(|path| {
+                if engine == "claude-code" {
+                    crate::continuous::completion::claude_turn_finished_after(&path, after)
+                } else { crate::continuous::completion::codex_turn_finished_after(&path, after) }
+            }));
         }
     }
     sessions
@@ -13792,12 +16675,14 @@ fn continuous_drain_status(
 /// Close admission and capture already-admitted work without input, a signal,
 /// a new queue claim or a session kill. Operator-only at dispatch.
 pub fn continuous_drain(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> MethodResult {
+    let _binding = crate::continuous::adoption::binding_lock();
     let p: ContinuousDrainParams = serde_json::from_value(params.clone()).map_err(|e| {
         (
             ErrorCode::InvalidParams,
             format!("continuous.drain params: {e}"),
         )
     })?;
+    crate::continuous::adoption::ensure_available(&p.task_id)?;
     crate::continuous::task::validate_task_id(&p.task_id)
         .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.drain: {e}")))?;
     if crate::continuous::task::load_one(&p.task_id).is_none() {
@@ -13808,6 +16693,7 @@ pub fn continuous_drain(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> 
     }
     let _lifecycle = crate::continuous::task::lock_lifecycle(&p.task_id)
         .map_err(|e| (ErrorCode::Internal, format!("continuous.drain lock: {e}")))?;
+    crate::continuous::adoption::ensure_available(&p.task_id)?;
     let updated = crate::continuous::task::modify(&p.task_id, |t| {
         crate::continuous::drain::request(t, crate::continuous::task::now_unix());
     })
@@ -13867,8 +16753,10 @@ pub fn continuous_pause(
     _state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
 ) -> MethodResult {
+    let _binding = crate::continuous::adoption::binding_lock();
     let p: ContinuousPauseParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.pause params: {}", e)))?;
+    crate::continuous::adoption::ensure_available(&p.task_id)?;
     crate::continuous::task::validate_task_id(&p.task_id)
         .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.pause: {}", e)))?;
     // Clean NotFound before the modify (which would otherwise surface a missing
@@ -13881,6 +16769,7 @@ pub fn continuous_pause(
     }
     let _lifecycle = crate::continuous::task::lock_lifecycle(&p.task_id)
         .map_err(|e| (ErrorCode::Internal, format!("continuous.pause lock: {e}")))?;
+    crate::continuous::adoption::ensure_available(&p.task_id)?;
     let updated = crate::continuous::task::try_modify::<_, ()>(&p.task_id, |t| {
         if !p.paused && t.reconciliation.as_ref().is_some_and(|r|r.items.values().any(|i|i.status != crate::continuous::migration::ItemStatus::Completed)) && t.account_blocked.is_none() && t.recovery_hold.is_none() && t.recovery.is_none() { return Err(()); }
         if !p.paused && t.retirement.is_some() && !(t.current_session_uid.is_none() && t.engine_changes.last().is_some_and(|c| c.target == t.engine && c.run_count == t.run_count)) { return Err(()); }
@@ -13966,8 +16855,10 @@ pub fn continuous_delete(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
 ) -> MethodResult {
+    let _binding = crate::continuous::adoption::binding_lock();
     let p: ContinuousDeleteParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.delete params: {}", e)))?;
+    crate::continuous::adoption::ensure_available(&p.task_id)?;
     crate::continuous::task::validate_task_id(&p.task_id)
         .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.delete: {}", e)))?;
     let task = crate::continuous::task::load_one(&p.task_id).ok_or((
@@ -13978,6 +16869,12 @@ pub fn continuous_delete(
         ),
     ))?;
 
+    let _lifecycle = crate::continuous::task::lock_lifecycle(&p.task_id)
+        .map_err(|e| (ErrorCode::Internal, e.to_string()))?;
+    crate::continuous::adoption::ensure_available(&p.task_id)?;
+    if p.gc && task.adoption_receipt.is_some() {
+        return Err((ErrorCode::Conflict, "adopted workspaces are retained; close the workspace separately".into()));
+    }
     // Optional worktree GC (default off). Resolve the repo LOCALLY (a delete
     // must never clone) and remove the worktree; any failure is logged, never
     // fatal — the record still retires below.
@@ -14113,6 +17010,10 @@ pub fn create_session(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> Me
     if p.label.trim().is_empty() {
         return Err((ErrorCode::InvalidParams, "label must be non-empty".into()));
     }
+    // Resolve the model and effort before any filesystem side effect, so a
+    // bad explicit one fails cleanly.
+    let (model, effort) =
+        resolve_spawn_pick(state_arc, &p.engine, p.model.as_deref(), p.effort.as_deref(), p.task_id.as_deref())?;
     if p.slug.trim().is_empty() {
         return Err((ErrorCode::InvalidParams, "slug must be non-empty".into()));
     }
@@ -14239,6 +17140,8 @@ pub fn create_session(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> Me
         p.rows,
         Some(&worktree_path),
         resume_id.as_deref(),
+        &model,
+        &effort,
     ) {
         Ok(v) => v,
         Err(e) => {
@@ -14267,6 +17170,10 @@ pub fn create_session(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> Me
         "branch": crate::worktree::worktree_current_branch(&worktree_path),
         "worktree_path": worktree_path.to_string_lossy().into_owned(),
         "workspace_id": p.workspace_id,
+        "model": model.as_ref().map(|(m, _)| m.clone()),
+        "model_source": model.as_ref().map(|(_, src)| src.as_str()),
+        "effort": effort.as_ref().map(|(e, _)| e.clone()),
+        "effort_source": effort.as_ref().map(|(_, src)| src.as_str()),
     }))
 }
 
@@ -14403,6 +17310,18 @@ pub fn add_session(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> Metho
     if p.label.trim().is_empty() {
         return Err((ErrorCode::InvalidParams, "label must be non-empty".into()));
     }
+    if let Some(m) = p.model.as_deref().filter(|m| !m.trim().is_empty()) {
+        if !crate::models::takes_model(&p.engine) {
+            return Err((ErrorCode::InvalidParams, format!("model applies to claude and codex sessions, not '{}'", p.engine)));
+        }
+        crate::models::validate_model(m).map_err(|e| (ErrorCode::InvalidParams, e))?;
+    }
+    if let Some(e) = p.effort.as_deref().filter(|e| !e.trim().is_empty()) {
+        if !crate::models::takes_model(&p.engine) {
+            return Err((ErrorCode::InvalidParams, format!("effort applies to claude and codex sessions, not '{}'", p.engine)));
+        }
+        crate::models::validate_effort(&p.engine, e).map_err(|e| (ErrorCode::InvalidParams, e))?;
+    }
 
     if p.seed_from.is_some() && p.resume_id.is_some() {
         return Err((
@@ -14439,6 +17358,7 @@ pub fn add_session(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> Metho
 
     let mut seed = SessionSeedGuard::new(snapshot.as_ref(), &worktree_path)?;
     let resume_id = seed.id().or(p.resume_id.as_deref()).map(str::to_owned);
+    let mut resume_transcript = None;
     if let Some(id) = &resume_id {
         crate::agent_memory::validate_transcript_id(id)
             .map_err(|e| (ErrorCode::InvalidParams, e.to_string()))?;
@@ -14447,13 +17367,30 @@ pub fn add_session(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> Metho
             "codex" => crate::transcript_detect::codex_transcript_path(id),
             _ => None,
         };
-        if !path.is_some_and(|path| path.is_file()) {
+        if !path.as_ref().is_some_and(|path| path.is_file()) {
             return Err((
                 ErrorCode::NotFound,
                 "Requested transcript no longer exists on this host".into(),
             ));
         }
+        resume_transcript = path;
     }
+    // A resumed conversation keeps the model and effort its transcript
+    // names.
+    let (model, effort) = if resume_id.is_some() {
+        resolve_respawn_pick(
+            &p.uid,
+            &p.engine,
+            p.model.as_deref(),
+            p.effort.as_deref(),
+            None,
+            None,
+            Some(resume_transcript.as_deref()),
+            &mut || task_defaults(state_arc, p.task_id.as_deref(), &p.engine),
+        )?
+    } else {
+        resolve_spawn_pick(state_arc, &p.engine, p.model.as_deref(), p.effort.as_deref(), p.task_id.as_deref())?
+    };
     // No auto-register hint: the workspace is already known to the
     // daemon (we just looked it up).
     let full = compose_daemon_spawn_params(
@@ -14468,6 +17405,8 @@ pub fn add_session(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> Metho
         p.rows,
         None,
         resume_id.as_deref(),
+        &model,
+        &effort,
     )?;
     let start_result = start_session(state_arc, &full)?;
 
@@ -14481,6 +17420,10 @@ pub fn add_session(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> Metho
         "session_uid": session_uid,
         "resume_id": resume_id,
         "worktree_path": worktree_path.to_string_lossy().into_owned(),
+        "model": model.as_ref().map(|(m, _)| m.clone()),
+        "model_source": model.as_ref().map(|(_, src)| src.as_str()),
+        "effort": effort.as_ref().map(|(e, _)| e.clone()),
+        "effort_source": effort.as_ref().map(|(_, src)| src.as_str()),
     }))
 }
 
@@ -14512,8 +17455,22 @@ fn resume_picked_session(state_arc: &Arc<Mutex<DaemonState>>, p: &AddSessionPara
         "claude-code" => crate::transcript_detect::claude_transcript_path(&record.worktree_path, id),
         "codex" => crate::transcript_detect::codex_transcript_path(id),
         _ => None,
-    }.filter(|p| p.is_file()).ok_or((ErrorCode::NotFound, "Requested transcript no longer exists on this host".into()))?;
+    };
+    #[cfg(test)]
+    let path = RECOVERY_TEST_TRANSCRIPT.with(|value| value.borrow().clone()).or(path);
+    let path = path.filter(|p| p.is_file()).ok_or((ErrorCode::NotFound, "Requested transcript no longer exists on this host".into()))?;
     record.entry.session_type = p.engine.clone();
+    // An explicit choice replaces the recorded one; the rest are reused.
+    use crate::models::{ModelSource, Setting};
+    let explicit = ModelSource::Explicit.as_str().to_string();
+    if let Some(m) = p.model.as_deref().filter(|m| !m.trim().is_empty()) {
+        record.entry.model = Some(Setting::Model.validate(&p.engine, m).map_err(|e| (ErrorCode::InvalidParams, e))?);
+        record.entry.model_source = Some(explicit.clone());
+    }
+    if let Some(e) = p.effort.as_deref().filter(|e| !e.trim().is_empty()) {
+        record.entry.effort = Some(Setting::Effort.validate(&p.engine, e).map_err(|e| (ErrorCode::InvalidParams, e))?);
+        record.entry.effort_source = Some(explicit);
+    }
     record.entry.transcript_id = Some(id.into());
     record.entry.transcript_path = Some(path.to_string_lossy().into_owned());
     record.entry.last_exit = None;
@@ -14682,6 +17639,8 @@ fn resolve_workflow_spawn_program(
     uid: &str,
     workflow: Option<&crate::mcp_config::WorkflowMeta>,
     server_path_override: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
 ) -> std::io::Result<(String, Vec<String>)> {
     #[cfg(test)]
     {
@@ -14705,7 +17664,7 @@ fn resolve_workflow_spawn_program(
     // new conversation per activation), so the detector remains the binding
     // authority. The pin still rides in argv, making the transcript file
     // name deterministic from process start.
-    crate::mcp_config::build_args(session_type, uid, workflow, server_path_override, None)
+    crate::mcp_config::build_args(session_type, uid, workflow, server_path_override, None, model, effort)
         .map(|(prog, args, _pin)| (prog, args))
 }
 
@@ -14894,7 +17853,7 @@ fn test_detector_spawn_fn() -> crate::transcript_detect::DetectorSpawnFn {
     })
 }
 
-fn new_daemon_minted_session_uid() -> String {
+pub(crate) fn new_daemon_minted_session_uid() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -15141,15 +18100,357 @@ fn api_list_initiatives(
     creds: &PlanningApiCreds,
     status: Option<&str>,
     project: Option<&str>,
+    kind: Option<&str>,
     include_archived: bool,
 ) -> Result<Vec<Value>, PlanningClientError> {
     let agent = PlanningApiCreds::agent();
     let mut request = agent.get(&creds.url("/initiatives"));
     if let Some(status) = status { request = request.query("status", status); }
     if let Some(project) = project { request = request.query("project", project); }
+    if let Some(kind) = kind { request = request.query("kind", kind); }
     request = request.query("include_archived", if include_archived { "true" } else { "false" });
     let resp = request.header("Authorization", &creds.auth()).call().map_err(map_ureq_err)?;
     crate::planning_client::decode_json_response(resp, "list_initiatives")
+}
+
+/// POST /tasks/{id}/lead — atomically pin (or with None, clear)
+/// `metadata.lead_session_uid`; returns the updated task row.
+fn api_set_task_lead(
+    creds: &PlanningApiCreds,
+    task_id: &str,
+    session_uid: Option<&str>,
+) -> Result<Value, PlanningClientError> {
+    let agent = PlanningApiCreds::agent();
+    let resp = agent
+        .post(&creds.url(&format!("/tasks/{}/lead", task_id)))
+        .header("Authorization", &creds.auth())
+        .send_json(json!({ "session_uid": session_uid }))
+        .map_err(map_ureq_err)?;
+    crate::planning_client::decode_json_response(resp, "set_task_lead")
+}
+
+/// A task's inherited per-engine defaults (`metadata.models.<engine>` and
+/// `metadata.efforts.<engine>`, each from the nearest task up the chain
+/// that sets it).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TaskDefaults {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    /// The lookup didn't answer in time (the restore budget, or the
+    /// request's own timeout): a config default it leads to is recorded
+    /// as `lookup_timeout` and resolved again on the next respawn.
+    pub timed_out: bool,
+}
+
+impl TaskDefaults {
+    pub(crate) fn get(&self, setting: crate::models::Setting) -> Option<String> {
+        match setting {
+            crate::models::Setting::Model => self.model.clone(),
+            crate::models::Setting::Effort => self.effort.clone(),
+        }
+    }
+}
+
+/// GET /tasks/{id}/model?engine= — the task's inherited default model and
+/// effort for one engine.
+fn api_resolve_task_defaults(
+    creds: &PlanningApiCreds,
+    task_id: &str,
+    engine_key: &str,
+) -> Result<TaskDefaults, PlanningClientError> {
+    // Short bound: this sits in front of every spawn without a model of
+    // its own, startup restore included.
+    let agent = ureq::Agent::new_with_config(
+        ureq::config::Config::builder()
+            .timeout_global(Some(std::time::Duration::from_secs(3)))
+            .http_status_as_error(false)
+            .build(),
+    );
+    let resp = agent
+        .get(&creds.url(&format!("/tasks/{}/model", task_id)))
+        .query("engine", engine_key)
+        .header("Authorization", &creds.auth())
+        .call()
+        .map_err(map_ureq_err)?;
+    let row: Value = crate::planning_client::decode_json_response(resp, "resolve_task_model")?;
+    let field = |k: &str| row.get(k).and_then(Value::as_str).map(str::to_string);
+    Ok(TaskDefaults { model: field("model"), effort: field("effort"), timed_out: false })
+}
+
+/// The task default step of the resolution order: the task's (or nearest
+/// ancestor's) `metadata.models.<engine>` / `metadata.efforts.<engine>`.
+/// Best-effort like prompt auto-delivery: no credentials, an unreachable
+/// API or a missing row all mean "no task default", and the config
+/// default applies. Never called with the state lock held.
+fn task_defaults(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    task_id: Option<&str>,
+    engine: &str,
+) -> TaskDefaults {
+    let Some(task_id) = task_id.filter(|t| !t.trim().is_empty()) else { return TaskDefaults::default() };
+    let Some(key) = crate::models::engine_key(engine) else { return TaskDefaults::default() };
+    let (api_url_cfg, api_token_cfg) = {
+        let st = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        (st.config.api_url.clone(), st.config.api_token.clone())
+    };
+    let Ok(creds) = PlanningApiCreds::from_config(&api_url_cfg, &api_token_cfg) else {
+        return TaskDefaults::default();
+    };
+    match api_resolve_task_defaults(&creds, task_id, key) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!(
+                "cm-daemon: task '{}' default model/effort lookup failed ({:?}); using the {} config defaults",
+                task_id, e, key,
+            );
+            let timed_out = matches!(&e, PlanningClientError::Transport(m) if m.to_ascii_lowercase().contains("timeout")
+                || m.to_ascii_lowercase().contains("timed out"));
+            TaskDefaults { timed_out, ..TaskDefaults::default() }
+        }
+    }
+}
+
+/// A spawn's resolved model and effort, each with its source (`None`
+/// for bash).
+pub(crate) type Resolved = Option<(String, crate::models::ModelSource)>;
+
+/// Record a resolved model and effort, each with its source, on
+/// `start_session` params.
+fn insert_pick(full: &mut serde_json::Map<String, Value>, model: &Resolved, effort: &Resolved) {
+    for (key, v) in [("model", model), ("effort", effort)] {
+        if let Some((value, source)) = v {
+            full.insert(key.into(), Value::String(value.clone()));
+            full.insert(format!("{key}_source"), Value::String(source.as_str().into()));
+        }
+    }
+}
+
+/// Resolve the model and effort for one new agent spawn: `explicit` →
+/// the task default → the config default. The planning lookup runs once,
+/// and only when a setting has no explicit value.
+pub(crate) fn resolve_spawn_pick(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    engine: &str,
+    explicit_model: Option<&str>,
+    explicit_effort: Option<&str>,
+    task_id: Option<&str>,
+) -> Result<(Resolved, Resolved), (ErrorCode, String)> {
+    resolve_spawn_pick_with_rule(state_arc, engine, explicit_model, explicit_effort, task_id, None)
+}
+
+fn resolve_spawn_pick_with_rule(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    engine: &str,
+    explicit_model: Option<&str>,
+    explicit_effort: Option<&str>,
+    task_id: Option<&str>,
+    rule_model: Option<&str>,
+) -> Result<(Resolved, Resolved), (ErrorCode, String)> {
+    use crate::models::Setting;
+    let blank = |v: Option<&str>| v.is_none_or(|v| v.trim().is_empty());
+    let task = if crate::models::takes_model(engine) && (blank(explicit_model) || blank(explicit_effort)) {
+        task_defaults(state_arc, task_id, engine)
+    } else {
+        TaskDefaults::default()
+    };
+    let one = |setting: Setting, explicit: Option<&str>| {
+        if explicit.is_some_and(|v| !v.trim().is_empty()) {
+            return setting.resolve(engine, explicit, None).map_err(|e| (ErrorCode::InvalidParams, e));
+        }
+        if setting == Setting::Model && crate::models::takes_model(engine) {
+            if let Some(rule) = rule_model {
+                let task_model = task.get(setting);
+                if task_model.as_deref().is_none_or(|m| {
+                    crate::models::validate_model(m)
+                        .and_then(|m| crate::models::check_engine(engine, &m))
+                        .is_err()
+                }) {
+                    crate::models::check_engine(engine, rule).map_err(|e| (ErrorCode::InvalidParams, e))?;
+                    // A timed-out task lookup remains provisional on restore.
+                    let source = if task.timed_out { crate::models::ModelSource::LookupTimeout }
+                        else { crate::models::ModelSource::StaffingRule };
+                    return setting.resolve(engine, None, Some((rule, source)))
+                        .map_err(|e| (ErrorCode::InvalidParams, e));
+                }
+            }
+        }
+        resolve_default(setting, task_id.unwrap_or("-"), engine, &task)
+    };
+    Ok((one(Setting::Model, explicit_model)?, one(Setting::Effort, explicit_effort)?))
+}
+
+/// The default step of the order: the task's (inherited) default, else
+/// the config default. A task value the engine can't take (a codex
+/// `max` effort) is logged and replaced (`task_invalid_fallback`); a
+/// config default reached because the lookup timed out is
+/// `lookup_timeout`. `who` names the session or task for the log.
+fn resolve_default(
+    setting: crate::models::Setting,
+    who: &str,
+    engine: &str,
+    task: &TaskDefaults,
+) -> Resolved2 {
+    use crate::models::ModelSource;
+    let from_task = task.get(setting);
+    let resolved = setting
+        .resolve(engine, None, from_task.as_deref().map(|v| (v, ModelSource::Task)))
+        .map_err(|e| (ErrorCode::InvalidParams, e))?;
+    Ok(resolved.map(|(v, source)| match source {
+        ModelSource::TaskInvalidFallback => {
+            eprintln!(
+                "cm-daemon: {who}: task default {name} '{}' is not valid for {engine}; using '{v}'",
+                from_task.as_deref().unwrap_or_default(),
+                name = setting.name(),
+            );
+            (v, source)
+        }
+        ModelSource::Engine if task.timed_out => (v, ModelSource::LookupTimeout),
+        _ => (v, source),
+    }))
+}
+
+/// Per-restore cache of task defaults, keyed by `(task_id, engine slot)`.
+/// Filled up front by [`prefetch_task_models`]; a key it couldn't fill
+/// in time maps to no defaults (the config defaults apply).
+pub(crate) type TaskModelCache = std::collections::HashMap<(String, &'static str), TaskDefaults>;
+
+/// How long a restore waits, in total, for task defaults.
+const RESTORE_TASK_MODEL_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Look up the task defaults for each `(task_id, engine)` pair
+/// concurrently, giving up on whatever hasn't answered within `budget`.
+/// Restore needs these only for sessions with no recorded model or effort
+/// and none in their transcript, and must not stall on an unreachable API.
+pub(crate) fn prefetch_task_models(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    keys: Vec<(String, &'static str)>,
+    budget: std::time::Duration,
+) -> TaskModelCache {
+    let mut cache = TaskModelCache::new();
+    let keys: std::collections::BTreeSet<_> = keys.into_iter().collect();
+    if keys.is_empty() {
+        return cache;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    for key in &keys {
+        let (tx, state, key) = (tx.clone(), Arc::clone(state_arc), key.clone());
+        std::thread::spawn(move || {
+            let defaults = task_defaults(&state, Some(&key.0), key.1);
+            let _ = tx.send((key, defaults));
+        });
+    }
+    drop(tx);
+    let deadline = std::time::Instant::now() + budget;
+    while cache.len() < keys.len() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok((key, defaults)) => {
+                cache.insert(key, defaults);
+            }
+            Err(_) => break,
+        }
+    }
+    let missing = keys.len() - cache.len();
+    if missing > 0 {
+        eprintln!(
+            "cm-daemon: {} task default lookup(s) did not answer within {:?}; \
+             those sessions use the config defaults",
+            missing, budget,
+        );
+    }
+    for key in keys {
+        cache.entry(key).or_insert_with(|| TaskDefaults { timed_out: true, ..TaskDefaults::default() });
+    }
+    cache
+}
+
+/// Resolve one setting (model or effort) for a respawn of an existing
+/// session (restore, revive, resume, fork): `explicit` → the recorded
+/// value (keeping its recorded source) → for a resume, the value the
+/// conversation's transcript names (`transcript`) → the task or config
+/// default. On a resume that last step is `default_on_resume` and logged:
+/// the conversation may have run something else. A fresh respawn resolves
+/// like a new spawn. `task_default` supplies the task's default for this
+/// engine (a restore passes its prefetched cache, so this never blocks on
+/// the API).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_respawn(
+    setting: crate::models::Setting,
+    uid: &str,
+    engine: &str,
+    explicit: Option<&str>,
+    recorded: Option<(&str, Option<&str>)>,
+    resume: Option<Option<&std::path::Path>>,
+    task_default: &mut dyn FnMut() -> TaskDefaults,
+) -> Resolved2 {
+    use crate::models::ModelSource;
+    let invalid = |e: String| (ErrorCode::InvalidParams, e);
+    if !crate::models::takes_model(engine) || explicit.is_some_and(|m| !m.trim().is_empty()) {
+        return setting.resolve(engine, explicit, None).map_err(invalid);
+    }
+    if let Some((v, source)) = recorded_slot(setting, engine, recorded) {
+        return Ok(Some((v, source)));
+    }
+    let Some(transcript) = resume else {
+        return resolve_default(setting, uid, engine, &task_default());
+    };
+    if let Some(v) = transcript.and_then(|t| setting.from_transcript(engine, t)) {
+        return Ok(Some((v, ModelSource::Transcript)));
+    }
+    let fallback = resolve_default(setting, uid, engine, &task_default())?;
+    Ok(fallback.map(|(v, from)| {
+        // An invalid task value or a timed-out lookup says so instead.
+        if from != ModelSource::Task && from != ModelSource::Engine {
+            return (v, from);
+        }
+        eprintln!(
+            "cm-daemon: session {uid}: no recorded {name} and none in its transcript ({}); \
+             resuming on the {} default '{v}'",
+            transcript.map_or_else(|| "transcript not found".to_string(), |t| t.display().to_string()),
+            if from == ModelSource::Task { "task" } else { "config" },
+            name = setting.name(),
+        );
+        (v, ModelSource::DefaultOnResume)
+    }))
+}
+
+type Resolved2 = Result<Resolved, (ErrorCode, String)>;
+
+/// A session's recorded value, if it still stands: valid for the engine
+/// and not provisional (a `lookup_timeout` stand-in is resolved again).
+fn recorded_slot(
+    setting: crate::models::Setting,
+    engine: &str,
+    recorded: Option<(&str, Option<&str>)>,
+) -> Option<(String, crate::models::ModelSource)> {
+    use crate::models::ModelSource;
+    let (v, source) = recorded?;
+    let source = source.and_then(ModelSource::parse).unwrap_or(ModelSource::Recorded);
+    if source.is_provisional() {
+        return None;
+    }
+    Some((setting.validate(engine, v).ok()?, source))
+}
+
+/// [`resolve_respawn`] for both settings, sharing one lazy task lookup.
+/// `recorded_*` are the session's recorded value and source.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_respawn_pick(
+    uid: &str,
+    engine: &str,
+    explicit_model: Option<&str>,
+    explicit_effort: Option<&str>,
+    recorded_model: Option<(&str, Option<&str>)>,
+    recorded_effort: Option<(&str, Option<&str>)>,
+    resume: Option<Option<&std::path::Path>>,
+    task_defaults: &mut dyn FnMut() -> TaskDefaults,
+) -> Result<(Resolved, Resolved), (ErrorCode, String)> {
+    use crate::models::Setting;
+    let mut cached: Option<TaskDefaults> = None;
+    let mut lookup = || cached.get_or_insert_with(&mut *task_defaults).clone();
+    let model = resolve_respawn(Setting::Model, uid, engine, explicit_model, recorded_model, resume, &mut lookup)?;
+    let effort = resolve_respawn(Setting::Effort, uid, engine, explicit_effort, recorded_effort, resume, &mut lookup)?;
+    Ok((model, effort))
 }
 
 fn api_get_initiative(
@@ -15219,6 +18520,7 @@ enum TaskStatusPromotion {
 fn promote_task_to_running(
     creds: &PlanningApiCreds,
     task_id: &str,
+    actor: Option<&Value>,
 ) -> Result<TaskStatusPromotion, PlanningClientError> {
     let row = api_get_task(creds, task_id)?;
     let kind = row.get("kind").and_then(Value::as_str).unwrap_or("oneshot");
@@ -15229,7 +18531,11 @@ fn promote_task_to_running(
     if status != "draft" && status != "backlog" {
         return Ok(TaskStatusPromotion::LeftAlone);
     }
-    api_update_task(creds, task_id, &json!({ "status": "running" }))?;
+    let mut body = json!({ "status": "running" });
+    if let Some(actor) = actor {
+        body["actor"] = actor.clone();
+    }
+    api_update_task(creds, task_id, &body)?;
     Ok(TaskStatusPromotion::Promoted { from: status.to_string() })
 }
 
@@ -15244,6 +18550,7 @@ fn spawn_task_status_promotion(
     session_uid: String,
     api_url_cfg: String,
     api_token_cfg: String,
+    actor: Option<Value>,
 ) {
     // Test hermeticity: parallel tests own CM_API_URL/CM_API_TOKEN under
     // the crate env lock, which this call site does not hold. A test that
@@ -15271,7 +18578,7 @@ fn spawn_task_status_promotion(
     let task_id_for_log = task_id.clone();
     let spawned = std::thread::Builder::new()
         .name(format!("task-promote-{}", session_uid))
-        .spawn(move || match promote_task_to_running(&creds, &task_id) {
+        .spawn(move || match promote_task_to_running(&creds, &task_id, actor.as_ref()) {
             Ok(TaskStatusPromotion::Promoted { from }) => eprintln!(
                 "cm-daemon: task '{}' status {} → running (session {} launched)",
                 task_id, from, session_uid,
@@ -15373,6 +18680,15 @@ struct CreateSubtaskParams {
     /// resolution when present; absent keeps the parent-branch default.
     #[serde(default)]
     base: Option<String>,
+    /// Default model for the subtask (`metadata.models.<engine>`); see
+    /// `ProposeTaskParams::model`. Absent = it inherits its parent's.
+    #[serde(default)]
+    model: Option<String>,
+    /// Default reasoning effort for the subtask (`metadata.efforts.<engine>`).
+    #[serde(default)]
+    effort: Option<String>,
+    #[serde(default)]
+    model_engine: Option<String>,
 }
 
 fn default_subtask_worktree_mode() -> String {
@@ -15396,8 +18712,52 @@ pub fn create_subtask(
     params: &Value,
     caller_uid: Option<&str>,
 ) -> MethodResult {
+    with_cap_hint(state_arc, caller_uid, create_subtask_inner(state_arc, params, caller_uid))
+}
+
+fn create_subtask_inner(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
     let p: CreateSubtaskParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("create_subtask params: {}", e)))?;
+    let (base, leaf_slug) = validate_create_subtask(&p)?;
+    // The caller's OWN task is the PARENT, its workspace the repo context.
+    let parent = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let cuid = caller_uid.ok_or((
+            ErrorCode::Unauthorized,
+            "create_subtask is callable only by Session callers (the daemon \
+             resolves the parent task from the caller's session)"
+                .into(),
+        ))?;
+        let caller = state.sessions.get(cuid).ok_or((
+            ErrorCode::Unauthorized,
+            format!("caller session '{}' not in daemon registry", cuid),
+        ))?;
+        // Taskless callers should use propose_task for top-level tasks.
+        let parent_task_id = caller.task_id.clone().ok_or((
+            ErrorCode::Unauthorized,
+            "create_subtask requires a tasked caller; use propose_task for top-level tasks"
+                .into(),
+        ))?;
+        SubtaskParent {
+            task_id: Some(parent_task_id),
+            workspace_id: caller.workspace_id.clone(),
+            worktree_path: None,
+            base_from_parent_repo: false,
+        }
+    };
+    create_subtask_core(state_arc, &p, base, leaf_slug, parent, caller_uid, "mcp.create_subtask")
+}
+
+/// Shape checks shared by `create_subtask` and `session.fork`, run before
+/// any caller resolution or API/git work. Returns the trimmed `base` and
+/// the leaf slug.
+fn validate_create_subtask(
+    p: &CreateSubtaskParams,
+) -> Result<(Option<String>, String), (ErrorCode, String)> {
     // Validate mode BEFORE resolving the caller (mirror TUI ordering).
     if !matches!(p.worktree_mode.as_str(), "inherit" | "branch" | "in-place") {
         return Err((
@@ -15434,13 +18794,39 @@ pub fn create_subtask(
             format!("name '{}' produces an empty slug after normalization", p.name),
         ));
     }
+    Ok((base, leaf_slug))
+}
 
-    // Resolve the caller + snapshot everything the unlocked HTTP/git
-    // phase needs, then DROP the lock.
+/// Where a subtask hangs: the planning-row parent (`None` = top-level row)
+/// and the workspace whose repo/checkout supplies the main repo, repo URL
+/// and (inherit mode) the shared worktree. `create_subtask` passes the
+/// caller's own task + workspace; `session.fork` passes the SOURCE
+/// session's. `worktree_path` overrides the workspace's recorded path
+/// (a source known only from its exit tombstone).
+struct SubtaskParent {
+    task_id: Option<String>,
+    workspace_id: String,
+    worktree_path: Option<PathBuf>,
+    /// `base` is a commit of the PARENT's repo (a fork's source HEAD), so
+    /// when the subtask lands in another repo it is dropped for that
+    /// repo's trunk and the result says `base_downgraded: "trunk"`. An
+    /// explicit `create_subtask(base=…)` names a ref in the subtask's own
+    /// repo and is never dropped.
+    base_from_parent_repo: bool,
+}
+
+fn create_subtask_core(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    p: &CreateSubtaskParams,
+    base: Option<String>,
+    leaf_slug: String,
+    parent: SubtaskParent,
+    caller_uid: Option<&str>,
+    submitted_via: &str,
+) -> MethodResult {
     let machine = local_machine_hostname();
+    let parent_workspace_id = parent.workspace_id.clone();
     let (
-        parent_task_id,
-        parent_workspace_id,
         parent_worktree_path,
         parent_main_repo_path,
         parent_ws_repo_url,
@@ -15450,51 +18836,23 @@ pub fn create_subtask(
         filer,
         api_url_cfg,
         api_token_cfg,
-    ): (
-        String,
-        String,
-        Option<PathBuf>,
-        Option<PathBuf>,
-        Option<String>,
-        PathBuf,
-        bool,
-        Vec<(String, String)>,
-        Value,
-        String,
-        String,
+        workspace_paths,
     ) = {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-        let cuid = caller_uid.ok_or((
-            ErrorCode::Unauthorized,
-            "create_subtask is callable only by Session callers (the daemon \
-             resolves the parent task from the caller's session)"
-                .into(),
-        ))?;
-        let caller = state.sessions.get(cuid).ok_or((
-            ErrorCode::Unauthorized,
-            format!("caller session '{}' not in daemon registry", cuid),
-        ))?;
-        // The caller's OWN task is the PARENT. Taskless callers should
-        // use propose_task for top-level tasks.
-        let parent_task_id = caller.task_id.clone().ok_or((
-            ErrorCode::Unauthorized,
-            "create_subtask requires a tasked caller; use propose_task for top-level tasks"
-                .into(),
-        ))?;
-        let parent_workspace_id = caller.workspace_id.clone();
-        let ws = state.workspaces.get(&parent_workspace_id).ok_or((
-            ErrorCode::Conflict,
-            format!(
-                "caller's workspace '{}' not in daemon manifest snapshot",
-                parent_workspace_id
-            ),
-        ))?;
+        let ws = state.workspaces.get(&parent_workspace_id);
+        if ws.is_none() && parent.worktree_path.is_none() {
+            return Err((
+                ErrorCode::Conflict,
+                format!(
+                    "parent workspace '{}' not in daemon manifest snapshot",
+                    parent_workspace_id
+                ),
+            ));
+        }
         (
-            parent_task_id,
-            parent_workspace_id,
-            ws.worktree_path.clone(),
-            ws.main_repo_path.clone(),
-            ws.repo_url.clone(),
+            parent.worktree_path.clone().or_else(|| ws.and_then(|w| w.worktree_path.clone())),
+            ws.and_then(|w| w.main_repo_path.clone()),
+            ws.and_then(|w| w.repo_url.clone()),
             state.config.repos_dir_or_default(),
             state.config.allow_clone,
             state
@@ -15502,20 +18860,18 @@ pub fn create_subtask(
                 .repos
                 .iter()
                 .map(|e| (e.name.clone(), e.url.clone()))
-                .collect(),
-            filer_metadata(
-                &state,
-                caller_uid,
-                machine.as_deref(),
-                "mcp.create_subtask",
-            ),
+                .collect::<Vec<(String, String)>>(),
+            filer_metadata(&state, caller_uid, machine.as_deref(), submitted_via),
             state.config.api_url.clone(),
             state.config.api_token.clone(),
+            state.workspaces.values().flat_map(workspace_paths_of).collect::<Vec<PathBuf>>(),
         )
     };
 
     // ---- API + git phase (lock dropped) ----
 
+    // Refuse a bad model before anything is created.
+    let (models, efforts) = filed_task_defaults(p.model.as_deref(), p.effort.as_deref(), p.model_engine.as_deref())?;
     let creds =
         PlanningApiCreds::from_config(&api_url_cfg, &api_token_cfg).map_err(|e| e.to_method_err())?;
 
@@ -15529,9 +18885,12 @@ pub fn create_subtask(
     // that a dangling id would violate anyway. ONLY a clean 404 falls back —
     // a transport/auth/5xx error still propagates (we can't tell if the
     // parent really exists, so retrying is safer than silently orphaning).
-    let parent_row: Value = match api_get_task(&creds, &parent_task_id) {
-        Ok(row) => row,
-        Err(PlanningClientError::ApiError { status: 404, .. }) => {
+    // `None` parent (a fork of a taskless session) → top-level row.
+    let parent_task_id: String = parent.task_id.clone().unwrap_or_default();
+    let parent_row: Value = match parent.task_id.as_deref().map(|id| api_get_task(&creds, id)) {
+        None => Value::Null,
+        Some(Ok(row)) => row,
+        Some(Err(PlanningClientError::ApiError { status: 404, .. })) => {
             eprintln!(
                 "cm-daemon: create_subtask parent task {} not found on the \
                  planning API (deleted?); creating '{}' as a TOP-LEVEL task \
@@ -15540,19 +18899,18 @@ pub fn create_subtask(
             );
             Value::Null
         }
-        Err(e) => return Err(e.to_method_err()),
+        Some(Err(e)) => return Err(e.to_method_err()),
     };
     let parent_exists = !parent_row.is_null();
     // The FK we actually write into the new row: Some(parent) only when the
     // parent row exists; None (top-level) when it was deleted.
     let effective_parent_id: Option<String> = parent_exists.then(|| parent_task_id.clone());
-    let parent_repo_url: String = parent_row
+    let parent_repo_url: Option<String> = parent_row
         .get("repo_url")
         .and_then(Value::as_str)
         .map(str::to_string)
         .or_else(|| parent_ws_repo_url.clone())
-        .filter(|s| !s.is_empty())
-        .ok_or((ErrorCode::Conflict, "parent task has no repo_url".into()))?;
+        .filter(|s| !s.is_empty());
     let parent_project = parent_row
         .get("project")
         .and_then(Value::as_str)
@@ -15561,6 +18919,69 @@ pub fn create_subtask(
         .get("wip_branch")
         .and_then(Value::as_str)
         .map(str::to_string);
+
+    // A subtask filed into ANOTHER project gets that project's repo and
+    // checkout, never the parent's (the row's repo is what every later
+    // subtask and minted worktree inherits). Unknown repo → refuse.
+    let other_project: Option<crate::planning_client::ProjectRepo> = match p.project.as_deref() {
+        // No parent row (a top-level fork) leaves nothing to differ from.
+        Some(pj) if parent_exists && parent_project.as_deref() != Some(pj) => {
+            let projects = api_list_projects(&creds).map_err(|e| e.to_method_err())?;
+            let repo = crate::planning_client::project_repo(&projects, pj).ok_or((
+                ErrorCode::InvalidParams,
+                format!(
+                    "create_subtask: project '{}' has no known repo (no project record \
+                     and no tasks yet), and a subtask in another project can't use its \
+                     parent's repo ({}); check the name with list_projects",
+                    pj,
+                    parent_repo_url.as_deref().unwrap_or("none"),
+                ),
+            ))?;
+            // Another project in the parent's own repo is no repo change.
+            (!parent_repo_url
+                .as_deref()
+                .is_some_and(|u| crate::worktree::same_repo(&repo.repo_url, u)))
+            .then_some(repo)
+        }
+        _ => None,
+    };
+    let (repo_url, repo_branch): (String, String) = match &other_project {
+        Some(r) => (r.repo_url.clone(), r.repo_branch.clone()),
+        None => (
+            parent_repo_url
+                .clone()
+                .ok_or((ErrorCode::Conflict, "parent task has no repo_url".into()))?,
+            "main".to_string(),
+        ),
+    };
+
+    // The parent's checkout counts only when it IS a clone of the
+    // subtask's repo (a lead can run in another repo's checkout than its
+    // task's). Otherwise the subtask's repo is located on this host and
+    // cut from its trunk, and `inherit` (the parent's checkout) is refused.
+    let parent_checkout: Option<PathBuf> = parent_main_repo_path
+        .clone()
+        .or_else(|| parent_worktree_path.as_deref().and_then(crate::worktree::main_checkout_of));
+    let parent_in_repo: Option<PathBuf> = parent_checkout
+        .clone()
+        .filter(|c| other_project.is_none() && crate::worktree::checkout_is_repo(c, &repo_url));
+    // `inherit` and `in-place` both run in an existing checkout (the
+    // parent's, or the located clone's main checkout, which others share),
+    // so across repos only a fresh branch worktree is safe.
+    let shared_checkout_mode = matches!(p.worktree_mode.as_str(), "inherit" | "in-place");
+    let foreign_repo = other_project.is_some() || (parent_checkout.is_some() && parent_in_repo.is_none());
+    let base_downgraded = parent.base_from_parent_repo && foreign_repo && base.is_some();
+    let base = if base_downgraded { None } else { base };
+    if shared_checkout_mode && foreign_repo {
+        return Err((
+            ErrorCode::InvalidParams,
+            format!(
+                "create_subtask: worktree_mode='{}' would run the subtask (repo {}) in a \
+                 shared checkout outside its parent's repo; use worktree_mode='branch'",
+                p.worktree_mode, repo_url,
+            ),
+        ));
+    }
 
     // Project: explicit arg > inherit from parent.
     let project = p.project.clone().or(parent_project);
@@ -15582,22 +19003,46 @@ pub fn create_subtask(
     // the daemon's filesystem from the parent's `repo_url` — the
     // `create_session` pattern.
     let resolve_main_repo = || -> Result<PathBuf, (ErrorCode, String)> {
-        if let Some(mr) = parent_main_repo_path.clone() {
+        if let Some(mr) = parent_in_repo.clone() {
             return Ok(mr);
         }
         let allowlist: Vec<crate::worktree::RepoAllow> = allow_entries
             .iter()
             .map(|(n, u)| crate::worktree::RepoAllow { name: n, url: u })
             .collect();
-        crate::worktree::resolve_repo(&parent_repo_url, &repos_dir, allow_clone, &allowlist).map_err(
+        if parent_checkout.is_some() || other_project.is_some() {
+            // Not the parent's repo: an origin-verified clone, or refuse.
+            let candidates: Vec<PathBuf> = workspace_paths
+                .iter()
+                .filter_map(|p| crate::worktree::main_checkout_of(p))
+                .collect();
+            return crate::worktree::locate_repo_clone(
+                &repo_url,
+                &candidates,
+                &repos_dir,
+                allow_clone,
+                &allowlist,
+            )
+            .map_err(|detail| (ErrorCode::Conflict, format!("create_subtask: {}", detail)));
+        }
+        crate::worktree::resolve_repo(&repo_url, &repos_dir, allow_clone, &allowlist).map_err(
             |e| match e {
                 crate::worktree::RepoResolveError::NotPermitted(name) => (
                     ErrorCode::Conflict,
-                    format!(
-                        "parent workspace has no main_repo_path and repo '{}' is not \
-                         resolvable on the daemon host; cannot branch/launch in-place",
-                        name
-                    ),
+                    if other_project.is_some() {
+                        format!(
+                            "repo '{}' of project '{}' is not resolvable on the daemon \
+                             host; cannot branch/launch in-place",
+                            name,
+                            p.project.as_deref().unwrap_or_default(),
+                        )
+                    } else {
+                        format!(
+                            "parent workspace has no main_repo_path and repo '{}' is not \
+                             resolvable on the daemon host; cannot branch/launch in-place",
+                            name
+                        )
+                    },
                 ),
                 crate::worktree::RepoResolveError::CloneFailed { repo, detail } => (
                     ErrorCode::Internal,
@@ -15631,23 +19076,30 @@ pub fn create_subtask(
     // concrete commit HERE, before the POST, so a typo'd ref fails as
     // invalid_params instead of minting a `running` row that then has to
     // be rolled back. The cut below reuses the resolved sha.
+    // In another repo than the parent's, the parent's branch means
+    // nothing: the cut defaults to that repo's trunk.
     let resolved_base: Option<String> = match (base.as_deref(), branch_main_repo.as_deref()) {
         (Some(b), Some(main_repo)) => Some(
             crate::worktree::resolve_base_commit(main_repo, b)
                 .map_err(|e| (ErrorCode::InvalidParams, e.to_string()))?,
+        ),
+        (None, Some(main_repo)) if Some(main_repo) != parent_in_repo.as_deref() => Some(
+            crate::worktree::resolve_project_main(main_repo)
+                .map(|(_, sha)| sha)
+                .map_err(|e| (ErrorCode::Conflict, format!("create_subtask: {}", e)))?,
         ),
         _ => None,
     };
 
     // Parent's base branch: wip_branch, else the worktree's actual HEAD.
     // Branch mode REQUIRES this (never falls back to "main") — UNLESS an
-    // explicit `base` was passed, which replaces this resolution outright.
+    // explicit `base` (or another project's branch) replaces it outright.
     let parent_branch_resolved: Option<String> = parent_wip_branch.clone().or_else(|| {
         parent_worktree_path
             .as_deref()
             .and_then(crate::worktree::worktree_current_branch)
     });
-    if p.worktree_mode == "branch" && base.is_none() && parent_branch_resolved.is_none() {
+    if p.worktree_mode == "branch" && resolved_base.is_none() && parent_branch_resolved.is_none() {
         return Err((
             ErrorCode::Conflict,
             "cannot determine parent's base branch (no wip_branch and worktree HEAD is \
@@ -15667,16 +19119,23 @@ pub fn create_subtask(
     };
 
     // Step 2 — create the task row. Server assigns the UUID.
+    let mut metadata = json!({ "filer": filer });
+    if let Some(models) = models {
+        metadata[crate::models::TASK_MODELS_METADATA_KEY] = models;
+    }
+    if let Some(efforts) = efforts {
+        metadata[crate::models::TASK_EFFORTS_METADATA_KEY] = efforts;
+    }
     let mut body = json!({
-        "repo_url": parent_repo_url,
-        "repo_branch": "main",
+        "repo_url": repo_url,
+        "repo_branch": repo_branch,
         "name": p.name,
         "priority": 0,
         "status": "running",
         "slug": unique_slug,
         "source": "claude",
         "is_cloud": false,
-        "metadata": { "filer": filer },
+        "metadata": metadata,
         // null when the parent was deleted (top-level fallback) — never a
         // dangling FK that the API insert would reject.
         "parent_task_id": effective_parent_id,
@@ -15745,9 +19204,11 @@ pub fn create_subtask(
                 let ws = crate::manifest::ManifestWorkspace {
                     id: uuid::Uuid::new_v4().simple().to_string(),
                     name: leaf_slug.clone(),
-                    repo_url: Some(parent_repo_url.clone()),
+                    repo_url: Some(repo_url.clone()),
                     worktree_path: Some(wt.clone()),
                     main_repo_path: Some(main_repo.clone()),
+                    // Branch mode mints a new checkout: ephemeral (§12).
+                    org: crate::manifest::ephemeral_workspace_org(),
                     ..Default::default()
                 };
                 (wt, Some(ws))
@@ -15761,7 +19222,7 @@ pub fn create_subtask(
                 let ws = crate::manifest::ManifestWorkspace {
                     id: uuid::Uuid::new_v4().simple().to_string(),
                     name: leaf_slug.clone(),
-                    repo_url: Some(parent_repo_url.clone()),
+                    repo_url: Some(repo_url.clone()),
                     worktree_path: Some(main_repo.clone()),
                     main_repo_path: Some(main_repo.clone()),
                     ..Default::default()
@@ -15800,7 +19261,9 @@ pub fn create_subtask(
         // overlay entry also survives the TUI's replace-not-merge
         // `task.update_tree` pushes, which race this mint window (the
         // TUI's planning snapshot doesn't know the subtask yet).
-        state.record_agent_task_edge(&new_task_id, &parent_task_id);
+        if let Some(parent_task_id) = parent.task_id.as_deref() {
+            state.record_agent_task_edge(&new_task_id, parent_task_id);
+        }
         state
             .task_workspaces
             .insert(new_task_id.clone(), workspace_id_for_new.clone());
@@ -15819,7 +19282,7 @@ pub fn create_subtask(
     // shell call. `null` when the path isn't readable as a git checkout.
     let base_sha = crate::worktree::worktree_head_sha(&worktree_path);
 
-    Ok(json!({
+    let mut out = json!({
         "task_id": new_task_id,
         "worktree_path": worktree_path.to_string_lossy(),
         "base_sha": base_sha,
@@ -15827,7 +19290,948 @@ pub fn create_subtask(
         // Stated explicitly so an agent doesn't assume a worker is
         // already running on it — nothing runs until start_session.
         "launched": false,
-    }))
+    });
+    if base_downgraded {
+        out["base_downgraded"] = json!("trunk");
+    }
+    Ok(out)
+}
+
+// ===================================================================
+// Fork into new task (`session.fork`). One daemon RPC behind both the
+// TUI's A-F action (Operator caller) and the MCP `fork_session` tool
+// (Session caller): mint a subtask of the source's task with its own
+// branch worktree, then spawn a session there whose argv is the engine's
+// NATIVE fork of the source conversation (`claude --resume <src>
+// --fork-session --session-id <pin>` / `codex fork <src>`). The source
+// session is untouched and CM writes no copy of the history — unlike the
+// agent-memory snapshots, which keep a transcript copy under
+// `~/.cm/agent-memories/` until deleted by hand.
+// ===================================================================
+
+#[derive(Deserialize)]
+struct ForkSessionParams {
+    /// The session whose conversation is forked (live, or a recent exit
+    /// tombstone that still names its transcript).
+    source_uid: String,
+    /// Fork into a NEW task with this name (exactly one of `task_name` /
+    /// `task_id`).
+    #[serde(default)]
+    task_name: Option<String>,
+    /// Fork into this EXISTING task: join its workspace (minting one if it
+    /// never ran), like `start_session(task_id=…)`.
+    #[serde(default)]
+    task_id: Option<String>,
+    /// New task only: make it top-level (same project as the source's
+    /// task) instead of a subtask.
+    #[serde(default)]
+    top_level: bool,
+    /// `"source"` (default): cut the new branch at the source worktree's
+    /// current HEAD. `"trunk"`: cut it at the project's main branch.
+    #[serde(default)]
+    base: Option<String>,
+    /// Optional first prompt, delivered once the fork is up.
+    #[serde(default)]
+    prompt: Option<String>,
+    /// Override the parent task (must be within the caller's scope).
+    /// Default: the source's task.
+    #[serde(default)]
+    parent_task_id: Option<String>,
+    /// Sidebar label for the new session (default: the task name).
+    #[serde(default)]
+    label: Option<String>,
+    /// The fork's model. Absent → the source session's model → the
+    /// landing task's default → the engine default.
+    #[serde(default)]
+    model: Option<String>,
+    /// The fork's reasoning effort, resolved like `model`.
+    #[serde(default)]
+    effort: Option<String>,
+    /// Operator callers (the TUI) pre-mint the uid they will attach to.
+    #[serde(default)]
+    uid: Option<String>,
+    #[serde(default)]
+    cols: Option<u16>,
+    #[serde(default)]
+    rows: Option<u16>,
+}
+
+/// The source conversation a fork starts from.
+#[derive(Debug, Clone, PartialEq)]
+struct ForkSource {
+    engine: String,
+    transcript_id: String,
+    workspace_id: String,
+    worktree_path: PathBuf,
+    task_id: Option<String>,
+    label: String,
+    model: Option<String>,
+    model_source: Option<String>,
+    effort: Option<String>,
+    effort_source: Option<String>,
+    /// The source conversation's transcript file, for the model it ran.
+    transcript_file: Option<PathBuf>,
+}
+
+/// `"source"` / `"trunk"` (case-insensitive, default source).
+fn fork_base_choice(raw: Option<&str>) -> Result<bool, (ErrorCode, String)> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("source") => Ok(false),
+        Some("trunk") => Ok(true),
+        Some(other) => Err((
+            ErrorCode::InvalidParams,
+            format!("base must be \"source\" or \"trunk\", got '{}'", other),
+        )),
+    }
+}
+
+/// Resolve `uid` to a forkable source: a live registry session first, then
+/// the newest exit tombstone. Fails for bash, for a session with no bound
+/// transcript yet, and for ids that could escape the transcript dirs.
+fn resolve_fork_source(state: &DaemonState, uid: &str) -> Result<ForkSource, (ErrorCode, String)> {
+    let (engine, transcript_path, workspace_id, task_id, label, tomb_worktree, (model, model_source, effort, effort_source)) =
+        if let Some(s) = state.sessions.get(uid) {
+            (
+                s.session_type.clone(),
+                s.transcript_path.clone(),
+                s.workspace_id.clone(),
+                s.task_id.clone(),
+                s.title.clone(),
+                None,
+                (s.model.clone(), s.model_source.clone(), s.effort.clone(), s.effort_source.clone()),
+            )
+        } else if let Some(t) = state.recently_exited.iter().rev().find(|t| t.session_uid == uid) {
+            (
+                t.session_type.clone(),
+                t.transcript_path.clone(),
+                t.workspace_id.clone(),
+                t.task_id.clone(),
+                t.label.clone(),
+                t.worktree_path.clone().map(PathBuf::from),
+                (t.model.clone(), t.model_source.clone(), t.effort.clone(), t.effort_source.clone()),
+            )
+        } else {
+            return Err((
+                ErrorCode::NotFound,
+                format!("session '{}' is not known to this daemon", uid),
+            ));
+        };
+    if !matches!(engine.as_str(), "claude-code" | "codex") {
+        return Err((
+            ErrorCode::InvalidParams,
+            format!("only claude / codex sessions can be forked (session '{}' is {})", uid, engine),
+        ));
+    }
+    let transcript_id = transcript_path
+        .as_deref()
+        .and_then(crate::session::transcript_id_from_path)
+        .ok_or((
+            ErrorCode::Conflict,
+            format!(
+                "source unavailable for fork context: session '{}' has no bound transcript \
+                 yet. fork_session uses the retained transcript and does not wait for a new \
+                 source turn; use start_session for a fresh worker or request_handoff to keep \
+                 this CM identity",
+                uid
+            ),
+        ))?;
+    crate::agent_memory::validate_transcript_id(&transcript_id)
+        .map_err(|e| (ErrorCode::InvalidParams, e.to_string()))?;
+    let worktree_path = tomb_worktree
+        .or_else(|| state.workspaces.get(&workspace_id).and_then(|w| w.worktree_path.clone()))
+        .ok_or((
+            ErrorCode::NotFound,
+            format!("session '{}' has no worktree on this host", uid),
+        ))?;
+    let transcript_file = transcript_path.map(PathBuf::from).filter(|p| p.is_file());
+    Ok(ForkSource {
+        engine,
+        transcript_id,
+        workspace_id,
+        worktree_path,
+        task_id,
+        label,
+        model,
+        model_source,
+        effort,
+        effort_source,
+        transcript_file,
+    })
+}
+
+/// Completed / in-flight forks by `(caller, request_id)`. A client whose
+/// read timed out may retry with the same `request_id`; it must get the
+/// first fork back, not a second one. The per-key mutex is held for the
+/// whole fork, so a concurrent retry waits for the original and then
+/// returns its result. Failures are not cached (a retry runs again).
+/// Brain-process memory only, pruned after `FORK_REQUEST_TTL`.
+type ForkRequestSlot = Arc<Mutex<Option<Value>>>;
+static FORK_REQUESTS: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<String, (std::time::Instant, ForkRequestSlot)>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+const FORK_REQUEST_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// `session.fork` entry point: idempotent per `(caller, request_id)` when a
+/// `request_id` is supplied, otherwise a plain fork.
+pub fn session_fork(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
+    let Some(request_id) = params
+        .get("request_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return session_fork_once(state_arc, params, caller_uid);
+    };
+    let key = format!("{}\u{0}{}", caller_uid.unwrap_or("operator"), request_id);
+    let slot = {
+        let mut map = FORK_REQUESTS.lock().unwrap_or_else(|p| p.into_inner());
+        let now = std::time::Instant::now();
+        map.retain(|_, (at, _)| now.duration_since(*at) < FORK_REQUEST_TTL);
+        Arc::clone(
+            &map.entry(key.clone())
+                .or_insert_with(|| (now, Arc::new(Mutex::new(None))))
+                .1,
+        )
+    };
+    let mut done = slot.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(first) = done.as_ref() {
+        let mut replay = first.clone();
+        replay["deduplicated"] = json!(true);
+        return Ok(replay);
+    }
+    match session_fork_once(state_arc, params, caller_uid) {
+        Ok(v) => {
+            *done = Some(v.clone());
+            Ok(v)
+        }
+        Err(e) => {
+            drop(done);
+            let mut map = FORK_REQUESTS.lock().unwrap_or_else(|p| p.into_inner());
+            if map.get(&key).is_some_and(|(_, s)| Arc::ptr_eq(s, &slot)) {
+                map.remove(&key);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Files with uncommitted changes in `worktree` (`git status --porcelain`
+/// lines), or `None` when git can't say.
+fn uncommitted_file_count(worktree: &std::path::Path) -> Option<usize> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.trim().is_empty()).count())
+}
+
+fn session_fork_once(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
+    let p: ForkSessionParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("session.fork params: {}", e)))?;
+    refuse_if_draining(state_arc, "session.fork")?;
+    let use_trunk = fork_base_choice(p.base.as_deref())?;
+    let target = fork_target(&p)?;
+    let prompt = p.prompt.as_deref().filter(|s| !s.trim().is_empty()).map(str::to_string);
+    if let Some(m) = p.model.as_deref().filter(|m| !m.trim().is_empty()) {
+        crate::models::validate_model(m).map_err(|e| (ErrorCode::InvalidParams, e))?;
+    }
+    // The level is checked against the source's engine once it is known
+    // (codex has no max); this rejects unknown levels before any work.
+    if let Some(e) = p.effort.as_deref().filter(|e| !e.trim().is_empty()) {
+        crate::models::validate_effort("claude", e).map_err(|e| (ErrorCode::InvalidParams, e))?;
+    }
+    if prompt.as_ref().is_some_and(|s| s.len() > MAX_SEND_INPUT_BYTES) {
+        return Err((
+            ErrorCode::InvalidParams,
+            format!("prompt exceeds cap of {} bytes", MAX_SEND_INPUT_BYTES),
+        ));
+    }
+    let session_uid = match p.uid.as_deref() {
+        Some(uid) if caller_uid.is_none() => {
+            if !is_valid_session_uid(uid) {
+                return Err((
+                    ErrorCode::InvalidParams,
+                    format!("invalid session uid '{}' (expected ts-<hex>-<hex>)", uid),
+                ));
+            }
+            uid.to_string()
+        }
+        _ => new_daemon_minted_session_uid(),
+    };
+
+    // ---- resolve source, scope and target under the lock ----
+    let (source, source_ws, cap_inherit, cols, rows, server_path, plan) = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        if state.sessions.contains_key(&session_uid) {
+            return Err((ErrorCode::Conflict, format!("session '{}' already exists", session_uid)));
+        }
+        let source = resolve_fork_source(&state, &p.source_uid)?;
+        let mut caller_global = caller_uid.is_none();
+        let mut caller_task: Option<String> = None;
+        let mut cap_inherit = None;
+        let mut size = (p.cols.unwrap_or(0), p.rows.unwrap_or(0));
+        if let Some(cuid) = caller_uid {
+            let decision = if state.sessions.contains_key(&p.source_uid) {
+                crate::control::auth::check_session_caller(&state, cuid, &p.source_uid)
+            } else {
+                crate::control::auth::check_session_caller_for_exited(
+                    &state,
+                    cuid,
+                    &p.source_uid,
+                    source.task_id.as_deref(),
+                    &source.workspace_id,
+                )
+            };
+            return_auth_error_if_denied_with_state(decision, cuid, &p.source_uid, Some(&state))?;
+            let caller = state.sessions.get(cuid).ok_or((
+                ErrorCode::Unauthorized,
+                format!("caller session '{}' not in daemon registry", cuid),
+            ))?;
+            caller_global = caller.global_perms;
+            caller_task = caller.task_id.clone();
+            if let (Some(soft), Some(hard), Some(prefix)) = (
+                caller.memory_cap_soft_bytes,
+                caller.memory_cap_hard_bytes,
+                caller.cgroup_prefix.clone(),
+            ) {
+                cap_inherit = Some(InheritedCap { soft_bytes: soft, hard_bytes: hard, cgroup_prefix: prefix });
+            }
+            if size.0 == 0 || size.1 == 0 {
+                size = (caller.last_cols, caller.last_rows);
+            }
+        }
+        // The task the fork lands in (an existing task, or the parent of a
+        // new one) must sit inside a Session caller's OWN task tree —
+        // reaching the source (e.g. as a co-tenant of its workspace) is not
+        // enough. Taskless callers have no tree unless they are global.
+        let in_scope = |task: Option<&str>| -> Result<(), (ErrorCode, String)> {
+            if caller_global {
+                return Ok(());
+            }
+            let Some(own) = caller_task.as_deref() else {
+                return Err((
+                    ErrorCode::Unauthorized,
+                    "fork_session requires a tasked caller (the fork lands in your own \
+                     task tree)"
+                        .into(),
+                ));
+            };
+            match task {
+                Some(t) if crate::control::auth::task_in_scope(&state, t, own) => Ok(()),
+                Some(t) => Err((
+                    ErrorCode::Unauthorized,
+                    format!("task '{}' is not the caller's task or a descendant", t),
+                )),
+                None => Err((
+                    ErrorCode::Unauthorized,
+                    "a top-level task is outside your task tree; pass a parent within it".into(),
+                )),
+            }
+        };
+        let plan = match &target {
+            ForkTarget::New { top_level, parent_task_id, .. } => {
+                let parent = if *top_level {
+                    None
+                } else {
+                    parent_task_id
+                        .clone()
+                        .or_else(|| source.task_id.clone())
+                        .or_else(|| caller_task.clone())
+                };
+                in_scope(parent.as_deref())?;
+                ForkPlan::New { parent }
+            }
+            ForkTarget::Existing(task_id) => {
+                in_scope(Some(task_id))?;
+                let bound = state
+                    .task_workspaces
+                    .get(task_id)
+                    .or_else(|| state.bindings.get(task_id))
+                    .cloned();
+                match bound.as_ref().and_then(|ws_id| state.workspaces.get(ws_id).map(|w| (ws_id, w))) {
+                    Some((ws_id, ws)) => ForkPlan::Join {
+                        workspace_id: ws_id.clone(),
+                        worktree_path: ws.worktree_path.clone().ok_or((
+                            ErrorCode::NotFound,
+                            format!("task '{}' workspace '{}' has no worktree", task_id, ws_id),
+                        ))?,
+                    },
+                    None => ForkPlan::Mint { recover_existing: bound.is_some() },
+                }
+            }
+        };
+        let source_ws = state.workspaces.get(&source.workspace_id).cloned();
+        let server_path = Some(state.config.mcp_server_path.clone()).filter(|s| !s.trim().is_empty());
+        let (cols, rows) = if size.0 == 0 || size.1 == 0 { (120, 40) } else { size };
+        (source, source_ws, cap_inherit, cols, rows, server_path, plan)
+    };
+
+    // Reject incompatible explicit settings before creating a task/worktree.
+    // Native forks always use the source engine; model= cannot switch it.
+    if let Some(model) = p.model.as_deref().filter(|m| !m.trim().is_empty()) {
+        crate::models::check_engine(&source.engine, model).map_err(|error| (
+            ErrorCode::InvalidParams,
+            format!("fork_session keeps the source engine ({}): {error}. \
+                Use request_handoff to switch this CM identity (requires the source \
+                to answer), or start_session with the target engine and an explicit \
+                context prompt for a separate worker. No task or session was created.",
+                source.engine),
+        ))?;
+    }
+    if let Some(effort) = p.effort.as_deref().filter(|e| !e.trim().is_empty()) {
+        crate::models::validate_effort(&source.engine, effort)
+            .map_err(|error| (ErrorCode::InvalidParams, error))?;
+    }
+
+    // The conversation must still exist where the engine will look for it.
+    let source_file = match source.engine.as_str() {
+        "claude-code" => crate::transcript_detect::claude_transcript_path(
+            &source.worktree_path,
+            &source.transcript_id,
+        ),
+        _ => crate::transcript_detect::codex_transcript_path(&source.transcript_id),
+    };
+    if !source_file.is_some_and(|f| f.is_file()) {
+        return Err((
+            ErrorCode::NotFound,
+            format!(
+                "source unavailable for fork context: transcript {} is not on this host. \
+                 fork_session needs retained source context; use start_session for a fresh \
+                 worker or request_handoff to keep this CM identity",
+                source.transcript_id
+            ),
+        ));
+    }
+
+    // ---- base commit (used by every path that cuts a branch) ----
+    let source_head = crate::worktree::worktree_head_sha(&source.worktree_path);
+    let base_sha = if use_trunk {
+        crate::worktree::resolve_project_main(&source.worktree_path)
+            .map(|(_, sha)| sha)
+            .map_err(|e| (ErrorCode::Conflict, e.to_string()))?
+    } else {
+        source_head.clone().ok_or((
+            ErrorCode::Conflict,
+            format!(
+                "cannot read HEAD of the source worktree {}",
+                source.worktree_path.display()
+            ),
+        ))?
+    };
+    // Uncommitted edits in the source never travel with the fork (the cut
+    // is a commit); say so in the result instead of losing them silently.
+    let uncommitted_files = uncommitted_file_count(&source.worktree_path).unwrap_or(0);
+    let api_creds = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        PlanningApiCreds::from_config(&state.config.api_url, &state.config.api_token)
+    };
+
+    // ---- the target workspace ----
+    let mut worktree_report = WorktreeCheckReport::default();
+    // The source commit is meaningless in another repo: both paths below
+    // then cut at that repo's trunk and say so.
+    let mut base_downgraded = false;
+    let mut rollback_new: Option<(String, String)> = None; // (task_id, workspace_id)
+    let (task_id, task_name, parent_task_id, workspace_id, worktree_path, created_base_sha) =
+        match (&target, plan) {
+            (ForkTarget::New { task_name, .. }, ForkPlan::New { parent }) => {
+                // "Top-level in the same project": no parent row to inherit
+                // the project from, so carry the source task's.
+                let project = match (&parent, source.task_id.as_deref(), api_creds.as_ref()) {
+                    (None, Some(src_task), Ok(creds)) => api_get_task(creds, src_task)
+                        .ok()
+                        .and_then(|row| row.get("project").and_then(Value::as_str).map(str::to_string)),
+                    _ => None,
+                };
+                let subtask = CreateSubtaskParams {
+                    name: task_name.clone(),
+                    prompt: prompt.clone(),
+                    worktree_mode: "branch".into(),
+                    project,
+                    base: Some(base_sha.clone()),
+                    // The fork runs the source's model; the new task sets no default.
+                    model: None,
+                    effort: None,
+                    model_engine: None,
+                };
+                let (base, leaf_slug) = validate_create_subtask(&subtask)?;
+                let created = create_subtask_core(
+                    state_arc,
+                    &subtask,
+                    base,
+                    leaf_slug,
+                    SubtaskParent {
+                        task_id: parent.clone(),
+                        workspace_id: source.workspace_id.clone(),
+                        worktree_path: Some(source.worktree_path.clone()),
+                        base_from_parent_repo: true,
+                    },
+                    caller_uid,
+                    if caller_uid.is_some() { "mcp.fork_session" } else { "tui.fork" },
+                )?;
+                let task_id = created["task_id"].as_str().unwrap_or_default().to_string();
+                let worktree_path = PathBuf::from(created["worktree_path"].as_str().unwrap_or_default());
+                let workspace_id = {
+                    let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                    state.task_workspaces.get(&task_id).cloned()
+                }
+                .ok_or((ErrorCode::Internal, "forked task has no workspace binding".into()))?;
+                rollback_new = Some((task_id.clone(), workspace_id.clone()));
+                base_downgraded = created.get("base_downgraded").is_some();
+                let base = created.get("base_sha").cloned().unwrap_or(Value::Null);
+                (task_id, task_name.clone(), parent, workspace_id, worktree_path, base)
+            }
+            (ForkTarget::Existing(task_id), ForkPlan::Join { workspace_id, worktree_path }) => {
+                // Same as start_session(task_id=X): join the bound checkout,
+                // re-creating it first if it was reaped. Co-tenancy is fine.
+                worktree_report = ensure_ready_worktree(state_arc, &workspace_id, &worktree_path, Some(task_id))?;
+                let name = api_creds
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| api_get_task(c, task_id).ok())
+                    .and_then(|row| row.get("name").and_then(Value::as_str).map(str::to_string))
+                    .unwrap_or_else(|| task_id.clone());
+                (task_id.clone(), name, None, workspace_id, worktree_path, Value::Null)
+            }
+            (ForkTarget::Existing(task_id), ForkPlan::Mint { recover_existing }) => {
+                // A never-run task: mint its checkout via the start_session
+                // path, cut at the requested base.
+                let ctx = MintContext {
+                    explicit_repo: None,
+                    recover_existing,
+                    caller_paths: source_ws.as_ref().map(workspace_paths_of).unwrap_or_default(),
+                    workspace_paths: Vec::new(),
+                    repos_dir: Default::default(),
+                    allow_clone: false,
+                    allow_entries: Vec::new(),
+                    api_url: String::new(),
+                    api_token: String::new(),
+                    base: Some(base_sha.clone()),
+                };
+                let ctx = {
+                    let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                    MintContext {
+                        workspace_paths: state.workspaces.values().flat_map(workspace_paths_of).collect(),
+                        repos_dir: state.config.repos_dir_or_default(),
+                        allow_clone: state.config.allow_clone,
+                        allow_entries: state
+                            .config
+                            .repos
+                            .iter()
+                            .map(|e| (e.name.clone(), e.url.clone()))
+                            .collect(),
+                        api_url: state.config.api_url.clone(),
+                        api_token: state.config.api_token.clone(),
+                        ..ctx
+                    }
+                };
+                let minted = mint_task_workspace(state_arc, task_id, &ctx)?;
+                worktree_report = minted.worktree_report;
+                base_downgraded = minted.base_downgraded;
+                let name = minted
+                    .task_row
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| task_id.clone());
+                (task_id.clone(), name, None, minted.workspace_id, minted.worktree_path, Value::Null)
+            }
+            _ => return Err((ErrorCode::Internal, "fork target/plan mismatch".into())),
+        };
+    let base_sha_out = if created_base_sha.is_null() {
+        json!(crate::worktree::worktree_head_sha(&worktree_path))
+    } else {
+        created_base_sha
+    };
+    let fork_branch = crate::worktree::worktree_current_branch(&worktree_path);
+
+    // Undo a NEW task's mint if the spawn fails, so a failed fork leaves no
+    // task row, auth edge, checkout or zero-commit branch behind. An
+    // existing task's workspace is never torn down.
+    let rollback = |state_arc: &Arc<Mutex<DaemonState>>| {
+        let Some((task_id, workspace_id)) = rollback_new.as_ref() else { return };
+        let (api_url, api_token, main_repo) = {
+            let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            state.task_workspaces.remove(task_id);
+            state.bindings.remove(task_id);
+            state.agent_task_edges.remove(task_id);
+            state.task_tree.remove(task_id);
+            let main = state.workspaces.remove(workspace_id).and_then(|w| w.main_repo_path);
+            state.persist_sessions_best_effort();
+            (state.config.api_url.clone(), state.config.api_token.clone(), main)
+        };
+        if let Some(main) = main_repo {
+            let _ = crate::worktree::remove_worktree(&main, &worktree_path);
+            if let Some(branch) = fork_branch.as_deref().filter(|b| b.starts_with("cm-sub/")) {
+                let _ = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&main)
+                    .args(["branch", "-D", branch])
+                    .output();
+            }
+        }
+        if let Ok(creds) = PlanningApiCreds::from_config(&api_url, &api_token) {
+            let _ = api_delete_task(&creds, task_id);
+        }
+    };
+
+    // ---- spawn the native fork ----
+    let label = p
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| task_name.clone());
+    // A fork continues the source conversation: its recorded model and
+    // effort, else what its transcript names, else the new task's default.
+    let (model, effort) = match resolve_respawn_pick(
+        &session_uid,
+        &source.engine,
+        p.model.as_deref(),
+        p.effort.as_deref(),
+        source.model.as_deref().map(|m| (m, source.model_source.as_deref())),
+        source.effort.as_deref().map(|e| (e, source.effort_source.as_deref())),
+        Some(source.transcript_file.as_deref()),
+        &mut || task_defaults(state_arc, Some(task_id.as_str()), &source.engine),
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            rollback(state_arc);
+            return Err(e);
+        }
+    };
+    let mut full = match compose_fork_spawn_params(
+        &session_uid,
+        &workspace_id,
+        &label,
+        &source,
+        &worktree_path,
+        &task_id,
+        cols,
+        rows,
+        server_path.as_deref(),
+        caller_uid,
+        cap_inherit.as_ref(),
+        &model,
+        &effort,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            rollback(state_arc);
+            return Err(e);
+        }
+    };
+    let forked_transcript_id = full
+        .get("transcript_path")
+        .and_then(Value::as_str)
+        .and_then(crate::session::transcript_id_from_path);
+    let detector_snapshot = if source.engine == "codex" {
+        crate::transcript_detect::snapshot_codex_transcript_ids(&worktree_path)
+    } else {
+        Vec::new()
+    };
+    // O5: a fork works for the SOURCE's member (as its assistant, or as a
+    // continuous member's worker), not the caller's.
+    {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(org) = crate::assistants::fork_org(&state, &p.source_uid, &source.engine) {
+            full["org"] = Value::Object(org);
+        }
+    }
+    let start_result = match start_session(state_arc, &full) {
+        Ok(v) => v,
+        Err(e) => {
+            rollback(state_arc);
+            return Err(e);
+        }
+    };
+    // Codex mints the forked thread's rollout after start; bind it the same
+    // way an MCP spawn is bound (claude's pin is already exact).
+    if source.engine == "codex" {
+        if let Err(e) = crate::transcript_detect::spawn_queued_detector(
+            state_arc.clone(),
+            session_uid.clone(),
+            crate::transcript_detect::DetectorEngine::Codex,
+            worktree_path.clone(),
+            detector_snapshot,
+            None,
+            crate::transcript_detect::default_detector_spawn_fn(),
+        ) {
+            eprintln!(
+                "cm-daemon: session.fork {}: transcript detector failed to start ({}); \
+                 the /proc watcher binds the rollout instead",
+                session_uid, e
+            );
+        }
+    }
+
+    // What the move did NOT carry, reported in the result (and the TUI's
+    // status line) — never typed into the session. A fork starts at its
+    // composer with no first prompt unless the caller passed one: Owner
+    // prompts it right away, and an auto-typed turn could land in a startup
+    // dialog instead of the composer (2026-10-07). Accepted cost: a claude
+    // fork writes its transcript only on its first message, so a fork that
+    // was never prompted cannot be resumed after a daemon restart.
+    let source_branch = crate::worktree::worktree_current_branch(&source.worktree_path);
+    // In another repo the fork carries none of the source's own work:
+    // what it lacks is every source commit beyond the SOURCE repo's trunk.
+    let missing = if base_downgraded {
+        match (
+            source_head.as_deref(),
+            crate::worktree::resolve_project_main(&source.worktree_path).ok(),
+        ) {
+            (Some(a), Some((_, trunk))) => commits_not_carried(&source.worktree_path, &trunk, a),
+            _ => Vec::new(),
+        }
+    } else {
+        match (source_head.as_deref(), crate::worktree::worktree_head_sha(&worktree_path)) {
+            (Some(a), Some(b)) => commits_not_carried(&worktree_path, &b, a),
+            _ => Vec::new(),
+        }
+    };
+    let missing_truncated = missing.len() > FORK_MISSING_COMMITS_CAP;
+    let missing: Vec<String> = missing.into_iter().take(FORK_MISSING_COMMITS_CAP).collect();
+    let mut prompt_receipt = None;
+    if let Some(first_prompt) = prompt.clone() {
+        let handle = {
+            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            state.sessions.get(&session_uid).map(|s| (s.input_handle(), s.fanout.clone()))
+        };
+        if let Some((handle, fanout)) = handle {
+            let ticket = super::prompt_delivery::Receipt::pending();
+            {
+                let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(session) = state.sessions.get_mut(&session_uid) {
+                    session.prompt_delivery = Some(Arc::clone(&ticket));
+                }
+            }
+            spawn_initial_prompt_delivery(
+                Arc::clone(state_arc),
+                handle,
+                fanout,
+                session_uid.clone(),
+                first_prompt,
+                Arc::clone(&ticket),
+            );
+            prompt_receipt = Some(ticket.lock().unwrap_or_else(|p| p.into_inner()).clone());
+        }
+    }
+    let co_tenants = live_workspace_co_tenants(state_arc, &workspace_id, &session_uid);
+    let mut out = json!({
+        "session_uid": start_result.get("session_uid").and_then(Value::as_str).unwrap_or(&session_uid),
+        "target": if matches!(target, ForkTarget::New { .. }) { "new" } else { "existing" },
+        "task_id": task_id,
+        "task_name": task_name,
+        "parent_task_id": parent_task_id,
+        "workspace_id": workspace_id,
+        "worktree_path": worktree_path.to_string_lossy(),
+        "branch": fork_branch,
+        "base": if use_trunk { "trunk" } else { "source" },
+        "base_sha": base_sha_out,
+        "engine": source.engine,
+        "model": model.as_ref().map(|(m, _)| m.clone()),
+        "model_source": model.as_ref().map(|(_, src)| src.as_str()),
+        "effort": effort.as_ref().map(|(e, _)| e.clone()),
+        "effort_source": effort.as_ref().map(|(_, src)| src.as_str()),
+        "label": label,
+        "transcript_id": forked_transcript_id,
+        "forked_from": {
+            "session_uid": p.source_uid,
+            "transcript_id": source.transcript_id,
+            "label": source.label,
+            "worktree_path": source.worktree_path.to_string_lossy(),
+            "branch": source_branch,
+        },
+        "commits_not_carried": missing,
+        "commits_not_carried_truncated": missing_truncated,
+        "base_downgraded": if base_downgraded && !use_trunk { json!("trunk") } else { Value::Null },
+        "prompt_source": if prompt.is_some() { "caller" } else { "none" },
+        "uncommitted_left_behind": uncommitted_files > 0,
+        "uncommitted_files": uncommitted_files,
+    });
+    if !co_tenants.is_empty() {
+        out["workspace_shared_with"] = json!(co_tenants);
+    }
+    if let Some(obj) = out.as_object_mut() {
+        worktree_report.decorate(obj);
+    }
+    if let Some(receipt) = prompt_receipt {
+        out["prompt_delivery"] = json!(receipt);
+    }
+    if let Some(cgroup) = start_result.get("cgroup_path") {
+        out["cgroup_path"] = cgroup.clone();
+    }
+    let staffing = {
+        let s = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let snapshot = s.staffing.lock().unwrap_or_else(|p| p.into_inner())
+            .snapshot.clone();
+        snapshot
+    };
+    out["staffing_version"] = json!(staffing.version);
+    if let Some(note) = staffing.policy.note(&source.engine, None, chrono::Utc::now()) {
+        out["staffing_note"] = json!(note);
+    }
+    crate::staffing::record_spawn(state_arc, caller_uid, staffing.version);
+    Ok(out)
+}
+
+/// Where the fork lands, from the request.
+#[derive(Debug, Clone, PartialEq)]
+enum ForkTarget {
+    New { task_name: String, parent_task_id: Option<String>, top_level: bool },
+    Existing(String),
+}
+
+/// What the lock-time resolution decided to do for that target.
+enum ForkPlan {
+    New { parent: Option<String> },
+    Join { workspace_id: String, worktree_path: PathBuf },
+    Mint { recover_existing: bool },
+}
+
+/// Exactly one of `task_name` (a new task) / `task_id` (an existing one).
+fn fork_target(p: &ForkSessionParams) -> Result<ForkTarget, (ErrorCode, String)> {
+    let trimmed = |s: &Option<String>| s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    match (trimmed(&p.task_name), trimmed(&p.task_id)) {
+        (Some(task_name), None) => Ok(ForkTarget::New {
+            task_name,
+            parent_task_id: trimmed(&p.parent_task_id),
+            top_level: p.top_level,
+        }),
+        (None, Some(task_id)) => {
+            if p.top_level || trimmed(&p.parent_task_id).is_some() {
+                return Err((
+                    ErrorCode::InvalidParams,
+                    "parent_task_id / top_level apply only to a new task (task_name)".into(),
+                ));
+            }
+            Ok(ForkTarget::Existing(task_id))
+        }
+        _ => Err((
+            ErrorCode::InvalidParams,
+            "pass exactly one of task_name (fork into a new task) or task_id (fork into an \
+             existing task)"
+                .into(),
+        )),
+    }
+}
+
+/// `git log --oneline <target>..<source>` in `worktree`, capped: the
+/// commits the source sits on that the fork's checkout lacks.
+fn commits_not_carried(worktree: &std::path::Path, target_sha: &str, source_sha: &str) -> Vec<String> {
+    if target_sha == source_sha {
+        return Vec::new();
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["log", "--oneline", "-n", &(FORK_MISSING_COMMITS_CAP + 1).to_string()])
+        .arg(format!("{}..{}", target_sha, source_sha))
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+const FORK_MISSING_COMMITS_CAP: usize = 10;
+
+/// Full-shape `start_session` params for a fork: the engine-native fork
+/// argv (MCP config, hooks and env exactly as a fresh spawn of `uid`),
+/// bound to the NEW task, with claude's pinned fork id stamped as the
+/// transcript path from birth.
+#[allow(clippy::too_many_arguments)]
+fn compose_fork_spawn_params(
+    uid: &str,
+    workspace_id: &str,
+    label: &str,
+    source: &ForkSource,
+    working_dir: &std::path::Path,
+    task_id: &str,
+    cols: u16,
+    rows: u16,
+    server_path: Option<&str>,
+    managed_by: Option<&str>,
+    cap: Option<&InheritedCap>,
+    model: &Resolved,
+    effort: &Resolved,
+) -> MethodResult {
+    let (program, tail, pin) = crate::mcp_config::build_launch_args(
+        &source.engine,
+        uid,
+        None,
+        server_path,
+        crate::mcp_config::Launch::Fork(&source.transcript_id),
+        model.as_ref().map(|(m, _)| m.as_str()),
+        effort.as_ref().map(|(e, _)| e.as_str()),
+    )
+    .map_err(|e| (ErrorCode::Internal, format!("build_args: {}", e)))?;
+    let (program, tail) = match cap {
+        Some(cap) => {
+            let spec = crate::mcp_config::CapSpec {
+                soft_bytes: cap.soft_bytes,
+                hard_bytes: cap.hard_bytes,
+                session_uid: uid,
+                cgroup_prefix: &cap.cgroup_prefix,
+            };
+            let (p, a, _) = crate::mcp_config::wrap_with_systemd_run(&program, &tail, Some(&spec));
+            (p, a)
+        }
+        None => (program, tail),
+    };
+    let mut argv = vec![program];
+    argv.extend(tail);
+    let env: serde_json::Map<String, Value> = crate::mcp_config::build_env(uid, None)
+        .into_iter()
+        .map(|(k, v)| (k, Value::String(v)))
+        .collect();
+    let mut full = json!({
+        "uid": uid,
+        "workspace_id": workspace_id,
+        "label": label,
+        "argv": argv,
+        "working_dir": working_dir.to_string_lossy(),
+        "env": env,
+        "session_type": source.engine,
+        "cols": cols,
+        "rows": rows,
+        "task_id": task_id,
+    });
+    if let Value::Object(obj) = &mut full {
+        insert_pick(obj, model, effort);
+    }
+    if let Some(path) = pin
+        .as_deref()
+        .and_then(|pin| crate::transcript_detect::claude_transcript_path(working_dir, pin))
+    {
+        full["transcript_path"] = json!(path.to_string_lossy());
+    }
+    if let Some(m) = managed_by {
+        full["managed_by_uid"] = json!(m);
+    }
+    if let Some(cap) = cap {
+        full["memory_cap_bytes"] = json!(cap.soft_bytes);
+        full["memory_cap_hard_bytes"] = json!(cap.hard_bytes);
+        full["cgroup_prefix"] = json!(cap.cgroup_prefix.to_string_lossy());
+    }
+    Ok(full)
 }
 
 #[derive(Deserialize, Default)]
@@ -15884,7 +20288,7 @@ pub fn list_subtasks(
                     ErrorCode::Unauthorized,
                     format!("taskless caller cannot scope to task {}", req),
                 ))?;
-                if !crate::control::auth::task_is_self_or_descendant_of(&state.task_tree, req, own) {
+                if !crate::control::auth::task_in_scope(&state, req, own) {
                     return Err((
                         ErrorCode::Unauthorized,
                         format!("task {} is not the caller's task or a descendant", req),
@@ -15956,6 +20360,14 @@ struct SetSubtaskStatusParams {
     #[serde(default)]
     task_id: Option<String>,
     status: String,
+    /// The trigger of a `blocked` write (doc/org-model.md §7.1): on a placed
+    /// task it becomes the item's `blocked_on` (`reason`) or `blocked_by`
+    /// (item numbers on its board). Without either a placed task's item gets
+    /// a labelled default trigger and a `legacy_blocked` flag.
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    blocked_by: Option<Vec<i64>>,
 }
 
 /// `set_subtask_status` — Session-callable. Set the planning status of the
@@ -15999,7 +20411,7 @@ pub fn set_subtask_status(
             "taskless caller cannot set a task status; use propose_task for top-level tasks".into(),
         ))?;
         let target = p.task_id.clone().unwrap_or_else(|| own.clone());
-        if !crate::control::auth::task_is_self_or_descendant_of(&state.task_tree, &target, &own) {
+        if !crate::control::auth::task_in_scope(&state, &target, &own) {
             return Err((
                 ErrorCode::Unauthorized,
                 format!("task {} is not the caller's task or a descendant", target),
@@ -16013,8 +20425,17 @@ pub fn set_subtask_status(
     };
     let creds =
         PlanningApiCreds::from_config(&api_url_cfg, &api_token_cfg).map_err(|e| e.to_method_err())?;
-    api_update_task(&creds, &target_task_id, &json!({ "status": p.status }))
-        .map_err(|e| e.to_method_err())?;
+    let mut body = json!({ "status": p.status });
+    if let Some(reason) = p.reason.as_deref().filter(|r| !r.trim().is_empty()) {
+        body["reason"] = json!(reason);
+    }
+    if let Some(blocked_by) = p.blocked_by.as_ref().filter(|b| !b.is_empty()) {
+        body["blocked_by"] = json!(blocked_by);
+    }
+    if let Some(actor) = caller_uid.and_then(|uid| crate::items::rpc::session_actor(state_arc, uid)) {
+        body["actor"] = actor;
+    }
+    api_update_task(&creds, &target_task_id, &body).map_err(|e| e.to_method_err())?;
     Ok(json!({ "task_id": target_task_id, "status": p.status }))
 }
 
@@ -16062,6 +20483,9 @@ pub fn update_task(
         "metadata",
         "parent_task_id",
         "initiative_id",
+        // Org model S3: a `blocked` write's trigger on a placed task.
+        "reason",
+        "blocked_by",
     ];
     let mut rejected: Vec<&str> = fields
         .keys()
@@ -16114,11 +20538,27 @@ pub fn update_task(
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .unwrap_or_else(|| own.clone());
-        if !crate::control::auth::task_is_self_or_descendant_of(&state.task_tree, &target, &own) {
+        if !crate::control::auth::task_in_scope(&state, &target, &own) {
             return Err((
                 ErrorCode::Unauthorized,
                 format!("task {} is not the caller's task or a descendant", target),
             ));
+        }
+        // A reparent must land inside the caller's tree too: otherwise it
+        // could hang its tasks under someone else's, and (with the target
+        // check alone) the move is the only scope-crossing write update_task
+        // allows. Detaching (null) makes the task top-level, which takes it
+        // out of the caller's tree rather than widening it.
+        if let Some(new_parent) = fields.get("parent_task_id").and_then(|v| v.as_str()) {
+            if !caller.global_perms && !crate::control::auth::task_in_scope(&state, new_parent, &own) {
+                return Err((
+                    ErrorCode::Unauthorized,
+                    format!(
+                        "update_task: new parent {new_parent} is not the caller's task or a descendant; \
+                         a task can only be moved within your own tree"
+                    ),
+                ));
+            }
         }
         (
             target,
@@ -16128,11 +20568,72 @@ pub fn update_task(
     };
     let creds =
         PlanningApiCreds::from_config(&api_url_cfg, &api_token_cfg).map_err(|e| e.to_method_err())?;
+    let mut fields = fields;
+    if let Some(actor) = caller_uid.and_then(|uid| crate::items::rpc::session_actor(state_arc, uid)) {
+        fields.insert("actor".into(), actor);
+    }
     api_update_task(&creds, &target_task_id, &Value::Object(fields))
         .map_err(|e| e.to_method_err())?;
     // Re-read the row so the tool returns the updated task (api_update_task
     // discards the PATCH response body).
     api_get_task(&creds, &target_task_id).map_err(|e| e.to_method_err())
+}
+
+/// Most task ids one `task.scope_check` call may ask about.
+pub const TASK_SCOPE_CHECK_MAX_IDS: usize = 64;
+
+/// `task.scope_check` — Session-callable, read-only: which of `task_ids`
+/// are the caller's task or its descendants (the rule every Session
+/// method applies). The MCP server's direct-API `update_task` branch asks
+/// before a reparent, since that route has no daemon in the write path.
+/// A global-perms caller reaches every task. No HTTP: the answer comes
+/// from the pushed tree and the parent refresher's readings.
+///
+/// Returns `{"global": bool, "in_scope": {<task_id>: bool, ...}}`.
+pub fn task_scope_check(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
+    let ids: Vec<String> = params
+        .get("task_ids")
+        .and_then(|v| v.as_array())
+        .ok_or((ErrorCode::InvalidParams, "task.scope_check: 'task_ids' must be an array".into()))?
+        .iter()
+        .map(|v| v.as_str().map(str::to_string))
+        .collect::<Option<_>>()
+        .ok_or((ErrorCode::InvalidParams, "task.scope_check: task ids must be strings".into()))?;
+    // Every id is walked under the state lock; keep one call cheap.
+    if ids.len() > TASK_SCOPE_CHECK_MAX_IDS {
+        return Err((
+            ErrorCode::InvalidParams,
+            format!(
+                "task.scope_check: at most {TASK_SCOPE_CHECK_MAX_IDS} task_ids per call, got {}",
+                ids.len()
+            ),
+        ));
+    }
+    let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    let cuid = caller_uid.ok_or((
+        ErrorCode::Unauthorized,
+        "task.scope_check is callable only by Session callers".into(),
+    ))?;
+    let caller = state.sessions.get(cuid).ok_or((
+        ErrorCode::Unauthorized,
+        format!("caller session '{}' not in daemon registry", cuid),
+    ))?;
+    let in_scope: serde_json::Map<String, Value> = ids
+        .iter()
+        .map(|id| {
+            let ok = caller.global_perms
+                || caller
+                    .task_id
+                    .as_deref()
+                    .is_some_and(|own| crate::control::auth::task_in_scope(&state, id, own));
+            (id.clone(), Value::Bool(ok))
+        })
+        .collect();
+    Ok(json!({ "global": caller.global_perms, "in_scope": in_scope }))
 }
 
 /// Read the daemon's planning-API creds from config (shared by the
@@ -16163,6 +20664,7 @@ pub fn list_projects(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
 struct ListInitiativesParams {
     status: Option<String>,
     project: Option<String>,
+    kind: Option<String>,
     #[serde(default)]
     include_archived: bool,
 }
@@ -16180,7 +20682,7 @@ pub fn list_initiatives(state_arc: &Arc<Mutex<DaemonState>>, params: &Value) -> 
     let creds = planning_creds(state_arc)?;
     Ok(Value::Array(api_list_initiatives(
         &creds, filters.status.as_deref(), filters.project.as_deref(),
-        filters.include_archived,
+        filters.kind.as_deref(), filters.include_archived,
     ).map_err(|e| e.to_method_err())?))
 }
 
@@ -16230,6 +20732,549 @@ pub fn propose_initiative_project(
     let creds = planning_creds(state_arc)?;
     api_add_initiative_project(&creds, reference, &Value::Object(body))
         .map_err(|e| e.to_method_err())
+}
+
+// ============================================================
+// org — reporting lines, leads and divisions (read-only + set_lead)
+// ============================================================
+//
+// Reporting lines follow the task tree (`parent_task_id`); a division is an
+// initiative with `kind = 'division'` rooted at its coordinator task. Leads
+// come from the shared rule in `crate::org`, the same function the TUI uses
+// for its ★. Session data is THIS daemon's registry: a lead running on
+// another host is not visible here (reported as `lead: null`, with the raw
+// pin in `pinned_lead_session_uid`). Reporting is not approval authority, so
+// every view is open to every caller and returns names and ids only.
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrgParams {
+    view: Option<String>,
+    action: Option<String>,
+    /// `view="reports"`: whose reports (default: the caller's task).
+    task_id: Option<String>,
+    /// `view="division"`: initiative UUID or slug (default: the caller's).
+    division: Option<String>,
+    /// `action="set_lead"`: the session to pin (default: the caller).
+    session_uid: Option<String>,
+    /// `view="member"`: a member id, handle, alias or `main/<handle>`.
+    member: Option<String>,
+    /// `view="team"`: a team (initiative) id or slug; `division` is the
+    /// old name and is accepted too.
+    team: Option<String>,
+    /// `action="adopt"` fields (Owner's `org.adopt`, routed before
+    /// methods::org). Accepted so an agent's call gets the Owner-only
+    /// answer rather than a params error.
+    #[allow(dead_code)]
+    pid: Option<Value>,
+    #[allow(dead_code)]
+    handle: Option<Value>,
+    #[allow(dead_code)]
+    title: Option<Value>,
+    #[allow(dead_code)]
+    kind: Option<Value>,
+    #[allow(dead_code)]
+    manager: Option<Value>,
+    #[allow(dead_code)]
+    team_id: Option<Value>,
+    #[allow(dead_code)]
+    home_workspace: Option<Value>,
+    #[allow(dead_code)]
+    request_id: Option<Value>,
+    /// `action="move" | "retire" | "reinstate"` (routed before methods::org).
+    #[allow(dead_code)]
+    reason: Option<Value>,
+}
+
+/// Upper bound on the reporting chain walk (guards a corrupt parent cycle).
+const ORG_CHAIN_MAX: usize = 32;
+
+/// The sessions bound to `task_id` on this daemon, as lead candidates
+/// (uid, engine, live). Registry rows are live by construction; exited
+/// sessions move to the tombstone list and never lead.
+fn org_lead_candidates(state: &DaemonState, task_id: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = state
+        .sessions
+        .iter()
+        .filter(|(_, s)| s.task_id.as_deref() == Some(task_id))
+        .map(|(uid, s)| (uid.clone(), s.session_type.clone()))
+        .collect();
+    for (uid, s) in state.tui_sessions.iter() {
+        if s.task_id.as_deref() == Some(task_id) && !state.sessions.contains_key(uid) {
+            out.push((uid.clone(), s.session_type.clone().unwrap_or_default()));
+        }
+    }
+    out
+}
+
+/// `{session_uid, name, label, engine, pinned}` for the task's lead session,
+/// `{owner: true, stand_in}` when Owner leads it (pinned `"owner"`, or a
+/// division root with no live lead), or null.
+fn org_lead(state: &DaemonState, task: &Value) -> Value {
+    org_lead_with(state, task, crate::org::is_division_root(task))
+}
+
+fn org_lead_with(state: &DaemonState, task: &Value, division_root: bool) -> Value {
+    let Some(task_id) = task.get("id").and_then(Value::as_str) else {
+        return Value::Null;
+    };
+    let pinned = task.get("metadata").and_then(crate::org::pinned_lead);
+    let owned = org_lead_candidates(state, task_id);
+    let candidates: Vec<crate::org::LeadCandidate<'_>> = owned
+        .iter()
+        .map(|(uid, engine)| crate::org::LeadCandidate { uid, engine, live: true })
+        .collect();
+    let uid = match crate::org::task_lead(pinned, &candidates, division_root) {
+        crate::org::Lead::Session(uid) => uid,
+        crate::org::Lead::Owner { stand_in } => return json!({ "owner": true, "stand_in": stand_in }),
+        crate::org::Lead::None => return Value::Null,
+    };
+    let engine = owned.iter().find(|(u, _)| *u == uid).map(|(_, e)| e.clone());
+    let label = state
+        .sessions
+        .get(&uid)
+        .map(|s| s.title.clone())
+        .or_else(|| state.tui_sessions.get(&uid).and_then(|s| s.label.clone()));
+    json!({
+        "session_uid": uid,
+        "name": state.messaging_names.get(&uid).map(|n| n.name.clone()),
+        "label": label,
+        "engine": engine,
+        "pinned": pinned == Some(uid.as_str()),
+    })
+}
+
+/// The compact task shape every org view returns.
+fn org_task(state: &DaemonState, task: &Value) -> Value {
+    let pinned = task.get("metadata").and_then(crate::org::pinned_lead);
+    json!({
+        "id": task.get("id"),
+        "name": task.get("name"),
+        "slug": task.get("slug"),
+        "project": task.get("project"),
+        "status": task.get("status"),
+        "parent_task_id": task.get("parent_task_id"),
+        "lead": org_lead(state, task),
+        "pinned_lead_session_uid": pinned,
+    })
+}
+
+/// The `initiative` object embedded in a task row, labelled by kind.
+fn org_unit(task: &Value) -> Value {
+    match task.get("initiative") {
+        Some(init) if init.is_object() => {
+            let kind = init.get("kind").and_then(Value::as_str).unwrap_or("initiative");
+            json!({
+                "id": init.get("id"),
+                "slug": init.get("slug"),
+                "name": init.get("name"),
+                "status": init.get("status"),
+                "kind": kind,
+                "root_task_id": init.get("coordinator_task_id"),
+            })
+        }
+        _ => Value::Null,
+    }
+}
+
+/// Nest `tasks` under `root_id` by `parent_task_id`. Tasks whose parent is
+/// outside the set (and that aren't the root) come back in `unattached`.
+fn org_build_tree(
+    root_id: &str,
+    tasks: &[Value],
+    node: &dyn Fn(&Value) -> Value,
+) -> (Value, Vec<Value>) {
+    use std::collections::{HashMap, HashSet};
+    let id_of = |t: &Value| t.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+    let by_id: HashMap<String, &Value> = tasks.iter().map(|t| (id_of(t), t)).collect();
+    let mut children: HashMap<String, Vec<&Value>> = HashMap::new();
+    for t in tasks {
+        if let Some(parent) = t.get("parent_task_id").and_then(Value::as_str) {
+            if by_id.contains_key(parent) {
+                children.entry(parent.to_string()).or_default().push(t);
+            }
+        }
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    fn build(
+        id: &str,
+        by_id: &HashMap<String, &Value>,
+        children: &HashMap<String, Vec<&Value>>,
+        seen: &mut HashSet<String>,
+        node: &dyn Fn(&Value) -> Value,
+    ) -> Value {
+        seen.insert(id.to_string());
+        let mut out = by_id.get(id).map(|t| node(t)).unwrap_or_else(|| json!({"id": id}));
+        let reports: Vec<Value> = children
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c.get("id").and_then(Value::as_str))
+            .filter(|cid| !seen.contains(*cid))
+            .map(|cid| cid.to_string())
+            .collect::<Vec<_>>()
+            .iter()
+            .map(|cid| build(cid, by_id, children, seen, node))
+            .collect();
+        out["reports"] = Value::Array(reports);
+        out
+    }
+    let tree = build(root_id, &by_id, &children, &mut seen, node);
+    let unattached = tasks
+        .iter()
+        .filter(|t| !seen.contains(&id_of(t)))
+        .map(node)
+        .collect();
+    (tree, unattached)
+}
+
+fn org_caller_task(state: &DaemonState, caller_uid: Option<&str>) -> Option<String> {
+    caller_uid
+        .and_then(|cuid| state.lookup_session_any(cuid))
+        .and_then(|view| view.task_id)
+}
+
+pub fn org(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+    caller_uid: Option<&str>,
+) -> MethodResult {
+    let p: OrgParams = if params.is_null() {
+        OrgParams::default()
+    } else {
+        serde_json::from_value(params.clone())
+            .map_err(|e| (ErrorCode::InvalidParams, format!("org params: {}", e)))?
+    };
+    let caller_task = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let engine = caller_uid.and_then(|uid| state.sessions.get(uid).map(|s| s.session_type.as_str())
+            .or_else(|| state.tui_sessions.get(uid).and_then(|s| s.session_type.as_deref())));
+        if engine == Some("bash") {
+            return Err((ErrorCode::InvalidParams, "agent_only: org requires an agent session; bash is a shell".into()));
+        }
+        org_caller_task(&state, caller_uid)
+    };
+    let creds = planning_creds(state_arc)?;
+    if let Some(action) = p.action.as_deref() {
+        if p.view.is_some() {
+            return Err((ErrorCode::InvalidParams, "org: pass view or action, not both".into()));
+        }
+        return match action {
+            "set_lead" | "clear_lead" => org_set_lead(state_arc, &creds, &p, action, caller_uid, caller_task),
+            // Owner-only (the operator's `org.adopt`, routed in dispatch_org).
+            "adopt" => Err((
+                ErrorCode::Unauthorized,
+                "owner_only: org(action=\"adopt\") binds a session to a new member and is Owner's \
+                 (the TUI roster screen); ask Owner"
+                    .into(),
+            )),
+            other => Err((
+                ErrorCode::InvalidParams,
+                format!("org: unknown action '{}' (expected set_lead, clear_lead, move, retire, reinstate, close_assistant or adopt)", other),
+            )),
+        };
+    }
+    let need_task = |what: &str| {
+        caller_task.clone().ok_or((
+            ErrorCode::InvalidParams,
+            format!("org: {} needs a caller bound to a task, or an explicit id", what),
+        ))
+    };
+    // The caller's member (org model S2): who it works as, its manager
+    // chain, reports and teams. Best-effort: a planning API before S2 (or
+    // an outage) leaves the task-based views exactly as they were.
+    let my_member = |body: &mut Value| {
+        let Some(uid) = caller_uid else { return };
+        match crate::items::org::member_for_session(state_arc, uid) {
+            Ok(Some(found)) => {
+                body["member"] = found["member"].clone();
+                body["acting_as"] = found["acting_as"].clone();
+                body["manager_chain"] = found.get("chain").cloned().unwrap_or(Value::Null);
+                body["member_reports"] = found.get("reports").cloned().unwrap_or(Value::Null);
+                body["teams"] = found.get("teams").cloned().unwrap_or(Value::Null);
+            }
+            Ok(None) => {}
+            Err((_, message)) => body["member_error"] = json!(message),
+        }
+    };
+    match p.view.as_deref().unwrap_or("me") {
+        "me" if caller_task.is_none() => {
+            // A taskless session can still be a member.
+            let mut body = json!({"view": "me", "session_uid": caller_uid, "task": null});
+            my_member(&mut body);
+            if body.get("member").is_some_and(|m| !m.is_null()) {
+                return Ok(body);
+            }
+            Err((
+                ErrorCode::InvalidParams,
+                "org: view=\"me\" needs a caller bound to a task (or a member), or an explicit id".into(),
+            ))
+        }
+        "member" => {
+            let reference = p.member.clone().ok_or((
+                ErrorCode::InvalidParams,
+                "org: view=\"member\" needs member (an id, handle or main/<handle>)".to_string(),
+            ))?;
+            let mut found = crate::items::org::member_detail(state_arc, &reference)?;
+            found["view"] = json!("member");
+            Ok(found)
+        }
+        "me" => {
+            let own = need_task("view=\"me\"")?;
+            let mut row = api_get_task(&creds, &own).map_err(|e| e.to_method_err())?;
+            let mut chain: Vec<Value> = Vec::new();
+            let mut visited = vec![own.clone()];
+            let me = row.clone();
+            while let Some(parent) = row.get("parent_task_id").and_then(Value::as_str).map(str::to_string) {
+                if visited.contains(&parent) || chain.len() >= ORG_CHAIN_MAX {
+                    break;
+                }
+                visited.push(parent.clone());
+                row = api_get_task(&creds, &parent).map_err(|e| e.to_method_err())?;
+                chain.push(row.clone());
+            }
+            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            let unit = org_unit(&me);
+            let is_division = unit.get("kind").and_then(Value::as_str) == Some("division");
+            // Who you report to: the nearest ancestor with a lead, which is
+            // `{owner: true, stand_in}` when that is Owner (an Owner-led
+            // division root, or a task pinned to Owner).
+            let boss_lead = chain.iter().find_map(|t| {
+                let lead = org_lead(&state, t);
+                if lead.is_null() {
+                    return None;
+                }
+                let mut lead = lead;
+                lead["task_id"] = t.get("id").cloned().unwrap_or(Value::Null);
+                Some(lead)
+            });
+            let mut body = json!({
+                "view": "me",
+                "session_uid": caller_uid,
+                "task": org_task(&state, &me),
+                "boss": chain.first().map(|t| org_task(&state, t)),
+                "boss_lead": boss_lead,
+                "chain": chain.iter().map(|t| org_task(&state, t)).collect::<Vec<_>>(),
+                "division": if is_division { unit.clone() } else { Value::Null },
+                "initiative": if is_division { Value::Null } else { unit },
+                "lead_scope": "sessions on this host",
+            });
+            drop(state);
+            my_member(&mut body);
+            Ok(body)
+        }
+        "reports" => {
+            let target = match p.task_id.clone() {
+                Some(t) => t,
+                None => need_task("view=\"reports\"")?,
+            };
+            let task = api_get_task(&creds, &target).map_err(|e| e.to_method_err())?;
+            let id = task.get("id").and_then(Value::as_str).unwrap_or(&target).to_string();
+            let all = api_list_tasks(&creds, None, None, None).map_err(|e| e.to_method_err())?;
+            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            let reports: Vec<Value> = all
+                .iter()
+                .filter(|t| t.get("parent_task_id").and_then(Value::as_str) == Some(id.as_str()))
+                .map(|t| org_task(&state, t))
+                .collect();
+            let mut body = json!({
+                "view": "reports",
+                "task": org_task(&state, &task),
+                "reports": reports,
+                "lead_scope": "sessions on this host",
+            });
+            drop(state);
+            if p.task_id.is_none() {
+                // Your reports as a member (manager_member_id = you).
+                my_member(&mut body);
+                for key in ["member", "acting_as", "manager_chain", "teams"] {
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.remove(key);
+                    }
+                }
+            }
+            Ok(body)
+        }
+        // `team` is the org-model name; `division` stays as its alias.
+        "division" | "team" => {
+            let view = p.view.clone().unwrap_or_default();
+            let reference = match p.team.clone().or_else(|| p.division.clone()) {
+                Some(d) => d,
+                None => {
+                    let own = need_task("view=\"division\"")?;
+                    let me = api_get_task(&creds, &own).map_err(|e| e.to_method_err())?;
+                    me.get("initiative_id").and_then(Value::as_str).map(str::to_string).ok_or((
+                        ErrorCode::InvalidParams,
+                        "org: your task is not in a division or initiative; pass division=<id or slug>"
+                            .to_string(),
+                    ))?
+                }
+            };
+            let init = api_get_initiative(&creds, &reference).map_err(|e| e.to_method_err())?;
+            let init_id = init.get("id").and_then(Value::as_str).unwrap_or(&reference).to_string();
+            let root = init.get("coordinator_task_id").and_then(Value::as_str).unwrap_or("").to_string();
+            let tasks = api_list_tasks(&creds, None, None, Some(&init_id)).map_err(|e| e.to_method_err())?;
+            let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+            let (tree, unattached) = org_build_tree(&root, &tasks, &|t| org_task(&state, t));
+            // The division's leader: its root task's lead, Owner (stand-in)
+            // when the root has no live lead.
+            let kind = init.get("kind").and_then(Value::as_str).unwrap_or("initiative");
+            let leader = if root.is_empty() {
+                Value::Null
+            } else {
+                let row = tasks
+                    .iter()
+                    .find(|t| t.get("id").and_then(Value::as_str) == Some(root.as_str()))
+                    .cloned()
+                    .unwrap_or_else(|| json!({"id": root}));
+                org_lead_with(&state, &row, kind == "division")
+            };
+            drop(state);
+            let team = crate::items::org::team_detail(state_arc, &init_id).unwrap_or(None);
+            Ok(json!({
+                "view": view,
+                "team": team,
+                "division": {
+                    "id": init.get("id"),
+                    "slug": init.get("slug"),
+                    "name": init.get("name"),
+                    "status": init.get("status"),
+                    "kind": kind,
+                    "root_task_id": root,
+                    "leader": leader,
+                },
+                "tree": tree,
+                "unattached": unattached,
+                "lead_scope": "sessions on this host",
+            }))
+        }
+        other => Err((
+            ErrorCode::InvalidParams,
+            format!("org: unknown view '{}' (expected me, member, reports, team or division)", other),
+        )),
+    }
+}
+
+/// Whether `caller` may make Owner the lead of `target`, or undo that: a
+/// session with global permissions, or one whose task is strictly above
+/// `target` (its parent chain, walked at most [`ORG_CHAIN_MAX`] steps and
+/// stopping at a loop). The operator is checked by the callers.
+fn org_owner_authority(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    creds: &PlanningApiCreds,
+    caller: &str,
+    caller_task: Option<&str>,
+    target: &str,
+) -> bool {
+    let global = {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        state.sessions.get(caller).is_some_and(|s| s.global_perms)
+    };
+    if global {
+        return true;
+    }
+    let Some(own) = caller_task else { return false };
+    let mut seen = std::collections::HashSet::from([target.to_string()]);
+    let mut cur = target.to_string();
+    for _ in 0..ORG_CHAIN_MAX {
+        let Ok(row) = api_get_task(creds, &cur) else { return false };
+        match row.get("parent_task_id").and_then(Value::as_str) {
+            Some(parent) if parent == own => return true,
+            Some(parent) if seen.insert(parent.to_string()) => cur = parent.to_string(),
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// `org(action="set_lead" | "clear_lead")`: only on the caller's own task,
+/// and only naming a live agent session bound to it on this host.
+///
+/// `session_uid="owner"` (Owner leads the task) is different: never on the
+/// caller's own task, and only from Owner (the operator, with `task_id`) or
+/// an orchestrator: a session with global permissions, or one whose task is
+/// an ancestor of the target.
+fn org_set_lead(
+    state_arc: &Arc<Mutex<DaemonState>>,
+    creds: &PlanningApiCreds,
+    p: &OrgParams,
+    action: &str,
+    caller_uid: Option<&str>,
+    caller_task: Option<String>,
+) -> MethodResult {
+    if action == "set_lead" && p.session_uid.as_deref().is_some_and(crate::org::is_owner_pin) {
+        let target = p.task_id.clone().ok_or((
+            ErrorCode::InvalidParams,
+            "org: set_lead to owner needs task_id (the task Owner should lead)".to_string(),
+        ))?;
+        if let Some(caller) = caller_uid {
+            if caller_task.as_deref() == Some(target.as_str()) {
+                return Err((
+                    ErrorCode::Unauthorized,
+                    "org: an agent can't make Owner the lead of its own task; ask your orchestrator or Owner".into(),
+                ));
+            }
+            if !org_owner_authority(state_arc, creds, caller, caller_task.as_deref(), &target) {
+                return Err((
+                    ErrorCode::Unauthorized,
+                    format!(
+                        "org: only Owner or an orchestrator (global permissions, or a task above {target}) can make Owner its lead"
+                    ),
+                ));
+            }
+        }
+        let task = api_set_task_lead(creds, &target, Some(crate::org::OWNER_LEAD)).map_err(|e| e.to_method_err())?;
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        return Ok(json!({"action": action, "task": org_task(&state, &task)}));
+    }
+    let Some(caller) = caller_uid else {
+        return Err((ErrorCode::Unauthorized, "org: set_lead is for agent sessions; Owner uses A-e".into()));
+    };
+    let own = caller_task.ok_or((
+        ErrorCode::Unauthorized,
+        "org: set_lead needs a caller bound to a task".to_string(),
+    ))?;
+    if let Some(t) = p.task_id.as_deref() {
+        if t != own {
+            return Err((
+                ErrorCode::Unauthorized,
+                format!("org: set_lead only changes your own task ({}), not {}", own, t),
+            ));
+        }
+    }
+    // An Owner pin is changed (cleared or overridden by a session) only by
+    // whoever may set one: never by a worker on its own task.
+    let row = api_get_task(creds, &own).map_err(|e| e.to_method_err())?;
+    if row.get("metadata").and_then(crate::org::pinned_lead).is_some_and(crate::org::is_owner_pin)
+        && !org_owner_authority(state_arc, creds, caller, Some(own.as_str()), &own)
+    {
+        return Err((
+            ErrorCode::Unauthorized,
+            "org: Owner leads your task; only Owner or an orchestrator can change that".into(),
+        ));
+    }
+    let uid = if action == "clear_lead" {
+        None
+    } else {
+        let uid = p.session_uid.clone().unwrap_or_else(|| caller.to_string());
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let bound = org_lead_candidates(&state, &own)
+            .into_iter()
+            .any(|(u, engine)| u == uid && crate::org::is_agent_engine(&engine));
+        if !bound {
+            return Err((
+                ErrorCode::InvalidParams,
+                format!(
+                    "org: session '{}' is not a live agent session bound to your task on this host",
+                    uid
+                ),
+            ));
+        }
+        Some(uid)
+    };
+    let task = api_set_task_lead(creds, &own, uid.as_deref()).map_err(|e| e.to_method_err())?;
+    let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    Ok(json!({"action": action, "task": org_task(&state, &task)}))
 }
 
 #[derive(Default, Deserialize)]
@@ -16348,11 +21393,54 @@ fn local_machine_hostname() -> Option<String> {
         })
 }
 
+/// `metadata.models` / `metadata.efforts` for a task an agent files with a
+/// `model` and/or `effort`, in one engine slot: `model_engine` (claude /
+/// codex), else the engine the model's id names
+/// (`models::task_model_slot`). An effort alone needs `model_engine`: the
+/// levels don't name an engine. Each is `None` when not given. The TUI's
+/// `create_subtask` twin uses it too.
+pub fn filed_task_defaults(
+    model: Option<&str>,
+    effort: Option<&str>,
+    model_engine: Option<&str>,
+) -> Result<(Option<Value>, Option<Value>), (ErrorCode, String)> {
+    let invalid = |e: String| (ErrorCode::InvalidParams, e);
+    let model_engine = model_engine.map(str::trim).filter(|e| !e.is_empty());
+    let model = model.filter(|m| !m.trim().is_empty());
+    let effort = effort.filter(|e| !e.trim().is_empty());
+    let (slot, models) = match model {
+        Some(model) => {
+            let (slot, model) = crate::models::task_model_slot(model, model_engine).map_err(invalid)?;
+            (Some(slot), Some(json!({ slot: model })))
+        }
+        None => match model_engine {
+            Some(e) => {
+                let slot = crate::models::engine_key(e)
+                    .ok_or_else(|| invalid(format!("model_engine must be \"claude\" or \"codex\", not '{e}'")))?;
+                (Some(slot), None)
+            }
+            None => (None, None),
+        },
+    };
+    let efforts = match (effort, slot) {
+        (None, _) => None,
+        (Some(e), Some(slot)) => Some(json!({ slot: crate::models::validate_effort(slot, e).map_err(invalid)? })),
+        (Some(_), None) => {
+            return Err(invalid("an effort without a model needs model_engine=\"claude\" or \"codex\"".into()))
+        }
+    };
+    if models.is_none() && efforts.is_none() && model_engine.is_some() {
+        return Err(invalid("model_engine needs a model or an effort".into()));
+    }
+    Ok((models, efforts))
+}
+
 /// Build the persisted `metadata.filer` object from daemon-known caller
 /// identity (daemon-owned session first, then the TUI-pushed snapshot). No
 /// filer identity is accepted from request params: session, task, workspace,
 /// workflow, and continuous-task ids are authoritative snapshots of the
 /// caller that authenticated the RPC.
+
 fn filer_metadata(
     state: &DaemonState,
     caller_uid: Option<&str>,
@@ -16656,7 +21744,9 @@ fn wait_for_task_sessions_gone(
             state
                 .sessions
                 .values()
-                .any(|s| s.task_id.as_deref() == Some(task_id))
+                // Only the sessions the sweep asked to die: spared members,
+                // assistants and shells stay (O5).
+                .any(|s| s.task_id.as_deref() == Some(task_id) && s.last_exit.operator_kill_requested())
         };
         if !any || std::time::Instant::now() >= deadline {
             return;
@@ -16707,54 +21797,96 @@ fn wait_for_task_sessions_gone(
 /// some since August.
 ///
 /// Returns the uids it killed. Three deliberate filters:
-/// * IDLE only — a session mid-turn on a terminal task is unusual, so leave it
-///   for a later pass rather than killing an agent mid-write. The explicit
+/// * Engine idle, errored or waiting-on-human, or PTY-quiet legacy/unknown.
+///   Keep foreground and background work alive. The explicit
 ///   operator paths (`mark_subtask_done`, an approved reap) stay unconditional.
 /// * NEVER a continuous orchestrator (`continuous_task_id`): the scheduler owns
 ///   that lifecycle, and its planning row's status says nothing about the run.
 /// * NEVER a workflow participant: the workflow engine owns those.
+/// * With `owner_grace`, never a session Owner used within the window (see
+///   [`crate::terminal_sweep::owner_recently_used`]).
 pub(crate) fn sweep_terminal_task_sessions(
     state_arc: &Arc<Mutex<DaemonState>>,
     task_id: &str,
     killer: &str,
+    owner_grace: Option<crate::terminal_sweep::OwnerGrace>,
+    // The task was closed from its board item (`terminal_via = "item"`):
+    // only ephemeral workspaces' sessions close (lifecycle_guard_v1).
+    via_item: bool,
 ) -> Vec<String> {
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     let targets: Vec<String> = state
         .sessions
         .iter()
-        .filter(|(_, s)| {
+        .filter(|(uid, s)| {
             s.task_id.as_deref() == Some(task_id)
+                // Members' main sessions and their assistants are only
+                // unassigned (lifecycle_guard_v1, assistant_guard_v1), and a
+                // shell is Owner's alone to close.
+                && !crate::assistants::is_member_session(s)
+                && !crate::assistants::is_shell(&s.session_type)
+                && (!via_item
+                    || crate::lifecycle_guard::sweepable_after_item_close(
+                        state.workspaces.get(&s.workspace_id),
+                    ))
+                && !owner_grace.is_some_and(|grace| {
+                    crate::terminal_sweep::owner_recently_used(&state, uid, s, grace)
+                })
                 && s.continuous_task_id.is_none()
                 && s.workflow_run_id.is_none()
-                && compute_session_state_and_idle(s).1
+                && {
+                    let agent = crate::agent_state::current(s);
+                    if !agent.source.engine_reported() || agent.state == crate::agent_state::State::Unknown {
+                        compute_session_state_and_idle(s).1
+                    } else {
+                        matches!(agent.state, crate::agent_state::State::Idle
+                            | crate::agent_state::State::Errored | crate::agent_state::State::WaitingOnHuman)
+                    }
+                }
         })
         .map(|(uid, _)| uid.clone())
         .collect();
     let swept_at = now_unix_f64();
     let attribution = format!("{} (terminal task)", killer);
+    let mut closed = Vec::new();
     for uid in &targets {
+        let gate = crate::claude_recovery::lifecycle_gate(uid);
+        let Ok(_permit) = gate.try_write() else { continue };
+        if crate::claude_recovery::admission_refusal(uid).is_some() || crate::claude_recovery::has_pending_input(uid) { continue; }
         if let Some(sess) = state.sessions.get_mut(uid) {
             sess.last_exit.mark_operator_kill_requested();
             sess.set_kill_attribution(&attribution);
             let _ = sess.kill();
         }
         state.record_kill_request(uid, &attribution, swept_at);
+        closed.push(uid.clone());
     }
-    targets
+    closed
 }
 
 /// fast the children die.
-fn sweep_task_sessions(state_arc: &Arc<Mutex<DaemonState>>, task_id: &str, killer: &str) {
+pub(crate) fn sweep_task_sessions(state_arc: &Arc<Mutex<DaemonState>>, task_id: &str, killer: &str) -> Vec<String> {
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     let targets: Vec<String> = state
         .sessions
         .iter()
-        .filter(|(_, s)| s.task_id.as_deref() == Some(task_id))
+        // A member's main session or assistant is only unassigned
+        // (lifecycle_guard_v1, assistant_guard_v1).
+        // A shell is Owner's alone to close, kill or restart.
+        .filter(|(_, s)| {
+            s.task_id.as_deref() == Some(task_id)
+                && !crate::assistants::is_member_session(s)
+                && !crate::assistants::is_shell(&s.session_type)
+        })
         .map(|(uid, _)| uid.clone())
         .collect();
     let swept_at = now_unix_f64();
     let killer = format!("{} (mark_subtask_done)", killer);
+    let mut recovery_blocked = Vec::new();
     for uid in targets {
+        let gate = crate::claude_recovery::lifecycle_gate(&uid);
+        let Ok(_permit) = gate.try_write() else { recovery_blocked.push(uid); continue };
+        if crate::claude_recovery::admission_refusal(&uid).is_some() || crate::claude_recovery::has_pending_input(&uid) { recovery_blocked.push(uid); continue; }
         if let Some(sess) = state.sessions.get_mut(&uid) {
             sess.last_exit.mark_operator_kill_requested();
             // O4 routing: the verb-routed kill carries the sweep's
@@ -16764,6 +21896,7 @@ fn sweep_task_sessions(state_arc: &Arc<Mutex<DaemonState>>, task_id: &str, kille
         }
         state.record_kill_request(&uid, &killer, swept_at);
     }
+    recovery_blocked
 }
 
 fn teardown_subtask_done(
@@ -16861,14 +21994,29 @@ fn teardown_subtask_done(
     // regardless of worktree_mode / close_worktree (the daemon previously only
     // closed them inside the branch-mode + close_worktree path, stranding live
     // sessions on inherit / in-place / close_worktree=false done subtasks).
-    sweep_task_sessions(state_arc, &p.task_id, killer);
+    let recovery_blocked = sweep_task_sessions(state_arc, &p.task_id, killer);
+    if !recovery_blocked.is_empty() {
+        return Err((ErrorCode::Conflict, format!(
+            "task teardown deferred while background recovery is pending for: {}",
+            recovery_blocked.join(", ")
+        )));
+    }
     wait_for_task_sessions_gone(state_arc, &p.task_id, std::time::Duration::from_secs(2));
 
     // Phase 1/2 — cleanup BEFORE the API flip. Only branch mode owns a
     // dedicated worktree; inherit shares the parent's, in-place runs in
-    // the main repo (worktree_path == main_repo_path).
+    // the main repo (worktree_path == main_repo_path). A home, stream or
+    // pinned workspace is never removed: finishing work only unassigns
+    // (lifecycle_guard_v1, doc/org-model.md §7.1).
     let mut worktree_removed = false;
-    if p.close_worktree && was_branch_mode {
+    // A member's main session or assistant the sweep spared may live in
+    // this worktree: removing it would pull the floor from under it (review
+    // of 6522623, O5), so it is kept as "member" / "assistant".
+    let workspace_kept: Option<&'static str> = cleanup.as_ref().and_then(|(ws_id, _, _)| {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        crate::assistants::workspace_kept(&state, ws_id)
+    });
+    if p.close_worktree && was_branch_mode && workspace_kept.is_none() {
         let (ws_id, wt_opt, mr_opt) = cleanup.ok_or((
             ErrorCode::Conflict,
             format!(
@@ -16923,11 +22071,18 @@ fn teardown_subtask_done(
         }
     }
 
-    // Phase 3 — only NOW commit the Done status.
-    api_update_task(&creds, &p.task_id, &json!({ "status": "done" }))
-        .map_err(|e| e.to_method_err())?;
+    // Phase 3 — only NOW commit the Done status, attributed to the caller.
+    let mut done = json!({ "status": "done" });
+    if let Some(actor) = crate::items::rpc::session_actor(state_arc, killer) {
+        done["actor"] = actor;
+    }
+    api_update_task(&creds, &p.task_id, &done).map_err(|e| e.to_method_err())?;
 
-    Ok(json!({ "ok": true, "worktree_removed": worktree_removed }))
+    let mut out = json!({ "ok": true, "worktree_removed": worktree_removed });
+    if let Some(kind) = workspace_kept {
+        out["workspace_kept"] = json!(kind);
+    }
+    Ok(out)
 }
 
 pub fn mark_subtask_done(
@@ -16955,7 +22110,7 @@ pub fn mark_subtask_done(
             ErrorCode::Unauthorized,
             "taskless caller cannot mark subtasks done".into(),
         ))?;
-        if !crate::control::auth::task_is_self_or_descendant_of(&state.task_tree, &p.task_id, own) {
+        if !crate::control::auth::task_in_scope(&state, &p.task_id, own) {
             return Err((
                 ErrorCode::Unauthorized,
                 format!("task {} is not the caller's task or a descendant", p.task_id),
@@ -17093,6 +22248,7 @@ mod tests {
         s.workspaces.insert(
             ws_id.into(),
             ManifestWorkspace {
+                org: None,
                 color: None,
                 pinned: false,
                 id: ws_id.into(),
@@ -17154,6 +22310,8 @@ mod tests {
             "workspace_id": workspace_id,
             "label": label,
             "argv": ["/bin/bash"],
+            "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.display().to_string(),
         })
     }
@@ -17197,6 +22355,8 @@ mod tests {
             "workspace_id": "ws-empty-argv",
             "label": "x",
             "argv": [],
+            "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
         });
         let err = start_session(&state, &params).expect_err("empty argv");
@@ -17250,6 +22410,157 @@ mod tests {
             !s.workspaces.contains_key("ws-orphan"),
             "unbound sessionless workspace is still GC'd",
         );
+    }
+
+    /// S0b binding_epoch guard (doc/org-model.md §12): a TUI snapshot that
+    /// doesn't know a centrally bound workspace's epoch cannot bind a task
+    /// to it, unbind its tasks, rewrite its path or GC it; a push carrying
+    /// the current epoch can. Unguarded workspaces behave as before.
+    #[test]
+    fn task_update_tree_binding_epoch_guard() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        {
+            let mut s = state.lock().unwrap();
+            let mut home = crate::manifest::ManifestWorkspace::default();
+            home.id = "ws-home".into();
+            home.worktree_path = Some("/tmp/home-wt".into());
+            cm_holder_proto::org::set(&mut home.org, "binding_epoch", json!(4));
+            s.workspaces.insert("ws-home".into(), home);
+            s.task_workspaces.insert("task-a".into(), "ws-home".into());
+        }
+        // An old TUI: no epoch, task-a moved elsewhere, task-b onto the
+        // home workspace, a null path, and the home workspace left out.
+        task_update_tree(
+            &state,
+            &json!({
+                "tasks": [
+                    {"task_id": "task-a", "parent_task_id": null, "workspace_id": "ws-other"},
+                    {"task_id": "task-b", "parent_task_id": null, "workspace_id": "ws-home"},
+                ],
+                "workspaces": [{"workspace_id": "ws-other", "worktree_path": "/tmp/o"}],
+            }),
+        )
+        .unwrap();
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.task_workspaces.get("task-a").map(String::as_str), Some("ws-home"));
+            assert!(s.task_workspaces.get("task-b").is_none());
+            assert!(s.workspaces.contains_key("ws-home"), "never GC'd by a stale snapshot");
+            assert_eq!(s.workspaces["ws-home"].worktree_path.as_deref(), Some(std::path::Path::new("/tmp/home-wt")));
+        }
+        // A TUI that knows epoch 4 is authoritative again.
+        task_update_tree(
+            &state,
+            &json!({
+                "tasks": [{"task_id": "task-b", "parent_task_id": null, "workspace_id": "ws-home"}],
+                "workspaces": [{"workspace_id": "ws-home", "worktree_path": "/tmp/new-wt", "binding_epoch": 4}],
+            }),
+        )
+        .unwrap();
+        let s = state.lock().unwrap();
+        assert!(s.task_workspaces.get("task-a").is_none());
+        assert_eq!(s.task_workspaces.get("task-b").map(String::as_str), Some("ws-home"));
+        assert_eq!(s.workspaces["ws-home"].worktree_path.as_deref(), Some(std::path::Path::new("/tmp/new-wt")));
+    }
+
+    /// S0b: both reconstruction paths skip re-inferring bindings for a
+    /// centrally bound workspace; an unguarded one is rebuilt as before.
+    /// Register records the TUI's workspace kind once, and the persisted
+    /// org object fills a TUI-loaded row that has none.
+    #[test]
+    fn reconstruction_respects_binding_epoch_and_keeps_workspace_org() {
+        with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let path = home.join(".cm/daemon-sessions.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut guarded = crate::manifest::ManifestWorkspace::default();
+            guarded.id = "ws-g".into();
+            cm_holder_proto::org::set(&mut guarded.org, "binding_epoch", json!(2));
+            let mut e = me("ts-g-0", "bash");
+            e.task_id = Some("task-g".into());
+            guarded.sessions = vec![e];
+            let mut plain = crate::manifest::ManifestWorkspace::default();
+            plain.id = "ws-p".into();
+            plain.org = crate::manifest::ephemeral_workspace_org();
+            let mut e = me("ts-p-0", "bash");
+            e.task_id = Some("task-p".into());
+            plain.sessions = vec![e];
+            let manifest = crate::manifest::Manifest {
+                workspaces: [("ws-g".to_string(), guarded.clone()), ("ws-p".to_string(), plain)].into(),
+                ..Default::default()
+            };
+            std::fs::write(&path, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+            // state.rs: the TUI-file load path.
+            let mut loaded = DaemonState::new();
+            let tui = home.join(".cm/tui-sessions.json");
+            std::fs::write(&tui, serde_json::to_string(&manifest).unwrap()).unwrap();
+            loaded.load_manifest_from_disk(&tui).unwrap();
+            assert!(loaded.bindings.get("task-g").is_none(), "state.rs path guarded");
+            assert_eq!(loaded.bindings.get("task-p").map(String::as_str), Some("ws-p"));
+
+            // methods.rs: the durable-registry path, over a TUI-loaded row
+            // that lacks the org object.
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                s.daemon_sessions_path = Some(path.clone());
+                let mut tui_row = crate::manifest::ManifestWorkspace::default();
+                tui_row.id = "ws-p".into();
+                s.workspaces.insert("ws-p".into(), tui_row);
+            }
+            rehydrate_derived_state(&state);
+            let s = state.lock().unwrap();
+            assert!(s.bindings.get("task-g").is_none(), "methods.rs path guarded");
+            assert_eq!(s.bindings.get("task-p").map(String::as_str), Some("ws-p"));
+            assert_eq!(
+                cm_holder_proto::org::workspace_kind(s.workspaces["ws-p"].org.as_ref()),
+                Some("ephemeral"),
+            );
+            assert_eq!(s.workspaces["ws-g"].org, guarded.org);
+            drop(s);
+
+            // Review #3: a TUI file that carries no `org` (TUIs never
+            // learn the daemon-recorded object) lets the boot-time load
+            // infer task-g → ws-g; the rehydrate merge then shows ws-g is
+            // centrally bound and drops the inference.
+            let mut tui_manifest = manifest.clone();
+            for ws in tui_manifest.workspaces.values_mut() {
+                ws.org = None;
+            }
+            std::fs::write(&tui, serde_json::to_string(&tui_manifest).unwrap()).unwrap();
+            let booted = make_state_arc();
+            {
+                let mut s = booted.lock().unwrap();
+                s.load_manifest_from_disk(&tui).unwrap();
+                assert_eq!(s.bindings.get("task-g").map(String::as_str), Some("ws-g"), "inferred at load");
+                s.daemon_sessions_path = Some(path.clone());
+            }
+            rehydrate_derived_state(&booted);
+            {
+                let s = booted.lock().unwrap();
+                assert!(s.bindings.get("task-g").is_none(), "dropped once ws-g shows its epoch");
+                assert_eq!(s.bindings.get("task-p").map(String::as_str), Some("ws-p"));
+                assert_eq!(s.workspaces["ws-g"].org, guarded.org);
+            }
+
+            register_agent_subtask(&state, &json!({
+                "task_id": "t-new", "parent_task_id": "t-parent", "workspace_id": "ws-new",
+                "worktree_path": "/tmp/ws-new", "workspace_kind": "ephemeral",
+            }))
+            .unwrap();
+            register_agent_subtask(&state, &json!({
+                "task_id": "t-new", "parent_task_id": "t-parent", "workspace_id": "ws-new",
+                "workspace_kind": "home",
+            }))
+            .unwrap();
+            let s = state.lock().unwrap();
+            assert_eq!(
+                cm_holder_proto::org::workspace_kind(s.workspaces["ws-new"].org.as_ref()),
+                Some("ephemeral"),
+                "a kind is recorded once, never overwritten by register",
+            );
+        });
     }
 
     /// `base` names the commit a NEW subtask branch is cut from, so it is
@@ -17425,8 +22736,8 @@ mod tests {
         {
             let s = state.lock().unwrap();
             assert!(
-                crate::control::auth::task_is_self_or_descendant_of(
-                    &s.task_tree,
+                crate::control::auth::task_in_scope(
+                    &s,
                     "task-sub",
                     "task-orch",
                 ),
@@ -17457,8 +22768,8 @@ mod tests {
         {
             let s = state.lock().unwrap();
             assert!(
-                crate::control::auth::task_is_self_or_descendant_of(
-                    &s.task_tree,
+                crate::control::auth::task_in_scope(
+                    &s,
                     "task-sub",
                     "task-orch",
                 ),
@@ -17511,8 +22822,8 @@ mod tests {
             Some(std::path::PathBuf::from("/tmp/wt-parent")),
             "an omitted worktree_path must leave the inherited workspace intact",
         );
-        assert!(crate::control::auth::task_is_self_or_descendant_of(
-            &s.task_tree,
+        assert!(crate::control::auth::task_in_scope(
+            &s,
             "task-sub",
             "task-orch",
         ));
@@ -17634,6 +22945,28 @@ mod tests {
         assert_eq!(passed["mcp_ok"], json!(true));
     }
 
+    #[test]
+    fn daemon_health_reads_sync_without_projecting_or_waiting_for_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("daemon-sessions.json");
+        std::fs::write(&manifest, b"manifest sentinel").unwrap();
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        state.lock().unwrap().daemon_sessions_path = Some(manifest.clone());
+        let messaging = state.lock().unwrap().messaging.clone();
+        assert_eq!(daemon_health(&state).unwrap()["messaging_sync_state"], "starting");
+        *messaging.lock().unwrap() = Some(crate::messaging::Store::open(dir.path()).unwrap());
+        let health = daemon_health(&state).unwrap();
+        assert_eq!(health["messaging_sync_state"], "ready");
+        assert!(health["messaging_sync"]["role"].is_string());
+        assert_eq!(std::fs::read(&manifest).unwrap(), b"manifest sentinel");
+        let held = messaging.lock().unwrap();
+        let busy = daemon_health(&state).unwrap();
+        assert_eq!(busy["messaging_sync_state"], "busy");
+        assert!(busy["messaging_sync"].is_null());
+        drop(held);
+        assert_eq!(std::fs::read(&manifest).unwrap(), b"manifest sentinel");
+    }
+
     /// DESIGN_SEAMLESS_RESTART phase 2e (R14): `daemon.health` carries
     /// `strong_operator_auth` so a deploy script can check the
     /// fail-closed restart precondition up front — false in the compat
@@ -17709,6 +23042,8 @@ mod tests {
             "workspace_id": "ws-does-not-exist",
             "label": "x",
             "argv": ["/bin/bash"],
+            "model": "test-model",
+            "effort": "xhigh",
             "working_dir": "/tmp",
         });
         let err = start_session(&state, &params).expect_err("missing ws");
@@ -17742,6 +23077,8 @@ mod tests {
             "workspace_id": workspace_id,
             "label": "shell",
             "argv": ["/bin/bash"],
+            "model": "test-model",
+            "effort": "xhigh",
             "working_dir": worktree_path,
             "worktree_path": worktree_path,
         });
@@ -17779,6 +23116,8 @@ mod tests {
             "workspace_id": "ws-unknown",
             "label": "x",
             "argv": ["/bin/bash"],
+            "model": "test-model",
+            "effort": "xhigh",
             "working_dir": "/tmp",
             // intentionally no worktree_path
         });
@@ -17810,6 +23149,8 @@ mod tests {
             "workspace_id": "ws-add",
             "label": "reviewer",
             "argv": ["/bin/bash"],
+            "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
             "session_type": "claude-code",
             "workflow_run_id": "wf_add",
@@ -17869,6 +23210,8 @@ mod tests {
             "workspace_id": "ws-promote",
             "label": "worker",
             "argv": ["/bin/sleep", "120"],
+            "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
             "task_id": "task-launch",
         });
@@ -17919,6 +23262,8 @@ mod tests {
             "workspace_id": "ws-done",
             "label": "relaunch",
             "argv": ["/bin/sleep", "120"],
+            "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
             "task_id": "task-done",
         });
@@ -17965,6 +23310,8 @@ mod tests {
             "workspace_id": "ws-bt",
             "label": "watcher",
             "argv": ["/bin/sleep", "120"],
+            "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
             "task_id": "task-bt",
         });
@@ -18001,6 +23348,8 @@ mod tests {
             "workspace_id": "ws-skip",
             "label": "restored",
             "argv": ["/bin/sleep", "120"],
+            "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
             "task_id": "task-restored",
             "skip_task_status_promotion": true,
@@ -18101,7 +23450,7 @@ mod tests {
             let cloned_path = seed.0.as_ref().unwrap().transcript_path.clone();
             let state = Arc::new(Mutex::new(DaemonState::new()));
             let full = compose_daemon_spawn_params(&state, &fresh_test_uid(), "ws-seed", "agent", "claude-code", &target,
-                None, 80, 24, None, seed.id()).unwrap();
+                None, 80, 24, None, seed.id(), &explicit("test-model"), &explicit("xhigh")).unwrap();
             let argv = full["argv"].as_array().unwrap();
             assert!(argv.windows(2).any(|args| args[0] == "--resume" && args[1] == seed.id().unwrap()));
             assert_eq!(full["transcript_path"], cloned_path.to_string_lossy().as_ref());
@@ -18408,7 +23757,7 @@ mod tests {
         std::fs::create_dir_all(&wt).unwrap();
 
         let full = compose_daemon_spawn_params(
-            &state, &uid, "ws-c", "label", "claude-code", &wt, None, 100, 40, Some(&wt), None,
+            &state, &uid, "ws-c", "label", "claude-code", &wt, None, 100, 40, Some(&wt), None, &explicit("test-model"), &explicit("xhigh"),
         )
         .expect("compose ok");
 
@@ -18604,6 +23953,8 @@ mod tests {
             "workspace_id": "ws-existing",
             "label": "x",
             "argv": ["/bin/bash"],
+            "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
             // A different path — must be ignored.
             "worktree_path": other.path().display().to_string(),
@@ -18647,6 +23998,7 @@ mod tests {
             s.workspaces.insert(
                 "ws-cloud".into(),
                 ManifestWorkspace {
+                    org: None,
                     color: None,
                     pinned: false,
                     id: "ws-cloud".into(),
@@ -18670,6 +24022,8 @@ mod tests {
             "workspace_id": "ws-cloud",
             "label": "x",
             "argv": ["/bin/bash"],
+            "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
         });
         let result = start_session(&state, &params)
@@ -18726,6 +24080,8 @@ mod tests {
             "workspace_id": "ws-uid-passthrough",
             "label": "passthrough",
             "argv": ["/bin/bash"],
+            "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
         });
         let result = start_session(&state, &params).expect("spawn");
@@ -18762,6 +24118,8 @@ mod tests {
             "workspace_id": "ws-uid-dup",
             "label": "first",
             "argv": ["/bin/bash"],
+            "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
         });
         let _ok = start_session(&state, &params).expect("first spawn");
@@ -18772,6 +24130,8 @@ mod tests {
             "workspace_id": "ws-uid-dup",
             "label": "duplicate",
             "argv": ["/bin/bash"],
+            "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
         });
         let err = start_session(&state, &dup_params).expect_err("duplicate uid");
@@ -18832,6 +24192,8 @@ mod tests {
                     "workspace_id": "ws-race-uid",
                     "label": format!("race-{}", i),
                     "argv": ["/bin/bash"],
+                    "model": "test-model",
+                    "effort": "xhigh",
                     "working_dir": wd_c,
                 });
                 start_session(&state_c, &params)
@@ -18901,6 +24263,8 @@ mod tests {
                 "workspace_id": "ws-bad-uid",
                 "label": "x",
                 "argv": ["/bin/bash"],
+                "model": "test-model",
+                "effort": "xhigh",
                 "working_dir": dir.path().display().to_string(),
             });
             let err = start_session(&state, &params).expect_err(
@@ -18981,6 +24345,8 @@ mod tests {
             "workspace_id": "ws-outside-scope",
             "label": "outside-scope-test",
             "argv": ["/bin/sleep", "30"],
+            "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
             "memory_cap_bytes": 64 * 1024 * 1024u64,
             "memory_cap_hard_bytes": 128 * 1024 * 1024u64,
@@ -19036,6 +24402,8 @@ mod tests {
             "workspace_id": "ws-forged-path",
             "label": "forged-path-test",
             "argv": ["/bin/sleep", "30"],
+            "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
             "memory_cap_bytes": 64 * 1024 * 1024u64,
             "memory_cap_hard_bytes": 128 * 1024 * 1024u64,
@@ -19105,6 +24473,8 @@ mod tests {
             "workspace_id": "ws-watcher-fail",
             "label": "watcher-fail-test",
             "argv": ["/bin/sleep", "30"],
+            "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
             "memory_cap_bytes": 64 * 1024 * 1024u64,
         });
@@ -19247,6 +24617,7 @@ mod tests {
             s.workspaces.insert(
                 "ws-envinj".into(),
                 ManifestWorkspace {
+                    org: None,
                     color: None,
                     pinned: false,
                     id: "ws-envinj".into(),
@@ -19264,6 +24635,14 @@ mod tests {
                 },
             );
             s.config = crate::config::DaemonConfig {
+                claude_limit_recovery: true,
+                claude_limit_menu_clear: true,
+                memory: Default::default(),
+                s4_min_write: false,
+                transcript_rotation: Default::default(),
+                chat_search_budget_bytes: 512 * 1024 * 1024,
+                presence_idle_enabled: true,
+                workflow_state_gate: false,
                 mcp_server_path:
                     "/opt/cm-daemon/mcp_server/server.py".to_string(),
                 api_url: "http://10.150.0.2:8000".to_string(),
@@ -19277,6 +24656,8 @@ mod tests {
                 repos: Vec::new(),
                 scheduler: Default::default(),
                 notify_command: None,
+                codex_inline_scrollback: true,
+                models: Default::default(),
             };
             Arc::new(Mutex::new(s))
         };
@@ -19294,6 +24675,8 @@ mod tests {
             "workspace_id": "ws-envinj",
             "label": "env-inj",
             "argv": argv,
+            "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
             // Workflow context — exercises the CM_WORKFLOW_RUN_ID /
             // CM_ROLE injection branch.
@@ -19419,6 +24802,7 @@ mod tests {
             s.workspaces.insert(
                 "ws-empty-cfg".into(),
                 ManifestWorkspace {
+                    org: None,
                     color: None,
                     pinned: false,
                     id: "ws-empty-cfg".into(),
@@ -19450,6 +24834,8 @@ mod tests {
             "workspace_id": "ws-empty-cfg",
             "label": "empty-cfg",
             "argv": argv,
+            "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
         });
         let _r = start_session(&state, &params).expect("ok");
@@ -19537,6 +24923,7 @@ mod tests {
             s.workspaces.insert(
                 "ws-abs".into(),
                 ManifestWorkspace {
+                    org: None,
                     color: None,
                     pinned: false,
                     id: "ws-abs".into(),
@@ -19567,6 +24954,8 @@ mod tests {
             "workspace_id": "ws-abs",
             "label": "abs-paths",
             "argv": argv,
+            "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
         });
         let _result = start_session(&state, &params).expect("spawn ok");
@@ -20000,6 +25389,11 @@ mod tests {
             let mut s = state.lock().unwrap();
             s.workspaces.get_mut("ws-10e-a-t1").unwrap().sessions.push(
                 crate::manifest::ManifestEntry {
+                    org: None,
+                    model: None,
+                    model_source: None,
+                    effort: None,
+                    effort_source: None,
                     transcript_path: None,
                     reported_done_at: None,
                     report_reason: None,
@@ -20251,6 +25645,11 @@ mod tests {
             let mut s = state.lock().unwrap();
             s.workspaces.get_mut("ws-10e-a-cap").unwrap().sessions.push(
                 crate::manifest::ManifestEntry {
+                    org: None,
+                    model: None,
+                    model_source: None,
+                    effort: None,
+                    effort_source: None,
                     transcript_path: None,
                     reported_done_at: None,
                     report_reason: None,
@@ -20453,6 +25852,11 @@ mod tests {
             let mut s = state.lock().unwrap();
             s.workspaces.get_mut("ws-10e-a-opkill").unwrap().sessions.push(
                 crate::manifest::ManifestEntry {
+                    org: None,
+                    model: None,
+                    model_source: None,
+                    effort: None,
+                    effort_source: None,
                     transcript_path: None,
                     reported_done_at: None,
                     report_reason: None,
@@ -20546,6 +25950,68 @@ mod tests {
     /// (untracked-uid call) without needing a real spawn. Subscriber
     /// receives nothing; manifest snapshot stays untouched.
     #[test]
+    fn startup90_exit_preserves_content_free_diagnostics_before_session_removal() {
+        let state=make_state_arc();let uid="ts-startup90";
+        insert_session(&state,uid,"ws-startup90");
+        let id;
+        {
+            let mut st=state.lock().unwrap();
+            let s=st.sessions.get_mut(uid).unwrap();s.session_type="codex".into();
+            let ticket=super::super::prompt_delivery::Receipt::pending();
+            id=ticket.lock().unwrap().id.clone();s.prompt_delivery=Some(ticket);
+            s.fanout.push(&vec![b'x';8192]);
+            s.fanout.push(b"Update available\r\nUpdate now\r\nnpm error EACCES secret-token=DO_NOT_RETAIN\n");
+            s.fanout.close();
+            s.last_exit.set_kernel(crate::session::KernelExitStatus {code:Some(1),signal:None});
+            handle_session_exit(&mut st,uid);
+            assert!(!st.sessions.contains_key(uid));
+            let tomb=st.exited_tombstone(uid).unwrap();
+            let failure=tomb.startup_failure.as_ref().unwrap();
+            assert_eq!(failure.receipt_id.as_deref(),Some(id.as_str()));
+            assert_eq!(failure.exit_code,1);
+            assert_eq!(failure.pty_bytes_inspected,4096);
+            assert!(failure.pty_tail_truncated && failure.pty_closed);
+            assert_eq!(failure.markers,vec!["update_notice","update_choice","permission_denied"]);
+            let saved=serde_json::to_string(tomb).unwrap();
+            assert!(!saved.contains("DO_NOT_RETAIN") && !saved.contains("secret-token"));
+            let restored:crate::state::ExitedTombstone=serde_json::from_str(&saved).unwrap();
+            assert_eq!(restored.startup_failure,tomb.startup_failure,"existing persisted tombstone schema retains evidence");
+        }
+        let read=resolve_authorized_session(&state,&json!({"session_uid":uid}),None).unwrap();
+        assert_eq!(read["startup_failure"]["receipt_id"],id);
+        assert_eq!(read["state"],"exited");
+        let list=list_sessions(&state,&json!({"include_exited":true}),None).unwrap();
+        assert_eq!(list.as_array().unwrap().iter().find(|r|r["session_uid"]==uid).unwrap()["startup_failure"],read["startup_failure"]);
+    }
+
+    #[test]
+    fn startup90_clean_intentional_late_and_started_exits_do_not_capture() {
+        let state=make_state_arc();let uid="ts-startup90-control";
+        insert_session(&state,uid,"ws-startup90");
+        {
+            let mut st=state.lock().unwrap();let s=st.sessions.get_mut(uid).unwrap();
+            s.session_type="codex".into();let at=now_unix_f64();
+            s.agent_state.lock().unwrap().inputs.spawned_at=at-1.0;
+            s.fanout.push(b"Update available EACCES");
+            let collect=super::super::prompt_delivery::startup_failure;
+            assert!(collect(s,Some(0),at,false).is_none());
+            assert!(collect(s,Some(1),at,true).is_none());
+            assert!(collect(s,None,at,false).is_none());
+            assert!(collect(s,Some(1),at+121.0,false).is_none());
+            s.agent_state.lock().unwrap().inputs.relay=Some(crate::agent_state::RelaySnapshot {
+                turn_started_at:Some(at),..Default::default()});
+            assert!(collect(s,Some(1),at,false).is_none());
+            // A resume's historical turn is not a turn started by this process.
+            s.agent_state.lock().unwrap().inputs.relay.as_mut().unwrap().turn_started_at=Some(at-3600.0);
+            assert!(collect(s,Some(1),at,false).is_some());
+            let ticket=super::super::prompt_delivery::Receipt::pending();
+            super::super::prompt_delivery::finish(&ticket,Ok("relay"));s.prompt_delivery=Some(ticket);
+            assert!(collect(s,Some(1),at,false).is_none());
+        }
+        kill_all_sessions(&state);
+    }
+
+    #[test]
     fn handle_session_exit_noops_when_uid_not_in_sessions() {
         let dir = TempDir::new().unwrap();
         let state = state_with_workspace("ws-10e-a-t3", &dir);
@@ -20586,6 +26052,104 @@ mod tests {
     /// Real PTY regression for the incident: old conversation history exists,
     /// startup repaints swallow the first Enter, and the 40KB batch remains in
     /// the composer. All three production entry points must retry only Enter.
+    #[test]
+    fn initial_prompt_confirmation_retries_once_and_ignores_repaint() {
+        // Real PTYs swallow the first submit while repainting; only the
+        // identical Enter is accepted. One case never starts a turn; slash
+        // commands are delivered without requiring a model turn.
+        for (engine, accept, command) in [("claude-code", true, false), ("codex", true, false),
+            ("codex", false, false), ("claude-code", false, true)] {
+            let _serial = crate::writer_gate::TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = TempDir::new().unwrap();
+            let state = state_with_workspace("ws-confirm", &dir);
+            let uid = fresh_test_uid();
+            let rollout = dir.path().join("rollout.jsonl");
+            let writes = dir.path().join("writes.json");
+            let script = dir.path().join("composer.py");
+            let body = if command { "/triage-review X" } else { "one initial prompt\nsecond line" };
+            std::fs::write(&script, r#"
+import datetime,json,os,pathlib,select,sys,time,tty
+rollout,writes=map(pathlib.Path,sys.argv[1:3]);engine=sys.argv[3];accept=sys.argv[4]=='true'
+tty.setraw(0)
+os.write(1,b'\x1b[?2004h\x1b[>1uStarting\r\n')
+time.sleep(.3);os.write(1,b'.'*1024+b'\r\n')
+buf=b'';enters=0;encodings=[]
+while True:
+    ready,_,_=select.select([0],[],[],.1)
+    if enters:os.write(1,b'\rStartup redraw')
+    if not ready:continue
+    data=os.read(0,65536)
+    if not data:break
+    buf+=data
+    for marker in [b'\x1b[13u',b'\r']:
+        while marker in buf:
+            enters+=1;encodings.append(marker.hex());buf=buf.replace(marker,b'',1)
+    text=buf.replace(b'\x1b[200~',b'').replace(b'\x1b[201~',b'').decode()
+    writes.write_text(json.dumps({'enters':enters,'text':text,'encodings':encodings}))
+    if accept and enters==2 and not rollout.exists():
+        stamp=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00','Z')
+        row={'timestamp':stamp,'type':'user','message':{'content':'expanded '+text}} if engine=='claude-code' else {'timestamp':stamp,'type':'event_msg','payload':{'type':'user_message','message':text}}
+        rollout.write_text(json.dumps(row)+'\n')
+"#).unwrap();
+            let mut sp = crate::session::SpawnParams::new(&uid, "confirm", "/usr/bin/python3");
+            sp.args = vec!["-u".into(), script.display().to_string(), rollout.display().to_string(),
+                writes.display().to_string(), engine.into(), accept.to_string()];
+            sp.workspace_id = "ws-confirm".into();
+            sp.session_type = engine.into();
+            let mut session = crate::session::DaemonSession::spawn(sp).unwrap();
+            let ticket = crate::control::prompt_delivery::Receipt::pending();
+            session.prompt_delivery = Some(ticket.clone());
+            let handle = session.input_handle();
+            let fanout = session.fanout.clone();
+            state.lock().unwrap().sessions.insert(uid.clone(), session);
+            spawn_initial_prompt_delivery(state.clone(), handle, fanout, uid.clone(), body.into(), ticket.clone());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(110);
+            loop {
+                // Detector bind followed by a hook/path correction before
+                // evidence is observed. Two bumps still belong to this process.
+                if rollout.exists() {
+                    let mut state = state.lock().unwrap();
+                    let session = state.sessions.get_mut(&uid).unwrap();
+                    if session.transcript_path.is_none() {
+                        session.transcript_path = Some(dir.path().join("detector-guess.jsonl").display().to_string());
+                        session.generation += 1;
+                        session.transcript_path = Some(rollout.display().to_string());
+                        session.generation += 1;
+                    }
+                }
+                if ticket.lock().unwrap().status != "pending" { break; }
+                assert!(std::time::Instant::now() < deadline, "{engine}: confirmation hung");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let receipt = ticket.lock().unwrap().clone();
+            assert_eq!(receipt.submitted, accept || command, "{engine}: {receipt:?}");
+            assert_eq!(receipt.attempts, if command {1} else {2});
+            assert_eq!(receipt.confirmed_by, if command {Some("write")} else if accept {Some("transcript")} else {None});
+            assert_eq!(receipt.reason, if accept || command {None} else {Some("no_engine_turn")});
+            if command { assert_eq!(receipt.status, "delivered"); }
+            let input: Value = loop {
+                if let Ok(text) = std::fs::read_to_string(&writes) {
+                    if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                        if v["enters"] == if command {1} else {2} { break v; }
+                    }
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            assert_eq!(input["text"], body, "body must never be re-pasted");
+            if !command { assert_eq!(input["encodings"][0], input["encodings"][1]); }
+            assert_eq!(input["enters"], if command {1} else {2}, "only the allowed Enter attempts");
+            let resolved = resolve_authorized_session(&state, &json!({"session_uid":uid}), None).unwrap();
+            assert_eq!(resolved["prompt_delivery"]["id"], receipt.id);
+            assert_eq!(resolved["prompt_delivery"]["submitted"], accept || command);
+            if command {
+                assert_eq!(resolved["agent_state"]["turn_seq"], 0);
+                assert!(resolved["agent_state"].get("latest_start_at").is_none());
+            }
+            kill_all_sessions(&state);
+        }
+    }
+
     #[test]
     fn codex_delivery_recovers_parked_prompt_on_all_agent_entry_points() {
         for route in ["fresh", "persistent", "send_input"] {
@@ -20637,7 +26201,7 @@ while True:
             let fanout = session.fanout.clone();
             state.lock().unwrap().sessions.insert(uid.clone(), session);
             match route {
-                "fresh" => spawn_agent_prompt_delivery(handle, fanout, uid.clone(), body.clone(), true, Some(state.clone())),
+                "fresh" => spawn_agent_prompt_delivery(handle, fanout, uid.clone(), body.clone(), true, false, Some(state.clone())),
                 "persistent" => spawn_persistent_prompt_delivery(handle, fanout, uid.clone(), body.clone(), false, state.clone()),
                 _ => { send_input(&state, &json!({"session_uid":uid,"text":body,"submit":true}), None).unwrap(); }
             }
@@ -20741,6 +26305,8 @@ while True:
             "workspace_id": "ws-defsize",
             "label": "x",
             "argv": ["/bin/bash"],
+            "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
         });
         let result = start_session(&state, &params).expect("spawn");
@@ -20792,6 +26358,8 @@ while True:
             "workspace_id": "ws-bigsize",
             "label": "x",
             "argv": ["/bin/bash"],
+            "model": "test-model",
+            "effort": "xhigh",
             "working_dir": dir.path().display().to_string(),
             "cols": 120u16,
             "rows": 40u16,
@@ -20855,7 +26423,8 @@ while True:
             "uid": fresh_test_uid(),
             "workspace_id": ws_id,
             "label": "test-bash",
-            "argv": ["/bin/bash"],
+            "argv": ["/bin/bash", "--noprofile", "--norc"],
+            "session_type": "bash",
             "working_dir": working_dir,
         });
         let result = start_session(state, &params).expect("spawn bash");
@@ -20924,6 +26493,11 @@ while True:
         {
             let mut s = state.lock().unwrap();
             s.sessions.get_mut(&uid).unwrap().session_type = "claude-code".to_string();
+            s.sessions[&uid].agent_state.lock().unwrap().inputs.presence = Some(crate::agent_state::PresenceObs {
+                valid: true, status: crate::agent_state::PresenceStatus::Idle,
+                observed_at: now_unix_f64(), status_updated_at: Some(now_unix_f64() - 60.0), native_session_id: None,
+                engine_version: None, waiting_for: None, main_turn_open: None, transcript_error: None, transcript_end: None, transcript_evidence_path: None, wait_resolution: None,
+            });
         }
         let params = json!({ "session_uid": &uid, "text": "implement the fix" });
         let result = send_input(&state, &params, None).expect("send_input ok");
@@ -20932,6 +26506,16 @@ while True:
             result["delivery"], "agent-kitty-async",
             "agent sessions submit via the async kitty-Enter path, not a bare newline",
         );
+        // Simulate the next presence tick seeing the same old idle file during
+        // async body/Enter delivery. Both MCP read paths must stay non-idle.
+        state.lock().unwrap().sessions[&uid].agent_state.lock().unwrap()
+            .inputs.presence.as_mut().unwrap().observed_at = now_unix_f64();
+        let resolved = resolve_authorized_session(&state, &json!({"session_uid": uid}), None).unwrap();
+        assert_eq!(resolved["agent_state"]["state"], "working");
+        assert_eq!(resolved["idle"], false);
+        let rows = list_sessions(&state, &json!({}), None).unwrap();
+        let row = rows.as_array().unwrap().iter().find(|row| row["session_uid"] == uid).unwrap();
+        assert_eq!(row["idle"], false);
         kill_all_sessions(&state);
     }
 
@@ -21095,10 +26679,11 @@ while True:
         let state = state_with_workspace("ws-rso-2", &dir);
         let uid = spawn_bash(&state, "ws-rso-2");
 
-        // First marker.
+        // Split each marker in the command so PTY echo cannot satisfy the
+        // wait before bash has actually emitted that marker's output.
         let _ = send_input(
             &state,
-            &json!({ "session_uid": &uid, "text": "echo CURSOR-A" }),
+            &json!({ "session_uid": &uid, "text": "printf 'CURSOR-%s\\n' A" }),
             None,
         )
         .unwrap();
@@ -21108,7 +26693,7 @@ while True:
         // Second marker, then snapshot since the first cursor.
         let _ = send_input(
             &state,
-            &json!({ "session_uid": &uid, "text": "echo CURSOR-B-marker" }),
+            &json!({ "session_uid": &uid, "text": "printf 'CURSOR-%s\\n' B-marker" }),
             None,
         )
         .unwrap();
@@ -21650,6 +27235,8 @@ while True:
         tmp
     }
 
+    include!("adoption_tests.rs");
+
     fn make_state_arc() -> Arc<Mutex<DaemonState>> {
         Arc::new(Mutex::new(DaemonState::new()))
     }
@@ -21659,6 +27246,79 @@ while True:
     /// names them in `requires_restart`, and re-runs the MCP preflight
     /// when `mcp_server_path` moved (failing loudly here, since the
     /// test's new path is fake).
+    #[test]
+    fn recovery_journal_failure_does_not_block_other_reload_keys() {
+        with_temp_home(|| {
+            let state = make_state_arc();
+            let root = tempfile::tempdir().unwrap();
+            let journal = root.path().join("daemon-claude-account-recovery.json");
+            std::fs::write(&journal, b"{broken").unwrap();
+            crate::notifications::set_recovery_enabled(root.path(), true).unwrap();
+            {
+                let mut st = state.lock().unwrap();
+                st.daemon_sessions_path = Some(root.path().join("daemon-sessions.json"));
+                st.messaging_root = root.path().into();
+            }
+            let path = crate::config::default_config_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "[memory]\ntrim_interval_secs=2\n").unwrap();
+            let result = reload_config(&state).unwrap();
+            assert!(result["changed"].as_array().unwrap().iter().any(|v| v == "memory"));
+            assert!(result["warnings"][0].as_str().unwrap().contains("disabled marker confirmed"));
+            assert_eq!(state.lock().unwrap().config.memory.trim_interval_secs, 2);
+            assert!(!state.lock().unwrap().config.claude_limit_recovery);
+            assert!(crate::notifications::recovery_disabled_confirmed(root.path()));
+            assert!(!journal.exists());
+            std::fs::write(&path, "[memory]\ntrim_interval_secs=3\n").unwrap();
+            let second = reload_config(&state).unwrap();
+            assert!(!second["warnings"].as_array().unwrap().is_empty());
+            assert_eq!(state.lock().unwrap().config.memory.trim_interval_secs, 3);
+            assert!(!state.lock().unwrap().config.claude_limit_recovery);
+        });
+    }
+
+    #[test]
+    fn reload_reports_when_recovery_disable_marker_cannot_be_confirmed() {
+        with_temp_home(|| {
+            let state = make_state_arc();
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("daemon-claude-account-recovery.json"), b"{broken").unwrap();
+            std::fs::write(root.path().join("notifications"), b"not a directory").unwrap();
+            {
+                let mut st = state.lock().unwrap();
+                st.daemon_sessions_path = Some(root.path().join("daemon-sessions.json"));
+                st.messaging_root = root.path().into();
+            }
+            let path = crate::config::default_config_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "[memory]\ntrim_interval_secs=4\n").unwrap();
+            let result = reload_config(&state).unwrap();
+            assert!(result["warnings"][0].as_str().unwrap().contains("disabled marker could not be confirmed"));
+            assert_eq!(state.lock().unwrap().config.memory.trim_interval_secs, 4);
+            assert!(!state.lock().unwrap().config.claude_limit_recovery);
+        });
+    }
+
+    #[test]
+    fn memory_trim_reload_config_is_hot_and_zero_disables_periodic() {
+        with_temp_home(|| {
+            let state = make_state_arc();
+            let path = crate::config::default_config_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "[memory]\ntrim_interval_secs=0\ntrim_min_free_bytes=17\n").unwrap();
+            let result = reload_config(&state).unwrap();
+            assert_eq!(result["changed"], json!(["memory"]));
+            assert_eq!(result["requires_restart"], json!([]));
+            assert_eq!(state.lock().unwrap().config.memory.trim_interval_secs, 0);
+            assert_eq!(state.lock().unwrap().config.memory.trim_min_free_bytes, 17);
+            assert_eq!(reload_config(&state).unwrap()["changed"], json!([]));
+            std::fs::write(&path, "[memory]\ntrim_interval_secs=2\n").unwrap();
+            reload_config(&state).unwrap();
+            assert_eq!(state.lock().unwrap().config.memory.trim_interval_secs, 2);
+            assert_eq!(state.lock().unwrap().config.memory.trim_min_free_bytes, 1 << 30);
+        });
+    }
+
     #[test]
     fn reload_config_applies_hot_keys_and_reports_restart_only() {
         with_temp_home(|| {
@@ -21675,6 +27335,8 @@ while True:
             std::fs::write(
                 &cfg_path,
                 "mcp_server_path = \"/new/server.py\"\n\
+                 presence_idle_enabled = false\n\
+                 workflow_state_gate = true\n\
                  api_url = \"http://example:8000\"\n\
                  [auth]\nmode = \"token\"\n",
             )
@@ -21695,6 +27357,8 @@ while True:
                 .collect();
             assert!(changed.contains(&"mcp_server_path"), "{:?}", changed);
             assert!(changed.contains(&"api_url"), "{:?}", changed);
+            assert!(changed.contains(&"presence_idle_enabled"), "{:?}", changed);
+            assert!(changed.contains(&"workflow_state_gate"), "{:?}", changed);
             let restart: Vec<&str> = out["requires_restart"]
                 .as_array()
                 .unwrap()
@@ -21708,11 +27372,127 @@ while True:
             let st = state.lock().unwrap();
             assert_eq!(st.config.mcp_server_path, "/new/server.py");
             assert_eq!(st.config.api_url, "http://example:8000");
+            assert!(!st.config.presence_idle_enabled);
+            assert!(st.config.workflow_state_gate);
             assert_eq!(
                 st.config.auth.mode,
                 crate::config::AuthMode::SshTrust,
                 "auth mode must NOT hot-swap",
             );
+        });
+    }
+
+    #[test]
+    fn s4_config_reload_invalidates_pre_toggle_capability_and_delayed_snapshot() {
+        with_temp_home(|| {
+            crate::items::s4_attribution::reset_for_test();
+            let state = make_state_arc();
+            seed_mcp_spawn_fixture(&state, "ts-caller", None);
+            {
+                let mut st = state.lock().unwrap();
+                st.config.api_url = "http://127.0.0.1:9".into();
+                st.config.api_token = "tok".into();
+                let caller = st.sessions.get_mut("ts-caller").unwrap();
+                caller.s4_spawn_origin = Some((caller.pid, caller.holder_incarnation, caller.generation, caller.org.clone()));
+            }
+            crate::messaging::startup::open_for_test(&state).unwrap();
+            let req = crate::control::protocol::Request { id:"config".into(),
+                caller:crate::control::protocol::Caller::session("ts-caller"),
+                method:"item.set".into(), params:json!({"n":1, "status":"active"}) };
+            let old_epoch = crate::items::s4_attribution::config_epoch();
+            let snapshot = json!({"version": 7, "s4_min_wire":true,
+                "members":[{"id":"mem_a", "main":{"pid":"agent:d:ts-caller", "daemon_id":"d",
+                    "session_uid":"ts-caller", "occupancy_generation":1}}]});
+            crate::items::s4_attribution::absorb_snapshot("d", &snapshot, old_epoch);
+            let check = |want_wire: bool, want_claim: bool| {
+                let _scope = crate::items::s4_attribution::begin(&state, &req);
+                let (claims, wire) = crate::items::s4_attribution::current();
+                assert_eq!(wire, want_wire);
+                assert_eq!(claims.contains_key("ts-caller"), want_claim);
+                let ctx = crate::items::rpc::Ctx::capture(&state, &req).unwrap();
+                assert_eq!(ctx.actor().get("attribution").is_some(), want_wire);
+            };
+            check(false, false); // default-off, even with a populated cache
+            assert_eq!(daemon_health(&state).unwrap()["s4_min_write"], false);
+            let cm = std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cm");
+            std::fs::create_dir_all(&cm).unwrap();
+            let path = cm.join("daemon.toml");
+            let write_config = |enabled| {
+                std::fs::write(&path, format!("s4_min_write = {enabled}\napi_url = \"http://127.0.0.1:9\"\napi_token = \"tok\"\n")).unwrap();
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            };
+            write_config(true);
+            let reply = reload_config(&state).unwrap();
+            assert!(reply["changed"].as_array().unwrap().contains(&json!("s4_min_write")));
+            assert_eq!(daemon_health(&state).unwrap()["s4_min_write"], true);
+            check(false, false); // pre-enable capability invalidated
+            crate::items::s4_attribution::absorb_snapshot("d", &snapshot, old_epoch); // delayed old beat
+            check(false, false);
+            let enabled_epoch = crate::items::s4_attribution::config_epoch();
+            crate::items::s4_attribution::absorb_snapshot("d", &snapshot, enabled_epoch);
+            check(true, true);
+            // A modern writer that cannot resolve the subject must send an
+            // explicit unknown for the retained holder, not omit the field
+            // like an old writer (which preserves prior stored evidence).
+            let observed_holders = std::cell::RefCell::new(Vec::<Value>::new());
+            let assert_unknown_holder = || {
+                let ctx = crate::items::rpc::Ctx::capture(&state, &req).unwrap();
+                let pid = format!("agent:{}:ts-caller", ctx.daemon_id);
+                let holder = ctx.test_holder(&pid);
+                assert_eq!(holder["attribution"]["provenance"], "unknown");
+                observed_holders.borrow_mut().push(holder);
+            };
+            {
+                let state_lock = state.lock().unwrap();
+                let scope = crate::items::s4_attribution::begin(&state, &req);
+                drop(state_lock);
+                assert_unknown_holder();
+                drop(scope);
+            }
+            crate::items::s4_attribution::with_busy_cache(|| {
+                let _scope = crate::items::s4_attribution::begin(&state, &req);
+                assert_unknown_holder();
+            });
+            std::fs::write(&path, "s4_min_write = true\napi_url = \"http://127.0.0.1:10\"\napi_token = \"tok\"\n").unwrap();
+            reload_config(&state).unwrap();
+            check(false, false); // switching API cannot reuse its predecessor's capability
+            write_config(true);
+            reload_config(&state).unwrap();
+            crate::items::s4_attribution::absorb_snapshot("d", &snapshot, enabled_epoch);
+            check(false, false);
+            let second_epoch = crate::items::s4_attribution::config_epoch();
+            crate::items::s4_attribution::absorb_snapshot("d", &snapshot, second_epoch);
+            check(true, true);
+            write_config(false);
+            reload_config(&state).unwrap();
+            assert_eq!(daemon_health(&state).unwrap()["s4_min_write"], false);
+            check(false, false);
+            write_config(true);
+            reload_config(&state).unwrap();
+            crate::items::s4_attribution::absorb_snapshot("d", &snapshot, enabled_epoch);
+            check(false, false);
+            let current_epoch = crate::items::s4_attribution::config_epoch();
+            crate::items::s4_attribution::absorb_snapshot("d", &json!({"version":7,"members":[]}), current_epoch);
+            check(false, false); // old API: no new request shape
+            {
+                let state_lock = state.lock().unwrap();
+                let scope = crate::items::s4_attribution::begin(&state, &req);
+                drop(state_lock);
+                let ctx = crate::items::rpc::Ctx::capture(&state, &req).unwrap();
+                let pid = format!("agent:{}:ts-caller", ctx.daemon_id);
+                let holder = ctx.test_holder(&pid);
+                assert!(holder.get("attribution").is_none());
+                observed_holders.borrow_mut().push(holder);
+                drop(scope);
+            }
+            // The isolated cross-language proof feeds these exact generated
+            // wire objects to the private Postgres-backed API fixture.
+            if let Some(path) = std::env::var_os("CM_S4_HOLDER_PROOF") {
+                std::fs::write(path, serde_json::to_vec(&*observed_holders.borrow()).unwrap()).unwrap();
+            }
+            crate::items::s4_attribution::reset_for_test();
+            kill_all_sessions(&state);
         });
     }
 
@@ -21898,6 +27678,11 @@ while True:
     /// Minimal live plain-session `ManifestEntry` for restore tests.
     fn me(uid: &str, session_type: &str) -> crate::manifest::ManifestEntry {
         crate::manifest::ManifestEntry {
+            org: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             color: None,
             uid: uid.into(),
             managed_by_uid: None,
@@ -21926,6 +27711,515 @@ while True:
         }
     }
 
+    fn explicit(v: &str) -> Resolved {
+        Some((v.to_string(), crate::models::ModelSource::Explicit))
+    }
+
+    /// CM never relies on an engine's default model or effort. Every spawn
+    /// composer names both in the argv and in the `start_session` params
+    /// (where they are recorded for revive/resume), the argv builders refuse
+    /// an agent spawn without them, and the shared spawn core refuses an
+    /// agent spawn that names none. A spawn route that forgets either fails
+    /// here, and a NEW argv-building call site fails the census at the end
+    /// until it is added to this test. (`mcp_start_session` is pinned by
+    /// `mcp_start_session_records_and_returns_the_resolved_model`.)
+    #[test]
+    fn every_spawn_path_names_its_model() {
+        let _home = with_temp_home(|| {
+            let state = make_state_arc();
+            let wt = std::path::PathBuf::from(std::env::var("HOME").unwrap()).join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let argv_of = |v: &Value| -> Vec<String> {
+                v["argv"].as_array().unwrap().iter().map(|a| a.as_str().unwrap().to_string()).collect()
+            };
+            let check = |what: &str, engine: &str, v: &Value, model: &str, effort: &str| {
+                let argv = argv_of(v);
+                assert_eq!(crate::models::argv_model(engine, &argv), Some(model), "{what} ({engine}): argv {argv:?}");
+                assert_eq!(crate::models::argv_effort(engine, &argv).as_deref(), Some(effort), "{what} ({engine}): argv {argv:?}");
+                assert_eq!(v["model"], model, "{what} ({engine}): start_session params");
+                assert_eq!(v["effort"], effort, "{what} ({engine}): start_session params");
+                assert!(v["model_source"].is_string() && v["effort_source"].is_string(), "{what}: sources recorded: {v}");
+                start_session_model(engine, v["model"].as_str(), &argv).expect(what);
+                start_session_effort(engine, v["effort"].as_str(), &argv).expect(what);
+            };
+            for engine in ["claude-code", "codex"] {
+                let default = crate::models::default_model(engine).unwrap();
+                let default_effort = crate::models::default_effort(engine).unwrap();
+                let v = compose_daemon_spawn_params(
+                    &state, &fresh_test_uid(), "ws", "l", engine, &wt, None, 80, 24, Some(&wt), None,
+                    &explicit("explicit-1"), &explicit("low"),
+                )
+                .unwrap();
+                check("create/add/resume", engine, &v, "explicit-1", "low");
+
+                let mut e = me(&fresh_test_uid(), engine);
+                let v = compose_restore_params(&state, "ws", &wt, &e).unwrap();
+                check("restore/revive, nothing recorded", engine, &v, &default, &default_effort);
+                e.model = Some("recorded-1".into());
+                e.effort = Some("medium".into());
+                let v = compose_restore_params(&state, "ws", &wt, &e).unwrap();
+                check("restore/revive, recorded", engine, &v, "recorded-1", "medium");
+
+                let v = compose_continuous_spawn_params(
+                    &state, &fresh_test_uid(), "ws", "l", engine, &wt, None, "ct-unknown", None, 80, 24,
+                )
+                .unwrap();
+                check("continuous fire", engine, &v, &default, &default_effort);
+
+                let source = ForkSource {
+                    engine: engine.into(),
+                    transcript_id: "0b4f7c9e-1d2a-4c3b-8e5f-6a7b8c9d0e1f".into(),
+                    workspace_id: "ws".into(),
+                    worktree_path: wt.clone(),
+                    task_id: None,
+                    label: "src".into(),
+                    model: Some("source-m".into()),
+                    model_source: None,
+                    effort: None,
+                    effort_source: None,
+                    transcript_file: None,
+                };
+                let v = compose_fork_spawn_params(
+                    &fresh_test_uid(), "ws", "l", &source, &wt, "task-1", 80, 24, None, None, None,
+                    &explicit("fork-m"), &explicit("high"),
+                )
+                .unwrap();
+                check("fork", engine, &v, "fork-m", "high");
+
+                let meta = crate::mcp_config::WorkflowMeta { run_id: "run-1", role: "worker" };
+                let (_, tail) = resolve_workflow_spawn_program(
+                    engine, &fresh_test_uid(), Some(&meta), None, Some("role-m"), Some("high"),
+                )
+                .unwrap();
+                assert_eq!(crate::models::argv_model(engine, &tail), Some("role-m"), "workflow role");
+                assert_eq!(crate::models::argv_effort(engine, &tail).as_deref(), Some("high"), "workflow role");
+
+                for launch in [
+                    crate::mcp_config::Launch::Fresh,
+                    crate::mcp_config::Launch::Resume("0b4f7c9e-1d2a-4c3b-8e5f-6a7b8c9d0e1f"),
+                    crate::mcp_config::Launch::Fork("0b4f7c9e-1d2a-4c3b-8e5f-6a7b8c9d0e1f"),
+                ] {
+                    let uid = fresh_test_uid();
+                    let err = crate::mcp_config::build_launch_args(engine, &uid, None, None, launch, None, Some("high"))
+                        .expect_err("an agent argv without a model");
+                    assert!(err.to_string().contains("model"), "{err}");
+                    let err = crate::mcp_config::build_launch_args(engine, &uid, None, None, launch, Some("m"), None)
+                        .expect_err("an agent argv without an effort");
+                    assert!(err.to_string().contains("effort"), "{err}");
+                }
+
+                // The spawn core: no model / effort anywhere → refused; a mismatch → refused.
+                let base = json!({
+                    "uid": fresh_test_uid(), "workspace_id": "ws", "label": "l",
+                    "argv": ["/bin/true"], "working_dir": wt, "worktree_path": wt,
+                    "session_type": engine,
+                });
+                let err = start_session(&state, &base).unwrap_err();
+                assert!(matches!(err.0, ErrorCode::InvalidParams) && err.1.contains("must name its model"), "{err:?}");
+                let mut with_model = base.clone();
+                with_model["model"] = json!("m");
+                with_model["uid"] = json!(fresh_test_uid());
+                let err = start_session(&state, &with_model).unwrap_err();
+                assert!(matches!(err.0, ErrorCode::InvalidParams) && err.1.contains("must name its effort"), "{err:?}");
+                let flag = if engine == "codex" { "-m" } else { "--model" };
+                let argv = vec!["x".to_string(), flag.to_string(), "a".to_string()];
+                assert!(start_session_model(engine, Some("b"), &argv).is_err(), "declared vs argv mismatch");
+                assert_eq!(start_session_model(engine, None, &argv).unwrap().as_deref(), Some("a"));
+                assert!(start_session_model(engine, Some("bad model"), &[]).is_err());
+                let argv = crate::models::effort_args(engine, "low");
+                assert!(start_session_effort(engine, Some("high"), &argv).is_err(), "declared vs argv mismatch");
+                assert_eq!(start_session_effort(engine, None, &argv).unwrap().as_deref(), Some("low"));
+                assert!(start_session_effort(engine, Some("extreme"), &[]).is_err());
+            }
+            assert!(start_session_effort("codex", Some("max"), &[]).is_err(), "codex has no max");
+            assert_eq!(start_session_model("bash", None, &["/bin/bash".into()]).unwrap(), None);
+            assert!(start_session_model("bash", Some("m"), &["/bin/bash".into()]).is_err());
+            assert_eq!(start_session_effort("bash", None, &["/bin/bash".into()]).unwrap(), None);
+            assert!(start_session_effort("bash", Some("high"), &["/bin/bash".into()]).is_err());
+            let v = compose_daemon_spawn_params(
+                &state, &fresh_test_uid(), "ws", "l", "bash", &wt, None, 80, 24, Some(&wt), None, &None, &None,
+            )
+            .unwrap();
+            assert!(v.get("model").is_none() && v.get("effort").is_none(), "bash carries neither: {v}");
+        });
+
+        // Census: the production call sites that build an agent argv. Each
+        // is covered above (or, for mcp_start_session, by its own test). A
+        // new one fails here until it is checked and listed.
+        let mut sites = Vec::new();
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut dirs = vec![src.clone()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") || path.ends_with("mcp_config.rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                let production = text.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+                let mut current_fn = String::new();
+                for line in production.lines() {
+                    let t = line.trim_start();
+                    if let Some(rest) = t.split("fn ").nth(1).filter(|_| !t.starts_with("//") && t.contains("fn ")) {
+                        current_fn = rest.split(['(', '<']).next().unwrap_or("").to_string();
+                    }
+                    if !t.starts_with("//")
+                        && (t.contains("mcp_config::build_args(") || t.contains("mcp_config::build_launch_args("))
+                    {
+                        sites.push(current_fn.clone());
+                    }
+                }
+            }
+        }
+        sites.sort();
+        assert_eq!(
+            sites,
+            [
+                // Reached through `compose_daemon_spawn_params` (covered
+                // above); its `fork` flag (#24 rotation) only swaps the
+                // Launch, not the model/effort arguments.
+                "compose_daemon_spawn_params_launch",
+                "compose_fork_spawn_params",
+                // The body behind `mcp_start_session` (which adds the O5
+                // worktree-cap hint).
+                "mcp_start_session_inner",
+                "resolve_workflow_spawn_program",
+            ],
+            "a new agent-argv call site: cover it in this test, then list it here"
+        );
+    }
+
+    fn tombstone(uid: &str, engine: &str) -> crate::state::ExitedTombstone {
+        crate::state::ExitedTombstone {
+            startup_failure: None,
+            org: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
+            incarnation: None,
+            status_lost: false,
+            session_uid: uid.into(),
+            transcript_path: None,
+            generation: 0,
+            session_type: engine.into(),
+            workspace_id: "ws".into(),
+            task_id: None,
+            managed_by_uid: None,
+            continuous_task_id: None,
+            label: "l".into(),
+            workflow_run_id: None,
+            workflow_role: None,
+            worktree_path: None,
+            global_perms: false,
+            exited_at: 1.0,
+            killed: false,
+            killed_by: None,
+            reported_done_at: None,
+            report_reason: None,
+        }
+    }
+
+    /// Revive keeps what the session ran: the caller's value (viewer record
+    /// or explicit change) → the entry's record → the tombstone's; nothing
+    /// sent leaves the record alone.
+    #[test]
+    fn revive_merges_the_recorded_and_sent_model_and_effort() {
+        let pairs = |e: &crate::manifest::ManifestEntry| {
+            (e.model.clone(), e.model_source.clone(), e.effort.clone(), e.effort_source.clone())
+        };
+        let some = |v: &str| Some(v.to_string());
+        // Tombstone only: the entry has nothing, the tombstone has both.
+        let mut tomb = tombstone("ts-r", "codex");
+        tomb.model = some("gpt-6-luna");
+        tomb.model_source = some("task");
+        tomb.effort = some("high");
+        tomb.effort_source = some("transcript");
+        let mut e = me("ts-r", "codex");
+        merge_revive_settings(&mut e, Some(&tomb), [(None, None), (None, None)]);
+        assert_eq!(pairs(&e), (some("gpt-6-luna"), some("task"), some("high"), some("transcript")));
+        // Without p.model / p.effort: the entry's own record stands.
+        let mut e2 = e.clone();
+        let mut other = tomb.clone();
+        other.model = some("gpt-6-astra");
+        merge_revive_settings(&mut e2, Some(&other), [(None, None), (None, None)]);
+        assert_eq!(pairs(&e2), pairs(&e));
+        // The same value sent back keeps its source unless one is sent.
+        let mut e3 = e.clone();
+        merge_revive_settings(&mut e3, None, [(Some("gpt-6-luna"), None), (Some("high"), Some("explicit"))]);
+        assert_eq!(pairs(&e3), (some("gpt-6-luna"), some("task"), some("high"), some("explicit")));
+        // A different value: the sent source, else explicit; effort normalized.
+        let mut e4 = e.clone();
+        merge_revive_settings(&mut e4, None, [(Some(" gpt-6-astra "), Some("recorded")), (Some("LOW"), None)]);
+        assert_eq!(pairs(&e4), (some("gpt-6-astra"), some("recorded"), some("low"), some("explicit")));
+        // Nothing anywhere stays unset for compose_restore_params to resolve.
+        let mut e5 = me("ts-r", "codex");
+        merge_revive_settings(&mut e5, Some(&tombstone("ts-r", "codex")), [(None, None), (None, None)]);
+        assert_eq!(pairs(&e5), (None, None, None, None));
+    }
+
+    /// A session from before CM recorded models/efforts resumes on what its
+    /// transcript says it ran (`transcript`), never silently on a default;
+    /// with no transcript value it takes the default, marked
+    /// `default_on_resume`. Restore and revive share this composer.
+    #[test]
+    fn restore_of_an_unrecorded_session_keeps_its_transcript_model_and_effort() {
+        let _home = with_temp_home(|| {
+            let state = make_state_arc();
+            let wt = std::path::PathBuf::from(std::env::var("HOME").unwrap()).join("wt-unrec");
+            std::fs::create_dir_all(&wt).unwrap();
+            let id = "0b4f7c9e-1d2a-4c3b-8e5f-6a7b8c9d0e1f";
+            let path = crate::transcript_detect::claude_transcript_path(&wt, id).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                "{\"type\":\"assistant\",\"effort\":\"medium\",\"message\":{\"model\":\"claude-sonnet-5-5\"}}\n",
+            )
+            .unwrap();
+            let mut e = me(&fresh_test_uid(), "claude-code");
+            e.transcript_id = Some(id.into());
+            let v = compose_restore_params(&state, "ws", &wt, &e).unwrap();
+            assert_eq!((v["model"].as_str(), v["model_source"].as_str()), (Some("claude-sonnet-5-5"), Some("transcript")));
+            assert_eq!((v["effort"].as_str(), v["effort_source"].as_str()), (Some("medium"), Some("transcript")));
+
+            std::fs::write(&path, "{\"type\":\"user\"}\n").unwrap();
+            let v = compose_restore_params(&state, "ws", &wt, &e).unwrap();
+            assert_eq!(v["model"], crate::models::DEFAULT_CLAUDE_MODEL);
+            assert_eq!(v["model_source"], "default_on_resume");
+            assert_eq!((v["effort"].as_str(), v["effort_source"].as_str()), (Some("xhigh"), Some("default_on_resume")));
+
+            // A recorded value wins over the transcript and keeps its source.
+            e.model = Some("claude-opus-5-5".into());
+            e.model_source = Some("explicit".into());
+            let v = compose_restore_params(&state, "ws", &wt, &e).unwrap();
+            assert_eq!((v["model"].as_str(), v["model_source"].as_str()), (Some("claude-opus-5-5"), Some("explicit")));
+        });
+    }
+
+    /// Adoption (holder adopt-at-boot, monolith re-exec) records the model
+    /// and effort of carried sessions: the registry entry's first, else the
+    /// transcript's. One with neither stays unrecorded.
+    #[test]
+    fn backfill_records_adopted_settings_from_the_registry_then_the_transcript() {
+        use crate::session::{DaemonSession, SpawnParams};
+        let _home = with_temp_home(|| {
+            let state = make_state_arc();
+            let dir = tempfile::tempdir().unwrap();
+            let transcript = dir.path().join("rollout-2026-10-22T00-00-00-0b4f7c9e-1d2a-4c3b-8e5f-6a7b8c9d0e1f.jsonl");
+            std::fs::write(
+                &transcript,
+                "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-6-astra\",\"effort\":\"high\"}}\n",
+            )
+            .unwrap();
+            {
+                let mut s = state.lock().unwrap();
+                for (uid, path) in [("ts-bf00000000000001-0", Some(&transcript)), ("ts-bf00000000000002-0", None)] {
+                    let mut sp = SpawnParams::new(uid, "bf", "/bin/sleep");
+                    sp.args = vec!["120".to_string()];
+                    sp.session_type = "codex".into();
+                    sp.transcript_path = path.map(|p| p.to_string_lossy().into_owned());
+                    s.sessions.insert(uid.into(), DaemonSession::spawn(sp).expect("spawn"));
+                }
+                s.recently_exited.push_back(tombstone("ts-bf00000000000003-0", "claude-code"));
+            }
+            let mut manifest = crate::manifest::Manifest::default();
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            let mut entry = me("ts-bf00000000000003-0", "claude-code");
+            entry.model = Some("claude-opus-5-5".into());
+            entry.model_source = Some("explicit".into());
+            entry.effort = Some("max".into());
+            entry.effort_source = Some("task".into());
+            ws.sessions = vec![entry];
+            manifest.workspaces.insert("ws".into(), ws);
+
+            assert_eq!(backfill_session_models(&state, Some(&manifest)), 4);
+            let mut s = state.lock().unwrap();
+            let live = s.sessions.get("ts-bf00000000000001-0").unwrap();
+            assert_eq!((live.model.as_deref(), live.model_source.as_deref()), (Some("gpt-6-astra"), Some("transcript")));
+            assert_eq!((live.effort.as_deref(), live.effort_source.as_deref()), (Some("high"), Some("transcript")));
+            let bare = s.sessions.get("ts-bf00000000000002-0").unwrap();
+            assert_eq!((bare.model.as_deref(), bare.effort.as_deref()), (None, None), "no record: left unrecorded");
+            let t = s.recently_exited.iter().find(|t| t.session_uid == "ts-bf00000000000003-0").unwrap();
+            assert_eq!((t.model.as_deref(), t.model_source.as_deref()), (Some("claude-opus-5-5"), Some("explicit")));
+            assert_eq!((t.effort.as_deref(), t.effort_source.as_deref()), (Some("max"), Some("task")));
+            s.sessions.clear();
+        });
+    }
+
+    /// Timing for the adopt-at-boot backfill against real transcripts:
+    /// `CM_BACKFILL_BENCH` names a file of `<engine> <transcript path>`
+    /// lines, one adopted session each. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn backfill_timing_on_real_transcripts() {
+        use crate::session::{DaemonSession, SpawnParams};
+        let Some(list) = std::env::var_os("CM_BACKFILL_BENCH") else { return };
+        let lines: Vec<(String, String)> = std::fs::read_to_string(list)
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.split_once(' ').map(|(e, p)| (e.to_string(), p.to_string())))
+            .collect();
+        let _home = with_temp_home(|| {
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                for (i, (engine, path)) in lines.iter().enumerate() {
+                    let uid = format!("ts-be{i:014}-0");
+                    let mut sp = SpawnParams::new(&uid, "be", "/bin/sleep");
+                    sp.args = vec!["300".to_string()];
+                    sp.session_type = engine.clone();
+                    sp.transcript_path = Some(path.clone());
+                    s.sessions.insert(uid, DaemonSession::spawn(sp).expect("spawn"));
+                }
+            }
+            let started = std::time::Instant::now();
+            let n = backfill_session_models(&state, None);
+            eprintln!("BENCH backfill: {} sessions, {n} values recorded in {:?}", lines.len(), started.elapsed());
+            state.lock().unwrap().sessions.clear();
+        });
+    }
+
+    /// Restore never stalls on an unreachable planning API: the task
+    /// lookups run concurrently under one total budget, and the ones that
+    /// didn't answer fall back to the config defaults.
+    #[test]
+    fn restore_task_lookups_are_bounded_when_the_api_hangs() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Accept and never answer.
+        let held = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&held);
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                sink.lock().unwrap().push(conn);
+            }
+        });
+        let state = make_state_arc();
+        {
+            let mut s = state.lock().unwrap();
+            s.config.api_url = format!("http://127.0.0.1:{port}");
+            s.config.api_token = "tok".into();
+        }
+        let keys: Vec<(String, &'static str)> =
+            (0..6).map(|i| (format!("task-{i}"), if i % 2 == 0 { "claude" } else { "codex" })).collect();
+        let started = std::time::Instant::now();
+        let cache = prefetch_task_models(&state, keys, std::time::Duration::from_millis(300));
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(2), "bounded by the budget, not 6 × the 3 s timeout: {took:?}");
+        assert_eq!(cache.len(), 6);
+        assert!(
+            cache.values().all(|d| d.timed_out && d.model.is_none() && d.effort.is_none()),
+            "unanswered → config defaults, marked timed out"
+        );
+        // A default reached that way is recorded as lookup_timeout.
+        let d = cache.values().next().unwrap();
+        let (_, src) = resolve_default(crate::models::Setting::Effort, "s", "codex", d).unwrap().unwrap();
+        assert_eq!(src, crate::models::ModelSource::LookupTimeout);
+    }
+
+    /// The default step says why a config default applied: a task value
+    /// the engine can't take (codex `max`) is `task_invalid_fallback`; a
+    /// timed-out lookup is `lookup_timeout`, which a later respawn resolves
+    /// again instead of reusing.
+    #[test]
+    fn task_default_fallbacks_are_recorded_and_provisional_ones_re_resolve() {
+        use crate::models::{ModelSource as S, Setting};
+        let codex_max = TaskDefaults { effort: Some("max".into()), ..TaskDefaults::default() };
+        let pick = |task: TaskDefaults, recorded: Option<(&str, Option<&str>)>| {
+            resolve_respawn(Setting::Effort, "u", "codex", None, recorded, None, &mut || task.clone()).unwrap().unwrap()
+        };
+        assert_eq!(pick(codex_max.clone(), None), (crate::models::DEFAULT_EFFORT.into(), S::TaskInvalidFallback));
+        // On a resume with nothing in the transcript the specific reason wins over default_on_resume.
+        let resumed =
+            resolve_respawn(Setting::Effort, "u", "codex", None, None, Some(None), &mut || codex_max.clone()).unwrap().unwrap();
+        assert_eq!(resumed.1, S::TaskInvalidFallback);
+        let ok = TaskDefaults { effort: Some("low".into()), ..TaskDefaults::default() };
+        // A recorded lookup_timeout stand-in is looked up again…
+        assert_eq!(pick(ok.clone(), Some(("xhigh", Some("lookup_timeout")))), ("low".into(), S::Task));
+        // …while any other recorded value stands.
+        assert_eq!(pick(ok.clone(), Some(("high", Some("engine_default")))), ("high".into(), S::Engine));
+        assert_eq!(pick(ok, Some(("high", None))), ("high".into(), S::Recorded));
+        let timed_out = TaskDefaults { timed_out: true, ..TaskDefaults::default() };
+        assert_eq!(pick(timed_out.clone(), None).1, S::LookupTimeout);
+        let resumed = resolve_respawn(Setting::Model, "u", "codex", None, None, Some(None), &mut || timed_out.clone());
+        assert_eq!(resumed.unwrap().unwrap().1, S::LookupTimeout);
+    }
+
+    /// `start_workflow` resolves each fresh role's model and effort: the
+    /// launch's `role_models` / `role_efforts` → the role's TOML values →
+    /// the config defaults, recorded on each participant with its source.
+    #[test]
+    fn start_workflow_resolves_role_models_and_efforts() {
+        use crate::workflow::toml_schema::{Context, Engine, Role, Transition, TriggerOn, Workflow};
+        use std::collections::BTreeMap;
+        let _tmp = with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("wt-models");
+            std::fs::create_dir_all(&wt).unwrap();
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = crate::manifest::ManifestWorkspace::default();
+                ws.id = "ws-1".to_string();
+                ws.worktree_path = Some(wt.clone());
+                s.workspaces.insert("ws-1".to_string(), ws);
+                let role = |engine, model: Option<&str>, effort: Option<&str>| Role {
+                    engine,
+                    context: Context::Persistent,
+                    activation_prompt: None,
+                    subsequent_activation_prompt: None,
+                    needs_mcp: false,
+                    model: model.map(str::to_string),
+                    effort: effort.map(str::to_string),
+                };
+                let mut roles = BTreeMap::new();
+                roles.insert("worker".to_string(), role(Engine::Codex, Some("gpt-6-astra"), Some("high")));
+                roles.insert("reviewer".to_string(), role(Engine::ClaudeCode, Some("claude-sonnet-5-5"), None));
+                roles.insert("manager".to_string(), role(Engine::ClaudeCode, None, None));
+                s.base_workflow_definitions.insert("models".to_string(), Workflow {
+                    name: "models".to_string(), description: String::new(), roles,
+                    role_order: vec!["worker".into(), "reviewer".into(), "manager".into()],
+                    transitions: vec![
+                        Transition { from: "worker".into(), on: TriggerOn::Idle, to: "reviewer".into() },
+                    ],
+                });
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            set_disable_workflow_detector_for_test(true);
+            start_workflow(&state, &Caller::operator("op"), &json!({
+                "workflow_name": "models",
+                "goal": "g",
+                "worktree": wt.to_str().unwrap(),
+                "workspace_id": "ws-1",
+                "role_models": { "reviewer": "claude-opus-5-5" },
+                "role_efforts": { "reviewer": "max", "manager": "low" },
+            })).expect("start_workflow ok");
+            set_spawn_program_override_for_test(None);
+            set_disable_workflow_detector_for_test(false);
+            let mut s = state.lock().unwrap();
+            let by_role: BTreeMap<String, (Option<String>, Option<String>, Option<String>, Option<String>)> = s
+                .sessions
+                .values()
+                .filter_map(|x| {
+                    Some((x.workflow_role.clone()?, (x.model.clone(), x.model_source.clone(), x.effort.clone(), x.effort_source.clone())))
+                })
+                .collect();
+            let some = |v: &str| Some(v.to_string());
+            assert_eq!(by_role["worker"], (some("gpt-6-astra"), some("explicit"), some("high"), some("explicit")), "TOML role values");
+            assert_eq!(by_role["reviewer"], (some("claude-opus-5-5"), some("explicit"), some("max"), some("explicit")), "launch overrides win");
+            assert_eq!(
+                by_role["manager"],
+                (some(crate::models::DEFAULT_CLAUDE_MODEL), some("engine_default"), some("low"), some("explicit")),
+                "config defaults fill the rest",
+            );
+            s.sessions.clear();
+        });
+    }
+
     /// The IO-free restore-scope predicate: live non-workflow sessions pass
     /// (continuous included — its gating moved to `continuous_restorable`);
     /// workflow (poller-owned) + exited (don't-resurrect) are out of scope.
@@ -21942,6 +28236,7 @@ while True:
         assert!(!restore_in_scope(&w), "workflow participant skipped");
         let mut x = me("ts-4444444444444444-0", "bash");
         x.last_exit = Some(crate::manifest::LastExit {
+            killed_by: None,
             code: Some(0),
             memory_cap_kill: false,
             kills_file_offset: None,
@@ -22006,6 +28301,7 @@ while True:
         wf.workflow_run_id = Some("wf-1".into());
         let mut exited = me("ts-dddddddddddddddd-0", "bash");
         exited.last_exit = Some(crate::manifest::LastExit {
+            killed_by: None,
             code: Some(0),
             memory_cap_kill: false,
             kills_file_offset: None,
@@ -22167,8 +28463,8 @@ while True:
         // …and the descendant predicate — the one whose failure IS the
         // phantom-task `unauthorized` — answers correctly again.
         assert!(
-            crate::control::auth::task_is_self_or_descendant_of(
-                &st.task_tree,
+            crate::control::auth::task_in_scope(
+                &st,
                 "task-minted",
                 "task-parent",
             ),
@@ -22358,6 +28654,109 @@ while True:
     /// uuid, so restore must normalize legacy rows at compose time. Rows
     /// persisted post-4f already carry the uuid (via
     /// `transcript_id_from_path`) and pass through untouched.
+    /// #24: a Claude restore of a superseded transcript resumes the newest
+    /// session of its two-hop `continued-in` chain, and the session's
+    /// transcript_path (its resume key) is that file.
+    #[test]
+    fn restore_follows_a_two_hop_continued_in_chain() {
+        with_temp_home(|| {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let wt = home.join("rwt-chain");
+            std::fs::create_dir_all(&wt).unwrap();
+            let dir = crate::transcript_detect::claude_transcript_dir_for(&wt).unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            use crate::transcript_chain::tests::{moved, user, write};
+            let (a, b, c) = (
+                "aaaaaaaa-0000-4000-8000-000000000001",
+                "bbbbbbbb-0000-4000-8000-000000000002",
+                "cccccccc-0000-4000-8000-000000000003",
+            );
+            write(&dir, a, &[user("one"), moved(a, b)]);
+            write(&dir, b, &[user("two"), moved(b, c)]);
+            write(&dir, c, &[user("three")]);
+            let state = make_state_arc();
+            let mut e = me("ts-cccccccccccccccc-7", "claude-code");
+            e.transcript_id = Some(a.to_string());
+            let params = compose_restore_params(&state, "ws-chain", &wt, &e).expect("compose");
+            let argv: Vec<String> =
+                params["argv"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+            assert!(argv.windows(2).any(|w| w[0] == "--resume" && w[1] == c), "{argv:?}");
+            assert!(!argv.iter().any(|x| x == a || x == b));
+            assert_eq!(params["transcript_path"], json!(dir.join(format!("{c}.jsonl")).to_string_lossy()));
+
+            // A fork launch (the rotation) resumes the same source but
+            // pins a NEW transcript for the session.
+            e.transcript_id = Some(c.to_string());
+            let forked = compose_restore_params_launch(&state, "ws-chain", &wt, &e, None, true).expect("fork");
+            let argv: Vec<String> =
+                forked["argv"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+            let at = argv.iter().position(|x| x == "--fork-session").expect("--fork-session");
+            assert_eq!(argv[at - 2..at], ["--resume".to_string(), c.to_string()]);
+            assert_eq!(argv[at + 1], "--session-id");
+            let pin = &argv[at + 2];
+            assert_ne!(pin, c);
+            assert_eq!(forked["transcript_path"], json!(dir.join(format!("{pin}.jsonl")).to_string_lossy()));
+        });
+    }
+
+    /// #24: the rotation's safe boundary refuses the cases it must.
+    #[test]
+    fn rotation_boundary_refusals() {
+        let state = make_state_arc();
+        let idle = std::time::Duration::from_secs(300);
+        let quiet = std::time::Duration::from_secs(600);
+        let spawn = |uid: &str, ty: &str| {
+            let mut sp = crate::session::SpawnParams::new(uid, "r", "/bin/sleep");
+            sp.args = vec!["60".into()];
+            sp.session_type = ty.into();
+            crate::session::DaemonSession::spawn(sp).expect("spawn")
+        };
+        let mut s = state.lock().unwrap();
+        assert!(crate::rotation::boundary(&s, "ts-none-0", idle, quiet).unwrap_err().contains("not live"));
+        s.sessions.insert("ts-bash-0".into(), spawn("ts-bash-0", "bash"));
+        assert!(crate::rotation::boundary(&s, "ts-bash-0", idle, quiet).unwrap_err().contains("bash sessions cannot"));
+        let mut c = spawn("ts-cl-0", "claude-code");
+        s.sessions.insert("ts-cl-0".into(), spawn("ts-cl-1", "claude-code"));
+        assert!(crate::rotation::boundary(&s, "ts-cl-0", idle, quiet).unwrap_err().contains("no bound transcript"));
+        c.transcript_path = Some("/tmp/x.jsonl".into());
+        c.workflow_run_id = Some("wf".into());
+        s.sessions.insert("ts-cl-0".into(), c);
+        assert!(crate::rotation::boundary(&s, "ts-cl-0", idle, quiet).unwrap_err().contains("workflow"));
+        s.sessions.get_mut("ts-cl-0").unwrap().workflow_run_id = None;
+        // A freshly spawned process is not idle (or not idle long enough).
+        let why = crate::rotation::boundary(&s, "ts-cl-0", idle, quiet).unwrap_err();
+        assert!(why.contains("idle"), "{why}");
+        // Idle for 1000 s with nothing in flight: at a boundary.
+        let ago = |secs: u64| std::time::Instant::now().checked_sub(std::time::Duration::from_secs(secs));
+        {
+            let c = s.sessions.get("ts-cl-0").unwrap();
+            *c.last_input_at.lock().unwrap() = ago(1100);
+            *c.last_activity_at.lock().unwrap() = ago(1000);
+            *c.last_turn_end_at.lock().unwrap() = ago(1000);
+        }
+        assert_eq!(crate::rotation::boundary(&s, "ts-cl-0", idle, quiet), Ok(()));
+        // A pending scheduled wakeup does not block a rotation (#114): the
+        // rotation carries it over (saved and named in the after-notice).
+        s.sessions.get("ts-cl-0").unwrap().agent_state.lock().unwrap().inputs.background.crons.push(
+            crate::agent_state::Cron { id: "c1".into(), schedule: "44 23 * * *".into(), recurring: false });
+        assert_eq!(crate::rotation::boundary(&s, "ts-cl-0", idle, quiet), Ok(()), "crons are carried, not blocking");
+        // A handoff does not carry them yet: there they still block.
+        let handoff = crate::rotation::Checks { idle, owner_quiet: quiet, draft: true, at_turn_end: false, crons_block: true };
+        let why = crate::rotation::boundary_checked(&s, "ts-cl-0", &["claude-code"], handoff).unwrap_err();
+        assert!(why.contains("scheduled wakeup"), "{why}");
+        s.sessions.get("ts-cl-0").unwrap().agent_state.lock().unwrap().inputs.background.crons.clear();
+        // Owner typing recently, or typing since the last turn (a draft).
+        *s.sessions.get("ts-cl-0").unwrap().last_operator_input_at.lock().unwrap() = ago(100);
+        assert!(crate::rotation::boundary(&s, "ts-cl-0", idle, quiet).unwrap_err().contains("Owner typed in it"));
+        *s.sessions.get("ts-cl-0").unwrap().last_operator_input_at.lock().unwrap() = ago(700);
+        assert!(crate::rotation::boundary(&s, "ts-cl-0", idle, quiet).unwrap_err().contains("draft"));
+        let zero = std::time::Duration::ZERO;
+        assert_eq!(crate::rotation::boundary(&s, "ts-cl-0", zero, zero), Ok(()), "a forced rotation decided");
+        *s.sessions.get("ts-cl-0").unwrap().last_operator_input_at.lock().unwrap() = ago(1050);
+        assert_eq!(crate::rotation::boundary(&s, "ts-cl-0", idle, quiet), Ok(()), "typed before the turn");
+        s.sessions.clear();
+    }
+
     #[test]
     fn compose_restore_params_normalizes_legacy_codex_rollout_stem() {
         with_temp_home(|| {
@@ -22467,6 +28866,7 @@ while True:
             e.seeded_from_snapshot = Some("seed".into());
             e.managed_by_uid = Some("ts-parent-0".into());
             e.last_exit = Some(crate::manifest::LastExit {
+                killed_by: None,
                 code: None,
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -22478,6 +28878,12 @@ while True:
             ws.sessions = vec![e];
             s.workspaces.insert("ws-rv".into(), ws);
             s.record_exited(crate::state::ExitedTombstone {
+                startup_failure: None,
+                org: None,
+                model: None,
+                model_source: None,
+                effort: None,
+                effort_source: None,
                 incarnation: None,
                 status_lost: false,
                 session_uid: uid.into(),
@@ -22530,6 +28936,101 @@ while True:
         assert_eq!(restored.generation, 42);
         assert_eq!(restored.seeded_from_snapshot.as_deref(), Some("seed"));
         assert_eq!(restored.managed_by_uid.as_deref(), Some("ts-parent-0"));
+        s.sessions.clear();
+    }
+
+    /// Review #1: a respawn at an existing uid whose caller sends no `org`
+    /// (TUI startup restore / local A-R through `rpc_start_session_full`,
+    /// older TUIs) keeps the uid's recorded org object.
+    #[test]
+    fn start_session_at_a_reused_uid_keeps_its_recorded_org() {
+        let org = crate::manifest::tests::bridge_org();
+        let state = make_state_arc();
+        let wt = std::env::temp_dir();
+        {
+            let mut s = state.lock().unwrap();
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "ws-reuse".into();
+            ws.worktree_path = Some(wt.clone());
+            let mut e = me("ts-e05e-0", "bash");
+            e.org = Some(org.clone());
+            ws.sessions = vec![e];
+            s.workspaces.insert("ws-reuse".into(), ws);
+            assert_eq!(persisted_org(&s, "ts-e05e-0"), Some(org.clone()));
+            assert_eq!(persisted_org(&s, "ts-never-0"), None);
+        }
+        start_session(
+            &state,
+            &json!({
+                "uid": "ts-e05e-0", "workspace_id": "ws-reuse", "label": "r",
+                "argv": ["/bin/sleep", "60"], "working_dir": wt.to_string_lossy(),
+                "session_type": "bash", "cols": 80, "rows": 24, "env": {},
+            }),
+        )
+        .expect("spawn");
+        let mut s = state.lock().unwrap();
+        assert_eq!(s.sessions["ts-e05e-0"].org.as_ref(), Some(&org));
+        s.sessions.clear();
+    }
+
+    /// S0b (doc/org-model.md §12): a revive rebuilt from the exit
+    /// tombstone alone keeps the org object, and the composed restore
+    /// params carry it, so the live session and its next persisted entry
+    /// have it — with the transcript generation kept apart.
+    #[test]
+    fn revive_from_a_tombstone_keeps_the_org_object() {
+        let uid = "ts-aaaa000000000002-0";
+        let wt = std::env::temp_dir();
+        let org = crate::manifest::tests::bridge_org();
+        let state = make_state_arc();
+        {
+            let mut s = state.lock().unwrap();
+            let mut ws = crate::manifest::ManifestWorkspace::default();
+            ws.id = "ws-org".into();
+            ws.worktree_path = Some(wt.clone());
+            s.workspaces.insert("ws-org".into(), ws);
+            s.record_exited(crate::state::ExitedTombstone {
+                startup_failure: None,
+                org: Some(org.clone()),
+                model: None,
+                model_source: None,
+                effort: None,
+                effort_source: None,
+                incarnation: None,
+                status_lost: false,
+                session_uid: uid.into(),
+                transcript_path: None,
+                generation: 7,
+                session_type: "bash".into(),
+                workspace_id: "ws-org".into(),
+                task_id: None,
+                managed_by_uid: None,
+                continuous_task_id: None,
+                label: "org".into(),
+                workflow_run_id: None,
+                workflow_role: None,
+                worktree_path: Some(wt.to_string_lossy().into_owned()),
+                global_perms: false,
+                exited_at: 1.0,
+                killed: false,
+                killed_by: None,
+                reported_done_at: None,
+                report_reason: None,
+            });
+        }
+        let mut e = me("ts-x-0", "bash");
+        e.org = Some(org.clone());
+        let params = compose_restore_params(&state, "ws-org", &wt, &e).expect("compose");
+        assert_eq!(params["org"], Value::Object(org.clone()));
+
+        revive_session(&state, &json!({ "uid": uid })).expect("revive ok");
+        let mut s = state.lock().unwrap();
+        assert_eq!(s.sessions[uid].org.as_ref(), Some(&org));
+        let persisted = s.build_daemon_manifest();
+        let entry = &persisted.workspaces["ws-org"].sessions[0];
+        assert_eq!(entry.org.as_ref(), Some(&org));
+        assert_eq!(entry.generation, 7);
+        assert_eq!(entry.org.as_ref().unwrap()["occupancy_generation"], 11);
         s.sessions.clear();
     }
 
@@ -22599,6 +29100,7 @@ while True:
             let mut e = me(uid, "bash");
             e.workflow_run_id = Some("wf-1".into());
             e.last_exit = Some(crate::manifest::LastExit {
+                killed_by: None,
                 code: Some(0),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -22627,6 +29129,7 @@ while True:
             let mut e = me(uid, "bash");
             e.continuous_task_id = Some("ct-1".into());
             e.last_exit = Some(crate::manifest::LastExit {
+                killed_by: None,
                 code: Some(0),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -22652,6 +29155,12 @@ while True:
         let wt = std::env::temp_dir();
         let state = make_state_arc();
         state.lock().unwrap().record_exited(crate::state::ExitedTombstone {
+            startup_failure: None,
+            org: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             incarnation: None,
             status_lost: false,
             session_uid: uid.into(),
@@ -24285,6 +30794,58 @@ while True:
         });
     }
 
+    #[test]
+    fn set_workflow_context_persists_consumed_owner_placement_intent() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let path = std::env::temp_dir().join(format!(
+                "cm-owner-placement-workflow-{}.json",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            {
+                let mut s = state.lock().unwrap();
+                s.daemon_sessions_path = Some(path.clone());
+                let mut p = crate::session::SpawnParams::new(
+                    "ts-workflow-placement",
+                    "workflow",
+                    "/bin/sleep",
+                );
+                p.args = vec!["3".to_string()];
+                p.workspace_id = "ws-workflow-placement".to_string();
+                let session = crate::session::DaemonSession::spawn(p).expect("spawn");
+                s.sessions.insert("ts-workflow-placement".to_string(), session);
+                assert!(crate::assistants::mark_owner_placement(
+                    &mut s,
+                    "ts-workflow-placement"
+                ));
+            }
+            set_workflow_context(
+                &state,
+                &json!({
+                    "uid": "ts-workflow-placement",
+                    "workflow_run_id": "wf-placement",
+                    "workflow_role": "worker",
+                }),
+            )
+            .expect("set_workflow_context ok");
+            assert!(!crate::assistants::wants_owner_placement(
+                state
+                    .lock()
+                    .unwrap()
+                    .sessions
+                    .get("ts-workflow-placement")
+                    .and_then(|s| s.org.as_ref())
+            ));
+            let persisted = std::fs::read_to_string(&path).expect("persisted sessions");
+            assert!(
+                !persisted.contains("auto_place_owner"),
+                "workflow tagging must persist the consumed placement marker"
+            );
+            let _ = std::fs::remove_file(path);
+        });
+    }
+
     /// F1 round-5: `set_workflow_context` on an unknown uid
     /// returns success with `daemon_owned: false` — TUI calls
     /// this helper for every workflow participant; a TUI-local
@@ -24406,6 +30967,8 @@ while True:
                     "worktree_path": wt.to_str().unwrap(),
                     "label": "esmisc",
                     "argv": ["/bin/sleep", "120"],
+                    "model": "test-model",
+                    "effort": "xhigh",
                 }),
             )
             .expect("start_session ok");
@@ -24448,6 +31011,45 @@ while True:
                 rx.recv_timeout(std::time::Duration::from_millis(100)).is_err(),
                 "a same-path re-push must not broadcast",
             );
+        });
+    }
+
+    /// #114: while a rotation moves a session off its transcript, neither a
+    /// detector push nor the turn-end hook can bind it back to that source.
+    #[test]
+    fn a_rotating_fork_is_not_restamped_to_its_source() {
+        let _tmp = with_temp_home(|| {
+            let _serial = crate::rotation::test_registry_lock();
+            let state = make_state_arc();
+            let wt = std::env::temp_dir();
+            let uid = "ts-1a2b3c4d5e6f0114-0";
+            start_session(
+                &state,
+                &json!({
+                    "uid": uid, "session_type": "claude-code", "workspace_id": "ws-rot",
+                    "working_dir": wt.to_str().unwrap(), "worktree_path": wt.to_str().unwrap(),
+                    "label": "ep", "argv": ["/bin/sleep", "120"], "model": "test-model", "effort": "xhigh",
+                }),
+            )
+            .expect("start_session ok");
+            let dir = crate::transcript_detect::claude_transcript_dir_for(&wt).expect("claude dir");
+            let old = dir.join("650fb958-1e42-4428-b4aa-33e4f7061ba5.jsonl").to_string_lossy().into_owned();
+            let fork = dir.join("9f6089a3-30f8-40ab-8194-05333e583b84.jsonl").to_string_lossy().into_owned();
+            set_transcript_path(&state, &json!({ "session_uid": uid, "transcript_path": fork })).unwrap();
+            crate::rotation::test_set_rotating(uid, "650fb958-1e42-4428-b4aa-33e4f7061ba5", "verifying");
+            let r = set_transcript_path(&state, &json!({ "session_uid": uid, "transcript_path": old })).unwrap();
+            assert!(r["ignored"].is_string(), "{r}");
+            rebind_reported_transcript(&mut state.lock().unwrap(), uid, Some(&old));
+            let path = |st: &Arc<Mutex<DaemonState>>| st.lock().unwrap().sessions[uid].transcript_path.clone();
+            assert_eq!(path(&state).as_deref(), Some(fork.as_str()), "still on the fork");
+            // Once the rotation is over, an in-pane /resume of the old one binds.
+            crate::rotation::test_finish(uid);
+            rebind_reported_transcript(&mut state.lock().unwrap(), uid, Some(&old));
+            assert_eq!(path(&state).as_deref(), Some(old.as_str()));
+            crate::rotation::test_set_running(uid, false);
+            for s in state.lock().unwrap().sessions.values_mut() {
+                let _ = s.kill();
+            }
         });
     }
 
@@ -24715,6 +31317,227 @@ while True:
         wt
     }
 
+    #[test]
+    fn s4_mcp_spawn_records_local_origin_without_changing_shell_lifecycle() {
+        let _tmp = with_temp_home(|| {
+            crate::items::s4_attribution::reset_for_test();
+            let state = make_state_arc();
+            seed_mcp_spawn_fixture(&state, "ts-caller", None);
+            set_spawn_program_override_for_test(Some(("/bin/sleep".into(), vec!["120".into()])));
+            let child = mcp_start_session(&state, &json!({"type":"codex", "label":"s4 child"}), Some("ts-caller")).unwrap();
+            let shell = mcp_start_session(&state, &json!({"type":"bash", "label":"shell"}), Some("ts-caller")).unwrap();
+            {
+                let st = state.lock().unwrap();
+                assert!(st.sessions[child["session_uid"].as_str().unwrap()].s4_spawn_origin.is_some());
+                assert!(st.sessions[shell["session_uid"].as_str().unwrap()].s4_spawn_origin.is_none());
+            }
+            let uid = child["session_uid"].as_str().unwrap();
+            crate::items::s4_attribution::absorb_snapshot("d", &json!({"version":7, "s4_min_wire":true,
+                "members":[{"id":"mem_new", "main":{"pid":format!("agent:d:{uid}"),
+                    "daemon_id":"d", "session_uid":uid, "occupancy_generation":1}}]}), crate::items::s4_attribution::config_epoch());
+            assert_eq!(crate::items::s4_attribution::capture(&state).0[uid].claim["member_id"], "mem_new");
+            assert!(crate::items::s4_attribution::capture(&state).0.get(shell["session_uid"].as_str().unwrap()).is_none());
+            state.lock().unwrap().config.s4_min_write = true;
+            crate::items::org::absorb_reply(&json!({"org":{"members":{
+                "ts-caller":{"id":"mem_cont", "kind":"continuous", "acting_as":"main"}}}}), 1.0);
+            {
+                let mut st = state.lock().unwrap();
+                st.sessions.get_mut("ts-caller").unwrap().continuous_task_id = Some("ct".into());
+                st.config.api_url = "http://127.0.0.1:9".into();
+                st.config.api_token = "tok".into();
+            }
+            crate::messaging::startup::open_for_test(&state).unwrap();
+            // The fake engine never creates a transcript, so its detector retains
+            // the per-worktree slot. Give each subsequent agent its own worktree
+            // rather than bypassing the real spawn admission queue.
+            let next_worktree = |name: &str| {
+                let path = std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(name);
+                std::fs::create_dir_all(&path).unwrap();
+                state.lock().unwrap().workspaces.get_mut("ws-1").unwrap().worktree_path = Some(path);
+            };
+            next_worktree("wt-worker");
+            let worker = mcp_start_session(&state, &json!({"type":"codex", "label":"worker"}), Some("ts-caller")).unwrap();
+            let worker_uid = worker["session_uid"].as_str().unwrap();
+            let req = crate::control::protocol::Request { id:"item".into(), caller:crate::control::protocol::Caller::session(worker_uid),
+                method:"item.set".into(), params:json!({"n":1,"status":"active"}) };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                let _scope = crate::items::s4_attribution::begin(&state, &req);
+                let ctx = crate::items::rpc::Ctx::capture(&state, &req).unwrap();
+                let attribution = ctx.actor()["attribution"].clone();
+                if attribution["acting_as"] == "worker" {
+                    assert_eq!(attribution["provenance"], "o5-spawn-stamp");
+                    break;
+                }
+                assert!(attribution.is_null() || attribution["provenance"] == "unknown", "{attribution}");
+                assert!(std::time::Instant::now() < deadline, "worker item evidence never became available");
+                std::thread::yield_now();
+            }
+            // Force the state try-lock to fail at the production dispatch
+            // snapshot, then release it before normal authorization/delivery.
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+            let locked_state = state.clone();
+            let holder = std::thread::spawn(move || {
+                let guard = locked_state.lock().unwrap();
+                held_tx.send(()).unwrap();
+                release_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+                drop(guard);
+                dropped_tx.send(()).unwrap();
+            });
+            held_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+            crate::items::s4_attribution::take_test_trace();
+            crate::control::dispatch::test_after_s4(Some(Box::new(move || {
+                assert!(crate::items::s4_attribution::take_test_trace().contains(&"state-busy"));
+                assert!(crate::items::s4_attribution::current().0.is_empty());
+                release_tx.send(()).unwrap();
+                dropped_rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+            })));
+            let contended = crate::control::protocol::Request { id:"contended-chat".into(), caller:crate::control::protocol::Caller::session(worker_uid),
+                method:"messaging.send".into(), params:json!({"channel":"general", "name":"worker", "body":"contended", "request_id":"contended-chat"}) };
+            let result = crate::control::dispatch::dispatch_request(&state, &contended);
+            crate::control::dispatch::test_after_s4(None);
+            holder.join().unwrap();
+            let crate::control::dispatch::DispatchOutcome::Done(response) = result else { panic!("contended chat must complete") };
+            assert!(response.ok, "{:?}", response.error);
+            assert!(response.result.unwrap()["event"]["data"]["actor_attribution"].is_null());
+            eprintln!("forced state-busy snapshot: unknown attribution, successful chat");
+            // Each attempt is a separate successful write; a busy nonblocking
+            // snapshot may legitimately omit evidence on any one attempt.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                let chat = crate::control::protocol::Request { id:format!("chat-{attempt}"), caller:crate::control::protocol::Caller::session(worker_uid),
+                    method:"messaging.send".into(), params:json!({"channel":"general", "name":"worker", "body":"ready", "request_id":format!("worker-chat-{attempt}")}) };
+                crate::items::s4_attribution::take_test_trace();
+                let captured = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let observed = captured.clone();
+                let observed_uid = worker_uid.to_owned();
+                crate::control::dispatch::test_after_s4(Some(Box::new(move || {
+                    observed.store(crate::items::s4_attribution::current().0.contains_key(&observed_uid), std::sync::atomic::Ordering::SeqCst);
+                })));
+                let result = crate::control::dispatch::dispatch_request(&state, &chat);
+                crate::control::dispatch::test_after_s4(None);
+                let crate::control::dispatch::DispatchOutcome::Done(response) = result else { panic!("chat must complete") };
+                assert!(response.ok, "{:?}", response.error);
+                let attribution = response.result.unwrap()["event"]["data"]["actor_attribution"].clone();
+                if attribution["acting_as"] == "worker" {
+                    assert!(captured.load(std::sync::atomic::Ordering::SeqCst), "positive chat needs its own captured subject");
+                    assert_eq!(attribution["provenance"], "o5-spawn-stamp");
+                    eprintln!("worker positive capture and chat claim at attempt {attempt}");
+                    break;
+                }
+                eprintln!("worker chat attempt {attempt} unknown (captured={}): {:?}",
+                    captured.load(std::sync::atomic::Ordering::SeqCst), crate::items::s4_attribution::take_test_trace());
+                assert!(attribution.is_null() || attribution["provenance"] == "unknown", "{attribution}");
+                assert!(std::time::Instant::now() < deadline, "worker chat evidence never became available");
+                std::thread::yield_now();
+            }
+            crate::items::org::reset_cache_for_test();
+            state.lock().unwrap().sessions.get_mut("ts-caller").unwrap().workflow_run_id = Some("workflow".into());
+            next_worktree("wt-workflow");
+            let workflow_child = mcp_start_session(&state, &json!({"type":"codex", "label":"workflow child"}), Some("ts-caller")).unwrap();
+            assert!(state.lock().unwrap().sessions[workflow_child["session_uid"].as_str().unwrap()].s4_spawn_origin.is_none());
+            set_spawn_program_override_for_test(None);
+            crate::items::s4_attribution::reset_for_test();
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn s4_dispatch_spawn_progresses_after_queued_retirement_writer() {
+        let _tmp = with_temp_home(|| {
+            crate::items::s4_attribution::reset_for_test();
+            let state = make_state_arc();
+            state.lock().unwrap().config.s4_min_write = true;
+            seed_mcp_spawn_fixture(&state, "ts-caller", None);
+            {
+                let mut st = state.lock().unwrap();
+                let caller = st.sessions.get_mut("ts-caller").unwrap();
+                caller.s4_spawn_origin = Some((caller.pid, caller.holder_incarnation, caller.generation, caller.org.clone()));
+            }
+            crate::items::s4_attribution::absorb_snapshot("d", &json!({"version":9, "s4_min_wire":true,
+                "members":[{"id":"mem_a", "main":{"pid":"agent:d:ts-caller", "daemon_id":"d",
+                    "session_uid":"ts-caller", "occupancy_generation":1}}]}), crate::items::s4_attribution::config_epoch());
+            let gate = crate::continuous::retirement::gate("ts-caller");
+            let reader = gate.read().unwrap();
+            let (writer_started_tx, writer_started_rx) = std::sync::mpsc::channel();
+            let (writer_acquired_tx, writer_acquired_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let writer_gate = gate.clone();
+            let writer = std::thread::spawn(move || {
+                writer_started_tx.send(()).unwrap();
+                let _guard = writer_gate.write().unwrap();
+                writer_acquired_tx.send(()).unwrap();
+                release_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+            });
+            writer_started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while gate.try_read().is_ok() && std::time::Instant::now() < deadline { std::thread::yield_now(); }
+            assert!(gate.try_read().is_err(), "writer must be queued behind the existing reader");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker_state = state.clone();
+            let worker = std::thread::spawn(move || {
+                set_spawn_program_override_for_test(Some(("/bin/sleep".into(), vec!["120".into()])));
+                let req = crate::control::protocol::Request {
+                    id:"s4-writer".into(), caller: crate::control::protocol::Caller::session("ts-caller"),
+                    method:"mcp_start_session".into(), params:json!({"type":"codex", "label":"s4 child"}),
+                };
+                let result = crate::control::dispatch::dispatch_request(&worker_state, &req);
+                set_spawn_program_override_for_test(None);
+                let ok = matches!(result, crate::control::dispatch::DispatchOutcome::Done(response) if response.ok);
+                tx.send(ok).unwrap();
+            });
+            assert!(rx.recv_timeout(std::time::Duration::from_millis(100)).is_err());
+            drop(reader);
+            writer_acquired_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            release_tx.send(()).unwrap();
+            assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).expect("spawn must not deadlock"));
+            worker.join().unwrap();
+            writer.join().unwrap();
+            crate::items::s4_attribution::reset_for_test();
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn s4_dispatch_holds_no_outer_gate_after_snapshot() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            state.lock().unwrap().config.s4_min_write = true;
+            seed_mcp_spawn_fixture(&state, "ts-caller", None);
+            let gate = crate::continuous::retirement::gate("ts-caller");
+            let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker_state = state.clone();
+            let worker = std::thread::spawn(move || {
+                set_spawn_program_override_for_test(Some(("/bin/sleep".into(), vec!["120".into()])));
+                crate::control::dispatch::test_after_s4(Some(Box::new(move || {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+                })));
+                let req = crate::control::protocol::Request { id:"seam".into(),
+                    caller:crate::control::protocol::Caller::session("ts-caller"), method:"mcp_start_session".into(),
+                    params:json!({"type":"codex", "label":"child"}) };
+                let result = crate::control::dispatch::dispatch_request(&worker_state, &req);
+                crate::control::dispatch::test_after_s4(None);
+                set_spawn_program_override_for_test(None);
+                done_tx.send(matches!(result, crate::control::dispatch::DispatchOutcome::Done(response) if response.ok)).unwrap();
+            });
+            paused_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            let writer = gate.try_write().expect("S4 snapshot must hold no outer retirement read");
+            resume_tx.send(()).unwrap();
+            assert!(done_rx.recv_timeout(std::time::Duration::from_millis(100)).is_err());
+            drop(writer);
+            assert!(done_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
+            worker.join().unwrap();
+            kill_all_sessions(&state);
+        });
+    }
+
     /// ux-1c: every `mcp_start_session` success carries
     /// `worktree_path` (where the child actually landed) and, when the
     /// child is task-bound, `task_id`. Pre-fix the agent got only
@@ -24723,6 +31546,39 @@ while True:
     /// ux-5c corollary asserted here: a caller-supplied prompt reports
     /// `prompt_source: "caller"` and costs NO planning-API round trip
     /// (the stub records zero requests).
+    /// #28 (msgfix's race): the creator's name for the child is claimed
+    /// inside the spawn, before any prompt is delivered, and reported as
+    /// `name_setup`; a shell is never named.
+    #[test]
+    fn mcp_start_session_claims_the_creators_name_before_the_prompt() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            let root = tempfile::tempdir().unwrap();
+            state.lock().unwrap().messaging_root = root.path().into();
+            crate::messaging::startup::open_for_test(&state).unwrap();
+            seed_mcp_spawn_fixture(&state, "ts-caller", Some("task-1"));
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            let resp = mcp_start_session(
+                &state,
+                &json!({ "type": "codex", "label": "lead", "name": "Lead-A" }),
+                Some("ts-caller"),
+            )
+            .expect("spawn ok");
+            let shell = mcp_start_session(
+                &state,
+                &json!({ "type": "bash", "label": "sh", "name": "Shell-A" }),
+                Some("ts-caller"),
+            )
+            .expect("spawn ok");
+            set_spawn_program_override_for_test(None);
+            let uid = resp["session_uid"].as_str().unwrap().to_string();
+            assert_eq!(resp["name_setup"], json!("ok"), "{resp}");
+            assert_eq!(crate::messaging::rpc::current_name(&state, &uid).map(|(n, _)| n).as_deref(), Some("Lead-A"));
+            assert!(shell.get("name_setup").is_none(), "a shell has no chat name");
+            kill_all_sessions(&state);
+        });
+    }
+
     #[test]
     fn mcp_start_session_returns_worktree_task_and_caller_prompt_source() {
         let _tmp = with_temp_home(|| {
@@ -24840,6 +31696,11 @@ while True:
             set_spawn_program_override_for_test(None);
 
             assert_eq!(resp["prompt_source"], json!("task"));
+            assert!(resp.get("submitted").is_none(), "old MCP must not see pending as failure");
+            assert_eq!(resp["prompt_delivery"]["status"], "pending");
+            let resolved = resolve_authorized_session(&state,
+                &json!({"session_uid":resp["session_uid"]}), Some("ts-caller")).unwrap();
+            assert_eq!(resolved["prompt_delivery"]["id"], resp["prompt_delivery"]["id"]);
             assert_eq!(resp["task_id"].as_str(), Some("task-1"));
             let reqs = stub.requests.lock().unwrap();
             assert!(
@@ -24887,13 +31748,207 @@ while True:
             // The inherited binding itself is preserved on the child.
             assert_eq!(resp["task_id"].as_str(), Some("task-1"));
             let reqs = stub.requests.lock().unwrap();
+            // The only call is the task-default model lookup (the stub's 500
+            // falls back to the engine default); never a prompt lookup.
             assert!(
-                reqs.is_empty(),
-                "inherited binding must not trigger a task lookup: {:?}",
-                reqs,
+                reqs.iter().all(|r| r.method == "GET" && r.path.starts_with("/tasks/task-1/model")),
+                "inherited binding must not trigger a task prompt lookup: {:?}",
+                reqs.iter().map(|r| (&r.method, &r.path)).collect::<Vec<_>>(),
             );
+            assert_eq!(resp["model"], crate::models::DEFAULT_CODEX_MODEL);
+            assert_eq!(resp["model_source"], "engine_default");
             drop(reqs);
             kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn mcp_start_session_staffing_default_and_explicit_override_are_local() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_mcp_spawn_fixture(&state, "ts-caller", None);
+            {
+                let s = state.lock().unwrap();
+                let mut cache = s.staffing.lock().unwrap();
+                cache.snapshot = crate::staffing::Snapshot {
+                    version: 7,
+                    policy: crate::staffing::Policy::default(),
+                    updated_at: None,
+                };
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".into(), vec!["120".into()])));
+            let chosen = mcp_start_session(
+                &state,
+                &json!({"label":"policy-child","work_kind":"fanout"}),
+                Some("ts-caller"),
+            )
+            .unwrap();
+            assert_eq!(chosen["session_type"], "claude-code");
+            assert_eq!(chosen["staffing_version"], 7);
+            assert!(chosen.get("staffing_note").is_none());
+            if let Some(mut child) = state
+                .lock()
+                .unwrap()
+                .sessions
+                .remove(chosen["session_uid"].as_str().unwrap())
+            {
+                let _ = child.kill();
+            }
+            {
+                let s = state.lock().unwrap();
+                s.staffing.lock().unwrap().snapshot.policy.preference =
+                    Some(crate::staffing::Preference {
+                        engine: crate::staffing::Engine::Codex,
+                        strength: crate::staffing::Strength::Strong,
+                        reason: "limits".into(),
+                        expires_at: Some(chrono::Utc::now() + chrono::Duration::days(1)),
+                    });
+            }
+            let explicit = mcp_start_session(
+                &state,
+                &json!({"label":"explicit-child","type":"claude-code"}),
+                Some("ts-caller"),
+            )
+            .unwrap();
+            assert_eq!(explicit["session_type"], "claude-code");
+            assert!(explicit["staffing_note"]
+                .as_str()
+                .unwrap()
+                .contains(crate::staffing::PRECEDENCE));
+            kill_all_sessions(&state);
+            set_spawn_program_override_for_test(None);
+        });
+    }
+
+    #[test]
+    fn mcp_start_session_staffing_models_follow_explicit_task_rule_precedence() {
+        with_temp_home(|| {
+            let state = make_state_arc();
+            seed_mcp_spawn_fixture(&state, "ts-caller", Some("task-1"));
+            let task_model = Arc::new(Mutex::new(None::<&str>));
+            let stub_model = task_model.clone();
+            let stub = spawn_routed_stub(move |method, path, _| {
+                assert!(method == "GET" && path.starts_with("/tasks/task-1/model"));
+                let model = *stub_model.lock().unwrap();
+                (200, json!({"engine":"codex","model":model,"effort":"medium"}).to_string())
+            });
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".into();
+                let mut cache = s.staffing.lock().unwrap();
+                cache.snapshot.policy = crate::staffing::Policy::default();
+                cache.snapshot.policy.preference = Some(crate::staffing::Preference {
+                    engine: crate::staffing::Engine::Codex,
+                    strength: crate::staffing::Strength::Strong,
+                    reason: "foreseeable future".into(), expires_at: None,
+                });
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".into(), vec!["120".into()])));
+            for (explicit, task_default, want, source, note) in [
+                (None, None, "gpt-6-luna", "staffing_rule", false),
+                (Some("gpt-6.1-sol"), Some("gpt-6-astra"), "gpt-6.1-sol", "explicit", false),
+                (None, Some("gpt-6-astra"), "gpt-6-astra", "task", true),
+                (None, Some("claude-sonnet-5-5"), "gpt-6-luna", "staffing_rule", false),
+            ] {
+                *task_model.lock().unwrap() = task_default;
+                let mut params = json!({"label":"busy-worker","work_kind":"busywork"});
+                if let Some(model) = explicit { params["model"] = json!(model); }
+                let result = mcp_start_session(&state, &params, Some("ts-caller")).unwrap();
+                assert_eq!(result["session_type"], "codex");
+                assert_eq!(result["model"], want);
+                assert_eq!(result["model_source"], source);
+                assert_eq!(result["effort"], "medium");
+                assert_eq!(result.get("staffing_note").is_some(), note);
+                if note {
+                    assert!(result["staffing_note"].as_str().unwrap().contains(crate::staffing::MODEL_PRECEDENCE));
+                }
+                let mut child = state.lock().unwrap().sessions.remove(result["session_uid"].as_str().unwrap()).unwrap();
+                assert_eq!(child.to_manifest_entry().model.as_deref(), Some(want));
+                let _ = child.kill();
+            }
+            kill_all_sessions(&state);
+            set_spawn_program_override_for_test(None);
+        });
+    }
+
+    /// `start_session(model=…)` wins; else the bound task's default (one
+    /// planning GET, inherited server-side); else the engine default. The
+    /// resolved model is recorded on the session (so revive/resume reuse
+    /// it), shown by `list_sessions`, and returned with its source. Bash
+    /// refuses a model.
+    #[test]
+    fn mcp_start_session_records_and_returns_the_resolved_model() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_mcp_spawn_fixture(&state, "ts-caller", Some("task-1"));
+            let stub = spawn_routed_stub(|method, path, _b| {
+                if method == "GET" && path.starts_with("/tasks/task-1/model") {
+                    (200, r#"{"engine":"codex","model":"gpt-6-luna","source_task_id":"root-task","effort":"medium","effort_source_task_id":"root-task"}"#.into())
+                } else if method == "GET" && path.starts_with("/tasks/task-2/model") {
+                    (200, r#"{"engine":"codex","model":null,"source_task_id":null}"#.into())
+                } else {
+                    (200, r#"{"id":"task-1","status":"running"}"#.into())
+                }
+            });
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".to_string();
+                s.task_tree.insert("task-2".into(), Some("task-1".into()));
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            // Every codex spawn runs the real engine, and its transcript
+            // detector holds the worktree's spawn slot until a rollout
+            // appears or the session goes. Read each spawn's record and
+            // list_sessions row, then drop the session so the next spawn
+            // in this worktree doesn't wait 20 s on the slot. Whether the
+            // sandboxed codex exits on its own varies by host.
+            let recorded = |resp: &Value| {
+                let st = state.lock().unwrap();
+                let uid = resp["session_uid"].as_str().unwrap();
+                st.sessions.get(uid).map(|sess| sess.to_manifest_entry().model).unwrap_or_else(|| {
+                    st.recently_exited.iter().find(|t| t.session_uid == uid).and_then(|t| t.model.clone())
+                })
+            };
+            let listed = |resp: &Value| {
+                let rows = list_sessions(&state, &json!({"include_exited": true}), None).unwrap();
+                rows.as_array().unwrap().iter().find(|r| r["session_uid"] == resp["session_uid"]).cloned()
+            };
+            let spawn = |params: Value| {
+                let resp = mcp_start_session(&state, &params, Some("ts-caller"));
+                let seen = resp.as_ref().ok().map(|r| (recorded(r), listed(r)));
+                if let Some(uid) = resp.as_ref().ok().and_then(|r| r["session_uid"].as_str()) {
+                    if let Some(mut sess) = state.lock().unwrap().sessions.remove(uid) {
+                        let _ = sess.kill();
+                    }
+                }
+                resp.map(|r| (r, seen.unwrap()))
+            };
+            let (explicit, (_, explicit_row)) =
+                spawn(json!({"type": "codex", "label": "a", "model": "gpt-6-astra", "effort": "LOW"})).unwrap();
+            let (task, (task_recorded, _)) = spawn(json!({"type": "codex", "label": "b"})).unwrap();
+            let (engine, _) = spawn(json!({"type": "codex", "label": "c", "task_id": "task-2",
+                                      "allow_shared_workspace": true})).unwrap();
+            let bad = spawn(json!({"type": "codex", "label": "d", "model": "two words"})).unwrap_err();
+            let bash = spawn(json!({"type": "bash", "label": "e", "model": "gpt-6-luna"})).unwrap_err();
+            let max = spawn(json!({"type": "codex", "label": "f", "effort": "max"})).unwrap_err();
+            set_spawn_program_override_for_test(None);
+            assert!(matches!(max.0, ErrorCode::InvalidParams) && max.1.contains("codex"), "{max:?}");
+            assert_eq!((explicit["effort"].as_str(), explicit["effort_source"].as_str()), (Some("low"), Some("explicit")));
+            assert_eq!((task["effort"].as_str(), task["effort_source"].as_str()), (Some("medium"), Some("task")));
+            assert_eq!((engine["effort"].as_str(), engine["effort_source"].as_str()), (Some("xhigh"), Some("engine_default")));
+
+            assert_eq!((explicit["model"].as_str(), explicit["model_source"].as_str()), (Some("gpt-6-astra"), Some("explicit")));
+            assert_eq!((task["model"].as_str(), task["model_source"].as_str()), (Some("gpt-6-luna"), Some("task")));
+            assert_eq!(engine["model"], crate::models::DEFAULT_CODEX_MODEL, "{engine}");
+            assert_eq!(engine["model_source"], "engine_default");
+            assert!(matches!(bad.0, ErrorCode::InvalidParams), "{bad:?}");
+            assert!(matches!(bash.0, ErrorCode::InvalidParams) && bash.1.contains("not 'bash'"), "{bash:?}");
+            // The real codex child may already have exited in the sandbox:
+            // the record lives on the session, or on its exit tombstone.
+            assert_eq!(task_recorded.as_deref(), Some("gpt-6-luna"));
+            assert_eq!(explicit_row.unwrap()["model"], "gpt-6-astra");
         });
     }
 
@@ -25009,6 +32064,41 @@ while True:
         });
     }
 
+    /// Launch grants (doc/org-model.md §7.4): the owner-role holder of a
+    /// placed item may launch for its task from outside the task tree, even
+    /// taskless. Without the grant the same call is refused.
+    #[test]
+    fn mcp_start_session_admits_a_launch_grant_for_a_taskless_owner() {
+        let _tmp = with_temp_home(|| {
+            let state = make_state_arc();
+            seed_mcp_spawn_fixture(&state, "ts-caller", None);
+            // The task's workspace is known here (as after a mint).
+            state.lock().unwrap().task_workspaces.insert("task-9".into(), "ws-1".into());
+            set_spawn_program_override_for_test(Some((
+                "/bin/sleep".to_string(),
+                vec!["120".to_string()],
+            )));
+            let params = json!({ "type": "bash", "label": "assistant", "task_id": "task-9" });
+            let err = mcp_start_session(&state, &params, Some("ts-caller")).unwrap_err();
+            assert_eq!(err.0, ErrorCode::Unauthorized, "{err:?}");
+            state.lock().unwrap().launch_grants.push(crate::items::grants::LaunchGrant {
+                task_id: "task-9".into(),
+                session_uid: "ts-caller".into(),
+                pid: "agent:d1:ts-caller".into(),
+                board: Some("sfd".into()),
+                n: Some(4),
+            });
+            let resp = mcp_start_session(&state, &params, Some("ts-caller")).expect("granted");
+            assert_eq!(resp["task_id"].as_str(), Some("task-9"));
+            // A grant for another session or task admits nothing.
+            state.lock().unwrap().launch_grants[0].session_uid = "ts-someone-else".into();
+            let err = mcp_start_session(&state, &params, Some("ts-caller")).unwrap_err();
+            assert_eq!(err.0, ErrorCode::Unauthorized);
+            set_spawn_program_override_for_test(None);
+            kill_all_sessions(&state);
+        });
+    }
+
     /// ux-5c fail-soft: an unreachable / erroring planning API must
     /// NEVER fail the spawn. The session comes up promptless with
     /// `prompt_source: "none"` — exactly the pre-ux-5c behavior.
@@ -25048,13 +32138,27 @@ while True:
     #[test]
     fn compose_task_launch_prompt_precedence() {
         assert_eq!(
-            compose_task_launch_prompt("why", "how").as_deref(),
+            compose_task_launch_prompt("why", "how", "T").as_deref(),
             Some("why\n\n---\n\nhow"),
         );
-        assert_eq!(compose_task_launch_prompt("", "how").as_deref(), Some("how"));
-        assert_eq!(compose_task_launch_prompt("why", "  ").as_deref(), Some("why"));
-        assert_eq!(compose_task_launch_prompt("  \n ", "\t"), None);
-        assert_eq!(compose_task_launch_prompt("", ""), None);
+        assert_eq!(compose_task_launch_prompt("", "how", "T").as_deref(), Some("how"));
+        assert_eq!(compose_task_launch_prompt("why", "  ", "T").as_deref(), Some("why"));
+        assert_eq!(compose_task_launch_prompt("  \n ", "\t", "T"), None);
+        assert_eq!(compose_task_launch_prompt("", "", "T"), None);
+    }
+
+    /// org-model §13.2: a prompt the description already carries (the S1
+    /// backfill's `## Instructions`), or one that is just the name, is not
+    /// delivered a second time.
+    #[test]
+    fn compose_task_launch_prompt_skips_a_contained_prompt() {
+        let backfilled = "why\n\n## Instructions\n\nhow";
+        assert_eq!(
+            compose_task_launch_prompt(backfilled, "how", "T").as_deref(),
+            Some(backfilled),
+        );
+        assert_eq!(compose_task_launch_prompt("why", "T", "T").as_deref(), Some("why"));
+        assert_eq!(compose_task_launch_prompt("", " T ", "T"), None, "a bare title is noise");
     }
 
     /// ux-5c: an over-long task prompt is TRUNCATED, not rejected —
@@ -25064,7 +32168,7 @@ while True:
     #[test]
     fn compose_task_launch_prompt_truncates_over_cap() {
         let huge = "x".repeat(MAX_SEND_INPUT_BYTES + 10_000);
-        let out = compose_task_launch_prompt("", &huge).expect("still composes");
+        let out = compose_task_launch_prompt("", &huge, "T").expect("still composes");
         assert!(
             out.len() <= MAX_SEND_INPUT_BYTES,
             "truncated body must fit the send_input cap, got {}",
@@ -25197,6 +32301,7 @@ while True:
                     activation_prompt: Some("a".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
+                    model: None, effort: None,
                 },
             );
             let wf_a = Workflow {
@@ -25235,6 +32340,7 @@ while True:
                     activation_prompt: Some("b".to_string()),
                     subsequent_activation_prompt: None,
                     needs_mcp: false,
+                    model: None, effort: None,
                 },
             );
             let wf_b = Workflow {
@@ -25286,6 +32392,7 @@ while True:
                         activation_prompt: None,
                         subsequent_activation_prompt: None,
                     needs_mcp: false,
+                    model: None, effort: None,
                     },
                 );
                 s.workflow_definitions.insert(
@@ -25327,7 +32434,7 @@ while True:
                 let mut roles = BTreeMap::new();
                 roles.insert("worker".to_string(), Role {
                     engine: Engine::ClaudeCode, context: Context::Persistent,
-                    activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false,
+                    activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None, effort: None,
                 });
                 Workflow {
                     name: "feedback".to_string(), description: String::new(), roles,
@@ -25392,9 +32499,9 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
-                roles.insert("reviewer".to_string(), Role { engine: Engine::Codex, context: Context::Fresh, activation_prompt: Some("review".to_string()), subsequent_activation_prompt: None, needs_mcp: false });
-                roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("manage".to_string()), subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+                roles.insert("reviewer".to_string(), Role { engine: Engine::Codex, context: Context::Fresh, activation_prompt: Some("review".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+                roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("manage".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 // BASE layer only — no TUI override.
                 s.base_workflow_definitions.insert("feedback".to_string(), Workflow {
                     name: "feedback".to_string(), description: String::new(), roles,
@@ -25492,9 +32599,9 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
-                roles.insert("reviewer".to_string(), Role { engine: Engine::Codex, context: Context::Fresh, activation_prompt: Some("review".to_string()), subsequent_activation_prompt: None, needs_mcp: false });
-                roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("manage".to_string()), subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+                roles.insert("reviewer".to_string(), Role { engine: Engine::Codex, context: Context::Fresh, activation_prompt: Some("review".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+                roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("manage".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("feedback".to_string(), Workflow {
                     name: "feedback".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into(), "reviewer".into(), "manager".into()],
@@ -25558,8 +32665,8 @@ while True:
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
                 // Both roles declare claude-code in the TOML.
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
-                roles.insert("reviewer".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("review".to_string()), subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+                roles.insert("reviewer".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("review".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("review".to_string(), Workflow {
                     name: "review".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into(), "reviewer".into()],
@@ -25625,7 +32732,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-own".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -25679,7 +32786,7 @@ while True:
                 s.task_tree.insert("task-child".to_string(), Some("task-parent".to_string()));
                 s.task_workspaces.insert("task-child".to_string(), "ws-child".to_string());
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -25731,8 +32838,8 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
-                roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("m".into()), subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+                roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("m".into()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("two".to_string(), Workflow {
                     name: "two".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into(), "manager".into()], transitions: vec![],
@@ -25783,7 +32890,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::Codex, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker".to_string(), Role { engine: Engine::Codex, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -25841,7 +32948,7 @@ while True:
                 // Codex: the only engine that still arms a spawn-time detector
                 // (its rollout exists from boot). Claude roles bind at
                 // activation via the drainer and never reach this path.
-                roles.insert("worker".to_string(), Role { engine: Engine::Codex, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker".to_string(), Role { engine: Engine::Codex, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -25937,7 +33044,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -25996,7 +33103,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -26061,7 +33168,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -26114,7 +33221,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -26167,10 +33274,10 @@ while True:
                     s.workspaces.insert(id.to_string(), ws);
                 }
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
-                roles.insert("worker2".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("w2".into()), subsequent_activation_prompt: None, needs_mcp: false });
-                roles.insert("reviewer".to_string(), Role { engine: Engine::Codex, context: Context::Fresh, activation_prompt: Some("r".into()), subsequent_activation_prompt: None, needs_mcp: false });
-                roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("m".into()), subsequent_activation_prompt: None, needs_mcp: true });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+                roles.insert("worker2".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("w2".into()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+                roles.insert("reviewer".to_string(), Role { engine: Engine::Codex, context: Context::Fresh, activation_prompt: Some("r".into()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+                roles.insert("manager".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("m".into()), subsequent_activation_prompt: None, needs_mcp: true, model: None , effort: None});
                 s.base_workflow_definitions.insert("multi".to_string(), Workflow {
                     name: "multi".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into(), "worker2".into(), "reviewer".into(), "manager".into()],
@@ -26258,7 +33365,7 @@ while True:
                 s.task_tree.insert("task-A".to_string(), None);
                 s.task_tree.insert("task-B".to_string(), None);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -26318,8 +33425,8 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
-                roles.insert("reviewer".to_string(), Role { engine: Engine::Codex, context: Context::Fresh, activation_prompt: Some("r".into()), subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
+                roles.insert("reviewer".to_string(), Role { engine: Engine::Codex, context: Context::Fresh, activation_prompt: Some("r".into()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("feedback".to_string(), Workflow {
                     name: "feedback".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into(), "reviewer".into()],
@@ -26415,7 +33522,7 @@ while True:
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
                 // No activation_prompt on the initial role.
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -26458,7 +33565,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -26502,7 +33609,7 @@ while True:
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
                 // Whitespace-only activation_prompt on the initial role.
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("   ".to_string()), subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("   ".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -26543,7 +33650,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("  \n ".to_string()), subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: Some("  \n ".to_string()), subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -26590,7 +33697,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-cap".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -26654,7 +33761,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-op".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -26716,7 +33823,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-op".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -26765,7 +33872,7 @@ while True:
                 ws.worktree_path = Some(wt.clone());
                 s.workspaces.insert("ws-1".to_string(), ws);
                 let mut roles = BTreeMap::new();
-                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false });
+                roles.insert("worker".to_string(), Role { engine: Engine::ClaudeCode, context: Context::Persistent, activation_prompt: None, subsequent_activation_prompt: None, needs_mcp: false, model: None , effort: None});
                 s.base_workflow_definitions.insert("solo".to_string(), Workflow {
                     name: "solo".to_string(), description: String::new(), roles,
                     role_order: vec!["worker".into()], transitions: vec![],
@@ -28755,6 +35862,36 @@ while True:
         });
     }
 
+    /// #24: a persistent orchestrator that is being rotated is absent from
+    /// the registry for a moment; a fire then is a busy skip, never a fresh
+    /// uid (which would leave two orchestrators once the rotation returns).
+    #[test]
+    fn trigger_skips_while_the_orchestrator_is_rotating() {
+        let _serial = crate::rotation::test_registry_lock();
+        with_continuous_home(|home| {
+            let wt = home.join("wt");
+            std::fs::create_dir_all(&wt).unwrap();
+            let mut task = continuous_task(
+                "ct-rotating",
+                crate::continuous::task::Engine::Claude,
+                crate::continuous::task::RunMode::Persistent,
+                &wt,
+            );
+            task.current_session_uid = Some("ts-rot-orch-0".into());
+            crate::continuous::task::save(&task).expect("save");
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            crate::rotation::test_set_running("ts-rot-orch-0", true);
+            let resp = trigger(&state, &Caller::operator("op-token"), &json!({ "task_id": "ct-rotating" }))
+                .expect("trigger ok");
+            crate::rotation::test_set_running("ts-rot-orch-0", false);
+            assert_eq!((resp["fired"].clone(), resp["reason"].clone()), (json!(false), json!("busy")));
+            assert!(take_continuous_spawn_spy_for_test().is_empty(), "no second orchestrator");
+            let reloaded = crate::continuous::task::load_one("ct-rotating").unwrap();
+            assert_eq!(reloaded.current_session_uid.as_deref(), Some("ts-rot-orch-0"));
+            assert!(reloaded.in_flight.is_none() && reloaded.run_count == 0);
+        });
+    }
+
     /// A second concurrent fire while `in_flight` is set is rejected `busy`
     /// (the spawn-window guard) — no second spawn, no mutation.
     #[test]
@@ -29028,7 +36165,16 @@ while True:
 
             // Wire shape: claim (max_items = batch_max, claimed_by = task#seq)
             // then ack (both ids).
-            let reqs = stub.requests.lock().unwrap();
+            // The fire also looks up the task's default model; only the
+            // queue calls matter here.
+            let reqs: Vec<_> = stub
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.path.starts_with("/queues/"))
+                .cloned()
+                .collect();
             assert_eq!(reqs.len(), 2, "claim then ack: {:?}", reqs);
             assert_eq!(reqs[0].path, "/queues/props/claim");
             let claim_body: Value = serde_json::from_str(&reqs[0].body).unwrap();
@@ -29102,7 +36248,16 @@ while True:
             assert_eq!(err.0, ErrorCode::Internal);
 
             // Claim was released, guard cleared.
-            let reqs = stub.requests.lock().unwrap();
+            // The fire also looks up the task's default model; only the
+            // queue calls matter here.
+            let reqs: Vec<_> = stub
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.path.starts_with("/queues/"))
+                .cloned()
+                .collect();
             assert_eq!(reqs.len(), 2, "claim then requeue: {:?}", reqs);
             assert_eq!(reqs[1].path, "/queues/props/requeue");
             let rq_body: Value = serde_json::from_str(&reqs[1].body).unwrap();
@@ -29171,7 +36326,16 @@ while True:
 
             // The batch WAS staged (claim succeeded), then the boot failed →
             // the claim is released via requeue, not left stranded.
-            let reqs = stub.requests.lock().unwrap();
+            // The fire also looks up the task's default model; only the
+            // queue calls matter here.
+            let reqs: Vec<_> = stub
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.path.starts_with("/queues/"))
+                .cloned()
+                .collect();
             assert_eq!(reqs.len(), 2, "claim then requeue: {:?}", reqs);
             assert_eq!(reqs[0].path, "/queues/props/claim");
             assert_eq!(reqs[1].path, "/queues/props/requeue");
@@ -30589,7 +37753,7 @@ while True:
 
             // A channel subscription is scheduler-owned and repeated config
             // updates preserve its identity/checkpoint; null explicitly clears it.
-            crate::messaging::rpc::initialize(&state).unwrap();
+            crate::messaging::startup::open_for_test(&state).unwrap();
             let channel = {
                 let handle = state.lock().unwrap().messaging.clone();
                 let slot = handle.lock().unwrap();
@@ -31164,6 +38328,467 @@ while True:
     }
 
     #[test]
+    fn state_core_local_commands_complete_without_advancing_the_turn_or_sticking_drain() {
+        with_temp_home(|| {
+            use crate::agent_state::{HookEdges, InputDelivery};
+            let state = make_state_arc();
+            let uid = fresh_test_uid();
+            insert_session(&state, &uid, "ws-command");
+            for body in ["/clear", "/compact", ""] {
+                let handle = state.lock().unwrap().sessions[&uid].input_handle();
+                let (before_seq, before_start) = {
+                    let mut st = state.lock().unwrap();
+                    let session = st.sessions.get_mut(&uid).unwrap();
+                    session.session_type = "claude-code".into();
+                    let mut cell = session.agent_state.lock().unwrap();
+                    cell.inputs.hooks = HookEdges { stop_at: Some(now_unix_f64() - 100.0), ..Default::default() };
+                    (cell.inputs.turn_seq, cell.inputs.latest_start)
+                };
+                let handle = handle.prepare_agent_input(body);
+                handle.note_agent_submitted();
+                {
+                    let st = state.lock().unwrap();
+                    let session = &st.sessions[&uid];
+                    let mut cell = session.agent_state.lock().unwrap();
+                    assert_eq!(cell.inputs.turn_seq, before_seq, "{body}");
+                    assert_eq!(cell.inputs.latest_start, before_start, "{body}");
+                    let now = now_unix_f64();
+                    cell.inputs.delivery = Some(InputDelivery { requested_at: now - 20.0,
+                        submitted_at: Some(now - 18.0), local_command: true, engine_started: false });
+                    *session.last_activity_at.lock().unwrap() = None;
+                    *session.last_input_at.lock().unwrap() =
+                        Some(std::time::Instant::now() - std::time::Duration::from_secs(18));
+                }
+                assert!(crate::control::continuous_drain::notice_ready(&state, &uid), "{body}");
+                // An ordinary swallowed prompt remains protected from a stop
+                // notice even when its monitor can return labelled no_turn.
+                state.lock().unwrap().sessions[&uid].agent_state.lock().unwrap()
+                    .inputs.delivery.as_mut().unwrap().local_command = false;
+                assert!(!crate::control::continuous_drain::notice_ready(&state, &uid));
+            }
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn state_core_drain_notice_rejects_parked_input_after_idle_escape() {
+        with_temp_home(|| {
+            use crate::agent_state::{
+                LastTurn, PresenceObs, PresenceStatus, RelaySnapshot, RelayStatus, State,
+            };
+            let state = make_state_arc();
+            let uid = fresh_test_uid();
+            insert_session(&state, &uid, "ws-parked");
+            let now = now_unix_f64();
+            for engine in ["codex", "claude-code"] {
+                {
+                    let mut st = state.lock().unwrap();
+                    let session = st.sessions.get_mut(&uid).unwrap();
+                    session.session_type = engine.into();
+                    *session.last_input_at.lock().unwrap() =
+                        Some(std::time::Instant::now() - std::time::Duration::from_secs(20));
+                    let mut cell = session.agent_state.lock().unwrap();
+                    cell.inputs.latest_start = Some(now - 20.0);
+                    cell.inputs.previous = None;
+                    cell.inputs.relay = (engine == "codex").then(|| RelaySnapshot {
+                        backend_connected: true,
+                        foreground: RelayStatus::Idle,
+                        observed_at: now,
+                        turn_started_at: Some(now - 40.0),
+                        last_turn: LastTurn {
+                            ended_at: Some(now - 30.0),
+                            status: Some(crate::agent_state::TurnStatus::Completed),
+                        },
+                        ..Default::default()
+                    });
+                    cell.inputs.presence = (engine == "claude-code").then(|| PresenceObs {
+                        valid: true,
+                        status: PresenceStatus::Idle,
+                        observed_at: now,
+                        status_updated_at: Some(now - 30.0), native_session_id: None,
+                        engine_version: None,
+                        waiting_for: None,
+                        main_turn_open: Some(false),
+                        transcript_error: None, transcript_end: None, transcript_evidence_path: None, wait_resolution: None,
+                    });
+                    cell.inputs.hooks.stop_at = Some(now - 30.0);
+                }
+                assert_eq!(
+                    crate::agent_state::current(&state.lock().unwrap().sessions[&uid]).state,
+                    State::Idle
+                );
+                assert!(
+                    !crate::control::continuous_drain::notice_ready(&state, &uid),
+                    "{engine}: parked input must not receive a second pasted prompt"
+                );
+                {
+                    let st = state.lock().unwrap();
+                    let mut cell = st.sessions[&uid].agent_state.lock().unwrap();
+                    if let Some(relay) = cell.inputs.relay.as_mut() {
+                        relay.last_turn.ended_at = Some(now - 10.0);
+                    }
+                    cell.inputs.hooks.stop_at = Some(now - 10.0);
+                }
+                assert!(
+                    crate::control::continuous_drain::notice_ready(&state, &uid),
+                    "{engine}: the accepted input's completed turn permits the notice"
+                );
+            }
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn state_core_unknown_claude_drain_uses_new_transcript_end_after_ninety_seconds() {
+        with_continuous_home(|home| {
+            use crate::agent_state::{PresenceObs, PresenceStatus, State};
+            let state = make_state_arc();
+            let uid = fresh_test_uid();
+            let mut task = fresh_task_running("unknown-claude", home, &uid);
+            crate::continuous::drain::request(&mut task, crate::continuous::task::now_unix());
+            insert_continuous_session(&state, &uid, &task.task_id);
+            let path = home.join("unknown-claude.jsonl");
+            std::fs::write(
+                &path,
+                r#"{"timestamp":"2026-10-07T00:00:00.500Z","type":"system","subtype":"turn_duration"}"#,
+            )
+            .unwrap();
+            let ended = crate::workflow::history::iso8601_to_ms("2026-10-07T00:00:00.500Z").unwrap()
+                as f64
+                / 1000.0;
+            let now = now_unix_f64();
+            {
+                let mut st = state.lock().unwrap();
+                let session = st.sessions.get_mut(&uid).unwrap();
+                session.transcript_path = Some(path.to_string_lossy().into_owned());
+                session.stamp_reported_done(None);
+                session
+                    .done_report
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .at_unix = ended - 1.0;
+                *session.last_input_at.lock().unwrap() = None;
+                session.stamp_turn_end();
+                let mut cell = session.agent_state.lock().unwrap();
+                cell.inputs.latest_start = Some(ended - 2.0);
+                cell.inputs.presence = Some(PresenceObs {
+                    valid: false,
+                    status: PresenceStatus::Unknown,
+                    observed_at: now,
+                    status_updated_at: Some(now), native_session_id: None,
+                    engine_version: None,
+                    waiting_for: None,
+                    main_turn_open: None,
+                    transcript_error: None, transcript_end: None, transcript_evidence_path: None, wait_resolution: None,
+                });
+            }
+            assert!(!crate::control::continuous_drain::notice_ready(
+                &state, &uid
+            ));
+            assert!(!capture_drain_sessions(&state, &task)[0].final_turn_ended);
+            {
+                let st = state.lock().unwrap();
+                let mut cell = st.sessions[&uid].agent_state.lock().unwrap();
+                cell.inputs.previous.as_mut().unwrap().since = now - 91.0;
+            }
+            assert!(crate::control::continuous_drain::notice_ready(&state, &uid));
+            assert!(capture_drain_sessions(&state, &task)[0].final_turn_ended);
+            assert_eq!(
+                crate::agent_state::current(&state.lock().unwrap().sessions[&uid]).state,
+                State::Unknown
+            );
+            {
+                let st = state.lock().unwrap();
+                st.sessions[&uid]
+                    .agent_state
+                    .lock()
+                    .unwrap()
+                    .inputs
+                    .latest_start = Some(ended + 1.0);
+            }
+            assert!(
+                !crate::control::continuous_drain::notice_ready(&state, &uid),
+                "fallback cannot paste over a newer accepted input"
+            );
+            assert!(
+                !capture_drain_sessions(&state, &task)[0].final_turn_ended,
+                "fallback cannot reuse a transcript end from before the new input"
+            );
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn state_core_unknown_confirmed_turn_blocks_quiet_reads_and_unsettled_drain() {
+        with_continuous_home(|home| {
+            use crate::agent_state::{PresenceObs, PresenceStatus};
+            let state = make_state_arc();
+            let uid = fresh_test_uid();
+            let mut task = fresh_task_running("confirmed-unknown", home, &uid);
+            crate::continuous::drain::request(&mut task, crate::continuous::task::now_unix());
+            insert_continuous_session(&state, &uid, &task.task_id);
+            let path = home.join("confirmed-unknown.jsonl");
+            let ended = crate::workflow::history::iso8601_to_ms("2026-10-07T00:00:00Z").unwrap() as f64 / 1000.0;
+            let assistant = json!({"type":"assistant", "sessionId":"confirmed-unknown",
+                "timestamp":"2026-10-07T00:00:00Z", "message":{"role":"assistant", "stop_reason":"end_turn"}});
+            for valid in [false, true] {
+                {
+                    let mut st = state.lock().unwrap();
+                    let session = st.sessions.get_mut(&uid).unwrap();
+                    session.transcript_path = Some(path.to_string_lossy().into_owned());
+                    session.stamp_reported_done(None);
+                    session.done_report.lock().unwrap().as_mut().unwrap().at_unix = ended - 1.0;
+                    *session.last_input_at.lock().unwrap() = None;
+                    *session.last_activity_at.lock().unwrap() = Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+                    let mut cell = session.agent_state.lock().unwrap();
+                    cell.inputs.latest_start = Some(ended - 2.0);
+                    cell.inputs.hooks.prompt_at = Some(ended - 2.0);
+                    cell.inputs.hooks.stop_at = Some(ended - 100.0);
+                    cell.inputs.previous = None;
+                    cell.inputs.presence = Some(PresenceObs {
+                        valid, status: PresenceStatus::Idle, observed_at: now_unix_f64() - 100.0,
+                        status_updated_at: None, native_session_id: None,
+                        engine_version: None, waiting_for: None, main_turn_open: None,
+                        transcript_error: Some("unverified".into()), transcript_end: None, transcript_evidence_path: None, wait_resolution: None,
+                    });
+                }
+                let resolved = resolve_authorized_session(&state, &json!({"session_uid":uid}), None).unwrap();
+                let rows = list_sessions(&state, &json!({}), None).unwrap();
+                let row = rows.as_array().unwrap().iter().find(|r| r["session_uid"] == uid).unwrap();
+                for result in [&resolved, row] {
+                    assert_eq!(result["agent_state"]["state"], "unknown");
+                    assert_eq!(result["agent_state"]["detail"]["confirmed_turn_open"], true);
+                    assert_eq!(result["pty_idle"], true);
+                    assert_eq!(result["idle"], false);
+                }
+                for (sid, stamp, settled, expected) in [
+                    ("confirmed-unknown", "2026-10-07T00:00:00Z", false, false),
+                    ("foreign", "2026-10-07T00:00:00Z", true, false),
+                    ("confirmed-unknown", "2026-10-06T00:00:00Z", true, false),
+                    ("confirmed-unknown", "2026-10-07T00:00:00Z", true, false),
+                ] {
+                    let mut transcript = format!("{assistant}\n");
+                    if settled {
+                        transcript += &format!("{}\n", json!({"type":"system", "subtype":"turn_duration", "sessionId":sid, "timestamp":stamp}));
+                    }
+                    std::fs::write(&path, transcript).unwrap();
+                    assert_eq!(crate::control::continuous_drain::notice_ready(&state, &uid), expected,
+                        "valid={valid} sid={sid} settled={settled} stamp={stamp}");
+                    assert_eq!(capture_drain_sessions(&state, &task)[0].final_turn_ended, expected);
+                }
+                // Production Reader ingestion, not a direct synthetic LastTurn:
+                // invalid process and native identity cannot authorize recovery.
+                for (native, process_valid, expected) in [
+                    ("foreign", true, false), ("confirmed-unknown", false, false),
+                    ("confirmed-unknown", true, true),
+                ] {
+                    let observed = crate::claude_presence::fixture_observation(&path, native, process_valid, now_unix_f64());
+                    state.lock().unwrap().sessions[&uid].agent_state.lock().unwrap().inputs.presence = Some(observed);
+                    assert_eq!(crate::control::continuous_drain::notice_ready(&state, &uid), expected);
+                    assert_eq!(capture_drain_sessions(&state, &task)[0].final_turn_ended, expected);
+                }
+                let mut failed = assistant.clone();
+                failed["isApiErrorMessage"] = json!(true);
+                failed["error"] = json!("api_error");
+                std::fs::write(&path, format!("{failed}\n")).unwrap();
+                let observed = crate::claude_presence::fixture_observation(&path, "confirmed-unknown", true, now_unix_f64());
+                state.lock().unwrap().sessions[&uid].agent_state.lock().unwrap().inputs.presence = Some(observed);
+                let resolved = resolve_authorized_session(&state, &json!({"session_uid":uid}), None).unwrap();
+                assert_eq!(resolved["agent_state"]["state"], "errored");
+                assert!(resolved["agent_state"]["detail"]["confirmed_turn_open"].is_null());
+                assert!(crate::control::continuous_drain::notice_ready(&state, &uid));
+                assert!(capture_drain_sessions(&state, &task)[0].final_turn_ended);
+                {
+                    let st = state.lock().unwrap();
+                    let mut cell = st.sessions[&uid].agent_state.lock().unwrap();
+                    cell.inputs.presence.as_mut().unwrap().transcript_end = None;
+                    cell.inputs.presence.as_mut().unwrap().valid = valid;
+                    cell.inputs.hooks.stop_at = Some(ended);
+                }
+                let resolved = resolve_authorized_session(&state, &json!({"session_uid":uid}), None).unwrap();
+                assert!(resolved["agent_state"]["detail"]["confirmed_turn_open"].is_null());
+                assert_eq!(resolved["idle"], true, "actual Stop releases the quiet fallback guard");
+            }
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn state_core_legacy_stop_timestamp_cannot_close_a_newer_prompt() {
+        with_temp_home(|| {
+            let state = make_state_arc();
+            let uid = fresh_test_uid();
+            insert_session(&state, &uid, "ws-stop");
+            let now = now_unix_f64();
+            {
+                let mut st = state.lock().unwrap();
+                let session = st.sessions.get_mut(&uid).unwrap();
+                session.session_type = "claude-code".into();
+                session.stamp_turn_end();
+                session.input_handle().stamp_activity();
+                let mut cell = session.agent_state.lock().unwrap();
+                cell.inputs.latest_start = Some(now - 1.0);
+                cell.inputs.hooks.prompt_at = Some(now - 1.0);
+            }
+            let stop = |at| {
+                session_turn_ended(&state, &json!({"session_uid":uid, "observed_at":at}), None).unwrap()
+            };
+            stop(now - 2.0);
+            assert_eq!(
+                state.lock().unwrap().sessions[&uid].semantic_idle(),
+                Some(false)
+            );
+            assert_eq!(
+                crate::agent_state::current(&state.lock().unwrap().sessions[&uid]).state,
+                crate::agent_state::State::Working
+            );
+            stop(now);
+            assert_eq!(
+                state.lock().unwrap().sessions[&uid].semantic_idle(),
+                Some(true)
+            );
+            let ended = *state.lock().unwrap().sessions[&uid]
+                .last_turn_end_at
+                .lock()
+                .unwrap();
+            stop(now - 2.0);
+            assert_eq!(
+                *state.lock().unwrap().sessions[&uid]
+                    .last_turn_end_at
+                    .lock()
+                    .unwrap(),
+                ended
+            );
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn state_core_daemon_consumers_respect_engine_work_and_final_report_time() {
+        with_continuous_home(|home| {
+            use crate::agent_state::{LastTurn, PresenceObs, PresenceStatus, State, TurnStatus};
+            let state = make_state_arc();
+            let uid = fresh_test_uid();
+            let mut task = fresh_task_running("state-drain", home, &uid);
+            crate::continuous::drain::request(&mut task, crate::continuous::task::now_unix());
+            insert_continuous_session(&state, &uid, &task.task_id);
+            let report = state.lock().unwrap().sessions[&uid].stamp_reported_done(None);
+            for (status, failed, valid, expected, ready, mid_turn) in [
+                (PresenceStatus::Idle, false, true, State::Idle, true, 0),
+                (PresenceStatus::Idle, true, true, State::Errored, true, 0),
+                (PresenceStatus::Busy, false, true, State::Working, false, 1),
+                (
+                    PresenceStatus::Shell,
+                    false,
+                    true,
+                    State::WorkingBackground,
+                    false,
+                    1,
+                ),
+                (
+                    PresenceStatus::Waiting,
+                    false,
+                    true,
+                    State::WaitingOnHuman,
+                    false,
+                    0,
+                ),
+                (PresenceStatus::Idle, false, false, State::Unknown, false, 0),
+            ] {
+                {
+                    let st = state.lock().unwrap();
+                    let session = &st.sessions[&uid];
+                    // Intentionally disagree with the engine on both legacy clocks.
+                    *session.last_activity_at.lock().unwrap() = if ready {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
+                    *session.last_turn_end_at.lock().unwrap() = Some(std::time::Instant::now());
+                    let mut cell = session.agent_state.lock().unwrap();
+                    cell.inputs.latest_start = None;
+                    cell.inputs.hooks.stop_at = Some(report.at_unix + 0.01);
+                    cell.inputs.presence = Some(PresenceObs {
+                        valid,
+                        status,
+                        observed_at: report.at_unix + 0.01,
+                        status_updated_at: Some(report.at_unix + 0.01), native_session_id: None,
+                        engine_version: None,
+                        waiting_for: None,
+                        main_turn_open: Some(true),
+                        transcript_error: failed.then(|| "auth".into()),
+                        // Error attribution needs its own boundary after Stop;
+                        // the presence status timestamp cannot date the hint.
+                        transcript_end: failed.then(|| LastTurn {
+                            ended_at: Some(report.at_unix + 0.02), status: Some(TurnStatus::Failed),
+                        }), transcript_evidence_path: None, wait_resolution: None,
+                    });
+                    assert_eq!(
+                        crate::agent_state::derive(&cell.inputs, now_unix_f64()).state,
+                        expected
+                    );
+                }
+                assert_eq!(
+                    crate::control::continuous_drain::notice_ready(&state, &uid),
+                    ready,
+                    "{expected:?}"
+                );
+                assert_eq!(
+                    daemon_health(&state).unwrap()["sessions_mid_turn"],
+                    mid_turn,
+                    "{expected:?}"
+                );
+                let observations = capture_drain_sessions(&state, &task);
+                assert_eq!(
+                    observations
+                        .iter()
+                        .find(|s| s.session_uid == uid)
+                        .unwrap()
+                        .final_turn_ended,
+                    ready,
+                    "{expected:?}"
+                );
+            }
+            // Codex errors are final for drain, but their end must follow report_done.
+            {
+                let mut st = state.lock().unwrap();
+                let session = st.sessions.get_mut(&uid).unwrap();
+                session.session_type = "codex".into();
+                let mut cell = session.agent_state.lock().unwrap();
+                cell.inputs.presence = None;
+                cell.inputs.relay = Some(crate::agent_state::RelaySnapshot {
+                    backend_connected: true,
+                    foreground: crate::agent_state::RelayStatus::Idle,
+                    observed_at: now_unix_f64(),
+                    last_turn: LastTurn {
+                        ended_at: Some(report.at_unix - 1.0),
+                        status: Some(TurnStatus::Failed),
+                    },
+                    ..Default::default()
+                });
+            }
+            assert!(!capture_drain_sessions(&state, &task)[0].final_turn_ended);
+            {
+                let st = state.lock().unwrap();
+                st.sessions[&uid]
+                    .agent_state
+                    .lock()
+                    .unwrap()
+                    .inputs
+                    .relay
+                    .as_mut()
+                    .unwrap()
+                    .last_turn
+                    .ended_at = Some(report.at_unix + 0.01);
+            }
+            assert!(capture_drain_sessions(&state, &task)[0].final_turn_ended);
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
     fn continuous_drain_stop_hook_continuation_invalidates_idle_and_old_report() {
         with_continuous_home(|home| {
             let state = Arc::new(Mutex::new(DaemonState::new()));
@@ -31523,6 +39148,621 @@ while True:
         });
     }
 
+    // ============================================================
+    // session.fork — fork into new task
+    // ============================================================
+
+    const FORK_SRC_ID: &str = "11111111-2222-4333-8444-555555555555";
+
+    /// Seed `ts-src` as a live claude session in `ws-src` (task
+    /// `task-src`) whose bound transcript exists on disk.
+    fn seed_fork_source(state: &Arc<Mutex<DaemonState>>, repo: &std::path::Path, name: &str) {
+        {
+            let mut s = state.lock().unwrap();
+            let mut ws = ManifestWorkspace::default();
+            ws.id = "ws-src".to_string();
+            ws.worktree_path = Some(repo.to_path_buf());
+            ws.main_repo_path = Some(repo.to_path_buf());
+            ws.repo_url = Some(name.to_string());
+            s.workspaces.insert("ws-src".to_string(), ws);
+        }
+        seed_tasked_caller(state, "ts-src", "ws-src", "task-src");
+        let path = crate::transcript_detect::claude_transcript_path(repo, FORK_SRC_ID).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{\"type\":\"user\"}\n").unwrap();
+        let mut s = state.lock().unwrap();
+        let src = s.sessions.get_mut("ts-src").unwrap();
+        src.session_type = "claude-code".to_string();
+        src.transcript_path = Some(path.to_string_lossy().into_owned());
+    }
+
+    /// Review 7b5fd3f #3: a fork whose target lands in ANOTHER repo than the
+    /// source (a never-run predictionTrading task, or a new task under a lead
+    /// whose own row is predictionTrading while it runs in claude-manager)
+    /// cuts at that repo's trunk on BOTH paths, reports
+    /// `base_downgraded: "trunk"`, and lists the source commits beyond the
+    /// source repo's trunk as not carried.
+    #[test]
+    fn session_fork_into_another_repo_downgrades_base_on_both_paths() {
+        with_home_and_repo("cmrepo", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            run_git(&repo, &["branch", "-M", "main"]);
+            run_git(&repo, &["remote", "add", "origin", "git@github.com:o/claude-manager.git"]);
+            run_git(&repo, &["checkout", "-q", "-b", "cm/wip"]);
+            std::fs::write(repo.join("wip.txt"), "source work").unwrap();
+            run_git(&repo, &["add", "-A"]);
+            run_git(&repo, &["commit", "-q", "-m", "source wip"]);
+            let pt = seed_other_clone(home, "predictionTrading", "https://github.com/o/predictionTrading.git");
+            let pt_main = git_sha(&pt, "main");
+            let state = make_state_arc();
+            seed_fork_source(&state, &repo, "git@github.com:o/claude-manager.git");
+            state.lock().unwrap().record_agent_task_edge("task-pt", "task-src");
+            let stub = spawn_routed_stub(|method, path, _| match (method, path) {
+                ("GET", "/tasks/task-pt") => (
+                    200,
+                    r#"{"id":"task-pt","name":"PT task","repo_url":"git@github.com:o/predictionTrading.git"}"#.into(),
+                ),
+                ("GET", "/tasks/task-src") => (
+                    200,
+                    r#"{"id":"task-src","name":"Lead","repo_url":"git@github.com:o/predictionTrading.git","project":"predictionTrading","wip_branch":null}"#.into(),
+                ),
+                ("POST", "/tasks") => (200, r#"{"id":"task-new","name":"n"}"#.into()),
+                ("PATCH", _) | ("DELETE", _) => (200, "{}".into()),
+                _ => (404, r#"{"detail":"unexpected"}"#.into()),
+            });
+            set_api_env(stub.port);
+            let old_path = fake_claude_on_path(home);
+            let existing = session_fork(&state, &json!({"source_uid": "ts-src", "task_id": "task-pt"}), None);
+            let new = session_fork(&state, &json!({"source_uid": "ts-src", "task_name": "pt fork"}), None);
+            unsafe { std::env::set_var("PATH", &old_path) };
+            for (label, result) in [("existing", existing), ("new", new)] {
+                let result = result.unwrap_or_else(|e| panic!("{label}: {e:?}"));
+                assert_eq!(result["base_downgraded"], json!("trunk"), "{label}: {result}");
+                let wt = std::path::PathBuf::from(result["worktree_path"].as_str().unwrap());
+                assert!(wt.join("predictionTrading.md").exists(), "{label}: a PT checkout");
+                assert!(!wt.join("wip.txt").exists(), "{label}: source work isn't carried");
+                assert_eq!(result["base_sha"], json!(pt_main), "{label}");
+                let missing = result["commits_not_carried"].as_array().unwrap();
+                assert_eq!(missing.len(), 1, "{label}: {result}");
+                assert!(missing[0].as_str().unwrap().contains("source wip"), "{label}: {result}");
+            }
+            kill_all_sessions(&state);
+            clear_api_env();
+        });
+    }
+
+    #[test]
+    fn fork_base_choice_accepts_source_and_trunk_only() {
+        assert_eq!(fork_base_choice(None), Ok(false));
+        assert_eq!(fork_base_choice(Some("")), Ok(false));
+        assert_eq!(fork_base_choice(Some("Source")), Ok(false));
+        assert_eq!(fork_base_choice(Some("trunk")), Ok(true));
+        assert_eq!(fork_base_choice(Some("main")).unwrap_err().0, ErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn session_fork_rejects_cross_engine_model_before_task_creation() {
+        with_home_and_repo("forkmodel", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let state = make_state_arc();
+            seed_fork_source(&state, &repo, name);
+            // Any API call would fail this test, including task creation.
+            let stub = spawn_routed_stub(|method, path, _| {
+                panic!("model preflight must not call the API: {method} {path}")
+            });
+            set_api_env(stub.port);
+            let before = state.lock().unwrap().sessions.len();
+            let err = session_fork(
+                &state,
+                &json!({"source_uid": "ts-src", "task_name": "wrong engine", "model": "gpt-6-astra"}),
+                None,
+            ).expect_err("cross-engine model is not a native fork");
+            assert_eq!(err.0, ErrorCode::InvalidParams);
+            assert!(err.1.contains("fork_session keeps the source engine"), "{}", err.1);
+            assert!(err.1.contains("No task or session was created"), "{}", err.1);
+            assert_eq!(state.lock().unwrap().sessions.len(), before);
+            kill_all_sessions(&state);
+            clear_api_env();
+        });
+    }
+
+    #[test]
+    fn resolve_fork_source_requires_an_agent_with_a_transcript() {
+        with_home_and_repo("forksrc", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let state = make_state_arc();
+            seed_fork_source(&state, &repo, name);
+            {
+                let s = state.lock().unwrap();
+                let src = resolve_fork_source(&s, "ts-src").expect("forkable");
+                assert_eq!(src.engine, "claude-code");
+                assert_eq!(src.transcript_id, FORK_SRC_ID);
+                assert_eq!(src.worktree_path, repo);
+                assert_eq!(src.task_id.as_deref(), Some("task-src"));
+                assert_eq!(resolve_fork_source(&s, "ts-nope").unwrap_err().0, ErrorCode::NotFound);
+            }
+            {
+                let mut s = state.lock().unwrap();
+                s.sessions.get_mut("ts-src").unwrap().transcript_path = None;
+                let missing = resolve_fork_source(&s, "ts-src").unwrap_err();
+                assert_eq!(missing.0, ErrorCode::Conflict);
+                assert!(missing.1.contains("source unavailable for fork context"), "{}", missing.1);
+                s.sessions.get_mut("ts-src").unwrap().session_type = "bash".into();
+                assert_eq!(resolve_fork_source(&s, "ts-src").unwrap_err().0, ErrorCode::InvalidParams);
+            }
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// A Session caller can fork only a source it could drive, and
+    /// cannot hang the fork under a task outside its own tree.
+    #[test]
+    fn session_fork_session_caller_is_scoped() {
+        with_home_and_repo("forkscope", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let state = make_state_arc();
+            seed_fork_source(&state, &repo, name);
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = ManifestWorkspace::default();
+                ws.id = "ws-other".to_string();
+                ws.worktree_path = Some(repo.clone());
+                s.workspaces.insert("ws-other".to_string(), ws);
+                s.task_tree.insert("task-src".into(), None);
+                s.task_tree.insert("task-other".into(), None);
+                s.task_tree_pushed = true;
+            }
+            seed_tasked_caller(&state, "ts-other", "ws-other", "task-other");
+            let err = session_fork(
+                &state,
+                &json!({"source_uid": "ts-src", "task_name": "x"}),
+                Some("ts-other"),
+            )
+            .expect_err("an unrelated session cannot fork ts-src");
+            assert_eq!(err.0, ErrorCode::Unauthorized, "{:?}", err);
+            // The source itself may fork, but not under someone else's task.
+            let err = session_fork(
+                &state,
+                &json!({"source_uid": "ts-src", "task_name": "x", "parent_task_id": "task-other"}),
+                Some("ts-src"),
+            )
+            .expect_err("explicit parent outside the caller's tree");
+            assert_eq!(err.0, ErrorCode::Unauthorized, "{:?}", err);
+            kill_all_sessions(&state);
+        });
+    }
+
+
+    #[test]
+    fn fork_target_requires_exactly_one_of_task_name_and_task_id() {
+        let parse = |v: Value| fork_target(&serde_json::from_value::<ForkSessionParams>(v).unwrap());
+        assert_eq!(
+            parse(json!({"source_uid": "s", "task_name": " x "})).unwrap(),
+            ForkTarget::New { task_name: "x".into(), parent_task_id: None, top_level: false }
+        );
+        assert_eq!(
+            parse(json!({"source_uid": "s", "task_id": "t"})).unwrap(),
+            ForkTarget::Existing("t".into())
+        );
+        for bad in [
+            json!({"source_uid": "s"}),
+            json!({"source_uid": "s", "task_name": "x", "task_id": "t"}),
+            json!({"source_uid": "s", "task_id": "t", "parent_task_id": "p"}),
+            json!({"source_uid": "s", "task_id": "t", "top_level": true}),
+        ] {
+            assert_eq!(parse(bad.clone()).unwrap_err().0, ErrorCode::InvalidParams, "{bad}");
+        }
+    }
+
+    /// Put a stand-in `claude` (records argv, then sleeps) first on PATH.
+    /// Returns the previous PATH to restore.
+    fn fake_claude_on_path(home: &std::path::Path) -> std::ffi::OsString {
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake = bin.join("claude");
+        std::fs::write(&fake, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let old = std::env::var_os("PATH").unwrap_or_default();
+        unsafe { std::env::set_var("PATH", format!("{}:{}", bin.display(), old.to_string_lossy())) };
+        old
+    }
+
+    /// Fork into an EXISTING task that already runs somewhere: join its
+    /// workspace exactly like start_session(task_id) — no task row, no new
+    /// worktree — and report the co-tenant instead of refusing.
+    #[test]
+    fn session_fork_into_existing_task_joins_its_workspace_and_reports_co_tenants() {
+        with_home_and_repo("forkjoin", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let state = make_state_arc();
+            seed_fork_source(&state, &repo, name);
+            let target_wt = home.join("target-wt");
+            run_git(&repo, &["worktree", "add", "-q", "-b", "cm/target", target_wt.to_str().unwrap()]);
+            // A source commit the target branch lacks: reported, not typed.
+            std::fs::write(repo.join("source-only.txt"), "x").unwrap();
+            run_git(&repo, &["add", "-A"]);
+            run_git(&repo, &["commit", "-q", "-m", "source only work"]);
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = ManifestWorkspace::default();
+                ws.id = "ws-target".to_string();
+                ws.worktree_path = Some(target_wt.clone());
+                ws.main_repo_path = Some(repo.clone());
+                s.workspaces.insert("ws-target".to_string(), ws);
+                s.task_workspaces.insert("task-t".into(), "ws-target".into());
+                s.bindings.insert("task-t".into(), "ws-target".into());
+            }
+            seed_tasked_caller(&state, "ts-tenant", "ws-target", "task-t");
+            let stub = spawn_routed_stub(|method, path, _| {
+                if method == "GET" && path == "/tasks/task-t" {
+                    (200, r#"{"id":"task-t","name":"Target Task","wip_branch":"cm/target"}"#.into())
+                } else {
+                    (404, r#"{"detail":"unexpected"}"#.into())
+                }
+            });
+            set_api_env(stub.port);
+            let old_path = fake_claude_on_path(home);
+            let result = session_fork(&state, &json!({"source_uid": "ts-src", "task_id": "task-t"}), None);
+            unsafe { std::env::set_var("PATH", &old_path) };
+            let result = result.expect("fork into existing task");
+            assert_eq!(result["target"], "existing");
+            assert_eq!(result["task_id"], "task-t");
+            assert_eq!(result["task_name"], "Target Task");
+            assert_eq!(result["workspace_id"], "ws-target");
+            assert_eq!(result["worktree_path"], json!(target_wt.to_string_lossy()));
+            assert_eq!(result["branch"], "cm/target");
+            let missing = result["commits_not_carried"].as_array().expect("list");
+            assert_eq!(missing.len(), 1, "{}", result);
+            assert!(missing[0].as_str().unwrap().ends_with("source only work"));
+            assert_eq!(result["prompt_source"], "none");
+            assert!(result.get("prompt_delivery").is_none());
+            let shared = result["workspace_shared_with"].as_array().expect("co-tenant reported");
+            assert!(shared.iter().any(|t| t["session_uid"] == "ts-tenant"));
+            let uid = result["session_uid"].as_str().unwrap();
+            assert_eq!(state.lock().unwrap().sessions[uid].task_id.as_deref(), Some("task-t"));
+            let reqs = stub.requests.lock().unwrap();
+            assert!(!reqs.iter().any(|r| r.method == "POST"), "no task row minted");
+            drop(reqs);
+            assert_eq!(state.lock().unwrap().workspaces.len(), 2, "no workspace minted");
+            kill_all_sessions(&state);
+            clear_api_env();
+        });
+    }
+
+    /// Fork into an existing task that never ran: mint its checkout via the
+    /// start_session path, cut at the source HEAD (base="source").
+    #[test]
+    fn session_fork_into_never_run_task_mints_at_the_requested_base() {
+        with_home_and_repo("forkmint", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            std::fs::write(repo.join("wip.txt"), "source work").unwrap();
+            run_git(&repo, &["add", "-A"]);
+            run_git(&repo, &["commit", "-q", "-m", "source wip"]);
+            let state = make_state_arc();
+            seed_fork_source(&state, &repo, name);
+            let name_owned = name.to_string();
+            let stub = spawn_routed_stub(move |method, path, _| {
+                if method == "GET" && path == "/tasks/task-n" {
+                    (200, format!(r#"{{"id":"task-n","name":"Never Ran","repo_url":"{}"}}"#, name_owned))
+                } else if method == "PATCH" {
+                    (200, "{}".into())
+                } else {
+                    (404, r#"{"detail":"unexpected"}"#.into())
+                }
+            });
+            set_api_env(stub.port);
+            let old_path = fake_claude_on_path(home);
+            let result = session_fork(&state, &json!({"source_uid": "ts-src", "task_id": "task-n"}), None);
+            unsafe { std::env::set_var("PATH", &old_path) };
+            let result = result.expect("fork into never-run task");
+            assert_eq!(result["target"], "existing");
+            let wt = std::path::PathBuf::from(result["worktree_path"].as_str().unwrap());
+            assert_ne!(wt, repo);
+            assert!(wt.join("wip.txt").exists(), "cut at the source HEAD, not trunk's first commit");
+            assert!(result["branch"].as_str().unwrap().starts_with("cm-sub/never-ran-"));
+            assert_eq!(
+                state.lock().unwrap().task_workspaces.get("task-n"),
+                Some(&result["workspace_id"].as_str().unwrap().to_string())
+            );
+            kill_all_sessions(&state);
+            clear_api_env();
+        });
+    }
+
+    /// New-task parent: an explicit parent, or top-level in the source
+    /// task's project.
+    #[test]
+    fn session_fork_new_task_parent_override_and_top_level() {
+        with_home_and_repo("forkparent", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let state = make_state_arc();
+            seed_fork_source(&state, &repo, name);
+            let name_owned = name.to_string();
+            let stub = spawn_routed_stub(move |method, path, _| {
+                match (method, path) {
+                    ("GET", "/tasks/task-src") | ("GET", "/tasks/task-other") => (
+                        200,
+                        format!(
+                            r#"{{"id":"{}","name":"Some Task","repo_url":"{}","project":"proj"}}"#,
+                            path.trim_start_matches("/tasks/"),
+                            name_owned
+                        ),
+                    ),
+                    ("POST", "/tasks") => (200, r#"{"id":"task-new","name":"n"}"#.into()),
+                    _ => (404, r#"{"detail":"unexpected"}"#.into()),
+                }
+            });
+            set_api_env(stub.port);
+            let old_path = fake_claude_on_path(home);
+            let a = session_fork(
+                &state,
+                &json!({"source_uid": "ts-src", "task_name": "a", "parent_task_id": "task-other"}),
+                None,
+            );
+            let b = session_fork(
+                &state,
+                &json!({"source_uid": "ts-src", "task_name": "b", "top_level": true}),
+                None,
+            );
+            unsafe { std::env::set_var("PATH", &old_path) };
+            assert_eq!(a.expect("explicit parent")["parent_task_id"], "task-other");
+            assert_eq!(b.expect("top level")["parent_task_id"], Value::Null);
+            let reqs = stub.requests.lock().unwrap();
+            let posts: Vec<Value> = reqs
+                .iter()
+                .filter(|r| r.method == "POST")
+                .map(|r| serde_json::from_str(&r.body).unwrap())
+                .collect();
+            assert_eq!(posts[0]["parent_task_id"], "task-other");
+            assert_eq!(posts[1]["parent_task_id"], Value::Null);
+            assert_eq!(posts[1]["project"], "proj", "top-level stays in the source's project");
+            drop(reqs);
+            kill_all_sessions(&state);
+            clear_api_env();
+        });
+    }
+
+    /// A taskless Session caller has no task tree to hang the fork in,
+    /// even when it can reach the source (e.g. a workspace co-tenant).
+    #[test]
+    fn session_fork_refuses_taskless_non_global_callers() {
+        with_home_and_repo("forktaskless", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let state = make_state_arc();
+            seed_fork_source(&state, &repo, name);
+            let mut sp = SpawnParams::new("ts-loose", "loose", "/bin/sleep");
+            sp.args = vec!["120".to_string()];
+            sp.workspace_id = "ws-src".to_string();
+            let sess = crate::session::DaemonSession::spawn(sp).expect("spawn");
+            state.lock().unwrap().sessions.insert("ts-loose".into(), sess);
+            let err = session_fork(
+                &state,
+                &json!({"source_uid": "ts-src", "task_name": "x"}),
+                Some("ts-loose"),
+            )
+            .expect_err("taskless caller");
+            assert_eq!(err.0, ErrorCode::Unauthorized, "{:?}", err);
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// A spawn failure after the mint removes everything the fork made:
+    /// the planning row, the workspace, the auth edge, the worktree and
+    /// its zero-commit cm-sub branch.
+    #[test]
+    fn session_fork_rolls_back_task_worktree_and_branch_on_spawn_failure() {
+        with_home_and_repo("forkrollback", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let state = make_state_arc();
+            seed_fork_source(&state, &repo, name);
+            // No `claude` anywhere on PATH (git stays reachable for the mint):
+            // the spawn fails after the task and worktree exist.
+            let old_path = std::env::var_os("PATH").unwrap_or_default();
+            unsafe { std::env::set_var("PATH", "/usr/bin:/bin") };
+            let name_owned = name.to_string();
+            let stub = spawn_routed_stub(move |method, path, _body| {
+                if method == "GET" && path == "/tasks/task-src" {
+                    (200, format!(r#"{{"id":"task-src","name":"Src","repo_url":"{}"}}"#, name_owned))
+                } else if method == "POST" && path == "/tasks" {
+                    (200, r#"{"id":"task-doomed","name":"doomed"}"#.to_string())
+                } else if method == "DELETE" {
+                    (200, "{}".to_string())
+                } else {
+                    (404, r#"{"detail":"unexpected"}"#.to_string())
+                }
+            });
+            set_api_env(stub.port);
+            let result = session_fork(
+                &state,
+                &json!({"source_uid": "ts-src", "task_name": "doomed"}),
+                None,
+            );
+            unsafe { std::env::set_var("PATH", &old_path) };
+            assert!(result.is_err(), "spawn must fail: {:?}", result);
+            {
+                let s = state.lock().unwrap();
+                assert!(!s.task_workspaces.contains_key("task-doomed"));
+                assert!(!s.bindings.contains_key("task-doomed"));
+                assert!(!s.agent_task_edges.contains_key("task-doomed"));
+                assert!(!s.task_tree.contains_key("task-doomed"));
+                assert_eq!(s.workspaces.len(), 1, "only the source workspace remains");
+            }
+            let branches = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["branch", "--list", "cm-sub/*"])
+                .output()
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+                "zero-commit fork branch deleted: {}",
+                String::from_utf8_lossy(&branches.stdout)
+            );
+            let reqs = stub.requests.lock().unwrap();
+            assert!(
+                reqs.iter().any(|r| r.method == "DELETE" && r.path == "/tasks/task-doomed"),
+                "planning row deleted"
+            );
+            drop(reqs);
+            kill_all_sessions(&state);
+            clear_api_env();
+        });
+    }
+
+    /// End to end (with a stand-in `claude` on PATH): the fork mints a
+    /// subtask of the source's task on a branch cut at the source HEAD,
+    /// spawns `claude --resume <src> --fork-session --session-id <new>`
+    /// there bound to the NEW task and the NEW transcript id, and leaves
+    /// the source session untouched.
+    #[test]
+    fn session_fork_claude_spawns_native_fork_in_new_subtask() {
+        with_home_and_repo("forkrepo", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            std::fs::write(repo.join("wip.txt"), "source work").unwrap();
+            run_git(&repo, &["add", "-A"]);
+            run_git(&repo, &["commit", "-q", "-m", "source wip"]);
+            let source_head = git_sha(&repo, "HEAD");
+            std::fs::write(repo.join("dirty.txt"), "uncommitted").unwrap();
+            let state = make_state_arc();
+            seed_fork_source(&state, &repo, name);
+            let source_path_before =
+                state.lock().unwrap().sessions["ts-src"].transcript_path.clone();
+
+            let bin = home.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let argv_file = home.join("claude-argv.txt");
+            let fake = bin.join("claude");
+            std::fs::write(
+                &fake,
+                format!("#!/bin/sh\necho \"$@\" > {}\nexec sleep 60\n", argv_file.display()),
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let old_path = std::env::var_os("PATH").unwrap_or_default();
+            unsafe {
+                std::env::set_var(
+                    "PATH",
+                    format!("{}:{}", bin.display(), old_path.to_string_lossy()),
+                )
+            };
+
+            let name_owned = name.to_string();
+            let stub = spawn_routed_stub(move |method, path, _body| {
+                if method == "GET" && path == "/tasks/task-src" {
+                    (
+                        200,
+                        format!(
+                            r#"{{"id":"task-src","name":"Source Task","repo_url":"{}","project":"proj","status":"running","parent_task_id":null}}"#,
+                            name_owned
+                        ),
+                    )
+                } else if method == "POST" && path == "/tasks" {
+                    (200, r#"{"id":"task-fork","name":"other idea","status":"running"}"#.to_string())
+                } else {
+                    (404, r#"{"detail":"unexpected"}"#.to_string())
+                }
+            });
+            set_api_env(stub.port);
+
+            let params = json!({
+                "source_uid": "ts-src", "task_name": "other idea", "request_id": "req-1",
+            });
+            let result = session_fork(&state, &params, None);
+            unsafe { std::env::set_var("PATH", &old_path) };
+            let result = result.expect("session.fork ok");
+            // A retry with the same request id (a client whose read timed
+            // out) gets the first fork back instead of minting a second.
+            let again = session_fork(&state, &params, None).expect("dedup replay");
+            assert_eq!(again["session_uid"], result["session_uid"]);
+            assert_eq!(again["deduplicated"], json!(true));
+            // No first prompt unless the caller passed one: the fork waits
+            // at its composer and the move's facts ride the result instead.
+            assert_eq!(result["prompt_source"], "none");
+            assert!(result.get("prompt_delivery").is_none(), "nothing typed: {}", result);
+            assert!(
+                state.lock().unwrap().sessions[result["session_uid"].as_str().unwrap()]
+                    .prompt_delivery
+                    .is_none(),
+                "no delivery armed",
+            );
+            assert_eq!(result["commits_not_carried"], json!([]), "cut at the source HEAD");
+            assert_eq!(result["commits_not_carried_truncated"], json!(false));
+            assert!(result["forked_from"].get("branch").is_some(), "{}", result);
+            assert_eq!(result["uncommitted_left_behind"], json!(true));
+            assert_eq!(result["uncommitted_files"], json!(1));
+
+            assert_eq!(result["task_id"], "task-fork");
+            assert_eq!(result["parent_task_id"], "task-src");
+            assert_eq!(result["engine"], "claude-code");
+            assert_eq!(result["base"], "source");
+            assert_eq!(result["base_sha"], json!(source_head));
+            assert_eq!(result["forked_from"]["session_uid"], "ts-src");
+            assert_eq!(result["forked_from"]["transcript_id"], FORK_SRC_ID);
+            let new_id = result["transcript_id"].as_str().expect("claude fork id is pinned");
+            assert_ne!(new_id, FORK_SRC_ID);
+            let wt = std::path::PathBuf::from(result["worktree_path"].as_str().unwrap());
+            assert!(wt.join("wip.txt").exists(), "branch cut at the source HEAD");
+            assert!(!wt.join("dirty.txt").exists(), "uncommitted edits stay behind");
+            assert_ne!(wt, repo);
+            assert!(result["branch"].as_str().unwrap().starts_with("cm-sub/source-task-other-idea-"));
+
+            let uid = result["session_uid"].as_str().unwrap().to_string();
+            {
+                let s = state.lock().unwrap();
+                let forked = &s.sessions[&uid];
+                assert_eq!(forked.task_id.as_deref(), Some("task-fork"));
+                assert_eq!(forked.session_type, "claude-code");
+                assert_eq!(forked.workspace_id, result["workspace_id"].as_str().unwrap());
+                assert_eq!(
+                    forked.transcript_path,
+                    crate::transcript_detect::claude_transcript_path(&wt, new_id)
+                        .map(|p| p.to_string_lossy().into_owned()),
+                    "the fork is bound to its OWN conversation in its OWN worktree",
+                );
+                let src = &s.sessions["ts-src"];
+                assert_eq!(src.transcript_path, source_path_before, "source untouched");
+                assert_eq!(src.task_id.as_deref(), Some("task-src"));
+                assert_eq!(s.task_tree.get("task-fork"), Some(&Some("task-src".to_string())));
+            }
+
+            let reqs = stub.requests.lock().unwrap();
+            assert_eq!(reqs.iter().filter(|r| r.method == "POST").count(), 1, "one fork only");
+            let post = reqs.iter().find(|r| r.method == "POST").expect("POST /tasks");
+            let body: Value = serde_json::from_str(&post.body).unwrap();
+            assert_eq!(body["parent_task_id"], "task-src");
+            assert_eq!(body["worktree_mode"], "branch");
+            assert_eq!(body["metadata"]["filer"]["submitted_via"], "tui.fork");
+            drop(reqs);
+
+            let mut argv = String::new();
+            for _ in 0..100 {
+                argv = std::fs::read_to_string(&argv_file).unwrap_or_default();
+                if !argv.is_empty() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert!(
+                argv.contains(&format!(
+                    "--resume {} --fork-session --session-id {}",
+                    FORK_SRC_ID, new_id
+                )),
+                "engine-native fork argv: {}",
+                argv
+            );
+            assert!(argv.contains("--mcp-config"), "MCP injected: {}", argv);
+            assert!(
+                !home.join(".cm/agent-memories").exists(),
+                "no snapshot copy is written",
+            );
+
+            kill_all_sessions(&state);
+            clear_api_env();
+        });
+    }
+
     /// Branch-mode `create_subtask(base=<committish>)`: the new worktree
     /// branch is cut from the NAMED commit, not the parent branch's tip
     /// — the "fork this subtask off clean upstream instead of my WIP"
@@ -31692,6 +39932,213 @@ while True:
 
             kill_all_sessions(&state);
             clear_api_env();
+        });
+    }
+
+    fn scope_call(
+        state: &Arc<Mutex<DaemonState>>,
+        caller: &str,
+        method: &str,
+        params: Value,
+    ) -> crate::control::protocol::Response {
+        use crate::control::dispatch::{dispatch_request, DispatchOutcome};
+        let req = crate::control::protocol::Request {
+            id: "t".into(),
+            caller: crate::control::protocol::Caller::session(caller),
+            method: method.into(),
+            params,
+        };
+        match dispatch_request(state, &req) {
+            DispatchOutcome::Done(r) => r,
+            _ => panic!("{method}: unexpected stream outcome"),
+        }
+    }
+
+    fn refused_out_of_scope(r: &crate::control::protocol::Response) -> bool {
+        !r.ok && r.error.as_ref().is_some_and(|e| e.code == ErrorCode::Unauthorized)
+    }
+
+    /// The TUI's `task.update_tree` push now carries the parent edges of
+    /// done/backlog/draft subtasks (it used to carry only running/blocked
+    /// rows), so an orchestrator reaches its own done subtask: update_task,
+    /// set_subtask_status, send_key and list_sessions. Dispatch makes no
+    /// planning call for scope: a task the tree doesn't know is simply
+    /// refused, and the stub sees only the methods' own writes.
+    #[test]
+    fn done_subtask_is_in_scope_after_a_full_tree_push_and_dispatch_never_fetches() {
+        with_home_and_repo("donepush", |_home, _name| {
+            let state = make_state_arc();
+            seed_tasked_caller(&state, "ts-orch", "ws-orch", "orch");
+            seed_tasked_caller(&state, "ts-worker", "ws-worker", "sub-done");
+            seed_tasked_caller(&state, "ts-stranger", "ws-x", "unrelated");
+            let stub = spawn_routed_stub(|method, _path, _b| match method {
+                "PATCH" => (200, r#"{"id":"x","status":"running"}"#.into()),
+                _ => (200, r#"{"id":"sub-done","status":"running","parent_task_id":"orch"}"#.into()),
+            });
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".to_string();
+            }
+            task_update_tree(
+                &state,
+                &json!({"tasks": [
+                    {"task_id": "orch", "parent_task_id": null, "workspace_id": "ws-orch"},
+                    {"task_id": "sub-done", "parent_task_id": "orch"},
+                    {"task_id": "sub-grand", "parent_task_id": "sub-done"},
+                    {"task_id": "unrelated", "parent_task_id": "other-root"},
+                ]}),
+            )
+            .unwrap();
+
+            let r = scope_call(&state, "ts-orch", "update_task", json!({"task_id": "sub-done", "fields": {"status": "running"}}));
+            assert!(r.ok, "done subtask: {:?}", r.error);
+            let r = scope_call(&state, "ts-orch", "set_subtask_status", json!({"task_id": "sub-grand", "status": "running"}));
+            assert!(r.ok, "done grandchild: {:?}", r.error);
+            let r = scope_call(&state, "ts-orch", "send_key", json!({"session_uids": ["ts-worker", "ts-stranger"], "key": "escape"}));
+            let statuses: Vec<String> = r.result.as_ref().unwrap()["results"].as_array().unwrap().iter()
+                .map(|x| x["status"].as_str().unwrap().to_string()).collect();
+            assert_eq!(statuses, ["ok", "unauthorized"], "{r:?}");
+            let rows = scope_call(&state, "ts-orch", "list_sessions", json!({}));
+            let uids: Vec<String> = rows.result.as_ref().unwrap().as_array().unwrap().iter()
+                .map(|x| x["session_uid"].as_str().unwrap().to_string()).collect();
+            assert!(uids.contains(&"ts-worker".to_string()) && !uids.contains(&"ts-stranger".to_string()), "{uids:?}");
+
+            let r = scope_call(&state, "ts-orch", "update_task", json!({"task_id": "unrelated", "fields": {"status": "running"}}));
+            assert!(refused_out_of_scope(&r), "unrelated: {r:?}");
+            let r = scope_call(&state, "ts-orch", "update_task", json!({"task_id": "never-pushed", "fields": {"status": "running"}}));
+            assert!(refused_out_of_scope(&r), "unknown task: {r:?}");
+
+            let reqs = stub.requests.lock().unwrap();
+            let seen: Vec<(String, String)> = reqs.iter().map(|r| (r.method.clone(), r.path.clone())).collect();
+            assert!(
+                seen.iter().all(|(m, p)| (m == "PATCH" || m == "GET") && (p == "/tasks/sub-done" || p == "/tasks/sub-grand")),
+                "only the methods' own writes and update_task's re-read reach the API: {seen:?}",
+            );
+            assert!(!seen.iter().any(|(_, p)| p.contains("unrelated") || p.contains("never-pushed") || p.contains("orch")));
+            drop(reqs);
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// A host no TUI pushes to: the background refresher reads the parent
+    /// chain of the tasks its sessions reference, so the done subtask comes
+    /// into scope with no HTTP on dispatch. Readings are reused while
+    /// fresh; a cycle stops; an unrelated task stays out.
+    #[test]
+    fn headless_refresher_brings_a_done_subtask_into_scope() {
+        with_home_and_repo("donerefresh", |_home, _name| {
+            let state = make_state_arc();
+            seed_tasked_caller(&state, "ts-orch", "ws-orch", "orch");
+            seed_tasked_caller(&state, "ts-worker", "ws-worker", "sub-done");
+            seed_tasked_caller(&state, "ts-cyc", "ws-c", "cyc-a");
+            let stub = spawn_routed_stub(|method, path, _b| {
+                let row = |p: &str| (200, format!(r#"{{"id":"x","status":"done","parent_task_id":{p}}}"#));
+                match (method, path) {
+                    ("PATCH", _) => (200, r#"{"id":"x"}"#.into()),
+                    ("GET", "/tasks/sub-done") => row(r#""orch""#),
+                    ("GET", "/tasks/orch") => row("null"),
+                    ("GET", "/tasks/cyc-a") => row(r#""cyc-b""#),
+                    ("GET", "/tasks/cyc-b") => row(r#""cyc-a""#),
+                    _ => (404, r#"{"detail":"not found"}"#.into()),
+                }
+            });
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".to_string();
+            }
+            let status = |task: &str| scope_call(&state, "ts-orch", "set_subtask_status", json!({"task_id": task, "status": "running"}));
+            assert!(refused_out_of_scope(&status("sub-done")), "before any refresh the daemon doesn't know the edge");
+
+            let pass = crate::task_parent_refresh::refresh_once(&state);
+            assert_eq!(pass.failures, 0);
+            assert_eq!(pass.lookups, 4, "sub-done, orch, cyc-a, cyc-b — each once, the cycle stops");
+            assert!(status("sub-done").ok, "done subtask after a refresh");
+            assert!(refused_out_of_scope(&status("cyc-a")));
+            assert!(refused_out_of_scope(&status("unrelated")));
+            assert_eq!(crate::task_parent_refresh::refresh_once(&state).lookups, 0, "fresh readings are reused");
+
+            // A pushed edge wins over the refresher's reading.
+            task_update_tree(&state, &json!({"tasks": [{"task_id": "sub-done", "parent_task_id": "elsewhere"}]})).unwrap();
+            assert!(refused_out_of_scope(&status("sub-done")));
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// An unreachable API adds nothing, records the failure, and backs off
+    /// instead of asking again on the next pass; scope refuses as before.
+    #[test]
+    fn headless_refresher_backs_off_when_the_api_is_unreachable() {
+        with_home_and_repo("donerefreshoff", |_home, _name| {
+            let state = make_state_arc();
+            seed_tasked_caller(&state, "ts-orch", "ws-orch", "orch");
+            seed_tasked_caller(&state, "ts-worker", "ws-worker", "sub-done");
+            let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{port}");
+                s.config.api_token = "tok".to_string();
+            }
+            let first = crate::task_parent_refresh::refresh_once(&state);
+            assert_eq!((first.lookups, first.failures), (2, 2), "orch and sub-done each tried once");
+            assert!(state.lock().unwrap().planning_task_parents.is_empty());
+            assert_eq!(crate::task_parent_refresh::refresh_once(&state).lookups, 0, "failures back off");
+            let err = set_subtask_status(&state, &json!({"task_id": "sub-done", "status": "running"}), Some("ts-orch")).unwrap_err();
+            assert_eq!(err.0, ErrorCode::Unauthorized);
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// update_task with parent_task_id: the new parent must be in the
+    /// caller's tree too (unless the caller is global); `task.scope_check`
+    /// gives the MCP direct-API route the same answer.
+    #[test]
+    fn update_task_reparent_stays_inside_the_callers_tree() {
+        with_home_and_repo("reparent", |_home, _name| {
+            let state = make_state_arc();
+            seed_tasked_caller(&state, "ts-orch", "ws-orch", "orch");
+            seed_tasked_caller(&state, "ts-global", "ws-g", "elsewhere");
+            state.lock().unwrap().sessions.get_mut("ts-global").unwrap().global_perms = true;
+            let stub = spawn_routed_stub(|_m, _p, _b| (200, r#"{"id":"x"}"#.into()));
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".to_string();
+            }
+            task_update_tree(
+                &state,
+                &json!({"tasks": [
+                    {"task_id": "orch", "parent_task_id": null},
+                    {"task_id": "sub-a", "parent_task_id": "orch"},
+                    {"task_id": "sub-b", "parent_task_id": "orch"},
+                    {"task_id": "foreign", "parent_task_id": "foreign-root"},
+                ]}),
+            )
+            .unwrap();
+            let reparent = |caller: &str, task: &str, parent: Value| {
+                scope_call(&state, caller, "update_task", json!({"task_id": task, "fields": {"parent_task_id": parent}}))
+            };
+            let r = reparent("ts-orch", "sub-a", json!("foreign"));
+            assert!(refused_out_of_scope(&r) && r.error.as_ref().unwrap().message.contains("new parent foreign"), "{r:?}");
+            let r = reparent("ts-orch", "foreign", json!("orch"));
+            assert!(refused_out_of_scope(&r), "pulling a foreign task in: {r:?}");
+            assert!(reparent("ts-orch", "sub-a", json!("sub-b")).ok, "within the tree");
+            assert!(reparent("ts-orch", "sub-a", Value::Null).ok, "detach");
+            let patched = stub.requests.lock().unwrap().iter().filter(|r| r.method == "PATCH").count();
+            assert_eq!(patched, 2, "the refused moves never reached the API");
+
+            let check = scope_call(&state, "ts-orch", "task.scope_check", json!({"task_ids": ["sub-b", "foreign", "orch"]}));
+            assert_eq!(check.result.unwrap()["in_scope"], json!({"sub-b": true, "foreign": false, "orch": true}));
+            let check = scope_call(&state, "ts-global", "task.scope_check", json!({"task_ids": ["foreign"]}));
+            assert_eq!(check.result.unwrap()["in_scope"]["foreign"], true);
+            let ids = |n: usize| (0..n).map(|i| format!("t-{i}")).collect::<Vec<_>>();
+            assert!(scope_call(&state, "ts-orch", "task.scope_check", json!({"task_ids": ids(TASK_SCOPE_CHECK_MAX_IDS)})).ok);
+            let over = scope_call(&state, "ts-orch", "task.scope_check", json!({"task_ids": ids(TASK_SCOPE_CHECK_MAX_IDS + 1)}));
+            let err = over.error.expect("over the cap is refused");
+            assert_eq!(err.code, ErrorCode::InvalidParams);
+            assert!(err.message.contains("at most 64"), "{}", err.message);
+            kill_all_sessions(&state);
         });
     }
 
@@ -31932,6 +40379,114 @@ while True:
         repo.to_path_buf()
     }
 
+    #[test]
+    fn session_launch_operator_mints_binds_replays_and_composes_both_engines() {
+        with_home_and_repo("launch72repo", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            run_git(&repo, &["branch", "-M", "main"]);
+            let base = git_sha(&repo, "HEAD");
+            std::fs::write(repo.join("newer.txt"), "newer trunk").unwrap();
+            run_git(&repo, &["add", "."]); run_git(&repo, &["commit", "-qm", "newer"]);
+            let state = make_state_arc();
+            let stub = spawn_routed_stub(|method, path, _| match (method, path) {
+                ("GET", p) if p.starts_with("/tasks/") => (200, json!({"id":p.trim_start_matches("/tasks/"), "name":"Operator worker", "status":"backlog"}).to_string()),
+                ("PATCH", _) => (200, "{}".into()),
+                _ => (404, "{}".into()),
+            });
+            {
+                let mut st = state.lock().unwrap();
+                st.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                st.config.api_token = "fixture".into();
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".into(), vec!["120".into()])));
+            for (engine, model, task, global) in [("codex","gpt-6.1-terra","task-a-72",false), ("claude","claude-opus-4-6","task-b-72",true)] {
+                let params = json!({"request_id":task,"task_id":task,"engine":engine,"model":model,
+                    "effort":"xhigh","prompt":"explicit launch prompt", "label":"operator worker",
+                    "repo_path":repo,"base":base,"managed_by_uid":"ts-parent-72","global_perms":global});
+                let response = crate::control::session_launch::launch(&state, &params).expect("operator launch without a Session caller");
+                let uid = response["uid"].as_str().unwrap();
+                assert_eq!(response["session_uid"], uid);
+                assert_eq!(response["task_id"], task);
+                assert_eq!(response["prompt_source"], "caller");
+                assert!(response["prompt_delivery"].is_object(), "normal asynchronous receipt");
+                let path = PathBuf::from(response["worktree_path"].as_str().unwrap());
+                assert_eq!(crate::worktree::worktree_head_sha(&path).as_deref(), Some(base.as_str()));
+                assert!(crate::worktree::worktree_current_branch(&path).unwrap().starts_with("cm-sub/operator-worker-"));
+                let count = {
+                    let st = state.lock().unwrap();
+                    let session = &st.sessions[uid];
+                    assert_eq!(session.model.as_deref(), Some(model));
+                    assert_eq!(session.managed_by_uid.as_deref(), Some("ts-parent-72"));
+                    assert_eq!(session.global_perms, global);
+                    assert_eq!(st.task_workspaces.get(task), st.bindings.get(task));
+                    assert_eq!(st.workspaces[&session.workspace_id].main_repo_path.as_deref(), Some(repo.as_path()));
+                    st.sessions.len()
+                };
+                assert_eq!(crate::control::session_launch::launch(&state, &params).unwrap(), response);
+                assert_eq!(state.lock().unwrap().sessions.len(), count, "retry creates no child or prompt");
+                std::fs::write(path.join("keep.txt"), "uncommitted work").unwrap();
+                let context = OperatorLaunchContext { uid:"unused".into(), repo_path:repo.clone(), base:None, managed_by_uid:None };
+                assert!(matches!(operator_workspace_resolution(&state,task,&context).unwrap(), WorkspaceResolution::Ready { working_dir, .. } if working_dir == path));
+                assert_eq!(std::fs::read_to_string(path.join("keep.txt")).unwrap(), "uncommitted work");
+                let other = seed_other_clone(home, &format!("other-{engine}"), "fixture-other");
+                std::fs::write(other.join("setup_worktree.sh"),
+                    r#"#!/bin/sh
+printf ran > "$MAIN_REPO/setup-ran"
+"#).unwrap();
+                let context = OperatorLaunchContext { repo_path:other.clone(), ..context };
+                assert_eq!(operator_workspace_resolution(&state,task,&context).err().unwrap().0, ErrorCode::Conflict);
+                // Simulate the mint plan taken before a competing registration:
+                // the registration check must reject a different winning path.
+                let config = state.lock().unwrap().config.clone();
+                let mut stale = MintContext { explicit_repo:Some(other.clone()), recover_existing:false,
+                    caller_paths:vec![other.clone()], workspace_paths:vec![], repos_dir:home.join("repos"),
+                    allow_clone:false, allow_entries:vec![], api_url:config.api_url,
+                    api_token:config.api_token, base:None };
+                let error = mint_task_workspace(&state,task,&stale).err().unwrap();
+                assert_eq!(error.0, ErrorCode::Conflict);
+                assert!(error.1.contains("does not belong to repo_path"), "{}", error.1);
+                assert!(!other.join("setup-ran").exists(), "foreign setup must not run in this checkout");
+                assert_eq!(std::fs::read_to_string(path.join("keep.txt")).unwrap(), "uncommitted work");
+                // A different registration path in the same repo must also
+                // refuse; matching only repository identity is insufficient.
+                let wsid = state.lock().unwrap().task_workspaces[task].clone();
+                state.lock().unwrap().workspaces.get_mut(&wsid).unwrap().worktree_path = Some(repo.clone());
+                stale.explicit_repo = Some(repo.clone());
+                stale.caller_paths = vec![repo.clone()];
+                let error = mint_task_workspace(&state,task,&stale).err().unwrap();
+                assert!(error.1.contains("changed during operator mint"), "{}", error.1);
+                state.lock().unwrap().workspaces.get_mut(&wsid).unwrap().worktree_path = Some(path);
+                assert_eq!(state.lock().unwrap().sessions.len(), count);
+            }
+            set_spawn_program_override_for_test(None);
+            assert_eq!(state.lock().unwrap().sessions.len(), 2);
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn session_launch_verified_mint_refuses_pruned_admin_before_setup() {
+        with_home_and_repo("pruned-launch72", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            run_git(&repo, &["branch", "-M", "main"]);
+            let branch = crate::worktree::task_worktree_branch("pruned72", "Broken checkout");
+            let path = crate::worktree::worktree_dir_for_branch(&repo, &branch).unwrap();
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join(".git"), format!("gitdir: {}\n", repo.join(".git/worktrees/pruned-admin").display())).unwrap();
+            // Path parsing alone still identifies the right main repository.
+            assert_eq!(crate::worktree::main_checkout_of(&path), Some(repo.clone()));
+            assert!(!crate::worktree::is_git_worktree_root(&path));
+            std::fs::write(repo.join("setup_worktree.sh"), r#"#!/bin/sh
+printf ran > "$MAIN_REPO/setup-ran"
+"#).unwrap();
+            let error = crate::worktree::mint_task_worktree_at_verified(
+                &repo, "pruned72", "Broken checkout", None, None).err().unwrap();
+            assert!(error.to_string().contains("not a valid git checkout"));
+            assert!(!repo.join("setup-ran").exists());
+            assert!(!crate::worktree::local_branch_exists(&repo, &branch));
+        });
+    }
+
     /// ux-1a, the headline: `start_session(task_id=<workspace-less task>)`
     /// MINTS that task a branch worktree cut from the project's main and
     /// spawns the worker THERE — outside the caller's checkout. Pre-fix
@@ -32049,6 +40604,92 @@ while True:
                 assert_eq!(ws.worktree_path.as_deref(), Some(minted.as_path()));
                 assert_eq!(ws.main_repo_path.as_deref(), Some(repo.as_path()));
             }
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// Add a second clone, `~/code/projects/<name>` with `origin` set and
+    /// a commit of its own (file `<name>.md`) on `main`; returns its path.
+    fn seed_other_clone(home: &std::path::Path, name: &str, origin: &str) -> std::path::PathBuf {
+        let other = home.join("code/projects").join(name);
+        std::fs::create_dir_all(&other).unwrap();
+        run_git(&other, &["init", "-q"]);
+        run_git(&other, &["config", "user.email", "t@example.com"]);
+        run_git(&other, &["config", "user.name", "t"]);
+        std::fs::write(other.join(format!("{}.md", name)), name).unwrap();
+        run_git(&other, &["add", "-A"]);
+        run_git(&other, &["commit", "-q", "-m", "other init"]);
+        run_git(&other, &["branch", "-M", "main"]);
+        run_git(&other, &["remote", "add", "origin", origin]);
+        other
+    }
+
+    /// Prob Pipeline (be324b86): the lead runs in a claude-manager checkout
+    /// whose workspace even RECORDS the task's predictionTrading URL. A task
+    /// in predictionTrading must still mint from a predictionTrading clone
+    /// (verified by origin, ssh vs https alike) at ITS trunk, and a task
+    /// whose repo has no clone on the host is refused, never minted in the
+    /// caller's repo.
+    #[test]
+    fn mcp_start_session_mints_from_the_task_repos_clone_not_the_callers() {
+        with_home_and_repo("cmrepo", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            run_git(&repo, &["remote", "add", "origin", "git@github.com:o/claude-manager.git"]);
+            let pt = seed_other_clone(home, "predictionTrading", "https://github.com/o/predictionTrading.git");
+            let pt_main = git_sha(&pt, "main");
+            let state = make_state_arc();
+            let caller_wt = seed_mint_fixture(
+                &state,
+                &repo,
+                "https://github.com/o/predictionTrading.git",
+                "task-pt",
+            );
+            state.lock().unwrap().record_agent_task_edge("task-gone", "task-parent");
+            let stub = spawn_routed_stub(|method, path, _b| match (method, path) {
+                ("GET", "/tasks/task-pt") => (
+                    200,
+                    r#"{"id":"task-pt","name":"Pipeline","repo_url":"git@github.com:o/predictionTrading.git","project":"predictionTrading","status":"backlog"}"#.to_string(),
+                ),
+                ("GET", "/tasks/task-gone") => (
+                    200,
+                    r#"{"id":"task-gone","name":"Elsewhere","repo_url":"git@github.com:o/nowhere.git","status":"backlog"}"#.to_string(),
+                ),
+                ("PATCH", _) => (200, "{}".to_string()),
+                _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+            });
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".to_string();
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            let resp = mcp_start_session(
+                &state,
+                &json!({ "type": "codex", "label": "w", "task_id": "task-pt", "prompt": "go" }),
+                Some("ts-orch"),
+            );
+            let refused = mcp_start_session(
+                &state,
+                &json!({ "type": "codex", "label": "w2", "task_id": "task-gone", "prompt": "go" }),
+                Some("ts-orch"),
+            );
+            set_spawn_program_override_for_test(None);
+            let resp = resp.expect("mint from the predictionTrading clone");
+            let minted = std::path::PathBuf::from(resp["worktree_path"].as_str().unwrap());
+            assert_ne!(minted, caller_wt);
+            assert!(minted.join("predictionTrading.md").exists(), "a predictionTrading checkout");
+            assert!(!minted.join("README.md").exists(), "not the caller's claude-manager repo");
+            assert_eq!(crate::worktree::worktree_head_sha(&minted).as_deref(), Some(pt_main.as_str()));
+            {
+                let s = state.lock().unwrap();
+                let ws = &s.workspaces[&s.task_workspaces["task-pt"]];
+                assert_eq!(ws.main_repo_path.as_deref(), Some(pt.as_path()));
+            }
+
+            let err = refused.expect_err("no clone of the task's repo");
+            assert_eq!(err.0, ErrorCode::Conflict);
+            assert!(err.1.contains("no local clone of git@github.com:o/nowhere.git"), "{}", err.1);
+            assert!(!state.lock().unwrap().task_workspaces.contains_key("task-gone"));
             kill_all_sessions(&state);
         });
     }
@@ -32484,6 +41125,146 @@ while True:
         });
     }
 
+    /// 2026-10-08: a live agent deleted its own worktree. Delivering input
+    /// re-creates it from the branch (and says so) instead of feeding a turn
+    /// into a session with no cwd; the missing-checkout watch uses the same
+    /// helper.
+    #[test]
+    fn send_input_recreates_a_live_sessions_deleted_worktree() {
+        with_home_and_repo("healsend", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let state = make_state_arc();
+            let (wt, branch, sha) =
+                seed_bound_subtask_with_reaped_worktree(&state, &repo, name, "task-sub", true);
+            let stub = spawn_routed_stub(|_m, _p, _b| (404, "{}".to_string()));
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".to_string();
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            let resp = mcp_start_session(&state,
+                &json!({"type": "bash", "label": "w", "task_id": "task-sub"}), Some("ts-orch"))
+                .expect("spawn");
+            set_spawn_program_override_for_test(None);
+            let uid = resp["session_uid"].as_str().unwrap().to_string();
+            assert!(heal_missing_session_worktree(&state, &uid).is_none(), "healthy: nothing to do");
+            // The agent runs `git worktree remove --force` on its own cwd.
+            run_git(&repo, &["worktree", "remove", "--force", wt.to_str().unwrap()]);
+            assert!(!wt.exists());
+            let reply = send_input(&state, &json!({"session_uid": uid, "text": "true"}), None)
+                .expect("delivered");
+            assert!(wt.is_dir() && crate::worktree::is_git_worktree_root(&wt));
+            assert_eq!(crate::worktree::worktree_current_branch(&wt).as_deref(), Some(branch.as_str()));
+            assert_eq!(crate::worktree::worktree_head_sha(&wt).as_deref(), Some(sha.as_str()));
+            assert_eq!(reply["worktree_recreated"]["branch"], json!(branch), "{reply}");
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// A-R / `session.revive` of a session whose checkout is gone re-creates
+    /// it first and reports it, instead of failing on a missing cwd.
+    #[test]
+    fn revive_recreates_a_deleted_worktree_before_respawning() {
+        with_home_and_repo("healrevive", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let state = make_state_arc();
+            let (wt, branch, _sha) =
+                seed_bound_subtask_with_reaped_worktree(&state, &repo, name, "task-sub", true);
+            let stub = spawn_routed_stub(|_m, _p, _b| (404, "{}".to_string()));
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".to_string();
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            let resp = mcp_start_session(&state,
+                &json!({"type": "bash", "label": "w", "task_id": "task-sub"}), Some("ts-orch"))
+                .expect("spawn");
+            let uid = resp["session_uid"].as_str().unwrap().to_string();
+            kill_all_sessions(&state);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while state.lock().unwrap().sessions.contains_key(&uid) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            run_git(&repo, &["worktree", "remove", "--force", wt.to_str().unwrap()]);
+            assert!(!wt.exists());
+            let revived = revive_session(&state, &json!({"uid": uid, "workspace_id": "ws-sub",
+                "worktree_path": wt.to_string_lossy(), "session_type": "bash"}))
+                .expect("revive heals the checkout and respawns");
+            set_spawn_program_override_for_test(None);
+            assert!(wt.is_dir() && crate::worktree::is_git_worktree_root(&wt));
+            assert_eq!(revived["worktree_recreated"]["branch"], json!(branch), "{revived}");
+            kill_all_sessions(&state);
+        });
+    }
+
+    /// Review 7b5fd3f #1: the planning row's repo_url is WRONG (says
+    /// claude-manager, and a claude-manager clone exists on the host) but the
+    /// reaped checkout really lives in a predictionTrading clone, which git
+    /// still has registered. Both the start_session heal and an A-R revive
+    /// rebuild it from the predictionTrading clone, never the row's repo.
+    #[test]
+    fn heal_and_revive_trust_git_registration_over_a_wrong_row_repo() {
+        with_home_and_repo("predictionTrading", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            run_git(&repo, &["remote", "add", "origin", "git@github.com:o/predictionTrading.git"]);
+            let cm = seed_other_clone(home, "claude-manager", "git@github.com:o/claude-manager.git");
+            let state = make_state_arc();
+            let (wt, branch, sha) = seed_bound_subtask_with_reaped_worktree(
+                &state,
+                &repo,
+                "git@github.com:o/predictionTrading.git",
+                "task-sub",
+                true,
+            );
+            let stub = spawn_routed_stub(|method, path, _b| match (method, path) {
+                ("GET", "/tasks/task-sub") => (
+                    200,
+                    r#"{"id":"task-sub","name":"sub","repo_url":"git@github.com:o/claude-manager.git","project":"claude-manager"}"#.to_string(),
+                ),
+                _ => (404, "{}".to_string()),
+            });
+            {
+                let mut s = state.lock().unwrap();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".to_string();
+            }
+            set_spawn_program_override_for_test(Some(("/bin/sleep".to_string(), vec!["120".to_string()])));
+            let resp = mcp_start_session(
+                &state,
+                &json!({"type": "bash", "label": "w", "task_id": "task-sub"}),
+                Some("ts-orch"),
+            );
+            let resp = resp.expect("heal from the clone git registered");
+            assert_eq!(resp["worktree_recreated"]["branch"], json!(branch), "{resp}");
+            assert_eq!(git_sha(&wt, "HEAD"), sha, "the task's own work is back");
+            assert_eq!(
+                crate::worktree::main_checkout_of(&wt).map(|p| p.canonicalize().unwrap()),
+                Some(repo.canonicalize().unwrap()),
+                "rebuilt in the predictionTrading clone",
+            );
+            assert!(!cm.join(".git/worktrees").exists(), "nothing was cut in claude-manager");
+
+            // A-R revive after a second reap takes the same route.
+            let uid = resp["session_uid"].as_str().unwrap().to_string();
+            kill_all_sessions(&state);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while state.lock().unwrap().sessions.contains_key(&uid) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            std::fs::remove_dir_all(&wt).unwrap();
+            let revived = revive_session(&state, &json!({"uid": uid, "workspace_id": "ws-sub",
+                "worktree_path": wt.to_string_lossy(), "session_type": "bash"}));
+            set_spawn_program_override_for_test(None);
+            let revived = revived.expect("revive heals from the registered clone");
+            assert_eq!(revived["worktree_recreated"]["branch"], json!(branch), "{revived}");
+            assert_eq!(git_sha(&wt, "HEAD"), sha);
+            assert!(!cm.join(".git/worktrees").exists());
+            kill_all_sessions(&state);
+        });
+    }
+
     /// A second spawn after the heal is the ordinary healthy path: no
     /// `worktree_recreated`, no warning, same checkout.
     #[test]
@@ -32640,6 +41421,288 @@ while True:
         });
     }
 
+    /// A caller in one project proposing into another: the row gets the
+    /// TARGET project's repo and branch (Prob Pipeline, be324b86, came up
+    /// with the proposer's claude-manager repo). The caller's checkout
+    /// stands in only for its own project when that project has no repo
+    /// yet; any other unknown project is refused before the POST.
+    #[test]
+    fn propose_task_stamps_the_target_projects_repo_not_the_callers() {
+        let _g = crate::test_support::env_lock();
+        let state = make_state_arc();
+        seed_tasked_caller(&state, "ts-prop", "ws-cm", "task-cm");
+        let stub = spawn_routed_stub(|method, path, _body| match (method, path) {
+            ("GET", "/projects") => (
+                200,
+                r#"[{"name":"claude-manager","repo_url":"git@x.com:o/claude-manager.git","repo_branch":"main"},
+                    {"name":"predictionTrading","repo_url":"https://x.com/o/predictionTrading.git","repo_branch":"trunk"}]"#
+                    .to_string(),
+            ),
+            ("GET", "/tasks/task-cm") => (200, r#"{"id":"task-cm","project":"fresh"}"#.to_string()),
+            ("POST", "/tasks") => (200, r#"{"id":"task-new"}"#.to_string()),
+            _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+        });
+        set_api_env(stub.port);
+        let propose = |project: &str| {
+            propose_task(
+                &state,
+                &json!({"project": project, "name": "n",
+                        "repo_url": "git@x.com:o/claude-manager.git"}),
+                Some("ts-prop"),
+            )
+        };
+        let posted = || -> Vec<Value> {
+            stub.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.method == "POST")
+                .map(|r| serde_json::from_str(&r.body).unwrap())
+                .collect()
+        };
+
+        propose("predictionTrading").expect("known project");
+        let body = posted().pop().unwrap();
+        assert_eq!(body["repo_url"], "https://x.com/o/predictionTrading.git");
+        assert_eq!(body["repo_branch"], "trunk");
+        assert_eq!(body["project"], "predictionTrading");
+
+        // The caller's own project has no repo yet: its checkout stands in.
+        propose("fresh").expect("caller's own project");
+        let body = posted().pop().unwrap();
+        assert_eq!(body["repo_url"], "git@x.com:o/claude-manager.git");
+        assert_eq!(body["repo_branch"], "main");
+
+        // A taskless caller filing a brand-new project: its checkout, logged.
+        let taskless = propose_task(
+            &state,
+            &json!({"project": "brand-new", "name": "n",
+                    "repo_url": "git@x.com:o/brand-new.git"}),
+            None,
+        );
+        taskless.expect("taskless new project falls back to the caller's repo");
+        let body = posted().pop().unwrap();
+        assert_eq!(body["repo_url"], "git@x.com:o/brand-new.git");
+
+        // A tasked caller in another project, project with no repo: refused.
+        let err = propose("elsewhere").expect_err("unknown project refused");
+        assert_eq!(err.0, ErrorCode::InvalidParams);
+        assert!(err.1.contains("'elsewhere' has no known repo"), "{}", err.1);
+        assert!(err.1.contains("'fresh'"), "names the caller's project: {}", err.1);
+        assert_eq!(posted().len(), 3, "no row for the refused proposal");
+        clear_api_env();
+    }
+
+    /// A subtask filed into ANOTHER project than its parent's takes that
+    /// project's repo, checkout and branch, never the parent's; `inherit`
+    /// (the parent's checkout) and an unknown project are refused before
+    /// any row is created.
+    #[test]
+    fn create_subtask_in_another_project_uses_that_projects_repo() {
+        with_home_and_repo("cmrepo", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let other = home.join("code/projects/ptrepo");
+            std::fs::create_dir_all(&other).unwrap();
+            run_git(&other, &["init", "-q"]);
+            run_git(&other, &["config", "user.email", "t@example.com"]);
+            run_git(&other, &["config", "user.name", "t"]);
+            std::fs::write(other.join("PT.md"), "pt").unwrap();
+            run_git(&other, &["add", "-A"]);
+            run_git(&other, &["commit", "-q", "-m", "pt init"]);
+            run_git(&other, &["branch", "-M", "main"]);
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = ManifestWorkspace::default();
+                ws.id = "ws-parent".to_string();
+                ws.worktree_path = Some(repo.clone());
+                ws.main_repo_path = Some(repo.clone());
+                ws.repo_url = Some(name.to_string());
+                s.workspaces.insert("ws-parent".to_string(), ws);
+            }
+            seed_tasked_caller(&state, "ts-orch", "ws-parent", "task-parent");
+            let name_owned = name.to_string();
+            let stub = spawn_routed_stub(move |method, path, _body| match (method, path) {
+                ("GET", "/tasks/task-parent") => (
+                    200,
+                    format!(
+                        r#"{{"id":"task-parent","name":"Parent","repo_url":"{}","project":"claude-manager","status":"running","wip_branch":null,"parent_task_id":null}}"#,
+                        name_owned
+                    ),
+                ),
+                ("GET", "/projects") => (
+                    200,
+                    r#"[{"name":"predictionTrading","repo_url":"ptrepo","repo_branch":"main"}]"#.to_string(),
+                ),
+                ("POST", "/tasks") => (
+                    200,
+                    r#"{"id":"task-pt","status":"running","parent_task_id":"task-parent"}"#.to_string(),
+                ),
+                _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+            });
+            set_api_env(stub.port);
+            let posts = || {
+                stub.requests.lock().unwrap().iter().filter(|r| r.method == "POST").count()
+            };
+
+            let err = create_subtask(
+                &state,
+                &json!({"name": "pt work", "project": "predictionTrading", "worktree_mode": "inherit"}),
+                Some("ts-orch"),
+            )
+            .expect_err("inherit across projects refused");
+            assert_eq!(err.0, ErrorCode::InvalidParams);
+            assert!(err.1.contains("worktree_mode='branch'"), "{}", err.1);
+            let err = create_subtask(
+                &state,
+                &json!({"name": "pt work", "project": "predictionTrading", "worktree_mode": "in-place"}),
+                Some("ts-orch"),
+            )
+            .expect_err("in-place across projects refused");
+            assert!(err.1.contains("worktree_mode='in-place'"), "{}", err.1);
+            let err = create_subtask(
+                &state,
+                &json!({"name": "x", "project": "nowhere", "worktree_mode": "branch"}),
+                Some("ts-orch"),
+            )
+            .expect_err("unknown project refused");
+            assert!(err.1.contains("'nowhere' has no known repo"), "{}", err.1);
+            assert_eq!(posts(), 0, "refusals create no row");
+
+            let result = create_subtask(
+                &state,
+                &json!({"name": "pt work", "project": "predictionTrading", "worktree_mode": "branch"}),
+                Some("ts-orch"),
+            )
+            .expect("cross-project branch subtask");
+            let wt = std::path::PathBuf::from(result["worktree_path"].as_str().unwrap());
+            assert!(wt.join("PT.md").exists(), "cut from the project's repo: {}", wt.display());
+            assert!(!wt.join("README.md").exists(), "not from the parent's repo");
+            assert_eq!(result["base_sha"], json!(git_sha(&other, "main")));
+            let reqs = stub.requests.lock().unwrap();
+            let post = reqs.iter().find(|r| r.method == "POST").unwrap();
+            let body: Value = serde_json::from_str(&post.body).unwrap();
+            assert_eq!(body["repo_url"], "ptrepo");
+            assert_eq!(body["project"], "predictionTrading");
+            assert_eq!(body["parent_task_id"], "task-parent");
+            drop(reqs);
+            let s = state.lock().unwrap();
+            let ws_id = s.task_workspaces.get("task-pt").unwrap();
+            let ws = s.workspaces.get(ws_id).unwrap();
+            assert_eq!(ws.repo_url.as_deref(), Some("ptrepo"));
+            assert_eq!(ws.main_repo_path.as_deref(), Some(other.as_path()));
+            drop(s);
+            clear_api_env();
+        });
+    }
+
+    /// `isolated=true` under a lead whose checkout is another repo than its
+    /// task's (the Prob Pipeline lead: claude-manager checkout, task in
+    /// predictionTrading): the subtask is cut from a predictionTrading
+    /// clone's trunk, not from the lead's branch in claude-manager, and
+    /// `inherit` is refused.
+    #[test]
+    fn create_subtask_under_a_lead_in_another_repo_cuts_from_the_task_repo() {
+        with_home_and_repo("cmrepo", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            run_git(&repo, &["remote", "add", "origin", "git@github.com:o/claude-manager.git"]);
+            let pt = seed_other_clone(home, "predictionTrading", "git@github.com:o/predictionTrading.git");
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = ManifestWorkspace::default();
+                ws.id = "ws-parent".to_string();
+                ws.worktree_path = Some(repo.clone());
+                ws.main_repo_path = Some(repo.clone());
+                ws.repo_url = Some("git@github.com:o/claude-manager.git".to_string());
+                s.workspaces.insert("ws-parent".to_string(), ws);
+            }
+            seed_tasked_caller(&state, "ts-orch", "ws-parent", "task-parent");
+            let stub = spawn_routed_stub(|method, path, _b| match (method, path) {
+                ("GET", "/tasks/task-parent") => (
+                    200,
+                    r#"{"id":"task-parent","name":"Lead","repo_url":"https://github.com/o/predictionTrading.git","project":"predictionTrading","status":"running","wip_branch":null,"parent_task_id":null}"#.to_string(),
+                ),
+                ("POST", "/tasks") => (200, r#"{"id":"task-sub","status":"running"}"#.to_string()),
+                _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+            });
+            set_api_env(stub.port);
+            for mode in ["inherit", "in-place"] {
+                let err = create_subtask(&state, &json!({"name": "w", "worktree_mode": mode}), Some("ts-orch"))
+                    .expect_err("a shared checkout in another repo");
+                assert!(err.1.contains("worktree_mode='branch'"), "{mode}: {}", err.1);
+            }
+            let result = create_subtask(&state, &json!({"name": "w", "worktree_mode": "branch"}), Some("ts-orch"))
+                .expect("branch subtask");
+            let wt = std::path::PathBuf::from(result["worktree_path"].as_str().unwrap());
+            assert!(wt.join("predictionTrading.md").exists(), "{}", wt.display());
+            assert_eq!(result["base_sha"], json!(git_sha(&pt, "main")));
+            let s = state.lock().unwrap();
+            let ws = &s.workspaces[&s.task_workspaces["task-sub"]];
+            assert_eq!(ws.main_repo_path.as_deref(), Some(pt.as_path()));
+            assert_eq!(ws.repo_url.as_deref(), Some("https://github.com/o/predictionTrading.git"));
+            drop(s);
+            clear_api_env();
+        });
+    }
+
+    /// Same repo, written differently: the parent row says ssh, the clone's
+    /// origin is https. That is still the parent's repo, so the subtask is
+    /// cut from the PARENT's branch (not trunk), and `inherit` / another
+    /// project in the same repo stay allowed.
+    #[test]
+    fn create_subtask_same_repo_with_origin_cuts_from_the_parent_branch() {
+        with_home_and_repo("predictionTrading", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            run_git(&repo, &["branch", "-M", "main"]);
+            run_git(&repo, &["remote", "add", "origin", "https://github.com/o/predictionTrading.git"]);
+            run_git(&repo, &["checkout", "-q", "-b", "cm/lead-work"]);
+            std::fs::write(repo.join("lead.txt"), "lead").unwrap();
+            run_git(&repo, &["add", "-A"]);
+            run_git(&repo, &["commit", "-q", "-m", "lead work"]);
+            let lead_sha = git_sha(&repo, "HEAD");
+            let _ = home;
+            let state = make_state_arc();
+            {
+                let mut s = state.lock().unwrap();
+                let mut ws = ManifestWorkspace::default();
+                ws.id = "ws-parent".to_string();
+                ws.worktree_path = Some(repo.clone());
+                ws.main_repo_path = Some(repo.clone());
+                ws.repo_url = Some("git@github.com:o/predictionTrading.git".to_string());
+                s.workspaces.insert("ws-parent".to_string(), ws);
+            }
+            seed_tasked_caller(&state, "ts-orch", "ws-parent", "task-parent");
+            let stub = spawn_routed_stub(|method, path, _b| match (method, path) {
+                ("GET", "/tasks/task-parent") => (
+                    200,
+                    r#"{"id":"task-parent","name":"Lead","repo_url":"git@github.com:o/predictionTrading.git","project":"predictionTrading","status":"running","wip_branch":"cm/lead-work","parent_task_id":null}"#.to_string(),
+                ),
+                ("GET", "/projects") => (
+                    200,
+                    r#"[{"name":"pt-sibling","repo_url":"ssh://git@github.com:22/o/predictionTrading","repo_branch":"main"}]"#.to_string(),
+                ),
+                ("POST", "/tasks") => (200, r#"{"id":"task-sub","status":"running"}"#.to_string()),
+                _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+            });
+            set_api_env(stub.port);
+            let result = create_subtask(&state, &json!({"name": "w", "worktree_mode": "branch"}), Some("ts-orch"))
+                .expect("same-repo branch subtask");
+            assert_eq!(result["base_sha"], json!(lead_sha), "cut from the parent's branch");
+            assert!(result.get("base_downgraded").is_none());
+            create_subtask(&state, &json!({"name": "i", "worktree_mode": "inherit"}), Some("ts-orch"))
+                .expect("inherit stays allowed in the same repo");
+            let sibling = create_subtask(
+                &state,
+                &json!({"name": "s", "project": "pt-sibling", "worktree_mode": "branch"}),
+                Some("ts-orch"),
+            )
+            .expect("another project in the same repo is no repo change");
+            assert_eq!(sibling["base_sha"], json!(lead_sha));
+            clear_api_env();
+        });
+    }
+
     /// HARDENING: when the parent planning row is GONE (404 on
     /// `GET /tasks/{parent}` — e.g. an `A-x` board delete hard-removed it),
     /// create_subtask must NOT fail. It falls back to creating a TOP-LEVEL
@@ -32748,6 +41811,8 @@ while True:
                     r#"{"id":"task-proposed-1","name":"lane d","status":"draft","parent_task_id":null}"#
                         .to_string(),
                 )
+            } else if method == "GET" && path == "/projects" {
+                (200, r#"[{"name":"proj","repo_url":"git@x.com:a/b.git"}]"#.to_string())
             } else {
                 (404, r#"{"detail":"unexpected"}"#.to_string())
             }
@@ -32816,6 +41881,198 @@ while True:
         assert!(filer["machine"].as_str().is_some_and(|s| !s.is_empty()));
         drop(requests);
 
+        kill_all_sessions(&state);
+    }
+
+    /// `org`: "me" walks the reporting chain and resolves leads from this
+    /// daemon's registry; `set_lead` only pins a live agent session bound to
+    /// the caller's own task, through the atomic lead endpoint.
+    #[test]
+    fn org_me_view_and_set_lead_guards() {
+        let state = make_state_arc();
+        let stub = spawn_routed_stub(move |method, path, _body| match (method, path) {
+            ("GET", "/tasks/task-me") => (200, r#"{"id":"task-me","name":"me","parent_task_id":"task-boss",
+                "metadata":{"filer":{}},
+                "initiative":{"id":"div-1","slug":"trader","name":"Trader","status":"active",
+                              "kind":"division","coordinator_task_id":"task-boss"}}"#.to_string()),
+            ("GET", "/tasks/task-boss") => (200, r#"{"id":"task-boss","name":"boss","parent_task_id":null,
+                "metadata":{"lead_session_uid":"ts-gone-0"}}"#.to_string()),
+            ("POST", "/tasks/task-me/lead") => (200, r#"{"id":"task-me","name":"me",
+                "metadata":{"filer":{},"lead_session_uid":"ts-10-0"}}"#.to_string()),
+            _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+        });
+        {
+            let mut s = state.lock().unwrap();
+            s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+            s.config.api_token = "test-token".to_string();
+        }
+        seed_tasked_caller(&state, "ts-10-0", "ws-me", "task-me");
+        seed_tasked_caller(&state, "ts-20-0", "ws-me", "task-me");
+        seed_tasked_caller(&state, "ts-5-0", "ws-me", "task-me");
+        {
+            let mut s = state.lock().unwrap();
+            s.sessions.get_mut("ts-10-0").unwrap().session_type = "codex".to_string();
+            s.sessions.get_mut("ts-20-0").unwrap().session_type = "claude".to_string();
+            s.sessions.get_mut("ts-5-0").unwrap().session_type = "bash".to_string();
+        }
+
+        let me = org(&state, &json!({}), Some("ts-20-0")).expect("org me");
+        assert_eq!(me["task"]["id"], "task-me");
+        assert_eq!(me["task"]["lead"]["session_uid"], "ts-10-0", "earliest live agent, not bash");
+        assert_eq!(me["boss"]["id"], "task-boss");
+        assert_eq!(me["boss"]["lead"], Value::Null, "the boss's pinned lead isn't on this host");
+        assert_eq!(me["boss"]["pinned_lead_session_uid"], "ts-gone-0");
+        assert_eq!(me["chain"].as_array().unwrap().len(), 1);
+        assert_eq!(me["division"]["kind"], "division");
+        assert_eq!(me["division"]["root_task_id"], "task-boss");
+
+        // Guards: operator, another task, a bash or unbound session.
+        let set = |params: Value, caller: Option<&str>| org(&state, &params, caller);
+        assert_eq!(set(json!({"action": "set_lead"}), None).unwrap_err().0, ErrorCode::Unauthorized);
+        assert_eq!(
+            set(json!({"action": "set_lead", "task_id": "task-boss"}), Some("ts-20-0")).unwrap_err().0,
+            ErrorCode::Unauthorized
+        );
+        for uid in ["ts-5-0", "ts-nobody"] {
+            assert_eq!(
+                set(json!({"action": "set_lead", "session_uid": uid}), Some("ts-20-0")).unwrap_err().0,
+                ErrorCode::InvalidParams
+            );
+        }
+        assert!(stub.requests.lock().unwrap().iter().all(|r| r.method == "GET"), "no write yet");
+
+        let out = set(json!({"action": "set_lead", "session_uid": "ts-10-0"}), Some("ts-20-0"))
+            .expect("set_lead");
+        assert_eq!(out["task"]["lead"]["session_uid"], "ts-10-0");
+        assert_eq!(out["task"]["lead"]["pinned"], true);
+        let requests = stub.requests.lock().unwrap();
+        let post = requests.iter().find(|r| r.method == "POST").expect("lead POST");
+        assert_eq!(serde_json::from_str::<Value>(&post.body).unwrap(), json!({"session_uid": "ts-10-0"}));
+        drop(requests);
+        kill_all_sessions(&state);
+    }
+
+    /// Owner as leader (2026-10-22): a division root with no live lead is led
+    /// by Owner as stand-in (`me` shows it as the boss, `division` as the
+    /// leader); `set_lead` to "owner" only from Owner or an orchestrator,
+    /// never on the caller's own task.
+    #[test]
+    fn org_owner_leads_division_roots_and_set_lead_owner_is_guarded() {
+        let state = make_state_arc();
+        let div = r#""initiative":{"id":"div-1","slug":"pt-misc","name":"PT misc","status":"active",
+                      "kind":"division","coordinator_task_id":"task-root"}"#;
+        let stub = spawn_routed_stub(move |method, path, _body| match (method, path) {
+            ("GET", "/tasks/task-me") => (200, format!(r#"{{"id":"task-me","name":"me","parent_task_id":"task-root",{div}}}"#)),
+            ("GET", "/tasks/task-root") => (200, format!(r#"{{"id":"task-root","name":"root","parent_task_id":null,{div}}}"#)),
+            ("GET", "/tasks/task-child") => (200, r#"{"id":"task-child","name":"child","parent_task_id":"task-me"}"#.to_string()),
+            ("GET", "/tasks/task-other") => (200, r#"{"id":"task-other","name":"other","parent_task_id":null}"#.to_string()),
+            ("POST", p) if p.ends_with("/lead") => {
+                let id = p.trim_start_matches("/tasks/").trim_end_matches("/lead");
+                (200, format!(r#"{{"id":"{id}","name":"x","metadata":{{"lead_session_uid":"owner"}}}}"#))
+            }
+            ("GET", "/initiatives/pt-misc") => (200, r#"{"id":"div-1","slug":"pt-misc","name":"PT misc","status":"active",
+                "kind":"division","coordinator_task_id":"task-root"}"#.to_string()),
+            ("GET", p) if p.starts_with("/tasks?") => (200, format!(
+                r#"[{{"id":"task-root","name":"root","parent_task_id":null,{div}}},
+                    {{"id":"task-me","name":"me","parent_task_id":"task-root",{div}}}]"#)),
+            _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+        });
+        {
+            let mut s = state.lock().unwrap();
+            s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+            s.config.api_token = "test-token".to_string();
+        }
+        seed_tasked_caller(&state, "ts-10-0", "ws-me", "task-me");
+        state.lock().unwrap().sessions.get_mut("ts-10-0").unwrap().session_type = "codex".to_string();
+
+        let me = org(&state, &json!({}), Some("ts-10-0")).expect("org me");
+        assert_eq!(me["boss"]["id"], "task-root");
+        assert_eq!(me["boss"]["lead"], json!({"owner": true, "stand_in": true}), "no session on the root: Owner stands in");
+        assert_eq!(me["boss_lead"], json!({"owner": true, "stand_in": true, "task_id": "task-root"}));
+        assert_eq!(me["task"]["lead"]["session_uid"], "ts-10-0", "a member task keeps its session lead");
+
+        let division = org(&state, &json!({"view": "division", "division": "pt-misc"}), Some("ts-10-0")).expect("division");
+        assert_eq!(division["division"]["leader"], json!({"owner": true, "stand_in": true}));
+        assert_eq!(division["tree"]["lead"], json!({"owner": true, "stand_in": true}));
+
+        // set_lead to Owner: not on your own task, not on an unrelated one...
+        let set = |params: Value, caller: Option<&str>| org(&state, &params, caller);
+        let owner = |task: &str| json!({"action": "set_lead", "session_uid": "owner", "task_id": task});
+        assert_eq!(set(owner("task-me"), Some("ts-10-0")).unwrap_err().0, ErrorCode::Unauthorized);
+        assert_eq!(set(owner("task-other"), Some("ts-10-0")).unwrap_err().0, ErrorCode::Unauthorized);
+        assert_eq!(
+            set(json!({"action": "set_lead", "session_uid": "owner"}), Some("ts-10-0")).unwrap_err().0,
+            ErrorCode::InvalidParams,
+            "needs task_id"
+        );
+        assert!(stub.requests.lock().unwrap().iter().all(|r| r.method == "GET"), "no write yet");
+        // ...but yes on a task below yours (you orchestrate it), from Owner,
+        // and from a global session.
+        let out = set(owner("task-child"), Some("ts-10-0")).expect("orchestrator");
+        assert_eq!(out["task"]["lead"], json!({"owner": true, "stand_in": false}), "explicit Owner");
+        set(owner("task-other"), None).expect("Owner (operator)");
+        state.lock().unwrap().sessions.get_mut("ts-10-0").unwrap().global_perms = true;
+        set(owner("task-other"), Some("ts-10-0")).expect("global");
+        let requests = stub.requests.lock().unwrap();
+        let posts: Vec<_> = requests.iter().filter(|r| r.method == "POST").collect();
+        assert_eq!(posts.len(), 3);
+        assert_eq!(serde_json::from_str::<Value>(&posts[0].body).unwrap(), json!({"session_uid": "owner"}));
+        drop(requests);
+        kill_all_sessions(&state);
+    }
+
+    /// Review of 3c8d674: a worker can't clear or override an Owner pin on
+    /// its own task; the "above the target" walk stops at a loop and at the
+    /// chain limit; the division leader is right when the root isn't listed.
+    #[test]
+    fn owner_pins_resist_workers_and_the_authority_walk_is_bounded() {
+        let state = make_state_arc();
+        let stub = spawn_routed_stub(move |method, path, _body| match (method, path) {
+            // The worker's own task is pinned to Owner.
+            ("GET", "/tasks/task-me") => (200, r#"{"id":"task-me","name":"me","parent_task_id":null,
+                "metadata":{"lead_session_uid":"owner"}}"#.to_string()),
+            // loop-a → loop-b → loop-a: never reaches task-me.
+            ("GET", "/tasks/loop-a") => (200, r#"{"id":"loop-a","parent_task_id":"loop-b"}"#.to_string()),
+            ("GET", "/tasks/loop-b") => (200, r#"{"id":"loop-b","parent_task_id":"loop-a"}"#.to_string()),
+            // deep-0 → deep-1 → … → deep-40 → task-me: 41 steps up.
+            ("GET", p) if p.starts_with("/tasks/deep-") => {
+                let n: usize = p.trim_start_matches("/tasks/deep-").parse().unwrap();
+                let parent = if n == 40 { "task-me".to_string() } else { format!("deep-{}", n + 1) };
+                (200, format!(r#"{{"id":"deep-{n}","parent_task_id":"{parent}"}}"#))
+            }
+            ("GET", "/initiatives/pt-misc") => (200, r#"{"id":"div-1","slug":"pt-misc","name":"PT misc",
+                "kind":"division","coordinator_task_id":"task-root"}"#.to_string()),
+            // The list holds only a member, not the root.
+            ("GET", p) if p.starts_with("/tasks?") => (200, r#"[{"id":"task-m","name":"m","parent_task_id":"task-root"}]"#.to_string()),
+            ("POST", p) if p.ends_with("/lead") => (200, r#"{"id":"x","metadata":{}}"#.to_string()),
+            _ => (404, r#"{"detail":"unexpected"}"#.to_string()),
+        });
+        {
+            let mut s = state.lock().unwrap();
+            s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+            s.config.api_token = "test-token".to_string();
+        }
+        seed_tasked_caller(&state, "ts-10-0", "ws-me", "task-me");
+        state.lock().unwrap().sessions.get_mut("ts-10-0").unwrap().session_type = "codex".to_string();
+        let call = |params: Value| org(&state, &params, Some("ts-10-0"));
+
+        // Clearing, or overriding with your own session, is refused.
+        assert_eq!(call(json!({"action": "clear_lead"})).unwrap_err().0, ErrorCode::Unauthorized);
+        assert_eq!(call(json!({"action": "set_lead"})).unwrap_err().0, ErrorCode::Unauthorized);
+        assert_eq!(call(json!({"action": "set_lead", "session_uid": "ts-10-0"})).unwrap_err().0, ErrorCode::Unauthorized);
+        // A loop and an over-long chain never make you "above".
+        assert_eq!(call(json!({"action": "set_lead", "session_uid": "owner", "task_id": "loop-a"})).unwrap_err().0, ErrorCode::Unauthorized);
+        assert_eq!(call(json!({"action": "set_lead", "session_uid": "owner", "task_id": "deep-0"})).unwrap_err().0, ErrorCode::Unauthorized);
+        assert!(stub.requests.lock().unwrap().iter().all(|r| r.method == "GET"), "nothing written");
+        // Within the limit it is: deep-20 is 21 steps below task-me.
+        call(json!({"action": "set_lead", "session_uid": "owner", "task_id": "deep-20"})).expect("within the limit");
+        // A global caller may clear the Owner pin on its own task.
+        state.lock().unwrap().sessions.get_mut("ts-10-0").unwrap().global_perms = true;
+        call(json!({"action": "clear_lead"})).expect("global clears");
+
+        // The division's leader, with the root missing from the list.
+        let division = call(json!({"view": "division", "division": "pt-misc"})).expect("division");
+        assert_eq!(division["division"]["leader"], json!({"owner": true, "stand_in": true}));
         kill_all_sessions(&state);
     }
 
@@ -32928,6 +42185,7 @@ while True:
             s.workspaces.insert(
                 "ws-child".into(),
                 ManifestWorkspace {
+                    org: None,
                     color: None,
                     pinned: false,
                     id: "ws-child".into(),
@@ -33067,6 +42325,226 @@ while True:
     }
 
     #[test]
+    fn agent_report_is_self_scoped_and_keeps_background_legacy_idle() {
+        let state = make_state_arc();
+        let uid = "ts-state-rpc";
+        insert_session(&state, uid, "ws-state");
+        insert_session(&state, "ts-state-other", "ws-state");
+        {
+            let mut s = state.lock().unwrap();
+            s.sessions.get_mut(uid).unwrap().session_type = "codex".into();
+            s.sessions.get_mut("ts-state-other").unwrap().global_perms = true;
+        }
+        let epoch = uuid::Uuid::new_v4().to_string();
+        let now = now_unix_f64();
+        let mut params = json!({"session_uid": uid, "kind": "snapshot", "epoch": epoch, "seq": 1,
+            "snapshot": {"backend_connected": true, "foreground": "idle", "turn_seq": 1,
+                "turn_started_at": now - 5.0,
+                "last_turn": {"ended_at": now - 3.0, "status": "completed"},
+                "child_active": true}});
+        assert_eq!(session_agent_report(&state, &params, Some("ts-state-other")).unwrap_err().0,
+            ErrorCode::Unauthorized, "even global permissions cannot forge another session's engine state");
+        let answer = session_agent_report(&state, &params, Some(uid)).unwrap();
+        assert_eq!(answer["applied"], true);
+        assert_eq!(answer["agent_state"]["state"], "working-background");
+        let resolved = resolve_authorized_session(&state, &json!({"session_uid": uid}), Some(uid)).unwrap();
+        assert_eq!(resolved["idle"], true, "old turn_end monitors may finish with live background work");
+        assert_eq!(resolved["pty_idle"], false, "raw clock was stamped by the engine start");
+        assert_eq!(resolved["semantic_idle"], true);
+        let rows = list_sessions(&state, &json!({}), None).unwrap();
+        let row = rows.as_array().unwrap().iter().find(|row| row["session_uid"] == uid).unwrap();
+        assert_eq!(row["agent_state"], resolved["agent_state"]);
+        assert_eq!(row["idle"], true);
+        assert_eq!(row["pty_idle"], false);
+        report_done(&state, &Caller::session(uid), &json!({"reason": "done"})).unwrap();
+        assert_eq!(session_agent_report(&state, &params, None).unwrap()["applied"], false,
+            "duplicate report does not cancel report_done");
+        assert!(state.lock().unwrap().sessions[uid].reported_done().is_some());
+        params["seq"] = json!(2);
+        params["snapshot"]["turn_seq"] = json!(2);
+        params["snapshot"]["turn_started_at"] = json!(now_unix_f64());
+        params["snapshot"]["foreground"] = json!("active");
+        let answer = session_agent_report(&state, &params, None).unwrap();
+        assert_eq!(answer["agent_state"]["state"], "working");
+        assert_eq!(answer["agent_state"]["turn_seq"], 2);
+        assert!(!state.lock().unwrap().sessions[uid].reported_done().is_some());
+        assert_eq!(state.lock().unwrap().sessions[uid].semantic_idle(), Some(false));
+        state.lock().unwrap().restarting = true;
+        assert_eq!(session_agent_report(&state, &params, Some(uid)).unwrap_err().0, ErrorCode::Conflict);
+        state.lock().unwrap().restarting = false;
+        kill_all_sessions(&state);
+    }
+
+    #[test]
+    fn legacy_stop_closes_core_turn_after_rich_report_rejection() {
+        let state = make_state_arc();
+        let uid = "ts-stop-fallback-core";
+        insert_session(&state, uid, "ws-state");
+        state.lock().unwrap().sessions.get_mut(uid).unwrap().session_type = "claude-code".into();
+        let now = now_unix_f64();
+        state.lock().unwrap().sessions[uid].agent_state.lock().unwrap().inputs.spawned_at = now - 60.0;
+        session_agent_report(&state, &json!({"session_uid":uid, "kind":"hook",
+            "event":"UserPromptSubmit", "payload":{"observed_at":now - 2.0}}), Some(uid)).unwrap();
+        assert_eq!(session_agent_report(&state, &json!({"session_uid":uid, "kind":"hook",
+            "event":"Stop", "payload":{"observed_at":now, "background":{"jobs":[{}]}}}), Some(uid))
+            .unwrap_err().0, ErrorCode::InvalidParams);
+        session_turn_ended(&state, &json!({"session_uid":uid}), Some(uid)).unwrap();
+        {
+            let st = state.lock().unwrap();
+            let mut cell = st.sessions[uid].agent_state.lock().unwrap();
+            let current = cell.recompute(now_unix_f64() + 2.0);
+            assert_eq!(current.state, crate::agent_state::State::Idle);
+            assert_eq!(current.last_turn.status, Some(crate::agent_state::TurnStatus::Completed));
+            assert!(current.last_turn.ended_at.unwrap() >= now);
+        }
+        kill_all_sessions(&state);
+    }
+
+    #[test]
+    fn agent_report_late_continuing_stop_refreshes_legacy_activity_without_extra_turn() {
+        let state = make_state_arc();
+        let uid = "ts-continuing-hook";
+        insert_session(&state, uid, "ws-state");
+        state.lock().unwrap().sessions.get_mut(uid).unwrap().session_type = "claude-code".into();
+        let now = now_unix_f64();
+        state.lock().unwrap().sessions[uid].agent_state.lock().unwrap().inputs.spawned_at = now - 60.0;
+        session_agent_report(&state, &json!({"session_uid":uid, "kind":"hook",
+            "event":"UserPromptSubmit", "payload":{"observed_at":now}}), Some(uid)).unwrap();
+        {
+            let s = state.lock().unwrap();
+            s.sessions[uid].stamp_turn_end();
+            s.sessions[uid].stamp_reported_done(Some("before inbox continuation".into()));
+            assert_eq!(s.sessions[uid].semantic_idle(), Some(true));
+        }
+        let answer = session_agent_report(&state, &json!({"session_uid":uid, "kind":"hook",
+            "event":"Stop", "payload":{"observed_at":now - 1.0, "continuing":true}}), Some(uid)).unwrap();
+        assert_eq!(answer["applied"], true);
+        assert_eq!(answer["agent_state"]["turn_seq"], 1, "a newer engine start already opened this turn");
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.sessions[uid].semantic_idle(), Some(false));
+            assert!(s.sessions[uid].reported_done().is_none());
+        }
+        kill_all_sessions(&state);
+    }
+
+    #[test]
+    fn presence_compatibility_rollback_and_unknown_reach_both_read_surfaces() {
+        let state = make_state_arc();
+        let uid = "ts-presence-rollback";
+        insert_session(&state, uid, "ws-state");
+        {
+            let st = state.lock().unwrap();
+            let session = &st.sessions[uid];
+            *session.last_activity_at.lock().unwrap() = Some(std::time::Instant::now());
+            session.agent_state.lock().unwrap().inputs.presence = Some(crate::agent_state::PresenceObs {
+                valid: true, status: crate::agent_state::PresenceStatus::Idle,
+                observed_at: now_unix_f64(), status_updated_at: Some(now_unix_f64() - 60.0), native_session_id: None,
+                engine_version: None, waiting_for: None, main_turn_open: None, transcript_error: None, transcript_end: None, transcript_evidence_path: None, wait_resolution: None,
+            });
+        }
+        let reads = |expected_state: &str, expected_idle: bool| {
+            let resolved = resolve_authorized_session(&state, &json!({"session_uid": uid}), None).unwrap();
+            let rows = list_sessions(&state, &json!({}), None).unwrap();
+            let row = rows.as_array().unwrap().iter().find(|row| row["session_uid"] == uid).unwrap();
+            for result in [&resolved, row] {
+                assert_eq!(result["agent_state"]["state"], expected_state);
+                assert_eq!(result["idle"], expected_idle);
+                assert_eq!(result["pty_idle"], false);
+            }
+        };
+        reads("idle", true);
+        state.lock().unwrap().config.presence_idle_enabled = false;
+        reads("idle", false);
+        {
+            let mut st = state.lock().unwrap();
+            st.config.presence_idle_enabled = true;
+            st.sessions[uid].agent_state.lock().unwrap().inputs.presence.as_mut().unwrap().valid = false;
+        }
+        reads("unknown", false);
+        kill_all_sessions(&state);
+    }
+
+    #[test]
+    fn needs_human81_agent_report_identity_order_and_since_on_both_reads() {
+        let state=make_state_arc(); let uid="ts-permission81";
+        insert_session(&state,uid,"ws-permission81");
+        let now=now_unix_f64();
+        {
+            let mut st=state.lock().unwrap(); let s=st.sessions.get_mut(uid).unwrap();
+            s.session_type="claude-code".into();
+            s.transcript_path=Some("/fixture/main.jsonl".into());
+            s.agent_state.lock().unwrap().inputs.spawned_at=now-50.0;
+        }
+        let report=|payload:Value| json!({"session_uid":uid,"kind":"hook","event":"PermissionRequest","payload":payload});
+        let waiting=json!({"observed_at":now-10.0,"session_id":"main","transcript_path":"/fixture/main.jsonl",
+            "tool_use_id":"a","tool_name":"Agent"});
+        for change in [json!({"agent_id":"nested"}),json!({"session_id":"other"}),
+            json!({"transcript_path":"/fixture/child.jsonl"}),json!({"observed_at":now-60.0})] {
+            let mut payload=waiting.clone();
+            payload.as_object_mut().unwrap().extend(change.as_object().unwrap().clone());
+            assert_eq!(session_agent_report(&state,&report(payload),Some(uid)).unwrap()["applied"],false);
+            let st=state.lock().unwrap();
+            assert!(st.sessions[uid].agent_state.lock().unwrap().inputs.hooks.waiting_at.is_none());
+            assert_eq!(st.sessions[uid].transcript_path.as_deref(),Some("/fixture/main.jsonl"));
+        }
+        let accepted=session_agent_report(&state,&report(waiting.clone()),Some(uid)).unwrap();
+        assert_eq!(accepted["applied"],true);
+        assert_eq!(accepted["agent_state"]["state"],"waiting-on-human");
+        assert_eq!(accepted["agent_state"]["since"],json!(now-10.0));
+        let mut stale=waiting.clone(); stale["observed_at"]=json!(now-11.0); stale["tool_use_id"]=json!("stale");
+        assert_eq!(session_agent_report(&state,&report(stale),Some(uid)).unwrap()["applied"],false);
+        let rows=list_sessions(&state,&json!({}),None).unwrap();
+        let row=rows.as_array().unwrap().iter().find(|r| r["session_uid"]==uid).unwrap();
+        let resolved=resolve_authorized_session(&state,&json!({"session_uid":uid}),Some(uid)).unwrap();
+        for value in [row,&resolved] {
+            assert_eq!(value["agent_state"]["state"],"waiting-on-human");
+            assert_eq!(value["agent_state"]["since"],json!(now-10.0));
+            assert_eq!(value["idle"],true,"legacy compatibility idle remains unchanged; consumers use agent_state");
+        }
+        let mut oversized=waiting; oversized["tool_use_id"]=json!("x".repeat(257));
+        assert_eq!(session_agent_report(&state,&report(oversized),Some(uid)).unwrap_err().0,ErrorCode::InvalidParams);
+        kill_all_sessions(&state);
+    }
+
+    #[test]
+    fn agent_report_hooks_rebind_transcript_and_clear_failure_on_new_prompt() {
+        let dir = TempDir::new().unwrap();
+        let state = state_with_workspace("ws-hooks", &dir);
+        let uid = "ts-hook-state";
+        insert_session(&state, uid, "ws-hooks");
+        state.lock().unwrap().sessions.get_mut(uid).unwrap().session_type = "claude-code".into();
+        let now = now_unix_f64();
+        state.lock().unwrap().sessions[uid].agent_state.lock().unwrap().inputs.spawned_at = now - 60.0;
+        let make = |event: &str, at: f64| json!({"session_uid": uid, "kind": "hook", "event": event,
+            "payload": {"observed_at": at}});
+        session_agent_report(&state, &make("UserPromptSubmit", now - 5.0), Some(uid)).unwrap();
+        let error = session_agent_report(&state, &make("StopFailure", now - 3.0), Some(uid)).unwrap();
+        assert_eq!(error["agent_state"]["state"], "errored");
+        assert_eq!(state.lock().unwrap().sessions[uid].semantic_idle(), Some(true));
+        let working = session_agent_report(&state, &make("UserPromptSubmit", now), Some(uid)).unwrap();
+        assert_eq!(working["agent_state"]["state"], "working");
+        assert_eq!(working["agent_state"]["turn_seq"], 2);
+        assert_eq!(state.lock().unwrap().sessions[uid].semantic_idle(), Some(false));
+        let mut late_stop = make("Stop", now - 1.0);
+        late_stop["payload"]["transcript_path"] = json!("/unrelated/session.jsonl");
+        session_agent_report(&state, &late_stop, Some(uid)).unwrap();
+        assert!(state.lock().unwrap().sessions[uid].transcript_path.is_none());
+        assert_eq!(state.lock().unwrap().sessions[uid].semantic_idle(), Some(false));
+        let own_dir = crate::transcript_detect::claude_transcript_dir_for(dir.path()).unwrap();
+        let path = own_dir.join("state-hook-conversation.jsonl");
+        let mut stop = make("Stop", now_unix_f64());
+        stop["payload"]["transcript_path"] = json!(path.to_string_lossy());
+        session_agent_report(&state, &stop, Some(uid)).unwrap();
+        let s = state.lock().unwrap();
+        assert_eq!(s.sessions[uid].transcript_path.as_deref(), path.to_str());
+        assert_eq!(s.sessions[uid].generation, 1);
+        assert_eq!(s.sessions[uid].semantic_idle(), Some(true));
+        drop(s);
+        kill_all_sessions(&state);
+    }
+
+    #[test]
     fn viewer_input_preserves_semantic_idle_and_report_done_until_submit() {
         let state = Arc::new(Mutex::new(DaemonState::new()));
         let uid = "ts-viewer-input";
@@ -33101,7 +42579,6 @@ while True:
                 let session = &s.sessions[uid];
                 assert_eq!(*session.last_input_at.lock().unwrap(), baseline, "{bytes:?}");
                 assert!(session.last_activity_at.lock().unwrap().unwrap() >= before);
-                assert!(session.last_operator_input_at.lock().unwrap().unwrap() >= before);
             }
             let resolved = resolve_authorized_session(
                 &state, &json!({"session_uid": uid}), None,
@@ -33249,6 +42726,69 @@ while True:
     /// agent's final report — the same misread the operator/agent kill
     /// paths were already fixed for.
     #[test]
+    fn state_core_terminal_sweep_spares_quiet_work_but_closes_engine_boundaries() {
+        use crate::agent_state::{PresenceObs, PresenceStatus};
+        let state = make_state_arc();
+        for (uid, status, valid, quiet) in [
+            ("ts-working", PresenceStatus::Busy, true, true),
+            ("ts-background", PresenceStatus::Shell, true, true),
+            ("ts-idle", PresenceStatus::Idle, true, false),
+            ("ts-error", PresenceStatus::Idle, true, false),
+            ("ts-wait", PresenceStatus::Waiting, true, false),
+            ("ts-unknown-quiet", PresenceStatus::Unknown, false, true),
+            ("ts-unknown-busy", PresenceStatus::Unknown, false, false),
+        ] {
+            let mut sp = crate::session::SpawnParams::new(uid, "worker", "/bin/sleep");
+            sp.args = vec!["60".into()];
+            let mut session = crate::session::DaemonSession::spawn(sp).unwrap();
+            session.task_id = Some("done-task".into());
+            if quiet {
+                *session.last_activity_at.lock().unwrap() = None;
+            }
+            let now = now_unix_f64();
+            session.agent_state.lock().unwrap().inputs.presence = Some(PresenceObs {
+                valid,
+                status,
+                observed_at: now,
+                status_updated_at: Some(now), native_session_id: None,
+                engine_version: None,
+                waiting_for: None,
+                main_turn_open: Some(true),
+                transcript_error: (uid == "ts-error").then(|| "auth".into()),
+                transcript_end: None, transcript_evidence_path: None, wait_resolution: None,
+            });
+            state.lock().unwrap().sessions.insert(uid.into(), session);
+        }
+        let mut swept = sweep_terminal_task_sessions(&state, "done-task", "test", None, false);
+        swept.sort();
+        assert_eq!(
+            swept,
+            ["ts-error", "ts-idle", "ts-unknown-quiet", "ts-wait"]
+        );
+        kill_all_sessions(&state);
+    }
+
+    #[test]
+    fn task_sweeps_do_not_signal_a_recovery_reserved_uid() {
+        let state = make_state_arc();
+        let uid = "ts-sweep-recovery";
+        let mut params = crate::session::SpawnParams::new(uid, "worker", "/bin/sleep");
+        params.args = vec!["60".into()];
+        params.session_type = "claude-code".into();
+        let mut session = crate::session::DaemonSession::spawn(params).unwrap();
+        session.task_id = Some("done-task".into());
+        *session.last_activity_at.lock().unwrap() = None;
+        state.lock().unwrap().sessions.insert(uid.into(), session);
+        let gate = crate::claude_recovery::lifecycle_gate(uid);
+        let _write = gate.write().unwrap();
+        assert!(sweep_terminal_task_sessions(&state, "done-task", "test", None, false).is_empty());
+        assert_eq!(sweep_task_sessions(&state, "done-task", "test"), vec![uid.to_string()]);
+        let mut state = state.lock().unwrap();
+        assert!(state.sessions.get_mut(uid).unwrap().try_wait().is_none());
+        let _ = state.sessions.get_mut(uid).unwrap().kill();
+    }
+
+    #[test]
     fn terminal_sweep_closes_plain_workers_and_spares_scheduler_owned_ones() {
         // The general-action sweep: a task going terminal by ANY route closes
         // the workers it still owns, because each one is a hard `live_session`
@@ -33277,7 +42817,13 @@ while True:
         // A different task's worker is untouched even though it is idle.
         state.lock().unwrap().sessions.insert("ts-other".into(), make("ts-other", "task-open"));
 
-        let mut swept = sweep_terminal_task_sessions(&state, "task-done", "terminal-task-sweep");
+        // A board-originated close (terminal_via = "item") only unassigns:
+        // nothing is classified ephemeral yet, so nothing closes
+        // (lifecycle_guard_v1, doc/org-model.md §7.1).
+        assert!(sweep_terminal_task_sessions(&state, "task-done", "terminal-task-sweep", None, true).is_empty());
+        assert!(!state.lock().unwrap().sessions["ts-w1"].last_exit.operator_kill_requested());
+
+        let mut swept = sweep_terminal_task_sessions(&state, "task-done", "terminal-task-sweep", None, false);
         swept.sort(); // `sessions` is a HashMap; the sweep's order is not a contract.
         assert_eq!(swept, vec!["ts-w1".to_string(), "ts-w2".to_string()]);
 
@@ -33375,6 +42921,75 @@ while True:
         // A session on a DIFFERENT task is untouched.
         assert!(s.sessions.contains_key("ts-other"));
         drop(s);
+        kill_all_sessions(&state);
+    }
+
+    /// 2026-10-12: the terminal-task sweep closed a worker Owner was still
+    /// using. A session Owner typed into, showed in the TUI, revived or
+    /// resumed within the grace window is spared; the one nobody touched is
+    /// closed, and its exit record says the sweep did it so the TUI can show
+    /// "closed: task done" instead of a crash.
+    #[test]
+    fn terminal_sweep_spares_sessions_owner_used_and_labels_the_rest() {
+        use std::time::{Duration, Instant};
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let long_ago = Instant::now()
+            .checked_sub(Duration::from_secs(3 * 3600))
+            .expect("host uptime above three hours");
+        for uid in ["ts-typed", "ts-viewed", "ts-stale-typed", "ts-untouched"] {
+            insert_session(&state, uid, "ws-owner");
+        }
+        {
+            let mut s = state.lock().unwrap();
+            for sess in s.sessions.values_mut() {
+                sess.task_id = Some("task-owner".into());
+                *sess.last_activity_at.lock().unwrap() = None;
+            }
+            *s.sessions["ts-typed"].last_operator_input_at.lock().unwrap() = Some(Instant::now());
+            *s.sessions["ts-stale-typed"].last_operator_input_at.lock().unwrap() = Some(long_ago);
+            s.note_owner_activity("ts-viewed");
+        }
+        let (rx, _guard) = state.lock().unwrap().manifest_watcher.subscribe();
+        let grace = crate::terminal_sweep::OwnerGrace {
+            window: Duration::from_secs(2 * 3600),
+            floor: long_ago,
+        };
+        let mut swept =
+            sweep_terminal_task_sessions(&state, "task-owner", "terminal-task-sweep", Some(grace), false);
+        swept.sort();
+        assert_eq!(swept, ["ts-stale-typed", "ts-untouched"]);
+
+        // A brain that started inside the window spares everything.
+        let fresh = crate::terminal_sweep::OwnerGrace { floor: Instant::now(), ..grace };
+        insert_session(&state, "ts-new", "ws-owner");
+        {
+            let mut s = state.lock().unwrap();
+            let sess = s.sessions.get_mut("ts-new").unwrap();
+            sess.task_id = Some("task-owner".into());
+            *sess.last_activity_at.lock().unwrap() = None;
+        }
+        assert!(
+            sweep_terminal_task_sessions(&state, "task-owner", "terminal-task-sweep", Some(fresh), false)
+                .is_empty()
+        );
+
+        poll_until_session_removed(&state, "ts-untouched");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut labelled = 0;
+        while labelled < 2 && Instant::now() < deadline {
+            if let Ok(crate::manifest::ManifestDiff::Exited { last_exit, .. }) =
+                rx.recv_timeout(Duration::from_millis(200))
+            {
+                assert_eq!(
+                    last_exit.killed_by.as_deref(),
+                    Some("terminal-task-sweep (terminal task)")
+                );
+                labelled += 1;
+            }
+        }
+        assert_eq!(labelled, 2, "both swept exits carry the sweep's attribution");
+        assert!(state.lock().unwrap().sessions.contains_key("ts-typed"));
+        assert!(state.lock().unwrap().sessions.contains_key("ts-viewed"));
         kill_all_sessions(&state);
     }
     fn migration_request(state: &Arc<Mutex<DaemonState>>, id: &str, home: &std::path::Path) -> Value {
@@ -33558,6 +43173,195 @@ while True:
         });
     }
 
+
+    /// A Codex task held for recovery: a live orchestrator bound as the
+    /// current session, its held run, and one live worker it manages.
+    fn held_codex_fixture(state: &Arc<Mutex<DaemonState>>, home: &std::path::Path, id: &str) -> (String, String) {
+        use crate::continuous::task;
+        let orchestrator=fresh_test_uid(); let worker=fresh_test_uid();
+        let mut t=fresh_task_running(id,home,&orchestrator); t.engine=task::Engine::Codex;
+        t.run_mode=task::RunMode::Persistent; t.current_session_uid=Some(orchestrator.clone());
+        let run=t.last_run.as_mut().unwrap(); run.status=task::RunStatus::Failed; run.finished_at=Some(100);
+        t.recovery_hold=Some(task::RecoveryHold{run_seq:1,session_uid:orchestrator.clone(),fire_token:"ft-stuck-1".into(),detected_at:100,
+            detail:"Codex turn ended without report_done.".into(),capacity:false});
+        task::save(&t).unwrap();
+        insert_continuous_session(state,&orchestrator,id);
+        insert_continuous_session(state,&worker,id);
+        {
+            let mut state=state.lock().unwrap();
+            state.sessions.get_mut(&orchestrator).unwrap().session_type="codex".into();
+            let w=state.sessions.get_mut(&worker).unwrap(); w.continuous_task_id=None; w.managed_by_uid=Some(orchestrator.clone());
+        }
+        write_drain_monitor_journal(&orchestrator,json!({}));
+        (orchestrator,worker)
+    }
+
+    /// The held orchestrator's rollout ends in a completed turn.
+    fn set_completed_codex_rollout(state: &Arc<Mutex<DaemonState>>, uid: &str, home: &std::path::Path) {
+        let transcript=home.join("rollout.jsonl");
+        std::fs::write(&transcript,"{\"timestamp\":\"2026-09-06T22:00:00.500Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"error\":{\"codex_error_info\":\"usage_limit_exceeded\"}}}\n").unwrap();
+        state.lock().unwrap().sessions.get_mut(uid).unwrap().transcript_path=Some(transcript.to_string_lossy().into_owned());
+    }
+
+    fn finish_worker(state: &Arc<Mutex<DaemonState>>, worker: &str) {
+        report_done(state,&Caller::session(worker.to_string()),&json!({})).unwrap();
+        state.lock().unwrap().sessions[worker].stamp_turn_end();
+    }
+
+    #[test]
+    fn continuous_self_clear_releases_a_settled_hold_through_recovery() {
+        with_continuous_home(|home| {
+            use crate::continuous::{task,migration as m};
+            let state=Arc::new(Mutex::new(DaemonState::new()));
+            let (orchestrator,worker)=held_codex_fixture(&state,home,"self-clear");
+            finish_worker(&state,&worker);
+            let reason=json!({"reason":"Both workers reported; artifacts are in the index."});
+            let preview=m::self_clear_hold(&state,&orchestrator,&json!({"reason":"check","dry_run":true})).unwrap();
+            assert_eq!(preview["eligible"],true,"{preview}");
+            assert!(task::load_one("self-clear").unwrap().reconciliation.is_none(),"dry run records nothing");
+            let cleared=m::self_clear_hold(&state,&orchestrator,&reason).unwrap();
+            assert_eq!(cleared["committed"],true);
+            let t=task::load_one("self-clear").unwrap();
+            let record=t.reconciliation.clone().unwrap();
+            let clear=record.self_clear.clone().unwrap();
+            assert_eq!((clear.session_uid.as_str(),clear.run_seq),(orchestrator.as_str(),1));
+            assert_eq!(clear.reason,"Both workers reported; artifacts are in the index.");
+            let evidence:Value=serde_json::from_slice(&std::fs::read(&record.handover.path).unwrap()).unwrap();
+            assert_eq!(evidence["self_clear"]["reason"],clear.reason);
+            assert!(t.recovery_hold.is_some(),"recovery, not the call, lifts the hold");
+            // The orchestrator keeps talking after the call and then ends its
+            // turn; its own row moving does not invalidate the record.
+            set_completed_codex_rollout(&state,&orchestrator,home);
+            migration_probe_fixture(home,101.0);
+            assert!(!m::recover_codex(&state,"self-clear",111).unwrap(),"retire both sessions first");
+            let deadline=std::time::Instant::now()+std::time::Duration::from_secs(3);
+            for uid in [&orchestrator,&worker] {
+                while !state.lock().unwrap().sessions[uid].last_exit.kernel_set() { assert!(std::time::Instant::now()<deadline); std::thread::sleep(std::time::Duration::from_millis(10)); }
+                handle_session_exit(&mut state.lock().unwrap(),uid);
+            }
+            assert!(m::recover_codex(&state,"self-clear",111).unwrap());
+            let after=task::load_one("self-clear").unwrap();
+            assert!(after.recovery_hold.is_none() && after.reconciliation.is_none() && after.current_session_uid.is_none());
+            let receipt:Value=serde_json::from_slice(&std::fs::read(task::task_dir("self-clear").join("recoveries/1.json")).unwrap()).unwrap();
+            assert_eq!(receipt["progress"]["reconciliation"]["self_clear"]["reason"],clear.reason,"the reason survives in the run's recovery receipt");
+        });
+    }
+
+    #[test]
+    fn continuous_self_clear_refuses_live_work_and_pending_deliveries() {
+        with_continuous_home(|home| {
+            use crate::continuous::{task,migration as m};
+            let state=Arc::new(Mutex::new(DaemonState::new()));
+            let (orchestrator,worker)=held_codex_fixture(&state,home,"self-clear-held");
+            let reason=json!({"reason":"settled"});
+            let refused=m::self_clear_hold(&state,&orchestrator,&reason).unwrap_err();
+            assert_eq!(refused.0,ErrorCode::Conflict);
+            assert!(refused.1.contains(&format!("{worker} still needs its completion report")),"{}",refused.1);
+            let dry=m::self_clear_hold(&state,&orchestrator,&json!({"reason":"settled","dry_run":true})).unwrap();
+            assert_eq!(dry["eligible"],false); assert!(dry["blockers"].as_array().unwrap().iter().any(|b| b.as_str().unwrap().contains(&worker)));
+            finish_worker(&state,&worker);
+            let root=crate::path::dot_cm_dir();
+            crate::notifications::publish(&root,&orchestrator,"wake-1","session_monitor","[cm-monitor m1] done","[cm-monitor m1]").unwrap();
+            let refused=m::self_clear_hold(&state,&orchestrator,&reason).unwrap_err();
+            assert!(refused.1.contains("unconfirmed notification"),"{}",refused.1);
+            crate::notifications::update_pending(&root,&orchestrator,"wake-1",None).unwrap();
+            write_drain_monitor_journal(&orchestrator,json!({"m1":{"monitor_id":"m1","state":"undelivered"}}));
+            let refused=m::self_clear_hold(&state,&orchestrator,&reason).unwrap_err();
+            assert!(refused.1.contains("monitor m1 has an undelivered or uncertain delivery"),"{}",refused.1);
+            write_drain_monitor_journal(&orchestrator,json!({"m1":{"monitor_id":"m1","state":"delivered","delivery_uncertain":true}}));
+            assert!(m::self_clear_hold(&state,&orchestrator,&reason).is_err());
+            std::fs::remove_file(root.join("monitor-state").join(format!("{orchestrator}.json"))).unwrap();
+            let refused=m::self_clear_hold(&state,&orchestrator,&reason).unwrap_err();
+            assert!(refused.1.contains("no durable monitor journal"),"{}",refused.1);
+            assert!(task::load_one("self-clear-held").unwrap().reconciliation.is_none(),"no refusal records anything");
+            // The operator path is unchanged: it attests what the self-clear
+            // must prove, and still reconciles this hold.
+            set_completed_codex_rollout(&state,&orchestrator,home);
+            m::handle(&state,"continuous.reconcile",&migration_request(&state,"self-clear-held",home)).unwrap();
+            let record=task::load_one("self-clear-held").unwrap().reconciliation.unwrap();
+            assert!(record.self_clear.is_none());
+            assert!(m::self_clear_hold(&state,&orchestrator,&reason).unwrap_err().1.contains("operator"),"an operator record is not replaced");
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn continuous_self_clear_record_does_not_make_the_operator_path_strict() {
+        with_continuous_home(|home| {
+            use crate::continuous::{task,migration as m};
+            let state=Arc::new(Mutex::new(DaemonState::new()));
+            let (orchestrator,worker)=held_codex_fixture(&state,home,"self-clear-op");
+            finish_worker(&state,&worker);
+            m::self_clear_hold(&state,&orchestrator,&json!({"reason":"settled"})).unwrap();
+            let evidence_dir=crate::path::dot_cm_dir().join("migrations/self-clear-op");
+            assert_eq!(std::fs::read_dir(&evidence_dir).unwrap().count(),1);
+            // A notice to the live orchestrator turns uncertain after the
+            // self-clear: recovery of that record is held...
+            let root=crate::path::dot_cm_dir();
+            crate::notifications::publish(&root,&orchestrator,"wake-1","session_monitor","[cm-monitor m1] done","[cm-monitor m1]").unwrap();
+            for entry in std::fs::read_dir(crate::notifications::directory(&root,&orchestrator)).unwrap() {
+                let path=entry.unwrap().path();
+                if path.extension().is_some_and(|x| x=="json") && path.file_name().is_some_and(|n| n!="transport.json") {
+                    let mut event:Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                    event["status"]=json!("uncertain"); std::fs::write(&path,event.to_string()).unwrap();
+                }
+            }
+            set_completed_codex_rollout(&state,&orchestrator,home);
+            migration_probe_fixture(home,101.0);
+            assert!(!m::recover_codex(&state,"self-clear-op",111).unwrap());
+            assert!(!state.lock().unwrap().sessions[&orchestrator].last_exit.operator_kill_requested(),"strict recovery waits on the uncertain notice");
+            // ...but the operator attests deliveries as before and replaces it.
+            m::handle(&state,"continuous.reconcile",&migration_request(&state,"self-clear-op",home)).unwrap();
+            assert!(task::load_one("self-clear-op").unwrap().reconciliation.unwrap().self_clear.is_none());
+            assert!(!m::recover_codex(&state,"self-clear-op",111).unwrap(),"retires before releasing");
+            assert!(state.lock().unwrap().sessions[&orchestrator].last_exit.operator_kill_requested(),"the operator record proceeds past the notice");
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn continuous_self_clear_refuses_staged_batches_and_capacity_holds() {
+        with_continuous_home(|home| {
+            use crate::continuous::{task,migration as m};
+            let state=Arc::new(Mutex::new(DaemonState::new()));
+            let (orchestrator,worker)=held_codex_fixture(&state,home,"self-clear-batch");
+            finish_worker(&state,&worker);
+            task::modify("self-clear-batch",|t| t.schedule=task::Schedule::Consumer{queue:"canary".into(),batch_max:2,window_secs:1,depth_threshold:0}).unwrap();
+            std::fs::create_dir_all(home.join(".queue")).unwrap();
+            std::fs::write(home.join(".queue/batch-1.json"),json!({"queue":"canary","task_id":"self-clear-batch","seq":1,"items":[
+                {"id":uuid::Uuid::new_v4().to_string(),"payload":{},"dedupe_key":"a","enqueued_at":"2026-09-06T20:00:00Z"}]}).to_string()).unwrap();
+            let refused=m::self_clear_hold(&state,&orchestrator,&json!({"reason":"settled"})).unwrap_err();
+            assert!(refused.1.contains("staged batch has 1 item(s)"),"{}",refused.1);
+            assert_eq!(m::self_clear_hold(&state,&orchestrator,&json!({"reason":"settled","items":{}})).unwrap_err().0,ErrorCode::InvalidParams,"no caller-asserted outcomes");
+            std::fs::write(home.join(".queue/batch-1.json"),json!({"queue":"canary","task_id":"self-clear-batch","seq":1,"items":[]}).to_string()).unwrap();
+            assert_eq!(m::self_clear_hold(&state,&orchestrator,&json!({"reason":"settled","dry_run":true})).unwrap()["eligible"],true,"an empty batch clears");
+            task::modify("self-clear-batch",|t| t.recovery_hold.as_mut().unwrap().capacity=true).unwrap();
+            assert!(m::self_clear_hold(&state,&orchestrator,&json!({"reason":"settled"})).unwrap_err().1.contains("capacity hold"));
+            assert!(task::load_one("self-clear-batch").unwrap().reconciliation.is_none());
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn continuous_self_clear_is_only_for_the_current_orchestrator() {
+        with_continuous_home(|home| {
+            use crate::continuous::{task,migration as m};
+            let state=Arc::new(Mutex::new(DaemonState::new()));
+            let (orchestrator,worker)=held_codex_fixture(&state,home,"self-clear-auth");
+            finish_worker(&state,&worker);
+            let reason=json!({"reason":"settled"});
+            assert_eq!(m::self_clear_hold(&state,&worker,&reason).unwrap_err().0,ErrorCode::Unauthorized,"a worker cannot clear its orchestrator's hold");
+            let stale=fresh_test_uid(); insert_continuous_session(&state,&stale,"self-clear-auth");
+            let refused=m::self_clear_hold(&state,&stale,&reason).unwrap_err();
+            assert_eq!(refused.0,ErrorCode::Unauthorized); assert!(refused.1.contains("replaced instance"),"{}",refused.1);
+            assert_eq!(m::self_clear_hold(&state,"ts-not-live",&reason).unwrap_err().0,ErrorCode::NotFound);
+            assert_eq!(m::self_clear_hold(&state,&orchestrator,&json!({"reason":"  "})).unwrap_err().0,ErrorCode::InvalidParams);
+            task::modify("self-clear-auth",|t| t.recovery_hold=None).unwrap();
+            assert!(m::self_clear_hold(&state,&orchestrator,&reason).unwrap_err().1.contains("no recovery hold"));
+            kill_all_sessions(&state);
+        });
+    }
+
 }
 
 #[cfg(test)]
@@ -33571,5 +43375,43 @@ mod orphan_prompt_tests {
             assert!(!super::deliver_agent_body(&handle, &fanout, "exited", &"abandoned prompt".repeat(3000), fresh, "test"));
         }
         assert!(writes.lock().unwrap().is_empty(), "do not fill an orphan PTY after startup failure");
+    }
+}
+
+#[cfg(test)]
+mod org_tree_tests {
+    use super::org_build_tree;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn division_tree_nests_by_parent_and_lists_strays() {
+        let tasks = vec![
+            json!({"id": "root", "parent_task_id": null}),
+            json!({"id": "a", "parent_task_id": "root"}),
+            json!({"id": "a1", "parent_task_id": "a"}),
+            json!({"id": "b", "parent_task_id": "root"}),
+            json!({"id": "stray", "parent_task_id": "elsewhere"}),
+        ];
+        let node = |t: &Value| json!({"id": t["id"]});
+        let (tree, unattached) = org_build_tree("root", &tasks, &node);
+        assert_eq!(tree["id"], "root");
+        let kids: Vec<&str> = tree["reports"].as_array().unwrap().iter()
+            .map(|n| n["id"].as_str().unwrap()).collect();
+        assert_eq!(kids, ["a", "b"]);
+        assert_eq!(tree["reports"][0]["reports"][0]["id"], "a1");
+        assert_eq!(unattached, vec![json!({"id": "stray"})]);
+    }
+
+    #[test]
+    fn division_tree_survives_a_parent_cycle() {
+        let tasks = vec![
+            json!({"id": "root", "parent_task_id": "x"}),
+            json!({"id": "x", "parent_task_id": "root"}),
+        ];
+        let node = |t: &Value| json!({"id": t["id"]});
+        let (tree, unattached) = org_build_tree("root", &tasks, &node);
+        assert_eq!(tree["reports"][0]["id"], "x");
+        assert_eq!(tree["reports"][0]["reports"], json!([]));
+        assert!(unattached.is_empty());
     }
 }

@@ -59,6 +59,11 @@ pub struct Task {
     /// the schema doesn't churn for every new shape. None = no bag.
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+    /// The task's live board link (S3 placement, doc/org-model.md §7.1):
+    /// `{board, board_id, n, status, group_id, group}`; null or absent when
+    /// not placed (and on APIs that predate placement).
+    #[serde(default)]
+    pub placement: Option<serde_json::Value>,
 }
 
 /// Provenance stamped on agent-filed tasks at `metadata.filer`.
@@ -249,6 +254,23 @@ pub struct TaskCreateBody {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// `GET /boards?open_only=true`: item boards with open items, newest first
+/// (doc/items-board.md). For the board overlay's picker; called off-thread.
+pub fn list_open_boards(base_url: &str, token: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+    let agent = ureq::Agent::new_with_config(
+        ureq::config::Config::builder()
+            .timeout_global(Some(std::time::Duration::from_secs(30)))
+            .build(),
+    );
+    let url = format!("{}/boards?open_only=true", base_url.trim_end_matches('/'));
+    Ok(agent
+        .get(&url)
+        .header("Authorization", &format!("Bearer {token}"))
+        .call()?
+        .body_mut()
+        .read_json::<Vec<serde_json::Value>>()?)
+}
+
 /// Blocking HTTP client for the Claude Manager API.
 pub struct ApiClient {
     base_url: String,
@@ -397,6 +419,43 @@ impl ApiClient {
             .body_mut()
             .read_json::<Task>()?;
         Ok(resp)
+    }
+
+    /// `POST /tasks/{id}/lead`: pin (`Some`) or clear (`None`) the task's
+    /// lead session, `metadata.lead_session_uid`, leaving the rest of the
+    /// metadata bag alone (a PATCH would replace it). Returns the updated
+    /// row when the server sends one.
+    pub fn set_task_lead(&self, task_id: &str, session_uid: Option<&str>) -> anyhow::Result<Option<Task>> {
+        let body: serde_json::Value = self
+            .agent
+            .post(&self.url(&format!("/tasks/{}/lead", task_id)))
+            .header("Authorization", &self.auth_header())
+            .send_json(serde_json::json!({ "session_uid": session_uid }))?
+            .body_mut()
+            .read_json()?;
+        Ok(serde_json::from_value(body).ok())
+    }
+
+    /// `POST /tasks/{id}/model`: set (`Some`) or clear (`None`) the task's
+    /// default model for `engine` (`claude` / `codex`), touching only
+    /// `metadata.models.<engine>`. Subtasks inherit it.
+    /// Set (or with `None`, clear) one of the task's own defaults for
+    /// `engine`; the other setting is left as it is.
+    pub fn set_task_default(
+        &self,
+        task_id: &str,
+        engine: &str,
+        setting: cm_daemon::models::Setting,
+        value: Option<&str>,
+    ) -> anyhow::Result<Option<Task>> {
+        let body: serde_json::Value = self
+            .agent
+            .post(&self.url(&format!("/tasks/{}/model", task_id)))
+            .header("Authorization", &self.auth_header())
+            .send_json(serde_json::json!({ "engine": engine, setting.name(): value }))?
+            .body_mut()
+            .read_json()?;
+        Ok(serde_json::from_value(body).ok())
     }
 
     pub fn delete_task(&self, task_id: &str) -> anyhow::Result<()> {

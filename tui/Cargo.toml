@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 # Workspace sibling. Transitional Phase-1 dep that lets the TUI call into
 # modules already relocated into the daemon (worktree, eventually
 # mcp_config / workflow / etc.) without breaking the build during the
@@ -66,6 +67,10 @@ rustls-pki-types = "1"
 # by the daemon-launch setsid+chdir pre_exec (any Unix). libc
 # compiles on every Unix target; the Linux-only call sites are
 # already cfg-gated at their use sites.
+# Display-width math for the activity badge and symbol checks (already in
+# the tree via ratatui).
+unicode-width = "0.2"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

@@ -3,6 +3,8 @@
 //! delivery. Native adapters never resend an ambiguous submission.
 pub mod alarm;
 mod marker;
+use super::atomic_replace_json;
+#[cfg(test)]
 use super::atomic_replace;
 use super::{Store, WakeIntent};
 use crate::{session::PtyByteFanout, state::DaemonState};
@@ -91,9 +93,16 @@ fn digest(s: &str) -> String {
 struct Queue {
     batches: Vec<Batch>,
     last_attempt: u64,
+    // In-memory checkpoint state, including migrations applied during load.
+    #[serde(skip)]
+    dirty: bool,
+    // Effect-scoped keys whose task authority is unknown. Never persisted:
+    // every caller rebuilds this projection while holding authority guards.
+    #[serde(skip)]
+    deferred: BTreeSet<String>,
 }
 #[derive(Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(from = "BatchWire")]
 struct Batch {
     wake_id: String,
     ids: Vec<String>,
@@ -116,8 +125,85 @@ struct Batch {
     // `LATCH_HORIZON_SECS`, so a session that ignored one wake still gets the
     // next one (2026-09-14: an orchestrator's 11:01 wake swallowed a 16:17
     // mention for good).
-    #[serde(default)]
     delivered_at: u64,
+    // When `compact_history` first saw this batch as settled history with no
+    // delivery time of its own (a wake cancelled before delivery, or a legacy
+    // record). Its age anchor for the history horizon.
+    #[serde(skip_serializing_if = "is_zero")]
+    settled_at: u64,
+    // Set by `load` when this record predates `released`; never persisted.
+    #[serde(skip)]
+    migrated: bool,
+}
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+/// The on-disk batch. `released` and `status` are optional only so a record
+/// that predates the latch can be migrated while it is parsed: the queue is
+/// deserialized straight into structs instead of through a `Value` tree
+/// (2026-11-05: a 23 MB queue's two Value copies per load/save were most of
+/// the brain's allocator churn).
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct BatchWire {
+    wake_id: String,
+    ids: Vec<String>,
+    status: Option<String>,
+    attempts: u8,
+    attempted_at: u64,
+    original: Option<Binding>,
+    scan: Scan,
+    hook_keys: Vec<String>,
+    checked: BTreeSet<String>,
+    sealed: bool,
+    released: Option<bool>,
+    coalesced: BTreeSet<String>,
+    delivered_at: u64,
+    settled_at: u64,
+}
+impl From<BatchWire> for Batch {
+    fn from(w: BatchWire) -> Self {
+        let migrated = w.released.is_none();
+        // Keep old unsubmitted work live. Delivered/ambiguous old receipts
+        // have no fetch history and cannot own a new latch.
+        let released = w.released.unwrap_or_else(|| {
+            let status = w.status.as_deref().unwrap_or("pending");
+            !pending(status) && status != "native_pending"
+        });
+        Batch {
+            wake_id: w.wake_id,
+            ids: w.ids,
+            status: w.status.unwrap_or_default(),
+            attempts: w.attempts,
+            attempted_at: w.attempted_at,
+            original: w.original,
+            scan: w.scan,
+            hook_keys: w.hook_keys,
+            checked: w.checked,
+            sealed: w.sealed,
+            released,
+            coalesced: w.coalesced,
+            delivered_at: w.delivered_at,
+            settled_at: w.settled_at,
+            migrated,
+        }
+    }
+}
+impl Batch {
+    fn deferred(&self, keys: &BTreeSet<String>) -> bool {
+        self.ids.iter().any(|id| keys.contains(id))
+    }
+    fn settled_history(&self) -> bool {
+        self.released && matches!(self.status.as_str(), "confirmed" | "cancelled")
+    }
+
+    fn set_status(&mut self, status: &str) -> bool {
+        if self.status == status {
+            return false;
+        }
+        self.status = status.into();
+        true
+    }
 }
 /// How long a delivered-but-unread wake batch keeps coalescing new arrivals.
 const LATCH_HORIZON_SECS: u64 = 120;
@@ -129,7 +215,7 @@ fn delivered(status: &str) -> bool {
 fn expire_latches(q: &mut Queue, now: u64) -> bool {
     let mut changed = false;
     for batch in &mut q.batches {
-        if batch.released || !delivered(&batch.status) {
+        if batch.deferred(&q.deferred) || batch.released || !delivered(&batch.status) {
             continue;
         }
         if batch.delivered_at == 0 {
@@ -154,29 +240,103 @@ fn expire_latches(q: &mut Queue, now: u64) -> bool {
     }
     changed
 }
+/// How long settled wake history outlives its last use. History is the dedup
+/// record that stops a key from being woken twice, so a batch whose keys are
+/// still wake intents (an unread DM, an unacknowledged monitor hit) is kept
+/// whatever its age. Once none of its keys is an intent, the horizon only
+/// absorbs brief intent gaps (DND, a membership flip); past it the batch goes.
+/// Before this, queues kept every batch ever delivered: execution-policy's was
+/// 23 MB (28,722 batches, median age 17 days), re-read and re-written by every
+/// delivery tick, ~400 MiB/min of rewrites across cm-sessions (2026-11-05).
+const HISTORY_HORIZON_SECS: u64 = 24 * 3600;
+/// The newest batches are always kept, so recent status lookups and
+/// `monitor_status` counts keep their context.
+const HISTORY_TAIL: usize = 16;
+
+/// Drop settled history (released, confirmed/cancelled) that no current
+/// intent needs and that settled at least `HISTORY_HORIZON_SECS` ago. Deferred
+/// task work is never touched. A batch with no delivery time is stamped
+/// `settled_at` the first time it is seen here and ages from then.
+fn compact_history(q: &mut Queue, intents: &[WakeIntent], now: u64) -> bool {
+    if q.batches.len() <= HISTORY_TAIL {
+        return false;
+    }
+    let eligible: BTreeSet<&str> = intents.iter().map(|i| i.key.as_str()).collect();
+    let tail_from = q.batches.len() - HISTORY_TAIL;
+    let Queue { batches, deferred, .. } = q;
+    let mut changed = false;
+    let mut index = 0;
+    batches.retain_mut(|batch| {
+        let in_tail = index >= tail_from;
+        index += 1;
+        if in_tail
+            || !batch.settled_history()
+            || batch.deferred(deferred)
+            || batch.ids.iter().chain(&batch.coalesced).any(|id| eligible.contains(id.as_str()))
+        {
+            return true;
+        }
+        let since = if batch.delivered_at != 0 { batch.delivered_at } else { batch.settled_at };
+        if since == 0 {
+            batch.settled_at = now;
+            changed = true;
+            return true;
+        }
+        if now.saturating_sub(since) < HISTORY_HORIZON_SECS {
+            return true;
+        }
+        changed = true;
+        false
+    });
+    changed
+}
 fn queue_path(root: &Path, uid: &str) -> PathBuf {
     root.join("_delivery").join(format!("{}.json", digest(uid)))
 }
+#[cfg(test)]
+thread_local! {
+    static QUEUE_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static QUEUE_SAVE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FAIL_QUEUE_SAVE_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static AFTER_RECONCILE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(super) fn queue_load_count() -> usize {
+    QUEUE_LOADS.with(|count| count.get())
+}
 fn load(path: &Path) -> io::Result<Queue> {
+    #[cfg(test)]
+    QUEUE_LOADS.with(|count| count.set(count.get() + 1));
     match fs::read(path) {
         Ok(b) => {
-            let mut value: Value = serde_json::from_slice(&b)?;
-            for batch in value["batches"].as_array_mut().into_iter().flatten() {
-                if batch.get("released").is_none() {
-                    let status = batch["status"].as_str().unwrap_or("pending");
-                    // Keep old unsubmitted work live. Delivered/ambiguous old
-                    // receipts have no fetch history and cannot own a new latch.
-                    batch["released"] = json!(!pending(status) && status != "native_pending");
-                }
-            }
-            Ok(serde_json::from_value(value)?)
+            // Legacy records are migrated in `From<BatchWire>`; persist that.
+            let mut queue: Queue = serde_json::from_slice(&b)?;
+            queue.dirty = queue.batches.iter().any(|b| b.migrated);
+            Ok(queue)
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Queue::default()),
         Err(e) => Err(e),
     }
 }
 fn save(path: &Path, q: &Queue) -> io::Result<()> {
-    atomic_replace(path, &serde_json::to_value(q)?)
+    #[cfg(test)]
+    {
+        let calls = QUEUE_SAVE_CALLS.with(|count| {
+            count.set(count.get() + 1);
+            count.get()
+        });
+        if FAIL_QUEUE_SAVE_AT.with(|at| at.get() == Some(calls)) {
+            return Err(io::Error::other("injected delivery checkpoint failure"));
+        }
+    }
+    atomic_replace_json(path, q)
+}
+fn checkpoint(path: &Path, q: &mut Queue) -> io::Result<()> {
+    if q.dirty {
+        save(path, q)?;
+        q.dirty = false;
+    }
+    Ok(())
 }
 fn pending(status: &str) -> bool {
     matches!(status, "pending" | "deferred" | "deferred_unsupported")
@@ -214,25 +374,59 @@ pub fn status(root: &Path, uid: &str, event: &str) -> Value {
     json!({"recipient":uid,"status":state})
 }
 pub fn spawn(state: &Arc<Mutex<DaemonState>>) {
+    // Delivery may be blocked on the store or on one recipient. The Owner
+    // alarm must keep running even when that worker cannot make progress.
+    let alarm_state = Arc::downgrade(state);
+    thread::spawn(move || loop {
+        let Some(state) = alarm_state.upgrade() else { break };
+        let root = state.lock().unwrap_or_else(|p| p.into_inner()).messaging_root.clone();
+        alarm_tick(&state, &root);
+        drop(state);
+        thread::sleep(Duration::from_secs(alarm::ALARM_INTERVAL_SECS));
+    });
     let weak = Arc::downgrade(state);
     let wake = state
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .messaging_wake
         .clone();
-    thread::spawn(move || loop {
+    thread::spawn(move || {
+        worker_loop(&wake, Duration::from_secs(2), MIN_TICK_SPACING, || {
+            let Some(state) = weak.upgrade() else {
+                return false;
+            };
+            tick(&state);
+            true
+        })
+    });
+}
+/// Shortest interval between delivery ticks; the most a wake waits for the
+/// previous tick's spacing.
+const MIN_TICK_SPACING: Duration = Duration::from_millis(250);
+type Wake = (Mutex<bool>, std::sync::Condvar);
+/// Run `tick` on each signal or every `idle`, at most once per `spacing`.
+/// Every chat send/read/follow and every replicated batch signals delivery,
+/// so under load the worker used to run back to back (35–57% of a core on
+/// cm-sessions, 30% on f-sessions; 2026-11-05). A signal that arrives during a
+/// tick or its spacing stays latched and is served by the next tick. Stops
+/// when `tick` returns false.
+fn worker_loop(wake: &Wake, idle: Duration, spacing: Duration, mut tick: impl FnMut() -> bool) {
+    loop {
         let ready = wake.0.lock().unwrap_or_else(|p| p.into_inner());
         let (mut ready, _) = wake
             .1
-            .wait_timeout_while(ready, Duration::from_secs(2), |v| !*v)
+            .wait_timeout_while(ready, idle, |v| !*v)
             .unwrap_or_else(|p| p.into_inner());
         *ready = false;
         drop(ready);
-        let Some(state) = weak.upgrade() else {
-            break;
-        };
-        tick(&state);
-    });
+        let started = std::time::Instant::now();
+        if !tick() {
+            return;
+        }
+        if let Some(rest) = spacing.checked_sub(started.elapsed()) {
+            thread::sleep(rest);
+        }
+    }
 }
 pub fn signal(state: &Arc<Mutex<DaemonState>>) {
     let wake = state
@@ -253,7 +447,11 @@ impl Recipient {
     fn current_binding(&self) -> Option<Binding> {
         if let Some((state, uid)) = &self.live {
             let state = state.upgrade()?;
-            let state = state.lock().unwrap_or_else(|p| p.into_inner());
+            let state = match state.try_lock() {
+                Ok(s) => s,
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return None,
+            };
             let s = state.sessions.get(uid)?;
             return marker::binding(s.transcript_path.as_deref(), s.generation);
         }
@@ -262,7 +460,13 @@ impl Recipient {
     fn still_current(&self) -> bool {
         self.live.as_ref().is_none_or(|(state, uid)| {
             state.upgrade().is_some_and(|state| {
-                let state = state.lock().unwrap_or_else(|p| p.into_inner());
+                // Publication may retain task authority guards. Never wait on
+                // the registry in that lock order; this tick can retry later.
+                let state = match state.try_lock() {
+                    Ok(s) => s,
+                    Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => return false,
+                };
                 state.sessions.get(uid).is_some_and(|s| {
                     Arc::ptr_eq(&s.fanout, &self.fanout)
                         && marker::binding(s.transcript_path.as_deref(), s.generation)
@@ -272,7 +476,43 @@ impl Recipient {
         })
     }
 }
+const SKIP_OUTPUT_CLOSED: &str =
+    "its terminal output has ended (PTY reader closed) but the session is still registered";
+
+/// Sessions currently skipped with wakes waiting, and why. One log line when
+/// a session starts being skipped, one when it is reachable again.
+static SKIPPED: Mutex<BTreeMap<String, &'static str>> = Mutex::new(BTreeMap::new());
+
+/// Record whether `uid` was skipped this tick. Returns true when a line was
+/// logged.
+fn note_skip(uid: &str, reason: Option<&'static str>, waiting: usize) -> bool {
+    let mut skipped = SKIPPED.lock().unwrap_or_else(|p| p.into_inner());
+    match reason.filter(|_| waiting > 0) {
+        Some(reason) => {
+            if skipped.get(uid) == Some(&reason) {
+                return false;
+            }
+            skipped.insert(uid.to_owned(), reason);
+            eprintln!(
+                "cm messaging: not waking {uid} ({waiting} wake(s) waiting): {reason}; \
+                 its messages wait until the session is restarted (A-R) or exits"
+            );
+            true
+        }
+        None => {
+            if skipped.remove(uid).is_none() {
+                return false;
+            }
+            eprintln!("cm messaging: {uid} is reachable again; delivering its waiting wakes");
+            true
+        }
+    }
+}
+
 pub fn tick(state: &Arc<Mutex<DaemonState>>) {
+    // Release legacy held Owner requests after upgrade, independently of
+    // the messaging store lock below. Availability no longer filters them.
+    crate::owner_availability::tick(state);
     let (handle, root, gate, recipients) = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         if s.draining { return; }
@@ -283,6 +523,8 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>) {
         let _guard = gate.lock().unwrap_or_else(|p| p.into_inner());
         let Ok(mut slot) = handle.try_lock() else { return; };
         let Some(store) = slot.as_mut() else { return; };
+        let mut authority = super::task_authority::View::new(store);
+        let store = &mut *authority;
         if store.degraded.is_some() || store.advance_monitors_at(chrono::Utc::now()).is_err() {
             return;
         }
@@ -294,72 +536,105 @@ pub fn tick(state: &Arc<Mutex<DaemonState>>) {
         let recipient = {
             let s = state.lock().unwrap_or_else(|p| p.into_inner());
             if s.draining { return; }
-            s.sessions.get(&uid)
-                .filter(|s| !s.fanout.snapshot_since(None).closed)
-                .map(|s| Recipient {
+            let Some(s) = s.sessions.get(&uid) else { continue; };
+            if s.fanout.is_closed() {
+                Err(SKIP_OUTPUT_CLOSED)
+            } else {
+                Ok(Recipient {
                     engine: s.session_type.clone(),
                     fanout: s.fanout.clone(),
                     binding: marker::binding(s.transcript_path.as_deref(), s.generation),
                     live: Some((Arc::downgrade(state), uid.clone())),
                 })
+            }
         };
-        let Some(recipient) = recipient else { continue; };
-        let (ids, store_root) = {
+        let recipient = match recipient {
+            Ok(recipient) => {
+                note_skip(&uid, None, 0);
+                recipient
+            }
+            Err(reason) => {
+                // Still registered, so it looks live, but nothing can reach it.
+                // Say so once, while it has wakes waiting (2026-10-16: an
+                // orchestrator missed 5 minutes of Owner DMs with no log line).
+                let waiting = handle
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_mut()
+                    .map_or(0, |store| super::task_authority::View::new(store).wake_intents_for_session(&uid).len());
+                note_skip(&uid, Some(reason), waiting);
+                continue;
+            }
+        };
+        let (ids, store_root, mut queue, _authority, previews) = {
             let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
             let Some(store) = slot.as_mut() else { return; };
             if store.degraded.is_some() { return; }
+            let mut authority = super::task_authority::View::new(store);
+            let store = &mut *authority;
             let ids = store.wake_intents_for_session(&uid);
-            if let Err(e) = reconcile_intents(&root, store, &uid, &ids) {
-                eprintln!("cm messaging: wake reconciliation for {uid}: {e}");
-                return;
-            }
-            (ids, store.root.clone())
+            let queue = match reconcile_intents(&root, store, &uid, &ids) {
+                Ok(queue) => queue,
+                Err(e) => {
+                    eprintln!("cm messaging: wake reconciliation for {uid}: {e}");
+                    return;
+                }
+            };
+            let previews: BTreeMap<_, _> = ids.iter().filter_map(|i| preview(store, &i.event_id)
+                .map(|p| (i.event_id.clone(), p))).collect();
+            let store_root = store.root.clone();
+            (ids, store_root, queue, authority.take_guards(), previews)
         };
-        // Lock order matches the RPC path: delivery gate, then store.
-        let lookup = |id: &str| {
-            let slot = handle.lock().unwrap_or_else(|p| p.into_inner());
-            slot.as_ref().and_then(|store| preview(store, id))
-        };
-        if let Err(e) = deliver_intents_previewed(
+        #[cfg(test)]
+        if let Some(hook) = AFTER_RECONCILE.with(|hook| hook.borrow_mut().take()) { hook(); }
+        // No blocking state/store reacquisition while task authority is held.
+        // Previews refer to the same immutable messages as this intent batch.
+        let lookup = |id: &str| previews.get(id).cloned();
+        if let Err(e) = deliver_queue(
             &root,
             &store_root,
             &uid,
-            ids,
+            &ids,
             &recipient,
             crate::continuous::task::now_unix(),
             &lookup,
+            &mut queue,
         ) {
             eprintln!("cm messaging: wake for {uid} pending: {e}");
         }
     }
-    alarm_tick(state, &root);
 }
 
-/// Throttled stall alarm over live native-capable sessions.
+/// Stall alarm over live native-capable sessions. The dedicated worker
+/// controls its cadence; this pass does not require the delivery store.
 fn alarm_tick(state: &Arc<Mutex<DaemonState>>, root: &Path) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static LAST: AtomicU64 = AtomicU64::new(0);
-    let now = crate::continuous::task::now_unix();
-    let last = LAST.load(Ordering::Relaxed);
-    if now.saturating_sub(last) < alarm::ALARM_INTERVAL_SECS
-        || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err()
-    {
-        return;
-    }
     let uids: Vec<String> = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         if s.draining {
             return;
         }
-        s.sessions
-            .iter()
-            .filter(|(_, x)| ["claude-code", "codex"].contains(&x.session_type.as_str()))
-            .filter(|(_, x)| !x.fanout.snapshot_since(None).closed)
-            .map(|(uid, _)| uid.clone())
+        super::store::live_sessions(&s)
+            .into_iter()
+            .filter(|x| matches!(x.engine.as_deref(), Some("claude-code" | "codex")))
+            .map(|x| x.uid)
             .collect()
     };
     let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
     alarm::pass(state, root, &uids, now, alarm::threshold_secs());
+    // Sender-side: a session's own messages stuck pending_sync (hub link
+    // stalled). Skipped this round if the store is busy.
+    let handle = state.lock().unwrap_or_else(|p| p.into_inner()).messaging.clone();
+    let outboxes: Option<Vec<(String, Option<serde_json::Value>)>> = handle.try_lock().ok().and_then(|slot| {
+        slot.as_ref().map(|store| {
+            let overdue = store.outbox_overdue();
+            uids.iter()
+                .map(|uid| (uid.clone(), overdue.get(&store.participant_id(uid)).cloned()))
+                .collect()
+        })
+    });
+    if let Some(outboxes) = outboxes {
+        alarm::outbox_pass(state, root, &outboxes, alarm::OUTBOX_ALERT_SECS);
+    }
 }
 
 #[cfg(test)]
@@ -390,6 +665,7 @@ fn deliver_intents_at(
 ) -> io::Result<()> {
     deliver_intents_previewed(cm_root, store_root, uid, intents, r, now, &no_preview)
 }
+#[cfg(test)]
 fn deliver_intents_previewed(
     cm_root: &Path,
     store_root: &Path,
@@ -401,20 +677,43 @@ fn deliver_intents_previewed(
 ) -> io::Result<()> {
     let path = queue_path(store_root, uid);
     let mut q = load(&path)?;
-    let expired = expire_latches(&mut q, now);
-    if collect(&mut q, &intents) || expired {
-        save(&path, &q)?;
-    }
+    deliver_queue(cm_root, store_root, uid, &intents, r, now, preview, &mut q)
+}
+
+// The production caller retains the recipient delivery gate across reconcile
+// and delivery, so the checkpointed queue can be reused without a second load.
+fn deliver_queue(
+    cm_root: &Path,
+    store_root: &Path,
+    uid: &str,
+    intents: &[WakeIntent],
+    r: &Recipient,
+    now: u64,
+    preview: PreviewFn,
+    q: &mut Queue,
+) -> io::Result<()> {
+    let path = queue_path(store_root, uid);
+    q.dirty |= expire_latches(q, now);
+    q.dirty |= collect(q, intents);
+    q.dirty |= compact_history(q, intents, now);
+    checkpoint(&path, q)?;
     let first = q
         .batches
         .iter()
-        .position(|b| !b.released && b.status != "cancelled");
-    for (index, batch) in q.batches.iter_mut().enumerate() {
+        .position(|b| !b.deferred(&q.deferred) && !b.released && b.status != "cancelled");
+    for index in 0..q.batches.len() {
+        let batch = &mut q.batches[index];
+        // Released ambiguous submissions still need late native/transcript
+        // confirmation. Only final receipts are safe to leave as history.
+        if batch.deferred(&q.deferred) || batch.settled_history() {
+            continue;
+        }
         let id = format!("chat:{}", batch.wake_id);
         if let Some(event) = crate::notifications::get(cm_root, uid, &id)? {
-            batch.status = native_status(&event).into();
+            q.dirty |= batch.set_status(native_status(&event));
             if delivered(&batch.status) && batch.delivered_at == 0 {
                 batch.delivered_at = now;
+                q.dirty = true;
             }
             continue;
         }
@@ -429,9 +728,9 @@ fn deliver_intents_previewed(
                     .join(uid)
                     .join(format!("chat-{}.json", batch.wake_id));
                 match fs::rename(&inbox, inbox.with_extension("json.retired")) {
-                    Ok(()) => batch.status = "pending".into(),
+                    Ok(()) => q.dirty |= batch.set_status("pending"),
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                        batch.status = "uncertain".into()
+                        q.dirty |= batch.set_status("uncertain")
                     }
                     Err(e) => return Err(e),
                 }
@@ -439,6 +738,7 @@ fn deliver_intents_previewed(
             if !pending(&batch.status) {
                 if matches!(batch.status.as_str(), "submitted_unverified" | "uncertain") {
                     let current = r.current_binding();
+                    let before = batch.scan.clone();
                     if marker::inspect(
                         &mut batch.scan,
                         batch.original.as_ref(),
@@ -447,8 +747,9 @@ fn deliver_intents_previewed(
                         &batch.wake_id,
                     ) == Evidence::Found
                     {
-                        batch.status = "confirmed".into();
+                        q.dirty |= batch.set_status("confirmed");
                     }
+                    q.dirty |= batch.scan != before;
                 }
                 continue;
             }
@@ -459,30 +760,35 @@ fn deliver_intents_previewed(
             continue;
         }
         if !["claude-code", "codex"].contains(&r.engine.as_str()) {
-            batch.status = "deferred_unsupported".into();
+            q.dirty |= batch.set_status("deferred_unsupported");
             continue;
         }
         if !r.still_current() {
             continue;
         }
+        let text = wake_text(batch, intents, preview);
+        let marker = format!("[cm-chat {}]", batch.wake_id);
+        // Also checkpoint a legacy retirement before its replacement can be
+        // claimed. A failed pre-publication save must leave no new native wake.
+        checkpoint(&path, q)?;
         let event = crate::notifications::publish(
             cm_root,
             uid,
             &id,
             "chat",
-            &wake_text(batch, &intents, preview),
-            &format!("[cm-chat {}]", batch.wake_id),
+            &text,
+            &marker,
         )?;
-        batch.status = native_status(&event).into();
+        q.dirty |= q.batches[index].set_status(native_status(&event));
     }
-    save(&path, &q)
+    checkpoint(&path, q)
 }
 
 fn settle(q: &mut Queue, intents: &[WakeIntent]) -> bool {
     let eligible: BTreeSet<_> = intents.iter().map(|i| &i.key).collect();
     let mut changed = false;
     for batch in &mut q.batches {
-        if !batch.released
+        if !batch.deferred(&q.deferred) && !batch.released
             && batch
                 .ids
                 .iter()
@@ -512,7 +818,7 @@ fn collect(q: &mut Queue, intents: &[WakeIntent]) -> bool {
         if let Some(batch) = q
             .batches
             .iter_mut()
-            .find(|b| !b.released && !b.sealed && b.status != "cancelled")
+            .find(|b| !b.deferred(&q.deferred) && !b.released && !b.sealed && b.status != "cancelled")
         {
             if !pending(&batch.status) {
                 batch.coalesced.extend(new.iter().cloned());
@@ -548,7 +854,8 @@ pub fn read_boundary(store: &Store, uid: &str, result: &Value) -> io::Result<()>
     let path = queue_path(&store.root, uid);
     let mut q = load(&path)?;
     // Include arrivals not yet visited by the delivery worker before sealing.
-    collect(&mut q, &intents);
+    defer_task_keys(store, uid, &mut q);
+    q.dirty |= collect(&mut q, &intents);
     let checked: BTreeSet<_> = intents
         .iter()
         .filter(|i| ids.contains(i.event_id.as_str()))
@@ -557,13 +864,16 @@ pub fn read_boundary(store: &Store, uid: &str, result: &Value) -> io::Result<()>
     for batch in &mut q.batches {
         for id in &batch.ids {
             if checked.contains(id) {
-                batch.checked.insert(id.clone());
-                batch.sealed = true;
+                q.dirty |= batch.checked.insert(id.clone());
+                if !batch.sealed {
+                    batch.sealed = true;
+                    q.dirty = true;
+                }
             }
         }
     }
-    settle(&mut q, &intents);
-    save(&path, &q)
+    q.dirty |= settle(&mut q, &intents);
+    checkpoint(&path, &mut q)
 }
 fn native_status(event: &Value) -> &str {
     match event["status"].as_str() {
@@ -651,16 +961,63 @@ pub fn reconcile(cm_root: &Path, store: &Store) -> io::Result<()> {
 /// Agent read receipts, follows and monitor changes affect only that actor.
 /// Keep offline actors' durable queues until they resume or explicitly cancel.
 pub fn reconcile_session(cm_root: &Path, store: &Store, uid: &str) -> io::Result<()> {
-    reconcile_intents(cm_root, store, uid, &store.wake_intents_for_session(uid))
+    reconcile_intents(cm_root, store, uid, &store.wake_intents_for_session(uid)).map(|_| ())
 }
 
-fn reconcile_intents(cm_root: &Path, store: &Store, uid: &str, intents: &[WakeIntent]) -> io::Result<()> {
+fn defer_task_keys(store: &Store, uid: &str, q: &mut Queue) {
+    let generations = store.deferred_task_wake_generations(&store.participant_id(uid));
+    q.deferred = q.batches.iter().flat_map(|b| &b.ids)
+        .filter(|id| generations.iter().any(|(prefix, latest)| {
+            id.strip_prefix(prefix).and_then(|tail| tail.split_once(':'))
+                .is_some_and(|(revision, event)| !event.is_empty()
+                    && revision.parse::<u64>().is_ok_and(|n| n <= *latest && n.to_string() == revision))
+        }))
+        .cloned().collect();
+}
+
+/// Move eligible personal work out of a never-published mixed batch. An
+/// existing native receipt (even pending), or any legacy/ambiguous attempt,
+/// keeps its identity and dedup keys intact. Independent new arrivals can
+/// bypass that frozen batch, but already submitted work is never replayed.
+fn split_unpublished(cm_root: &Path, uid: &str, q: &mut Queue, intents: &[WakeIntent]) -> io::Result<()> {
+    let eligible: BTreeSet<_> = intents.iter().map(|i| i.key.as_str()).collect();
+    let mut split = Vec::new();
+    for batch in &mut q.batches {
+        if !batch.deferred(&q.deferred) || batch.released || !pending(&batch.status)
+            || batch.attempts != 0 || batch.attempted_at != 0 || batch.original.is_some()
+            || crate::notifications::get(cm_root, uid, &format!("chat:{}", batch.wake_id))?.is_some() {
+            continue;
+        }
+        let ids: Vec<_> = batch.ids.iter()
+            .filter(|id| !q.deferred.contains(*id) && !batch.checked.contains(*id) && eligible.contains(id.as_str()))
+            .cloned().collect();
+        if ids.is_empty() { continue; }
+        let moved: BTreeSet<_> = ids.iter().cloned().collect();
+        batch.ids.retain(|id| !moved.contains(id));
+        batch.coalesced.retain(|id| !moved.contains(id));
+        split.push(Batch { wake_id: uuid::Uuid::new_v4().to_string(), ids, status: "pending".into(), ..Batch::default() });
+    }
+    if !split.is_empty() {
+        q.batches.extend(split);
+        q.dirty = true;
+    }
+    Ok(())
+}
+
+fn reconcile_intents(cm_root: &Path, store: &Store, uid: &str, intents: &[WakeIntent]) -> io::Result<Queue> {
     let path = queue_path(&store.root, uid);
     let mut q = load(&path)?;
-    let before = serde_json::to_value(&q)?;
-    settle(&mut q, intents);
+    defer_task_keys(store, uid, &mut q);
+    split_unpublished(cm_root, uid, &mut q, intents)?;
+    // The separation is one durable write before any native queue effect.
+    // Reload/retry sees the same personal wake identity and all retained keys.
+    checkpoint(&path, &mut q)?;
+    q.dirty |= settle(&mut q, intents);
     let eligible: BTreeSet<_> = intents.iter().map(|i| i.key.as_str()).collect();
     for batch in &mut q.batches {
+        if batch.deferred(&q.deferred) || batch.settled_history() {
+            continue;
+        }
         let active = batch
             .ids
             .iter()
@@ -678,9 +1035,9 @@ fn reconcile_intents(cm_root: &Path, store: &Store, uid: &str, intents: &[WakeIn
         if let Some(event) =
             crate::notifications::update_pending(cm_root, uid, &id, text.as_deref())?
         {
-            batch.status = native_status(&event).into();
+            q.dirty |= batch.set_status(native_status(&event));
         } else if !active && pending(&batch.status) {
-            batch.status = "cancelled".into();
+            q.dirty |= batch.set_status("cancelled");
         } else if !active
             && matches!(
                 batch.status.as_str(),
@@ -696,24 +1053,86 @@ fn reconcile_intents(cm_root: &Path, store: &Store, uid: &str, intents: &[WakeIn
                 Ok(()) => {
                     fs::remove_file(&claim)?;
                     fs::File::open(inbox.parent().unwrap())?.sync_all()?;
-                    batch.status = "cancelled".into();
+                    q.dirty |= batch.set_status("cancelled");
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    batch.status = "submitted_no_retry".into()
+                    q.dirty |= batch.set_status("submitted_no_retry")
                 }
                 Err(e) => return Err(e),
             }
         }
     }
-    if serde_json::to_value(&q)? != before {
-        save(&path, &q)?;
-    }
-    Ok(())
+    checkpoint(&path, &mut q)?;
+    Ok(q)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn alarm_pass_runs_while_delivery_store_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut daemon = DaemonState::new();
+        daemon.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
+        daemon.tui_sessions.insert("ts-stalled".into(), serde_json::from_value(json!({
+            "uid":"ts-stalled", "type":"claude", "label":"worker"
+        })).unwrap());
+        let store = Arc::clone(&daemon.messaging);
+        let state = Arc::new(Mutex::new(daemon));
+        crate::notifications::publish(dir.path(), "ts-stalled", "one", "chat", "[one] wake", "[one]").unwrap();
+        let queue = crate::notifications::directory(dir.path(), "ts-stalled");
+        let file = fs::read_dir(queue).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "json")).unwrap();
+        let mut event: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        event["status"] = json!("submitted");
+        event["created_at"] = json!(1.0);
+        event["updated_at"] = json!(1.0);
+        atomic_replace(&file, &event).unwrap();
+        let _busy = store.lock().unwrap();
+        alarm_tick(&state, dir.path());
+        assert!(crate::owner_attention::snapshot(&state.lock().unwrap()).unwrap().contains_key("notification-stall:ts-stalled"));
+    }
+    #[test]
+    fn delivery_worker_serves_signal_bursts_with_spaced_ticks() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        use std::time::Instant;
+        let wake: Arc<Wake> = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let ticks = Arc::new(Mutex::new(Vec::<Instant>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let spacing = Duration::from_millis(100);
+        let worker = {
+            let (wake, ticks, stop) = (wake.clone(), ticks.clone(), stop.clone());
+            thread::spawn(move || worker_loop(&wake, Duration::from_secs(60), spacing, || {
+                ticks.lock().unwrap().push(Instant::now());
+                !stop.load(SeqCst)
+            }))
+        };
+        let raise = || {
+            *wake.0.lock().unwrap() = true;
+            wake.1.notify_one();
+        };
+        // ~450 signals in 450 ms are served by a handful of ticks.
+        let burst = Instant::now();
+        while burst.elapsed() < Duration::from_millis(450) {
+            raise();
+            thread::sleep(Duration::from_millis(1));
+        }
+        let during = ticks.lock().unwrap().len();
+        assert!(during <= 6, "{during} ticks for a 450 ms burst");
+        // After an idle gap a signal is served at once: no fixed debounce.
+        thread::sleep(spacing * 2);
+        let raised = Instant::now();
+        raise();
+        let deadline = raised + Duration::from_secs(5);
+        while !ticks.lock().unwrap().iter().any(|t| *t >= raised) {
+            assert!(Instant::now() < deadline, "an idle worker must serve a signal");
+            thread::sleep(Duration::from_millis(5));
+        }
+        stop.store(true, SeqCst);
+        raise();
+        worker.join().unwrap();
+        let ticks = ticks.lock().unwrap();
+        assert!(ticks.windows(2).all(|w| w[1] - w[0] >= spacing), "ticks closer than the spacing");
+    }
     fn recipient(engine: &str) -> Recipient {
         Recipient {
             engine: engine.into(),
@@ -731,6 +1150,7 @@ mod tests {
             name: "Reader".into(),
             session_uid: "b".into(),
             kind: "agent".into(),
+            engine: None,
             present: true,
             task: None,
         }];
@@ -775,6 +1195,585 @@ mod tests {
         )
         .unwrap();
     }
+
+    fn save_calls() -> usize {
+        QUEUE_SAVE_CALLS.with(|count| count.get())
+    }
+
+    fn mixed_task_queue() -> (tempfile::TempDir, Store, String, Vec<super::super::Person>, String, Vec<WakeIntent>) {
+        let (tmp, mut store, actor, people) = fixture();
+        let sub = uuid::Uuid::new_v4().to_string();
+        let channel = store.channel_id_at_path("general").unwrap().to_string();
+        store.bind_task_subscription(super::super::TaskBinding {
+            id: sub.clone(), task_id: "mixed-task".into(), channel_id: channel.clone(), actor: actor.clone(),
+            revision: 1, active: true, acknowledged: BTreeSet::new(), start_position: None,
+        }).unwrap();
+        store.post_system_notice(&channel, "task work", "mixed-task-notice").unwrap();
+        dm(&mut store, &actor, &people, "old-personal");
+        let all = store.wake_intents_for_session("b");
+        assert!(all.iter().any(|i| i.monitor.is_some()) && all.iter().any(|i| i.monitor.is_none()));
+        let mut q = Queue::default();
+        q.dirty |= collect(&mut q, &all);
+        checkpoint(&queue_path(&store.root, "b"), &mut q).unwrap();
+        store.task_authority = Some(BTreeMap::from([(sub.clone(), super::super::task_authority::Authority::Deferred)]));
+        (tmp, store, actor, people, sub, all)
+    }
+
+    #[test]
+    fn deferred_mixed_split_is_durable_before_publication_and_retry_keeps_keys() {
+        let (tmp, mut store, _, _, sub, all) = mixed_task_queue();
+        let path = queue_path(&store.root, "b");
+        let original = fs::read(&path).unwrap();
+        let eligible = store.wake_intents_for_session("b");
+        assert!(eligible.iter().all(|i| i.monitor.is_none()));
+        FAIL_QUEUE_SAVE_AT.with(|at| at.set(Some(save_calls() + 1)));
+        assert!(reconcile_intents(tmp.path(), &store, "b", &eligible).is_err());
+        FAIL_QUEUE_SAVE_AT.with(|at| at.set(None));
+        assert_eq!(original, fs::read(&path).unwrap(), "failed split must preserve original ledger");
+        let old = load(&path).unwrap();
+        assert!(native_event(tmp.path(), &old.batches[0]).is_none());
+
+        let q = reconcile_intents(tmp.path(), &store, "b", &eligible).unwrap();
+        assert_eq!(q.batches.len(), 2);
+        let split_id = q.batches[1].wake_id.clone();
+        let all_keys: BTreeSet<_> = all.iter().map(|i| i.key.clone()).collect();
+        assert_eq!(q.batches.iter().flat_map(|b| b.ids.clone()).collect::<BTreeSet<_>>(), all_keys);
+        assert!(q.batches[0].deferred(&q.deferred));
+        assert!(native_event(tmp.path(), &q.batches[1]).is_none());
+        // Crash/reload after the single split checkpoint, before publication.
+        drop(q);
+        let mut q = reconcile_intents(tmp.path(), &store, "b", &eligible).unwrap();
+        assert_eq!(q.batches.len(), 2);
+        assert_eq!(q.batches[1].wake_id, split_id);
+        deliver_queue(tmp.path(), &store.root, "b", &eligible, &recipient("codex"), 1, &|id| preview(&store, id), &mut q).unwrap();
+        assert!(native_event(tmp.path(), &q.batches[0]).is_none());
+        let personal = native_event(tmp.path(), &q.batches[1]).unwrap();
+        assert!(!personal["text"].as_str().unwrap().contains(&sub));
+        let mut q = reconcile_intents(tmp.path(), &store, "b", &eligible).unwrap();
+        deliver_queue(tmp.path(), &store.root, "b", &eligible, &recipient("codex"), 2, &|id| preview(&store, id), &mut q).unwrap();
+        assert_eq!(native_event(tmp.path(), &q.batches[1]).unwrap(), personal);
+        store.task_authority = None; // Existing Store-only/scheduler contract.
+        let mut q = reconcile_intents(tmp.path(), &store, "b", &all).unwrap();
+        deliver_queue(tmp.path(), &store.root, "b", &all, &recipient("codex"), 3, &|id| preview(&store, id), &mut q).unwrap();
+        assert!(native_event(tmp.path(), &q.batches[0]).is_some());
+        assert_eq!(native_event(tmp.path(), &q.batches[1]).unwrap(), personal);
+        assert_eq!(q.batches.iter().flat_map(|b| b.ids.clone()).collect::<BTreeSet<_>>(), all_keys);
+    }
+
+    #[test]
+    fn deferred_task_generation_matching_is_exact_bounded_and_actor_scoped() {
+        let (_tmp, mut store, actor, people, sub, _) = mixed_task_queue();
+        let mut binding = store.task_binding_for("mixed-task").unwrap().clone();
+        binding.revision = 12;
+        store.bind_task_subscription_quiet(binding.clone()).unwrap();
+        let other_sub = uuid::Uuid::new_v4().to_string();
+        let mut other = binding.clone();
+        other.id = other_sub.clone();
+        other.task_id = "other-task".into();
+        store.bind_task_subscription(other).unwrap();
+        store.task_authority.as_mut().unwrap().insert(other_sub.clone(), super::super::task_authority::Authority::Current);
+
+        let prefix = format!("monitor:task-{sub}-");
+        let accepted: BTreeSet<_> = [0, 1, 11, 12].into_iter()
+            .map(|n| format!("{prefix}{n}:replica:event")).collect();
+        let rejected = [
+            format!("{prefix}13:event"), format!("{prefix}120:event"),
+            format!("{prefix}012:event"), format!("{prefix}+12:event"),
+            format!("{prefix}-1:event"), format!("{prefix}12x:event"),
+            format!("{prefix}18446744073709551616:event"), format!("{prefix}:event"),
+            format!("{prefix}12"), format!("{prefix}12:"),
+            format!("monitor:task-{sub}x-1:event"), format!("monitor:task-{sub}-extra-1:event"),
+            format!("monitor:task-{other_sub}-1:event"), format!("monitor:{sub}-1:event"),
+            format!("task-{sub}-1:event"), format!("replica:monitor:task-{sub}-1:event"),
+        ];
+        let mut q = Queue { batches: vec![Batch {
+            ids: accepted.iter().cloned().chain(rejected).collect(),
+            status: "pending".into(), ..Batch::default()
+        }], ..Queue::default() };
+        defer_task_keys(&store, "b", &mut q);
+        assert_eq!(q.deferred, accepted);
+        defer_task_keys(&store, "different-actor", &mut q);
+        assert!(q.deferred.is_empty(), "same subscription key must not freeze another actor's queue");
+        for authority in [super::super::task_authority::Authority::Current, super::super::task_authority::Authority::Stale] {
+            store.task_authority.as_mut().unwrap().insert(sub.clone(), authority);
+            defer_task_keys(&store, "b", &mut q);
+            assert!(q.deferred.is_empty(), "known authority permits obsolete generation reconciliation");
+        }
+        store.task_authority = None;
+        defer_task_keys(&store, "b", &mut q);
+        assert!(q.deferred.is_empty(), "Store-only contract has no authority projection");
+        store.task_authority = Some(BTreeMap::from([(sub, super::super::task_authority::Authority::Deferred)]));
+        binding.active = false;
+        store.bind_task_subscription(binding).unwrap();
+        defer_task_keys(&store, "b", &mut q);
+        assert!(q.deferred.is_empty(), "inactive binding must not freeze keys");
+
+        // The existing independent DM path remains available; no broad task
+        // prefix or another binding can swallow personal event identities.
+        let personal = dm(&mut store, &actor, &people, "generation-scope-personal");
+        q.batches[0].ids.push(personal);
+        defer_task_keys(&store, "b", &mut q);
+        assert!(q.deferred.is_empty());
+    }
+
+    #[test]
+    fn deferred_mixed_native_receipts_keep_identity_while_new_personal_work_bypasses() {
+        for status in ["pending", "submitting", "observed"] {
+            let (tmp, mut store, actor, people, _, all) = mixed_task_queue();
+            let path = queue_path(&store.root, "b");
+            let mut original = load(&path).unwrap();
+            // Native publication won a crash race before its ledger checkpoint.
+            let b = &original.batches[0];
+            crate::notifications::publish(tmp.path(), "b", &format!("chat:{}", b.wake_id), "chat",
+                &wake_text(b, &all, &no_preview), &format!("[cm-chat {}]", b.wake_id)).unwrap();
+            set_native_status(tmp.path(), b, status);
+            let receipt = native_event(tmp.path(), b).unwrap();
+            let batch = serde_json::to_value(b).unwrap();
+            dm(&mut store, &actor, &people, "new-independent");
+            let eligible = store.wake_intents_for_session("b");
+            original = reconcile_intents(tmp.path(), &store, "b", &eligible).unwrap();
+            deliver_queue(tmp.path(), &store.root, "b", &eligible, &recipient("codex"), 1, &|id| preview(&store, id), &mut original).unwrap();
+            assert_eq!(original.batches.len(), 2);
+            assert_eq!(serde_json::to_value(&original.batches[0]).unwrap(), batch);
+            assert_eq!(native_event(tmp.path(), &original.batches[0]).unwrap(), receipt);
+            assert_eq!(original.batches[1].ids.len(), 1, "already published personal key must not be replayed");
+            let fresh = native_event(tmp.path(), &original.batches[1]).unwrap();
+            let mut q = reconcile_intents(tmp.path(), &store, "b", &eligible).unwrap();
+            deliver_queue(tmp.path(), &store.root, "b", &eligible, &recipient("codex"), 2, &|id| preview(&store, id), &mut q).unwrap();
+            assert_eq!(q.batches.len(), 2);
+            assert_eq!(native_event(tmp.path(), &q.batches[1]).unwrap(), fresh);
+        }
+    }
+    #[test]
+    fn messaging_unchanged_live_tick_loads_once_and_writes_zero_queues() {
+        let _env = crate::test_support::env_lock();
+        let (tmp, mut store, actor, people) = fixture();
+        dm(&mut store, &actor, &people, "tick-once");
+        let path = queue_path(&store.root, "b");
+        let mut daemon = DaemonState::default();
+        daemon.messaging_root = tmp.path().into();
+        *daemon.messaging.lock().unwrap() = Some(store);
+        let mut params = crate::session::SpawnParams::new("b", "delivery-test", "/bin/cat");
+        params.session_type = "codex".into();
+        daemon.sessions.insert("b".into(), crate::session::DaemonSession::spawn(params).unwrap());
+        let state = Arc::new(Mutex::new(daemon));
+        let loads = queue_load_count();
+        tick(&state);
+        assert_eq!(queue_load_count() - loads, 1, "reconcile and deliver share a queue");
+        let q = load(&path).unwrap();
+        assert_eq!(q.batches[0].status, "native_pending");
+        let bytes = fs::read(&path).unwrap();
+        let native = native_event(tmp.path(), &q.batches[0]).unwrap();
+        let (loads, writes) = (queue_load_count(), save_calls());
+        tick(&state);
+        assert_eq!(queue_load_count() - loads, 1);
+        assert_eq!(save_calls() - writes, 0, "count writes, not merely equal saved content");
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(native_event(tmp.path(), &q.batches[0]).unwrap(), native);
+    }
+
+    /// 2026-10-16: Owner's DMs to an orchestrator waited 5 minutes for its
+    /// restart and the log said nothing. A registered session whose output
+    /// has ended gets one line naming why it is skipped, not one per tick.
+    #[test]
+    fn a_registered_session_with_closed_output_and_waiting_wakes_is_logged_once() {
+        let uid = "skip-closed-output";
+        let t = tempfile::tempdir().unwrap();
+        let mut store = Store::open(t.path()).unwrap();
+        let actor = store.participant_id(uid);
+        let people = vec![super::super::Person {
+            id: actor.clone(),
+            name: "Stuck".into(),
+            session_uid: uid.into(),
+            kind: "agent".into(),
+            engine: None,
+            present: true,
+            task: None,
+        }];
+        store.enroll_participants(&people).unwrap();
+        dm(&mut store, &actor, &people, "are-you-there");
+        let mut daemon = DaemonState::default();
+        daemon.messaging_root = t.path().into();
+        *daemon.messaging.lock().unwrap() = Some(store);
+        let mut params = crate::session::SpawnParams::new(uid, "delivery-test", "/bin/true");
+        params.session_type = "claude-code".into();
+        let session = crate::session::DaemonSession::spawn(params).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !session.fanout.is_closed() {
+            assert!(std::time::Instant::now() < deadline, "the child's output never ended");
+            thread::sleep(Duration::from_millis(20));
+        }
+        daemon.sessions.insert(uid.into(), session);
+        let state = Arc::new(Mutex::new(daemon));
+
+        tick(&state);
+        assert_eq!(
+            SKIPPED.lock().unwrap().get(uid).copied(),
+            Some(SKIP_OUTPUT_CLOSED),
+            "the skip and its reason are recorded",
+        );
+        assert!(!note_skip(uid, Some(SKIP_OUTPUT_CLOSED), 1), "the next tick logs nothing new");
+        let published = crate::notifications::directory(t.path(), uid)
+            .read_dir()
+            .map_or(0, |d| d.count());
+        assert_eq!(published, 0, "nothing was published for a session that cannot read it");
+        assert!(note_skip(uid, None, 0), "recovery is logged once");
+        assert!(SKIPPED.lock().unwrap().get(uid).is_none());
+    }
+
+    #[test]
+    fn messaging_large_settled_history_needs_no_native_io_and_ages_out_past_the_horizon() {
+        let (tmp, store, _, _) = fixture();
+        let path = queue_path(&store.root, "b");
+        let q = Queue {
+            batches: (0..7745).map(|i| Batch {
+                wake_id: format!("history-{i}"),
+                ids: vec![format!("message-{i}")],
+                status: if i % 2 == 0 { "confirmed" } else { "cancelled" }.into(),
+                released: true,
+                ..Batch::default()
+            }).collect(),
+            ..Queue::default()
+        };
+        save(&path, &q).unwrap();
+        // Any native lookup/lock would fail: settled history must not touch it.
+        fs::write(tmp.path().join("notifications"), "not a directory").unwrap();
+        let pass = |now: u64| {
+            let (loads, writes) = (queue_load_count(), save_calls());
+            let mut q = reconcile_intents(tmp.path(), &store, "b", &[]).unwrap();
+            deliver_queue(tmp.path(), &store.root, "b", &[], &recipient("codex"),
+                now, &no_preview, &mut q).unwrap();
+            assert_eq!(queue_load_count() - loads, 1);
+            (save_calls() - writes, q)
+        };
+        let t0 = 1_000_000;
+        // Undelivered history has no age yet: the first pass stamps it once.
+        let started = std::time::Instant::now();
+        let (writes, q) = pass(t0);
+        eprintln!("P2 synthetic history: 7745 batches, {:.3} ms, one load, no native reads",
+            started.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(writes, 1);
+        assert_eq!(q.batches.len(), 7745, "history inside the horizon remains intact");
+        assert!(q.batches[..7745 - HISTORY_TAIL].iter().all(|b| b.settled_at == t0));
+        let bytes = fs::read(&path).unwrap();
+        let (writes, q) = pass(t0 + HISTORY_HORIZON_SECS - 1);
+        assert_eq!((writes, q.batches.len()), (0, 7745));
+        assert_eq!(fs::read(&path).unwrap(), bytes, "no rewrite inside the horizon");
+        // Past the horizon only the newest tail is left, in order.
+        let (writes, q) = pass(t0 + HISTORY_HORIZON_SECS);
+        assert_eq!(writes, 1);
+        let kept: Vec<_> = q.batches.iter().map(|b| b.wake_id.clone()).collect();
+        let tail: Vec<_> = (7745 - HISTORY_TAIL..7745).map(|i| format!("history-{i}")).collect();
+        assert_eq!(kept, tail);
+        let (writes, q) = pass(t0 + 2 * HISTORY_HORIZON_SECS);
+        assert_eq!((writes, q.batches.len()), (0, HISTORY_TAIL));
+        assert!(fs::metadata(&path).unwrap().len() < 64 * 1024);
+    }
+
+    #[test]
+    fn messaging_history_compaction_keeps_live_intents_open_work_and_the_tail() {
+        let now = 10 * HISTORY_HORIZON_SECS;
+        let old = now - HISTORY_HORIZON_SECS;
+        let settled = |i: usize, delivered_at: u64| Batch {
+            wake_id: format!("w{i}"),
+            ids: vec![format!("k{i}")],
+            status: "confirmed".into(),
+            released: true,
+            delivered_at,
+            ..Batch::default()
+        };
+        let mut batches: Vec<Batch> = (0..200).map(|i| settled(i, old)).collect();
+        // Still an intent (e.g. an unread DM): its history is the dedup record.
+        batches[3].ids.push("unread".into());
+        // A coalesced arrival that is still an intent also keeps its batch.
+        batches[4].coalesced.insert("k-coalesced".into());
+        batches[4].ids.push("k-coalesced".into());
+        // Delivered inside the horizon.
+        batches[5].delivered_at = old + 1;
+        // Not settled: released but only submitted, or settled but not released.
+        batches[6].status = "submitted_unverified".into();
+        batches[7].released = false;
+        // Deferred task work is never compacted.
+        batches[8].ids = vec!["deferred-key".into()];
+        let mut q = Queue {
+            batches,
+            deferred: BTreeSet::from(["deferred-key".to_string()]),
+            ..Queue::default()
+        };
+        let intents: Vec<_> = ["unread", "k-coalesced"].iter().map(|k| WakeIntent {
+            key: (*k).into(), event_id: (*k).into(), monitor: None,
+        }).collect();
+        assert!(compact_history(&mut q, &intents, now));
+        let kept: Vec<_> = q.batches.iter().map(|b| b.wake_id.as_str()).collect();
+        let mut expected = vec!["w3", "w4", "w5", "w6", "w7", "w8"];
+        let tail: Vec<String> = (200 - HISTORY_TAIL..200).map(|i| format!("w{i}")).collect();
+        expected.extend(tail.iter().map(String::as_str));
+        assert_eq!(kept, expected);
+        assert!(!compact_history(&mut q, &intents, now), "a second pass changes nothing");
+        // Intents whose history was kept stay covered: no second wake.
+        let n = q.batches.len();
+        collect(&mut q, &intents);
+        assert_eq!(q.batches.len(), n);
+        // Small queues are never compacted.
+        let mut small = Queue { batches: (0..HISTORY_TAIL).map(|i| settled(i, 1)).collect(), ..Queue::default() };
+        assert!(!compact_history(&mut small, &[], now));
+        assert_eq!(small.batches.len(), HISTORY_TAIL);
+    }
+
+    #[test]
+    fn messaging_queue_loads_without_a_value_round_trip_and_keeps_legacy_migration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("q.json");
+        let legacy = json!({"last_attempt": 7, "batches": [
+            {"wake_id": "a", "ids": ["x"], "status": "confirmed"},
+            {"wake_id": "b", "ids": ["y"], "status": "native_pending"},
+            {"wake_id": "c", "ids": ["z"]},
+            {"wake_id": "d", "ids": ["w"], "status": "confirmed", "released": false, "delivered_at": 5},
+        ]});
+        atomic_replace(&path, &legacy).unwrap();
+        let q = load(&path).unwrap();
+        assert!(q.dirty, "a migrated legacy record is persisted");
+        let released: Vec<_> = q.batches.iter().map(|b| b.released).collect();
+        assert_eq!(released, [true, false, false, false]);
+        assert_eq!(q.batches[2].status, "", "a missing status stays empty, as before");
+        assert_eq!((q.last_attempt, q.batches[3].delivered_at), (7, 5));
+        save(&path, &q).unwrap();
+        let q = load(&path).unwrap();
+        assert!(!q.dirty);
+        let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(saved["batches"][0].get("settled_at").is_none(), "an unset stamp is not written");
+        assert!(saved["batches"][0].get("migrated").is_none());
+        assert_eq!(saved["batches"][0]["released"], true);
+    }
+
+    #[test]
+    fn messaging_settled_ids_becoming_eligible_again_do_not_rewake_or_read_native() {
+        for status in ["confirmed", "cancelled"] {
+            let (tmp, store, _, _) = fixture();
+            let path = queue_path(&store.root, "b");
+            save(&path, &Queue {
+                batches: vec![Batch {
+                    wake_id: "settled".into(), ids: vec!["eligible-again".into()],
+                    status: status.into(), released: true, ..Batch::default()
+                }], ..Queue::default()
+            }).unwrap();
+            fs::write(tmp.path().join("notifications"), "no native I/O allowed").unwrap();
+            let intents = vec![WakeIntent {
+                key: "eligible-again".into(), event_id: "eligible-again".into(), monitor: None,
+            }];
+            let writes = save_calls();
+            let mut queue = reconcile_intents(tmp.path(), &store, "b", &intents).unwrap();
+            deliver_queue(tmp.path(), &store.root, "b", &intents, &recipient("codex"),
+                1_000_000, &no_preview, &mut queue).unwrap();
+            assert_eq!(save_calls() - writes, 0);
+            assert_eq!(queue.batches.len(), 1);
+            assert_eq!(queue.batches[0].wake_id, "settled");
+            assert_eq!(queue.batches[0].status, status);
+            assert!(queue.batches[0].released);
+        }
+    }
+
+    #[test]
+    fn messaging_shared_queue_tick_serializes_cancel_against_native_claim() {
+        use std::os::fd::AsRawFd;
+        // Simulate the adapter's pending -> submitting transition under the
+        // actual native queue flock, independently of the daemon delivery gate.
+        fn claim(root: &Path, wake: &str) -> bool {
+            let dir = crate::notifications::directory(root, "b");
+            let lock = fs::OpenOptions::new().read(true).write(true).open(dir.join("queue.lock")).unwrap();
+            assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+            let path = dir.join(format!("{}.json", digest(&format!("chat:{wake}"))));
+            let mut event: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            if event["status"] != "pending" { return false; }
+            event["status"] = json!("submitting");
+            atomic_replace(&path, &event).unwrap();
+            true
+        }
+        let _env = crate::test_support::env_lock();
+        for claim_first in [true, false] {
+            let (tmp, mut store, actor, people) = fixture();
+            dm(&mut store, &actor, &people, "claim-race");
+            let path = queue_path(&store.root, "b");
+            let mut daemon = DaemonState::default();
+            daemon.messaging_root = tmp.path().into();
+            *daemon.messaging.lock().unwrap() = Some(store);
+            let mut params = crate::session::SpawnParams::new("b", "delivery-race", "/bin/cat");
+            params.session_type = "codex".into();
+            daemon.sessions.insert("b".into(), crate::session::DaemonSession::spawn(params).unwrap());
+            let gate = daemon.messaging_delivery.clone();
+            let slot = daemon.messaging.clone();
+            let state = Arc::new(Mutex::new(daemon));
+            tick(&state);
+            let queue = load(&path).unwrap();
+            let wake = queue.batches[0].wake_id.clone();
+            let (go, start) = std::sync::mpsc::channel();
+            let (started, trying) = std::sync::mpsc::channel();
+            let (done, cancelled) = std::sync::mpsc::channel();
+            let root = tmp.path().to_owned();
+            let canceller = std::thread::spawn(move || {
+                start.recv().unwrap();
+                started.send(()).unwrap();
+                let _guard = gate.lock().unwrap();
+                let mut slot = slot.lock().unwrap();
+                let store = slot.as_mut().unwrap();
+                store.follow(&actor, &json!({"action":"set","dnd":true,"request_id":"race-cancel"}), &people).unwrap();
+                reconcile_session(&root, store, "b").unwrap();
+                let _ = done.send(());
+            });
+            let root = tmp.path().to_owned();
+            let hook_wake = wake.clone();
+            AFTER_RECONCILE.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                go.send(()).unwrap();
+                trying.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert!(cancelled.recv_timeout(Duration::from_millis(50)).is_err(),
+                    "cancellation must wait for the recipient gate through shared-queue delivery");
+                if claim_first {
+                    assert!(claim(&root, &hook_wake), "adapter can claim after reconcile before deliver");
+                }
+            })));
+            let loads = queue_load_count();
+            tick(&state);
+            assert_eq!(queue_load_count() - loads, 1, "deliver must reuse reconcile's snapshot");
+            canceller.join().unwrap();
+            let final_queue = load(&path).unwrap();
+            assert_eq!(final_queue.batches.len(), 1);
+            assert!(final_queue.batches[0].released);
+            if claim_first {
+                assert_eq!(final_queue.batches[0].status, "submitting", "claimed native work cannot be recalled");
+            } else {
+                assert_eq!(final_queue.batches[0].status, "cancelled");
+                assert!(!claim(tmp.path(), &wake), "cancelled work cannot be claimed later");
+            }
+        }
+    }
+
+    #[test]
+    fn messaging_released_ambiguous_native_receipts_still_confirm_late() {
+        for status in ["submitted", "uncertain"] {
+            let (tmp, mut store, actor, people) = fixture();
+            dm(&mut store, &actor, &people, "late");
+            let mut q = deliver(&store, tmp.path(), "codex");
+            set_native_status(tmp.path(), &q.batches[0], status);
+            q.batches[0].status = native_status(&json!({"status":status})).into();
+            q.batches[0].released = true;
+            q.batches[0].delivered_at = 1;
+            save(&queue_path(&store.root, "b"), &q).unwrap();
+            let writes = save_calls();
+            reconcile_session(tmp.path(), &store, "b").unwrap();
+            deliver(&store, tmp.path(), "codex");
+            assert_eq!(save_calls() - writes, 0, "unchanged ambiguous receipts do not rewrite");
+            set_native_status(tmp.path(), &q.batches[0], "observed");
+            let writes = save_calls();
+            reconcile_session(tmp.path(), &store, "b").unwrap();
+            let confirmed = deliver(&store, tmp.path(), "codex");
+            assert_eq!(save_calls() - writes, 1);
+            assert_eq!(confirmed.batches[0].status, "confirmed");
+            assert!(confirmed.batches[0].released);
+        }
+    }
+
+    #[test]
+    fn messaging_marker_scan_progress_is_checkpointed_without_status_change() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("transcript.jsonl");
+        fs::write(&transcript, "{}\n".repeat(700_000)).unwrap();
+        let mut r = recipient("codex");
+        r.binding = marker::binding(transcript.to_str(), 1);
+        let path = queue_path(tmp.path(), "b");
+        save(&path, &Queue {
+            batches: vec![Batch {
+                wake_id: "scan-progress".into(), ids: vec!["old".into()],
+                status: "uncertain".into(), released: true,
+                original: r.binding.clone(), ..Batch::default()
+            }], ..Queue::default()
+        }).unwrap();
+        let writes = save_calls();
+        deliver_intents(tmp.path(), tmp.path(), "b", vec![], &r).unwrap();
+        let first = load(&path).unwrap();
+        assert_eq!(save_calls() - writes, 1);
+        let offset = serde_json::to_value(&first.batches[0].scan).unwrap()["offset"].as_u64().unwrap();
+        assert!(offset > 0 && offset < fs::metadata(&transcript).unwrap().len());
+        deliver_intents(tmp.path(), tmp.path(), "b", vec![], &r).unwrap();
+        let scanned = load(&path).unwrap();
+        assert_eq!(scanned.batches[0].status, "uncertain");
+        assert_eq!(serde_json::to_value(&scanned.batches[0].scan).unwrap()["offset"], 2_100_000);
+        let writes = save_calls();
+        deliver_intents(tmp.path(), tmp.path(), "b", vec![], &r).unwrap();
+        assert_eq!(save_calls() - writes, 0);
+        writeln!(fs::OpenOptions::new().append(true).open(&transcript).unwrap(),
+            "{}", json!({"type":"event_msg","payload":{"type":"user_message","message":"[cm-chat scan-progress]"}})).unwrap();
+        // Changed transcript resets the scan, then the next bounded pass sees
+        // the late inbound marker beyond the first 2 MiB.
+        deliver_intents(tmp.path(), tmp.path(), "b", vec![], &r).unwrap();
+        deliver_intents(tmp.path(), tmp.path(), "b", vec![], &r).unwrap();
+        assert_eq!(load(&path).unwrap().batches[0].status, "confirmed");
+        assert!(crate::notifications::get(tmp.path(), "b", "chat:scan-progress").unwrap().is_none());
+    }
+
+    #[test]
+    fn messaging_checkpoint_failures_recover_without_duplicate_publication() {
+        for checkpoint_number in [1, 2] {
+            let (tmp, mut store, actor, people) = fixture();
+            dm(&mut store, &actor, &people, "durable");
+            let path = queue_path(&store.root, "b");
+            FAIL_QUEUE_SAVE_AT.with(|at| at.set(Some(save_calls() + checkpoint_number)));
+            let result = deliver_intents(tmp.path(), &store.root, "b",
+                store.wake_intents_for_session("b"), &recipient("codex"));
+            FAIL_QUEUE_SAVE_AT.with(|at| at.set(None));
+            assert!(result.is_err());
+            let before = load(&path).unwrap();
+            let events = crate::notifications::snapshot(tmp.path(), "b").unwrap().0;
+            if checkpoint_number == 1 {
+                assert!(before.batches.is_empty());
+                assert!(events.is_empty(), "a failed initial checkpoint must not publish");
+            } else {
+                assert_eq!(before.batches[0].status, "pending");
+                assert_eq!(events.len(), 1, "publication precedes the receipt checkpoint");
+            }
+            drop(store);
+            let store = Store::open(tmp.path()).unwrap();
+            let intents = store.wake_intents_for_session("b");
+            let mut q = reconcile_intents(tmp.path(), &store, "b", &intents).unwrap();
+            deliver_queue(tmp.path(), &store.root, "b", &intents, &recipient("codex"),
+                1_000_000, &no_preview, &mut q).unwrap();
+            assert_eq!(q.batches.len(), 1);
+            assert_eq!(q.batches[0].status, "native_pending");
+            if checkpoint_number == 2 {
+                assert_eq!(q.batches[0].wake_id, before.batches[0].wake_id);
+            }
+            assert_eq!(crate::notifications::snapshot(tmp.path(), "b").unwrap().0.len(), 1);
+            let writes = save_calls();
+            reconcile_session(tmp.path(), &store, "b").unwrap();
+            deliver(&store, tmp.path(), "codex");
+            assert_eq!(save_calls() - writes, 0);
+        }
+    }
+
+    #[test]
+    fn messaging_legacy_migration_and_repeated_read_checkpoint_only_changes() {
+        let (tmp, mut store, actor, people) = fixture();
+        dm(&mut store, &actor, &people, "legacy");
+        let q = deliver(&store, tmp.path(), "codex");
+        let path = queue_path(&store.root, "b");
+        set_native_status(tmp.path(), &q.batches[0], "observed");
+        let mut old = serde_json::to_value(&q).unwrap();
+        old["batches"][0]["status"] = json!("confirmed");
+        old["batches"][0].as_object_mut().unwrap().remove("released");
+        atomic_replace(&path, &old).unwrap();
+        let writes = save_calls();
+        reconcile_session(tmp.path(), &store, "b").unwrap();
+        assert_eq!(save_calls() - writes, 1, "persist the legacy migration even without other changes");
+        assert!(load(&path).unwrap().batches[0].released);
+        let writes = save_calls();
+        reconcile_session(tmp.path(), &store, "b").unwrap();
+        assert_eq!(save_calls() - writes, 0);
+        let page = read_page(&mut store, &actor, &json!({"dm":"owner"}));
+        let writes = save_calls();
+        read_boundary(&store, "b", &page).unwrap();
+        assert_eq!(save_calls() - writes, 0, "a repeated full-message fetch adds no persistent change");
+    }
+
     #[test]
     fn messaging_legacy_unsubmitted_work_stays_live_and_coalesces_after_upgrade() {
         for initial_engine in ["codex", "bash"] {
@@ -1053,6 +2052,7 @@ mod tests {
                 name: engine.into(),
                 session_uid: engine.into(),
                 kind: "agent".into(),
+                engine: None,
                 present: true,
                 task: None,
             }];
@@ -1187,6 +2187,7 @@ mod tests {
         let offline = super::super::Person {
             id: other.clone(), name: "Offline".into(), session_uid: "offline".into(),
             kind: "agent".into(), present: false, task: None,
+            engine: None,
         };
         store.enroll_participants(&[offline.clone()]).unwrap();
         dm(&mut store, &other, &[offline], "offline-pending");

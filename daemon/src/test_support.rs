@@ -28,3 +28,76 @@ pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|p| p.into_inner())
 }
+
+/// Requested allocation totals on this test thread only (not RSS, live bytes,
+/// allocator capacity or allocations on spawned threads). System remains the
+/// allocator; disabled outside an explicitly measured fixture closure.
+pub(crate) mod allocations {
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        cell::Cell,
+    };
+
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Counts {
+        pub calls: u64,
+        pub bytes: u64,
+    }
+    thread_local! { static COUNTS: Cell<Option<Counts>> = const { Cell::new(None) }; }
+
+    struct Counting;
+    #[global_allocator]
+    static ALLOCATOR: Counting = Counting;
+
+    fn record(bytes: usize) {
+        let _ = COUNTS.try_with(|slot| {
+            if let Some(mut counts) = slot.get() {
+                counts.calls += 1;
+                counts.bytes += bytes as u64;
+                slot.set(Some(counts));
+            }
+        });
+    }
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let p = System.alloc(layout);
+            if !p.is_null() {
+                record(layout.size());
+            }
+            p
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let p = System.alloc_zeroed(layout);
+            if !p.is_null() {
+                record(layout.size());
+            }
+            p
+        }
+        unsafe fn realloc(&self, p: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            let p = System.realloc(p, layout, size);
+            if !p.is_null() {
+                record(size);
+            }
+            p
+        }
+        unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
+            System.dealloc(p, layout);
+        }
+    }
+
+    pub fn measure<T>(run: impl FnOnce() -> T) -> (T, Counts) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                COUNTS.with(|s| s.set(None));
+            }
+        }
+        COUNTS.with(|s| {
+            assert!(s.get().is_none(), "nested allocation measurement");
+            s.set(Some(Counts::default()));
+        });
+        let _reset = Reset;
+        let result = run();
+        (result, COUNTS.with(|s| s.get().unwrap()))
+    }
+}

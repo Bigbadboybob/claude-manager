@@ -58,6 +58,8 @@ pub const RECENTLY_EXITED_CAP: usize = 256;
 /// swap instead of dying with the old image (the P4b known gap).
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ExitedTombstone {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_failure: Option<crate::control::prompt_delivery::StartupFailure>,
     pub session_uid: String,
     pub transcript_path: Option<String>,
     pub generation: u64,
@@ -68,6 +70,22 @@ pub struct ExitedTombstone {
     /// Retain scheduler ownership on exits and across brain restarts.
     #[serde(default)]
     pub continuous_task_id: Option<String>,
+    /// The model the session was launched with (`crate::models`), so
+    /// revive, resume and restore reuse it. `None` for bash and for
+    /// sessions recorded before models were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Where `model` came from ([`crate::models::ModelSource::as_str`]):
+    /// `explicit`, `task`, `engine_default`, `transcript`, … `None` when
+    /// unknown (bash, or recorded before sources were).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_source: Option<String>,
+    /// The reasoning effort the session runs at, recorded with `model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Where `effort` came from (the same sources as `model_source`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_source: Option<String>,
     pub label: String,
     pub workflow_run_id: Option<String>,
     pub workflow_role: Option<String>,
@@ -120,6 +138,24 @@ pub struct ExitedTombstone {
     /// entry absent from a surviving holder's records).
     #[serde(default)]
     pub status_lost: bool,
+    /// The exited session's org object (doc/org-model.md §12, S0b),
+    /// carried so a revive from this tombstone keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<cm_holder_proto::org::OrgObject>,
+}
+
+/// Whether a workspace's task bindings are set centrally (its org object
+/// carries a `binding_epoch`, doc/org-model.md §12): local reconstruction
+/// and older TUI snapshots must then leave them alone.
+pub fn binding_guarded(ws: &ManifestWorkspace) -> bool {
+    cm_holder_proto::org::binding_epoch(ws.org.as_ref()).is_some()
+}
+
+/// Whether a workspace is durable by kind (`home`/`stream`, set by a central
+/// mark, doc/org-model.md §5): it is persisted even with no live session, so
+/// the mark survives a restart. The API never re-pushes a confirmed mark.
+pub fn durable_kind(ws: &ManifestWorkspace) -> bool {
+    matches!(cm_holder_proto::org::workspace_kind(ws.org.as_ref()), Some("home" | "stream"))
 }
 
 /// Bound on [`DaemonState::kill_requests`]. A request is normally
@@ -379,17 +415,39 @@ impl Drop for WorktreeSpawnTicket {
 
 pub type WorktreeSpawnQueues = Arc<Mutex<HashMap<PathBuf, Arc<WorktreeSpawnQueue>>>>;
 
+/// A planning-API `parent_task_id` reading, cached in
+/// [`DaemonState::planning_task_parents`].
+#[derive(Debug, Clone)]
+pub struct PlanningParent {
+    pub parent: Option<String>,
+    pub fetched_at: std::time::Instant,
+}
+
 /// Daemon process state. Lives behind `Arc<Mutex<DaemonState>>` in
 /// `run()`; per-connection threads lock it for the duration of one
 /// JSON-RPC dispatch. Mutex (not RwLock) because method handlers
 /// almost always mutate — even read-only-looking calls like
 /// `list_sessions` need a consistent snapshot.
 pub struct DaemonState {
+    pub staffing: Arc<Mutex<crate::staffing::Cache>>,
     pub messaging: Arc<Mutex<Option<crate::messaging::Store>>>,
+    /// One background opener per brain; rebuilding never holds daemon/store locks.
+    pub messaging_startup: Arc<std::sync::atomic::AtomicBool>,
+    /// Name recovery must not persist the session registry before adoption finishes.
+    pub messaging_registry_restored: bool,
     /// Serializes chat cancellation/preferences with the final delivery boundary.
     pub messaging_delivery: Arc<Mutex<()>>,
     pub messaging_wake: Arc<(Mutex<bool>, std::sync::Condvar)>,
     pub messaging_root: PathBuf,
+    /// When each session last called a `messaging.*` method, for the
+    /// one-time maintenance announcement (`crate::maintenance`). In memory
+    /// only: a notice is set before the restart it announces.
+    pub last_chat_at: std::collections::HashMap<String, std::time::Instant>,
+    /// When this brain's messaging opener started (None until it runs), so
+    /// a store that never opens reads as a local failure, not a restart.
+    pub messaging_opening_since: Option<std::time::Instant>,
+    pub owner_notifications: Arc<crate::owner_notifications::Feed>,
+    pub owner_alert_relay: Arc<crate::owner_alert_relay::Relay>,
     pub messaging_sync: Option<Arc<crate::messaging::sync::Runtime>>,
     pub messaging_names: std::collections::BTreeMap<String, crate::messaging::Name>,
     /// Daemon-owned per-session state (PTY, fanout, memory cap).
@@ -397,6 +455,7 @@ pub struct DaemonState {
     /// spawning sessions. Indexed by the stable session uid that
     /// already lives on `ManifestEntry` / `TerminalSession`.
     pub sessions: HashMap<String, DaemonSession>,
+    pub agent_state_runtime: Arc<crate::agent_state::Runtime>,
     /// H3 (restart hardening): drain mode. While true, spawn-shaped
     /// operations (`mcp_start_session`, `session.revive`) refuse and
     /// the continuous scheduler's tick no-ops, so an operator can bring
@@ -441,6 +500,13 @@ pub struct DaemonState {
     /// [`ExitedTombstone`]. Bounded by [`KILL_REQUEST_CAP`]. See
     /// [`DaemonState::record_kill_request`].
     pub kill_requests: HashMap<String, KillRequest>,
+    /// Last time Owner was seen USING a session other than by typing into it
+    /// (typing is `DaemonSession::last_operator_input_at`): the TUI reports
+    /// the session it shows (`session.viewed`), and a revive or resume counts
+    /// too. In memory only: the terminal-task sweep treats every session as
+    /// seen when its brain started, so a restart never loses a grace window.
+    /// Pruned to live sessions by [`Self::note_owner_activity`].
+    pub owner_seen: HashMap<String, std::time::Instant>,
     /// Snapshot of the persisted manifest's workspaces, keyed by
     /// stable workspace id. Loaded at daemon startup via
     /// [`load_manifest_from_disk`](Self::load_manifest_from_disk).
@@ -559,6 +625,31 @@ pub struct DaemonState {
     /// (`daemon-sessions.json`) so the creator keeps scope over
     /// its spawned workers across a daemon restart.
     pub agent_task_edges: HashMap<String, String>,
+    /// task → workspace bindings [`DaemonState::load_manifest_from_disk`]
+    /// inferred from session task ids rather than read as recorded truth.
+    /// The TUI file it loads carries no daemon-recorded `org`, so a
+    /// workspace's `binding_epoch` is known only once
+    /// `rehydrate_derived_state` merges `daemon-sessions.json`; that pass
+    /// drops these for workspaces that turn out centrally bound
+    /// (doc/org-model.md §12).
+    pub inferred_bindings: Vec<(String, String)>,
+    /// Launch grants for owner-role holders of placed items
+    /// (doc/org-model.md §7.4): replaced by every board heartbeat reply,
+    /// persisted at `<messaging_root>/launch-grants.json`, checked by the
+    /// spawn authorization path. Never a task-tree edge.
+    pub launch_grants: Vec<crate::items::grants::LaunchGrant>,
+    /// `task → parent` edges read from the planning API for tasks the
+    /// pushed `task_tree` doesn't carry, for a host no TUI has pushed to
+    /// lately (a headless cm-manager). Written only by the background
+    /// `crate::task_parent_refresh` loop, never on the dispatch path, and
+    /// read by `auth::task_in_scope` after `task_tree` (whose edges win).
+    /// Pruned each pass to the tasks live/exited sessions and
+    /// `agent_task_edges` still reach. Not persisted.
+    pub planning_task_parents: HashMap<String, PlanningParent>,
+    /// Failed refresher lookups: task → (next retry, consecutive failures),
+    /// so an unreachable API or a bad id backs off instead of being asked
+    /// every pass.
+    pub planning_parent_failures: HashMap<String, (std::time::Instant, u32)>,
     /// Startup MCP preflight result: `Ok(summary)` or `Err(diagnosis)`
     /// (fix-loud-preflight). `None` only before startup has run it.
     ///
@@ -794,10 +885,12 @@ impl Default for DaemonState {
     fn default() -> Self {
         Self {
             sessions: HashMap::new(),
+            agent_state_runtime: Arc::new(crate::agent_state::Runtime::default()),
             recently_exited: VecDeque::new(),
             resume_history: Mutex::new(Default::default()),
             resume_claims: Default::default(),
             kill_requests: HashMap::new(),
+            owner_seen: HashMap::new(),
             workspaces: HashMap::new(),
             bindings: HashMap::new(),
             daemon_sessions_path: None,
@@ -807,6 +900,10 @@ impl Default for DaemonState {
             task_workspaces: HashMap::new(),
             task_tree_pushed: false,
             agent_task_edges: HashMap::new(),
+            inferred_bindings: Vec::new(),
+            launch_grants: Vec::new(),
+            planning_task_parents: HashMap::new(),
+            planning_parent_failures: HashMap::new(),
             mcp_preflight: None,
             worktree_spawn_queues: Arc::new(Mutex::new(HashMap::new())),
             tui_sessions: HashMap::new(),
@@ -815,9 +912,16 @@ impl Default for DaemonState {
             workflow_definitions: HashMap::new(),
             base_workflow_definitions: HashMap::new(),
             messaging: Arc::new(Mutex::new(None)),
+            staffing: Arc::new(Mutex::new(crate::staffing::Cache::default())),
+            messaging_startup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            messaging_registry_restored: false,
             messaging_delivery: Arc::new(Mutex::new(())),
             messaging_wake: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
             messaging_root: crate::messaging::rpc::default_root(),
+            last_chat_at: std::collections::HashMap::new(),
+            messaging_opening_since: None,
+            owner_notifications: Arc::new(crate::owner_notifications::Feed::default()),
+            owner_alert_relay: Arc::new(crate::owner_alert_relay::Relay::default()),
             messaging_sync: None,
             messaging_names: Default::default(),
             manifest_watcher: Arc::new(crate::manifest::ManifestWatcher::new()),
@@ -851,6 +955,18 @@ impl DaemonState {
         self.recently_exited.push_back(tomb);
         while self.recently_exited.len() > RECENTLY_EXITED_CAP {
             self.recently_exited.pop_front();
+        }
+        // Let the items board see the exit within seconds, not a full beat.
+        crate::items::heartbeat::poke();
+    }
+
+    /// Owner used `uid` just now (viewed it in the TUI, revived or resumed
+    /// it). Read by the terminal-task sweep's grace rule.
+    pub fn note_owner_activity(&mut self, uid: &str) {
+        self.owner_seen.insert(uid.to_string(), std::time::Instant::now());
+        if self.owner_seen.len() > 4 * self.sessions.len().max(64) {
+            let live: std::collections::HashSet<&String> = self.sessions.keys().collect();
+            self.owner_seen.retain(|k, _| live.contains(k));
         }
     }
 
@@ -1074,17 +1190,25 @@ impl DaemonState {
         // binding is fully reconstructable here. Merge (`or_insert`) so an explicit
         // persisted binding always wins over a derived one. Collect first to avoid
         // borrowing `self.workspaces` while mutating `self.bindings`.
+        // doc/org-model.md §12: a workspace with a `binding_epoch` has its
+        // bindings set centrally; its sessions' task ids are the work they
+        // are on, not a binding to re-infer.
         let derived: Vec<(String, String)> = self
             .workspaces
             .iter()
+            .filter(|(_, ws)| !binding_guarded(ws))
             .flat_map(|(ws_id, ws)| {
                 ws.sessions
                     .iter()
                     .filter_map(move |s| s.task_id.as_ref().map(|tid| (tid.clone(), ws_id.clone())))
             })
             .collect();
+        self.inferred_bindings.clear();
         for (task_id, ws_id) in derived {
-            self.bindings.entry(task_id).or_insert(ws_id);
+            if !self.bindings.contains_key(&task_id) {
+                self.bindings.insert(task_id.clone(), ws_id.clone());
+                self.inferred_bindings.push((task_id, ws_id));
+            }
         }
         Ok(true)
     }
@@ -1105,7 +1229,9 @@ impl DaemonState {
     ///
     /// Only workspaces that actually own a live session are emitted —
     /// restore needs no others, and a headless daemon's `workspaces`
-    /// map is exactly the set auto-registered at spawn anyway. All
+    /// map is exactly the set auto-registered at spawn anyway — plus
+    /// [`durable_kind`] ones, whose org object must outlive their
+    /// sessions. All
     /// `bindings` are kept (small, and symmetric with
     /// [`Self::load_manifest_from_disk`]).
     pub fn build_daemon_manifest(&self) -> Manifest {
@@ -1132,6 +1258,13 @@ impl DaemonState {
                 });
             ws.sessions.push(crate::resume_identity::entry(self, sess));
         }
+        for (id, w) in self.workspaces.iter().filter(|(_, w)| durable_kind(w)) {
+            workspaces.entry(id.clone()).or_insert_with(|| ManifestWorkspace {
+                sessions: Vec::new(),
+                tombstones: Vec::new(),
+                ..w.clone()
+            });
+        }
         Manifest {
             messaging_names: self.messaging_names.clone(),
             workspaces,
@@ -1146,6 +1279,9 @@ impl DaemonState {
             continuous_column_on: false,
             hide_keybinding_helper: false,
             task_colors: HashMap::new(),
+            folded_tasks: Default::default(),
+            folded_divisions: Default::default(),
+            folded_org: Default::default(),
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
             sidebar_receipts: HashMap::new(),
@@ -1429,14 +1565,23 @@ pub(crate) fn write_json_atomic(path: &Path, json: &str, durable: bool) -> std::
     }
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), n));
-    if durable {
-        let mut f = std::fs::File::create(&tmp)?;
-        std::io::Write::write_all(&mut f, json.as_bytes())?;
-        f.sync_all()?;
-    } else {
-        std::fs::write(&tmp, json.as_bytes())?;
+    let staged = (|| {
+        if durable {
+            let mut f = std::fs::File::create(&tmp)?;
+            std::io::Write::write_all(&mut f, json.as_bytes())?;
+            f.sync_all()?;
+        } else {
+            std::fs::write(&tmp, json.as_bytes())?;
+        }
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(e) = staged {
+        // A failed write (ENOSPC on 2026-10-14) used to leave its temp file
+        // behind, one per retry: ten empty `daemon-agent-state.tmp.*` files
+        // were still in ~/.cm three weeks later (#109).
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    std::fs::rename(&tmp, path)?;
     if durable {
         if let Some(parent) = path.parent() {
             // Directory fsync makes the rename itself durable (the
@@ -1457,8 +1602,30 @@ mod tests {
         crate::test_support::env_lock()
     }
 
+    #[test]
+    fn failed_atomic_write_leaves_no_temp_file() {
+        let dir = TempDir::new().unwrap();
+        // A non-empty directory where the file should be: the rename fails.
+        let path = dir.path().join("daemon-agent-state.json");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("occupied"), b"x").unwrap();
+        for durable in [true, false] {
+            assert!(write_json_atomic(&path, "{}", durable).is_err());
+        }
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["daemon-agent-state.json".to_string()]);
+        std::fs::remove_dir_all(&path).unwrap();
+        write_json_atomic(&path, "{}", true).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+    }
+
     fn tomb(uid: &str) -> ExitedTombstone {
         ExitedTombstone {
+            startup_failure: None,
+            org: None,
             incarnation: None,
             status_lost: false,
             session_uid: uid.to_string(),
@@ -1469,6 +1636,10 @@ mod tests {
             task_id: None,
             managed_by_uid: None,
             continuous_task_id: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             label: uid.to_string(),
             workflow_run_id: None,
             workflow_role: None,
@@ -1550,6 +1721,7 @@ mod tests {
 
     fn entry(uid: &str) -> ManifestEntry {
         ManifestEntry {
+            org: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -1569,6 +1741,10 @@ mod tests {
             workflow_run_id: None,
             workflow_role: None,
             continuous_task_id: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             task_id: None,
             notify_on_idle: false,
             seeded_from_snapshot: None,

@@ -1,0 +1,30 @@
+{
+  "backend_connected": true,
+  "foreground": "active",
+  "engine_version": "0.160.1",
+  "turn_seq": 4,
+  "turn_started_at": 1791325765.163928,
+  "last_turn": {
+    "ended_at": null,
+    "status": null
+  },
+  "active_flags": [
+    "waitingOnApproval"
+  ],
+  "pending_requests": [
+    {
+      "kind": "approval",
+      "since": 1791325765.2866051
+    }
+  ],
+  "child_active": false,
+  "retrying": false,
+  "error_kind": null,
+  "background": {
+    "complete": true,
+    "observed_at": 1791325765.1565886,
+    "jobs": [],
+    "crons": [],
+    "ended": []
+  }
+}

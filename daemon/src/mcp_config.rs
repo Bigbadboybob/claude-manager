@@ -40,11 +40,60 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
+
+/// Whether CM launches Codex in inline mode (`--no-alt-screen`). Codex's
+/// default alternate screen has no scrollback, so CM's mouse wheel and
+/// Shift+PageUp (which move CM's own terminal scrollback) had nothing to
+/// scroll. Inline mode inserts history above the viewport, where it reaches
+/// the scrollback. Process-wide: the daemon sets it from `daemon.toml`'s
+/// `codex_inline_scrollback` (startup + reload_config), the TUI from
+/// `~/.cm/tui-settings.toml`. Applies to the next spawn/resume only.
+static CODEX_INLINE_SCROLLBACK: AtomicBool = AtomicBool::new(true);
+
+pub fn set_codex_inline_scrollback(on: bool) {
+    CODEX_INLINE_SCROLLBACK.store(on, Ordering::Relaxed);
+}
+
+pub fn codex_inline_scrollback() -> bool {
+    CODEX_INLINE_SCROLLBACK.load(Ordering::Relaxed)
+}
+
+/// Screen-mode flags for a CM Codex argv. Both argv composers (this
+/// module's `build_args` and the TUI's `codex_args`) call this, fresh and
+/// resume alike; `native_codex.py::split_args` forwards it to the frontend.
+pub fn codex_screen_args(inline: bool) -> Vec<String> {
+    if inline { vec!["--no-alt-screen".into()] } else { Vec::new() }
+}
+
+/// Whether a NEW session's MCP server runs behind `mcp_proxy.py`, the stable
+/// stdio proxy that lets CM activate new MCP code without a `/mcp`
+/// reconnect (doc/mcp-managed-activation.md). Per host and per spawn:
+/// `CM_MCP_PROXY_ENABLE=1|0` in the composing process wins, else the
+/// top-level `mcp_proxy = true` in this host's `daemon.toml` (re-read at
+/// every spawn, so no reload is needed). Default off. The decision is
+/// frozen into the session's MCP env as `CM_MCP_PROXY_ENABLED=1`, so a
+/// running session never changes mode, even across `/mcp` reconnects.
+pub fn mcp_proxy_enabled() -> bool {
+    match std::env::var("CM_MCP_PROXY_ENABLE").as_deref() {
+        Ok("1") => return true,
+        Ok("0") => return false,
+        _ => {}
+    }
+    mcp_proxy_from_toml(&crate::config::default_config_path())
+}
+
+fn mcp_proxy_from_toml(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.parse::<toml::Value>().ok())
+        .and_then(|value| value.get("mcp_proxy").and_then(|v| v.as_bool()))
+        .unwrap_or(false)
+}
 
 /// Per-session MCP config dir. `~/.cm/mcp/<session_uid>/`.
 fn mcp_config_dir(session_uid: &str) -> Option<PathBuf> {
@@ -184,6 +233,13 @@ fn render_launcher_script(pairs: &[(String, String)]) -> String {
          \t[ -f \"$t_dir/$REL\" ] || return 1\n\
          \tif [ \"$REL\" = \"server.py\" ]; then\n\
          \t\t\"$t_py\" -c 'import mcp' >/dev/null 2>&1 || return 1\n\
+         \t\t# A session spawned with the proxy flag runs server.py behind the\n\
+         \t\t# stable stdio proxy, which re-runs this launcher for each backend\n\
+         \t\t# (CM_MCP_PROXY_CHILD=1). proxy.disabled is the host kill switch.\n\
+         \t\tif [ \"$CM_MCP_PROXY_ENABLED\" = 1 ] && [ -z \"$CM_MCP_PROXY_CHILD\" ] \\\n\
+         \t\t\t&& [ ! -e \"$HOME/.cm/mcp/proxy.disabled\" ] && [ -f \"$t_dir/mcp_proxy.py\" ]; then\n\
+         \t\t\texec \"$t_py\" \"$t_dir/mcp_proxy.py\" -- \"$0\" server.py \"$@\"\n\
+         \t\tfi\n\
          \telif [ \"$REL\" = \"native_codex.py\" ]; then\n\
          \t\t\"$t_py\" -c 'from websockets.asyncio.client import unix_connect; from websockets.asyncio.server import unix_serve' >/dev/null 2>&1 || return 1\n\
          \telse\n\
@@ -293,6 +349,9 @@ pub fn build_env(
 ) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     env.insert("CM_TUI_SESSION_ID".into(), session_uid.to_string());
+    if mcp_proxy_enabled() {
+        env.insert("CM_MCP_PROXY_ENABLED".into(), "1".into());
+    }
     env.insert(
         "CM_DAEMON_SOCKET".into(),
         absolutized_socket_or_raw(&crate::default_socket_path()),
@@ -352,9 +411,9 @@ pub fn resolve_server_path(server_path_override: Option<&str>) -> Option<PathBuf
 }
 
 /// Build the inline-JSON value for a claude-code spawn's `--settings`
-/// flag, injecting the cm Stop hook (`mcp_server/hooks/cm_stop_hook.py`
+/// flag, injecting cm state hooks plus the synchronous Stop hook (`mcp_server/hooks/cm_stop_hook.py`
 /// beside the resolved server.py). The hook (a) reports turn-ends to
-/// the daemon (`session.turn_ended` → `semantic_idle`) and (b) drains
+/// the daemon (`session.agent_report`, legacy `session.turn_ended`) and (b) drains
 /// the session's monitor inbox at turn boundaries via Stop-hook
 /// block+reason. Returns `None` (spawn proceeds hook-less) when the
 /// script isn't present at the resolved location — e.g. a deployment
@@ -372,29 +431,43 @@ pub fn claude_settings_hook_arg(server_path_override: Option<&str>) -> Option<St
     // config: the `--settings` argv is frozen for the life of the
     // claude process, so a baked interpreter path here goes stale the
     // same way — route through the launcher, direct pair as fallback.
-    let command = match ensure_launcher(&server) {
-        Ok(launcher) => format!(
-            "'{}' 'hooks/cm_stop_hook.py'",
-            launcher.to_string_lossy()
+    let launcher = ensure_launcher(&server).ok();
+    let hook_command = |filename: &str| match &launcher {
+        Some(launcher) => format!(
+            "'{}' 'hooks/{}'",
+            sh_squote(&launcher.to_string_lossy()),
+            filename
         ),
-        Err(_) => format!(
+        None => format!(
             "'{}' '{}'",
-            resolve_python_interpreter(&server),
-            hook.to_string_lossy()
+            sh_squote(&resolve_python_interpreter(&server)),
+            sh_squote(
+                &server
+                    .parent()
+                    .unwrap()
+                    .join("hooks")
+                    .join(filename)
+                    .to_string_lossy()
+            )
         ),
     };
-    Some(
-        serde_json::json!({
-            "hooks": {
-                "Stop": [
-                    {"hooks": [
-                        {"type": "command", "command": command, "timeout": 15}
-                    ]}
-                ]
-            }
-        })
-        .to_string(),
-    )
+    let mut hooks = serde_json::json!({
+        "Stop": [{"hooks": [{"type": "command", "command": hook_command("cm_stop_hook.py"), "timeout": 15}]}]
+    });
+    if server.parent()?.join("hooks/cm_state_hook.py").is_file() {
+        // async is supported in Claude 2.1.291's command-hook settings.
+        // The script also double-forks so older runners cannot block on IPC.
+        for event in [
+            "UserPromptSubmit",
+            "StopFailure",
+            "PermissionRequest",
+            "Notification",
+        ] {
+            hooks[event] = serde_json::json!([{"hooks": [{"type": "command",
+                "command": hook_command("cm_state_hook.py"), "timeout": 5, "async": true}]}]);
+        }
+    }
+    Some(serde_json::json!({"hooks": hooks}).to_string())
 }
 
 /// Resolve the Python interpreter that runs `server.py`, in priority order:
@@ -721,18 +794,89 @@ pub fn codex_overrides(
 /// Restricted to the three Python MCP tool types. Anything else
 /// → `Err(io::Error::Other)` so callers surface `InvalidParams`
 /// at the wire boundary.
+///
+/// `model` and `effort` are required for `claude-code` and `codex`
+/// (resolved by the caller, see `crate::models`) and ignored for `bash`:
+/// CM never leaves an agent on its engine's default model or effort.
 pub fn build_args(
     session_type: &str,
     session_uid: &str,
     workflow: Option<&WorkflowMeta>,
     server_path_override: Option<&str>,
     resume_session_id: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
 ) -> std::io::Result<(String, Vec<String>, Option<String>)> {
+    let launch = match resume_session_id {
+        Some(id) => Launch::Resume(id),
+        None => Launch::Fresh,
+    };
+    build_launch_args(session_type, session_uid, workflow, server_path_override, launch, model, effort)
+}
+
+/// The validated effort for an agent argv, or an `InvalidInput` error
+/// naming the omission.
+fn required_effort(session_type: &str, effort: Option<&str>) -> std::io::Result<String> {
+    let invalid = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg);
+    let e = effort.ok_or_else(|| {
+        invalid(format!("a {session_type} spawn must name its effort explicitly"))
+    })?;
+    crate::models::validate_effort(session_type, e).map_err(invalid)
+}
+
+/// The validated model for an agent argv, or an `InvalidInput` error
+/// naming the omission.
+fn required_model(session_type: &str, model: Option<&str>) -> std::io::Result<String> {
+    let invalid = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg);
+    let m = model.ok_or_else(|| {
+        invalid(format!("a {session_type} spawn must name its model explicitly"))
+    })?;
+    crate::models::validate_model(m).map_err(invalid)
+}
+
+/// How an agent conversation starts: fresh, continuing a transcript in
+/// place, or as an engine-native FORK of one (a new conversation whose
+/// history is copied from the source by the engine itself — the source
+/// is never touched and CM keeps no copy of its own).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Launch<'a> {
+    Fresh,
+    Resume(&'a str),
+    Fork(&'a str),
+}
+
+/// [`build_args`] with an explicit [`Launch`]. Forks:
+///
+/// - claude: `--resume <src> --fork-session --session-id <pin>`. The CLI
+///   accepts `--session-id` alongside `--resume` only with
+///   `--fork-session`, so the fork's transcript id is a daemon-minted pin
+///   (returned like a fresh spawn's) and the binding is exact from birth.
+///   Works across directories: the fork lands in the new cwd's project dir.
+/// - codex: the `fork` subcommand, shaped exactly like `resume` (SESSION_ID
+///   last, no permission flag); codex mints a new thread + rollout, which
+///   the detector / native relay bind.
+pub fn build_launch_args(
+    session_type: &str,
+    session_uid: &str,
+    workflow: Option<&WorkflowMeta>,
+    server_path_override: Option<&str>,
+    launch: Launch<'_>,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> std::io::Result<(String, Vec<String>, Option<String>)> {
+    let resume_session_id = match launch {
+        Launch::Resume(id) => Some(id),
+        _ => None,
+    };
     match session_type {
         "claude-code" => {
+            let model = required_model(session_type, model)?;
+            let effort = required_effort(session_type, effort)?;
             let cfg = write_claude_mcp_config(session_uid, workflow, server_path_override)?;
             let mut args = Vec::new();
             args.push("--dangerously-skip-permissions".to_string());
+            args.extend(crate::models::model_args(session_type, &model));
+            args.extend(crate::models::effort_args(session_type, &effort));
             args.push("--mcp-config".to_string());
             args.push(cfg.to_string_lossy().to_string());
             args.extend(crate::claude_channels::args(&cfg));
@@ -753,13 +897,22 @@ pub fn build_args(
             // Fresh spawns instead get a daemon-minted `--session-id` pin
             // (hyphenated: the CLI requires "a valid UUID"); never both
             // flags — a resume's identity IS the resumed id.
-            let pinned = match resume_session_id {
-                Some(sid) => {
+            let pinned = match launch {
+                Launch::Resume(sid) => {
                     args.push("--resume".to_string());
                     args.push(sid.to_string());
                     None
                 }
-                None => {
+                Launch::Fork(src) => {
+                    let pin = uuid::Uuid::new_v4().to_string();
+                    args.push("--resume".to_string());
+                    args.push(src.to_string());
+                    args.push("--fork-session".to_string());
+                    args.push("--session-id".to_string());
+                    args.push(pin.clone());
+                    Some(pin)
+                }
+                Launch::Fresh => {
                     let pin = uuid::Uuid::new_v4().to_string();
                     args.push("--session-id".to_string());
                     args.push(pin.clone());
@@ -769,6 +922,8 @@ pub fn build_args(
             Ok(("claude".to_string(), args, pinned))
         }
         "codex" => {
+            let model = required_model(session_type, model)?;
+            let effort = required_effort(session_type, effort)?;
             let mut args = Vec::new();
             // P0 S3 (resume): codex resumes via the `resume` SUBCOMMAND
             // (must be the first arg) with the SESSION_ID positional at the
@@ -778,12 +933,22 @@ pub fn build_args(
             // to rebind `transcript_path`.
             if resume_session_id.is_some() {
                 args.push("resume".into());
+            } else if matches!(launch, Launch::Fork(_)) {
+                // Same frontend shape as `resume`: a remote fork inherits
+                // the source thread's policy (or the host policy file).
+                args.push("fork".into());
             } else {
                 // The native launcher always uses Codex's remote frontend,
                 // including on a local CM host. Remote resumes reject CLI
                 // permission overrides and inherit the saved task's policy.
                 args.push("--dangerously-bypass-approvals-and-sandbox".into());
             }
+            args.extend(codex_screen_args(codex_inline_scrollback()));
+            // `native_codex.py::split_args` gives `-m` to the frontend and
+            // mirrors it as the backend's `model` default; the effort
+            // override goes to both sides the same way.
+            args.extend(crate::models::model_args(session_type, &model));
+            args.extend(crate::models::effort_args(session_type, &effort));
             // Same update-check disable the TUI applies — prevents
             // codex's popup from tearing down the PTY.
             args.push("-c".into());
@@ -795,7 +960,7 @@ pub fn build_args(
             args.push("-c".into());
             args.push("project_doc_max_bytes=262144".into());
             args.extend(codex_overrides(session_uid, workflow, server_path_override));
-            if let Some(sid) = resume_session_id {
+            if let Launch::Resume(sid) | Launch::Fork(sid) = launch {
                 args.push(sid.to_string());
             }
             // No pin for codex: `--session-id` is a claude flag; codex
@@ -1136,6 +1301,18 @@ mod tests {
             entry["timeout"].as_u64().is_some(),
             "hook must carry an explicit timeout"
         );
+        assert!(parsed["hooks"].get("UserPromptSubmit").is_none(), "partial old payload keeps Stop only");
+        std::fs::write(srv_dir.join("hooks/cm_state_hook.py"), "").unwrap();
+        let new_arg = claude_settings_hook_arg(Some(server.to_str().unwrap())).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&new_arg).unwrap();
+        assert_eq!(settings["hooks"]["Stop"][0]["hooks"][0]["timeout"], 15);
+        assert!(settings["hooks"]["Stop"][0]["hooks"][0].get("async").is_none());
+        for event in ["UserPromptSubmit", "StopFailure", "PermissionRequest", "Notification"] {
+            let hook = &settings["hooks"][event][0]["hooks"][0];
+            assert_eq!(hook["async"], true);
+            assert_eq!(hook["timeout"], 5);
+            assert!(hook["command"].as_str().unwrap().contains("hooks/cm_state_hook.py"));
+        }
     }
 
     #[test]
@@ -1173,7 +1350,7 @@ mod tests {
             "ts-hooky",
             None,
             Some(server.to_str().unwrap()),
-            None,
+            None, Some("test-model"), Some("xhigh"),
         )
         .expect("build_args");
         let pos = args
@@ -1570,6 +1747,69 @@ mod tests {
         );
     }
 
+    /// The proxy runs only for a session spawned with the flag, never for
+    /// the proxy's own backend (`CM_MCP_PROXY_CHILD`), never with the host
+    /// kill switch present, and never from a payload without the proxy.
+    #[test]
+    fn launcher_runs_server_behind_proxy_only_for_flagged_sessions() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = TempDir::new().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(home.join(".cm/mcp")).unwrap();
+        let dir = root.path().join("mcp_server");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("server.py"), "").unwrap();
+        std::fs::write(dir.join("mcp_proxy.py"), "").unwrap();
+        let py = root.path().join("python");
+        std::fs::write(&py, "#!/bin/sh
+if [ \"$1\" = \"-c\" ]; then exit 0; fi\necho \"$@\"\n").unwrap();
+        std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = root.path().join("launcher.sh");
+        let pairs = vec![(py.to_string_lossy().into_owned(),
+                          dir.join("server.py").to_string_lossy().into_owned())];
+        std::fs::write(&script, render_launcher_script(&pairs)).unwrap();
+        let run = |vars: &[(&str, &str)]| {
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.arg(&script).arg("server.py").env("HOME", &home)
+                .env_remove("CM_MCP_SERVER").env_remove("CM_MCP_PROXY_ENABLED")
+                .env_remove("CM_MCP_PROXY_CHILD");
+            for (k, v) in vars {
+                cmd.env(k, v);
+            }
+            let out = cmd.output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let direct = dir.join("server.py").display().to_string();
+        assert_eq!(run(&[]), direct);
+        assert_eq!(
+            run(&[("CM_MCP_PROXY_ENABLED", "1")]),
+            format!("{} -- {} server.py", dir.join("mcp_proxy.py").display(), script.display()),
+        );
+        assert_eq!(run(&[("CM_MCP_PROXY_ENABLED", "1"), ("CM_MCP_PROXY_CHILD", "1")]), direct);
+        std::fs::write(home.join(".cm/mcp/proxy.disabled"), "").unwrap();
+        assert_eq!(run(&[("CM_MCP_PROXY_ENABLED", "1")]), direct);
+        std::fs::remove_file(home.join(".cm/mcp/proxy.disabled")).unwrap();
+        std::fs::remove_file(dir.join("mcp_proxy.py")).unwrap();
+        assert_eq!(run(&[("CM_MCP_PROXY_ENABLED", "1")]), direct);
+    }
+
+    #[test]
+    fn mcp_proxy_flag_reads_the_hosts_daemon_toml() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("daemon.toml");
+        assert!(!mcp_proxy_from_toml(&path), "absent file = off");
+        std::fs::write(&path, "log_path = \"x\"\n").unwrap();
+        assert!(!mcp_proxy_from_toml(&path), "absent key = off");
+        std::fs::write(&path, "mcp_proxy = true\nlog_path = \"x\"\n[auth]\nmode = \"ssh-trust\"\n").unwrap();
+        assert!(mcp_proxy_from_toml(&path));
+        std::fs::write(&path, "mcp_proxy = \"yes\"\n").unwrap();
+        assert!(!mcp_proxy_from_toml(&path), "only a real bool enables it");
+        // The key is outside DaemonConfig's schema, which must keep loading.
+        std::fs::write(&path, "mcp_proxy = true\n").unwrap();
+        assert!(toml::from_str::<crate::config::DaemonConfig>("mcp_proxy = true\n").is_ok());
+    }
+
     #[test]
     fn launcher_native_codex_skips_override_without_asyncio_websockets() {
         use std::os::unix::fs::PermissionsExt;
@@ -1630,7 +1870,7 @@ mod tests {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
-        let (prog, args, _pin) = build_args("bash", "ts-bash-1", None, None, None).expect("ok");
+        let (prog, args, _pin) = build_args("bash", "ts-bash-1", None, None, None, Some("test-model"), Some("xhigh")).expect("ok");
         assert_eq!(prog, "/bin/bash");
         assert!(args.is_empty(), "bash spawns raw with no args");
     }
@@ -1640,7 +1880,7 @@ mod tests {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
-        let (prog, args, _pin) = build_args("claude-code", "ts-claude-1", None, None, None).expect("ok");
+        let (prog, args, _pin) = build_args("claude-code", "ts-claude-1", None, None, None, Some("test-model"), Some("xhigh")).expect("ok");
         assert_eq!(prog, "claude");
         assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
         let mcp_idx = args
@@ -1684,7 +1924,7 @@ mod tests {
         for transport in ["channel", "socket"] {
             std::fs::write(&preference, format!(r#"{{"transport":"{transport}"}}"#)).unwrap();
             for resume in [None, Some("saved-claude-session")] {
-                let (_, args, pin) = build_args("claude-code", "ts-channel-1", None, None, resume).unwrap();
+                let (_, args, pin) = build_args("claude-code", "ts-channel-1", None, None, resume, Some("test-model"), Some("xhigh")).unwrap();
                 let cfg = Path::new(&args[args.iter().position(|a| a == "--mcp-config").unwrap() + 1]);
                 let json: serde_json::Value = serde_json::from_slice(&std::fs::read(cfg).unwrap()).unwrap();
                 assert_eq!(json["mcpServers"]["claude-manager"]["env"]["CM_CLAUDE_CHANNEL"] == "1", transport == "channel");
@@ -1706,7 +1946,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
         let (prog, args, _pin) =
-            build_args("claude-code", "ts-rsm-1", None, None, Some("sid-abc")).expect("ok");
+            build_args("claude-code", "ts-rsm-1", None, None, Some("sid-abc"), Some("test-model"), Some("xhigh")).expect("ok");
         assert_eq!(prog, "claude");
         assert!(
             args.windows(2).any(|w| w[0] == "--resume" && w[1] == "sid-abc"),
@@ -1728,7 +1968,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
         let (prog, args, pin) =
-            build_args("claude-code", "ts-pin-1", None, None, None).expect("ok");
+            build_args("claude-code", "ts-pin-1", None, None, None, Some("test-model"), Some("xhigh")).expect("ok");
         assert_eq!(prog, "claude");
         let pin = pin.expect("fresh claude spawn must return the minted pin");
         assert!(
@@ -1748,11 +1988,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
         let (_p, codex_args, codex_pin) =
-            build_args("codex", "ts-pin-2", None, None, None).expect("ok");
+            build_args("codex", "ts-pin-2", None, None, None, Some("test-model"), Some("xhigh")).expect("ok");
         assert!(codex_pin.is_none());
         assert!(!codex_args.iter().any(|a| a == "--session-id"));
         let (_p2, bash_args, bash_pin) =
-            build_args("bash", "ts-pin-3", None, None, None).expect("ok");
+            build_args("bash", "ts-pin-3", None, None, None, Some("test-model"), Some("xhigh")).expect("ok");
         assert!(bash_pin.is_none() && bash_args.is_empty());
     }
 
@@ -1762,7 +2002,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
         let (prog, args, _pin) =
-            build_args("codex", "ts-rsm-2", None, None, Some("sid-xyz")).expect("ok");
+            build_args("codex", "ts-rsm-2", None, None, Some("sid-xyz"), Some("test-model"), Some("xhigh")).expect("ok");
         assert!(prog.ends_with("launcher.sh"));
         assert_eq!(args[0], "native_codex.py");
         assert_eq!(
@@ -1780,19 +2020,96 @@ mod tests {
         assert!(!args.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
     }
 
+    // ---- fork-into-a-task: engine-native fork argv ------------------
+
+    #[test]
+    fn build_launch_args_claude_fork_resumes_source_with_fork_and_new_pin() {
+        let _g = home_lock();
+        let dir = TempDir::new().unwrap();
+        let _h = HomeGuard::set(dir.path());
+        let (prog, args, pin) = build_launch_args(
+            "claude-code", "ts-fork-1", None, None, Launch::Fork("src-sid"), Some("test-model"), Some("xhigh"),
+        )
+        .expect("ok");
+        assert_eq!(prog, "claude");
+        let pin = pin.expect("a claude fork pins its NEW conversation id");
+        assert_ne!(pin, "src-sid", "the fork's identity must not be the source's");
+        assert_eq!(pin.len(), 36, "hyphenated uuid, got {:?}", pin);
+        let at = args.iter().position(|a| a == "--resume").expect("--resume present");
+        assert_eq!(
+            &args[at..at + 5],
+            &["--resume", "src-sid", "--fork-session", "--session-id", pin.as_str()],
+            "claude fork argv: {:?}",
+            args,
+        );
+        // MCP injection + hooks ride along exactly like a fresh spawn.
+        assert!(args.iter().any(|a| a == "--mcp-config"));
+        assert!(args.iter().any(|a| a == "--dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn build_launch_args_codex_fork_uses_fork_subcommand_and_trailing_source() {
+        let _g = home_lock();
+        let dir = TempDir::new().unwrap();
+        let _h = HomeGuard::set(dir.path());
+        let (prog, args, pin) = build_launch_args(
+            "codex", "ts-fork-2", None, None, Launch::Fork("src-thread"), Some("test-model"), Some("xhigh"),
+        )
+        .expect("ok");
+        assert!(prog.ends_with("launcher.sh"));
+        assert!(pin.is_none(), "codex fork identity is bound post-spawn");
+        let dash = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(args[dash + 1], "fork", "fork is the first engine argument: {:?}", args);
+        assert_eq!(args.last().map(String::as_str), Some("src-thread"));
+        assert!(!args.iter().any(|a| a == "resume"));
+        assert!(!args.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+        assert!(args.iter().any(|a| a.contains("ts-fork-2")), "MCP env carries the NEW uid");
+    }
+
+    #[test]
+    fn build_args_matches_launch_variants() {
+        let _g = home_lock();
+        let dir = TempDir::new().unwrap();
+        let _h = HomeGuard::set(dir.path());
+        let (_, resumed, _) = build_args("codex", "ts-v-1", None, None, Some("x"), Some("test-model"), Some("xhigh")).unwrap();
+        let (_, launched, _) =
+            build_launch_args("codex", "ts-v-1", None, None, Launch::Resume("x"), Some("test-model"), Some("xhigh")).unwrap();
+        assert_eq!(resumed, launched);
+    }
+
+    #[test]
+    fn build_args_codex_launches_inline_for_scrollback_fresh_and_resume() {
+        let _g = home_lock();
+        let dir = TempDir::new().unwrap();
+        let _h = HomeGuard::set(dir.path());
+        for resume in [None, Some("sid-inline")] {
+            let (_p, args, _pin) = build_args("codex", "ts-inl-1", None, None, resume, Some("test-model"), Some("xhigh")).expect("ok");
+            let engine = &args[args.iter().position(|a| a == "--").unwrap() + 1..];
+            let flag = engine.iter().position(|a| a == "--no-alt-screen");
+            assert!(flag.is_some(), "codex must launch inline (scrollback): {:?}", engine);
+            if let Some(sid) = resume {
+                assert_eq!(engine.last().map(String::as_str), Some(sid));
+                assert!(flag.unwrap() < engine.len() - 1, "flag precedes the resume id");
+            }
+        }
+        // The off switch (daemon.toml codex_inline_scrollback = false).
+        assert!(codex_screen_args(false).is_empty());
+        assert_eq!(codex_screen_args(true), vec!["--no-alt-screen".to_string()]);
+    }
+
     #[test]
     fn build_args_no_resume_omits_resume_tokens() {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
         let (_p, claude, _pin) =
-            build_args("claude-code", "ts-nr-1", None, None, None).expect("ok");
+            build_args("claude-code", "ts-nr-1", None, None, None, Some("test-model"), Some("xhigh")).expect("ok");
         assert!(
             !claude.iter().any(|a| a == "--resume"),
             "no `--resume` when not resuming: {:?}",
             claude,
         );
-        let (_p2, codex, _pin) = build_args("codex", "ts-nr-2", None, None, None).expect("ok");
+        let (_p2, codex, _pin) = build_args("codex", "ts-nr-2", None, None, None, Some("test-model"), Some("xhigh")).expect("ok");
         assert_ne!(
             codex.first().map(String::as_str),
             Some("resume"),
@@ -1806,7 +2123,7 @@ mod tests {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
-        let (prog, args, _pin) = build_args("codex", "ts-codex-1", None, None, None).expect("ok");
+        let (prog, args, _pin) = build_args("codex", "ts-codex-1", None, None, None, Some("test-model"), Some("xhigh")).expect("ok");
         assert!(prog.ends_with("launcher.sh"));
         assert_eq!(args[0], "native_codex.py");
         assert!(
@@ -1897,7 +2214,7 @@ mod tests {
         let _h = HomeGuard::set(dir.path());
         let meta = WorkflowMeta { run_id: "wf_42", role: "reviewer" };
         let (_prog, args, _pin) =
-            build_args("claude-code", "ts-wf-1", Some(&meta), None, None).expect("ok");
+            build_args("claude-code", "ts-wf-1", Some(&meta), None, None, Some("test-model"), Some("xhigh")).expect("ok");
         let mcp_idx = args
             .iter()
             .position(|a| a == "--mcp-config")
@@ -1986,7 +2303,7 @@ mod tests {
         let _h = HomeGuard::set(dir.path());
         let meta = WorkflowMeta { run_id: "wf_99", role: "manager" };
         let (_prog, args, _pin) =
-            build_args("codex", "ts-wf-codex", Some(&meta), None, None).expect("ok");
+            build_args("codex", "ts-wf-codex", Some(&meta), None, None, Some("test-model"), Some("xhigh")).expect("ok");
         assert!(
             args.iter().any(|a| a.contains("CM_WORKFLOW_RUN_ID=\"wf_99\"")),
             "codex overrides must register the run id in the MCP env: {:?}",
@@ -2013,7 +2330,7 @@ mod tests {
         let _g = home_lock();
         let dir = TempDir::new().unwrap();
         let _h = HomeGuard::set(dir.path());
-        let err = build_args("gcloud", "ts-x", None, None, None).expect_err("must reject");
+        let err = build_args("gcloud", "ts-x", None, None, None, Some("test-model"), Some("xhigh")).expect_err("must reject");
         assert!(
             err.to_string().contains("claude-code | codex | bash"),
             "error must list supported types: {}",

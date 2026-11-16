@@ -129,6 +129,68 @@ class _MonitorEnv(unittest.TestCase):
 
 
 class RegisterAndFireTests(_MonitorEnv):
+    def test_launch_finished_before_confirmation_still_fires(self):
+        from mcp_server.server import start_session
+
+        def call(method, params=None, **kw):
+            if method == "mcp_start_session":
+                return {"session_uid": self.WORKER, "prompt_source": "caller",
+                        "prompt_delivery": {"id": "launch", "status": "pending", "submitted": False}}
+            result = self._fake_call(method, params, **kw)
+            if method == "resolve_authorized_session":
+                result["prompt_delivery"] = {"id": "launch", "status": "confirmed", "submitted": True}
+            return result
+
+        async def scenario():
+            result = await start_session("claude-code", "fast worker", prompt="go")
+            rec = async_monitor._MONITORS[result["monitor"]["monitor_id"]]
+            await asyncio.wait_for(rec["task"], 5)
+            return rec
+
+        with mock.patch.object(control_client, "call", side_effect=call), mock.patch.object(
+            control_client, "resolve_socket_route",
+            return_value=control_client.SocketRoute(path=None, chose_daemon=True),
+        ):
+            rec = asyncio.run(scenario())
+        self.assertEqual(rec["state"], "delivered")
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("WORKER DONE: 42", self.sent[0]["text"])
+
+    def test_unconfirmed_launch_wakes_with_uncertainty_not_completion(self):
+        from mcp_server.server import start_session
+
+        def call(method, params=None, **kw):
+            if method == "mcp_start_session":
+                return {"session_uid": self.WORKER, "prompt_source": "caller",
+                        "prompt_delivery": {"id": "launch", "status": "pending", "submitted": False}}
+            result = self._fake_call(method, params, **kw)
+            if method == "resolve_authorized_session":
+                result["prompt_delivery"] = {"id": "launch", "status": "unconfirmed",
+                                             "submitted": False, "reason": "no_engine_turn"}
+            return result
+
+        async def scenario():
+            result = await start_session("claude-code", "worker", prompt="go")
+            self.assertNotIn("submitted", result)
+            rec = async_monitor._MONITORS[result["monitor"]["monitor_id"]]
+            await asyncio.wait_for(rec["task"], 5)
+            return rec
+
+        with mock.patch.object(control_client, "call", side_effect=call), mock.patch.object(
+            control_client, "resolve_socket_route",
+            return_value=control_client.SocketRoute(path=None, chose_daemon=True),
+        ), mock.patch.object(async_monitor, "_monitor_sessions") as completion:
+            rec = asyncio.run(scenario())
+        completion.assert_not_called()
+        self.assertEqual(rec["state"], "delivered")
+        self.assertFalse(rec["result"]["submitted"])
+        self.assertEqual(rec["result"]["completed"], [])
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("submission unconfirmed", self.sent[0]["text"])
+        self.assertIn("before re-sending", self.sent[0]["text"])
+        self.assertNotIn("finished its initial prompt", self.sent[0]["text"])
+        self.assertNotIn("WORKER DONE", self.sent[0]["text"])
+
     def test_fire_delivers_marker_and_reply_to_caller(self):
         async def scenario():
             # edge=False: the scaffold's worker is ALREADY finished, and
@@ -595,6 +657,41 @@ if __name__ == "__main__":
 
 
 class DurableMonitorTests(_MonitorEnv):
+    def test_path_registration_is_persisted_as_a_string(self):
+        async def scenario():
+            reg = async_monitor.register_monitor(
+                [self.WORKER], edge=False,
+                launch_receipt={"status": "pending", "submitted": None},
+                launch_socket_path=Path("/tmp/cm-daemon.sock"),
+            )
+            persisted = async_monitor.monitor_state.read()["producers"][
+                async_monitor.monitor_state.PRODUCER_ID
+            ]["records"][reg["monitor_id"]]
+            self.assertEqual(persisted["launch_socket_path"], "/tmp/cm-daemon.sock")
+            async_monitor._MONITORS[reg["monitor_id"]]["task"].cancel()
+            await asyncio.sleep(0)
+
+        asyncio.run(scenario())
+
+    def test_send_input_rewrites_existing_path_record_and_keeps_receipt(self):
+        from mcp_server.server import send_input
+
+        async def scenario():
+            old = async_monitor.register_monitor(
+                [self.WORKER], edge=False,
+                launch_socket_path=Path("/tmp/old-daemon.sock"),
+            )
+            async_monitor._MONITORS[old["monitor_id"]]["task"].cancel()
+            await asyncio.sleep(0)
+            result = await send_input(self.WORKER, "go")
+            new = result.get("monitor", {})
+            self.assertEqual(result.get("ok"), True)
+            self.assertEqual(new.get("monitor_id") is not None, True)
+            async_monitor._MONITORS[new["monitor_id"]]["task"].cancel()
+            await asyncio.sleep(0)
+
+        asyncio.run(scenario())
+
     def test_tracking_failure_prevents_registering_or_sending(self):
         async def scenario():
             with mock.patch.object(async_monitor, "persist_state", side_effect=OSError("disk full")):
@@ -603,6 +700,16 @@ class DurableMonitorTests(_MonitorEnv):
             self.assertEqual(async_monitor._MONITORS, {})
         asyncio.run(scenario())
         self.assertEqual(self.sent, [])
+
+    def test_type_error_persistence_is_a_clean_registration_error(self):
+        async def scenario():
+            with mock.patch.object(async_monitor, "persist_state", side_effect=TypeError("Path")):
+                with self.assertRaises(async_monitor.RegistrationError) as caught:
+                    async_monitor.register_monitor([self.WORKER], edge=False)
+            self.assertEqual(caught.exception.code, "tracking_failed")
+            self.assertEqual(async_monitor._MONITORS, {})
+
+        asyncio.run(scenario())
 
     def test_tracking_failure_before_delivery_prevents_queued_input(self):
         real_publish = async_monitor.persist_state

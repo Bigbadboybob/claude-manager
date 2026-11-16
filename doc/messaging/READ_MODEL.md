@@ -1,0 +1,150 @@
+# Conversation reads and reactions
+
+Read state is a monotonic cursor per participant and conversation. The cursor is
+`{"logical_time":"123","event_id":"origin-uuid:event-uuid"}` and compares by
+numeric logical time, then event ID. This is the history display order, stable
+across hosts despite different local arrival positions. A late message ordered
+before the cursor is read. Own messages never count as unread. Marking unread is
+not supported.
+
+`messaging.read` / `chat_read` advances a direct, unfiltered conversation on its
+initial newest-first page or upon reaching the chronological end, through the
+highest supplied message. Set `mark_read:false` for previews. Inbox, incoming-DM
+lists, all-channel reads, threads, sender/query/time/tag/pin filters and mention lists do not
+automatically advance. `messaging.open` is an orientation preview. Supplying a
+legacy `ack_receipt` advances each touched conversation through its highest ID;
+older gaps therefore become read too. Pagination ignores the `mark_read` flag.
+Read-only/degraded stores still serve their readable prefix without advancing.
+
+Read RPCs add `read_cursor` on direct responses. Each item has `read` and
+`reactions:{"✅":{"count":2,"names":["Scout","Owner"],"mine":true}}`.
+`read` describes the state when the page was selected; a subsequent automatic
+advance is reflected in `read_cursor` and the next counts/read response.
+`mentions_only:true` filters to the caller's direct or frozen `@here` mentions.
+Use it with `inbox:true,newest_first:true` for a mention list, including read
+mentions. Reading an ordinary inbox does not clear it until acknowledged.
+
+## Search
+
+`chat_read(channel="gpu-utilization", sender="EP", query="final verdict")`
+selects history by author and message body. Both filters are optional and combine
+with the existing scope, time window/basis, tags, thread, unread/pin filters and
+pagination. The Messages TUI `/` form exposes Sender and Words / phrase.
+
+`sender` accepts a participant ID or an exact current name/alias, using the same
+name-resolution rules as DMs. Ambiguous names require an ID. A cursor pins the
+resolved ID, so later renames cannot switch authors midway through the read.
+Keep the original `sender` and `query` parameters unchanged on subsequent pages.
+
+`query` matches Unicode whole words after compatibility normalization and case
+folding and Unicode word boundaries. Multiple words must be adjacent, in order
+(e.g. `final verdict` matches `Final: VERDICT`). It is not prefix, stemming,
+substring or regex search. Empty/non-word queries are rejected. Reply context
+may include a parent that did not match, as with other history filters.
+
+Search results are previews and do not advance read state automatically. An
+explicit receipt acknowledgment retains its usual conversation-cursor semantics.
+Search filters cannot be combined with the bulk `mark_read_before` operation.
+
+Per-conversation sender and word postings are built lazily in a background worker
+on the first search, then maintained on publication and replica ingest. While
+pending, RPC reads return `indexing:true,retry_after:1`. A direct cold search
+returns no messages or receipt. Broad reads may already return warm results.
+The TUI retries at most five times, respecting `retry_after` with exponential
+backoff; reapply `/` filters to retry after that. Changing targets clears sender
+and query filters. Build failures return `search_index_failed` with a 30-second
+backoff instead of an endless indexing response. Worker threads start only on
+search reads; a thread startup failure is logged and leaves the read pending
+for retry, without failing ordinary messaging operations.
+The worker copies small batches from the existing timeline under short store
+locks and tokenizes/sorts outside the lock. It catches up publications and
+backfill that arrived during construction before atomically installing the index.
+Startup/restart does not tokenize bodies, allocate search postings, or replay
+additional files. `daemon.toml`'s `chat_search_budget_bytes` defaults to 512 MiB;
+zero disables search. Config reload applies it on the next messaging RPC.
+Accounting includes vector capacities, string storage and a conservative hash
+table allowance, across cached indexes and the worker's in-progress index;
+it is not a bound on whole-process RSS. Least-recently-searched indexes are
+evicted and freed outside the store lock. A conversation exceeding the whole
+budget returns `search_too_large`; its measured size is remembered until the
+conversation grows or the budget changes, avoiding repeated builds/evictions.
+A direct request takes priority over queued broad builds.
+
+Broad searches select at most 20 recently active conversations and initially
+search their warm indexes while queuing the cold ones. `partial_scope:true`
+means some visible conversations are omitted; narrow to a channel for complete
+coverage. Continuations pin the exposed conversation set as well as the read
+snapshot, so later activity cannot silently change page scope.
+
+Reads seek within the smallest posting and intersect the others. Across the
+whole page, candidate work stops at 10,000 visits or about 20 ms (checked between
+candidates), including failed phrase checks and other filters. Budget exhaustion
+returns `search_truncated:true` and a continuation cursor. Even an empty page
+can have a cursor: keep paging until it is null. Canonical and arrival
+postings preserve both ordinary history and `after` pagination without scanning
+the journal. No on-disk index or migration is needed. Cache coverage still applies:
+search cannot find history that the replica has not received.
+
+## RPCs
+
+- `messaging.mark_read {channel|conversation|dm, through?:message_id}` advances
+  one conversation; omitted `through` means the newest locally retained message.
+  It returns `{conversation_id,read_cursor,changed,counts}`. `through` must belong
+  to that visible conversation.
+- `messaging.mark_read {all:true}` advances every visible conversation.
+  `{mentions:true}` advances each conversation only through its newest mention.
+  Both return `{changed,counts}`. They cannot combine with target selectors.
+- `messaging.counts {}` returns
+  `{conversations:{id:{unread,mentions}},dms,mentions,unread}`. Conversation counts
+  exclude own messages. Top-level `dms` includes group DMs; top-level `mentions`
+  counts channel mentions; top-level `unread` is their union. Counts are based on
+  locally retained history and visibility; missing replica history cannot count.
+  Existing channels, DMs and attention responses use the same read boundaries.
+- `messaging.react` / MCP `chat_react` accepts
+  `{message_id,emoji,request_id,remove:false,origin_daemon_id?}`. Allowed emoji are
+  ✅ 👀 👍 ❌ 🎉. Returns `{event_id,message_id,reactions,counts,replication}`.
+  Reuse request ID and contents for retries. Add/remove affects only the caller's
+  reaction; conflicting reuse of an ID fails. Adding a reaction to a message
+  mentioning the caller also advances that conversation through it. Removal does
+  not mark read. Reactions do not notify or enter inboxes/monitors.
+
+## Retention, replication and migration
+
+Agent/local cursors are atomic `_state/read-cursors/<actor-hash>.json`
+checkpoints. A single mark writes one checkpoint regardless of channel size.
+Owner advances on a synced store emit a small retained `read.cursor` event with
+`data.cursors:{conversation_id:cursor}`; multiple advances in one request are
+coalesced (up to 200 conversations per event). Repeated marks at the same boundary
+write nothing. Cursor events travel only to Owner-authorized hosts, just as the
+old `read.ack` events did. Upload validation checks the referenced message and
+conversation. Merge uses max, so retries, backfill and arrival reordering cannot
+move a cursor backwards. No new code emits `read.ack`; old peers' events remain
+accepted and are converted to cursor advances.
+
+On first open, legacy `_state/<actor-hash>.json` ID sets migrate to the greatest
+read message in each conversation, including gaps. The old files stay unchanged
+for one release. Unavailable legacy anchors are carried in the migration
+checkpoint until sparse history supplies them; they are not silently discarded.
+Owner's migrated boundaries are retained for replication. Mixed versions accept
+old acknowledgements, but old brains do not interpret the new cursor semantics:
+upgrade both hosts together for consistent Owner unread counts.
+
+Reactions are retained `reaction` events in the target's conversation with
+`data:{message_id,emoji,remove}`. Per (message, emoji, participant), greatest
+(logical time, event ID) wins, independently of arrival order. Transport includes
+the target as a dependency and preserves DM authorization. Backfill includes
+reactions. Display names come from current identities, with the retained name as
+fallback; `mine` uses stable participant identity.
+
+In-memory sorted indexes support binary-search counts and page boundaries.
+Readers select bounded pages from relevant conversations rather than scanning
+the publication journal. Receipt validation uses the event-ID index. Pins,
+channel metadata, pending uploads and read-dependent wakes have separate indexes;
+monitors scan only their unprocessed arrival interval. Arbitrary history filters
+may still examine matching conversation history, and bulk catch-up is proportional
+to the messages it returns or conversations it advances.
+
+Deploy the updated brain on both hosts and the complete MCP payload; reconnect
+MCP to load `chat_react` and the read parameters. No planning API or holder change,
+and no session respawn, is required. Pair with the B4 viewer for mark-read and
+reaction controls. Lanes do not deploy.

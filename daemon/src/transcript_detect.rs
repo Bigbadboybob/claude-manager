@@ -1101,6 +1101,11 @@ fn run_detector(
         };
         if let Some((id, path)) = detected {
             let path_str = path.to_string_lossy().into_owned();
+            let recovery_gate = crate::claude_recovery::lifecycle_gate(&session_uid);
+            let _recovery_read = recovery_gate.read().unwrap_or_else(|p| p.into_inner());
+            if crate::claude_recovery::admission_refusal(&session_uid).is_some() {
+                return DetectorOutcome::SessionGone;
+            }
             let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
             // Sub-2b-3 review-3 #1: claim check held under the
             // same state lock as the write. If any OTHER live

@@ -92,9 +92,29 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "messaging.open", "messaging.read", "messaging.send", "messaging.sync",
     "messaging.dms", "messaging.people", "messaging.channels", "messaging.pins", "session.set_name",
     "messaging.norms", "messaging.monitor", "messaging.monitors", "messaging.follow",
-    "ping",
+    "messaging.availability", "messaging.attention",
+    "messaging.counts", "messaging.mark_read", "messaging.react",
+    "ping", "staffing.get", "staffing.set", "session.roster",
     "notify_user",
     "owner_attention.ack",
+    # Owner-only surfaces (TUI / web board), daemon-routed for correctness.
+    # No MCP tool calls them, and dispatch rejects Session callers: the
+    # first three require the Operator, owner.board_token the strong one.
+    "owner_attention.list", "owner.notifications.next", "session.viewed",
+    "owner.board_token",
+    # #24: an agent's own transcript rotation request (and its status).
+    "session.rotate_transcript",
+    "session.handoff",
+    "session.handoff_cancel",
+    # Operator-only bulk handoff (#25): listed so the method sets match the
+    # dispatcher; the daemon refuses Session callers.
+    "session.handoff_many",
+    # One key to one or more sessions, for direct daemon clients. The MCP
+    # tool calls `send_key` (TUI-routed, like send_input).
+    "session.send_key",
+    "session.send_bound_escape",
+    "session.interrupt",
+    "session.interrupt_authority",
     "sidebar.list",
     "sidebar.assign",
     "sidebar.publish",
@@ -114,11 +134,17 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "task.register_agent_subtask",
     "session.revive",
     "session.resume",  # Alias of add_session; same Operator gate.
+    # Explicit, caller-selected Claude account-limit recovery and its
+    # read-only outcome census.  Both are daemon-routed so the journal fence
+    # and per-target session authority stay on the owning host.
+    "session.resume_many",
+    "session.resume_status",
     # Operator-only daemon lifecycle/configuration RPCs. Routing does not
     # grant access: the daemon retains each method's authorization gates.
     "daemon.health",
     "daemon.reload_config",
     "daemon.drain",
+    "daemon.maintenance",
     "daemon.restart",
     "daemon.rollback_brain",
     "daemon.migrate_split",
@@ -131,6 +157,7 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # Session-caller self-target; feeds `semantic_idle` in
     # resolve_authorized_session. No TUI handler — always daemon-routed.
     "session.turn_ended",
+    "session.agent_report",
     # PTY resize (TIOCSWINSZ). Operator-only, TUI-called over the daemon
     # socket on (re)attach; no MCP tool routes it. Listed for dispatch-
     # surface alignment only.
@@ -142,6 +169,17 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # index issues. No MCP tool routes it. Listed for dispatch-surface
     # alignment only.
     "continuous.dispatch_pending",
+    "org.team_mark_continuous", "org.continuous_status",
+    "session_wake_schedule", "session_wake_schedules",
+    # Operator-only: create/repair a continuous task's `ct/<slug>` channel
+    # (migration scripts). Listed for dispatch-surface alignment only.
+    "continuous.ensure_channel",
+    # Operator-only shared Owner-attention gate for evaluators outside the
+    # daemon (work-item board). No MCP tool routes them. Alignment only.
+    "owner_attention.escalate", "owner_attention.withdraw",
+    # Operator-only kitty-graphics file read for TUI panes. No MCP tool
+    # routes it. Listed for dispatch-surface alignment only.
+    "graphics.read_file",
     # Operator-only grant of global session permissions (TUI A-e toggle →
     # this RPC). No MCP tool routes it — an agent escalates via
     # start_session(global_perms=true), not this. Listed for dispatch-surface
@@ -154,6 +192,10 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "session.set_workflow_context",
     "propose_task",
     "mcp_start_session",
+    # Fork into new task (`fork_session` tool + the TUI's A-F action):
+    # mints a subtask + worktree and spawns the engine-native fork. Daemon-
+    # owned on every host (there is no TUI handler), like mcp_start_session.
+    "session.fork",
     # Headless-capable subtask status PATCH. Unlike its create_subtask /
     # list_subtasks / mark_subtask_done siblings (TUI-served on a laptop —
     # see DAEMON_DISPATCHED_BUT_TUI_ROUTED), there is NO TUI handler, so it
@@ -168,6 +210,9 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # cli-routed PlanningClient is unavailable and the field set is more than
     # just `status`.
     "update_task",
+    # Read-only descendant-scope answer for the caller (no TUI handler):
+    # server.py's direct-API update_task asks it before a reparent.
+    "task.scope_check",
     # Headless planning READS — daemon serves these (it holds the planning-API
     # creds) so a daemon-spawned agent can inspect the board / its own task
     # when the cli-routed PlanningClient isn't installed. The server.py tools
@@ -182,6 +227,8 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "get_initiative",
     "propose_initiative",
     "propose_initiative_project",
+    # Org hierarchy: reporting-line views + set_lead on the caller's task.
+    "org",
     # 10d-2b: workflow_transition / workflow_done flip from
     # MCP-server-side `_append_event` (direct events.jsonl
     # write) to daemon-side writers via 10d-2a's
@@ -262,6 +309,7 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "continuous.create",
     "continuous.update",
     "continuous.list",
+    "continuous.dashboard",
     "continuous.drain",
     "continuous.migration_preview",
     "continuous.reconcile",
@@ -270,6 +318,7 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "continuous.context",
     "continuous.ack_drain",
     "continuous.checkpoint_drain",
+    "continuous.self_clear_hold",
     "continuous.pause",
     "continuous.run_now",
     "continuous.delete",
@@ -296,6 +345,10 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # shared transport between producers and the consuming task.
     "enqueue",
     "queue.stats",
+    "queue.list",
+    "queue.bind",
+    "queue.claim",
+    "queue.ack",
     # Cloud auto-backtest: `backtest.submit` lands a kind='backtest' planning
     # row via the daemon's planning creds (propose_task-like openness: any
     # bound session may submit; the dispatcher gates execution), and
@@ -305,6 +358,55 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # daemon-routed under a daemon pin.
     "backtest.submit",
     "backtest.result",
+    # Work items and boards (doc/items-board.md): daemon-only proxies to the
+    # planning API. The daemon stamps the caller as actor and resolves holder
+    # names; there is no TUI handler and no PlanningClient fallback.
+    "item.create",
+    "item.read",
+    # Org model S3 (doc/org-model.md §7): placement, groups, epics, on-boards.
+    "item.place",
+    "item.unplace",
+    "group.create",
+    "group.set",
+    "boards.on_boards",
+    "epic.set_poc",
+    "epic.staff",
+    "epic.close_plan",
+    "epic.close_apply",
+    "board.join",
+    "board.leave",
+    "board.remove_member",
+    # #28: spawn-time setup of a session the caller spawned.
+    "session.setup",
+    "item.set",
+    "item.resolve",
+    "board.read",
+    "board.settings",
+    "board.owner_blocked",
+    # Org model S2 (doc/org-core-api.md): daemon-only proxies to /org.
+    "org.snapshot",
+    "org.member",
+    "org.team",
+    "org.roster",
+    "org.roster_apply",
+    "org.adopt",
+    "org.team_create",
+    "org.team_update",
+    "org.move",
+    "org.retire",
+    "org.reinstate",
+    "org.close_assistant",
+    "org.promote",
+    "org.rebind_main",
+    "org.hire",
+    "org.member_update",
+    # Gate receipts on items (doc/gate-receipts.md): same daemon-only proxy.
+    "gate.report",
+    "gate.receipts",
+    "gate.waive",
+    "gate.profile",
+    # Usage recording (doc/usage-recording.md): read this host's samples.
+    "usage.read",
 })
 
 
@@ -326,6 +428,11 @@ DAEMON_METHODS: frozenset[str] = frozenset({
 # route there.
 DAEMON_DISPATCHED_BUT_TUI_ROUTED: frozenset[str] = frozenset({
     "send_input",
+    # Same routing as send_input: the laptop TUI holds every session it
+    # shows (local and remote) and writes the key through its own terminal,
+    # in that terminal's keyboard mode; a headless host pins CM_TUI_SOCKET
+    # to its daemon, which serves `send_key` too (daemon/src/control/send_key.rs).
+    "send_key",
     # Subtask CRUD: daemon-dispatched (API-backed, so headless orchestrators
     # work — CM_TUI_SOCKET is pinned to daemon.sock on a headless host), but
     # the TUI ALSO serves them on a laptop (it owns the task tree there), so

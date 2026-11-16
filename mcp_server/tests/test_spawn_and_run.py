@@ -20,6 +20,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from mcp_server import control_client
 from mcp_server import server as srv
@@ -144,6 +145,47 @@ class _SpawnStubMixin:
 
 
 class StartSessionWaitTests(_SpawnStubMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_monitor_persistence_error_preserves_accepted_spawn_receipt(self):
+        receipt = {"status": "confirmed", "submitted": True, "turn_seq_before": 3}
+
+        def _call(method, params, *a, **k):
+            if method == "mcp_start_session":
+                return {
+                    "session_uid": "ts-spawn-err", "prompt_source": "caller",
+                    "prompt_delivery": receipt,
+                }
+            if method == "resolve_authorized_session":
+                return {"state": "ready", "idle": False, "engine": "claude-code",
+                        "transcript_path": None, "generation": 0}
+            raise AssertionError(f"unexpected method {method}")
+
+        control_client.call = _call
+        with mock.patch.dict("os.environ", {"CM_TUI_SESSION_ID": "ts-caller"}), mock.patch.object(
+            srv.async_monitor, "persist_state", side_effect=TypeError("Path")
+        ):
+            res = await start_session("claude-code", "worker", prompt="go")
+        self.assertIs(res["prompt_delivery"], receipt)
+        self.assertTrue(res["submitted"])
+        self.assertEqual(res["monitor"]["error"], "tracking_failed")
+
+    async def test_staffing_omits_type_and_forwards_work_kind_and_note(self):
+        def _call(method, params, *a, **k):
+            self.assertEqual(method, "mcp_start_session")
+            self.assertNotIn("type", params)
+            self.assertEqual(params["work_kind"], "math")
+            return {"session_uid": "ts-policy", "session_type": "codex", "staffing_version": 4,
+                    "staffing_note": "Policy note"}
+        control_client.call = _call
+        res = await start_session(label="math-worker", work_kind="math")
+        self.assertEqual(res["staffing_note"], "Policy note")
+        self.assertEqual(res["staffing_version"], 4)
+
+    async def test_staffing_missing_label_is_rejected_before_isolation(self):
+        def _call(*a, **k):
+            self.fail("missing label must not mint a task or session")
+        control_client.call = _call
+        self.assertEqual((await start_session(isolated=True))["error"], "invalid_params")
+
     async def test_wait_false_unchanged(self):
         # The default path must return exactly {"session_uid": ...} and never
         # touch resolve_authorized_session.
@@ -192,25 +234,16 @@ class StartSessionWaitTests(_SpawnStubMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res["status"], "awaiting_input")
         self.assertEqual(res["last_message"]["content"], "ALL DONE")
 
-    async def test_wait_bash_transcriptless_returns_null_message(self):
-        # A bash session never binds a transcript; wait must return after the
-        # pending-idle grace with last_message=None (not hang to timeout).
-        def _call(method, params, *a, **k):
-            if method == "mcp_start_session":
-                return {"session_uid": "ts-bash-0"}
-            return _pending(None)  # forever pending+quiet
-
-        control_client.call = _call
-        res = await start_session(
-            "bash", "sh", prompt="echo hi", wait=True,
-            poll_interval_s=0.02, pending_idle_grace_s=0.2, timeout_s=30,
-        )
+    async def test_wait_bash_returns_after_pty_quiet_without_a_reply(self):
+        def call(method, params=None, **kwargs):
+            if method in ("mcp_start_session", "start_session"):
+                return {"session_uid": "ts-shell", "session_type": "bash"}
+            return {"engine": "bash", "state": "pending", "idle": True}
+        control_client.call = call
+        res = await start_session("bash", "sh", prompt="echo hi", wait=True)
         self.assertTrue(res["completed"])
+        self.assertEqual(res["kind"], "shell")
         self.assertIsNone(res["last_message"])
-        self.assertEqual(res["status"], "starting")
-        self.assertEqual(res["session_uid"], "ts-bash-0")
-        # P1: the transcript-less read dead-end is now explained, not silent.
-        self.assertEqual(res["note"], _NO_TRANSCRIPT_NOTE)
 
 
 # ── Structured output ──────────────────────────────────────────────────

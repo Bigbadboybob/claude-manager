@@ -37,10 +37,13 @@ fn pane_cell_pixels(graphics: bool) -> (u16, u16) {
         .unwrap_or((1, 1))
 }
 
-/// Proxy that forwards alacritty terminal events to a channel.
+/// Proxy that forwards alacritty terminal events to a channel. Clones share
+/// the target, so [`Self::retarget`] moves a `Term`'s events (title, bell,
+/// query replies) to a new session's channel when a resumed stream adopts
+/// that `Term`.
 #[derive(Clone)]
 pub struct EventProxy {
-    tx: mpsc::Sender<TermEvent>,
+    tx: Arc<std::sync::Mutex<mpsc::Sender<TermEvent>>>,
 }
 
 impl EventProxy {
@@ -49,14 +52,29 @@ impl EventProxy {
     /// equivalent EventProxies without exposing the private `tx`
     /// field across modules.
     pub fn new(tx: mpsc::Sender<TermEvent>) -> Self {
-        Self { tx }
+        Self { tx: Arc::new(std::sync::Mutex::new(tx)) }
+    }
+
+    /// Send this proxy's events, and every clone's, to `tx` from now on.
+    pub fn retarget(&self, tx: mpsc::Sender<TermEvent>) {
+        *self.tx.lock().unwrap_or_else(|p| p.into_inner()) = tx;
     }
 }
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: TermEvent) {
-        let _ = self.tx.send(event);
+        let _ = self.tx.lock().unwrap_or_else(|p| p.into_inner()).send(event);
     }
+}
+
+/// Agent TUIs that rebuild their whole screen on a resize (SIGWINCH). A
+/// reattach replays only the daemon's bounded byte tail, which starts
+/// mid-frame; these engines then draw incremental updates over a screen the
+/// viewer never saw (Claude Code's prompt box, status line and agent list
+/// stayed missing or mangled). A resize pulse makes them repaint. Shells
+/// cannot recreate their output, so they are never pulsed.
+pub fn repaints_on_resize(session_type: &str) -> bool {
+    matches!(session_type, "codex" | "claude" | "claude-code")
 }
 
 /// A terminal session wrapping alacritty's Term + PTY + EventLoop.
@@ -90,6 +108,15 @@ pub struct Session {
     /// — without this, dropping the session would just close the
     /// attach socket while the daemon's session keeps running.
     pub daemon_session_uid: Option<String>,
+    /// The model a daemon spawn's argv named (`ClientSessionConfig::model`);
+    /// `None` for bash, local PTYs and plain re-attaches. TerminalSession
+    /// constructors record it so revive / restart reuse it.
+    pub spawn_model: Option<String>,
+    /// Where `spawn_model` came from.
+    pub spawn_model_source: Option<String>,
+    /// The reasoning effort the session was spawned with, and its source.
+    pub spawn_effort: Option<String>,
+    pub spawn_effort_source: Option<String>,
     /// Latched `memory_cap_kill` flag for daemon-attached
     /// sessions (slice 10c-e-3b-fix4b). The attach-stream reader
     /// half stores `true` here when the daemon's `End` frame
@@ -133,9 +160,24 @@ pub struct Session {
     /// for daemon-attached sessions; `None` for local-PTY sessions. See
     /// [`Self::attach_socket_hung_up`].
     pub attach_hup_fd: Option<std::os::fd::OwnedFd>,
+    /// Present only when the daemon acknowledged attach heartbeats.
+    pub attach_progress: Option<std::sync::Arc<std::sync::Mutex<Instant>>>,
     /// Kitty graphics passthrough for daemon-attached panes; `None` when it
     /// is off or for local PTYs. See doc/kitty-graphics-passthrough.md.
     pub graphics: Option<crate::graphics::PaneGraphics>,
+    /// Attached screen-first (remote panes): only the visible screen was
+    /// sent, so scrolling up has nothing to show until the full output ring
+    /// is fetched. The app re-attaches with the ring on the first scroll up.
+    pub history_deferred: bool,
+    /// Daemon-attached: where this pane's terminal is in the session's output
+    /// stream, so a reconnect can resume instead of repainting. `None` for
+    /// local PTYs and older daemons.
+    pub stream: Option<crate::client_session::StreamCursor>,
+    /// The events proxy `term` was built with (daemon-attached only).
+    pub term_events: Option<EventProxy>,
+    /// This session continues an earlier session's `term` (see
+    /// [`Self::resume_from`]); the app carries that pane's state over.
+    pub resumed: bool,
 }
 
 #[derive(Default)]
@@ -295,6 +337,10 @@ impl Session {
             pty_writer: Some(pty_writer),
             event_rx,
             title: format!("{} {}", shell, args.join(" ")),
+            spawn_model: None,
+            spawn_model_source: None,
+            spawn_effort: None,
+            spawn_effort_source: None,
             exited: false,
             wakeup_times: Vec::new(),
             memory_cap,
@@ -308,8 +354,13 @@ impl Session {
             daemon_transport_eof: None,
             // Local PTY session — no attach socket to watch for HUP.
             attach_hup_fd: None,
+            attach_progress: None,
             output_control: None,
             graphics: None,
+            history_deferred: false,
+            stream: None,
+            term_events: None,
+            resumed: false,
         })
     }
 
@@ -336,23 +387,30 @@ impl Session {
     pub fn new_attached_existing(
         config: crate::client_session::ClientSessionConfig,
     ) -> anyhow::Result<Self> {
-        Self::new_attached_existing_with_context(config, false)
+        Self::new_attached_existing_with_context(config, false, Default::default())
     }
 
     pub(crate) fn new_attached_existing_with_context(
         config: crate::client_session::ClientSessionConfig,
         restore_context: bool,
+        how: crate::client_session::AttachHow,
     ) -> anyhow::Result<Self> {
         let title_label = config.label.to_string();
+        let spawn_model = config.model.map(str::to_string);
+        let spawn_model_source = config.model_source.map(str::to_string);
+        let spawn_effort = config.effort.map(str::to_string);
+        let spawn_effort_source = config.effort_source.map(str::to_string);
         // A bounded raw replay can start after the application's last complete
-        // screen. Codex can reconstruct its history on resize; defer that work
-        // until this pane is viewed, rather than repainting the whole fleet.
-        let repaint = if config.session_type == "codex" {
+        // screen. Codex and Claude Code rebuild their screen on resize; defer
+        // that until this pane is viewed, rather than repainting the fleet.
+        let repaint = if repaints_on_resize(&config.session_type) {
             Repaint::WhenVisible
         } else {
             Repaint::None
         };
-        let cs = crate::client_session::ClientSession::attach_existing_with_context(config, restore_context)?;
+        let cs = crate::client_session::ClientSession::attach_existing_with_context(config, restore_context, how)?;
+        // A resumed terminal missed nothing, so the program need not redraw.
+        let repaint = if cs.resumed { Repaint::None } else { repaint };
         let cgroup_path = cs.cgroup_path.as_deref().map(PathBuf::from);
         Ok(Session {
             repaint,
@@ -361,6 +419,10 @@ impl Session {
             pty_writer: None,
             event_rx: cs.event_rx,
             title: format!("{} (daemon:{})", title_label, cs.session_uid),
+            spawn_model: spawn_model.clone(),
+            spawn_model_source: spawn_model_source.clone(),
+            spawn_effort: spawn_effort.clone(),
+            spawn_effort_source: spawn_effort_source.clone(),
             exited: false,
             wakeup_times: Vec::new(),
             memory_cap: None,
@@ -372,8 +434,13 @@ impl Session {
             // session triggers reconnect, not teardown.
             daemon_transport_eof: Some(cs.transport_eof),
             attach_hup_fd: cs.hup_fd,
+            attach_progress: cs.attach_progress,
             output_control: cs.output_control,
             graphics: cs.graphics,
+            history_deferred: cs.history_deferred,
+            stream: cs.stream,
+            term_events: Some(cs.term_events),
+            resumed: cs.resumed,
         })
     }
 
@@ -381,6 +448,10 @@ impl Session {
         config: crate::client_session::ClientSessionConfig,
     ) -> anyhow::Result<Self> {
         let title_label = config.label.to_string();
+        let spawn_model = config.model.map(str::to_string);
+        let spawn_model_source = config.model_source.map(str::to_string);
+        let spawn_effort = config.effort.map(str::to_string);
+        let spawn_effort_source = config.effort_source.map(str::to_string);
         let cs = crate::client_session::ClientSession::new(config)?;
         // Mirror the daemon-echoed cgroup_path so the local
         // Session has parity with what `Session::new` would
@@ -402,6 +473,10 @@ impl Session {
             pty_writer: None,
             event_rx: cs.event_rx,
             title: format!("{} (daemon:{})", title_label, cs.session_uid),
+            spawn_model: spawn_model.clone(),
+            spawn_model_source: spawn_model_source.clone(),
+            spawn_effort: spawn_effort.clone(),
+            spawn_effort_source: spawn_effort_source.clone(),
             exited: false,
             wakeup_times: Vec::new(),
             // Daemon-spawned sessions: the memory-cap watcher
@@ -427,8 +502,25 @@ impl Session {
             // session reconnects instead of tearing down.
             daemon_transport_eof: Some(cs.transport_eof),
             attach_hup_fd: cs.hup_fd,
+            attach_progress: cs.attach_progress,
             output_control: cs.output_control,
             graphics: cs.graphics,
+            history_deferred: cs.history_deferred,
+            stream: cs.stream,
+            term_events: Some(cs.term_events),
+            resumed: cs.resumed,
+        })
+    }
+
+    /// What a reconnect needs to continue this pane's terminal from where
+    /// its stream stopped: the stream position plus the terminal itself.
+    pub fn resume_from(&self) -> Option<crate::client_session::ResumeFrom> {
+        let stream = self.stream.as_ref()?;
+        Some(crate::client_session::ResumeFrom {
+            stream_id: stream.stream_id,
+            position: stream.position.load(std::sync::atomic::Ordering::SeqCst),
+            term: self.term.clone(),
+            term_events: self.term_events.clone()?,
         })
     }
 
@@ -553,7 +645,8 @@ impl Session {
     }
 
     /// Ask a repaintable application to rebuild its screen, without input or
-    /// restart. Callers restrict this to Codex; shells cannot recreate output.
+    /// restart. Callers restrict this to [`repaints_on_resize`] engines;
+    /// shells cannot recreate output.
     pub fn request_repaint(&mut self) {
         if !self.exited && !matches!(self.repaint, Repaint::RestoreAt(_)) {
             self.repaint = Repaint::WhenVisible;

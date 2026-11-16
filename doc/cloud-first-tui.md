@@ -1,6 +1,7 @@
 # Cloud-first interactive sessions
 
-Fresh sessions and planning launches use the default in `~/.cm/hosts.toml`.
+Fresh sessions use the default in `~/.cm/hosts.toml` (planning no longer
+launches; see [org model §13.4](org-model.md#134-close-out-owner-2026-11-05)).
 The migration sets this to `sessions`. The Host field remains available for
 explicit local execution; an unavailable cloud host produces an error.
 
@@ -35,7 +36,7 @@ previously called.
 Cloud Neovim uses OSC 52 through the TUI for the viewing machine's clipboard.
 Clipboard reads support Wayland and X11, run on a bounded background worker,
 and reply to the requesting attachment. Reads are served for the visible
-terminal, including single-session workspace/task rows. Those rows also repaint
+terminal, including single-session workspace rows in the Status sub-view. Those rows also repaint
 on terminal output; previously only an explicit session row passed that gate.
 Local and attached terminals share the 1,500-line scrollback setting.
 Actual cloud Neovim edit/save, copy/paste in both directions, and unchanged

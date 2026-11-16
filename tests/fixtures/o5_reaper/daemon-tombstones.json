@@ -1,0 +1,32 @@
+{
+ "version": 1,
+ "recently_exited": [
+  {
+   "session_uid": "ts-18d6e3462ddc449a-7",
+   "transcript_path": null,
+   "generation": 0,
+   "session_type": "claude-code",
+   "workspace_id": "ws-18dfbbd735cf14a7",
+   "task_id": "task-1",
+   "managed_by_uid": "ts-18d9d61a2e945aa9-3",
+   "continuous_task_id": null,
+   "label": "Batch-Valid",
+   "workflow_run_id": null,
+   "workflow_role": null,
+   "worktree_path": "WORKTREE",
+   "global_perms": false,
+   "exited_at": "EXITED",
+   "killed": false,
+   "killed_by": null,
+   "reported_done_at": null,
+   "report_reason": null,
+   "incarnation": 78,
+   "status_lost": false,
+   "org": {
+    "member_id": "mem_01m5t9gpxqc6evpt0f42m2az4n",
+    "acting_as": "assistant",
+    "member_via": "spawner:ts-18d9d61a2e945aa9-3"
+   }
+  }
+ ]
+}

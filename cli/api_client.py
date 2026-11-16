@@ -17,7 +17,7 @@ class CMClient:
         # pick it up". The TUI cloud push already sends is_cloud=true.
         r = self.client.post("/tasks", json={
             "repo_url": repo_url, "repo_branch": branch,
-            "prompt": prompt, "priority": priority, "is_cloud": True,
+            "description": prompt, "priority": priority, "is_cloud": True,
         })
         r.raise_for_status()
         return r.json()

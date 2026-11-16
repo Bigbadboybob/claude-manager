@@ -73,6 +73,15 @@ pub struct Role {
     /// safely set this to `false`. Default `true` preserves prior behavior.
     #[serde(default = "default_needs_mcp")]
     pub needs_mcp: bool,
+    /// The model this role's sessions launch with. Absent → the workflow
+    /// task's default → the engine default (`crate::models`). Ignored when
+    /// a launch overrides the role's engine.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The reasoning effort this role's sessions launch with, resolved like
+    /// `model` (role → task default → config default).
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 fn default_needs_mcp() -> bool {

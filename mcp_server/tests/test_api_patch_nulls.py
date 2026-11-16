@@ -154,16 +154,14 @@ class PatchNullClearTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("priority", ctx.exception.detail)
         self.assertEqual(self.captured, {})
 
-    async def test_prompt_null_returns_400(self):
-        # prompt is column-nullable but downstream consumers (cli list,
-        # /workers preview, dispatch_daemon) treat it as a string. Null
-        # would TypeError elsewhere — defend at the API boundary.
+    async def test_prompt_null_is_ignored(self):
+        # prompt is deprecated (doc/org-model.md §13.2): an empty or null
+        # PATCH prompt adds nothing and is dropped before the column, so it
+        # can never be written as NULL for a string-reading consumer.
         body = TaskUpdate.model_validate({"prompt": None})
-        with self.assertRaises(HTTPException) as ctx:
-            await api_main.update_task("t-1", body, pool=None)
-        self.assertEqual(ctx.exception.status_code, 400)
-        self.assertIn("prompt", ctx.exception.detail)
+        result = await api_main.update_task("t-1", body, pool=None)
         self.assertEqual(self.captured, {})
+        self.assertIs(result, self.existing)
 
     async def test_repo_branch_null_returns_400(self):
         body = TaskUpdate.model_validate({"repo_branch": None})

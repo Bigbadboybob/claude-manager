@@ -17,13 +17,30 @@ import tempfile
 import time
 
 PRODUCER_ID = secrets.token_hex(16)
+
+
+def _own_start() -> str | None:
+    try:
+        return Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+# pid plus start time names this process unambiguously (pids are reused).
+PRODUCER_START = _own_start()
 MAX_BYTES = 4 * 1024 * 1024
 SETTLED = frozenset({"delivered", "cancelled", "replaced"})
 FIELDS = frozenset({
     "monitor_id", "watching", "mode", "until", "note", "source", "state",
     "created_at", "result", "delivered", "delivery_uncertain",
     "notification_id", "delivery_status", "cancellation_retracted",
+    # Enough to resume the watch in a successor after an MCP activation
+    # (doc/mcp-managed-activation.md §5): the ORIGINAL edge, not a new one.
+    "caller", "baselines", "report_anchors", "deadline_at", "interim_turn_ends",
+    "launch_receipt", "launch_socket_path", "adopted_from", "adopted_by",
 })
+# Unfinished states a successor producer takes over.
+ADOPTABLE = frozenset({"watching", "fired", "interrupted"})
 
 
 def _refresh_native_receipts(uid: str, records: dict[str, dict]) -> bool:
@@ -114,26 +131,94 @@ def publish(records: dict[str, dict]) -> None:
         journal["producers"][PRODUCER_ID] = {
             "started_at": old.get("started_at", time.time()),
             "updated_at": time.time(),
+            "pid": os.getpid(),
+            "start": PRODUCER_START,
             "records": retained,
         }
-        data = json.dumps(journal, sort_keys=True, allow_nan=False).encode()
-        if len(data) > MAX_BYTES:
-            raise ValueError("monitor journal exceeds size limit; inspect retained obligations")
-        fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+        _write(path, journal)
+
+
+def adopt(predecessor_pid: int, predecessor_start: str | None) -> dict[str, dict]:
+    """Take over a dead predecessor producer's unfinished watches.
+
+    One atomic journal write moves each record: the predecessor's copy
+    becomes `replaced` (settled, never resumed again) and this producer's
+    copy is `watching`. There is no moment where both own it or neither
+    does. Records written before baselines were persisted are left alone:
+    resuming them without their original edge could fire on old news.
+    The predecessor is the producer with this pid AND start time; the caller
+    must have seen that process exit."""
+    path = _path()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_fd = os.open(str(path) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(lock_fd, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        journal = _load(path)
+        taken: dict[str, dict] = {}
+        for producer_id, producer in journal["producers"].items():
+            if (producer_id == PRODUCER_ID or producer.get("pid") != predecessor_pid
+                    or not predecessor_start or producer.get("start") != predecessor_start):
+                continue
+            for mid, record in producer["records"].items():
+                if record.get("state") not in ADOPTABLE or "baselines" not in record:
+                    continue
+                taken[mid] = {**record, "state": "watching", "adopted_from": producer_id}
+                record["state"] = "replaced"
+                record["adopted_by"] = PRODUCER_ID
+        if not taken:
+            return {}
+        mine = journal["producers"].setdefault(
+            PRODUCER_ID, {"started_at": time.time(), "records": {}})
+        mine["records"].update(taken)
+        mine["updated_at"] = time.time()
+        mine["pid"] = os.getpid()
+        mine["start"] = PRODUCER_START
+        journal["revision"] += 1
+        _write(path, journal)
+        return taken
+
+
+def _write(path: Path, journal: dict) -> None:
+    # Socket routes are represented as ``Path`` objects in the live monitor
+    # record.  The journal is the serialization boundary: normalize those
+    # values here so a Path from the current producer (or a retained record
+    # being rewritten) cannot make an otherwise accepted action fail with a
+    # raw ``TypeError``.
+    data = json.dumps(_normalize(journal), sort_keys=True, allow_nan=False).encode()
+    if len(data) > MAX_BYTES:
+        raise ValueError("monitor journal exceeds size limit; inspect retained obligations")
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            with os.fdopen(fd, "wb") as output:
-                output.write(data)
-                output.flush()
-                os.fsync(output.fileno())
-            os.replace(temporary, path)
-            directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            os.fsync(directory_fd)
         finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _normalize(value):
+    """Return a JSON-safe copy of journal values.
+
+    ``launch_socket_path`` is a ``pathlib.Path`` on the live registration
+    path.  Keep this conversion at the journal boundary so in-memory monitor
+    records retain their useful Path type while every persisted producer,
+    including older records rewritten during a later publish, is recoverable.
+    """
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _normalize(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize(item) for item in value]
+    return value
 
 
 def read() -> dict:

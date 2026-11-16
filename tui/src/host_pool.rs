@@ -196,6 +196,16 @@ const STDERR_RING_CAP: usize = 32;
 // was throttled under a pile of (now keepalive-reaped) zombie tunnels.
 const SPAWN_SOCKET_WAIT: Duration = Duration::from_secs(8);
 
+/// After a failed tunnel spawn, `ensure_alive` answers the cached error for
+/// this long instead of spawning again. Every `for_host` caller (watch
+/// consumers, pollers, the push worker, attach workers, main-thread key
+/// handlers) queues on the handle's state lock, and on a network that
+/// silently drops port 22 each spawn burns the full [`SPAWN_SOCKET_WAIT`] —
+/// without the cooldown the queue serialized into 30-80s stalls per call
+/// (guest-wifi hang, 2026-10-30). A route change clears it
+/// (`reset_ssh_after_network_change`).
+const SPAWN_FAILURE_COOLDOWN: Duration = Duration::from_secs(15);
+
 /// Polling interval inside the spawn wait loop.
 const SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -362,6 +372,9 @@ enum HandleState {
     SshUnix {
         spec: SshTunnelSpec,
         tunnel: Option<SshTunnel>,
+        /// Last failed spawn (when, error text), see
+        /// [`SPAWN_FAILURE_COOLDOWN`]. Cleared on a successful spawn.
+        spawn_failed: Option<(Instant, String)>,
     },
     /// 12h: TLS-TCP transport. No persistent process and no
     /// socket file — each RPC opens a fresh TCP connect + TLS
@@ -396,6 +409,7 @@ impl ConnectionHandle {
             state: Mutex::new(HandleState::SshUnix {
                 spec,
                 tunnel: None,
+                spawn_failed: None,
             }),
             generation: std::sync::atomic::AtomicU64::new(0),
         }
@@ -537,7 +551,11 @@ impl ConnectionHandle {
             // is a no-op so `for_host` keeps a uniform return
             // shape across transports.
             HandleState::TcpTls { .. } => Ok(()),
-            HandleState::SshUnix { spec, tunnel } => {
+            HandleState::SshUnix {
+                spec,
+                tunnel,
+                spawn_failed,
+            } => {
                 // Dead-child detection: try_wait returns
                 // Ok(Some(_)) if the child has exited. Clear
                 // `tunnel` so the spawn-fresh branch below
@@ -548,7 +566,25 @@ impl ConnectionHandle {
                     }
                 }
                 if tunnel.is_none() {
-                    let fresh = SshTunnel::spawn(spec)?;
+                    if let Some((at, msg)) = spawn_failed.as_ref() {
+                        let age = at.elapsed();
+                        if age < SPAWN_FAILURE_COOLDOWN {
+                            return Err(io::Error::other(format!(
+                                "{msg} (spawn failed {}s ago; not retrying \
+                                 for {}s)",
+                                age.as_secs(),
+                                (SPAWN_FAILURE_COOLDOWN - age).as_secs(),
+                            )));
+                        }
+                    }
+                    let fresh = match SshTunnel::spawn(spec) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            *spawn_failed = Some((Instant::now(), e.to_string()));
+                            return Err(e);
+                        }
+                    };
+                    *spawn_failed = None;
                     *tunnel = Some(fresh);
                     // A fresh tunnel means any attach stream on the PRIOR
                     // tunnel is dead (the old ssh child exited / was replaced).
@@ -825,15 +861,32 @@ impl SshTunnel {
                     // 3s×2 makes ssh detect the dead peer and EXIT within ~6s,
                     // converting the undetectable hang into the death the
                     // existing dead-tunnel respawn already heals.
+                    //
+                    // 10s×3 (30s), not 3s×2: on a slow, lossy link a 6s gap is
+                    // normal, and each false "dead" respawn reattached every
+                    // session on the host with a full replay (2026-10-13).
+                    // Route changes and resume from sleep are caught at once by
+                    // `network_watch`, so only a silent stall waits the 30s.
                     "-o".into(),
-                    "ServerAliveInterval=3".into(),
+                    "ServerAliveInterval=10".into(),
                     "-o".into(),
-                    "ServerAliveCountMax=2".into(),
+                    "ServerAliveCountMax=3".into(),
+                    // zlib on the whole connection. Attach replays are base64
+                    // terminal output in JSON and compress 4-12x (5.7x across
+                    // 36 live sessions on cm-sessions, 2026-10-13: 1.4 MB per
+                    // pane down to ~220 KB); RPCs and live output shrink too.
+                    "-o".into(),
+                    "Compression=yes".into(),
                     // Exit immediately if the forward can't be established
                     // (don't linger with a useless connection the readiness
                     // probe would still pass once the socket binds).
                     "-o".into(),
                     "ExitOnForwardFailure=yes".into(),
+                    // Bound the TCP connect: on a network that silently drops
+                    // port 22, ssh otherwise sits in connect() until the
+                    // readiness wait kills it, with no stderr to explain why.
+                    "-o".into(),
+                    "ConnectTimeout=5".into(),
                     // Never block on an interactive auth prompt — stdin is
                     // already null, so a prompt would hang the spawn until the
                     // readiness timeout kills it. Fail fast instead.
@@ -1436,6 +1489,20 @@ impl HostPool {
     /// startup freeze this code removes. Lock contention surfaces as `None`
     /// (not-ready-yet); the drain re-probes next tick once the spawn frees
     /// the lock.
+    /// Every configured host, the default first, then the rest by name.
+    pub fn host_ids(&self) -> Vec<HostId> {
+        let mut rest: Vec<HostId> = self
+            .entries
+            .keys()
+            .filter(|h| **h != self.default_host_id)
+            .cloned()
+            .collect();
+        rest.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+        let mut out = vec![self.default_host_id.clone()];
+        out.extend(rest);
+        out
+    }
+
     pub fn live_socket_path(&self, host_id: &HostId) -> Option<PathBuf> {
         self.entries
             .get(host_id)
@@ -1457,7 +1524,13 @@ impl HostPool {
     pub(crate) fn reset_ssh_after_network_change(&self) {
         for handle in self.entries.values() {
             let mut state = handle.state.lock().unwrap_or_else(|p| p.into_inner());
-            if let HandleState::SshUnix { tunnel, .. } = &mut *state {
+            if let HandleState::SshUnix {
+                tunnel,
+                spawn_failed,
+                ..
+            } = &mut *state
+            {
+                *spawn_failed = None;
                 if tunnel.take().is_some() {
                     handle.generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 }
@@ -3307,6 +3380,36 @@ remote_socket = "/home/lucas/.cm/daemon.sock"
             }
             Ok(_) => panic!("spawn should have errored on early exit"),
         }
+    }
+
+    /// A failed spawn is cached for `SPAWN_FAILURE_COOLDOWN`: the next
+    /// `ensure_alive` answers the same error without running the command
+    /// again, so callers queued on the handle lock don't each pay a fresh
+    /// spawn wait against an unreachable host.
+    #[test]
+    fn failed_spawn_is_not_retried_within_cooldown() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let counter = tmp.path().join("spawns");
+        let spec = SshTunnelSpec::with_explicit_socket(
+            "down-host".into(),
+            None,
+            tmp.path().join("never-bound.sock"),
+            tmp.path().join("remote.sock"),
+            PathBuf::from("bash"),
+            vec![
+                "-c".into(),
+                format!("echo x >> '{}'; exit 255", counter.display()).into(),
+            ],
+        );
+        let handle = ConnectionHandle::ssh_unix(spec);
+        let first = handle.ensure_alive().expect_err("spawn must fail");
+        let start = Instant::now();
+        let second = handle.ensure_alive().expect_err("cooldown must fail");
+        assert!(start.elapsed() < Duration::from_millis(200));
+        assert!(second.to_string().contains(&first.to_string()));
+        assert!(second.to_string().contains("not retrying"), "{second}");
+        let spawns = std::fs::read_to_string(&counter).unwrap();
+        assert_eq!(spawns.lines().count(), 1, "second call must not respawn");
     }
 
     // ---------------------------------------------------------------

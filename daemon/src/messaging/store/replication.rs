@@ -23,6 +23,7 @@ pub(super) struct IngestBatch {
     pub journal: Vec<(PathBuf, Vec<u8>)>,
     /// Monitors were advanced before the page's first publication.
     pub advanced: bool,
+    pub owner_notifications: Vec<crate::owner_notifications::Notification>,
 }
 
 /// Deletes superseded legacy coverage records in the background. The journal
@@ -201,6 +202,10 @@ impl Replication {
     }
 }
 
+/// Own messages younger than this are not reported in `outbox`: a healthy
+/// link uploads them within seconds.
+pub(super) const OUTBOX_GRACE_S: i64 = 60;
+
 impl Store {
     /// A/B committed locally before receipts existed. The original coordinator
     /// may attest those verified publications, preserving bytes, IDs, arrival
@@ -220,19 +225,18 @@ impl Store {
                         .rejections
                         .contains_key(strv(&e.event, "id"))
             })
-            .map(|e| (e.event.clone(), e.position))
+            .map(|e| (e.event.clone(), e.position, e.event_sha256.clone()))
             .collect::<Vec<_>>();
-        for (event, position) in missing {
+        for (event, position, digest) in missing {
             if event["origin_daemon_id"] != self.daemon_id {
                 return Err(err(
                     "invalid_receipt",
                     "Foreign publication has no retained acceptance",
                 ));
             }
-            let bytes = fs::read(self.event_path(&event)?)?;
             let receipt = json!({"space_id":self.space_id,"coordinator_id":self.daemon_id,
                 "generation":self.generation,"position":format!("{position:020}"),
-                "event_id":event["id"],"event_sha256":hash(&bytes)});
+                "event_id":event["id"],"event_sha256":digest});
             self.record_receipt(&receipt)?;
         }
         Ok(())
@@ -268,7 +272,84 @@ impl Store {
         json!({"enabled":self.sync_enabled(),"role":if self.is_coordinator(){"coordinator"}else{"replica"},
             "coordinator_id":self.coordinator_id(),"connected":self.is_coordinator() || self.replication.connected,
             "last_reconciled":self.replication.last_reconciled,"error":self.replication.error,
-            "handoff_paused":self.messaging_frozen(),"pending":self.events.iter().filter(|e| e.event["origin_daemon_id"] == self.daemon_id && !self.replication.receipts.contains_key(strv(&e.event,"id")) && !self.replication.rejections.contains_key(strv(&e.event,"id"))).count()})
+            "handoff_paused":self.messaging_frozen(),"pending":self.read_model.pending_local.len()})
+    }
+    /// The caller's own events saved on this replica that the hub has not
+    /// accepted within `OUTBOX_GRACE_S`: `{pending_sync, oldest_age_s,
+    /// oldest_event_id}`, or None when nothing is overdue (and always None on
+    /// the hub or a standalone host, whose events are authoritative where
+    /// they are written). The grace keeps a just-sent message, which is
+    /// normally uploaded within seconds, from reporting itself.
+    pub fn outbox_status(&self, actor: &str) -> Option<Value> {
+        self.outbox_status_at(actor, Utc::now())
+    }
+    /// Every actor's overdue outbox in ONE pass over the events (the alarm's
+    /// path: per-actor scans of a 2M-event store under its lock stalled the
+    /// delivery worker). Only actors with something overdue appear.
+    pub fn outbox_overdue(&self) -> BTreeMap<String, Value> {
+        let mut out = BTreeMap::new();
+        if self.is_coordinator() || !self.sync_enabled() {
+            return out;
+        }
+        let now = Utc::now();
+        let cutoff = now - chrono::Duration::seconds(OUTBOX_GRACE_S);
+        let mut acc: BTreeMap<&str, (usize, &str)> = BTreeMap::new();
+        for e in &self.events {
+            if e.event["origin_daemon_id"] != self.daemon_id {
+                continue;
+            }
+            let id = strv(&e.event, "id");
+            if self.replication.receipts.contains_key(id) || self.replication.rejections.contains_key(id) {
+                continue;
+            }
+            let at = strv(&e.event, "created_at");
+            if DateTime::parse_from_rfc3339(at).is_ok_and(|t| t.with_timezone(&Utc) > cutoff) {
+                continue;
+            }
+            let entry = acc.entry(strv(&e.event["actor"], "id")).or_insert((0, at));
+            entry.0 += 1;
+            if at < entry.1 {
+                entry.1 = at;
+            }
+        }
+        for (actor, (pending, oldest)) in acc {
+            let age = DateTime::parse_from_rfc3339(oldest)
+                .map(|t| (now - t.with_timezone(&Utc)).num_seconds().max(0))
+                .ok();
+            out.insert(actor.to_owned(), json!({"pending_sync":pending,"oldest_age_s":age}));
+        }
+        out
+    }
+    pub(super) fn outbox_status_at(&self, actor: &str, now: DateTime<Utc>) -> Option<Value> {
+        if self.is_coordinator() || !self.sync_enabled() {
+            return None;
+        }
+        let cutoff = now - chrono::Duration::seconds(OUTBOX_GRACE_S);
+        let mut pending = 0usize;
+        let mut oldest: Option<(&str, &str)> = None;
+        for e in self.read_model.pending_local.iter().map(|i| &self.events[*i]) {
+            let id = strv(&e.event, "id");
+            if e.event["origin_daemon_id"] != self.daemon_id
+                || e.event["actor"]["id"] != actor
+                || self.replication.receipts.contains_key(id)
+                || self.replication.rejections.contains_key(id)
+            {
+                continue;
+            }
+            let at = strv(&e.event, "created_at");
+            if DateTime::parse_from_rfc3339(at).is_ok_and(|t| t.with_timezone(&Utc) > cutoff) {
+                continue;
+            }
+            pending += 1;
+            if oldest.is_none_or(|(_, o)| at < o) {
+                oldest = Some((id, at));
+            }
+        }
+        let (id, at) = oldest?;
+        let age = DateTime::parse_from_rfc3339(at)
+            .map(|t| (now - t.with_timezone(&Utc)).num_seconds().max(0))
+            .ok();
+        Some(json!({"pending_sync":pending,"oldest_age_s":age,"oldest_event_id":id}))
     }
     pub fn set_sync_connection(&mut self, connected: bool, error: Option<String>) {
         self.replication.connected = connected;
@@ -319,7 +400,7 @@ impl Store {
                 let event = self
                     .published(&id)
                     .ok_or_else(|| err("invalid_receipt", "Decision precedes its local event"))?;
-                if journal["event_sha256"] != hash(&fs::read(self.event_path(&event.event)?)?) {
+                if journal["event_sha256"] != event.event_sha256 {
                     return Err(err(
                         "invalid_receipt",
                         "Decision digest does not match its retained event",
@@ -370,6 +451,11 @@ impl Store {
                 self.replication.last_reconciled = Some(required(journal, "recorded_at")?);
             }
             _ => return Err(err("invalid_record", "Unsupported journal kind")),
+        }
+        if journal["kind"] == "replication.status" {
+            if let Some(index) = self.event_index.get(strv(journal,"event_id")) {
+                self.read_model.pending_local.remove(index);
+            }
         }
         Ok(())
     }
@@ -476,7 +562,7 @@ impl Store {
             ));
         }
         if let Some(event) = self.published(&id) {
-            if hash(&fs::read(self.event_path(&event.event)?)?) != digest {
+            if event.event_sha256 != digest {
                 return Err(err(
                     "receipt_conflict",
                     "Receipt digest does not match the retained event",
@@ -500,6 +586,11 @@ impl Store {
             json!({"status":"replicated","receipt":receipt}),
         )
     }
+    /// True when `id` is a locally published event whose actor is the
+    /// daemon itself (`system`), e.g. a #continuous monitor notice.
+    pub fn published_actor_is_system(&self, id: &str) -> bool {
+        self.published(id).is_some_and(|e| e.event["actor"]["id"] == "system")
+    }
     pub fn reject_replication(&mut self, id: &str, reason: &str) -> Result<()> {
         if self.replication.rejections.contains_key(id) {
             return Ok(());
@@ -513,7 +604,7 @@ impl Store {
         let e = self
             .published(id)
             .ok_or_else(|| err("not_found", "Local event not found"))?;
-        let digest = hash(&fs::read(self.event_path(&e.event)?)?);
+        let digest = e.event_sha256.clone();
         self.journal_status("replication.status",Some(id),Some(&digest),json!({"status":"replication_rejected","reason":reason,"coordinator_id":self.coordinator_id()}))?;
         let children: Vec<_> = self
             .events
@@ -539,8 +630,7 @@ impl Store {
         Ok(json!({"event":body,"receipt":self.replication.receipts.get(id),"position":e.position}))
     }
     pub fn pending_uploads(&self, limit: usize) -> Result<Vec<Value>> {
-        self.events
-            .iter()
+        self.read_model.pending_local.iter().map(|i| &self.events[*i])
             .filter(|e| {
                 e.event["origin_daemon_id"] == self.daemon_id
                     && !self.replication.receipts.contains_key(strv(&e.event, "id"))
@@ -628,6 +718,9 @@ impl Store {
             self.degraded = Some(format!("Publication outcome requires reconciliation: {e}"));
             return Err(err("outcome_unknown", self.degraded.clone().unwrap()));
         }
+        for notification in batch.owner_notifications {
+            self.publish_owner_notification(notification);
+        }
         Ok(())
     }
     fn ingest_one(&mut self, wire: &Value) -> Result<bool> {
@@ -669,10 +762,11 @@ impl Store {
         Ok(true)
     }
     pub(super) fn validate_replication_envelope(&self, raw: &[u8]) -> Result<Value> {
-        if raw.len() > 65536 {
-            return Err(err("event_too_large", "Serialized event exceeds 64 KiB"));
+        if raw.len() > MAX_HOST_DIRECTORY_BYTES {
+            return Err(err("event_too_large", "Serialized event exceeds 1 MiB"));
         }
         let e: Value = serde_json::from_slice(raw)?;
+        check_event_size(&e, raw.len())?;
         if e["protocol"] != 1
             || e["space_id"] != self.space_id
             || !e["data"].is_object()
@@ -743,6 +837,12 @@ impl Store {
                     .map_err(|_| err("invalid_record", "Invalid channel UUID"))?;
             }
         }
+        if e["type"] == crate::owner_availability::EVENT_TYPE {
+            Self::validate_owner_availability(e)?;
+        }
+        if e["type"] == crate::maintenance::EVENT_TYPE {
+            Self::validate_maintenance(e)?;
+        }
         if e["type"] == "host.update" {
             if e["actor"]["id"] != "system" {
                 return Err(err("invalid_record", "Host enrollment is system-owned"));
@@ -797,9 +897,9 @@ impl Store {
             "channel.membership" => {
                 self.validate_membership_event(e)?;
             }
-            "read.ack" => {
-                self.validate_read_event(e, false)?;
-            }
+            "read.ack" => { self.validate_read_event(e, false)?; }
+            "read.cursor" => { self.validate_cursor_event(e, false)?; }
+            "reaction" => { self.validate_reaction(e)?; }
             _ => {}
         }
         if let Some(c) = data.get("conversation_create") {
@@ -840,7 +940,13 @@ impl Store {
             required(&e["actor"], "id")?,
             required(&e["request"], "key")?
         );
-        if self.requests.contains_key(&key) {
+        // Daemon-generated System notices can share a request key across
+        // hosts (each daemon posts its own copy of a #continuous transition).
+        // That is a duplicate notice, not a client double-publish; refusing
+        // the hub's copy here stopped this replica's whole download
+        // (2026-11-16 #continuous wedge). Accept it; the local copy is set
+        // aside when the hub rejects its upload.
+        if self.requests.contains_key(&key) && e["actor"]["id"] != "system" {
             return Err(err(
                 "idempotency_conflict",
                 "A retained request already has a different event ID",
@@ -1009,6 +1115,7 @@ impl Store {
                 task: None,
                 present: true,
                 kind: "owner".into(),
+                engine: None,
             }))
             .collect::<Vec<_>>();
         if p["origin_daemon_id"].as_str().is_some_and(|o| o != host) {
@@ -1036,6 +1143,7 @@ impl Store {
             "messaging.follow" if actor == "owner" => self.follow(actor, p, &people),
             "messaging.channels" => self.channel_action(actor, p, &people),
             "messaging.pins" => self.pins(actor, p, &people),
+            "messaging.availability" if actor == "owner" => self.availability(actor, p),
             "messaging.norms" => {
                 let name = self
                     .names
@@ -1110,7 +1218,7 @@ impl Store {
         if !self.host_authorized(host, Some(&actor)) {
             return Err(err("host_revoked", "Host or participant is not enrolled"));
         }
-        if !matches!(e["type"].as_str(), Some("message.create" | "read.ack"))
+        if !matches!(e["type"].as_str(), Some("message.create" | "read.ack" | "read.cursor" | "reaction"))
             || [
                 "channels",
                 "identity_claim",
@@ -1125,8 +1233,12 @@ impl Store {
                 "Only ordinary messages may originate at a replica",
             ));
         }
-        if e["type"] == "read.ack" {
-            self.validate_read_event(&e, true)?;
+        if matches!(strv(&e,"type"), "read.ack" | "read.cursor" | "reaction") {
+            match strv(&e,"type") {
+                "read.ack" => { self.validate_read_event(&e, true)?; }
+                "read.cursor" => { self.validate_cursor_event(&e, true)?; }
+                _ => self.validate_reaction(&e)?,
+            }
             let key = format!("{actor}\n{}", required(&e["request"], "key")?);
             if self.requests.contains_key(&key) {
                 return Err(err(
@@ -1178,16 +1290,11 @@ impl Store {
             if identity != self.owner_identity_revision {
                 return Err(err("invalid_metadata", "Unknown Owner identity revision"));
             }
-        } else if !self.events.iter().any(|p| {
-            let n = if p.event["type"] == "identity.update" {
-                &p.event["data"]["identity"]
-            } else {
-                &p.event["data"]["identity_claim"]
-            };
-            n["participant_id"] == actor
-                && n["revision_id"] == identity
-                && n["name"] == e["actor"]["name"]
-        }) {
+        } else if !self.lookups.identities.contains(&(
+            actor.clone(),
+            identity.clone(),
+            e["actor"]["name"].to_string(),
+        )) {
             return Err(err("invalid_metadata", "Unknown sender identity revision"));
         }
         let enrollment = required(&e["data"]["metadata_seen"], "enrollment")?;
@@ -1197,12 +1304,11 @@ impl Store {
                 "An earlier host enrollment cannot submit new operations",
             ));
         }
-        if !self.events.iter().any(|p| {
-            p.event["type"] == "host.update"
-                && p.event["data"]["host_id"] == host
-                && p.event["data"]["enrollment_revision"] == enrollment
-                && p.event["data"]["active"] == true
-        }) {
+        if !self
+            .lookups
+            .host_enrollments
+            .contains(&(host.to_owned(), enrollment.clone()))
+        {
             return Err(err("invalid_metadata", "Unknown host enrollment revision"));
         }
         let tags: Vec<String> = serde_json::from_value(e["data"]["tags"].clone())?;
@@ -1227,31 +1333,26 @@ impl Store {
                 return Err(err("invalid_metadata", "Invalid immutable DM revision"));
             }
         } else if conversation_revision != conv
-            && !self.events.iter().any(|p| {
-                p.event["type"] == "channel.update"
-                    && p.event["data"]["channel"]["id"] == conv
-                    && p.event["data"]["channel"]["revision"] == conversation_revision
-            })
+            && !self
+                .lookups
+                .channel_revisions
+                .contains_key(&(conv.clone(), conversation_revision.clone()))
         {
             return Err(err("invalid_metadata", "Unknown channel revision"));
         }
         let mut stale_archive = false;
         if let Some((path, cid)) = self.channels.iter().find(|(_, cid)| *cid == &conv) {
             let observed = self
-                .events
-                .iter()
-                .find(|p| {
-                    p.event["type"] == "channel.update"
-                        && p.event["data"]["channel"]["id"] == conv
-                        && p.event["data"]["channel"]["revision"] == conversation_revision
-                })
-                .map(|p| &p.event["data"]["channel"]);
+                .lookups
+                .channel_revisions
+                .get(&(conv.clone(), conversation_revision.clone()))
+                .map(|&i| &self.events[i].event["data"]["channel"]);
             let created_archived = conversation_revision == conv
-                && self.events.iter().any(|p| {
-                    p.event["data"]["channels"]
-                        .as_array()
-                        .is_some_and(|a| a.iter().any(|c| c["id"] == conv && c["archived"] == true))
-                });
+                && self
+                    .lookups
+                    .channel_listings
+                    .get(&conv)
+                    .is_some_and(|(_, archived)| *archived);
             if created_archived || observed.is_some_and(|c| c["archived"] == true) {
                 return Err(err(
                     "conversation_archived",
@@ -1396,7 +1497,7 @@ impl Store {
         json!({"protocol":1,"space_id":self.space_id,"coordinator_id":self.coordinator_id(),"owner_identity_revision":self.owner_identity_revision,"coordinator_lineage":self.replication.coordinator_lineage})
     }
     fn eligible_for_host(&self, host: &str, interests: &BTreeSet<String>, e: &Value) -> bool {
-        if e["type"] == "read.ack" {
+        if matches!(strv(e,"type"), "read.ack" | "read.cursor") {
             return self
                 .replication
                 .hosts
@@ -1435,7 +1536,7 @@ impl Store {
     fn dependency_ids(&self, e: &Value) -> Result<Vec<String>> {
         // Parent chains are walked iteratively. Pages can stop within a chain;
         // the publication cursor advances only after its target is durable.
-        let mut parent = e["data"]["reply_to"].as_str().or_else(|| {
+        let mut parent = e["data"]["message_id"].as_str().filter(|_|e["type"] == "reaction").or_else(|| e["data"]["reply_to"].as_str()).or_else(|| {
             (e["type"] == "conversation.pin")
                 .then(|| e["data"]["target_id"].as_str())
                 .flatten()
@@ -1495,11 +1596,7 @@ impl Store {
         let mut visited = BTreeSet::new();
         let mut bytes = 0;
         let mut scanned = after;
-        for p in self
-            .events
-            .iter()
-            .filter(|p| p.position > after && p.position <= through)
-        {
+        for p in self.events_between(after, through) {
             let e = &p.event;
             let conv = strv(e, "conversation_id");
             if e["type"] == "message.create"
@@ -1508,15 +1605,15 @@ impl Store {
                     || mention_recipients(e).iter().any(|m| owns(m)))
             {
                 let creation = self
-                    .events
-                    .iter()
-                    .find(|v| v.event["data"]["conversation_create"]["id"] == conv);
-                let channel_known = self.events.iter().any(|v| {
-                    v.position <= covered
-                        && v.event["data"]["channels"]
-                            .as_array()
-                            .is_some_and(|cs| cs.iter().any(|c| c["id"] == conv))
-                });
+                    .lookups
+                    .conversation_creations
+                    .get(conv)
+                    .map(|&i| &self.events[i]);
+                let channel_known = self
+                    .lookups
+                    .channel_listings
+                    .get(conv)
+                    .is_some_and(|(first, _)| *first <= covered);
                 if !channel_known && creation.is_none() {
                     scanned = p.position;
                     continue;
@@ -1525,11 +1622,11 @@ impl Store {
                 if let Some(c) = creation.filter(|v| v.position > covered) {
                     ids.push(required(&c.event, "id")?);
                 }
-                ids.extend(self.dependency_ids(e)?.into_iter().filter(|id| {
-                    self.events
-                        .iter()
-                        .any(|v| v.event["id"] == *id && v.position > covered)
-                }));
+                ids.extend(
+                    self.dependency_ids(e)?
+                        .into_iter()
+                        .filter(|id| self.published(id).is_some_and(|v| v.position > covered)),
+                );
                 ids.push(required(e, "id")?);
                 let mut extra = Vec::new();
                 let mut extra_ids = BTreeSet::new();
@@ -1620,15 +1717,11 @@ impl Store {
         })
     }
     fn backfill_member(scope: &str, e: &Value) -> bool {
-        e["type"] == "message.create" && strv(e, "conversation_id") == scope
+        matches!(strv(e,"type"), "message.create" | "reaction") && strv(e, "conversation_id") == scope
     }
     /// Messages of `scope` in `(after, through]`, for backfill progress.
     pub fn scope_message_count(&self, scope: &str, after: u64, through: u64) -> u64 {
-        self.events
-            .iter()
-            .filter(|p| p.position > after && p.position <= through)
-            .filter(|p| Self::backfill_member(scope, &p.event))
-            .count() as u64
+        self.read_model.conversations.get(scope).map_or(0,|c| c.arrivals.partition_point(|(p, _)| *p <= through).saturating_sub(c.arrivals.partition_point(|(p, _)| *p <= after))) as u64
     }
     /// Per-scope coverage this replica holds in `generation`; a hub uses it to
     /// start a re-added scope's backfill where the earlier coverage ended.
@@ -1660,11 +1753,7 @@ impl Store {
         let mut bytes = 0;
         let mut cursor = after;
         let mut visited = BTreeSet::new();
-        for p in self
-            .events
-            .iter()
-            .filter(|p| p.position > after && p.position <= through)
-        {
+        for p in self.events_between(after, through) {
             if eligible(p) {
                 let mut ids = self.dependency_ids(&p.event)?;
                 ids.push(required(&p.event, "id")?);
@@ -1741,6 +1830,7 @@ mod tests {
                 task: None,
                 present: true,
                 kind: "agent".into(),
+                engine: None,
             })
             .to_vec();
         hub.register_host(&replica.daemon_id, true, true, &people)
@@ -1756,6 +1846,75 @@ mod tests {
         };
         catch_up(&mut pair);
         pair
+    }
+    /// The indexed answers equal the full scans they replaced, for every key
+    /// the history mentions plus misses, across DMs, channel updates and an
+    /// archive, identity claims and host enrollments.
+    #[test]
+    fn event_lookups_match_full_scans() {
+        let mut p = pair();
+        let host = p.replica.daemon_id.clone();
+        let actor = p.people[0].id.clone();
+        p.hub.coordinate(&host, &actor, "messaging.send", &json!({"dm":"owner","body":"DM","request_id":"dm-1"})).unwrap();
+        p.hub.coordinate(&host, &actor, "messaging.send", &json!({"dm":["owner",p.people[1].id],"body":"Group","request_id":"dm-2"})).unwrap();
+        p.hub.create_channel("owner", &json!({"path":"work/a","request_id":"c-a"})).unwrap();
+        p.hub.create_channel("owner", &json!({"path":"work/old","archived":true,"request_id":"c-old"})).unwrap();
+        let id = p.hub.channels["general"].clone();
+        let rev = p.hub.channel_info("general", &id)["revision"].clone();
+        p.hub.channel_action("owner",&json!({"action":"update","path":"general","archived":true,"expected_revision":rev,"request_id":"archive"}),&p.people).unwrap();
+        let s = &p.hub;
+        let mut convs: BTreeSet<String> = s.events.iter().map(|v| strv(&v.event, "conversation_id").to_owned()).collect();
+        convs.extend(s.channels.values().cloned());
+        convs.insert("missing".into());
+        for conv in &convs {
+            let scan = s.events.iter().position(|v| v.event["data"]["conversation_create"]["id"] == conv.as_str());
+            assert_eq!(s.lookups.conversation_creations.get(conv).copied(), scan, "{conv}");
+            for covered in [0, s.position / 2, s.position] {
+                let scan = s.events.iter().any(|v| v.position <= covered && v.event["data"]["channels"].as_array().is_some_and(|cs| cs.iter().any(|c| c["id"] == conv.as_str())));
+                assert_eq!(s.lookups.channel_listings.get(conv).is_some_and(|(f, _)| *f <= covered), scan);
+            }
+            let scan = s.events.iter().any(|v| v.event["data"]["channels"].as_array().is_some_and(|a| a.iter().any(|c| c["id"] == conv.as_str() && c["archived"] == true)));
+            assert_eq!(s.lookups.channel_listings.get(conv).is_some_and(|(_, a)| *a), scan, "{conv}");
+            let mut revs: BTreeSet<String> = s.events.iter().filter_map(|v| v.event["data"]["channel"]["revision"].as_str().map(str::to_owned)).collect();
+            revs.insert(conv.clone());
+            for rev in revs {
+                let scan = s.events.iter().position(|v| v.event["type"] == "channel.update" && v.event["data"]["channel"]["id"] == conv.as_str() && v.event["data"]["channel"]["revision"] == rev.as_str());
+                assert_eq!(s.lookups.channel_revisions.get(&(conv.clone(), rev.clone())).copied(), scan);
+            }
+        }
+        assert!(s.lookups.channel_listings.values().any(|(_, a)| *a), "the archived creation was indexed");
+        assert!(
+            s.lookups.channel_revisions.values().any(|&i| s.events[i].event["data"]["channel"]["archived"] == true),
+            "the archive's revision was indexed"
+        );
+        let mut claims = Vec::new();
+        for v in &s.events {
+            for n in [&v.event["data"]["identity"], &v.event["data"]["identity_claim"]] {
+                claims.push((strv(n, "participant_id").to_owned(), strv(n, "revision_id").to_owned(), n["name"].clone()));
+            }
+            claims.push((strv(&v.event["actor"], "id").to_owned(), "nope".into(), v.event["actor"]["name"].clone()));
+        }
+        for (actor, rev, name) in claims {
+            let scan = s.events.iter().any(|p| {
+                let n = if p.event["type"] == "identity.update" { &p.event["data"]["identity"] } else { &p.event["data"]["identity_claim"] };
+                n["participant_id"] == actor.as_str() && n["revision_id"] == rev.as_str() && n["name"] == name
+            });
+            assert_eq!(s.lookups.identities.contains(&(actor.clone(), rev.clone(), name.to_string())), scan, "{actor} {rev} {name}");
+        }
+        let mut enrollments: BTreeSet<(String, String)> = s.events.iter().map(|v| (strv(&v.event["data"], "host_id").to_owned(), strv(&v.event["data"], "enrollment_revision").to_owned())).collect();
+        enrollments.insert((host.clone(), "stale".into()));
+        for (h, rev) in enrollments {
+            let scan = s.events.iter().any(|p| p.event["type"] == "host.update" && p.event["data"]["host_id"] == h.as_str() && p.event["data"]["enrollment_revision"] == rev.as_str() && p.event["data"]["active"] == true);
+            assert_eq!(s.lookups.host_enrollments.contains(&(h.clone(), rev.clone())), scan);
+        }
+        assert!(s.lookups.host_enrollments.iter().any(|(h, _)| *h == host));
+        // A reopened store rebuilds the same lookups from the journal.
+        let root = s.root.parent().unwrap().parent().unwrap().to_path_buf();
+        let (creations, listings) = (s.lookups.conversation_creations.clone(), s.lookups.channel_listings.clone());
+        drop(p.hub);
+        let hub = Store::open(&root).unwrap();
+        assert_eq!(hub.lookups.conversation_creations, creations);
+        assert_eq!(hub.lookups.channel_listings, listings);
     }
     fn catch_up(pair: &mut Pair) {
         let mut after = 0;
@@ -1773,6 +1932,48 @@ mod tests {
                 break;
             }
         }
+    }
+    #[test]
+    fn owner_push_at_every_level_preserves_mutes_dnd_reads_and_coordinator_routing() {
+        let mut p = pair();
+        let hub_feed = std::sync::Arc::new(crate::owner_notifications::Feed::default());
+        let replica_feed = std::sync::Arc::new(crate::owner_notifications::Feed::default());
+        p.hub.owner_notifications = Some(hub_feed.clone());
+        p.replica.owner_notifications = Some(replica_feed.clone());
+        let host = p.replica.daemon_id.clone();
+        let actor = p.people[0].id.clone();
+        let mut last_dm = Value::Null;
+        for (i, level) in [None, Some("away"), Some("around"), Some("focused"), Some("on-call")].into_iter().enumerate() {
+            p.hub.availability("owner", &json!({"action":"set","level":level.unwrap_or("unset"),"request_id":format!("level-{i}")})).unwrap();
+            last_dm = p.hub.coordinate(&host, &actor, "messaging.send", &json!({"dm":"owner","body":"DM for Owner","request_id":format!("owner-dm-{i}")})).unwrap();
+            p.hub.coordinate(&host, &actor, "messaging.send", &json!({"dm":["owner",p.people[1].id],"body":"Group DM for Owner","request_id":format!("owner-group-{i}")})).unwrap();
+            p.hub.coordinate(&host, &actor, "messaging.send", &json!({"channel":"general","body":"For Owner","mentions":["owner"],"request_id":format!("owner-mention-{i}")})).unwrap();
+            p.hub.coordinate(&host, &actor, "messaging.send", &json!({"channel":"general","body":"Everyone","mention_here":true,"request_id":format!("owner-here-{i}")})).unwrap();
+            // Unmentioned channel traffic is still not a push subscription.
+            p.hub.coordinate(&host, &actor, "messaging.send", &json!({"channel":"general","body":"Ordinary traffic","request_id":format!("ordinary-{i}")})).unwrap();
+            hub_feed.flush();
+            let page = hub_feed.next(p.hub.cm_root(), &json!({"wait_ms":0})).unwrap();
+            assert_eq!(page["events"].as_array().unwrap().len(), (i + 1) * 4, "{level:?}");
+        }
+        catch_up(&mut p);
+        replica_feed.flush();
+        assert!(replica_feed.next(p.replica.cm_root(), &json!({"wait_ms":0})).unwrap()["events"].as_array().unwrap().is_empty());
+        let cid = last_dm["event"]["conversation_id"].clone();
+        let event_id = last_dm["event_id"].as_str().unwrap();
+        assert!(p.hub.owner_message_notification(p.hub.published(event_id).unwrap()).is_some());
+        let page = p.hub.read("owner", &json!({"conversation":cid}), &[]).unwrap();
+        p.hub.read("owner", &json!({"conversation":cid,"ack_receipt":page["receipt"]}), &[]).unwrap();
+        assert!(p.hub.owner_message_notification(p.hub.published(event_id).unwrap()).is_none(), "read messages stay read");
+        hub_feed.flush();
+        let before_quiet = hub_feed.next(p.hub.cm_root(), &json!({"wait_ms":0})).unwrap();
+        assert_eq!(p.hub.follow("owner", &json!({"action":"set","scope":{"conversation":cid},"muted":true,"request_id":"quiet-dm"}), &[]).unwrap()["revision"], 1);
+        p.hub.coordinate(&host, &actor, "messaging.send", &json!({"dm":"owner","body":"Muted DM","request_id":"owner-muted"})).unwrap();
+        assert_eq!(p.hub.follow("owner", &json!({"action":"set","scope":{"channel":"general"},"muted":true,"expected_revision":1,"request_id":"quiet-channel"}), &[]).unwrap()["revision"], 2);
+        p.hub.coordinate(&host, &actor, "messaging.send", &json!({"channel":"general","body":"Muted mention","mentions":["owner"],"request_id":"owner-muted-mention"})).unwrap();
+        assert_eq!(p.hub.follow("owner", &json!({"action":"set","dnd":true,"expected_revision":2,"request_id":"quiet-all"}), &[]).unwrap()["revision"], 3);
+        p.hub.coordinate(&host, &actor, "messaging.send", &json!({"dm":["owner",p.people[1].id],"body":"DND group","request_id":"owner-dnd"})).unwrap();
+        hub_feed.flush();
+        assert!(hub_feed.next(p.hub.cm_root(), &json!({"wait_ms":0,"cursor":before_quiet["cursor"]})).unwrap()["events"].as_array().unwrap().is_empty());
     }
     #[test]
     fn self_rename_preserves_identity_history_and_routing_across_replication_and_restart() {
@@ -2023,6 +2224,88 @@ mod tests {
         );
     }
     #[test]
+    fn a_hub_maintenance_notice_reaches_the_replica_and_outlives_the_link() {
+        let mut p = pair();
+        let now = Utc::now();
+        let hub_root = p.hub.cm_root().to_path_buf();
+        let (_, rec) = crate::maintenance::apply_local(&hub_root, &json!({"action":"set","reason":"CM redeploy"}), now).unwrap();
+        let rec = rec.unwrap();
+        assert!(!p.replica.publish_maintenance(&rec).unwrap(), "a replica never publishes");
+        assert!(p.hub.publish_maintenance(&rec).unwrap());
+        catch_up(&mut p);
+        // The replica shows the hub's notice from its projection alone, so
+        // losing the hub afterwards changes nothing.
+        let shown = crate::maintenance::current(p.replica.cm_root(), now).expect("replicated");
+        assert_eq!(shown["id"], rec["id"]);
+        let clear = crate::maintenance::build_clear(&rec, now + chrono::Duration::seconds(60));
+        assert!(p.hub.publish_maintenance(&clear).unwrap());
+        catch_up(&mut p);
+        assert!(crate::maintenance::current(p.replica.cm_root(), now + chrono::Duration::seconds(61)).is_none());
+    }
+    #[test]
+    fn owner_availability_replicates_to_every_host_and_is_hub_only() {
+        let mut p = pair();
+        let set = json!({"action":"set","level":"around","note":"in meetings","request_id":"avail-1"});
+        // A replica forwards the change to the hub instead of publishing it.
+        assert!(p.replica.needs_coordinator("owner", "messaging.availability", &set, &p.people).unwrap());
+        assert!(!p.replica.needs_coordinator("owner", "messaging.availability", &json!({"action":"get"}), &p.people).unwrap());
+        assert_eq!(p.replica.availability("owner", &set).unwrap_err().code, "coordinator_required");
+        // Agents cannot set it through the hub either.
+        let agent = p.people[0].id.clone();
+        assert!(p.hub.coordinate(&p.replica.daemon_id, &agent, "messaging.availability", &set).is_err());
+        let hub = p.hub.availability("owner", &set).unwrap();
+        assert_eq!(hub["owner_availability"]["level"], "around");
+        catch_up(&mut p);
+        assert_eq!(p.replica.owner_availability["level"], "around");
+        assert_eq!(p.replica.owner_availability["note"], "in meetings");
+        let projected = crate::owner_availability::exposure(p.replica.cm_root());
+        assert_eq!(projected["level"], "around");
+        assert_eq!(projected["owner_note"], "in meetings");
+        // A forged Owner record cannot be replicated in by another author.
+        let mut forged = p.hub.events.iter().find(|e| e.event["type"] == "owner.availability").unwrap().event.clone();
+        forged["actor"]["id"] = json!(agent);
+        assert!(p.replica.preflight_projection(&forged).is_err());
+    }
+    #[test]
+    fn outbox_counts_own_pending_messages_until_the_hub_accepts_them() {
+        let mut p = pair();
+        let (a, b) = (p.people[0].id.clone(), p.people[1].id.clone());
+        assert!(p.replica.outbox_status(&a).is_none());
+        let later = Utc::now() + chrono::Duration::seconds(OUTBOX_GRACE_S + 5);
+        p.replica.set_sync_connection(false, Some("storage_error: connection reset".into()));
+        for key in ["o1", "o2"] {
+            p.replica
+                .send(&a, "a", "agent", &json!({"channel":"general","body":"Offline","request_id":key}), &p.people)
+                .unwrap();
+        }
+        // Just sent: inside the grace window, not reported yet.
+        assert!(p.replica.outbox_status(&a).is_none());
+        let outbox = p.replica.outbox_status_at(&a, later).unwrap();
+        assert_eq!(outbox["pending_sync"], 2);
+        assert!(outbox["oldest_age_s"].as_i64().is_some_and(|s| s >= OUTBOX_GRACE_S));
+        assert!(outbox["oldest_event_id"].is_string());
+        // Another participant's view of the same replica is unaffected.
+        assert!(p.replica.outbox_status_at(&b, later).is_none());
+        // The hub's own events are authoritative where written.
+        assert!(p.hub.outbox_status_at(&a, later).is_none());
+        // A body-promoted mention keeps the ID-only stored shape, so the hub's
+        // mention-audience validation accepts it; receipts drain the outbox.
+        let promoted = p
+            .replica
+            .send(&a, "a", "agent", &json!({"channel":"general","body":"@Scout-b over to you","request_id":"o3"}), &p.people)
+            .unwrap();
+        assert_eq!(promoted["event"]["data"]["mentions"], json!([b]));
+        assert_eq!(p.replica.outbox_status_at(&a, later).unwrap()["pending_sync"], 3);
+        for wire in p.replica.pending_uploads(64).unwrap() {
+            let receipt = p.hub.accept_upload(&p.replica.daemon_id, &wire).unwrap();
+            p.replica.record_receipt(&receipt).unwrap();
+        }
+        let id = promoted["event_id"].as_str().unwrap();
+        assert!(mention_recipients(&p.hub.events.iter().find(|e| e.event["id"] == id).unwrap().event)
+            .contains(&b.as_str()));
+        assert!(p.replica.outbox_status_at(&a, later).is_none());
+    }
+    #[test]
     fn offline_messages_and_monitors_survive_receipt_loss_and_origin_restart() {
         let mut p = pair();
         let reader = &p.people[1];
@@ -2125,6 +2408,7 @@ mod tests {
             task: None,
             present: true,
             kind: "agent".into(),
+            engine: None,
         };
         p.people.push(newcomer.clone());
         p.hub
@@ -2314,6 +2598,7 @@ mod tests {
             task: None,
             present: true,
             kind: "agent".into(),
+            engine: None,
         };
         p.hub
             .register_host(&receiver, true, false, std::slice::from_ref(&person))
@@ -2379,10 +2664,10 @@ impl Store {
         let mut requested = requested.clone();
         for selector in requested.clone() {
             if let Some(event) = selector.strip_prefix("thread:") {
+                // Indexed, as on the replica side: this runs on every
+                // per-peer push-loop pass under the store slot.
                 if let Some(conv) = self
-                    .events
-                    .iter()
-                    .find(|e| e.event["id"] == event)
+                    .published(event)
                     .and_then(|e| e.event["conversation_id"].as_str())
                 {
                     requested.insert(conv.into());
@@ -2428,10 +2713,13 @@ impl Store {
                             || base == path
                             || scope.include_children && path.starts_with(&format!("{base}/"))
                     }) || scope.conversation.as_ref() == Some(id)
+                        // Indexed lookup: this runs on every sync-loop pass
+                        // under the store slot, once per scope × channel, so a
+                        // scan of every event here starved all messaging RPCs
+                        // (cm-sessions, 2026-10-12).
                         || scope.thread.as_deref().is_some_and(|thread| {
-                            self.events.iter().any(|e| {
-                                e.event["id"] == thread && e.event["conversation_id"] == *id
-                            })
+                            self.published(thread)
+                                .is_some_and(|e| e.event["conversation_id"] == *id)
                         });
                     if follows {
                         out.insert(id.clone());
@@ -2491,6 +2779,7 @@ impl Store {
                 Some("pin" | "unpin" | "set" | "remove")
             ),
             "messaging.norms" => matches!(p["action"].as_str(), Some("publish" | "revert")),
+            "messaging.availability" => p["action"] == "set",
             "session.set_name" => true,
             "messaging.follow" | "messaging.monitor" | "messaging.monitors" if actor == "owner" => {
                 true
@@ -2575,6 +2864,29 @@ impl Store {
     }
 }
 
+/// Encode exactly the newest retained checkpoint marks, overlaying a staged
+/// insertion/replacement without copying the unbounded in-memory history.
+pub(super) fn recent_marks(marks: &BTreeMap<u64, Value>, pending: Option<&(u64, Value)>) -> Vec<Value> {
+    let mut old = marks.iter().rev().peekable();
+    let mut pending = pending;
+    let mut recent = Vec::new();
+    while recent.len() < RETAINED_MARKS {
+        if let Some((key, value)) = pending {
+            if old.peek().is_none_or(|(old_key, _)| key >= *old_key) {
+                if old.peek().is_some_and(|(old_key, _)| key == *old_key) {
+                    old.next();
+                }
+                recent.push(json!([key, value]));
+                pending = None;
+                continue;
+            }
+        }
+        let Some((key, value)) = old.next() else { break; };
+        recent.push(json!([key, value]));
+    }
+    recent
+}
+
 /// Coverage checkpoints. A checkpoint claims "this replica holds everything
 /// through hub position N" for a scope, so it is written only after the
 /// records it covers are durable, and losing it (or falling back to an older
@@ -2607,7 +2919,7 @@ impl Store {
                 .get_or_insert_with(|| self.replication.coverage.clone())
                 .insert((*scope).to_owned(), data);
         }
-        let mut marks = None;
+        let mut pending_mark = None;
         if let Some((cursor, revision, subscribed)) = transport {
             let data = json!({"scope":"transport","coordinator_id":self.coordinator_id(),"generation":generation,"cursor":cursor,"revision":revision,"scopes":subscribed,"complete":false});
             coverage
@@ -2615,18 +2927,17 @@ impl Store {
                 .insert("transport".into(), data.clone());
             // Known to position tokens minted after the next local arrival
             // (a token at the current position may predate this checkpoint).
-            let mut m = self.replication.marks.clone();
-            m.insert(self.position.saturating_add(1), transport_mark(&data));
-            marks = Some(m);
+            pending_mark = Some((self.position.saturating_add(1), transport_mark(&data)));
         }
         let Some(coverage) = coverage else {
             return Ok(());
         };
-        let marks = marks.unwrap_or_else(|| self.replication.marks.clone());
         let recorded_at = now();
-        self.save_coverage(&coverage, &marks, &recorded_at)?;
+        self.save_coverage(&coverage, pending_mark.as_ref(), &recorded_at)?;
         self.replication.coverage = coverage;
-        self.replication.marks = marks;
+        if let Some((position, mark)) = pending_mark {
+            self.replication.marks.insert(position, mark);
+        }
         self.replication.last_reconciled = Some(recorded_at);
         self.replication.signal.signal();
         Ok(())
@@ -2634,7 +2945,7 @@ impl Store {
     fn save_coverage(
         &mut self,
         coverage: &BTreeMap<String, Value>,
-        marks: &BTreeMap<u64, Value>,
+        pending_mark: Option<&(u64, Value)>,
         recorded_at: &str,
     ) -> Result<()> {
         // Claims are persisted only once everything ingested is durable.
@@ -2642,12 +2953,7 @@ impl Store {
         if let Some(reason) = &self.degraded {
             return Err(err("store_read_only", reason.clone()));
         }
-        let recent: Vec<_> = marks
-            .iter()
-            .rev()
-            .take(RETAINED_MARKS)
-            .map(|(k, v)| json!([k, v]))
-            .collect();
+        let recent = recent_marks(&self.replication.marks, pending_mark);
         atomic_replace(
             &self.root.join(COVERAGE_FILE),
             &json!({"version":1,"replica_id":self.daemon_id,"generation":self.generation,
@@ -2729,7 +3035,6 @@ impl Store {
                 .clone()
                 .unwrap_or_else(now);
             let coverage = self.replication.coverage.clone();
-            let marks = self.replication.marks.clone();
             let mut kept: BTreeSet<u64> = index.map(|i| i.kept).unwrap_or_default();
             kept.extend(scan.kept);
             // Legacy marks are immutable history; recent new-style marks
@@ -2740,7 +3045,7 @@ impl Store {
                 .range(..=floor)
                 .map(|(k, v)| json!([k, v]))
                 .collect();
-            let written = self.save_coverage(&coverage, &marks, &recorded_at).and_then(|_| {
+            let written = self.save_coverage(&coverage, None, &recorded_at).and_then(|_| {
                 atomic_replace(
                     &self.root.join(JOURNAL_INDEX_FILE),
                     &json!({"version":1,"replica_id":self.daemon_id,"generation":self.generation,

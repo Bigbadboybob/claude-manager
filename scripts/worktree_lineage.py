@@ -16,6 +16,7 @@ import time
 import uuid
 
 MARKER = '# cm-worktree-lineage v1'
+TRAILER_MARKER = '# cm-commit-trailers v1'
 
 
 def cm_home() -> Path:
@@ -50,6 +51,73 @@ def git(path: Path, *args: str) -> str:
     env = {key: value for key, value in os.environ.items() if key not in {'GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'}}
     result = subprocess.run(['git', '-C', str(path), *args], capture_output=True, text=True, timeout=15, check=True, env=env)
     return result.stdout.strip()
+
+
+def git_dirs(path: Path) -> tuple[Path, Path] | None:
+    """(admin git dir, common dir) read from `.git` without spawning Git.
+
+    A cleanup preview inspects every checkout on the host; at ~20 ms per Git
+    process on a loaded host, seven processes per checkout made previews take
+    40 s (2026-10-07, 226 checkouts). Returns None for anything unusual
+    (symlinks, missing files, an unexpected `.git` form) so callers fall back
+    to asking Git.
+    """
+    dotgit = path / '.git'
+    try:
+        if dotgit.is_symlink():
+            return None
+        if dotgit.is_dir():
+            admin = dotgit.resolve()
+            return admin, admin
+        link = dotgit.read_text().strip()
+        if not link.startswith('gitdir: '):
+            return None
+        admin = (path / link[8:]).resolve()
+        common = (admin / (admin / 'commondir').read_text().strip()).resolve()
+    except (OSError, ValueError):
+        return None
+    if not (admin / 'HEAD').is_file() or not (common / 'config').is_file():
+        return None
+    return admin, common
+
+
+def common_dir(path: Path) -> str:
+    """`git rev-parse --path-format=absolute --git-common-dir`, resolved."""
+    dirs = git_dirs(path)
+    if dirs is not None:
+        return str(dirs[1])
+    return str(Path(git(path, 'rev-parse', '--path-format=absolute', '--git-common-dir')).resolve())
+
+
+def current_branch(path: Path) -> str:
+    """`git branch --show-current`: the branch name, '' when detached."""
+    dirs = git_dirs(path)
+    if dirs is not None:
+        try:
+            head = (dirs[0] / 'HEAD').read_text().strip()
+        except OSError:
+            head = None
+        if head is not None:
+            if head.startswith('ref: refs/heads/'):
+                return head[len('ref: refs/heads/'):]
+            if not head.startswith('ref:'):
+                return ''  # detached: HEAD holds an object id
+    return git(path, 'branch', '--show-current')
+
+
+_ORIGIN_CACHE: dict[str, str | None] = {}
+
+
+def origin_url(path: Path) -> str | None:
+    """`git remote get-url origin` (None when there is no origin), cached per
+    repository: every checkout of one repository shares its config."""
+    key = common_dir(path)
+    if key not in _ORIGIN_CACHE:
+        try:
+            _ORIGIN_CACHE[key] = git(path, 'remote', 'get-url', 'origin')
+        except subprocess.SubprocessError:
+            _ORIGIN_CACHE[key] = None
+    return _ORIGIN_CACHE[key]
 
 
 def checkout(path: Path, *, create: bool = True) -> dict:
@@ -169,9 +237,91 @@ def register(path: Path, parent: Path | None = None, task_ids=(), source='git-ho
     return value
 
 
-def install_hook(repo: Path) -> dict:
-    """Chain the existing hook in place; never change core.hooksPath or bootstrap."""
-    hook = Path(git(repo, 'rev-parse', '--path-format=absolute', '--git-path', 'hooks/post-checkout'))
+PRUNE_AFTER_DAYS = 14.0
+
+
+def prune(min_age_days: float = PRUNE_AFTER_DAYS, apply: bool = False, now: float | None = None) -> dict:
+    """Drop creation evidence nothing can use any more (#109).
+
+    Every record stays until its checkout is gone, so the directory only grew:
+    on cm-sessions 2026-11-05 it held 6,849 records (and as many `.lock`
+    files) for 232 live checkouts, and every cleanup preview and per-candidate
+    scope check reads all of them (0.65 s warm, 7.8 s cold each time).
+
+    A record is removed only when all of these hold:
+    - its checkout is not current (`records()` rejected it);
+    - its own identity stamp is gone too, so a moved checkout keeps its record;
+    - no current checkout descends from it, since a reaped ancestor's task ids
+      still protect surviving descendants;
+    - nothing has rewritten it for `min_age_days`.
+    New records only ever name existing parents, so a removed record cannot be
+    needed later. Dry run unless `apply`."""
+    now = time.time() if now is None else now
+    directory = cm_home() / 'worktree-lineage'
+    stored = stored_records()
+    live = records()
+    needed = set(live)
+    pending = list(live)
+    while pending:
+        for parent in stored.get(pending.pop(), {}).get('parents', []):
+            if parent not in needed:
+                needed.add(parent)
+                pending.append(parent)
+    cutoff = now - min_age_days * 86400
+    summary = {'mode': 'apply' if apply else 'dry-run', 'min_age_days': min_age_days, 'records': len(stored),
+               'live': len(live), 'ancestors_kept': len(needed - set(live)), 'recent_kept': 0,
+               'stamped_kept': 0, 'removed': 0, 'orphan_locks_removed': 0}
+    for ident, row in stored.items():
+        if ident in needed:
+            continue
+        target = directory / (ident + '.json')
+        try:
+            if target.stat().st_mtime > cutoff:
+                summary['recent_kept'] += 1
+                continue
+        except FileNotFoundError:
+            continue
+        try:
+            stamped = (Path(row['git_dir']) / 'cm-checkout-id').read_text().strip() == ident
+        except FileNotFoundError:
+            stamped = False
+        except (OSError, KeyError, TypeError):
+            stamped = True  # unreadable is not proof of absence
+        if stamped:
+            summary['stamped_kept'] += 1
+            continue
+        summary['removed'] += 1
+        if apply:
+            lock = target.with_suffix('.lock')
+            with locked(lock):
+                target.unlink(missing_ok=True)
+            lock.unlink(missing_ok=True)
+    # Per-record locks whose record is gone (hook locks are named `hook-*`).
+    for lock in directory.glob('*.lock'):
+        try:
+            ident = str(uuid.UUID(lock.stem))
+        except ValueError:
+            continue
+        if lock.stem != ident or ident in stored or (directory / (ident + '.json')).exists():
+            continue
+        try:
+            if lock.stat().st_mtime > cutoff:
+                continue
+        except FileNotFoundError:
+            continue
+        summary['orphan_locks_removed'] += 1
+        if apply:
+            lock.unlink(missing_ok=True)
+    return summary
+
+
+def _chain_hook(repo: Path, name: str, marker: str, ours: str, ours_first: bool) -> dict:
+    """Chain the existing `name` hook in place; never change core.hooksPath or bootstrap.
+
+    `ours` is the shell line CM adds. With `ours_first` it runs before the
+    pre-existing hook (which can exit, exec or change cwd); otherwise after
+    it. Either way the pre-existing hook's exit status is preserved."""
+    hook = Path(git(repo, 'rev-parse', '--path-format=absolute', '--git-path', f'hooks/{name}'))
     try:
         configured = git(repo, 'config', '--get', 'core.hooksPath')
     except subprocess.CalledProcessError:
@@ -196,28 +346,89 @@ def install_hook(repo: Path) -> dict:
         if hook.is_symlink():
             raise ValueError(f'leaving symlink hook unchanged: {hook}')
         original = hook.read_text() if hook.exists() else ''
-        if MARKER in original:
+        if marker in original:
             return {'hook': str(hook), 'installed': True}
-        previous = hook.with_name('post-checkout.before-cm-lineage')
+        previous = hook.with_name(f'{name}.before-cm-lineage')
         if previous.exists():
             raise ValueError(f'hook was replaced since installation; inspect {hook}')
         executable = hook.exists() and os.access(hook, os.X_OK)
         if hook.exists():
             os.replace(hook, previous)
-        script = shlex.quote(str(Path(__file__).resolve()))
-        # Run tracking before the pre-existing hook: that hook can exit, exec,
-        # change cwd, or create further worktrees. Its exit status is preserved.
-        body = f'#!/bin/sh\n{MARKER}\n/usr/bin/python3 {script} hook "$@" >/dev/null 2>&1 || :\n'
-        if executable:
-            body += f'exec {shlex.quote(str(previous))} "$@"\n'
+        body = f'#!/bin/sh\n{marker}\n'
+        if ours_first or not executable:
+            body += ours
+            body += f'exec {shlex.quote(str(previous))} "$@"\n' if executable else 'exit 0\n'
         else:
-            body += 'exit 0\n'
-        fd, name = tempfile.mkstemp(prefix='.post-checkout-', dir=hook.parent)
+            body += f'{shlex.quote(str(previous))} "$@" || exit $?\n{ours}exit 0\n'
+        fd, tmp = tempfile.mkstemp(prefix=f'.{name}-', dir=hook.parent)
         with os.fdopen(fd, 'w') as stream:
             stream.write(body)
-        os.chmod(name, 0o755)
-        os.replace(name, hook)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, hook)
     return {'hook': str(hook), 'installed': True}
+
+
+def install_hook(repo: Path) -> dict:
+    """The post-checkout lineage hook. Tracking runs before the pre-existing
+    hook: that hook can exit, exec, change cwd, or create further worktrees."""
+    script = shlex.quote(str(Path(__file__).resolve()))
+    return _chain_hook(repo, 'post-checkout', MARKER,
+                       f'/usr/bin/python3 {script} hook "$@" >/dev/null 2>&1 || :\n', ours_first=True)
+
+
+def install_trailer_hook(repo: Path) -> dict:
+    """The prepare-commit-msg hook adding CM-Session / CM-Member trailers
+    (doc/org-model.md §8.3). It runs after the pre-existing hook, so a hook
+    that rewrites the message keeps the trailers, and never fails a commit."""
+    script = shlex.quote(str(Path(__file__).resolve()))
+    return _chain_hook(repo, 'prepare-commit-msg', TRAILER_MARKER,
+                       f'/usr/bin/python3 {script} trailers "$@" >/dev/null 2>&1 || :\n', ours_first=False)
+
+
+def install_hooks(repo: Path) -> list[dict]:
+    """Both CM hooks; one refusing (a tracked or checkout-local hook) does
+    not stop the other. Raises the first refusal after trying both."""
+    results, errors = [], []
+    for install in (install_hook, install_trailer_hook):
+        try:
+            results.append(install(repo))
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            errors.append(exc)
+    if errors:
+        raise errors[0]
+    return results
+
+
+def commit_trailers(env=os.environ) -> list[str]:
+    """`CM-Session: <uid>` for a commit made inside a CM session, plus
+    `CM-Member: <id>` once sessions carry a member id (org model S2+)."""
+    out = []
+    uid = env.get('CM_TUI_SESSION_ID', '').strip()
+    if uid:
+        out.append(f'CM-Session: {uid}')
+    member = env.get('CM_MEMBER_ID', '').strip()
+    if member:
+        out.append(f'CM-Member: {member}')
+    return out
+
+
+def trailers(args: list[str]) -> None:
+    """prepare-commit-msg payload: `<message file> [source [sha]]`. Credits
+    authors, not landers, so a merge commit gets no trailer; an amended or
+    reused message keeps the trailers it already has."""
+    if not args or (len(args) > 1 and args[1] == 'merge'):
+        return
+    try:
+        lines = Path(args[0]).read_text().splitlines()
+    except OSError:
+        return
+    for trailer in commit_trailers():
+        key = trailer.split(':', 1)[0] + ':'
+        if any(line.startswith(key) for line in lines):
+            continue
+        subprocess.run(['git', 'interpret-trailers', '--in-place', '--if-exists', 'doNothing',
+                        '--trailer', trailer, args[0]], check=True, timeout=15,
+                       capture_output=True)
 
 
 def hook(args: list[str]) -> None:
@@ -248,8 +459,17 @@ def hook(args: list[str]) -> None:
 if __name__ == '__main__':
     if sys.argv[1:2] == ['hook']:
         hook(sys.argv[2:])
+    elif sys.argv[1:2] == ['trailers']:
+        trailers(sys.argv[2:])
     elif sys.argv[1:2] == ['install']:
         for arg in sys.argv[2:]:
-            print(json.dumps(install_hook(Path(arg))))
+            print(json.dumps(install_hooks(Path(arg))))
+    elif sys.argv[1:2] == ['prune']:
+        # prune [--days N] [--apply]: dry run by default.
+        rest = sys.argv[2:]
+        days = float(rest[rest.index('--days') + 1]) if '--days' in rest else PRUNE_AFTER_DAYS
+        if days <= 0:
+            raise SystemExit('--days must be positive')
+        print(json.dumps(prune(days, apply='--apply' in rest)))
     elif sys.argv[1:2] == ['register']:
         print(json.dumps(register(Path(sys.argv[2]), Path(sys.argv[3]) if len(sys.argv) > 3 else None, source='cm')))

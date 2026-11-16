@@ -7,6 +7,7 @@ fn person(s: &Store, uid: &str) -> Person {
         task: None,
         present: true,
         kind: "agent".into(),
+        engine: None,
     }
 }
 fn post(s: &mut Store, p: &Person, target: Value, key: &str, people: &[Person]) -> Value {
@@ -16,6 +17,129 @@ fn post(s: &mut Store, p: &Person, target: Value, key: &str, people: &[Person]) 
     q["name"] = json!(format!("{} builder", p.name));
     s.send(&p.id, &p.session_uid, "agent", &q, people).unwrap()
 }
+
+#[test]
+fn monitor_status_counts_receipts_without_delivery_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Store::open(tmp.path()).unwrap();
+    let a = person(&s, "a");
+    let b = person(&s, "b");
+    let people = vec![a.clone(), b.clone()];
+    s.enroll_participants(&people).unwrap();
+    assert_eq!(s.monitor_status(&b.id), json!({
+        "active":0,"unacknowledged":0,"badges":0,"recently_expired":[]
+    }));
+    let mut monitors = BTreeMap::new();
+    for (key, mode, notify) in [
+        ("wake", "continuous", "wake"),
+        ("badge", "continuous", "badge"),
+        ("silent", "continuous", "none"),
+        ("once", "once", "wake"),
+        ("cancel", "continuous", "wake"),
+        ("dismiss", "continuous", "badge"),
+        ("expire", "continuous", "wake"),
+    ] {
+        let mut p = json!({"scope":{"dm":a.id},"mode":mode,"notify":notify,"request_id":key});
+        if key == "expire" {
+            p["expires_in"] = json!("1m");
+        }
+        monitors.insert(key, s.register_monitor(&b.id, &p, &people).unwrap());
+    }
+    let first = post(&mut s, &a, json!({"dm":b.id}), "first", &people);
+    post(&mut s, &a, json!({"dm":b.id}), "second", &people);
+    for action in ["cancel", "dismiss"] {
+        s.monitors(&b.id, &json!({
+            "action":action,"monitor_id":monitors[action]["id"],
+            "request_id":format!("{action}-now")
+        })).unwrap();
+    }
+    s.advance_monitors_at(Utc::now() + chrono::Duration::minutes(2)).unwrap();
+
+    // A real retained receipt must remain visible to explicit monitor reads.
+    let wake_id = monitors["wake"]["id"].as_str().unwrap();
+    let queue = s.root.join("_delivery").join(format!("{}.json", hash(b.session_uid.as_bytes())));
+    atomic_replace(&queue, &json!({"last_attempt":0,"batches":[{
+        "wake_id":"retained","ids":[format!("monitor:{wake_id}:{}", first["event_id"].as_str().unwrap())],
+        "status":"confirmed","released":true
+    }]})).unwrap();
+    let check = |s: &Store, unread: u64, badges: u64| {
+        let before = super::super::delivery::queue_load_count();
+        let status = s.monitor_status(&b.id);
+        assert_eq!(super::super::delivery::queue_load_count(), before,
+            "aggregate chat decoration must perform zero delivery queue loads");
+        assert_eq!(status["active"], 3);
+        assert_eq!(status["unacknowledged"], unread);
+        assert_eq!(status["badges"], badges);
+        assert_eq!(status["recently_expired"][0]["id"], monitors["expire"]["id"]);
+    };
+    check(&s, 11, 9);
+    let before = super::super::delivery::queue_load_count();
+    let listing = s.monitors(&b.id, &json!({"action":"list"})).unwrap();
+    assert_eq!(super::super::delivery::queue_load_count() - before, 6);
+    let rich = listing["items"].as_array().unwrap().iter()
+        .find(|m| m["id"] == wake_id).unwrap();
+    assert_eq!(rich["delivery"], json!({"confirmed":1}));
+    assert_eq!(rich["unacknowledged"], 2);
+
+    // A result receipt affects one watch, whereas a read receipt affects all
+    // matching watches. Overlap must not decrement the same hit twice.
+    let page = s.monitors(&b.id, &json!({
+        "action":"get","monitor_id":wake_id,"limit":1,"unacknowledged_only":true
+    })).unwrap();
+    s.monitors(&b.id, &json!({"action":"ack","monitor_id":wake_id,
+        "receipt":page["receipt"],"request_id":"ack-first"})).unwrap();
+    check(&s, 10, 8);
+    s.acknowledge(&b.id, &json!({"actor":b.id,"space_id":s.space_id,
+        "ids":[first["event_id"]]})).unwrap();
+    check(&s, 5, 4);
+    s.mark_read(&b.id, &json!({"all":true}), &people).unwrap();
+    check(&s, 0, 0);
+}
+
+#[test]
+fn monitor_status_recent_expiries_keep_order_limit_and_horizon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Store::open(tmp.path()).unwrap();
+    let m = s.register_monitor("owner", &json!({
+        "scope":{"channel":"general"},"mode":"continuous","request_id":"template"
+    }), &[]).unwrap();
+    let mut state = s.personal_state("owner");
+    let template = state.monitors.remove(m["id"].as_str().unwrap()).unwrap();
+    let now = Utc::now();
+    for hours in 1..=7 {
+        let mut expired = template.clone();
+        expired.id = format!("expired-{hours}");
+        expired.state = "expired".into();
+        expired.expires_at = Some((now - chrono::Duration::hours(hours)).to_rfc3339());
+        state.monitors.insert(expired.id.clone(), expired);
+    }
+    for (id, status, expiry) in [
+        ("old", "expired", Some((now - chrono::Duration::hours(25)).to_rfc3339())),
+        ("invalid", "expired", Some("invalid".into())),
+        ("missing", "expired", None),
+        ("dismissed", "dismissed", Some(now.to_rfc3339())),
+    ] {
+        let mut monitor = template.clone();
+        monitor.id = id.into();
+        monitor.state = status.into();
+        monitor.expires_at = expiry;
+        state.monitors.insert(id.into(), monitor);
+    }
+    s.save_personal(state).unwrap();
+    let status = s.monitor_status("owner");
+    assert_eq!(status["active"], 0);
+    assert_eq!(status["unacknowledged"], 0);
+    assert_eq!(status["badges"], 0);
+    let expired = status["recently_expired"].as_array().unwrap();
+    assert_eq!(expired.len(), 5);
+    for (i, entry) in expired.iter().enumerate() {
+        assert_eq!(entry["id"], format!("expired-{}", i + 1));
+        assert_eq!(entry["mode"], "continuous");
+        assert_eq!(entry["scope"], m["scope"]);
+        assert_eq!(entry["expired_at"], (now - chrono::Duration::hours(i as i64 + 1)).to_rfc3339());
+    }
+}
+
 #[test]
 fn messaging_monitors_first_contact_privacy_restart_and_receipt_boundary() {
     let tmp = tempfile::tempdir().unwrap();
@@ -337,4 +461,111 @@ fn messaging_group_monitors_and_mutes_do_not_spill_into_other_dms() {
     let wakes=s.wake_intents();
     assert!(!wakes["b"].iter().any(|w| w.event_id == group_msg["event"]["id"].as_str().unwrap()));
     assert!(wakes["b"].iter().any(|w| w.event_id == pair_msg["event"]["id"].as_str().unwrap()));
+}
+
+#[test]
+fn owner_attention_splits_unread_dms_and_mentions_and_reading_clears_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Store::open(tmp.path()).unwrap();
+    let a = person(&s, "a");
+    let people = vec![a.clone()];
+    post(&mut s, &a, json!({"dm":"owner"}), "dm one", &people);
+    post(&mut s, &a, json!({"dm":"owner"}), "dm two", &people);
+    let mention = post(&mut s, &a, json!({"channel":"general","mentions":["owner"]}), "mention", &people);
+    let mut here = json!({"channel":"general","mention_here":true});
+    here["body"] = json!("here");
+    here["request_id"] = json!("here");
+    s.send(&a.id, "a", "agent", &here, &people).unwrap();
+    post(&mut s, &a, json!({"channel":"general"}), "plain", &people);
+    let att = s.attention("owner", false).unwrap();
+    assert_eq!((att["dms"].as_u64(), att["mentions"].as_u64()), (Some(2), Some(2)), "{att}");
+    // Reading the mention clears it from the count.
+    s.acknowledge("owner", &json!({"actor":"owner","space_id":s.space_id,"ids":[mention["event_id"]]})).unwrap();
+    assert_eq!(s.attention("owner", false).unwrap()["mentions"], 1);
+    // Agents get nothing.
+    assert!(s.attention(&a.id, false).unwrap().is_null());
+}
+
+/// A thread-scoped watch makes its own conversation a sync interest and no
+/// other. The lookup is indexed: this runs on every sync-loop pass under the
+/// store slot, and the old per-channel scan of every event starved messaging
+/// RPCs on cm-sessions (2026-10-12).
+#[test]
+fn thread_watch_interest_is_its_own_conversation_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Store::open(tmp.path()).unwrap();
+    let a = person(&s, "a");
+    let people = vec![a.clone()];
+    for path in ["alpha", "beta"] {
+        s.create_channel("owner", &json!({"action":"create","path":path,"request_id":path}))
+            .unwrap();
+        s.channel_action(&a.id, &json!({"action":"join","path":path,"request_id":format!("j-{path}")}), &people)
+            .unwrap();
+    }
+    let root = post(&mut s, &a, json!({"channel":"alpha"}), "root", &people);
+    post(&mut s, &a, json!({"channel":"beta"}), "other", &people);
+    s.register_monitor(
+        "owner",
+        &json!({"scope":{"thread":root["event_id"]},"mode":"continuous","expires_in":"10m","request_id":"t"}),
+        &people,
+    )
+    .unwrap();
+    let interests = s.local_transport_interests();
+    assert_eq!(
+        interests,
+        BTreeSet::from([s.channels["alpha"].clone()]),
+        "only the thread's conversation"
+    );
+}
+
+/// DM rows name every member, including agents that have since left the
+/// people directory (which lists only present participants): the board
+/// showed a departed peer's raw uid as the DM label (2026-10-13).
+#[test]
+fn dm_rows_carry_member_names_including_departed_agents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Store::open(tmp.path()).unwrap();
+    let a = person(&s, "a");
+    post(&mut s, &a, json!({"dm":"owner"}), "hello", &[a.clone()]);
+    // The agent departs: nothing below passes a people list.
+    let page = s.dms_page("owner", &json!({})).unwrap();
+    let row = &page["items"][0];
+    assert_eq!(row["member_names"][&a.id], "a-builder", "{row}");
+    assert_eq!(row["member_names"]["owner"], "Owner");
+    assert_eq!(row["peer"], json!(a.id), "existing fields unchanged");
+}
+
+/// A DM by NAME to a closed session is refused when a live session carries
+/// that name plus a suffix (a replaced lead), and names the live one; the
+/// closed participant stays reachable by ID, and a closed name with no live
+/// successor still resolves (Owner 2026-11-08: "PP-Lead" went to a closed
+/// session while "PP-Lead-6ef" was live).
+#[test]
+fn dm_by_name_refuses_closed_session_with_live_successor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Store::open(tmp.path()).unwrap();
+    let old = person(&s, "old");
+    let new = person(&s, "new");
+    let lone = person(&s, "lone");
+    let me = person(&s, "me");
+    let send = |s: &mut Store, from: &Person, name: &str, target: Value, key: &str, people: &[Person]| {
+        let mut q = target;
+        q["body"] = json!(key);
+        q["request_id"] = json!(key);
+        q["name"] = json!(name);
+        s.send(&from.id, &from.session_uid, "agent", &q, people)
+    };
+    send(&mut s, &old, "PP-Lead", json!({"dm":"owner"}), "o1", &[old.clone()]).unwrap();
+    send(&mut s, &new, "PP-Lead-6ef", json!({"dm":"owner"}), "n1", &[new.clone()]).unwrap();
+    send(&mut s, &lone, "Solo-Lead", json!({"dm":"owner"}), "l1", &[lone.clone()]).unwrap();
+    // `old` and `lone` have exited: only `new` and `me` are present.
+    let live = vec![new.clone(), me.clone()];
+    let e = send(&mut s, &me, "Me", json!({"dm":"PP-Lead"}), "m1", &live).unwrap_err();
+    assert_eq!(e.code, "not_found", "{e:?}");
+    assert!(e.message.contains("PP-Lead-6ef") && e.message.contains("closed"), "{e:?}");
+    // The live successor by name, and the closed one by explicit ID, both work.
+    send(&mut s, &me, "Me", json!({"dm":"PP-Lead-6ef"}), "m2", &live).unwrap();
+    send(&mut s, &me, "Me", json!({"dm":old.id.clone()}), "m3", &live).unwrap();
+    // A closed name with no live successor keeps resolving as before.
+    send(&mut s, &me, "Me", json!({"dm":"Solo-Lead"}), "m4", &live).unwrap();
 }

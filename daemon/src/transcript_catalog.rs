@@ -18,6 +18,10 @@ pub struct TranscriptCandidate {
     /// Label of the sidebar row currently bound to this transcript
     /// (filled in by the caller — the lister has no sidebar view).
     pub bound_to: Option<String>,
+    /// #24: the id this transcript was rotated to — CM moved the
+    /// conversation on and the picker labels the old file "rotated".
+    #[serde(default)]
+    pub rotated_to: Option<String>,
 }
 
 /// How many lines of a transcript's head to scan for a preview.
@@ -51,7 +55,22 @@ pub fn list_transcript_candidates_in(
     };
     out.sort_by(|a, b| b.modified.cmp(&a.modified));
     out.truncate(MAX_CANDIDATES);
+    let lineage = rotated_lineage_in(home);
+    for cand in &mut out {
+        cand.rotated_to = lineage.get(&cand.id).cloned();
+    }
     out
+}
+
+/// #24: the daemon's rotation lineage (superseded id → successor), read
+/// from its resume-identity archive under `home/.cm`. Empty when the
+/// archive is absent or unreadable — a missing label is harmless.
+pub fn rotated_lineage_in(home: &Path) -> std::collections::BTreeMap<String, String> {
+    std::fs::read_to_string(home.join(".cm/daemon-resume-identities.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|v| serde_json::from_value(v.get("rotated")?.clone()).ok())
+        .unwrap_or_default()
 }
 
 /// `~/.claude/projects/<encoded worktree>/*.jsonl` — the same encoding
@@ -86,6 +105,7 @@ fn list_claude(home: &Path, worktree: &Path) -> Vec<TranscriptCandidate> {
             size_bytes: meta.len(),
             preview: claude_preview(&path),
             bound_to: None,
+            rotated_to: None,
         });
     }
     out
@@ -136,6 +156,7 @@ fn walk_codex(dir: &Path, wt_str: &str, out: &mut Vec<TranscriptCandidate>) {
             size_bytes: meta.len(),
             preview: codex_preview(&path),
             bound_to: None,
+            rotated_to: None,
         });
     }
 }

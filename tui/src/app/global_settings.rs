@@ -11,6 +11,17 @@ const MAX_TINT: f64 = 5.0;
 #[serde(default)]
 struct Preferences {
     sidebar_tint_strength: f64,
+    /// File-only (no F9 row): launch Codex with `--no-alt-screen` so its
+    /// history reaches CM's scrollback. Applies to the next TUI-composed
+    /// Codex spawn/A-R; restart the TUI after editing.
+    codex_inline_scrollback: bool,
+    /// Messages view conversation sidebar width in cells; 0 fits the
+    /// longest name. Set with `<` / `>` in Messages.
+    messages_sidebar_width: u16,
+    /// The live activity badge on sidebar rows and org chart cards
+    /// (`⚙ 3m`, `⧗ cargo test`, `⚠ rate limit`). The info pane always
+    /// shows it.
+    activity_badges: bool,
 }
 
 #[cfg(test)]
@@ -44,6 +55,36 @@ mod tests {
     }
 
     #[test]
+    fn global_settings_models_section_defaults_overrides_and_rejects() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.toml");
+        let settings = GlobalSettings::load_from(path.clone());
+        assert_eq!(
+            settings.models(),
+            &cm_daemon::models::ModelConfig::default()
+        );
+        std::fs::write(&path, "[models]\ncodex = \"gpt-6-luna\"\n").unwrap();
+        let settings = GlobalSettings::load_from(path.clone());
+        assert_eq!(settings.models().codex, "gpt-6-luna");
+        assert_eq!(
+            settings.models().claude,
+            cm_daemon::models::DEFAULT_CLAUDE_MODEL
+        );
+        assert!(settings.load_error.is_none());
+        std::fs::write(&path, "[models]\nclaude = \"opus latest\"\n").unwrap();
+        let settings = GlobalSettings::load_from(path.clone());
+        assert_eq!(
+            settings.models(),
+            &cm_daemon::models::ModelConfig::default()
+        );
+        assert!(settings
+            .load_error
+            .as_deref()
+            .unwrap()
+            .contains("models.claude"));
+    }
+
+    #[test]
     fn global_settings_preview_cancel_save_reload_and_preserve_other_keys() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.toml");
@@ -72,6 +113,32 @@ mod tests {
             Some(true)
         );
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    /// The activity badge toggle: on by default, ↓ then Space flips it,
+    /// Enter saves both rows, and a reload keeps it.
+    #[test]
+    fn activity_badges_toggle_saves_and_reloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.toml");
+        let mut settings = GlobalSettings::load_from(path.clone());
+        assert!(settings.activity_badges());
+        settings.handle_event(&key(KeyCode::F(9)));
+        settings.handle_event(&key(KeyCode::Down));
+        settings.handle_event(&key(KeyCode::Char(' ')));
+        assert_eq!(
+            settings.tint_strength(),
+            2.0,
+            "the badge row leaves the tint alone"
+        );
+        settings.handle_event(&key(KeyCode::Up));
+        settings.handle_event(&key(KeyCode::Right));
+        settings.handle_event(&key(KeyCode::Enter));
+        let reloaded = GlobalSettings::load_from(path.clone());
+        assert!(!reloaded.activity_badges());
+        assert_eq!(reloaded.tint_strength(), 2.25);
+        std::fs::write(&path, "activity_badges = true\n").unwrap();
+        assert!(GlobalSettings::load_from(path).activity_badges());
     }
 
     #[test]
@@ -110,12 +177,47 @@ mod tests {
             "modal keys must be consumed"
         );
     }
+
+    #[test]
+    fn staffing_guide_key_opens_read_only_page_and_esc_returns_to_f9() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut settings = GlobalSettings::load_from(temp.path().join("settings.toml"));
+        assert!(!settings.is_open());
+        settings.handle_event(&key(KeyCode::F(9)));
+        settings.handle_event(&key(KeyCode::Char('g')));
+        assert!(settings.staffing.is_open());
+        settings.handle_event(&key(KeyCode::Char('j')));
+        settings.handle_event(&key(KeyCode::Esc));
+        assert!(
+            settings.is_open(),
+            "Esc from the guide returns to the F9 list"
+        );
+        assert!(!settings.staffing.is_open());
+
+        // The existing policy key still opens the editor from the same list.
+        settings.handle_event(&key(KeyCode::Char('s')));
+        assert!(settings.staffing.is_open());
+        settings.handle_event(&key(KeyCode::Esc));
+        assert!(settings.is_open());
+
+        // The row is also reachable from the short F9 menu.
+        for _ in 0..3 {
+            settings.handle_event(&key(KeyCode::Down));
+        }
+        settings.handle_event(&key(KeyCode::Enter));
+        assert!(settings.staffing.is_open());
+        settings.handle_event(&key(KeyCode::Esc));
+        assert!(settings.is_open());
+    }
 }
 
 impl Default for Preferences {
     fn default() -> Self {
         Self {
             sidebar_tint_strength: DEFAULT_TINT,
+            codex_inline_scrollback: true,
+            messages_sidebar_width: 0,
+            activity_badges: true,
         }
     }
 }
@@ -123,13 +225,28 @@ impl Default for Preferences {
 struct Dialog {
     draft: Preferences,
     error: Option<String>,
+    /// The focused row: 0 section tint, 1 activity badges, 2 policy, 3 guide.
+    row: u8,
 }
 
 pub(super) struct GlobalSettings {
+    pub(super) staffing: super::staffing::Staffing,
     path: PathBuf,
     saved: Preferences,
+    /// File-only `[models]` section (no F9 row). See `cm_daemon::models`.
+    models: cm_daemon::models::ModelConfig,
     load_error: Option<String>,
     dialog: Option<Dialog>,
+}
+
+/// Parse and validate `[models]`; a missing section means the defaults.
+fn load_models(path: &Path) -> anyhow::Result<cm_daemon::models::ModelConfig> {
+    let models = match read_document(path)?.remove("models") {
+        Some(value) => value.try_into().context("Invalid [models] section")?,
+        None => cm_daemon::models::ModelConfig::default(),
+    };
+    models.validate().map_err(anyhow::Error::msg)?;
+    Ok(models)
 }
 
 fn read_document(path: &Path) -> anyhow::Result<toml::Table> {
@@ -142,11 +259,16 @@ fn read_document(path: &Path) -> anyhow::Result<toml::Table> {
 
 impl GlobalSettings {
     pub(super) fn load() -> Self {
-        Self::load_from(
+        let settings = Self::load_from(
             dirs::home_dir()
                 .unwrap_or_default()
                 .join(".cm/tui-settings.toml"),
-        )
+        );
+        // Process-wide, so only the production load sets it (tests use
+        // `load_from` and must not flip other tests' argv).
+        cm_daemon::mcp_config::set_codex_inline_scrollback(settings.saved.codex_inline_scrollback);
+        cm_daemon::models::set_models(settings.models.clone());
+        settings
     }
 
     fn load_from(path: PathBuf) -> Self {
@@ -159,16 +281,32 @@ impl GlobalSettings {
             );
             Ok(preferences)
         });
-        let (saved, load_error) = match loaded {
+        let (saved, mut load_error) = match loaded {
             Ok(p) => (p, None),
             Err(e) => (Preferences::default(), Some(format!("{e:#}"))),
         };
+        let models = match load_models(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                load_error.get_or_insert(format!("{e:#}"));
+                cm_daemon::models::ModelConfig::default()
+            }
+        };
         Self {
+            staffing: Default::default(),
             path,
             saved,
+            models,
             load_error,
             dialog: None,
         }
+    }
+
+    /// The `[models]` section: engine default models for TUI-composed
+    /// spawns and the Model field's presets.
+    #[cfg(test)]
+    pub(super) fn models(&self) -> &cm_daemon::models::ModelConfig {
+        &self.models
     }
 
     pub(super) fn tint_strength(&self) -> f64 {
@@ -179,17 +317,56 @@ impl GlobalSettings {
             })
     }
 
+    /// Whether rows and cards show the activity badge (the draft while
+    /// F9 is open, for a live preview).
+    pub(super) fn activity_badges(&self) -> bool {
+        self.dialog
+            .as_ref()
+            .map_or(self.saved.activity_badges, |d| d.draft.activity_badges)
+    }
+
     pub(super) fn is_open(&self) -> bool {
         self.dialog.is_some()
     }
 
+    pub(super) fn close(&mut self) {
+        self.dialog = None;
+    }
+
+    pub(super) fn messages_sidebar_width(&self) -> u16 {
+        self.saved.messages_sidebar_width
+    }
+
+    /// Save the Messages sidebar width (0 = fit names) right away.
+    pub(super) fn set_messages_sidebar_width(&mut self, width: u16) -> anyhow::Result<()> {
+        self.write_key("messages_sidebar_width", toml::Value::Integer(width.into()))?;
+        self.saved.messages_sidebar_width = width;
+        Ok(())
+    }
+
     fn save(&self, draft: Preferences) -> anyhow::Result<()> {
+        self.write_keys(&[
+            (
+                "sidebar_tint_strength",
+                toml::Value::Float(draft.sidebar_tint_strength),
+            ),
+            (
+                "activity_badges",
+                toml::Value::Boolean(draft.activity_badges),
+            ),
+        ])
+    }
+
+    fn write_key(&self, key: &str, value: toml::Value) -> anyhow::Result<()> {
+        self.write_keys(&[(key, value)])
+    }
+
+    fn write_keys(&self, keys: &[(&str, toml::Value)]) -> anyhow::Result<()> {
         // Read on save to preserve unrelated keys, and refuse malformed files.
         let mut document = read_document(&self.path)?;
-        document.insert(
-            "sidebar_tint_strength".into(),
-            toml::Value::Float(draft.sidebar_tint_strength),
-        );
+        for (key, value) in keys {
+            document.insert((*key).into(), value.clone());
+        }
         let text = toml::to_string_pretty(&document)?;
         let parent = self.path.parent().context("Settings path has no parent")?;
         std::fs::create_dir_all(parent)?;
@@ -210,6 +387,9 @@ impl GlobalSettings {
 
     /// Consume every event while open so preview keys never reach a session.
     pub(super) fn handle_event(&mut self, event: &CrosstermEvent) -> bool {
+        if self.staffing.event(event) {
+            return true;
+        }
         let CrosstermEvent::Key(key) = event else {
             return self.is_open();
         };
@@ -220,11 +400,37 @@ impl GlobalSettings {
             self.dialog = Some(Dialog {
                 draft: self.saved,
                 error: self.load_error.clone(),
+                row: 0,
             });
             return true;
         }
         let dialog = self.dialog.as_mut().unwrap();
+        if key.code == KeyCode::Char('s')
+            || dialog.row == 2
+                && matches!(
+                    key.code,
+                    KeyCode::Enter | KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                )
+        {
+            self.staffing.open();
+            return true;
+        }
+        if key.code == KeyCode::Char('g') || dialog.row == 3 && matches!(key.code, KeyCode::Enter) {
+            self.staffing.open_guide();
+            return true;
+        }
         match key.code {
+            KeyCode::Down | KeyCode::Tab => dialog.row = (dialog.row + 1) % 4,
+            KeyCode::Up | KeyCode::BackTab => dialog.row = (dialog.row + 3) % 4,
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Char(' ')
+            | KeyCode::Char('-')
+            | KeyCode::Char('+')
+                if dialog.row == 1 =>
+            {
+                dialog.draft.activity_badges = !dialog.draft.activity_badges;
+            }
             KeyCode::Left | KeyCode::Char('-') => {
                 dialog.draft.sidebar_tint_strength =
                     (dialog.draft.sidebar_tint_strength - 0.25).max(0.0);
@@ -256,7 +462,7 @@ impl GlobalSettings {
             return;
         };
         let width = 60.min(area.width);
-        let height = (if dialog.error.is_some() { 16 } else { 12 }).min(area.height);
+        let height = (if dialog.error.is_some() { 23 } else { 20 }).min(area.height);
         let area = Rect::new(
             area.x + area.width.saturating_sub(width) / 2,
             area.y + area.height.saturating_sub(height) / 2,
@@ -271,14 +477,24 @@ impl GlobalSettings {
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let strength = dialog.draft.sidebar_tint_strength;
+        let row_style = |focused: bool| {
+            let s = Style::default().fg(theme::TEXT);
+            if focused {
+                s.add_modifier(Modifier::BOLD)
+            } else {
+                s
+            }
+        };
+        let pointer = |focused: bool| if focused { "› " } else { "  " };
         let mut lines = vec![
             Line::from("All projects on this laptop."),
             Line::from(""),
             Line::styled(
-                format!("Section tint:  ◀  {strength:.2}×  ▶"),
-                Style::default()
-                    .fg(theme::TEXT)
-                    .add_modifier(Modifier::BOLD),
+                format!(
+                    "{}Section tint:  ◀  {strength:.2}×  ▶",
+                    pointer(dialog.row == 0)
+                ),
+                row_style(dialog.row == 0),
             ),
             Line::from("←/→ 0.25 steps · 0 off · Default 2×"),
             Line::from(""),
@@ -296,8 +512,33 @@ impl GlobalSettings {
                     .collect::<Vec<_>>(),
             ),
             Line::from(""),
+            Line::styled(
+                format!(
+                    "{}Activity badges:  [{}]",
+                    pointer(dialog.row == 1),
+                    if dialog.draft.activity_badges {
+                        "x"
+                    } else {
+                        " "
+                    }
+                ),
+                row_style(dialog.row == 1),
+            ),
+            Line::from("What each agent is doing, on rows and F6 cards."),
+            Line::styled(
+                format!("{}Staffing policy → (s)", pointer(dialog.row == 2)),
+                row_style(dialog.row == 2),
+            ),
+            Line::from("Edit the shared engine guidance."),
+            Line::styled(
+                format!("{}Staffing guide → (g)", pointer(dialog.row == 3)),
+                row_style(dialog.row == 3),
+            ),
+            Line::from("Read the live policy and how to choose models."),
+            Line::from("Continuous teams dashboard → (c)"),
+            Line::from(""),
             Line::from("Live preview · Opacity unchanged."),
-            Line::from("Home reset · Enter save · Esc cancel"),
+            Line::from("↑/↓ row · Home reset · Enter save · Esc cancel"),
         ];
         if let Some(error) = &dialog.error {
             lines.push(Line::styled(
@@ -309,5 +550,6 @@ impl GlobalSettings {
             Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
             inner,
         );
+        self.staffing.draw(frame, frame.area());
     }
 }

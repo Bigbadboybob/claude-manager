@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{self, Write},
     os::unix::{
@@ -21,18 +21,31 @@ mod operations;
 mod owner_sync;
 mod private_sync;
 mod replication;
+mod rebuild;
+mod read_model;
+mod search;
+mod reactions;
+use read_model::{ReadState, ReadModel, ReadCursor};
 mod task_subscriptions;
 pub use replication::ChangeSignal;
 pub use task_subscriptions::TaskBinding;
 mod personal;
+mod memory;
+pub(crate) use memory::StoreMemorySnapshot;
 #[cfg(test)]
 mod tests_b;
+#[cfg(test)]
+mod tests_alloc56;
 mod wake_intents;
 pub use wake_intents::WakeIntent;
 mod norms;
 pub use norms::textual_diff as norms_diff;
 mod channels;
 mod membership;
+mod availability;
+mod maintenance;
+mod inbox;
+mod mentions;
 mod preferences;
 mod watches;
 use membership::mention_recipients;
@@ -52,6 +65,24 @@ fn err(code: &str, message: impl Into<String>) -> ChatError {
         code: code.into(),
         message: message.into(),
     }
+}
+/// Ordinary events stay within 64 KiB. A host directory event lists every
+/// live agent on its host (peers may report up to 512), so it gets more room:
+/// at 64 KiB it overflowed near 200 agents and broke that host's link.
+const MAX_EVENT_BYTES: usize = 64 * 1024;
+const MAX_HOST_DIRECTORY_BYTES: usize = 1024 * 1024;
+fn check_event_size(event: &Value, len: usize) -> Result<()> {
+    if event["type"] == "host.update" && event["actor"]["id"] == "system" {
+        if len > MAX_HOST_DIRECTORY_BYTES {
+            return Err(err(
+                "event_too_large",
+                format!("Host directory event is {len} bytes, over the 1 MiB limit"),
+            ));
+        }
+    } else if len > MAX_EVENT_BYTES {
+        return Err(err("event_too_large", "Serialized event exceeds 64 KiB"));
+    }
+    Ok(())
 }
 #[derive(Debug)]
 pub struct ChatError {
@@ -125,8 +156,12 @@ fn write_file_synced(path: &Path, bytes: &[u8], replace: bool, sync_dir: bool) -
             .open(&temp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
+        #[cfg(test)]
+        tests_alloc56::write_fault(path, "before_rename")?;
         if replace {
             fs::rename(&temp, path)?;
+            #[cfg(test)]
+            tests_alloc56::write_fault(path, "after_rename")?;
         } else {
             fs::hard_link(&temp, path)?;
             fs::remove_file(&temp)?;
@@ -140,6 +175,12 @@ fn write_file_synced(path: &Path, bytes: &[u8], replace: bool, sync_dir: bool) -
     result
 }
 pub fn atomic_replace(path: &Path, value: &Value) -> io::Result<()> {
+    atomic_replace_json(path, value)
+}
+/// `atomic_replace` for any serializable value, without first building a
+/// `serde_json::Value` copy of it (a large struct's Value tree is several
+/// times its JSON size, and every copy is allocator churn).
+pub fn atomic_replace_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> io::Result<()> {
     write_file(path, &serde_json::to_vec_pretty(value)?, true)
 }
 // Projections are disposable. Avoid fsyncing identical directory/name/norm
@@ -234,16 +275,121 @@ pub struct Person {
     pub task: Option<String>,
     pub present: bool,
     pub kind: String,
+    /// The session's engine (`claude-code`, `codex`, `bash`) when known.
+    /// Bash sessions have no agent to read messages; clients use this to
+    /// leave them out of DM pickers. Absent for remote participants from
+    /// a peer that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
 }
+
+/// A live local session, before it becomes a [`Person`].
+pub struct LiveSession {
+    pub uid: String,
+    pub name: String,
+    pub task: Option<String>,
+    pub engine: Option<String>,
+}
+
+/// Every live local session: the daemon's own, then TUI rows it does not hold.
+pub fn live_sessions(s: &crate::state::DaemonState) -> Vec<LiveSession> {
+    s.sessions
+        .values()
+        .map(|v| LiveSession {
+            uid: v.uid.clone(),
+            name: v.title.clone(),
+            task: v.task_id.clone(),
+            engine: Some(v.session_type.clone()),
+        })
+        .chain(s.tui_sessions.values().filter(|t| !s.sessions.contains_key(&t.uid)).map(|t| LiveSession {
+            uid: t.uid.clone(),
+            name: t.label.clone().unwrap_or_else(|| t.uid.clone()),
+            task: t.task_id.clone(),
+            // The TUI says `claude` where the daemon says `claude-code`.
+            engine: t.session_type.as_deref().map(|e| if e == "claude" { "claude-code" } else { e }.to_owned()),
+        }))
+        .collect()
+}
+
+impl Person {
+    /// A present agent participant for a live session.
+    pub fn present_agent(id: String, live: LiveSession) -> Person {
+        Person {
+            id,
+            name: live.name,
+            session_uid: live.uid,
+            task: live.task,
+            present: true,
+            kind: if live.engine.as_deref() == Some("bash") { "shell" } else { "agent" }.into(),
+            engine: live.engine,
+        }
+    }
+}
+/// First-match answers over `Store::events`, kept in step with appends.
+#[derive(Default)]
+struct EventLookups {
+    /// `data.conversation_create.id` -> index of the first event creating it.
+    conversation_creations: HashMap<String, usize>,
+    /// Channel ID -> (position of the first `data.channels` listing it,
+    /// whether any listing marked it archived).
+    channel_listings: HashMap<String, (u64, bool)>,
+    /// `channel.update` (channel ID, revision) -> index of the first such event.
+    channel_revisions: HashMap<(String, String), usize>,
+    /// Identity revisions published by `identity.update` or claimed by any
+    /// event: (participant_id, revision_id, JSON text of name).
+    identities: HashSet<(String, String, String)>,
+    /// (host ID, enrollment revision) of every active `host.update`.
+    host_enrollments: HashSet<(String, String)>,
+}
+impl EventLookups {
+    fn observe(&mut self, e: &Value, position: u64, index: usize) {
+        if let Some(id) = e["data"]["conversation_create"]["id"].as_str() {
+            self.conversation_creations.entry(id.to_owned()).or_insert(index);
+        }
+        for c in e["data"]["channels"].as_array().into_iter().flatten() {
+            if let Some(id) = c["id"].as_str() {
+                let entry = self
+                    .channel_listings
+                    .entry(id.to_owned())
+                    .or_insert((position, false));
+                entry.1 |= c["archived"] == true;
+            }
+        }
+        let channel = &e["data"]["channel"];
+        if e["type"] == "channel.update" {
+            if let (Some(id), Some(rev)) = (channel["id"].as_str(), channel["revision"].as_str()) {
+                self.channel_revisions
+                    .entry((id.to_owned(), rev.to_owned()))
+                    .or_insert(index);
+            }
+        }
+        let n = if e["type"] == "identity.update" {
+            &e["data"]["identity"]
+        } else {
+            &e["data"]["identity_claim"]
+        };
+        if let (Some(id), Some(rev)) = (n["participant_id"].as_str(), n["revision_id"].as_str()) {
+            self.identities
+                .insert((id.to_owned(), rev.to_owned(), n["name"].to_string()));
+        }
+        let data = &e["data"];
+        if e["type"] == "host.update" && data["active"] == true {
+            if let (Some(host), Some(rev)) =
+                (data["host_id"].as_str(), data["enrollment_revision"].as_str())
+            {
+                self.host_enrollments.insert((host.to_owned(), rev.to_owned()));
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Published {
     event: Value,
     position: u64,
     received_at: String,
-}
-#[derive(Default, Serialize, Deserialize)]
-struct ReadState {
-    ids: BTreeSet<String>,
+    /// Digest of the exact retained bytes, verified on replay or computed at commit.
+    event_sha256: String,
 }
 
 pub struct Store {
@@ -255,6 +401,9 @@ pub struct Store {
     pub degraded: Option<String>,
     replication: replication::Replication,
     task_bindings: BTreeMap<String, TaskBinding>,
+    /// Ephemeral, effect-scoped daemon authority. Never persisted; standalone
+    /// Store users retain their store-only contract when no view is installed.
+    pub(super) task_authority: Option<BTreeMap<String, super::task_authority::Authority>>,
     /// Background deletion of superseded legacy coverage journal files.
     /// Declared before `_lock`: dropping the store stops it before the
     /// writer lock is released.
@@ -263,23 +412,39 @@ pub struct Store {
     events: Vec<Published>,
     /// Event ID -> index into `events` (append-only, so indices are stable).
     event_index: HashMap<String, usize>,
+    /// Lookups the hub's per-peer sync loop and replica-ingest validation
+    /// used to answer by scanning every retained event under the store slot
+    /// (~22 ms per uploaded message on cm-manager at 243k events, growing
+    /// with history). Maintained only by `push_published`.
+    lookups: EventLookups,
     /// Replica ingest page in progress: journal records wait here until the
     /// page's event files and directories are durable (see `ingest_replica_page`).
     ingest_batch: Option<replication::IngestBatch>,
     channels: BTreeMap<String, String>,
+    // Reverse index retains the first lexical path even if legacy IDs have aliases.
+    channel_paths: HashMap<String, BTreeSet<String>>,
     memberships: BTreeMap<String, BTreeSet<String>>,
     membership_revisions: BTreeMap<String, String>,
     enrolled: BTreeSet<String>,
     conversations: BTreeMap<String, Vec<String>>,
+    /// Member actor -> its DM conversation IDs (the inverse of
+    /// `conversations`), so per-actor scans skip everyone else's DMs.
+    member_dms: HashMap<String, BTreeSet<String>>,
     requests: BTreeMap<String, (String, String, String)>,
     position: u64,
     clock: u64,
     reads: BTreeMap<String, ReadState>,
+    read_model: ReadModel,
     personal: BTreeMap<String, Personal>,
     pub norms: Value,
+    /// Latest `owner.availability` record (Null until Owner sets a level).
+    pub owner_availability: Value,
+    pub owner_notifications: Option<std::sync::Arc<crate::owner_notifications::Feed>>,
     channel_norms: BTreeMap<String, Value>,
     enrollment_revision: String,
     owner_identity_revision: String,
+    /// Where the last open spent its time, for the startup log line.
+    pub open_report: String,
 }
 impl Store {
     pub fn open(cm_root: &Path) -> Result<Self> {
@@ -300,6 +465,9 @@ impl Store {
         Self::open_locked(cm_root, lock)
     }
     fn open_locked(cm_root: &Path, lock: File) -> Result<Self> {
+        Self::open_locked_with_workers(cm_root, lock, rebuild::worker_count())
+    }
+    fn open_locked_with_workers(cm_root: &Path, lock: File, workers: usize) -> Result<Self> {
         operations::finish_install(cm_root)?;
         let root = cm_root.join("messages/main");
         let id_path = cm_root.join("daemon-id");
@@ -335,12 +503,14 @@ impl Store {
             ));
         }
         let mut s = Self {
+            owner_notifications: None,
             root,
             daemon_id,
             space_id: required(&meta, "space_id")?,
             generation: required(&meta, "generation")?,
             names: BTreeMap::new(),
             task_bindings: BTreeMap::new(),
+            task_authority: None,
             degraded: None,
             replication: replication::Replication::new(
                 &meta,
@@ -349,22 +519,28 @@ impl Store {
             _lock: lock,
             events: Vec::new(),
             event_index: HashMap::new(),
+            lookups: EventLookups::default(),
             ingest_batch: None,
             compactor: None,
             channels: BTreeMap::new(),
+            channel_paths: HashMap::new(),
             memberships: BTreeMap::new(),
             membership_revisions: BTreeMap::new(),
             enrolled: BTreeSet::new(),
             conversations: BTreeMap::new(),
+            member_dms: HashMap::new(),
             requests: BTreeMap::new(),
             position: 0,
             clock: 0,
             reads: BTreeMap::new(),
+            read_model: ReadModel::default(),
             personal: BTreeMap::new(),
             norms: json!({}),
+            owner_availability: Value::Null,
             channel_norms: BTreeMap::new(),
             enrollment_revision: required(&meta, "enrollment_revision")?,
             owner_identity_revision: required(&meta, "owner_identity_revision")?,
+            open_report: String::new(),
         };
         for id in [
             &s.space_id,
@@ -380,9 +556,25 @@ impl Store {
             })?;
         }
         mkdir(&s.journal_dir())?;
-        if let Err(e) = s.rebuild() {
-            s.degraded = Some(e.to_string());
-            return Ok(s);
+        let began = std::time::Instant::now();
+        let mut phase = began;
+        let mut lap = |name: &str, report: &mut String| {
+            let now = std::time::Instant::now();
+            report.push_str(&format!(" {name}={:.1}s", (now - phase).as_secs_f64()));
+            phase = now;
+        };
+        match s.rebuild(workers) {
+            Ok((read, skipped)) => {
+                s.open_report = format!(
+                    "journal_read={read} journal_skipped={skipped} events={} readers={workers}",
+                    s.events.len()
+                );
+                lap("rebuild", &mut s.open_report);
+            }
+            Err(e) => {
+                s.degraded = Some(e.to_string());
+                return Ok(s);
+            }
         }
         if let Err(e) = s
             .load_personal()
@@ -402,6 +594,7 @@ impl Store {
                 }
             }
         }
+        lap("state", &mut s.open_report);
         if let Err(e) = s
             .quarantine_staged()
             .and_then(|_| File::open(s.journal_dir())?.sync_all())
@@ -409,6 +602,7 @@ impl Store {
             s.degraded = Some(format!("Recovery reconciliation failed: {e}"));
             return Ok(s);
         }
+        lap("quarantine_scan", &mut s.open_report);
         if s.is_coordinator() && !s.messaging_frozen() {
             for (path, description) in [
                 ("general", "Shared discussion"),
@@ -449,6 +643,7 @@ impl Store {
         if let Err(e) = recovered.and_then(|_| s.project()) {
             s.degraded = Some(format!("Projection recovery failed: {e}"));
         }
+        lap("recovery", &mut s.open_report);
         Ok(s)
     }
     /// Unreferenced objects never become messages by directory scanning. Move
@@ -527,111 +722,115 @@ impl Store {
         };
         Ok(dir.join("_events").join(format!("{origin}--{event}.json")))
     }
-    fn rebuild(&mut self) -> Result<()> {
+    /// Replays the journal; returns (journal files read, superseded skipped).
+    fn rebuild(&mut self, workers: usize) -> Result<(usize, usize)> {
         let index = self.load_journal_index();
         let mut paths = fs::read_dir(self.journal_dir())?
             .map(|x| x.map(|e| e.path()))
             .collect::<io::Result<Vec<_>>>()?;
         paths.sort();
         let mut scan = replication::JournalScan::default();
-        for path in paths {
+        paths.retain(|path| {
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
+                return false;
             }
-            // Coverage records folded into the checkpoint by an earlier
-            // compaction are skipped by name, without reading them.
-            if let Some(pos) = index.as_ref().and_then(|index| index.superseded(&path)) {
+            // Compacted coverage records are still skipped without reading.
+            if let Some(pos) = index.as_ref().and_then(|index| index.superseded(path)) {
                 scan.superseded.push(pos);
-                continue;
+                return false;
             }
-            let j = load(&path)?;
-            let pos = required(&j, "position")?
-                .parse::<u64>()
-                .map_err(|_| err("invalid_record", "Bad journal position"))?;
-            if pos <= self.position
-                || j["protocol"] != 1
-                || path.file_name().and_then(|s| s.to_str())
-                    != Some(format!("{pos:020}.json").as_str())
-                || j["replica_id"] != self.daemon_id
-                || j["generation"] != self.generation
-            {
-                return Err(err(
-                    "invalid_record",
-                    "Conflicting or unsupported journal record",
-                ));
-            }
-            if j["kind"] != "publish" {
-                self.apply_replication_journal(&j)?;
-                self.position = pos;
-                scan.observe(pos, &j);
-                continue;
-            }
-            scan.observe(pos, &j);
-            let rel = required(&j["data"], "event_path")?;
-            if Path::new(&rel).is_absolute()
-                || Path::new(&rel)
-                    .components()
-                    .any(|x| !matches!(x, std::path::Component::Normal(_)))
-            {
-                return Err(err("invalid_record", "Unsafe event path"));
-            }
-            let bytes = fs::read(self.root.join(&rel))?;
-            if hash(&bytes) != strv(&j, "event_sha256") {
-                return Err(err("corrupt_event", "Event digest mismatch"));
-            }
-            let event: Value = serde_json::from_slice(&bytes)?;
-            if event["id"] != j["event_id"]
-                || event["space_id"] != self.space_id
-                || self.event_index.contains_key(&required(&event, "id")?)
-            {
-                return Err(err("invalid_record", "Duplicate event or wrong space"));
-            }
-            if event["protocol"] != 1
-                || event["origin_daemon_id"].as_str()
-                    != strv(&event, "id").split_once(':').map(|s| s.0)
-                || !event["data"].is_object()
-                || !event["extensions"].is_object()
-                || strv(&event["actor"], "id").is_empty()
-                || strv(&event, "body").is_empty()
-                || strv(&event["request"], "key").is_empty()
-                || strv(&event["request"], "sha256").len() != 64
-            {
-                return Err(err("invalid_record", "Malformed event envelope"));
-            }
-            parse_time(&required(&event, "created_at")?)?;
-            parse_time(&required(&j["data"], "received_at")?)?;
-            required(&event, "logical_time")?
-                .parse::<u64>()
-                .map_err(|_| err("invalid_record", "Bad logical time"))?;
-            let expected = self.event_path(&event)?;
-            if expected != self.root.join(rel) {
-                return Err(err(
-                    "invalid_record",
-                    "Event in incorrect conversation directory",
-                ));
-            }
-            self.clock = self.clock.max(
-                event["logical_time"]
-                    .as_str()
-                    .unwrap_or("0")
-                    .parse()
-                    .map_err(|_| err("invalid_record", "Bad logical time"))?,
-            );
-            self.clock = self
-                .clock
-                .max(j["data"]["logical_clock"].as_u64().unwrap_or(0));
-            self.position = pos;
-            self.apply_replication_journal(&j)?;
-            self.reduce(&event)?;
-            self.push_published(Published {
-                event,
-                position: pos,
-                received_at: required(&j["data"], "received_at")?,
-            });
+            true
+        });
+        let counts = (paths.len(), scan.superseded.len());
+        rebuild::replay(self, &paths, workers, &mut scan)?;
+        self.finish_journal_scan(index, scan)?;
+        Ok(counts)
+    }
+    fn apply_rebuilt(
+        &mut self,
+        path: &Path,
+        prepared: rebuild::Prepared,
+        scan: &mut replication::JournalScan,
+    ) -> Result<()> {
+        let j = prepared.journal;
+        let pos = required(&j, "position")?
+            .parse::<u64>()
+            .map_err(|_| err("invalid_record", "Bad journal position"))?;
+        if pos <= self.position
+            || j["protocol"] != 1
+            || path.file_name().and_then(|s| s.to_str())
+                != Some(format!("{pos:020}.json").as_str())
+            || j["replica_id"] != self.daemon_id
+            || j["generation"] != self.generation
+        {
+            return Err(err(
+                "invalid_record",
+                "Conflicting or unsupported journal record",
+            ));
         }
-        self.finish_journal_scan(index, scan)
+        if j["kind"] != "publish" {
+            self.apply_replication_journal(&j)?;
+            self.position = pos;
+            scan.observe(pos, &j);
+            return Ok(());
+        }
+        scan.observe(pos, &j);
+        let (rel, event) = prepared.event.expect("publish was prepared")?;
+        if event["id"] != j["event_id"]
+            || event["space_id"] != self.space_id
+            || self.event_index.contains_key(&required(&event, "id")?)
+        {
+            return Err(err("invalid_record", "Duplicate event or wrong space"));
+        }
+        if event["protocol"] != 1
+            || event["origin_daemon_id"].as_str()
+                != strv(&event, "id").split_once(':').map(|s| s.0)
+            || !event["data"].is_object()
+            || !event["extensions"].is_object()
+            || strv(&event["actor"], "id").is_empty()
+            || strv(&event, "body").is_empty()
+            || strv(&event["request"], "key").is_empty()
+            || strv(&event["request"], "sha256").len() != 64
+        {
+            return Err(err("invalid_record", "Malformed event envelope"));
+        }
+        parse_time(&required(&event, "created_at")?)?;
+        parse_time(&required(&j["data"], "received_at")?)?;
+        required(&event, "logical_time")?
+            .parse::<u64>()
+            .map_err(|_| err("invalid_record", "Bad logical time"))?;
+        let expected = self.event_path(&event)?;
+        if expected != self.root.join(rel) {
+            return Err(err(
+                "invalid_record",
+                "Event in incorrect conversation directory",
+            ));
+        }
+        self.clock = self.clock.max(
+            event["logical_time"]
+                .as_str()
+                .unwrap_or("0")
+                .parse()
+                .map_err(|_| err("invalid_record", "Bad logical time"))?,
+        );
+        self.clock = self
+            .clock
+            .max(j["data"]["logical_clock"].as_u64().unwrap_or(0));
+        self.position = pos;
+        self.apply_replication_journal(&j)?;
+        self.reduce(&event)?;
+        self.push_published(Published {
+            event,
+            position: pos,
+            received_at: required(&j["data"], "received_at")?,
+            event_sha256: required(&j, "event_sha256")?,
+        });
+        Ok(())
     }
     fn push_published(&mut self, published: Published) {
+        self.index_read_model(&published, self.events.len());
+        self.lookups
+            .observe(&published.event, published.position, self.events.len());
         self.event_index
             .insert(strv(&published.event, "id").to_owned(), self.events.len());
         self.events.push(published);
@@ -648,12 +847,22 @@ impl Store {
             for item in items {
                 let path = required(item, "path")?;
                 channel_path(&path)?;
-                self.channels.insert(path, required(item, "id")?);
+                let id = required(item, "id")?;
+                if let Some(old) = self.channels.insert(path.clone(), id.clone()) {
+                    if let Some(paths) = self.channel_paths.get_mut(&old) {
+                        paths.remove(&path);
+                        if paths.is_empty() {
+                            self.channel_paths.remove(&old);
+                        }
+                    }
+                }
+                self.channel_paths.entry(id).or_default().insert(path);
             }
         }
         self.reduce_membership(e)?;
         self.reduce_replication(e)?;
         self.reduce_private_sync(e)?;
+        self.reduce_reaction(e)?;
         if let Some(c) = e["data"].get("conversation_create") {
             let id = required(c, "id")?;
             let members: Vec<String> = serde_json::from_value(c["members"].clone())?;
@@ -671,7 +880,7 @@ impl Store {
                     "DM needs 2–32 sorted, distinct, immutable members including its sender",
                 ));
             }
-            self.conversations.insert(id, members);
+            self.insert_dm(id, members);
         }
         let name = if e["type"] == "identity.update" {
             e["data"].get("identity")
@@ -697,6 +906,12 @@ impl Store {
                 self.names.insert(id, v);
             }
         }
+        if e["type"] == crate::owner_availability::EVENT_TYPE {
+            self.reduce_owner_availability(e)?;
+        }
+        if e["type"] == crate::maintenance::EVENT_TYPE {
+            self.reduce_maintenance(e)?;
+        }
         if e["type"] == "norms.update" {
             if e["data"]["scope"] == "global" {
                 self.norms = e["data"].clone();
@@ -714,8 +929,11 @@ impl Store {
             strv(&e["request"], "sha256").into(),
             strv(&e["request"], "origin_daemon_id").into(),
         );
+        let system_actor = e["actor"]["id"] == "system";
         if let Some(old) = self.requests.insert(key, value.clone()) {
-            if old != value {
+            // See preflight_projection: a System notice duplicated across
+            // hosts is tolerated, and the later (hub-ingested) copy wins.
+            if old != value && !system_actor {
                 return Err(err(
                     "idempotency_conflict",
                     "Duplicate request in retained history",
@@ -837,9 +1055,7 @@ impl Store {
             }
         }
         let path = self.event_path(&event)?;
-        if bytes.len() > 65536 {
-            return Err(err("event_too_large", "Serialized event exceeds 64 KiB"));
-        }
+        check_event_size(&event, bytes.len())?;
         let pos = self
             .position
             .checked_add(1)
@@ -850,8 +1066,9 @@ impl Store {
                 .parse::<u64>()
                 .map_err(|_| err("invalid_record", "Bad logical time"))?,
         );
-        let receipt = receipt.or_else(|| self.is_coordinator().then(|| json!({"space_id":self.space_id,"coordinator_id":self.daemon_id,"generation":self.generation,"position":format!("{pos:020}"),"event_id":event["id"],"event_sha256":hash(&bytes)})));
-        let j = json!({"protocol":1,"replica_id":self.daemon_id,"generation":self.generation,"position":format!("{pos:020}"),"recorded_at":received,"kind":"publish","event_id":event["id"],"event_sha256":hash(&bytes),"data":{"source":source,"received_at":received,"logical_clock":self.clock,"event_path":path.strip_prefix(&self.root).unwrap().to_string_lossy(),"hub_receipt":receipt}});
+        let digest = hash(&bytes);
+        let receipt = receipt.or_else(|| self.is_coordinator().then(|| json!({"space_id":self.space_id,"coordinator_id":self.daemon_id,"generation":self.generation,"position":format!("{pos:020}"),"event_id":event["id"],"event_sha256":digest})));
+        let j = json!({"protocol":1,"replica_id":self.daemon_id,"generation":self.generation,"position":format!("{pos:020}"),"recorded_at":received,"kind":"publish","event_id":event["id"],"event_sha256":digest,"data":{"source":source,"received_at":received,"logical_clock":self.clock,"event_path":path.strip_prefix(&self.root).unwrap().to_string_lossy(),"hub_receipt":receipt}});
         // No reader sees the body until the durable publication record exists.
         // Within an ingest page the journal record is queued: the page flush
         // makes every body and its directory durable before any record, and
@@ -883,10 +1100,16 @@ impl Store {
             event: event.clone(),
             position: pos,
             received_at: received,
+            event_sha256: digest,
         });
+        let notification = self.owner_message_notification(self.events.last().unwrap());
         if batched {
+            if let Some(n) = notification {
+                self.ingest_batch.as_mut().unwrap().owner_notifications.push(n);
+            }
             return Ok(event);
         }
+        if let Some(n) = notification { self.publish_owner_notification(n); }
         // A durable message stays successful if a derived checkpoint fails;
         // restart replays from the prior saved monitor scan position.
         if let Err(e) = self.advance_monitors_at(Utc::now()) {
@@ -907,7 +1130,7 @@ impl Store {
         key: &str,
         digest: &str,
     ) -> Result<Value> {
-        if !matches!(ty, "message.create" | "read.ack") {
+        if !matches!(ty, "message.create" | "read.ack" | "read.cursor" | "reaction") {
             self.shared_mutation_allowed()?;
         }
         let e = self.event(ty, conv, body, data, actor, name, kind, key, digest)?;
@@ -991,9 +1214,7 @@ impl Store {
     /// publishes (which bypass `request()`) stay idempotent across restarts.
     fn prior_system_event(&self, key: &str) -> Option<Value> {
         let (id, _, _) = self.requests.get(&format!("system\n{key}"))?;
-        self.events
-            .iter()
-            .find(|x| strv(&x.event, "id") == id)
+        self.published(id)
             .map(|x| x.event.clone())
     }
     /// Scheduler-only: give `actor` (the session bound as a continuous task's
@@ -1122,11 +1343,32 @@ impl Store {
         Ok(())
     }
     fn visible(&self, actor: &str, conv: &str) -> bool {
-        self.channels.values().any(|c| c == conv)
+        self.channel_paths.contains_key(conv)
             || self
                 .conversations
                 .get(conv)
                 .is_some_and(|m| m.iter().any(|p| p == actor))
+    }
+    /// Record a DM's (immutable) membership and its per-member index.
+    fn insert_dm(&mut self, id: String, members: Vec<String>) {
+        for member in &members {
+            self.member_dms.entry(member.clone()).or_default().insert(id.clone());
+        }
+        self.conversations.insert(id, members);
+    }
+    /// The read-model conversations `actor` can see, in ID order: the same
+    /// sequence as filtering all of them by [`Self::visible`], without
+    /// visiting every other actor's DMs (1,043 DMs against 37 channels and a
+    /// median of 2 DMs per member on cm-sessions, 2026-11-05).
+    fn visible_conversations(&self, actor: &str) -> Vec<(&str, &read_model::ConversationIndex)> {
+        let dms = self.member_dms.get(actor).into_iter().flatten()
+            .filter(|cid| !self.channel_paths.contains_key(*cid));
+        let mut out: Vec<_> = self.channel_paths.keys().chain(dms)
+            .filter_map(|cid| self.read_model.conversations.get_key_value(cid))
+            .map(|(cid, index)| (cid.as_str(), index))
+            .collect();
+        out.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        out
     }
     fn resolve(
         &self,
@@ -1195,45 +1437,27 @@ impl Store {
         }
         let mut members = vec![actor.to_owned()];
         for peer in peers {
-            let peer = if peer == "owner"
+            let by_id = peer == "owner"
                 || self.names.contains_key(&peer)
-                || people.iter().any(|x| x.id == peer)
-            {
-                peer
-            } else {
-                let mut hits: Vec<_> = self
-                    .names
-                    .iter()
-                    .filter(|(_, n)| {
-                        normalize(&n.name) == normalize(&peer)
-                            || n.aliases.iter().any(|a| normalize(a) == normalize(&peer))
-                    })
-                    .collect();
-                // Honor exact legacy names/aliases first: before this policy,
-                // "Build Scout" and "Build-Scout" could belong to different IDs.
-                if hits.is_empty() {
-                    hits = self
-                        .names
-                        .iter()
-                        .filter(|(_, n)| {
-                            name_key(&n.name) == name_key(&peer)
-                                || n.aliases.iter().any(|a| name_key(a) == name_key(&peer))
-                        })
-                        .collect();
+                || people.iter().any(|x| x.id == peer);
+            let typed = peer.clone();
+            let peer = match self.resolve_participant_ref(&peer, people) {
+                mentions::ParticipantRef::Found(id) => {
+                    if !by_id {
+                        self.refuse_closed_name_with_live_successor(&typed, &id, people)?;
+                    }
+                    id
                 }
-                // A released name (a task's superseded orchestrator) yields to
-                // the participant that holds it now.
-                if hits.len() > 1 && hits.iter().any(|(_, n)| !n.released) {
-                    hits.retain(|(_, n)| !n.released);
-                }
-                if hits.len() != 1 {
+                _ => {
                     return Err(err(
                         "not_found",
                         "Peer not found; use chat_people to resolve a participant ID",
-                    ));
+                    ))
                 }
-                hits[0].0.clone()
             };
+            if people.iter().any(|p| p.id == peer && (p.kind == "shell" || p.engine.as_deref() == Some("bash"))) {
+                return Err(err("invalid_target", "agent_only: bash is a shell and cannot receive agent chat"));
+            }
             if members.contains(&peer) {
                 return Err(err(
                     "invalid_target",
@@ -1253,6 +1477,53 @@ impl Store {
         Ok((
             id.clone(),
             Some(json!({"id":id,"kind":"dm","members":members})),
+        ))
+    }
+    /// A DM addressed by NAME that lands on a closed session while a live
+    /// session carries the same name plus a suffix (a replaced lead:
+    /// "PP-Lead" closed, "PP-Lead-6ef" live) is refused and names the live
+    /// one. Owner 2026-11-08: lookups should not land on closed sessions by
+    /// default. Addressing the closed participant by its ID still works.
+    /// A participant's current chat name and aliases, else its directory name.
+    fn chat_names<'a>(&'a self, x: &'a Person) -> Box<dyn Iterator<Item = &'a str> + 'a> {
+        match self.names.get(&x.id) {
+            Some(n) => Box::new(std::iter::once(n.name.as_str()).chain(n.aliases.iter().map(String::as_str))),
+            None => Box::new(std::iter::once(x.name.as_str())),
+        }
+    }
+    fn refuse_closed_name_with_live_successor(
+        &self,
+        typed: &str,
+        id: &str,
+        people: &[Person],
+    ) -> Result<()> {
+        if people.iter().any(|x| x.id == id && x.present) {
+            return Ok(());
+        }
+        let key = name_key(typed);
+        let prefix = format!("{key}-");
+        let mut live: Vec<&str> = people
+            .iter()
+            .filter(|x| {
+                x.present
+                    && x.id != id
+                    && x.kind == "agent"
+                    && x.engine.as_deref() != Some("bash")
+                    && self.chat_names(x).any(|n| name_key(n).starts_with(&prefix))
+            })
+            .map(|x| self.names.get(&x.id).map_or(x.name.as_str(), |n| n.name.as_str()))
+            .collect();
+        if live.is_empty() {
+            return Ok(());
+        }
+        live.sort_unstable();
+        live.dedup();
+        Err(err(
+            "not_found",
+            format!(
+                "'{typed}' is a closed session. Live: {}. DM the live one, or pass the closed participant ID ({id}) to reach it anyway",
+                live.join(", ")
+            ),
         ))
     }
     fn request(
@@ -1304,9 +1575,7 @@ impl Store {
             return Ok((
                 key,
                 digest,
-                self.events
-                    .iter()
-                    .find(|x| strv(&x.event, "id") == id)
+                self.published(id)
                     .map(|x| x.event.clone()),
             ));
         }
@@ -1320,9 +1589,18 @@ impl Store {
         p: &Value,
         people: &[Person],
     ) -> Result<Value> {
+        self.send_with_attribution(actor, uid, kind, p, people, None)
+    }
+
+    pub(crate) fn send_with_attribution(
+        &mut self, actor: &str, uid: &str, kind: &str, p: &Value,
+        people: &[Person], attribution: Option<&Value>,
+    ) -> Result<Value> {
         let (key, digest, prior) = self.request(actor, p, "message.create")?;
         if let Some(e) = prior {
-            return Ok(self.send_response(&e));
+            let mut result = self.send_response(&e);
+            self.annotate_retry_mentions(actor, p, people, &e, &mut result);
+            return Ok(result);
         }
         if !self.is_coordinator()
             && self
@@ -1408,20 +1686,11 @@ impl Store {
                     .collect::<Vec<_>>()
             })
             .or_else(|| self.conversations.get(&conv).cloned());
-        let mentions: BTreeSet<String> = p["mentions"].as_array().into_iter().flatten()
-            .filter_map(Value::as_str).map(str::to_owned).collect();
-        for m in &mentions {
-            let id = m.as_str();
-            if !people.iter().any(|x| x.id == id) && !self.names.contains_key(id) && id != "owner" {
-                return Err(err("not_found", "Mention participant not found"));
-            }
-            if members.as_ref().is_some_and(|v| !v.iter().any(|x| x == id)) {
-                return Err(err(
-                    "invalid_mention",
-                    "DM mentions are restricted to its members",
-                ));
-            }
-        }
+        let mentions::MentionPlan {
+            mentions,
+            resolved: mentions_resolved,
+            warnings: mention_warnings,
+        } = self.plan_mentions(actor, &conv, members.as_ref(), p, &body, people)?;
         let mention_here = p["mention_here"] == true;
         if mention_here && members.is_some() {
             return Err(err(
@@ -1479,6 +1748,7 @@ impl Store {
             .map(|(path, id)| self.channel_info(path, id)["revision"].clone())
             .unwrap_or(json!(conv));
         let mut data = json!({"reply_to":reply,"thread_root":root,"mentions":mentions,"tags":p.get("tags").cloned().unwrap_or(json!([])),"links":links,"norms_seen":p.get("norms_seen").cloned().unwrap_or(json!({})),"metadata_seen":{"identity":identity_revision,"conversation":conversation_revision,"enrollment":enrollment_revision}});
+        if let Some(claim) = attribution { data["actor_attribution"] = claim.clone(); }
         data["metadata_seen"]["membership"] = json!(self.membership_revisions.get(&conv));
         data["mention_here"] = json!(mention_here);
         data["mention_recipients"] = json!(recipients);
@@ -1502,7 +1772,7 @@ impl Store {
             )?;
             data["identity_attestation"] = json!(serde_json::to_string(&att)?);
         }
-        let e = self.publish(
+        let mut e = self.event(
             "message.create",
             Some(&conv),
             &body,
@@ -1513,15 +1783,22 @@ impl Store {
             &key,
             &digest,
         )?;
+        // Provenance must not make an otherwise valid message exceed the
+        // existing event limit. Drop only the optional evidence before commit.
+        if attribution.is_some() && serde_json::to_vec_pretty(&e).map_or(true, |b| b.len() > 65536) {
+            if let Some(data) = e["data"].as_object_mut() { data.remove("actor_attribution"); }
+        }
+        let e = self.commit(e)?;
         let repair = self.repair_attestations().and_then(|_| self.project());
         let mut result = self.send_response(&e);
         if let Err(e) = repair {
             result["projection_status"] = json!(e.to_string());
         }
+        mentions::annotate(&mut result, mentions_resolved, mention_warnings);
         Ok(result)
     }
     fn send_response(&self, e: &Value) -> Value {
-        json!({"event":e,"event_id":e["id"],"name":e["actor"]["name"],"operation":{"space_id":self.space_id,"actor_id":e["actor"]["id"],"origin_daemon_id":e["request"]["origin_daemon_id"],"request_id":e["request"]["key"]},"position":self.position_token(self.position),"replication":self.event_replication(strv(e,"id"))["status"],"sync":self.sync_status(),"notification":self.notification_status(e),"name_publication":if e["data"]["identity_claim"].is_null() || self.events.iter().any(|v|v.event["type"]=="identity.update" && v.event["data"]["identity"]==e["data"]["identity_claim"]){"published"}else{"pending"},"norms":self.norms})
+        json!({"event":e,"event_id":e["id"],"created_at":e["created_at"],"name":e["actor"]["name"],"operation":{"space_id":self.space_id,"actor_id":e["actor"]["id"],"origin_daemon_id":e["request"]["origin_daemon_id"],"request_id":e["request"]["key"]},"position":self.position_token(self.position),"replication":self.event_replication(strv(e,"id"))["status"],"sync":self.sync_status(),"notification":self.notification_status(e),"name_publication":if e["data"]["identity_claim"].is_null() || self.events.iter().any(|v|v.event["type"]=="identity.update" && v.event["data"]["identity"]==e["data"]["identity_claim"]){"published"}else{"pending"},"norms":self.norms})
     }
     pub fn rename(&mut self, actor: &str, uid: &str, p: &Value) -> Result<Value> {
         let initiator = p["_authenticated_actor"].as_str().unwrap_or(actor);
@@ -1529,25 +1806,32 @@ impl Store {
         if let Some(e) = prior {
             return Ok(self.send_response(&e));
         }
-        let old = self.names.get(actor).ok_or_else(|| {
-            err(
-                "not_enrolled",
-                "This session has not chosen a messaging name yet",
-            )
-        })?;
-        if p["expected_name_revision"].as_u64() != Some(old.revision) {
-            return Err(err(
-                "name_revision_conflict",
-                format!("Current name revision is {}", old.revision),
-            ));
-        }
+        // A session with no name yet can claim its first one here, without
+        // a message (#28: its creator names it at spawn); it passes no
+        // expected_name_revision. Renaming still needs the current revision.
+        let first = match self.names.get(actor) {
+            None if p["expected_name_revision"].is_null() => true,
+            None => {
+                return Err(err(
+                    "not_enrolled",
+                    "This session has not chosen a messaging name yet",
+                ))
+            }
+            Some(old) if p["expected_name_revision"].as_u64() != Some(old.revision) => {
+                return Err(err(
+                    "name_revision_conflict",
+                    format!("Current name revision is {}", old.revision),
+                ));
+            }
+            Some(_) => false,
+        };
         let n = self.allocate(actor, &required(p, "name")?, uid)?;
         let mut v = serde_json::to_value(&n)?;
         v["participant_id"] = json!(actor);
         let e = self.publish(
             "identity.update",
             None,
-            &format!("Session renamed to {}", n.name),
+            &if first { format!("Session named {}", n.name) } else { format!("Session renamed to {}", n.name) },
             json!({"identity":v}),
             initiator,
             if initiator == "owner" {
@@ -1579,6 +1863,7 @@ impl Store {
                     task: None,
                     present: false,
                     kind: "agent".into(),
+                    engine: None,
                 });
             }
         }
@@ -1619,10 +1904,7 @@ impl Store {
     }
     /// Path of a channel id, if the channel exists.
     pub fn channel_path_of(&self, id: &str) -> Option<&str> {
-        self.channels
-            .iter()
-            .find(|(_, cid)| cid.as_str() == id)
-            .map(|(p, _)| p.as_str())
+        self.channel_paths.get(id)?.first().map(String::as_str)
     }
     /// Current joined membership without building the per-channel view.
     pub fn is_member(&self, channel_id: &str, actor: &str) -> bool {
@@ -1636,19 +1918,8 @@ impl Store {
     pub fn channels_for(&mut self, actor: &str) -> Result<Vec<Value>> {
         self.load_read(actor)?;
         let mut channels = self.channels().as_array().cloned().unwrap_or_default();
-        // (unread, mentions) per conversation, from one pass over the history.
-        let mut counts: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
-        for e in self.events.iter().filter(|e| {
-            e.event["type"] == "message.create"
-                && e.event["actor"]["id"] != actor
-                && !self.reads[actor].ids.contains(strv(&e.event, "id"))
-        }) {
-            let count = counts.entry(strv(&e.event, "conversation_id")).or_default();
-            count.0 += 1;
-            count.1 += usize::from(mention_recipients(&e.event).contains(&actor));
-        }
         for channel in &mut channels {
-            let (unread, mentions) = counts.get(strv(channel, "id")).copied().unwrap_or_default();
+            let (unread, mentions) = self.unread_counts(actor,strv(channel,"id"));
             self.channel_permissions(actor, channel);
             channel["unread"] = json!(unread);
             channel["mentions"] = json!(mentions);
@@ -1673,21 +1944,6 @@ impl Store {
             .filter(|p| *p <= self.position)
             .ok_or_else(|| err("invalid_cursor", "Invalid position"))
     }
-    fn load_read(&mut self, actor: &str) -> Result<()> {
-        if !self.reads.contains_key(actor) {
-            let p = self
-                .root
-                .join("_state")
-                .join(format!("{}.json", hash(actor.as_bytes())));
-            let state = if p.exists() {
-                serde_json::from_value(load(&p)?)?
-            } else {
-                ReadState::default()
-            };
-            self.reads.insert(actor.into(), state);
-        }
-        Ok(())
-    }
     pub fn acknowledge(&mut self, actor: &str, receipt: &Value) -> Result<()> {
         self.load_read(actor)?;
         if receipt.is_null() {
@@ -1701,41 +1957,22 @@ impl Store {
             return Err(err("invalid_receipt", "Receipt too large"));
         }
         for id in &ids {
-            if !self.events.iter().any(|e| {
-                e.event["id"] == *id && self.visible(actor, strv(&e.event, "conversation_id"))
-            }) {
+            if !self.published(id).is_some_and(|e| Self::readable_event(&e.event) && self.visible(actor,strv(&e.event,"conversation_id"))) {
                 return Err(err("not_found", "Receipt message not found"));
             }
         }
-        let unseen: BTreeSet<_> = ids
-            .into_iter()
-            .filter(|id| !self.reads[actor].ids.contains(id))
-            .collect();
-        if unseen.is_empty() {
-            return Ok(());
-        }
-        self.ensure_messaging_writable()?;
-        if actor == "owner" && self.sync_enabled() {
-            self.publish(
-                "read.ack",
-                None,
-                "Owner acknowledged messages",
-                json!({"ids":unseen}),
-                "owner",
-                "Owner",
-                "owner",
-                &uuid(),
-                "",
-            )?;
-            Ok(())
-        } else {
-            self.merge_read_ids(actor, unseen)
-        }
+        self.merge_read_ids(actor,ids.into_iter().collect())
     }
 
     pub fn read(&mut self, actor: &str, p: &Value, people: &[Person]) -> Result<Value> {
         if !p.is_object() {
             return Err(err("invalid_params", "Expected an object"));
+        }
+        if p.get("mark_read_before").is_some_and(|v| !v.is_null()) {
+            if ["sender", "query"].iter().any(|k| p.get(*k).is_some_and(|v| !v.is_null())) {
+                return Err(err("invalid_params", "Search filters cannot be combined with mark_read_before"));
+            }
+            return self.mark_read_before(actor, p, people);
         }
         let mut normalized;
         let p = if p["inbox"] != true
@@ -1746,7 +1983,7 @@ impl Store {
         {
             normalized = p.clone();
             if let Some(thread) = p["thread"].as_str() {
-                let event = self.events.iter().find(|e| e.event["id"] == thread)
+                let event = self.published(thread)
                     .ok_or_else(|| err("not_found", "Thread is not available in the local cache; request hub freshness to fetch it"))?;
                 normalized["conversation"] = event.event["conversation_id"].clone();
             } else {
@@ -1783,8 +2020,9 @@ impl Store {
         } else {
             Some(self.resolve(actor, p, people, false)?.0)
         };
+        let search = self.search_filter(p, people)?;
         let mut filter = p.clone();
-        for k in ["cursor", "ack_receipt", "limit"] {
+        for k in ["cursor", "ack_receipt", "limit", "mark_read"] {
             filter.as_object_mut().unwrap().remove(k);
         }
         let digest = hash(&serde_json::to_vec(&filter)?);
@@ -1826,11 +2064,13 @@ impl Store {
             vec![]
         };
         let pin_states = self.pin_states(high);
-        let read = &self.reads[actor].ids;
-        let mut items: Vec<_> = self
-            .events
-            .iter()
-            .filter(|e| {
+        let limit = p["limit"].as_u64().unwrap_or(50).clamp(1, 200) as usize;
+        let newest = p["newest_first"] == true && p.get("after").is_none();
+        let anchor = last_id.map(|id|self.published(id).map(|e|ReadCursor::of(&e.event))
+            .ok_or_else(||err("invalid_cursor","Missing page anchor"))).transpose()?;
+        let search_scope = if search.active() { self.search_scope(actor, conv.as_deref(), public, p["dms"] == true, cursor)? }
+            else { search::SearchScope::default() };
+        let matches = |e: &&Published| {
                 let v = &e.event;
                 let cid = strv(v, "conversation_id");
                 if v["type"] == "conversation.pin" || v["type"] == "channel.membership"
@@ -1850,9 +2090,12 @@ impl Store {
                 if public && !self.channels.values().any(|id| id == cid) {
                     return false;
                 }
+                if p["mentions_only"] == true && !mention_recipients(v).contains(&actor) { return false; }
                 if broad {
                     let incoming = v["actor"]["id"] != actor;
-                    let eligible = if p["inbox"] == true {
+                    let eligible = if p["mentions_only"] == true {
+                        mention_recipients(v).contains(&actor)
+                    } else if p["inbox"] == true {
                         self.preference_for_event(actor, e).0 || self.monitor_inbox(actor,e)
                     } else {
                         self.conversations.contains_key(cid)
@@ -1862,7 +2105,7 @@ impl Store {
                     }
                 }
                 if p["unread_only"] == true
-                    && (read.contains(strv(v, "id")) || v["actor"]["id"] == actor)
+                    && (self.is_read(actor,v) || v["actor"]["id"] == actor)
                 {
                     return false;
                 }
@@ -1887,8 +2130,27 @@ impl Store {
                     return false;
                 };
                 start_dt.is_none_or(|s| t >= s) && end_dt.is_none_or(|end| t < end)
-            })
-            .collect();
+        };
+        let default_inbox = p["inbox"] == true && self.personal.get(actor).is_none_or(|s|s.preferences.rules.is_empty() && s.monitors.is_empty());
+        let mut search_scanned = None;
+        let mut search_truncated = false;
+        let mut items: Vec<_> = if search.active() {
+            let arrival_after = p.get("after").map(|_| last_id.and_then(|id| self.published(id))
+                .map_or(after, |e| after.max(e.position)));
+            let page = self.search_page(&search_scope.ids, &search, anchor.as_ref(), newest, arrival_after, high, limit, matches);
+            search_scanned = page.scanned;
+            search_truncated = page.truncated;
+            page.items
+        } else if p.get("after").is_some() {
+            self.events_between(last_id.and_then(|id|self.published(id)).map_or(after,|e|after.max(e.position)),high).iter().filter(|e|Self::readable_event(&e.event))
+                .filter(matches).take(limit+1).collect()
+        } else {
+            self.read_model.conversations.keys()
+                .filter(|cid|conv.as_ref().is_none_or(|wanted|*cid==wanted) && self.visible(actor,cid))
+                .flat_map(|cid|self.message_candidates(actor,cid,anchor.as_ref(),newest,p["unread_only"]==true,
+                    p["mentions_only"]==true || (default_inbox && !self.conversations.contains_key(cid)))
+                    .filter(matches).take(limit+1)).collect()
+        };
         if p.get("after").is_some() {
             items.sort_by_key(|e| e.position);
         } else {
@@ -1902,41 +2164,10 @@ impl Store {
                 )
             });
         }
-        let newest = p["newest_first"] == true && p.get("after").is_none();
         if newest {
             items.reverse();
         }
-        if let Some(last) = last_id {
-            let anchor = self
-                .events
-                .iter()
-                .find(|e| strv(&e.event, "id") == last)
-                .ok_or_else(|| err("invalid_cursor", "Missing page anchor"))?;
-            // Cursor advances through the ordering, even if acknowledged items
-            // disappear from an unread-only query between pages.
-            items.retain(|e| {
-                if p.get("after").is_some() {
-                    e.position > anchor.position
-                } else {
-                    let order = (
-                        strv(&e.event, "logical_time").parse::<u64>().unwrap_or(0),
-                        strv(&e.event, "id"),
-                    )
-                        .cmp(&(
-                            strv(&anchor.event, "logical_time")
-                                .parse::<u64>()
-                                .unwrap_or(0),
-                            strv(&anchor.event, "id"),
-                        ));
-                    if newest {
-                        order.is_lt()
-                    } else {
-                        order.is_gt()
-                    }
-                }
-            });
-        }
-        let limit = p["limit"].as_u64().unwrap_or(50).clamp(1, 200) as usize;
+        items.truncate(limit+1);
         let mut out = vec![];
         let mut chars = 0;
         let mut bytes = 0;
@@ -1947,8 +2178,9 @@ impl Store {
             let mut v = e.event.clone();
             v["pinned"] = json!(pin_states.contains_key(strv(&v, "id")));
             v["pin"] = pin_states.get(strv(&v, "id")).cloned().unwrap_or(Value::Null);
+            v["reactions"] = self.reaction_summary(actor,strv(&e.event,"id"));
             v["received_at"] = json!(e.received_at);
-            v["read"] = json!(read.contains(strv(&e.event, "id")) || e.event["actor"]["id"] == actor);
+            v["read"] = json!(self.is_read(actor,&e.event) || e.event["actor"]["id"] == actor);
             v["conversation_kind"] = json!(if self.conversations.contains_key(strv(&e.event, "conversation_id")) { "dm" } else { "channel" });
             if e.event["actor"]["id"] == actor {
                 v["notification"] = self.notification_status(&e.event);
@@ -1962,8 +2194,15 @@ impl Store {
             out.push(v);
             index += 1;
         }
-        let next = if index < items.len() {
-            json!({"filter":digest,"snapshot":self.position_token(high),"last_id":out.last().map(|v|&v["id"]),"start":start,"end":end})
+        let next = if index < items.len() || search_truncated {
+            let mut next = json!({"filter":digest,"snapshot":self.position_token(high),"last_id":out.last().map(|v|&v["id"]),"start":start,"end":end});
+            if let Some(sender) = &search.sender { next["search_sender"] = json!(sender); }
+            if search.active() {
+                next["search_scope"] = json!(search_scope.ids);
+                next["search_partial_scope"] = json!(search_scope.partial);
+            }
+            if search_truncated && index == items.len() { next["last_id"] = json!(search_scanned); }
+            next
         } else {
             Value::Null
         };
@@ -1974,7 +2213,7 @@ impl Store {
                 if !ids.iter().any(|id| id == parent)
                     && !context.iter().any(|x: &Value| x["id"] == parent)
                 {
-                    if let Some(e) = self.events.iter().find(|e| e.event["id"] == parent) {
+                    if let Some(e) = self.published(parent) {
                         if e.position <= high
                             && self.visible(actor, strv(&e.event, "conversation_id"))
                             && chars + strv(&e.event, "body").chars().count() <= 16000
@@ -1997,20 +2236,28 @@ impl Store {
                 c
             });
         let pins_revision = conv.as_deref().map(|id| self.pins_revision(id, high));
-        let pins: Option<BTreeMap<_, _>> = conv.as_deref().map(|cid| {
-            self.events
-                .iter()
-                .filter(|e| e.event["conversation_id"] == cid)
-                .filter_map(|e| {
-                    pin_states
-                        .get(strv(&e.event, "id"))
-                        .map(|pin| (strv(&e.event, "id"), pin.clone()))
-                })
-                .collect()
-        });
-        Ok(
-            json!({"target":target,"pins_revision":pins_revision,"pins":pins,"items":out,"context":context,"next_cursor":next,"position":self.position_token(high),"receipt":{"actor":actor,"space_id":self.space_id,"ids":ids},"time":{"start":start,"end":end,"basis":basis},"coverage":if self.degraded.is_some(){"partial"}else{"complete"},"connection":"local","norms":self.norms,"degraded":self.degraded}),
-        )
+        let pins: Option<BTreeMap<_, _>> = conv.as_deref().map(|cid| pin_states.iter()
+            .filter(|(id,_)|self.published(id).is_some_and(|e|e.event["conversation_id"]==cid))
+            .map(|(id,pin)|(id.clone(),pin.clone())).collect());
+        // Filters/previews never mark unrelated history. A newest page marks
+        // through its newest supplied message; reaching the chronological end
+        // does the same, without consuming messages arriving after this snapshot.
+        if self.degraded.is_none() && !self.messaging_frozen() && p["mark_read"] != false && !broad && !public && p["mentions_only"] != true
+            && !search.active() && p["thread"].is_null() && p["time"].is_null() && p["tags"].is_null()
+            && p["pinned_only"] != true && p["after"].is_null()
+            && ((newest && cursor.is_none()) || (!newest && next.is_null())) {
+            if let Some(v) = out.iter().max_by_key(|v| ReadCursor::of(v)) {
+                self.advance_cursors(actor,BTreeMap::from([(strv(v,"conversation_id").to_owned(),ReadCursor::of(v))]))?;
+            }
+        }
+        let read_cursor = conv.as_deref().map(|cid|self.read_cursor(actor,cid));
+        let mut result = json!({"read_cursor":read_cursor,"target":target,"pins_revision":pins_revision,"pins":pins,"items":out,"context":context,"next_cursor":next,"position":self.position_token(high),"receipt":{"actor":actor,"space_id":self.space_id,"ids":ids},"time":{"start":start,"end":end,"basis":basis},"coverage":if self.degraded.is_some(){"partial"}else{"complete"},"connection":"local","norms":self.norms,"degraded":self.degraded});
+        if search.active() {
+            result["search_truncated"] = json!(search_truncated);
+            result["partial_scope"] = json!(search_scope.partial);
+            if search_scope.indexing { result["indexing"] = json!(true); result["retry_after"] = json!(1); }
+        }
+        Ok(result)
     }
     pub fn dms(&mut self, actor: &str, unread: bool) -> Result<Value> {
         self.dms_page(actor, &json!({"unread_only":unread}))
@@ -2027,25 +2274,23 @@ impl Store {
             if p["peer"].as_str().is_some_and(|s| !peers.iter().any(|id| id.as_str() == s)) {
                 continue;
             }
-            let events: Vec<_> = self
-                .events
-                .iter()
-                .filter(|e| {
-                    e.event["conversation_id"] == *id && e.event["type"] == "message.create"
-                })
-                .collect();
-            let count = events
-                .iter()
-                .filter(|e| {
-                    e.event["actor"]["id"] != actor
-                        && !self.reads[actor].ids.contains(strv(&e.event, "id"))
-                })
-                .count();
+            let last_event = self.messages_in(id).next_back();
+            let (count, mentions) = self.unread_counts(actor,id);
             if p["unread_only"] == true && count == 0 {
                 continue;
             }
-            let last=events.last().map(|e|json!({"id":e.event["id"],"actor":e.event["actor"],"created_at":e.event["created_at"],"preview":strv(&e.event,"body").chars().take(180).collect::<String>()}));
-            out.push(json!({"id":id,"peer":peer,"peers":peers,"members":m,"group":m.len()>2,"unread":count,"last":last}));
+            let last=last_event.map(|e|json!({"id":e.event["id"],"actor":e.event["actor"],"created_at":e.event["created_at"],"preview":strv(&e.event,"body").chars().take(180).collect::<String>()}));
+            // Display names for every member, departed agents included (the
+            // people directory lists only present ones), so clients can
+            // label a DM without it. Additive: ids without a name are omitted.
+            let member_names: serde_json::Map<String, Value> = m
+                .iter()
+                .filter_map(|id| {
+                    let name = if id == "owner" { Some("Owner".to_owned()) } else { self.names.get(id).map(|n| n.name.clone()) };
+                    name.map(|n| (id.clone(), json!(n)))
+                })
+                .collect();
+            out.push(json!({"id":id,"peer":peer,"peers":peers,"members":m,"member_names":member_names,"group":m.len()>2,"unread":count,"mentions":mentions,"last":last}));
         }
         self.directory_page(actor, p, out)
     }
@@ -2101,6 +2346,30 @@ impl Store {
             statuses.push(super::delivery::status(&self.root, &uid, &intent.event_id));
         }
         json!(statuses)
+    }
+    /// The body of a message, for readers outside messaging (the items board
+    /// resolves `#N` in a thread's root). Read-only.
+    pub fn message_body(&self, id: &str) -> Option<String> {
+        self.events
+            .iter()
+            .rev()
+            .find(|p| p.event["id"] == id && p.event["type"] == "message.create")
+            .and_then(|p| p.event["body"].as_str().map(str::to_owned))
+    }
+    /// A message's sender participant id and body by message id, through the
+    /// event index (gate waivers check that the grantor sent the linked
+    /// message and what it names). Messages are immutable in this store:
+    /// there are no edit or retraction events, so the create event is the
+    /// latest version. Read-only.
+    pub fn message_sender_and_body(&self, id: &str) -> Option<(String, String)> {
+        self.published(id)
+            .filter(|p| p.event["type"] == "message.create")
+            .map(|p| {
+                (
+                    p.event["actor"]["id"].as_str().unwrap_or_default().to_owned(),
+                    p.event["body"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
     }
     pub fn notifications(&self) -> Vec<(String, String, String)> {
         self.wake_intents()
@@ -2185,6 +2454,7 @@ mod tests {
             task: None,
             present: true,
             kind: "agent".into(),
+            engine: None,
         }
     }
     fn send(s: &mut Store, p: &Person, body: &str, key: &str, name: &str) -> Value {
@@ -2196,6 +2466,19 @@ mod tests {
             &[p.clone()],
         )
         .unwrap()
+    }
+    #[test]
+    fn s4_attribution_is_not_part_of_chat_request_digest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = Store::open(tmp.path()).unwrap();
+        let p = person(&s, "a");
+        let params = json!({"channel":"general", "body":"Ready", "request_id":"same", "name":"Scout"});
+        let a = json!({"member_id":"mem_a", "acting_as":"main", "provenance":"central-open-main", "org_version":1});
+        let b = json!({"member_id":"mem_b", "acting_as":"main", "provenance":"central-open-main", "org_version":2});
+        let first = s.send_with_attribution(&p.id, "a", "agent", &params, &[p.clone()], Some(&a)).unwrap();
+        let retry = s.send_with_attribution(&p.id, "a", "agent", &params, &[p.clone()], Some(&b)).unwrap();
+        assert_eq!(first["event_id"], retry["event_id"]);
+        assert_eq!(retry["event"]["data"]["actor_attribution"], a);
     }
     #[test]
     fn names_collide_on_unicode_case_and_retries_survive_rebuild() {
@@ -2408,7 +2691,7 @@ mod tests {
         assert_eq!(
             s.read(
                 "owner",
-                &json!({"channel":"general","unread_only":true}),
+                &json!({"channel":"general","unread_only":true,"mark_read":false}),
                 &[]
             )
             .unwrap()["items"]
@@ -2421,7 +2704,7 @@ mod tests {
         assert_eq!(
             s.read(
                 "owner",
-                &json!({"channel":"general","unread_only":true}),
+                &json!({"channel":"general","unread_only":true,"mark_read":false}),
                 &[]
             )
             .unwrap()["items"]
@@ -2536,6 +2819,25 @@ mod tests {
                 .clone()
         );
     }
+    /// #28: a session with no name claims its first one without a message
+    /// (its creator names it at spawn); renaming still needs the revision.
+    #[test]
+    fn a_first_name_is_claimed_without_a_message_and_a_rename_still_needs_its_revision() {
+        let t = tempfile::tempdir().unwrap();
+        let mut s = Store::open(t.path()).unwrap();
+        let a = person(&s, "a");
+        let err = s.rename(&a.id, "a", &json!({"name": "Lead", "expected_name_revision": 1, "request_id": "r0"}))
+            .unwrap_err();
+        assert_eq!(err.code, "not_enrolled", "a revision for a name it never had");
+        let first = s.rename(&a.id, "a", &json!({"name": "Lead", "request_id": "r1"})).unwrap();
+        assert_eq!(first["event"]["body"], "Session named Lead");
+        assert_eq!(s.names.get(&a.id).map(|n| (n.name.as_str(), n.revision)), Some(("Lead", 1)));
+        assert_eq!(s.rename(&a.id, "a", &json!({"name": "Other", "request_id": "r2"})).unwrap_err().code,
+                   "name_revision_conflict", "a named session renames at its revision");
+        s.rename(&a.id, "a", &json!({"name": "Lead-2", "expected_name_revision": 1, "request_id": "r3"})).unwrap();
+        assert_eq!(s.names.get(&a.id).unwrap().aliases, ["Lead"]);
+    }
+
     #[test]
     fn historical_aliases_suffix_collisions_owner_rename_and_missing_bootstrap_recover() {
         let t = tempfile::tempdir().unwrap();

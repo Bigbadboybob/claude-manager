@@ -12,3 +12,6 @@ tui/target/
 # (~/.cm/shared-target, see .cargo/config.toml), and `/target/` only
 # matches real directories.
 /target
+
+# Written on each deploy target by `mcp_version.py stamp`; never committed.
+mcp_server/VERSION

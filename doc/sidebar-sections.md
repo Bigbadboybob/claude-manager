@@ -2,7 +2,13 @@
 
 ## Summary
 
-Owner-created, collapsible sections in the Sessions-view sidebar (Task sub-view) that group workspaces by project. A section is a display construct stored in the TUI manifest. The viewer publishes its catalogue to each daemon; agent tools can queue durable workspace assignment changes. Sections remain separate from planning initiatives. Membership is explicit per workspace, and a workspace without an explicit assignment inherits its parent task's section through the task tree, so an agent's `create_subtask` lands under its parent's section automatically.
+Owner-created, collapsible sections in the Sessions-view sidebar (Workspaces sub-view, `Task` in the code) that group workspaces by project. A section is a display construct stored in the TUI manifest. The viewer publishes its catalogue to each daemon; agent tools can queue durable workspace assignment changes. Sections remain separate from planning initiatives. Membership is explicit per workspace, and a workspace without an explicit assignment inherits its parent task's section through the task tree, so an agent's `create_subtask` lands under its parent's section automatically. Since 2026-10-20 the Task sub-view is a nested work tree (`tui/src/app/tree.rs`): sections group the top-level blocks, and a block nested under another task's block follows that root's section even when it was assigned elsewhere. Since 2026-11-05 it has no task subheaders (tasks live on the board): each workspace shows its sessions directly under it, and its header is titled "Workspaces".
+
+**Work tree display (2026-10-21).** Every block draws at the top-level indent, whatever its depth; only sessions keep their indent under their workspace row. The hierarchy shows through two cues instead:
+- **Group strip.** The focused row's group (its workspace and everything below it) shows as a narrow coloured strip (`▏`) at the sidebar's left edge, clear of the row text. The group has no background tint, so section tints show unchanged.
+- **Leader marks.** The lead session of a task with live reports carries its level's mark: ★ for a root task, ☆ one level down, ✦, then ✧ for every deeper level. A live report is a subtask that is not done or archived and has a live agent session in its subtree; sessionless, bash-only and finished subtasks don't count. The F6 org chart draws the same marks (`App::leader_marks`; see doc/org-chart.md).
+
+Space/Enter on a workspace header folds only the blocks nested under it: the header and its own sessions stay, and the folded header's count covers just the hidden subtree. Only a workspace whose task has live reports has a fold glyph (`▾`/`▸`). Fold state is separate for each workspace (the manifest's `folded_tasks` field now holds workspace ids; older `[workspace, task]` keys migrate to their workspace), so folding one header leaves another workspace’s header open, even when both hold the same task. A child workspace attaches to a parent on its own host, preferring its managing session’s workspace; otherwise it remains top-level when no parent is on that host. A division header still folds its whole tree.
 
 ## Agent tools: remote subsection assignment
 
@@ -101,7 +107,7 @@ Subtasks nest to arbitrary depth, and rendering that tree faithfully in one side
 ## Goals
 
 - Create, rename, recolor, reorder, fold, and delete sections from the Sessions view.
-- Assign a workspace to a section from the A-e settings form on a workspace or task row.
+- Assign a workspace to a section from the A-e settings form on a workspace row.
 - A new workspace created with A-n while the cursor is inside a section joins that section.
 - A subtask (task with `parent_task_id`) whose parent's workspace is in a section renders in that section without any assignment.
 - Everything persists in `~/.cm/tui-sessions.json`, including fold state.
@@ -166,6 +172,12 @@ workspace separators stay thin and dim. Filtering
 or scrolling away the heading does not remove a member's tint. Planning keeps
 its default background and the initiative coordinator `◆` glyph.
 
+Continuous org teams are an additional boxed block in this Task view. The
+block stays with the team's org placement, uses the same F9 tint strength, and
+contains the lead and its managed sessions. Its header is the live marker
+summary (`⟳ every 6h · next 1h12m · ok`, or `⟳ queue · 3 pending · ok`); the
+legacy continuous column is unchanged.
+
 Select a section heading and press **Alt+E** to change its color. The palette is
 red, orange, yellow, green, cyan, blue, magenta, and pink, plus the neutral default.
 The choice controls both the heading accent and its background tint.
@@ -186,6 +198,10 @@ at the next TUI launch. A missing setting defaults to 2×:
 sidebar_tint_strength = 2.0
 ```
 
+The second row, **Activity badges**, is a checkbox (Space or ←/→ toggles it,
+↑/↓ moves between rows); it previews live and saves with the tint as
+`activity_badges = true|false` (default on).
+
 Invalid settings fall back to 2× and show an error in Global Settings. A malformed
 TOML file is preserved rather than overwritten on save; fix it before saving.
 Other settings keys are preserved when saving (TOML comments/formatting are not).
@@ -199,6 +215,41 @@ set `background-opacity-cells = true` to apply your existing
 `background-opacity` to colored cells as well. This affects all explicit cell
 backgrounds in the terminal, including other applications.
 
+### Activity badge
+
+Each live agent row ends with a compact, right-aligned badge saying what the
+agent is doing right now: a mark plus at most a time or a count, never more
+than 6 cells. The F6 org chart cards show the same badge. The full wording
+(job labels, the tool asking permission, the error kind) is in the A-i peek's
+`Doing` line and the F6 info pane's `doing` line, e.g. `background: cargo
+test --workspace`, `waiting on permission: Bash for 1m`, `rate limited
+(usageLimitExceeded), resumes in 12m`.
+
+| Badge | Meaning |
+|---|---|
+| `⚙ 3m`, `⚙ 3m+2` | working on its turn for 3 minutes (with two background jobs). Past 6 cells the space goes, then the job count (`⚙12m+2`, `⚙12m`) |
+| `⧗2`, `⧗` | turn over, background jobs still running: how many, when known. Never the job's label |
+| `☛` | waiting on a human (permission, a question, input) |
+| `⚠12m`, `⚠` | stopped on a rate or usage limit (Claude `rate_limit`, Codex `usageLimitExceeded`, quota/429), with the time until it resumes when known. Drawn reversed and bold so sessions that need waking stand out |
+| `✕` | stopped on another error, such as a server error |
+| `↻` | the engine is retrying a failed request |
+| `⏱6m` | working, but no progress for 6 minutes |
+
+Idle, starting, unknown and exited sessions have no badge; their state glyph
+says enough. Rows that already carry a status (hidden, owner-blocked, revive
+failed) show none either. The session name has priority: when the row is too
+narrow for the whole name, a blank cell and the badge, the badge is dropped
+and the name is never cut for it.
+
+The badge reads only the daemon's `agent_state` (doc/SESSION_STATE.md),
+which the TUI already receives on `manifest.watch`; it adds no polling. The
+engines do not report the tool a working session is running (`open_tool` is
+filled only while a permission prompt is open), so a working badge shows how
+long the turn has run rather than the current tool. The marks live in
+`symbols::doing` (`tui/src/app/symbols.rs`), the label choice in
+`agent_state::badge`. Turn badges off with the second row of F9 Global
+Settings; the A-i peek and the info pane keep their full line either way.
+
 ### Cursor and keys
 
 New `Cursor::Section(String)`. It is selectable; `active_workspace_index`, `active_session`, `cursor_task_id` return `None` for it, so task/session actions no-op with a status hint.
@@ -207,7 +258,7 @@ New `Cursor::Section(String)`. It is selectable; `active_workspace_index`, `acti
 |---|---|---|
 | `A-N` | new section | new section |
 | `A-e` | Section settings: name, color | Workspace/Task settings gain a **Section** field (←/→ cycles none + sections) |
-| `F9` | Global Settings: section tint strength | Applies across projects; live preview and persistent save |
+| `F9` | Global Settings: section tint strength, activity badges | Applies across projects; live preview and persistent save |
 | `A-x` | delete section (confirm; workspaces become loose) | unchanged |
 | `Space` / `Enter` | fold / unfold | unchanged |
 | `A-J` / `A-K` | move section down / up | unchanged |

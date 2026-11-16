@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import shutil
 import signal
+import socket
+import struct
 import sys
 import tempfile
 import time
@@ -28,9 +31,12 @@ from websockets.asyncio.server import unix_serve
 from websockets.exceptions import ConnectionClosed
 
 from mcp_server import control_client
+from mcp_server.codex_state import CodexState
+from mcp_server.codex_startup import UPDATE_OFF, dismiss_cached_update
 from mcp_server.notifications import (
     NotSubmitted,
     Queue,
+    atomic_write,
     consume_supervised,
     transcript_observed,
 )
@@ -93,7 +99,9 @@ class FrontendAttachment:
             self.detached_since = self.clock()
 
     def detached_for(self):
-        return None if self.detached_since is None else self.clock() - self.detached_since
+        return (
+            None if self.detached_since is None else self.clock() - self.detached_since
+        )
 
     def exit_followed_detach(self, settle_secs=5.0):
         """A frontend that quit while already detached for longer than a clean
@@ -112,11 +120,91 @@ def apply_launch_permissions(params, policy):
     return params
 
 
+def apply_launch_model(params, model, effort=None):
+    """Pin CM's resolved model and effort on a thread start/resume/fork.
+
+    CM never leaves a session on Codex's default model or reasoning
+    effort; a resumed thread would otherwise keep whatever it was last
+    using. The thread RPCs carry no effort field, so the effort rides as
+    the ``model_reasoning_effort`` config override.
+    """
+    if not model and not effort:
+        return params
+    params = dict(params)
+    if model:
+        params["model"] = model
+    if effort:
+        config = params.get("config")
+        params["config"] = {
+            **(config if isinstance(config, dict) else {}),
+            "model_reasoning_effort": effort,
+        }
+    return params
+
+
+EFFORT_OVERRIDE = "model_reasoning_effort="
+
+
+def launch_effort(args):
+    """The effort a CM Codex argv selects (``-c model_reasoning_effort=``)."""
+    for index, arg in enumerate(args):
+        if arg in ("-c", "--config") and index + 1 < len(args):
+            value = args[index + 1]
+            if value.startswith(EFFORT_OVERRIDE):
+                value = value[len(EFFORT_OVERRIDE):].strip()
+                try:
+                    parsed = json.loads(value)
+                except ValueError:
+                    parsed = value
+                return parsed if isinstance(parsed, str) and parsed else None
+    return None
+
+
+def launch_model(args):
+    """The model a CM Codex argv selects (``-m``/``--model``), if any."""
+    for index, arg in enumerate(args):
+        if arg in ("-m", "--model") and index + 1 < len(args):
+            return args[index + 1]
+        if arg.startswith("--model="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+class NativeRPCError(RuntimeError):
+    def __init__(self, error):
+        super().__init__("Codex rejected native RPC")
+        self.error = error
+
+    @property
+    def unsupported(self):
+        message = self.error.get("message", "")
+        return self.error.get("code") == -32601 or (
+            self.error.get("code") == -32600
+            and "thread/backgroundTerminals/list" in message
+            and "unknown variant" in message
+        )
+
+
+def selectable(thread):
+    """Wake routing identity is independent of the optional telemetry model."""
+    if not isinstance(thread, dict) or not thread.get("id") or thread.get("ephemeral"):
+        return False
+    source = thread.get("source")
+    subagent = source.get("subagent") if isinstance(source, dict) else None
+    spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+    parent = spawn.get("parent_thread_id") if isinstance(spawn, dict) else None
+    return not (thread.get("parentThreadId") or parent)
+
+
 class Relay:
     engine = "codex"
 
-    def __init__(self, socket: str, queue: Queue, permissions=None):
+    def __init__(
+        self, socket: str, queue: Queue, permissions=None, model=None, effort=None
+    ):
         self.socket = socket
+        self.launch_model = model
+        self.launch_effort = effort
         self.queue = queue
         self.upstream = None
         self.frontend = None
@@ -135,8 +223,24 @@ class Relay:
         self.reader = None
         self.identity_revision = 0
         self.selecting = set()
-        self.report_tasks = set()
+        self.state = CodexState()
+        self.state_enabled = True
+        self.legacy_report = None
+        self.legacy_revision = 0
+        self.legacy_published = 0
+        self.legacy_until = 0.0
+        self.legacy_probe_delay = 60.0
+        self.report_epoch = str(uuid.uuid4())
+        self.report_seq = 0
+        self.report_dirty = asyncio.Event()
+        self.background_dirty = asyncio.Event()
+        self.publisher = None
+        self.background_poller = None
+        self.background_supported = None
         self.launch_permissions = permissions
+        # Serialize native wakes with a manager's interrupt-and-stop operation.
+        self.delivery_lock = asyncio.Lock()
+        self.interrupt_waiters = 0
 
     def identity(self):
         return {
@@ -150,6 +254,9 @@ class Relay:
     def health_status(self):
         return "ready" if self.ready.is_set() else "awaiting_thread"
 
+    def can_claim(self):
+        return not self.delivery_lock.locked() and not self.interrupt_waiters
+
     async def connect(self):
         self.upstream = await unix_connect(
             self.socket,
@@ -159,6 +266,9 @@ class Relay:
             open_timeout=5,
         )
         self.connected.set()
+        self.state_connection(True)
+        self.publisher = asyncio.create_task(self.publish_state())
+        self.background_poller = asyncio.create_task(self.poll_background())
         self.reader = asyncio.create_task(self.read())
 
     async def call(self, method: str, params: dict, timeout=30):
@@ -174,7 +284,8 @@ class Relay:
             )
             result = await asyncio.wait_for(future, timeout)
             if "error" in result:
-                raise RuntimeError("Codex rejected native RPC")
+                raise NativeRPCError(result["error"])
+            self.observe(result, method=method, params=params)
             return result["result"]
         finally:
             self.pending.pop(request_id, None)
@@ -184,29 +295,212 @@ class Relay:
             with suppress(ConnectionClosed):
                 await self.frontend.send(json.dumps(message))
 
-    def report(self, continuing: bool):
+    def observe(self, message, *, method=None, params=None, select=False):
+        try:
+            self.observe_legacy(
+                message,
+                select=select
+                or method in {"thread/start", "thread/resume", "thread/fork"},
+            )
+            if self.state_enabled:
+                self.state.observe(
+                    message, time.time(), method=method, params=params, select=select
+                )
+        except (
+            Exception
+        ) as exc:  # State reporting must never break native wake routing.
+            self.state_failed("observe", exc)
+        # Streaming deltas carry no state; avoid a daemon RPC per token.
+        if (
+            method
+            in {
+                "initialize",
+                "thread/start",
+                "thread/resume",
+                "thread/fork",
+                "thread/read",
+                "turn/start",
+            }
+            or message.get("method")
+            in {
+                "thread/started",
+                "thread/status/changed",
+                "turn/started",
+                "turn/completed",
+                "error",
+                "serverRequest/resolved",
+                "thread/closed",
+            }
+            or ("id" in message and "method" in message)
+        ):
+            self.report_dirty.set()
+        if select or message.get("method") == "turn/completed":
+            self.background_dirty.set()
+
+    def state_failed(self, operation, exc):
+        was_enabled = self.state_enabled
+        self.state_enabled = False
+        if was_enabled:
+            with suppress(Exception):
+                print(
+                    f"CM Codex state reporting disabled after {operation}: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+
+    def state_connection(self, connected):
+        if self.state_enabled:
+            try:
+                self.state.connection(connected)
+            except Exception as exc:
+                self.state_failed("connection", exc)
+
+    def observe_legacy(self, message, *, select=False):
+        """Keep old-brain turn edges independent of the optional state model."""
         if not self.thread:
             return
-        params = {
+        event, params = message.get("method"), message.get("params", {})
+        if (
+            select
+            and (thread := message.get("result", {}).get("thread"))
+            and thread.get("id") == self.thread["id"]
+        ):
+            continuing = thread.get("status", {}).get("type") == "active"
+        elif (
+            event in {"turn/started", "turn/completed"}
+            and params.get("threadId") == self.thread["id"]
+        ):
+            continuing = event == "turn/started"
+        else:
+            return
+        self.legacy_report = {
             "session_uid": self.queue.uid,
             "continuing": continuing,
             "transcript_path": self.thread.get("path"),
         }
+        self.legacy_revision += 1
 
-        async def work():
-            # Registry publication can race the initial frontend handshake.
-            for _ in range(10):
-                try:
-                    await asyncio.to_thread(
-                        control_client.call, "session.turn_ended", params, timeout=2
-                    )
-                    return
-                except (control_client.ControlError, control_client.TransportError):
-                    await asyncio.sleep(0.5)
+    async def publish_once(self):
+        if (
+            self.state_enabled
+            and self.state.foreground
+            and time.monotonic() >= self.legacy_until
+        ):
+            self.report_seq += 1
+            snapshot = self.state.snapshot()
+            snapshot["transcript_path"] = (self.thread or {}).get("path")
+            params = {
+                "session_uid": self.queue.uid,
+                "kind": "snapshot",
+                "epoch": self.report_epoch,
+                "seq": self.report_seq,
+                "snapshot": snapshot,
+            }
+            try:
+                await asyncio.to_thread(
+                    control_client.call, "session.agent_report", params, timeout=2
+                )
+            except control_client.ControlError as exc:
+                if exc.code not in {"unknown_method", "method_not_found", -32601}:
+                    raise
+                self.legacy_until = time.monotonic() + self.legacy_probe_delay
+                self.legacy_probe_delay = min(self.legacy_probe_delay * 2, 600)
+            else:
+                self.legacy_until = 0
+                self.legacy_probe_delay = 60
+                return
+        if self.legacy_report and self.legacy_revision != self.legacy_published:
+            revision = self.legacy_revision
+            await asyncio.to_thread(
+                control_client.call,
+                "session.turn_ended",
+                dict(self.legacy_report),
+                timeout=2,
+            )
+            self.legacy_published = revision
 
-        task = asyncio.create_task(work())
-        self.report_tasks.add(task)
-        task.add_done_callback(self.report_tasks.discard)
+    async def publish_state(self):
+        """One in-flight call. A retry always takes the latest model value."""
+        delay = 0.5
+        while not self.closing:
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self.report_dirty.wait(), 30)
+            self.report_dirty.clear()
+            try:
+                await self.publish_once()
+                delay = 0.5
+            except control_client.ControlError as exc:
+                if exc.code not in {"conflict", "not_found", "internal"}:
+                    self.state_failed("daemon rejected state report", exc)
+                    continue
+                self.report_dirty.set()
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 5)
+            except control_client.TransportError:
+                self.report_dirty.set()
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 5)
+            except Exception as exc:
+                self.state_failed("publish", exc)
+
+    async def poll_background(self):
+        while not self.closing:
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self.background_dirty.wait(), 30)
+            self.background_dirty.clear()
+            try:
+                await self.poll_background_once()
+            except Exception as exc:
+                self.state_failed("background poll", exc)
+
+    async def poll_background_once(self):
+        if (
+            not self.state_enabled
+            or not self.connected.is_set()
+            or not self.state.foreground
+            or self.background_supported is False
+        ):
+            return
+        uid = self.state.foreground
+        rows, cursors, cursor = [], set(), None
+        complete = False
+        try:
+            for _ in range(16):
+                result = await self.call(
+                    "thread/backgroundTerminals/list",
+                    {
+                        "threadId": uid,
+                        "cursor": cursor,
+                        "limit": 100,
+                    },
+                    timeout=5,
+                )
+                if not isinstance(result, dict):
+                    break
+                page = result.get("data")
+                if not isinstance(page, list) or not all(
+                    isinstance(t, dict) for t in page
+                ):
+                    break
+                self.background_supported = True
+                rows.extend(page)
+                if "nextCursor" not in result:
+                    break
+                cursor = result.get("nextCursor")
+                if len(rows) > 256:
+                    break
+                if cursor is None:
+                    complete = True
+                    break
+                if not isinstance(cursor, str) or cursor in cursors:
+                    break
+                cursors.add(cursor)
+        except NativeRPCError as exc:
+            if exc.unsupported:
+                self.background_supported = False
+        except (TimeoutError, ConnectionError, ConnectionClosed, OSError, NotSubmitted):
+            pass
+        self.state.background(uid, rows, time.time(), complete=complete)
+        self.report_dirty.set()
 
     async def read(self):
         while not self.closing:
@@ -214,6 +508,8 @@ class Relay:
             if self.closing:
                 return
             self.connected.clear()
+            self.state_connection(False)
+            self.report_dirty.set()
             self.queue.health(self.engine, "disconnected", **self.identity())
             for request_id in list(self.requests):
                 await self.to_frontend(
@@ -251,18 +547,28 @@ class Relay:
                 json.dumps({"id": request_id, "method": method, "params": params})
             )
             while True:
-                message = json.loads(await asyncio.wait_for(self.upstream.recv(), timeout))
+                message = json.loads(
+                    await asyncio.wait_for(self.upstream.recv(), timeout)
+                )
                 if message.get("id") == request_id and (
                     "result" in message or "error" in message
                 ):
                     if "error" in message:
                         raise RuntimeError("native reconnect rejected")
+                    self.observe(message, method=method, params=params)
                     return message["result"]
+                message_id = message.get("id")
+                if isinstance(message_id, str) and message_id.startswith(self.prefix):
+                    continue
+                self.observe(message)
+                self.track_server_request(message)
                 await self.to_frontend(message)
 
         try:
             if self.init_request is not None:
-                await handshake("initialize", self.init_request, timeout=INITIALIZE_TIMEOUT_SECS)
+                await handshake(
+                    "initialize", self.init_request, timeout=INITIALIZE_TIMEOUT_SECS
+                )
                 await self.upstream.send(json.dumps({"method": "initialized"}))
                 if self.thread:
                     result = await handshake(
@@ -276,6 +582,9 @@ class Relay:
                     }
                     self.ready.set()
             self.connected.set()
+            self.state_connection(True)
+            self.report_dirty.set()
+            self.background_dirty.set()
             self.queue.health(self.engine, self.health_status(), **self.identity())
         except BaseException:
             await self.upstream.close()
@@ -293,11 +602,16 @@ class Relay:
                     if not future.done():
                         future.set_result(message)
                     continue
-                method = (
+                if isinstance(request_id, str) and request_id.startswith(self.prefix):
+                    # A timed-out poll may reply later. Relay-owned IDs never
+                    # enter the terminal frontend's RPC namespace.
+                    continue
+                request = (
                     self.requests.pop(request_id, None)
                     if "result" in message or "error" in message
                     else None
                 )
+                method, request_params = request if request else (None, None)
                 if method == "initialize" and "result" in message:
                     self.init_result = message["result"]
                 if method in {"thread/start", "thread/resume", "thread/fork"}:
@@ -305,28 +619,20 @@ class Relay:
                     thread = message.get("result", {}).get("thread")
                     # Codex's TUI also starts ephemeral title-generation jobs.
                     # Those are never the operator's conversation.
-                    if (
-                        thread
-                        and not thread.get("ephemeral")
-                        and not thread.get("parentThreadId")
-                    ):
+                    if thread and selectable(thread):
                         self.thread = {
                             key: thread.get(key) for key in ("id", "path", "status")
                         }
                         self.identity_revision += 1
                         self.ready.set()
                         self.queue.health(self.engine, "ready", **self.identity())
-                        self.report(thread.get("status", {}).get("type") == "active")
-                event = message.get("method")
-                params = message.get("params", {})
-                if event in {"turn/started", "turn/completed"} and params.get(
-                    "threadId"
-                ) == (self.thread or {}).get("id"):
-                    self.report(event == "turn/started")
-                if "id" in message and "method" in message:
-                    self.server_requests[request_id] = message
-                if event == "serverRequest/resolved":
-                    self.server_requests.pop(params.get("requestId"), None)
+                self.observe(
+                    message,
+                    method=method,
+                    params=request_params,
+                    select=method in {"thread/start", "thread/resume", "thread/fork"},
+                )
+                self.track_server_request(message)
                 await self.to_frontend(message)
         except (ConnectionClosed, OSError, ValueError):
             pass
@@ -337,6 +643,12 @@ class Relay:
                     future.set_exception(
                         ConnectionError("native backend connection lost")
                     )
+
+    def track_server_request(self, message):
+        if "id" in message and "method" in message:
+            self.server_requests[message["id"]] = message
+        if message.get("method") == "serverRequest/resolved":
+            self.server_requests.pop(message.get("params", {}).get("requestId"), None)
 
     async def detached_for(self, grace):
         """Resolve once no terminal frontend has been attached for `grace` seconds."""
@@ -384,10 +696,14 @@ class Relay:
                         await ws.send(json.dumps(request))
                 if "id" in message and method:
                     if method in {"thread/start", "thread/resume", "thread/fork"}:
-                        message["params"] = apply_launch_permissions(
-                            message.get("params", {}), self.launch_permissions
+                        message["params"] = apply_launch_model(
+                            apply_launch_permissions(
+                                message.get("params", {}), self.launch_permissions
+                            ),
+                            self.launch_model,
+                            self.launch_effort,
                         )
-                    self.requests[request_id] = method
+                    self.requests[request_id] = (method, message.get("params", {}))
                     if method in {
                         "thread/start",
                         "thread/resume",
@@ -412,7 +728,11 @@ class Relay:
                             )
                         )
                     continue
-                await self.upstream.send(json.dumps(message))
+                if self.interrupt_waiters and method in {"turn/start", "thread/start", "thread/resume", "thread/fork"}:
+                    async with self.delivery_lock:
+                        await self.upstream.send(json.dumps(message))
+                else:
+                    await self.upstream.send(json.dumps(message))
         except (ConnectionClosed, OSError):
             pass
         finally:
@@ -421,6 +741,10 @@ class Relay:
                 self.attachment.detached()
 
     async def send(self, event):
+        async with self.delivery_lock:
+            return await self._send_locked(event)
+
+    async def _send_locked(self, event):
         if not self.ready.is_set() or self.selecting or not self.thread:
             raise NotSubmitted("no selected live thread")
         # An event claimed before a thread switch must not drift to that thread.
@@ -445,6 +769,141 @@ class Relay:
             "transcript_path": selected.get("path"),
         }
 
+    async def interrupt_and_stop(self, request, press_escape, timeout=15.0, validate_identity=None):
+        """Interrupt one observed turn and submit one user stop instruction.
+
+        The durable intent is written before any side effect. A repeated or
+        interrupted request never replays an Escape or an ambiguous user turn.
+        """
+        request_id = request.get("request_id")
+        uid = request.get("session_uid")
+        thread_id = request.get("thread_id")
+        note = request.get("note")
+        if (not isinstance(request_id, str) or not request_id or len(request_id) > 200
+                or uid != self.queue.uid or not isinstance(thread_id, str)
+                or not thread_id or not isinstance(note, str) or not note.strip()
+                or len(note.encode()) > 4096):
+            return {"status": "refused", "reason": "invalid_request"}
+        identity = {k: request.get(k) for k in
+                    ("request_id", "session_uid", "thread_id", "pid", "incarnation", "note")}
+        path = self.queue.path / ("interrupt-" + hashlib.sha256(request_id.encode()).hexdigest() + ".receipt")
+        async with self.delivery_lock:
+            try:
+                if path.exists() and path.stat().st_size > 65536:
+                    return {"status": "uncertain", "reason": "receipt_unreadable"}
+                previous = json.loads(path.read_text())
+            except FileNotFoundError:
+                previous = None
+            except (OSError, ValueError):
+                return {"status": "uncertain", "reason": "receipt_unreadable"}
+            if previous is not None:
+                saved = previous.get("identity") or {}
+                if any(saved.get(k) != identity[k] for k in ("request_id", "session_uid", "note")):
+                    return {"status": "refused", "reason": "request_id_conflict"}
+                return previous.get("result") or {"status": "uncertain", "reason": "operation_interrupted"}
+            if (not self.ready.is_set() or self.selecting or not self.state_enabled
+                    or (self.thread or {}).get("id") != thread_id
+                    or self.state.foreground != thread_id):
+                return {"status": "refused", "reason": "thread_not_proven"}
+            if any(method == "turn/start" and (params or {}).get("threadId") == thread_id
+                   for method, params in self.requests.values()):
+                return {"status": "refused", "reason": "frontend_turn_pending"}
+            thread = self.state.threads.get(thread_id)
+            if not thread or not thread.turn_id or thread.completed_id == thread.turn_id:
+                return {"status": "refused", "reason": "no_active_turn"}
+            turn_id = thread.turn_id
+            revision = self.identity_revision
+            try:
+                atomic_write(path, {"identity": identity, "result": None})
+            except OSError:
+                return {"status": "refused", "reason": "receipt_write_failed"}
+            result = {"status": "uncertain", "reason": "interrupt_unconfirmed"}
+            try:
+                await press_escape()
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    if (not self.ready.is_set() or self.identity_revision != revision
+                            or (self.thread or {}).get("id") != thread_id):
+                        result = {"status": "uncertain", "reason": "thread_changed"}
+                        break
+                    thread = self.state.threads.get(thread_id)
+                    if thread and thread.turn_id != turn_id:
+                        result = {"status": "uncertain", "reason": "turn_changed"}
+                        break
+                    if thread and thread.completed_id == turn_id:
+                        if thread.last_status != "interrupted":
+                            result = {"status": "uncertain", "reason": "turn_not_interrupted"}
+                            break
+                        if validate_identity is not None and not await validate_identity():
+                            result = {"status": "uncertain", "reason": "incarnation_changed"}
+                            break
+                        if (self.selecting or self.identity_revision != revision or (self.thread or {}).get("id") != thread_id
+                                or self.state.threads.get(thread_id).turn_id != turn_id):
+                            result = {"status": "uncertain", "reason": "thread_changed"}
+                            break
+                        text = f"[cm] Stop: {note.strip()}. Do not resume the interrupted work; wait for new instructions."
+                        reply = await self.call("turn/start", {"threadId": thread_id,
+                                                "input": [{"type": "text", "text": text}]})
+                        new_turn = (reply.get("turn") or {}).get("id")
+                        result = ({"status": "delivered", "turn_id": new_turn,
+                                   "thread_id": thread_id, "pid": request.get("pid"),
+                                   "incarnation": request.get("incarnation")}
+                                  if new_turn else {"status": "uncertain", "reason": "missing_turn_receipt"})
+                        break
+                    await asyncio.sleep(0.05)
+            except Exception:
+                result = {"status": "uncertain", "reason": "operation_failed"}
+            try:
+                atomic_write(path, {"identity": identity, "result": result})
+            except OSError:
+                return {"status": "uncertain", "reason": "receipt_write_failed"}
+            return result
+
+    async def serve_interrupt(self, reader, writer):
+        """Accept commands only from the currently authenticated CM brain."""
+        try:
+            sock = writer.get_extra_info("socket")
+            peer_pid, _, _ = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            authority = await asyncio.to_thread(control_client.call, "session.interrupt_authority", {})
+            if authority.get("pid") != peer_pid:
+                return
+            raw = await asyncio.wait_for(reader.readline(), 5)
+            if len(raw) > 32768:
+                return
+            request = json.loads(raw)
+
+            async def valid_identity():
+                binding = await asyncio.to_thread(control_client.call, "session.interrupt_authority", {})
+                return (binding.get("session_pid") == os.getpid() == request.get("pid")
+                        and binding.get("incarnation") == request.get("incarnation")
+                        and binding.get("thread_id") == request.get("thread_id"))
+
+            if not await valid_identity():
+                return
+
+            async def escape():
+                await asyncio.to_thread(control_client.call, "session.send_bound_escape", {
+                    "session_uid": self.queue.uid, "pid": request.get("pid"),
+                    "incarnation": request.get("incarnation"),
+                })
+
+            self.interrupt_waiters += 1
+            try:
+                result = await asyncio.wait_for(
+                    self.interrupt_and_stop(request, escape, validate_identity=valid_identity), 20
+                )
+            finally:
+                self.interrupt_waiters -= 1
+            writer.write(json.dumps(result).encode() + b"\n")
+            await writer.drain()
+        except (OSError, ValueError, TimeoutError, ConnectionError,
+                control_client.ControlError, control_client.TransportError):
+            pass
+        finally:
+            writer.close()
+            with suppress(OSError):
+                await writer.wait_closed()
+
     async def observed(self, event):
         # Bind positive receipt checks to the exact target rollout, including
         # after the frontend switches to another conversation.
@@ -466,17 +925,21 @@ class Relay:
         if self.reader:
             self.reader.cancel()
             await asyncio.gather(self.reader, return_exceptions=True)
-        for task in list(self.report_tasks):
+        tasks = [t for t in (self.publisher, self.background_poller) if t]
+        for task in tasks:
             task.cancel()
-        await asyncio.gather(*self.report_tasks, return_exceptions=True)
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def split_args(args, permissions=None):
     """CM-generated embedded argv -> backend configuration + remote UI intent."""
     args = list(args)
     resume = None
-    if args and args[0] == "resume":
-        args.pop(0)
+    # `fork` (CM's fork-into-a-task) is shaped exactly like `resume`:
+    # subcommand first, SESSION_ID last, and no frontend permission flag.
+    subcommand = "resume"
+    if args and args[0] in ("resume", "fork"):
+        subcommand = args.pop(0)
         resume = args.pop()
     backend = []
     frontend = []
@@ -485,6 +948,12 @@ def split_args(args, permissions=None):
         arg = args[index]
         if arg == "-c":
             backend.extend(args[index : index + 2])
+            if args[index + 1 : index + 2] and args[index + 1].startswith(
+                EFFORT_OVERRIDE
+            ):
+                # The frontend sends each turn's effort from its own config:
+                # without the same override it would use ~/.codex/config.toml.
+                frontend.extend(args[index : index + 2])
             index += 2
         elif arg == "--dangerously-bypass-approvals-and-sandbox":
             # Fresh sessions retain CM's launch policy. A remote resume must
@@ -505,19 +974,41 @@ def split_args(args, permissions=None):
         elif arg == "--no-alt-screen":
             frontend.append(arg)
             index += 1
+        elif arg in ("-m", "--model") and index + 1 < len(args):
+            # The frontend starts/resumes the thread with it; the backend's
+            # default matches so nothing falls back to Codex's own default.
+            model = args[index + 1]
+            frontend.extend(["-m", model])
+            backend.extend(["-c", "model=" + json.dumps(model)])
+            index += 2
         else:
             raise ValueError(f"unsupported CM Codex launch argument: {arg}")
+    # Override both configs: a remote frontend owns startup menus too.
+    backend.extend(["-c", UPDATE_OFF])
+    frontend.extend(["-c", UPDATE_OFF])
     if resume:
-        frontend.extend(["resume", resume])
+        if subcommand == "fork":
+            # A fork runs in a NEW worktree; without this the frontend stops
+            # at a "Working directory · fork" picker whose default is the
+            # SOURCE session's directory (verified on codex-cli 0.160.1).
+            # With --remote, "current" must be explicit: the frontend cannot
+            # infer which directory the remote backend should use.
+            frontend.extend(["-c", 'tui.resume_cwd="current"', "--cd", os.getcwd()])
+        frontend.extend([subcommand, resume])
     if permissions is not None:
         # The remote resume frontend rejects permission flags. Set the backend
         # defaults and explicit thread RPC instead. Tool-level direct approval
         # is configured separately; `never` alone rejects prompted MCP calls.
-        backend.extend([
-            "-c", "approval_policy=" + json.dumps(permissions["approvalPolicy"]),
-            "-c", "approvals_reviewer=" + json.dumps(permissions["approvalsReviewer"]),
-            "-c", 'sandbox_mode="danger-full-access"',
-        ])
+        backend.extend(
+            [
+                "-c",
+                "approval_policy=" + json.dumps(permissions["approvalPolicy"]),
+                "-c",
+                "approvals_reviewer=" + json.dumps(permissions["approvalsReviewer"]),
+                "-c",
+                'sandbox_mode="danger-full-access"',
+            ]
+        )
     return backend, frontend
 
 
@@ -545,6 +1036,18 @@ def configure_external_editor():
             return
 
 
+async def spawn_frontend(binary, frontend_args, frontend_socket):
+    # Fresh/resume/fork and every detached-frontend relaunch share this gate.
+    # Failure exits before another child can consume the inherited PTY input.
+    dismiss_cached_update()
+    return await asyncio.create_subprocess_exec(
+        sys.executable,
+        str(Path(__file__).with_name("native_process.py")),
+        "--exec-child", str(os.getpid()), binary,
+        "--remote", "unix://" + frontend_socket, *frontend_args,
+    )
+
+
 async def launch(args):
     os.environ.update(json.loads(args.cm_env))
     configure_external_editor()
@@ -569,6 +1072,7 @@ async def launch(args):
     with tempfile.TemporaryDirectory(prefix="cm-codex-") as private:
         backend_socket = str(Path(private) / "backend.sock")
         frontend_socket = str(Path(private) / "terminal.sock")
+        interrupt_socket = str(Path(private) / "interrupt.sock")
         log_path = queue.path / "backend.log"
         log_fd = os.open(log_path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
         try:
@@ -597,30 +1101,27 @@ async def launch(args):
                 raise RuntimeError(
                     f"Codex app-server startup timed out; see {log_path}"
                 )
-            relay = Relay(backend_socket, queue, permissions)
+            relay = Relay(
+                backend_socket,
+                queue,
+                permissions,
+                launch_model(args.codex_args),
+                launch_effort(args.codex_args),
+            )
             await relay.connect()
+            interrupt_server = await asyncio.start_unix_server(relay.serve_interrupt, interrupt_socket)
+            atomic_write(queue.path / "interrupt-control", {"socket": interrupt_socket, "pid": os.getpid()})
             async with unix_serve(
                 relay.serve_frontend,
                 frontend_socket,
                 compression=None,
                 max_size=None,
-            ):
+            ), interrupt_server:
                 consumer = asyncio.create_task(consume_supervised(queue, relay))
 
-                async def spawn_frontend():
-                    return await asyncio.create_subprocess_exec(
-                        sys.executable,
-                        str(Path(__file__).with_name("native_process.py")),
-                        "--exec-child",
-                        str(os.getpid()),
-                        binary,
-                        "--remote",
-                        "unix://" + frontend_socket,
-                        *frontend_args,
-                    )
 
                 respawns = 0
-                frontend = await spawn_frontend()
+                frontend = await spawn_frontend(binary, frontend_args, frontend_socket)
                 while True:
                     detach = asyncio.create_task(
                         relay.detached_for(FRONTEND_DETACH_GRACE_SECS)
@@ -655,9 +1156,9 @@ async def launch(args):
                         raise RuntimeError(f"Codex app-server exited; see {log_path}")
                     if stop.is_set() or backend.returncode is not None:
                         return frontend.returncode or 0
-                    stranded = (
-                        detach in done
-                        or (frontend.returncode is not None and relay.attachment.exit_followed_detach())
+                    stranded = detach in done or (
+                        frontend.returncode is not None
+                        and relay.attachment.exit_followed_detach()
                     )
                     if not stranded:
                         # The operator quit the terminal while it was attached.
@@ -675,7 +1176,7 @@ async def launch(args):
                     )
                     await terminate(frontend)
                     relay.attachment.detached()
-                    frontend = await spawn_frontend()
+                    frontend = await spawn_frontend(binary, frontend_args, frontend_socket)
         finally:
             if consumer:
                 consumer.cancel()

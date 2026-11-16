@@ -80,6 +80,18 @@ being swallowed for good (2026-09-14: an orchestrator's 11:01 wake absorbed a
 keeps its ids as history. Mute/cancellation can still retract unclaimed native
 work.
 
+That history is bounded. A settled batch (released, and confirmed or
+cancelled) stays while any of its keys is still a wake intent, such as an
+unread DM or an unacknowledged monitor hit, so nothing is woken twice. Once no
+key is an intent, the batch is dropped 24 hours after delivery, or 24 hours
+after it was first seen settled if it was never delivered. The newest 16
+batches always stay, and deferred task work is never dropped. The one effect is
+that a message unread for over a day, whose intent was briefly suspended (DND,
+leaving and rejoining a channel), can be woken once more. Before this, every
+batch ever delivered was kept and rewritten on each delivery pass: one
+orchestrator's ledger had reached 23 MB and 28,722 batches, and cm-sessions
+rewrote about 400 MiB/min of ledgers (2026-11-05, #105).
+
 Chat wake text and worker-completion notices instruct agents to inspect pending
 activity before responding, continue the existing task, and report only meaningful
 changes, blockers or Owner decisions. They must not repeat a completed summary.
@@ -158,12 +170,15 @@ reported connected/ready. The forked client was also launched **without**
 new server's channel events were silently dropped.
 
 **Handoff.** A consumer waiting for `consumer.lock` files
-`takeover-<pid>.request` in the queue directory only while its own Claude
-session id (`CLAUDE_CODE_SESSION_ID`, else the parent's `--session-id`) is the
-daemon-bound transcript. The holder releases the lock only when it also has
+`takeover-<pid>.request` in the queue directory only when its owning Claude
+process's explicit session ID matches the daemon-bound transcript. An inherited
+`CLAUDE_CODE_SESSION_ID` alone does not prove ownership. The holder rechecks
+the requester's PID/start time, parent process and binding before handing off.
+The holder releases the lock only when it also has
 positive staleness evidence of its own: the bound transcript is not its
-session, its own transcript has a `continued-in` record, or three of its
-unobserved submissions were only enqueued (no later dequeue/remove). A holder
+session, or three of its unobserved submissions were only enqueued (no later
+dequeue/remove) with evidence that its client is stale. Enqueues during an
+ordinary long-running turn alone do not establish staleness. A holder
 keeps the lock at least 30 seconds after acquiring it, and a consumer that
 just handed off stands aside while its successor's request is fresh, so two
 live processes cannot alternate. The handed-off process stays a passive
@@ -176,8 +191,19 @@ MCP server, so there is no successor and no handoff.
 the latest observation, unobserved for 5 minutes;
 `CM_NOTIFY_UNOBSERVED_DEGRADED_S`), `transcript_mismatch` (with stalled work
 or other evidence; alone it is informational), and `channels_disabled`.
-`transport.connected` is false while degraded. A later observation ends the
-condition; older lost submissions remain as history.
+`transport.connected` is false while degraded. An aged `submitting` receipt
+is also reported as unobserved: a later observation of another notice cannot
+resolve that particular in-flight claim. `external_background` means Claude's
+roster lists the exact bound conversation in the workspace while this channel
+is not its background-host child; the roster alone does not prove process
+identity. A later observation can end a submission stall; older lost
+submissions remain as history.
+
+Board pushes use a per-push marker for receipt evidence. Older board pushes
+used a shared board marker; their retained submitted/uncertain receipts are
+ambiguous and are not re-sent or newly confirmed from that shared marker.
+Previously observed legacy board entries do not establish a later healthy
+delivery checkpoint.
 
 **Channels disabled.** A channel consumer inspects its parent Claude
 process's command line (directly, or through CM's launcher shell). If the
@@ -188,7 +214,7 @@ evidence. A Claude bg/fork hand-off loses the channel flag; recover with CM
 **A-R** (restart/resume in place), which relaunches with the flag and the same
 UID and conversation. Reconnecting MCP does not change the client's flags.
 
-**Owner alarm.** The daemon delivery worker checks live Claude/Codex sessions
+**Owner alarm.** An independent daemon worker checks live Claude/Codex sessions
 every 30 seconds from the queue files themselves, so it works when the MCP
 process is the broken part. When a session's submissions stay unobserved (or,
 under `channels_disabled`, its notices stay pending) for 15 minutes
@@ -196,9 +222,22 @@ under `channels_disabled`, its notices stay pending) for 15 minutes
 [Owner alert](../OWNER_NOTIFICATIONS.md) per episode naming the session, the
 count, the duration and the reason. Episode state is kept in
 `~/.cm/notifications/stall-alarms.state`. Acknowledging the alert does not
-re-raise it in the same episode; the next observation clears the episode and
-withdraws the alarm's own alert. It never replaces a pending agent alert for
-that session; it retries after Owner acknowledges that one.
+re-raise it in the same episode; confirmed progress clears an episode once
+no unresolved held or in-flight claim remains, withdrawing its own alert.
+Its separate key allows an agent alert to
+coexist; the affected pane also shows the stall until the episode clears.
+Busy or corrupt queue snapshots are retried without clearing existing health.
+The longstanding marker-missing legacy retirement remains narrowly limited
+to records that predate marker enforcement; it is not proof of delivery.
+
+**Claude background recovery.** A-R first checks the bound native ID and the
+Claude roster on the session's host. If a matching external background host is
+proven, the operator sees its ID, PID/start, task and workspace and must
+explicitly confirm stopping that exact work. The daemon rechecks identity at
+the effect boundaries, journals before effects, verifies disappearance, and
+then revives the original CM session. An interrupted or uncertain attempt is
+fenced and surfaced for operator reconciliation; it is never blindly re-stopped.
+The daemon's fence serializes CM operations, not independent Claude clients.
 
 **Wake text.** Chat wakes now summarize the newest unread item (≤400 chars):
 `[cm-chat <id>] 3 new: #gpu-utilization — rl-scale-out: "rlso: A5 readmit

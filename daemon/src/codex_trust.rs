@@ -33,6 +33,13 @@
 //! codex ends up not using is harmless (it's an inert extra entry for a
 //! directory the operator's own daemon minted).
 //!
+//! The working-dir key is the one that matters for CM today: CM's native
+//! launcher runs Codex's REMOTE frontend (`codex --remote … --cd <wd>`),
+//! which checks trust for the exact directory and does NOT fall back to a
+//! linked worktree's main checkout (codex-cli 0.160.1, 2026-10-07: a
+//! worktree of a trusted repo showed "Folder access — Trust this folder?"
+//! under `--remote`, none under plain `codex`).
+//!
 //! ## Safety contract (mirrors `claude_trust`)
 //!
 //! - **Merge, never clobber.** `config.toml` is hand-edited by the operator
@@ -97,19 +104,30 @@ pub fn maybe_pretrust_for_spawn(shell: &str, args: &[String], working_dir: Optio
 
 /// True when the program that will actually `exec` is `codex` — either
 /// directly or wrapped under `systemd-run` for a memory cap (token after
-/// the `--` separator). Mirrors `claude_trust::program_is_claude`.
+/// the `--` separator) — OR CM's native Codex launcher, whose argv is
+/// `<launcher-or-python> native_codex.py --session-uid … -- <codex args>`
+/// (see `mcp_config::native_codex_command`). Every CM Codex spawn takes the
+/// native shape since the owned app-server landed, and its remote frontend
+/// (`codex --remote … --cd <wd>`) keys trust off the EXACT working dir: it
+/// does not resolve a linked worktree to its trusted main checkout the way
+/// a plain `codex` does (verified on codex-cli 0.160.1, 2026-10-07).
+/// Missing this shape left every minted worktree — a fork's included —
+/// booting into the "Folder access" dialog.
 fn program_is_codex(shell: &str, args: &[String]) -> bool {
-    match basename(shell) {
-        Some("codex") => true,
-        Some("systemd-run") => args
-            .iter()
-            .position(|a| a == "--")
-            .and_then(|sep| args.get(sep + 1))
-            .and_then(|prog| basename(prog))
-            .map(|b| b == "codex")
-            .unwrap_or(false),
-        _ => false,
-    }
+    let (program, first) = match basename(shell) {
+        Some("systemd-run") => {
+            let Some(sep) = args.iter().position(|a| a == "--") else {
+                return false;
+            };
+            match args.get(sep + 1) {
+                Some(prog) => (prog.as_str(), args.get(sep + 2)),
+                None => return false,
+            }
+        }
+        _ => (shell, args.first()),
+    };
+    basename(program) == Some("codex")
+        || first.and_then(|a| basename(a)) == Some("native_codex.py")
 }
 
 fn basename(program: &str) -> Option<&str> {
@@ -434,5 +452,30 @@ mod tests {
         let args: Vec<String> = vec!["--scope".into(), "--".into(), "codex".into()];
         maybe_pretrust_for_spawn("systemd-run", &args, Some(&wd));
         assert!(cfg.exists(), "capped codex under systemd-run must be pre-trusted");
+
+        // CM's native launcher shape (`mcp_config::native_codex_command`):
+        // the launcher (or python) runs native_codex.py, which execs codex.
+        std::fs::remove_file(&cfg).unwrap();
+        let native: Vec<String> = vec![
+            "native_codex.py".into(), "--session-uid".into(), "u".into(), "--".into(), "fork".into(),
+        ];
+        maybe_pretrust_for_spawn("/home/op/.cm/bin/mcp-launcher", &native, Some(&wd));
+        assert!(cfg.exists(), "native-launcher codex must be pre-trusted");
+
+        std::fs::remove_file(&cfg).unwrap();
+        let py: Vec<String> = vec!["/srv/mcp_server/native_codex.py".into(), "--".into()];
+        maybe_pretrust_for_spawn("/usr/bin/python3", &py, Some(&wd));
+        assert!(cfg.exists(), "python fallback of the native launcher must be pre-trusted");
+
+        std::fs::remove_file(&cfg).unwrap();
+        let mut capped: Vec<String> = vec!["--scope".into(), "--".into(), "/l/launcher".into()];
+        capped.extend(native.iter().cloned());
+        maybe_pretrust_for_spawn("systemd-run", &capped, Some(&wd));
+        assert!(cfg.exists(), "capped native-launcher codex must be pre-trusted");
+
+        // A non-codex script under the same launcher stays untouched.
+        std::fs::remove_file(&cfg).unwrap();
+        maybe_pretrust_for_spawn("/l/launcher", &["server.py".into()], Some(&wd));
+        assert!(!cfg.exists(), "the MCP server launch is not a codex spawn");
     }
 }

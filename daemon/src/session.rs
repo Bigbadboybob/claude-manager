@@ -115,6 +115,7 @@ pub struct FanoutSnapshot {
 
 pub struct PtyByteFanout {
     inner: Mutex<FanoutInner>,
+    geometry: std::sync::atomic::AtomicU64,
     /// Sub-2b-1 review-r#2 #1: shared activity timestamp.
     /// `None` for fanouts constructed via the unit-test
     /// `PtyByteFanout::new` shortcut (idle isn't observable
@@ -174,6 +175,41 @@ struct FanoutInner {
     /// `buf_start = bytes_written - buffer.len()` and the caller's
     /// cursor.
     bytes_written: u64,
+    /// Random identity of this byte stream. Offsets (`bytes_written`) are
+    /// only comparable within one stream: a respawn or a brain restart
+    /// builds a new fanout, whose offsets restart.
+    stream_id: u64,
+    /// The program's kitty keyboard mode, followed as output passes
+    /// through `push` (used to encode `send_key`). A fresh fanout has seen
+    /// every byte; an adopted one restores the mode its previous brain
+    /// persisted ([`PtyByteFanout::seed_adopted`]).
+    keyboard: crate::keys::KeyboardTracker,
+}
+
+/// What [`PtyByteFanout::subscribe_output_for`] queued for a viewer.
+pub struct OutputAttach {
+    pub rx: crate::attach_output::OutputSubscription,
+    /// Bytes queued ahead of live output (ring or resume tail).
+    pub replay_len: usize,
+    /// The ring, for a screen-first attach to render; nothing was queued.
+    pub screen_ring: Option<Vec<u8>>,
+    /// Stream offset of the first live byte.
+    pub offset: u64,
+    pub stream_id: u64,
+    /// The viewer's `since` was in this stream's ring: only the bytes after
+    /// it were queued, for the viewer's existing terminal.
+    pub resumed: bool,
+}
+
+fn new_stream_id() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    h.finish()
 }
 
 impl PtyByteFanout {
@@ -203,9 +239,45 @@ impl PtyByteFanout {
                 output_subscribers: Vec::new(),
                 closed: false,
                 bytes_written: 0,
+                stream_id: new_stream_id(),
+                keyboard: crate::keys::KeyboardTracker::fresh(),
             }),
+            geometry: std::sync::atomic::AtomicU64::new(0),
             last_activity_at,
         }
+    }
+
+    pub(crate) fn geometry_version(&self) -> u64 {
+        self.geometry.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Seed an adopted session's fanout: its keyboard mode, then its replay
+    /// tail. The mode the previous brain persisted wins; without one, the
+    /// tail is scanned from an unknown start (it rarely holds the program's
+    /// startup push, so the mode usually stays unknown until the program
+    /// sets it again). Before any reader thread exists, like `seed_replay`.
+    pub fn seed_adopted(&self, ring: Option<&[u8]>, keyboard: Option<crate::keys::KeyboardSnapshot>) {
+        let tracker = match keyboard {
+            Some(saved) => crate::keys::KeyboardTracker::restored(saved),
+            None => {
+                let mut t = crate::keys::KeyboardTracker::unknown();
+                if let Some(ring) = ring {
+                    t.feed(ring);
+                }
+                t
+            }
+        };
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).keyboard = tracker;
+        if let Some(ring) = ring {
+            self.seed_replay(ring);
+        }
+    }
+
+    /// The program's keyboard mode now (None = unknown) and the state to
+    /// persist across a brain restart.
+    pub fn keyboard(&self) -> (Option<alacritty_terminal::term::TermMode>, crate::keys::KeyboardSnapshot) {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        (inner.keyboard.mode(), inner.keyboard.snapshot())
     }
 
     /// Seed the ring with a replay tail carried over from a previous
@@ -256,6 +328,11 @@ impl PtyByteFanout {
         for tx in inner.output_subscribers.drain(..) { tx.close(); }
     }
 
+    /// Read producer closure without copying the replay buffer.
+    pub fn is_closed(&self) -> bool {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).closed
+    }
+
     /// Append `bytes` to the ring (FIFO-evicting if needed) and
     /// broadcast a copy to every live subscriber.
     pub fn push(&self, bytes: &[u8]) {
@@ -284,6 +361,7 @@ impl PtyByteFanout {
         // `snapshot_since` uses this to detect cursors that point
         // at evicted data.
         inner.bytes_written = inner.bytes_written.saturating_add(bytes.len() as u64);
+        inner.keyboard.feed(bytes);
 
         // Broadcast the *whole* incoming chunk (not the ring) to live
         // subscribers. `retain` drops senders whose receiver has been
@@ -301,6 +379,21 @@ impl PtyByteFanout {
         if let Some(ts) = self.last_activity_at.as_ref() {
             let mut slot = ts.lock().unwrap_or_else(|p| p.into_inner());
             *slot = Some(Instant::now());
+        }
+    }
+
+    /// Small forensic tail without cloning the replay ring or subscribing.
+    pub(crate) fn startup_tail(&self) -> FanoutSnapshot {
+        const MAX: usize = 4096;
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut bytes: Vec<u8> = inner.buffer.iter().rev().take(MAX).copied().collect();
+        bytes.reverse();
+        FanoutSnapshot {
+            start_offset: inner.bytes_written.saturating_sub(bytes.len() as u64),
+            evicted_since_cursor: inner.bytes_written > bytes.len() as u64,
+            cursor: inner.bytes_written,
+            closed: inner.closed,
+            bytes,
         }
     }
 
@@ -420,6 +513,38 @@ impl PtyByteFanout {
         tx.push(&replay);
         if inner.closed { tx.close(); } else { inner.output_subscribers.push(tx); }
         (rx, replay.len())
+    }
+
+    /// A bounded viewer subscription. `resume` = `(stream_id, since)`: when
+    /// `since` lies within this stream's ring, queue only the bytes after it.
+    /// Otherwise `screen` returns the ring for the caller to render and
+    /// queues nothing; else the whole ring is queued. One lock covers the
+    /// ring and the subscription, so live output continues exactly at
+    /// `offset`.
+    pub fn subscribe_output_for(&self, screen: bool, resume: Option<(u64, u64)>) -> OutputAttach {
+        let (tx, rx) = crate::attach_output::channel();
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let offset = inner.bytes_written;
+        let buf_start = offset - inner.buffer.len() as u64;
+        let tail_from = resume
+            .filter(|&(id, since)| id == inner.stream_id && (buf_start..=offset).contains(&since))
+            .map(|(_, since)| (since - buf_start) as usize);
+        let (replay_len, screen_ring) = match tail_from {
+            Some(from) => {
+                let tail: Vec<u8> = inner.buffer.iter().skip(from).copied().collect();
+                tx.push(&tail);
+                (tail.len(), None)
+            }
+            None if screen => (0, Some(inner.buffer.iter().copied().collect())),
+            None => {
+                let ring: Vec<u8> = inner.buffer.iter().copied().collect();
+                tx.push(&ring);
+                (ring.len(), None)
+            }
+        };
+        let stream_id = inner.stream_id;
+        if inner.closed { tx.close(); } else { inner.output_subscribers.push(tx); }
+        OutputAttach { rx, replay_len, screen_ring, offset, stream_id, resumed: tail_from.is_some() }
     }
 
     /// Test helper: number of buffered bytes.
@@ -548,6 +673,18 @@ pub struct SpawnParams {
     /// funnel that sets it lands in Phase 2. See
     /// DESIGN_CONTINUOUS_TASKS.md §6.
     pub continuous_task_id: Option<String>,
+    /// The model the session was launched with (`crate::models`), so
+    /// revive, resume and restore reuse it. `None` for bash and for
+    /// sessions recorded before models were.
+    pub model: Option<String>,
+    /// Where `model` came from ([`crate::models::ModelSource::as_str`]):
+    /// `explicit`, `task`, `engine_default`, `transcript`, … `None` when
+    /// unknown (bash, or recorded before sources were).
+    pub model_source: Option<String>,
+    /// The reasoning effort the session runs at, recorded with `model`.
+    pub effort: Option<String>,
+    /// Where `effort` came from (the same sources as `model_source`).
+    pub effort_source: Option<String>,
     /// Global-permissions grant. When `true`, this session's
     /// Session-caller auth checks (`auth::check_session_caller` and
     /// `check_session_caller_for_exited`) short-circuit to `Allow`
@@ -558,6 +695,10 @@ pub struct SpawnParams {
     /// guard), so a normal agent can never self-promote. `false` is
     /// the default and the safe baseline (descendant-only scope).
     pub global_perms: bool,
+    /// The org-model preservation object (doc/org-model.md §12): opaque,
+    /// carried from the record this session was built from to every record
+    /// built from it.
+    pub org: Option<cm_holder_proto::org::OrgObject>,
     /// Human-readable label for the sidebar. Not used for routing.
     pub title: String,
     /// Program to exec. Typically `claude`, `codex`, or `bash`.
@@ -650,10 +791,15 @@ impl SpawnParams {
             workflow_role: None,
             // Phase-1 continuous wire field: non-continuous default.
             continuous_task_id: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             // Global perms default to off — descendant-only scope is
             // the safe baseline. Only the operator (TUI) or a global
             // caller can flip this true at spawn time.
             global_perms: false,
+            org: None,
             title: title.into(),
             shell: shell.into(),
             args: Vec::new(),
@@ -865,6 +1011,11 @@ impl LastExitProbe {
             .is_some()
     }
 
+    /// Nonblocking exit observation for display evidence; contention is unknown.
+    pub(crate) fn try_kernel_set(&self) -> Option<bool> {
+        self.kernel.try_lock().ok().map(|status| status.is_some())
+    }
+
     /// Snapshot the End-frame payload's `(exit_code, memory_cap_kill)`.
     /// Reads kernel exit from the cached slot; scans the kill log
     /// AT THIS MOMENT for `memory_cap_kill` — that's the lazy
@@ -947,6 +1098,7 @@ impl LastExitProbe {
                 exited_at,
             ),
             None => crate::manifest::LastExit {
+                killed_by: None,
                 code,
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -958,7 +1110,12 @@ impl LastExitProbe {
 
 pub struct DaemonSession {
     pub uid: String,
+    /// Ephemeral S4-min spawn evidence; never restored from a manifest.
+    pub(crate) s4_spawn_origin: Option<(libc::pid_t, Option<u64>, u64, Option<cm_holder_proto::org::OrgObject>)>,
     pub title: String,
+    pub agent_state: crate::agent_state::AgentStateCell,
+    /// Initial MCP launch prompt receipt; absence after adoption is unknown.
+    pub prompt_delivery: Option<crate::control::prompt_delivery::Ticket>,
     /// Holder-minted process identity when this session is
     /// holder-owned (split mode) — the key every holder verb and the
     /// phase-7 `rollback_record` stream use. `None` in monolith mode.
@@ -1047,6 +1204,18 @@ pub struct DaemonSession {
     /// session is a tick of, carried through from `SpawnParams`.
     /// `None` for ordinary sessions. See DESIGN_CONTINUOUS_TASKS.md §6.
     pub continuous_task_id: Option<String>,
+    /// The model the session was launched with (`crate::models`), so
+    /// revive, resume and restore reuse it. `None` for bash and for
+    /// sessions recorded before models were.
+    pub model: Option<String>,
+    /// Where `model` came from ([`crate::models::ModelSource::as_str`]):
+    /// `explicit`, `task`, `engine_default`, `transcript`, … `None` when
+    /// unknown (bash, or recorded before sources were).
+    pub model_source: Option<String>,
+    /// The reasoning effort the session runs at, recorded with `model`.
+    pub effort: Option<String>,
+    /// Where `effort` came from (the same sources as `model_source`).
+    pub effort_source: Option<String>,
     /// Global-permissions grant for this session's Session-caller
     /// auth. When `true`, `auth::check_session_caller` /
     /// `check_session_caller_for_exited` short-circuit to `Allow`
@@ -1055,6 +1224,10 @@ pub struct DaemonSession {
     /// `SpawnParams` through `arm_reaper`. See the field doc on
     /// `SpawnParams.global_perms` for the grant rules.
     pub global_perms: bool,
+    /// The org-model preservation object (doc/org-model.md §12): opaque,
+    /// carried from the record this session was built from to every record
+    /// built from it.
+    pub org: Option<cm_holder_proto::org::OrgObject>,
     /// Sub-2b-1 review-r#2 #2: transcript generation counter.
     /// Initialized to 0; incremented by `session.set_transcript_path`
     /// when the incoming path differs from `transcript_path`
@@ -1325,6 +1498,10 @@ pub fn codex_rollout_uuid_from_stem(stem: &str) -> Option<String> {
 }
 
 impl DaemonSession {
+    /// Duplicate the spawn-bound pidfd for nonblocking provenance observation.
+    pub(crate) fn s4_pidfd(&self) -> Option<std::os::fd::OwnedFd> {
+        self.pidfd.try_clone().ok()
+    }
     /// Project this live session into a persistable
     /// [`ManifestEntry`](crate::manifest::ManifestEntry) for the
     /// daemon's own durable registry (P0 session durability, S1).
@@ -1370,6 +1547,10 @@ impl DaemonSession {
             workflow_run_id: self.workflow_run_id.clone(),
             workflow_role: self.workflow_role.clone(),
             continuous_task_id: self.continuous_task_id.clone(),
+            model: self.model.clone(),
+            model_source: self.model_source.clone(),
+            effort: self.effort.clone(),
+            effort_source: self.effort_source.clone(),
             task_id: self.task_id.clone(),
             notify_on_idle: false,
             // TUI-only presentation field (see doc comment above).
@@ -1392,6 +1573,7 @@ impl DaemonSession {
             transcript_path: self.transcript_path.clone(),
             reported_done_at: self.reported_done().map(|r| r.at_unix),
             report_reason: self.reported_done().and_then(|r| r.reason),
+            org: self.org.clone(),
         }
     }
 
@@ -1471,8 +1653,13 @@ struct PendingSessionInner {
     /// Phase-1 continuous wire field, carried SpawnParams →
     /// DaemonSession alongside the workflow tags.
     continuous_task_id: Option<String>,
+    model: Option<String>,
+    model_source: Option<String>,
+    effort: Option<String>,
+    effort_source: Option<String>,
     /// Global-perms grant, carried SpawnParams → DaemonSession.
     global_perms: bool,
+    org: Option<cm_holder_proto::org::OrgObject>,
     /// Sub-2b-1 review-r#2 #1: shared activity cell threaded
     /// from `PendingSession::spawn` → `arm_reaper` →
     /// `DaemonSession`. The fanout already holds an Arc clone
@@ -1734,8 +1921,14 @@ impl PendingSession {
                 return Err(anyhow::anyhow!("dup master fd for reader poll: {}", e));
             }
         };
-        let writer: SessionWriter = match pair.master.take_writer() {
-            Ok(w) => Arc::new(Mutex::new(w)),
+        // Bounded: a child that stops reading its input fails that
+        // session's writes instead of parking the writer (crate::pty_input).
+        let writer: SessionWriter = match pair
+            .master
+            .take_writer()
+            .and_then(|w| Ok(crate::pty_input::BoundedWriter::new(&params.uid, w)?))
+        {
+            Ok(w) => Arc::new(Mutex::new(Box::new(w))),
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -1807,7 +2000,12 @@ impl PendingSession {
                 workflow_run_id: params.workflow_run_id,
                 workflow_role: params.workflow_role,
                 continuous_task_id: params.continuous_task_id,
+                model: params.model,
+                model_source: params.model_source,
+                effort: params.effort,
+                effort_source: params.effort_source,
                 global_perms: params.global_perms,
+                org: params.org,
                 last_activity_at,
                 title: params.title,
                 fanout,
@@ -1874,7 +2072,12 @@ impl PendingSession {
             workflow_run_id,
             workflow_role,
             continuous_task_id,
+            model,
+            model_source,
+            effort,
+            effort_source,
             global_perms,
+            org,
             last_activity_at,
             title,
             fanout,
@@ -1953,6 +2156,9 @@ impl PendingSession {
         };
 
         Ok(DaemonSession {
+            agent_state: crate::agent_state::StateCell::for_process(pid),
+            s4_spawn_origin: None,
+            prompt_delivery: None,
             holder_incarnation: None,
             uid,
             title,
@@ -1973,7 +2179,12 @@ impl PendingSession {
             workflow_run_id,
             workflow_role,
             continuous_task_id,
+            model,
+            model_source,
+            effort,
+            effort_source,
             global_perms,
+            org,
             // Sub-2b-1 review-r#2 #2: generation starts at 0;
             // `session.set_transcript_path` increments on
             // path-change. Subscribed-from-spawn callers
@@ -2292,9 +2503,25 @@ pub struct AdoptedSessionMeta {
     pub workflow_role: Option<String>,
     /// Continuous-task tag.
     pub continuous_task_id: Option<String>,
+    /// The model the session was launched with (`crate::models`), so
+    /// revive, resume and restore reuse it. `None` for bash and for
+    /// sessions recorded before models were.
+    pub model: Option<String>,
+    /// Where `model` came from ([`crate::models::ModelSource::as_str`]):
+    /// `explicit`, `task`, `engine_default`, `transcript`, … `None` when
+    /// unknown (bash, or recorded before sources were).
+    pub model_source: Option<String>,
+    /// The reasoning effort the session runs at, recorded with `model`.
+    pub effort: Option<String>,
+    /// Where `effort` came from (the same sources as `model_source`).
+    pub effort_source: Option<String>,
     /// Global-permissions grant — an orchestrator must not lose its
     /// scope across a deploy.
     pub global_perms: bool,
+    /// The org-model preservation object (doc/org-model.md §12): opaque,
+    /// carried from the record this session was built from to every record
+    /// built from it.
+    pub org: Option<cm_holder_proto::org::OrgObject>,
     /// Transcript generation counter, restored from the manifest so
     /// post-handoff cursor semantics don't reset.
     pub generation: u64,
@@ -2378,6 +2605,12 @@ impl AdoptedSessionBuild {
     /// pushing live bytes and a seed would land out of order.
     pub fn seed_replay(&self, bytes: &[u8]) {
         self.fanout.seed_replay(bytes);
+    }
+
+    /// Seed the adopted fanout's keyboard mode and replay tail; see
+    /// [`PtyByteFanout::seed_adopted`]. Safe before `arm` only.
+    pub fn seed_adopted(&self, ring: Option<&[u8]>, keyboard: Option<crate::keys::KeyboardSnapshot>) {
+        self.fanout.seed_adopted(ring, keyboard);
     }
 
     /// The ARM stage: start the two threads and produce the armed
@@ -2496,6 +2729,9 @@ impl AdoptedSessionBuild {
         };
 
         Ok(DaemonSession {
+            agent_state: crate::agent_state::StateCell::for_process(pid),
+            s4_spawn_origin: None,
+            prompt_delivery: None,
             holder_incarnation: None,
             title: meta.title,
             // Phase 4b (R11): the full v2 record lands verbatim — no
@@ -2514,7 +2750,12 @@ impl AdoptedSessionBuild {
             workflow_run_id: meta.workflow_run_id,
             workflow_role: meta.workflow_role,
             continuous_task_id: meta.continuous_task_id,
+            model: meta.model,
+            model_source: meta.model_source,
+            effort: meta.effort,
+            effort_source: meta.effort_source,
             global_perms: meta.global_perms,
+            org: meta.org,
             generation: meta.generation,
             last_activity_at,
             // Reconstructed status cells (ages → Instants, done in
@@ -2594,11 +2835,15 @@ impl DaemonSession {
             .map_err(|e| anyhow::anyhow!("adopt {}: try_clone_reader: {}", uid, e))?;
         let poll_fd = dup_master_fd_for_poll(&master)
             .map_err(|e| anyhow::anyhow!("adopt {}: dup master fd for reader poll: {}", uid, e))?;
-        let writer: SessionWriter = Arc::new(Mutex::new(
-            master
-                .take_writer()
-                .map_err(|e| anyhow::anyhow!("adopt {}: take_writer: {}", uid, e))?,
-        ));
+        let writer: SessionWriter = Arc::new(Mutex::new(Box::new(
+            crate::pty_input::BoundedWriter::new(
+                &uid,
+                master
+                    .take_writer()
+                    .map_err(|e| anyhow::anyhow!("adopt {}: take_writer: {}", uid, e))?,
+            )
+            .map_err(|e| anyhow::anyhow!("adopt {}: PTY input worker: {}", uid, e))?,
+        )));
 
         // Activity cell: the carried pre-swap value when the record
         // has one (an idle-for-40-minutes session must still read
@@ -2723,8 +2968,11 @@ impl Drop for PendingSession {
 /// PTY would freeze every other daemon RPC. The handle pattern
 /// keeps the lock-then-clone-then-drop-then-write shape
 /// load-bearing.
+#[derive(Clone)]
 pub struct InputHandle {
+    delivery_token: Option<f64>,
     session_uid: Option<String>,
+    agent_state: crate::agent_state::AgentStateCell,
     writer: SessionWriter,
     last_activity_at: SharedLastActivity,
     last_operator_input_at: SharedLastActivity,
@@ -2737,8 +2985,8 @@ fn stamp_now(cell: &SharedLastActivity) {
 }
 
 /// The viewer sends either a raw Enter or a kitty keyboard Enter (CSI 13 u,
-/// optionally with numeric modifier/event parameters). Other terminal input
-/// is activity for delivery timing, but does not start an agent turn.
+/// optionally with numeric modifier/event parameters). Draft input affects
+/// delivery timing but does not start an agent turn.
 fn contains_operator_submit(bytes: &[u8]) -> bool {
     bytes.contains(&b'\r')
         || bytes.windows(4).enumerate().any(|(i, prefix)| {
@@ -2760,7 +3008,92 @@ fn contains_operator_submit(bytes: &[u8]) -> bool {
         })
 }
 
+/// Automatic terminal replies and viewer navigation cannot edit the composer.
+/// Recognize complete frames only; mixed text/unknown bytes remain typing.
+fn passive_viewer_input(mut bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    while !bytes.is_empty() {
+        if let Some(csi) = bytes.strip_prefix(b"\x1b[") {
+            let Some(end) = csi.iter().position(|b| (0x40..=0x7e).contains(b)) else {
+                return false;
+            };
+            let params = &csi[..end];
+            let final_byte = csi[end];
+            let passive = matches!(
+                final_byte,
+                b'A' | b'B'
+                    | b'C'
+                    | b'D'
+                    | b'H'
+                    | b'F'
+                    | b'I'
+                    | b'O'
+                    | b'R'
+                    | b'c'
+                    | b'n'
+                    | b't'
+                    | b'y'
+            ) || (final_byte == b'u' && params.starts_with(b"?"))
+                || (matches!(final_byte, b'M' | b'm') && params.starts_with(b"<"));
+            if !passive {
+                return false;
+            }
+            bytes = &csi[end + 1..];
+        } else if bytes.starts_with(b"\x1bP>|") || bytes.starts_with(b"\x1b_G") {
+            let Some(end) = bytes.windows(2).position(|p| p == b"\x1b\\") else {
+                return false;
+            };
+            bytes = &bytes[end + 2..];
+        } else if let Some(osc) = bytes.strip_prefix(b"\x1b]") {
+            // Color-query replies from the terminal emulator.
+            if !osc.starts_with(b"10;") && !osc.starts_with(b"11;") {
+                return false;
+            }
+            if let Some(end) = osc.iter().position(|b| *b == 7) {
+                bytes = &osc[end + 1..];
+            } else if let Some(end) = osc.windows(2).position(|p| p == b"\x1b\\") {
+                bytes = &osc[end + 2..];
+            } else {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// Recognize only terminal-generated response frames for recovery bypass.
+/// Navigation and mouse events are actions even when they do not type text.
+fn terminal_response_input(mut bytes: &[u8]) -> bool {
+    if bytes.is_empty() { return false; }
+    while !bytes.is_empty() {
+        if let Some(csi) = bytes.strip_prefix(b"\x1b[") {
+            let Some(end) = csi.iter().position(|b| (0x40..=0x7e).contains(b)) else { return false };
+            let params = &csi[..end];
+            let final_byte = csi[end];
+            if !(matches!(final_byte, b'R' | b'c' | b't' | b'y')
+                || (final_byte == b'u' && params.starts_with(b"?"))) { return false; }
+            bytes = &csi[end + 1..];
+        } else if bytes.starts_with(b"\x1bP>|") || bytes.starts_with(b"\x1b_G") {
+            let Some(end) = bytes.windows(2).position(|p| p == b"\x1b\\") else { return false };
+            bytes = &bytes[end + 2..];
+        } else if let Some(osc) = bytes.strip_prefix(b"\x1b]") {
+            if !osc.starts_with(b"10;") && !osc.starts_with(b"11;") { return false; }
+            if let Some(end) = osc.iter().position(|b| *b == 7) { bytes = &osc[end + 1..]; }
+            else if let Some(end) = osc.windows(2).position(|p| p == b"\x1b\\") { bytes = &osc[end + 2..]; }
+            else { return false; }
+        } else { return false; }
+    }
+    true
+}
+
 impl InputHandle {
+    pub(crate) fn belongs_to(&self, session: &DaemonSession) -> bool {
+        Arc::ptr_eq(&self.writer, &session.writer)
+    }
     /// Write `bytes` to the PTY then stamp activity. Stamp is
     /// AFTER the write so a failed write doesn't lie about
     /// "session was active." Lock order: writer-gate permit first
@@ -2781,11 +3114,12 @@ impl InputHandle {
     /// deadlock the exec sequence's post-freeze state-lock holds),
     /// not just for RPC latency.
     pub fn write_and_stamp(&self, bytes: &[u8]) -> std::io::Result<()> {
-        let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
+        let _permit = crate::writer_gate::write_permit();
+        let gate = self.session_uid.as_deref().filter(|uid| !crate::continuous::retirement::input_unit_active(uid))
+            .map(crate::continuous::retirement::gate);
         let _fence = gate.as_ref().map(|g| g.read().unwrap_or_else(|p| p.into_inner()));
         if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
         {
-            let _permit = crate::writer_gate::write_permit();
             let mut w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
             w.write_all(bytes)?;
             w.flush()?;
@@ -2795,14 +3129,60 @@ impl InputHandle {
         Ok(())
     }
 
-    /// A recovery Enter must not submit a draft typed since the agent paste.
-    /// Check under the same writer lock used to stamp human input, closing
-    /// the race between checking operator activity and writing the retry.
-    pub(crate) fn write_recovery_enter(&self, bytes: &[u8], since: Instant) -> std::io::Result<bool> {
+    /// Write one `send_key` key. A key does not supersede the done report,
+    /// but it records operator activity for fresh-recovery proof because it
+    /// can affect the terminal or submit a command.
+    pub fn write_key(&self, bytes: &[u8]) -> std::io::Result<()> {
+        let _permit = crate::writer_gate::write_permit();
         let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
         let _fence = gate.as_ref().map(|g| g.read().unwrap_or_else(|p| p.into_inner()));
         if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
+        let mut w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        w.write_all(bytes)?;
+        w.flush()?;
+        // A key can execute a command (Enter/escape/etc.) even though it does
+        // not count as a new agent turn; fresh-recovery proof must see it.
+        stamp_now(&self.last_operator_input_at);
+        Ok(())
+    }
+
+    /// CM's own Escape on Claude's usage-limit menu (`claude_limit_menu`).
+    /// Unlike [`write_key`](Self::write_key) it stamps no input clock:
+    /// Escape closes the menu without typing, submitting or starting a
+    /// turn, so the failed-turn boundary that limit recovery admits on
+    /// (and a done report) must survive it. Refused, before any byte,
+    /// while recovery or retirement holds the input gate, when a human or
+    /// agent wrote input within `quiet`, or when `screen_unchanged` reports
+    /// new output since the caller matched the menu.
+    pub(crate) fn write_limit_menu_escape(&self, bytes: &[u8], quiet: std::time::Duration,
+        screen_unchanged: impl FnOnce() -> bool) -> std::io::Result<bool> {
         let _permit = crate::writer_gate::write_permit();
+        let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
+        let _fence = match gate.as_ref().map(|g| g.try_read()) {
+            Some(Ok(guard)) => Some(guard),
+            Some(Err(_)) => return Ok(false),
+            None => None,
+        };
+        if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
+        let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        let recent = |slot: &SharedLastActivity| slot.lock().unwrap_or_else(|p| p.into_inner())
+            .is_some_and(|at| at.elapsed() < quiet);
+        if recent(&self.last_operator_input_at) || recent(&self.last_input_at) || !screen_unchanged() {
+            return Ok(false);
+        }
+        writer.write_all(bytes)?;
+        writer.flush()?;
+        Ok(true)
+    }
+
+    /// A recovery Enter must not touch a draft typed since the agent paste.
+    /// Check under the same writer lock used to stamp human input, closing
+    /// the race between checking operator activity and writing the retry.
+    pub(crate) fn write_recovery_enter(&self, bytes: &[u8], since: Instant) -> std::io::Result<bool> {
+        let _permit = crate::writer_gate::write_permit();
+        let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
+        let _fence = gate.as_ref().map(|g| g.read().unwrap_or_else(|p| p.into_inner()));
+        if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
         let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         if self.last_operator_input_at.lock().unwrap_or_else(|p| p.into_inner())
             .is_some_and(|at| at >= since) {
@@ -2818,10 +3198,10 @@ impl InputHandle {
     /// CM's own channel onboarding only. Any operator input since process
     /// creation cancels automation, including input racing the screen check.
     pub(crate) fn write_startup_confirmation(&self, bytes: &[u8]) -> std::io::Result<bool> {
+        let _permit = crate::writer_gate::write_permit();
         let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
         let _fence = gate.as_ref().map(|g| g.read().unwrap_or_else(|p| p.into_inner()));
         if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
-        let _permit = crate::writer_gate::write_permit();
         let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         if self.last_operator_input_at.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
             return Ok(false);
@@ -2831,6 +3211,141 @@ impl InputHandle {
         stamp_now(&self.last_activity_at);
         stamp_now(&self.last_input_at);
         Ok(true)
+    }
+
+    /// One native recovery command, serialized against human/agent PTY input.
+    /// Never clear a composer or retry Enter. The caller has checked the live
+    /// screen; recheck its cursor and the failed turn immediately before typing.
+    pub(crate) fn write_codex_recovery_fork(
+        &self,
+        captured: Instant,
+        turn_seq: u64,
+        ended_at: Option<f64>,
+        error_kind: Option<&str>,
+        enter: &[u8],
+        screen_unchanged: impl FnOnce() -> bool,
+    ) -> std::io::Result<bool> {
+        let _unit = crate::writer_gate::unit_permit();
+        let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
+        let _fence = gate.as_ref().map(|g| g.read().unwrap_or_else(|p| p.into_inner()));
+        if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
+        let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        let typed = *self.last_operator_input_at.lock().unwrap_or_else(|p| p.into_inner());
+        let input = *self.last_input_at.lock().unwrap_or_else(|p| p.into_inner());
+        if typed.is_some_and(|t| t >= captured || input.is_none_or(|i| t > i))
+            || input.is_some_and(|t| t >= captured)
+            || !screen_unchanged()
+        {
+            return Ok(false);
+        }
+        let token = crate::agent_state::unix_now();
+        {
+            let mut cell = self.agent_state.lock().unwrap_or_else(|p| p.into_inner());
+            let state = cell.recompute(token);
+            if !crate::codex_recovery::failed_boundary(&state)
+                || state.turn_seq != turn_seq || state.last_turn.ended_at != ended_at
+                || !matches!((error_kind, state.detail.error_kind.as_deref()),
+                    (Some("other" | "serverOverloaded" | "previous_response_not_found"),
+                     Some("other" | "serverOverloaded" | "previous_response_not_found")))
+            {
+                return Ok(false);
+            }
+            cell.note_command(token);
+        }
+        // No state/cell lock across PTY writes or the Codex paste-settle gap.
+        // Keep the writer until Enter so a draft cannot slip between the two.
+        writer.write_all(b"/fork")?;
+        writer.flush()?;
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        writer.write_all(enter)?;
+        writer.flush()?;
+        stamp_now(&self.last_activity_at);
+        stamp_now(&self.last_input_at);
+        self.agent_state.lock().unwrap_or_else(|p| p.into_inner())
+            .note_submitted(token, crate::agent_state::unix_now());
+        Ok(true)
+    }
+
+    /// A single guarded resume. `commit` revalidates transcript evidence
+    /// and durably records the attempt while this writer is exclusively held;
+    /// neither an ambiguous write nor a crash may trigger a second attempt.
+    pub(crate) fn write_claude_limit_resume(
+        &self, captured: Instant, turn_seq: u64, ended_at: Option<f64>,
+        background: &crate::agent_state::Background,
+        enter: &[u8], commit: impl FnOnce() -> std::io::Result<bool>,
+        after_commit: impl FnOnce() -> std::io::Result<bool>,
+        screen_unchanged: impl FnOnce() -> bool,
+        gap_safe: impl FnOnce() -> std::io::Result<bool>,
+    ) -> std::io::Result<bool> {
+        let _unit = crate::writer_gate::unit_permit();
+        let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
+        let _fence = gate.as_ref().map(|g| g.read().unwrap_or_else(|p| p.into_inner()));
+        if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
+        let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        let typed = *self.last_operator_input_at.lock().unwrap_or_else(|p| p.into_inner());
+        let input = *self.last_input_at.lock().unwrap_or_else(|p| p.into_inner());
+        if typed.is_some_and(|t| t >= captured || input.is_none_or(|i| t > i))
+            || input.is_some_and(|t| t >= captured) { return Ok(false); }
+        let token = crate::agent_state::unix_now();
+        {
+            let mut cell = self.agent_state.lock().unwrap_or_else(|p| p.into_inner());
+            let state = cell.recompute(token);
+            if !crate::claude_account_recovery::failed_boundary(&state)
+                || state.turn_seq != turn_seq || state.last_turn.ended_at != ended_at
+                || !crate::claude_account_recovery::same_background(background, &state.background) { return Ok(false); }
+        }
+        if !commit()? { return Ok(false); }
+        // Slow transcript reads and journal fsync have finished. Recheck the
+        // active census and the rendered screen immediately before any bytes.
+        if !after_commit()? || !self.claude_limit_boundary_matches(turn_seq, ended_at, background)
+            || !screen_unchanged() { return Ok(false); }
+        self.agent_state.lock().unwrap_or_else(|p| p.into_inner()).note_input(token);
+        writer.write_all(b"\x1b[200~Your last turn stopped on a usage limit. Capacity may be available now; continue where you stopped. If it fails again, stop and wait.\x1b[201~")?;
+        writer.flush()?;
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let background_unchanged = {
+            let cell = self.agent_state.lock().unwrap_or_else(|p| p.into_inner());
+            crate::claude_account_recovery::same_background(background, &cell.inputs.background)
+        };
+        if !background_unchanged || !gap_safe()? {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted,
+                "resume paste may be present; submit withheld after background activity"));
+        }
+        writer.write_all(enter)?;
+        writer.flush()?;
+        stamp_now(&self.last_activity_at);
+        stamp_now(&self.last_input_at);
+        self.agent_state.lock().unwrap_or_else(|p| p.into_inner())
+            .note_submitted(token, crate::agent_state::unix_now());
+        Ok(true)
+    }
+
+    pub(crate) fn claude_limit_boundary_matches(&self, turn_seq: u64, ended_at: Option<f64>,
+        background: &crate::agent_state::Background) -> bool {
+        let state = self.agent_state.lock().unwrap_or_else(|p| p.into_inner()).recompute(crate::agent_state::unix_now());
+        crate::claude_account_recovery::failed_boundary(&state)
+            && state.turn_seq == turn_seq && state.last_turn.ended_at == ended_at
+            && crate::claude_account_recovery::same_background(background, &state.background)
+    }
+
+    /// Hold the same input serialization while admitting an atomic native
+    /// recovery notification. No PTY bytes are written on this path.
+    pub(crate) fn admit_claude_limit_notice(
+        &self, captured: Instant, turn_seq: u64, ended_at: Option<f64>,
+        background: &crate::agent_state::Background,
+        publish: impl FnOnce() -> std::io::Result<bool>,
+    ) -> std::io::Result<bool> {
+        let _unit = crate::writer_gate::unit_permit();
+        let gate = self.session_uid.as_deref().map(crate::continuous::retirement::gate);
+        let _fence = gate.as_ref().map(|g| g.read().unwrap_or_else(|p| p.into_inner()));
+        if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
+        let _writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        let typed = *self.last_operator_input_at.lock().unwrap_or_else(|p| p.into_inner());
+        let input = *self.last_input_at.lock().unwrap_or_else(|p| p.into_inner());
+        if typed.is_some_and(|t| t >= captured || input.is_none_or(|i| t > i))
+            || input.is_some_and(|t| t >= captured) { return Ok(false); }
+        if !self.claude_limit_boundary_matches(turn_seq, ended_at, background) { return Ok(false); }
+        publish()
     }
 
     /// Bump the activity clock WITHOUT writing to the PTY. The agent
@@ -2851,25 +3366,82 @@ impl InputHandle {
         if self.session_uid.as_deref().is_some_and(|uid| crate::continuous::retirement::ensure_open(uid).is_err()) { return; }
         stamp_now(&self.last_activity_at);
         stamp_now(&self.last_input_at);
+        self.note_turn_start();
+    }
+
+    /// Each asynchronous delivery carries its own token so an older writer
+    /// cannot mark a newer queued prompt submitted. Commands do not start turns.
+    pub(crate) fn prepare_agent_input(mut self, body: &str) -> Self {
+        if self.delivery_token.is_some() { return self; }
+        let gate = self.session_uid.as_deref().filter(|uid| !crate::continuous::retirement::input_unit_active(uid))
+            .map(crate::continuous::retirement::gate);
+        let _fence = match gate.as_ref().map(|g| g.try_read()) {
+            Some(Ok(guard)) => Some(guard),
+            Some(Err(_)) => return self,
+            None => None,
+        };
+        if self.session_uid.as_deref().is_some_and(|uid|
+            crate::continuous::retirement::ensure_open(uid).is_err()) { return self; }
+        let now = crate::agent_state::unix_now();
+        stamp_now(&self.last_activity_at);
+        stamp_now(&self.last_input_at);
+        {
+            let mut cell = self.agent_state.lock().unwrap_or_else(|p| p.into_inner());
+            if body.trim().is_empty() || body.trim_start().starts_with('/') {
+                cell.note_command(now);
+            } else { cell.note_input(now); }
+        }
+        self.delivery_token = Some(now);
+        self
+    }
+
+    pub(crate) fn note_agent_submitted(&self) {
+        if let Some(token) = self.delivery_token {
+            self.agent_state.lock().unwrap_or_else(|p| p.into_inner())
+                .note_submitted(token, crate::agent_state::unix_now());
+        }
+    }
+
+    pub(crate) fn note_turn_start(&self) {
+        self.agent_state.lock().unwrap_or_else(|p| p.into_inner())
+            .note_input(crate::agent_state::unix_now());
     }
 
     /// [`write_and_stamp`](Self::write_and_stamp) for OPERATOR input
     /// (the attach stream — a human typing). Additionally stamps
-    /// `last_operator_input_at` so the agent-prompt delivery threads
-    /// can defer injection while the operator is actively typing. Only
+    /// `last_operator_input_at` for typing (excluding recognized terminal
+    /// replies/navigation) so delivery can defer while the operator types. Only
     /// a submit key stamps `last_input_at`: drafts and navigation must
     /// preserve semantic idle and the agent's done report.
     pub fn write_and_stamp_operator(&self, bytes: &[u8]) -> std::io::Result<()> {
         let _permit = crate::writer_gate::write_permit();
+        // Terminal protocol replies/navigation must still flow while recovery
+        // is fenced. Bytes that can alter the composer take the same UID gate
+        // as agent delivery and are refused during/after an ambiguous effect.
+        let gate = if terminal_response_input(bytes) { None } else {
+            self.session_uid.as_deref().map(crate::continuous::retirement::gate)
+        };
+        let _fence = match gate.as_ref() {
+            Some(gate) => Some(gate.try_read().map_err(|_| std::io::Error::new(
+                std::io::ErrorKind::WouldBlock, "session input is reserved for recovery or retirement"))?),
+            None => None,
+        };
+        if gate.is_some() {
+            if let Some(uid) = &self.session_uid { crate::continuous::retirement::ensure_open(uid)?; }
+        }
         let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         // Stamp while holding the same writer lock as explicit prompt delivery.
         // Even a partial/failed human write means the composer may contain text.
-        stamp_now(&self.last_operator_input_at);
+        if !passive_viewer_input(bytes) { stamp_now(&self.last_operator_input_at); }
         writer.write_all(bytes)?;
         writer.flush()?;
         stamp_now(&self.last_activity_at);
         if contains_operator_submit(bytes) {
             stamp_now(&self.last_input_at);
+            let now = crate::agent_state::unix_now();
+            let mut cell = self.agent_state.lock().unwrap_or_else(|p| p.into_inner());
+            cell.note_input(now);
+            cell.note_submitted(now, now);
         }
         Ok(())
     }
@@ -2901,12 +3473,27 @@ impl InputHandle {
     #[cfg(test)]
     pub(crate) fn test_handle() -> Self {
         InputHandle {
+            delivery_token: None,
             session_uid: None,
+            agent_state: Arc::new(Mutex::new(crate::agent_state::StateCell::new(
+                crate::agent_state::unix_now(), None,
+            ))),
             writer: Arc::new(Mutex::new(Box::new(Vec::new()))),
             last_activity_at: Arc::new(Mutex::new(None)),
             last_operator_input_at: Arc::new(Mutex::new(None)),
             last_input_at: Arc::new(Mutex::new(None)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_agent_state(&self) -> crate::agent_state::AgentStateCell {
+        Arc::clone(&self.agent_state)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_uid(mut self, uid: &str) -> Self {
+        self.session_uid = Some(uid.to_string());
+        self
     }
 
     /// Test-only handle whose writes are captured per-call (one
@@ -2932,7 +3519,11 @@ impl InputHandle {
         let captured: Arc<Mutex<Vec<(Instant, Vec<u8>)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let handle = InputHandle {
+            delivery_token: None,
             session_uid: None,
+            agent_state: Arc::new(Mutex::new(crate::agent_state::StateCell::new(
+                crate::agent_state::unix_now(), None,
+            ))),
             writer: Arc::new(Mutex::new(Box::new(CapturingWriter(
                 Arc::clone(&captured),
             )))),
@@ -2962,7 +3553,9 @@ impl DaemonSession {
     /// PTY writes don't stall other daemon RPCs.
     pub fn input_handle(&self) -> InputHandle {
         InputHandle {
+            delivery_token: None,
             session_uid: Some(self.uid.clone()),
+            agent_state: Arc::clone(&self.agent_state),
             writer: Arc::clone(&self.writer),
             last_activity_at: Arc::clone(&self.last_activity_at),
             last_operator_input_at: Arc::clone(&self.last_operator_input_at),
@@ -2974,6 +3567,12 @@ impl DaemonSession {
     /// → `session.turn_ended`).
     pub fn stamp_turn_end(&self) {
         stamp_now(&self.last_turn_end_at);
+    }
+
+    /// An engine start mirrors legacy clocks without counting the same turn twice.
+    pub(crate) fn stamp_engine_activity(&self) {
+        stamp_now(&self.last_activity_at);
+        stamp_now(&self.last_input_at);
     }
 
     /// Record the agent's own "my work is finished" report
@@ -3123,6 +3722,7 @@ impl DaemonSession {
         rows: u16,
         cell_pixels: Option<(u16, u16)>,
     ) -> std::io::Result<()> {
+        self.fanout.geometry.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         use portable_pty::PtySize;
         if let Some((w, h)) = cell_pixels.filter(|&(w, h)| w > 0 && h > 0) {
             self.last_cell_pixels = Some((w, h));
@@ -3190,11 +3790,26 @@ impl DaemonSession {
     /// holder mode (monolith kills stay pidfd-direct and the
     /// attribution rides `DaemonState::record_kill_request` as
     /// always).
+    /// The shared attribution cell (read by an attach stream's End frame).
+    pub fn kill_attribution_cell(&self) -> Arc<Mutex<Option<String>>> {
+        Arc::clone(&self.kill_attribution)
+    }
+
     pub fn set_kill_attribution(&self, who: &str) {
         *self
             .kill_attribution
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(who.to_string());
+    }
+
+    /// Non-consuming kernel liveness check for an operator adoption preview.
+    pub(crate) fn process_alive_read_only(&self) -> std::io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        let mut pfd = libc::pollfd { fd: self.pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: pfd is valid for one pollfd; timeout zero never waits.
+        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if rc < 0 { return Err(std::io::Error::last_os_error()); }
+        Ok(rc == 0)
     }
 
     /// Non-blocking exit check. Returns `Some(DaemonExitStatus)`
@@ -3618,6 +4233,33 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn alloc56_closed_check_preserves_replay_and_allocates_nothing() {
+        use crate::test_support::allocations::measure;
+        let fanout = PtyByteFanout::new(1024 * 1024);
+        fanout.push(&vec![b'x'; 1024 * 1024]);
+        for closed in [false, true] {
+            if closed { fanout.close(); }
+            let (old, before) = measure(|| fanout.snapshot_since(None).closed);
+            let (new, after) = measure(|| fanout.is_closed());
+            assert_eq!((old, new), (closed, closed));
+            assert_eq!(before.bytes, 1024 * 1024);
+            assert_eq!(after.bytes, 0);
+            assert_eq!(after.calls, 0);
+            println!("ALLOC56 closed={closed} old_requested_bytes={} new_requested_bytes={}", before.bytes, after.bytes);
+            let snapshot = fanout.snapshot_since(None);
+            assert_eq!(snapshot.bytes, vec![b'x'; 1024 * 1024]);
+            assert_eq!(snapshot.cursor, 1024 * 1024);
+        }
+        // Keep the accessor's existing poisoned-mutex recovery behavior.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = fanout.inner.lock().unwrap();
+            panic!("poison fixture");
+        }));
+        assert!(fanout.is_closed());
+        assert!(fanout.snapshot_since(None).closed);
+    }
 
     /// Wait briefly for an mpsc receiver to surface a value; helps
     /// the few multi-thread tests not flake.

@@ -93,12 +93,8 @@ pub struct PlanTask {
     pub source: String,
     pub is_cloud: bool,
     pub repo_url: String,
-    /// Sub-2a Finding #2: pinned at the planning row so launch
-    /// actions can surface the parent edge in `LaunchTask` /
-    /// `LaunchTaskIntoWorkspace`. Without it the launch site
-    /// would have to look up the parent off the API row again
-    /// — which is exactly the race the finding describes (local
-    /// stub init happens BEFORE the next API reconcile).
+    /// The reporting line (`parent_task_id` on the API row): subtask
+    /// folding, `A-N` and the "Reports to" pickers read it.
     pub parent_task_id: Option<String>,
     /// First-class initiative membership. `None` means standalone task.
     pub initiative_id: Option<String>,
@@ -107,6 +103,11 @@ pub struct PlanTask {
     pub initiative_color: Option<String>,
     /// Marks the initiative's designated coordinator, not every member task.
     pub is_initiative_coordinator: bool,
+    /// The initiative's `kind`: `"division"` for a permanent division,
+    /// else an ordinary initiative (also when the API predates the field).
+    pub initiative_kind: Option<String>,
+    /// `metadata.lead_session_uid`: a pinned lead session, or `"owner"`.
+    pub lead_pin: Option<String>,
     /// Task kind from the API row ("oneshot" | "continuous" | "backtest").
     /// The `A-w` watch action fires only on `"backtest"`.
     pub kind: String,
@@ -129,6 +130,12 @@ pub struct PlanTask {
     pub bt_label: Option<String>,
     /// Agent/session/task/workspace provenance (`metadata.filer`).
     pub filer: Option<FilerMetadata>,
+    /// Per-engine default model (`metadata.models`: `{"claude": .., "codex": ..}`).
+    /// Subtasks without their own inherit through `parent_task_id`.
+    pub models: std::collections::BTreeMap<String, String>,
+    /// Per-engine default reasoning effort (`metadata.efforts`), inherited
+    /// the same way.
+    pub efforts: std::collections::BTreeMap<String, String>,
 }
 
 /// Pull a `"vm"` / `"backtest"` string field out of a task's free-form
@@ -142,6 +149,40 @@ fn meta_str(metadata: &Option<serde_json::Value>, group: &str, key: &str) -> Opt
         .map(|s| s.to_string())
 }
 
+/// `metadata.models` as an engine → model map (invalid entries dropped).
+pub(crate) fn meta_models(metadata: &Option<serde_json::Value>) -> std::collections::BTreeMap<String, String> {
+    metadata
+        .as_ref()
+        .and_then(|m| m.get(cm_daemon::models::TASK_MODELS_METADATA_KEY))
+        .and_then(|m| m.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| {
+                    let model = cm_daemon::models::validate_model(v.as_str()?).ok()?;
+                    Some((k.clone(), model))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `metadata.efforts` as an engine → effort map (invalid entries dropped).
+pub(crate) fn meta_efforts(metadata: &Option<serde_json::Value>) -> std::collections::BTreeMap<String, String> {
+    metadata
+        .as_ref()
+        .and_then(|m| m.get(cm_daemon::models::TASK_EFFORTS_METADATA_KEY))
+        .and_then(|m| m.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| {
+                    let effort = cm_daemon::models::validate_effort(k, v.as_str()?).ok()?;
+                    Some((k.clone(), effort))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn plan_filer_fields(task: &PlanTask) -> Vec<(&'static str, String)> {
     task.filer
         .as_ref()
@@ -150,6 +191,14 @@ fn plan_filer_fields(task: &PlanTask) -> Vec<(&'static str, String)> {
 }
 
 impl PlanTask {
+    /// The task's own per-engine models or efforts.
+    pub fn defaults(&self, setting: cm_daemon::models::Setting) -> &std::collections::BTreeMap<String, String> {
+        match setting {
+            cm_daemon::models::Setting::Model => &self.models,
+            cm_daemon::models::Setting::Effort => &self.efforts,
+        }
+    }
+
     fn initiative_marker(&self) -> &'static str {
         if self.is_initiative_coordinator { "◆ " } else { "" }
     }
@@ -183,6 +232,9 @@ impl PlanTask {
                 && task.initiative.as_ref()
                     .and_then(|v| v.get("coordinator_task_id"))
                     .and_then(|v| v.as_str()) == Some(task.id.as_str()),
+            initiative_kind: task.initiative.as_ref()
+                .and_then(|v| v.get("kind")).and_then(|v| v.as_str()).map(str::to_string),
+            lead_pin: task.metadata.as_ref().and_then(cm_daemon::org::pinned_lead).map(str::to_owned),
             kind: task.kind.clone(),
             worker_vm: task.worker_vm.clone().filter(|s| !s.is_empty()),
             vm_project: meta_str(&task.metadata, "vm", "project"),
@@ -191,8 +243,21 @@ impl PlanTask {
             run_key: meta_str(&task.metadata, "backtest", "run_key"),
             bt_label: meta_str(&task.metadata, "backtest", "label"),
             filer: FilerMetadata::from_metadata(&task.metadata),
+            models: meta_models(&task.metadata),
+            efforts: meta_efforts(&task.metadata),
         }
     }
+}
+
+/// A division (an initiative with `kind = "division"`), as a sidebar
+/// header shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Division {
+    pub id: String,
+    pub name: String,
+    pub color: Option<String>,
+    /// The task asked about is the division's root (its coordinator).
+    pub coordinator: bool,
 }
 
 #[derive(Clone)]
@@ -380,11 +445,11 @@ struct ProjectData {
 #[derive(Clone, Copy, PartialEq)]
 enum NewProjectField { Name, RepoUrl }
 
-/// Agent engine chosen in the workspace and planning launch dialogs.
+/// Agent engine chosen in the Sessions view's workspace dialog (`A-n`).
 /// Codex is the default; `←/→` cycles. Only the two agent engines are
-/// offered — a planning launch always delivers the task prompt to an
-/// agent, so `bash` (the third session type elsewhere in the TUI) has
-/// no meaning here.
+/// offered: a task-bound launch delivers the task prompt to an agent, so
+/// `bash` (the third session type elsewhere in the TUI) has no meaning
+/// here. Planning never launches (doc/org-model.md §13.4, O7).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LaunchEngine {
     Claude,
@@ -392,6 +457,12 @@ pub enum LaunchEngine {
 }
 
 impl LaunchEngine {
+    pub(crate) fn for_staffing(policy: &cm_daemon::staffing::Policy) -> Self {
+        match policy.recommend(None, chrono::Utc::now()).0 {
+            cm_daemon::staffing::Engine::Codex => Self::Codex,
+            cm_daemon::staffing::Engine::Claude => Self::Claude,
+        }
+    }
     /// Internal TUI session-type vocabulary (`"claude"` / `"codex"`) —
     /// what `try_spawn_via_daemon` and `TerminalSession::session_type`
     /// expect. NOT the public MCP wire form (`"claude-code"`).
@@ -416,7 +487,7 @@ impl Default for LaunchEngine {
     }
 }
 
-/// The `Engine: [claude]  codex` row shared by the launch dialogs.
+/// The `Engine: [claude]  codex` row of the workspace dialog.
 /// Selected option is bracketed + bold so it reads at a glance in the
 /// same style as the other in-place cyclers (A-e color pickers).
 pub(crate) fn engine_line(engine: LaunchEngine) -> Line<'static> {
@@ -462,141 +533,46 @@ enum PlanInputMode {
     BulkArchiveConfirm { project_idx: usize, count: usize },
     NewProject { name: String, repo_url: String, field: NewProjectField },
     ProjectPicker { selected: usize },
-    /// Before LaunchConfirm: pick either "new workspace" or an existing one.
-    /// Selected is an index into [NewWorkspace, ...workspace_candidates].
-    /// `engine` is the agent to spawn (←/→ cycles); it rides through to
-    /// LaunchConfirm when "New workspace" is picked, so the choice is made
-    /// once regardless of which of the two launch routes is taken.
-    WorkspacePicker { project_idx: usize, task_idx: usize, selected: usize, engine: LaunchEngine },
-    LaunchConfirm { project_idx: usize, task_idx: usize, branch_text: String, engine: LaunchEngine },
 }
 
-/// An open workspace the planning view can offer as a launch target.
-/// Populated by the App from its current workspace list each event cycle.
-#[derive(Clone, Debug)]
-pub struct WorkspaceCandidate {
-    pub workspace_id: String,
-    pub name: String,
-    pub repo_url: Option<String>,
+/// A task's brief (doc/org-model.md §13.2): its description, plus a legacy
+/// `prompt` only when that says something the description does not. A
+/// prompt that is empty, equal to the title, or contained in the
+/// description (the S1 backfill's `## Instructions`) is skipped, so nothing
+/// is delivered twice. Empty when there is nothing but the title.
+pub(crate) fn task_brief(description: &str, prompt: &str, title: &str) -> String {
+    let description = description.trim();
+    let prompt = prompt.trim();
+    if prompt.is_empty() || prompt == title.trim() || description.contains(prompt) {
+        description.to_string()
+    } else if description.is_empty() {
+        prompt.to_string()
+    } else {
+        format!("{}\n\n---\n\n{}", description, prompt)
+    }
 }
 
-/// Reduce a repo URL to a comparable form so SSH and HTTPS pointers to the
-/// same repo match. `git@github.com:org/repo.git` and
-/// `https://github.com/org/repo.git` both collapse to `github.com/org/repo`.
-/// Compose the activation text delivered to a worker agent on planning
-/// launch. The agent only sees ONE string at session-spawn time, but
-/// tasks have two natural fields: `description` (background/motivation
-/// for the user reading the planning queue) and `prompt` (instructions
-/// for the agent). We combine both so the agent always has the WHY plus
-/// the HOW, separated by a clear delimiter so a smart worker can ignore
-/// the background if it's irrelevant.
-///
-/// Precedence:
-///   - Both present: "{description}\n\n---\n\n{prompt}"
-///   - Only prompt: prompt verbatim (most common today; older tasks)
-///   - Only description: description verbatim (description-only tasks
-///     are rare but the agent should still get something useful)
-///   - Neither: title fallback (prevents the empty-prompt class of
-///     bug where the worker spawns with nothing to do)
-///
-/// Whitespace-only fields are treated as empty.
+/// The activation text delivered to a task-bound worker (the TUI's
+/// `start_session(task_id=…)` auto-delivery): the task's brief, else its title (so a worker never spawns with nothing to
+/// do). Whitespace-only fields are treated as empty.
 pub(crate) fn compose_launch_prompt(
     description: &str,
     prompt: &str,
     title: &str,
 ) -> String {
-    let description = description.trim();
-    let prompt = prompt.trim();
-    if !description.is_empty() && !prompt.is_empty() {
-        format!("{}\n\n---\n\n{}", description, prompt)
-    } else if !prompt.is_empty() {
-        prompt.to_string()
-    } else if !description.is_empty() {
-        description.to_string()
-    } else {
+    let brief = task_brief(description, prompt, title);
+    if brief.is_empty() {
         title.to_string()
+    } else {
+        brief
     }
-}
-
-/// Used when matching task→workspace at launch time, where the task's URL
-/// often comes from `git remote get-url origin` (SSH) and the workspace's
-/// from `~/.cm/projects/*/repo_url` (HTTPS).
-fn normalize_repo_url(url: &str) -> String {
-    let s = url.trim();
-    let s = s
-        .strip_prefix("https://")
-        .or_else(|| s.strip_prefix("http://"))
-        .or_else(|| s.strip_prefix("ssh://"))
-        .or_else(|| s.strip_prefix("git@"))
-        .unwrap_or(s);
-    // SSH form `host:org/repo` — turn the first ':' into '/' so it lines up
-    // with HTTPS form `host/org/repo`.
-    let s = s.replacen(':', "/", 1);
-    let s = s.strip_suffix(".git").unwrap_or(&s).to_string();
-    let s = s.trim_end_matches('/').to_string();
-    s.to_lowercase()
 }
 
 pub enum PlanAction {
     Consumed,
     Ignored,
-    LaunchTask {
-        project: String,
-        slug: String,
-        prompt: String,
-        branch: Option<String>,
-        autostart: bool,
-        task_id: String,
-        /// Sub-2a Finding #2: subtask launches must surface
-        /// `parent_task_id` from the planning row so the
-        /// launch site can initialize the local TaskEntry
-        /// stub with the correct edge. Pre-fix the stub set
-        /// `parent_task_id: None` and `push_task_tree_to_daemon`
-        /// published the wrong tree until the next API
-        /// reconcile patched it — opening a window where the
-        /// daemon saw a subtask as top-level and the
-        /// descendant-task auth walk could not authorize a
-        /// parent → subtask action.
-        parent_task_id: Option<String>,
-        /// `true` when the branch field held the `.` sentinel: launch
-        /// in-place in the main repo (no worktree, no branch).
-        in_place: bool,
-        /// Agent to spawn into the new worktree (launch-dialog choice,
-        /// Claude by default).
-        engine: LaunchEngine,
-        host_id: crate::hosts::HostId,
-    },
-    /// Bind a task to an existing workspace and spawn a session there
-    /// (no new worktree, no branch input).
-    LaunchTaskIntoWorkspace {
-        workspace_id: String,
-        task_id: String,
-        task_title: String,
-        task_repo_url: String,
-        /// Project name from the planning row. Pinned at action time so
-        /// the launch site can persist it on the local TaskEntry stub
-        /// even when the API row hasn't been reconciled yet — fixes
-        /// the disappearing-subtask race when an agent calls
-        /// `create_subtask` before reconcile backfills `project`.
-        project: String,
-        prompt: String,
-        /// Sub-2a Finding #2: same backstory as LaunchTask. The
-        /// "into existing workspace" variant carries it too so
-        /// the stub at the call site lands with the correct
-        /// parent edge on first push.
-        parent_task_id: Option<String>,
-        /// Agent to spawn into the existing workspace (picker
-        /// choice, Claude by default).
-        engine: LaunchEngine,
-    },
     /// Clear a task's `workspace_id`. Task status is not affected.
     UnbindTask {
-        task_id: String,
-    },
-    /// Send a running task back to backlog: PATCH status, clear workspace_id
-    /// on the local TaskEntry, and close the bound workspace. Worktree and
-    /// branch are left on disk.
-    UnlaunchTask {
         task_id: String,
     },
     /// Reopen a done task: validate the worktree is still on disk, PATCH the
@@ -719,23 +695,18 @@ fn write_temp_task(task: &PlanTask, parent_slug: Option<&str>) -> Option<PathBuf
     let yaml = serde_yaml::to_string(&front).ok()?;
     let yaml = yaml.trim_end_matches('\n');
 
-    let body = if task.description.is_empty() && task.prompt.is_empty() {
-        "## Description\n\n\n\n## Prompt\n".to_string()
-    } else {
-        let mut body = String::new();
-        if !task.description.is_empty() {
-            body.push_str(&task.description);
-        } else {
-            body.push_str("## Description\n");
+    // One brief (doc/org-model.md §13.2): the body is the description. A
+    // legacy prompt it lacks (a row from an older API) is shown under
+    // `## Instructions`, so saving folds it in rather than losing it.
+    let mut body = task.description.trim_end().to_string();
+    let prompt = task.prompt.trim();
+    if !prompt.is_empty() && prompt != task.title.trim() && !body.contains(prompt) {
+        if !body.trim().is_empty() {
+            body.push_str("\n\n");
         }
-        if !task.prompt.is_empty() {
-            if !body.contains("## Prompt") {
-                body.push_str("\n\n## Prompt\n");
-            }
-            body.push_str(&task.prompt);
-        }
-        body
-    };
+        body.push_str("## Instructions\n\n");
+        body.push_str(prompt);
+    }
 
     let content = format!("---\n{}\n---\n\n{}", yaml, body);
     std::fs::write(&path, content).ok()?;
@@ -812,26 +783,16 @@ fn parse_temp_task(path: &Path) -> Option<TempTaskParsed> {
         }
     };
 
-    // Extract prompt section from body.
-    let mut in_prompt = false;
-    let mut prompt_lines = vec![];
-    let mut desc_lines = vec![];
-    for line in body.lines() {
-        if line.starts_with("## Prompt") {
-            in_prompt = true;
-            continue;
-        }
-        if in_prompt {
-            if line.starts_with("## ") {
-                in_prompt = false;
-                desc_lines.push(line);
-            } else {
-                prompt_lines.push(line);
-            }
-        } else {
-            desc_lines.push(line);
-        }
-    }
+    // The whole body is the description. A `## Prompt` section (an older
+    // editor's template) is kept, renamed to the `## Instructions` heading.
+    let description = body
+        .lines()
+        .map(|line| match line.strip_prefix("## Prompt") {
+            Some(rest) => format!("## Instructions{}", rest),
+            None => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     Some(TempTaskParsed {
         title: front.title,
@@ -840,8 +801,7 @@ fn parse_temp_task(path: &Path) -> Option<TempTaskParsed> {
         depends,
         branch,
         parent,
-        description: desc_lines.join("\n").trim().to_string(),
-        prompt: prompt_lines.join("\n").trim().to_string(),
+        description: description.trim().to_string(),
     })
 }
 
@@ -856,7 +816,6 @@ struct TempTaskParsed {
     /// cycle/scope validation.
     parent: FieldUpdate<String>,
     description: String,
-    prompt: String,
 }
 
 /// Build the PATCH map sent to the API for an editor save. Cleared
@@ -871,7 +830,6 @@ fn build_patch_fields(parsed: &TempTaskParsed) -> HashMap<String, serde_json::Va
         "description".to_string(),
         serde_json::json!(parsed.description),
     );
-    fields.insert("prompt".to_string(), serde_json::json!(parsed.prompt));
 
     match &parsed.difficulty {
         FieldUpdate::Absent => {}
@@ -1132,9 +1090,6 @@ fn repo_url_for_project(project: &str) -> String {
 
 pub struct PlanningView {
     pub keybinding_helper_visible: bool,
-    pub launch_host: crate::hosts::HostId,
-    launch_hosts: Vec<crate::hosts::HostId>,
-    default_launch_host: crate::hosts::HostId,
     projects: Vec<PlanProject>,
     project_data: Vec<ProjectData>,
     /// None = show all projects, Some(idx) = show one project.
@@ -1169,12 +1124,17 @@ pub struct PlanningView {
     editing_project_idx: Option<usize>,
     editing_temp_path: Option<PathBuf>,
     input_mode: PlanInputMode,
+    /// Board links by task id (`Task::placement`, S3): the board chip and
+    /// the detail line. Kept beside the rows so a missing API field is
+    /// simply an empty map.
+    pub placements: HashMap<String, serde_json::Value>,
+    /// The API places tasks on boards (app/place.rs): `A-b` toggles the
+    /// on-boards strip. `A-f` always opens the place dialog, or a notice
+    /// when placing is unsupported; planning never launches (O7).
+    pub placement_on: bool,
     pub needs_redraw: bool,
     last_editor_size: (u16, u16),
     initialized: bool,
-    /// Open workspaces the user can launch a task into. Populated by App
-    /// before each planning event / render.
-    workspace_candidates: Vec<WorkspaceCandidate>,
     /// When false, archived tasks are skipped from rendering and cursor
     /// navigation. Toggled with alt+shift+v.
     show_archived: bool,
@@ -1204,12 +1164,58 @@ pub struct PlanningView {
 }
 
 impl PlanningView {
+    /// The initiative a task belongs to (its own, else its nearest
+    /// ancestor's), from the API rows the planning view already holds.
+    pub fn task_initiative(&self, task_id: &str) -> Option<String> {
+        let find = |id: &str| self.project_data.iter().flat_map(|pd| &pd.tasks).find(|t| t.id == id);
+        let mut current = find(task_id);
+        for _ in 0..64 {
+            let task = current?;
+            if task.initiative_id.is_some() {
+                return task.initiative_id.clone();
+            }
+            current = task.parent_task_id.as_deref().and_then(find);
+        }
+        None
+    }
+
+    /// The models or efforts the task itself sets (not inherited).
+    pub fn task_own(&self, task_id: &str, setting: cm_daemon::models::Setting) -> std::collections::BTreeMap<String, String> {
+        self.project_data
+            .iter()
+            .flat_map(|pd| &pd.tasks)
+            .find(|t| t.id == task_id)
+            .map(|t| PlanTask::defaults(t, setting).clone())
+            .unwrap_or_default()
+    }
+
+    pub fn task_parent_id(&self, task_id: &str) -> Option<String> {
+        self.project_data
+            .iter()
+            .flat_map(|pd| &pd.tasks)
+            .find(|t| t.id == task_id)
+            .and_then(|t| t.parent_task_id.clone())
+    }
+
+    /// The task's default model or effort for `engine` (its own, else its
+    /// nearest ancestor's), with the task that set it.
+    pub fn task_default(&self, task_id: &str, engine: &str, setting: cm_daemon::models::Setting) -> Option<(String, String)> {
+        let key = cm_daemon::models::engine_key(engine)?;
+        let find = |id: &str| self.project_data.iter().flat_map(|pd| &pd.tasks).find(|t| t.id == id);
+        let mut current = find(task_id);
+        for _ in 0..64 {
+            let task = current?;
+            if let Some(m) = task.defaults(setting).get(key) {
+                return Some((m.clone(), task.id.clone()));
+            }
+            current = task.parent_task_id.as_deref().and_then(find);
+        }
+        None
+    }
+
     pub fn new() -> Self {
         PlanningView {
             keybinding_helper_visible: true,
-            launch_host: crate::hosts::HostId::local(),
-            launch_hosts: vec![crate::hosts::HostId::local()],
-            default_launch_host: crate::hosts::HostId::local(),
             projects: vec![],
             project_data: vec![],
             project_filter: None,
@@ -1227,10 +1233,11 @@ impl PlanningView {
             editing_project_idx: None,
             editing_temp_path: None,
             input_mode: PlanInputMode::Normal,
+            placements: HashMap::new(),
+            placement_on: false,
             needs_redraw: true,
             last_editor_size: (80, 24),
             initialized: false,
-            workspace_candidates: vec![],
             show_archived: false,
             expanded_tasks: HashSet::new(),
             last_search: None,
@@ -1241,15 +1248,106 @@ impl PlanningView {
     }
 
     /// Shared with the work-panel task sidebar; filters and folds do not hide membership.
-    pub(crate) fn task_initiative_marker(&self, task_id: &str) -> &'static str {
+    /// The division a task belongs to, when its initiative is one.
+    pub(crate) fn task_division(&self, task_id: &str) -> Option<Division> {
+        let task = self.project_data.iter().flat_map(|pd| &pd.tasks).find(|t| t.id == task_id)?;
+        if task.initiative_kind.as_deref() != Some("division") {
+            return None;
+        }
+        Some(Division {
+            id: task.initiative_id.clone()?,
+            name: task.initiative_name.clone().unwrap_or_else(|| "division".into()),
+            color: task.initiative_color.clone(),
+            coordinator: task.is_initiative_coordinator,
+        })
+    }
+
+    /// Every task in a division, mapped to that division: one pass over the
+    /// planning data, for the sidebar tree.
+    pub(crate) fn divisions_by_task(&self) -> HashMap<String, Division> {
+        self.project_data
+            .iter()
+            .flat_map(|pd| &pd.tasks)
+            .filter(|t| t.initiative_kind.as_deref() == Some("division"))
+            .filter_map(|t| {
+                Some((t.id.clone(), Division {
+                    id: t.initiative_id.clone()?,
+                    name: t.initiative_name.clone().unwrap_or_else(|| "division".into()),
+                    color: t.initiative_color.clone(),
+                    coordinator: t.is_initiative_coordinator,
+                }))
+            })
+            .collect()
+    }
+
+    /// Every loaded task, across projects.
+    pub(crate) fn loaded_tasks(&self) -> impl Iterator<Item = &PlanTask> {
         self.project_data.iter().flat_map(|pd| &pd.tasks)
-            .find(|task| task.id == task_id)
-            .map(PlanTask::initiative_marker).unwrap_or("")
+    }
+
+    /// A division's root task (its coordinator task), if loaded.
+    pub(crate) fn division_root(&self, id: &str) -> Option<String> {
+        self.project_data
+            .iter()
+            .flat_map(|pd| &pd.tasks)
+            .find(|t| t.initiative_id.as_deref() == Some(id) && t.initiative_kind.as_deref() == Some("division") && t.is_initiative_coordinator)
+            .map(|t| t.id.clone())
+    }
+
+    /// Each loaded task's lead pin (a session uid, or `"owner"`).
+    pub(crate) fn lead_pins(&self) -> HashMap<String, String> {
+        self.project_data
+            .iter()
+            .flat_map(|pd| &pd.tasks)
+            .filter_map(|t| Some((t.id.clone(), t.lead_pin.clone()?)))
+            .collect()
+    }
+
+    /// Display data of a division, from any of its tasks.
+    pub(crate) fn division(&self, id: &str) -> Option<Division> {
+        let task = self
+            .project_data
+            .iter()
+            .flat_map(|pd| &pd.tasks)
+            .find(|t| t.initiative_id.as_deref() == Some(id) && t.initiative_kind.as_deref() == Some("division"))?;
+        self.task_division(&task.id)
+    }
+
+    /// The initiative marker (◆ for a coordinator) of every loaded task that
+    /// has one, in one pass: the sidebar draws one per workspace header
+    /// each frame, and a scan of the snapshot per header was a frame-sized
+    /// cost.
+    pub(crate) fn initiative_markers(&self) -> HashMap<&str, &'static str> {
+        let mut markers = HashMap::new();
+        for task in self.project_data.iter().flat_map(|pd| &pd.tasks) {
+            let marker = task.initiative_marker();
+            if !marker.is_empty() {
+                markers.entry(task.id.as_str()).or_insert(marker);
+            }
+        }
+        markers
+    }
+
+    /// Backlog tasks not on a board yet, for F6's assign picker (#96):
+    /// `(task id, title, project)`, by project, in board order. Placed
+    /// tasks are board items there; backtests and continuous tasks are
+    /// never handed to a member.
+    pub(crate) fn backlog_tasks(&self) -> Vec<(String, String, String)> {
+        self.project_data
+            .iter()
+            .flat_map(|pd| {
+                pd.tasks
+                    .iter()
+                    .filter(|t| t.status == PlanStatus::Backlog && !matches!(t.kind.as_str(), "backtest" | "continuous") && !self.placements.contains_key(&t.id))
+                    .map(|t| (t.id.clone(), t.title.clone(), pd.project.name.clone()))
+            })
+            .collect()
     }
 
     /// Update planning data from API tasks. Called when BackendEvent::PlanTasksUpdated arrives.
     /// Merges API state into existing local state rather than rebuilding from scratch.
     pub fn update_from_api(&mut self, api_tasks: Vec<Task>) {
+        self.placements = api_tasks.iter().filter_map(|t| Some((t.id.clone(), t.placement.clone().filter(|p| !p.is_null())?))).collect();
         // Group incoming tasks by project.
         let mut by_project: HashMap<String, Vec<PlanTask>> = HashMap::new();
         for task in &api_tasks {
@@ -1346,6 +1444,7 @@ impl PlanningView {
                         local_task.initiative_status = api_task.initiative_status.clone();
                         local_task.initiative_color = api_task.initiative_color.clone();
                         local_task.is_initiative_coordinator = api_task.is_initiative_coordinator;
+                        local_task.initiative_kind = api_task.initiative_kind.clone();
                     } else {
                         // New task from API — add it.
                         pd.tasks.push(api_task.clone());
@@ -1402,6 +1501,7 @@ impl PlanningView {
 
     /// Handle a single task being created via the API.
     pub fn on_task_created(&mut self, task: Task) {
+        self.note_placement(&task);
         if let Some(ref project_name) = task.project {
             let plan_task = PlanTask::from_api(&task);
             let slug = plan_task.slug.clone();
@@ -1478,6 +1578,7 @@ impl PlanningView {
     /// Handle a single task being updated via the API response.
     /// Merges the API state into the existing local task without rebuilding.
     pub fn on_task_updated(&mut self, api_task: Task) {
+        self.note_placement(&api_task);
         for pd in &mut self.project_data {
             if let Some(task) = pd.tasks.iter_mut().find(|t| t.id == api_task.id) {
                 task.title = api_task.name.clone().unwrap_or_else(|| {
@@ -1493,6 +1594,8 @@ impl PlanningView {
                 task.is_cloud = api_task.is_cloud;
                 task.parent_task_id = api_task.parent_task_id.clone();
                 task.filer = FilerMetadata::from_metadata(&api_task.metadata);
+                task.models = meta_models(&api_task.metadata);
+                task.efforts = meta_efforts(&api_task.metadata);
                 self.recompute_conflicts();
                 self.needs_redraw = true;
                 return;
@@ -1652,6 +1755,30 @@ impl PlanningView {
         Some((pi, ti))
     }
 
+    fn note_placement(&mut self, task: &Task) {
+        match task.placement.clone().filter(|p| !p.is_null()) {
+            Some(p) => self.placements.insert(task.id.clone(), p),
+            None => self.placements.remove(&task.id),
+        };
+    }
+
+    /// No dialog, editor or prompt is open (plain board navigation).
+    pub fn normal_mode(&self) -> bool {
+        matches!(self.input_mode, PlanInputMode::Normal) && self.editor.is_none()
+    }
+
+    /// The selected task's id and title.
+    pub fn selected_task_ref(&self) -> Option<(String, String)> {
+        self.selected_task().map(|(t, _)| (t.id.clone(), t.title.clone()))
+    }
+
+    /// The board chip for a placed task: `swarm #15 ➤`.
+    fn placement_chip(&self, task_id: &str) -> Option<(String, Style)> {
+        let p = self.placements.get(task_id)?;
+        let (mark, style) = crate::app::symbols::board_status(p["status"].as_str().unwrap_or(""));
+        Some((format!("[{} #{} {mark}] ", p["board"].as_str().unwrap_or("?"), p["n"]), style))
+    }
+
     fn selected_task(&self) -> Option<(&PlanTask, &str)> {
         let slug = self.selected_slug()?;
         let pi = self.cursor_project_idx()?;
@@ -1769,6 +1896,16 @@ impl PlanningView {
     // ── Navigation ──────────────────────────────────────────
 
     fn navigate_vertical(&mut self, direction: i32) {
+        self.navigate_vertical_step(direction, true);
+    }
+
+    fn page_vertical(&mut self, direction: i32) {
+        for _ in 0..(self.grid_rows_visible.get() / 2).max(1) {
+            self.navigate_vertical_step(direction, false);
+        }
+    }
+
+    fn navigate_vertical_step(&mut self, direction: i32, wrap: bool) {
         if self.unified_cols.is_empty() { return; }
         let prev_slug = self.selected_slug();
         let in_visual = self.visual_anchor.is_some();
@@ -1787,7 +1924,11 @@ impl PlanningView {
             let cur = selectable_positions.iter()
                 .position(|&(c, r)| c == self.cursor.col && r == self.cursor.row)
                 .unwrap_or(0);
-            let next = (cur as i32 + direction).rem_euclid(selectable_positions.len() as i32) as usize;
+            let next = if wrap {
+                (cur as i32 + direction).rem_euclid(selectable_positions.len() as i32) as usize
+            } else {
+                (cur as i32 + direction).clamp(0, selectable_positions.len() as i32 - 1) as usize
+            };
             self.cursor.col = selectable_positions[next].0;
             self.cursor.row = selectable_positions[next].1;
         } else {
@@ -1803,15 +1944,17 @@ impl PlanningView {
             } else {
                 let mut next = self.cursor.row as i32;
                 for _ in 0..rows.len() {
-                    next = (next + direction).rem_euclid(len);
+                    let candidate = next + direction;
+                    if !wrap && (candidate < 0 || candidate >= len) { return; }
+                    next = candidate.rem_euclid(len);
                     if rows.get(next as usize)
                         .map(|r| self.is_visible_row_selectable(r))
                         .unwrap_or(false)
                     {
+                        self.cursor.row = next as usize;
                         break;
                     }
                 }
-                self.cursor.row = next as usize;
             }
         }
         self.ensure_cursor_visible();
@@ -2128,8 +2271,6 @@ impl PlanningView {
             PlanInputMode::BulkArchiveConfirm { .. } => self.handle_bulk_archive_confirm_event(event),
             PlanInputMode::NewProject { .. } => self.handle_new_project_event(event),
             PlanInputMode::ProjectPicker { .. } => self.handle_project_picker_event(event),
-            PlanInputMode::WorkspacePicker { .. } => self.handle_workspace_picker_event(event),
-            PlanInputMode::LaunchConfirm { .. } => self.handle_launch_confirm_event(event),
             PlanInputMode::Normal => self.handle_normal_event(event),
         }
     }
@@ -2152,6 +2293,9 @@ impl PlanningView {
                         return PlanAction::Consumed;
                     }
                     KeyCode::Char('s') | KeyCode::Char('S') => { return self.cycle_status(false); }
+                    // `A-D`: mark done (moved from A-d, 2026-10-20, to match
+                    // the Sessions view where A-d pages the sidebar).
+                    KeyCode::Char('d') | KeyCode::Char('D') => { return self.cycle_status_to_done(); }
                     // `A-O` (Alt+Shift+O): reopen a done task's worktree.
                     // Only fires on a focused task whose status is Done.
                     KeyCode::Char('o') | KeyCode::Char('O') => {
@@ -2183,7 +2327,6 @@ impl PlanningView {
                         }
                         return PlanAction::Consumed;
                     }
-                    KeyCode::Char('u') | KeyCode::Char('U') => { return self.unlaunch_task(); }
                     KeyCode::Char('a') | KeyCode::Char('A') => {
                         self.cancel_visual();
                         if let Some(pi) = self.cursor_project_idx() {
@@ -2214,6 +2357,8 @@ impl PlanningView {
                 match key.code {
                     KeyCode::Char('q') => return PlanAction::Quit,
                     KeyCode::Char('t') => return PlanAction::SwitchToSessions,
+                    KeyCode::Char('d') if !key.modifiers.contains(KeyModifiers::CONTROL) => { self.page_vertical(1); return PlanAction::Consumed; }
+                    KeyCode::Char('u') if !key.modifiers.contains(KeyModifiers::CONTROL) => { self.page_vertical(-1); return PlanAction::Consumed; }
                     KeyCode::Char('j') => { self.navigate_vertical(1); return PlanAction::Consumed; }
                     KeyCode::Char('k') => { self.navigate_vertical(-1); return PlanAction::Consumed; }
                     KeyCode::Char('h') => { self.navigate_horizontal(-1); return PlanAction::Consumed; }
@@ -2286,9 +2431,10 @@ impl PlanningView {
                         }
                         return self.delete_task();
                     }
-                    KeyCode::Char('d') => { return self.cycle_status_to_done(); }
-                    KeyCode::Char('f') => { self.cancel_visual(); return self.start_launch(); }
-                    KeyCode::Char('u') => {
+                    // A-D marks done (Alt+Shift+d arrives here when the
+                    // terminal folds Shift into the char).
+                    KeyCode::Char('D') => { return self.cycle_status_to_done(); }
+                    KeyCode::Char('y') => {
                         self.cancel_visual();
                         if let Some((pi, ti)) = self.selected_task_loc() {
                             if let Some(task) = self.project_data.get(pi).and_then(|pd| pd.tasks.get(ti)) {
@@ -2652,6 +2798,12 @@ impl PlanningView {
                 _ => return PlanAction::Consumed,
             };
             let max = self.projects.len();
+            if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd')) {
+                let step = ((max + 1).min(self.grid_rows_visible.get()) / 2).max(1);
+                let selected = if key.code == KeyCode::Char('u') { selected.saturating_sub(step) } else { selected.saturating_add(step).min(max) };
+                self.input_mode = PlanInputMode::ProjectPicker { selected };
+                return PlanAction::Consumed;
+            }
             match key.code {
                 KeyCode::Esc => self.input_mode = PlanInputMode::Normal,
                 KeyCode::Char('j') | KeyCode::Down => {
@@ -2675,192 +2827,6 @@ impl PlanningView {
                     // match list (and its ordering) must be rebuilt.
                     self.refresh_search_matches();
                     self.search_status = None;
-                }
-                _ => {}
-            }
-        }
-        PlanAction::Consumed
-    }
-
-    fn handle_workspace_picker_event(&mut self, event: &CrosstermEvent) -> PlanAction {
-        let (project_idx, task_idx, mut selected, mut engine) = match self.input_mode {
-            PlanInputMode::WorkspacePicker {
-                project_idx,
-                task_idx,
-                selected,
-                engine,
-            } => (project_idx, task_idx, selected, engine),
-            _ => return PlanAction::Consumed,
-        };
-        let num_candidates = self.candidates_for(project_idx, task_idx).len();
-        // Option 0 is always "New workspace"; options 1..=num_candidates are
-        // existing workspaces.
-        let total = num_candidates + 1;
-
-        if let CrosstermEvent::Key(key) = event {
-            if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('h') {
-                self.cycle_launch_host();
-                return PlanAction::Consumed;
-            }
-
-            match key.code {
-                KeyCode::Esc => {
-                    self.input_mode = PlanInputMode::Normal;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    selected = (selected + total - 1) % total;
-                    self.input_mode = PlanInputMode::WorkspacePicker {
-                        project_idx,
-                        task_idx,
-                        selected,
-                        engine,
-                    };
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    selected = (selected + 1) % total;
-                    self.input_mode = PlanInputMode::WorkspacePicker {
-                        project_idx,
-                        task_idx,
-                        selected,
-                        engine,
-                    };
-                }
-                // Engine picker: only two options, so either arrow
-                // toggles. j/k stay reserved for the workspace list.
-                KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                    engine = engine.cycle();
-                    self.input_mode = PlanInputMode::WorkspacePicker {
-                        project_idx,
-                        task_idx,
-                        selected,
-                        engine,
-                    };
-                }
-                KeyCode::Enter => {
-                    if selected == 0 {
-                        // Fall through to branch-input dialog (current flow),
-                        // carrying the engine picked here.
-                        let branch_text = self.project_data[project_idx].tasks[task_idx]
-                            .branch
-                            .clone()
-                            .unwrap_or_default();
-                        self.input_mode = PlanInputMode::LaunchConfirm {
-                            project_idx,
-                            task_idx,
-                            branch_text,
-                            engine,
-                        };
-                    } else {
-                        // Bind task to the selected existing workspace.
-                        let ws = {
-                            let cands = self.candidates_for(project_idx, task_idx);
-                            cands.get(selected - 1).map(|c| (*c).clone())
-                        };
-                        let Some(ws) = ws else {
-                            self.input_mode = PlanInputMode::Normal;
-                            return PlanAction::Consumed;
-                        };
-                        self.input_mode = PlanInputMode::Normal;
-                        if let Some(pd) = self.project_data.get_mut(project_idx) {
-                            if let Some(task) = pd.tasks.get_mut(task_idx) {
-                                let prompt = compose_launch_prompt(
-                                    &task.description,
-                                    &task.prompt,
-                                    &task.title,
-                                );
-                                task.status = PlanStatus::InProgress;
-                                return PlanAction::LaunchTaskIntoWorkspace {
-                                    workspace_id: ws.workspace_id,
-                                    task_id: task.id.clone(),
-                                    task_title: task.title.clone(),
-                                    task_repo_url: task.repo_url.clone(),
-                                    project: pd.project.name.clone(),
-                                    prompt,
-                                    // Sub-2a Finding #2: pin the parent
-                                    // at action time so the launch site
-                                    // initializes the local stub with
-                                    // the correct edge.
-                                    parent_task_id: task.parent_task_id.clone(),
-                                    engine,
-                                };
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        PlanAction::Consumed
-    }
-
-    fn handle_launch_confirm_event(&mut self, event: &CrosstermEvent) -> PlanAction {
-        if let CrosstermEvent::Key(key) = event {
-            if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('h') {
-                self.cycle_launch_host();
-                return PlanAction::Consumed;
-            }
-
-            let (project_idx, task_idx, mut branch_text, mut engine) = match &self.input_mode {
-                PlanInputMode::LaunchConfirm { project_idx, task_idx, branch_text, engine } => {
-                    (*project_idx, *task_idx, branch_text.clone(), *engine)
-                }
-                _ => return PlanAction::Consumed,
-            };
-            match key.code {
-                KeyCode::Esc => self.input_mode = PlanInputMode::Normal,
-                KeyCode::Enter => {
-                    self.input_mode = PlanInputMode::Normal;
-                    if let Some(pd) = self.project_data.get_mut(project_idx) {
-                        if let Some(task) = pd.tasks.get_mut(task_idx) {
-                            let project = pd.project.name.clone();
-                            let prompt = compose_launch_prompt(
-                                &task.description,
-                                &task.prompt,
-                                &task.title,
-                            );
-                            let slug = task.slug.clone();
-                            // Branch field: "." → in-place (main repo, no
-                            // worktree/branch); "" → new worktree from HEAD;
-                            // other → new worktree from that base branch.
-                            let trimmed = branch_text.trim();
-                            let in_place = trimmed == ".";
-                            let branch = if trimmed.is_empty() || in_place {
-                                None
-                            } else {
-                                Some(trimmed.to_string())
-                            };
-                            let task_id = task.id.clone();
-                            let parent_task_id = task.parent_task_id.clone();
-                            task.status = PlanStatus::InProgress;
-                            return PlanAction::LaunchTask {
-                                project,
-                                slug,
-                                prompt,
-                                branch,
-                                autostart: false,
-                                task_id,
-                                // Sub-2a Finding #2: see LaunchTaskIntoWorkspace.
-                                parent_task_id,
-                                in_place,
-                                engine,
-                                host_id: self.launch_host.clone(),
-                            };
-                        }
-                    }
-                }
-                // Branch is a free-text field, so the engine toggle can't
-                // use letters — arrows (unused by this dialog) and Tab do it.
-                KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                    engine = engine.cycle();
-                    self.input_mode = PlanInputMode::LaunchConfirm { project_idx, task_idx, branch_text, engine };
-                }
-                KeyCode::Backspace => {
-                    branch_text.pop();
-                    self.input_mode = PlanInputMode::LaunchConfirm { project_idx, task_idx, branch_text, engine };
-                }
-                KeyCode::Char(c) => {
-                    branch_text.push(c);
-                    self.input_mode = PlanInputMode::LaunchConfirm { project_idx, task_idx, branch_text, engine };
                 }
                 _ => {}
             }
@@ -2932,19 +2898,6 @@ impl PlanningView {
             }
         }
         PlanAction::Consumed
-    }
-
-    fn unlaunch_task(&mut self) -> PlanAction {
-        let (pi, ti) = match self.selected_task_loc() {
-            Some(v) => v,
-            None => return PlanAction::Consumed,
-        };
-        let task = &mut self.project_data[pi].tasks[ti];
-        if task.status != PlanStatus::InProgress {
-            return PlanAction::Consumed;
-        }
-        task.status = PlanStatus::Backlog;
-        PlanAction::UnlaunchTask { task_id: task.id.clone() }
     }
 
     fn cycle_status_to_done(&mut self) -> PlanAction {
@@ -3613,7 +3566,7 @@ impl PlanningView {
                         task.parent_task_id = p;
                     }
                     task.description = parsed.description.clone();
-                    task.prompt = parsed.prompt.clone();
+                    task.prompt.clear();
 
                     let mut fields = build_patch_fields(&parsed);
                     if let Some(v) = parent_field {
@@ -3638,60 +3591,15 @@ impl PlanningView {
         action
     }
 
-    /// Workspace candidates visible for launching `task_idx` of `project_idx`
-    /// — filtered to those in the same repo so the worktree is meaningful.
-    fn candidates_for(&self, project_idx: usize, task_idx: usize) -> Vec<&WorkspaceCandidate> {
-        let Some(pd) = self.project_data.get(project_idx) else {
-            return vec![];
-        };
-        let Some(task) = pd.tasks.get(task_idx) else {
-            return vec![];
-        };
-        let task_repo = normalize_repo_url(&task.repo_url);
-        self.workspace_candidates
+    /// Every open (not done/archived) task on the board, for "Reports to"
+    /// pickers outside the planning view.
+    pub fn open_task_choices(&self) -> Vec<crate::task_picker::TaskChoice> {
+        self.project_data
             .iter()
-            .filter(|c| {
-                c.repo_url
-                    .as_deref()
-                    .map_or(false, |u| normalize_repo_url(u) == task_repo)
-            })
+            .flat_map(|pd| pd.tasks.iter())
+            .filter(|t| !t.id.is_empty() && !matches!(t.status, PlanStatus::Done | PlanStatus::Archived))
+            .map(|t| crate::task_picker::TaskChoice { task_id: t.id.clone(), name: t.title.clone() })
             .collect()
-    }
-
-    pub fn set_launch_hosts(&mut self, hosts: Vec<crate::hosts::HostId>, default: crate::hosts::HostId) {
-        self.launch_hosts = hosts;
-        self.default_launch_host = default;
-    }
-
-    fn cycle_launch_host(&mut self) {
-        if self.launch_hosts.is_empty() { return; }
-        let i = self.launch_hosts.iter().position(|h| h == &self.launch_host).unwrap_or(0);
-        self.launch_host = self.launch_hosts[(i + 1) % self.launch_hosts.len()].clone();
-    }
-
-    fn launch_host_line(&self) -> Line<'static> {
-        Line::from(Span::styled(format!("  Host: {}  (Alt+h change; new workspace)", self.launch_host), Style::default().fg(theme::MUTED)))
-    }
-
-    fn start_launch(&mut self) -> PlanAction {
-        self.launch_host = self.default_launch_host.clone();
-        if let Some((pi, ti)) = self.selected_task_loc() {
-            self.input_mode = PlanInputMode::WorkspacePicker {
-                project_idx: pi,
-                task_idx: ti,
-                selected: 0,
-                // Fresh default per launch — the engine choice is
-                // deliberately not sticky.
-                engine: LaunchEngine::default(),
-            };
-        }
-        PlanAction::Consumed
-    }
-
-    /// Sync the list of open workspaces for the picker. Called by App each
-    /// event cycle before the picker is drawn or handled.
-    pub fn set_workspace_candidates(&mut self, candidates: Vec<WorkspaceCandidate>) {
-        self.workspace_candidates = candidates;
     }
 
     // ── Search ──────────────────────────────────────────────
@@ -4008,8 +3916,6 @@ impl PlanningView {
             PlanInputMode::BulkArchiveConfirm { project_idx, count } => self.draw_bulk_archive_confirm(frame, area, *project_idx, *count),
             PlanInputMode::NewProject { name, repo_url, field } => self.draw_new_project_overlay(frame, area, name, repo_url, *field),
             PlanInputMode::ProjectPicker { selected } => self.draw_project_picker(frame, area, *selected),
-            PlanInputMode::WorkspacePicker { project_idx, task_idx, selected, engine } => self.draw_workspace_picker(frame, area, *project_idx, *task_idx, *selected, *engine),
-            PlanInputMode::LaunchConfirm { project_idx, task_idx, branch_text, engine } => self.draw_launch_confirm(frame, area, *project_idx, *task_idx, branch_text, *engine),
             _ => {}
         }
     }
@@ -4112,11 +4018,12 @@ impl PlanningView {
             help_lines.push(Line::from(Span::styled(self.grid_debug_line(), Style::default().fg(theme::ATTN))));
         }
         help_lines.push(Line::from(Span::styled(
-            " A-j/k nav \u{00b7} A-h/l cols \u{00b7} A-J/K reorder \u{00b7} A-H/L move \u{00b7} A-v visual \u{00b7} A-g linear \u{00b7} / search \u{00b7} n/N match",
+            " A-j/k nav \u{00b7} A-u/d half page \u{00b7} A-h/l cols \u{00b7} A-J/K reorder \u{00b7} A-H/L move \u{00b7} A-v visual \u{00b7} A-g linear \u{00b7} / search \u{00b7} n/N match",
             dim,
         )));
+        let place = if self.placement_on { "A-f place \u{00b7} A-b on boards" } else { "A-f place" };
         help_lines.push(Line::from(Span::styled(
-            " A-e edit \u{00b7} A-n new \u{00b7} A-i header \u{00b7} A-Ent sep \u{00b7} A-Spc empty \u{00b7} Spc fold \u{00b7} A-s status \u{00b7} A-d done \u{00b7} A-a accept \u{00b7} A-A archive done \u{00b7} A-V show arch \u{00b7} A-x del \u{00b7} A-f launch \u{00b7} A-U unlaunch \u{00b7} A-c col \u{00b7} A-r refresh \u{00b7} A-q quit",
+            format!(" A-e edit \u{00b7} A-n new \u{00b7} A-i header \u{00b7} A-Ent sep \u{00b7} A-Spc empty \u{00b7} Spc fold \u{00b7} A-s status \u{00b7} A-D done \u{00b7} A-a accept \u{00b7} A-A archive done \u{00b7} A-V show arch \u{00b7} A-x del \u{00b7} {place} \u{00b7} A-y unbind \u{00b7} A-c col \u{00b7} A-r refresh \u{00b7} A-q quit"),
             dim,
         )));
         frame.render_widget(Paragraph::new(help_lines), help_area);
@@ -4229,8 +4136,10 @@ impl PlanningView {
 
                     let claude_prefix = if is_claude { "[C] " } else { "" };
                     let initiative_marker = task.map(PlanTask::initiative_marker).unwrap_or("");
+                    let chip = task.and_then(|t| self.placement_chip(&t.id));
                     let prefix_len = indent.len() + 2 /*fold*/ + 2 /*ind+space*/
-                        + claude_prefix.len() + initiative_marker.chars().count();
+                        + claude_prefix.len() + initiative_marker.chars().count()
+                        + chip.as_ref().map_or(0, |(c, _)| c.chars().count());
                     let max_title = width.saturating_sub(prefix_len + count_suffix.len());
                     let title_display = truncate_with_ellipsis(&title_str, max_title);
 
@@ -4244,6 +4153,9 @@ impl PlanningView {
                         spans.push(Span::styled(claude_prefix, Style::default().fg(theme::REMOTE)));
                     }
                     spans.push(Span::raw(initiative_marker));
+                    if let Some((c, st)) = chip {
+                        spans.push(Span::styled(c, st));
+                    }
                     self.push_title_spans(&mut spans, title_display, task, search_q.as_deref());
                     if !count_suffix.is_empty() {
                         spans.push(Span::styled(count_suffix, Style::default().fg(theme::DIM)));
@@ -4327,13 +4239,13 @@ impl PlanningView {
         frame.render_widget(block, area);
         if inner.height < 4 || inner.width < 4 { return; }
 
-        let help_entries: Vec<(&str, &str)> = vec![
-            ("A-j/k  nav", "A-d    done"),
-            ("A-J/K  reorder", "A-f    launch"),
+        let mut help_entries: Vec<(&str, &str)> = vec![
+            ("A-j/k  nav", "A-D    done"),
+            ("A-J/K  reorder", "A-f    place"),
             ("A-e    edit", "A-a    accept"),
             ("A-n    new", "A-x    delete"),
             ("A-N    subtask", "A-O    reopen done"),
-            ("A-u    unbind", "A-U    unlaunch"),
+            ("A-u/d  half page", "A-y    unbind"),
             ("A-Ent  sep", "A-Spc  empty"),
             ("A-i    header", "A-A    archive done"),
             ("A-s/S  status", "A-V    show arch"),
@@ -4341,6 +4253,9 @@ impl PlanningView {
             ("A-p    filter", "/      search"),
             ("n      next match", "N      prev match"),
         ];
+        if self.placement_on {
+            help_entries.push(("A-b    on boards", ""));
+        }
         let help_rows = if self.keybinding_helper_visible { help_entries.len() as u16 } else { 0 };
         let help_height = if self.keybinding_helper_visible { help_rows + 2 } else { 0 };
         let list_height = inner.height.saturating_sub(help_height) as usize;
@@ -4529,6 +4444,15 @@ impl PlanningView {
             }
             lines.push(Line::from(meta));
 
+            if let Some(p) = self.placements.get(&task.id) {
+                let group = p["group"].as_str().map(|g| format!(" \u{00b7} {g}")).unwrap_or_default();
+                let mirror = if p["mirror"] == "off" { " \u{00b7} status mirror off" } else { "" };
+                lines.push(Line::from(vec![
+                    Span::styled("  Board: ", Style::default().fg(theme::DIM)),
+                    Span::styled(format!("{} #{} ({}){group}", p["board"].as_str().unwrap_or("?"), p["n"], p["status"].as_str().unwrap_or("?")), Style::default().fg(theme::HEADER)),
+                    Span::styled(mirror, Style::default().fg(theme::DIM)),
+                ]));
+            }
             if let Some(name) = task.initiative_name.as_deref() {
                 let status = task.initiative_status.as_deref().unwrap_or("unknown");
                 lines.push(Line::from(vec![
@@ -4564,7 +4488,7 @@ impl PlanningView {
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
                     Span::styled(" PROPOSED ", Style::default().fg(theme::TEXT).bg(theme::REMOTE).add_modifier(Modifier::BOLD)),
-                    Span::styled("  Alt+a to accept, Alt+d to reject", Style::default().fg(theme::DIM)),
+                    Span::styled("  Alt+a to accept, Alt+D to reject", Style::default().fg(theme::DIM)),
                 ]));
             }
             lines.push(Line::from(""));
@@ -4782,86 +4706,6 @@ impl PlanningView {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
-    fn draw_workspace_picker(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        project_idx: usize,
-        task_idx: usize,
-        selected: usize,
-        engine: LaunchEngine,
-    ) {
-        let task_name = self
-            .project_data
-            .get(project_idx)
-            .and_then(|pd| pd.tasks.get(task_idx))
-            .map(|t| t.title.as_str())
-            .unwrap_or("?");
-        let candidates = self.candidates_for(project_idx, task_idx);
-        // +2 for the engine row and its blank separator.
-        let rows = 5 + candidates.len() as u16 + 2 + 3;
-        let (w, h) = (60u16.min(area.width.saturating_sub(4)), rows);
-        let dialog = Rect::new(
-            (area.width - w) / 2,
-            (area.height.saturating_sub(h)) / 2,
-            w,
-            h,
-        );
-        frame.render_widget(Clear, dialog);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::TEXT))
-            .title(Span::styled(
-                " Launch Into ",
-                Style::default()
-                    .fg(theme::TEXT)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(dialog);
-        frame.render_widget(block, dialog);
-
-        let display_name: String = task_name
-            .chars()
-            .take((w as usize).saturating_sub(10))
-            .collect();
-        let mut lines: Vec<Line> = Vec::new();
-        lines.push(Line::from(vec![
-            Span::styled("  Task: ", Style::default().fg(theme::DIM)),
-            Span::styled(display_name, Style::default().fg(theme::TEXT)),
-        ]));
-        lines.push(Line::from(""));
-        let row = |label: &str, idx: usize| -> Line<'static> {
-            let is_sel = idx == selected;
-            let ind = if is_sel { ">" } else { " " };
-            let st = if is_sel {
-                Style::default()
-                    .fg(theme::TEXT)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme::MUTED)
-            };
-            Line::from(Span::styled(format!("  {} {}", ind, label), st))
-        };
-        lines.push(row("+ New workspace (create worktree)", 0));
-        for (i, c) in candidates.iter().enumerate() {
-            let label = if c.name.len() > (w as usize).saturating_sub(8) {
-                truncate_with_ellipsis(&c.name, (w as usize).saturating_sub(8))
-            } else {
-                c.name.clone()
-            };
-            lines.push(row(&label, i + 1));
-        }
-        lines.push(Line::from(""));
-        lines.push(engine_line(engine));
-        lines.push(self.launch_host_line());
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  j/k navigate \u{00b7} \u{2190}/\u{2192} engine \u{00b7} Enter select \u{00b7} Esc cancel",
-            Style::default().fg(theme::DIM),
-        )));
-        frame.render_widget(Paragraph::new(lines), inner);
-    }
-
     fn draw_bulk_archive_confirm(&self, frame: &mut Frame, area: Rect, project_idx: usize, count: usize) {
         let project_name = self.project_data.get(project_idx)
             .map(|pd| pd.project.name.as_str())
@@ -4882,48 +4726,6 @@ impl PlanningView {
             ]),
             Line::from(""),
             Line::from(Span::styled("  Enter confirm \u{00b7} Esc cancel", Style::default().fg(theme::DIM))),
-        ]), inner);
-    }
-
-    fn draw_launch_confirm(&self, frame: &mut Frame, area: Rect, project_idx: usize, task_idx: usize, branch_text: &str, engine: LaunchEngine) {
-        let task_name = self.project_data.get(project_idx)
-            .and_then(|pd| pd.tasks.get(task_idx))
-            .map(|t| t.title.as_str())
-            .unwrap_or("?");
-        // +2 rows for the engine line and its blank separator.
-        let (w, h) = (60u16.min(area.width.saturating_sub(4)), 12u16);
-        let dialog = Rect::new((area.width - w) / 2, (area.height - h) / 2, w, h);
-        frame.render_widget(Clear, dialog);
-        let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme::TEXT))
-            .title(Span::styled(" Launch Task ", Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)));
-        let inner = block.inner(dialog);
-        frame.render_widget(block, dialog);
-
-        let display_name: String = task_name.chars().take((w as usize).saturating_sub(10)).collect();
-        let branch_hint = if branch_text.trim() == "." {
-            "  in-place (main repo, no worktree)"
-        } else if branch_text.is_empty() {
-            "main"
-        } else {
-            ""
-        };
-        frame.render_widget(Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled("    Task: ", Style::default().fg(theme::DIM)),
-                Span::styled(display_name, Style::default().fg(theme::TEXT)),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("  Branch: ", Style::default().fg(theme::DIM)),
-                Span::styled(branch_text, Style::default().fg(theme::TEXT)),
-                Span::styled("\u{2588}", Style::default().fg(theme::TEXT)),
-                Span::styled(branch_hint, Style::default().fg(theme::DIM)),
-            ]),
-            Line::from(""),
-            engine_line(engine),
-            self.launch_host_line(),
-            Line::from(""),
-            Line::from(Span::styled("  \u{2190}/\u{2192} engine \u{00b7} Enter launch \u{00b7} Esc cancel", Style::default().fg(theme::DIM))),
         ]), inner);
     }
 }
@@ -5009,6 +4811,8 @@ mod tests {
             initiative_status: None,
             initiative_color: None,
             is_initiative_coordinator: false,
+            lead_pin: None,
+            initiative_kind: None,
             kind: "oneshot".to_string(),
             worker_vm: None,
             vm_project: None,
@@ -5016,6 +4820,8 @@ mod tests {
             run_key: None,
             bt_label: None,
             filer: None,
+            models: Default::default(),
+            efforts: Default::default(),
         }
     }
 
@@ -5119,6 +4925,34 @@ mod tests {
         let mut buffer = ratatui::buffer::Buffer::empty(area);
         List::new(view.build_column_items(0, "p", 0, 0, 36, height as usize)).render(area, &mut buffer);
         buffer
+    }
+
+    #[test]
+    fn planning_half_page_stops_at_ends_and_preserves_task_actions() {
+        let mut view = subsection_test_view();
+        view.grid_rows_visible.set(4);
+        view.cursor.row = 1;
+        let event = |c, mods| CrosstermEvent::Key(crossterm::event::KeyEvent::new(KeyCode::Char(c), mods));
+        view.handle_event(&event('d', KeyModifiers::ALT));
+        assert_eq!(view.cursor.row, 3);
+        view.handle_event(&event('d', KeyModifiers::ALT));
+        assert_eq!(view.cursor.row, 4);
+        view.handle_event(&event('d', KeyModifiers::ALT));
+        assert_eq!(view.cursor.row, 4, "does not wrap");
+        view.handle_event(&event('u', KeyModifiers::ALT));
+        assert_eq!(view.cursor.row, 2);
+        assert!(matches!(view.handle_event(&event('y', KeyModifiers::ALT)), PlanAction::UnbindTask { .. }));
+        assert!(!matches!(view.handle_event(&event('D', KeyModifiers::ALT)), PlanAction::UnbindTask { .. }));
+        let mut linear = subsection_test_view();
+        linear.linear_mode = true;
+        linear.grid_rows_visible.set(4);
+        linear.cursor.row = 0;
+        linear.handle_event(&event('d', KeyModifiers::ALT));
+        assert_eq!(linear.cursor.row, 2);
+        for _ in 0..4 { linear.handle_event(&event('d', KeyModifiers::ALT)); }
+        assert_eq!(linear.cursor.row, 4);
+        linear.handle_event(&event('u', KeyModifiers::ALT));
+        assert_eq!(linear.cursor.row, 2);
     }
 
     #[test]
@@ -5382,6 +5216,7 @@ mod tests {
             initiative: None,
             worktree_mode: "inherit".to_string(),
             metadata: None,
+            placement: None,
         }
     }
 
@@ -5579,6 +5414,8 @@ mod tests {
             initiative_status: None,
             initiative_color: None,
             is_initiative_coordinator: false,
+            lead_pin: None,
+            initiative_kind: None,
             kind: "oneshot".to_string(),
             worker_vm: None,
             vm_project: None,
@@ -5586,6 +5423,8 @@ mod tests {
             run_key: None,
             bt_label: None,
             filer: None,
+            models: Default::default(),
+            efforts: Default::default(),
         });
         view.project_data.push(pd);
         view.projects = view.project_data.iter().map(|pd| pd.project.clone()).collect();
@@ -5598,225 +5437,9 @@ mod tests {
         assert_eq!(parent, Some("parent-id-123".to_string()));
     }
 
-    // ── Sub-2a Finding #2: launch actions carry parent_task_id ───────
-    //
-    // Without this, a subtask launched via A-l / A-f publishes a
-    // local TaskEntry stub with `parent_task_id: None`. The first
-    // `push_task_tree_to_daemon` then sends the subtask to the
-    // daemon as top-level — daemon's auth walk can't see the
-    // parent → subtask edge until the next API reconcile, leaving
-    // a window where descendant-task auth fails for actions that
-    // SHOULD succeed.
+    // ── One-task fixture ─────────────────────────────────────
 
-    /// Pin: `LaunchTask` carries `parent_task_id` derived from the
-    /// PlanTask. Drives the LaunchConfirm input mode through Enter
-    /// and inspects the returned action.
-    #[test]
-    fn launch_task_action_carries_parent_task_id_for_subtask() {
-        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
-        let mut view = PlanningView::new();
-        let mut pd = make_project("repo", "git@example.com:org/repo.git");
-        pd.tasks.push(PlanTask {
-            id: "sub-id".to_string(),
-            slug: "subtask".to_string(),
-            title: "Subtask".to_string(),
-            status: PlanStatus::Backlog,
-            difficulty: None,
-            depends: vec![],
-            branch: None,
-            created: None,
-            description: String::new(),
-            prompt: String::new(),
-            source: "user".to_string(),
-            is_cloud: false,
-            repo_url: "git@example.com:org/repo.git".to_string(),
-            parent_task_id: Some("parent-id".to_string()),
-            initiative_id: None,
-            initiative_name: None,
-            initiative_status: None,
-            initiative_color: None,
-            is_initiative_coordinator: false,
-            kind: "oneshot".to_string(),
-            worker_vm: None,
-            vm_project: None,
-            vm_zone: None,
-            run_key: None,
-            bt_label: None,
-            filer: None,
-        });
-        view.project_data.push(pd);
-        view.projects = view
-            .project_data
-            .iter()
-            .map(|pd| pd.project.clone())
-            .collect();
-        view.input_mode = PlanInputMode::LaunchConfirm {
-            project_idx: 0,
-            task_idx: 0,
-            branch_text: String::new(),
-            engine: LaunchEngine::Claude,
-        };
-        let enter = CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let action = view.handle_event(&enter);
-        match action {
-            PlanAction::LaunchTask { parent_task_id, task_id, .. } => {
-                assert_eq!(task_id, "sub-id");
-                assert_eq!(
-                    parent_task_id,
-                    Some("parent-id".to_string()),
-                    "launch action must carry parent_task_id from PlanTask",
-                );
-            }
-            other => panic!(
-                "expected LaunchTask, got {:?}",
-                std::mem::discriminant(&other)
-            ),
-        }
-    }
-
-    /// Top-level task (no parent) → `parent_task_id: None` rides
-    /// through unchanged.
-    #[test]
-    fn launch_task_action_carries_none_for_top_level_task() {
-        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
-        let mut view = PlanningView::new();
-        let mut pd = make_project("repo", "git@example.com:org/repo.git");
-        pd.tasks.push(PlanTask {
-            id: "top-id".to_string(),
-            slug: "toplevel".to_string(),
-            title: "Top".to_string(),
-            status: PlanStatus::Backlog,
-            difficulty: None,
-            depends: vec![],
-            branch: None,
-            created: None,
-            description: String::new(),
-            prompt: String::new(),
-            source: "user".to_string(),
-            is_cloud: false,
-            repo_url: "git@example.com:org/repo.git".to_string(),
-            parent_task_id: None,
-            initiative_id: None,
-            initiative_name: None,
-            initiative_status: None,
-            initiative_color: None,
-            is_initiative_coordinator: false,
-            kind: "oneshot".to_string(),
-            worker_vm: None,
-            vm_project: None,
-            vm_zone: None,
-            run_key: None,
-            bt_label: None,
-            filer: None,
-        });
-        view.project_data.push(pd);
-        view.projects = view
-            .project_data
-            .iter()
-            .map(|pd| pd.project.clone())
-            .collect();
-        view.input_mode = PlanInputMode::LaunchConfirm {
-            project_idx: 0,
-            task_idx: 0,
-            branch_text: String::new(),
-            engine: LaunchEngine::Claude,
-        };
-        let enter = CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let action = view.handle_event(&enter);
-        match action {
-            PlanAction::LaunchTask { parent_task_id, .. } => {
-                assert_eq!(parent_task_id, None);
-            }
-            other => panic!(
-                "expected LaunchTask, got {:?}",
-                std::mem::discriminant(&other)
-            ),
-        }
-    }
-
-    /// The `.` sentinel in the LaunchConfirm branch field launches
-    /// in-place: `in_place: true`, `branch: None`. Empty branch stays
-    /// `in_place: false`.
-    #[test]
-    fn launch_confirm_dot_branch_sets_in_place() {
-        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
-        let enter = CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        let mk = || {
-            let mut view = PlanningView::new();
-            let mut pd = make_project("repo", "git@example.com:org/repo.git");
-            pd.tasks.push(PlanTask {
-                id: "top-id".to_string(),
-                slug: "toplevel".to_string(),
-                title: "Top".to_string(),
-                status: PlanStatus::Backlog,
-                difficulty: None,
-                depends: vec![],
-                branch: None,
-                created: None,
-                description: String::new(),
-                prompt: String::new(),
-                source: "user".to_string(),
-                is_cloud: false,
-                repo_url: "git@example.com:org/repo.git".to_string(),
-                parent_task_id: None,
-                initiative_id: None,
-                initiative_name: None,
-                initiative_status: None,
-                initiative_color: None,
-                is_initiative_coordinator: false,
-                kind: "oneshot".to_string(),
-                worker_vm: None,
-                vm_project: None,
-                vm_zone: None,
-                run_key: None,
-                bt_label: None,
-                filer: None,
-            });
-            view.project_data.push(pd);
-            view.projects = view
-                .project_data
-                .iter()
-                .map(|pd| pd.project.clone())
-                .collect();
-            view
-        };
-
-        // "." → in-place.
-        let mut view = mk();
-        view.input_mode = PlanInputMode::LaunchConfirm {
-            project_idx: 0,
-            task_idx: 0,
-            branch_text: ".".to_string(),
-            engine: LaunchEngine::Claude,
-        };
-        match view.handle_event(&enter) {
-            PlanAction::LaunchTask { in_place, branch, .. } => {
-                assert!(in_place, "`.` must launch in-place");
-                assert!(branch.is_none(), "in-place carries no branch");
-            }
-            other => panic!("expected LaunchTask, got {:?}", std::mem::discriminant(&other)),
-        }
-
-        // empty → normal worktree launch.
-        let mut view = mk();
-        view.input_mode = PlanInputMode::LaunchConfirm {
-            project_idx: 0,
-            task_idx: 0,
-            branch_text: String::new(),
-            engine: LaunchEngine::Claude,
-        };
-        match view.handle_event(&enter) {
-            PlanAction::LaunchTask { in_place, .. } => {
-                assert!(!in_place, "empty branch is not in-place");
-            }
-            other => panic!("expected LaunchTask, got {:?}", std::mem::discriminant(&other)),
-        }
-    }
-
-    // ── Launch engine picker (claude | codex) ────────────────
-
-    /// Build a one-task planning view for the launch-dialog tests.
+    /// Build a one-task planning view.
     #[cfg(test)]
     fn view_with_one_task() -> PlanningView {
         let mut view = PlanningView::new();
@@ -5841,6 +5464,8 @@ mod tests {
             initiative_status: None,
             initiative_color: None,
             is_initiative_coordinator: false,
+            lead_pin: None,
+            initiative_kind: None,
             kind: "oneshot".to_string(),
             worker_vm: None,
             vm_project: None,
@@ -5848,6 +5473,8 @@ mod tests {
             run_key: None,
             bt_label: None,
             filer: None,
+            models: Default::default(),
+            efforts: Default::default(),
         });
         view.project_data.push(pd);
         view.projects = view
@@ -5858,131 +5485,30 @@ mod tests {
         view
     }
 
-    /// Default is Codex, and ←/→ toggles to Claude. The chosen engine
-    /// rides out on the `LaunchTask` action so the launch site honors it.
+    /// 2026-10-20: mark done moved from A-d to A-D (A-d pages the Sessions
+    /// sidebar). Both Shift encodings reach it; plain A-d no longer does.
     #[test]
-    fn launch_confirm_engine_defaults_codex_and_arrow_toggles() {
+    fn alt_shift_d_marks_done_and_plain_alt_d_does_not() {
         use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
-        let key = |c: KeyCode| CrosstermEvent::Key(KeyEvent::new(c, KeyModifiers::NONE));
+        let key = |c: char, m: KeyModifiers| CrosstermEvent::Key(KeyEvent::new(KeyCode::Char(c), m));
+        let is_done = |a: &PlanAction| matches!(a, PlanAction::UpdateTask { fields, .. }
+            if fields.get("status") == Some(&serde_json::json!("done")));
 
-        // Untouched → codex.
-        let mut view = view_with_one_task();
-        view.input_mode = PlanInputMode::LaunchConfirm {
-            project_idx: 0,
-            task_idx: 0,
-            branch_text: String::new(),
-            engine: LaunchEngine::default(),
-        };
-        match view.handle_event(&key(KeyCode::Enter)) {
-            PlanAction::LaunchTask { engine, .. } => {
-                assert_eq!(engine, LaunchEngine::Codex, "default engine is codex");
-                assert_eq!(engine.as_session_type(), "codex");
-            }
-            other => panic!("expected LaunchTask, got {:?}", std::mem::discriminant(&other)),
-        }
-
-        // One → (or ←) → claude.
-        for toggle in [KeyCode::Right, KeyCode::Left, KeyCode::Tab] {
+        let focused = || {
             let mut view = view_with_one_task();
-            view.input_mode = PlanInputMode::LaunchConfirm {
-                project_idx: 0,
-                task_idx: 0,
-                branch_text: String::new(),
-                engine: LaunchEngine::default(),
-            };
-            view.handle_event(&key(toggle));
-            match view.handle_event(&key(KeyCode::Enter)) {
-                PlanAction::LaunchTask { engine, .. } => {
-                    assert_eq!(engine, LaunchEngine::Claude, "{:?} must select claude", toggle);
-                    assert_eq!(engine.as_session_type(), "claude");
-                }
-                other => panic!("expected LaunchTask, got {:?}", std::mem::discriminant(&other)),
-            }
-        }
-    }
+            view.project_data[0].layout.columns = vec![vec![GridItem::Task("toplevel".to_string())]];
+            view.rebuild_unified_cols();
+            view.cursor = GridCursor { col: 0, row: 0 };
+            assert!(view.selected_task_loc().is_some(), "cursor on the task");
+            view
+        };
+        let mut view = focused();
+        assert!(!is_done(&view.handle_event(&key('d', KeyModifiers::ALT))));
+        assert_eq!(view.project_data[0].tasks[0].status, PlanStatus::Backlog);
+        assert!(is_done(&view.handle_event(&key('D', KeyModifiers::ALT | KeyModifiers::SHIFT))));
 
-    /// The engine toggle must not steal characters from the branch
-    /// field — it's a free-text input, so `h`/`l`/`j`/`k` are branch
-    /// name characters, not navigation.
-    #[test]
-    fn launch_confirm_letters_still_edit_branch_text() {
-        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
-        let key = |c: char| {
-            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
-        };
-        let mut view = view_with_one_task();
-        view.input_mode = PlanInputMode::LaunchConfirm {
-            project_idx: 0,
-            task_idx: 0,
-            branch_text: String::new(),
-            engine: LaunchEngine::default(),
-        };
-        for c in "hjkl".chars() {
-            view.handle_event(&key(c));
-        }
-        let enter = CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        match view.handle_event(&enter) {
-            PlanAction::LaunchTask { branch, engine, .. } => {
-                assert_eq!(branch.as_deref(), Some("hjkl"));
-                assert_eq!(engine, LaunchEngine::Codex, "letters must not cycle engine");
-            }
-            other => panic!("expected LaunchTask, got {:?}", std::mem::discriminant(&other)),
-        }
-    }
-
-    /// The picker's engine choice survives the hop into the branch
-    /// dialog ("New workspace" route) — the operator picks once.
-    #[test]
-    fn workspace_picker_engine_rides_into_launch_confirm() {
-        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
-        let key = |c: KeyCode| CrosstermEvent::Key(KeyEvent::new(c, KeyModifiers::NONE));
-        let mut view = view_with_one_task();
-        view.input_mode = PlanInputMode::WorkspacePicker {
-            project_idx: 0,
-            task_idx: 0,
-            selected: 0,
-            engine: LaunchEngine::default(),
-        };
-        view.handle_event(&key(KeyCode::Right));
-        view.handle_event(&key(KeyCode::Enter));
-        match view.input_mode {
-            PlanInputMode::LaunchConfirm { engine, .. } => {
-                assert_eq!(engine, LaunchEngine::Claude, "engine carries into LaunchConfirm");
-            }
-            _ => panic!("expected LaunchConfirm after selecting 'New workspace'"),
-        }
-    }
-
-    /// The existing-workspace route honors the picker's engine too, so
-    /// both launch paths can start a claude worker.
-    #[test]
-    fn workspace_picker_engine_rides_into_existing_workspace_launch() {
-        use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
-        let key = |c: KeyCode| CrosstermEvent::Key(KeyEvent::new(c, KeyModifiers::NONE));
-        let mut view = view_with_one_task();
-        view.set_workspace_candidates(vec![WorkspaceCandidate {
-            workspace_id: "ws-1".to_string(),
-            name: "repo-toplevel".to_string(),
-            repo_url: Some("https://example.com/org/repo.git".to_string()),
-        }]);
-        view.input_mode = PlanInputMode::WorkspacePicker {
-            project_idx: 0,
-            task_idx: 0,
-            // 0 is "New workspace"; 1 is the candidate above.
-            selected: 1,
-            engine: LaunchEngine::default(),
-        };
-        view.handle_event(&key(KeyCode::Right));
-        match view.handle_event(&key(KeyCode::Enter)) {
-            PlanAction::LaunchTaskIntoWorkspace { engine, workspace_id, .. } => {
-                assert_eq!(workspace_id, "ws-1");
-                assert_eq!(engine, LaunchEngine::Claude);
-            }
-            other => panic!(
-                "expected LaunchTaskIntoWorkspace, got {:?}",
-                std::mem::discriminant(&other)
-            ),
-        }
+        let mut view = focused();
+        assert!(is_done(&view.handle_event(&key('D', KeyModifiers::ALT))), "Shift folded into the char");
     }
 
     // ── Frontmatter round-trip tests ─────────────────────────
@@ -6014,6 +5540,8 @@ mod tests {
             initiative_status: None,
             initiative_color: None,
             is_initiative_coordinator: false,
+            lead_pin: None,
+            initiative_kind: None,
             kind: "oneshot".to_string(),
             worker_vm: None,
             vm_project: None,
@@ -6021,6 +5549,8 @@ mod tests {
             run_key: None,
             bt_label: None,
             filer: None,
+            models: Default::default(),
+            efforts: Default::default(),
         }
     }
 
@@ -6029,6 +5559,39 @@ mod tests {
         let parsed = parse_temp_task(&path).expect("parse_temp_task");
         let _ = std::fs::remove_file(&path);
         parsed
+    }
+
+    /// org-model §13.2: the editor edits one brief. A legacy prompt the
+    /// description lacks is shown under `## Instructions` and saved into the
+    /// description; the PATCH never carries a prompt.
+    #[test]
+    fn editor_folds_a_legacy_prompt_into_the_description() {
+        let mut task = make_plan_task("brief-rt-legacy");
+        task.description = "Why.".to_string();
+        task.prompt = "Never push to main.".to_string();
+        let parsed = round_trip(&task);
+        assert_eq!(parsed.description, "Why.\n\n## Instructions\n\nNever push to main.");
+        let fields = build_patch_fields(&parsed);
+        assert!(!fields.contains_key("prompt"));
+        assert_eq!(fields["description"], serde_json::json!(parsed.description));
+
+        // Already folded (or equal to the title): shown once.
+        task.description = parsed.description.clone();
+        assert_eq!(round_trip(&task).description, parsed.description);
+        task.description = "Why.".to_string();
+        task.prompt = task.title.clone();
+        assert_eq!(round_trip(&task).description, "Why.");
+    }
+
+    #[test]
+    fn editor_keeps_an_old_prompt_section_as_instructions() {
+        let dir = std::env::temp_dir().join("cm-planning");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("brief-old-template.md");
+        std::fs::write(&path, "---\ntitle: t\nstatus: backlog\n---\n\nWhy.\n\n## Prompt\nStep 1.\n").unwrap();
+        let parsed = parse_temp_task(&path).expect("parse");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(parsed.description, "Why.\n\n## Instructions\nStep 1.");
     }
 
     #[test]
@@ -6435,6 +5998,18 @@ mod tests {
         // with nothing to do.
         let out = compose_launch_prompt("", "", "Untitled task");
         assert_eq!(out, "Untitled task");
+    }
+
+    #[test]
+    fn compose_skips_a_prompt_the_description_already_has() {
+        // org-model §13.2: the S1 backfill appends the prompt under
+        // `## Instructions`; an old row read after it must not deliver the
+        // instructions twice, and a prompt that is only the title adds
+        // nothing.
+        let backfilled = "Why.\n\n## Instructions\n\nDo it.";
+        assert_eq!(compose_launch_prompt(backfilled, "Do it.", "T"), backfilled);
+        assert_eq!(compose_launch_prompt("Why.", "T", "T"), "Why.");
+        assert_eq!(task_brief("", " T ", "T"), "");
     }
 
     #[test]

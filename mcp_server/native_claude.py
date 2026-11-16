@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import time
+import uuid
 from pathlib import Path
 
 from mcp_server import control_client
@@ -19,6 +20,118 @@ from mcp_server.notifications import (
 # removal afterwards) in this consumer's own transcript mark it stale.
 ENQUEUE_ONLY_STALE = 3
 TAIL_BYTES = 2 * 1024 * 1024
+# Every record `stale_evidence` reads has one of these types; other lines of
+# the tail are skipped unparsed.
+STALE_EVIDENCE_NEEDLES = (b"continued-in", b"queue-operation")
+BG_PROBE_INTERVAL = 30.0
+
+
+def recovery_record_state(path, session_id, record_id):
+    """Confirm the exact failed main turn, or fail closed on an unclear tail."""
+    try:
+        if str(uuid.UUID(session_id)) != session_id or str(uuid.UUID(record_id)) != record_id:
+            return "unknown"
+        path = Path(path)
+        if path.stem != session_id:
+            return "superseded"
+        with path.open("rb") as stream:
+            size = os.fstat(stream.fileno()).st_size
+            start = max(0, size - TAIL_BYTES)
+            stream.seek(start)
+            data = stream.read(TAIL_BYTES + 1)
+        if len(data) > TAIL_BYTES or not data.endswith(b"\n"):
+            return "unknown"
+        if start:
+            _, sep, data = data.partition(b"\n")
+            if not sep:
+                return "unknown"
+        queue_activity = False
+        for line in reversed(data.splitlines()):
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                return "unknown"
+            if row.get("isSidechain") is True:
+                continue
+            kind = row.get("type")
+            if kind == "user":
+                return "superseded"
+            if kind == "assistant":
+                if row.get("sessionId") != session_id:
+                    return "unknown"
+                if (row.get("uuid") != record_id or row.get("error") != "rate_limit"
+                        or row.get("isApiErrorMessage") is not True
+                        or (row.get("message") or {}).get("model") != "<synthetic>"):
+                    return "superseded"
+                return "superseded" if queue_activity else "ready"
+            if kind in {"queue-operation", "attachment"}:
+                queue_activity = True
+            elif kind not in {"system", "progress", "file-history-snapshot", "last-prompt", "summary"}:
+                return "unknown"
+        return "unknown" if start else "superseded"
+    except (OSError, ValueError, TypeError, AttributeError):
+        return "unknown"
+
+
+def background_match(rows, session_id, cwd):
+    """Only an exact native ID and workspace from Claude's own roster count.
+
+    A short ID, missing cwd, malformed roster or multiple matches is not
+    enough evidence to label the session as externally backgrounded.
+    """
+    try:
+        sid = str(uuid.UUID(session_id))
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if session_id != sid:
+        return None
+    if not isinstance(rows, list) or not cwd:
+        return None
+    found = [r for r in rows if isinstance(r, dict) and r.get("kind") == "background"
+             and r.get("sessionId") == sid]
+    if (len(found) != 1 or not isinstance(found[0].get("cwd"), str)
+            or os.path.realpath(found[0]["cwd"]) != os.path.realpath(cwd)):
+        return None
+    return found[0]
+
+
+async def background_roster():
+    """Bounded read-only supported Claude CLI query; failure means unknown."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "claude", "agents", "--json", stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+    async def collect():
+        chunks = []
+        size = 0
+        while True:
+            chunk = await proc.stdout.read(min(65536, 1024 * 1024 + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > 1024 * 1024:
+                return None
+        await proc.wait()
+        return b"".join(chunks)
+
+    try:
+        out = await asyncio.wait_for(collect(), 3)
+    finally:
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+    if out is None or proc.returncode != 0:
+        return None
+    try:
+        return json.loads(out)
+    except (ValueError, UnicodeError):
+        return None
 
 
 def _argv(pid: int) -> list[str] | None:
@@ -36,6 +149,13 @@ def _ppid(pid: int) -> int | None:
         return None
 
 
+def _start(pid: int) -> str | None:
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
 def _is_claude(argv: list[str]) -> bool:
     head = os.path.basename(argv[0])
     return head == "claude" or head.startswith("claude-") or (
@@ -43,11 +163,12 @@ def _is_claude(argv: list[str]) -> bool:
 
 
 def claude_parent_argv(pid: int | None = None) -> list[str] | None:
-    """The owning Claude process: the MCP server's parent, or its grandparent
-    when CM's launcher shell sits in between. Nothing further up: a test or a
-    nested run must never inspect an unrelated ancestor Claude."""
+    """The owning Claude process: the MCP server's parent, or a nearer
+    ancestor when only CM's launcher shell and/or CM's stdio proxy
+    (mcp_proxy.py) sit in between. Nothing further up: a test or a nested
+    run must never inspect an unrelated ancestor Claude."""
     current = os.getpid() if pid is None else pid
-    for _ in range(2):
+    for _ in range(3):
         current = _ppid(current)
         if not current or current <= 1:
             return None
@@ -56,10 +177,31 @@ def claude_parent_argv(pid: int | None = None) -> list[str] | None:
             return None
         if _is_claude(argv):
             return argv
-        if not (os.path.basename(argv[0]) in {"sh", "bash", "dash"}
-                and any(a.endswith("launcher.sh") for a in argv)):
+        if not _is_cm_intermediary(argv):
             return None
     return None
+
+
+def _is_cm_intermediary(argv: list[str]) -> bool:
+    head = os.path.basename(argv[0])
+    if head in {"sh", "bash", "dash"}:
+        return any(a.endswith("launcher.sh") for a in argv)
+    return head.startswith("python") and len(argv) > 1 and argv[1].endswith("mcp_proxy.py")
+
+
+def is_bg_pty_host(argv: list[str] | None) -> bool:
+    """A Claude bg-pty-host argv: `claude bg-pty-host ...`, or Claude
+    2.1.3xx's retitled form whose argv[0] is the one string
+    "claude bg-pty-host" followed by `--bg-pty-host`. Missing the retitled
+    form marked a session's own host as external_background and stalled
+    its notifications (2026-11-13)."""
+    if not argv:
+        return False
+    if "bg-pty-host" in argv:
+        return True
+    words = argv[0].split()
+    return (len(words) == 2 and words[1] == "bg-pty-host"
+            and os.path.basename(words[0]).startswith("claude"))
 
 
 def argv_session_id(argv: list[str] | None) -> str | None:
@@ -92,7 +234,10 @@ def channel_flag_present(argv: list[str]) -> bool:
     return False
 
 
-def transcript_tail(path: str | None):
+def transcript_tail(path: str | None, needles: tuple[bytes, ...] | None = None):
+    """Parsed records of the transcript's last TAIL_BYTES. With `needles`,
+    only lines containing one of them are parsed: a 2 MiB tail of large
+    assistant turns costs 20-40 ms to parse in full, every 5 s per session."""
     if not path:
         return
     try:
@@ -100,15 +245,18 @@ def transcript_tail(path: str | None):
             stream.seek(0, 2)
             start = max(0, stream.tell() - TAIL_BYTES)
             stream.seek(start)
-            if start:
-                stream.readline()
-            for line in stream:
-                try:
-                    yield json.loads(line)
-                except (ValueError, UnicodeError):
-                    continue
+            data = stream.read()
     except OSError:
         return
+    if start:
+        data = data.partition(b"\n")[2]
+    for line in data.split(b"\n"):
+        if needles is not None and not any(n in line for n in needles):
+            continue
+        try:
+            yield json.loads(line)
+        except (ValueError, UnicodeError):
+            continue
 
 
 class ClaudeAdapter:
@@ -127,10 +275,15 @@ class ClaudeAdapter:
         except (OSError, IndexError):
             self.peer_start = None
         self.transcript_path = None
+        self.resolved_session = None
         self.resolve_after = 0.0
         self.initial_bound = None
         self._own_session_id = None
         self._own_transcript_cache = None
+        self._bg_probe_after = 0.0
+        self._bg_result = None
+        self._bg_identity = None
+        self._evidence_cache = None
 
     def identity(self):
         # No socket credentials in persistent diagnostics.
@@ -153,8 +306,10 @@ class ClaudeAdapter:
                     timeout=2,
                 )
                 self.transcript_path = resolved.get("transcript_path")
+                self.resolved_session = resolved
             except (control_client.ControlError, control_client.TransportError):
                 self.transcript_path = None
+                self.resolved_session = None
             if self.initial_bound is None and self.transcript_path:
                 self.initial_bound = self.transcript_path
             self.resolve_after = time.monotonic() + 1
@@ -166,8 +321,10 @@ class ClaudeAdapter:
         A Claude bg/fork hand-off starts a new client with a new id while the
         old client (and its MCP child) can keep running."""
         if self._own_session_id is None:
-            self._own_session_id = (os.environ.get("CLAUDE_CODE_SESSION_ID")
-                                    or argv_session_id(claude_parent_argv()) or "")
+            # The client parent is evidence about this particular channel;
+            # an inherited environment can name a later background fork.
+            self._own_session_id = (argv_session_id(claude_parent_argv())
+                                    or os.environ.get("CLAUDE_CODE_SESSION_ID") or "")
         return self._own_session_id or None
 
     def own_transcript(self):
@@ -207,10 +364,29 @@ class ClaudeAdapter:
         # A live client with channels disabled still claims: holding the
         # queue it keeps notices pending and reports channels_disabled,
         # instead of a stale client submitting them into a void.
-        if self.live() is True:
-            return {"session_id": self.own_session_id(),
-                    "transcript_path": self.transcript_path}
+        # An inherited environment variable is useful diagnostics, but does
+        # not prove which client owns this MCP child after a native fork.
+        # Only the owning Claude process's explicit argv can authorize a
+        # channel takeover.
+        parent_id = argv_session_id(claude_parent_argv())
+        if parent_id and self.peer_start and self.live() is True and parent_id == self.own_session_id():
+            return {"session_id": parent_id,
+                    "transcript_path": self.transcript_path,
+                    "peer_start": self.peer_start}
         return None
+
+    def valid_takeover_request(self, claim):
+        """Recheck the waiting process, its parent and the current binding."""
+        pid = claim.get("pid")
+        if not isinstance(pid, int) or pid <= 0 or not self.transcript_path:
+            return False
+        sid = Path(self.transcript_path).stem
+        return (claim.get("session_id") == sid
+                and claim.get("transcript_path") == self.transcript_path
+                and claim.get("peer_start") is not None
+                and _start(pid) == claim["peer_start"]
+                and argv_session_id(claude_parent_argv(pid)) == sid
+                and _start(pid) == claim["peer_start"])
 
     @staticmethod
     def stale_evidence(own, markers):
@@ -219,7 +395,7 @@ class ClaudeAdapter:
         our recent submissions were only enqueued, never processed."""
         continued = False
         enqueued = []
-        for item in transcript_tail(own):
+        for item in transcript_tail(own, STALE_EVIDENCE_NEEDLES):
             kind = item.get("type")
             if kind == "continued-in":
                 continued = True
@@ -236,17 +412,40 @@ class ClaudeAdapter:
             out.append("enqueued_unobserved")
         return out
 
+    def own_evidence(self, own, markers):
+        """`stale_evidence`, reused while the transcript file and the markers
+        are unchanged: an idle session's diagnostics heartbeat otherwise
+        re-reads the same 2 MiB tail every 5 s."""
+        try:
+            st = os.stat(own)
+            key = (own, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, list(markers))
+        except OSError:
+            key = None
+        cached = self._evidence_cache
+        if key is not None and cached is not None and cached[0] == key:
+            return list(cached[1])
+        evidence = self.stale_evidence(own, markers)
+        self._evidence_cache = None if key is None else (key, list(evidence))
+        return evidence
+
     async def diagnostics(self, events):
         await self._resolve()
         live = self.live()
         stale = []
         if live is False:
             stale.append("transcript_mismatch")
-        if live is not True:
-            own = self.own_transcript()
-            if own:
-                markers = delivery_health(events)["unobserved_markers"]
-                stale.extend(await asyncio.to_thread(self.stale_evidence, own, markers))
+        own = self.own_transcript()
+        if own:
+            markers = delivery_health(events)["unobserved_markers"]
+            evidence = await asyncio.to_thread(self.own_evidence, own, markers)
+            # `continued-in` alone can be an in-pane resume. Queue-only
+            # submissions are stronger evidence even when inherited identity
+            # misleadingly equals the daemon's binding.
+            if live is True and "continued_in" not in evidence:
+                # A busy client can legitimately enqueue notices for a long
+                # turn. Enqueues alone do not prove its channel is stale.
+                evidence = [x for x in evidence if x != "enqueued_unobserved"]
+            stale.extend(x for x in evidence if x != "continued_in" or live is not True)
         out = {
             "own_session_id": self.own_session_id(),
             "bound_session_id": (Path(self.transcript_path).stem
@@ -255,6 +454,32 @@ class ClaudeAdapter:
             "stale": stale,
         }
         blocked = self.channels_blocked()
+        # A native /bg can keep a live conversation outside the CM holder
+        # while this child's MCP connection is still attached to the old UI.
+        # Query only when delivery has stalled; an unavailable roster is not
+        # evidence. An actual background-host parent with the matching ID owns
+        # its own channel, so don't block it merely for being backgrounded.
+        if delivery_health(events)["stalled"] and self.transcript_path:
+            identity = (Path(self.transcript_path).stem, os.getcwd())
+            if identity != self._bg_identity:
+                self._bg_identity = identity
+                self._bg_result = None
+                self._bg_probe_after = 0.0
+            if time.monotonic() >= self._bg_probe_after:
+                self._bg_probe_after = time.monotonic() + BG_PROBE_INTERVAL
+                try:
+                    rows = await background_roster()
+                except TimeoutError:
+                    rows = None
+                self._bg_result = background_match(rows, *identity)
+            if self._bg_result:
+                sid = Path(self.transcript_path).stem
+                argv = claude_parent_argv() or []
+                owns_bg = is_bg_pty_host(argv) and argv_session_id(argv) == sid
+                out["background_session_id"] = sid
+                out["background_state"] = self._bg_result.get("state")
+                if not owns_bg:
+                    blocked = "external_background"
         if blocked:
             out["blocked"] = blocked
         return out
@@ -268,6 +493,34 @@ class ClaudeAdapter:
             event["marker"],
             event.get("binding"),
         )
+
+    async def recovery_check(self, event):
+        parts = event.get("id", "").split(":")
+        if len(parts) != 3 or parts[0] != "claude-limit":
+            return "unknown"
+        # A cached binding is not sufficient at the effect boundary.
+        self.resolve_after = 0.0
+        await self._resolve()
+        resolved = self.resolved_session
+        scope = event.get("recovery_scope")
+        if not isinstance(resolved, dict) or not isinstance(scope, dict):
+            return "unknown"
+        if (not isinstance(scope.get("manager"), str) or not scope["manager"]
+                or not isinstance(scope.get("generation"), int)):
+            return "unknown"
+        if (resolved.get("claude_recovery_eligible") is not True
+                or resolved.get("managed_by_uid") != scope["manager"]
+                or resolved.get("generation") != scope["generation"]
+                or resolved.get("workflow_run_id") is not None
+                or resolved.get("continuous_task_id") is not None):
+            return "superseded"
+        if self.live() is False:
+            return "superseded"
+        if self.live() is not True or not self.transcript_path:
+            return "unknown"
+        if Path(self.transcript_path).stem != parts[1]:
+            return "superseded"
+        return await asyncio.to_thread(recovery_record_state, self.transcript_path, parts[1], parts[2])
 
 
 class ClaudeSocket(ClaudeAdapter):

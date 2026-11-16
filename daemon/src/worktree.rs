@@ -392,6 +392,49 @@ pub fn resolve_base_commit(main_repo: &Path, base: &str) -> anyhow::Result<Strin
     anyhow::bail!("base '{}' does not resolve to a commit", base)
 }
 
+/// `git merge-base --is-ancestor <a> <b>` inside `repo`.
+fn is_ancestor(repo: &Path, a: &str, b: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", a, b])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// The newest trunk commit known locally: for `main` then `master`, the
+/// local branch or its `origin/` mirror, whichever contains the other
+/// (the remote when they have diverged is NOT assumed; local wins).
+/// No fetch: this runs on the spawn path.
+fn freshest_trunk(main_repo: &Path) -> Option<String> {
+    for cand in PROJECT_MAIN_CANDIDATES {
+        let local = rev_parse_commit(main_repo, cand);
+        let remote = rev_parse_commit(main_repo, &format!("origin/{}", cand));
+        match (local, remote) {
+            (Some(l), Some(r)) => {
+                return Some(if l != r && is_ancestor(main_repo, &l, &r) { r } else { l });
+            }
+            (Some(l), None) => return Some(l),
+            (None, Some(r)) => return Some(r),
+            (None, None) => {}
+        }
+    }
+    None
+}
+
+/// `Some(trunk_sha)` when the parent branch `b` (local ref, else
+/// `origin/<b>`) is a STRICT ancestor of the freshest trunk, i.e. it has
+/// no commits of its own and is merely behind. `None` when the parent has
+/// its own work, equals trunk, or anything fails to resolve: those keep
+/// the normal cut from the parent branch.
+fn fossil_parent_trunk(main_repo: &Path, b: &str) -> Option<String> {
+    let parent = rev_parse_commit(main_repo, b)
+        .or_else(|| rev_parse_commit(main_repo, &format!("origin/{}", b)))?;
+    let trunk = freshest_trunk(main_repo)?;
+    (parent != trunk && is_ancestor(main_repo, &parent, &trunk)).then_some(trunk)
+}
+
 /// Trunk refs `resolve_project_main` tries, in order. Local first
 /// (matching `resolve_base_commit`'s local-first rule: the operator's own
 /// commits are usually the point), then the remote-tracking mirror.
@@ -525,6 +568,54 @@ pub fn mint_task_worktree(
     task_name: &str,
     wip_branch_hint: Option<&str>,
 ) -> anyhow::Result<MintedTaskWorktree> {
+    mint_task_worktree_at(main_repo, task_id, task_name, wip_branch_hint, None)
+}
+
+/// [`mint_task_worktree`] with an explicit cut point for the FRESH-cut arm
+/// (a fork into a never-run task cuts at the source's HEAD). The
+/// re-attach arms are unchanged: a task that already has a branch keeps it.
+pub fn mint_task_worktree_at(
+    main_repo: &Path,
+    task_id: &str,
+    task_name: &str,
+    wip_branch_hint: Option<&str>,
+    base: Option<&str>,
+) -> anyhow::Result<MintedTaskWorktree> {
+    mint_task_worktree_at_impl(main_repo, task_id, task_name, wip_branch_hint, base, false)
+}
+
+/// Operator launch requires the resulting checkout to belong to its explicit
+/// local repository, including a reused deterministic path. Verify before setup
+/// can run scripts in that path. Legacy MCP mint semantics are unchanged.
+pub fn mint_task_worktree_at_verified(
+    main_repo: &Path,
+    task_id: &str,
+    task_name: &str,
+    wip_branch_hint: Option<&str>,
+    base: Option<&str>,
+) -> anyhow::Result<MintedTaskWorktree> {
+    let minted = mint_task_worktree_at_impl(main_repo, task_id, task_name, wip_branch_hint, base, true)?;
+    verify_task_worktree_repo(main_repo, &minted.worktree_path)?;
+    Ok(minted)
+}
+
+pub(crate) fn verify_task_worktree_repo(main_repo: &Path, path: &Path) -> anyhow::Result<()> {
+    let expected = std::fs::canonicalize(main_repo)?;
+    let actual = main_checkout_of(path).and_then(|p| std::fs::canonicalize(p).ok());
+    if actual.as_ref() != Some(&expected) || !is_git_worktree_root(path) {
+        anyhow::bail!("task worktree {} does not belong to repo_path {} or is not a valid git checkout", path.display(), main_repo.display());
+    }
+    Ok(())
+}
+
+fn mint_task_worktree_at_impl(
+    main_repo: &Path,
+    task_id: &str,
+    task_name: &str,
+    wip_branch_hint: Option<&str>,
+    base: Option<&str>,
+    verify_repo: bool,
+) -> anyhow::Result<MintedTaskWorktree> {
     let branch = task_worktree_branch(task_id, task_name);
 
     // (1) The task already has a branch on record → re-attach it.
@@ -543,9 +634,15 @@ pub fn mint_task_worktree(
         return reattach_task_branch(main_repo, &branch, &path, hint);
     }
 
-    // (3) Fresh cut from trunk.
-    let (base_ref, trunk_sha) = resolve_project_main(main_repo)?;
+    // (3) Fresh cut from trunk (or the explicit base).
+    let (base_ref, trunk_sha) = match base {
+        Some(b) => (b.to_string(), resolve_base_commit(main_repo, b)?),
+        None => resolve_project_main(main_repo)?,
+    };
     let worktree_path = create_subtask_worktree(main_repo, &branch, SubtaskStart::Base(&trunk_sha))?;
+    if verify_repo {
+        verify_task_worktree_repo(main_repo, &worktree_path)?;
+    }
     setup_worktree(main_repo, &worktree_path);
     let base_sha = worktree_head_sha(&worktree_path).unwrap_or(trunk_sha);
     Ok(MintedTaskWorktree {
@@ -650,7 +747,34 @@ pub fn create_subtask_worktree(
     // pinned to exactly one commit (no `origin/<base>` second-guessing
     // of what the caller literally asked for).
     let start_branch = match start {
-        SubtaskStart::ParentBranch(b) => b,
+        SubtaskStart::ParentBranch(b) => {
+            // A parent branch with no work of its own (an ancestor of
+            // trunk) carries nothing trunk lacks, so cutting from it only
+            // makes the child stale: a task's `wip_branch` minted weeks ago
+            // and never committed to put workers 52k commits behind main
+            // (2026-11-13). Cut from the freshest trunk instead.
+            if let Some(trunk_sha) = fossil_parent_trunk(main_repo, b) {
+                let out = Command::new("git")
+                    .arg("-C")
+                    .arg(main_repo)
+                    .args(["worktree", "add"])
+                    .arg(&worktree_path)
+                    .args(["-b", branch_name, &trunk_sha])
+                    .output()?;
+                if out.status.success() {
+                    return Ok(worktree_path);
+                }
+                anyhow::bail!(
+                    "git worktree add failed for subtask branch {} at trunk {} (parent {} \
+                     has no commits beyond trunk): {}",
+                    branch_name,
+                    trunk_sha,
+                    b,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            b
+        }
         SubtaskStart::Base(b) => {
             let sha = resolve_base_commit(main_repo, b)?;
             let out = Command::new("git")
@@ -1469,6 +1593,167 @@ pub fn find_local_repo(repo_url: &str) -> Option<PathBuf> {
     None
 }
 
+/// A repo URL reduced to what names the repo: `host/owner/name`,
+/// lower-cased, without scheme, user, port or `.git`, so the ssh, scp and
+/// https forms of one GitHub repo compare equal. An ssh host alias
+/// (`Host gh` in ~/.ssh/config) is resolved to its real host name via
+/// `ssh -G`. A bare shortname stays just the name.
+pub fn repo_identity(repo_url: &str) -> String {
+    let u = repo_url.trim().trim_end_matches('/');
+    let u = u.strip_suffix(".git").unwrap_or(u).trim_end_matches('/');
+    let (scheme, rest) = match u.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme.to_ascii_lowercase()), rest),
+        None => (None, u),
+    };
+    let (host, path) = match scheme {
+        // `scheme://[user@]host[:port]/path`
+        Some(_) => {
+            let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+            let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            let host = host.split_once(':').map_or(host, |(h, _)| h);
+            (host.to_string(), path.to_string())
+        }
+        None => match rest.split_once(':') {
+            // scp form `[user@]host:path`; a ':' after a '/' is a path.
+            Some((authority, path)) if !authority.contains('/') => {
+                let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+                (host.to_string(), path.trim_start_matches('/').to_string())
+            }
+            _ => return rest.to_ascii_lowercase(),
+        },
+    };
+    let ssh_like = matches!(scheme.as_deref(), None | Some("ssh") | Some("git+ssh"));
+    let host = if ssh_like { ssh_host_name(&host) } else { host };
+    format!("{}/{}", host, path.trim_end_matches('/')).to_ascii_lowercase()
+}
+
+/// The real host name behind an ssh alias (`ssh -G <alias>`'s `hostname`
+/// line), cached per process; the alias itself when ssh can't tell.
+fn ssh_host_name(alias: &str) -> String {
+    static CACHE: Mutex<Option<std::collections::HashMap<String, String>>> = Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = cache.get_or_insert_with(Default::default);
+    if let Some(h) = map.get(alias) {
+        return h.clone();
+    }
+    let resolved = Command::new("ssh")
+        .args(["-G", "--", alias])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .find_map(|l| l.strip_prefix("hostname ").map(|h| h.trim().to_string()))
+        })
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| alias.to_string());
+    map.insert(alias.to_string(), resolved.clone());
+    resolved
+}
+
+/// Whether two repo URLs name the same repo. A bare shortname on either
+/// side (`predictionTrading`) compares by repo name alone.
+pub fn same_repo(a: &str, b: &str) -> bool {
+    let (ia, ib) = (repo_identity(a), repo_identity(b));
+    if !ia.contains('/') || !ib.contains('/') {
+        return repo_name(&ia) == repo_name(&ib);
+    }
+    ia == ib
+}
+
+/// `git remote get-url origin` of a checkout.
+pub fn origin_url(repo: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !url.is_empty()).then_some(url)
+}
+
+/// Whether the checkout at `repo` is a clone of `repo_url`: its origin
+/// names the same repo. A checkout with no origin matches by its
+/// directory name.
+pub fn checkout_is_repo(repo: &Path, repo_url: &str) -> bool {
+    match origin_url(repo) {
+        Some(origin) => same_repo(&origin, repo_url),
+        None => repo
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == repo_name(repo_url)),
+    }
+}
+
+/// The main checkout a linked worktree belongs to, read from its `.git`
+/// file (`gitdir: <main>/.git/worktrees/<name>`) without running git. A
+/// main checkout (a `.git` directory) is its own.
+pub fn main_checkout_of(path: &Path) -> Option<PathBuf> {
+    let dotgit = path.join(".git");
+    if dotgit.is_dir() {
+        return Some(path.to_path_buf());
+    }
+    let text = std::fs::read_to_string(&dotgit).ok()?;
+    let gitdir = PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
+    let gitdir = if gitdir.is_absolute() { gitdir } else { path.join(gitdir) };
+    // <main>/.git/worktrees/<name>
+    let common = gitdir.parent()?.parent()?;
+    (common.file_name()? == ".git").then(|| common.parent().map(Path::to_path_buf))?
+}
+
+/// Find a local clone of `repo_url` to cut a task's worktree from, never
+/// trusting a recorded path without checking its origin:
+///   1. `candidates`, in order (the caller's main checkout, then the main
+///      checkouts of the host's other workspaces);
+///   2. [`resolve_repo`]: `~/code/projects/<name>`, `repos_dir/<name>`
+///      (`~/.cm/repos`), or a permitted clone.
+/// Each must actually be a clone of `repo_url` ([`checkout_is_repo`]).
+/// `Err` is a message naming what was tried; there is no fallback to some
+/// other repo.
+pub fn locate_repo_clone(
+    repo_url: &str,
+    candidates: &[PathBuf],
+    repos_dir: &Path,
+    allow_clone: bool,
+    allowlist: &[RepoAllow],
+) -> Result<PathBuf, String> {
+    let mut seen: Vec<&Path> = Vec::new();
+    for c in candidates {
+        if seen.contains(&c.as_path()) || !c.is_dir() {
+            continue;
+        }
+        seen.push(c);
+        if checkout_is_repo(c, repo_url) {
+            return Ok(c.clone());
+        }
+    }
+    match resolve_repo(repo_url, repos_dir, allow_clone, allowlist) {
+        Ok(p) if checkout_is_repo(&p, repo_url) => Ok(p),
+        Ok(p) => Err(format!(
+            "no local clone of {} on this host: {} has origin {}, a different repo",
+            repo_url,
+            p.display(),
+            origin_url(&p).unwrap_or_else(|| "(none)".into()),
+        )),
+        Err(RepoResolveError::NotPermitted(name)) => Err(format!(
+            "no local clone of {} on this host (checked {} workspace checkouts, \
+             ~/code/projects/{}, {}/{}; cloning it is not permitted)",
+            repo_url,
+            seen.len(),
+            name,
+            repos_dir.display(),
+            name,
+        )),
+        Err(RepoResolveError::CloneFailed { repo, detail }) => {
+            Err(format!("clone of repo '{}' failed: {}", repo, detail))
+        }
+    }
+}
+
 /// An allowlist entry the daemon may clone (borrowed view of
 /// `config::RepoAllowEntry`, so this module stays free of a config
 /// dependency).
@@ -2190,6 +2475,48 @@ mod tests {
         });
     }
 
+    /// A parent branch with no commits of its own that has fallen behind
+    /// trunk (a task `wip_branch` minted weeks ago and never used) must
+    /// not make the subtask stale: the cut moves to trunk. 2026-11-13: an
+    /// RM-ES2 worker was cut 52,076 commits behind origin/main this way.
+    #[test]
+    fn create_subtask_worktree_fossil_parent_branch_cuts_from_trunk() {
+        with_home(|_home| {
+            let (_tmp, repo, first, second) = repo_with_history();
+            git(&repo, &["branch", "fossil", &first]);
+
+            let wt = create_subtask_worktree(
+                &repo,
+                "cm-sub/fossil-child-abc1234",
+                SubtaskStart::ParentBranch("fossil"),
+            )
+            .expect("cut");
+            assert_eq!(worktree_head_sha(&wt).as_deref(), Some(second.as_str()));
+            assert!(wt.join("two.txt").exists());
+        });
+    }
+
+    /// A parent branch WITH its own work keeps the normal cut, even when
+    /// it is behind trunk: that work is the point of a branch subtask.
+    #[test]
+    fn create_subtask_worktree_parent_with_own_work_keeps_parent_cut() {
+        with_home(|_home| {
+            let (_tmp, repo, first, _second) = repo_with_history();
+            git(&repo, &["checkout", "-q", "-b", "work", &first]);
+            let own = commit_file(&repo, "own.txt", "mine");
+            git(&repo, &["checkout", "-q", "main"]);
+
+            let wt = create_subtask_worktree(
+                &repo,
+                "cm-sub/work-child-abc1234",
+                SubtaskStart::ParentBranch("work"),
+            )
+            .expect("cut");
+            assert_eq!(worktree_head_sha(&wt).as_deref(), Some(own.as_str()));
+            assert!(!wt.join("two.txt").exists());
+        });
+    }
+
     /// An unresolvable base fails BEFORE any worktree is produced, so the
     /// caller's rollback path (delete the API row) isn't racing a
     /// half-built checkout.
@@ -2243,6 +2570,56 @@ mod tests {
     /// policy (the ux note's incident was a worker "branching off main"
     /// inside the proposer's WIP checkout). `repo_with_history` leaves
     /// `main` at `second`, so that's the commit the mint must land on.
+    #[test]
+    fn repo_identity_equates_ssh_and_https_forms() {
+        let ssh = "git@github.com:Bigbadboybob/predictionTrading.git";
+        let https = "https://github.com/Bigbadboybob/predictionTrading.git";
+        assert_eq!(repo_identity(ssh), "github.com/bigbadboybob/predictiontrading");
+        assert!(same_repo(ssh, https));
+        assert!(same_repo("ssh://git@github.com/Bigbadboybob/predictionTrading", https));
+        assert!(same_repo("predictionTrading", https), "a bare name compares by name");
+        assert!(same_repo("ssh://git@github.com:22/Bigbadboybob/predictionTrading.git", https));
+        assert!(same_repo("github.com:Bigbadboybob/predictionTrading", https), "scp form, no user");
+        assert!(same_repo(&format!("{}/", https), "git@github.com:Bigbadboybob/predictionTrading"));
+        assert!(!same_repo(ssh, "git@github.com:Bigbadboybob/claude-manager.git"));
+        assert!(!same_repo(ssh, "git@github.com:someone-else/predictionTrading.git"));
+    }
+
+    #[test]
+    fn locate_repo_clone_checks_origin_and_never_falls_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |name: &str, origin: &str| {
+            let p = tmp.path().join(name);
+            std::fs::create_dir_all(&p).unwrap();
+            git(&p, &["init", "-q"]);
+            git(&p, &["remote", "add", "origin", origin]);
+            p
+        };
+        let cm = mk("cm", "git@github.com:o/claude-manager.git");
+        let pt = mk("pt-clone", "https://github.com/o/predictionTrading.git");
+        let repos_dir = tmp.path().join("repos");
+        let found = locate_repo_clone(
+            "git@github.com:o/predictionTrading.git",
+            &[cm.clone(), pt.clone()],
+            &repos_dir,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(found, pt, "skips the caller's claude-manager checkout");
+        let err = locate_repo_clone("git@github.com:o/elsewhere.git", &[cm.clone()], &repos_dir, false, &[])
+            .expect_err("no clone");
+        assert!(err.contains("no local clone of git@github.com:o/elsewhere.git"), "{}", err);
+        // A worktree leads back to its main checkout.
+        git(&cm, &["-c", "user.email=t@e", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "x"]);
+        let wt = tmp.path().join("cm-wt");
+        git(&cm, &["worktree", "add", "-q", "-b", "side", wt.to_str().unwrap()]);
+        assert_eq!(
+            main_checkout_of(&wt).map(|p| p.canonicalize().unwrap()),
+            Some(cm.canonicalize().unwrap())
+        );
+    }
+
     #[test]
     fn mint_task_worktree_cuts_from_project_main() {
         with_home(|_home| {

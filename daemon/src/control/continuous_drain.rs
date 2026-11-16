@@ -37,7 +37,7 @@ impl Drop for PendingNotice {
 }
 
 pub(super) fn notice_ready(state: &Arc<Mutex<DaemonState>>, uid: &str) -> bool {
-    let (engine, idle, path, after) = {
+    let (engine, idle, path, after, fallback) = {
         let state = state.lock().unwrap_or_else(|p| p.into_inner());
         if state.draining || crate::writer_gate::pause_requested() {
             return false;
@@ -52,17 +52,43 @@ pub(super) fn notice_ready(state: &Arc<Mutex<DaemonState>>, uid: &str) -> bool {
             .last_input_at
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        let agent = crate::agent_state::current(session);
+        let now = super::methods::now_unix_f64();
         let after = last_input
-            .map(|at| super::methods::now_unix_f64() - at.elapsed().as_secs_f64())
-            .unwrap_or(0.0);
+            .map(|at| now - at.elapsed().as_secs_f64())
+            .unwrap_or(0.0)
+            .max(agent.latest_start_at.unwrap_or(0.0));
+        let finished = if session.session_type == "codex" {
+            completion::codex_drain_relay_finished_after(
+                &session
+                    .agent_state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()),
+                after,
+                now,
+            )
+        } else if session.session_type == "claude-code" && agent.source.engine_reported() {
+            completion::claude_drain_state_finished_after(&agent, after, now,
+                session.agent_state.lock().unwrap_or_else(|p| p.into_inner()).inputs.delivery
+                    .as_ref().is_some_and(|d| d.local_command))
+        } else {
+            None
+        };
+        if let Some(finished) = finished {
+            return finished;
+        }
         (
             session.session_type.clone(),
             session.semantic_idle(),
             session.transcript_path.clone(),
             after,
+            agent.source.engine_reported(),
         )
     };
     match engine.as_str() {
+        "claude-code" if fallback => {
+            path.is_some_and(|p| completion::claude_turn_finished_after(&p, after))
+        }
         "claude-code" => idle == Some(true),
         "codex" => path.is_some_and(|p| completion::codex_turn_finished_after(&p, after)),
         _ => false,
@@ -188,8 +214,20 @@ pub fn handle(
     if method == "continuous.context" {
         let task = task::load_one(&task_id)
             .ok_or((ErrorCode::NotFound, "Continuous task is missing.".into()))?;
+        // A non-capacity hold on this orchestrator's run can be cleared by
+        // the orchestrator itself (continuous.self_clear_hold).
+        let self_clear = task
+            .recovery_hold
+            .as_ref()
+            .filter(|h| {
+                !h.auto_releasable()
+                    && task.engine == task::Engine::Codex
+                    && task.current_session_uid.as_deref() == Some(uid.as_str())
+            })
+            .map(|_| crate::continuous::scheduler::SELF_CLEAR_HINT);
         return Ok(
-            json!({"task_id": task_id, "paused": task.paused, "drain": task.drain, "notice": notice(&task)}),
+            json!({"task_id": task_id, "paused": task.paused, "drain": task.drain, "notice": notice(&task),
+                "recovery_hold": task.recovery_hold, "self_clear": self_clear}),
         );
     }
     let receipt: ReceiptParams = serde_json::from_value(params.clone()).map_err(|e| {

@@ -109,6 +109,14 @@ const QUEUE_DEPTH_CACHE_TTL_SECS: u64 = 30;
 /// the full TTL, and a flapping API parked them indefinitely.
 const QUEUE_DEPTH_MAX_STALE_SECS: u64 = 300;
 
+/// Bound-queue native wakes are retried independently of producers. 20s keeps
+/// direct API producers responsive without turning a down API or absent lead
+/// into a hot loop.
+const QUEUE_WAKE_SWEEP_SECS: u64 = 20;
+const QUEUE_WAKE_BACKOFF_CAP_SECS: u64 = 300;
+const CONTINUOUS_MONITOR_SECS: u64 = 30;
+const CONTINUOUS_QUEUE_AGE_SECS: f64 = 3600.0;
+
 /// How often (seconds) the auth/wedge pass re-reads a given task's transcript
 /// tail. The pass runs every tick (250 ms) but tail reads are file I/O +
 /// JSON parsing; per-task throttling keeps the steady-state cost at one small
@@ -138,6 +146,9 @@ const CAPACITY_HOLD_RELEASE_MAX_SECS: u64 = 4 * 3600;
 /// How often (seconds) a held task's release eligibility is re-checked (the
 /// check reads the probe files; the held branch otherwise runs every tick).
 const HOLD_RELEASE_CHECK_INTERVAL_SECS: u64 = 60;
+/// How a held orchestrator learns it may clear its own hold
+/// (`continuous.self_clear_hold`, migration.rs).
+pub const SELF_CLEAR_HINT: &str = "Orchestrator: if every worker of this run has exited or reported done, the run staged no batch items, no monitor delivery or notification is pending and no background job is running, call clear_continuous_hold(reason=...) yourself (dry_run=true lists any blockers). Otherwise the operator reconciles: `continuous.migration_preview` → HANDOVER_CODEX.md → `continuous.reconcile`.";
 /// A recovery hold older than this pages the operator (`notify_command`),
 /// then re-pages every [`STALE_HOLD_REALERT_SECS`] while it persists. The
 /// raise-time alert is a single push that is easy to miss; nothing else
@@ -274,6 +285,15 @@ pub struct ContinuousScheduler {
     /// the LAST GOOD snapshot across a fetch failure. In-memory only — a
     /// restart just re-polls.
     queue_depths: Mutex<HashMap<String, DepthCacheEntry>>,
+    /// Queue-wake sweep throttle/backoff: queue -> (next attempt, failures).
+    queue_wake_retries: Mutex<HashMap<String, (u64, u32)>>,
+    last_queue_wake_sweep: AtomicU64,
+    /// Bound queues are intentionally handed from the legacy scheduler to the
+    /// lead. Log that handoff once per queue, not once per scheduler tick.
+    bound_queue_warnings: Mutex<HashSet<String>>,
+    continuous_alerts: Mutex<HashMap<String, String>>,
+    continuous_episodes: Mutex<HashMap<String, u64>>,
+    last_continuous_monitor: AtomicU64,
     /// Account-block/wedge transcript-probe throttle: `task_id -> last probe ts`
     /// ([`TAIL_PROBE_INTERVAL_SECS`]). In-memory only.
     probe_at: Mutex<HashMap<String, u64>>,
@@ -327,6 +347,7 @@ impl ContinuousScheduler {
     /// `0`. Mirrors `WorkflowPoller::new` but honors the config (the poller
     /// hardcodes its default) so lib.rs stays a plain `new()` + `start()`.
     pub fn new(state: Arc<Mutex<DaemonState>>) -> Self {
+        let (monitor_active, monitor_episodes) = load_monitor_latch();
         let configured = {
             let s = state.lock().unwrap_or_else(|p| p.into_inner());
             s.config.scheduler.tick_interval
@@ -344,6 +365,12 @@ impl ContinuousScheduler {
             panic_record: Arc::new(Mutex::new(None)),
             stall_alerts: Mutex::new(HashMap::new()),
             queue_depths: Mutex::new(HashMap::new()),
+            queue_wake_retries: Mutex::new(HashMap::new()),
+            last_queue_wake_sweep: AtomicU64::new(0),
+            bound_queue_warnings: Mutex::new(HashSet::new()),
+            continuous_alerts: Mutex::new(monitor_active),
+            continuous_episodes: Mutex::new(monitor_episodes),
+            last_continuous_monitor: AtomicU64::new(0),
             probe_at: Mutex::new(HashMap::new()),
             evidence_warnings: Mutex::new(HashMap::new()),
             transient_pool: Mutex::new(HashMap::new()),
@@ -389,6 +416,7 @@ impl ContinuousScheduler {
         self.shutdown.store(true, Ordering::SeqCst);
         let handle = self.handle.lock().unwrap().take();
         if let Some(h) = handle {
+            h.thread().unpark();
             // Ignore join errors — a panicked tick was already caught by
             // `catch_unwind` inside the loop, so a panic at the join boundary
             // would be a bug to surface but not abort shutdown over.
@@ -441,6 +469,15 @@ impl ContinuousScheduler {
     pub fn tick_once(&self) {
         // Operator stop notices remain usable with scheduled fires disabled.
         // The notifier separately respects host restart drain/quiescence.
+        let now = task::now_unix();
+        let owns_continuous = {
+            let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            owns_continuous_scheduler(s.config.scheduler.enabled, s.draining)
+        };
+        if owns_continuous {
+            self.sweep_bound_queue_wakes(now);
+            self.monitor_continuous_health(now);
+        }
         crate::control::continuous_drain::queue_notices(&self.state, &task::load_all());
         // Master on/off (read under a brief lock). lib.rs still constructs +
         // starts the thread when disabled; the tick is just a no-op.
@@ -454,8 +491,6 @@ impl ContinuousScheduler {
             }
         }
 
-        let now = task::now_unix();
-
         // (a) RESTART RECONCILIATION — closes the Phase-2 in_flight-leak
         // residual. Runs BEFORE the load below so (c)/(d) see post-reconcile
         // state.
@@ -465,7 +500,7 @@ impl ContinuousScheduler {
         // Periodic-only + small N, so a plain Vec filter of the due set is
         // behaviorally identical to the design's BinaryHeap due-index (that
         // heap is an optimization deferred until load volume warrants it).
-        let tasks = task::load_all();
+        let tasks: Vec<_> = task::load_all().into_iter().filter(|t| t.adoption_pending.is_none()).collect();
 
         // Tasks already fired this tick (supervision), so the due check below
         // doesn't double-fire a Persistent+Periodic task.
@@ -640,6 +675,33 @@ impl ContinuousScheduler {
             entry.last_attempt_at = now;
             match fetched {
                 Ok(stats) => {
+                    if !scheduler_should_consume_queue(&stats) {
+                        let binding = stats.binding.as_ref().expect("bound queue has binding");
+                        let consumer = binding["consumer"].as_str().unwrap_or("unknown");
+                        let first = self
+                            .bound_queue_warnings
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(q.clone());
+                        if first {
+                            eprintln!(
+                                "cm-daemon: continuous scheduler skipping bound queue '{}' — \
+                                 handed to lead consumer '{}'",
+                                q, consumer,
+                            );
+                        }
+                        // A bound queue is no longer scheduler-owned. Do not
+                        // retain a depth snapshot that could fire it after a
+                        // transient API response, and do not turn this into a
+                        // per-tick error/backoff loop.
+                        entry.good = None;
+                        entry.last_error_log_at = 0;
+                        continue;
+                    }
+                    self.bound_queue_warnings
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&q);
                     let depth = QueueDepth {
                         pending: stats.pending,
                         oldest_pending_at: stats.oldest_pending_unix(),
@@ -680,6 +742,280 @@ impl ContinuousScheduler {
             }
         }
         out
+    }
+
+    /// Retry native wakes for producers that POST directly to the planning API
+    /// (or for an inline wake that ran while the lead was absent). The API's
+    /// `wake_id` is the durable coalescing key; the sweep never creates a
+    /// second wake for a still-pending burst.
+    fn sweep_bound_queue_wakes(&self, now: u64) {
+        let previous = self.last_queue_wake_sweep.load(Ordering::Relaxed);
+        if now.saturating_sub(previous) < QUEUE_WAKE_SWEEP_SECS {
+            return;
+        }
+        self.last_queue_wake_sweep.store(now, Ordering::Relaxed);
+
+        let (api_url, api_token) = {
+            let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            (s.config.api_url.clone(), s.config.api_token.clone())
+        };
+        let Ok(client) = crate::continuous::queue::QueueClient::from_overrides(
+            Some(&api_url), Some(&api_token),
+        ) else {
+            return;
+        };
+        let snapshot = match client.list() {
+            Ok(value) => value,
+            Err(e) => {
+                eprintln!("cm-daemon: bound queue wake sweep could not list queues: {}", e.to_method_err().1);
+                return;
+            }
+        };
+        let Some(queues) = snapshot["queues"].as_array() else { return; };
+        for row in queues {
+            if row["pending"].as_u64().unwrap_or(0) == 0
+                || row["wake_pending"] != true
+                || !matches!(row["wake_delivery"].as_str(), Some("pending" | "failed"))
+            {
+                continue;
+            }
+            let Some(queue) = row["queue"].as_str() else { continue; };
+            let Some(consumer) = row["binding"]["consumer"].as_str() else { continue; };
+            let Some(wake_id) = row["wake_id"].as_str() else { continue; };
+            {
+                let retries = self.queue_wake_retries.lock().unwrap_or_else(|p| p.into_inner());
+                if retries.get(queue).is_some_and(|(next, _)| *next > now) {
+                    continue;
+                }
+            }
+
+            let uid = crate::items::org::cached_member_session(consumer).filter(|uid| {
+                self.state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .sessions
+                    .contains_key(uid)
+            });
+            let has_uid = uid.is_some();
+            let root = self
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .messaging_root
+                .clone();
+            let marker = format!("[cm-queue {queue}]");
+            let text = format!(
+                "{marker} Queue '{queue}' has {} pending item(s). Read the queue and claim work if it is yours.",
+                row["pending"].as_u64().unwrap_or(0),
+            );
+            let delivered = match uid {
+                Some(uid) => crate::notifications::publish(
+                    &root,
+                    &uid,
+                    wake_id,
+                    "cm",
+                    &text,
+                    &marker,
+                )
+                .is_ok(),
+                None => false,
+            };
+            let receipt = client.record_wake(
+                queue,
+                delivered,
+                (!delivered).then_some(if has_uid {
+                    "native notification publish failed"
+                } else {
+                    "bound consumer has no live main session"
+                }),
+            );
+            if let Err(e) = receipt {
+                eprintln!("cm-daemon: bound queue wake receipt for '{}' failed: {}", queue, e.to_method_err().1);
+            }
+            let mut retries = self.queue_wake_retries.lock().unwrap_or_else(|p| p.into_inner());
+            if delivered {
+                retries.remove(queue);
+            } else {
+                let failures = retries.get(queue).map(|(_, n)| *n).unwrap_or(0).saturating_add(1);
+                let backoff = queue_wake_backoff(failures);
+                retries.insert(queue.to_string(), (now.saturating_add(backoff), failures));
+            }
+        }
+    }
+
+    /// Daemon-side health monitor for the shared `#continuous` channel. The
+    /// alert map is a transition latch: each problem posts once, and a single
+    /// clear is posted when the condition disappears.
+    fn monitor_continuous_health(&self, now: u64) {
+        let previous = self.last_continuous_monitor.load(Ordering::Relaxed);
+        if now.saturating_sub(previous) < CONTINUOUS_MONITOR_SECS {
+            return;
+        }
+        self.last_continuous_monitor.store(now, Ordering::Relaxed);
+        let tasks = crate::continuous::task::load_all();
+        let mut current: HashMap<String, String> = HashMap::new();
+        for task in tasks {
+            let every = match &task.schedule {
+                Schedule::Periodic { every_secs } => Some(*every_secs),
+                Schedule::Consumer { window_secs, .. } => Some(*window_secs),
+                _ => None,
+            };
+            let run_status = task.last_run.as_ref().map(|run| run.status);
+            // `current_session_uid` is also populated for a persistent lead
+            // between runs. It is therefore not, by itself, proof that a run
+            // is in flight. A run is active while its durable record is
+            // Running; a pre-record spawn is the only case where a live
+            // current session supplies that proof.
+            let live_current_run = task.last_run.is_none()
+                && task.current_session_uid.as_deref().is_some_and(|uid| {
+                    self.state.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid)
+                });
+            if overdue_alerts_allowed(run_status, live_current_run) {
+                if let Some(period) = every.filter(|p| *p > 0) {
+                    if task.next_fire_at > 0 && now > task.next_fire_at {
+                        let late = now.saturating_sub(task.next_fire_at) > period / 2;
+                        if late {
+                            current.insert(
+                                format!("late:{}", task.task_id),
+                                format!("{} is late: next run was {}s ago", task.label, now - task.next_fire_at),
+                            );
+                        }
+                        if now.saturating_sub(task.next_fire_at) >= period {
+                            current.insert(
+                                format!("missed:{}", task.task_id),
+                                format!("{} missed a run (next run overdue by {}s)", task.label, now - task.next_fire_at),
+                            );
+                        }
+                    }
+                }
+            }
+            if task.account_blocked.is_some() || task.recovery_hold.is_some() {
+                current.insert(
+                    format!("blocked:{}", task.task_id),
+                    format!("{} is blocked and needs recovery", task.label),
+                );
+            }
+            if let Some(uid) = task.current_session_uid.as_deref() {
+                let live = self.state.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid);
+                if !live {
+                    current.insert(
+                        format!("lead:{}", task.task_id),
+                        format!("{} lead session {} is dead", task.label, uid),
+                    );
+                }
+            }
+        }
+        // Org-model continuous teams are lead-owned rather than legacy
+        // scheduler tasks. Their marker already contains the wake outcome;
+        // use that durable outcome instead of deriving missed runs from a
+        // task-local `next_fire_at`.
+        // Team markers and planning-API queues are the same data on every
+        // daemon; only the messaging hub checks them, so two hosts never
+        // raise the same cross-host alert.
+        if crate::messaging::tasks::messaging_is_coordinator(&self.state) {
+            let mut marker_queue_names = HashSet::new();
+            for team in self.continuous_team_markers() {
+                let Some(marker) = continuous_team_marker(&team) else { continue };
+                let id = team["id"].as_str().or_else(|| team["slug"].as_str()).unwrap_or("team");
+                let label = team["name"].as_str().or_else(|| team["slug"].as_str()).unwrap_or(id);
+                let health = marker["health"].as_str().unwrap_or("");
+                if matches!(health, "late" | "missed") {
+                    current.insert(
+                        format!("team:{id}:{health}"),
+                        format!("continuous team {label} is {health}"),
+                    );
+                }
+                if marker["health"] == "blocked" || marker["blocked"] == true {
+                    current.insert(
+                        format!("team:{id}:blocked"),
+                        format!("continuous team {label} is blocked"),
+                    );
+                }
+                let lead_uid = marker["lead_session_uid"].as_str();
+                let lead_alive = marker["lead_alive"].as_bool().or_else(|| {
+                    lead_uid.map(|uid| self.state.lock().unwrap_or_else(|p| p.into_inner()).sessions.contains_key(uid))
+                });
+                // A raw/static marker (or a remote/unknown projection) has no
+                // lead UID and must not be treated as a dead local lead. The
+                // daemon-side org projection supplies a resolved UID when this
+                // daemon owns the member; otherwise locality is ambiguous and we
+                // stay quiet rather than page on another host's lead.
+                if should_alert_missing_lead(&marker, lead_alive) {
+                    current.insert(
+                        format!("team:{id}:lead"),
+                        format!("continuous team {label} lead is dead"),
+                    );
+                }
+                if let Some(queues) = marker["queues"].as_array() {
+                    for queue in queues {
+                        if queue["pending"].as_u64().unwrap_or(0) > 0
+                            && queue["oldest_item_age_seconds"].as_f64().unwrap_or(0.0) > CONTINUOUS_QUEUE_AGE_SECS
+                        {
+                            if let Some(name) = queue["queue"].as_str() {
+                                marker_queue_names.insert(name.to_string());
+                                current.insert(
+                                    format!("team:{id}:queue:{name}"),
+                                    format!("continuous team {label} queue {name} has an item waiting {:.0}m", queue["oldest_item_age_seconds"].as_f64().unwrap_or(0.0) / 60.0),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            if let Ok(client) = {
+                let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                crate::continuous::queue::QueueClient::from_overrides(Some(&s.config.api_url), Some(&s.config.api_token))
+            } {
+                if let Ok(snapshot) = client.list() {
+                    for row in snapshot["queues"].as_array().into_iter().flatten() {
+                        if row["pending"].as_u64().unwrap_or(0) == 0 { continue; }
+                        // A marker team already reports its lead-filtered queue;
+                        // don't emit a second alert for the same bound queue.
+                        if row["binding"].is_object()
+                            && row["queue"].as_str().is_some_and(|name| marker_queue_names.contains(name))
+                        {
+                            continue;
+                        }
+                        let age = row["oldest_item_age_seconds"].as_f64().unwrap_or(0.0);
+                        if age > CONTINUOUS_QUEUE_AGE_SECS {
+                            if let Some(queue) = row["queue"].as_str() {
+                                current.insert(
+                                    format!("queue:{queue}"),
+                                    format!("queue {queue} has an item waiting {:.0}m", age / 60.0),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut alerts = self.continuous_alerts.lock().unwrap_or_else(|p| p.into_inner());
+        let old = alerts.clone();
+        let (raised, cleared) = monitor_alert_transitions(&old, &current);
+        let mut episodes = self.continuous_episodes.lock().unwrap_or_else(|p| p.into_inner());
+        for key in raised {
+            let body = &current[&key];
+            let episode = episodes.entry(key.clone()).or_default();
+            *episode = episode.saturating_add(1);
+            let _ = crate::messaging::tasks::post_continuous_notice(
+                &self.state,
+                &format!("continuous-alert:{key}:{episode}"),
+                &format!("[cm-continuous] {body}"),
+            );
+        }
+        for key in cleared {
+            let _ = crate::messaging::tasks::post_continuous_notice(
+                &self.state,
+                &format!("continuous-clear:{key}:{}", episodes.get(&key).copied().unwrap_or(1)),
+                &format!("[cm-continuous] cleared: {}", key),
+            );
+        }
+        save_monitor_latch(&current, &episodes);
+        *alerts = current;
+    }
+
+    fn continuous_team_markers(&self) -> Vec<serde_json::Value> {
+        crate::items::org::continuous_team_markers(&self.state)
     }
 
     /// Test-only: canned per-queue pending depths for the Consumer due-check
@@ -1121,8 +1457,9 @@ impl ContinuousScheduler {
             )
         } else {
             format!(
-                "Run seq {seq} of {} is HELD for recovery: {detail} The scheduler will not refire it. Operator: `continuous.migration_preview` → HANDOVER_CODEX.md → `continuous.reconcile`; recovery then replaces the thread automatically once the pool probe is healthy.",
-                tk.task_id
+                "Run seq {seq} of {} is HELD for recovery: {detail} The scheduler will not refire it. {} Recovery then replaces the thread automatically once the pool probe is healthy.",
+                tk.task_id,
+                SELF_CLEAR_HINT
             )
         };
         if let Err(e) = crate::messaging::tasks::notify_task_channel(
@@ -1307,7 +1644,7 @@ impl ContinuousScheduler {
         let next = if hold.auto_releasable() {
             "Capacity hold: the scheduler resumes it once a post-hold Codex pool probe is OK and its session is live; check the probe cron and the session."
         } else {
-            "Operator: continuous.migration_preview -> HANDOVER_CODEX.md -> continuous.reconcile."
+            "Operator: continuous.migration_preview -> HANDOVER_CODEX.md -> continuous.reconcile, unless the orchestrator self-clears it (clear_continuous_hold) once nothing is in flight."
         };
         crate::notify::notify_operator(
             notify_cmd,
@@ -1426,7 +1763,12 @@ impl ContinuousScheduler {
             };
             let tail = match tk.engine {
                 task::Engine::Claude => probe::probe_transcript_tail(&path),
-                task::Engine::Codex => crate::continuous::codex_probe::probe(&path, run.started_at.max(tk.last_fired_at) as f64),
+                task::Engine::Codex => {
+                    let after = run.started_at.max(tk.last_fired_at) as f64;
+                    crate::continuous::codex_probe::prefer_relay(
+                        crate::continuous::codex_probe::probe(&path, after),
+                        self.codex_relay_finished(uid, after, now as f64))
+                },
                 task::Engine::Bash => None,
             };
             let Some(tail) = tail else {
@@ -1983,7 +2325,10 @@ impl ContinuousScheduler {
                 let input = *session.last_input_at.lock().unwrap_or_else(|p| p.into_inner());
                 input.map(|at| crate::control::methods::now_unix_f64() - at.elapsed().as_secs_f64()).unwrap_or(0.0)
             };
-            let Some(tail) = crate::continuous::codex_probe::probe(&path, after.max(tk.last_fired_at as f64)) else { return; };
+            let after = after.max(tk.last_fired_at as f64);
+            let Some(tail) = crate::continuous::codex_probe::prefer_relay(
+                crate::continuous::codex_probe::probe(&path, after),
+                self.codex_relay_finished(uid, after, now as f64)) else { return; };
             if tail.shape == crate::continuous::probe::TailShape::MidTurn || tail.auth_error.is_some() || tail.usage_limit.is_some() || tail.pool_unavailable.is_some() { return; }
         }
         let mut closed = false;
@@ -2199,7 +2544,7 @@ impl ContinuousScheduler {
     /// in_flight-leak residual (a guard left set on an unclean fire path); an
     /// overdue on-disk guard from before a daemon restart clears here too.
     fn reconcile_orphans(&self, now: u64) {
-        for tk in task::load_all() {
+        for tk in task::load_all().into_iter().filter(|t| t.adoption_pending.is_none()) {
             if tk.recovery.is_some() || (tk.engine == task::Engine::Codex && (tk.account_blocked.is_some() || tk.recovery_hold.is_some())) { continue; }
             // A run can be stranded `Running` with no live reaper to finish it
             // when the daemon restarts / crashes / is SIGKILLed mid-run (systemd
@@ -2487,11 +2832,23 @@ impl ContinuousScheduler {
     /// gap). Prefers the immutable `kernel_set()` read over `try_wait` (which
     /// needs `&mut`). The lock drops on return — before any fire.
     fn session_is_dead(&self, uid: &str) -> bool {
+        // #24: a transcript rotation stops the process and brings it back at
+        // the same uid; supervision must not respawn over it meanwhile.
+        if crate::rotation::in_progress(uid) {
+            return false;
+        }
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state
             .sessions
             .get(uid)
             .map_or(true, |s| s.last_exit.kernel_set())
+    }
+
+    fn codex_relay_finished(&self, uid: &str, after: f64, now: f64) -> Option<bool> {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let session = state.sessions.get(uid)?;
+        let cell = session.agent_state.lock().unwrap_or_else(|p| p.into_inner());
+        crate::continuous::completion::codex_relay_finished_after(&cell, after, now)
     }
 
     /// Brief, read-only lookup of a session's resolved transcript path — used by
@@ -2538,28 +2895,90 @@ impl ContinuousScheduler {
                 *rec = Some(PanicRecord { message: msg, count });
             }
 
-            // Sleep the remainder of the tick interval in small chunks so
-            // shutdown latency is bounded by ~MIN_TICK_INTERVAL_MICROS rather
-            // than the full tick. The shutdown flag is re-checked at the top of
-            // the loop, so worst-case shutdown latency is `2 × tick_interval`.
+            // Park for the remainder of the tick interval; `shutdown` unparks
+            // this thread, so shutdown stays prompt without a wakeup every
+            // millisecond.
             let tick_micros = self.tick_micros.load(Ordering::SeqCst);
             let target = Duration::from_micros(tick_micros);
-            let elapsed = tick_start.elapsed();
-            if elapsed < target {
-                let remaining = target - elapsed;
-                let chunk = Duration::from_micros(MIN_TICK_INTERVAL_MICROS);
-                let mut left = remaining;
-                while left > Duration::ZERO {
-                    if self.shutdown.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    let sleep_for = if left < chunk { left } else { chunk };
-                    std::thread::sleep(sleep_for);
-                    left = left.saturating_sub(sleep_for);
-                }
+            if tick_start.elapsed() < target
+                && crate::workflow::poller::park_until_shutdown(&self.shutdown, tick_start + target)
+            {
+                return;
             }
         }
     }
+}
+
+fn owns_continuous_scheduler(enabled: bool, draining: bool) -> bool {
+    // This is intentionally the same gate as the scheduler's fire path below:
+    // only the configured scheduler owner runs queue sweeps and health
+    // monitoring. Other daemons may expose the API but must stay observers.
+    enabled && !draining
+}
+
+fn overdue_alerts_allowed(run_status: Option<RunStatus>, live_current_run: bool) -> bool {
+    run_status != Some(RunStatus::Running) && !live_current_run
+}
+
+fn continuous_team_marker(team: &serde_json::Value) -> Option<&serde_json::Value> {
+    match team.get("continuous") {
+        Some(value @ serde_json::Value::Object(_)) => Some(value),
+        Some(serde_json::Value::Bool(true)) => Some(team),
+        _ => None,
+    }
+}
+
+fn should_alert_missing_lead(marker: &serde_json::Value, lead_alive: Option<bool>) -> bool {
+    marker["lead_session_uid"].as_str().is_some() && lead_alive == Some(false)
+}
+
+fn monitor_alert_transitions(
+    old: &HashMap<String, String>,
+    current: &HashMap<String, String>,
+) -> (Vec<String>, Vec<String>) {
+    let raised = current.keys().filter(|key| !old.contains_key(*key)).cloned().collect();
+    let cleared = old.keys().filter(|key| !current.contains_key(*key)).cloned().collect();
+    (raised, cleared)
+}
+
+fn monitor_latch_path() -> std::path::PathBuf {
+    crate::path::dot_cm_dir().join("continuous-monitor-latch.json")
+}
+
+fn load_monitor_latch() -> (HashMap<String, String>, HashMap<String, u64>) {
+    let value = std::fs::read(monitor_latch_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .unwrap_or_default();
+    let active = value["active"].as_object().map(|map| map.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect()).unwrap_or_default();
+    let episodes = value["episodes"].as_object().map(|map| map.iter().filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n))).collect()).unwrap_or_default();
+    (active, episodes)
+}
+
+fn save_monitor_latch(active: &HashMap<String, String>, episodes: &HashMap<String, u64>) {
+    let path = monitor_latch_path();
+    let Some(parent) = path.parent() else { return; };
+    let _ = std::fs::create_dir_all(parent);
+    let value = serde_json::json!({"active": active, "episodes": episodes});
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, value.to_string()).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        let _ = std::fs::rename(tmp, path);
+    }
+}
+
+fn scheduler_should_consume_queue(stats: &crate::continuous::queue::QueueStats) -> bool {
+    stats.binding.is_none()
+}
+
+fn queue_wake_backoff(failures: u32) -> u64 {
+    QUEUE_WAKE_SWEEP_SECS
+        .saturating_mul(1u64 << failures.min(4))
+        .min(QUEUE_WAKE_BACKOFF_CAP_SECS)
 }
 
 /// A durable account block is active only while it still names the current
@@ -2582,6 +3001,7 @@ fn active_account_block(tk: &ContinuousTask) -> Option<&AccountBlockRecord> {
 /// uid.
 fn should_supervise(tk: &ContinuousTask) -> bool {
     tk.run_mode == task::RunMode::Persistent
+        && tk.adoption_pending.is_none()
         && tk.supervise
         && tk.enabled
         && !tk.paused
@@ -2680,7 +3100,7 @@ fn collect_due(
     tasks
         .iter()
         .filter(|t| {
-            t.enabled && !t.paused && t.in_flight.is_none() && t.next_fire_at <= now
+            t.adoption_pending.is_none() && t.enabled && !t.paused && t.in_flight.is_none() && t.next_fire_at <= now
         })
         .filter(|t| match &t.schedule {
             Schedule::Periodic { .. } => true,
@@ -3276,6 +3696,93 @@ mod tests {
         assert_eq!(backoff_secs(100, 5), 3200);
         assert_eq!(backoff_secs(100, 6), BACKOFF_CAP_SECS); // 6400 -> capped
         assert_eq!(backoff_secs(100, 30), BACKOFF_CAP_SECS); // no overflow panic
+    }
+
+    #[test]
+    fn bound_queue_is_handed_to_lead_and_wake_retries_back_off() {
+        let unbound: crate::continuous::queue::QueueStats = serde_json::from_value(serde_json::json!({
+            "pending": 1, "claimed": 0, "oldest_pending_at": null
+        })).unwrap();
+        let bound: crate::continuous::queue::QueueStats = serde_json::from_value(serde_json::json!({
+            "pending": 1, "claimed": 0, "oldest_pending_at": null,
+            "binding": {"consumer": "ingest"}
+        })).unwrap();
+        assert!(scheduler_should_consume_queue(&unbound));
+        assert!(!scheduler_should_consume_queue(&bound));
+        assert_eq!(queue_wake_backoff(1), QUEUE_WAKE_SWEEP_SECS * 2);
+        assert_eq!(queue_wake_backoff(99), QUEUE_WAKE_BACKOFF_CAP_SECS);
+    }
+
+    #[test]
+    fn monitor_alert_transitions_raise_once_and_clear_once() {
+        let old = HashMap::new();
+        let current = HashMap::from([(String::from("late:one"), String::from("late"))]);
+        let (raised, cleared) = monitor_alert_transitions(&old, &current);
+        assert_eq!(raised, vec!["late:one"]);
+        assert!(cleared.is_empty());
+        let (raised, cleared) = monitor_alert_transitions(&current, &current);
+        assert!(raised.is_empty());
+        assert!(cleared.is_empty());
+        let (raised, cleared) = monitor_alert_transitions(&current, &HashMap::new());
+        assert!(raised.is_empty());
+        assert_eq!(cleared, vec!["late:one"]);
+    }
+
+    #[test]
+    fn monitor_does_not_mark_running_or_live_current_runs_late() {
+        assert!(!overdue_alerts_allowed(Some(RunStatus::Running), false));
+        // A persistent lead remains live between runs; once its last run is
+        // terminal, that session is not a current run and overdue math is
+        // allowed again.
+        assert!(overdue_alerts_allowed(Some(RunStatus::Done), false));
+        assert!(!overdue_alerts_allowed(None, true));
+        assert!(owns_continuous_scheduler(true, false));
+        assert!(!owns_continuous_scheduler(false, false));
+        assert!(!owns_continuous_scheduler(true, true));
+    }
+
+    #[test]
+    fn continuous_marker_health_is_detected_without_next_fire_math() {
+        let team = serde_json::json!({
+            "id": "ingest",
+            "continuous": {
+                "lead_member_id": "mem-ingest",
+                "lead_session_uid": "ts-ingest",
+                "health": "missed",
+                "queues": [{"queue": "momentum", "pending": 1, "oldest_item_age_seconds": 4000.0}]
+            }
+        });
+        let marker = continuous_team_marker(&team).expect("marker");
+        assert_eq!(marker["health"], "missed");
+        assert_eq!(marker["queues"][0]["queue"], "momentum");
+        assert!(continuous_team_marker(&serde_json::json!({"id":"ordinary"})).is_none());
+    }
+
+    #[test]
+    fn raw_marker_without_live_projection_does_not_page_dead_lead() {
+        let raw = serde_json::json!({
+            "id": "ingest",
+            "continuous": {"lead_member_id": "mem-ingest", "host_id": "cm-manager"}
+        });
+        let marker = continuous_team_marker(&raw).expect("marker");
+        assert!(marker["lead_session_uid"].is_null());
+        assert!(!should_alert_missing_lead(marker, None));
+    }
+
+    #[test]
+    fn monitor_latch_survives_restart_and_episode_keys_change() {
+        let _tmp = with_temp_home(|| {
+            let active = HashMap::from([(String::from("late:ingest"), String::from("old text"))]);
+            let episodes = HashMap::from([(String::from("late:ingest"), 3u64)]);
+            save_monitor_latch(&active, &episodes);
+            let (loaded_active, loaded_episodes) = load_monitor_latch();
+            assert_eq!(loaded_active, active);
+            assert_eq!(loaded_episodes, episodes);
+            let first = format!("continuous-alert:late:ingest:{}", loaded_episodes["late:ingest"] + 1);
+            let second = format!("continuous-alert:late:ingest:{}", loaded_episodes["late:ingest"] + 2);
+            assert_ne!(first, second);
+            assert!(monitor_latch_path().exists());
+        });
     }
 
     /// A compact-only fire (`FiredCompact`) advances like a success but floors
@@ -4198,6 +4705,22 @@ mod tests {
         });
     }
 
+    /// The loop parks for the whole tick, so `shutdown` must unpark it.
+    #[test]
+    fn shutdown_unparks_a_long_tick() {
+        let _tmp = with_temp_home(|| {
+            let sched = Arc::new(ContinuousScheduler::new(Arc::new(Mutex::new(
+                DaemonState::default(),
+            ))));
+            sched.set_tick_interval_for_test(30_000_000); // 30s
+            sched.start().expect("spawn scheduler thread under test load");
+            std::thread::sleep(Duration::from_millis(100)); // let it park
+            let t0 = Instant::now();
+            sched.shutdown();
+            assert!(t0.elapsed() < Duration::from_secs(2), "shutdown took {:?}", t0.elapsed());
+        });
+    }
+
     /// `start` is idempotent — a second call doesn't spawn a second thread.
     #[test]
     fn start_is_idempotent() {
@@ -4367,6 +4890,20 @@ mod tests {
             assert_eq!(current.last_run.unwrap().status, RunStatus::Running);
             assert!(!sched.session_is_dead(uid));
         });
+    }
+
+    #[test]
+    fn a_session_mid_rotation_is_not_dead() {
+        let _serial = crate::rotation::test_registry_lock();
+        // #24: supervision must not respawn over a rotation (the process is
+        // stopped and comes back at the same uid).
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        let sched = ContinuousScheduler::new(Arc::clone(&state));
+        assert!(sched.session_is_dead("ts-rot-sched"), "absent = dead");
+        crate::rotation::test_set_running("ts-rot-sched", true);
+        assert!(!sched.session_is_dead("ts-rot-sched"));
+        crate::rotation::test_set_running("ts-rot-sched", false);
+        assert!(sched.session_is_dead("ts-rot-sched"));
     }
 
     #[test]
@@ -4576,7 +5113,24 @@ mod tests {
             let journal = crate::path::dot_cm_dir().join("monitor-state").join(format!("{uid}.json"));
             std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
             std::fs::write(&journal, serde_json::json!({"schema_version":1,"coverage_version":1,"session_uid":uid,"revision":1,"producers":{"p":{"records":{}}}}).to_string()).unwrap();
+            let tick = now + TAIL_PROBE_INTERVAL_SECS + 1;
+            let cell = Arc::clone(&state.lock().unwrap().sessions[uid].agent_state);
+            cell.lock().unwrap().inputs.relay = Some(crate::agent_state::RelaySnapshot {
+                backend_connected: true, foreground: crate::agent_state::RelayStatus::Active,
+                observed_at: tick as f64,
+                last_turn: crate::agent_state::LastTurn { ended_at: Some(tick as f64 - 1.0), status: Some(crate::agent_state::TurnStatus::Completed) },
+                ..Default::default()
+            });
             sched.auth_wedge_pass(&task::load_all(), now + TAIL_PROBE_INTERVAL_SECS + 1);
+            assert_eq!(task::load_one(&t.task_id).unwrap().last_run.unwrap().status, RunStatus::Running, "active relay overrides old rollout completion");
+            let tick = tick + TAIL_PROBE_INTERVAL_SECS + 1;
+            {
+                let mut cell = cell.lock().unwrap();
+                let relay = cell.inputs.relay.as_mut().unwrap();
+                relay.foreground = crate::agent_state::RelayStatus::Idle;
+                relay.observed_at = tick as f64;
+            }
+            sched.auth_wedge_pass(&task::load_all(), tick);
             let closed = task::load_one(&t.task_id).unwrap();
             assert_eq!(closed.last_run.as_ref().unwrap().status, RunStatus::Failed);
             assert_eq!(closed.recovery_hold.as_ref().unwrap().run_seq, 1);

@@ -27,8 +27,8 @@ receipt. A disconnected desktop cannot display a notification immediately.
 Existing desktop/DND behavior and notification sound remain in effect. The
 separate per-session `notify_on_idle` setting is unchanged; explicit requests
 have always been independent of that automatic-idle switch. Chat mutes, DND,
-follow settings, and native agent wake queues are unchanged. This tool does not
-send Telegram messages or alter `notify_command` escalation subscriptions.
+follow settings, and native agent wake queues are unchanged. Out-of-band `notify_command` delivery (for example Telegram) follows the
+urgency/viewer rules below, independently of availability.
 
 An identical reason while that session's alert is pending coalesces to the same
 ID. A changed reason replaces it with a new alert. Desktop submission IDs are
@@ -44,6 +44,61 @@ sessions and 512 KiB serialized); overflow fails explicitly and retains existing
 alerts. An alert from an exited ordinary session still gets its desktop
 notification on connection, even if its row is gone. It remains stored until an
 operator acknowledges it. No agent can acknowledge another session's alert.
+
+## Owner availability
+
+Owner sets how reachable they are: `away`, `around`, `focused`, `on-call`, or
+unset. **Availability is information for agents, not a notification filter.**
+Every level delivers Owner alerts, direct/group DMs and mentions. Explicit
+conversation mutes, DND, read state and device notification settings still apply.
+
+In the TUI press **F7** (any view): 1–5 or ↑/↓ + Enter sets, Esc cancels. The
+picker asks the laptop daemon first and falls back to the other configured
+hosts if that daemon predates availability. The status bar shows the current
+level and its age (`● focused 14m`); nothing is shown while unset.
+Or set it with `scripts/cm-availability <level> [--note "..."]` on a host whose
+daemon serves Owner (cloud hosts: `ssh cm-manager cm-availability away`, once
+installed to `~/.cm/bin/`); with no argument it prints the current level, and
+`unset` returns to the default. The level is an Owner-only messaging event
+(`owner.availability`) published on the messaging hub and replicated to every
+enrolled host; each daemon projects the latest value to
+`~/.cm/messages/main/OWNER_AVAILABILITY.json`. Agents read it from `ping()` and
+`chat_open()` as `owner_availability: {level, set, changed_at, age_s, previous,
+source, owner_note}`. The RPC is `messaging.availability {action: get | set,
+level, note?, source?, request_id}`; `set` requires the Owner/operator caller.
+
+### Urgency and delivery
+
+`notify_user(message, urgency)` takes `fyi`, `decision` (default), `blocking`
+or `emergency`. All four are delivered at every availability level, including
+unset. Availability never holds, drops or downgrades a request. The result is
+`{status:"queued", delivery:"immediate", alert_id, urgency, owner_availability}`;
+`immediate` means accepted into the normal delivery queue, not proof of a popup
+or read receipt.
+
+On each upgraded daemon's first delivery tick, any requests in the legacy
+`~/.cm/owner-attention-held.json` are released into the normal queue, even if
+Owner's level and revision have not changed. Original request times and held
+counts are retained. Held text merges into a pending alert for the same session
+(up to 4,096 bytes), preserving the pending alert's ID and higher urgency.
+Released entries carry `released_at`; the desktop groups simultaneous releases
+into one notification. Live sessions whose requests were released receive a
+native notice. `~/.cm/owner-availability-applied.json` records
+`unfiltered_notifications: true` after migration; failed storage operations
+retry with backoff. Changing availability alone no longer wakes agents.
+
+Out-of-band push (`notify_command`, e.g. Telegram, tag `owner-attention`):
+every `emergency`, plus `blocking` requests while no viewer is connected.
+These rules apply at every availability level, including unset. Pushes are
+rate-limited to one per alert key per 10 minutes. Web Push does not count as a
+viewer and therefore does not suppress this fallback.
+
+Daemon-side sources use `owner_attention::escalate()` / `withdraw()` (Operator
+RPCs `owner_attention.escalate` / `owner_attention.withdraw` for evaluators
+elsewhere). The notification stall alarm (per session) and outbox alarm (one
+per host per episode: messages still `pending_sync` after 15 minutes) escalate
+as `blocking` at every level. Escalations never displace an agent's own pending
+request.
 
 ## Routing and authorization
 

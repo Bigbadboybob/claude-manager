@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from mcp_server.native_codex import (
-    apply_launch_permissions, launch_permissions, split_args,
+    apply_launch_model, apply_launch_permissions, launch_effort, launch_model, launch_permissions, split_args,
 )
 
 BYPASS = "--dangerously-bypass-approvals-and-sandbox"
@@ -66,7 +66,7 @@ class CodexResumeArgsTests(unittest.TestCase):
         policy = {"approvalPolicy": "never", "approvalsReviewer": "user",
                   "permissions": ":danger-full-access"}
         backend, frontend = split_args(["resume", BYPASS, "--no-alt-screen", "saved-thread"], policy)
-        self.assertEqual(frontend, ["--no-alt-screen", "resume", "saved-thread"])
+        self.assertEqual(frontend, ["--no-alt-screen", "-c", "check_for_update_on_startup=false", "resume", "saved-thread"])
         self.assertIn('approval_policy="never"', backend)
         self.assertIn('approvals_reviewer="user"', backend)
         self.assertNotIn('approvals_reviewer="auto_review"', backend)
@@ -74,13 +74,32 @@ class CodexResumeArgsTests(unittest.TestCase):
         self.assertEqual(apply_launch_permissions({"threadId": "saved", "sandbox": "read-only"}, policy),
                          {"threadId": "saved", **policy})
 
+    def test_fork_is_shaped_like_resume(self):
+        # CM fork-into-a-task: `fork <id>` reaches the remote frontend as
+        # a fork, never a resume, with no permission flag on the frontend.
+        with patch("mcp_server.native_codex.os.getcwd", return_value="/work/fork with spaces"):
+            backend, frontend = split_args(["fork", "-c", "x=1", "--no-alt-screen", "src-thread"])
+        # The fork runs in its new worktree, never the source's directory.
+        self.assertEqual(frontend, [
+            "--no-alt-screen", "-c", "check_for_update_on_startup=false", "-c", 'tui.resume_cwd="current"',
+            "--cd", "/work/fork with spaces", "fork", "src-thread",
+        ])
+        self.assertEqual(backend, ["-c", "x=1", "-c", "check_for_update_on_startup=false"])
+        policy = {"approvalPolicy": "never", "approvalsReviewer": "user",
+                  "permissions": ":danger-full-access"}
+        backend, frontend = split_args(["fork", "src-thread"], policy)
+        self.assertEqual(frontend[-2:], ["fork", "src-thread"])
+        self.assertNotIn("resume", frontend)
+        self.assertIn('sandbox_mode="danger-full-access"', backend)
+
     def test_fresh_session_retains_yolo_on_backend_and_frontend(self):
         backend, frontend = split_args([BYPASS, "--no-alt-screen"])
         self.assertEqual(backend, [
             "-c", 'approval_policy="never"',
             "-c", 'sandbox_mode="danger-full-access"',
+            "-c", "check_for_update_on_startup=false",
         ])
-        self.assertEqual(frontend, [BYPASS, "--no-alt-screen"])
+        self.assertEqual(frontend, [BYPASS, "--no-alt-screen", "-c", "check_for_update_on_startup=false"])
 
     def test_remote_resume_inherits_permissions_with_old_or_new_viewer(self):
         for legacy in ([], [BYPASS]):
@@ -94,8 +113,63 @@ class CodexResumeArgsTests(unittest.TestCase):
                 self.assertEqual(backend, [
                     "-c", "check_for_update_on_startup=false",
                     "-c", 'mcp_servers.claude-manager.command="launcher.sh"',
+                    "-c", "check_for_update_on_startup=false",
                 ])
-                self.assertEqual(frontend, ["--no-alt-screen", "resume", "saved-thread"])
+                self.assertEqual(frontend, ["--no-alt-screen", "-c", "check_for_update_on_startup=false", "resume", "saved-thread"])
+
+    def test_model_reaches_frontend_backend_and_thread_requests(self):
+        for argv in ([BYPASS, "--no-alt-screen", "-m", "gpt-6-luna"],
+                     ["resume", "--no-alt-screen", "-m", "gpt-6-luna", "saved-thread"]):
+            with self.subTest(argv=argv):
+                backend, frontend = split_args(argv)
+                self.assertEqual(launch_model(argv), "gpt-6-luna")
+                self.assertIn('model="gpt-6-luna"', backend)
+                self.assertEqual(frontend[frontend.index("-m") + 1], "gpt-6-luna")
+                if argv[0] == "resume":
+                    self.assertEqual(frontend[-2:], ["resume", "saved-thread"])
+        self.assertIsNone(launch_model([BYPASS]))
+        self.assertEqual(launch_model(["--model=x1"]), "x1")
+        params = {"threadId": "saved", "model": "gpt-6-astra"}
+        self.assertEqual(apply_launch_model(params, "gpt-6-luna"),
+                         {"threadId": "saved", "model": "gpt-6-luna"})
+        self.assertEqual(params["model"], "gpt-6-astra", "the request is copied, not mutated")
+        self.assertIs(apply_launch_model(params, None), params)
+
+    def test_effort_reaches_frontend_backend_and_thread_requests(self):
+        effort = ["-c", 'model_reasoning_effort="xhigh"']
+        cases = (
+            [BYPASS, "--no-alt-screen", "-m", "gpt-6-luna", *effort],
+            ["resume", "--no-alt-screen", "-m", "gpt-6-luna", *effort, "saved-thread"],
+            ["fork", "--no-alt-screen", "-m", "gpt-6-luna", *effort, "src-thread"],
+        )
+        for argv in cases:
+            with self.subTest(argv=argv[0]), patch(
+                "mcp_server.native_codex.os.getcwd", return_value="/work/fork"
+            ):
+                backend, frontend = split_args(argv)
+                self.assertEqual(launch_effort(argv), "xhigh")
+                self.assertEqual(launch_model(argv), "gpt-6-luna")
+                # Both sides: the frontend sends each turn's effort from its
+                # own config, the backend's default matches it.
+                self.assertIn('model_reasoning_effort="xhigh"', backend)
+                self.assertIn('model_reasoning_effort="xhigh"', frontend)
+                self.assertIn('model="gpt-6-luna"', backend)
+                self.assertEqual(frontend[frontend.index("-m") + 1], "gpt-6-luna")
+                if argv[0] in ("resume", "fork"):
+                    self.assertEqual(frontend[-2:], [argv[0], argv[-1]])
+        self.assertIsNone(launch_effort([BYPASS, "-c", "x=1"]))
+        self.assertEqual(launch_effort(["-c", "model_reasoning_effort=low"]), "low")
+        params = {"threadId": "saved", "config": {"x": 1}}
+        self.assertEqual(
+            apply_launch_model(params, "gpt-6-luna", "high"),
+            {"threadId": "saved", "model": "gpt-6-luna",
+             "config": {"x": 1, "model_reasoning_effort": "high"}},
+        )
+        self.assertEqual(params["config"], {"x": 1}, "the request is copied, not mutated")
+        self.assertEqual(
+            apply_launch_model({"config": None}, None, "low"),
+            {"config": {"model_reasoning_effort": "low"}},
+        )
 
 
 if __name__ == "__main__":

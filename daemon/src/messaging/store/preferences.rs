@@ -24,7 +24,7 @@ pub(super) struct Follow {
 }
 
 impl Scope {
-    fn specificity(&self) -> (usize, usize) {
+    pub(super) fn specificity(&self) -> (usize, usize) {
         if self.thread.is_some() {
             (4, 0)
         } else if self.peer.is_some() || self.conversation.is_some() {

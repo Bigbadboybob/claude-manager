@@ -15,10 +15,12 @@ pub fn default_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(".cm")
 }
+/// Project an already-open store. Startup owns opening/retrying in the
+/// background; no RPC or maintenance caller may rebuild the store here.
 pub fn initialize(state: &Arc<Mutex<DaemonState>>) -> Result<(), ChatError> {
-    let (handle, root) = {
+    let handle = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
-        (s.messaging.clone(), s.messaging_root.clone())
+        s.messaging.clone()
     };
     let delivery_gate = state
         .lock()
@@ -26,11 +28,9 @@ pub fn initialize(state: &Arc<Mutex<DaemonState>>) -> Result<(), ChatError> {
         .messaging_delivery
         .clone();
     let _delivery_guard = delivery_gate.lock().unwrap_or_else(|p| p.into_inner());
-    let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
-    if slot.is_none() {
-        *slot = Some(Store::open(&root)?);
-    }
-    project_names(state, slot.as_ref().unwrap(), false);
+    let slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+    let store = slot.as_ref().ok_or_else(super::startup::starting)?;
+    project_names(state, store, false);
     Ok(())
 }
 pub fn project_names(state: &Arc<Mutex<DaemonState>>, store: &Store, persist: bool) {
@@ -67,13 +67,22 @@ pub fn project_names(state: &Arc<Mutex<DaemonState>>, store: &Store, persist: bo
             s.manifest_watcher.broadcast(crate::manifest::ManifestDiff::Updated{uid:n.session_uid.clone(),entry:json!({"uid":n.session_uid,"label":n.name,"name_revision":n.revision,"messaging_daemon_id":store.daemon_id})});
         }
     }
-    if any_changed && persist {
+    if any_changed && (persist || s.messaging_registry_restored) {
         s.persist_sessions_best_effort();
     }
 }
 pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Caller::Session(c) = &req.caller {
+        crate::maintenance::stamp_chat(state, &c.session_uid);
+    }
     match execute(state, req) {
-        Ok(v) => {
+        Ok(mut v) => {
+            // Agents see why sync looks broken during a deploy or hub outage.
+            if matches!(req.caller, Caller::Session(_)) && v.is_object() {
+                if let Some(m) = crate::maintenance::field_for(state) {
+                    v["maintenance"] = json!(m);
+                }
+            }
             if matches!(
                 req.method.as_str(),
                 "messaging.send"
@@ -97,6 +106,15 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
             format!("{}: {}", e.code, e.message),
         ),
     }
+}
+
+/// A session's current chat name and its revision, if it has claimed one
+/// (#28's spawn-time setup renames at that revision).
+pub fn current_name(state: &Arc<Mutex<DaemonState>>, uid: &str) -> Option<(String, u64)> {
+    let handle = state.lock().unwrap_or_else(|p| p.into_inner()).messaging.clone();
+    let slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+    let store = slot.as_ref()?;
+    store.names.get(&store.participant_id(uid)).filter(|n| !n.released).map(|n| (n.name.clone(), n.revision))
 }
 
 /// Label migration is permitted only after legacy workflow bindings have a
@@ -171,10 +189,17 @@ fn repair_legacy_binding(state: &Arc<Mutex<DaemonState>>, uid: &str) -> Result<(
 }
 
 fn execute(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, ChatError> {
+    // A readiness check must not take the delivery gate: plain sends are
+    // deliberately allowed while another thread is publishing a wake.
+    let handle = state.lock().unwrap_or_else(|p| p.into_inner()).messaging.clone();
+    if handle.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+        return Err(super::startup::starting());
+    }
     if req.method == "messaging.sync" {
         return execute_sync_admin(state, req);
     }
-    // Fence stale task subscription owners before they can acknowledge hits.
+    // Opportunistic maintenance only. Deferred refresh is not an authority
+    // fence; task monitor effects below use a locked authoritative view.
     super::tasks::refresh(state)?;
     let mut result = execute_with_freshness(state, req, false)?;
     if matches!(req.caller, Caller::Operator(_)) && req.params["claim_bell"] == true {
@@ -212,6 +237,15 @@ fn execute_sync_admin(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<
         code: "unauthorized".into(),
         message: e.into(),
     })?;
+    // Status is an observation only. `initialize` projects chat names into
+    // the session registry and can broadcast/persist, so use the already-open
+    // store directly without projecting names or taking the delivery gate.
+    if req.params["action"].as_str().unwrap_or("status") == "status" {
+        let handle = state.lock().unwrap_or_else(|p| p.into_inner()).messaging.clone();
+        let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+        let store = slot.as_mut().ok_or_else(super::startup::starting)?;
+        return store.sync_admin(&req.params, &[]);
+    }
     initialize(state)?;
     let restart = matches!(
         req.params["action"].as_str(),
@@ -231,22 +265,7 @@ fn execute_sync_admin(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         (
             s.messaging.clone(),
-            s.sessions
-                .values()
-                .map(|s| (s.uid.clone(), s.title.clone(), s.task_id.clone()))
-                .chain(
-                    s.tui_sessions
-                        .values()
-                        .filter(|t| !s.sessions.contains_key(&t.uid))
-                        .map(|t| {
-                            (
-                                t.uid.clone(),
-                                t.label.clone().unwrap_or_else(|| t.uid.clone()),
-                                t.task_id.clone(),
-                            )
-                        }),
-                )
-                .collect::<Vec<_>>(),
+            super::live_sessions(&s),
         )
     };
     let result = {
@@ -254,14 +273,7 @@ fn execute_sync_admin(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<
         let store = slot.as_mut().unwrap();
         let people = people
             .into_iter()
-            .map(|(uid, name, task)| Person {
-                id: store.participant_id(&uid),
-                name,
-                session_uid: uid,
-                task,
-                present: true,
-                kind: "agent".into(),
-            })
+            .map(|live| Person::present_agent(store.participant_id(&live.uid), live))
             .collect::<Vec<_>>();
         store.sync_admin(&req.params, &people)
     };
@@ -288,13 +300,18 @@ fn execute_with_freshness(
     req: &Request,
     caught_up: bool,
 ) -> Result<Value, ChatError> {
+    let s4_snapshot = match &req.caller {
+        Caller::Session(c) if req.method == "messaging.send" =>
+            crate::items::s4_attribution::current().0.get(&c.session_uid).cloned(),
+        _ => None,
+    };
     if matches!(req.caller, Caller::Operator(_)) {
         crate::control::operator::validate_operator(&req.caller).map_err(|e| ChatError {
             code: "unauthorized".into(),
             message: e.into(),
         })?;
     }
-    let (handle, root, uid, kind, live, draining, graph) = {
+    let (handle, root, uid, kind, live, draining, graph, search_budget, s4_subject) = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         let (uid, kind) = match &req.caller {
             Caller::Operator(_) => (String::new(), "owner"),
@@ -307,26 +324,17 @@ fn execute_with_freshness(
                         message: "Messaging caller is not a registered session".into(),
                     });
                 }
+                let engine = s.sessions.get(&c.session_uid).map(|v| v.session_type.as_str())
+                    .or_else(|| s.tui_sessions.get(&c.session_uid).and_then(|v| v.session_type.as_deref()));
+                if engine == Some("bash") {
+                    return Err(ChatError { code: "invalid_params".into(),
+                        message: "agent_only: chat identity requires an agent; bash is a shell".into() });
+                }
                 (c.session_uid.clone(), "agent")
             }
         };
-        let live = s
-            .sessions
-            .values()
-            .map(|s| (s.uid.clone(), s.title.clone(), s.task_id.clone()))
-            .chain(
-                s.tui_sessions
-                    .values()
-                    .filter(|t| !s.sessions.contains_key(&t.uid))
-                    .map(|t| {
-                        (
-                            t.uid.clone(),
-                            t.label.clone().unwrap_or_else(|| t.uid.clone()),
-                            t.task_id.clone(),
-                        )
-                    }),
-            )
-            .collect::<Vec<_>>();
+        let live = super::live_sessions(&s);
+        let s4_subject = s.sessions.get(&uid).map(crate::items::s4_attribution::Subject::from_session);
         (
             s.messaging.clone(),
             s.messaging_root.clone(),
@@ -335,7 +343,17 @@ fn execute_with_freshness(
             live,
             s.draining,
             super::tasks::SessionGraph::capture(&s),
+            s.config.chat_search_budget_bytes,
+            s4_subject,
         )
+    };
+    let s4 = match (s4_snapshot, s4_subject) {
+        (Some(evidence), Some(subject)) => {
+            let claims = std::collections::HashMap::from([(uid.clone(), evidence)]);
+            let subjects = std::collections::HashMap::from([(uid.clone(), subject)]);
+            crate::items::s4_attribution::matching(claims, &subjects).remove(&uid)
+        }
+        _ => None,
     };
     if draining {
         return Err(ChatError {
@@ -346,7 +364,7 @@ fn execute_with_freshness(
     // Full-message reads advance the wake batch boundary. Serialize their
     // snapshot with publication; native adapter I/O runs outside this gate.
     let coordinates_delivery = kind != "owner"
-        && (req.method == "messaging.read"
+        && (matches!(req.method.as_str(), "messaging.read" | "messaging.mark_read" | "messaging.react")
             || req.method == "messaging.follow"
                 && matches!(req.params["action"].as_str(), Some("set" | "remove"))
             || req.method == "messaging.monitors"
@@ -366,10 +384,8 @@ fn execute_with_freshness(
     let _delivery_guard =
         coordinates_delivery.then(|| delivery_gate.lock().unwrap_or_else(|p| p.into_inner()));
     let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
-    if slot.is_none() {
-        *slot = Some(Store::open(&root)?);
-    }
-    let store = slot.as_mut().unwrap();
+    let store = slot.as_mut().ok_or_else(super::startup::starting)?;
+    store.configure_search(&handle, search_budget);
     let actor = if kind == "owner" {
         "owner".into()
     } else {
@@ -377,14 +393,7 @@ fn execute_with_freshness(
     };
     let mut people = live
         .into_iter()
-        .map(|(uid, name, task)| Person {
-            id: store.participant_id(&uid),
-            name,
-            session_uid: uid,
-            task,
-            present: true,
-            kind: "agent".into(),
-        })
+        .map(|live| Person::present_agent(store.participant_id(&live.uid), live))
         .collect::<Vec<_>>();
     people.push(Person {
         id: "owner".into(),
@@ -393,6 +402,7 @@ fn execute_with_freshness(
         task: None,
         present: true,
         kind: "owner".into(),
+        engine: None,
     });
     people.extend(store.remote_people());
     let p = &req.params;
@@ -419,11 +429,25 @@ fn execute_with_freshness(
             message: "This messaging host is not enrolled to serve Owner".into(),
         });
     }
+    if req.method == "messaging.counts" { return super::task_authority::View::new(store).counts(&actor); }
+    if req.method == "messaging.attention" {
+        return super::task_authority::View::new(store).attention(&actor,false).map(|attention|json!({"attention":attention}));
+    }
+    if req.method == "messaging.mark_read" {
+        let mut authority = super::task_authority::View::new(store);
+        let store = &mut *authority;
+        let result = store.mark_read(&actor,p,&people);
+        if result.is_ok() && kind != "owner" {
+            super::delivery::reconcile_session(&root,store,&uid).map_err(|e|ChatError {code:"outcome_unknown".into(),message:format!("Cursor saved; wake reconciliation needs retry: {e}")})?;
+        }
+        return result;
+    }
     store.enroll_participants(&people)?;
     if store.sync_enabled() && store.is_coordinator() {
         let local = people
             .iter()
-            .filter(|p| p.id.starts_with(&format!("agent:{}:", store.daemon_id)))
+            .filter(|p| p.kind != "shell" && p.engine.as_deref() != Some("bash")
+                && p.id.starts_with(&format!("agent:{}:", store.daemon_id)))
             .cloned()
             .collect::<Vec<_>>();
         store.register_host(&store.daemon_id.clone(), true, true, &local)?;
@@ -497,12 +521,17 @@ fn execute_with_freshness(
             drop(slot);
             drop(_delivery_guard);
             if forward {
+                let submitted_at = chrono::Utc::now();
                 let mut result = sync.request(&actor, &req.method, &forwarded)?;
                 let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
                 let store = slot.as_mut().unwrap();
                 if req.method == "messaging.send" {
                     result["coordinator_position"] = result["position"].clone();
                     result["position"] = submission_position;
+                    annotate_forward_delay(&mut result, submitted_at);
+                }
+                if let Some(o) = result.as_object_mut() {
+                    o.remove("_marked_ids");
                 }
                 if let Some(snapshot) = result.get("owner_snapshot").cloned() {
                     store.apply_owner_snapshot(&snapshot)?;
@@ -510,6 +539,7 @@ fn execute_with_freshness(
                 project_names(state, store, true);
                 result = store.context_response(&actor, p, result, false);
                 store.decorate_sync_response(p, &mut result);
+                annotate_outbox(store, &actor, &mut result);
                 annotate_backfill(Some(&sync), store, p, &mut result);
                 return Ok(result);
             }
@@ -522,13 +552,30 @@ fn execute_with_freshness(
             return execute_with_freshness(state, req, true);
         }
     }
-    let result = match req.method.as_str() {
+    // These registry repairs may acquire DaemonState. Do them before taking
+    // task-file authority guards; no blocking state lock is allowed inside.
+    if req.method == "messaging.send" && kind != "owner" && !store.names.contains_key(&actor) {
+        repair_legacy_binding(state, &uid)?;
+    }
+    if req.method == "session.set_name" {
+        let target = p["uid"].as_str().unwrap_or(&uid);
+        if kind != "owner" && target != uid {
+            return Err(ChatError { code: "unauthorized".into(), message: "An agent can rename only itself".into() });
+        }
+        repair_legacy_binding(state, target)?;
+    }
+    // Display orientation loads task records. Do not reacquire task-file
+    // locks while the effect guards below are held (another task may be busy).
+    let continuous_orientation = (req.method == "messaging.open")
+        .then(|| super::tasks::orientation(store, &graph, &uid));
+    let result = {
+    let mut authority = super::task_authority::View::new(store);
+    let store = &mut *authority;
+    match req.method.as_str() {
+        "messaging.react" => store.react(&actor,p),
         "messaging.send" => {
-            if kind != "owner" && !store.names.contains_key(&actor) {
-                repair_legacy_binding(state, &uid)?;
-            }
             store.acknowledge(&actor, &p["ack_receipt"])?;
-            store.send(&actor, &uid, kind, p, &people)
+            store.send_with_attribution(&actor, &uid, kind, p, &people, s4.as_ref())
         }
         "messaging.read" => {
             // A proactive read may beat the maintenance scan. Include watch
@@ -559,11 +606,13 @@ fn execute_with_freshness(
         "messaging.monitor" => store.register_monitor(&actor, p, &people),
         "messaging.monitors" => store.monitors(&actor, p),
         "messaging.follow" => store.follow(&actor, p, &people),
+        "messaging.availability" => store.availability(&actor, p),
         "messaging.people" => {
             let mut value = store.people(&people);
             if let Some(items) = value.as_array_mut() {
                 items.retain(|v| {
-                    (p["include_exited"] == true || v["present"] == true)
+                    v["kind"] != "shell" && v["engine"] != "bash"
+                        && (p["include_exited"] == true || v["present"] == true)
                         && p["query"].as_str().is_none_or(|q| {
                             v.to_string().to_lowercase().contains(&q.to_lowercase())
                         })
@@ -581,22 +630,16 @@ fn execute_with_freshness(
             {
                 query["channel"] = json!("general");
             }
+            query["mark_read"] = json!(false);
             query["limit"] = json!(10);
             query["newest_first"] = json!(true);
             let recent = store.read(&actor, &query, &people)?;
             Ok(
-                json!({"actor_id":actor,"daemon_id":store.daemon_id,"space_id":store.space_id,"name":store.names.get(&actor),"self":people.iter().find(|p|p.id==actor),"target":recent["target"],"norms":store.norms,"recent":recent,"dms":store.dms(&actor,true)?,"task_subscriptions":store.task_orientation(&actor),"continuous":super::tasks::orientation(store,&graph,&uid),"capabilities":["open","read","send","dms","people","channels","norms","monitor","monitors","follow","pins"],"features":["group_dms","channel_admins","pins","channel_membership","channel_mentions","channel_norms","channel_member_add"],"dm_max_members":32,"message_max_chars":3000}),
+                json!({"actor_id":actor,"daemon_id":store.daemon_id,"space_id":store.space_id,"name":store.names.get(&actor),"self":people.iter().find(|p|p.id==actor),"target":recent["target"],"norms":store.norms,"recent":recent,"dms":store.dms(&actor,true)?,"task_subscriptions":store.task_orientation(&actor),"continuous":continuous_orientation,"owner_availability":crate::owner_availability::exposure_at(&store.owner_availability, chrono::Utc::now()),"capabilities":["open","read","send","dms","people","channels","norms","monitor","monitors","follow","pins","react","mark_read","counts"],"features":["group_dms","channel_admins","pins","channel_membership","channel_mentions","channel_norms","channel_member_add","read_cursors","reactions"],"dm_max_members":32,"message_max_chars":3000}),
             )
         }
         "session.set_name" => {
             let target = p["uid"].as_str().unwrap_or(&uid);
-            if kind != "owner" && target != uid {
-                return Err(ChatError {
-                    code: "unauthorized".into(),
-                    message: "An agent can rename only itself".into(),
-                });
-            }
-            repair_legacy_binding(state, target)?;
             let target_actor = store.participant_id(target);
             let mut params = p.clone();
             params["_authenticated_actor"] = json!(actor);
@@ -606,9 +649,41 @@ fn execute_with_freshness(
             code: "unsupported_feature".into(),
             message: "Messaging method not implemented".into(),
         }),
+    }
+    };
+    if req.method == "messaging.read"
+        && ["sender", "query"].iter().any(|key| p.get(key).is_some_and(|v| !v.is_null()))
+    {
+        if let Err(error) = store.start_search_worker(&handle) {
+            eprintln!("cm messaging: could not start search worker: {error}");
+        }
+    }
+    let result = match result {
+        Err(e) if e.code == "search_indexing" => Ok(json!({"items":[], "indexing":true,
+            "retry_after":1,"partial_scope":p["channel"] == "*" || p["inbox"] == true || p["dms"] == true,
+            "next_cursor":p["cursor"], "search_truncated":false})),
+        result => result,
     };
     project_names(state, store, true);
+    // Reacquire after the registry projection. Keep read/cancel boundaries and
+    // response monitor visibility under current authority too, without holding
+    // file guards over the state lock above or any remote forwarding earlier.
+    let mut authority = super::task_authority::View::new(store);
+    let store = &mut *authority;
     let mut retraction_note = None;
+    // A bulk mark settles pending wakes for every message it marked, exactly
+    // like supplying those messages in a page would.
+    let mut result = result.map(|mut value| {
+        if let Some(ids) = value.as_object_mut().and_then(|o| o.remove("_marked_ids")) {
+            value["items"] = json!(ids
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|id| json!({"id":id}))
+                .collect::<Vec<_>>());
+        }
+        value
+    });
     if kind != "owner" && req.method == "messaging.read" {
         if let Ok(value) = &result {
             if let Err(error) = super::delivery::read_boundary(store, &uid, value) {
@@ -616,6 +691,14 @@ fn execute_with_freshness(
                 retraction_note = Some("Messages supplied, but the notification boundary could not be saved; retry the read.".into());
             }
         }
+    }
+    if p.get("mark_read_before").is_some_and(|v| !v.is_null()) {
+        result = result.map(|mut value| {
+            if let Some(o) = value.as_object_mut() {
+                o.remove("items");
+            }
+            value
+        });
     }
     if coordinates_delivery {
         if let Err(error) = super::delivery::reconcile_session(&root, store, &uid) {
@@ -636,9 +719,15 @@ fn execute_with_freshness(
                 .map(|s| s["monitor_status"].clone())
                 .unwrap_or(json!({"state":"uncached","execution_host":store.coordinator_id()}))
         } else {
+            // Read receipts lower the outstanding count; make sure they are
+            // loaded even for methods that never touched them.
+            if let Err(error) = store.load_reads(&actor) {
+                eprintln!("cm messaging: load read receipts: {error}");
+            }
             store.monitor_status(&actor)
         };
         store.decorate_sync_response(p, &mut value);
+        annotate_outbox(store, &actor, &mut value);
         annotate_backfill(sync.as_ref(), store, p, &mut value);
         if req.method == "messaging.read" {
             super::delivery::annotate_conversations(store, &mut value);
@@ -657,6 +746,39 @@ fn execute_with_freshness(
         }
         value
     })
+}
+
+/// A send executed on the hub is stamped with the hub's `created_at`. Tell the
+/// sender when it submitted and, when the hub stamped it more than a minute
+/// later (a stalled link), by how much: `created_at` stays authoritative.
+fn annotate_forward_delay(result: &mut Value, submitted_at: chrono::DateTime<chrono::Utc>) {
+    if !result.is_object() {
+        return;
+    }
+    result["submitted_at"] = json!(submitted_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+    let created = result["created_at"]
+        .as_str()
+        .or_else(|| result["event"]["created_at"].as_str())
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
+    if let Some(created) = created {
+        let delay = (created.with_timezone(&chrono::Utc) - submitted_at).num_seconds();
+        if delay > 60 {
+            result["delay_s"] = json!(delay);
+            result["delay_note"] = json!(format!("The hub stamped this message {delay}s after you submitted it; its created_at is the authoritative send time"));
+        }
+    }
+}
+
+/// Own messages still waiting for the hub (`pending_sync`), on every messaging
+/// response, so a stalled link is visible to the sender rather than silent.
+/// Only scanned when the replica reports anything pending at all.
+fn annotate_outbox(store: &Store, actor: &str, value: &mut Value) {
+    if !value.is_object() || value["sync"]["pending"].as_u64().unwrap_or(0) == 0 {
+        return;
+    }
+    if let Some(outbox) = store.outbox_status(actor) {
+        value["outbox"] = outbox;
+    }
 }
 
 /// Report a conversation whose history is still arriving from the hub, so a
@@ -703,7 +825,27 @@ fn annotate_backfill(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn forwarded_send_reports_submission_time_and_hub_delay() {
+        let submitted = chrono::DateTime::parse_from_rfc3339("2026-10-06T15:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut prompt = json!({"created_at":"2026-10-06T15:00:02.000Z"});
+        annotate_forward_delay(&mut prompt, submitted);
+        assert_eq!(prompt["submitted_at"], "2026-10-06T15:00:00.000Z");
+        assert!(prompt.get("delay_s").is_none());
+        // Older hubs only carry created_at inside the event.
+        let mut stalled = json!({"event":{"created_at":"2026-10-06T15:40:00.000Z"}});
+        annotate_forward_delay(&mut stalled, submitted);
+        assert_eq!(stalled["delay_s"], 2400);
+        assert!(stalled["delay_note"].as_str().unwrap().contains("authoritative"));
+    }
     fn setup(root: &std::path::Path) -> Arc<Mutex<DaemonState>> {
+        let state = uninitialized(root);
+        super::super::startup::open_for_test(&state).unwrap();
+        state
+    }
+    fn uninitialized(root: &std::path::Path) -> Arc<Mutex<DaemonState>> {
         let mut state = DaemonState::default();
         state.messaging_root = root.into();
         for uid in ["a", "b", "outsider"] {
@@ -733,6 +875,140 @@ mod tests {
             },
         )
     }
+    fn dispatched(state: &Arc<Mutex<DaemonState>>, caller: Caller, method: &str, p: Value) -> Value {
+        let r = dispatch(state, &Request { id: "rpc-test".into(), caller, method: format!("messaging.{method}"), params: p });
+        assert!(r.ok, "{method}: {:?}", r.error);
+        r.result.unwrap()
+    }
+
+    #[test]
+    fn sync_status_is_read_only_and_never_projects_names() {
+        let root = tempfile::tempdir().unwrap();
+        let state = setup(root.path());
+        call(&state, "a", "send", json!({"channel":"general", "name":"Named Scout", "body":"Ready", "request_id":"status-name"})).unwrap();
+        let manifest = root.path().join("daemon-sessions.json");
+        std::fs::write(&manifest, b"unchanged manifest sentinel").unwrap();
+        let (rx, _guard, delivery) = {
+            let mut st = state.lock().unwrap();
+            st.messaging_names.remove("a");
+            st.tui_sessions.get_mut("a").unwrap().label = Some("old label".into());
+            st.daemon_sessions_path = Some(manifest.clone());
+            st.messaging_registry_restored = true;
+            let (rx, guard) = st.manifest_watcher.subscribe();
+            (rx, guard, st.messaging_delivery.clone())
+        };
+        let delivery_guard = delivery.lock().unwrap();
+        let req = |params| Request { id:"status".into(), caller:Caller::operator("t"), method:"messaging.sync".into(), params };
+        for params in [json!({}), json!({"action":"status"})] {
+            let result = execute_sync_admin(&state, &req(params)).unwrap();
+            assert!(result["sync"]["role"].is_string());
+            assert!(result["descriptor"].is_object());
+        }
+        drop(delivery_guard);
+        let st = state.lock().unwrap();
+        assert!(!st.messaging_names.contains_key("a"));
+        assert_eq!(st.tui_sessions["a"].label.as_deref(), Some("old label"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(std::fs::read(&manifest).unwrap(), b"unchanged manifest sentinel");
+        drop(st);
+        let denied = execute_sync_admin(&state, &Request { id:"denied".into(), caller:Caller::session("a"), method:"messaging.sync".into(), params:json!({}) });
+        assert_eq!(denied.unwrap_err().code, "unauthorized");
+    }
+
+    /// A maintenance notice rides on every agent chat response while it is
+    /// in force, and each call stamps the caller's last chat use.
+    #[test]
+    fn chat_responses_carry_the_maintenance_line_while_a_notice_is_in_force() {
+        let root = tempfile::tempdir().unwrap();
+        let state = setup(root.path());
+        let a = || Caller::session("a");
+        let send = |key: &str| json!({"channel":"general","body":"hi","name":"Maint Scout","request_id":key});
+        for (method, p) in [("open", json!({})), ("read", json!({"channel":"general"})), ("send", send("s1"))] {
+            assert!(dispatched(&state, a(), method, p).get("maintenance").is_none(), "{method}: no notice, no field");
+        }
+        assert!(state.lock().unwrap().last_chat_at.contains_key("a"));
+        crate::maintenance::apply_local(root.path(), &json!({"action":"set","reason":"CM redeploy"}), chrono::Utc::now()).unwrap();
+        for (method, p) in [("open", json!({})), ("read", json!({"channel":"general"})), ("send", send("s2"))] {
+            let v = dispatched(&state, a(), method, p);
+            assert!(v["maintenance"].as_str().unwrap().starts_with("CM redeploy in progress since"), "{method}: {v}");
+        }
+        // Operator (TUI) reads are unchanged.
+        assert!(dispatched(&state, Caller::operator("t"), "read", json!({"channel":"general"})).get("maintenance").is_none());
+        crate::maintenance::apply_local(root.path(), &json!({"action":"clear"}), chrono::Utc::now()).unwrap();
+        assert!(dispatched(&state, a(), "open", json!({})).get("maintenance").is_none());
+    }
+
+    /// While local messaging is still opening, the refusal and the
+    /// maintenance line both say nothing was sent; a store stuck for 10
+    /// minutes reads as a local failure.
+    #[test]
+    fn messaging_starting_reads_as_a_plain_explanation() {
+        let root = tempfile::tempdir().unwrap();
+        let state = uninitialized(root.path());
+        assert_eq!(crate::maintenance::field_for(&state), None, "no opener yet: nothing to say");
+        state.lock().unwrap().messaging_opening_since = Some(std::time::Instant::now());
+        let r = dispatch(&state, &Request { id: "x".into(), caller: Caller::session("a"), method: "messaging.open".into(), params: json!({}) });
+        let e = r.error.unwrap();
+        assert!(e.message.starts_with("messaging_starting: CM messaging on this host is still starting"), "{}", e.message);
+        assert!(e.message.contains("retry the same request"), "{}", e.message);
+        // Sends are refused, not queued: the line says so and blames no hub.
+        let line = crate::maintenance::field_for(&state).unwrap();
+        assert!(line.starts_with("CM messaging on this host is still starting") && !line.contains("saved"), "{line}");
+        state.lock().unwrap().messaging_opening_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(11 * 60));
+        assert!(crate::maintenance::field_for(&state).unwrap().contains("failed to start"));
+    }
+
+    /// The board's New DM picker leaves out bash sessions, which have no
+    /// agent to read a DM, so the directory reports each session's engine.
+    #[test]
+    fn people_report_each_live_sessions_engine() {
+        let root = tempfile::tempdir().unwrap();
+        let state = setup(root.path());
+        {
+            let mut s = state.lock().unwrap();
+            for (uid, engine) in [("a", "claude"), ("b", "codex"), ("sh", "bash")] {
+                s.tui_sessions.insert(
+                    uid.into(),
+                    serde_json::from_value(json!({"uid":uid,"label":uid,"type":engine})).unwrap(),
+                );
+            }
+        }
+        let page = call(&state, "a", "people", json!({})).unwrap();
+        let engine = |uid: &str| {
+            page["items"].as_array().unwrap().iter()
+                .find(|p| p["session_uid"] == uid)
+                .map(|p| p["engine"].clone())
+                .unwrap()
+        };
+        assert_eq!(engine("a"), "claude-code", "the TUI's `claude` is the daemon's `claude-code`");
+        assert_eq!(engine("b"), "codex");
+        assert!(!page["items"].as_array().unwrap().iter().any(|p| p["session_uid"] == "sh"));
+        let refusal = call(&state, "sh", "open", json!({})).unwrap_err();
+        assert!(refusal.message.contains("bash is a shell"));
+        let target = { let slot = state.lock().unwrap().messaging.clone(); let s = slot.lock().unwrap(); s.as_ref().unwrap().participant_id("sh") };
+        let refusal = call(&state, "a", "send", json!({"dm":target,"body":"work","request_id":"shell-dm"})).unwrap_err();
+        assert!(refusal.message.contains("bash is a shell"));
+        assert_eq!(engine("outsider"), Value::Null, "an unknown engine is omitted, not guessed");
+    }
+    #[test]
+    fn cursor_and_reaction_rpcs_use_the_authenticated_reader_and_return_counts() {
+        let root = tempfile::tempdir().unwrap();
+        let state = setup(root.path());
+        call(&state,"b","send",json!({"channel":"general","body":"Here","name":"Bravo","request_id":"claim"})).unwrap();
+        let actor=call(&state,"b","open",json!({"channel":"general"})).unwrap()["actor_id"].clone();
+        let sent=call(&state,"a","send",json!({"channel":"general","body":"Review","name":"Alpha","request_id":"review","mentions":[actor]})).unwrap();
+        assert_eq!(call(&state,"b","counts",json!({})).unwrap()["mentions"],1);
+        let preview=call(&state,"b","read",json!({"channel":"general","mark_read":false})).unwrap();
+        assert!(preview["items"].as_array().unwrap().iter().any(|v|v["id"]==sent["event_id"] && v["read"]==false));
+        let reaction=call(&state,"b","react",json!({"message_id":sent["event_id"],"emoji":"✅","request_id":"ack"})).unwrap();
+        assert_eq!(reaction["reactions"]["✅"]["mine"],true);
+        assert_eq!(reaction["counts"]["mentions"],0);
+        let marked=call(&state,"b","mark_read",json!({"channel":"general"})).unwrap();
+        assert_eq!(marked["changed"],false);
+        assert_eq!(marked["read_cursor"]["event_id"],sent["event_id"]);
+        assert!(call(&state,"b","counts",json!({"from":"owner"})).is_err());
+    }
+
     #[test]
     fn messaging_full_read_covers_unscanned_watch_but_preview_and_invalid_read_do_not() {
         let root = tempfile::tempdir().unwrap();
@@ -803,6 +1079,49 @@ mod tests {
         );
     }
     #[test]
+    fn mark_read_before_clears_backlog_monitor_count_and_pending_wakes() {
+        let root = tempfile::tempdir().unwrap();
+        let state = setup(root.path());
+        let b_id = call(&state, "b", "open", json!({})).unwrap()["actor_id"].clone();
+        call(&state, "b", "send", json!({"channel":"general","name":"Reader","body":"here","request_id":"hello"})).unwrap();
+        call(&state, "b", "monitor", json!({"scope":{"dms":true},"mode":"continuous","request_id":"dm-watch"})).unwrap();
+        let mut times = vec![];
+        for (i, name) in [(1, Some("Publisher")), (2, None), (3, None)] {
+            let mut q = json!({"dm":b_id,"body":format!("update {i}"),"request_id":format!("dm-{i}")});
+            if let Some(n) = name {
+                q["name"] = json!(n);
+            }
+            times.push(call(&state, "a", "send", q).unwrap()["created_at"].as_str().unwrap().to_owned());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let before = call(&state, "b", "monitors", json!({})).unwrap();
+        assert_eq!(before["monitor_status"]["unacknowledged"], 3);
+        // Everything created before the third message is marked in one call.
+        let marked = call(&state, "b", "read", json!({"inbox":true,"mark_read_before":times[2]})).unwrap();
+        assert_eq!(marked["marked"], 2);
+        assert_eq!(marked["monitors_advanced"], 1);
+        assert!(marked["items"].is_null() && marked.get("_marked_ids").is_none());
+        assert_eq!(marked["monitor_status"]["unacknowledged"], 1);
+        let rest = call(&state, "b", "read", json!({"inbox":true,"unread_only":true})).unwrap();
+        assert_eq!(rest["items"].as_array().unwrap().len(), 1);
+        assert_eq!(rest["items"][0]["body"], "update 3");
+        // Pending wakes for the marked messages were settled like a read.
+        use sha2::Digest;
+        let uid_hash = format!("{:x}", sha2::Sha256::digest(b"b"));
+        let ledger = root.path().join("messages/main/_delivery").join(format!("{uid_hash}.json"));
+        let q: Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+        let checked: usize = q["batches"].as_array().unwrap().iter()
+            .map(|b| b["checked"].as_array().unwrap().len()).sum();
+        assert!(checked >= 2, "{q}");
+        // Acknowledging the last page lowers the watch count too: reading is
+        // enough, no separate monitor receipt needed.
+        let after = call(&state, "b", "read", json!({"inbox":true,"unread_only":true,"ack_receipt":rest["receipt"]})).unwrap();
+        assert!(after["items"].as_array().unwrap().is_empty());
+        assert_eq!(after["monitor_status"]["unacknowledged"], 0);
+        // Only inbox/dms reads accept the bulk mark.
+        assert_eq!(call(&state, "b", "read", json!({"channel":"general","mark_read_before":times[2]})).unwrap_err().code, "invalid_target");
+    }
+    #[test]
     fn messaging_channel_norms_authentication_and_scoped_context_through_rpc() {
         let root = tempfile::tempdir().unwrap();
         let state = setup(root.path());
@@ -843,6 +1162,69 @@ mod tests {
         let opened = call(&state, "b", "open", json!({"channel":"roles"})).unwrap();
         assert_eq!(opened["target"]["can_edit"], false);
         assert_eq!(opened["target"]["created_by"], channel["created_by"]);
+    }
+    #[test]
+    fn messaging_search_spawn_failure_never_fails_or_restarts_on_ordinary_rpc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = setup(tmp.path());
+        let handle = state.lock().unwrap().messaging.clone();
+        handle.lock().unwrap().as_mut().unwrap().fail_search_spawn_for_test(true);
+        call(&state, "a", "send", json!({"channel":"general","name":"Search Builder","body":"first verdict","request_id":"first"})).unwrap();
+        let q = json!({"channel":"general","query":"verdict"});
+        assert_eq!(call(&state, "b", "read", q.clone()).unwrap()["indexing"], true);
+        assert_eq!(handle.lock().unwrap().as_mut().unwrap().fail_search_spawn_for_test(true), 1);
+        let sent = call(&state, "a", "send", json!({"channel":"general","body":"second verdict","request_id":"second"})).unwrap();
+        let page = call(&state, "b", "read", json!({"channel":"general"})).unwrap();
+        assert!(page["items"].as_array().unwrap().iter().any(|e| e["id"] == sent["event_id"]));
+        assert_eq!(handle.lock().unwrap().as_mut().unwrap().fail_search_spawn_for_test(false), 1,
+            "non-search RPCs must not even attempt to start the queued worker");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let page = call(&state, "b", "read", q.clone()).unwrap();
+            if page["indexing"] != true {
+                assert_eq!(page["items"].as_array().unwrap().len(), 2);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    #[test]
+    fn messaging_search_build_keeps_sends_and_retry_responsive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = setup(tmp.path());
+        call(&state, "a", "send", json!({"channel":"general","name":"Search Builder","body":"first verdict","request_id":"first"})).unwrap();
+        let handle = state.lock().unwrap().messaging.clone();
+        let (entered, release) = handle.lock().unwrap().as_mut().unwrap().pause_search_for_test();
+        let q = json!({"channel":"general","query":"verdict"});
+        let pending = call(&state, "b", "read", q.clone()).unwrap();
+        assert_eq!(pending["indexing"], true);
+        assert_eq!(pending["retry_after"], 1);
+        entered.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        // The worker is suspended mid-build until release, making this a
+        // deterministic concurrency check rather than a race with a tiny index.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let clone = state.clone();
+        let sender = std::thread::spawn(move || {
+            tx.send(call(&clone, "a", "send", json!({"channel":"general","body":"delta verdict","request_id":"delta"}))).unwrap();
+        });
+        let sent = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("send blocked on cold search").unwrap();
+        sender.join().unwrap();
+        assert_eq!(call(&state, "b", "read", q.clone()).unwrap()["indexing"], true);
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let page = loop {
+            match call(&state, "b", "read", q.clone()) {
+                Ok(page) if page["indexing"] == true => {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Ok(page) => break page,
+                Err(e) => panic!("{e}"),
+            }
+        };
+        assert_eq!(page["items"].as_array().unwrap().len(), 2);
+        assert!(page["items"].as_array().unwrap().iter().any(|e| e["id"] == sent["event_id"]));
     }
     #[test]
     fn messaging_reads_and_cancellation_serialize_with_wake_publication_but_sends_do_not() {
@@ -1115,12 +1497,12 @@ mod tests {
         )
         .unwrap();
         drop(state);
-        let state = setup(tmp.path());
+        let state = uninitialized(tmp.path());
         let manifest = tmp.path().join("daemon-sessions.json");
         let original = b"headless registry must survive initialization";
         std::fs::write(&manifest, original).unwrap();
         state.lock().unwrap().daemon_sessions_path = Some(manifest.clone());
-        initialize(&state).unwrap();
+        super::super::startup::open_for_test(&state).unwrap();
         assert_eq!(std::fs::read(&manifest).unwrap(), original);
         assert_eq!(state.lock().unwrap().messaging_names["a"].name, "Scout");
         let stale = tmp.path().join("stale-tui.json");
@@ -1135,5 +1517,27 @@ mod tests {
         assert_eq!(entry.label, "Scout");
         assert_eq!(entry.workflow_role.as_deref(), Some("worker"));
         assert_eq!(entry.task_id.as_deref(), Some("task-a"));
+    }
+
+    #[test]
+    fn messaging_late_name_recovery_persists_after_registry_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = setup(tmp.path());
+        call(&state, "a", "send", json!({
+            "channel":"general", "name":"Restored-Scout", "body":"Ready", "request_id":"name",
+        })).unwrap();
+        drop(state);
+        let state = uninitialized(tmp.path());
+        let manifest = tmp.path().join("daemon-sessions.json");
+        {
+            let mut s = state.lock().unwrap();
+            s.daemon_sessions_path = Some(manifest.clone());
+            s.messaging_registry_restored = true;
+        }
+        super::super::startup::open_for_test(&state).unwrap();
+        assert!(manifest.exists(), "late name recovery must persist the restored registry");
+        assert_eq!(state.lock().unwrap().messaging_names["a"].name, "Restored-Scout");
+        let saved: Value = serde_json::from_slice(&std::fs::read(manifest).unwrap()).unwrap();
+        assert_eq!(saved["messaging_names"]["a"]["name"], "Restored-Scout");
     }
 }

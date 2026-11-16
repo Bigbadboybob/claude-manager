@@ -16,7 +16,7 @@ use crate::agent_memory;
 use crate::api::Task;
 use crate::backend::{BackendEvent, BackendHandle};
 use crate::config::Config;
-use crate::planning::{LaunchEngine, PlanAction, PlanningView, WorkspaceCandidate};
+use crate::planning::{LaunchEngine, PlanAction, PlanningView};
 use crate::session::Session;
 use crate::terminal_widget::TerminalWidget;
 use crate::theme;
@@ -28,11 +28,14 @@ use crate::workflow::observer::{
 };
 use cm_daemon::worktree;
 
+mod archive;
 mod backtests;
 use backtests::*;
 mod sections;
 mod sidebar_remote;
 use sections::*;
+mod tree;
+
 mod model;
 use model::*;
 mod nav;
@@ -47,7 +50,13 @@ mod events;
 use events::*;
 mod lifecycle;
 mod plan_launch;
+mod reports_to;
+pub(crate) mod model_field;
 mod remote_create;
+mod restart;
+mod background;
+mod fork;
+mod handoff;
 mod image_paste;
 use lifecycle::*;
 mod input;
@@ -59,8 +68,26 @@ use transcripts::*;
 mod draw;
 mod messages;
 mod global_settings;
+mod staffing;
+mod availability;
+mod agent_state;
+mod board;
+mod orgchart;
+mod orgchart_actions;
+mod orgchart_teams;
+mod org_model;
+mod place;
+mod team_view;
+mod roster;
+pub(crate) mod symbols;
+mod owner_blocked;
+mod maintenance;
+mod color_grid;
+mod unread;
+#[cfg(test)]
+mod sidebar_perf_tests;
 
-pub(crate) use lifecycle::try_attach_via_daemon_with_deps;
+pub(crate) use lifecycle::{attach_via_daemon, is_open_assistant_row, try_attach_via_daemon_with_deps};
 
 pub(crate) use model::{
     new_workspace_id, parse_worktree_mode, PendingWrite, SessionStatus, TaskEntry, TaskStatus,
@@ -81,7 +108,7 @@ mod dirs {
 /// when sizing the PTY).
 pub const SIDEBAR_WIDTH: u16 = 36;
 /// Minimum Wakeups within the window to consider a session actively working.
-const WAKEUP_BURST_THRESHOLD: usize = 5;
+const WAKEUP_BURST_THRESHOLD: usize = 3;
 
 // ── MRU quick-switch (A-;) ──────────────────────────────────────
 
@@ -247,6 +274,12 @@ pub struct App {
     pub keybinding_helper_visible: bool,
     sidebar_list_state: ListState,
     continuous_list_state: ListState,
+    /// Rows the main sidebar list and the continuous column showed on the
+    /// last draw; A-u / A-d page by half of the focused one.
+    pub(crate) sidebar_page_rows: u16,
+    /// The open grid color picker over an A-e form, if any.
+    pub(crate) color_grid: Option<color_grid::ColorGrid>,
+    pub(crate) continuous_page_rows: u16,
     pub view_mode: ViewMode,
     pub planning: PlanningView,
     pub should_quit: bool,
@@ -256,6 +289,24 @@ pub struct App {
     pub last_adopt_scan: Option<Instant>,
     pub config: Config,
     global_settings: global_settings::GlobalSettings,
+    availability: availability::Availability,
+    board: board::Board,
+    /// F6 org chart overlay (app/orgchart.rs).
+    orgchart: orgchart::OrgChart,
+    /// The org model snapshot (app/org_model.rs), polled only while a
+    /// screen that draws it is open.
+    org: org_model::OrgState,
+    /// The roster screen (app/roster.rs), opened with `R` in F6.
+    roster: roster::Roster,
+    place: place::Place,
+    /// The viewer's terminal has focus (focus reports; true until a
+    /// terminal says otherwise, so one without them polls as before).
+    pub(crate) focused: bool,
+    owner_blocked: owner_blocked::OwnerBlocked,
+    maintenance: maintenance::Maintenance,
+    /// Reap requests submitted from the cleanup dialog, tracked after it closed.
+    cleanup_jobs: Vec<worktree_cleanup::Menu>,
+    unread: unread::Unread,
     pub backend: BackendHandle,
     pub connected: bool,
     pub status_msg: Option<(String, Instant)>,
@@ -272,6 +323,17 @@ pub struct App {
     input_mode: InputMode,
     snapshot_store: agent_memory::SnapshotStore,
     session_form_host: Option<cm_daemon::host_id::HostId>,
+    /// A-n "Reports to" field and its open picker. Kept beside the form
+    /// (not in `InputMode::NewSession`) so the snapshot-picker round trip
+    /// preserves it; `start_new_session` resets both.
+    new_session_reports_to: crate::task_picker::ReportsTo,
+    new_session_picker: Option<crate::task_picker::TaskPicker>,
+    /// The open launch form's Model field (A-n, A-s, A-f, A-F); each form
+    /// re-seeds it when it opens. See `model_field.rs`.
+    form_model: model_field::ModelField,
+    /// A-n forms with a "Reports to" parent, parked until their task row
+    /// exists (`BackendEvent::ReportingTaskCreated`), keyed by request id.
+    pending_report_launches: HashMap<String, reports_to::PendingReportLaunch>,
     start_time: Instant,
     sessions_restored: bool,
     /// Task→workspace bindings loaded from the manifest at startup. Consulted
@@ -355,11 +417,32 @@ pub struct App {
     /// sidebar builders NEVER emit continuous sessions — they render only in the
     /// column, never in both places. Off by default. Persisted in the manifest.
     pub continuous_column_on: bool,
-    /// User-assigned accent colors for planning tasks, keyed by task id.
-    /// Tasks live in the planning API, so their color rides in the local
-    /// manifest as a sidecar (`Manifest::task_colors`). Consumed by the
-    /// sidebar `TaskHeader` arm; edited via A-e on a task row.
+    /// Legacy accent colors of planning tasks, keyed by task id, from the
+    /// task-header era (`Manifest::task_colors`). A workspace header with no
+    /// color of its own falls back to its task's; A-e on the workspace row
+    /// moves it onto the workspace.
     pub task_colors: HashMap<String, String>,
+    /// Folded workspace and division headers of the Task sub-view's work
+    /// tree (`app/tree.rs`), by workspace id and initiative id. Persisted in
+    /// the manifest (workspace folds in its `folded_tasks` field).
+    pub(crate) folded_workspaces: HashSet<String>,
+    pub(crate) folded_divisions: HashSet<String>,
+    /// Folded Team sub-view headers (app/team_view.rs).
+    pub(crate) folded_org: HashSet<String>,
+    /// The last `App::session_attachments` result and the key it was
+    /// computed for (F6, the Team sidebar and the roster share it).
+    pub(crate) attach_cache: std::cell::RefCell<Option<(u64, std::rc::Rc<orgchart_teams::Attachments>)>>,
+    /// Cached Task-sidebar tree. The model is immutable between data/fold
+    /// changes; keeping it across draws avoids rebuilding the full forest on
+    /// every frame when a large group is expanded.
+    pub(crate) task_tree_cache: std::cell::RefCell<Option<(u64, std::rc::Rc<tree::TaskTree>)>>,
+    /// Set per frame while an A-e form is open on a nested workspace: the
+    /// read-only Section value it inherits (`App::nested_section_label`).
+    pub(crate) section_note: Option<String>,
+    /// The cursor at the last sidebar draw: a draw reveals the cursor's row
+    /// only when the cursor moved since (a jump, spawn, fork, restore or an
+    /// event), never against Owner's own filter or folds.
+    pub(crate) last_drawn_cursor: Option<Cursor>,
     /// Sidebar sections (doc/sidebar-sections.md) in display order.
     /// Persisted as `Manifest::sections`; see `app/sections.rs`.
     pub(crate) sections: Vec<SidebarSection>,
@@ -372,6 +455,19 @@ pub struct App {
     pub(crate) sidebar_pending: HashMap<(cm_daemon::host_id::HostId, String), cm_daemon::sidebar::Assignment>,
     /// Adopted agent workspace ids, persisted independently of display names.
     pub(crate) auto_close_workspaces: HashSet<String>,
+    /// Workspaces Owner reopened with A-O in this viewer run. A reopen is an
+    /// explicit claim: neither the spent sweep nor the agent-marker close
+    /// may hide them again (2026-10-12: a reopened cloud workspace whose
+    /// restore had failed was auto-closed seconds later). Cleared when Owner
+    /// closes the workspace.
+    pub(crate) user_reopened: HashSet<String>,
+    /// Bash-pane checks in flight for a workspace whose last agent is gone
+    /// (`check_and_close_workspace`); drained by `drain_last_agent_closes`.
+    last_agent_close_tx: std::sync::mpsc::Sender<lifecycle::LastAgentVerdict>,
+    last_agent_close_rx: std::sync::mpsc::Receiver<lifecycle::LastAgentVerdict>,
+    /// When to make the one-time bash-only sweep offer; None once made (or
+    /// made in an earlier run, per its marker file).
+    bash_sweep_due: Option<Instant>,
     /// Cloud backtest runs, rendered in the continuous panel's `backtests`
     /// group instead of per-task workspaces (they never hold a local session).
     /// Rebuilt from the API task list by `reconcile_tasks` →
@@ -498,6 +594,20 @@ pub struct App {
     pub attaching: std::collections::HashMap<String, PendingRemoteReattach>,
     plan_launches: Vec<plan_launch::PlanLaunchFlight>,
     remote_creates: Vec<remote_create::RemoteCreateFlight>,
+    /// When the adopt pass first saw each untracked TASKLESS daemon session
+    /// (uid → instant). One is adopted only after `TASKLESS_ADOPT_GRACE`,
+    /// so a spawn whose own response is still on its way lands once.
+    taskless_seen: HashMap<String, Instant>,
+    /// A-R restarts/revives whose daemon RPCs are in flight (`restart.rs`).
+    restarts: Vec<restart::RestartFlight>,
+    /// A-O remote restores in flight.
+    restores: Vec<restart::RestoreFlight>,
+    /// Remote A-s adds in flight.
+    remote_adds: Vec<restart::AddFlight>,
+    /// Keypress-triggered daemon RPCs in flight (`background.rs`).
+    background_jobs: Vec<background::BackgroundJob>,
+    /// A-F forks in flight (the host provisions a worktree before replying).
+    fork_flights: Vec<fork::ForkFlight>,
     image_pastes: Vec<image_paste::ImagePasteFlight>,
     /// 10e-d: per-process de-dup set for cap-kill toasts. A given
     /// session's cap-kill event can reach the TUI through two
@@ -517,10 +627,27 @@ pub struct App {
     /// that diff is applied, the slot already holds the revived
     /// incarnation, so the normal exit handling (stamping
     /// `preserved_last_exit`, pruning agent-spawned rows) would act on
-    /// the wrong session. Inserted by `kill_live_session_for_restart`
-    /// once the reap is confirmed; consumed one-shot in
+    /// the wrong session. Inserted by `start_restart` before the kill is
+    /// sent (removed again if the kill fails); consumed one-shot in
     /// `apply_manifest_diff_from_host`.
     pub(crate) restart_suppressed_exit_uids: std::collections::HashSet<String>,
+    /// Sessions whose last A-R failed, with the error: the row stays (no
+    /// exit prune) and shows the failure until a later revive succeeds.
+    pub(crate) revive_failed: HashMap<String, String>,
+    /// #24/#25: uids CM stopped to bring straight back (a transcript
+    /// rotation or a handoff), with when the stop was seen. While fresh, a
+    /// NotFound from the daemon is the gap before the new process, not a
+    /// gone session, and A-R leaves it to the automatic reattach.
+    pub(crate) respawning: HashMap<String, std::time::Instant>,
+    /// Last `session.viewed` report: which session, and when. See
+    /// `report_viewed_session`.
+    pub(crate) viewed_report: Option<(String, std::time::Instant)>,
+    /// `session.viewed` reports waiting per host. A host present here has a
+    /// sender thread running, which sends the latest uid (if any) and exits
+    /// when none is left, so quick selection changes cost one RPC at a time.
+    viewed_pending: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<cm_daemon::host_id::HostId, Option<String>>>,
+    >,
     /// 12a (Phase 3): parsed `~/.cm/hosts.toml`. Synthesized
     /// local-default when the file is missing (A1 in the Phase 3
     /// plan). No consumer yet — 12b adds the field to manifest
@@ -592,8 +719,14 @@ pub struct App {
     /// selects that session's row. See `tick_alerts` / `reap_and_clear_alerts`.
     alerts: HashMap<String, String>,
     owner_alerts: HashMap<(crate::hosts::HostId, String), cm_daemon::owner_attention::Alert>,
-    owner_alert_rows: HashSet<String>,
-    dismissed_owner_alerts: HashSet<String>,
+    notification_health: HashMap<(crate::hosts::HostId, String), serde_json::Value>,
+    /// Engine-reported `agent_state` per (host, uid); see `app/agent_state.rs`.
+    agent_states: HashMap<(crate::hosts::HostId, String), agent_state::AgentStateView>,
+    owner_alert_rows: HashMap<(crate::hosts::HostId, String), String>,
+    dismissed_owner_alerts: HashSet<(crate::hosts::HostId, String, String)>,
+    /// When this viewer first saw each open alert (alert id, or `legacy:<uid>`
+    /// for TUI-raised ones): the Messages "Open alerts" ages and order.
+    owner_alert_since: HashMap<String, SystemTime>,
     /// Fingerprint of every open-workspace idle session's `(uid, age
     /// bucket)` set at the last `tick_idle_ages` evaluation. Idle ages only
     /// matter at bucket granularity (afterglow → settled → stale), and an
@@ -631,6 +764,15 @@ pub struct App {
     /// Transient + in-memory only. Cleared when the session is re-queued (and
     /// re-inserted on the next successful attach).
     attached_tunnel_generation: std::collections::HashMap<String, u64>,
+    /// Per-uid reconnect backoff (`remote::ReattachBackoff`).
+    reattach_backoff: std::collections::HashMap<String, remote::ReattachBackoff>,
+    /// Scrollback loads Owner asked for by scrolling up in a screen-first
+    /// pane (`load_deferred_history`); that pane's next attach replays the
+    /// whole ring.
+    pub(crate) history_fetches: std::collections::HashMap<String, remote::HistoryFetch>,
+    /// Panes whose scrollback just loaded: scroll them up a page once the
+    /// replay has been read, so the gesture that asked for it takes effect.
+    scroll_after_load: std::collections::HashMap<String, Instant>,
 }
 
 /// Phase 6 activity-feed entry. Logged from each mutating control-socket
@@ -674,6 +816,7 @@ impl App {
         let manifest = Self::load_manifest();
         let sidebar_view = match manifest.view.as_deref() {
             Some("task") => SidebarView::Task,
+            Some("team") => SidebarView::Team,
             _ => SidebarView::Status,
         };
         let hide_continuous = manifest.hide_continuous;
@@ -682,11 +825,15 @@ impl App {
         let mut planning = PlanningView::new();
         planning.keybinding_helper_visible = keybinding_helper_visible;
         let task_colors = manifest.task_colors.clone();
+        let folded_workspaces = tree::migrate_workspace_folds(&manifest.folded_tasks, manifest.workspaces.keys());
+        let folded_divisions: HashSet<String> = manifest.folded_divisions.iter().cloned().collect();
+        let folded_org: HashSet<String> = manifest.folded_org.iter().cloned().collect();
         let sections = manifest.sections.clone();
         // Only keep bindings whose target workspace still exists in the
         // manifest — otherwise we'd set workspace_id to a dangling id that
         // nothing resolves to.
         let known_ws_ids: HashSet<&String> = manifest.workspaces.keys().collect();
+        let (last_agent_close_tx, last_agent_close_rx) = std::sync::mpsc::channel();
         let auto_close_workspaces = manifest.auto_close_workspaces.iter()
             .filter(|id| known_ws_ids.contains(id))
             .cloned().collect();
@@ -907,6 +1054,9 @@ impl App {
             keybinding_helper_visible,
             sidebar_list_state: ListState::default(),
             continuous_list_state: ListState::default(),
+            sidebar_page_rows: 0,
+            color_grid: None,
+            continuous_page_rows: 0,
             view_mode: ViewMode::Sessions,
             planning,
             should_quit: false,
@@ -914,6 +1064,17 @@ impl App {
             last_adopt_scan: None,
             config,
             global_settings: global_settings::GlobalSettings::load(),
+            availability: availability::Availability::load(),
+            board: board::Board::default(),
+            orgchart: orgchart::OrgChart::default(),
+            org: org_model::OrgState::default(),
+            roster: roster::Roster::default(),
+            place: place::Place::default(),
+            focused: true,
+            owner_blocked: owner_blocked::OwnerBlocked::default(),
+            maintenance: maintenance::Maintenance::load(),
+            cleanup_jobs: Vec::new(),
+            unread: unread::Unread::default(),
             backend,
             connected: false,
             status_msg: None,
@@ -922,6 +1083,10 @@ impl App {
             input_mode: InputMode::Normal,
             snapshot_store: agent_memory::SnapshotStore::Local,
             session_form_host: None,
+            new_session_reports_to: Default::default(),
+            new_session_picker: None,
+            form_model: Default::default(),
+            pending_report_launches: HashMap::new(),
             start_time: Instant::now(),
             sessions_restored: false,
             manifest_bindings,
@@ -947,12 +1112,24 @@ impl App {
             hide_continuous,
             continuous_column_on,
             task_colors,
+            folded_workspaces,
+            folded_divisions,
+            folded_org,
+            attach_cache: Default::default(),
+            task_tree_cache: Default::default(),
+            section_note: None,
+            last_drawn_cursor: None,
             sections,
             workspace_sections,
             sidebar_receipts: manifest.sidebar_receipts.clone(),
             sidebar_pending: HashMap::new(),
             sidebar_retry_at: Instant::now(),
             auto_close_workspaces,
+            user_reopened: HashSet::new(),
+            last_agent_close_tx,
+            last_agent_close_rx,
+            bash_sweep_due: (!lifecycle::bash_sweep_marker().exists())
+                .then(|| Instant::now() + lifecycle::BASH_SWEEP_DELAY),
             backtest_rows: Vec::new(),
             backtests_folded: false,
             backtest_unfolded_fleets: HashSet::new(),
@@ -971,6 +1148,10 @@ impl App {
             continuous_dispatch_pending: std::collections::HashMap::new(),
             cap_kill_toasted: std::collections::HashSet::new(),
             restart_suppressed_exit_uids: std::collections::HashSet::new(),
+            revive_failed: HashMap::new(),
+            respawning: HashMap::new(),
+            viewed_report: None,
+            viewed_pending: Default::default(),
             hosts,
             host_pool,
             skipped_manifest_entries: HashMap::new(),
@@ -979,19 +1160,31 @@ impl App {
             attaching: HashMap::new(),
             plan_launches: Vec::new(),
             remote_creates: Vec::new(),
+            taskless_seen: HashMap::new(),
+            restarts: Vec::new(),
+            restores: Vec::new(),
+            remote_adds: Vec::new(),
+            background_jobs: Vec::new(),
+            fork_flights: Vec::new(),
             image_pastes: Vec::new(),
             push_worker,
             last_drawn_view_mode: None,
             last_drawn_input_disc: None,
             alerts: HashMap::new(),
             owner_alerts: HashMap::new(),
-            owner_alert_rows: HashSet::new(),
+            notification_health: HashMap::new(),
+            agent_states: HashMap::new(),
+            owner_alert_rows: HashMap::new(),
             dismissed_owner_alerts: HashSet::new(),
+            owner_alert_since: HashMap::new(),
             last_alert_frame: 0,
             idle_bucket_fingerprint: 0,
             last_idle_bucket_check: None,
             reconnecting_sessions: std::collections::HashSet::new(),
             attached_tunnel_generation: std::collections::HashMap::new(),
+            reattach_backoff: std::collections::HashMap::new(),
+            history_fetches: std::collections::HashMap::new(),
+            scroll_after_load: std::collections::HashMap::new(),
         }
     }
 
@@ -1041,20 +1234,19 @@ impl App {
         }
         let wi = match &self.cursor {
             Cursor::Workspace(wi) => *wi,
-            Cursor::Task { ws_idx, .. } => *ws_idx,
             Cursor::Session(wi, _) => *wi,
-            Cursor::Backtest(_) | Cursor::Section(_) => return None,
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => return None,
         };
         (wi < self.workspaces.len()).then_some(wi)
     }
 
-    /// Return the task_id for the cursor's current task scope, if any:
-    ///   - Cursor::Task → the task_id on the cursor
+    /// Return the task_id of the session the cursor is on, if any:
     ///   - Cursor::Session → the session's task_id (may be None)
-    ///   - Cursor::Workspace → None (not task-scoped, even if one task is bound)
+    ///   - Cursor::Workspace → None: A-x there deletes the whole workspace.
+    ///     Actions that take the workspace row as its task use
+    ///     [`App::cursor_scope_task_id`].
     fn cursor_task_id(&self) -> Option<String> {
         match &self.cursor {
-            Cursor::Task { task_id, .. } => Some(task_id.clone()),
             Cursor::Session(wi, si) => self
                 .workspaces
                 .get(*wi)
@@ -1062,11 +1254,23 @@ impl App {
                 .and_then(|ts| ts.task_id.clone()),
             Cursor::Workspace(_) => None,
             // Deliberately None even on a Run row: task-scoped actions
-            // (A-d done, A-x delete) must not act on a backtest task from
+            // (A-D done, A-x delete) must not act on a backtest task from
             // the sidebar — the dispatch daemon owns its lifecycle.
             Cursor::Backtest(_) => None,
-            // A section header is a display grouping, not a task.
-            Cursor::Section(_) => None,
+            // A section header is a display grouping, not a task; nor is a
+            // division header (task actions there would hit its root task).
+            Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => None,
+        }
+    }
+
+    /// The task the cursor's row stands for: a session's task, or on a
+    /// workspace row the workspace's task when exactly one is bound
+    /// (`App::workspace_task`; the workspace row replaced the task header,
+    /// 2026-11-05). A-d, A-s and A-f launch use it.
+    fn cursor_scope_task_id(&self) -> Option<String> {
+        match &self.cursor {
+            Cursor::Workspace(wi) => self.workspace_task(*wi),
+            _ => self.cursor_task_id(),
         }
     }
 
@@ -1078,6 +1282,11 @@ impl App {
                 let ts = ws.sessions.get(*si)?;
                 Some((ws, ts))
             }
+            // In the Task sub-view a workspace header is a tree row
+            // (app/tree.rs): Space/Enter fold it, and no keys reach a
+            // terminal from it, even when the workspace has a single
+            // session (that session is one row down).
+            Cursor::Workspace(_) if self.workspace_header_is_tree_row() => None,
             Cursor::Workspace(wi) => {
                 let ws = self.workspaces.get(*wi)?;
                 if ws.sessions.len() == 1 {
@@ -1086,22 +1295,9 @@ impl App {
                     None
                 }
             }
-            Cursor::Task { ws_idx, task_id } => {
-                let ws = self.workspaces.get(*ws_idx)?;
-                let matches: Vec<&TerminalSession> = ws
-                    .sessions
-                    .iter()
-                    .filter(|ts| ts.task_id.as_deref() == Some(task_id.as_str()))
-                    .collect();
-                if matches.len() == 1 {
-                    Some((ws, matches[0]))
-                } else {
-                    None
-                }
-            }
             // No PTY behind backtest rows — plain keys fall through to the
             // fold toggle in input.rs instead of a terminal.
-            Cursor::Backtest(_) | Cursor::Section(_) => None,
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => None,
         }
     }
 
@@ -1112,6 +1308,7 @@ impl App {
                 let ws = self.workspaces.get_mut(*wi)?;
                 ws.sessions.get_mut(*si)
             }
+            Cursor::Workspace(_) if self.workspace_header_is_tree_row() => None,
             Cursor::Workspace(wi) => {
                 let ws = self.workspaces.get_mut(*wi)?;
                 if ws.sessions.len() == 1 {
@@ -1120,24 +1317,7 @@ impl App {
                     None
                 }
             }
-            Cursor::Task { ws_idx, task_id } => {
-                let task_id = task_id.clone();
-                let ws = self.workspaces.get_mut(*ws_idx)?;
-                let mut found_idx = None;
-                let mut count = 0;
-                for (i, ts) in ws.sessions.iter().enumerate() {
-                    if ts.task_id.as_deref() == Some(task_id.as_str()) {
-                        count += 1;
-                        if count == 1 {
-                            found_idx = Some(i);
-                        } else {
-                            return None;
-                        }
-                    }
-                }
-                ws.sessions.get_mut(found_idx?)
-            }
-            Cursor::Backtest(_) | Cursor::Section(_) => None,
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => None,
         }
     }
 
@@ -1208,14 +1388,11 @@ impl App {
                 .all(|t| matches!(t.api_status, TaskStatus::Done))
     }
 
-    /// Compute effective task status: derived from the workspace's sessions
-    /// if bound, otherwise falls back to api_status.
-    fn task_status(&self, task: &TaskEntry) -> TaskStatus {
-        if let Some(ws) = task
-            .workspace_id
-            .as_deref()
-            .and_then(|id| self.workspaces.iter().find(|w| w.id == id))
-        {
+    /// Compute effective task status: derived from its workspace's sessions
+    /// when bound (`ws`, found by the caller from an index: the manifest
+    /// holds thousands of workspaces), otherwise falls back to api_status.
+    fn task_status_in(task: &TaskEntry, ws: Option<&Workspace>) -> TaskStatus {
+        if let Some(ws) = ws {
             if ws.sessions.iter().any(|s| s.status == SessionStatus::Running) {
                 return TaskStatus::Running;
             }

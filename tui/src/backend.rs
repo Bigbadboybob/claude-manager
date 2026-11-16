@@ -181,9 +181,34 @@ pub enum BackendCommand {
         id: String,
         fields: HashMap<String, serde_json::Value>,
     },
+    /// Pin or clear a task's lead session (`POST /tasks/{id}/lead`).
+    SetTaskLead {
+        id: String,
+        session_uid: Option<String>,
+        /// The pin before this change, restored if the call fails.
+        previous: Option<String>,
+    },
+    /// Set or clear a task's default model for one engine
+    /// (`POST /tasks/{id}/model`).
+    SetTaskModel {
+        id: String,
+        engine: String,
+        setting: cm_daemon::models::Setting,
+        value: Option<String>,
+    },
     /// Delete a planning task from the DB.
     DeletePlanTask {
         id: String,
+    },
+    /// A-n "Reports to": create the new workspace's task under its parent.
+    /// The reply (`ReportingTaskCreated`) carries `request_id` so the App
+    /// can launch the form it parked for it.
+    CreateReportingTask {
+        request_id: String,
+        project: String,
+        repo_url: String,
+        name: String,
+        parent_task_id: String,
     },
     /// Fetch all planning tasks (tasks that have a project set).
     RefreshPlanTasks,
@@ -206,6 +231,18 @@ pub enum BackendEvent {
     PlanTaskCreated(Task),
     /// A planning task was deleted.
     PlanTaskDeleted(String),
+    /// Reply to `CreateReportingTask`.
+    ReportingTaskCreated {
+        request_id: String,
+        result: Result<Task, String>,
+    },
+    /// `POST /tasks/{id}/lead` failed: undo the optimistic local pin.
+    TaskLeadFailed {
+        id: String,
+        attempted: Option<String>,
+        previous: Option<String>,
+        error: String,
+    },
 }
 
 /// Handle to the background threads.
@@ -295,11 +332,39 @@ impl BackendHandle {
         );
     }
 
+    pub fn create_reporting_task(
+        &self,
+        request_id: String,
+        project: String,
+        repo_url: String,
+        name: String,
+        parent_task_id: String,
+    ) {
+        self.try_send_or_warn(
+            BackendCommand::CreateReportingTask { request_id, project, repo_url, name, parent_task_id },
+            "create_reporting_task",
+        );
+    }
+
     pub fn update_plan_task(&self, id: String, fields: HashMap<String, serde_json::Value>) {
         self.try_send_or_warn(
             BackendCommand::UpdatePlanTask { id, fields },
             "update_plan_task",
         );
+    }
+
+    pub fn set_task_lead(&self, id: String, session_uid: Option<String>, previous: Option<String>) {
+        self.try_send_or_warn(BackendCommand::SetTaskLead { id, session_uid, previous }, "set_task_lead");
+    }
+
+    pub fn set_task_default(
+        &self,
+        id: String,
+        engine: String,
+        setting: cm_daemon::models::Setting,
+        value: Option<String>,
+    ) {
+        self.try_send_or_warn(BackendCommand::SetTaskModel { id, engine, setting, value }, "set_task_model");
     }
 
     pub fn delete_plan_task(&self, id: String) {
@@ -316,7 +381,11 @@ impl BackendHandle {
         // exited (clean shutdown race); skip the warn helper.
         let _ = self.cmd_tx.send(BackendCommand::Shutdown);
         if let Some(handle) = self.thread.take() {
-            let _ = handle.join();
+            crate::push_worker::join_with_deadline(
+                handle,
+                crate::push_worker::SHUTDOWN_JOIN_DEADLINE,
+                "planning backend",
+            );
         }
     }
 }
@@ -398,6 +467,72 @@ fn backend_loop(
                     }
                     Err(e) => {
                         let _ = event_tx.send(BackendEvent::ApiError(e.to_string()));
+                    }
+                }
+            }
+            Ok(BackendCommand::CreateReportingTask {
+                request_id,
+                project,
+                repo_url,
+                name,
+                parent_task_id,
+            }) => {
+                let body = TaskCreateBody {
+                    repo_url,
+                    repo_branch: "main".to_string(),
+                    name: Some(name),
+                    prompt: None,
+                    priority: 0,
+                    status: Some("backlog".to_string()),
+                    project: Some(project),
+                    slug: None,
+                    description: Some(String::new()),
+                    difficulty: None,
+                    depends: None,
+                    source: None,
+                    is_cloud: Some(false),
+                    parent_task_id: Some(parent_task_id),
+                    worktree_mode: None,
+                    initiative_id: None,
+                    wip_branch: None,
+                    metadata: None,
+                };
+                let result = client.create_task(&body).map_err(|e| e.to_string());
+                if let Ok(task) = &result {
+                    let _ = event_tx.send(BackendEvent::PlanTaskCreated(task.clone()));
+                }
+                let _ = event_tx.send(BackendEvent::ReportingTaskCreated { request_id, result });
+            }
+            Ok(BackendCommand::SetTaskLead { id, session_uid, previous }) => {
+                match client.set_task_lead(&id, session_uid.as_deref()) {
+                    Ok(task) => {
+                        if let Some(task) = task {
+                            let _ = event_tx.send(BackendEvent::PlanTaskUpdated(task));
+                        }
+                        after_write(&client);
+                    }
+                    Err(e) => {
+                        let _ = event_tx.send(BackendEvent::TaskLeadFailed {
+                            id,
+                            attempted: session_uid,
+                            previous,
+                            error: e.to_string(),
+                        });
+                    }
+                }
+            }
+            Ok(BackendCommand::SetTaskModel { id, engine, setting, value }) => {
+                match client.set_task_default(&id, &engine, setting, value.as_deref()) {
+                    Ok(task) => {
+                        if let Some(task) = task {
+                            let _ = event_tx.send(BackendEvent::PlanTaskUpdated(task));
+                        }
+                        after_write(&client);
+                    }
+                    Err(e) => {
+                        let _ = event_tx.send(BackendEvent::ApiError(format!(
+                            "Task {engine} {} not saved: {e}", setting.name()
+                        )));
                     }
                 }
             }

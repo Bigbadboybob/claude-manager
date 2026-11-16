@@ -72,11 +72,13 @@
 //! the slice-arc ordering. Don't re-litigate it round by round.
 
 use std::sync::{mpsc, Arc, Mutex};
+use serde_json::{json, Value};
 
 use crate::attach::{
     self, AttachOpenParams, AttachOpenResponse, SessionAttachParams, SessionAttachResponse,
 };
 use crate::control::methods;
+use crate::control::auth::{check_session_caller, AuthDecision};
 use crate::control::operator;
 use crate::control::protocol::{Caller, ErrorCode, Request, Response};
 use crate::session::SharedLastExit;
@@ -131,9 +133,17 @@ pub struct AttachStreamHandle {
     /// emission to encode `{exit_code, memory_cap_kill}` into the
     /// payload.
     pub last_exit: SharedLastExit,
+    /// The session's pending kill attribution (`killed_by`), so the End
+    /// frame can say who stopped it (#24: a rotation or handoff stop is a
+    /// restart the viewer keeps the slot for).
+    pub kill_attribution: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// Echoed back on every outbound `StreamFrame`. Matches the
     /// `attach.open` request id so the client can demux.
     pub request_id: String,
+    /// The client asked for raw data frames (`wire::write_raw_data_frame`).
+    pub binary: bool,
+    /// Heartbeats are opt-in so older viewers never receive an unknown frame.
+    pub heartbeat: bool,
 }
 
 /// What `dispatch_request` returns. Most arms produce `Done` with
@@ -303,10 +313,13 @@ pub struct EventsSubscribeHandle {
 /// comment in [`dispatch_request`]).
 pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "ping",
+    "staffing.get",
     "list_sessions",
+    "session.roster",
     "read_session_output",
     "resolve_authorized_session",
     "session.list_transcripts",
+    "session.interrupt_authority",
     "get_workflow_state",
     "workflow.get_state",
     "list_workflows",
@@ -318,10 +331,25 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "sidebar.list",
     "get_initiative",
     "backtest.result",
+    "board.read",
+    "item.read",
+    "board.owner_blocked",
+    "boards.on_boards",
+    "gate.receipts",
+    "usage.read",
+    "daemon.memory_snapshot",
     "continuous.list",
+    "continuous.dashboard",
     "continuous.context",
     "continuous.dispatch_pending",
     "queue.stats",
+    "queue.list",
+    "owner_attention.list",
+    // Org model S2 reads (planning API proxies; items::org::READ_METHODS).
+    "org.snapshot",
+    "org.member",
+    "org.team",
+    "org.roster",
 ];
 
 /// Coordinator-adjacent methods that must NOT count as mutations even
@@ -337,10 +365,18 @@ pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
 /// `daemon.restart` call would wait on a counter it is itself
 /// inflating.
 pub(crate) const RESTART_BARRIER_EXEMPT_METHODS: &[&str] = &[
+    // Allocator-only maintenance does not alter session/persisted state; an
+    // uncancellable allocator call must not pin restart quiescence.
+    "daemon.memory_trim",
+    // Leaf feed recovery may quarantine a corrupt checkpoint. No registry,
+    // child or session state is touched; a 25s wait must not pin quiescence.
+    "owner.notifications.next",
     "daemon.health",
     "daemon.drain",
     "daemon.reload_config",
     "daemon.restart",
+    // Announces the restart the coordinator runs; it must work mid-drain.
+    "daemon.maintenance",
     // DESIGN_SEAMLESS_RESTART phase 3b: the dev-gated re-exec
     // skeleton trigger RUNS the coordinator (begin → wait_quiesced →
     // gate freezes → exec) — counting it as a mutation would deadlock
@@ -365,6 +401,11 @@ pub(crate) fn method_counts_as_restart_mutation(method: &str) -> bool {
         && !RESTART_BARRIER_EXEMPT_METHODS.contains(&method)
 }
 
+#[cfg(test)]
+thread_local! { static TEST_AFTER_S4: std::cell::RefCell<Option<Box<dyn FnMut()>>> = std::cell::RefCell::new(None); }
+#[cfg(test)]
+pub(crate) fn test_after_s4(hook: Option<Box<dyn FnMut()>>) { TEST_AFTER_S4.with(|h| *h.borrow_mut() = hook); }
+
 /// Route `req` to the appropriate method handler. Returns
 /// `UnknownMethod` for everything that depends on App state that
 /// hasn't migrated; see the module doc for the cutoff.
@@ -372,6 +413,18 @@ pub fn dispatch_request(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
 ) -> DispatchOutcome {
+    // Snapshot provenance before any operation or lifecycle gate. Failure to
+    // take either short try-lock is merely unknown and never changes the RPC.
+    let _s4 = crate::items::s4_attribution::begin(state, req);
+    #[cfg(test)]
+    TEST_AFTER_S4.with(|h| { if let Some(hook) = h.borrow_mut().as_mut() { hook(); } });
+    // Reserved board credentials never fall through legacy fail-open Operator
+    // auth. Delegate only this service's fixed method/action capability.
+    let delegated = match super::board_token::authorize(state, req) {
+        Ok(r) => r,
+        Err(r) => return DispatchOutcome::Done(r),
+    };
+    let req = delegated.as_ref().unwrap_or(req);
     // DESIGN_SEAMLESS_RESTART phase 2d (R2): in-flight mutation guard,
     // taken BEFORE the method body runs and dropped when this function
     // RETURNS — which for the streaming outcomes (`attach.open`,
@@ -403,10 +456,20 @@ pub fn dispatch_request(
         None
     };
     match req.method.as_str() {
+        "staffing.get" | "staffing.set" => DispatchOutcome::Done(crate::staffing::dispatch(state, req)),
+        "owner.board_token" => DispatchOutcome::Done(super::board_token::manage(state, req)),
         "messaging.sync" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.open" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.read" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
-        "messaging.send" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "messaging.send" => {
+            let response = crate::messaging::rpc::dispatch(state, req);
+            // Board freshness: a holder naming `#N` touches the item
+            // (queued, best effort; never delays or changes the send).
+            if let (true, Caller::Session(c), Some(reply)) = (response.ok, &req.caller, &response.result) {
+                crate::items::chat::on_send(state, &c.session_uid, &req.params, reply);
+            }
+            DispatchOutcome::Done(response)
+        }
         "messaging.dms" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.people" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.channels" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
@@ -415,7 +478,12 @@ pub fn dispatch_request(
         "messaging.monitor" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.monitors" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "messaging.follow" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "messaging.availability" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "messaging.counts" | "messaging.mark_read" | "messaging.react" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        "messaging.attention" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
         "session.set_name" => DispatchOutcome::Done(crate::messaging::rpc::dispatch(state, req)),
+        // #28: spawn-time setup by the creator.
+        "session.setup" => DispatchOutcome::Done(crate::spawn_setup::dispatch(state, req)),
         "sidebar.list" | "sidebar.assign" => {
             if matches!(req.caller, Caller::Operator(_)) {
                 if let Err(resp) = require_operator(req, "Sidebar Operator calls require an authenticated Operator") {
@@ -437,12 +505,37 @@ pub fn dispatch_request(
             let s = state.lock().unwrap_or_else(|p| p.into_inner());
             DispatchOutcome::Done(crate::owner_attention::notify(&s, req))
         }
+        "owner.notifications.next" => {
+            if let Err(resp) = require_operator(req, "Owner notifications are Operator-only") {
+                return DispatchOutcome::Done(resp);
+            }
+            DispatchOutcome::Done(crate::owner_notifications::next_rpc(state, req))
+        }
+        "owner_attention.list" => {
+            if let Err(resp) = require_operator(req, "Owner alerts are Operator-only") {
+                return DispatchOutcome::Done(resp);
+            }
+            DispatchOutcome::Done(crate::owner_alert_relay::list(state, req))
+        }
         "owner_attention.ack" => {
             if let Err(resp) = require_operator(req, "Owner attention acknowledgement is Operator-only") {
                 return DispatchOutcome::Done(resp);
             }
+            DispatchOutcome::Done(crate::owner_alert_relay::acknowledge(state, req))
+        }
+        "owner_attention.escalate" => {
+            if let Err(resp) = require_operator(req, "Owner attention escalation is Operator-only") {
+                return DispatchOutcome::Done(resp);
+            }
             let s = state.lock().unwrap_or_else(|p| p.into_inner());
-            DispatchOutcome::Done(crate::owner_attention::acknowledge(&s, req))
+            DispatchOutcome::Done(crate::owner_attention::escalate_rpc(&s, req))
+        }
+        "owner_attention.withdraw" => {
+            if let Err(resp) = require_operator(req, "Owner attention withdrawal is Operator-only") {
+                return DispatchOutcome::Done(resp);
+            }
+            let s = state.lock().unwrap_or_else(|p| p.into_inner());
+            DispatchOutcome::Done(crate::owner_attention::withdraw_rpc(&s, req))
         }
         // Reads the caller's session (when known) to report its own scope.
         "ping" => DispatchOutcome::Done(dispatch_ping(state, req)),
@@ -454,6 +547,7 @@ pub fn dispatch_request(
         // review fix #2 for the race-safety argument; the Arc
         // serializes the insert against the callback's remove.
         "start_session" => DispatchOutcome::Done(dispatch_start_session(state, req)),
+        "session.launch" => DispatchOutcome::Done(super::session_launch::dispatch(state, req)),
 
         // Read-mostly methods lock for the duration of the dispatch
         // arm. Brief critical sections — no daemon-state-blocking
@@ -494,6 +588,29 @@ pub fn dispatch_request(
         // own locking inside `methods::*`; the dispatcher just
         // does the Caller-authorization shape check.
         "send_input" => DispatchOutcome::Done(dispatch_send_input(state, req)),
+        // One key (no body, no Enter) to one or more sessions; per-target
+        // results. `send_key` is the MCP tool's name for it (TUI-routed on
+        // a laptop, like send_input; a headless host's daemon serves it).
+        "session.send_key" | "send_key" => DispatchOutcome::Done(dispatch_send_key(state, req)),
+        "session.resume_many" => DispatchOutcome::Done(dispatch_session_resume_many(state, req)),
+        "session.resume_status" => DispatchOutcome::Done(dispatch_session_resume_status(state, req)),
+        "session.send_bound_escape" => DispatchOutcome::Done(dispatch_send_bound_escape(state, req)),
+        "session.interrupt" => DispatchOutcome::Done(dispatch_interrupt(state, req)),
+        "session.interrupt_authority" => {
+            let binding = match &req.caller {
+                Caller::Session(s) => {
+                    let st = state.lock().unwrap_or_else(|p| p.into_inner());
+                    st.sessions.get(&s.session_uid).map(|session| serde_json::json!({
+                        "pid": std::process::id(), "session_pid": session.pid,
+                        "incarnation": session.holder_incarnation,
+                        "thread_id": session.transcript_path.as_deref().and_then(crate::session::transcript_id_from_path),
+                    }))
+                },
+                Caller::Operator(_) => None,
+            };
+            if let Some(binding) = binding { DispatchOutcome::Done(Response::ok(req.id.clone(), binding)) }
+            else { DispatchOutcome::Done(Response::err(req.id.clone(), ErrorCode::Unauthorized, "live session required")) }
+        },
         // Reliable out-of-band PTY resize. Operator-only — the TUI's
         // adopt scan re-asserts the pane size on any session whose
         // daemon PTY drifted (dropped attach-stream resize frame,
@@ -508,6 +625,7 @@ pub fn dispatch_request(
         // see only their own workspace; Operator callers see the
         // full registry.
         "list_sessions" => DispatchOutcome::Done(dispatch_list_sessions(state, req)),
+        "session.roster" => DispatchOutcome::Done(crate::items::roster::dispatch(state, req)),
 
         // Slice 10d-mcp-surface-2a: TUI-pushed task-tree
         // snapshot. Operator-only — Session callers can't
@@ -525,10 +643,14 @@ pub fn dispatch_request(
         // fix-loud-preflight: post-restart health probe. Operator-only —
         // it reports host-environment diagnosis, not per-session state.
         "daemon.health" => DispatchOutcome::Done(dispatch_daemon_health(state, req)),
+        "daemon.memory_snapshot" => DispatchOutcome::Done(crate::memory_snapshot::dispatch(state, req)),
+        "daemon.memory_trim" => DispatchOutcome::Done(crate::memory_trim::dispatch(req)),
         "daemon.reload_config" => {
             DispatchOutcome::Done(dispatch_reload_config(state, req))
         }
         "daemon.drain" => DispatchOutcome::Done(dispatch_daemon_drain(state, req)),
+        // Operator maintenance notice ahead of a deploy (crate::maintenance).
+        "daemon.maintenance" => DispatchOutcome::Done(dispatch_daemon_maintenance(state, req)),
         // DESIGN_SEAMLESS_RESTART phase 6: the PRODUCTION in-place
         // restart. Always dispatched (no dev gate); strong-operator
         // gated (fail-closed, R14); pinned-artifact target policy; NO
@@ -613,6 +735,17 @@ pub fn dispatch_request(
         "session.turn_ended" => {
             DispatchOutcome::Done(dispatch_session_turn_ended(state, req))
         }
+        "session.agent_report" => {
+            let caller_uid = match &req.caller {
+                Caller::Operator(_) => None,
+                Caller::Session(s) => Some(s.session_uid.as_str()),
+            };
+            let response = match methods::session_agent_report(state, &req.params, caller_uid) {
+                Ok(value) => Response::ok(req.id.clone(), value),
+                Err((code, message)) => Response::err(req.id.clone(), code, message),
+            };
+            DispatchOutcome::Done(response)
+        }
 
         // Sub-2b-1 review #1: TUI pushes the discovered
         // transcript path post-detection so the resolver can
@@ -623,6 +756,18 @@ pub fn dispatch_request(
         // reads (same auth shape as `task.update_tree`).
         "session.set_transcript_path" => {
             DispatchOutcome::Done(dispatch_set_transcript_path(state, req))
+        }
+        "session.background_recovery_preflight" => {
+            DispatchOutcome::Done(dispatch_background_recovery_preflight(state, req))
+        }
+        "session.background_recovery_confirm" => {
+            DispatchOutcome::Done(dispatch_background_recovery_confirm(state, req))
+        }
+        "session.background_recovery_reconcile" => {
+            DispatchOutcome::Done(dispatch_background_recovery_reconcile(state, req))
+        }
+        "session.background_recovery_status" => {
+            DispatchOutcome::Done(dispatch_background_recovery_status(state, req))
         }
 
         // 10d-2c-1 review round-5 (F1): after-the-fact tagging
@@ -644,6 +789,16 @@ pub fn dispatch_request(
         "session.revive" => {
             DispatchOutcome::Done(dispatch_session_revive(state, req))
         }
+        "session.viewed" => DispatchOutcome::Done(dispatch_session_viewed(state, req)),
+        "session.shell_busy" => DispatchOutcome::Done(dispatch_session_shell_busy(state, req)),
+        // #24 transcript rotation: operator for any session (and `force`);
+        // a Session caller may rotate only itself, at a safe boundary.
+        "session.handoff" => DispatchOutcome::Done(dispatch_session_handoff(state, req)),
+        "session.handoff_cancel" => DispatchOutcome::Done(dispatch_session_handoff_cancel(state, req)),
+        "session.handoff_many" => DispatchOutcome::Done(dispatch_session_handoff_many(state, req)),
+        "session.rotate_transcript" => {
+            DispatchOutcome::Done(dispatch_session_rotate_transcript(state, req))
+        }
 
         // Sub-2b-2: `propose_task` — daemon-side HTTP forwarder
         // to the planning API. Both Operator and Session callers
@@ -656,6 +811,7 @@ pub fn dispatch_request(
         "list_initiatives" => DispatchOutcome::Done(dispatch_list_initiatives(state, req)),
         "get_initiative" => DispatchOutcome::Done(dispatch_get_initiative(state, req)),
         "propose_initiative" => DispatchOutcome::Done(dispatch_propose_initiative(state, req)),
+        "org" => DispatchOutcome::Done(dispatch_org(state, req)),
         "propose_initiative_project" => DispatchOutcome::Done(dispatch_propose_initiative_project(state, req)),
 
         // 10d-2b: workflow_transition / workflow_done relocate
@@ -764,6 +920,16 @@ pub fn dispatch_request(
         "update_task" => {
             DispatchOutcome::Done(dispatch_update_task(state, req))
         }
+        "task.scope_check" => {
+            let caller_uid = match &req.caller {
+                Caller::Operator(_) => None,
+                Caller::Session(s) => Some(s.session_uid.as_str()),
+            };
+            DispatchOutcome::Done(match methods::task_scope_check(state, &req.params, caller_uid) {
+                Ok(value) => Response::ok(req.id.clone(), value),
+                Err((code, message)) => Response::err(req.id.clone(), code, message),
+            })
+        }
 
         // Headless planning READS: a daemon-spawned agent (no cli-routed
         // PlanningClient) gets these served by the daemon, which holds the
@@ -783,6 +949,40 @@ pub fn dispatch_request(
         // so headless agents work without `cli/`.
         "backtest.submit" => DispatchOutcome::Done(dispatch_backtest_submit(state, req)),
         "backtest.result" => DispatchOutcome::Done(dispatch_backtest_result(state, req)),
+
+        // Work items and boards (doc/items-board.md): Session + Operator
+        // callable proxies to the planning API. The daemon stamps the
+        // caller's participant id as the actor and resolves holder names;
+        // editing rights are checked in `items::rpc`.
+        // Usage recording (doc/usage-recording.md): this host's samples.
+        "usage.read" => DispatchOutcome::Done(
+            if let Some(resp) = reject_forged_operator(req) {
+                resp
+            } else {
+                match crate::usage::read_rpc(state, &req.params) {
+                    Ok(value) => Response::ok(req.id.clone(), value),
+                    Err(error) => Response::err(req.id.clone(), ErrorCode::InvalidParams, error),
+                }
+            },
+        ),
+        "item.create" | "item.read" | "item.set" | "item.resolve" | "board.read" | "board.settings"
+        | "board.owner_blocked" | "item.place" | "item.unplace" | "group.create" | "group.set"
+        | "boards.on_boards" | "epic.set_poc" | "epic.staff" | "epic.close_plan"
+        | "epic.close_apply" | "board.join" | "board.leave" | "board.remove_member" => {
+            DispatchOutcome::Done(crate::items::rpc::dispatch(state, req))
+        }
+        // Org model S2 (doc/org-model.md): members, teams, the roster and
+        // adoption, proxied like items. Roster and adoption are Owner's.
+        "org.snapshot" | "org.continuous_status" | "org.member" | "org.team" | "org.roster" | "org.roster_apply"
+        | "org.adopt" | "org.team_create" | "org.team_update" | "org.move" | "org.retire"
+        | "org.reinstate" | "org.close_assistant" | "org.promote" | "org.rebind_main" | "org.hire"
+        | "org.member_update" | "org.team_mark_continuous" => {
+            DispatchOutcome::Done(crate::items::org::dispatch(state, req))
+        }
+        // Gate receipts (doc/gate-receipts.md §9): same proxy shape as items.
+        "gate.report" | "gate.receipts" | "gate.waive" | "gate.profile" => {
+            DispatchOutcome::Done(crate::items::gate::dispatch(state, req))
+        }
 
         // remote-session-execution Phase 1: Operator-only daemon RPCs
         // that resolve every path on the daemon's own filesystem, so the
@@ -827,6 +1027,9 @@ pub fn dispatch_request(
         "add_session" | "session.resume" => {
             DispatchOutcome::Done(dispatch_add_session(state, req))
         }
+        // Fork into new task: Operator (TUI A-F) or Session (MCP
+        // `fork_session`, scoped to sources the caller can reach).
+        "session.fork" => DispatchOutcome::Done(dispatch_session_fork(state, req)),
 
         // Continuous Tasks Phase 2 (DESIGN_CONTINUOUS_TASKS.md §8) — the
         // trigger funnel + continuous-task CRUD. `trigger` is bimodal
@@ -840,9 +1043,18 @@ pub fn dispatch_request(
         // arm that forwards the caller, because it re-dispatches to
         // `methods::trigger` with the (already operator-validated) caller.
         "trigger" => DispatchOutcome::Done(dispatch_trigger(state, req)),
+        "continuous.adopt_existing" => DispatchOutcome::Done(
+            match operator::require_strong_operator(&req.caller) {
+                Err((code, message)) => Response::err(req.id.clone(), code, message),
+                Ok(()) => match crate::continuous::adoption::handle(state, &req.params) {
+                    Ok(value) => Response::ok(req.id.clone(), value),
+                    Err((code, message)) => Response::err(req.id.clone(), code, message),
+                }
+            }),
         "continuous.create" => DispatchOutcome::Done(dispatch_continuous_create(state, req)),
         "continuous.update" => DispatchOutcome::Done(dispatch_continuous_update(state, req)),
         "continuous.list" => DispatchOutcome::Done(dispatch_continuous_list(state, req)),
+        "continuous.dashboard" => DispatchOutcome::Done(dispatch_continuous_dashboard(state, req)),
         "continuous.dispatch_pending" => {
             DispatchOutcome::Done(dispatch_continuous_dispatch_pending(state, req))
         }
@@ -855,6 +1067,7 @@ pub fn dispatch_request(
         "continuous.context" => DispatchOutcome::Done(dispatch_continuous_receipt(state, req)),
         "continuous.ack_drain" => DispatchOutcome::Done(dispatch_continuous_receipt(state, req)),
         "continuous.checkpoint_drain" => DispatchOutcome::Done(dispatch_continuous_receipt(state, req)),
+        "continuous.self_clear_hold" => DispatchOutcome::Done(dispatch_continuous_self_clear(state, req)),
         "continuous.run_now" => DispatchOutcome::Done(dispatch_continuous_run_now(state, req)),
         "continuous.delete" => DispatchOutcome::Done(dispatch_continuous_delete(state, req)),
         "continuous.ensure_channel" => {
@@ -863,6 +1076,13 @@ pub fn dispatch_request(
         "continuous.force_done" => {
             DispatchOutcome::Done(dispatch_continuous_force_done(state, req))
         }
+
+        // Phase 3 ordinary-session scheduled wakes. Session callers may
+        // manage their own schedules, or a descendant target under the same
+        // auth rule as send_input; global-perms callers may manage any live
+        // session. Operators are accepted for TUI/administrative clients.
+        "session_wake_schedule" => DispatchOutcome::Done(dispatch_session_wake_schedule(state, req)),
+        "session_wake_schedules" => DispatchOutcome::Done(dispatch_session_wake_schedules(state, req)),
 
         // Continuous Tasks Phase 3b (DESIGN_CONTINUOUS_TASKS.md §11) — the
         // stuck-story agent tools. Both are bimodal (Operator OR Session) like
@@ -881,6 +1101,10 @@ pub fn dispatch_request(
         // gate); `queue.stats` is a read-only depth probe.
         "enqueue" => DispatchOutcome::Done(dispatch_enqueue(state, req)),
         "queue.stats" => DispatchOutcome::Done(dispatch_queue_stats(state, req)),
+        "queue.list" => DispatchOutcome::Done(dispatch_queue_list(state, req)),
+        "queue.bind" => DispatchOutcome::Done(dispatch_queue_bind(state, req)),
+        "queue.claim" => DispatchOutcome::Done(dispatch_queue_claim(state, req)),
+        "queue.ack" => DispatchOutcome::Done(dispatch_queue_ack(state, req)),
 
         _ => DispatchOutcome::Done(Response::err(
             req.id.clone(),
@@ -915,8 +1139,26 @@ fn dispatch_start_session(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Res
     ) {
         return resp;
     }
+    // A viewer's restore/A-R spawn at a uid a rotation or handoff is about to
+    // bring back would race (and could duplicate) that respawn, which runs
+    // in-process and never comes through here.
+    if let Some(uid) = req.params.get("uid").and_then(|v| v.as_str()) {
+        if crate::rotation::in_progress(uid) || crate::handoff::in_progress(uid) {
+            return Response::err(
+                req.id.clone(),
+                ErrorCode::Conflict,
+                format!(
+                    "session '{uid}' is being restarted by CM (transcript rotation or handoff) \
+                     and comes straight back"
+                ),
+            );
+        }
+    }
     match methods::start_session(state, &req.params) {
-        Ok(value) => Response::ok(req.id.clone(), value),
+        Ok(value) => {
+            note_owner_spawn(state, req, &value);
+            Response::ok(req.id.clone(), value)
+        }
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
 }
@@ -955,8 +1197,60 @@ fn dispatch_list_sessions(
         }
     }
     match methods::list_sessions(state, &req.params, caller_uid.as_deref()) {
-        Ok(value) => Response::ok(req.id.clone(), value),
+        Ok(value) => Response::ok(req.id.clone(), shape_session_list(value, &req.params)),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// Optional `list_sessions` shaping for pollers on slow links (the TUI asks
+/// every 5 s; the full list was ~90 KB, three quarters of it `agent_state`,
+/// whose `observed_at` stamps change on every poll).
+///
+/// - `fields: [..]` keeps only those keys in each row (`session_uid` always).
+/// - `etag: "<previous>"` (any string, `""` the first time) turns the reply
+///   into `{etag, unchanged: true}` when the shaped list is the same as the
+///   one that etag names, else `{etag, sessions: [..]}`.
+///
+/// Without either parameter the reply is the plain array callers expect.
+fn shape_session_list(value: serde_json::Value, params: &serde_json::Value) -> serde_json::Value {
+    let fields: Option<Vec<&str>> = params
+        .get("fields")
+        .and_then(|f| f.as_array())
+        .map(|f| f.iter().filter_map(|v| v.as_str()).collect());
+    let value = match (fields, value) {
+        (Some(fields), serde_json::Value::Array(rows)) => serde_json::Value::Array(
+            rows.into_iter()
+                .map(|row| match row {
+                    serde_json::Value::Object(mut row) => {
+                        row.retain(|k, _| k == "session_uid" || fields.contains(&k.as_str()));
+                        serde_json::Value::Object(row)
+                    }
+                    other => other,
+                })
+                .collect(),
+        ),
+        (_, value) => value,
+    };
+    let Some(previous) = params.get("etag").and_then(|e| e.as_str()) else {
+        return value;
+    };
+    // Rows are hashed in uid order so registry iteration order cannot
+    // change the tag.
+    let mut rows: Vec<String> = value
+        .as_array()
+        .map(|rows| rows.iter().map(|r| r.to_string()).collect())
+        .unwrap_or_default();
+    rows.sort();
+    let etag = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        rows.hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
+    if etag == previous {
+        serde_json::json!({ "etag": etag, "unchanged": true })
+    } else {
+        serde_json::json!({ "etag": etag, "sessions": value })
     }
 }
 
@@ -1013,6 +1307,27 @@ fn dispatch_mcp_start_session(
         Caller::Session(s) => Some(s.session_uid.clone()),
     };
     match methods::mcp_start_session(state, &req.params, caller_uid.as_deref()) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `session.fork` — Operator frames must carry a valid operator token;
+/// Session callers are scoped in the method body (source reachable,
+/// explicit parent within the caller's task tree).
+fn dispatch_session_fork(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let caller_uid: Option<String> = match &req.caller {
+        Caller::Operator(_) => {
+            if let Err(resp) = require_operator(req, "session.fork requires an authenticated Operator") {
+                return resp;
+            }
+            None
+        }
+        Caller::Session(s) => Some(s.session_uid.clone()),
+    };
+    // O5: a worktree-cap refusal names the caller's idle assistants.
+    match methods::with_cap_hint(state, caller_uid.as_deref(),
+                                 methods::session_fork(state, &req.params, caller_uid.as_deref())) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -1161,7 +1476,10 @@ fn dispatch_create_session(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Re
         return resp;
     }
     match methods::create_session(state, &req.params) {
-        Ok(value) => Response::ok(req.id.clone(), value),
+        Ok(value) => {
+            note_owner_spawn(state, req, &value);
+            Response::ok(req.id.clone(), value)
+        }
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
 }
@@ -1181,7 +1499,10 @@ fn dispatch_add_session(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Respo
         return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session.resume requires resume_id");
     }
     match methods::add_session(state, &req.params) {
-        Ok(value) => Response::ok(req.id.clone(), value),
+        Ok(value) => {
+            note_owner_spawn(state, req, &value);
+            Response::ok(req.id.clone(), value)
+        }
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
 }
@@ -1264,6 +1585,16 @@ fn dispatch_continuous_list(state: &Arc<Mutex<DaemonState>>, req: &Request) -> R
     }
 }
 
+fn dispatch_continuous_dashboard(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(resp) = require_operator(req, "continuous.dashboard is Operator-callable only") {
+        return resp;
+    }
+    match methods::continuous_dashboard(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
 /// `continuous.dispatch_pending` — read-only index scan for operator-
 /// unblocked-but-unacknowledged issues (the TUI's Continuous-panel
 /// dispatch-pending indicator). Operator-only like the other reads.
@@ -1302,6 +1633,23 @@ fn dispatch_continuous_pause(state: &Arc<Mutex<DaemonState>>, req: &Request) -> 
 
 fn dispatch_continuous_receipt(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
     match super::continuous_drain::handle(state, &req.caller, &req.method, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `continuous.self_clear_hold` — Session-callable only: the task's current
+/// orchestrator clears its own recovery hold when nothing from the held run is
+/// in flight. Operators reconcile with `continuous.reconcile` instead.
+fn dispatch_continuous_self_clear(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let Caller::Session(session) = &req.caller else {
+        return Response::err(
+            req.id.clone(),
+            ErrorCode::Unauthorized,
+            "continuous.self_clear_hold is the orchestrator's own call; operators use continuous.reconcile",
+        );
+    };
+    match crate::continuous::migration::self_clear_hold(state, &session.session_uid, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -1364,6 +1712,23 @@ fn dispatch_continuous_delete(state: &Arc<Mutex<DaemonState>>, req: &Request) ->
     }
 }
 
+fn dispatch_session_wake_schedule(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Some(resp) = reject_forged_operator(req) { return resp; }
+    let action = req.params.get("action").and_then(|v| v.as_str()).unwrap_or("create");
+    match crate::session_wake::handle(state, &req.caller, action, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_session_wake_schedules(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Some(resp) = reject_forged_operator(req) { return resp; }
+    match crate::session_wake::handle(state, &req.caller, "list", &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
 /// `continuous.force_done` — operator BREAK-GLASS for a run wedged `Running`
 /// (born from the 2026-07-05 scraper-opt compact-boundary incident).
 /// Operator-only like the other `continuous.*` CRUD arms: `report_done` /
@@ -1402,7 +1767,13 @@ fn dispatch_report_done(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Respo
         return resp;
     }
     match methods::report_done(state, &req.caller, &req.params) {
-        Ok(value) => Response::ok(req.id.clone(), value),
+        Ok(mut value) => {
+            // Items the caller still holds (best effort, bounded; never fails).
+            if let Some(uid) = req.caller.session_uid() {
+                crate::items::held::attach(state, uid, &mut value);
+            }
+            Response::ok(req.id.clone(), value)
+        }
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
 }
@@ -1428,6 +1799,38 @@ fn dispatch_queue_stats(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Respo
         return resp;
     }
     match methods::queue_stats(state, &req.caller, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_queue_list(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Some(resp) = reject_forged_operator(req) { return resp; }
+    match methods::queue_list(state, &req.caller, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_queue_bind(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Some(resp) = reject_forged_operator(req) { return resp; }
+    match methods::queue_bind(state, &req.caller, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_queue_claim(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Some(resp) = reject_forged_operator(req) { return resp; }
+    match methods::queue_claim(state, &req.caller, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_queue_ack(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Some(resp) = reject_forged_operator(req) { return resp; }
+    match methods::queue_ack(state, &req.caller, &req.params) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -1485,6 +1888,71 @@ fn dispatch_list_initiatives(state: &Arc<Mutex<DaemonState>>, req: &Request) -> 
 
 fn dispatch_get_initiative(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
     match methods::get_initiative(state, &req.params) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `org` — reporting-line views (open to every caller) plus `set_lead` on
+/// the caller's own task. The Session caller's uid scopes "me".
+pub(crate) fn dispatch_org(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    // `org(action="adopt", …)` from Owner is the `org.adopt` RPC (org model
+    // S2). An agent's call falls through to methods::org, which refuses it.
+    if matches!(req.caller, Caller::Operator(_)) && req.params["action"] == "adopt" {
+        let mut adopt = req.clone();
+        adopt.method = "org.adopt".into();
+        if let Some(obj) = adopt.params.as_object_mut() {
+            obj.remove("action");
+        }
+        return crate::items::org::dispatch(state, &adopt);
+    }
+    // `org(action="move" | "retire" | "reinstate", member=…)` is the matching
+    // `org.*` RPC from any caller: the API decides who may (Owner, or an
+    // active member up the target's manager chain acting as its main
+    // session; reinstate is Owner's), with the caller stamped as actor.
+    if let Some(verb @ ("move" | "retire" | "reinstate")) = req.params["action"].as_str() {
+        let mut fwd = req.clone();
+        fwd.method = format!("org.{verb}");
+        let mut body = serde_json::Map::new();
+        for (from, to) in [("member", "member"), ("manager", "manager"), ("team", "primary_team_id"),
+                           ("reason", "reason"), ("request_id", "request_id")] {
+            if let Some(v) = req.params.get(from).filter(|v| !v.is_null()) {
+                body.insert(to.into(), v.clone());
+            }
+        }
+        // `team=""` / `"none"` clears the primary team (an explicit null).
+        if verb == "move"
+            && body.get("primary_team_id").and_then(|v| v.as_str())
+                .is_some_and(|t| t.trim().is_empty() || t.trim().eq_ignore_ascii_case("none"))
+        {
+            body.insert("primary_team_id".into(), serde_json::Value::Null);
+        }
+        if verb != "move" && (body.contains_key("manager") || body.contains_key("primary_team_id")) {
+            return Response::err(req.id.clone(), ErrorCode::InvalidParams,
+                format!("org: action=\"{verb}\" takes member and reason; use action=\"move\" to change a manager or team"));
+        }
+        fwd.params = serde_json::Value::Object(body);
+        return crate::items::org::dispatch(state, &fwd);
+    }
+    // `org(action="close_assistant", session_uid, reason)` (O5) is the
+    // `org.close_assistant` RPC for any caller; the planning API checks who
+    // may close it.
+    // `org(action="promote", session, handle, title?, team?, manager?, reason)`
+    // (§4.2) likewise: the API decides who may promote whose assistant.
+    // `rebind_main` likewise forwards the member and target to the API.
+    if let Some(verb @ ("close_assistant" | "promote" | "rebind_main")) = req.params["action"].as_str() {
+        let mut fwd = req.clone();
+        fwd.method = format!("org.{verb}");
+        if let Some(obj) = fwd.params.as_object_mut() {
+            obj.remove("action");
+        }
+        return crate::items::org::dispatch(state, &fwd);
+    }
+    let caller_uid: Option<String> = match &req.caller {
+        Caller::Operator(_) => None,
+        Caller::Session(s) => Some(s.session_uid.clone()),
+    };
+    match methods::org(state, &req.params, caller_uid.as_deref()) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -1711,6 +2179,377 @@ fn dispatch_set_global_perms(
     }
 }
 
+/// An Operator spawn, revive or resume is Owner using that session: stamp it
+/// so the terminal-task sweep does not close it again moments later (the
+/// 2026-10-12 revive that had to reopen its task first).
+fn note_owner_spawn(state: &Arc<Mutex<DaemonState>>, req: &Request, result: &serde_json::Value) {
+    if !matches!(req.caller, Caller::Operator(_)) {
+        return;
+    }
+    let uid = ["session_uid", "uid"]
+        .iter()
+        .find_map(|k| result.get(*k).or_else(|| req.params.get(*k)))
+        .and_then(serde_json::Value::as_str);
+    if let Some(uid) = uid {
+        let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+        guard.note_owner_activity(uid);
+        // Fresh operator/TUI spawns are the only top-level sessions that are
+        // auto-seated. Restore/revive and persisted transcript identities are
+        // rejected; fresh snapshot clones remain eligible. The daemon-side
+        // eligibility check also excludes shells, continuous sessions,
+        // workflows and existing attribution.
+        if operator_spawn_is_fresh(req)
+            && crate::assistants::mark_owner_placement(&mut guard, uid)
+        {
+            guard.persist_sessions_best_effort();
+            crate::items::heartbeat::poke();
+        }
+    }
+}
+
+/// Whether an Operator RPC represents a genuinely fresh top-level session.
+/// Startup restore/A-R and transcript resume reuse the same spawn machinery,
+/// so their resume identity must be rejected before the placement marker is
+/// written.
+fn operator_spawn_is_fresh(req: &Request) -> bool {
+    if !matches!(req.caller, Caller::Operator(_)) {
+        return false;
+    }
+    match req.method.as_str() {
+        "create_session" => true,
+        "add_session" => req.params.get("resume_id").and_then(Value::as_str)
+            .is_none_or(|id| id.trim().is_empty()),
+        "start_session" => req.params.get("auto_place_owner").and_then(Value::as_bool) == Some(true),
+        _ => false,
+    }
+}
+
+/// `session.viewed {uid}` — the TUI reports the session it is showing (on
+/// focus and every few minutes while it stays shown). Operator-only; feeds
+/// the terminal-task sweep's owner-activity grace. Unknown uids are accepted
+/// and ignored: a viewer may lag the registry.
+fn dispatch_session_viewed(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(resp) = require_operator(req, "session.viewed is Operator-callable only") {
+        return resp;
+    }
+    let Some(uid) = req.params.get("uid").and_then(serde_json::Value::as_str) else {
+        return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session.viewed requires uid");
+    };
+    let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+    let known = guard.sessions.contains_key(uid);
+    if known {
+        guard.note_owner_activity(uid);
+    }
+    Response::ok(req.id.clone(), serde_json::json!({ "uid": uid, "known": known }))
+}
+
+/// `session.shell_busy {uids}` — for each bash pane, whether it is running
+/// something: a foreground job, or any child process at all (a backgrounded
+/// job, an editor). The viewer asks before it closes a workspace whose last
+/// agent is gone; an idle prompt may close with it, a busy shell keeps it
+/// open. Agent sessions always answer busy (this is not their test), and a
+/// uid the daemon no longer holds answers `known: false`, not busy.
+fn dispatch_session_shell_busy(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(resp) = require_operator(req, "session.shell_busy is Operator-callable only") {
+        return resp;
+    }
+    let Some(uids) = req.params.get("uids").and_then(Value::as_array) else {
+        return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session.shell_busy requires uids");
+    };
+    let targets: Vec<(String, Option<(libc::pid_t, bool)>)> = {
+        let guard = state.lock().unwrap_or_else(|p| p.into_inner());
+        uids.iter()
+            .filter_map(Value::as_str)
+            .map(|uid| (uid.to_string(), guard.sessions.get(uid).map(|s| (s.pid, s.session_type == "bash"))))
+            .collect()
+    };
+    let mut out = serde_json::Map::new();
+    for (uid, found) in targets {
+        let row = match found {
+            None => json!({ "known": false, "busy": false }),
+            Some((_, false)) => json!({ "known": true, "busy": true, "command": "agent" }),
+            Some((pid, true)) => match shell_running(std::path::Path::new("/proc"), pid) {
+                Some(command) => json!({ "known": true, "busy": true, "command": command }),
+                None => json!({ "known": true, "busy": false }),
+            },
+        };
+        out.insert(uid, row);
+    }
+    Response::ok(req.id.clone(), json!({ "shells": out }))
+}
+
+/// What the shell `pid` is running, read from `proc`: the foreground job when
+/// the terminal's foreground group is not the shell's own, else its first
+/// child. None when it sits at its prompt. An unreadable stat reads as busy
+/// (`"unknown"`) — the caller then keeps the pane.
+fn shell_running(proc: &std::path::Path, pid: libc::pid_t) -> Option<String> {
+    let comm = |p: &str| {
+        std::fs::read_to_string(proc.join(p).join("comm")).map(|c| c.trim().to_string()).unwrap_or_else(|_| p.to_string())
+    };
+    let Ok(stat) = std::fs::read_to_string(proc.join(pid.to_string()).join("stat")) else {
+        return Some("unknown".into());
+    };
+    // Fields after the parenthesised comm: state ppid pgrp session tty_nr tpgid.
+    let rest: Vec<&str> = stat.rsplit_once(')').map(|(_, r)| r.split_whitespace().collect()).unwrap_or_default();
+    let (Some(pgrp), Some(tpgid)) = (rest.get(2), rest.get(5)) else {
+        return Some("unknown".into());
+    };
+    if tpgid.parse::<i64>().is_ok_and(|t| t > 0) && tpgid != pgrp {
+        return Some(comm(tpgid));
+    }
+    let children = std::fs::read_to_string(proc.join(pid.to_string()).join("task").join(pid.to_string()).join("children"))
+        .unwrap_or_default();
+    children.split_whitespace().next().map(comm)
+}
+
+/// `session.rotate_transcript {uid?, reason?, force?, status?}` (#24): move a
+/// Claude session's conversation to a fresh transcript at the same uid
+/// (`crate::rotation`). `status: true` only reports the latest rotation.
+fn dispatch_session_rotate_transcript(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let p = &req.params;
+    let asked = p.get("uid").or_else(|| p.get("session_uid")).and_then(serde_json::Value::as_str);
+    let force = p.get("force").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let reason = p.get("reason").and_then(serde_json::Value::as_str).unwrap_or("").trim().to_string();
+    let (uid, origin) = match &req.caller {
+        Caller::Operator(_) => match asked {
+            Some(uid) => (uid.to_string(), crate::rotation::Origin::Operator),
+            None => return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session.rotate_transcript requires uid"),
+        },
+        Caller::Session(s) => {
+            if force {
+                return Response::err(req.id.clone(), ErrorCode::Unauthorized, "force is operator-only");
+            }
+            (asked.unwrap_or(&s.session_uid).to_string(), crate::rotation::Origin::Agent)
+        }
+    };
+    // #25 follow-up: a session may ask for another session it has authority
+    // over (its task tree / global perms, or as a lead up the target
+    // member's manager chain). Status reads need the same authority.
+    let requested_by = match authorize_target(state, req, &uid) {
+        Ok(by) => by,
+        Err((code, message)) => return Response::err(req.id.clone(), code, message),
+    };
+    if p.get("status").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+        return Response::ok(
+            req.id.clone(),
+            serde_json::json!({ "session_uid": uid, "rotation": crate::rotation::status(&uid) }),
+        );
+    }
+    let reason = if reason.is_empty() { format!("{} request", origin_label(origin)) } else { reason };
+    if origin == crate::rotation::Origin::Agent {
+        // An agent asks mid-turn; the policy carries it out at its next
+        // safe boundary.
+        let guard = state.lock().unwrap_or_else(|p| p.into_inner());
+        return match crate::rotation::request_by(&guard, &uid, &reason, requested_by) {
+            Ok(v) => Response::ok(req.id.clone(), v),
+            Err((code, message)) => Response::err(req.id.clone(), code, message),
+        };
+    }
+    match crate::rotation::start(state, &uid, &reason, origin, force) {
+        Ok(v) => Response::ok(req.id.clone(), v),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// The handoff target fields of a `session.handoff*` request.
+fn handoff_request(p: &serde_json::Value, origin: crate::rotation::Origin, now: bool) -> crate::handoff::Request {
+    let text = |k: &str| p.get(k).and_then(serde_json::Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    crate::handoff::Request {
+        to_engine: text("to_engine").or_else(|| text("engine")),
+        to_model: text("to_model").or_else(|| text("model")),
+        to_effort: text("to_effort").or_else(|| text("effort")),
+        reason: text("reason").unwrap_or_else(|| format!("{} request", origin_label(origin))),
+        origin,
+        now,
+        requested_by: None,
+    }
+}
+
+/// For a Session caller naming `target`: whether it may rotate or hand off
+/// that session. Its own session always; another one only under authority
+/// CM already enforces for controlling sessions, nothing looser:
+/// - the session-caller scope `send_input` / `kill_session` use (its task
+///   tree, managed-by descendants, global permissions);
+/// - or as a lead: the target is a member's main session, assistant or
+///   worker, and the caller is up that member's manager chain (the planning
+///   API's check for move and retire; the member's own main also counts for
+///   its assistants and workers).
+/// Shells, continuous sessions and workflow participants are refused as
+/// targets of another session. Returns who asked (`None`: the operator or
+/// the session itself), else the refusal.
+fn authorize_target(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+    target: &str,
+) -> Result<Option<String>, (ErrorCode, String)> {
+    let Caller::Session(s) = &req.caller else { return Ok(None) };
+    let caller = s.session_uid.as_str();
+    if caller == target {
+        return Ok(None);
+    }
+    let (decision, member, label, refusal) = {
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(t) = st.sessions.get(target) else {
+            return Err((ErrorCode::NotFound, format!("session '{target}' is not live on this host")));
+        };
+        let refusal = if t.session_type == "bash" {
+            Some("shell sessions are never rotated or handed off")
+        } else if t.continuous_task_id.is_some() {
+            Some("continuous sessions are scheduler-owned: change the continuous task instead")
+        } else if t.workflow_run_id.is_some() {
+            Some("workflow participants are driven by their run")
+        } else {
+            None
+        };
+        (
+            crate::control::auth::check_session_caller(&st, caller, target),
+            crate::assistants::of_session(t),
+            st.sessions.get(caller).map(|c| c.to_manifest_entry().label).unwrap_or_default(),
+            refusal,
+        )
+    };
+    // Authority first: an unauthorized caller learns nothing about the
+    // target beyond "no authority".
+    let by = Some(if label.is_empty() { caller.to_string() } else { format!("{label} ({caller})") });
+    if !matches!(decision, crate::control::auth::AuthDecision::Allow) {
+        let lead_refusal = match member {
+            Some(m) => match crate::items::org::member_authority(
+                state,
+                req,
+                &m.member_id,
+                m.acting_as != crate::assistants::MAIN,
+                target,
+            ) {
+                Ok(_) => String::new(),
+                Err((_, e)) => format!("; not up member {}'s manager chain ({e})", m.member_id),
+            },
+            None => "; no org member it works for".to_string(),
+        };
+        if !lead_refusal.is_empty() {
+            return Err((
+                ErrorCode::Unauthorized,
+                format!(
+                    "'{caller}' has no authority over session '{target}': it is not in your task tree \
+                     (the send_input / kill_session scope){lead_refusal}"
+                ),
+            ));
+        }
+    }
+    if let Some(why) = refusal {
+        return Err((ErrorCode::Conflict, why.into()));
+    }
+    Ok(by)
+}
+
+/// `session.handoff {uid?, to_engine?, to_model?, to_effort?, reason?, now?,
+/// wait_secs?, status?}` (#25): move a session to another engine, model or
+/// effort at the same CM uid (same engine and nothing to change: a
+/// transcript rotation). Queued for the session's next safe boundary;
+/// `now` (operator-only) waives the idle and Owner-quiet waits and refuses
+/// at once if anything else is in flight. A Session caller may hand off only
+/// itself.
+fn dispatch_session_handoff(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let p = &req.params;
+    let asked = p.get("uid").or_else(|| p.get("session_uid")).and_then(serde_json::Value::as_str);
+    let now = p.get("now").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let (uid, origin) = match &req.caller {
+        Caller::Operator(_) => match asked {
+            Some(uid) => (uid.to_string(), crate::rotation::Origin::Operator),
+            None => return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session.handoff requires uid"),
+        },
+        Caller::Session(s) => {
+            if now {
+                return Response::err(req.id.clone(), ErrorCode::Unauthorized, "now is operator-only");
+            }
+            (asked.unwrap_or(&s.session_uid).to_string(), crate::rotation::Origin::Agent)
+        }
+    };
+    let requested_by = match authorize_target(state, req, &uid) {
+        Ok(by) => by,
+        Err((code, message)) => return Response::err(req.id.clone(), code, message),
+    };
+    if p.get("status").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+        return Response::ok(
+            req.id.clone(),
+            serde_json::json!({ "session_uid": uid, "handoff": crate::handoff::status(&uid),
+                                "rotation": crate::rotation::status(&uid) }),
+        );
+    }
+    let wait = p.get("wait_secs").and_then(serde_json::Value::as_u64).map(std::time::Duration::from_secs);
+    let mut request = handoff_request(p, origin, now);
+    request.requested_by = requested_by;
+    match crate::handoff::request(state, &uid, request, wait) {
+        Ok(v) => Response::ok(req.id.clone(), v),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `session.handoff_cancel {uid}`: remove a queued handoff without touching a
+/// handoff that has already started. Operator-only because this changes the
+/// transfer plan for any session, including one owned by another agent.
+fn dispatch_session_handoff_cancel(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(response) = require_operator(req, "Handoff cancellation is Operator-only") {
+        return response;
+    }
+    let uid = req
+        .params
+        .get("uid")
+        .or_else(|| req.params.get("session_uid"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|uid| !uid.is_empty());
+    let Some(uid) = uid else {
+        return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session.handoff_cancel requires uid");
+    };
+    match crate::handoff::cancel_queued(state, uid) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// `session.handoff_many {uids? | from_engine?, to_engine?, to_model?,
+/// to_effort?, reason?, wait_secs?}` (#25): Owner's bulk handoff,
+/// operator-only. Named `uids`, or every agent session on `from_engine`
+/// (never shells, continuous sessions or workflow participants). Each runs
+/// at its own boundary, one at a time.
+fn dispatch_session_handoff_many(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    if let Err(response) = require_operator(req, "Bulk handoff is Operator-only") {
+        return response;
+    }
+    let p = &req.params;
+    let uids: Vec<String> = match p.get("uids").and_then(serde_json::Value::as_array) {
+        Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+        None => {
+            let from = p
+                .get("from_engine")
+                .and_then(serde_json::Value::as_str)
+                .map(|e| crate::handoff::engine_name(e).ok_or(e));
+            let from = match from {
+                Some(Ok(e)) => Some(e),
+                Some(Err(e)) => {
+                    return Response::err(req.id.clone(), ErrorCode::InvalidParams, format!("unknown engine '{e}'"))
+                }
+                None => None,
+            };
+            crate::handoff::select(&state.lock().unwrap_or_else(|p| p.into_inner()), from)
+        }
+    };
+    if uids.is_empty() {
+        return Response::err(req.id.clone(), ErrorCode::InvalidParams, "no sessions to hand off");
+    }
+    let wait = p.get("wait_secs").and_then(serde_json::Value::as_u64).map(std::time::Duration::from_secs);
+    let request = handoff_request(p, crate::rotation::Origin::Operator, false);
+    Response::ok(req.id.clone(), crate::handoff::request_many(state, &uids, &request, wait))
+}
+
+fn origin_label(origin: crate::rotation::Origin) -> &'static str {
+    match origin {
+        crate::rotation::Origin::Operator => "operator",
+        crate::rotation::Origin::Agent => "agent",
+        crate::rotation::Origin::Policy => "policy",
+    }
+}
+
 /// `session.revive` — operator-triggered resurrection of an exited
 /// session at its same uid (see `methods::revive_session`).
 /// Operator-only: the revive re-applies the persisted identity
@@ -1729,6 +2568,77 @@ fn dispatch_session_revive(
         return resp;
     }
     match methods::revive_session(state, &req.params) {
+        Ok(value) => {
+            note_owner_spawn(state, req, &value);
+            Response::ok(req.id.clone(), value)
+        }
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_background_recovery_preflight(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "session.background_recovery_preflight is Operator-callable only — native background recovery may stop active work",
+    ) {
+        return resp;
+    }
+    let uid = req.params.get("uid").and_then(Value::as_str).unwrap_or_default();
+    Response::ok(req.id.clone(), crate::claude_recovery::preflight(state, uid))
+}
+
+fn dispatch_background_recovery_confirm(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "session.background_recovery_confirm is Operator-callable only — it requires explicit confirmation before stopping native work",
+    ) {
+        return resp;
+    }
+    let identity = req.params.get("identity").cloned().unwrap_or(Value::Null);
+    let confirmed = req.params.get("confirmed").and_then(Value::as_bool).unwrap_or(false);
+    match crate::claude_recovery::confirm(state, &identity, confirmed) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_background_recovery_reconcile(
+    _state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "session.background_recovery_reconcile is Operator-callable only — reconciliation clears a durable recovery fence",
+    ) {
+        return resp;
+    }
+    let uid = req.params.get("uid").and_then(Value::as_str).unwrap_or_default();
+    let identity = req.params.get("identity").cloned().unwrap_or(Value::Null);
+    let action = req.params.get("action").and_then(Value::as_str).unwrap_or_default();
+    match crate::claude_recovery::reconcile(uid, &identity, action) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_background_recovery_status(
+    _state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "session.background_recovery_status is Operator-callable only",
+    ) {
+        return resp;
+    }
+    let uid = req.params.get("uid").and_then(Value::as_str).unwrap_or_default();
+    match crate::claude_recovery::status(uid) {
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
@@ -1835,6 +2745,62 @@ fn dispatch_daemon_drain(
         Ok(value) => Response::ok(req.id.clone(), value),
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
+}
+
+/// `daemon.maintenance` — `{action: "get" | "set" | "clear", reason?,
+/// started_at?, expect_until?}`: this host's maintenance notice (see
+/// `crate::maintenance`). On the messaging hub a set or clear also
+/// replicates to every replica. A set that opens a new notice tells live
+/// agents that used chat in the last hour, once.
+fn dispatch_daemon_maintenance(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+) -> Response {
+    if let Err(resp) = require_operator(
+        req,
+        "daemon.maintenance is Operator-callable only — the notice is shown \
+         to every agent on the host",
+    ) {
+        return resp;
+    }
+    let (root, draining) = {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        (s.messaging_root.clone(), s.draining)
+    };
+    // A notice is set before the restart and cleared after it: changing it
+    // while this brain is draining for the restart is refused (get is fine).
+    if draining && req.params["action"].as_str().is_some_and(|a| a != "get") {
+        return Response::err(
+            req.id.clone(),
+            ErrorCode::Conflict,
+            "daemon.maintenance: this brain is draining for a restart; set the notice before the restart and clear it after",
+        );
+    }
+    let now = chrono::Utc::now();
+    let (mut out, fresh) = match crate::maintenance::apply_local(&root, &req.params, now) {
+        Ok(r) => r,
+        Err(m) => return Response::err(req.id.clone(), ErrorCode::InvalidParams, m),
+    };
+    if req.params["action"].as_str().is_some_and(|a| a != "get") {
+        let record = crate::maintenance::local_record(&root);
+        let handle = state.lock().unwrap_or_else(|p| p.into_inner()).messaging.clone();
+        let published = match handle.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+            Some(store) => store.publish_maintenance(&record).map_err(|e| e.to_string()),
+            None => Err("messaging is still starting; set the notice again to replicate it".to_owned()),
+        };
+        match published {
+            Ok(hub) => out["replicated"] = serde_json::json!(hub),
+            Err(e) => {
+                out["replicated"] = serde_json::json!(false);
+                out["replication_error"] = serde_json::json!(e);
+            }
+        }
+    }
+    if let Some(notice) = fresh {
+        let targets = crate::maintenance::announce_targets(state);
+        out["notified"] = serde_json::json!(crate::maintenance::announce(&root, &notice, &targets, now));
+    }
+    Response::ok(req.id.clone(), out)
 }
 
 /// `daemon.restart` — the PRODUCTION in-place restart
@@ -2369,6 +3335,21 @@ fn dispatch_attach_direct(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Dis
         cols: Option<u16>,
         rows: Option<u16>,
         context: Option<Context>,
+        /// `"screen"`: send the visible screen instead of the whole ring
+        /// (`crate::screen_replay`). Anything else, or absent: full ring.
+        replay: Option<String>,
+        /// The viewer passes kitty graphics through. A screen repaint carries
+        /// no images, so a ring holding image commands is replayed in full.
+        #[serde(default)]
+        graphics: bool,
+        /// Resume: the stream offset the viewer's terminal has reached and
+        /// that stream's id (both from an earlier reply). When the ring
+        /// still holds it, only the missing bytes are sent.
+        since: Option<u64>,
+        stream_id: Option<u64>,
+        /// Send output as raw data frames instead of base64 JSON.
+        binary: Option<bool>,
+        heartbeat: Option<bool>,
     }
     #[derive(serde::Deserialize)]
     struct Context {
@@ -2407,11 +3388,48 @@ fn dispatch_attach_direct(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Dis
             context_errors.push(message);
         }
     }
-    let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
-    let mut outcome = bind_attach_stream(&mut s, req, params.uid, params.cols, params.rows);
-    if let DispatchOutcome::AttachStream { response, .. } = &mut outcome {
-        response.result.as_mut().expect("attach result")["context_errors"] =
-            serde_json::json!(context_errors);
+    let screen = params.replay.as_deref() == Some("screen");
+    let resume = params.stream_id.zip(params.since);
+    let (mut outcome, ring) = {
+        let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+        bind_attach_stream_with(&mut s, req, params.uid, params.cols, params.rows, screen, resume)
+    };
+    if let DispatchOutcome::AttachStream { response, handle } = &mut outcome {
+        let result = response.result.as_mut().expect("attach result");
+        result["context_errors"] = serde_json::json!(context_errors);
+        if params.binary == Some(true) {
+            handle.binary = true;
+            result["binary"] = serde_json::json!(true);
+        }
+        if params.heartbeat == Some(true) {
+            handle.heartbeat = true;
+            result["heartbeat_interval_secs"] = serde_json::json!(crate::control::stream::ATTACH_HEARTBEAT_INTERVAL.as_secs());
+        }
+        if let Some(ring) = ring {
+            // Built outside the state lock; output that arrived meanwhile is
+            // queued behind it.
+            let images = params.graphics && ring.windows(3).any(|w| w == b"\x1b_G");
+            let started = std::time::Instant::now();
+            let replay = if images {
+                result.as_object_mut().expect("attach result").remove("replay");
+                ring
+            } else {
+                crate::screen_replay::render(
+                    &ring,
+                    params.cols.unwrap_or(80),
+                    params.rows.unwrap_or(24),
+                )
+            };
+            let render = (!images).then(|| started.elapsed());
+            handle.fanout_rx.flow_control().push_front(&replay);
+            result["replay_bytes"] = serde_json::json!(replay.len());
+            let kind = if images { "ring" } else { "screen" };
+            crate::health::note_attach(&handle.session_uid, kind, replay.len(), render);
+        } else {
+            let kind = if result["replay"] == "resume" { "resume" } else { "ring" };
+            let bytes = result["replay_bytes"].as_u64().unwrap_or(0) as usize;
+            crate::health::note_attach(&handle.session_uid, kind, bytes, None);
+        }
     }
     outcome
 }
@@ -2423,6 +3441,21 @@ fn bind_attach_stream(
     cols: Option<u16>,
     rows: Option<u16>,
 ) -> DispatchOutcome {
+    bind_attach_stream_with(state, req, session_uid, cols, rows, false, None).0
+}
+
+/// [`bind_attach_stream`]; with `screen`, queues no replay and returns the
+/// ring for the caller to render (outside the state lock) and put in front
+/// of the queued live output.
+fn bind_attach_stream_with(
+    state: &mut DaemonState,
+    req: &Request,
+    session_uid: String,
+    cols: Option<u16>,
+    rows: Option<u16>,
+    screen: bool,
+    resume: Option<(u64, u64)>,
+) -> (DispatchOutcome, Option<Vec<u8>>) {
     // Subscribe + clone last_exit inside the same critical
     // section as the ticket consume above (`state` is &mut and
     // we still hold the dispatch-arm lock from `dispatch_request`).
@@ -2430,7 +3463,7 @@ fn bind_attach_stream(
     // session.attach already minted a ticket for a uid that has
     // since exited — surface as Conflict so the client knows the
     // attach can't proceed.
-    let (fanout_rx, last_exit, replay_bytes) = match state.sessions.get_mut(&session_uid) {
+    let (fanout_rx, (last_exit, kill_attribution), replay_bytes, offset, ring) = match state.sessions.get_mut(&session_uid) {
         Some(session) => {
             // Apply the client's terminal size server-side, in the
             // same locked critical section that binds the stream.
@@ -2454,37 +3487,54 @@ fn bind_attach_stream(
                     );
                 }
             }
-            let (rx, replay_bytes) = session.fanout.subscribe_output_with_replay_len();
-            (rx, session.last_exit.clone(), replay_bytes)
+            let a = session.fanout.subscribe_output_for(screen, resume);
+            let kind = if a.resumed {
+                Some("resume")
+            } else if a.screen_ring.is_some() {
+                Some("screen")
+            } else {
+                None
+            };
+            (a.rx, (session.last_exit.clone(), session.kill_attribution_cell()), a.replay_len, (a.offset, a.stream_id, kind), a.screen_ring)
         }
         None => {
-            return DispatchOutcome::Done(Response::err(
+            return (DispatchOutcome::Done(Response::err(
                 req.id.clone(),
                 ErrorCode::Conflict,
                 format!(
                     "session '{}' exited between session.attach and attach.open",
                     session_uid
                 ),
-            ));
+            )), None);
         }
     };
 
-    let response = Response::ok(
-        req.id.clone(),
-        serde_json::json!({
-            "session_uid": session_uid.clone(),
-            "output_flow": true,
-            // Bytes of ring replay that precede live output on this stream.
-            "replay_bytes": replay_bytes,
-        }),
-    );
+    let (offset, stream_id, kind) = offset;
+    let mut result = serde_json::json!({
+        "session_uid": session_uid.clone(),
+        "output_flow": true,
+        // Bytes of replay that precede live output on this stream (for a
+        // screen attach, filled in by the caller once the repaint exists).
+        "replay_bytes": replay_bytes,
+        // Where live output starts in this stream; a viewer resumes from
+        // here plus the live bytes it has consumed.
+        "offset": offset,
+        "stream_id": stream_id,
+    });
+    if let Some(kind) = kind {
+        result["replay"] = serde_json::json!(kind);
+    }
+    let response = Response::ok(req.id.clone(), result);
     let handle = AttachStreamHandle {
         session_uid,
         fanout_rx,
         last_exit,
+        kill_attribution,
         request_id: req.id.clone(),
+        binary: false,
+        heartbeat: false,
     };
-    DispatchOutcome::AttachStream { response, handle }
+    (DispatchOutcome::AttachStream { response, handle }, ring)
 }
 
 /// 10e-b: `manifest.watch` dispatch arm. Operator-only.
@@ -2538,6 +3588,10 @@ fn dispatch_manifest_watch(state: &mut DaemonState, req: &Request) -> DispatchOu
             eprintln!("cm-daemon: {e}; sidebar requests unavailable in snapshot");
         }).ok(),
         "owner_attention": owner_attention,
+        "notification_health": crate::messaging::delivery::alarm::snapshot(&state.messaging_root)
+            .map_err(|e| eprintln!("cm-daemon: notification health snapshot unavailable: {e}"))
+            .ok(),
+        "agent_states": crate::agent_state::snapshot(state),
         "workspaces": state.workspaces,
         "bindings": state.bindings,
         "messaging_names": state.messaging_names,
@@ -2665,6 +3719,128 @@ fn dispatch_send_input(
     }
 }
 
+/// `session.send_key` — same caller shape as `dispatch_send_input`; scope is
+/// checked per target in the method body (see `control::send_key`).
+fn dispatch_send_key(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let caller_uid: Option<String> = match &req.caller {
+        Caller::Operator(_) => None,
+        Caller::Session(s) => Some(s.session_uid.clone()),
+    };
+    match super::send_key::send_key(state, &req.params, caller_uid.as_deref()) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+/// Explicit selected Claude-limit recovery. The operation only publishes
+/// through the durable #69 native journal fence; it never presses a PTY key.
+fn dispatch_session_resume_many(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let Some(values) = req.params.get("session_uids").and_then(Value::as_array) else {
+        return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session_uids must be an array");
+    };
+    let mut uids = Vec::new();
+    for value in values {
+        let Some(uid) = value.as_str().map(str::trim).filter(|uid| !uid.is_empty()) else {
+            return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session_uids must contain nonempty strings");
+        };
+        if !uids.iter().any(|old| old == uid) { uids.push(uid.to_owned()); }
+    }
+    if uids.is_empty() || uids.len() > crate::claude_account_recovery::MAX_BULK_RESUME_TARGETS {
+        return Response::err(req.id.clone(), ErrorCode::InvalidParams,
+            format!("session.resume_many takes 1..{} explicit session UIDs", crate::claude_account_recovery::MAX_BULK_RESUME_TARGETS));
+    }
+    let caller_uid = match &req.caller {
+        Caller::Operator(_) => None,
+        Caller::Session(s) => Some(s.session_uid.clone()),
+    };
+    let mut allowed = Vec::new();
+    let mut refused = Vec::new();
+    if let Some(caller) = caller_uid.as_deref() {
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+        for uid in &uids {
+            match check_session_caller(&st, caller, uid) {
+                AuthDecision::Allow => allowed.push(uid.clone()),
+                AuthDecision::TargetNotInRegistry => refused.push(json!({"session_uid":uid,"status":"refused","reason":"target not found"})),
+                AuthDecision::CallerNotInRegistry => return Response::err(req.id.clone(), ErrorCode::Unauthorized, "caller is not in the daemon registry"),
+                AuthDecision::TaskTreeNotYetSynced => refused.push(json!({"session_uid":uid,"status":"refused","reason":"caller task scope is not synced"})),
+                AuthDecision::OutOfScope => refused.push(json!({"session_uid":uid,"status":"refused","reason":"target is outside caller scope"})),
+            }
+        }
+    } else {
+        allowed = uids.clone();
+    }
+    let mut out = crate::claude_account_recovery::request_many(state, &allowed);
+    if let Some(rows) = out.get_mut("results").and_then(Value::as_array_mut) {
+        rows.extend(refused);
+    }
+    Response::ok(req.id.clone(), out)
+}
+
+fn dispatch_session_resume_status(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let Some(values) = req.params.get("session_uids").and_then(Value::as_array) else {
+        return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session_uids must be an array");
+    };
+    let mut uids = Vec::new();
+    for value in values {
+        let Some(uid) = value.as_str().map(str::trim).filter(|uid| !uid.is_empty()) else {
+            return Response::err(req.id.clone(), ErrorCode::InvalidParams, "session_uids must contain nonempty strings");
+        };
+        if !uids.iter().any(|old| old == uid) { uids.push(uid.to_owned()); }
+    }
+    if uids.is_empty() || uids.len() > crate::claude_account_recovery::MAX_BULK_RESUME_TARGETS {
+        return Response::err(req.id.clone(), ErrorCode::InvalidParams,
+            format!("session.resume_status takes 1..{} explicit session UIDs", crate::claude_account_recovery::MAX_BULK_RESUME_TARGETS));
+    }
+    let mut allowed = Vec::new();
+    let mut refused = Vec::new();
+    if let Caller::Session(caller) = &req.caller {
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+        for uid in &uids {
+            match check_session_caller(&st, &caller.session_uid, uid) {
+                AuthDecision::Allow => allowed.push(uid.clone()),
+                AuthDecision::TargetNotInRegistry => refused.push(json!({"session_uid":uid,"status":"refused","reason":"target not found"})),
+                AuthDecision::CallerNotInRegistry => return Response::err(req.id.clone(), ErrorCode::Unauthorized, "caller is not in the daemon registry"),
+                AuthDecision::TaskTreeNotYetSynced => refused.push(json!({"session_uid":uid,"status":"refused","reason":"caller task scope is not synced"})),
+                AuthDecision::OutOfScope => refused.push(json!({"session_uid":uid,"status":"refused","reason":"target is outside caller scope"})),
+            }
+        }
+    } else {
+        allowed = uids;
+    }
+    let mut out = crate::claude_account_recovery::status_many(state, &allowed);
+    if let Some(rows) = out.get_mut("results").and_then(Value::as_array_mut) {
+        rows.extend(refused);
+    }
+    Response::ok(req.id.clone(), out)
+}
+
+fn dispatch_send_bound_escape(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let caller_uid = match &req.caller {
+        Caller::Session(s) => Some(s.session_uid.as_str()),
+        Caller::Operator(_) => None,
+    };
+    match super::send_key::send_bound_escape(state, &req.params, caller_uid) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
+fn dispatch_interrupt(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
+    let caller_uid = match &req.caller {
+        Caller::Session(s) => Some(s.session_uid.as_str()),
+        Caller::Operator(_) => {
+            if let Err(response) = require_operator(req, "interrupt requires an authenticated Operator") {
+                return response;
+            }
+            None
+        },
+    };
+    match methods::interrupt_session(state, &req.params, caller_uid) {
+        Ok(value) => Response::ok(req.id.clone(), value),
+        Err((code, message)) => Response::err(req.id.clone(), code, message),
+    }
+}
+
 /// `session.turn_ended` — the cm Stop hook's turn-end self-report.
 /// Same caller shape as `dispatch_send_input`; auth (self-or-scope)
 /// runs in the method body.
@@ -2725,7 +3901,15 @@ fn dispatch_kill_session(
         Caller::Session(s) => Some(s.session_uid.clone()),
     };
     match methods::kill_session(state, &req.params, caller_uid.as_deref()) {
-        Ok(value) => Response::ok(req.id.clone(), value),
+        Ok(value) => {
+            // O5: the killed assistant's holds go back to its member, off the
+            // dispatch thread (the planning API may be slow or down).
+            if let Some(member_id) = value["assistant_ended"]["member_id"].as_str() {
+                let uid = req.params["session_uid"].as_str().unwrap_or_default().to_string();
+                crate::items::org::hand_back_after_kill(state, req, &uid, member_id);
+            }
+            Response::ok(req.id.clone(), value)
+        }
         Err((code, message)) => Response::err(req.id.clone(), code, message),
     }
 }
@@ -2776,6 +3960,7 @@ fn dispatch_ping(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
             // round-trip. An unknown uid (e.g. post-restart) still
             // pongs, with `global_perms=false` and null scope.
             let st = state.lock().unwrap_or_else(|p| p.into_inner());
+            let messaging_root = st.messaging_root.clone();
             let (
                 global_perms,
                 task_id,
@@ -2808,9 +3993,13 @@ fn dispatch_ping(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
                     }
                     None => (false, None, None, None, None, None, None, None, None),
                 };
-            Response::ok(
-                req.id.clone(),
-                serde_json::json!({
+            drop(st);
+            // Owner availability from the messaging store's projection: a
+            // small local file, so ping stays lock-free and network-free.
+            let owner_availability = crate::owner_availability::exposure(&messaging_root);
+            let staffing = crate::staffing::exposure(state);
+            let maintenance = crate::maintenance::field_for(state);
+            let mut body = serde_json::json!({
                     "pong": true,
                     "uid": s.session_uid,
                     "caller_kind": "session",
@@ -2823,8 +4012,17 @@ fn dispatch_ping(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
                     "workflow_role": workflow_role,
                     "managed_by_session_id": managed_by_session_id,
                     "worktree_path": worktree_path,
-                }),
-            )
+                    "owner_availability": owner_availability,
+                    "staffing": staffing,
+                    // The member this session works as (org model S2),
+                    // from the last heartbeat reply; null when it is an
+                    // assistant or the planning API predates S2.
+                    "member": crate::items::org::cached_member(&s.session_uid),
+                });
+            if let Some(m) = maintenance {
+                body["maintenance"] = serde_json::json!(m);
+            }
+            Response::ok(req.id.clone(), body)
         }
         Caller::Operator(_) => Response::err(
             req.id.clone(),
@@ -2853,6 +4051,657 @@ mod tests {
             caller: Caller::operator("op-default"),
             method: method.into(),
             params,
+        }
+    }
+
+    #[test]
+    fn selected_resume_enforces_cap_and_per_target_scope_refusal() {
+        let state = make_state();
+        let too_many = (0..=crate::claude_account_recovery::MAX_BULK_RESUME_TARGETS)
+            .map(|n| format!("uid-{n}"))
+            .collect::<Vec<_>>();
+        let capped = dispatch_request(&state, &operator_request(
+            "session.resume_many", serde_json::json!({"session_uids": too_many}),
+        )).into_response();
+        assert_eq!(capped.error.unwrap().code, ErrorCode::InvalidParams);
+
+        add_session(&state, "resume-caller", "ws-a");
+        add_session(&state, "resume-outside", "ws-b");
+        let scoped = dispatch_request(&state, &session_request(
+            "session.resume_many", serde_json::json!({"session_uids": ["resume-outside"]}),
+            "resume-caller",
+        )).into_response();
+        assert!(scoped.ok, "scope refusals are per target: {:?}", scoped.error);
+        assert_eq!(scoped.result.unwrap()["results"][0]["status"], "refused");
+
+        let mut st = state.lock().unwrap_or_else(|p| p.into_inner());
+        for session in st.sessions.values_mut() { let _ = session.kill(); }
+    }
+
+    /// A viewer's spawn at a uid a rotation is bringing back (TUI restore or
+    /// A-R) is refused: it would race the rotation's own respawn.
+    #[test]
+    fn start_session_at_a_rotating_uid_is_refused() {
+        let _serial = crate::rotation::test_registry_lock();
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        crate::rotation::test_set_running("ts-rotspawn-0", true);
+        let r = dispatch_start_session(
+            &state,
+            &operator_request("start_session", serde_json::json!({"uid": "ts-rotspawn-0", "type": "claude"})),
+        );
+        crate::rotation::test_set_running("ts-rotspawn-0", false);
+        let e = r.error.expect("refused");
+        assert_eq!(e.code, ErrorCode::Conflict);
+        assert!(e.message.contains("comes straight back"), "{}", e.message);
+        assert!(state.lock().unwrap().sessions.is_empty());
+    }
+
+    /// #25 follow-up: a session may rotate or hand off another session it has
+    /// authority over: its managed worker (the send_input / kill_session
+    /// scope), never an unrelated one; shells and continuous sessions are
+    /// refused as targets; who asked is recorded.
+    #[test]
+    fn a_lead_may_target_its_worker_and_nothing_else() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let spawn = |uid: &str, ty: &str| {
+            let mut sp = crate::session::SpawnParams::new(uid, uid, "/bin/sleep");
+            sp.args = vec!["30".into()];
+            sp.session_type = ty.into();
+            let mut s = crate::session::DaemonSession::spawn(sp).unwrap();
+            s.transcript_path = Some(format!("/tmp/{uid}.jsonl"));
+            s
+        };
+        {
+            let mut st = state.lock().unwrap();
+            st.sessions.insert("ts-lead-0".into(), spawn("ts-lead-0", "claude-code"));
+            let mut worker = spawn("ts-wkr-0", "claude-code");
+            worker.managed_by_uid = Some("ts-lead-0".into());
+            st.sessions.insert("ts-wkr-0".into(), worker);
+            // Another workspace and task: outside the lead's scope.
+            let mut other = spawn("ts-other-0", "claude-code");
+            other.workspace_id = "ws-elsewhere".into();
+            other.task_id = Some("task-elsewhere".into());
+            st.sessions.insert("ts-other-0".into(), other);
+            let mut shell = spawn("ts-wsh-0", "bash");
+            shell.managed_by_uid = Some("ts-lead-0".into());
+            st.sessions.insert("ts-wsh-0".into(), shell);
+            let mut ct = spawn("ts-wct-0", "claude-code");
+            ct.managed_by_uid = Some("ts-lead-0".into());
+            ct.continuous_task_id = Some("ct-x".into());
+            st.sessions.insert("ts-wct-0".into(), ct);
+            let mut far_shell = spawn("ts-fsh-0", "bash");
+            far_shell.workspace_id = "ws-elsewhere".into();
+            far_shell.task_id = Some("task-elsewhere".into());
+            st.sessions.insert("ts-fsh-0".into(), far_shell);
+        }
+        let as_lead = |method: &str, params: serde_json::Value| session_request(method, params, "ts-lead-0");
+        assert_eq!(authorize_target(&state, &as_lead("session.handoff", serde_json::json!({})), "ts-lead-0"), Ok(None), "self");
+        let by = authorize_target(&state, &as_lead("session.handoff", serde_json::json!({})), "ts-wkr-0").unwrap();
+        assert_eq!(by.as_deref(), Some("ts-lead-0 (ts-lead-0)"));
+        let err = authorize_target(&state, &as_lead("session.handoff", serde_json::json!({})), "ts-other-0").unwrap_err();
+        assert_eq!(err.0, ErrorCode::Unauthorized, "{}", err.1);
+        assert!(err.1.contains("no authority over session 'ts-other-0'"), "{}", err.1);
+        assert!(authorize_target(&state, &as_lead("session.handoff", serde_json::json!({})), "ts-wsh-0").unwrap_err().1.contains("shell"));
+        assert!(authorize_target(&state, &as_lead("session.handoff", serde_json::json!({})), "ts-wct-0").unwrap_err().1.contains("continuous"));
+        // Authority comes first: a shell outside the caller's scope reads as
+        // "no authority", never as a shell.
+        let far = authorize_target(&state, &as_lead("session.handoff", serde_json::json!({})), "ts-fsh-0").unwrap_err();
+        assert_eq!(far.0, ErrorCode::Unauthorized, "{}", far.1);
+        assert!(!far.1.contains("shell"), "{}", far.1);
+        // Through the RPCs: the worker's rotation is armed with the
+        // requester recorded; an unrelated session's is refused.
+        let ok = dispatch_session_rotate_transcript(
+            &state, &as_lead("session.rotate_transcript", serde_json::json!({"uid": "ts-wkr-0", "reason": "lag"})));
+        assert!(ok.ok, "{:?}", ok.error);
+        assert_eq!(ok.result.unwrap()["armed"], true);
+        let refused = dispatch_session_rotate_transcript(
+            &state, &as_lead("session.rotate_transcript", serde_json::json!({"uid": "ts-other-0"})));
+        assert!(!refused.ok);
+        let handoff = dispatch_session_handoff(
+            &state, &as_lead("session.handoff", serde_json::json!({"uid": "ts-wkr-0", "to_engine": "codex", "reason": "cheap work"})));
+        let v = handoff.result.expect("queued");
+        assert_eq!(v["handoff"]["requested_by"], "ts-lead-0 (ts-lead-0)");
+        assert!(v["handoff"]["reason"].as_str().unwrap().contains("requested by ts-lead-0"));
+        let now = dispatch_session_handoff(
+            &state, &as_lead("session.handoff", serde_json::json!({"uid": "ts-wkr-0", "to_engine": "codex", "now": true})));
+        assert!(now.error.unwrap().message.contains("operator-only"), "no `now` for agents");
+        crate::rotation::test_drop_arm("ts-wkr-0");
+        crate::handoff::test_drop_queued("ts-wkr-0");
+        for s in state.lock().unwrap().sessions.values_mut() {
+            let _ = s.kill();
+        }
+    }
+
+    /// Org read scope is additive to the task tree: a lead can list a report
+    /// whose session was spawned elsewhere, while an unavailable planning API
+    /// leaves the old task-tree answer in place.
+    #[test]
+    fn list_sessions_includes_org_report_from_one_batched_authority_check() {
+        let _env = crate::test_support::env_lock();
+        crate::items::org::reset_cache_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let (url, seen) = crate::items::org::test_stub(|method, path, _body| match (method, path) {
+            ("POST", "/org/members/authority-batch") => (
+                200,
+                serde_json::json!({"allowed": [{"member_id": "mem-report"}]}).to_string(),
+            ),
+            _ => (500, "{}".into()),
+        });
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        {
+            let mut st = state.lock().unwrap();
+            st.messaging_root = root.path().into();
+            st.config.api_url = url;
+            st.config.api_token = "tok".into();
+        }
+        crate::messaging::startup::open_for_test(&state).unwrap();
+        let spawn = |uid: &str, task: &str| {
+            let mut params = crate::session::SpawnParams::new(uid, uid, "/bin/sleep");
+            params.args = vec!["30".into()];
+            params.session_type = "codex".into();
+            let mut session = crate::session::DaemonSession::spawn(params).unwrap();
+            session.task_id = Some(task.into());
+            session
+        };
+        {
+            let mut st = state.lock().unwrap();
+            st.sessions.insert("lead-uid".into(), spawn("lead-uid", "task-lead"));
+            st.sessions.insert("report-uid".into(), spawn("report-uid", "task-report"));
+        }
+        crate::items::org::absorb_reply(
+            &serde_json::json!({"org": {"members": {
+                "lead-uid": {"id": "mem-lead", "acting_as": "main"},
+                "report-uid": {"id": "mem-report", "acting_as": "main"}
+            }}}),
+            1_700_000_000.0,
+        );
+        let response = dispatch_list_sessions(
+            &state,
+            &session_request("list_sessions", serde_json::json!({}), "lead-uid"),
+        );
+        assert!(response.ok, "{:?}", response.error);
+        let rows = response.result.unwrap();
+        let uids: Vec<_> = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["session_uid"].as_str())
+            .collect();
+        assert!(uids.contains(&"lead-uid"));
+        assert!(uids.contains(&"report-uid"), "report rows: {uids:?}");
+        let list_calls = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, path, _)| method == "POST" && path == "/org/members/authority-batch")
+            .count();
+        assert_eq!(list_calls, 1, "list_sessions uses one batch, not one request per row");
+
+        // Transcript resolution is a separate read operation. It performs
+        // its own concrete-session check, so it should add exactly one more
+        // batched request rather than reuse the listing's member-only result.
+        let resolved = dispatch_resolve_authorized_session(
+            &state,
+            &session_request(
+                "resolve_authorized_session",
+                serde_json::json!({"session_uid": "report-uid"}),
+                "lead-uid",
+            ),
+        );
+        assert!(resolved.ok, "{:?}", resolved.error);
+        let calls = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, path, _)| method == "POST" && path == "/org/members/authority-batch")
+            .count();
+        assert_eq!(calls, 2, "one batch for listing plus one concrete-session check");
+        for session in state.lock().unwrap().sessions.values_mut() {
+            let _ = session.kill();
+        }
+        crate::items::org::reset_cache_for_test();
+    }
+
+    #[test]
+    fn list_sessions_keeps_task_scope_when_org_api_is_unavailable() {
+        let _env = crate::test_support::env_lock();
+        crate::items::org::reset_cache_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let (url, _seen) = crate::items::org::test_stub(|_, _path, _| (503, "{}".into()));
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        {
+            let mut st = state.lock().unwrap();
+            st.messaging_root = root.path().into();
+            st.config.api_url = url;
+            st.config.api_token = "tok".into();
+        }
+        crate::messaging::startup::open_for_test(&state).unwrap();
+        let spawn = |uid: &str, task: &str| {
+            let mut params = crate::session::SpawnParams::new(uid, uid, "/bin/sleep");
+            params.args = vec!["30".into()];
+            params.session_type = "codex".into();
+            let mut session = crate::session::DaemonSession::spawn(params).unwrap();
+            session.task_id = Some(task.into());
+            session
+        };
+        {
+            let mut st = state.lock().unwrap();
+            st.sessions.insert("lead-down".into(), spawn("lead-down", "task-lead"));
+            st.sessions.insert("report-down".into(), spawn("report-down", "task-report"));
+        }
+        crate::items::org::absorb_reply(
+            &serde_json::json!({"org": {"members": {
+                "lead-down": {"id": "mem-lead-down", "acting_as": "main"},
+                "report-down": {"id": "mem-report-down", "acting_as": "main"}
+            }}}),
+            1_700_000_000.0,
+        );
+        let response = dispatch_list_sessions(
+            &state,
+            &session_request("list_sessions", serde_json::json!({}), "lead-down"),
+        );
+        assert!(response.ok, "{:?}", response.error);
+        let result = response.result.unwrap();
+        let uids: Vec<_> = result
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|row| row["session_uid"].as_str())
+            .collect();
+        assert!(uids.contains(&"lead-down"));
+        assert!(!uids.contains(&"report-down"), "API outage widened scope: {uids:?}");
+        for session in state.lock().unwrap().sessions.values_mut() {
+            let _ = session.kill();
+        }
+        crate::items::org::reset_cache_for_test();
+    }
+
+    #[test]
+    fn resolve_rechecks_target_identity_after_org_authority_call() {
+        let _env = crate::test_support::env_lock();
+        crate::items::org::reset_cache_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let (request_seen_tx, request_seen_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (url, _seen) = crate::items::org::test_stub(move |method, path, _body| {
+            if method == "POST" && path == "/org/members/authority-batch" {
+                request_seen_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("test must release the API response");
+                return (
+                    200,
+                    serde_json::json!({"allowed": [{"member_id": "mem-report"}]}).to_string(),
+                );
+            }
+            (500, "{}".into())
+        });
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        {
+            let mut st = state.lock().unwrap();
+            st.messaging_root = root.path().into();
+            st.config.api_url = url;
+            st.config.api_token = "tok".into();
+        }
+        crate::messaging::startup::open_for_test(&state).unwrap();
+        let spawn = |uid: &str, task: &str| {
+            let mut params = crate::session::SpawnParams::new(uid, uid, "/bin/sleep");
+            params.args = vec!["30".into()];
+            params.session_type = "codex".into();
+            let mut session = crate::session::DaemonSession::spawn(params).unwrap();
+            session.task_id = Some(task.into());
+            session
+        };
+        {
+            let mut st = state.lock().unwrap();
+            st.sessions.insert("lead-race".into(), spawn("lead-race", "task-lead"));
+            st.sessions.insert("report-race".into(), spawn("report-race", "task-report"));
+        }
+        crate::items::org::absorb_reply(
+            &serde_json::json!({"org": {"members": {
+                "lead-race": {"id": "mem-lead", "acting_as": "main"},
+                "report-race": {"id": "mem-report", "acting_as": "main"}
+            }}}),
+            1_700_000_000.0,
+        );
+        let worker_state = state.clone();
+        let worker = std::thread::spawn(move || {
+            dispatch_resolve_authorized_session(
+                &worker_state,
+                &session_request(
+                    "resolve_authorized_session",
+                    serde_json::json!({"session_uid": "report-race"}),
+                    "lead-race",
+                ),
+            )
+        });
+        request_seen_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("resolve must reach the authority API");
+        {
+            let mut st = state.lock().unwrap();
+            st.sessions.get_mut("report-race").unwrap().task_id = Some("task-replaced".into());
+        }
+        release_tx.send(()).unwrap();
+        let response = worker.join().unwrap();
+        assert!(!response.ok, "stale org grant authorized replacement: {response:?}");
+        for session in state.lock().unwrap().sessions.values_mut() {
+            let _ = session.kill();
+        }
+        crate::items::org::reset_cache_for_test();
+    }
+
+    #[test]
+    fn resolve_rejects_caller_loss_during_org_authority_call() {
+        let _env = crate::test_support::env_lock();
+        crate::items::org::reset_cache_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let (request_seen_tx, request_seen_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (url, _seen) = crate::items::org::test_stub(move |method, path, _body| {
+            if method == "POST" && path == "/org/members/authority-batch" {
+                request_seen_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("test must release the API response");
+                return (
+                    200,
+                    serde_json::json!({"allowed": [{"member_id": "mem-report"}]}).to_string(),
+                );
+            }
+            (500, "{}".into())
+        });
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        {
+            let mut st = state.lock().unwrap();
+            st.messaging_root = root.path().into();
+            st.config.api_url = url;
+            st.config.api_token = "tok".into();
+        }
+        crate::messaging::startup::open_for_test(&state).unwrap();
+        let spawn = |uid: &str, task: &str| {
+            let mut params = crate::session::SpawnParams::new(uid, uid, "/bin/sleep");
+            params.args = vec!["30".into()];
+            params.session_type = "codex".into();
+            let mut session = crate::session::DaemonSession::spawn(params).unwrap();
+            session.task_id = Some(task.into());
+            session
+        };
+        {
+            let mut st = state.lock().unwrap();
+            st.sessions.insert("lead-loss".into(), spawn("lead-loss", "task-lead"));
+            st.sessions.insert("report-loss".into(), spawn("report-loss", "task-report"));
+        }
+        crate::items::org::absorb_reply(
+            &serde_json::json!({"org": {"members": {
+                "lead-loss": {"id": "mem-lead", "acting_as": "main"},
+                "report-loss": {"id": "mem-report", "acting_as": "main"}
+            }}}),
+            1_700_000_000.0,
+        );
+        let worker_state = state.clone();
+        let worker = std::thread::spawn(move || {
+            dispatch_resolve_authorized_session(
+                &worker_state,
+                &session_request(
+                    "resolve_authorized_session",
+                    serde_json::json!({"session_uid": "report-loss"}),
+                    "lead-loss",
+                ),
+            )
+        });
+        request_seen_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("resolve must reach the authority API");
+        let mut caller = state.lock().unwrap().sessions.remove("lead-loss").unwrap();
+        let _ = caller.kill();
+        release_tx.send(()).unwrap();
+        let response = worker.join().unwrap();
+        assert!(!response.ok, "stale org grant survived caller loss: {response:?}");
+        for session in state.lock().unwrap().sessions.values_mut() {
+            let _ = session.kill();
+        }
+        crate::items::org::reset_cache_for_test();
+    }
+
+    /// #25: who may hand off what. A session only itself and never `now`;
+    /// bulk is operator-only; shells and continuous sessions are refused.
+    #[test]
+    fn handoff_scope_and_refusals() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let spawn = |uid: &str, ty: &str| {
+            let mut sp = crate::session::SpawnParams::new(uid, "h", "/bin/sleep");
+            sp.args = vec!["30".into()];
+            sp.session_type = ty.into();
+            crate::session::DaemonSession::spawn(sp).unwrap()
+        };
+        {
+            let mut st = state.lock().unwrap();
+            st.sessions.insert("ts-ho-a".into(), spawn("ts-ho-a", "claude-code"));
+            st.sessions.insert("ts-ho-b".into(), spawn("ts-ho-b", "claude-code"));
+            st.sessions.insert("ts-ho-sh".into(), spawn("ts-ho-sh", "bash"));
+            let mut ct = spawn("ts-ho-ct", "claude-code");
+            ct.continuous_task_id = Some("ct-x".into());
+            st.sessions.insert("ts-ho-ct".into(), ct);
+            let mut wf = spawn("ts-ho-wf", "claude-code");
+            wf.workflow_run_id = Some("wf-1".into());
+            st.sessions.insert("ts-ho-wf".into(), wf);
+        }
+        let other = dispatch_session_handoff(
+            &state,
+            &session_request("session.handoff", serde_json::json!({"uid": "ts-ho-sh", "to_engine": "codex"}), "ts-ho-a"),
+        );
+        // Another session in scope may be named, but a shell never.
+        assert!(!other.ok && other.error.unwrap().message.contains("shell"));
+        let now = dispatch_session_handoff(
+            &state,
+            &session_request("session.handoff", serde_json::json!({"to_engine": "codex", "now": true}), "ts-ho-a"),
+        );
+        assert!(!now.ok && now.error.unwrap().message.contains("operator-only"));
+        let bulk = dispatch_session_handoff_many(
+            &state,
+            &session_request("session.handoff_many", serde_json::json!({"to_engine": "codex"}), "ts-ho-a"),
+        );
+        assert!(!bulk.ok, "bulk is operator-only");
+        let shell = dispatch_session_handoff(
+            &state,
+            &operator_request("session.handoff", serde_json::json!({"uid": "ts-ho-sh", "to_engine": "codex"})),
+        );
+        assert!(shell.error.unwrap().message.contains("never handed off"));
+        let ct = dispatch_session_handoff(
+            &state,
+            &operator_request("session.handoff", serde_json::json!({"uid": "ts-ho-ct", "to_engine": "codex"})),
+        );
+        assert!(ct.error.unwrap().message.contains("scheduler-owned"));
+        // A named workflow participant is refused up front, not dropped later.
+        let wf = dispatch_session_handoff(
+            &state,
+            &operator_request("session.handoff", serde_json::json!({"uid": "ts-ho-wf", "to_engine": "codex"})),
+        );
+        assert!(wf.error.unwrap().message.contains("workflow participants"));
+        // A bulk selection never names shells or continuous sessions.
+        assert_eq!(crate::handoff::select(&state.lock().unwrap(), None), ["ts-ho-a", "ts-ho-b"]);
+        // Its own handoff is queued for its next boundary (it never gets
+        // there in this test: a fresh process is not idle).
+        let own = dispatch_session_handoff(
+            &state,
+            &session_request("session.handoff", serde_json::json!({"to_engine": "codex", "to_model": "gpt-6-luna"}), "ts-ho-a"),
+        );
+        let v = own.result.expect("queued");
+        assert_eq!((v["queued"].as_bool(), v["handoff"]["kind"].as_str()), (Some(true), Some("switch")));
+        let status = dispatch_session_handoff(
+            &state,
+            &session_request("session.handoff", serde_json::json!({"status": true}), "ts-ho-a"),
+        );
+        assert_eq!(status.result.unwrap()["handoff"]["to_engine"], "codex");
+        let second = dispatch_session_handoff(
+            &state,
+            &operator_request("session.handoff", serde_json::json!({"uid": "ts-ho-b", "to_engine": "codex"})),
+        );
+        assert!(second.ok, "{second:?}");
+        let agent_cancel = dispatch_session_handoff_cancel(
+            &state,
+            &session_request("session.handoff_cancel", serde_json::json!({"uid": "ts-ho-a"}), "ts-ho-a"),
+        );
+        assert_eq!(agent_cancel.error.unwrap().code, ErrorCode::Unauthorized);
+        let cancelled = dispatch_session_handoff_cancel(
+            &state,
+            &operator_request("session.handoff_cancel", serde_json::json!({"uid": "ts-ho-a"})),
+        );
+        assert!(cancelled.ok, "{cancelled:?}");
+        let cancelled = cancelled.result.unwrap();
+        assert_eq!(cancelled["cancelled"], true);
+        assert_eq!(cancelled["handoff"]["phase"], "cancelled");
+        assert!(cancelled["handoff"]["deferred"].is_null());
+        let other_status = dispatch_session_handoff(
+            &state,
+            &operator_request("session.handoff", serde_json::json!({"uid": "ts-ho-b", "status": true})),
+        );
+        assert_eq!(other_status.result.unwrap()["handoff"]["phase"], "queued");
+        let status = dispatch_session_handoff(
+            &state,
+            &operator_request("session.handoff", serde_json::json!({"uid": "ts-ho-a", "status": true})),
+        );
+        assert_eq!(status.result.unwrap()["handoff"]["phase"], "cancelled");
+        let missing = dispatch_session_handoff_cancel(
+            &state,
+            &operator_request("session.handoff_cancel", serde_json::json!({"uid": "ts-ho-a"})),
+        );
+        assert_eq!(missing.error.unwrap().code, ErrorCode::NotFound);
+        for s in state.lock().unwrap().sessions.values_mut() {
+            let _ = s.kill();
+        }
+        crate::handoff::test_drop_queued("ts-ho-b");
+    }
+
+    fn fake_proc(stat: &str, children: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let task = dir.path().join("100/task/100");
+        std::fs::create_dir_all(&task).unwrap();
+        std::fs::write(dir.path().join("100/stat"), stat).unwrap();
+        std::fs::write(task.join("children"), children).unwrap();
+        std::fs::create_dir_all(dir.path().join("200")).unwrap();
+        std::fs::write(dir.path().join("200/comm"), "nvim\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn shell_running_reads_the_foreground_job_and_children() {
+        // pid (comm) state ppid pgrp session tty_nr tpgid ...
+        let idle = fake_proc("100 (bash) S 1 100 100 34816 100 4194560", "");
+        assert_eq!(shell_running(idle.path(), 100), None, "a shell at its prompt is idle");
+        let fg = fake_proc("100 (ba sh) S 1 100 100 34816 200 4194560", "200 ");
+        assert_eq!(shell_running(fg.path(), 100).as_deref(), Some("nvim"), "a foreground job is busy");
+        let bg = fake_proc("100 (bash) S 1 100 100 34816 100 4194560", "200 ");
+        assert_eq!(shell_running(bg.path(), 100).as_deref(), Some("nvim"), "a background child is busy");
+        let gone = tempfile::tempdir().unwrap();
+        assert_eq!(shell_running(gone.path(), 100).as_deref(), Some("unknown"), "unreadable keeps the pane");
+    }
+
+    #[test]
+    fn session_shell_busy_answers_per_uid_for_operators_only() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let mut sp = crate::session::SpawnParams::new("ts-sh", "sh", "/bin/sleep");
+        sp.args = vec!["30".into()];
+        let mut sess = crate::session::DaemonSession::spawn(sp).unwrap();
+        sess.session_type = "claude".into();
+        state.lock().unwrap().sessions.insert("ts-sh".into(), sess);
+        let params = serde_json::json!({"uids": ["ts-sh", "ts-gone"]});
+        let agent = dispatch_session_shell_busy(&state, &session_request("session.shell_busy", params.clone(), "ts-sh"));
+        assert!(!agent.ok);
+        let ok = dispatch_session_shell_busy(&state, &operator_request("session.shell_busy", params));
+        let shells = ok.result.unwrap()["shells"].clone();
+        assert_eq!(shells["ts-sh"]["busy"], true, "an agent session is never an idle shell");
+        assert_eq!(shells["ts-gone"], serde_json::json!({"known": false, "busy": false}));
+    }
+
+    #[test]
+    fn session_viewed_stamps_owner_activity_for_operators_only() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let mut sp = crate::session::SpawnParams::new("ts-seen", "seen", "/bin/sleep");
+        sp.args = vec!["30".into()];
+        let sess = crate::session::DaemonSession::spawn(sp).unwrap();
+        state.lock().unwrap().sessions.insert("ts-seen".into(), sess);
+
+        let agent = dispatch_session_viewed(
+            &state,
+            &session_request("session.viewed", serde_json::json!({"uid": "ts-seen"}), "ts-seen"),
+        );
+        assert!(!agent.ok, "agents cannot claim Owner attention");
+        assert!(state.lock().unwrap().owner_seen.is_empty());
+
+        let ok = dispatch_session_viewed(
+            &state,
+            &operator_request("session.viewed", serde_json::json!({"uid": "ts-seen"})),
+        );
+        assert!(ok.ok);
+        assert_eq!(ok.result.unwrap()["known"], true);
+        assert!(state.lock().unwrap().owner_seen.contains_key("ts-seen"));
+
+        let unknown = dispatch_session_viewed(
+            &state,
+            &operator_request("session.viewed", serde_json::json!({"uid": "ts-gone"})),
+        );
+        assert_eq!(unknown.result.unwrap()["known"], false);
+        assert!(!state.lock().unwrap().owner_seen.contains_key("ts-gone"));
+
+        // A revive's result names the uid: the same stamp, so the sweep does
+        // not close a just-revived worker whose task is still done.
+        state.lock().unwrap().owner_seen.clear();
+        note_owner_spawn(
+            &state,
+            &operator_request("session.revive", serde_json::json!({"uid": "ts-seen"})),
+            &serde_json::json!({"session_uid": "ts-seen"}),
+        );
+        assert!(state.lock().unwrap().owner_seen.contains_key("ts-seen"));
+        for s in state.lock().unwrap().sessions.values_mut() {
+            let _ = s.kill();
+        }
+    }
+
+    #[test]
+    fn operator_fresh_spawn_is_marked_for_owner_placement_but_revive_is_not() {
+        let state = Arc::new(Mutex::new(DaemonState::new()));
+        let mut sp = crate::session::SpawnParams::new("ts-auto", "auto", "/bin/sleep");
+        sp.args = vec!["30".into()];
+        state.lock().unwrap().sessions.insert(
+            "ts-auto".into(),
+            crate::session::DaemonSession::spawn(sp).unwrap(),
+        );
+        note_owner_spawn(
+            &state,
+            &operator_request("start_session", serde_json::json!({
+                "uid": "ts-auto",
+                "auto_place_owner": true,
+            })),
+            &serde_json::json!({"session_uid": "ts-auto"}),
+        );
+        assert!(crate::assistants::wants_owner_placement(
+            state.lock().unwrap().sessions["ts-auto"].org.as_ref()
+        ));
+        state.lock().unwrap().sessions.get_mut("ts-auto").unwrap().org = None;
+        assert!(operator_spawn_is_fresh(&operator_request(
+            "start_session",
+            serde_json::json!({"uid": "ts-auto", "auto_place_owner": true}),
+        )));
+        assert!(!operator_spawn_is_fresh(&operator_request(
+            "start_session",
+            serde_json::json!({"uid": "ts-auto", "transcript_path": "/tmp/old.jsonl", "argv": ["claude"]}),
+        )));
+        assert!(!operator_spawn_is_fresh(&operator_request(
+            "add_session",
+            serde_json::json!({"uid": "ts-auto", "resume_id": "old"}),
+        )));
+        note_owner_spawn(
+            &state,
+            &operator_request("session.revive", serde_json::json!({"uid": "ts-auto"})),
+            &serde_json::json!({"session_uid": "ts-auto"}),
+        );
+        assert!(!crate::assistants::wants_owner_placement(
+            state.lock().unwrap().sessions["ts-auto"].org.as_ref()
+        ));
+        for session in state.lock().unwrap().sessions.values_mut() {
+            let _ = session.kill();
         }
     }
 
@@ -3463,6 +5312,84 @@ mod tests {
         assert!(!st.draining, "refusal must not leave the daemon draining");
     }
 
+    // --- daemon.maintenance --------------------------------------------
+
+    fn spawn_agent(state: &Arc<Mutex<DaemonState>>, uid: &str) {
+        let mut sp = crate::session::SpawnParams::new(uid, uid, "/bin/sleep");
+        sp.args = vec!["30".into()];
+        sp.session_type = "codex".into();
+        let sess = crate::session::DaemonSession::spawn(sp).unwrap();
+        state.lock().unwrap().sessions.insert(uid.into(), sess);
+    }
+
+    /// Operator-only; refused while draining; persists; shows on ping;
+    /// wakes nobody who isn't mid-turn; clear removes it.
+    #[test]
+    fn maintenance_notice_is_operator_set_shown_on_ping_and_announced_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = make_state();
+        state.lock().unwrap().messaging_root = tmp.path().into();
+        spawn_agent(&state, "ts-chatty");
+        spawn_agent(&state, "ts-quiet");
+        crate::maintenance::stamp_chat(&state, "ts-chatty");
+        let set = serde_json::json!({"action":"set","reason":"CM redeploy"});
+        let refused = dispatch_request(&state, &session_request("daemon.maintenance", set.clone(), "ts-chatty")).into_response();
+        assert_eq!(refused.error.unwrap().code, ErrorCode::Unauthorized);
+        let ping = |state: &Arc<Mutex<DaemonState>>| {
+            dispatch_request(state, &session_request("ping", serde_json::Value::Null, "ts-chatty")).into_response().result.unwrap()
+        };
+        assert!(ping(&state).get("maintenance").is_none());
+
+        // Draining for a restart: set/clear refused, get allowed.
+        state.lock().unwrap().draining = true;
+        let refused = dispatch_request(&state, &operator_request("daemon.maintenance", set.clone())).into_response();
+        assert_eq!(refused.error.unwrap().code, ErrorCode::Conflict);
+        assert!(dispatch_request(&state, &operator_request("daemon.maintenance", serde_json::json!({"action":"get"}))).into_response().ok);
+        assert!(crate::maintenance::current_now(tmp.path()).is_none());
+        state.lock().unwrap().draining = false;
+
+        let r = dispatch_request(&state, &operator_request("daemon.maintenance", set.clone())).into_response().result.unwrap();
+        // Both agents are fresh (`starting`), not mid-turn: neither is woken;
+        // they see the field on their next chat call.
+        assert_eq!((r["active"].clone(), r["notified"].clone()), (serde_json::json!(true), serde_json::json!(0)));
+        // No messaging store here: recorded locally, not replicated.
+        assert_eq!(r["replicated"], false);
+        assert!(ping(&state)["maintenance"].as_str().unwrap().starts_with("CM redeploy in progress since"));
+        let id = crate::maintenance::notification_id(&r["notice"]);
+        assert!(crate::notifications::get(tmp.path(), "ts-chatty", &id).unwrap().is_none(), "not mid-turn: not woken");
+        assert!(crate::notifications::get(tmp.path(), "ts-quiet", &id).unwrap().is_none());
+        // Re-setting extends the same notice and wakes nobody again.
+        let again = dispatch_request(&state, &operator_request("daemon.maintenance", set)).into_response().result.unwrap();
+        assert_eq!(again["notice"]["id"], r["notice"]["id"]);
+        assert!(again.get("notified").is_none());
+        let got = dispatch_request(&state, &operator_request("daemon.maintenance", serde_json::json!({}))).into_response().result.unwrap();
+        assert_eq!(got["active"], true);
+        dispatch_request(&state, &operator_request("daemon.maintenance", serde_json::json!({"action":"clear"}))).into_response();
+        assert!(ping(&state).get("maintenance").is_none());
+        let bad = dispatch_request(&state, &operator_request("daemon.maintenance", serde_json::json!({"action":"set","expect_until":"later"}))).into_response();
+        assert_eq!(bad.error.unwrap().code, ErrorCode::InvalidParams);
+    }
+
+    /// Review 2026-10-23: chat-use stamps of sessions gone from the
+    /// registry are dropped.
+    #[test]
+    fn last_chat_at_forgets_sessions_that_left_the_registry() {
+        let state = make_state();
+        spawn_agent(&state, "ts-live");
+        crate::maintenance::stamp_chat(&state, "ts-live");
+        crate::maintenance::stamp_chat(&state, "ts-gone");
+        assert_eq!(state.lock().unwrap().last_chat_at.len(), 2);
+        crate::maintenance::announce_targets(&state);
+        let s = state.lock().unwrap();
+        assert!(s.last_chat_at.contains_key("ts-live") && !s.last_chat_at.contains_key("ts-gone"));
+        drop(s);
+        // stamp_chat also prunes once the map outgrows the registry.
+        for i in 0..80 {
+            crate::maintenance::stamp_chat(&state, &format!("ts-old-{i}"));
+        }
+        assert!(state.lock().unwrap().last_chat_at.len() <= 2 + 64 + 1);
+    }
+
     // --- ping ---------------------------------------------------------
 
     #[test]
@@ -3497,11 +5424,16 @@ mod tests {
         assert_eq!(result["workflow_role"], serde_json::Value::Null);
         assert_eq!(result["managed_by_session_id"], serde_json::Value::Null);
         assert_eq!(result["worktree_path"], serde_json::Value::Null);
+        // Owner availability is always present; unset until Owner picks a level.
+        assert!(result["owner_availability"]["set"].is_boolean());
+        assert!(result["owner_availability"].get("level").is_some());
+        // Org model S2: the member this session works as (null: none known).
+        assert_eq!(result["member"], serde_json::Value::Null);
         assert_eq!(
             result.as_object().map(|o| o.len()),
-            Some(12),
-            "keys: pong, uid, caller_kind, global_perms, task/workspace and filer context. \
-             Any other key drift would be a client-visible change.",
+            Some(15),
+            "keys: pong, uid, caller_kind, global_perms, task/workspace and filer context, \
+             owner_availability, staffing and member. Any other key drift would be a client-visible change.",
         );
     }
 
@@ -3897,6 +5829,124 @@ mod tests {
     }
 
     #[test]
+    fn direct_attach_screen_mode_sends_a_repaint_then_live_output() {
+        let state = state_with_session("ts-live");
+        let history: Vec<u8> = (0..20_000)
+            .flat_map(|n| format!("history line {n}\r\n").into_bytes())
+            .collect();
+        state.lock().unwrap().sessions["ts-live"].fanout.push(&history);
+        let attach = |replay: serde_json::Value| {
+            let outcome = dispatch_request(&state, &operator_request("attach.direct", serde_json::json!({
+                "uid": "ts-live", "cols": 80, "rows": 24, "replay": replay,
+            })));
+            let DispatchOutcome::AttachStream { response, handle } = outcome else {
+                panic!("expected live stream");
+            };
+            (response.result.unwrap(), handle)
+        };
+
+        let (full, _full_handle) = attach(serde_json::Value::Null);
+        assert!(full.get("replay").is_none(), "absent replay keeps the full ring");
+        let ring_len = full["replay_bytes"].as_u64().unwrap();
+        assert!(ring_len >= 300_000);
+
+        let (screen, handle) = attach(serde_json::json!("screen"));
+        assert_eq!(screen["replay"], "screen");
+        let repaint_len = screen["replay_bytes"].as_u64().unwrap() as usize;
+        assert!(repaint_len > 0 && repaint_len < 4_000, "repaint was {repaint_len} bytes");
+        assert!(screen["offset"].as_u64().unwrap() >= ring_len);
+        state.lock().unwrap().sessions["ts-live"].fanout.push(b"live after attach");
+        let mut got = Vec::new();
+        while got.len() < repaint_len + 17 {
+            got.extend(handle.fanout_rx.recv().unwrap());
+        }
+        let text = String::from_utf8_lossy(&got[..repaint_len]);
+        assert!(text.contains("history line 19999"), "repaint shows the latest screen");
+        drop(handle);
+
+        // A ring holding kitty image commands is replayed in full to a viewer
+        // that passes graphics through, so its images come back.
+        state.lock().unwrap().sessions["ts-live"].fanout.push(b"\x1b_Ga=T,f=100;AAAA\x1b\\");
+        let outcome = dispatch_request(&state, &operator_request("attach.direct", serde_json::json!({
+            "uid": "ts-live", "cols": 80, "rows": 24, "replay": "screen", "graphics": true,
+        })));
+        let DispatchOutcome::AttachStream { response, .. } = outcome else { panic!("stream") };
+        let result = response.result.unwrap();
+        assert!(result.get("replay").is_none());
+        assert!(result["replay_bytes"].as_u64().unwrap() >= ring_len);
+        assert!(!text.contains("history line 100\r"), "but not old history");
+        assert_eq!(&got[repaint_len..], b"live after attach");
+    }
+
+    #[test]
+    fn direct_attach_binary_is_negotiated_per_stream() {
+        let state = state_with_session("ts-live");
+        for (binary, expected) in [(serde_json::json!(true), true), (serde_json::Value::Null, false)] {
+            let DispatchOutcome::AttachStream { response, handle } = dispatch_request(
+                &state,
+                &operator_request("attach.direct", serde_json::json!({"uid": "ts-live", "binary": binary})),
+            ) else {
+                panic!("expected live stream");
+            };
+            assert_eq!(handle.binary, expected);
+            assert_eq!(response.result.unwrap().get("binary").is_some(), expected);
+        }
+    }
+
+    #[test]
+    fn direct_attach_heartbeat_is_opt_in_and_acknowledged() {
+        let state = state_with_session("ts-live");
+        for (request, expected) in [(json!({}), false), (json!({"heartbeat": true}), true)] {
+            let mut params = json!({"uid":"ts-live"});
+            params.as_object_mut().unwrap().extend(request.as_object().unwrap().clone());
+            let DispatchOutcome::AttachStream { response, handle } = dispatch_request(
+                &state, &operator_request("attach.direct", params),
+            ) else { panic!("expected live stream") };
+            assert_eq!(handle.heartbeat, expected);
+            assert_eq!(response.result.unwrap().get("heartbeat_interval_secs").is_some(), expected);
+        }
+    }
+
+    #[test]
+    fn direct_attach_resumes_from_the_viewers_offset_within_one_stream() {
+        let state = state_with_session("ts-live");
+        let push = |bytes: &[u8]| state.lock().unwrap().sessions["ts-live"].fanout.push(bytes);
+        push(b"before the drop\r\n");
+        let attach = |extra: serde_json::Value| {
+            let mut params = serde_json::json!({"uid": "ts-live", "cols": 80, "rows": 24, "replay": "screen"});
+            for (k, v) in extra.as_object().unwrap() {
+                params[k] = v.clone();
+            }
+            let DispatchOutcome::AttachStream { response, handle } =
+                dispatch_request(&state, &operator_request("attach.direct", params))
+            else {
+                panic!("expected live stream");
+            };
+            (response.result.unwrap(), handle)
+        };
+        let (first, first_handle) = attach(serde_json::json!({}));
+        let (offset, stream) = (first["offset"].as_u64().unwrap(), first["stream_id"].as_u64().unwrap());
+        drop(first_handle);
+        push(b"missed while disconnected");
+
+        // Same stream, offset still in the ring: only the missed bytes.
+        let (resumed, handle) = attach(serde_json::json!({"since": offset, "stream_id": stream}));
+        assert_eq!(resumed["replay"], "resume");
+        assert_eq!(resumed["replay_bytes"], 25);
+        assert_eq!(resumed["offset"].as_u64().unwrap(), offset + 25);
+        assert_eq!(handle.fanout_rx.recv().unwrap(), b"missed while disconnected");
+        drop(handle);
+
+        // Another stream's offset (a respawn or brain restart) or an evicted
+        // one falls back to the requested screen repaint.
+        let (other, _h) = attach(serde_json::json!({"since": offset, "stream_id": stream ^ 1}));
+        assert_eq!(other["replay"], "screen");
+        push(&vec![b'x'; 2 * 1024 * 1024]);
+        let (evicted, _h) = attach(serde_json::json!({"since": offset, "stream_id": stream}));
+        assert_eq!(evicted["replay"], "screen");
+    }
+
+    #[test]
     fn direct_attach_rejects_partial_context_without_clearing_existing_tags() {
         let state = state_with_session("ts-live");
         {
@@ -4250,6 +6300,8 @@ mod tests {
                 "workspace_id": "ws-1",
                 "label": "x",
                 "argv": ["/bin/bash"],
+                "model": "test-model",
+                "effort": "xhigh",
                 "working_dir": "/tmp",
             }),
             "ts-agent",
@@ -4300,6 +6352,8 @@ mod tests {
                 "workspace_id": "ws-ghost",
                 "label": "x",
                 "argv": ["/bin/bash"],
+                "model": "test-model",
+                "effort": "xhigh",
                 "working_dir": "/tmp",
             }),
         );
@@ -4487,6 +6541,38 @@ mod tests {
             resp.error.expect("error body").code,
             ErrorCode::Unauthorized,
         );
+    }
+
+    /// Review of a41f14d (4): both send_key method names route through the
+    /// dispatcher with a Session caller; an out-of-scope target is refused
+    /// on its own, the caller's own session still gets the key.
+    #[test]
+    fn send_key_routes_with_a_session_caller_and_refuses_out_of_scope_targets() {
+        let state = state_with_session_in_workspace("ts-caller", "ws-1");
+        add_session(&state, "ts-target", "ws-2");
+        for method in ["send_key", "session.send_key"] {
+            let resp = dispatch_request(
+                &state,
+                &session_request(
+                    method,
+                    serde_json::json!({ "session_uids": ["ts-caller", "ts-target"], "key": "escape" }),
+                    "ts-caller",
+                ),
+            )
+            .into_response();
+            assert!(resp.ok, "{method}: {:?}", resp.error);
+            let result = resp.result.expect("result");
+            let statuses: Vec<&str> = result["results"].as_array().unwrap().iter().map(|r| r["status"].as_str().unwrap()).collect();
+            assert_eq!(statuses, ["ok", "unauthorized"], "{method}: {result}");
+            assert_eq!(result["sent"], 1);
+        }
+        // A caller the daemon doesn't know is refused outright.
+        let resp = dispatch_request(
+            &state,
+            &session_request("session.send_key", serde_json::json!({ "session_uids": "ts-target", "key": "enter" }), "ts-ghost"),
+        )
+        .into_response();
+        assert_eq!(resp.error.expect("error").code, ErrorCode::Unauthorized);
     }
 
     #[test]
@@ -4764,6 +6850,36 @@ mod tests {
         assert_eq!(s2["rows"].as_u64(), Some(50));
     }
 
+    #[test]
+    fn list_sessions_projects_fields_and_answers_unchanged_for_a_matching_etag() {
+        let state = state_with_session("ts-live");
+        let list = |params: serde_json::Value| {
+            let resp = dispatch_request(&state, &operator_request("list_sessions", params)).into_response();
+            assert!(resp.ok, "{:?}", resp.error);
+            resp.result.unwrap()
+        };
+        assert!(list(serde_json::json!({})).is_array(), "no shaping without fields/etag");
+        let fields = serde_json::json!(["label", "cols", "rows"]);
+
+        let first = list(serde_json::json!({"fields": fields, "etag": ""}));
+        let row = first["sessions"][0].as_object().unwrap();
+        let mut keys: Vec<&str> = row.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, ["cols", "label", "rows", "session_uid"]);
+        let etag = first["etag"].as_str().unwrap().to_string();
+
+        let again = list(serde_json::json!({"fields": fields, "etag": etag}));
+        assert_eq!(again, serde_json::json!({"etag": etag, "unchanged": true}));
+
+        let _ = dispatch_request(&state, &operator_request(
+            "session.resize",
+            serde_json::json!({ "session_uid": "ts-live", "cols": 120, "rows": 40 }),
+        ));
+        let changed = list(serde_json::json!({"fields": fields, "etag": etag}));
+        assert_ne!(changed["etag"], etag);
+        assert_eq!(changed["sessions"][0]["cols"], 120);
+    }
+
     /// 5d: TUI-owned rows carry `workspace_id` + `worktree_path` so an
     /// agent can tell that a TUI-launched sibling shares its checkout.
     /// Pre-5d these rows reported `workspace_id: null` and omitted
@@ -4978,6 +7094,28 @@ mod tests {
             .find(|s| s["session_uid"] == "ts-shell")
             .expect("bash entry");
         assert_eq!(shell["type"], "bash");
+    }
+
+    #[test]
+    fn shell_sessions_are_opt_in_for_agents_and_cannot_report_done() {
+        let state = state_with_session_in_workspace("ts-agent", "ws-1");
+        add_session_typed(&state, "ts-shell", "ws-1", "bash");
+        let list = |params| {
+            let response = dispatch_request(&state, &session_request("list_sessions", params, "ts-agent")).into_response();
+            assert!(response.ok, "{:?}", response.error);
+            response.result.unwrap()
+        };
+        assert!(!list(serde_json::json!({})).as_array().unwrap().iter().any(|s| s["session_uid"] == "ts-shell"));
+        let all = list(serde_json::json!({"include_shells":true}));
+        let shell = all.as_array().unwrap().iter().find(|s| s["session_uid"] == "ts-shell").unwrap();
+        assert_eq!(shell["kind"], "shell");
+        let resolved = super::methods::resolve_authorized_session(&state, &serde_json::json!({"session_uid":"ts-shell"}), None).unwrap();
+        assert_eq!(resolved["engine"], "bash");
+        assert_eq!(resolved["kind"], "shell");
+        let refused = super::methods::report_done(&state, &Caller::session("ts-shell"), &serde_json::json!({})).unwrap_err();
+        assert!(refused.1.contains("bash is a shell"));
+        assert!(super::methods::org(&state, &serde_json::json!({}), Some("ts-shell")).unwrap_err().1.contains("bash is a shell"));
+        assert!(state.lock().unwrap().sessions.contains_key("ts-shell"), "refusal never closes the shell");
     }
 
     /// Slice 10d-mcp-surface-1 review fix #2 + sub-2b-1 review-r#3 #1:
@@ -5652,6 +7790,8 @@ mod tests {
                     "workspace_id": "ws-act",
                     "label": "act",
                     "argv": ["/bin/sleep", "30"],
+                    "model": "test-model",
+                    "effort": "xhigh",
                     "working_dir": &worktree,
                     "worktree_path": &worktree,
                 }),
@@ -9457,29 +11597,9 @@ mod tests {
         assert!(err.message.contains("name"), "msg: {}", err.message);
     }
 
-    #[test]
-    fn propose_task_rejects_missing_repo_url() {
-        let state = make_state();
-        let resp = dispatch_request(
-            &state,
-            &operator_request(
-                "propose_task",
-                serde_json::json!({
-                    "project": "p",
-                    "name": "n",
-                    "repo_url": "",
-                }),
-            ),
-        ).into_response();
-        assert!(!resp.ok);
-        let err = resp.error.unwrap();
-        assert_eq!(err.code, ErrorCode::InvalidParams);
-        assert!(
-            err.message.contains("repo_url"),
-            "must explain why the daemon can't auto-detect: {}",
-            err.message,
-        );
-    }
+    /// `GET /projects` naming project `p`, for propose_task's repo lookup.
+    const PROJECT_P: &str =
+        r#"[{"name":"p","repo_url":"git@x.com:a/p.git","repo_branch":"main"}]"#;
 
     /// No `CM_API_URL`/`CM_API_TOKEN` in the test env → the
     /// method body's HTTP call fails with `MissingConfig`,
@@ -9581,16 +11701,23 @@ mod tests {
             std::env::set_var("CM_API_URL", "http://127.0.0.1:1");
             std::env::set_var("CM_API_TOKEN", "env-bogus");
         }
-        let (port, captured) =
-            crate::planning_client::spawn_stub_api_for_test(
-                200,
-                r#"{"id":"task-cfg-threaded"}"#,
-            );
+        let (port, captured) = crate::planning_client::spawn_stub_api_seq_for_test(vec![
+            (200, PROJECT_P),
+            (200, r#"{"id":"task-cfg-threaded"}"#),
+        ]);
         let cfg_url = format!("http://127.0.0.1:{}", port);
         let state = make_state();
         {
             let mut st = state.lock().unwrap();
             st.config = crate::config::DaemonConfig {
+                claude_limit_recovery: true,
+                claude_limit_menu_clear: true,
+                memory: Default::default(),
+                s4_min_write: false,
+                transcript_rotation: Default::default(),
+                chat_search_budget_bytes: 512 * 1024 * 1024,
+                presence_idle_enabled: true,
+                workflow_state_gate: false,
                 mcp_server_path: String::new(),
                 api_url: cfg_url.clone(),
                 api_token: "cfg-tok-threaded".into(),
@@ -9603,6 +11730,8 @@ mod tests {
                 repos: Vec::new(),
                 scheduler: Default::default(),
                 notify_command: None,
+                codex_inline_scrollback: true,
+                models: Default::default(),
             };
         }
         let resp = dispatch_request(
@@ -9629,6 +11758,8 @@ mod tests {
         let (method, path) = cap.method_and_path();
         assert_eq!(method, "POST");
         assert_eq!(path, "/tasks");
+        // The row carries project p's repo, not the caller's checkout.
+        assert_eq!(cap.body_json()["repo_url"], "git@x.com:a/p.git");
         // Authorization header MUST carry the config token,
         // not the env token.
         assert_eq!(
@@ -9643,6 +11774,47 @@ mod tests {
         }
     }
 
+    /// `propose_task(reports_to=…)` sets the draft's `parent_task_id`; "me"
+    /// needs a tasked caller (an Operator frame has none).
+    #[test]
+    fn propose_task_reports_to_sets_parent_task_id() {
+        let _g = crate::planning_client::test_env_lock();
+        let (port, captured) = crate::planning_client::spawn_stub_api_seq_for_test(vec![
+            (200, PROJECT_P),
+            (200, r#"{"id":"task-report"}"#),
+        ]);
+        let state = make_state();
+        {
+            let mut st = state.lock().unwrap();
+            st.config = crate::config::DaemonConfig {
+                memory: Default::default(),
+                api_url: format!("http://127.0.0.1:{}", port),
+                api_token: "tok".into(),
+                ..Default::default()
+            };
+        }
+        let params = |reports_to: &str| {
+            serde_json::json!({
+                "project": "p", "name": "n", "repo_url": "git@x.com:a/b.git",
+                "reports_to": reports_to,
+            })
+        };
+        let resp = dispatch_request(&state, &operator_request("propose_task", params("me")))
+            .into_response();
+        assert!(!resp.ok, "operator has no task for reports_to=me");
+        assert!(format!("{:?}", resp.error).contains("reports_to"), "{:?}", resp.error);
+
+        let resp = dispatch_request(&state, &operator_request("propose_task", params("boss-task")))
+            .into_response();
+        assert!(resp.ok, "{:?}", resp.error);
+        assert_eq!(captured.lock().unwrap().body_json()["parent_task_id"], "boss-task");
+        // The auth overlay mirrors the planning parent.
+        assert_eq!(
+            state.lock().unwrap().task_tree.get("task-report"),
+            Some(&Some("boss-task".to_string()))
+        );
+    }
+
     // -- Cloud auto-backtest (backtest.submit / backtest.result) -----------
 
     /// Point state.config at a stub API on `port` (bogus env cleared by the
@@ -9650,6 +11822,14 @@ mod tests {
     fn set_stub_api_config(state: &Arc<Mutex<DaemonState>>, port: u16) {
         let mut st = state.lock().unwrap();
         st.config = crate::config::DaemonConfig {
+            claude_limit_recovery: true,
+            claude_limit_menu_clear: true,
+                memory: Default::default(),
+            s4_min_write: false,
+            transcript_rotation: Default::default(),
+            chat_search_budget_bytes: 512 * 1024 * 1024,
+            presence_idle_enabled: true,
+            workflow_state_gate: false,
             mcp_server_path: String::new(),
             api_url: format!("http://127.0.0.1:{}", port),
             api_token: "bt-test-token".into(),
@@ -9662,6 +11842,8 @@ mod tests {
             repos: Vec::new(),
             scheduler: Default::default(),
             notify_command: None,
+            codex_inline_scrollback: true,
+            models: Default::default(),
         };
     }
 
@@ -10111,6 +12293,8 @@ mod tests {
                     "workspace_id": "ws-trsc",
                     "label": "trsc",
                     "argv": ["/bin/sleep", "30"],
+                    "model": "test-model",
+                    "effort": "xhigh",
                     "working_dir": worktree,
                     "worktree_path": worktree,
                     "transcript_path": "/tmp/x.jsonl",
@@ -10496,4 +12680,24 @@ mod tests {
             assert!(matches!(post.status, crate::workflow::run::RunStatus::Running));
         });
     }
+    #[test]
+    fn adoption_strong_operator_gate_precedes_params() {
+        let _g = crate::test_support::env_lock();
+        let state = make_state();
+        {
+            let _auth = crate::control::operator::test_override::set(None);
+            let r = dispatch_request(&state, &operator_request("continuous.adopt_existing", serde_json::json!({}))).into_response();
+            assert_eq!(r.error.unwrap().code, ErrorCode::Unauthorized);
+        }
+        let _auth = crate::control::operator::test_override::set(Some("strong-tok"));
+        let r = dispatch_request(&state, &session_request("continuous.adopt_existing", serde_json::json!({}), "ts-agent")).into_response();
+        assert_eq!(r.error.unwrap().code, ErrorCode::Unauthorized);
+        let mut req = operator_request("continuous.adopt_existing", serde_json::json!({}));
+        let r = dispatch_request(&state, &req).into_response();
+        assert_eq!(r.error.unwrap().code, ErrorCode::Unauthorized);
+        req.caller = Caller::operator("strong-tok");
+        let r = dispatch_request(&state, &req).into_response();
+        assert_eq!(r.error.unwrap().code, ErrorCode::InvalidParams);
+    }
+
 }

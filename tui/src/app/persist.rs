@@ -2,6 +2,46 @@
 
 use super::*;
 
+/// The row a local Claude resume should use when its transcript moved on
+/// (#24, `cm_daemon::transcript_chain`): the same entry bound to the newest
+/// session in the `continued-in` chain. `None` when nothing moved (or the
+/// files are not on this host).
+pub(crate) fn follow_claude_entry(
+    entry: &ManifestEntry,
+    worktree: Option<&std::path::Path>,
+) -> Option<ManifestEntry> {
+    if !matches!(entry.session_type.as_str(), "claude" | "claude-code") {
+        return None;
+    }
+    let id = follow_claude_id(worktree?, entry.transcript_id.as_deref()?)?;
+    let mut followed = entry.clone();
+    followed.transcript_id = Some(id);
+    followed.transcript_path = None;
+    Some(followed)
+}
+
+/// The newest session in `id`'s `continued-in` chain, when it moved.
+pub(crate) fn follow_claude_id(worktree: &std::path::Path, id: &str) -> Option<String> {
+    let path = cm_daemon::transcript_detect::claude_transcript_path(worktree, id)?;
+    cm_daemon::transcript_chain::follow(&path).map(|f| f.id)
+}
+
+/// How long an untracked taskless daemon session must stay untracked before
+/// the adopt pass takes it (doc/org-model.md §13 S0a). Longer than any spawn
+/// response of ours not covered by an in-flight set.
+const TASKLESS_ADOPT_GRACE: Duration = Duration::from_secs(30);
+/// First-seen entries for uids no pass has listed lately are dropped.
+const TASKLESS_SEEN_TTL: Duration = Duration::from_secs(24 * 3600);
+/// How long the adopt pass ignores a session this viewer just tombstoned
+/// (see `recently_removed_uids`): many session-poll intervals, so a cached
+/// list from before the kill landed never brings it back.
+const READOPT_HOLD_SECS: f64 = 120.0;
+
+/// How often the TUI re-reports the session it keeps showing. Well inside
+/// the daemon sweep's two-hour owner grace.
+pub(crate) const VIEWED_REPORT_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(300);
+
 impl App {
     /// Path to the session manifest file.
     fn manifest_path() -> PathBuf {
@@ -85,6 +125,7 @@ impl App {
             workspaces.insert(
                 ws.id.clone(),
                 ManifestWorkspace {
+                    org: ws.org.clone(),
                     id: ws.id.clone(),
                     name: ws.name.clone(),
                     is_closed: ws.is_closed,
@@ -113,6 +154,7 @@ impl App {
         let view = match self.sidebar_view {
             SidebarView::Status => "status",
             SidebarView::Task => "task",
+            SidebarView::Team => "team",
         };
         let manifest = Manifest {
             messaging_names: self.messaging_manifest_names(),
@@ -126,6 +168,9 @@ impl App {
             continuous_column_on: self.continuous_column_on,
             hide_keybinding_helper: !self.keybinding_helper_visible,
             task_colors: self.task_colors.clone(),
+            folded_tasks: self.folded_workspaces.iter().cloned().collect(),
+            folded_divisions: self.folded_divisions.iter().cloned().collect(),
+            folded_org: self.folded_org.iter().cloned().collect(),
             sections: self.sections.clone(),
             workspace_sections: self.workspace_sections.clone(),
             sidebar_receipts: self.sidebar_receipts.clone(),
@@ -138,7 +183,10 @@ impl App {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let saved = serde_json::to_vec_pretty(&manifest)
+        // Compact (#109): every reader is a JSON parser, and pretty-printing
+        // added ~25% to the bytes serialized and fsynced on the main thread
+        // at every save.
+        let saved = serde_json::to_vec(&manifest)
             .map_err(std::io::Error::other)
             .and_then(|bytes| Self::atomic_write_manifest(&path, &bytes));
         if let Err(e) = saved {
@@ -313,6 +361,8 @@ impl App {
                 .ok()
             })
             .unwrap_or_default();
+        // #109: bound tombstones, and move long-closed workspaces to the archive.
+        self.compact_and_archive_manifest(&mut manifest, &live_daemon_uids);
 
         // Identify worktree paths that are "covered" by a useful workspace —
         // one with sessions or referenced in bindings. We use this to drop
@@ -403,6 +453,7 @@ impl App {
                 && !bound_ws_ids.contains(&mw.id)
                 && !restored_tombstones.is_empty();
             let mut ws = Workspace {
+                org: mw.org.clone(),
                 id: mw.id.clone(),
                 name: if mw.name.is_empty() {
                     mw.worktree_path
@@ -648,18 +699,76 @@ impl App {
         self.adopt_untracked_daemon_sessions();
     }
 
+    /// Tell the owning daemon which session Owner is looking at, when the
+    /// selection changes and every [`VIEWED_REPORT_INTERVAL`] while it stays.
+    /// The terminal-task sweep never closes a session Owner showed within its
+    /// grace window, so a worker Owner is reading cannot vanish because its
+    /// task was marked done. Fire-and-forget on a thread: a remote host may
+    /// need its tunnel warmed, and an older daemon that lacks the method
+    /// just answers an error nobody needs to see.
+    pub(crate) fn report_viewed_session(&mut self) {
+        let Some((ws, ts)) = self.active_session() else { return };
+        if ts.session.exited {
+            return;
+        }
+        if self.viewed_report.as_ref().is_some_and(|(uid, at)| {
+            *uid == ts.uid && at.elapsed() < VIEWED_REPORT_INTERVAL
+        }) {
+            return;
+        }
+        let uid = ts.uid.clone();
+        let host = ws.host_id.clone();
+        self.viewed_report = Some((uid.clone(), std::time::Instant::now()));
+        {
+            // Latest selection wins; a sender already running for this host
+            // picks it up after its current RPC.
+            let mut pending = self.viewed_pending.lock().unwrap_or_else(|p| p.into_inner());
+            let running = pending.contains_key(&host);
+            pending.insert(host.clone(), Some(uid));
+            if running {
+                return;
+            }
+        }
+        let pool = std::sync::Arc::clone(&self.host_pool);
+        let pending = std::sync::Arc::clone(&self.viewed_pending);
+        let spawned = std::thread::Builder::new()
+            .name("cm-viewed-report".into())
+            .spawn({
+                let host = host.clone();
+                move || loop {
+                    let uid = {
+                        let mut slots = pending.lock().unwrap_or_else(|p| p.into_inner());
+                        match slots.get_mut(&host).and_then(Option::take) {
+                            Some(uid) => uid,
+                            None => {
+                                slots.remove(&host);
+                                return;
+                            }
+                        }
+                    };
+                    let Ok(handle) = pool.for_host(&host) else { continue };
+                    let Some(socket) = handle.socket_path() else { continue };
+                    let _ = crate::client_session::rpc_session_viewed(
+                        &socket,
+                        &pool.operator_token_for(&host),
+                        &uid,
+                    );
+                }
+            });
+        if spawned.is_err() {
+            self.viewed_pending.lock().unwrap_or_else(|p| p.into_inner()).remove(&host);
+        }
+    }
+
     /// Throttled entry point for daemon-session adoption, called from the
     /// main tick. Bounds the `list_sessions` RPC to once per
     /// `ADOPT_SCAN_INTERVAL` so the scan cost stays off the hot path.
     pub fn maybe_adopt_daemon_sessions(&mut self) {
         if let InputMode::WorktreeCleanup(menu) = &mut self.input_mode {
             self.needs_redraw |= menu.poll();
-            if menu.close_ready() {
-                let InputMode::WorktreeCleanup(menu) = std::mem::replace(&mut self.input_mode, InputMode::Normal) else { unreachable!() };
-                self.complete_with_cleanup(menu);
-                self.needs_redraw = true;
-            }
         }
+        self.cleanup_tick();
+        self.report_viewed_session();
         if let InputMode::ContinuousControl(menu) = &mut self.input_mode {
             self.needs_redraw |= menu.poll();
         }
@@ -838,12 +947,22 @@ impl App {
                     }
                 }
 
+                let in_flight = self.session_uids_in_flight();
+                let removed = self.recently_removed_uids();
                 let tracked: std::collections::HashSet<&str> = self
                     .workspaces
                     .iter()
                     .flat_map(|w| w.sessions.iter().map(|s| s.uid.as_str()))
+                    .chain(removed.iter().map(String::as_str))
                     .collect();
-                let adoptees = Self::select_daemon_adoptees(summaries, &tracked);
+                let settled = Self::settle_taskless(
+                    &mut self.taskless_seen,
+                    &summaries.iter().collect::<Vec<_>>(),
+                    &|uid| tracked.contains(uid),
+                    &in_flight,
+                    Instant::now(),
+                );
+                let adoptees = Self::select_daemon_adoptees(summaries, &tracked, &settled);
                 drop(tracked);
                 for s in adoptees {
                     let (target_ws_id, worktree) = self
@@ -922,6 +1041,7 @@ impl App {
             .iter()
             .map(|p| p.entry.uid.clone())
             .chain(self.plan_launches.iter().map(|f| f.spec.uid.clone()))
+            .chain(self.recently_removed_uids())
             .collect();
         // In-flight uids: dispatched to the attach worker but not yet bound into
         // a slot (so absent from BOTH `tracked` and `pending`). Without this set
@@ -931,9 +1051,19 @@ impl App {
         // continuous sessions, a duplicate orchestrator) per poll until it binds.
         let attaching: std::collections::HashSet<String> =
             self.attaching.keys().cloned().collect();
+        let in_flight = self.session_uids_in_flight();
+        let all: Vec<&crate::client_session::DaemonSessionSummary> =
+            remote.iter().flat_map(|(_, summaries)| summaries.iter()).collect();
+        let settled = Self::settle_taskless(
+            &mut self.taskless_seen,
+            &all,
+            &|uid| tracked.contains(uid) || pending.contains(uid) || attaching.contains(uid),
+            &in_flight,
+            Instant::now(),
+        );
         for (host, summaries) in remote {
             for s in summaries {
-                if !Self::is_remote_adoptee(&s, &tracked, &pending, &attaching) {
+                if !Self::is_remote_adoptee(&s, &tracked, &pending, &attaching, &settled) {
                     continue;
                 }
                 let (target_ws_id, _worktree) = self.resolve_adopt_workspace(&s, &host);
@@ -942,6 +1072,27 @@ impl App {
                     .push(PendingRemoteReattach::new(target_ws_id, entry));
             }
         }
+    }
+
+    /// Sessions this viewer tombstoned (closed, or pruned as exited) within
+    /// [`READOPT_HOLD_SECS`]. The session pollers' cached lists keep
+    /// reporting such a session until its kill lands, and adopting it again
+    /// reopened the workspace it was closed with: the attach then failed,
+    /// leaving that workspace open and empty, and a running bound task kept
+    /// the spent sweep from closing it again (laptop diag 2026-11-05: four
+    /// workspaces the bash-only sweep closed). A session still listed after
+    /// the hold is really alive and is adopted as before; a new session
+    /// (another uid) still lands at once and reopens its workspace.
+    fn recently_removed_uids(&self) -> std::collections::HashSet<String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64());
+        self.workspaces
+            .iter()
+            .flat_map(|w| &w.tombstones)
+            .filter(|t| now - t.exited_at < READOPT_HOLD_SECS)
+            .map(|t| t.uid.clone())
+            .collect()
     }
 
     /// Resolve (target workspace id, worktree) for an adoptee, creating a
@@ -1002,6 +1153,7 @@ impl App {
                     let new_id = s.workspace_id.clone().filter(|id| !id.is_empty())
                         .unwrap_or_else(new_workspace_id);
                     self.workspaces.push(Workspace {
+                        org: None,
                         color: None,
                         pinned: false,
                         id: new_id.clone(),
@@ -1043,6 +1195,11 @@ impl App {
         host: &cm_daemon::host_id::HostId,
     ) -> TerminalSession {
         TerminalSession {
+            org: s.org.clone(),
+            model: s.model.clone().or_else(|| session.spawn_model.clone()),
+            model_source: s.model_source.clone().or_else(|| session.spawn_model_source.clone()),
+            effort: s.effort.clone().or_else(|| session.spawn_effort.clone()),
+            effort_source: s.effort_source.clone().or_else(|| session.spawn_effort_source.clone()),
             color: None,
             uid: s.session_uid.clone(),
             label: s.label.clone(),
@@ -1086,6 +1243,11 @@ impl App {
         host: &cm_daemon::host_id::HostId,
     ) -> cm_daemon::manifest::ManifestEntry {
         cm_daemon::manifest::ManifestEntry {
+            org: s.org.clone(),
+            model: s.model.clone(),
+            model_source: s.model_source.clone(),
+            effort: s.effort.clone(),
+            effort_source: s.effort_source.clone(),
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -1128,30 +1290,81 @@ impl App {
         tracked: &std::collections::HashSet<String>,
         pending: &std::collections::HashSet<String>,
         attaching: &std::collections::HashSet<String>,
+        settled_taskless: &std::collections::HashSet<String>,
     ) -> bool {
-        (s.managed_by_uid.is_some() || s.continuous_task_id.is_some() || s.task_id.is_some())
+        Self::adoptable_binding(s, settled_taskless)
             && !tracked.contains(&s.session_uid)
             && !pending.contains(&s.session_uid)
             && !attaching.contains(&s.session_uid)
     }
 
+    /// Whether a summary's binding makes it adoptable: agent-spawned,
+    /// task-bound or continuous-tagged (`continuous_task_id.is_some()` —
+    /// scheduler/operator spawns whose `managed_by_uid` is `None`) at once,
+    /// and a TASKLESS one (doc/org-model.md §13 S0a: members' sessions need
+    /// not have a task) once it is in `settled_taskless`, i.e. untracked for
+    /// `TASKLESS_ADOPT_GRACE` with no spawn of ours in flight for it.
+    fn adoptable_binding(
+        s: &crate::client_session::DaemonSessionSummary,
+        settled_taskless: &std::collections::HashSet<String>,
+    ) -> bool {
+        Self::is_bound_summary(s) || settled_taskless.contains(&s.session_uid)
+    }
+
+    fn is_bound_summary(s: &crate::client_session::DaemonSessionSummary) -> bool {
+        s.managed_by_uid.is_some() || s.continuous_task_id.is_some() || s.task_id.is_some()
+    }
+
+    /// Track untracked taskless summaries and return those that have stayed
+    /// untracked for `TASKLESS_ADOPT_GRACE` and are not being spawned,
+    /// revived or restarted by one of our own workers. A TUI spawn binds its
+    /// own session when its response lands; the grace keeps the adopt pass
+    /// from racing it into a duplicate slot.
+    fn settle_taskless(
+        seen: &mut HashMap<String, Instant>,
+        summaries: &[&crate::client_session::DaemonSessionSummary],
+        tracked: &dyn Fn(&str) -> bool,
+        in_flight: &std::collections::HashSet<String>,
+        now: Instant,
+    ) -> std::collections::HashSet<String> {
+        let candidates: Vec<&str> = summaries
+            .iter()
+            .filter(|s| !Self::is_bound_summary(s) && !tracked(&s.session_uid))
+            .map(|s| s.session_uid.as_str())
+            .collect();
+        // Forget uids that got bound or tracked; the local and cached passes
+        // each see only some hosts, so entries for other hosts stay.
+        for s in summaries {
+            if !candidates.contains(&s.session_uid.as_str()) {
+                seen.remove(&s.session_uid);
+            }
+        }
+        seen.retain(|_, first| now.duration_since(*first) < TASKLESS_SEEN_TTL);
+        candidates
+            .into_iter()
+            .filter(|uid| {
+                let first = *seen.entry(uid.to_string()).or_insert(now);
+                !in_flight.contains(*uid) && now.duration_since(first) >= TASKLESS_ADOPT_GRACE
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
     /// Select which daemon-session summaries the adoption pass should take:
-    /// agent-spawned, task-bound, or continuous-tagged
-    /// (`continuous_task_id.is_some()` — scheduler/operator spawns whose
-    /// `managed_by_uid` is `None`), and not already tracked in any TUI
-    /// workspace. Unbound TUI/operator spawns are excluded —
-    /// they're tracked through the normal spawn path. Pure (no `self`) so the
-    /// gate + dedup is unit-testable without a live daemon.
+    /// an adoptable binding (`adoptable_binding`) not already tracked in any
+    /// TUI workspace. Pure (no `self`) so the gate + dedup is unit-testable
+    /// without a live daemon.
     fn select_daemon_adoptees(
         summaries: Vec<crate::client_session::DaemonSessionSummary>,
         tracked_uids: &std::collections::HashSet<&str>,
+        settled_taskless: &std::collections::HashSet<String>,
     ) -> Vec<crate::client_session::DaemonSessionSummary> {
         summaries
             .into_iter()
             .filter(|s| {
                 // Task-bound operator launches also need recovery when a create
                 // response was lost or a different TUI launched the task.
-                (s.managed_by_uid.is_some() || s.continuous_task_id.is_some() || s.task_id.is_some())
+                Self::adoptable_binding(s, settled_taskless)
                     && !tracked_uids.contains(s.session_uid.as_str())
             })
             .collect()
@@ -1214,6 +1427,10 @@ impl App {
         live_daemon_uids: &std::collections::HashSet<String>,
     ) -> Option<(TerminalSession, RestoreOutcome)> {
         let config = &self.config;
+        // #24: a Claude transcript that moved on (`continued-in`) restores
+        // the newest session in its chain, and the row rebinds to it.
+        let followed = follow_claude_entry(entry, ws.worktree_path.as_deref());
+        let entry = followed.as_ref().unwrap_or(entry);
         // migrate-tui-local Issue J: default is Spawned — the
         // common case for fresh manifest entries / clean daemon
         // restarts. The attach-success arm below upgrades to
@@ -1393,7 +1610,10 @@ impl App {
                         entry.workflow_role.as_deref(),
                         &entry.host_id,
                         pre_spawn_transcript.as_deref(),
+                        false, // restore/attach is not a fresh owner placement
                         entry.global_perms, // global_perms
+                        entry.model.as_deref(),
+                        entry.effort.as_deref(),
                     ) {
                         Some(Ok(s)) => Ok(s),
                         Some(Err(e)) => Err(e),
@@ -1423,7 +1643,10 @@ impl App {
                         entry.workflow_role.as_deref(),
                         &entry.host_id,
                         pre_spawn_transcript.as_deref(),
+                        false, // restore/attach is not a fresh owner placement
                         entry.global_perms, // global_perms
+                        entry.model.as_deref(),
+                        entry.effort.as_deref(),
                     ) {
                         Some(Ok(s)) => Ok(s),
                         Some(Err(e)) => Err(e),
@@ -1467,6 +1690,11 @@ impl App {
         // value used in `session_uid_for_mcp` above. Don't generate a
         // fresh one here.
         let ts = TerminalSession {
+            org: entry.org.clone(),
+            model: s.spawn_model.clone().or_else(|| entry.model.clone()),
+            model_source: s.spawn_model_source.clone().or_else(|| entry.model_source.clone()),
+            effort: s.spawn_effort.clone().or_else(|| entry.effort.clone()),
+            effort_source: s.spawn_effort_source.clone().or_else(|| entry.effort_source.clone()),
             color: entry.color.clone(),
             uid: restored_uid,
             label: entry.label.clone(),
@@ -1514,10 +1742,18 @@ mod adopt_daemon_session_tests {
     //! and task-bound daemon sessions without duplicating tracked sessions.
     use super::App;
     use crate::client_session::DaemonSessionSummary;
-    use std::collections::HashSet;
+    use super::TASKLESS_ADOPT_GRACE;
+    use std::collections::{HashMap, HashSet};
+    use std::time::Instant;
 
     fn summary(uid: &str, managed_by_uid: Option<&str>) -> DaemonSessionSummary {
         DaemonSessionSummary {
+            transcript_bytes: None,
+            org: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             session_uid: uid.to_string(),
             label: "w".to_string(),
             session_type: "claude-code".to_string(),
@@ -1542,22 +1778,69 @@ mod adopt_daemon_session_tests {
             summary("operator-1", None),           // skip: not agent-spawned
             summary("already-here", Some("ts-parent")), // skip: already tracked
         ];
-        let picked = App::select_daemon_adoptees(summaries, &tracked);
+        let picked = App::select_daemon_adoptees(summaries, &tracked, &HashSet::new());
         let uids: Vec<&str> = picked.iter().map(|s| s.session_uid.as_str()).collect();
         assert_eq!(uids, vec!["agent-1"]);
+    }
+
+    /// org-model S0a: a taskless session is adopted once it has stayed
+    /// untracked for the grace period, never while one of our own spawns
+    /// for it is in flight, and a bound one still is at once.
+    #[test]
+    fn taskless_sessions_are_adopted_after_the_grace() {
+        let t0 = Instant::now();
+        let mut seen = HashMap::new();
+        let loose = summary("loose", None);
+        let flying = summary("flying", None);
+        let bound = summary("agent", Some("ts-parent"));
+        let all = [&loose, &flying, &bound];
+        let in_flight = HashSet::from(["flying".to_string()]);
+        let untracked = |_: &str| false;
+        let settled = App::settle_taskless(&mut seen, &all, &untracked, &in_flight, t0);
+        assert!(settled.is_empty(), "nothing taskless settles on first sight");
+        let picked = App::select_daemon_adoptees(
+            vec![loose.clone(), bound.clone()], &HashSet::new(), &settled);
+        assert_eq!(picked.iter().map(|s| s.session_uid.as_str()).collect::<Vec<_>>(), ["agent"]);
+
+        let later = t0 + TASKLESS_ADOPT_GRACE;
+        let settled = App::settle_taskless(&mut seen, &all, &untracked, &in_flight, later);
+        assert_eq!(settled, HashSet::from(["loose".to_string()]));
+        assert!(App::is_remote_adoptee(&loose, &HashSet::new(), &HashSet::new(), &HashSet::new(), &settled));
+        assert!(!App::is_remote_adoptee(&flying, &HashSet::new(), &HashSet::new(), &HashSet::new(), &settled));
+
+        // Once tracked, the first-seen entry is forgotten: a later untrack
+        // starts a fresh grace.
+        let tracked = |uid: &str| uid == "loose";
+        App::settle_taskless(&mut seen, &all, &tracked, &in_flight, later);
+        assert!(!seen.contains_key("loose"));
+    }
+
+    /// doc/org-model.md §12: an adopted daemon session's org object lands
+    /// in the viewer's manifest entry unchanged.
+    #[test]
+    fn adopted_summary_keeps_the_org_object() {
+        let mut s = summary("agent-org", Some("ts-parent"));
+        s.org = serde_json::json!({"member_id": "m-7", "later": [1]}).as_object().cloned();
+        let entry = App::manifest_entry_from_summary(&s, &cm_daemon::host_id::HostId::local());
+        assert_eq!(entry.org, s.org);
+        let parsed = crate::client_session::parse_daemon_session_summary(&serde_json::json!({
+            "session_uid": "u", "org": {"member_id": "m-7"},
+        }))
+        .unwrap();
+        assert_eq!(parsed.org.unwrap()["member_id"], "m-7");
     }
 
     #[test]
     fn task_bound_operator_spawn_recovers_without_duplicate_attachments() {
         let mut s = summary("lost-launch", None);
         s.task_id = Some("task-new".into());
-        assert_eq!(App::select_daemon_adoptees(vec![s.clone()], &HashSet::new()).len(), 1);
+        assert_eq!(App::select_daemon_adoptees(vec![s.clone()], &HashSet::new(), &HashSet::new()).len(), 1);
         let none = HashSet::new();
         let uid = HashSet::from([s.session_uid.clone()]);
-        assert!(App::is_remote_adoptee(&s, &none, &none, &none));
-        assert!(!App::is_remote_adoptee(&s, &uid, &none, &none));
-        assert!(!App::is_remote_adoptee(&s, &none, &uid, &none));
-        assert!(!App::is_remote_adoptee(&s, &none, &none, &uid));
+        assert!(App::is_remote_adoptee(&s, &none, &none, &none, &HashSet::new()));
+        assert!(!App::is_remote_adoptee(&s, &uid, &none, &none, &HashSet::new()));
+        assert!(!App::is_remote_adoptee(&s, &none, &uid, &none, &HashSet::new()));
+        assert!(!App::is_remote_adoptee(&s, &none, &none, &uid, &HashSet::new()));
     }
 
     #[test]
@@ -1611,18 +1894,41 @@ mod adopt_daemon_session_tests {
         assert!(!app.workspaces[wi].is_closed, "follow-up adoption reopens the same workspace");
         app.apply_submit_action(crate::app::input::SubmitAction::SaveWorkspaceSettings {
             workspace_id: wid.clone(), name: "keep this investigation".into(),
-            color: None, pinned: false, section: None,
+            color: None, pinned: false, section: None, tasks: vec![],
         });
         assert!(!app.auto_close_workspaces.contains(&wid), "rename claims the wrapper");
         assert!(!app.close_agent_marker_if_empty(wi));
         assert!(!App::load_manifest().auto_close_workspaces.contains(&wid));
     }
 
+    /// doc/org-model.md §12: a workspace's org object (its kind, unknown
+    /// keys) survives the viewer's full-replace manifest save, and the
+    /// task-tree push reports its binding_epoch.
+    #[test]
+    fn workspace_org_survives_the_manifest_save() {
+        let _guard = crate::test_support::home_lock();
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(), api_token: String::new(), gcp_project: String::new(),
+            gcp_zone: String::new(), repos: std::collections::HashMap::new(),
+        });
+        let host = cm_daemon::host_id::HostId::local();
+        let mut worker = summary("org-worker", Some("p"));
+        worker.workspace_id = Some("org-ws".into());
+        let wid = app.resolve_adopt_workspace(&worker, &host).0;
+        let wi = app.workspaces.iter().position(|w| w.id == wid).unwrap();
+        let org = serde_json::json!({"workspace_kind": "ephemeral", "binding_epoch": 3, "later": 1});
+        app.workspaces[wi].org = org.as_object().cloned();
+        app.sessions_restored = true;
+        assert!(app.try_save_session_manifest());
+        let disk = App::load_manifest();
+        assert_eq!(disk.workspaces[&wid].org, org.as_object().cloned());
+    }
+
     #[test]
     fn plain_operator_spawn_is_never_adopted() {
         // Neither agent-spawned (managed_by_uid) nor continuous-tagged → skip.
         let tracked: HashSet<&str> = HashSet::new();
-        let picked = App::select_daemon_adoptees(vec![summary("x", None)], &tracked);
+        let picked = App::select_daemon_adoptees(vec![summary("x", None)], &tracked, &HashSet::new());
         assert!(
             picked.is_empty(),
             "plain TUI/operator-spawned sessions (both fields None) must not be adopted"
@@ -1637,7 +1943,7 @@ mod adopt_daemon_session_tests {
         let tracked: HashSet<&str> = HashSet::new();
         let mut s = summary("bug-triage-orch", None);
         s.continuous_task_id = Some("bug-triage".to_string());
-        let picked = App::select_daemon_adoptees(vec![s], &tracked);
+        let picked = App::select_daemon_adoptees(vec![s], &tracked, &HashSet::new());
         let uids: Vec<&str> = picked.iter().map(|s| s.session_uid.as_str()).collect();
         assert_eq!(uids, vec!["bug-triage-orch"]);
     }
@@ -1648,7 +1954,7 @@ mod adopt_daemon_session_tests {
         let tracked: HashSet<&str> = ["bug-triage-orch"].into_iter().collect();
         let mut s = summary("bug-triage-orch", None);
         s.continuous_task_id = Some("bug-triage".to_string());
-        let picked = App::select_daemon_adoptees(vec![s], &tracked);
+        let picked = App::select_daemon_adoptees(vec![s], &tracked, &HashSet::new());
         assert!(picked.is_empty(), "tracked continuous session must not double-adopt");
     }
 
@@ -1717,14 +2023,14 @@ mod adopt_daemon_session_tests {
         // Not yet in-flight → it IS an adoptee (proves the path is live).
         let empty: Set<String> = Set::new();
         assert!(
-            App::is_remote_adoptee(&s, &tracked, &pending, &empty),
+            App::is_remote_adoptee(&s, &tracked, &pending, &empty, &HashSet::new()),
             "a fresh continuous adoptee must be picked up",
         );
 
         // In-flight in the attach worker → must be skipped.
         let attaching: Set<String> = ["orch".to_string()].into_iter().collect();
         assert!(
-            !App::is_remote_adoptee(&s, &tracked, &pending, &attaching),
+            !App::is_remote_adoptee(&s, &tracked, &pending, &attaching, &HashSet::new()),
             "an in-flight (attaching) uid must NOT be re-adopted — it would mint \
              a duplicate workspace per poll",
         );
@@ -1767,5 +2073,49 @@ mod adopt_daemon_session_tests {
         ];
         let picked = App::select_size_drift_uids(&summaries, &tracked, want);
         assert!(picked.is_empty(), "unmeasured sessions must be skipped: {picked:?}");
+    }
+}
+
+#[cfg(test)]
+mod follow_chain_tests {
+    //! #24: TUI-side resumes (startup restore, A-O) follow a superseded
+    //! Claude transcript's `continued-in` chain to the newest session.
+    use super::follow_claude_entry;
+
+    #[test]
+    fn a_two_hop_chain_rebinds_the_restored_entry() {
+        let _guard = crate::test_support::home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let orig_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", tmp.path()) };
+        let wt = std::path::Path::new("/home/u/proj");
+        let dir = cm_daemon::transcript_detect::claude_transcript_dir_for(wt).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = |v: serde_json::Value| format!("{v}\n");
+        let user = serde_json::json!({"type": "user", "message": {"content": "hi"}});
+        let moved = |a: &str, b: &str| serde_json::json!({"type": "continued-in", "sessionId": a, "continuedInSessionId": b});
+        std::fs::write(dir.join("aaaa.jsonl"), line(user.clone()) + &line(moved("aaaa", "bbbb"))).unwrap();
+        std::fs::write(dir.join("bbbb.jsonl"), line(user.clone()) + &line(moved("bbbb", "cccc"))).unwrap();
+        std::fs::write(dir.join("cccc.jsonl"), line(user)).unwrap();
+
+        let entry: cm_daemon::manifest::ManifestEntry = serde_json::from_value(serde_json::json!({
+            "uid": "ts-x-0", "label": "x", "session_type": "claude",
+            "transcript_id": "aaaa", "transcript_path": dir.join("aaaa.jsonl"),
+        }))
+        .unwrap();
+        let followed = follow_claude_entry(&entry, Some(wt)).expect("superseded");
+        assert_eq!(followed.transcript_id.as_deref(), Some("cccc"));
+        assert_eq!(followed.uid, "ts-x-0", "same identity");
+        let mut codex = entry.clone();
+        codex.session_type = "codex".into();
+        assert!(follow_claude_entry(&codex, Some(wt)).is_none(), "claude only");
+        let mut newest = entry;
+        newest.transcript_id = Some("cccc".into());
+        assert!(follow_claude_entry(&newest, Some(wt)).is_none());
+
+        match orig_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
     }
 }

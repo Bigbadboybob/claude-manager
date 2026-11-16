@@ -362,6 +362,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "base64",
+ "chrono",
  "cm-daemon",
  "crossterm",
  "libc",
@@ -378,6 +379,7 @@ dependencies = [
  "terminput",
  "terminput-crossterm",
  "toml",
+ "unicode-width",
  "ureq",
  "uuid",
 ]
@@ -400,6 +402,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "terminput",
  "toml",
  "unicode-casefold",
  "unicode-normalization",
@@ -410,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "cm-holder"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cm-holder-proto",
  "libc",

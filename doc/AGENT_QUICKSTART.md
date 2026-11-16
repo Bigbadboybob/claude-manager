@@ -113,15 +113,17 @@ chat_send(channel="schema/parser", reply_to="<message-id>",
           request_id="<new-unique-request-id>")
 ```
 
-`reply_to` uses a message's `id` / send response's `event_id`; keep the same conversation. `mentions` directs attention subject to the recipient's settings. Typing a name or `@here` in the body alone is not a structured mention. Use `mention_here=True` on `chat_send` to notify the current channel members. Later joins do not receive old broadcasts. Tags are passive labels for organization and filtering.
+`reply_to` uses a message's `id` / send response's `event_id`; keep the same conversation. `mentions` directs attention subject to the recipient's settings. A body `@Name` of a current member of the conversation becomes a mention; any other body `@token`, including `@here`, notifies nobody and is listed in the response's `warnings`. Use `mention_here=True` on `chat_send` to notify the current channel members. Later joins do not receive old broadcasts. Tags are passive labels for organization and filtering.
 
 ## Read history and new messages
 
 ```python
 chat_read(channel="general", newest_first=True, limit=20)
 chat_read(dms=True, unread_only=True)
-chat_read(inbox=True, unread_only=True)
+chat_read(inbox=True, unread_only=True)             # newest first, slim
+chat_read(inbox=True, mark_read_before="2026-10-06T12:00:00Z")  # clear an old backlog
 chat_read(channel="schema/parser", time={"since": "10m"})
+chat_read(channel="gpu-utilization", sender="EP", query="final verdict")
 chat_read(channel="schema/parser", time={
     "start": "2026-09-07T09:00:00-05:00",
     "end": "2026-09-07T10:00:00-05:00"
@@ -131,11 +133,24 @@ chat_read(thread="<message-id>")
 
 Choose one scope per read: channel, DM, conversation, thread, inbox, or incoming DMs. `channel="*"` searches public channels; `tags=["review"]` filters by tags. Absolute times must include a timezone. Replace the example dates with your desired range.
 
-Read the returned `items`. For more pages, pass `next_cursor` back as `cursor` unchanged with the same query. After actually reading a page, pass its complete `receipt` object as `ack_receipt` on a subsequent `chat_read` or `chat_send`. This marks exactly those messages read. Previews and merely opening a conversation do not clear unread messages.
+Read the returned `items`. For more pages, pass `next_cursor` back as `cursor` unchanged with the same query. `sender` accepts an exact name/alias or participant ID. `query` matches case-insensitive whole words, or adjacent Unicode words for a phrase (e.g. `Final: VERDICT`). Both filters are indexed and combine with time and channel. Search results do not mark history read automatically. See [search semantics](messaging/READ_MODEL.md#search).
+
+**Reading marks read.** Every conversation has a read cursor per reader, as in Slack. Reading a channel, DM or conversation through its newest message (the newest page, or paging until the end) moves your cursor there; everything after it is unread, and your mentions after it are unread mentions. Pass `mark_read=False` for a background preview. Inbox, incoming-DM, `channel="*"` and filtered reads span conversations and mark nothing by themselves: after actually reading such a page, pass its complete `receipt` as `ack_receipt` on a subsequent `chat_read` or `chat_send`, which advances each touched conversation through the newest message in the receipt.
+
+**Reactions acknowledge.** To say "seen", "done" or "agreed" without a message, react:
+
+```python
+chat_react(message_id="<message-id>", emoji="✅", request_id="<new-id>")   # remove=True undoes
+```
+
+Allowed: ✅ 👀 👍 ❌ 🎉. Each participant has one of each; retries with the same `request_id` are idempotent. Reactions notify nobody. Reacting to a message that mentions you also marks it read. Read items carry `reactions: {"✅": {"count", "names", "mine"}}`.
 
 On a background notification, read pending activity **before responding**.
 `chat_read(inbox=True, unread_only=True)` combines eligible chat activity across
-conversations. Finish its pages and acknowledge each receipt. CM sends the first
+conversations, newest first and slim by default (`view="full"` or
+`newest_first=False` to change either). Finish its pages and acknowledge each
+receipt (or open the conversations, which marks them read); reading also lowers
+your watches' unacknowledged count. CM sends the first
 chat wake immediately and combines later arrivals until you fetch the messages.
 Only the returned message IDs advance that wake boundary; previews do not.
 Arrivals during a paginated read remain queued for a subsequent wake.
@@ -191,17 +206,48 @@ Read `~/.cm/policies/continuous-review-routing.md` on your execution host. The r
 
 Workers enter `review_queued`; parents enter `reviewing` and advance to `owner_review` only for a concrete Owner decision. Internal review stays planning `running`. Stage is carried by the colored task text and legend; a spinner or idle dot only describes activity. `report_done` completes your work slice (or your parent's scheduled run), not the planning task. Unfinished work keeps a live visible session; missing sessions need recovery using the existing task/worktree. Terminal work needs a settled, evidence-backed cleanup disposition, and closing a session is distinct from reaping its checkout.
 
+## Orchestrating other sessions
+
+Read [orchestration](ORCHESTRATION.md) (deployed at `~/.cm/policies/orchestration.md`) before running a swarm. The everyday moves:
+
+```python
+# Hand the next piece to a worker that already knows the area (auto-monitors it).
+send_input(session_uid="ts-…", text="Next: make the cache key include the region. Hand off in #<channel> when done.",
+           notify_until="final")
+
+# Wake a specific lane: a mention by participant ID or exact name. A body "@Name"
+# also works for a current member of the conversation; check `warnings` in the
+# response for anyone who was NOT notified.
+chat_send(channel="<channel>", mentions=["<participant id from chat_people>"],
+          body="Review ready on branch X at abc1234.", request_id="review-x-1")
+
+# Track work in flight as board items; declare a long job instead of going silent.
+item("fuse SEJD hot operators", holder="rl-scale-out", group="RL")   # assigns and wakes the holder
+item_set(14, "waiting", eta="40m", note="full daemon suite")         # never flagged idle before its ETA
+item_set(15, blocked_by=[14])                                        # back to active when #14 is done
+board()                                                              # flags first, then items by group
+item_resolve(14, "nudge", message="still on it?")                    # resolve each flag you are woken for
+
+# An Owner question: options, recommendation, who is blocked.
+notify_user(message="Decision needed: keep or drop the v1 endpoint? Options: keep (cost …) / drop (risk …). "
+                    "Recommend drop. Blocks the api lane. Details: <message link>")
+```
+
+After dispatching, end your turn; the monitor, mention or board push wakes you. After compaction, read your own last posts, then replies and inbox, then `board()` and `list_sessions`.
+
 ## CM beyond messaging
 
 | Need | Tools and usage |
 |---|---|
 | Find your context and work | `ping`, `list_projects`, `list_tasks`, `get_task`, `list_subtasks` |
-| File work for Owner to review | `propose_task(project=..., name=..., description=..., prompt=...)`; description explains why/what, prompt gives worker instructions |
+| File work into the backlog | `propose_task(project=..., name=..., description=...)`; the description is the whole brief: why, what done looks like, and the worker's instructions (`prompt` is a deprecated alias appended to it) |
 | Inspect other sessions | `list_sessions`, `list_sessions_grouped`, `read_last_turn(session_uid=...)`, `read_session_output` |
 | Delegate an authorized task | `start_session(type="claude-code", label=..., prompt=..., isolated=True, notify_until="final")` launches a worker in a separate worktree; `type="codex"` also works |
 | Work from a task | `start_session(type=..., label=..., task_id=...)`; an omitted prompt uses the named task's stored instructions when available |
 | Create a child task | `create_subtask`; creating a task does not start its session |
 | Assign follow-up work | `send_input(session_uid=..., text=...)`; check its schema for options |
+| Revive rate-limited or errored sessions, answer a menu | `send_key(session_uids=[...], key="enter")`: exactly one key per session (no text, no trailing Enter), encoded for each session's keyboard mode; also `escape`, arrows, `tab`, `ctrl-c`, or one character like `"1"`. Per-session results; send_input's scope. A key is not new work: it leaves a `reported` status and watches as they are |
+| Stop an interrupted assignment | `interrupt(session_uid=..., note="...", request_id="...")`. Escape alone stops the current turn; the earlier instruction remains in history and a later notification may wake the model. This action sends a stop instruction too. Reuse the same request ID and identical arguments after a timeout; an `uncertain` result may have acted and is not safe to repeat under a new ID. |
 | Watch worker completion | `monitor_sessions(session_uids=[...], until="final")`; a prompted `start_session` / `send_input` already registers a watch by default |
 | Report your own completion | `report_done(reason="...")` when your assignment is actually finished |
 
@@ -210,6 +256,14 @@ Use the session UIDs returned by CM for session-control tools. Tool access is no
 ### Controlling a session on another host
 
 Chat and session control have different routing. Chat spans enrolled hosts; `list_sessions`, `send_input`, `read_session_output`, `read_last_turn` and worker monitors address the daemon attached to your MCP process. They do not search other hosts for a UID. `global_perms` broadens task access on that daemon; it does not make the tools reach another daemon. The laptop TUI's multi-host view does not make an agent's MCP multi-host.
+
+For Codex on Linux, `interrupt` serializes the operation with native notification submissions in the owning relay, verifies the bound thread and interrupted turn, and reports `delivered` when the app server accepts the stop user turn. Other platforms refuse the Codex operation because this path requires Linux peer credentials. Acceptance does not prove the model will obey it. The Claude path sends Escape and queues the stop only after a fresh idle observation; it cannot serialize Claude notifications or confirm the queued prompt, so its outcome is `uncertain`. Neither path retracts work already performed or guarantees that background commands stopped.
+
+**Activating interrupt on an existing Codex session.** Deploying the daemon and MCP payload does not replace a running Codex relay. A session launched before this feature keeps its old relay until it is restarted or resumed; an MCP reconnect alone does not reload it. Separately, a Codex caller must restart to see newly added MCP tools; an authorized operator can use `cm-op` without relying on that caller's cached tool list.
+
+1. Identify the target's owning host, session UID, task and bound conversation, and choose a safe point for that specific session. On a live row, `A-R` is a **forced restart**: it kills the current session process before resuming the conversation. Do not use it casually on active work. Workflow and continuous sessions are controller-owned and refuse `A-R`; use their documented controller recovery path. See [session resume and recovery](session-resume-identity.md) and the `A-R` entry in [CLAUDE.md](../CLAUDE.md).
+2. Focus the target row and use `A-R` to restart or revive it in place. Check that the resumed row has the expected UID, task and conversation and has reattached; inspect and rearm any process-local watches as needed. This is a per-session action, not a daemon deployment. `notification_status` in the target can report native wake health, and `ping().mcp` reports its MCP payload version, but neither proves that the target relay supports `interrupt`. There is currently no supported read-only capability check for that support.
+3. On the upgraded daemon, if there is no saved receipt for the request, a missing or stale old-relay endpoint returns a Conflict such as `interrupt relay is unavailable` or `interrupt relay process does not match session` **before this attempt sends Escape**. An earlier attempt may still have acted. Once a request can reach a relay, `uncertain` (including a lost relay reply) may mean Escape or the stop turn already happened. Inspect the available receipt and conversation; a retry with the same ID and arguments can still perform the action if no receipt was persisted. Do not issue a new ID merely to retry an ambiguous attempt. A relay's `refused` response is also a refusal before that relay sends Escape.
 
 For example, a Claude reviewer on cm-sessions calling `send_input` with a cm-manager worker UID gets `not_found: target session ... not in the daemon registry`. This means the local registry lacks that UID; it does not prove the remote worker is dead or unreachable. Resolve its owning host and stable task/worktree binding before considering a replacement.
 
@@ -223,11 +277,77 @@ For an already-authorized instruction to that settled worker:
 
 ```bash
 scripts/cm-op --ssh cm-manager send_input '{"session_uid":"<worker-uid>","text":"<authorized instruction>","submit":true}'
+scripts/cm-op --ssh cm-manager session.interrupt '{"session_uid":"<worker-uid>","note":"stop the old assignment","request_id":"<stable-id>"}'
 ```
 
 On cm-manager itself, omit `--ssh cm-manager`; a deployed copy of the helper is `~/.cm/docs/continuous-tasks/scripts/cm-op`. Discover workers with the helper's `list_sessions`, matched by task UUID, and use `resolve_authorized_session` for the bound remote transcript. Read that transcript on its owning host; a remote path is not a local file. The daemon's `read_session_output` returns PTY bytes, whereas the similarly named MCP tool parses transcript messages.
 
 The helper is an Operator route for the work Owner authorized. Do not substitute the local session UID as a remote caller or copy tokens into prompts. No extra approval is needed merely to use this route for an already-approved dispatch. A successful `send_input` response means delivery was accepted; verify actual processing from the bound transcript. It does not register an MCP completion monitor. Prefer a task-channel post mentioning the worker or parent when native delivery is available; retain parent reconciliation for legacy workers. After an uncertain send, inspect delivery evidence before retrying—the input RPC has no chat-style request-ID deduplication.
+
+To launch a new task-bound agent on the chosen host, use the strong-operator
+`session.launch` RPC. It requires that host's configured operator token; Session
+callers, board tokens and tokenless operator mode cannot launch through it:
+
+```bash
+scripts/cm-op --ssh f-sessions session.launch '{"request_id":"f-build-001","task_id":"<task-id>","engine":"codex","model":"gpt-6.1-terra","effort":"xhigh","label":"F build","repo_path":"/home/lucas/code/project","prompt":"<authorized task>"}'
+```
+
+Required fields are `request_id`, `task_id`, `engine` (`claude` or `codex`),
+`model`, `label` and absolute `repo_path` **on that host**. Optional fields are
+`effort`, `prompt`, `base`, `managed_by_uid` and `global_perms` (default false).
+The planning API must resolve the task. CM mints or reattaches its normal
+`cm-sub/<task-slug>-<task7>` worktree, registers the workspace/task binding, and
+composes the engine argv, MCP configuration, environment and prompt just as for
+an in-host MCP launch. `base` selects the starting commit/ref of a new branch;
+existing work/history is preserved. A bound workspace in another repository
+is refused. An omitted/blank prompt uses the stored task brief, if present.
+
+The result includes `uid` (also `session_uid`), `worktree_path`, `task_id` and
+normal prompt-delivery metadata. Acceptance or a pending prompt receipt does
+not prove the engine started a turn. `managed_by_uid` is attribution and monitor
+routing metadata only: control still follows existing task/global scope. A lead
+whose task tree contains the child's task can control it on the same daemon;
+this RPC adds no cross-host MCP routing or new authorization edge.
+
+Retry an uncertain response with **identical fields and the same request_id on
+the same host**. CM durably saves an intent before effects and retains completed
+results and terminal errors across brain restarts in
+`~/.cm/session-launch-requests/` (request hash, reserved UID and result/error;
+no prompt or argv). Exact retries return the saved result without spawning or
+delivering again; changed fields conflict. A concurrent launch returns busy
+without consuming the ID. An interrupted intent reports **outcome unknown**
+with its reserved UID and refuses automatic relaunch. Inspect that UID, task
+binding and prompt evidence before any deliberate new request; even an error
+may follow a partial launch. Receipts have no automatic expiry. A retry returns
+the original launch receipt, not a fresh liveness or delivery-status read.
+
+Before using a new session host, run the read-only preflight from a checkout:
+
+```sh
+scripts/cm-op --ssh f-sessions host.readiness '{"required_repos":["claude-manager","predictionTrading"],"peer_hosts":["cm-manager","cm-sessions","f-sessions"]}'
+```
+
+The report gives individual PASS/FAIL checks and repair hints for daemon and
+replica health, repository origins, engine versions and credential presence,
+Claude onboarding and notification-channel preference, exact worktree-root trust, resources, MCP stamp, Codex pool,
+and external IP. It uses the holder's launch environment when available and
+does not print tokens or remote URL credentials. Credential presence does not
+prove login validity; disk, RAM and swap are measurements, not workload capacity
+guarantees. Root trust does not prove each new working directory is trusted.
+The laptop's `hosts.toml` is not remotely inspected: that check remains
+unverified and supplies a `[[host]]` block to review on the laptop. A reserved
+IP is only marked verified when the cloud metadata and API checks succeed.
+Replica status comes from a nonblocking read-only `daemon.health` snapshot;
+older brains report `unknown (old brain)` until upgraded, and a busy store
+reports `unknown (busy)`. The pool check accepts either the local service or
+the forward-only tunnel and checks loopback `/health`; it checks that the
+configured auth command resolves and the proxy key exists without executing
+the helper or displaying the key. Do not clone a pool's refresh tokens.
+The explicit `peer_hosts` list compares one-way hashes of Claude account UUIDs
+without printing the UUIDs or hashes. Matching accounts fail the check;
+unreachable peers or an absent list are WARN and leave coverage unverified.
+Never copy `.credentials.json` between live hosts: rotating refresh tokens can
+invalidate the other host's login.
 
 For routine coordination, post in the task channel (`chat_open().continuous.channel`) mentioning the current parent or worker. Native wake availability is a separate question from SSH/control reachability. Do not spawn a duplicate worker or move its implementation to a different host solely because a local session-control lookup failed.
 

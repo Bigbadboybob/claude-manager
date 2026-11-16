@@ -81,9 +81,8 @@ struct ProposeTaskBody<'a> {
     name: &'a str,
     project: &'a str,
     description: &'a str,
-    /// Worker activation prompt. Falls back to `name` when the
-    /// MCP caller didn't supply one (matches the Python tool's
-    /// `prompt or name` shape).
+    /// Deprecated (doc/org-model.md §13.2): sent as given; the API folds a
+    /// real one into the description.
     prompt: &'a str,
     source: &'static str,
     is_cloud: bool,
@@ -94,8 +93,39 @@ struct ProposeTaskBody<'a> {
     depends: Option<&'a [String]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     initiative_id: Option<&'a str>,
+    /// Reporting line (`propose_task(reports_to=…)`); the API inherits
+    /// the parent's initiative.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_task_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<&'a serde_json::Value>,
+}
+
+/// A project's repo as the planning API's `GET /projects` names it: the
+/// project record on the API host, else the repo most of its rows carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectRepo {
+    pub repo_url: String,
+    pub repo_branch: String,
+}
+
+/// Find `project` in a `GET /projects` listing. `None` when the project is
+/// absent or names no repo. An API without `repo_branch` means `main`.
+pub fn project_repo(projects: &[serde_json::Value], project: &str) -> Option<ProjectRepo> {
+    let row = projects
+        .iter()
+        .find(|p| p.get("name").and_then(|v| v.as_str()) == Some(project))?;
+    let repo_url = row.get("repo_url")?.as_str()?.trim();
+    if repo_url.is_empty() {
+        return None;
+    }
+    let repo_branch = row
+        .get("repo_branch")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .unwrap_or("main");
+    Some(ProjectRepo { repo_url: repo_url.to_string(), repo_branch: repo_branch.to_string() })
 }
 
 /// Parameters the daemon's `methods::propose_task` collects from
@@ -105,10 +135,14 @@ pub struct ProposeTaskRequest<'a> {
     pub name: &'a str,
     pub description: &'a str,
     pub prompt: &'a str,
+    /// The target project's repo, never the caller's checkout unless the
+    /// caller works in that same project (`methods::propose_task`).
     pub repo_url: &'a str,
+    pub repo_branch: &'a str,
     pub difficulty: Option<i32>,
     pub depends: Option<&'a [String]>,
     pub initiative_id: Option<&'a str>,
+    pub parent_task_id: Option<&'a str>,
     pub metadata: Option<&'a serde_json::Value>,
 }
 
@@ -321,6 +355,73 @@ pub fn fetch_task_status(
         .map(|s| s.trim().to_ascii_lowercase()))
 }
 
+/// What the terminal sweep needs from a task row: its status, and who closed
+/// it (`metadata.terminal_via`; `"item"` = the board's status mirror,
+/// doc/org-model.md §7.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskTerminal {
+    pub status: String,
+    pub terminal_via: Option<String>,
+}
+
+/// [`fetch_task_status`] plus `metadata.terminal_via`, one row per call.
+pub fn fetch_task_terminal(
+    task_id: &str,
+    api_url_override: Option<&str>,
+    api_token_override: Option<&str>,
+) -> Result<Option<TaskTerminal>, PlanningClientError> {
+    let api_url = resolve_api_url(api_url_override)?;
+    let api_token = resolve_api_token(api_token_override)?;
+    let endpoint = format!("{}/tasks/{}", api_url, task_id);
+    let response = build_agent()
+        .get(&endpoint)
+        .header("Authorization", &format!("Bearer {}", api_token))
+        .call()
+        .map_err(|e| PlanningClientError::Transport(format!("GET {}: {}", endpoint, e)))?;
+    if response.status().as_u16() == 404 {
+        return Ok(None);
+    }
+    let row: serde_json::Value = decode_json_response(response, "task row")?;
+    Ok(row.get("status").and_then(|v| v.as_str()).map(|s| TaskTerminal {
+        status: s.trim().to_ascii_lowercase(),
+        terminal_via: row
+            .get("metadata")
+            .and_then(|m| m.get("terminal_via"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    }))
+}
+
+/// `GET <CM_API_URL>/tasks/{id}` → the row's `parent_task_id`, for the
+/// headless parent refresher (`crate::task_parent_refresh`). `Ok(None)`
+/// for a missing row. `timeout` bounds the whole request.
+pub fn fetch_task_parent(
+    task_id: &str,
+    api_url_override: Option<&str>,
+    api_token_override: Option<&str>,
+    timeout: Duration,
+) -> Result<Option<Option<String>>, PlanningClientError> {
+    let api_url = resolve_api_url(api_url_override)?;
+    let api_token = resolve_api_token(api_token_override)?;
+    let endpoint = format!("{}/tasks/{}", api_url, task_id);
+    let agent = ureq::Agent::new_with_config(
+        ureq::config::Config::builder()
+            .timeout_global(Some(timeout))
+            .http_status_as_error(false)
+            .build(),
+    );
+    let response = agent
+        .get(&endpoint)
+        .header("Authorization", &format!("Bearer {}", api_token))
+        .call()
+        .map_err(|e| PlanningClientError::Transport(format!("GET {}: {}", endpoint, e)))?;
+    if response.status().as_u16() == 404 {
+        return Ok(None);
+    }
+    let row: serde_json::Value = decode_json_response(response, "task row")?;
+    Ok(Some(row.get("parent_task_id").and_then(|v| v.as_str()).map(str::to_string)))
+}
+
 /// POST to `<CM_API_URL>/tasks` with the propose-task body.
 /// Returns the API's JSON response on success (the new task
 /// row, including the assigned `id`).
@@ -340,24 +441,18 @@ pub fn propose_task(
     let endpoint = format!("{}/tasks", api_url);
     let body = ProposeTaskBody {
         repo_url: req.repo_url,
-        repo_branch: "main",
+        repo_branch: req.repo_branch,
         name: req.name,
         project: req.project,
         description: req.description,
-        // Match the Python tool's `prompt or name` fallback so
-        // the worker agent gets a non-empty activation prompt
-        // even when the MCP caller passed prompt="".
-        prompt: if req.prompt.is_empty() {
-            req.name
-        } else {
-            req.prompt
-        },
+        prompt: req.prompt,
         source: "claude",
         is_cloud: false,
         priority: 0,
         difficulty: req.difficulty,
         depends: req.depends,
         initiative_id: req.initiative_id,
+        parent_task_id: req.parent_task_id,
         metadata: req.metadata,
     };
     let agent = build_agent();
@@ -402,6 +497,16 @@ pub(crate) fn spawn_stub_api_for_test(
     canned_response_status: u16,
     canned_response_body: &'static str,
 ) -> (u16, std::sync::Arc<std::sync::Mutex<TestCapturedRequest>>) {
+    spawn_stub_api_seq_for_test(vec![(canned_response_status, canned_response_body)])
+}
+
+/// [`spawn_stub_api_for_test`] for a handler that makes several calls:
+/// connection N gets `responses[N]`, and the capture holds the LAST request
+/// (the write that follows the lookups).
+#[cfg(test)]
+pub(crate) fn spawn_stub_api_seq_for_test(
+    responses: Vec<(u16, &'static str)>,
+) -> (u16, std::sync::Arc<std::sync::Mutex<TestCapturedRequest>>) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
@@ -412,7 +517,8 @@ pub(crate) fn spawn_stub_api_for_test(
     let captured = Arc::new(Mutex::new(TestCapturedRequest::default()));
     let captured_clone = Arc::clone(&captured);
     thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
+        for (canned_response_status, canned_response_body) in responses {
+            let Ok((mut stream, _)) = listener.accept() else { break };
             let mut buf = [0u8; 8192];
             let mut accumulated = Vec::new();
             loop {
@@ -450,7 +556,7 @@ pub(crate) fn spawn_stub_api_for_test(
             drop(cap);
             let body_bytes = canned_response_body.as_bytes();
             let response = format!(
-                "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                "HTTP/1.1 {} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 canned_response_status,
                 body_bytes.len(),
                 canned_response_body,
@@ -490,6 +596,10 @@ impl TestCapturedRequest {
             parts.first().copied().unwrap_or("").to_string(),
             parts.get(1).copied().unwrap_or("").to_string(),
         )
+    }
+    pub(crate) fn body_json(&self) -> serde_json::Value {
+        let body = self.raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+        serde_json::from_str(body).unwrap_or(serde_json::Value::Null)
     }
 }
 
@@ -658,9 +768,11 @@ mod tests {
             description: "desc",
             prompt: "prompt",
             repo_url,
+            repo_branch: "main",
             difficulty: None,
             depends: None,
             initiative_id: None,
+            parent_task_id: None,
             metadata: None,
         }
     }
@@ -703,14 +815,14 @@ mod tests {
         assert_eq!(body["priority"], 0);
         assert_eq!(body["metadata"], metadata);
         assert!(body.get("difficulty").is_none() || body["difficulty"].is_null());
+        assert!(body.get("parent_task_id").is_none(), "no reporting line unless asked");
         clear_env();
     }
 
-    /// Empty `prompt` falls back to `name` — mirrors the
-    /// Python tool's `prompt or name` shape at
-    /// `cli/planning_client.py:64`.
+    /// An empty `prompt` is sent empty: the description is the brief, and a
+    /// copy of the name would only be noise (doc/org-model.md §13.2).
     #[test]
-    fn propose_task_empty_prompt_falls_back_to_name() {
+    fn propose_task_empty_prompt_stays_empty() {
         let _g = env_lock();
         let (port, captured) = spawn_stub_api(
             200,
@@ -723,16 +835,18 @@ mod tests {
             description: "",
             prompt: "",
             repo_url: "git@x.com:a/b.git",
+            repo_branch: "main",
             difficulty: None,
             depends: None,
             initiative_id: None,
+            parent_task_id: None,
             metadata: None,
         };
         let _ = propose_task(&req, None, None).expect("ok");
         let cap = captured.lock().unwrap();
         assert_eq!(
-            cap.body_json()["prompt"], "the-name",
-            "empty prompt must fall back to name",
+            cap.body_json()["prompt"], "",
+            "empty prompt is not replaced by the name",
         );
         clear_env();
     }

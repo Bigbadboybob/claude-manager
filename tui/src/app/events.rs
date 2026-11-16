@@ -99,6 +99,16 @@ fn activity_summary_for(
             let target = params.get("session_uid").and_then(V::as_str).unwrap_or("?");
             Some(format!("kill_session({})", short(target)))
         }
+        "send_key" => {
+            let key = params.get("key").and_then(V::as_str).unwrap_or("?");
+            let targets = match params.get("session_uids") {
+                Some(V::String(uid)) => short(uid),
+                Some(V::Array(uids)) if uids.len() == 1 => short(uids[0].as_str().unwrap_or("?")),
+                Some(V::Array(uids)) => format!("{} sessions", uids.len()),
+                _ => "?".into(),
+            };
+            Some(format!("send_key {key} ({targets})"))
+        }
         "notify_user" => {
             let msg = params.get("message").and_then(V::as_str).unwrap_or("");
             if msg.trim().is_empty() {
@@ -265,6 +275,48 @@ pub(super) fn encode_mouse_for_pty(
     crate::input::event_to_bytes(&CrosstermEvent::Mouse(translated), &term_mode)
 }
 
+/// Bytes for a mouse-wheel notch over an ALTERNATE-screen app that did not
+/// enable mouse reporting (CM forwards real reports itself when it did).
+/// The alternate screen has no scrollback, so moving CM's own viewport is a
+/// silent no-op; translate the wheel into keys the app scrolls with instead.
+///
+/// - Codex: one PageUp/PageDown. In Codex's alternate screen (0.160.1)
+///   PageUp/PageDown scroll the transcript while Up/Down recall composer
+///   history, so the usual arrow translation would rewrite the draft.
+/// - Anything else (less, vim, …): xterm/alacritty "alternate scroll"
+///   (`?1007`, on by default): three cursor-key presses per notch, in
+///   application-cursor form (`ESC O A`) when DECCKM is set.
+///
+/// `None` = not applicable (primary screen, mouse reporting, not a wheel
+/// event, or the app turned alternate scroll off).
+pub(super) fn alt_screen_wheel_bytes(
+    kind: MouseEventKind,
+    term_mode: TermMode,
+    codex: bool,
+) -> Option<Vec<u8>> {
+    let up = match kind {
+        MouseEventKind::ScrollUp => true,
+        MouseEventKind::ScrollDown => false,
+        _ => return None,
+    };
+    if !term_mode.contains(TermMode::ALT_SCREEN) || term_mode.intersects(TermMode::MOUSE_MODE) {
+        return None;
+    }
+    if codex {
+        return Some(if up { b"\x1b[5~".to_vec() } else { b"\x1b[6~".to_vec() });
+    }
+    if !term_mode.contains(TermMode::ALTERNATE_SCROLL) {
+        return None;
+    }
+    let key: &[u8] = match (term_mode.contains(TermMode::APP_CURSOR), up) {
+        (true, true) => b"\x1bOA",
+        (true, false) => b"\x1bOB",
+        (false, true) => b"\x1b[A",
+        (false, false) => b"\x1b[B",
+    };
+    Some(key.repeat(3))
+}
+
 /// Decide the actual byte sequence to write for a workflow delivery body,
 /// given the inner program's current terminal mode.
 ///
@@ -302,6 +354,13 @@ pub(super) struct SubtaskFlight {
     pending: crate::control::queue::Pending,
     result: std::sync::mpsc::Receiver<Result<crate::control::methods::CreatedSubtask,
         (crate::control::protocol::ErrorCode, String)>>,
+}
+
+/// An exit another agent caused: `kill_session` from a lead (its uid,
+/// possibly `"<uid> (mark_subtask_done)"`) or the daemon's terminal-task
+/// sweep. Not Owner (`operator`), a memory cap, a crash, or a respawn.
+fn is_agent_kill(killed_by: &str) -> bool {
+    killed_by.starts_with("ts-") || killed_by.starts_with("terminal-task-sweep")
 }
 
 impl App {
@@ -733,7 +792,12 @@ impl App {
                         if quiet && ts.status == SessionStatus::Running {
                             ts.set_status(SessionStatus::Idle);
                             visible_dirty = true;
-                            if ts.notify_on_idle {
+                            // With an engine-reported state, notify-on-idle
+                            // follows the daemon's transition instead
+                            // (`apply_agent_state`).
+                            if ts.notify_on_idle
+                                && !super::agent_state::covers_idle_notify(&self.agent_states, &ts.host_id, &ts.uid)
+                            {
                                 notify_session_idle(&ts.label);
                             }
                         } else if burst && ts.status != SessionStatus::Running {
@@ -1089,6 +1153,10 @@ impl App {
             // Idempotent per uid inside the helper (the dead EventLoop emits one
             // exit, but guard anyway). Shared with the stale-generation watchdog.
             for (wi, si) in remote_reconnect_requeue {
+                let uid = self.workspaces[wi].sessions[si].uid.clone();
+                if !self.reconnecting_sessions.contains(&uid) {
+                    self.note_stream_lost(&uid);
+                }
                 self.requeue_remote_reconnect(wi, si, "transport EOF");
             }
             self.needs_redraw = true;
@@ -1100,7 +1168,10 @@ impl App {
         // uid (`restart_suppressed_exit_uids`, consumed by the diff path).
         if !agent_exit_prunes.is_empty() {
             for (wi, uid) in agent_exit_prunes {
-                if self.restart_suppressed_exit_uids.contains(&uid) {
+                if self.restart_suppressed_exit_uids.contains(&uid)
+                    || self.restart_in_flight(&uid)
+                    || self.revive_failed.contains_key(&uid)
+                {
                     continue;
                 }
                 eprintln!(
@@ -1179,6 +1250,12 @@ impl App {
                 }
                 BackendEvent::PlanTaskDeleted(id) => {
                     self.planning.on_task_deleted(&id);
+                }
+                BackendEvent::ReportingTaskCreated { request_id, result } => {
+                    self.on_reporting_task_created(&request_id, result);
+                }
+                BackendEvent::TaskLeadFailed { id, attempted, previous, error } => {
+                    self.on_task_lead_failed(&id, attempted, previous, &error);
                 }
             }
         }
@@ -1343,6 +1420,7 @@ impl App {
             "get_caller_task" => methods::get_caller_task(self, caller, &req.params),
             "list_sessions" => methods::list_sessions(self, caller, &req.params),
             "send_input" => methods::send_input(self, caller, &req.params),
+            "send_key" => methods::send_key(self, caller, &req.params),
             "kill_session" => methods::kill_session(self, caller, &req.params),
             "start_session" => methods::start_session(self, caller, &req.params),
             // Phase 4 §D: start_workflow relocated to the daemon socket; the TUI
@@ -1420,6 +1498,8 @@ impl App {
         task_id: Option<String>,
         prompt: Option<&str>,
         global_perms: bool,
+        model: Option<&str>,
+        effort: Option<&str>,
     ) -> std::io::Result<String> {
         // 12e-r8 F1: derive the target host from the CALLER's
         // pinned host_id, NOT from `self.active_host`.
@@ -1498,10 +1578,13 @@ impl App {
             // MCP-driven spawn is always fresh — post-spawn
             // detector handles transcript path discovery.
             None,
+            false, // MCP/managed spawn is not a TUI operator spawn
             // Grant at spawn time (escalation-checked upstream in
             // `control::methods::start_session`) — no window where
             // the child runs ungranted, no second RPC to lose.
             global_perms,
+            model,
+            effort,
         ) {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
@@ -1544,6 +1627,11 @@ impl App {
             }
         }
         let ts = TerminalSession {
+            org: None,
+            model: session.spawn_model.clone(),
+            model_source: session.spawn_model_source.clone(),
+            effort: session.spawn_effort.clone(),
+            effort_source: session.spawn_effort_source.clone(),
             color: None,
             uid: session_uid.clone(),
             label: label.to_string(),
@@ -1608,33 +1696,79 @@ impl App {
     /// A host whose socket isn't live right now is an ERROR, not a
     /// silent local-only update: claiming "granted" while the daemon
     /// never heard it is exactly the divergence this guards against.
-    pub fn set_session_global_perms(
+    ///
+    /// The push runs on a worker (`background.rs`): over a slow link it
+    /// held keyboard input for its whole RPC budget. The row and manifest
+    /// change only once the daemon accepts (`finish_global_perms`).
+    pub fn set_session_global_perms(&mut self, uid: &str, value: bool, local_changed: bool) {
+        let Some((wi, si)) = crate::control::methods::find_live_session(&self.workspaces, uid) else {
+            self.set_status_msg(&format!(
+                "Settings saved, but global-perms change failed: session {} not found",
+                uid
+            ));
+            return;
+        };
+        let host = self.workspaces[wi].sessions[si].host_id.clone();
+        let pool = std::sync::Arc::clone(&self.host_pool);
+        let uid = uid.to_owned();
+        let key = format!("global_perms:{uid}");
+        let started = self.run_in_background(Some(key), move || {
+            // Push to the daemon first so a failed RPC doesn't leave the
+            // TUI's view diverged from the daemon's auth state.
+            let pushed = pool
+                .live_socket_path(&host)
+                .ok_or_else(|| {
+                    format!(
+                        "host `{}` socket not live — grant NOT applied (daemon never heard it); \
+                         retry once the host reconnects",
+                        host.as_str(),
+                    )
+                })
+                .and_then(|socket| {
+                    crate::client_session::rpc_set_global_perms(
+                        &socket,
+                        &pool.operator_token_for(&host),
+                        &uid,
+                        value,
+                    )
+                    .map_err(|e| format!("daemon rejected global-perms change: {}", e))
+                });
+            Box::new(move |app: &mut App| app.finish_global_perms(&uid, value, local_changed, pushed))
+        });
+        if started {
+            self.set_status_msg("Settings saved — applying global permissions…");
+        }
+    }
+
+    fn finish_global_perms(
         &mut self,
         uid: &str,
         value: bool,
-    ) -> Result<crate::client_session::GlobalPermsAck, String> {
-        let (wi, si) = crate::control::methods::find_live_session(&self.workspaces, uid)
-            .ok_or_else(|| format!("session {} not found", uid))?;
-        let host = self.workspaces[wi].sessions[si].host_id.clone();
-        // Push to the daemon first so a failed RPC doesn't leave the
-        // TUI's view diverged from the daemon's auth state.
-        let socket = self.host_pool.live_socket_path(&host).ok_or_else(|| {
-            format!(
-                "host `{}` socket not live — grant NOT applied (daemon never heard it); \
-                 retry once the host reconnects",
-                host.as_str(),
-            )
-        })?;
-        let ack = crate::client_session::rpc_set_global_perms(
-            &socket,
-            &self.host_pool.operator_token_for(&host),
-            uid,
-            value,
-        )
-        .map_err(|e| format!("daemon rejected global-perms change: {}", e))?;
-        self.workspaces[wi].sessions[si].global_perms = value;
-        self.save_session_manifest();
-        Ok(ack)
+        local_changed: bool,
+        pushed: Result<crate::client_session::GlobalPermsAck, String>,
+    ) {
+        let ack = match pushed {
+            Ok(ack) => ack,
+            Err(e) => {
+                self.set_status_msg(&format!("Settings saved, but global-perms change failed: {}", e));
+                return;
+            }
+        };
+        if let Some((wi, si)) = crate::control::methods::find_live_session(&self.workspaces, uid) {
+            self.workspaces[wi].sessions[si].global_perms = value;
+            self.save_session_manifest();
+        }
+        // `changed` = the DAEMON moved; a re-assert that converged a drifted
+        // daemon reads as a grant/revoke too, so the operator sees it took
+        // effect.
+        let daemon_moved = ack.changed.unwrap_or(local_changed);
+        let msg = match (value, daemon_moved || local_changed) {
+            (true, true) => "Settings saved — global permissions GRANTED",
+            (false, true) => "Settings saved — global permissions revoked",
+            (true, false) => "Settings saved — global permissions re-asserted (already granted)",
+            (false, false) => "Settings saved",
+        };
+        self.set_status_msg(msg);
     }
 
     /// Process planning editor events (non-blocking).
@@ -1832,6 +1966,16 @@ impl App {
         if let Some(alerts) = &snapshot.owner_attention {
             self.apply_owner_attention_snapshot(&snapshot.host, alerts);
         }
+        if let Some(health) = &snapshot.notification_health {
+            self.notification_health.retain(|(host, uid), _| host != &snapshot.host || health.contains_key(uid));
+            for (uid, value) in health {
+                self.notification_health.insert((snapshot.host.clone(), uid.clone()), value.clone());
+            }
+            self.needs_redraw = true;
+        }
+        if let Some(states) = &snapshot.agent_states {
+            self.apply_agent_state_snapshot(&snapshot.host, states);
+        }
         // 10e-d: collect uids we adopted with memory_cap_kill=true
         // so we can fire toasts AFTER the workspaces-iteration
         // is done — avoids the &mut self contention from calling
@@ -1975,6 +2119,8 @@ impl App {
                     || ts.managed_by_uid.is_none()
                     || ts.workflow_run_id.is_some()
                     || self.restart_suppressed_exit_uids.contains(&ts.uid)
+                    || self.restarts.iter().any(|f| f.uid == ts.uid)
+                    || self.revive_failed.contains_key(&ts.uid)
                 {
                     continue;
                 }
@@ -2057,16 +2203,33 @@ impl App {
         match diff {
             ManifestDiff::Exited { uid, last_exit } => {
                 // A-R force-restart: this exit is the restart's own
-                // kill. The revive ran synchronously before this diff
-                // could be applied, so the row under this uid is
-                // already the NEW live incarnation — stamping
-                // `preserved_last_exit` or pruning it here would hit
-                // the wrong session. Consume the one-shot marker and
+                // kill. The row under this uid is (or, while the restart
+                // worker finishes, is about to be) the NEW incarnation —
+                // stamping `preserved_last_exit` or pruning it here would
+                // hit the wrong session. Consume the one-shot marker and
                 // drop the diff.
                 if self.restart_suppressed_exit_uids.remove(&uid) {
                     return;
                 }
                 let memory_cap_kill = last_exit.memory_cap_kill;
+                let agent_kill = last_exit.killed_by.as_deref().is_some_and(is_agent_kill);
+                // #24/#25: a rotation or handoff stop comes straight back at
+                // the same uid: keep the row (its section and placement).
+                let respawning = last_exit
+                    .killed_by
+                    .as_deref()
+                    .is_some_and(crate::term_shim::is_respawn_killer);
+                // The rotation or handoff that stopped it failed and left it
+                // down: the daemon asks Owner to A-R it, so the row stays.
+                let not_back = last_exit
+                    .killed_by
+                    .as_deref()
+                    .is_some_and(crate::term_shim::is_respawn_failure);
+                if !respawning {
+                    // Any other exit ends a respawn gap: what follows is a
+                    // real exit, revivable with A-R.
+                    self.respawning.remove(&uid);
+                }
                 let mut found = false;
                 // Workspace index holding the exited session IFF it's an
                 // agent-spawned ephemeral that should be PRUNED (see below).
@@ -2111,8 +2274,14 @@ impl App {
                             // here too, so the remote repro is covered.
                             if ts.managed_by_uid.is_some()
                                 && ts.workflow_run_id.is_none()
+                                && !self.revive_failed.contains_key(&uid)
+                                && !respawning
+                                && !not_back
                             {
                                 prune_ws = Some(wi);
+                            }
+                            if not_back {
+                                ts.session.exited = true;
                             }
                             // Break both loops via label so
                             // `last_exit`'s move into the assignment
@@ -2153,6 +2322,30 @@ impl App {
                     // task-liveness gates still apply to them).
                     self.close_agent_marker_if_empty(wi);
                 }
+                if agent_kill {
+                    // The row may already be gone (an attach-stream exit
+                    // pruned it first): its tombstone still names the
+                    // workspace.
+                    let wi = self.workspaces.iter().position(|ws| {
+                        !ws.is_closed
+                            && (ws.sessions.iter().any(|ts| ts.uid == uid)
+                                || ws.tombstones.iter().any(|t| t.uid == uid))
+                    });
+                    if let Some(wi) = wi {
+                        self.after_agent_gone(wi, super::lifecycle::LastAgentClose::AgentKill);
+                    }
+                }
+                if not_back && found {
+                    self.pending_remote_reattach.retain(|p| p.entry.uid != uid);
+                    self.reconnecting_sessions.remove(&uid);
+                }
+                if respawning && found {
+                    // The pane follows on its own: queue the reattach to the
+                    // new incarnation now, whether or not this viewer's attach
+                    // stream reported the stop (an old frame or none at all).
+                    self.respawning.insert(uid.clone(), std::time::Instant::now());
+                    self.expect_respawn(&host, &uid);
+                }
                 // R5: untracked uid — `found` stays false; silent
                 // no-op. The diff referenced a session the TUI
                 // doesn't know about (e.g. a session the daemon
@@ -2160,41 +2353,14 @@ impl App {
                 // hasn't loaded; future divergence cases). No
                 // panic, no log, no toast.
             }
-            ManifestDiff::Added { uid, entry }
-            | ManifestDiff::Updated { uid, entry } => {
-                // Global-perms convergence: the daemon is the auth
-                // authority, and `session.set_global_perms` broadcasts
-                // the grant it now holds. Mirror it onto an
-                // already-tracked row so the sidebar / A-e form show
-                // the daemon's truth (another client's grant, or a
-                // re-assert that healed a drifted row). Entries that
-                // don't carry the field (workflow-binding `Updated`s,
-                // `Added`s) are left alone.
-                if let Some(value) = entry.get("sidebar_assignment") {
-                    if let Ok(assignment) = serde_json::from_value(value.clone()) {
-                        self.receive_sidebar_assignment(&host, assignment);
-                    }
-                }
-                if let Some(value) = entry.get("owner_attention") {
-                    if value.is_null() {
-                        self.apply_owner_attention(&host, &uid, None);
-                    } else if let Ok(alert) = serde_json::from_value(value.clone()) {
-                        self.apply_owner_attention(&host, &uid, Some(alert));
-                    }
-                }
-                self.apply_messaging_name(&host, &uid, &entry);
-                self.apply_global_perms_from_diff(&uid, &entry);
-                self.apply_transcript_from_diff(&host, &uid, &entry);
-                // Option B (criterion #4): adopt daemon-launched WORKFLOW
-                // PARTICIPANTS into the sidebar from broadcasts. The helper is
-                // deliberately scoped to entries carrying `workflow_run_id` —
-                // those are daemon-created in Phase 4 and have NO locally-built
-                // TerminalSession, so adopting them can't duplicate or race the
-                // TUI-local row creation that A-n/A-s/mcp_start_session use.
-                // Non-workflow daemon sessions keep their existing behavior
-                // (the broader manifest-sync consumer stays deferred — 10e-d/10f)
-                // EXCEPT remote ones — see `adopt_daemon_workflow_participant_on_host`.
-                self.adopt_daemon_workflow_participant_on_host(&host, &uid, &entry);
+            ManifestDiff::Added { uid, entry } => {
+                // A daemon-side respawn at a uid this viewer still shows as
+                // exited (a transcript rotation, #24): reattach in place.
+                self.reattach_respawned(&host, &uid);
+                self.apply_manifest_upsert(&host, uid, entry);
+            }
+            ManifestDiff::Updated { uid, entry } => {
+                self.apply_manifest_upsert(&host, uid, entry);
             }
             ManifestDiff::Tombstoned { .. } => {
                 // Session removal reaches the TUI via `Exited` (and the
@@ -2203,11 +2369,112 @@ impl App {
         }
     }
 
+    /// The shared `Added` / `Updated` handling of a manifest diff.
+    fn apply_manifest_upsert(&mut self, host: &cm_daemon::host_id::HostId, uid: String, entry: serde_json::Value) {
+        let host = host.clone();
+        // Global-perms convergence: the daemon is the auth
+        // authority, and `session.set_global_perms` broadcasts
+        // the grant it now holds. Mirror it onto an
+        // already-tracked row so the sidebar / A-e form show
+        // the daemon's truth (another client's grant, or a
+        // re-assert that healed a drifted row). Entries that
+        // don't carry the field (workflow-binding `Updated`s,
+        // `Added`s) are left alone.
+        if let Some(value) = entry.get("sidebar_assignment") {
+            if let Ok(assignment) = serde_json::from_value(value.clone()) {
+                self.receive_sidebar_assignment(&host, assignment);
+            }
+        }
+        if let Some(value) = entry.get("owner_attention") {
+            if value.is_null() {
+                self.apply_owner_attention(&host, &uid, None);
+            } else if let Ok(alert) = serde_json::from_value(value.clone()) {
+                self.apply_owner_attention(&host, &uid, Some(alert));
+            }
+        }
+        if let Some(value) = entry.get("notification_health") {
+            let key = (host.clone(), uid.clone());
+            if value.is_null() { self.notification_health.remove(&key); }
+            else { self.notification_health.insert(key, value.clone()); }
+            self.needs_redraw = true;
+        }
+        if let Some(value) = entry.get("agent_state") {
+            self.apply_agent_state(&host, &uid, value);
+        }
+        self.apply_messaging_name(&host, &uid, &entry);
+        self.apply_global_perms_from_diff(&uid, &entry);
+        self.apply_org_from_diff(&uid, &entry);
+        self.apply_engine_from_diff(&uid, &entry);
+        self.apply_transcript_from_diff(&host, &uid, &entry);
+        // Option B (criterion #4): adopt daemon-launched WORKFLOW
+        // PARTICIPANTS into the sidebar from broadcasts. The helper is
+        // deliberately scoped to entries carrying `workflow_run_id` —
+        // those are daemon-created in Phase 4 and have NO locally-built
+        // TerminalSession, so adopting them can't duplicate or race the
+        // TUI-local row creation that A-n/A-s/mcp_start_session use.
+        // Non-workflow daemon sessions keep their existing behavior
+        // (the broader manifest-sync consumer stays deferred — 10e-d/10f)
+        // EXCEPT remote ones — see `adopt_daemon_workflow_participant_on_host`.
+        self.adopt_daemon_workflow_participant_on_host(&host, &uid, &entry);
+    }
+
     /// Mirror a broadcast `global_perms` onto the tracked row for `uid`
     /// (see the `Added`/`Updated` arm of `apply_manifest_diff`). Returns
     /// whether a row changed. No-op when the entry lacks the field or
     /// the uid isn't tracked; persists the manifest on a real change so
     /// the TUI's own durable view stops disagreeing with the daemon's.
+    /// O5: the daemon broadcasts `Updated {member, org}` when it stamps a
+    /// session as a member's assistant or worker; mirror the org object onto
+    /// the row (the F6 chart and A-D read it). Diffs without `org` leave it.
+    /// #25: a handoff respawns the uid on another engine, model or effort.
+    /// Mirror the daemon's `session_type` / `model` / `effort` onto the row,
+    /// so its engine mark, keys and A-R follow. Diffs without the fields
+    /// leave them. Returns whether the row changed.
+    pub(crate) fn apply_engine_from_diff(&mut self, uid: &str, entry: &serde_json::Value) -> bool {
+        let Some((wi, si)) = crate::control::methods::find_live_session(&self.workspaces, uid) else {
+            return false;
+        };
+        let ts = &mut self.workspaces[wi].sessions[si];
+        let mut changed = false;
+        if let Some(engine) = entry.get("session_type").and_then(|v| v.as_str()) {
+            let engine = super::model::normalize_session_type_to_internal(engine);
+            if matches!(engine, "claude" | "codex") && matches!(ts.session_type.as_str(), "claude" | "codex") && ts.session_type != engine {
+                ts.session_type = engine.to_string();
+                changed = true;
+            }
+        }
+        for (key, slot, source_key) in [("model", 0, "model_source"), ("effort", 1, "effort_source")] {
+            let Some(v) = entry.get(key).and_then(|v| v.as_str()) else { continue };
+            let source = entry.get(source_key).and_then(|v| v.as_str()).map(str::to_string);
+            let (value, src) = if slot == 0 { (&mut ts.model, &mut ts.model_source) } else { (&mut ts.effort, &mut ts.effort_source) };
+            if value.as_deref() != Some(v) {
+                *value = Some(v.to_string());
+                *src = source;
+                changed = true;
+            }
+        }
+        if changed {
+            self.needs_redraw = true;
+            self.save_session_manifest();
+        }
+        changed
+    }
+
+    pub(crate) fn apply_org_from_diff(&mut self, uid: &str, entry: &serde_json::Value) -> bool {
+        let Some(org) = entry.get("org").and_then(|v| v.as_object()) else {
+            return false;
+        };
+        let Some((wi, si)) = crate::control::methods::find_live_session(&self.workspaces, uid) else {
+            return false;
+        };
+        if self.workspaces[wi].sessions[si].org.as_ref() == Some(org) {
+            return false;
+        }
+        self.workspaces[wi].sessions[si].org = Some(org.clone());
+        self.save_session_manifest();
+        true
+    }
+
     pub(crate) fn apply_global_perms_from_diff(
         &mut self,
         uid: &str,
@@ -2396,9 +2663,14 @@ impl App {
 
         let op_token = self.host_pool.operator_token_for(&host_id);
         let config = crate::client_session::ClientSessionConfig {
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             daemon_socket: &socket,
             operator_token_id: &op_token,
             uid,
+            auto_place_owner: false,
             workspace_id: &ws_id,
             label: &label,
             session_type: &session_type,
@@ -2487,7 +2759,7 @@ impl App {
     /// ephemeral GCP worker VMs, never hold a local session, and are
     /// therefore modelled as sidebar `backtest_rows` (one collapsible
     /// group) instead of workspaces — see `app/backtests.rs`.
-    fn reconcile_tasks(&mut self, tasks: Vec<Task>) {
+    pub(super) fn reconcile_tasks(&mut self, tasks: Vec<Task>) {
         // The work list below intentionally omits Done tasks. Keep their
         // ancestry separately: a retained session must not fall out of its
         // continuous tree merely because its planning task completed.
@@ -2514,9 +2786,8 @@ impl App {
         let saved_ws_id = match &self.cursor {
             Cursor::Workspace(wi) => self.workspaces.get(*wi).map(|w| w.id.clone()),
             Cursor::Session(wi, _) => self.workspaces.get(*wi).map(|w| w.id.clone()),
-            Cursor::Task { ws_idx, .. } => self.workspaces.get(*ws_idx).map(|w| w.id.clone()),
             // Not workspace-scoped; clamp_cursor re-validates it at the end.
-            Cursor::Backtest(_) | Cursor::Section(_) => None,
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => None,
         };
         let saved_session_uid = match &self.cursor {
             Cursor::Session(wi, si) => self
@@ -2529,6 +2800,15 @@ impl App {
 
         let mut seen_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // Work-list rows by task id, the first row winning as a scan would:
+        // the feed carries every task, done ones included, and a scan of
+        // the work list per feed task made each update O(feed × list).
+        let mut task_pos: HashMap<String, usize> = HashMap::new();
+        for (i, t) in self.tasks.iter().enumerate() {
+            if let Some(id) = &t.task_id {
+                task_pos.entry(id.clone()).or_insert(i);
+            }
+        }
 
         for task in &tasks {
             // Only show active tasks in the sessions view; backlog/draft/done
@@ -2539,10 +2819,8 @@ impl App {
                     // Update existing bindings before pruning. Otherwise a
                     // task that just completed retains its old Running status
                     // and pins an empty workspace until the next TUI restart.
-                    if let Some(entry) = self.tasks.iter_mut()
-                        .find(|entry| entry.task_id.as_deref() == Some(task.id.as_str()))
-                    {
-                        entry.api_status = TaskStatus::from_api(&task.status);
+                    if let Some(&i) = task_pos.get(&task.id) {
+                        self.tasks[i].api_status = TaskStatus::from_api(&task.status);
                     }
                     continue;
                 }
@@ -2552,11 +2830,21 @@ impl App {
             let display_name = task
                 .name
                 .as_deref()
+                .or(task.description.as_deref().filter(|d| !d.trim().is_empty()))
                 .or(task.prompt.as_deref())
                 .unwrap_or(&task.id[..8.min(task.id.len())])
                 .chars()
                 .take(60)
                 .collect::<String>();
+
+            // The task's brief (doc/org-model.md §13.2): the API now returns
+            // `prompt: ""`, so the description carries it.
+            let brief = Some(crate::planning::task_brief(
+                task.description.as_deref().unwrap_or(""),
+                task.prompt.as_deref().unwrap_or(""),
+                task.name.as_deref().unwrap_or(""),
+            ))
+            .filter(|b| !b.is_empty());
 
             let is_cloud = task.is_cloud;
             // Local recovery covers both top-level CM branches (`cm/...`)
@@ -2571,15 +2859,12 @@ impl App {
                 });
 
             // Upsert TaskEntry.
-            if let Some(entry) = self
-                .tasks
-                .iter_mut()
-                .find(|e| e.task_id.as_deref() == Some(&task.id))
-            {
+            if let Some(&i) = task_pos.get(&task.id) {
+                let entry = &mut self.tasks[i];
                 entry.name = display_name.clone();
                 entry.api_status = TaskStatus::from_api(&task.status);
                 entry.repo_url = Some(task.repo_url.clone());
-                entry.prompt = task.prompt.clone();
+                entry.prompt = brief.clone();
                 entry.wip_branch = task.wip_branch.clone();
                 entry.session_id = task.session_id.clone();
                 entry.blocked_at = task.blocked_at.clone();
@@ -2595,7 +2880,7 @@ impl App {
                     name: display_name.clone(),
                     api_status: TaskStatus::from_api(&task.status),
                     repo_url: Some(task.repo_url.clone()),
-                    prompt: task.prompt.clone(),
+                    prompt: brief,
                     wip_branch: task.wip_branch.clone(),
                     session_id: task.session_id.clone(),
                     blocked_at: task.blocked_at.clone(),
@@ -2607,6 +2892,7 @@ impl App {
                     worktree_mode: parse_worktree_mode(&task.worktree_mode),
                     metadata: task.metadata.clone(),
                 });
+                task_pos.insert(task.id.clone(), self.tasks.len() - 1);
             }
 
             // Cloud backtest tasks never get a workspace: nothing local ever
@@ -2623,11 +2909,7 @@ impl App {
             // have one. Multi-task workspaces: users explicitly bind via the
             // launch-into-workspace picker, so we only auto-bind when the
             // task's own worktree (local) or VM (cloud) matches.
-            let task_idx = self
-                .tasks
-                .iter()
-                .position(|t| t.task_id.as_deref() == Some(&task.id))
-                .expect("just inserted");
+            let task_idx = task_pos[&task.id];
             if self.tasks[task_idx].workspace_id.is_some() {
                 continue;
             }
@@ -2693,6 +2975,7 @@ impl App {
             } else if is_cloud || worktree_path.is_some() {
                 // Auto-provision a workspace so this task gets a sidebar row.
                 let ws = Workspace {
+                    org: None,
                     color: None,
                     pinned: false,
                     id: new_workspace_id(),
@@ -2722,16 +3005,15 @@ impl App {
         // Retain tasks: keep those still seen by the API, plus anything still
         // referenced by a workspace (in case a bound task temporarily vanished
         // from the API — unlikely but defensive).
+        let ws_ids: std::collections::HashSet<&str> =
+            self.workspaces.iter().map(|w| w.id.as_str()).collect();
         let ws_bound_task_ids: std::collections::HashSet<String> = self
-            .workspaces
+            .tasks
             .iter()
-            .flat_map(|w| {
-                self.tasks
-                    .iter()
-                    .filter(move |t| t.workspace_id.as_deref() == Some(&w.id))
-                    .filter_map(|t| t.task_id.clone())
-            })
+            .filter(|t| t.workspace_id.as_deref().is_some_and(|w| ws_ids.contains(w)))
+            .filter_map(|t| t.task_id.clone())
             .collect();
+        drop(ws_ids);
         self.tasks.retain(|t| {
             if t.api_status == TaskStatus::Done {
                 return false;
@@ -2802,43 +3084,40 @@ impl App {
                 TaskStatus::Done => 3,
             }
         };
-        let workspace_rank: Vec<(String, u8)> = self
-            .workspaces
-            .iter()
-            .map(|w| {
-                let rank = match self.first_task_for_ws(&w.id) {
-                    Some(t) => status_rank(&self.task_status(t)),
-                    // No bound task: rank by the workspace's own session
-                    // activity, mirroring how `task_status` derives a bound
-                    // task's status. This makes a taskless workspace sort
-                    // identically to a task-bound one — an active (running)
-                    // session floats up alongside running tasks instead of
-                    // always sinking to the bottom. A sessionless taskless
-                    // workspace still ranks last (it's a fresh, empty slot).
-                    None => {
-                        if w.sessions.iter().any(|s| s.status == SessionStatus::Running) {
-                            status_rank(&TaskStatus::Running)
-                        } else if w.sessions.iter().any(|s| s.status == SessionStatus::Idle) {
-                            status_rank(&TaskStatus::Blocked)
-                        } else {
-                            4
-                        }
-                    }
-                };
-                (w.id.clone(), rank)
-            })
-            .collect();
-        let rank_of = |id: &str| -> u8 {
-            workspace_rank
-                .iter()
-                .find(|(i, _)| i == id)
-                .map(|(_, r)| *r)
-                .unwrap_or(4)
-        };
         // Pinned workspaces float to the top; status rank orders each
-        // group. Stable sort keeps ties in their previous order.
-        self.workspaces
-            .sort_by_key(|w| (!w.pinned, rank_of(&w.id)));
+        // group, and the stable sort keeps ties in their previous order.
+        // The manifest holds thousands of closed workspaces, so each key is
+        // computed once from an index: a task scan per workspace and a rank
+        // lookup per comparison made every task-feed update quadratic in
+        // them (laptop diag 2026-11-05: drain_backend_events 200-300 ms).
+        let mut first_task: HashMap<&str, &TaskEntry> = HashMap::new();
+        for t in &self.tasks {
+            if let Some(ws) = t.workspace_id.as_deref() {
+                first_task.entry(ws).or_insert(t);
+            }
+        }
+        self.workspaces.sort_by_cached_key(|w| {
+            let rank = match first_task.get(w.id.as_str()).copied() {
+                Some(t) => status_rank(&Self::task_status_in(t, Some(w))),
+                // No bound task: rank by the workspace's own session
+                // activity, mirroring how `task_status` derives a bound
+                // task's status. This makes a taskless workspace sort
+                // identically to a task-bound one — an active (running)
+                // session floats up alongside running tasks instead of
+                // always sinking to the bottom. A sessionless taskless
+                // workspace still ranks last (it's a fresh, empty slot).
+                None => {
+                    if w.sessions.iter().any(|s| s.status == SessionStatus::Running) {
+                        status_rank(&TaskStatus::Running)
+                    } else if w.sessions.iter().any(|s| s.status == SessionStatus::Idle) {
+                        status_rank(&TaskStatus::Blocked)
+                    } else {
+                        4
+                    }
+                }
+            };
+            (!w.pinned, rank)
+        });
 
         // Restore cursor by workspace id.
         if let Some(ref id) = saved_ws_id {
@@ -2918,6 +3197,7 @@ mod apply_manifest_diff_tests {
         );
         // Minimal Workspace.
         let ws = Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-test".into(),
@@ -2975,7 +3255,63 @@ mod apply_manifest_diff_tests {
         cm_daemon::owner_attention::Alert {
             id: id.into(), session_uid: uid.into(), label: "Task".into(),
             message: "Ready for review".into(), task_id: None, continuous_task_id: None,
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn agent_state_snapshot_and_diffs_drive_glyphs_and_attention_order() {
+        let host = crate::hosts::HostId::new("sessions");
+        let mut app = build_app_with_session("self");
+        app.push_worker.shutdown();
+        let session = crate::session::Session::new("/bin/true", &[], 80, 24, None,
+            std::collections::HashMap::new(), None).expect("test PTY");
+        let second = make_simple_session_with_uid("other".to_string(), "other-label", "claude", session, None);
+        app.workspaces[0].sessions.push(second);
+        for ts in &mut app.workspaces[0].sessions {
+            ts.host_id = host.clone();
+            ts.session.exited = false;
+            ts.status = SessionStatus::Idle;
+        }
+        // Snapshot: "self" idle, "other" waiting on a human.
+        let mut snap = snapshot_payload(host.clone(), &["self", "other"], &[]);
+        snap.agent_states = Some([
+            ("self".to_string(), serde_json::json!({"state":"idle","since":1.0})),
+            ("other".to_string(), serde_json::json!({"state":"waiting-on-human","since":2.0})),
+        ].into_iter().collect());
+        app.apply_agent_state_snapshot(&host, snap.agent_states.as_ref().unwrap());
+        assert_eq!(app.agent_indicator(&app.workspaces[0].sessions[1]).unwrap().0, "?");
+        // A-g: waiting outranks idle even though it comes later visually.
+        app.cursor = Cursor::Session(0, 0);
+        app.jump_to_next_attention();
+        assert_eq!(app.cursor, Cursor::Session(0, 1));
+        // A diff to errored, applied twice, is idempotent.
+        let diff = || ManifestDiff::Updated { uid: "other".into(),
+            entry: serde_json::json!({"agent_state":{"state":"errored","since":3.0,"detail":{"error_kind":"rate_limit"}}}) };
+        app.apply_manifest_diff_from_host(host.clone(), diff());
+        app.needs_redraw = false;
+        app.apply_agent_state(&host, "other", &serde_json::json!({"state":"errored","since":3.0,"detail":{"error_kind":"rate_limit"}}));
+        assert!(!app.needs_redraw, "re-applying the same state does not repaint");
+        assert_eq!(app.agent_indicator(&app.workspaces[0].sessions[1]).unwrap().0, "\u{2717}");
+        assert_eq!(app.agent_state_wire(&app.workspaces[0].sessions[1])["detail"]["error_kind"], "rate_limit");
+        // waiting -> idle keeps the earlier notification (no second notify).
+        app.apply_agent_state(&host, "other", &serde_json::json!({"state":"waiting-on-human","since":3.5,"source":"hooks"}));
+        app.apply_agent_state(&host, "other", &serde_json::json!({"state":"idle","since":3.6,"source":"hooks"}));
+        assert!(app.agent_view(&app.workspaces[0].sessions[1]).unwrap().notified_quiet);
+        assert!(app.engine_covers_idle_notify(&host, "other"));
+        // Working by the engine beats a quiet PTY: renders as running.
+        app.apply_manifest_diff_from_host(host.clone(), ManifestDiff::Updated { uid: "self".into(),
+            entry: serde_json::json!({"agent_state":{"state":"working","since":4.0}}) });
+        assert!(app.display_running(&app.workspaces[0].sessions[0]));
+        assert!(!app.display_idle(&app.workspaces[0].sessions[0]));
+        // Null clears back to the PTY heuristic; another host's snapshot
+        // leaves these rows alone.
+        app.apply_manifest_diff_from_host(host.clone(), ManifestDiff::Updated { uid: "self".into(),
+            entry: serde_json::json!({"agent_state": null}) });
+        assert!(app.agent_activity(&app.workspaces[0].sessions[0]).is_none());
+        app.apply_agent_state_snapshot(&crate::hosts::HostId::local(), &Default::default());
+        assert!(app.agent_activity(&app.workspaces[0].sessions[1]).is_some());
+        let _ = diff;
     }
 
     #[test]
@@ -2988,18 +3324,111 @@ mod apply_manifest_diff_tests {
             app.apply_manifest_diff_from_host(host.clone(), ManifestDiff::Updated {
                 uid: "self".into(), entry: serde_json::json!({"owner_attention": alert}),
             });
-            assert!(app.session_has_alert("self"));
+            assert!(app.session_has_alert("self", &host));
             app.needs_redraw = false;
             app.sync_owner_alert_indicators();
             assert!(!app.needs_redraw, "pending alerts must not busy-redraw");
-            app.acknowledge_owner_alerts_for_row("self");
+            app.acknowledge_owner_alerts_for_row("self", &host);
             app.alerts.remove("self");
             assert!(app.owner_alerts.is_empty());
             app.apply_owner_attention(&host, "self", Some(alert));
-            assert!(!app.session_has_alert("self"), "old snapshot cannot resurrect a focused alert");
+            assert!(!app.session_has_alert("self", &host), "old snapshot cannot resurrect a focused alert");
             app.apply_owner_attention(&host, "self", Some(owner_test_alert("new", "self")));
-            assert!(app.session_has_alert("self"));
+            assert!(app.session_has_alert("self", &host));
         }
+    }
+
+    #[test]
+    fn owner_attention_independent_key_is_visible_on_affected_row() {
+        let host = crate::hosts::HostId::new("sessions");
+        let mut app = build_app_with_session("self");
+        app.push_worker.shutdown();
+        app.workspaces[0].sessions[0].host_id = host.clone();
+        app.apply_owner_attention(&host, "self", Some(owner_test_alert("decision", "self")));
+        app.apply_manifest_diff_from_host(host.clone(), ManifestDiff::Updated {
+            uid: "notification-stall:self".into(),
+            entry: serde_json::json!({"owner_attention": owner_test_alert("stall", "self")}),
+        });
+        assert_eq!(app.owner_alerts.len(), 2);
+        assert!(app.session_has_alert("self", &host));
+        assert_eq!(app.open_owner_alerts().iter().filter(|a| a.uid == "self").count(), 2);
+        // A stale menu selection cannot acknowledge the current alert.
+        app.jump_to_owner_alert("self", &host, Some("notification-stall:self"), Some("old"));
+        assert_eq!(app.owner_alerts.len(), 2);
+        app.jump_to_owner_alert("self", &host, Some("notification-stall:self"), Some("stall"));
+        assert_eq!(app.owner_alerts.len(), 1);
+        assert!(app.owner_alerts.contains_key(&(host.clone(), "self".into())));
+        assert!(app.session_has_alert("self", &host));
+        let other_host = crate::hosts::HostId::new("other-host");
+        app.apply_owner_attention(&other_host, "notification-stall:self", Some(owner_test_alert("stall", "self")));
+        assert!(app.owner_alerts.contains_key(&(other_host.clone(), "notification-stall:self".into())));
+        app.acknowledge_owner_alerts_for_row("self", &host);
+        assert_eq!(app.owner_alerts.len(), 1, "focusing one host cannot acknowledge another");
+    }
+
+    #[test]
+    fn owner_attention_same_uid_on_two_hosts_and_missing_row_ack() {
+        let a = crate::hosts::HostId::new("host-a");
+        let b = crate::hosts::HostId::new("host-b");
+        let mut app = build_app_with_session("same");
+        app.push_worker.shutdown();
+        app.workspaces[0].sessions[0].host_id = a.clone();
+        let session = crate::session::Session::new("/bin/true", &[], 80, 24, None,
+            std::collections::HashMap::new(), None).expect("test PTY");
+        let mut second = make_simple_session_with_uid("same".into(), "second", "claude", session, None);
+        second.host_id = b.clone();
+        app.workspaces[0].sessions.push(second);
+        app.apply_owner_attention(&a, "same", Some(owner_test_alert("a", "same")));
+        app.apply_owner_attention(&b, "same", Some(owner_test_alert("b", "same")));
+        assert!(app.session_has_alert("same", &a));
+        assert!(app.session_has_alert("same", &b));
+        app.cursor = Cursor::Session(0, 1);
+        app.reap_and_clear_alerts();
+        assert!(app.session_has_alert("same", &a));
+        assert!(!app.session_has_alert("same", &b));
+        app.apply_owner_attention(&b, "host-wide", Some(owner_test_alert("host", "no-row")));
+        app.jump_to_owner_alert("no-row", &b, Some("host-wide"), Some("stale"));
+        assert!(app.owner_alerts.contains_key(&(b.clone(), "host-wide".into())));
+        app.jump_to_owner_alert("no-row", &b, Some("host-wide"), Some("host"));
+        assert!(!app.owner_alerts.contains_key(&(b, "host-wide".into())));
+        assert!(app.owner_alerts.contains_key(&(a, "same".into())));
+    }
+
+    #[test]
+    fn notification_health_survives_alert_ack_until_recovery() {
+        let host = crate::hosts::HostId::new("sessions");
+        let mut app = build_app_with_session("self");
+        app.push_worker.shutdown();
+        app.workspaces[0].sessions[0].host_id = host.clone();
+        app.apply_manifest_diff_from_host(host.clone(), ManifestDiff::Updated {
+            uid: "self".into(), entry: serde_json::json!({"notification_health":{"reason":"external_background","since":100}}),
+        });
+        app.apply_owner_attention(&host, "notification-stall:self", Some(owner_test_alert("stall", "self")));
+        app.acknowledge_owner_alerts_for_row("self", &host);
+        assert!(app.notification_health.contains_key(&(host.clone(), "self".into())));
+        app.apply_manifest_diff_from_host(host.clone(), ManifestDiff::Updated {
+            uid: "self".into(), entry: serde_json::json!({"notification_health":null}),
+        });
+        assert!(!app.notification_health.contains_key(&(host, "self".into())));
+    }
+
+    #[test]
+    fn notification_health_reconnect_snapshot_preserves_unknown_and_clears_confirmed_recovery() {
+        let host = crate::hosts::HostId::new("sessions");
+        let mut app = build_app_with_session("self");
+        app.push_worker.shutdown();
+        app.workspaces[0].sessions[0].host_id = host.clone();
+        let mut snap = snapshot_payload(host.clone(), &["self"], &[]);
+        snap.notification_health = Some([("self".into(), serde_json::json!({"reason":"external_background"}))].into());
+        app.apply_manifest_snapshot(snap);
+        assert!(app.notification_health.contains_key(&(host.clone(), "self".into())));
+        let unknown = snapshot_payload(host.clone(), &["self"], &[]);
+        app.apply_manifest_snapshot(unknown);
+        assert!(app.notification_health.contains_key(&(host.clone(), "self".into())), "unknown must not clear prior evidence");
+        let mut recovered = snapshot_payload(host.clone(), &["self"], &[]);
+        recovered.notification_health = Some(Default::default());
+        app.apply_manifest_snapshot(recovered);
+        assert!(!app.notification_health.contains_key(&(host, "self".into())));
     }
 
     #[test]
@@ -3009,14 +3438,14 @@ mod apply_manifest_diff_tests {
         let host = crate::hosts::HostId::new("sessions");
         app.workspaces[0].sessions[0].host_id = host.clone();
         app.apply_owner_attention(&host, "self", Some(owner_test_alert("a", "self")));
-        assert!(!app.session_has_alert("self"));
+        assert!(!app.session_has_alert("self", &host));
         app.workspaces[0].sessions[0].uid = "self".into();
         app.sync_owner_alert_indicators();
-        assert!(app.session_has_alert("self"));
+        assert!(app.session_has_alert("self", &host));
         app.apply_owner_attention_snapshot(&crate::hosts::HostId::local(), &Default::default());
-        assert!(app.session_has_alert("self"));
+        assert!(app.session_has_alert("self", &host));
         app.apply_owner_attention_snapshot(&host, &Default::default());
-        assert!(!app.session_has_alert("self"));
+        assert!(!app.session_has_alert("self", &host));
     }
 
     #[test]
@@ -3029,8 +3458,8 @@ mod apply_manifest_diff_tests {
         let mut alert = owner_test_alert("a", "previous-tick");
         alert.continuous_task_id = Some("continuous".into());
         app.apply_owner_attention(&host, "previous-tick", Some(alert));
-        assert!(app.session_has_alert("new-tick"));
-        app.acknowledge_owner_alerts_for_row("new-tick");
+        assert!(app.session_has_alert("new-tick", &host));
+        app.acknowledge_owner_alerts_for_row("new-tick", &host);
         assert!(app.owner_alerts.is_empty());
     }
 
@@ -3062,6 +3491,7 @@ mod apply_manifest_diff_tests {
         let diff = ManifestDiff::Exited {
             uid: "ts-t15".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: None,
                 memory_cap_kill: true,
                 kills_file_offset: Some(42),
@@ -3095,6 +3525,7 @@ mod apply_manifest_diff_tests {
         app.needs_redraw = false;
 
         let last_exit = LastExit {
+            killed_by: None,
             code: None,
             memory_cap_kill: false,
             kills_file_offset: None,
@@ -3141,6 +3572,7 @@ mod apply_manifest_diff_tests {
         let diff = ManifestDiff::Exited {
             uid: "ts-t16-stranger".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(1),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -3203,6 +3635,7 @@ mod apply_manifest_diff_tests {
         app.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-agent".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(0),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -3217,6 +3650,46 @@ mod apply_manifest_diff_tests {
         );
     }
 
+    /// #24/#25: a worker CM stopped to rotate or hand it off comes straight
+    /// back at the same uid; its row (section, placement) stays.
+    #[test]
+    fn exited_diff_keeps_a_worker_that_is_being_respawned() {
+        for killer in ["transcript-rotation", "handoff"] {
+            let mut app = build_app_with_session("ts-agent");
+            app.workspaces[0].sessions[0].managed_by_uid = Some("orch".into());
+            app.apply_manifest_diff(ManifestDiff::Exited {
+                uid: "ts-agent".into(),
+                last_exit: LastExit {
+                    killed_by: Some(killer.into()),
+                    code: Some(143),
+                    memory_cap_kill: false,
+                    kills_file_offset: None,
+                    exited_at: 1.0,
+                },
+            });
+            assert_eq!(app.workspaces[0].sessions.len(), 1, "{killer}: the row stays");
+        }
+    }
+
+    /// #25: a handoff's respawn on another engine updates the row's engine,
+    /// model and effort; bash rows and unknown engines are never touched.
+    #[test]
+    fn an_engine_switch_diff_updates_the_row() {
+        let mut app = build_app_with_session("ts-h");
+        app.workspaces[0].sessions[0].session_type = "claude".into();
+        let entry = serde_json::json!({"session_type": "codex", "model": "gpt-6-luna", "model_source": "explicit",
+                                       "effort": "high"});
+        assert!(app.apply_engine_from_diff("ts-h", &entry));
+        let ts = &app.workspaces[0].sessions[0];
+        assert_eq!((ts.session_type.as_str(), ts.model.as_deref(), ts.effort.as_deref()), ("codex", Some("gpt-6-luna"), Some("high")));
+        assert_eq!(ts.model_source.as_deref(), Some("explicit"));
+        assert!(!app.apply_engine_from_diff("ts-h", &entry), "no change twice");
+        assert!(app.apply_engine_from_diff("ts-h", &serde_json::json!({"session_type": "claude-code"})));
+        assert_eq!(app.workspaces[0].sessions[0].session_type, "claude");
+        app.workspaces[0].sessions[0].session_type = "bash".into();
+        assert!(!app.apply_engine_from_diff("ts-h", &serde_json::json!({"session_type": "codex"})));
+    }
+
     /// A USER-created session (`managed_by_uid == None`) is NOT
     /// auto-removed on exit — it stays a ghost row with
     /// `preserved_last_exit` set so the user (who owns its lifecycle)
@@ -3229,6 +3702,7 @@ mod apply_manifest_diff_tests {
         app.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-user".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(0),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -3261,6 +3735,7 @@ mod apply_manifest_diff_tests {
         app.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-wf".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: None,
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -3292,6 +3767,7 @@ mod apply_manifest_diff_tests {
             ManifestDiff::Exited {
                 uid: "ts-remote".into(),
                 last_exit: LastExit {
+                    killed_by: None,
                     code: None,
                     memory_cap_kill: false,
                     kills_file_offset: None,
@@ -3320,13 +3796,16 @@ mod apply_manifest_diff_tests {
         std::mem::forget(tx);
     }
 
+    /// In the Status sub-view a single-session workspace row displays that
+    /// session's terminal, and it must repaint. (In the Task sub-view the
+    /// workspace header is a tree row and displays none, app/tree.rs.)
     #[test]
-    fn single_session_workspace_and_task_rows_repaint_terminal_output() {
+    fn single_session_workspace_row_repaints_terminal_output() {
         let mut app = build_app_with_session("ts-visible");
         app.workspaces[0].sessions[0].task_id = Some("task-visible".into());
         let (tx, rx) = std::sync::mpsc::channel();
         app.workspaces[0].sessions[0].session.event_rx = rx;
-        for cursor in [Cursor::Workspace(0), Cursor::Task { ws_idx: 0, task_id: "task-visible".into() }] {
+        for cursor in [Cursor::Workspace(0)] {
             app.cursor = cursor;
             app.drain_terminal_events();
             app.needs_redraw = false;
@@ -3404,12 +3883,15 @@ mod apply_manifest_diff_tests {
             host,
             session_transcripts: Vec::new(),
             owner_attention: None,
+            notification_health: None,
+            agent_states: None,
             sidebar_assignments: None,
             listed_uids: listed.iter().map(|u| u.to_string()).collect(),
             session_last_exits: listed
                 .iter()
                 .map(|u| {
                     let le = exited.contains(u).then(|| LastExit {
+                        killed_by: None,
                         code: Some(0),
                         memory_cap_kill: false,
                         kills_file_offset: None,
@@ -3510,6 +3992,159 @@ mod apply_manifest_diff_tests {
         age_agent_row(&mut app, 0, 0, remote.clone());
         app.restart_suppressed_exit_uids.insert("ts-snap-ar".into());
         assert_eq!(app.prune_rows_absent_from_snapshot(&empty(&remote)), 0, "A-R uid kept");
+
+        let mut app = build_app_with_session("ts-snap-revive-failed");
+        age_agent_row(&mut app, 0, 0, remote.clone());
+        app.note_revive_failure("ts-snap-revive-failed", "worktree missing");
+        assert_eq!(app.prune_rows_absent_from_snapshot(&empty(&remote)), 0, "failed revive kept");
+    }
+
+    /// 2026-10-08: a forced A-R whose revive failed lost its row to the
+    /// next exit prune, and its error to a transient status line. The row
+    /// now stays, marked, with the error kept.
+    #[test]
+    fn a_failed_revive_keeps_its_row_marked_through_exit_prunes() {
+        let mut app = build_app_with_session("ts-revive-x");
+        app.workspaces[0].sessions[0].managed_by_uid = Some("orch".into());
+        app.note_revive_failure("ts-revive-x", "worktree /w/x missing");
+        app.apply_manifest_diff(ManifestDiff::Exited {
+            uid: "ts-revive-x".into(),
+            last_exit: LastExit { code: Some(0), memory_cap_kill: false, kills_file_offset: None, exited_at: 1.0, killed_by: None },
+        });
+        assert_eq!(app.workspaces[0].sessions.len(), 1, "row kept after the exit diff");
+        assert!(app.status_msg.as_ref().is_some_and(|(m, _)| m.contains("worktree /w/x missing")));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 8)).unwrap();
+        terminal.draw(|f| app.draw_session_list(f, f.area())).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("revive failed") && text.contains('\u{2717}'), "{text}");
+    }
+
+    /// 2026-10-12: a worker the terminal-task sweep closed looked like a
+    /// crash. Its row, the A-i peek and the A-O picker now say why.
+    #[test]
+    fn a_swept_session_says_closed_task_done_on_row_peek_and_reopen_picker() {
+        let mut app = build_app_with_session("ts-swept");
+        app.apply_manifest_diff(ManifestDiff::Exited {
+            uid: "ts-swept".into(),
+            last_exit: LastExit {
+                code: None,
+                memory_cap_kill: false,
+                kills_file_offset: None,
+                exited_at: 1.0,
+                killed_by: Some("terminal-task-sweep (terminal task)".into()),
+            },
+        });
+        app.workspaces[0].sessions[0].session.exited = true;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 8)).unwrap();
+        terminal.draw(|f| app.draw_session_list(f, f.area())).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("closed: task done"), "{text}");
+
+        app.cursor = Cursor::Session(0, 0);
+        let peek = format!("{:?}", app.build_peek_lines());
+        assert!(peek.contains("closed: task done"), "{peek}");
+
+        // Closing the row keeps the reason on its tombstone for A-O.
+        app.tombstone_exited_and_remove(0, |_| true);
+        let entry = app.workspaces[0].tombstones[0].entry.as_ref().unwrap();
+        assert_eq!(super::model::exit_note(entry.last_exit.as_ref()), Some("closed: task done"));
+
+        // An operator kill is not relabelled.
+        let other = LastExit {
+            code: None,
+            memory_cap_kill: false,
+            kills_file_offset: None,
+            exited_at: 1.0,
+            killed_by: Some("operator".into()),
+        };
+        assert_eq!(super::model::exit_note(Some(&other)), None);
+    }
+
+    fn app_with_sessions(n: usize) -> App {
+        let mut app = build_app_with_session("ts-page-0");
+        for i in 1..n {
+            let session = crate::session::Session::new(
+                "/bin/true", &[], 80, 24, None, std::collections::HashMap::new(), None,
+            )
+            .expect("test PTY");
+            let ts = make_simple_session_with_uid(format!("ts-page-{i}"), "test-label", "claude", session, None);
+            app.workspaces[0].sessions.push(ts);
+        }
+        app.sidebar_view = SidebarView::Status;
+        app.cursor = Cursor::Session(0, 0);
+        app
+    }
+
+    fn alt(c: char) -> CrosstermEvent {
+        let mods = if c.is_ascii_uppercase() { KeyModifiers::ALT | KeyModifiers::SHIFT } else { KeyModifiers::ALT };
+        CrosstermEvent::Key(crossterm::event::KeyEvent::new(KeyCode::Char(c), mods))
+    }
+
+    /// 2026-10-20: A-u / A-d page by half the visible rows (vim Ctrl-u /
+    /// Ctrl-d) and stop at the ends instead of wrapping.
+    #[test]
+    fn alt_d_and_alt_u_page_half_the_visible_rows_without_wrapping() {
+        let mut app = app_with_sessions(12);
+        app.sidebar_page_rows = 8;
+        app.handle_event(&alt('d'));
+        assert_eq!(app.cursor, Cursor::Session(0, 4));
+        app.handle_event(&alt('d'));
+        app.handle_event(&alt('d'));
+        assert_eq!(app.cursor, Cursor::Session(0, 11), "clamped at the last row");
+        app.handle_event(&alt('u'));
+        assert_eq!(app.cursor, Cursor::Session(0, 7));
+        app.handle_event(&alt('u'));
+        app.handle_event(&alt('u'));
+        assert_eq!(app.cursor, Cursor::Session(0, 0), "clamped at the first row");
+        // A tiny pane still moves one row.
+        app.sidebar_page_rows = 1;
+        app.handle_event(&alt('d'));
+        assert_eq!(app.cursor, Cursor::Session(0, 1));
+        // A-j still wraps.
+        app.cursor = Cursor::Session(0, 11);
+        app.handle_event(&alt('j'));
+        assert_eq!(app.cursor, Cursor::Session(0, 0));
+    }
+
+    /// Mark-done moved to A-D and workflow resume to A-U; plain A-d / A-u
+    /// only page. Both Shift encodings reach the moved actions.
+    #[test]
+    fn mark_done_is_alt_shift_d_and_plain_alt_d_does_not_open_it() {
+        let mut app = app_with_sessions(3);
+        app.sidebar_page_rows = 4;
+        app.handle_event(&alt('d'));
+        assert!(!matches!(app.input_mode, InputMode::WorktreeCleanup(_)), "A-d pages");
+        app.handle_event(&alt('D'));
+        assert!(app.is_input_mode(), "A-D opens the completion dialog");
+        app.input_mode = InputMode::Normal;
+        let folded = CrosstermEvent::Key(crossterm::event::KeyEvent::new(KeyCode::Char('D'), KeyModifiers::ALT));
+        app.handle_event(&folded);
+        assert!(app.is_input_mode(), "Shift folded into the char also works");
+    }
+
+    /// The shown session is reported once, then not again until the
+    /// interval passes or the selection changes.
+    #[test]
+    fn the_shown_session_is_reported_on_change_and_then_throttled() {
+        let mut app = build_app_with_session("ts-shown");
+        app.cursor = Cursor::Session(0, 0);
+        app.report_viewed_session();
+        let first = app.viewed_report.clone().expect("reported");
+        assert_eq!(first.0, "ts-shown");
+        app.report_viewed_session();
+        assert_eq!(app.viewed_report.as_ref().unwrap().1, first.1, "throttled");
+        app.workspaces[0].sessions[0].session.exited = true;
+        app.viewed_report = None;
+        app.report_viewed_session();
+        assert!(app.viewed_report.is_none(), "an exited row is not reported");
     }
 
     // ── kill-time close of adoption-minted `agent:` markers ──
@@ -3518,6 +4153,7 @@ mod apply_manifest_diff_tests {
         ManifestDiff::Exited {
             uid: uid.into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(0),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -3666,6 +4302,206 @@ mod apply_manifest_diff_tests {
         assert!(!app.close_agent_marker_if_empty(99));
     }
 
+    fn add_bash_row(app: &mut App, uid: &str, daemon_uid: &str) {
+        let session = crate::session::Session::new("/bin/true", &[], 80, 24, None, HashMap::new(), None)
+            .expect("test PTY");
+        let mut ts = make_simple_session_with_uid(uid.to_string(), "shell", "bash", session, None);
+        ts.session.daemon_session_uid = Some(daemon_uid.into());
+        app.workspaces[0].sessions.push(ts);
+    }
+
+    fn kill_exit(killed_by: &str) -> LastExit {
+        LastExit { killed_by: Some(killed_by.into()), code: None, memory_cap_kill: false, kills_file_offset: None, exited_at: 1.0 }
+    }
+
+    /// Owner rule 2026-11-05: A-w on a workspace's last agent asks whether
+    /// to close the workspace too; with another agent left it does not.
+    #[test]
+    fn closing_the_last_agent_asks_to_close_the_workspace() {
+        let mut app = build_app_with_session("ts-lead");
+        add_bash_row(&mut app, "ts-sh", "d-sh");
+        app.cursor = Cursor::Session(0, 0);
+        app.close_active_session();
+        assert!(matches!(
+            &app.input_mode,
+            InputMode::Confirm { action: ConfirmAction::CloseAfterLastAgent { ws_id }, .. } if ws_id == "ws-test"
+        ));
+
+        let mut app = build_app_with_session("ts-a");
+        let second = build_app_with_session("ts-b").workspaces.remove(0).sessions.remove(0);
+        app.workspaces[0].sessions.push(second);
+        app.cursor = Cursor::Session(0, 0);
+        app.close_active_session();
+        assert!(matches!(app.input_mode, InputMode::Normal), "another agent is still working");
+    }
+
+    /// A-w on the workspace header (Task sub-view; it replaced the task
+    /// header, 2026-11-05) closes the sessions of the workspace's task and
+    /// leaves its shells, and closing the last agent that way still asks to
+    /// close the workspace (5752067).
+    #[test]
+    fn closing_the_task_from_the_workspace_header_keeps_shells_and_asks() {
+        let mut app = build_app_with_session("ts-lead");
+        app.sidebar_view = SidebarView::Task;
+        app.workspaces[0].sessions[0].task_id = Some("t-lead".into());
+        add_bash_row(&mut app, "ts-sh", "d-sh");
+        assert_eq!(app.workspace_task(0).as_deref(), Some("t-lead"));
+        app.cursor = Cursor::Workspace(0);
+        app.close_active_session();
+        let left: Vec<&str> = app.workspaces[0].sessions.iter().map(|s| s.uid.as_str()).collect();
+        assert_eq!(left, ["ts-sh"], "the shell stays");
+        assert!(app.workspaces[0].tombstones.iter().any(|t| t.uid == "ts-lead"));
+        assert!(matches!(
+            &app.input_mode,
+            InputMode::Confirm { action: ConfirmAction::CloseAfterLastAgent { ws_id }, .. } if ws_id == "ws-test"
+        ));
+
+        // A workspace with several sessions and no task: nothing closes.
+        let mut app = build_app_with_session("ts-a");
+        app.sidebar_view = SidebarView::Task;
+        add_bash_row(&mut app, "ts-sh", "d-sh");
+        app.cursor = Cursor::Workspace(0);
+        app.close_active_session();
+        assert_eq!(app.workspaces[0].sessions.len(), 2);
+        assert!(matches!(app.input_mode, InputMode::Normal));
+    }
+
+    /// The bash-pane answers decide: a busy pane, or a pane the daemon was
+    /// not asked about, keeps the workspace; all idle closes it and its panes.
+    #[test]
+    fn last_agent_verdicts_close_only_when_every_pane_is_idle() {
+        use super::lifecycle::{LastAgentClose, LastAgentVerdict};
+        let mut app = build_app_with_session("ts-gone");
+        app.workspaces[0].sessions.clear();
+        add_bash_row(&mut app, "ts-sh", "d-sh");
+        let verdict = |checked: &[&str], busy: Vec<(String, String)>| LastAgentVerdict {
+            ws_id: "ws-test".into(),
+            trigger: LastAgentClose::Owner,
+            checked: checked.iter().map(|s| s.to_string()).collect(),
+            busy: Ok(busy),
+        };
+        app.last_agent_close_tx.send(verdict(&["d-sh"], vec![("d-sh".into(), "nvim".into())])).unwrap();
+        app.drain_last_agent_closes();
+        assert!(!app.workspaces[0].is_closed, "a pane running nvim keeps it open");
+        assert!(app.status_msg.as_ref().is_some_and(|(m, _)| m.contains("shell is running nvim")), "{:?}", app.status_msg);
+
+        app.last_agent_close_tx.send(verdict(&[], vec![])).unwrap();
+        app.drain_last_agent_closes();
+        assert!(!app.workspaces[0].is_closed, "a pane nobody asked about keeps it open");
+
+        app.last_agent_close_tx.send(verdict(&["d-sh"], vec![])).unwrap();
+        app.drain_last_agent_closes();
+        assert!(app.workspaces[0].is_closed);
+        assert!(app.workspaces[0].sessions.is_empty());
+        assert!(app.workspaces[0].tombstones.iter().any(|t| t.uid == "ts-sh"), "the idle pane closes with it");
+    }
+
+    /// Laptop diag 2026-11-05: the bash-only sweep closed workspaces bound
+    /// to running tasks; the adopt pass then took the killed bash pane back
+    /// from the session poll's cached list (taken before the kill landed),
+    /// which reopened the workspace, and the failed attach left it open and
+    /// empty. A session the viewer just closed is not adopted back; a new
+    /// session in the workspace still reopens it.
+    #[test]
+    fn a_swept_workspace_stays_closed_until_a_new_session_lands() {
+        use super::lifecycle::{LastAgentClose, LastAgentVerdict};
+        // The fixture takes home_lock itself: build first, then hold it
+        // while manifest saves go to a scratch HOME.
+        let mut app = build_app_with_session("ts-agent");
+        let _guard = crate::test_support::home_lock();
+        let home = tempfile::tempdir().unwrap();
+        let old_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home.path()) };
+        add_bash_row(&mut app, "ts-sh", "ts-sh");
+        app.tasks.push(super::super::sections::layout_tests::task("t-run", "ws-test", None));
+        let (worker, _requests, _results) = crate::attach_worker::AttachWorker::for_test();
+        app.attach_worker = Some(worker);
+        app.sessions_restored = true;
+        app.tombstone_and_remove(0, |ts| ts.session_type == "claude");
+        app.last_agent_close_tx
+            .send(LastAgentVerdict {
+                ws_id: "ws-test".into(),
+                trigger: LastAgentClose::Owner,
+                checked: vec!["ts-sh".into()],
+                busy: Ok(vec![]),
+            })
+            .unwrap();
+        app.drain_last_agent_closes();
+        assert!(app.workspaces[0].is_closed);
+
+        let summary = |uid: &str| {
+            crate::client_session::parse_daemon_session_summary(&serde_json::json!({
+                "session_uid": uid, "type": "bash", "label": "shell",
+                "task_id": "t-run", "workspace_id": "ws-test",
+            }))
+            .unwrap()
+        };
+        let local = cm_daemon::host_id::HostId::local();
+        let queued = |app: &App, uid: &str| app.pending_remote_reattach.iter().any(|p| p.entry.uid == uid);
+        app.remote_session_lists.insert(local.clone(), vec![summary("ts-sh")]);
+        app.maybe_adopt_daemon_sessions();
+        assert!(app.workspaces[0].is_closed, "the closed pane does not reopen it");
+        assert!(!queued(&app, "ts-sh"));
+
+        app.remote_session_lists.insert(local, vec![summary("ts-sh"), summary("ts-new")]);
+        app.last_adopt_scan = None;
+        app.maybe_adopt_daemon_sessions();
+        assert!(!app.workspaces[0].is_closed, "a new session lands and reopens it");
+        assert!(queued(&app, "ts-new"));
+        assert!(!queued(&app, "ts-sh"));
+        match old_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    /// The one-time sweep lists workspaces that had an agent and now hold
+    /// only live bash panes, and asks once.
+    #[test]
+    fn bash_only_sweep_offers_workspaces_that_lost_their_agents() {
+        let mut app = build_app_with_session("ts-agent");
+        add_bash_row(&mut app, "ts-sh", "d-sh");
+        assert!(app.bash_only_workspaces().is_empty(), "the agent is still there");
+        app.tombstone_and_remove(0, |ts| ts.session_type == "claude");
+        assert_eq!(app.bash_only_workspaces(), vec!["ws-test".to_string()]);
+
+        let mut shell_only = build_app_with_session("ts-x");
+        shell_only.workspaces[0].sessions.clear();
+        add_bash_row(&mut shell_only, "ts-sh2", "d-sh2");
+        assert!(shell_only.bash_only_workspaces().is_empty(), "a shell-only workspace never had an agent");
+
+        app.bash_sweep_due = Some(Instant::now());
+        app.maybe_offer_bash_only_sweep();
+        assert!(matches!(
+            &app.input_mode,
+            InputMode::Confirm { action: ConfirmAction::CloseBashOnlyWorkspaces { ws_ids }, .. } if ws_ids == &vec!["ws-test".to_string()]
+        ));
+        assert!(app.bash_sweep_due.is_none(), "asked once");
+    }
+
+    /// A lead's kill of the last agent closes the workspace without asking;
+    /// Owner's own kill (operator) does not reach this path.
+    #[test]
+    fn an_agent_kill_of_the_last_agent_closes_the_workspace() {
+        for (killer, closes) in [("ts-lead", true), ("terminal-task-sweep (terminal task)", true), ("operator", false), ("memory-cap", false)] {
+            let mut app = build_app_with_session("ts-worker");
+            app.workspaces[0].sessions[0].session.exited = true;
+            let mut other = build_app_with_session("ts-other").workspaces.remove(0);
+            other.id = "ws-other".into();
+            app.workspaces.push(other);
+            app.cursor = Cursor::Session(1, 0);
+            app.apply_manifest_diff(ManifestDiff::Exited { uid: "ts-worker".into(), last_exit: kill_exit(killer) });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while closes && !app.workspaces[0].is_closed && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                app.drain_last_agent_closes();
+            }
+            app.drain_last_agent_closes();
+            assert_eq!(app.workspaces[0].is_closed, closes, "killed_by {killer}");
+            assert!(!app.workspaces[1].is_closed);
+        }
+    }
+
     /// Cursor safety: when the cursor sits on the pruned row, the apply
     /// path's `clamp_cursor` demotes it to the workspace rather than
     /// leaving a dangling `Session(wi, si)` that later indexing (e.g.
@@ -3679,6 +4515,7 @@ mod apply_manifest_diff_tests {
         app.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-cursor".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(0),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -3705,6 +4542,7 @@ mod apply_manifest_diff_tests {
         app.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-capkill".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: None,
                 memory_cap_kill: true,
                 kills_file_offset: Some(9),
@@ -3733,6 +4571,7 @@ mod apply_manifest_diff_tests {
         let make = || ManifestDiff::Exited {
             uid: "ts-dup".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(0),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -3767,6 +4606,7 @@ mod apply_manifest_diff_tests {
         app.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-drop".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(0),
                 memory_cap_kill: false,
                 kills_file_offset: None,
@@ -3991,6 +4831,8 @@ mod apply_manifest_diff_tests {
             session_last_exits: Vec::new(),
             session_transcripts: vec![("ts-snap-resume".into(), "current".into())],
             owner_attention: None,
+            notification_health: None,
+            agent_states: None,
             sidebar_assignments: None,
             received_at: std::time::Instant::now(),
         };
@@ -4012,6 +4854,7 @@ mod apply_manifest_diff_tests {
         assert!(app.workspaces[0].sessions[0].preserved_last_exit.is_none());
 
         let last_exit = LastExit {
+            killed_by: None,
             code: Some(137),
             memory_cap_kill: true,
             kills_file_offset: Some(7),
@@ -4022,6 +4865,8 @@ mod apply_manifest_diff_tests {
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
             owner_attention: None,
+            notification_health: None,
+            agent_states: None,
             sidebar_assignments: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
@@ -4047,6 +4892,7 @@ mod apply_manifest_diff_tests {
     fn apply_snapshot_does_not_overwrite_existing_local_last_exit() {
         let mut app = build_app_with_session("ts-t23");
         let local_exit = LastExit {
+            killed_by: None,
             code: Some(0),
             memory_cap_kill: false,
             kills_file_offset: None,
@@ -4056,6 +4902,7 @@ mod apply_manifest_diff_tests {
         app.needs_redraw = false;
 
         let snapshot_exit = LastExit {
+            killed_by: None,
             code: Some(137),
             memory_cap_kill: true,
             kills_file_offset: Some(99),
@@ -4066,6 +4913,8 @@ mod apply_manifest_diff_tests {
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
             owner_attention: None,
+            notification_health: None,
+            agent_states: None,
             sidebar_assignments: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
@@ -4123,6 +4972,7 @@ mod apply_manifest_diff_tests {
         app.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-t24".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(137),
                 memory_cap_kill: true,
                 kills_file_offset: Some(1),
@@ -4165,6 +5015,7 @@ mod apply_manifest_diff_tests {
             let diff = ManifestDiff::Exited {
                 uid: "ts-t25".into(),
                 last_exit: LastExit {
+                    killed_by: None,
                     code: Some(137),
                     memory_cap_kill: true,
                     kills_file_offset: Some(2),
@@ -4199,6 +5050,7 @@ mod apply_manifest_diff_tests {
         let make_diff = || ManifestDiff::Exited {
             uid: "ts-t26".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(137),
                 memory_cap_kill: true,
                 kills_file_offset: Some(3),
@@ -4227,11 +5079,14 @@ mod apply_manifest_diff_tests {
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
             owner_attention: None,
+            notification_health: None,
+            agent_states: None,
             sidebar_assignments: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t27".into(),
                 Some(LastExit {
+                    killed_by: None,
                     code: Some(137),
                     memory_cap_kill: true,
                     kills_file_offset: Some(4),
@@ -4257,6 +5112,7 @@ mod apply_manifest_diff_tests {
         // previous TUI session's manifest write.
         app.workspaces[0].sessions[0].preserved_last_exit =
             Some(LastExit {
+                killed_by: None,
                 code: Some(137),
                 memory_cap_kill: true,
                 kills_file_offset: Some(5),
@@ -4269,11 +5125,14 @@ mod apply_manifest_diff_tests {
             listed_uids: Vec::new(),
             session_transcripts: Vec::new(),
             owner_attention: None,
+            notification_health: None,
+            agent_states: None,
             sidebar_assignments: None,
             received_at: std::time::Instant::now(),
             session_last_exits: vec![(
                 "ts-t28".into(),
                 Some(LastExit {
+                    killed_by: None,
                     code: Some(137),
                     memory_cap_kill: true,
                     kills_file_offset: Some(5),
@@ -4315,6 +5174,7 @@ mod apply_manifest_diff_tests {
         app_detached.apply_manifest_diff(ManifestDiff::Exited {
             uid: "ts-t29d".into(),
             last_exit: LastExit {
+                killed_by: None,
                 code: Some(137),
                 memory_cap_kill: true,
                 kills_file_offset: Some(7),
@@ -4639,6 +5499,38 @@ mod mouse_forwarding_tests {
                 .is_some(),
             "bare motion forwards under any-motion tracking"
         );
+    }
+
+    #[test]
+    fn alt_screen_wheel_translates_for_non_mouse_apps() {
+        let alt = TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL;
+        // Codex (alt screen, no mouse reporting): PageUp/PageDown, which
+        // scroll its transcript; arrows would recall composer history.
+        assert_eq!(alt_screen_wheel_bytes(MouseEventKind::ScrollUp, alt, true).unwrap(), b"\x1b[5~");
+        assert_eq!(alt_screen_wheel_bytes(MouseEventKind::ScrollDown, alt, true).unwrap(), b"\x1b[6~");
+        // Other apps: alternate-scroll arrows, three per notch, DECCKM-aware.
+        assert_eq!(
+            alt_screen_wheel_bytes(MouseEventKind::ScrollUp, alt, false).unwrap(),
+            b"\x1b[A\x1b[A\x1b[A"
+        );
+        assert_eq!(
+            alt_screen_wheel_bytes(MouseEventKind::ScrollDown, alt | TermMode::APP_CURSOR, false)
+                .unwrap(),
+            b"\x1bOB\x1bOB\x1bOB"
+        );
+        // ?1007l turns the arrow translation off for non-Codex apps.
+        assert!(alt_screen_wheel_bytes(MouseEventKind::ScrollUp, TermMode::ALT_SCREEN, false).is_none());
+    }
+
+    #[test]
+    fn alt_screen_wheel_leaves_primary_screen_and_mouse_apps_alone() {
+        let alt = TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL;
+        // Primary screen (inline Codex, shells): CM scrolls its own scrollback.
+        assert!(alt_screen_wheel_bytes(MouseEventKind::ScrollUp, TermMode::ALTERNATE_SCROLL, true).is_none());
+        // Mouse-reporting apps get real SGR reports via encode_mouse_for_pty.
+        assert!(alt_screen_wheel_bytes(MouseEventKind::ScrollUp, alt | TermMode::MOUSE_REPORT_CLICK, true).is_none());
+        // Non-wheel events are never translated.
+        assert!(alt_screen_wheel_bytes(MouseEventKind::Moved, alt, true).is_none());
     }
 }
 
@@ -5060,6 +5952,7 @@ pub(super) mod pending_workflow_events_tests {
 
     fn test_workspace(id: &str, worktree: std::path::PathBuf) -> Workspace {
         Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: id.to_string(),
@@ -5190,6 +6083,7 @@ pub(super) mod pending_workflow_events_tests {
         state_inner.workspaces.insert(
             "ws-e2e".into(),
             cm_daemon::manifest::ManifestWorkspace {
+                org: None,
                 color: None,
                 pinned: false,
                 id: "ws-e2e".into(),
@@ -5279,9 +6173,14 @@ pub(super) mod pending_workflow_events_tests {
         let uid = new_session_uid();
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
+            model: Some("test-model"),
+            model_source: None,
+            effort: Some("xhigh"),
+            effort_source: None,
             daemon_socket: &sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
+            auto_place_owner: false,
             workspace_id: "ws-e2e",
             label: "reviewer",
             session_type: "claude-code",
@@ -5488,7 +6387,8 @@ pub(super) mod pending_workflow_events_tests {
         let chosen = cm_daemon::host_id::HostId::new("manager");
         let before = app.workspaces.len();
         app.create_local_session(
-            &chosen, "somerepo", "label", LaunchEngine::default(), None, 0, None, true,
+            &chosen, "somerepo", "label", LaunchEngine::default(), None, 0, None, true, None,
+            None,
         );
         assert!(
             status_text(&app).contains("not reachable"),
@@ -5506,7 +6406,8 @@ pub(super) mod pending_workflow_events_tests {
         let chosen = cm_daemon::host_id::HostId::new("manager");
         let before = app.workspaces.len();
         app.create_local_session(
-            &chosen, "somerepo", "label", LaunchEngine::default(), None, 0, Some("snap-1"), false,
+            &chosen, "somerepo", "label", LaunchEngine::default(), None, 0, Some("snap-1"), false, None,
+            None,
         );
         assert!(
             status_text(&app).contains("not reachable"),
@@ -5525,7 +6426,8 @@ pub(super) mod pending_workflow_events_tests {
         let mut app = build_app_for_buffer_tests();
         let chosen = cm_daemon::host_id::HostId::local();
         app.create_local_session(
-            &chosen, "no-such-repo-xyz", "label", LaunchEngine::default(), None, 0, None, true,
+            &chosen, "no-such-repo-xyz", "label", LaunchEngine::default(), None, 0, None, true, None,
+            None,
         );
         let st = status_text(&app);
         assert!(
@@ -5559,6 +6461,7 @@ pub(super) mod pending_workflow_events_tests {
             seed_from: None,
             in_place: true,
             host_id: cm_daemon::host_id::HostId::new("manager"),
+            model: None, effort: None,
         });
         assert!(
             status_text(&app).contains("not reachable"),
@@ -5578,6 +6481,7 @@ pub(super) mod pending_workflow_events_tests {
             seed_from: None,
             in_place: true,
             host_id: cm_daemon::host_id::HostId::local(),
+            model: None, effort: None,
         });
         assert_eq!(
             status_text(&app),
@@ -5602,6 +6506,7 @@ pub(super) mod pending_workflow_events_tests {
             None,
             Some("snap-2"),
             None,
+            None, None,
         );
         assert!(
             status_text(&app).contains("not reachable"),
@@ -5641,6 +6546,7 @@ pub(super) mod pending_workflow_events_tests {
         state_inner.workspaces.insert(
             "ws-mgr".into(),
             cm_daemon::manifest::ManifestWorkspace {
+                org: None,
                 color: None,
                 pinned: false,
                 id: "ws-mgr".into(),
@@ -5746,9 +6652,14 @@ pub(super) mod pending_workflow_events_tests {
         let uid = new_session_uid();
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
+            model: Some("test-model"),
+            model_source: None,
+            effort: Some("xhigh"),
+            effort_source: None,
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
+            auto_place_owner: false,
             workspace_id: "ws-mgr",
             label: "claude-code",
             session_type: "claude-code",
@@ -5854,6 +6765,7 @@ pub(super) mod pending_workflow_events_tests {
         state_inner.workspaces.insert(
             "ws-r".into(),
             cm_daemon::manifest::ManifestWorkspace {
+                org: None,
                 color: None,
                 pinned: false,
                 id: "ws-r".into(),
@@ -5924,9 +6836,14 @@ pub(super) mod pending_workflow_events_tests {
         let uid = new_session_uid();
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
+            model: Some("test-model"),
+            model_source: None,
+            effort: Some("xhigh"),
+            effort_source: None,
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
+            auto_place_owner: false,
             workspace_id: "ws-r",
             label: "claude-code",
             session_type: "claude-code",
@@ -5952,6 +6869,11 @@ pub(super) mod pending_workflow_events_tests {
         // Manifest on disk: workspace ws-r with one session pinned to host
         // "manager".
         let entry = ManifestEntry {
+            org: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -5979,6 +6901,7 @@ pub(super) mod pending_workflow_events_tests {
             host_id: cm_daemon::host_id::HostId::new("manager"),
         };
         let mw = ManifestWorkspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-r".into(),
@@ -5999,6 +6922,9 @@ pub(super) mod pending_workflow_events_tests {
         let manifest = Manifest {
             messaging_names: Default::default(),
             task_colors: Default::default(),
+            folded_tasks: Default::default(),
+            folded_divisions: Default::default(),
+            folded_org: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             agent_task_edges: HashMap::new(),
@@ -6116,6 +7042,7 @@ pub(super) mod pending_workflow_events_tests {
         state_inner.workspaces.insert(
             "ws-r".into(),
             ManifestWorkspace {
+                org: None,
                 color: None,
                 pinned: false,
                 id: "ws-r".into(),
@@ -6139,9 +7066,14 @@ pub(super) mod pending_workflow_events_tests {
         let uid = new_session_uid();
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
+            model: Some("test-model"),
+            model_source: None,
+            effort: Some("xhigh"),
+            effort_source: None,
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
+            auto_place_owner: false,
             workspace_id: "ws-r",
             label: "claude-code",
             session_type: "claude-code",
@@ -6166,6 +7098,11 @@ pub(super) mod pending_workflow_events_tests {
         // Manifest entry pinned to "manager" with a STALE workflow_run_id
         // (no active runs exist → it's Detached/Done from the TUI's POV).
         let entry = ManifestEntry {
+            org: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -6193,6 +7130,7 @@ pub(super) mod pending_workflow_events_tests {
             host_id: cm_daemon::host_id::HostId::new("manager"),
         };
         let mw = ManifestWorkspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-r".into(),
@@ -6213,6 +7151,9 @@ pub(super) mod pending_workflow_events_tests {
         let manifest = Manifest {
             messaging_names: Default::default(),
             task_colors: Default::default(),
+            folded_tasks: Default::default(),
+            folded_divisions: Default::default(),
+            folded_org: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             agent_task_edges: HashMap::new(),
@@ -6327,6 +7268,7 @@ pub(super) mod pending_workflow_events_tests {
         state_inner.workspaces.insert(
             "ws-r".into(),
             ManifestWorkspace {
+                org: None,
                 color: None,
                 pinned: false,
                 id: "ws-r".into(),
@@ -6351,9 +7293,14 @@ pub(super) mod pending_workflow_events_tests {
         let uid_gone = new_session_uid(); // never spawned → attach will fail
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
+            model: Some("test-model"),
+            model_source: None,
+            effort: Some("xhigh"),
+            effort_source: None,
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid_live,
+            auto_place_owner: false,
             workspace_id: "ws-r",
             label: "claude-code",
             session_type: "claude-code",
@@ -6377,6 +7324,11 @@ pub(super) mod pending_workflow_events_tests {
 
         // Manifest: [gone, live] — gone FIRST so its failure precedes live.
         let mk = |uid: &str| ManifestEntry {
+            org: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -6404,6 +7356,7 @@ pub(super) mod pending_workflow_events_tests {
             host_id: cm_daemon::host_id::HostId::new("manager"),
         };
         let mw = ManifestWorkspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-r".into(),
@@ -6424,6 +7377,9 @@ pub(super) mod pending_workflow_events_tests {
         let manifest = Manifest {
             messaging_names: Default::default(),
             task_colors: Default::default(),
+            folded_tasks: Default::default(),
+            folded_divisions: Default::default(),
+            folded_org: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             agent_task_edges: HashMap::new(),
@@ -6529,6 +7485,11 @@ pub(super) mod pending_workflow_events_tests {
         std::fs::create_dir_all(&cm_dir).unwrap();
 
         let mk = |uid: &str| ManifestEntry {
+            org: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -6557,6 +7518,7 @@ pub(super) mod pending_workflow_events_tests {
             host_id: cm_daemon::host_id::HostId::new("ghost"),
         };
         let mw = ManifestWorkspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-g".into(),
@@ -6577,6 +7539,9 @@ pub(super) mod pending_workflow_events_tests {
         let manifest = Manifest {
             messaging_names: Default::default(),
             task_colors: Default::default(),
+            folded_tasks: Default::default(),
+            folded_divisions: Default::default(),
+            folded_org: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             agent_task_edges: HashMap::new(),
@@ -6673,6 +7638,11 @@ pub(super) mod pending_workflow_events_tests {
         let local_sock = cm_dir.join("daemon.sock");
 
         let entry = ManifestEntry {
+            org: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -6700,6 +7670,7 @@ pub(super) mod pending_workflow_events_tests {
             host_id: cm_daemon::host_id::HostId::new("manager"),
         };
         let mw = ManifestWorkspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-ssh".into(),
@@ -6720,6 +7691,9 @@ pub(super) mod pending_workflow_events_tests {
         let manifest = Manifest {
             messaging_names: Default::default(),
             task_colors: Default::default(),
+            folded_tasks: Default::default(),
+            folded_divisions: Default::default(),
+            folded_org: Default::default(),
             workspaces,
             bindings: HashMap::new(),
             agent_task_edges: HashMap::new(),
@@ -6863,6 +7837,7 @@ pub(super) mod pending_workflow_events_tests {
         state_inner.workspaces.insert(
             "ws-c".into(),
             cm_daemon::manifest::ManifestWorkspace {
+                org: None,
                 color: None,
                 pinned: false,
                 id: "ws-c".into(),
@@ -6936,9 +7911,14 @@ pub(super) mod pending_workflow_events_tests {
         let uid = new_session_uid();
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
+            model: Some("test-model"),
+            model_source: None,
+            effort: Some("xhigh"),
+            effort_source: None,
             daemon_socket: &mgr_sock,
             operator_token_id: crate::daemon_launch::operator_token(),
             uid: &uid,
+            auto_place_owner: false,
             workspace_id: "ws-c",
             label: "claude-code",
             session_type: "claude-code",
@@ -7005,6 +7985,7 @@ pub(super) mod pending_workflow_events_tests {
         // plus a queued reattach (with its preserved-on-disk copy) for the
         // live session.
         app.workspaces.push(Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-c".into(),
@@ -7021,6 +8002,11 @@ pub(super) mod pending_workflow_events_tests {
             tombstones: Vec::new(),
         });
         let entry = ManifestEntry {
+            org: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             transcript_path: None,
             reported_done_at: None,
             report_reason: None,
@@ -7158,6 +8144,7 @@ pub(super) mod pending_workflow_events_tests {
             None,
         );
         app.workspaces.push(Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-local".into(),
@@ -7184,6 +8171,7 @@ pub(super) mod pending_workflow_events_tests {
         );
         remote_sess.host_id = cm_daemon::host_id::HostId::new("manager");
         app.workspaces.push(Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-remote".into(),
@@ -7204,6 +8192,7 @@ pub(super) mod pending_workflow_events_tests {
         // recording listener doesn't run the real spawn).
         app.launch_workflow_via_daemon("ws-local", "feedback", &[], Some("goal-l".into()), None);
         app.launch_workflow_via_daemon("ws-remote", "feedback", &[], Some("goal-r".into()), None);
+        app.settle_background();
 
         let find_sw = |caps: &std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>|
          -> Option<serde_json::Value> {
@@ -7713,6 +8702,7 @@ mod backtest_group_tests {
 
     fn empty_cloud_ws(id: &str, name: &str, worker_vm: Option<&str>) -> Workspace {
         Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: id.into(),
@@ -8012,5 +9002,101 @@ mod backtest_group_tests {
             assert!(app.backtest_rows.is_empty());
             assert_eq!(app.cursor, Cursor::Workspace(0));
         });
+    }
+}
+
+/// `send_key` over the TUI socket (Owner 2026-10-22; review of a41f14d):
+/// the TUI checks scope and liveness, then forwards each host's targets to
+/// that daemon's `session.send_key`, which encodes the key for the session's
+/// tracked keyboard mode and writes it without an input stamp.
+#[cfg(test)]
+mod send_key_tests {
+    use super::super::sections::layout_tests::{bare_ws, test_app};
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A TUI row for `uid`, backed by a local sleeper (the TUI's own PTY is
+    /// never written: keys go to the daemon).
+    fn row(app: &mut App, wi: usize, uid: &str, daemon_uid: Option<&str>) {
+        let mut pty = crate::session::Session::new("/bin/sleep", &["30".into()], 80, 24, None, HashMap::new(), None).unwrap();
+        pty.daemon_session_uid = daemon_uid.map(str::to_owned);
+        let mut ts = super::super::model::make_simple_session_with_uid(uid.into(), uid, "codex", pty, None);
+        ts.session.exited = false;
+        app.workspaces[wi].sessions.push(ts);
+    }
+
+    fn read(file: &std::path::Path, len: usize) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let got = std::fs::read(file).unwrap_or_default();
+            if got.len() >= len || Instant::now() > deadline {
+                return got;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn send_key_forwards_to_the_host_daemon_and_reports_each_target() {
+        let (socket, dir, state, stop, _handle) = crate::client_session::tests::start_test_daemon("ws-k");
+        // The daemon's session records its raw input, after a kitty push.
+        let file = dir.join("keys");
+        let mut sp = cm_daemon::session::SpawnParams::new("ts-31-0", "ts-31-0", "/bin/sh");
+        sp.args = vec!["-c".into(), format!("printf '\\033[>1u'; stty raw -echo; exec cat > '{}'", file.display())];
+        sp.workspace_id = "ws-k".into();
+        sp.session_type = "codex".into();
+        let sess = cm_daemon::session::DaemonSession::spawn(sp).unwrap();
+        state.lock().unwrap().sessions.insert("ts-31-0".into(), sess);
+        std::thread::sleep(Duration::from_millis(300));
+
+        let mut app = test_app();
+        let hosts = crate::hosts::HostsConfig {
+            hosts: vec![crate::hosts::HostConfig {
+                id: cm_daemon::host_id::HostId::local(),
+                transport: crate::hosts::HostTransport::Unix { socket: socket.clone() },
+                default: true,
+                operator_token: None,
+                operator_token_file: None,
+            }],
+        };
+        app.host_pool = std::sync::Arc::new(crate::host_pool::HostPool::from_config(&hosts).unwrap());
+        app.workspaces = vec![bare_ws("a"), bare_ws("b")];
+        row(&mut app, 0, "ts-1-0", None); // the caller
+        row(&mut app, 0, "ts-31-0", Some("ts-31-0"));
+        row(&mut app, 0, "ts-2-0", None); // in scope, not on a daemon
+        row(&mut app, 1, "ts-3-0", Some("ts-3-0"));
+        let reply = crate::control::methods::send_key(
+            &mut app,
+            "ts-1-0",
+            &serde_json::json!({"session_uids": ["ts-31-0", "ts-3-0", "ts-gone", "ts-2-0"], "key": "enter"}),
+        )
+        .unwrap();
+        let statuses: Vec<&str> = reply["results"].as_array().unwrap().iter().map(|r| r["status"].as_str().unwrap()).collect();
+        assert_eq!(statuses, ["ok", "unauthorized", "not_found", "error"], "{reply}");
+        assert_eq!(reply["results"][0]["session_uid"], "ts-31-0");
+        assert_eq!(reply["results"][0]["keyboard"], "kitty");
+        assert_eq!(reply["results"][0]["mode"], "observed");
+        assert_eq!(read(&file, 5), b"\x1b[13u", "the daemon's kitty Enter, nothing more");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(std::fs::read(&file).unwrap(), b"\x1b[13u");
+        assert!(
+            state.lock().unwrap().sessions["ts-31-0"].last_input_at.lock().unwrap().is_none(),
+            "a key is not new work: no input stamp"
+        );
+        // A bad key is refused before anything is sent.
+        let err = crate::control::methods::send_key(&mut app, "ts-1-0", &serde_json::json!({"session_uids": "ts-31-0", "key": "enter please"})).unwrap_err();
+        assert_eq!(err.0, crate::control::protocol::ErrorCode::InvalidParams);
+        for (_, mut s) in state.lock().unwrap().sessions.drain() {
+            let _ = s.kill();
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn send_key_shows_in_the_activity_feed_by_key() {
+        let one = activity_summary_for("send_key", &serde_json::json!({"session_uids": "ts-123456789-0", "key": "enter"}), &serde_json::Value::Null);
+        assert_eq!(one.as_deref(), Some("send_key enter (ts-12345)"));
+        let many = activity_summary_for("send_key", &serde_json::json!({"session_uids": ["a", "b", "c"], "key": "down"}), &serde_json::Value::Null);
+        assert_eq!(many.as_deref(), Some("send_key down (3 sessions)"));
     }
 }

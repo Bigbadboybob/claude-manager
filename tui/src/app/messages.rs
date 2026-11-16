@@ -26,6 +26,29 @@ pub struct Draft {
     links: Vec<Value>,
     origin: Option<String>,
 }
+/// One agent session with an open Owner alert (the "Open alerts" rows).
+#[derive(Clone, Debug)]
+pub struct OpenAlert {
+    pub uid: String,
+    pub key: String,
+    pub id: Option<String>,
+    pub host: cm_daemon::host_id::HostId,
+    pub label: String,
+    pub reason: String,
+    pub since: SystemTime,
+}
+
+/// `45s`, `12m`, `3h`, `2d` since `t`.
+fn short_age(t: SystemTime) -> String {
+    let s = SystemTime::now().duration_since(t).map_or(0, |d| d.as_secs());
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m", s / 60),
+        3600..=86_399 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86_400),
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Saved {
@@ -61,6 +84,12 @@ pub struct Messages {
     cache: Value,
     norms: String,
     filter: Value,
+    search_target: Value,
+    search_request_target: Value,
+    search_waiting: bool,
+    search_retry_at: Option<Instant>,
+    search_retry_count: u8,
+    search_retry_params: Value,
     next: Value,
     rx: Option<Receiver<(String, Result<Value, String>)>>,
     busy: bool,
@@ -69,6 +98,7 @@ pub struct Messages {
     daemon_id: String,
     space_id: String,
     body_scroll: u16,
+    body_max_scroll: u16,
     timeline_scroll: usize,
     timeline_size: (u16, u16),
     reveal_selection: bool,
@@ -83,8 +113,172 @@ pub struct Messages {
     channel_edit_base: Value,
     channel_selection_pending: bool,
     pub settings_name: Option<(String, String, u64)>,
+    /// Rendered rows per message id at a width (unselected); rebuilt only
+    /// when that message changes, so scrolling never re-wraps history.
+    layout: HashMap<String, (u16, Vec<Line<'static>>)>,
+    layout_builds: u64,
+    /// Older history is wanted (PgUp/k at the top, or the prefetch) but a
+    /// request was in flight; fetched on the next idle tick.
+    want_older: bool,
+    /// The visible rows reach the oldest loaded message: prefetch.
+    near_top: bool,
+    /// n / N: the direction to keep seeking a mention after older history
+    /// loads, with how many pages are left to try.
+    seek_mention: (i8, u8),
+    /// A one-line `y` confirm for marking a conversation read.
+    confirm: Option<(String, Value)>,
+    /// `+` was pressed: the next 1–5 toggles a reaction on the selection.
+    reacting: bool,
+    /// Screen width at the last draw (sidebar resize bounds).
+    screen_width: u16,
+    /// Older messages just prepended: the timeline keeps its place.
+    prepended: usize,
+    /// Pinned "Open alerts" rows, refreshed from the App before each draw
+    /// and key event.
+    pub open_alerts: Vec<OpenAlert>,
+    /// Bumped whenever the loaded messages change; keys `row_heights`.
+    layout_epoch: u64,
+    /// (epoch, width, count, rows per message incl. separator).
+    row_heights: (u64, u16, usize, Vec<usize>),
+}
+
+/// The reactions Owner can add (the daemon's allowlist), keys 1–5 after `+`.
+const REACTIONS: [&str; 5] = ["\u{2705}", "\u{1f440}", "\u{1f44d}", "\u{274c}", "\u{1f389}"];
+
+/// Has Owner already reacted with `emoji`? `reactions_mine` when the daemon
+/// supplies it, else Owner's display name among the reactors.
+fn reacted_by_me(m: &Value, emoji: &str) -> bool {
+    let r = &m["reactions"][emoji];
+    if let Some(mine) = r["mine"].as_bool() {
+        return mine;
+    }
+    match m["reactions_mine"].as_array() {
+        Some(mine) => mine.iter().any(|e| e == emoji),
+        None => reaction_names(r).iter().any(|n| n == "Owner"),
+    }
+}
+
+/// Reactor names from `{count, names, mine}` or a bare name list.
+fn reaction_names(r: &Value) -> Vec<String> {
+    r["names"]
+        .as_array()
+        .or_else(|| r.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|n| n.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Messages addressed to Owner: a structured mention or `@here`.
+fn mentions_owner(m: &Value) -> bool {
+    m["actor"]["id"] != "owner"
+        && (m["data"]["mention_here"] == true
+            || m["data"]
+                .get("mention_recipients")
+                .unwrap_or(&m["data"]["mentions"])
+                .as_array()
+                .is_some_and(|a| a.iter().any(|id| id == "owner")))
+}
+
+/// Shorten from the middle so both ends of a long name stay readable.
+fn middle_truncate(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_owned();
+    }
+    if max <= 1 {
+        return "\u{2026}".chars().take(max).collect();
+    }
+    let head = (max - 1).div_ceil(2);
+    let tail = max - 1 - head;
+    let mut out: String = s.chars().take(head).collect();
+    out.push('\u{2026}');
+    out.extend(s.chars().skip(n - tail));
+    out
+}
+
+/// Shorten from the end with `…`.
+fn end_truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    if max > 0 {
+        out.push('\u{2026}');
+    }
+    out
+}
+
+/// `@99+` style counts for the sidebar's count column.
+fn count_label(prefix: char, n: u64) -> String {
+    match n {
+        0 => String::new(),
+        1..=99 => format!("{prefix}{n}"),
+        _ => format!("{prefix}99+"),
+    }
+}
+
+/// Current UTC time as RFC 3339 (the TUI carries no date crate).
+fn rfc3339_now() -> String {
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let (days, secs) = (t.div_euclid(86_400), t.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", secs / 3600, secs % 3600 / 60, secs % 60)
 }
 impl Messages {
+    fn search_scope_key(&self) -> Value {
+        let mut key = json!({});
+        for field in ["channel", "conversation", "dm", "inbox", "dms", "mentions", "norms", "norms_scope", "monitors", "preferences"] {
+            if let Some(value) = self.target.get(field) { key[field] = value.clone(); }
+        }
+        key
+    }
+    fn set_target(&mut self, target: Value) {
+        self.target = target;
+        self.synchronize_search_target();
+    }
+    fn reset_search_retry(&mut self) {
+        self.search_waiting = false;
+        self.search_retry_at = None;
+        self.search_retry_count = 0;
+        self.search_retry_params = Value::Null;
+    }
+    fn synchronize_search_target(&mut self) -> bool {
+        let key = self.search_scope_key();
+        if self.search_target == key { return false; }
+        if let Some(filter) = self.filter.as_object_mut() {
+            filter.remove("sender"); filter.remove("query");
+        }
+        self.search_target = key;
+        self.page_cursor = Value::Null;
+        self.reset_search_retry();
+        true
+    }
+    fn search_response(&mut self, value: &Value) {
+        if self.search_request_target != self.search_target { self.reset_search_retry(); return; }
+        if value["indexing"] != true { self.reset_search_retry(); return; }
+        self.search_waiting = true;
+        self.search_retry_params = self.management.request.clone();
+        // Respect the server's minimum delay, then back off so five retries
+        // can cover a large cold index without polling forever.
+        if self.search_retry_count < 5 {
+            let seconds = value["retry_after"].as_u64().unwrap_or(1).clamp(1, 60);
+            let delay = seconds.saturating_mul(1 << self.search_retry_count).min(300);
+            self.search_retry_at = Some(Instant::now() + Duration::from_secs(delay));
+            self.status = format!("Search indexing · retry {} of 5 in {delay}s", self.search_retry_count + 1);
+        } else {
+            self.search_retry_at = None;
+            self.status = "Search still indexing · reapply / filters to retry".into();
+        }
+    }
     pub fn load() -> Self {
         let saved = std::fs::read(Self::path())
             .ok()
@@ -155,8 +349,29 @@ impl Messages {
         self.persist()
     }
     fn menu_items(&self) -> Vec<(String, Value)> {
-        let mut out = vec![
+        let mut out = Vec::new();
+        // Pinned first: agents waiting on Owner, oldest first.
+        if !self.open_alerts.is_empty() {
+            out.push((
+                format!("\u{2691} Open alerts ({})", self.open_alerts.len()),
+                json!({"alerts_header": true}),
+            ));
+            for a in &self.open_alerts {
+                let host = if a.host == cm_daemon::host_id::HostId::local() {
+                    String::new()
+                } else {
+                    format!(" \u{00b7} {}", a.host.as_str())
+                };
+                out.push((
+                    // Age first (like the count column), so it survives truncation.
+                    format!("  {:>3} {}{host} \u{00b7} {}", short_age(a.since), a.label, a.reason),
+                    json!({"alert": a.uid, "alert_host": a.host.as_str(), "alert_key": a.key, "alert_id": a.id}),
+                ));
+            }
+        }
+        out.extend(vec![
             ("Inbox".into(), json!({"inbox":true})),
+            ("  Mentions".into(), json!({"mentions":true})),
             (
                 "Needs Owner".into(),
                 json!({"channel":"*","tags":["needs-owner"]}),
@@ -177,7 +392,7 @@ impl Messages {
                 json!({"monitors":true}),
             ),
             ("Preferences".into(), json!({"preferences":true})),
-        ];
+        ]);
         out.push((
             "Browse channels · b".into(),
             json!({"channel_browser":true}),
@@ -188,19 +403,11 @@ impl Messages {
             .filter(|c| c["joined"] != false)
             .collect();
         channels.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+        // Counts are drawn in their own column before the name (menu_counts).
         out.extend(channels.into_iter().map(|c| {
-            let unread = c["unread"].as_u64().unwrap_or(0);
-            let mentions = c["mentions"].as_u64().unwrap_or(0);
-            let badge = if mentions > 0 {
-                format!(" @ {mentions}")
-            } else if unread > 0 {
-                " ·".into()
-            } else {
-                String::new()
-            };
             (
                 format!(
-                    "#{}{badge}",
+                    "#{}",
                     c["name"]
                         .as_str()
                         .or_else(|| c["path"].as_str())
@@ -235,24 +442,85 @@ impl Messages {
                     .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
             });
             out.extend(dms.into_iter().map(|d| {
-                let unread = d["unread"].as_u64().unwrap_or(0);
-                (
-                    format!(
-                        "  {}{}",
-                        if unread > 0 {
-                            format!("●{unread} ")
-                        } else {
-                            String::new()
-                        },
-                        self.dm_label(d)
-                    ),
-                    json!({"conversation":d["id"]}),
-                )
+                (format!("  {}", self.dm_label(d)), json!({"conversation":d["id"]}))
             }));
         }
         out
     }
+    /// (mentions, unread) for a sidebar row's count column.
+    fn menu_counts(&self, target: &Value) -> (u64, u64) {
+        let row = if let Some(path) = target["channel"].as_str() {
+            self.channels.iter().find(|c| c["path"] == path)
+        } else if target.get("conversation").is_some() {
+            self.dms.iter().find(|d| d["id"] == target["conversation"])
+        } else {
+            None
+        };
+        row.map_or((0, 0), |r| (r["mentions"].as_u64().unwrap_or(0), r["unread"].as_u64().unwrap_or(0)))
+    }
+    /// Width of the sidebar count column (`@2 ●15 `), and each target's text.
+    fn count_columns(&self) -> (usize, Vec<(String, String)>) {
+        let rows: Vec<(String, String)> = self
+            .menu_items()
+            .iter()
+            .map(|(_, t)| {
+                let (m, u) = self.menu_counts(t);
+                (count_label('@', m), count_label('\u{25cf}', u))
+            })
+            .collect();
+        let mw = rows.iter().map(|r| r.0.chars().count()).max().unwrap_or(0);
+        let uw = rows.iter().map(|r| r.1.chars().count()).max().unwrap_or(0);
+        let width = if mw > 0 { mw + 1 } else { 0 } + if uw > 0 { uw + 1 } else { 0 };
+        // Only conversation rows carry the column; menu rows stay flush.
+        let conversation = |t: &Value| {
+            t["channel"].as_str().is_some_and(|c| c != "*") || t.get("conversation").is_some()
+        };
+        let targets: Vec<Value> = self.menu_items().into_iter().map(|(_, t)| t).collect();
+        let rows = rows
+            .into_iter()
+            .zip(targets)
+            .map(|((m, u), t)| {
+                if !conversation(&t) {
+                    return (String::new(), String::new());
+                }
+                (
+                    if mw > 0 { format!("{m:<mw$} ") } else { String::new() },
+                    if uw > 0 { format!("{u:<uw$} ") } else { String::new() },
+                )
+            })
+            .collect();
+        (width, rows)
+    }
+    /// The conversation a mark-read applies to, with its label and counts.
+    fn mark_read_target(&self) -> Option<(String, Value, u64, u64)> {
+        let target = if self.pane == 0 {
+            self.menu_items().get(self.menu).map(|(_, t)| t.clone())?
+        } else {
+            self.target.clone()
+        };
+        if target["inbox"] == true {
+            return Some(("everything in Inbox".into(), json!({"inbox":true}), 0, 0));
+        }
+        if target["mentions"] == true {
+            return Some(("all your mentions".into(), json!({"mentions":true}), 0, 0));
+        }
+        if target["channel"].as_str().is_some_and(|c| c != "*") || target.get("conversation").is_some() {
+            let (mentions, unread) = self.menu_counts(&target);
+            let name = if let Some(c) = target["channel"].as_str() {
+                self.channels.iter().find(|ch| ch["path"] == c)
+                    .map(|ch| format!("#{}", ch["name"].as_str().unwrap_or(c)))
+                    .unwrap_or_else(|| format!("#{c}"))
+            } else {
+                self.conversation_label(&target["conversation"])
+            };
+            return Some((name, target, mentions, unread));
+        }
+        None
+    }
     fn target_label(&self) -> String {
+        if self.target["mentions"] == true {
+            return "Mentions".into();
+        }
         if self.target["norms"] == true {
             return self.target["norms_label"].as_str().unwrap_or("Shared norms").into();
         }
@@ -383,6 +651,10 @@ impl Messages {
             self.status = format!("Matches: {}", matches.join(", "));
         }
     }
+    #[cfg(test)]
+    pub(super) fn target_for_test(&self) -> &Value {
+        &self.target
+    }
     fn sync_label(&self) -> String {
         if self.sync["enabled"] != true {
             return String::new();
@@ -402,7 +674,10 @@ impl Messages {
     /// Refresh faster while a conversation's history is still arriving, so the
     /// board fills in as the hub backfill progresses.
     fn refresh_interval(&self) -> Duration {
-        if self.cache["backfill"].is_object() {
+        if self.target["mentions"] == true {
+            // A multi-page inbox scan; mentions are also pushed as wakes.
+            Duration::from_secs(15)
+        } else if self.cache["backfill"].is_object() {
             Duration::from_secs(1)
         } else {
             Duration::from_secs(3)
@@ -422,6 +697,22 @@ impl Messages {
     }
 }
 impl App {
+    /// F8 / Alt+m opening Messages while something is unread: start on the
+    /// Inbox, newest first, instead of the last channel (status-bar `✉`/`@`).
+    fn open_messages_on_unread(&mut self) {
+        if self.unread.total() == 0 {
+            return;
+        }
+        self.messages.menu = 0;
+        self.messages.set_target(json!({"inbox": true}));
+        self.messages.filter = json!({});
+        self.messages.page_cursor = Value::Null;
+        self.messages.pane = 1;
+        self.messages.selected = 0;
+        self.messages.body_scroll = 0;
+        self.messages.channel_selection_pending = false;
+    }
+
     pub fn messaging_tick(&mut self) {
         // Refreshes run off-thread, but input still belongs to the operator.
         // Replay it in order before starting another refresh. Closing the panel
@@ -445,6 +736,11 @@ impl App {
             self.needs_redraw = true;
             match result {
                 Err(e) => {
+                    if method == "messaging.read" && self.messages.search_request_target == self.messages.search_target
+                        && (e.contains("search_index_failed") || e.contains("search_disabled")) {
+                        self.messages.search_waiting = true;
+                        self.messages.search_retry_at = None;
+                    }
                     self.messaging_management_error(&method, &e);
                     if method == "messaging.send" {
                         if let Some((key, request)) = self.messages.pending_send.take() {
@@ -474,7 +770,13 @@ impl App {
                             }
                         }
                     }
-                    self.messages.error = e;
+                    self.messages.error = if method == "messaging.react"
+                        && (e.contains("unknown") || e.contains("not implemented"))
+                    {
+                        "Reactions need the updated daemon (next deploy)".into()
+                    } else {
+                        e
+                    };
                 }
                 Ok(v) => {
                     self.messages.error.clear();
@@ -517,11 +819,15 @@ impl App {
                         }
                         "messaging.read" => {
                             self.messages.accept_messages(&v);
+                            if self.messages.seek_mention.0 != 0 {
+                                self.messaging_seek_mention(self.messages.seek_mention.0);
+                            }
                             if let Some(reason) = v["degraded"].as_str() {
                                 self.messages.error = format!("Storage is read only: {reason}");
                             }
                             self.messages.status =
                                 read_status(self.messages.items.len(), &v);
+                            self.messages.search_response(&v);
                         }
                         "messaging.send" => {
                             if let Some((key, request)) = self.messages.pending_send.take() {
@@ -548,11 +854,38 @@ impl App {
                             }
                             .into();
                             if let Some(cid) = v["event"]["conversation_id"].as_str() {
-                                self.messages.target = json!({"conversation":cid});
+                                self.messages.set_target(json!({"conversation":cid}));
                             }
                             self.messages.page_cursor = Value::Null;
                             self.messages.loaded_target = Value::Null;
                             self.messaging_request("messaging.read", self.messages.query());
+                        }
+                        "mentions_list" => {
+                            self.messages.accept_messages(&v);
+                            self.messages.status = format!("{} mentions · Enter opens in context · M marks all read", self.messages.items.len());
+                        }
+                        "jump" => {
+                            self.messages.accept_messages(&v);
+                            if let Some(i) = self.messages.items.iter().position(|m| m["id"] == v["_jump"]) {
+                                self.messages.selected = i;
+                                self.messages.reveal_selection = true;
+                                self.messages.status = "Jumped to the mention · n/N next/previous mention".into();
+                            } else {
+                                self.messages.status = "That message is older than the loaded history".into();
+                            }
+                        }
+                        "mark_read" => {
+                            self.messages.status = match v["marked"].as_u64() {
+                                Some(n) => format!("Marked {n} read"),
+                                None => "Marked read".into(),
+                            };
+                            self.messaging_apply_counts(&v["counts"]);
+                            self.messages.page_cursor = Value::Null;
+                            self.messaging_refresh_target();
+                        }
+                        "messaging.react" => {
+                            self.messages.accept_reaction(&v);
+                            self.messaging_apply_counts(&v["counts"]);
                         }
                         "channel_members" => {
                             self.messages.channel_members = v["items"].as_array().cloned().unwrap_or_default();
@@ -572,8 +905,30 @@ impl App {
                 }
             }
         }
+        if self.messages.visible && !self.messages.busy && self.messages.mode.is_empty()
+            && self.messages.search_retry_at.is_some_and(|at| Instant::now() >= at) {
+            self.messages.search_retry_at = None;
+            self.messages.search_retry_count += 1;
+            self.messaging_request("messaging.read", self.messages.search_retry_params.clone());
+            return;
+        }
         if self.messages.visible
             && !self.messages.busy
+            && !self.messages.search_waiting
+            && (self.messages.want_older || self.messages.near_top)
+            && !self.messages.next.is_null()
+            // A failed page waits for the regular refresh, not every tick.
+            && self.messages.error.is_empty()
+            && self.messages.target["mentions"] != true
+        {
+            let select = std::mem::take(&mut self.messages.want_older) && self.messages.selected == 0;
+            self.messages.near_top = false;
+            self.messaging_load_older(select);
+            return;
+        }
+        if self.messages.visible
+            && !self.messages.busy
+            && !self.messages.search_waiting
             && self.messages.mode.is_empty()
             && (self.messages.page_cursor.is_null() || self.messages.live_conversation())
             && self
@@ -585,6 +940,11 @@ impl App {
         }
     }
     fn messaging_request(&mut self, method: &str, mut params: Value) {
+        if self.messages.synchronize_search_target() {
+            if let Some(p) = params.as_object_mut() {
+                p.remove("sender"); p.remove("query"); p.remove("cursor");
+            }
+        }
         if matches!(method, "messaging.norms" | "norms_document") && params.get("scope").is_none() {
             params["scope"] = json!(self.messages.norms_scope());
         }
@@ -598,10 +958,21 @@ impl App {
         };
         let token = self.host_pool.operator_token_for(&host);
         self.messages.management.request = params.clone();
-        let catch_up_to = (method == "messaging.read"
+        if matches!(method, "messaging.read" | "hub_refresh") {
+            self.messages.search_request_target = self.messages.search_scope_key();
+        }
+        let refresh = matches!(method, "messaging.read" | "hub_refresh")
             && self.messages.live_conversation()
             && self.messages.loaded_target == self.messages.query()
-            && params["cursor"].is_null())
+            && params["cursor"].is_null();
+        // Reading a conversation marks it read (the daemon's default for a
+        // direct read); a background refresh only does so while Owner is at
+        // the newest message, not while scrolled back in history.
+        if refresh {
+            params["mark_read"] = json!(self.messages.selected + 1 >= self.messages.items.len());
+            self.messages.management.request = params.clone();
+        }
+        let catch_up_to = (method == "messaging.read" && refresh)
             .then(|| self.messages.items.last().map(|m| m["id"].clone())).flatten();
         let method = method.to_owned();
         let (tx, rx) = mpsc::channel();
@@ -665,6 +1036,10 @@ impl App {
                         }
                     }
                     // Sidebar failures must not hide successfully read messages.
+                    // Older pages skip the sidebar: paging back stays one call.
+                    if !params["cursor"].is_null() {
+                        return Ok(value);
+                    }
                     if let Ok(dms) = directory("messaging.dms", json!({})) {
                         value["_dms"] = dms["items"].clone();
                     }
@@ -677,6 +1052,100 @@ impl App {
                         value["_people"] = people["items"].clone();
                     }
                     Ok(value)
+                })()
+            } else if method == "mentions_list" {
+                // Owner's mentions, newest first: inbox pages filtered here
+                // (the read API has no mention filter).
+                (|| {
+                    let mut out = Vec::new();
+                    // mentions_only filters on the daemon; the client filter
+                    // below keeps an older daemon (which ignores it) correct.
+                    let mut p = json!({"inbox":true,"mentions_only":true,"newest_first":true,"limit":200});
+                    for _ in 0..5 {
+                        let page = call("messaging.read", p.clone())?;
+                        out.extend(page["items"].as_array().into_iter().flatten().filter(|m| mentions_owner(m)).cloned());
+                        if page["next_cursor"].is_null() || out.len() >= 200 {
+                            break;
+                        }
+                        p["cursor"] = page["next_cursor"].clone();
+                    }
+                    Ok(json!({"items": out, "next_cursor": null}))
+                })()
+            } else if method == "jump" {
+                // Load a conversation back to a given message (≤ 40 pages).
+                (|| {
+                    let id = params["_jump"].clone();
+                    let mut p = params.clone();
+                    p.as_object_mut().unwrap().remove("_jump");
+                    let mut value = call("messaging.read", p.clone())?;
+                    for _ in 0..40 {
+                        if value["items"].as_array().is_some_and(|i| i.iter().any(|m| m["id"] == id))
+                            || value["next_cursor"].is_null()
+                        {
+                            break;
+                        }
+                        let mut older = p.clone();
+                        older["cursor"] = value["next_cursor"].clone();
+                        let page = call("messaging.read", older)?;
+                        value["items"].as_array_mut().unwrap().extend(page["items"].as_array().cloned().unwrap_or_default());
+                        value["next_cursor"] = page["next_cursor"].clone();
+                    }
+                    value["_jump"] = id;
+                    Ok(value)
+                })()
+            } else if method == "mark_read" {
+                // Inbox: one mark_read_before. A conversation or the mention
+                // list: collect its unread ids, then acknowledge them in
+                // receipts of ≤ 200 (the ordinary receipt path).
+                (|| {
+                    let target = params["target"].clone();
+                    let unsupported = |e: &str| {
+                        let l = e.to_lowercase();
+                        l.contains("not implemented") || (l.contains("unknown") && l.contains("method"))
+                    };
+                    // Read cursors: one O(1) write per affected conversation;
+                    // the reply carries the new counts.
+                    let request = if target["inbox"] == true {
+                        json!({"all": true})
+                    } else if target["mentions"] == true {
+                        json!({"mentions": true})
+                    } else {
+                        target.clone()
+                    };
+                    match call("messaging.mark_read", request) {
+                        Err(e) if unsupported(&e) => {}
+                        other => return other,
+                    }
+                    // An older daemon: the inbox bulk mark, else receipts.
+                    if target["inbox"] == true {
+                        return call("messaging.read", json!({"inbox":true,"mark_read_before":rfc3339_now()}));
+                    }
+                    // An older daemon: acknowledge the unread ids in receipts.
+                    let mentions_only = target["mentions"] == true;
+                    let mut q = if mentions_only { json!({"inbox":true}) } else { target.clone() };
+                    q["unread_only"] = json!(true);
+                    q["limit"] = json!(200);
+                    let mut ids: Vec<Value> = Vec::new();
+                    for _ in 0..100 {
+                        let page = call("messaging.read", q.clone())?;
+                        ids.extend(
+                            page["items"].as_array().into_iter().flatten()
+                                .filter(|m| !mentions_only || mentions_owner(m))
+                                .map(|m| m["id"].clone()),
+                        );
+                        if page["next_cursor"].is_null() {
+                            break;
+                        }
+                        q["cursor"] = page["next_cursor"].clone();
+                    }
+                    let base = if mentions_only { json!({"inbox":true}) } else { target };
+                    for chunk in ids.chunks(200) {
+                        let mut p = base.clone();
+                        p["limit"] = json!(1);
+                        p["ack_receipt"] = json!({"actor":"owner","space_id":params["space_id"],"ids":chunk});
+                        call("messaging.read", p)?;
+                    }
+                    Ok(json!({"marked": ids.len()}))
                 })()
             } else if method == "channel_members" {
                 directory("messaging.channels", params)
@@ -752,6 +1221,7 @@ impl App {
         {
             self.messages.visible = !self.messages.visible;
             if self.messages.visible {
+                self.open_messages_on_unread();
                 self.messaging_request("bootstrap", json!({}));
             }
             return true;
@@ -759,7 +1229,18 @@ impl App {
         if !self.messages.visible {
             return false;
         }
-        if self.messages.busy {
+        self.messages.open_alerts = self.open_owner_alerts();
+        // Moving around never waits for a refresh: only keys that change
+        // state queue behind the request in flight.
+        let navigation = self.messages.mode.is_empty()
+            && self.messages.confirm.is_none()
+            && !self.messages.reacting
+            && self.messages.queued_events.is_empty()
+            && ((key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd')))
+                || (!key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && matches!(key.code, KeyCode::Char('j' | 'k') | KeyCode::Up | KeyCode::Down
+                        | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End)));
+        if self.messages.busy && !navigation {
             if key.code == KeyCode::Esc {
                 self.messages.visible = false;
             } else if !(key.code == KeyCode::Char('s')
@@ -771,7 +1252,50 @@ impl App {
             }
             return true;
         }
+        if let Some((_, target)) = self.messages.confirm.take() {
+            if key.code == KeyCode::Char('y') {
+                self.messages.status = "Marking read…".into();
+                self.messaging_request("mark_read", json!({"target": target, "space_id": self.messages.space_id}));
+            } else {
+                self.messages.status = "Not marked".into();
+            }
+            return true;
+        }
+        if std::mem::take(&mut self.messages.reacting) {
+            match key.code {
+                KeyCode::Char(c @ '1'..='5') => self.messaging_react((c as u8 - b'1') as usize),
+                _ => self.messages.status = "No reaction".into(),
+            }
+            return true;
+        }
         if self.messages.mode.is_empty() && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return true;
+        }
+        if self.messages.mode.is_empty()
+            && key.code == KeyCode::Char('+')
+            && self.messages.pane == 1
+            && !self.messages.management_view()
+        {
+            if self.messages.items.get(self.messages.selected).is_some() {
+                self.messages.reacting = true;
+                self.messages.status = format!(
+                    "React: {} · same key again removes yours · any other key cancels",
+                    REACTIONS.iter().enumerate().map(|(i, e)| format!("{} {e}", i + 1)).collect::<Vec<_>>().join("  ")
+                );
+            }
+            return true;
+        }
+        // In a conversation n / N step between mentions of Owner (in the
+        // sidebar they keep their meaning: new channel / norms).
+        if self.messages.mode.is_empty()
+            && self.messages.pane == 1
+            && !self.messages.management_view()
+            && matches!(key.code, KeyCode::Char('n' | 'N'))
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            let forward = key.code == KeyCode::Char('n');
+            // The mention list is newest first: "next" goes down the list.
+            self.messaging_seek_mention(if forward { 1 } else { -1 });
             return true;
         }
         if self.messaging_channel_browser_key(key) || self.messages.mention_key(key) {
@@ -821,6 +1345,23 @@ impl App {
             }
             return true;
         }
+        // Page the focused list before single-letter actions such as drop or members.
+        // Management screens have their own selection and handle these keys below.
+        if self.messages.mode.is_empty() && !self.messages.management_view()
+            && key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('u' | 'd'))
+        {
+            let down = key.code == KeyCode::Char('d');
+            let rows = if self.messages.pane == 0 { self.last_term_size.1.saturating_sub(4) as usize }
+                else { self.messages.timeline_size.1 as usize };
+            let step = (rows / 2).max(1);
+            if self.messages.pane == 0 {
+                self.messages.menu = if down { self.messages.menu.saturating_add(step).min(self.messages.menu_items().len().saturating_sub(1)) } else { self.messages.menu.saturating_sub(step) };
+            } else {
+                self.messages.selected = if down { self.messages.selected.saturating_add(step).min(self.messages.items.len().saturating_sub(1)) } else { self.messages.selected.saturating_sub(step) };
+                self.messages.reveal_selection = true;
+            }
+            return true;
+        }
         match key.code {
             KeyCode::Esc => self.messages.visible = false,
             KeyCode::Tab => self.messages.pane = (self.messages.pane + 1) % 2,
@@ -843,12 +1384,7 @@ impl App {
                     self.messages.body_scroll = self.messages.body_scroll.saturating_sub(1);
                 } else {
                     if self.messages.selected == 0 && !self.messages.next.is_null() {
-                        let mut p = self.messages.query();
-                        p["cursor"] = self.messages.next.clone();
-                        self.messages.page_cursor = self.messages.next.clone();
-                        self.messages.append_older = true;
-                        self.messages.select_older = true;
-                        self.messaging_request("messaging.read", p);
+                        self.messaging_load_older(true);
                     } else {
                         self.messages.selected = self.messages.selected.saturating_sub(1);
                     }
@@ -856,13 +1392,29 @@ impl App {
                 }
             }
             KeyCode::PageDown => {
-                self.messages.timeline_scroll = self.messages.timeline_scroll.saturating_add(10);
+                let page = (self.messages.timeline_size.1 as usize).saturating_sub(2).max(10);
+                self.messages.timeline_scroll = self.messages.timeline_scroll.saturating_add(page);
                 self.messages.reveal_selection = false;
             }
             KeyCode::PageUp => {
-                self.messages.timeline_scroll = self.messages.timeline_scroll.saturating_sub(10);
+                let page = (self.messages.timeline_size.1 as usize).saturating_sub(2).max(10);
+                if self.messages.timeline_scroll == 0 {
+                    self.messaging_load_older(false);
+                }
+                self.messages.timeline_scroll = self.messages.timeline_scroll.saturating_sub(page);
                 self.messages.reveal_selection = false;
             }
+            KeyCode::Home if self.messages.pane == 1 => {
+                self.messages.selected = 0;
+                self.messages.reveal_selection = true;
+            }
+            KeyCode::End if self.messages.pane == 1 => {
+                self.messages.selected = self.messages.items.len().saturating_sub(1);
+                self.messages.reveal_selection = true;
+            }
+            KeyCode::Char('M') => self.messaging_confirm_mark_read(),
+            KeyCode::Char('<') => self.messaging_resize_sidebar(-2),
+            KeyCode::Char('>') => self.messaging_resize_sidebar(2),
             KeyCode::Char('d') => {
                 self.messages.mode = "dm_picker".into();
                 self.messages.text.clear();
@@ -886,19 +1438,31 @@ impl App {
                             self.messages.browse_channels();
                             return true;
                         }
+                        if target["alerts_header"] == true {
+                            return true;
+                        }
+                        if let Some(uid) = target["alert"].as_str() {
+                            let host = cm_daemon::host_id::HostId::new(target["alert_host"].as_str().unwrap_or("local"));
+                            self.jump_to_owner_alert(uid, &host, target["alert_key"].as_str(), target["alert_id"].as_str());
+                            return true;
+                        }
                         if target["dm_section"] == true {
                             self.messages.saved.dms_collapsed = !self.messages.saved.dms_collapsed;
                             self.messages.persist();
                             return true;
                         }
-                        self.messages.target = target;
+                        self.messages.set_target(target);
                         self.messages.filter = json!({});
                         self.messages.page_cursor = Value::Null;
+                        self.messages.seek_mention = (0, 0);
+                        self.messages.want_older = false;
                         self.messages.pane = 1;
                         self.messages.selected = 0;
                         self.messages.body_scroll = 0;
                         self.messaging_refresh_target();
                     }
+                } else if self.messages.target["mentions"] == true {
+                    self.messaging_open_in_context();
                 } else {
                     self.messaging_ack_selected();
                 }
@@ -927,7 +1491,7 @@ impl App {
             }
             KeyCode::Char('r') => {
                 if let Some(v) = self.messages.items.get(self.messages.selected).cloned() {
-                    self.messages.target = json!({"conversation":v["conversation_id"]});
+                    self.messages.set_target(json!({"conversation":v["conversation_id"]}));
                     if !self.messages.can_post() || !self.messages.can_edit() {
                         return true;
                     }
@@ -941,7 +1505,7 @@ impl App {
             }
             KeyCode::Char('t') => {
                 if let Some(v) = self.messages.items.get(self.messages.selected).cloned() {
-                    self.messages.target = json!({"conversation":v["conversation_id"]});
+                    self.messages.set_target(json!({"conversation":v["conversation_id"]}));
                     self.messages.filter = json!({"thread":v["data"]["thread_root"].as_str().unwrap_or(v["id"].as_str().unwrap_or(""))});
                     self.messaging_request("messaging.read", self.messages.query());
                 }
@@ -966,6 +1530,8 @@ impl App {
                         })
                         .unwrap_or_default(),
                     f["time_basis"].as_str().unwrap_or("created").into(),
+                    f["sender"].as_str().unwrap_or("").into(),
+                    f["query"].as_str().unwrap_or("").into(),
                 ];
                 self.messages.start_form("filter", fields);
             }
@@ -1010,7 +1576,7 @@ impl App {
                         .iter()
                         .find(|p| p["session_uid"] == uid)
                     {
-                        self.messages.target = json!({"dm":p["id"]});
+                        self.messages.set_target(json!({"dm":p["id"]}));
                         self.messaging_request("messaging.read", self.messages.query());
                     }
                 }
@@ -1070,9 +1636,10 @@ impl App {
         p["origin_daemon_id"] = json!(d.origin);
         p["reply_to"] = json!(d.reply_to);
         p["tags"] = json!(d.tags);
-        let (mentions, here) = d.mention_payload();
-        p["mentions"] = json!(mentions);
-        if here { p["mention_here"] = json!(true); }
+        // Picked mentions plus the ones the body types (@here, exact names).
+        let audience = self.messages.send_audience();
+        p["mentions"] = json!(audience.ids);
+        if audience.here { p["mention_here"] = json!(true); }
         p["links"] = json!(d.links);
         self.messages.pending_send = Some((self.messages.key(), d.request_id.clone()));
         self.messaging_request("messaging.send", p);
@@ -1106,6 +1673,13 @@ impl App {
                     }
                 }
                 self.messages.filter = json!({"time":if time.as_object().is_some_and(|v|v.is_empty()){Value::Null}else{time},"tags":split(&fields[3]),"time_basis":fields[4].trim()});
+                for (i, key) in [(5, "sender"), (6, "query")] {
+                    if !fields[i].trim().is_empty() {
+                        self.messages.filter[key] = json!(fields[i].trim());
+                    }
+                }
+                self.messages.search_target = self.messages.search_scope_key();
+                self.messages.reset_search_retry();
                 self.messages.page_cursor = Value::Null;
                 self.messaging_request("messaging.read", self.messages.query());
             }
@@ -1155,6 +1729,142 @@ impl App {
         }
         self.messages.mode.clear();
         self.messages.fields.clear();
+    }
+    /// Fetch the next older page (100 messages, no sidebar refresh).
+    fn messaging_load_older(&mut self, select: bool) {
+        if self.messages.next.is_null() {
+            return;
+        }
+        if self.messages.busy {
+            self.messages.want_older = true;
+            return;
+        }
+        let mut p = self.messages.query();
+        p["cursor"] = self.messages.next.clone();
+        p["limit"] = json!(100);
+        self.messages.page_cursor = self.messages.next.clone();
+        self.messages.append_older = true;
+        self.messages.select_older = select;
+        self.messaging_request("messaging.read", p);
+    }
+    /// n / N: select the next (1) or previous (-1) message that mentions
+    /// Owner; going back loads older history (up to 20 pages) as needed.
+    fn messaging_seek_mention(&mut self, dir: i8) {
+        let items = &self.messages.items;
+        let at = self.messages.selected;
+        let hit = if dir > 0 {
+            items.iter().enumerate().skip(at + 1).find(|(_, m)| mentions_owner(m)).map(|(i, _)| i)
+        } else {
+            items[..at.min(items.len())].iter().rposition(mentions_owner)
+        };
+        if let Some(i) = hit {
+            self.messages.selected = i;
+            self.messages.reveal_selection = true;
+            self.messages.seek_mention = (0, 0);
+            self.messages.status.clear();
+            return;
+        }
+        let (pending, pages) = self.messages.seek_mention;
+        let pages = if pending == dir { pages } else { 20 };
+        if dir < 0 && pages > 0 && !self.messages.next.is_null() {
+            self.messages.seek_mention = (dir, pages - 1);
+            self.messages.status = "Looking for an older mention…".into();
+            self.messaging_load_older(false);
+        } else {
+            self.messages.seek_mention = (0, 0);
+            self.messages.status = format!("No {} mention", if dir > 0 { "newer" } else { "older" });
+        }
+    }
+    /// Enter on a mention: open its conversation loaded back to it.
+    fn messaging_open_in_context(&mut self) {
+        let Some(m) = self.messages.items.get(self.messages.selected).cloned() else {
+            return;
+        };
+        self.messages.set_target(json!({"conversation": m["conversation_id"]}));
+        self.messages.filter = json!({});
+        self.messages.page_cursor = Value::Null;
+        self.messages.pane = 1;
+        self.messages.body_scroll = 0;
+        let mut p = self.messages.query();
+        p["limit"] = json!(100);
+        p["_jump"] = m["id"].clone();
+        self.messaging_request("jump", p);
+    }
+    /// Fresh `messaging.counts` from a mark-read or react reply: update the
+    /// sidebar rows and the status-bar indicator without another call.
+    fn messaging_apply_counts(&mut self, counts: &Value) {
+        let Some(per) = counts["conversations"].as_object() else { return };
+        for row in self.messages.channels.iter_mut().chain(self.messages.dms.iter_mut()) {
+            let Some(id) = row["id"].as_str() else { continue };
+            let c = per.get(id);
+            row["unread"] = json!(c.and_then(|c| c["unread"].as_u64()).unwrap_or(0));
+            row["mentions"] = json!(c.and_then(|c| c["mentions"].as_u64()).unwrap_or(0));
+        }
+        if self.unread.accept_counts(counts) {
+            self.needs_redraw = true;
+        }
+    }
+    /// Toggle reaction `REACTIONS[i]` by Owner on the selected message.
+    fn messaging_react(&mut self, i: usize) {
+        let Some(m) = self.messages.items.get(self.messages.selected) else { return };
+        let emoji = REACTIONS[i];
+        let remove = reacted_by_me(m, emoji);
+        let p = json!({
+            "message_id": m["id"],
+            "emoji": emoji,
+            "remove": remove,
+            "request_id": uuid::Uuid::new_v4().to_string(),
+            "origin_daemon_id": self.messages.daemon_id,
+        });
+        self.messages.status = format!("{} {emoji}…", if remove { "Removing" } else { "Reacting" });
+        self.messaging_request("messaging.react", p);
+    }
+    /// `M`: confirm, then mark the selected conversation (or the Inbox /
+    /// mention list) read, mentions included.
+    fn messaging_confirm_mark_read(&mut self) {
+        let Some((name, target, mentions, unread)) = self.messages.mark_read_target() else {
+            self.messages.error = "Choose a channel, DM, Inbox or Mentions to mark read".into();
+            return;
+        };
+        let counts = match (unread, mentions) {
+            (0, 0) if target["inbox"] == true || target["mentions"] == true => String::new(),
+            (0, 0) => " (nothing unread)".into(),
+            (u, 0) => format!(" ({u} unread)"),
+            (u, m) => format!(" ({u} unread, {m} mention{})", if m == 1 { "" } else { "s" }),
+        };
+        self.messages.confirm = Some((format!("Mark {name} read{counts}? y confirms · any other key cancels"), target));
+    }
+    fn messaging_resize_sidebar(&mut self, delta: i32) {
+        let width = self.messages.screen_width.max(80);
+        let current = i32::from(self.messages_sidebar_width(width));
+        let next = (current + delta).clamp(16, i32::from(width) * 3 / 5) as u16;
+        match self.global_settings.set_messages_sidebar_width(next) {
+            Ok(()) => self.messages.status = format!("Sidebar {next} columns · saved"),
+            Err(e) => self.messages.error = format!("Sidebar width not saved: {e:#}"),
+        }
+    }
+    /// Conversation sidebar width: the saved width, or one that fits the
+    /// longest row (count column + name), capped at 40% of the screen.
+    fn messages_sidebar_width(&self, total: u16) -> u16 {
+        if total < 80 {
+            return 16;
+        }
+        let saved = self.global_settings.messages_sidebar_width();
+        if saved > 0 {
+            return saved.clamp(16, total * 3 / 5);
+        }
+        let (cw, _) = self.messages.count_columns();
+        // Alert rows (long reasons) truncate; they don't widen the sidebar.
+        let longest = self
+            .messages
+            .menu_items()
+            .iter()
+            .filter(|(_, t)| t.get("alert").is_none())
+            .map(|(l, _)| l.chars().count())
+            .max()
+            .unwrap_or(0);
+        // "› " + counts + name + borders.
+        ((2 + cw + longest + 2) as u16).clamp(24, (total * 2 / 5).max(24))
     }
     fn messaging_ack_selected(&mut self) {
         let Some(v) = self.messages.items.get(self.messages.selected) else {
@@ -1273,6 +1983,7 @@ impl App {
         self.needs_redraw = true;
     }
     pub(super) fn draw_messages(&mut self, frame: &mut Frame) {
+        self.messages.open_alerts = self.open_owner_alerts();
         let area = frame.area();
         let text_style = Style::default().fg(theme::CHAT_TEXT);
         let muted = Style::default().fg(theme::CHAT_MUTED);
@@ -1303,8 +2014,10 @@ impl App {
             ])),
             rows[0],
         );
+        self.messages.screen_width = area.width;
+        let sidebar = self.messages_sidebar_width(area.width);
         let mut cols = Layout::horizontal([
-            Constraint::Length(if area.width >= 80 { 24 } else { 16 }),
+            Constraint::Length(sidebar),
             Constraint::Min(10),
         ])
         .split(rows[1])
@@ -1314,11 +2027,16 @@ impl App {
             cols = vec![rows[1], rows[1]];
         }
         let menu = self.messages.menu_items();
+        let (_, counts) = self.messages.count_columns();
+        // "› " + borders; the count column is never cut, the name shortens
+        // from the middle.
         let labels = menu
             .iter()
             .enumerate()
             .map(|(i, (label, target))| {
-                let color = if target.get("tags").is_some() {
+                let color = if target.get("alert").is_some() || target["alerts_header"] == true {
+                    theme::CHAT_TAG
+                } else if target.get("tags").is_some() {
                     theme::CHAT_TAG
                 } else if target.get("channel").is_some() {
                     theme::CHAT_FOCUS
@@ -1331,13 +2049,25 @@ impl App {
                 };
                 let selected = i == self.messages.menu;
                 let style = Style::default().fg(color);
-                Line::from(format!("{} {}", if selected { "›" } else { " " }, label)).style(
-                    if selected {
-                        style.bg(theme::CHAT_SELECTION).add_modifier(Modifier::BOLD)
+                let (mention, unread) = counts.get(i).cloned().unwrap_or_default();
+                let used = mention.chars().count() + unread.chars().count();
+                let name_room = (cols[0].width as usize).saturating_sub(4 + used);
+                Line::from(vec![
+                    Span::raw(if selected { "› " } else { "  " }),
+                    Span::styled(mention, Style::default().fg(theme::CHAT_TAG).add_modifier(Modifier::BOLD)),
+                    Span::styled(unread, Style::default().fg(theme::CHAT_OWNER)),
+                    // Alert rows keep their start (who, where, how long).
+                    Span::raw(if target.get("alert").is_some() {
+                        end_truncate(label, name_room)
                     } else {
-                        style
-                    },
-                )
+                        middle_truncate(label, name_room)
+                    }),
+                ])
+                .style(if selected {
+                    style.bg(theme::CHAT_SELECTION).add_modifier(Modifier::BOLD)
+                } else {
+                    style
+                })
             })
             .collect::<Vec<_>>();
         if !narrow || self.messages.pane == 0 && self.messages.mode.is_empty() {
@@ -1409,6 +2139,8 @@ impl App {
                             "Until (date/time + zone)",
                             "Tags, comma separated",
                             "Time basis (created / received)",
+                            "Sender name or participant ID",
+                            "Words / phrase (case-insensitive)",
                         ],
                         "metadata" => vec![
                             "Tags, comma separated",
@@ -1448,10 +2180,9 @@ impl App {
                     self.messages.text.clone()
                 };
                 let title = if self.messages.mode.is_empty() || self.messages.mode == "compose" {
-                    let (mentions, here) = self.messages.draft().mention_payload();
-                    let audience = if here { " · @here".into() } else if !mentions.is_empty() {
-                        format!(" · {} mention{}", mentions.len(), if mentions.len() == 1 { "" } else { "s" })
-                    } else { String::new() };
+                    // Who a send notifies, before Owner sends it.
+                    let preview = self.messages.audience_preview();
+                    let audience = if preview.is_empty() { String::new() } else { format!(" {preview}") };
                     format!(
                         "Owner → {}{audience} · {}/3000 · Ctrl+s sends",
                         self.messages.target_label(),
@@ -1492,12 +2223,16 @@ impl App {
                 }
             }
         }
-        let status = if self.messages.error.is_empty() {
+        let status = if let Some((prompt, _)) = &self.messages.confirm {
+            prompt.as_str()
+        } else if self.messages.error.is_empty() {
             self.messages.status.as_str()
         } else {
             self.messages.error.as_str()
         };
-        let status_style = Style::default().fg(if !self.messages.error.is_empty() {
+        let status_style = Style::default().fg(if self.messages.confirm.is_some() {
+            theme::CHAT_TAG
+        } else if !self.messages.error.is_empty() {
             theme::ERROR
         } else if self.messages.busy {
             theme::CHAT_TAG
@@ -1531,6 +2266,8 @@ impl App {
                     ("b", "channels"),
                     ("J/L", "join/leave"),
                     ("u", "members"),
+                    ("+", "react"),
+                    ("M", "mark read"),
                 ]),
                 chat_help(&[
                     ("r/t", "reply/thread"),
@@ -1538,11 +2275,13 @@ impl App {
                     ("p/P", "pin/pins"),
                     ("/", "filter"),
                     ("e", "metadata"),
+                    ("</>", "sidebar"),
                 ]),
                 chat_help(&[
                     ("]", "older"),
                     ("g/G", "refresh/hub"),
-                    ("N", "norms"),
+                    ("N", "norms (sidebar)"),
+                    ("n/N", "mention (chat)"),
                     ("W", "monitor"),
                     ("f", "preferences"),
                 ]),
@@ -1667,6 +2406,23 @@ fn wrap_draft(text: &str, cursor: usize, width: usize) -> (Vec<String>, usize, u
 mod tests {
     use super::*;
     #[test]
+    fn messaging_half_page_moves_selection_without_invoking_letter_actions() {
+        use crossterm::event::{Event, KeyEvent, KeyModifiers};
+        let mut app = owner_app();
+        app.messages.pane = 1;
+        app.messages.timeline_size = (80, 10);
+        app.messages.items = (0..20).map(|i| json!({"id": format!("m{i}")})).collect();
+        let alt = |c| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT));
+        app.messaging_event(&alt('d'));
+        assert_eq!(app.messages.selected, 5);
+        assert!(app.messages.mode.is_empty());
+        app.messaging_event(&alt('u'));
+        assert_eq!(app.messages.selected, 0);
+        app.messaging_event(&alt('u'));
+        assert_eq!(app.messages.selected, 0);
+    }
+
+    #[test]
     fn messaging_read_status_shows_backfill_progress_instead_of_uncached() {
         let fetching = json!({"coverage":"backfilling","target":{"joined":true},
             "cache":{"status":"backfilling","backfill":{"state":"fetching","done":1024,"total":6300}}});
@@ -1682,6 +2438,341 @@ mod tests {
         m.cache = fetching["cache"].clone();
         assert_eq!(m.refresh_interval(), Duration::from_secs(1));
     }
+    fn owner_app() -> App {
+        let mut app = App::new(crate::config::Config {
+            api_url: String::new(),
+            api_token: String::new(),
+            gcp_project: String::new(),
+            gcp_zone: String::new(),
+            repos: HashMap::new(),
+        });
+        app.messages.visible = true;
+        app.messages.space_id = "space".into();
+        app.messages.people = vec![json!({"id":"a","name":"Alpha"}), json!({"id":"owner","name":"Owner"})];
+        app.messages.channels = vec![
+            json!({"id":"c1","path":"behavior-triage","name":"Behavior Triage Orchestrator Reviews","unread":5,"mentions":2}),
+            json!({"id":"c2","path":"general","name":"general","unread":0,"mentions":0}),
+        ];
+        app.messages.dms = vec![json!({"id":"d1","peer":"a","peers":["a"],"unread":3})];
+        app
+    }
+
+    fn screen(app: &mut App, w: u16, h: u16) -> String {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| app.draw_messages(f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.messaging_event(&CrosstermEvent::Key(crossterm::event::KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    fn chat(n: usize, mention: bool, body: &str) -> Value {
+        json!({"id":format!("m{n}"),"conversation_id":"c1","logical_time":format!("{n}"),
+            "actor":{"id":"a","name":"Alpha"},"body":body,"created_at":"2026-10-07T22:00:00Z",
+            "read":true,"data":{"tags":[],"links":[],"mention_recipients": if mention { json!(["owner"]) } else { json!([]) }}})
+    }
+
+    #[test]
+    fn messaging_search_retry_is_bounded_and_target_change_clears_search() {
+        let mut m = Messages::default();
+        m.target = json!({"channel":"one"});
+        m.search_target = m.target.clone();
+        m.search_request_target = m.search_target.clone();
+        m.filter = json!({"sender":"Scout","query":"verdict","tags":["keep"]});
+        m.management.request = json!({"channel":"one","sender":"Scout","query":"verdict"});
+        for attempt in 0..=5 {
+            m.search_retry_count = attempt;
+            let before = Instant::now();
+            m.search_response(&json!({"indexing":true,"retry_after":2}));
+            assert!(m.search_waiting);
+            if attempt < 5 {
+                assert!(m.search_retry_at.unwrap() >= before + Duration::from_secs(2));
+                assert_eq!(m.search_retry_params,m.management.request);
+            } else { assert!(m.search_retry_at.is_none()); }
+        }
+        m.target["pinned_only"] = json!(true);
+        assert!(!m.synchronize_search_target());
+        assert_eq!(m.filter["query"], "verdict");
+        m.set_target(json!({"channel":"two"}));
+        assert!(m.filter["sender"].is_null() && m.filter["query"].is_null());
+        assert_eq!(m.filter["tags"],json!(["keep"]));
+        assert!(!m.search_waiting);
+        assert_eq!(m.search_retry_count,0);
+        m.search_response(&json!({"indexing":true,"retry_after":1}));
+        assert!(!m.search_waiting,"old-target responses must not restart retries");
+    }
+    #[test]
+    fn messages_sidebar_counts_lead_names_truncate_in_the_middle_and_resize_persists() {
+        let _lock = crate::test_support::home_lock();
+        let _home = Home::new();
+        let mut app = owner_app();
+        for width in [100u16, 160] {
+            let text = screen(&mut app, width, 30);
+            if std::env::var_os("CM_MSG_DUMP").is_some() {
+                println!("--- {width} columns ---\n{text}");
+            }
+            let row = text.lines().find(|l| l.contains("#Behavior")).unwrap_or_else(|| panic!("{text}"));
+            assert!(row.contains("@2 \u{25cf}5 #Behavior"), "counts before the name: {row}");
+            // Character columns within the sidebar (the timeline title also says #general).
+            let col = |line: &str, needle: &str| {
+                let chars: Vec<char> = line.chars().collect();
+                let n: Vec<char> = needle.chars().collect();
+                chars.windows(n.len()).position(|w| w == n.as_slice())
+            };
+            let general = text.lines().find(|l| col(l, "#general").is_some_and(|c| c < 40)).unwrap();
+            assert_eq!(col(general, "#general"), col(row, "#Behavior"), "names align after the count column");
+            let dm = text.lines().find(|l| l.contains("Alpha") && col(l, "Alpha").is_some_and(|c| c < 40)).unwrap();
+            assert_eq!(col(dm, "\u{25cf}3"), col(row, "\u{25cf}5"), "DM unread in the same column: {dm}");
+            if width >= 160 {
+                assert!(row.contains("#Behavior Triage Orchestrator Reviews"), "wide: the whole name fits: {row}");
+            } else {
+                assert!(row.contains("#Behavior Tri") && row.contains("\u{2026}") && row.contains("Reviews"), "middle truncation: {row}");
+            }
+        }
+        // > / < resize the sidebar and save the width.
+        let before = app.messages_sidebar_width(160);
+        press(&mut app, KeyCode::Char('>'));
+        assert_eq!(app.messages_sidebar_width(160), before + 2);
+        let saved = std::fs::read_to_string(dirs::home_dir().unwrap().join(".cm/tui-settings.toml")).unwrap();
+        assert!(saved.contains(&format!("messages_sidebar_width = {}", before + 2)), "{saved}");
+        press(&mut app, KeyCode::Char('<'));
+        press(&mut app, KeyCode::Char('<'));
+        assert_eq!(app.messages_sidebar_width(160), before - 2);
+        assert_eq!(middle_truncate("abcdefghij", 5), "ab\u{2026}ij");
+        assert_eq!(count_label('@', 140), "@99+");
+    }
+
+    #[test]
+    fn mark_read_confirms_with_counts_and_any_other_key_cancels() {
+        let _lock = crate::test_support::home_lock();
+        let _home = Home::new();
+        let mut app = owner_app();
+        app.messages.target = json!({"channel":"behavior-triage"});
+        app.messages.pane = 1;
+        press(&mut app, KeyCode::Char('M'));
+        let prompt = app.messages.confirm.as_ref().map(|c| c.0.clone()).unwrap();
+        assert_eq!(prompt, "Mark #Behavior Triage Orchestrator Reviews read (5 unread, 2 mentions)? y confirms \u{00b7} any other key cancels");
+        assert!(screen(&mut app, 160, 30).contains("(5 unread, 2 mentions)? y confirms"));
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.messages.confirm.is_none());
+        assert_eq!(app.messages.status, "Not marked");
+        // From the sidebar, the Inbox row marks everything in it.
+        app.messages.pane = 0;
+        app.messages.menu = 0;
+        press(&mut app, KeyCode::Char('M'));
+        assert_eq!(app.messages.confirm.as_ref().unwrap().1, json!({"inbox":true}));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.messages.confirm.is_none());
+        assert!(app.messages.busy || app.messages.error.contains("unavailable"), "y sends mark_read");
+    }
+
+    #[test]
+    fn mentions_list_is_newest_first_opens_in_context_and_n_steps_between_mentions() {
+        let _lock = crate::test_support::home_lock();
+        let _home = Home::new();
+        let mut app = owner_app();
+        // The Mentions entry sits under Inbox.
+        let items = app.messages.menu_items();
+        assert_eq!(items[1].1, json!({"mentions":true}));
+        app.messages.target = json!({"mentions":true});
+        app.messages.pane = 1;
+        app.messages.accept_messages(&json!({"items":[chat(9, true, "newest ping"), chat(3, true, "older ping")]}));
+        assert_eq!(app.messages.items[0]["id"], "m9", "newest first");
+        assert_eq!(app.messages.selected, 0);
+        let text = screen(&mut app, 100, 30);
+        assert!(text.contains("Mentions") && text.contains("#behavior-triage") && text.contains("newest ping"), "{text}");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.messages.target, json!({"conversation":"c1"}), "Enter opens the conversation");
+        app.messages.busy = false; // No daemon in tests: drop the jump request.
+        app.messages.rx = None;
+        // In a conversation: n / N walk the mentions of Owner.
+        app.messages.target = json!({"channel":"behavior-triage"});
+        app.messages.items = (0..10).map(|i| chat(i, i == 2 || i == 7, "hello")).collect();
+        app.messages.selected = 9;
+        press(&mut app, KeyCode::Char('N'));
+        assert_eq!(app.messages.selected, 7);
+        press(&mut app, KeyCode::Char('N'));
+        assert_eq!(app.messages.selected, 2);
+        press(&mut app, KeyCode::Char('N'));
+        assert_eq!(app.messages.selected, 2);
+        assert_eq!(app.messages.status, "No older mention");
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.messages.selected, 7);
+    }
+
+    #[test]
+    fn scrolling_a_5k_message_channel_reuses_layout_and_stays_fast() {
+        let _lock = crate::test_support::home_lock();
+        let _home = Home::new();
+        let mut app = owner_app();
+        app.messages.target = json!({"channel":"behavior-triage"});
+        app.messages.pane = 1;
+        app.messages.items = (0..5000)
+            .map(|i| chat(i, i % 50 == 0, &"long message body with several words to wrap ".repeat(1 + i % 7)))
+            .collect();
+        app.messages.loaded_target = app.messages.query();
+        app.messages.selected = 4999;
+        app.messages.reveal_selection = true;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 50)).unwrap();
+        terminal.draw(|f| app.draw_messages(f)).unwrap();
+        let warm = app.messages.layout_builds;
+        assert!(warm >= 5000, "first frame lays out every message once ({warm})");
+        let bottom = app.messages.timeline_scroll;
+        let started = Instant::now();
+        let frames = 60;
+        for _ in 0..frames {
+            press(&mut app, KeyCode::PageUp);
+            terminal.draw(|f| app.draw_messages(f)).unwrap();
+        }
+        let elapsed = started.elapsed();
+        println!("5k messages: {frames} PageUp frames in {elapsed:?} ({:?}/frame)", elapsed / frames);
+        assert!(app.messages.timeline_scroll < bottom, "the view moved up");
+        assert!(app.messages.layout_builds - warm <= frames as u64, "at most the selected message is rebuilt per frame");
+        // Debug build on a loaded host: generous, but far below a re-wrap per frame.
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+        // A width change re-lays out once, then caches again.
+        let mut narrow = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 50)).unwrap();
+        narrow.draw(|f| app.draw_messages(f)).unwrap();
+        let after_resize = app.messages.layout_builds;
+        narrow.draw(|f| app.draw_messages(f)).unwrap();
+        assert_eq!(app.messages.layout_builds - after_resize, 1);
+    }
+
+    #[test]
+    fn reactions_render_toggle_owner_and_counts_replies_update_sidebar_and_indicator() {
+        let _lock = crate::test_support::home_lock();
+        let _home = Home::new();
+        let mut app = owner_app();
+        app.messages.target = json!({"channel":"behavior-triage"});
+        app.messages.pane = 1;
+        let mut m = chat(1, false, "deploy done");
+        m["reactions"] = json!({"\u{2705}":{"count":2,"names":["Alpha","Owner"],"mine":true},"\u{1f440}":["Beta"]});
+        app.messages.items = vec![m];
+        let text = screen(&mut app, 160, 30);
+        if std::env::var_os("CM_MSG_DUMP").is_some() {
+            println!("--- reactions ---\n{text}");
+        }
+        // (A wide emoji's second cell reads as a blank in the buffer dump.)
+        let line = text.lines().find(|l| l.contains("Alpha, Owner")).unwrap_or_else(|| panic!("{text}"));
+        assert!(line.contains('\u{2705}') && line.contains('\u{1f440}') && line.contains("Beta"), "{line}");
+        assert!(reacted_by_me(&app.messages.items[0], "\u{2705}"));
+        assert!(!reacted_by_me(&app.messages.items[0], "\u{1f440}"));
+        // + then 1 toggles Owner's ✅ off (Owner already reacted).
+        press(&mut app, KeyCode::Char('+'));
+        assert!(app.messages.status.starts_with("React: 1 \u{2705}"));
+        press(&mut app, KeyCode::Char('1'));
+        let r = &app.messages.management.request;
+        assert!(
+            (r["emoji"] == "\u{2705}" && r["remove"] == true && r["request_id"].is_string())
+                || app.messages.error.contains("unavailable"),
+            "{r}"
+        );
+        app.messages.busy = false;
+        app.messages.rx = None;
+        // The reply replaces the aggregate and carries the new counts.
+        app.messages.accept_reaction(&json!({"message_id":"m1","reactions":{"\u{2705}":{"count":1,"names":["Alpha"],"mine":false}}}));
+        assert!(!reacted_by_me(&app.messages.items[0], "\u{2705}"));
+        let text = screen(&mut app, 160, 30);
+        assert!(text.lines().any(|l| l.contains('\u{2705}') && l.contains("Alpha ") && !l.contains("Owner")), "{text}");
+        app.messaging_apply_counts(&json!({"conversations":{"c1":{"unread":0,"mentions":0}},"dms":1,"mentions":0,"unread":1}));
+        assert_eq!(app.messages.menu_counts(&json!({"channel":"behavior-triage"})), (0, 0), "M clears the row at once");
+        assert_eq!(app.messages.menu_counts(&json!({"conversation":"d1"})), (0, 0), "absent from counts = read");
+        assert_eq!((app.unread.dms, app.unread.mentions), (1, 0));
+        // Any other key after + cancels.
+        press(&mut app, KeyCode::Char('+'));
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.messages.status, "No reaction");
+    }
+
+    #[test]
+    fn refreshes_mark_read_only_at_the_newest_message() {
+        let _lock = crate::test_support::home_lock();
+        let _home = Home::new();
+        let mut app = owner_app();
+        app.messages.target = json!({"channel":"behavior-triage"});
+        app.messages.items = (0..3).map(|i| chat(i, false, "x")).collect();
+        app.messages.loaded_target = app.messages.query();
+        app.messages.selected = 0;
+        app.messaging_refresh_target();
+        assert_eq!(app.messages.management.request["mark_read"], false, "scrolled back: a refresh does not mark read");
+        app.messages.busy = false;
+        app.messages.rx = None;
+        app.messages.selected = 2;
+        app.messaging_refresh_target();
+        assert_eq!(app.messages.management.request["mark_read"], true);
+        // Opening a conversation leaves the daemon default (reading marks read).
+        app.messages.busy = false;
+        app.messages.rx = None;
+        app.messages.loaded_target = Value::Null;
+        app.messaging_refresh_target();
+        assert!(app.messages.management.request.get("mark_read").is_none());
+    }
+
+    #[test]
+    fn open_alerts_pin_agents_oldest_first_and_enter_jumps_and_marks_seen() {
+        let _lock = crate::test_support::home_lock();
+        let _home = Home::new();
+        let mut app = owner_app();
+        let sessions = cm_daemon::host_id::HostId::new("sessions");
+        let mut ws = crate::app::lifecycle::revive_session_tests::dummy_ts("ts-perf", false, sessions.clone());
+        ws.label = "Native-Rollout-Perf".into();
+        app.workspaces.push(Workspace {
+            org: None,
+            color: None, pinned: false, id: "ws-perf".into(), name: "perf".into(), is_closed: false,
+            is_cloud: false, repo_url: None, worktree_path: None, main_repo_path: None, worker_vm: None,
+            worker_zone: None, host_id: sessions.clone(), sessions: vec![ws], tombstones: vec![],
+        });
+        let alert = |id: &str, uid: &str, label: &str, message: &str| cm_daemon::owner_attention::Alert {
+            id: id.into(), session_uid: uid.into(), label: label.into(), message: message.into(),
+            task_id: None, continuous_task_id: None, urgency: Some("decision".into()),
+            held_since: None, released_at: None, created_at: None,
+        };
+        let now = SystemTime::now();
+        app.owner_alerts.insert((sessions.clone(), "ts-perf".into()), alert("a1", "ts-perf", "perf", "Bench done: merge?\nmore"));
+        app.owner_alert_since.insert("a1".into(), now - Duration::from_secs(3 * 3600));
+        app.owner_alerts.insert((cm_daemon::host_id::HostId::local(), "ts-scout".into()), alert("a2", "ts-scout", "Scout", "Deploy tonight?"));
+        app.owner_alert_since.insert("a2".into(), now - Duration::from_secs(120));
+
+        for width in [100u16, 160] {
+            let text = screen(&mut app, width, 30);
+            if std::env::var_os("CM_MSG_DUMP").is_some() {
+                println!("--- open alerts {width} ---\n{text}");
+            }
+            let lines: Vec<&str> = text.lines().collect();
+            let header = lines.iter().position(|l| l.contains("\u{2691} Open alerts (2)")).unwrap_or_else(|| panic!("{text}"));
+            assert!(lines[header + 1].contains(" 3h Native-Rollout-Perf \u{00b7} session"), "oldest first, with age and host: {}", lines[header + 1]);
+            assert!(lines[header + 2].contains(" 2m Scout \u{00b7} Deploy"), "{}", lines[header + 2]);
+            if width >= 160 {
+                // The reason follows and is cut to the sidebar (> widens it).
+                assert!(lines[header + 1].contains("sessions \u{00b7} Ben"), "the reason's first line: {}", lines[header + 1]);
+            }
+            assert!(lines[header + 3].contains("Inbox"), "pinned above Inbox");
+        }
+        // A relayed alert carries when it was raised (B5b): that wins over
+        // first-seen, so it sorts first and shows its real age.
+        let mut old = alert("a0", "ts-old", "Old-Worker", "Waiting since forever");
+        old.created_at = Some("2026-01-01T00:00:00Z".into());
+        app.owner_alerts.insert((sessions.clone(), "ts-old".into()), old);
+        let rows = app.open_owner_alerts();
+        assert_eq!(rows[0].label, "Old-Worker");
+        assert!(super::short_age(rows[0].since).ends_with('d'), "aged from created_at");
+        app.owner_alerts.remove(&(sessions.clone(), "ts-old".to_string()));
+        // Enter on the Perf row: jump to the session and mark it seen.
+        app.messages.pane = 0;
+        app.messages.menu = 1;
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.messages.visible, "Messages closes on the jump");
+        let wi = app.workspaces.iter().position(|w| w.id == "ws-perf").unwrap();
+        assert!(matches!(app.cursor, Cursor::Session(w, 0) if w == wi));
+        assert!(!app.owner_alerts.contains_key(&(sessions, "ts-perf".to_string())), "seen");
+        assert_eq!(app.open_owner_alerts().len(), 1);
+    }
+
     pub(super) struct Home {
         old: Option<std::ffi::OsString>,
         _temp: tempfile::TempDir,
@@ -1791,16 +2882,32 @@ mod tests {
             KeyCode::Char('/'),
             KeyModifiers::NONE,
         )));
-        assert_eq!(app.messages.fields.len(), 5);
+        assert_eq!(app.messages.fields.len(), 7);
         app.messages.fields = vec![
             "10m".into(),
             "".into(),
             "".into(),
             "needs-owner".into(),
             "received".into(),
+            "Scout".into(),
+            "final verdict".into(),
         ];
+        app.messages.page_cursor = json!({"old":"cursor"});
         app.messaging_submit_form();
         assert_eq!(app.messages.filter["time"]["since"], "10m");
+        assert_eq!(app.messages.query()["sender"], "Scout");
+        assert_eq!(app.messages.query()["query"], "final verdict");
+        assert!(app.messages.page_cursor.is_null());
+        // The submitted read owns the busy state until its reply arrives.
+        app.messages.busy = false;
+        app.messaging_event(&CrosstermEvent::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('/'), KeyModifiers::NONE,
+        )));
+        app.messages.fields[5].clear();
+        app.messages.fields[6].clear();
+        app.messaging_submit_form();
+        assert!(app.messages.filter.get("sender").is_none());
+        assert!(app.messages.filter.get("query").is_none());
     }
     #[test]
     fn messaging_settings_and_reconnect_preserve_newer_names_and_grouping() {
@@ -1823,6 +2930,7 @@ mod tests {
         ts.task_id = Some("task".into());
         app.sessions_restored = true;
         app.workspaces.push(Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "w".into(),

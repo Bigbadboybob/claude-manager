@@ -230,7 +230,7 @@ pub fn live_caller_ctx(
 ///     same workspace as the caller, regardless of its task_id.
 pub fn caller_authorized_for(
     caller: &CallerCtx,
-    tasks: &[crate::app::TaskEntry],
+    tasks: &(impl TaskParents + ?Sized),
     target_wi: usize,
     target_task_id: Option<&str>,
 ) -> bool {
@@ -259,8 +259,38 @@ const MAX_TASK_DEPTH: usize = 64;
 /// Is `target_id` either equal to `caller_id` or a (transitive) child
 /// of it via the parent_task_id chain? Walks up from target. Stops at
 /// `MAX_TASK_DEPTH` or the first task without a parent (top-level).
+/// Where the scope walk reads a task's parent. `Some(None)` is a
+/// top-level task, `None` one the view doesn't know.
+pub trait TaskParents {
+    fn parent_of(&self, task_id: &str) -> Option<Option<String>>;
+}
+
+impl TaskParents for [crate::app::TaskEntry] {
+    fn parent_of(&self, task_id: &str) -> Option<Option<String>> {
+        self.iter()
+            .find(|t| t.task_id.as_deref() == Some(task_id))
+            .map(|t| t.parent_task_id.clone())
+    }
+}
+
+impl TaskParents for Vec<crate::app::TaskEntry> {
+    fn parent_of(&self, task_id: &str) -> Option<Option<String>> {
+        self.as_slice().parent_of(task_id)
+    }
+}
+
+/// The App's view: the sidebar's running/blocked `tasks`, then the full
+/// planning ancestry from the last task snapshot, which keeps done,
+/// backlog and draft rows. Pre-fix a finished subtask fell out of
+/// `tasks`, and its parent's session was refused on it.
+impl TaskParents for crate::app::App {
+    fn parent_of(&self, task_id: &str) -> Option<Option<String>> {
+        self.tasks.parent_of(task_id).or_else(|| self.planning_task_parent(task_id))
+    }
+}
+
 pub fn task_is_self_or_descendant_of(
-    tasks: &[crate::app::TaskEntry],
+    tasks: &(impl TaskParents + ?Sized),
     target_id: &str,
     caller_id: &str,
 ) -> bool {
@@ -274,13 +304,7 @@ pub fn task_is_self_or_descendant_of(
             // Cycle detected — bail.
             return false;
         }
-        let Some(task) = tasks
-            .iter()
-            .find(|t| t.task_id.as_deref() == Some(cur.as_str()))
-        else {
-            return false;
-        };
-        let Some(parent) = task.parent_task_id.clone() else {
+        let Some(Some(parent)) = tasks.parent_of(&cur) else {
             return false;
         };
         if parent == caller_id {
@@ -427,7 +451,7 @@ pub fn resolve_authorized_session(app: &App, caller_uid: &str, params: &Value) -
     match target {
         TargetLocation::Live { wi, si } => {
             let ts = &app.workspaces[wi].sessions[si];
-            if !caller_authorized_for(&caller, &app.tasks, wi, ts.task_id.as_deref()) {
+            if !caller_authorized_for(&caller, app, wi, ts.task_id.as_deref()) {
                 return Err((
                     ErrorCode::Unauthorized,
                     "session is outside caller's scope".into(),
@@ -454,7 +478,7 @@ pub fn resolve_authorized_session(app: &App, caller_uid: &str, params: &Value) -
         }
         TargetLocation::Exited { wi, ti } => {
             let tomb = &app.workspaces[wi].tombstones[ti];
-            if !caller_authorized_for(&caller, &app.tasks, wi, tomb.task_id.as_deref()) {
+            if !caller_authorized_for(&caller, app, wi, tomb.task_id.as_deref()) {
                 return Err((
                     ErrorCode::Unauthorized,
                     "session is outside caller's scope".into(),
@@ -478,11 +502,13 @@ pub fn resolve_authorized_session(app: &App, caller_uid: &str, params: &Value) -
 fn engine_str(session_type: &str) -> &'static str {
     match session_type {
         "codex" => "codex",
+        "bash" => "bash",
         _ => "claude-code",
     }
 }
 
 fn resolve_live_path(ws: &Workspace, ts: &TerminalSession) -> Option<String> {
+    if ts.session_type == "bash" { return None; }
     let sid = ts.transcript_id.as_deref()?;
     let wt = ws.worktree_path.as_deref()?;
     let agent = agent::agent_for(&ts.session_type);
@@ -499,6 +525,7 @@ fn resolve_live_path(ws: &Workspace, ts: &TerminalSession) -> Option<String> {
 }
 
 fn resolve_exited_path(_ws: &Workspace, tomb: &SessionTombstone) -> Option<String> {
+    if tomb.session_type == "bash" { return None; }
     let sid = tomb.last_transcript_id.as_deref()?;
     // Use the tombstone's own worktree snapshot — survives subsequent
     // mutations of the live workspace (e.g. `push_active` clearing
@@ -567,6 +594,8 @@ fn find_codex_file(dir: &std::path::Path, transcript_id: &str) -> Option<std::pa
 #[derive(Deserialize, Default)]
 struct ListSessionsParams {
     #[serde(default)]
+    include_shells: bool,
+    #[serde(default)]
     task_id: Option<String>,
     #[serde(default)]
     include_exited: bool,
@@ -611,7 +640,7 @@ pub fn list_sessions(app: &App, caller_uid: &str, params: &Value) -> MethodResul
                     ));
                 }
                 Some(own) => {
-                    if !task_is_self_or_descendant_of(&app.tasks, req, own) {
+                    if !task_is_self_or_descendant_of(app, req, own) {
                         return Err((
                             ErrorCode::Unauthorized,
                             format!(
@@ -643,11 +672,11 @@ pub fn list_sessions(app: &App, caller_uid: &str, params: &Value) -> MethodResul
             match scope_task.as_deref() {
                 // Explicit scope: only that task's own + descendants.
                 Some(scope) => task
-                    .map(|t| task_is_self_or_descendant_of(&app.tasks, t, scope))
+                    .map(|t| task_is_self_or_descendant_of(app, t, scope))
                     .unwrap_or(false),
                 // Default scope (no explicit task_id): everything the
                 // caller is authorized to see.
-                None => caller_authorized_for(&caller, &app.tasks, wi, task),
+                None => caller_authorized_for(&caller, app, wi, task),
             }
         };
         for ts in &ws.sessions {
@@ -660,6 +689,7 @@ pub fn list_sessions(app: &App, caller_uid: &str, params: &Value) -> MethodResul
         // this, an agent polling `list_sessions` to decide "is the
         // sibling done?" gets a different answer than
         // `read_session_output`.
+        if !p.include_shells && ts.session_type == "bash" { continue; }
         let runtime = session_runtime_state(ts);
         out.push(json!({
             "session_uid": ts.uid,
@@ -671,8 +701,13 @@ pub fn list_sessions(app: &App, caller_uid: &str, params: &Value) -> MethodResul
             // list→copy-type→start_session round-trip fails because
             // start_session rejects "claude".
             "type": public_session_type(&ts.session_type),
+            "kind": if ts.session_type == "bash" { "shell" } else { "agent" },
             "state": runtime.kind.as_wire(),
             "idle": runtime.idle,
+            // Engine-reported state (doc/SESSION_STATE.md), passed through
+            // from the owning daemon's manifest stream; absent from older
+            // daemons.
+            "agent_state": app.agent_state_wire(ts),
             "managed_by_uid": ts.managed_by_uid,
             // Grouping + perms metadata (parity with the daemon's
             // list_sessions): lets the MCP layer group by
@@ -693,17 +728,18 @@ pub fn list_sessions(app: &App, caller_uid: &str, params: &Value) -> MethodResul
                 let task = tomb.task_id.as_deref();
                 let included = match scope_task.as_deref() {
                     Some(scope) => task
-                        .map(|t| task_is_self_or_descendant_of(&app.tasks, t, scope))
+                        .map(|t| task_is_self_or_descendant_of(app, t, scope))
                         .unwrap_or(false),
-                    None => caller_authorized_for(&caller, &app.tasks, wi, task),
+                    None => caller_authorized_for(&caller, app, wi, task),
                 };
-                if !included {
+                if !included || (!p.include_shells && tomb.session_type == "bash") {
                     continue;
                 }
                 out.push(json!({
                     "session_uid": tomb.uid,
                     "label": tomb.label,
                     "type": public_session_type(&tomb.session_type),
+                    "kind": if tomb.session_type == "bash" { "shell" } else { "agent" },
                     "state": "exited",
                     "idle": Value::Null,
                     "managed_by_uid": tomb.managed_by_uid,
@@ -754,7 +790,7 @@ pub fn send_input(app: &mut App, caller_uid: &str, params: &Value) -> MethodResu
     let (wi, si) = find_live_session(&app.workspaces, &p.session_uid)
         .ok_or((ErrorCode::NotFound, "session_uid not found".into()))?;
     let target_task = app.workspaces[wi].sessions[si].task_id.clone();
-    if !caller_authorized_for(&caller, &app.tasks, wi, target_task.as_deref()) {
+    if !caller_authorized_for(&caller, app, wi, target_task.as_deref()) {
         return Err((
             ErrorCode::Unauthorized,
             "session is outside caller's scope".into(),
@@ -783,6 +819,13 @@ pub fn send_input(app: &mut App, caller_uid: &str, params: &Value) -> MethodResu
         ));
     }
     let session_type = app.workspaces[wi].sessions[si].session_type.clone();
+    if session_type == "bash" {
+        let mut payload = p.text.into_bytes();
+        payload.push(b'\n');
+        app.workspaces[wi].sessions[si].session.write(&payload)
+            .map_err(|e| (ErrorCode::Internal, format!("shell input: {e}")))?;
+        return Ok(json!({"ok": true, "kind": "shell", "submitted": true}));
+    }
     let agent = agent::agent_for(&session_type);
     let wt = app.workspaces[wi]
         .worktree_path
@@ -797,6 +840,121 @@ pub fn send_input(app: &mut App, caller_uid: &str, params: &Value) -> MethodResu
         .submit_prompt(ctx, &p.text)
         .map_err(|e| (ErrorCode::Internal, format!("submit_prompt: {}", e)))?;
     Ok(json!({"ok": true}))
+}
+
+// ---------------------------------------------------------------------------
+// send_key
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SendKeyTargets {
+    One(String),
+    Many(Vec<String>),
+}
+
+#[derive(Deserialize)]
+struct SendKeyParams {
+    session_uids: SendKeyTargets,
+    key: String,
+}
+
+/// Press exactly one key (no body, no Enter) in each target session: the
+/// TUI-socket route of `send_key`, with `send_input`'s scope. Scope and
+/// liveness are checked here; the allowed targets are then forwarded, per
+/// host, to that daemon's `session.send_key` (operator), which encodes the
+/// key for the session's tracked keyboard mode and writes it without
+/// stamping input. Writing through the attach stream instead would count an
+/// Enter as Owner submitting. Each target gets its own result (`ok`,
+/// `not_found`, `unauthorized`, `exited`, `error`); one bad target or host
+/// never stops the rest.
+pub fn send_key(app: &mut App, caller_uid: &str, params: &Value) -> MethodResult {
+    use cm_daemon::control::send_key::MAX_TARGETS;
+    let p: SendKeyParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
+    cm_daemon::keys::parse_key(&p.key).map_err(|e| (ErrorCode::InvalidParams, e))?;
+    let mut uids: Vec<String> = Vec::new();
+    for uid in match p.session_uids {
+        SendKeyTargets::One(u) => vec![u],
+        SendKeyTargets::Many(v) => v,
+    } {
+        let uid = uid.trim().to_owned();
+        if !uid.is_empty() && !uids.contains(&uid) {
+            uids.push(uid);
+        }
+    }
+    if uids.is_empty() {
+        return Err((ErrorCode::InvalidParams, "send_key needs at least one session uid".into()));
+    }
+    if uids.len() > MAX_TARGETS {
+        return Err((
+            ErrorCode::InvalidParams,
+            format!("send_key takes at most {MAX_TARGETS} sessions per call, got {}", uids.len()),
+        ));
+    }
+    let caller = live_caller_ctx(&app.workspaces, caller_uid)?;
+    let outcome = |uid: &str, status: &str, message: String| json!({"session_uid": uid, "status": status, "message": message});
+    let mut results: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    // host → [(our uid, the daemon's uid)]
+    let mut by_host: Vec<(cm_daemon::host_id::HostId, Vec<(String, String)>)> = Vec::new();
+    for uid in &uids {
+        let Some((wi, si)) = find_live_session(&app.workspaces, uid) else {
+            let r = if find_tombstone(&app.workspaces, uid).is_some() {
+                outcome(uid, "exited", missing_session_message(&app.workspaces, uid))
+            } else {
+                outcome(uid, "not_found", format!("session '{uid}' not found"))
+            };
+            results.insert(uid.clone(), r);
+            continue;
+        };
+        let target_task = app.workspaces[wi].sessions[si].task_id.clone();
+        if !caller_authorized_for(&caller, app, wi, target_task.as_deref()) {
+            results.insert(uid.clone(), outcome(uid, "unauthorized", "session is outside the caller's scope".into()));
+            continue;
+        }
+        let ts = &app.workspaces[wi].sessions[si];
+        if session_runtime_state(ts).kind == RuntimeStateKind::Exited {
+            results.insert(uid.clone(), outcome(uid, "exited", format!("session '{uid}' has exited; PTY no longer writable")));
+            continue;
+        }
+        let Some(daemon_uid) = ts.session.daemon_session_uid.clone() else {
+            results.insert(uid.clone(), outcome(uid, "error", "session is not attached to a daemon".into()));
+            continue;
+        };
+        match by_host.iter_mut().find(|(h, _)| *h == ts.host_id) {
+            Some((_, v)) => v.push((uid.clone(), daemon_uid)),
+            None => by_host.push((ts.host_id.clone(), vec![(uid.clone(), daemon_uid)])),
+        }
+    }
+    for (host, targets) in by_host {
+        let daemon_uids: Vec<String> = targets.iter().map(|(_, d)| d.clone()).collect();
+        let reply = app
+            .host_pool
+            .for_host(&host)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .and_then(|h| h.socket_path().ok_or_else(|| anyhow::anyhow!("no live socket for host {}", host.as_str())))
+            .and_then(|socket| {
+                crate::client_session::rpc_send_key(&socket, &app.host_pool.operator_token_for(&host), &daemon_uids, &p.key)
+            });
+        for (uid, daemon_uid) in targets {
+            let r = match &reply {
+                Ok(v) => v["results"]
+                    .as_array()
+                    .and_then(|rs| rs.iter().find(|r| r["session_uid"] == daemon_uid.as_str()))
+                    .map(|r| {
+                        let mut r = r.clone();
+                        r["session_uid"] = json!(uid);
+                        r
+                    })
+                    .unwrap_or_else(|| outcome(&uid, "error", "no result from the host daemon".into())),
+                Err(e) => outcome(&uid, "error", format!("host {}: {e:#}", host.as_str())),
+            };
+            results.insert(uid, r);
+        }
+    }
+    let results: Vec<Value> = uids.iter().filter_map(|u| results.remove(u)).collect();
+    let sent = results.iter().filter(|r| r["status"] == "ok").count();
+    Ok(json!({"key": p.key, "sent": sent, "results": results}))
 }
 
 // ---------------------------------------------------------------------------
@@ -875,7 +1033,7 @@ pub fn kill_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodRe
         }
     };
     let target_task = app.workspaces[wi].sessions[si].task_id.clone();
-    if !caller_authorized_for(&caller, &app.tasks, wi, target_task.as_deref()) {
+    if !caller_authorized_for(&caller, app, wi, target_task.as_deref()) {
         return Err((
             ErrorCode::Unauthorized,
             "session is outside caller's scope".into(),
@@ -916,6 +1074,30 @@ pub fn kill_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodRe
 // start_session
 // ---------------------------------------------------------------------------
 
+/// Resolve an MCP spawn's model the way the daemon's `resolve_spawn_model`
+/// does: explicit → task default (inherited) → engine default. Bash takes
+/// none; a bad explicit model is refused before anything spawns.
+fn tui_spawn_model(
+    app: &App,
+    setting: cm_daemon::models::Setting,
+    session_type: &str,
+    explicit: Option<&str>,
+    task_id: Option<&str>,
+) -> Result<(Option<String>, Option<&'static str>), (ErrorCode, String)> {
+    use cm_daemon::models::ModelSource;
+    let inherited = task_id.and_then(|t| app.task_default(t, session_type, setting));
+    let resolved = setting.resolve(
+        session_type,
+        explicit,
+        inherited.as_deref().map(|m| (m, ModelSource::Task)),
+    )
+    .map_err(|e| (ErrorCode::InvalidParams, e))?;
+    Ok(match resolved {
+        Some((m, src)) => (Some(m), Some(src.as_str())),
+        None => (None, None),
+    })
+}
+
 #[derive(Deserialize)]
 struct StartSessionParams {
     #[serde(default)]
@@ -940,6 +1122,13 @@ struct StartSessionParams {
     /// instead. Mirrors the daemon's `mcp_start_session`.
     #[serde(default)]
     allow_shared_workspace: bool,
+    /// The child's model; absent = the task default (inherited through
+    /// its parents), else the engine default. Mirrors the daemon's
+    /// `mcp_start_session`.
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
 }
 
 /// ux-5c (TUI twin of the daemon's `task_autodelivery_prompt`):
@@ -951,12 +1140,11 @@ struct StartSessionParams {
 /// daemon's API round trip. `None` ⇒ spawn promptless, exactly as
 /// before ux-5c.
 ///
-/// `TaskEntry` carries the task's `prompt` and display `name` but not
-/// its `description` (that lives only in the planning-board rows), so
-/// the composition here degenerates to "prompt verbatim". The daemon
-/// path — which reads the full API row — is the one that folds in the
-/// description. Both refuse to fall back to the bare title: a task with
-/// no stored prompt has nothing worth auto-delivering.
+/// `TaskEntry.prompt` holds the task's brief (its description plus any
+/// legacy prompt the description lacks; see `planning::task_brief`), the
+/// same text the daemon path composes from the full API row. Both refuse
+/// to fall back to the bare title: a task with no brief has nothing worth
+/// auto-delivering.
 fn task_autodelivery_prompt(
     tasks: &[crate::app::TaskEntry],
     task_id: &str,
@@ -1007,7 +1195,7 @@ pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodR
             ));
         }
         (Some(req), Some(own)) => {
-            if !task_is_self_or_descendant_of(&app.tasks, req, own) {
+            if !task_is_self_or_descendant_of(app, req, own) {
                 return Err((
                     ErrorCode::Unauthorized,
                     format!(
@@ -1101,6 +1289,11 @@ pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodR
         .map(|p| p.to_string_lossy().into_owned());
     let task_id_for_response = task_id_for_new.clone();
 
+    use cm_daemon::models::Setting;
+    let (model, model_source) =
+        tui_spawn_model(app, Setting::Model, &p.type_, p.model.as_deref(), task_id_for_new.as_deref())?;
+    let (effort, effort_source) =
+        tui_spawn_model(app, Setting::Effort, &p.type_, p.effort.as_deref(), task_id_for_new.as_deref())?;
     let new_uid = app.spawn_managed_session(
         target_wi,
         caller_uid,
@@ -1109,6 +1302,7 @@ pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodR
         task_id_for_new,
         effective_prompt.as_deref(),
         p.global_perms,
+        model.as_deref(), effort.as_deref(),
     )
     .map_err(|e| (ErrorCode::Internal, format!("spawn: {}", e)))?;
     // ux-1c / ux-5c: same enriched shape the daemon's
@@ -1117,6 +1311,10 @@ pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodR
     let mut resp = json!({
         "session_uid": new_uid,
         "prompt_source": prompt_source,
+        "model": model,
+        "model_source": model_source,
+        "effort": effort,
+        "effort_source": effort_source,
     });
     if let Some(wt) = worktree_path.as_deref() {
         resp["worktree_path"] = Value::String(wt.to_string());
@@ -1232,27 +1430,40 @@ fn ensure_target_worktree(
     if worktree_path.is_dir() && cm_daemon::worktree::is_git_worktree_root(&worktree_path) {
         return Ok(WorktreeReport::default());
     }
-    let main_repo = ws
+    let task_repo_url: Option<String> = task_id.and_then(|tid| {
+        app.tasks
+            .iter()
+            .find(|t| t.task_id.as_deref() == Some(tid))
+            .and_then(|t| t.repo_url.clone())
+            .filter(|u| !u.trim().is_empty())
+    });
+    let ws_url_repo = ws.repo_url.as_deref().and_then(cm_daemon::worktree::find_local_repo);
+    let task_url_repo = task_repo_url.as_deref().and_then(cm_daemon::worktree::find_local_repo);
+    // Git's own registration of the path comes first, over every known
+    // main repo UNFILTERED: it is where the checkout really lives, even
+    // when the task row's repo_url is wrong.
+    let registered = ws
         .main_repo_path
-        .clone()
+        .iter()
+        .chain(ws_url_repo.iter())
+        .chain(task_url_repo.iter())
+        .chain(app.workspaces.iter().filter_map(|w| w.main_repo_path.as_ref()))
         .filter(|p| p.is_dir())
-        .or_else(|| {
-            ws.repo_url
-                .as_deref()
-                .and_then(cm_daemon::worktree::find_local_repo)
-        })
-        .or_else(|| {
-            // Any known main repo that still lists the path as a
-            // (prunable) worktree owns it.
-            app.workspaces
-                .iter()
-                .filter_map(|w| w.main_repo_path.clone())
-                .filter(|p| p.is_dir())
-                .find(|r| {
-                    cm_daemon::worktree::registered_branch_for_path(r, &worktree_path).is_some()
-                })
-        })
-        ;
+        .find(|r| cm_daemon::worktree::registered_branch_for_path(r, &worktree_path).is_some())
+        .cloned();
+    // Nothing registered it: only a clone of the task's repo may rebuild it.
+    let of_task_repo = |p: &&std::path::PathBuf| {
+        p.is_dir()
+            && task_repo_url.as_deref().is_none_or(|u| cm_daemon::worktree::checkout_is_repo(p, u))
+    };
+    let main_repo = registered.or_else(|| {
+        ws.main_repo_path
+            .iter()
+            .chain(ws_url_repo.iter())
+            .chain(task_url_repo.iter())
+            .find(of_task_repo)
+            .cloned()
+    });
     let Some(main_repo) = main_repo else {
         if worktree_path.is_dir() {
             // A real directory not tied to any known repo: a usable cwd.
@@ -1359,12 +1570,11 @@ fn mint_workspace_for_task(
                 task_id, OVERRIDE_HINT
             ),
         ))?;
-    let caller_repo_url = app.workspaces[caller_wi].repo_url.clone();
+    // The task's own repo, never the caller's checkout.
     let repo_url = task
         .repo_url
         .clone()
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| caller_repo_url.clone())
         .ok_or((
             ErrorCode::Conflict,
             format!(
@@ -1373,22 +1583,24 @@ fn mint_workspace_for_task(
                 task_id, OVERRIDE_HINT
             ),
         ))?;
-    // Prefer the caller's own main repo, but only when the task names the
-    // SAME repo — otherwise a caller in repo A would drag a task in repo
-    // B into A's checkout. Falling back to the on-disk lookup mirrors the
-    // daemon's `resolve_repo` fast path.
-    let caller_repo_matches = caller_repo_url.as_deref() == Some(repo_url.as_str());
-    let main_repo = app.workspaces[caller_wi]
-        .main_repo_path
-        .clone()
-        .filter(|_| caller_repo_matches)
-        .or_else(|| cm_daemon::worktree::find_local_repo(&repo_url))
-        .ok_or((
+    // A local clone of the task's repo, verified by origin: the caller's
+    // own checkout first, then the other workspaces', then
+    // ~/code/projects (the daemon's `locate_repo_clone`). A caller in repo
+    // A never drags a task in repo B into A's checkout.
+    let caller = &app.workspaces[caller_wi];
+    let candidates: Vec<std::path::PathBuf> = [caller]
+        .into_iter()
+        .chain(app.workspaces.iter())
+        .flat_map(|w| w.main_repo_path.iter().chain(w.worktree_path.iter()))
+        .filter_map(|p| cm_daemon::worktree::main_checkout_of(p))
+        .collect();
+    let repos_dir = cm_daemon::path::dot_cm_dir().join("repos");
+    let main_repo = cm_daemon::worktree::locate_repo_clone(&repo_url, &candidates, &repos_dir, false, &[])
+        .map_err(|detail| (
             ErrorCode::Conflict,
             format!(
-                "task {} has no workspace and repo '{}' isn't checked out on this \
-                 machine, so a worktree can't be minted for it{}",
-                task_id, repo_url, OVERRIDE_HINT
+                "task {} has no workspace and one can't be minted: {}{}",
+                task_id, detail, OVERRIDE_HINT
             ),
         ))?;
 
@@ -1417,6 +1629,8 @@ fn mint_workspace_for_task(
 
     let new_ws_id = crate::app::new_workspace_id();
     app.workspaces.push(Workspace {
+        // A minted task worktree is ephemeral (doc/org-model.md §12).
+        org: cm_daemon::manifest::ephemeral_workspace_org(),
         color: None,
         pinned: false,
         id: new_ws_id.clone(),
@@ -1462,6 +1676,7 @@ fn mint_workspace_for_task(
             parent_task_id,
             &new_ws_id,
             Some(minted.worktree_path.as_path()),
+            Some(cm_daemon::org_bridge::KIND_EPHEMERAL),
         ) {
             // Non-fatal: the worktree exists and the TUI has the binding,
             // so failing the spawn would strand a checkout. The caller is
@@ -1536,6 +1751,14 @@ struct CreateSubtaskParams {
     /// resolution when present; absent keeps the parent-branch default.
     #[serde(default)]
     base: Option<String>,
+    /// The subtask's default model (`metadata.models.<engine>`); the slot is
+    /// `model_engine`, else the caller's engine. Mirrors the daemon.
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
+    #[serde(default)]
+    model_engine: Option<String>,
 }
 
 fn default_subtask_worktree_mode() -> String {
@@ -1615,6 +1838,11 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
         caller_uid,
         "mcp.create_subtask",
     );
+    let (models, efforts) = cm_daemon::control::methods::filed_task_defaults(
+        p.model.as_deref(),
+        p.effort.as_deref(),
+        p.model_engine.as_deref(),
+    )?;
 
     // Subtasks need a parent. Taskless callers should call propose_task
     // (the existing tool) to add a top-level task instead.
@@ -1650,7 +1878,21 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
         ErrorCode::Conflict,
         "parent task has no repo_url".into(),
     ))?;
+    // The parent's checkout counts only when it is a clone of the task's
+    // repo; otherwise branch mode cuts from a located clone's trunk.
     let parent_main_repo = app.workspaces[parent_wi].main_repo_path.clone();
+    let parent_checkout = parent_main_repo.clone().or_else(|| {
+        app.workspaces[parent_wi].worktree_path.as_deref().and_then(cm_daemon::worktree::main_checkout_of)
+    });
+    let parent_in_repo = parent_checkout
+        .clone()
+        .filter(|c| cm_daemon::worktree::checkout_is_repo(c, &parent_repo_url));
+    let clone_candidates: Vec<std::path::PathBuf> = app
+        .workspaces
+        .iter()
+        .flat_map(|w| w.main_repo_path.iter().chain(w.worktree_path.iter()))
+        .filter_map(|p| cm_daemon::worktree::main_checkout_of(p))
+        .collect();
 
     // Slug for the new task. Same encoding as `worktree::slugify`.
     let leaf_slug = cm_daemon::worktree::slugify(&p.name);
@@ -1666,6 +1908,34 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
     // Without this, subtasks created without an explicit `project`
     // arg get filtered out of the planning view by
     // `backend.rs::filter_project_tasks` after the next refresh.
+    if let (Some(pj), parent_pj) = (p.project.as_deref(), parent.project.as_deref()) {
+        // Another project is fine when it shares the parent's repo: the
+        // repo most of the TUI's own rows for it carry. Otherwise the TUI
+        // can't resolve that repo; the daemon route can.
+        let mut counts: std::collections::HashMap<&str, usize> = Default::default();
+        for t in app.tasks.iter().filter(|t| t.project.as_deref() == Some(pj)) {
+            if let Some(u) = t.repo_url.as_deref().filter(|u| !u.trim().is_empty()) {
+                *counts.entry(u).or_default() += 1;
+            }
+        }
+        let project_repo = counts.into_iter().max_by_key(|(_, n)| *n).map(|(u, _)| u);
+        let same_repo = project_repo
+            .is_some_and(|u| cm_daemon::worktree::same_repo(u, &parent_repo_url));
+        if parent_pj != Some(pj) && !same_repo {
+            return Err((
+                ErrorCode::InvalidParams,
+                format!(
+                    "create_subtask: project '{}' differs from the parent's ({}) and isn't \
+                     known to share its repo, and a TUI-owned session can't resolve another \
+                     project's repo; use propose_task(project='{}', reports_to='me') and \
+                     start_session(task_id=…)",
+                    pj,
+                    parent_pj.unwrap_or("none"),
+                    pj,
+                ),
+            ));
+        }
+    }
     let project = p.project.clone().or_else(|| parent.project.clone());
     // Cloned for the local TaskEntry insert below — `project` itself
     // gets moved into the API body.
@@ -1712,13 +1982,39 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
         } else {
             None
         };
-        let branch_main_repo: Option<std::path::PathBuf> = if p.worktree_mode == "branch" {
+        // `inherit` / `in-place` run in an existing (shared) checkout:
+        // across repos only a fresh branch worktree is safe.
+        if matches!(p.worktree_mode.as_str(), "inherit" | "in-place")
+            && parent_checkout.is_some()
+            && parent_in_repo.is_none()
+        {
+            return Err((
+                ErrorCode::InvalidParams,
+                format!(
+                    "create_subtask: worktree_mode='{}' would run the subtask (repo {}) in a \
+                     shared checkout outside its parent's repo; use worktree_mode='branch'",
+                    p.worktree_mode, parent_repo_url,
+                ),
+            ));
+        }
+        let branch_main_repo: Option<std::path::PathBuf> = if p.worktree_mode != "branch" {
+            None
+        } else if let Some(mr) = parent_in_repo.clone() {
+            Some(mr)
+        } else if parent_checkout.is_some() {
+            Some(cm_daemon::worktree::locate_repo_clone(
+                &parent_repo_url,
+                &clone_candidates,
+                &cm_daemon::path::dot_cm_dir().join("repos"),
+                false,
+                &[],
+            )
+            .map_err(|detail| (ErrorCode::Conflict, format!("create_subtask: {}", detail)))?)
+        } else {
             Some(parent_main_repo.clone().ok_or((
                 ErrorCode::Conflict,
                 "parent workspace has no main_repo_path; cannot branch".into(),
             ))?)
-        } else {
-            None
         };
         // In-place mode: the subtask runs directly in the parent's MAIN repo
         // checkout — no worktree, no branch. Resolve that path upfront so the
@@ -1740,6 +2036,13 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
             (Some(b), Some(main_repo)) => Some(
                 cm_daemon::worktree::resolve_base_commit(main_repo, b)
                     .map_err(|e| (ErrorCode::InvalidParams, e.to_string()))?,
+            ),
+            // Not the parent's repo: its branch means nothing here; cut
+            // from this repo's trunk.
+            (None, Some(main_repo)) if Some(main_repo) != parent_in_repo.as_deref() => Some(
+                cm_daemon::worktree::resolve_project_main(main_repo)
+                    .map(|(_, sha)| sha)
+                    .map_err(|e| (ErrorCode::Conflict, format!("create_subtask: {}", e)))?,
             ),
             _ => None,
         };
@@ -1765,7 +2068,7 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
             parent_worktree.as_deref()
                 .and_then(cm_daemon::worktree::worktree_current_branch)
         });
-        if p.worktree_mode == "branch" && base.is_none() && parent_branch_resolved.is_none() {
+        if p.worktree_mode == "branch" && resolved_base.is_none() && parent_branch_resolved.is_none() {
             return Err((
                 ErrorCode::Conflict,
                 "cannot determine parent's base branch (no wip_branch and worktree HEAD is detached or unreadable)".into(),
@@ -1825,7 +2128,16 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
             worktree_mode: Some(p.worktree_mode.clone()),
             initiative_id: None,
             wip_branch: branch_name_for_new.clone(),
-            metadata: Some(json!({ "filer": filer })),
+            metadata: Some({
+                let mut metadata = json!({ "filer": filer });
+                if let Some(models) = &models {
+                    metadata[cm_daemon::models::TASK_MODELS_METADATA_KEY] = models.clone();
+                }
+                if let Some(efforts) = &efforts {
+                    metadata[cm_daemon::models::TASK_EFFORTS_METADATA_KEY] = efforts.clone();
+                }
+                metadata
+            }),
         };
         let new_task = api_client
             .create_task(&body)
@@ -1888,6 +2200,8 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
                 // Register a fresh workspace for this subtask.
                 let new_ws_id = crate::app::new_workspace_id();
                 let new_ws = Workspace {
+                    // A branch-mode mint is ephemeral (doc/org-model.md §12).
+                    org: cm_daemon::manifest::ephemeral_workspace_org(),
                     color: None,
                     pinned: false,
                     id: new_ws_id.clone(),
@@ -1918,6 +2232,7 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
                 let main_repo = in_place_main_repo.expect("validated above");
                 let new_ws_id = crate::app::new_workspace_id();
                 let new_ws = Workspace {
+                    org: None,
                     color: None,
                     pinned: false,
                     id: new_ws_id.clone(),
@@ -1970,7 +2285,8 @@ pub(crate) fn prepare_create_subtask(app: &App, caller_uid: &str, params: &Value
                 .ok_or_else(|| anyhow::anyhow!("daemon socket unavailable"))?;
             crate::client_session::rpc_register_agent_subtask(&socket,
                 &host_pool.operator_token_for(&host), &new_task_id, &parent_task_id,
-                &workspace_id_for_new, Some(&worktree_path))
+                &workspace_id_for_new, Some(&worktree_path),
+                (p.worktree_mode == "branch").then_some(cm_daemon::org_bridge::KIND_EPHEMERAL))
         })();
         if let Err(e) = registration {
             eprintln!("cm-tui: create_subtask registration failed: {e} (async push will retry)");
@@ -2072,7 +2388,7 @@ pub fn list_subtasks(app: &App, caller_uid: &str, params: &Value) -> MethodResul
                 ErrorCode::Unauthorized,
                 format!("taskless caller cannot scope to task {}", req),
             ))?;
-            if !task_is_self_or_descendant_of(&app.tasks, req, own) {
+            if !task_is_self_or_descendant_of(app, req, own) {
                 return Err((
                     ErrorCode::Unauthorized,
                     format!("task {} is not the caller's task or a descendant", req),
@@ -2140,7 +2456,7 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
         ErrorCode::Unauthorized,
         "taskless caller cannot mark subtasks done".into(),
     ))?;
-    if !task_is_self_or_descendant_of(&app.tasks, &p.task_id, own) {
+    if !task_is_self_or_descendant_of(app, &p.task_id, own) {
         return Err((
             ErrorCode::Unauthorized,
             format!("task {} is not the caller's task or a descendant", p.task_id),
@@ -2188,6 +2504,10 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
     //     re-entering with `close_worktree=true` would bail on the
     //     missing `worktree_path` precheck before reaching Phase 3.
     let mut already_done = false;
+    // A pinned workspace is never removed: finishing work only unassigns
+    // (lifecycle_guard_v1, doc/org-model.md §7.1). Home/stream kinds join
+    // this once the TUI records them (S0b).
+    let mut workspace_kept: Option<&'static str> = None;
     let cleanup_target = if p.close_worktree && was_branch_mode {
         let ws_id = task.workspace_id.clone().ok_or((
             ErrorCode::Conflict,
@@ -2212,6 +2532,9 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
         // path-equality check is authoritative regardless of the label, so
         // we never trust `worktree_mode` alone to gate destruction.
         if app.workspaces[wi].is_in_place() {
+            None
+        } else if app.workspaces[wi].pinned {
+            workspace_kept = Some("pinned");
             None
         } else if app.workspaces[wi].worktree_path.is_none() {
             // The "already cleaned up" signal: Phase 2 sets
@@ -2290,11 +2613,33 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
     //   - branch-mode subtasks (own workspace): every session in
     //     that workspace closes, since they're all subtask-tagged.
     let target_task = p.task_id.clone();
+    // A member's main session or assistant is only unassigned, never
+    // closed, and its workspace is kept (lifecycle_guard_v1, O5;
+    // doc/org-model.md §4.3, §7.1).
+    let candidates: Vec<String> = app.workspaces.iter()
+        .flat_map(|w| w.sessions.iter())
+        .filter(|ts| ts.task_id.as_deref() == Some(target_task.as_str()) && ts.session_type != "bash")
+        .map(|ts| ts.uid.clone())
+        .collect();
+    let targets = app.owner_rpc_targets();
+    let spared = member_sessions(&candidates, |uid| {
+        targets.iter().any(|(_, socket, token)| {
+            crate::client_session::rpc_messaging_board(socket, token, "org.member",
+                                                       json!({"session_uid": uid}))
+                .is_ok_and(|v| v["acting_as"] == "main" || v["acting_as"] == "assistant")
+        })
+    });
+    // A shell is Owner's alone to close, kill or restart: it is spared too,
+    // and its checkout kept while it lives.
     for wi in 0..app.workspaces.len() {
-        let _ = app.tombstone_and_remove(wi, |ts| {
-            ts.task_id.as_deref() == Some(target_task.as_str())
-        });
+        let _ = app.tombstone_and_remove(wi, |ts| subtask_done_closes(ts, &target_task, &spared));
     }
+    if let Some((wi, _, _)) = &cleanup_target {
+        if let Some(why) = subtask_done_keeps(&app.workspaces[*wi].sessions, &spared) {
+            workspace_kept = Some(why);
+        }
+    }
+    let cleanup_target = if workspace_kept.is_some() { None } else { cleanup_target };
 
     // Observable end-state: `true` means the worktree is gone by the
     // time this response goes out, regardless of whether THIS call
@@ -2367,7 +2712,37 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
         .filter(|t| t.task_id.as_deref() == Some(p.task_id.as_str()))
         .for_each(|t| t.api_status = crate::app::TaskStatus::Done);
 
-    Ok(json!({"ok": true, "worktree_removed": worktree_removed}))
+    let mut out = json!({"ok": true, "worktree_removed": worktree_removed});
+    if let Some(kind) = workspace_kept {
+        out["workspace_kept"] = json!(kind);
+    }
+    Ok(out)
+}
+
+/// Whether `mark_subtask_done` closes `ts`: a session of the done task that
+/// is no member's main or assistant (`spared`) and no shell (Owner's alone
+/// to close, kill or restart).
+fn subtask_done_closes(ts: &TerminalSession, task: &str, spared: &std::collections::HashSet<String>) -> bool {
+    ts.task_id.as_deref() == Some(task) && !spared.contains(&ts.uid) && ts.session_type != "bash"
+}
+
+/// Why `mark_subtask_done` must keep the task's checkout, if it must: a
+/// spared member's session or a shell still lives in it.
+fn subtask_done_keeps(sessions: &[TerminalSession], spared: &std::collections::HashSet<String>) -> Option<&'static str> {
+    if sessions.iter().any(|ts| spared.contains(&ts.uid)) {
+        Some("member")
+    } else if sessions.iter().any(|ts| ts.session_type == "bash") {
+        Some("shell")
+    } else {
+        None
+    }
+}
+
+/// Which of `uids` are members' sessions (main or assistant), by
+/// `is_member` (the host daemon's `org.member`). A lookup that fails counts
+/// as not a member, as on a host without org S2.
+fn member_sessions(uids: &[String], is_member: impl Fn(&str) -> bool) -> std::collections::HashSet<String> {
+    uids.iter().filter(|uid| is_member(uid)).cloned().collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2494,7 +2869,7 @@ pub fn list_workflows(app: &App, caller_uid: &str, params: &Value) -> MethodResu
                 ));
             }
             Some(own) => {
-                if !task_is_self_or_descendant_of(&app.tasks, req, own) {
+                if !task_is_self_or_descendant_of(app, req, own) {
                     return Err((
                         ErrorCode::Unauthorized,
                         format!(
@@ -2697,6 +3072,7 @@ fn serialize_workflow_run(run: &crate::workflow::run::WorkflowRun) -> Value {
 
 #[cfg(test)]
 mod tests {
+
     //! Auth-helper tests. These target `live_caller_ctx` /
     //! `caller_ctx_or_tombstone` directly because they're the choke
     //! point that decides whether a tombstoned UID can mutate state.
@@ -2705,6 +3081,14 @@ mod tests {
     //! correctness boundary without that overhead.
 
     use super::*;
+
+    #[test]
+    fn member_sessions_are_spared_by_the_lookup_and_a_failed_lookup_spares_nothing() {
+        let uids = vec!["a".to_string(), "b".to_string()];
+        let spared = member_sessions(&uids, |uid| uid == "b");
+        assert_eq!(spared.into_iter().collect::<Vec<_>>(), vec!["b".to_string()]);
+        assert!(member_sessions(&uids, |_| false).is_empty());
+    }
     use crate::app::{SessionStatus, TerminalSession};
     use std::collections::HashMap;
     use std::time::Instant;
@@ -2716,6 +3100,11 @@ mod tests {
 
     fn live_ts(uid: &str, task_id: Option<&str>) -> TerminalSession {
         TerminalSession {
+            org: None,
+            model: None,
+            model_source: None,
+            effort: None,
+            effort_source: None,
             color: None,
             uid: uid.into(),
             label: "test".into(),
@@ -2750,6 +3139,7 @@ mod tests {
 
     fn workspace_with(sessions: Vec<TerminalSession>, tombstones: Vec<SessionTombstone>) -> Workspace {
         Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-1".into(),
@@ -2765,6 +3155,46 @@ mod tests {
             sessions,
             tombstones,
         }
+    }
+
+    /// Owner's rule: only Owner closes, kills or restarts a shell. A done
+    /// subtask's shell is spared and keeps its checkout.
+    #[test]
+    fn mark_subtask_done_spares_shells_and_keeps_their_checkout() {
+        let shell = || {
+            let mut ts = live_ts("ts-sh", Some("t"));
+            ts.session_type = "bash".into();
+            ts
+        };
+        let worker = || live_ts("ts-w", Some("t"));
+        let main = || live_ts("ts-m", Some("t"));
+        let spared: std::collections::HashSet<String> = ["ts-m".to_string()].into();
+        assert!(!subtask_done_closes(&shell(), "t", &spared));
+        assert!(!subtask_done_closes(&main(), "t", &spared));
+        assert!(subtask_done_closes(&worker(), "t", &spared));
+        assert!(!subtask_done_closes(&worker(), "other", &spared));
+        let none = std::collections::HashSet::new();
+        assert_eq!(subtask_done_keeps(&[shell(), worker()], &none), Some("shell"));
+        assert_eq!(subtask_done_keeps(&[main(), shell()], &spared), Some("member"));
+        assert_eq!(subtask_done_keeps(&[worker()], &none), None);
+    }
+
+    /// O5: A-D and A-w read a row's own stamp (no daemon round trip on the
+    /// input thread): open assistants are spared / closed deliberately;
+    /// workers, closed assistants and member-less rows are not.
+    #[test]
+    fn open_assistant_rows_are_read_from_the_rows_stamp() {
+        use crate::app::is_open_assistant_row;
+        let with = |org: serde_json::Value| {
+            let mut ts = live_ts("ts-a", Some("t"));
+            ts.org = org.as_object().cloned();
+            ts
+        };
+        assert!(is_open_assistant_row(&with(json!({"member_id": "m", "acting_as": "assistant"}))));
+        assert!(!is_open_assistant_row(&with(json!({"member_id": "m", "acting_as": "worker"}))));
+        assert!(!is_open_assistant_row(&with(json!({"member_id": "m", "acting_as": "assistant",
+                                                     "assistant_closed_at": "2026-10-25T00:00:00Z"}))));
+        assert!(!is_open_assistant_row(&live_ts("ts-b", Some("t"))));
     }
 
     #[test]
@@ -3572,6 +4002,7 @@ mod tests {
             repos: HashMap::new(),
         });
         app.workspaces.push(Workspace {
+            org: None,
             color: None,
             pinned: false,
             id: "ws-caller".into(),
@@ -3596,6 +4027,37 @@ mod tests {
             unsafe { std::env::remove_var("HOME") };
         }
         std::mem::forget(tmp);
+    }
+
+    #[test]
+    fn send_input_shell_submits_a_command_without_an_agent_prompt_queue() {
+        with_app_and_repo("shell-send", |app, repo| {
+            let wi = app.workspaces.len() - 1;
+            app.workspaces[wi].sessions.push(live_ts("caller", None));
+            let mut shell = live_ts("shell", None);
+            shell.session_type = "bash".into();
+            shell.session = crate::session::Session::new(
+                "/bin/bash", &["--noprofile".into(), "--norc".into()], 80, 24,
+                Some(repo.to_path_buf()), HashMap::new(), None,
+            ).expect("shell PTY");
+            app.workspaces[wi].sessions.push(shell);
+
+            let reply = send_input(app, "caller", &json!({
+                "session_uid": "shell",
+                "text": "printf 'submitted' > shell-result",
+                "submit": true,
+            })).expect("shell send");
+            assert_eq!(reply["kind"], "shell");
+            assert_eq!(reply["submitted"], true);
+            assert!(app.workspaces[wi].sessions[1].pending_prompt.is_none());
+
+            let marker = repo.join("shell-result");
+            let deadline = Instant::now() + std::time::Duration::from_secs(3);
+            while std::fs::read_to_string(&marker).ok().as_deref() != Some("submitted") {
+                assert!(Instant::now() < deadline, "submitted shell command did not execute");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
     }
 
     /// TUI twin of the daemon's reaped-worktree heal: a task bound to a
@@ -3629,6 +4091,7 @@ mod tests {
             git(&wt, &["add", "-A"]);
             git(&wt, &["commit", "-q", "-m", "fix"]);
             app.workspaces.push(Workspace {
+                org: None,
                 color: None,
                 pinned: false,
                 id: "ws-sub".into(),
@@ -3678,6 +4141,77 @@ mod tests {
             assert!(err.1.contains(&wt.display().to_string()), "{}", err.1);
             assert!(err.1.contains("cannot be re-created"), "{}", err.1);
             assert!(!wt.exists());
+        });
+    }
+
+    /// Review 7b5fd3f #1, TUI twin: the task row's repo_url is wrong, but
+    /// git registered the reaped worktree in the workspace's own clone. The
+    /// heal trusts the registration and rebuilds it there.
+    #[test]
+    fn target_worktree_heal_trusts_git_registration_over_a_wrong_row_repo() {
+        with_app_and_repo("tuihealrow", |app, repo| {
+            let branch = "cm-sub/row-wrong-rand1234";
+            let wt = cm_daemon::worktree::create_subtask_worktree(
+                repo,
+                branch,
+                cm_daemon::worktree::SubtaskStart::ParentBranch("main"),
+            )
+            .expect("subtask worktree");
+            let mut ws = workspace_with(vec![], vec![]);
+            ws.id = "ws-row".into();
+            ws.repo_url = Some("tuihealrow".into());
+            ws.worktree_path = Some(wt.clone());
+            ws.main_repo_path = Some(repo.to_path_buf());
+            app.workspaces.push(ws);
+            let mut task = task_with_parent("task-row", Some("task-parent"), "Row wrong");
+            task.workspace_id = Some("ws-row".into());
+            task.repo_url = Some("git@github.com:o/claude-manager.git".into());
+            app.tasks.push(task);
+            let wi = app.workspaces.len() - 1;
+            std::fs::remove_dir_all(&wt).unwrap();
+            let healed = ensure_target_worktree(app, wi, Some("task-row")).expect("heal");
+            assert_eq!(healed.recreated.expect("re-created").branch, branch);
+            assert!(wt.is_dir() && cm_daemon::worktree::is_git_worktree_root(&wt));
+        });
+    }
+
+    /// Review 7b5fd3f #4b: from a TUI-owned session, create_subtask into
+    /// another project is allowed when that project shares the parent's
+    /// repo, and still refused when its repo is another one or unknown.
+    #[test]
+    fn tui_create_subtask_allows_another_project_in_the_parents_repo() {
+        with_app_and_repo("tuisamerepo", |app, repo| {
+            let mut ws = workspace_with(vec![live_ts("ts-lead", Some("task-lead"))], vec![]);
+            ws.id = "ws-lead".into();
+            ws.repo_url = Some("git@github.com:o/tuisamerepo.git".into());
+            ws.worktree_path = Some(repo.to_path_buf());
+            ws.main_repo_path = Some(repo.to_path_buf());
+            app.workspaces.push(ws);
+            let mut lead = task_with_parent("task-lead", None, "Lead");
+            lead.workspace_id = Some("ws-lead".into());
+            lead.project = Some("main-proj".into());
+            lead.repo_url = Some("git@github.com:o/tuisamerepo.git".into());
+            app.tasks.push(lead);
+            let mut sib = task_with_parent("task-sib", None, "Sibling");
+            sib.project = Some("sibling".into());
+            sib.repo_url = Some("https://github.com/o/tuisamerepo".into());
+            app.tasks.push(sib);
+            let mut other = task_with_parent("task-other", None, "Other");
+            other.project = Some("other".into());
+            other.repo_url = Some("git@github.com:o/other.git".into());
+            app.tasks.push(other);
+            let params = |project: &str| {
+                json!({"name": "w", "project": project, "worktree_mode": "branch"})
+            };
+            assert!(prepare_create_subtask(app, "ts-lead", &params("sibling")).is_ok());
+            for project in ["other", "unknown"] {
+                let err = match prepare_create_subtask(app, "ts-lead", &params(project)) {
+                    Err(e) => e,
+                    Ok(_) => panic!("{project}: expected a refusal"),
+                };
+                assert_eq!(err.0, ErrorCode::InvalidParams, "{project}");
+                assert!(err.1.contains("isn't known to share its repo"), "{project}: {}", err.1);
+            }
         });
     }
 

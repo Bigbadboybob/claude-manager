@@ -18,6 +18,11 @@ REPO_BRANCH=$(curl -sf "$META_URL/repo-branch" -H "$META_HEADER")
 MANAGER_URL=$(curl -sf "$META_URL/manager-callback-url" -H "$META_HEADER" || echo "")
 API_TOKEN=$(curl -sf "$META_URL/api-token" -H "$META_HEADER" || echo "")
 POOL_ID=$(curl -sf "$META_URL/pool-id" -H "$META_HEADER" || echo "")
+# Claude's model and effort (CM never relies on the engine's defaults).
+CLAUDE_MODEL=$(curl -sf "$META_URL/claude-model" -H "$META_HEADER" || echo "claude-opus-5-5")
+CLAUDE_EFFORT=$(curl -sf "$META_URL/claude-effort" -H "$META_HEADER" || echo "xhigh")
+case "$CLAUDE_MODEL" in ""|-*|*[!A-Za-z0-9._:/@+\[\]-]*) CLAUDE_MODEL="claude-opus-5-5" ;; esac
+case "$CLAUDE_EFFORT" in low|medium|high|xhigh|max) ;; *) CLAUDE_EFFORT="xhigh" ;; esac
 
 echo "[cm-warm] Repo: $REPO_URL (branch: $REPO_BRANCH)"
 echo "[cm-warm] Pool: $POOL_ID"
@@ -75,7 +80,7 @@ echo "export CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_OAUTH_TOKEN" >> "$WORKER_HOME/.bash
 # ---------------------------------------------------------------------------
 su - worker -c "tmux new-session -d -s claude -x 200 -y 50"
 su - worker -c "tmux send-keys -t claude \
-    'cd /workspace && claude --dangerously-skip-permissions --permission-mode bypassPermissions' Enter"
+    'cd /workspace && claude --dangerously-skip-permissions --permission-mode bypassPermissions --model $CLAUDE_MODEL --effort $CLAUDE_EFFORT' Enter"
 
 # Wait for Claude to be ready
 for attempt in $(seq 1 30); do

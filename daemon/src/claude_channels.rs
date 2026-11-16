@@ -11,6 +11,9 @@ use crate::workflow::pty_tracker::PtyModeTracker;
 pub const FLAG: &str = "--dangerously-load-development-channels";
 pub const ENTRY: &str = "server:claude-manager";
 
+/// How long a launch watches for its own consent dialog.
+const WATCH: Duration = Duration::from_secs(180);
+
 /// Host-owned preference, sampled only when a fresh/resumed process launches.
 /// Default stays socket until the operator enables the preview on that host.
 pub fn enabled() -> bool {
@@ -60,7 +63,11 @@ pub fn accept_own_startup(state: &Arc<Mutex<DaemonState>>, uid: &str, argv: &[St
     let _ = std::thread::Builder::new().name(format!("cm-channel-consent-{uid}")).spawn(move || {
         let start = Instant::now();
         let mut tracker = PtyModeTracker::with_size(cols as usize, rows as usize);
-        while start.elapsed() < Duration::from_secs(30) {
+        // A resume or fork of a large transcript can take a while before the
+        // dialog appears, and it may draw the "Claude Code v…" banner first:
+        // keep watching for the dialog itself (#24: a rotated fork stopped at
+        // it because the watcher had given up on the banner).
+        while start.elapsed() < WATCH {
             if input.operator_quiet_for().is_some() { return; }
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(bytes) => tracker.feed(&bytes, Instant::now()),
@@ -78,10 +85,36 @@ pub fn accept_own_startup(state: &Arc<Mutex<DaemonState>>, uid: &str, argv: &[St
                 }
                 return;
             }
-            let compact: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
-            if compact.contains("ClaudeCodev") { return; } // already at the client, not onboarding
+            // The client's composer (its footer) only draws once any startup
+            // dialog is past: stop there. The banner alone is not enough; a
+            // resume or fork can draw it before the dialog.
+            if client_ready(&screen) {
+                return;
+            }
         }
     });
+}
+
+/// Whether the rendered screen shows Claude Code's composer footer.
+pub(crate) fn client_ready(screen: &str) -> bool {
+    let compact: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
+    compact.contains("shift+tabtocycle") || compact.contains("?forshortcuts")
+}
+
+/// Claude's `/model` confirmation menu can appear while a large resumed
+/// transcript is still loading. It is safe for CM to choose the first option
+/// only when the complete, distinctive menu is visible; otherwise a generic
+/// prompt must never receive an unsolicited `1`.
+pub(crate) fn model_switch_prompt(screen: &str) -> bool {
+    let compact: String = screen
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    compact.contains("switchmodel?")
+        && compact.contains("nextresponsewillbeslowerandusemoretokens")
+        && compact.contains("1.yes")
+        && compact.contains("2.no")
 }
 
 #[cfg(test)]
@@ -90,6 +123,23 @@ mod tests {
     const SCREEN: &str = "WARNING: Loading development channels\n\
         --dangerously-load-development-channels is for local channel development only.\n\
         Channels: server:claude-manager\n❯ 1. I am using this for local development\n2. Exit\nEnter to confirm";
+
+    #[test]
+    fn the_watcher_stops_at_the_composer_not_the_banner() {
+        assert!(!client_ready("Claude Code v2.1.310\n  /home/u/wt"), "a banner drawn first is not ready");
+        assert!(client_ready("❯ \n ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+        assert!(client_ready("  ? for shortcuts"));
+        assert!(!client_ready(SCREEN), "the consent dialog itself is not the composer");
+    }
+
+    #[test]
+    fn model_switch_prompt_requires_the_complete_menu() {
+        assert!(model_switch_prompt(
+            "Switch model? Your next response will be slower and use more tokens…\n1. Yes, switch to Sonnet 5.5\n2. No, go back"
+        ));
+        assert!(!model_switch_prompt("Switch model? 1. Yes 2. No"));
+        assert!(!model_switch_prompt("1. Yes, switch to Sonnet 5.5 2. No, go back"));
+    }
 
     #[test]
     fn accepts_only_the_cm_channel_dialog() {

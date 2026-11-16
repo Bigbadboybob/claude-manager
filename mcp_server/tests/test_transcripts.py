@@ -246,6 +246,114 @@ class CodexParserTest(unittest.TestCase):
         self.assertEqual(parse_cursor(cur), (0, 0))
 
 
+# Shape verified on a real Codex rollout (2026-10-04, thread 01a107a7):
+# the turn's reply is a `commentary` message, followed by an EMPTY
+# `final_answer` and a `task_complete` whose `last_agent_message` is null.
+CODEX_EMPTY_FINAL_ANSWER_TURN = "\n".join([
+    '{"timestamp":"2026-10-05T00:03:40.000Z","type":"response_item","payload":'
+    '{"type":"message","role":"user","content":[{"type":"input_text",'
+    '"text":"summarize the audit"}]}}',
+    '{"timestamp":"2026-10-05T00:03:50.000Z","type":"response_item","payload":'
+    '{"type":"custom_tool_call","status":"completed","call_id":"c1",'
+    '"name":"exec","input":"text(await tools.exec_command({cmd:\'ls\'}))"}}',
+    '{"timestamp":"2026-10-05T00:03:51.000Z","type":"response_item","payload":'
+    '{"type":"custom_tool_call_output","call_id":"c1","output":'
+    '[{"type":"input_text","text":"Script completed"}]}}',
+    '{"timestamp":"2026-10-05T00:03:52.000Z","type":"response_item","payload":'
+    '{"type":"agent_message","author":"/root/batch_audit","recipient":"/root",'
+    '"content":[{"type":"input_text","text":"inter-agent note"}]}}',
+    '{"timestamp":"2026-10-05T00:03:55.000Z","type":"response_item","payload":'
+    '{"type":"message","role":"assistant","content":[{"type":"output_text",'
+    '"text":"Audit summary: 3 findings."}],"phase":"commentary"}}',
+    '{"timestamp":"2026-10-05T00:03:56.074Z","type":"response_item","payload":'
+    '{"type":"message","role":"assistant","content":[{"type":"output_text",'
+    '"text":""}],"phase":"final_answer"}}',
+    '{"timestamp":"2026-10-05T00:03:56.232Z","type":"event_msg","payload":'
+    '{"type":"task_complete","last_agent_message":null}}',
+])
+
+
+class CodexEmptyFinalAnswerTest(unittest.TestCase):
+    """EP A8: `read_last_turn` / monitor fires returned empty content for
+    Codex because the empty `final_answer` record became an empty Message
+    that masked the preceding commentary."""
+
+    def test_empty_final_answer_is_dropped(self):
+        msgs, _ = codex.parse_lines(CODEX_EMPTY_FINAL_ANSWER_TURN, 0, 100, 0)
+        assistants = [m for m in msgs if m.role == Role.ASSISTANT]
+        self.assertEqual(len(assistants), 1)
+        self.assertEqual(assistants[0].content, "Audit summary: 3 findings.")
+        self.assertEqual(assistants[0].phase, "commentary")
+        self.assertEqual(assistants[0].to_dict()["phase"], "commentary")
+
+    def test_whitespace_only_text_is_dropped(self):
+        line = (
+            '{"type":"response_item","payload":{"type":"message",'
+            '"role":"assistant","content":[{"type":"output_text","text":" \\n "}]}}'
+        )
+        msgs, _ = codex.parse_lines(line, 0, 100, 0)
+        self.assertEqual(msgs, [])
+
+    def test_custom_tool_calls_render_as_tool_lines(self):
+        msgs, _ = codex.parse_lines(CODEX_EMPTY_FINAL_ANSWER_TURN, 0, 100, 0)
+        tools = [m.content for m in msgs if m.role == Role.TOOL]
+        self.assertEqual(tools, ["[tool_use: exec]", "[tool_use: ?]"])
+
+    def test_inter_agent_message_is_skipped(self):
+        msgs, _ = codex.parse_lines(CODEX_EMPTY_FINAL_ANSWER_TURN, 0, 100, 0)
+        self.assertFalse(any("inter-agent note" in m.content for m in msgs))
+
+    def test_phase_absent_keeps_dict_shape(self):
+        line = (
+            '{"type":"response_item","payload":{"type":"message",'
+            '"role":"assistant","content":[{"type":"output_text","text":"hi"}]}}'
+        )
+        msgs, _ = codex.parse_lines(line, 0, 100, 0)
+        self.assertNotIn("phase", msgs[0].to_dict())
+
+    def test_last_assistant_from_rollout_file(self):
+        import tempfile
+
+        from mcp_server.monitor import (
+            _last_assistant,
+            _monitor_completed_entry,
+            _read_all_messages,
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "rollout.jsonl"
+            path.write_text(CODEX_EMPTY_FINAL_ANSWER_TURN + "\n")
+            msgs, _ = _read_all_messages("codex", str(path), 0)
+            last = _last_assistant(msgs)
+            self.assertIsNotNone(last)
+            self.assertEqual(last["content"], "Audit summary: 3 findings.")
+            entry = _monitor_completed_entry(
+                "ts-x", "idle", "ready", True, "codex", str(path), 0, True,
+            )
+            self.assertEqual(
+                entry["last_message"]["content"], "Audit summary: 3 findings."
+            )
+
+
+class LastAssistantTest(unittest.TestCase):
+    def test_skips_whitespace_only_messages(self):
+        from mcp_server.monitor import _last_assistant
+        from mcp_server.transcripts.types import Message
+
+        msgs = [
+            Message(role=Role.ASSISTANT, content="real reply"),
+            Message(role=Role.ASSISTANT, content="  \n"),
+            Message(role=Role.TOOL, content="[tool_use: x]"),
+        ]
+        self.assertEqual(_last_assistant(msgs)["content"], "real reply")
+
+    def test_none_when_only_empty(self):
+        from mcp_server.monitor import _last_assistant
+        from mcp_server.transcripts.types import Message
+
+        self.assertIsNone(_last_assistant([Message(role=Role.ASSISTANT, content="")]))
+
+
 class SharedFixtureCorpusTest(unittest.TestCase):
     """Parse the SHARED fixtures in `tests/fixtures/transcripts/` and assert the
     same user/assistant text extraction the Rust parser asserts on them

@@ -25,7 +25,7 @@ pub(crate) enum IdleAgeBucket {
 
 /// Pure bucket classifier over "how long has this session been idle".
 /// `None` = unknown age → treated as old ([`IdleAgeBucket::Stale`]).
-fn idle_age_bucket(idle_for: Option<Duration>) -> IdleAgeBucket {
+pub(super) fn idle_age_bucket(idle_for: Option<Duration>) -> IdleAgeBucket {
     match idle_for {
         Some(d) if d < IDLE_AFTERGLOW_WINDOW => IdleAgeBucket::Afterglow,
         Some(d) if d < IDLE_STALE_THRESHOLD => IdleAgeBucket::Settled,
@@ -50,24 +50,31 @@ pub(super) fn idle_age_bucket_at(idle_since: Option<Instant>, now: Instant) -> I
 /// Returns the row index to jump to: the candidate after `current` in the
 /// priority-ordered ring (wrapping), or the top-priority candidate when the
 /// cursor isn't on a candidate. `None` = nothing needs attention.
+#[cfg(test)]
 fn next_attention_index(
     rows: &[(bool, bool, bool)],
     current: Option<usize>,
 ) -> Option<usize> {
-    let mut candidates: Vec<usize> = rows
+    let tiers: Vec<Option<u8>> = rows
+        .iter()
+        .map(|(has_alert, is_idle, hidden)| {
+            super::agent_state::attention_tier(*has_alert, *hidden, None, *is_idle)
+        })
+        .collect();
+    next_attention_index_tiered(&tiers, current)
+}
+
+/// Tiered A-g picker: each row's priority tier (lower first; None = not a
+/// candidate), candidates within a tier in visual order. Tiers come from
+/// `agent_state::attention_tier`: alerts, waiting-on-human, errored, idle.
+fn next_attention_index_tiered(rows: &[Option<u8>], current: Option<usize>) -> Option<usize> {
+    let mut candidates: Vec<(u8, usize)> = rows
         .iter()
         .enumerate()
-        .filter(|(_, (has_alert, _, _))| *has_alert)
-        .map(|(i, _)| i)
+        .filter_map(|(i, t)| t.map(|t| (t, i)))
         .collect();
-    candidates.extend(
-        rows.iter()
-            .enumerate()
-            .filter(|(_, (has_alert, is_idle, hidden))| {
-                !*has_alert && *is_idle && !*hidden
-            })
-            .map(|(i, _)| i),
-    );
+    candidates.sort();
+    let candidates: Vec<usize> = candidates.into_iter().map(|(_, i)| i).collect();
     if candidates.is_empty() {
         return None;
     }
@@ -156,14 +163,34 @@ pub(super) fn palette_match_indices(query: &str, displays: &[&str]) -> Vec<usize
     if q.is_empty() {
         return (0..displays.len()).collect();
     }
+    rank_prefix_then_substring(displays.len(), |i| {
+        let dl = displays[i].to_lowercase();
+        if dl.starts_with(&q) {
+            Some(true)
+        } else if dl.contains(&q) {
+            Some(false)
+        } else {
+            None
+        }
+    })
+}
+
+/// Shared ranking for the type-to-filter pickers (A-p palette, A-O past
+/// workspaces): `classify(i)` answers `Some(true)` for a prefix match,
+/// `Some(false)` for a plain substring match, `None` for no match. Prefix
+/// matches come first, then substring matches, each group keeping the
+/// caller's original order.
+pub(super) fn rank_prefix_then_substring(
+    len: usize,
+    mut classify: impl FnMut(usize) -> Option<bool>,
+) -> Vec<usize> {
     let mut prefix: Vec<usize> = Vec::new();
     let mut substr: Vec<usize> = Vec::new();
-    for (i, d) in displays.iter().enumerate() {
-        let dl = d.to_lowercase();
-        if dl.starts_with(&q) {
-            prefix.push(i);
-        } else if dl.contains(&q) {
-            substr.push(i);
+    for i in 0..len {
+        match classify(i) {
+            Some(true) => prefix.push(i),
+            Some(false) => substr.push(i),
+            None => {}
         }
     }
     prefix.extend(substr);
@@ -197,7 +224,7 @@ fn task_status_label(s: &TaskStatus) -> &'static str {
 }
 
 /// Peek body for a bound task: name, status, metadata, and the full
-/// prompt (the main payload — "what was this agent asked to do").
+/// brief (the main payload — "what was this agent asked to do").
 /// `parent_name` is the resolved parent task's name when the caller
 /// could find it; the raw id is shown otherwise.
 fn peek_task_lines(task: &TaskEntry, parent_name: Option<&str>) -> Vec<PeekLine> {
@@ -219,14 +246,14 @@ fn peek_task_lines(task: &TaskEntry, parent_name: Option<&str>) -> Vec<PeekLine>
         out.push(PeekLine::Field { label: "Branch".into(), value: b.to_string() });
     }
     out.push(PeekLine::Blank);
-    out.push(PeekLine::Field { label: "Prompt".into(), value: String::new() });
+    out.push(PeekLine::Field { label: "Brief".into(), value: String::new() });
     match task.prompt.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
         Some(p) => {
             for l in p.lines() {
                 out.push(PeekLine::Text(l.to_string()));
             }
         }
-        None => out.push(PeekLine::Text("(no prompt)".into())),
+        None => out.push(PeekLine::Text("(no description)".into())),
     }
     out
 }
@@ -258,7 +285,7 @@ fn peek_workspace_lines(
         out.push(PeekLine::Text("(none)".into()));
     } else {
         for (label, stype, status) in sessions {
-            out.push(PeekLine::Text(format!("{} ({}) \u{2014} {}", label, stype, status)));
+            out.push(PeekLine::Text(format!("{} ({}) \u{2014} {}", label, super::symbols::engine_with_name(stype), status)));
         }
     }
     out
@@ -275,11 +302,12 @@ fn peek_session_lines(
 ) -> Vec<PeekLine> {
     let mut out = vec![
         PeekLine::Field {
-            label: "Session".into(),
-            value: format!("{} ({})", label, session_type),
+            label: if session_type == "bash" { "Shell" } else { "Session" }.into(),
+            value: format!("{} ({})", label, super::symbols::engine_with_name(session_type)),
         },
         PeekLine::Field { label: "Uid".into(), value: uid.to_string() },
     ];
+    if session_type == "bash" { return out; }
     if let Some(s) = seeded_from {
         out.push(PeekLine::Field { label: "Seeded from".into(), value: s.to_string() });
     }
@@ -289,14 +317,34 @@ fn peek_session_lines(
     out
 }
 
+/// One division header row: the division (initiative id) and the section it
+/// draws in (`None` = the loose list). A division whose top-level blocks sit
+/// in several sections draws a header in each; the section keeps every
+/// header its own row, cursor stop and fold.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DivisionKey {
+    pub id: String,
+    pub section: Option<String>,
+}
+
+impl DivisionKey {
+    /// The `folded_divisions` key. A loose header keeps the bare initiative
+    /// id (the key every header used before headers were per section); a
+    /// header in a section uses the JSON pair `[section, id]`.
+    pub(crate) fn fold_key(&self) -> String {
+        match &self.section {
+            None => self.id.clone(),
+            Some(sec) => serde_json::to_string(&[sec.as_str(), self.id.as_str()]).unwrap(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Cursor {
-    /// Cursor is on a workspace header (by workspace index).
+    /// Cursor is on a workspace header (by workspace index). In the Task
+    /// sub-view it stands for the workspace's task and is a tree row (see
+    /// `app/tree.rs`).
     Workspace(usize),
-    /// Cursor is on a task subheader within a workspace. Identified by
-    /// workspace index plus task_id (tasks can move / be renumbered, so an
-    /// index wouldn't be stable).
-    Task { ws_idx: usize, task_id: String },
     /// Cursor is on a session within a workspace (workspace index, session index).
     Session(usize, usize),
     /// Cursor is inside the sidebar's `backtests` group (cloud backtest
@@ -309,6 +357,12 @@ pub enum Cursor {
     /// A-e / A-x / A-J / A-K edit / delete / reorder it, and A-n creates a
     /// workspace inside it. See `app/sections.rs`.
     Section(String),
+    /// Cursor is on a division header (Task sub-view).
+    /// Space/Enter fold it; no terminal behind it.
+    Division(DivisionKey),
+    /// Cursor is on a Team sub-view header (`team:<id>`, `member:<id>` or
+    /// the unassigned group; app/team_view.rs). Space/Enter fold it.
+    Org(String),
 }
 
 /// Which row of the `backtests` group the cursor is on. Space/Enter (which
@@ -336,7 +390,13 @@ pub enum SidebarColumn {
 #[derive(Clone, Debug, PartialEq)]
 pub enum SidebarView {
     Status,
+    /// The work tree (`app/tree.rs`), titled "Workspaces": sections,
+    /// divisions, workspaces with their sessions. The name and the persisted
+    /// `"task"` value predate the removal of the task level (2026-11-05).
     Task,
+    /// Teams and members (app/team_view.rs); the Task tree when the org
+    /// model isn't live.
+    Team,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -345,12 +405,9 @@ pub enum ViewMode {
     Planning,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum VisualItem {
     WorkspaceHeader(usize),
-    /// Subheader for a task inside a workspace. Sessions tagged with this
-    /// task_id follow immediately after.
-    TaskHeader { ws_idx: usize, task_id: String },
     Session(usize, usize),
     Separator,
     /// Closing boundary of a sidebar section, including the final section.
@@ -364,6 +421,10 @@ pub(super) enum VisualItem {
     /// group. Non-selectable. See
     /// DESIGN_CONTINUOUS_TASKS.md §12.
     ContinuousHeader,
+    /// A continuous org-model team block in the Task sidebar.
+    ContinuousTeamHeader(String),
+    /// A selectable session row inside a continuous org-model team block.
+    ContinuousTeamSession(usize, usize),
     /// Cloud-backtests group header, appended at the bottom of the
     /// continuous column when any backtest row is live. SELECTABLE
     /// (unlike `ContinuousHeader`) so Space/Enter can fold the group.
@@ -378,6 +439,13 @@ pub(super) enum VisualItem {
     /// workspaces follow until the next section header / separator unless
     /// the section is folded. See doc/sidebar-sections.md.
     SectionHeader(String),
+    /// A division's header (Task sub-view): groups the top-level blocks of
+    /// the division's tree within one section (or the loose list).
+    /// Selectable; Space/Enter fold it. See `app/tree.rs`.
+    DivisionHeader(DivisionKey),
+    /// Team sub-view header (app/team_view.rs): `team:<id>`, `member:<id>`
+    /// or the unassigned group. Not a cursor stop.
+    OrgHeader { key: String, depth: u8 },
 }
 
 /// One row in the dedicated continuous column (the two-column panel, S2 of
@@ -421,8 +489,9 @@ pub(super) fn cursor_selected_session_uid<'a>(
 
 impl App {
     /// True iff the session with this uid has a pending `notify_user` alert.
-    pub(crate) fn session_has_alert(&self, uid: &str) -> bool {
-        self.alerts.contains_key(uid)
+    pub(crate) fn session_has_alert(&self, uid: &str, host: &crate::hosts::HostId) -> bool {
+        self.owner_alert_rows.contains_key(&(host.clone(), uid.to_string()))
+            || (*host == crate::hosts::HostId::local() && self.alerts.contains_key(uid))
     }
 
     /// Record an attention alert for `uid` and fire the desktop notification.
@@ -439,7 +508,7 @@ impl App {
     /// idle. Cheap no-op when `alerts` is empty (the common case). Called once
     /// per main-loop iteration.
     pub fn tick_alerts(&mut self) {
-        if self.alerts.is_empty() {
+        if self.alerts.is_empty() && self.owner_alert_rows.is_empty() {
             return;
         }
         let frame = self.alert_frame();
@@ -499,18 +568,21 @@ impl App {
         self.apply_pending_sidebar_assignments();
         // Bind delayed adoption and replacement continuous ticks to retained alerts.
         if !self.owner_alerts.is_empty() { self.sync_owner_alert_indicators(); }
-        if self.alerts.is_empty() {
+        if self.alerts.is_empty() && self.owner_alerts.is_empty() {
             return;
         }
         // Clear-on-focus: the chosen semantics are "selecting the session's
         // sidebar row counts as focusing it" (attach selects first, so it's
         // covered too). Resolve the uid first and drop the workspaces borrow
         // before mutating `alerts`.
-        let selected = cursor_selected_session_uid(&self.cursor, &self.workspaces)
-            .map(str::to_string);
-        if let Some(uid) = selected {
-            self.acknowledge_owner_alerts_for_row(&uid);
-            if self.alerts.remove(&uid).is_some() {
+        let selected = match self.cursor {
+            Cursor::Session(wi, si) => self.workspaces.get(wi).and_then(|w| w.sessions.get(si))
+                .map(|s| (s.uid.clone(), s.host_id.clone())),
+            _ => None,
+        };
+        if let Some((uid, host)) = selected {
+            self.acknowledge_owner_alerts_for_row(&uid, &host);
+            if host == crate::hosts::HostId::local() && self.alerts.remove(&uid).is_some() {
                 self.needs_redraw = true;
             }
         }
@@ -537,26 +609,18 @@ impl App {
     /// re-resolved by workspace id / session uid so it stays on the
     /// same row across the reorder.
     pub(super) fn resort_workspaces_for_pin(&mut self) {
-        let (saved_ws_id, saved_uid, saved_task) = match &self.cursor {
+        let (saved_ws_id, saved_uid) = match &self.cursor {
             Cursor::Session(wi, si) => (
                 self.workspaces.get(*wi).map(|w| w.id.clone()),
                 self.workspaces
                     .get(*wi)
                     .and_then(|w| w.sessions.get(*si))
                     .map(|s| s.uid.clone()),
-                None,
             ),
-            Cursor::Workspace(wi) => {
-                (self.workspaces.get(*wi).map(|w| w.id.clone()), None, None)
-            }
-            Cursor::Task { ws_idx, task_id } => (
-                self.workspaces.get(*ws_idx).map(|w| w.id.clone()),
-                None,
-                Some(task_id.clone()),
-            ),
+            Cursor::Workspace(wi) => (self.workspaces.get(*wi).map(|w| w.id.clone()), None),
             // Backtest rows live outside the workspace list — the reorder
             // can't move them, so the cursor needs no re-resolution.
-            Cursor::Backtest(_) | Cursor::Section(_) => (None, None, None),
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => (None, None),
         };
         self.workspaces.sort_by_key(|w| !w.pinned);
         if let Some(id) = saved_ws_id {
@@ -570,8 +634,6 @@ impl App {
                         Some(si) => Cursor::Session(wi, si),
                         None => Cursor::Workspace(wi),
                     }
-                } else if let Some(task_id) = saved_task {
-                    Cursor::Task { ws_idx: wi, task_id }
                 } else {
                     Cursor::Workspace(wi)
                 };
@@ -621,6 +683,34 @@ impl App {
             }
             return;
         }
+        // A division header that no longer draws (its blocks closed, or the
+        // initiative is no longer a division) falls back to the first row.
+        if matches!(self.cursor, Cursor::Org(_)) {
+            self.clamp_org_cursor();
+            return;
+        }
+        if let Cursor::Division(key) = &self.cursor {
+            let tree = self.task_tree_shared();
+            let items = &tree.items;
+            if !items.iter().any(|vi| matches!(vi, VisualItem::DivisionHeader(d) if d == key)) {
+                // The same division's header in another section, else the
+                // first workspace.
+                let same = items.iter().find_map(|vi| match vi {
+                    VisualItem::DivisionHeader(d) if d.id == key.id => Some(Cursor::Division(d.clone())),
+                    _ => None,
+                });
+                self.cursor = same
+                    .or_else(|| items.iter().find_map(|vi| match vi {
+                        VisualItem::WorkspaceHeader(wi) => Some(Cursor::Workspace(*wi)),
+                        _ => None,
+                    }))
+                    .unwrap_or(Cursor::Workspace(0));
+                if !matches!(self.cursor, Cursor::Division(_)) {
+                    self.clamp_cursor();
+                }
+            }
+            return;
+        }
         if self.workspaces.is_empty() {
             self.cursor = Cursor::Workspace(0);
             return;
@@ -644,22 +734,8 @@ impl App {
                         Cursor::Session(wi, self.workspaces[wi].sessions.len() - 1);
                 }
             }
-            Cursor::Task { ws_idx, task_id } => {
-                let wi = *ws_idx;
-                let tid = task_id.clone();
-                if wi > max {
-                    self.cursor = Cursor::Workspace(max);
-                } else if !self
-                    .tasks
-                    .iter()
-                    .any(|t| t.task_id.as_deref() == Some(tid.as_str()))
-                {
-                    // Task disappeared — fall back to workspace.
-                    self.cursor = Cursor::Workspace(wi);
-                }
-            }
             // Fully handled by the early-returns at the top of this fn.
-            Cursor::Backtest(_) | Cursor::Section(_) => {}
+            Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Division(_) | Cursor::Org(_) => {}
         }
     }
 
@@ -667,10 +743,16 @@ impl App {
     /// are owned by the dedicated continuous column and are returned by
     /// [`continuous_backtest_items`].
     pub(super) fn visual_items(&self) -> Vec<VisualItem> {
-        let mut items = match self.sidebar_view {
+        let items = match self.sidebar_view {
             SidebarView::Status => self.visual_items_status(),
             SidebarView::Task => self.visual_items_task(),
+            SidebarView::Team => self.visual_items_team(),
         };
+        self.filter_visual_items(items)
+    }
+
+    /// Apply the sidebar filter (A-/) to a row list.
+    pub(super) fn filter_visual_items(&self, mut items: Vec<VisualItem>) -> Vec<VisualItem> {
         if let Some(query) = self.sidebar_filter.as_deref() {
             let query = query.to_lowercase();
             items.retain(|item| self.visual_item_matches(item, &query));
@@ -704,27 +786,33 @@ impl App {
     fn visual_item_matches(&self, item: &VisualItem, query: &str) -> bool {
         let contains = |s: &str| s.to_lowercase().contains(query);
         match item {
-            VisualItem::WorkspaceHeader(wi) => self.workspaces.get(*wi).is_some_and(|w| contains(&w.name)),
-            VisualItem::Session(wi, si) => self.workspaces.get(*wi).and_then(|w| w.sessions.get(*si)).is_some_and(|s| {
+            // A workspace row stands for its tasks: their names match too.
+            VisualItem::WorkspaceHeader(wi) => self.workspaces.get(*wi).is_some_and(|w| contains(&w.name))
+                || self.workspace_tasks(*wi).iter().any(|id| {
+                    contains(id) || self.find_task_entry(id).is_some_and(|t| contains(&t.name))
+                }),
+            VisualItem::Session(wi, si) | VisualItem::ContinuousTeamSession(wi, si) => self.workspaces.get(*wi).and_then(|w| w.sessions.get(*si)).is_some_and(|s| {
                 contains(&s.label)
                     || s.task_id.as_deref().and_then(|id| self.find_task_entry(id)).is_some_and(|t| contains(&t.name))
             }),
-            VisualItem::TaskHeader { task_id, .. } => self.find_task_entry(task_id).is_some_and(|t| contains(&t.name) || contains(task_id)),
             VisualItem::WorkflowHeader { run_id, .. } => contains(run_id),
             VisualItem::SectionHeader(id) => self.section_by_id(id).is_some_and(|s| contains(&s.name) || contains(id)),
+            VisualItem::DivisionHeader(key) => self.planning.division(&key.id).is_some_and(|d| contains(&d.name)) || contains(&key.id),
             VisualItem::BacktestHeader => contains("backtest") || self.backtest_rows.iter().any(|r| contains(&r.label)),
             VisualItem::BacktestFleet(stem) => contains(stem),
             VisualItem::BacktestRun { task_id, .. } => self.backtest_rows.iter().find(|r| r.task_id == *task_id).is_some_and(|r| contains(&r.label) || contains(task_id)),
-            VisualItem::ContinuousHeader | VisualItem::Separator | VisualItem::SectionEnd => false,
+            VisualItem::OrgHeader { key, .. } => contains(&self.org_header_text(key)),
+            VisualItem::ContinuousHeader | VisualItem::ContinuousTeamHeader(_) | VisualItem::Separator | VisualItem::SectionEnd => false,
         }
     }
 
     pub(super) fn sidebar_cursor_index(&self, items: &[VisualItem]) -> Option<usize> {
         items.iter().position(|item| match (&self.cursor, item) {
             (Cursor::Workspace(a), VisualItem::WorkspaceHeader(b)) => a == b,
-            (Cursor::Session(a, b), VisualItem::Session(c, d)) => a == c && b == d,
-            (Cursor::Task { ws_idx, task_id }, VisualItem::TaskHeader { ws_idx: a, task_id: b }) => ws_idx == a && task_id == b,
+            (Cursor::Session(a, b), VisualItem::Session(c, d) | VisualItem::ContinuousTeamSession(c, d)) => a == c && b == d,
             (Cursor::Section(a), VisualItem::SectionHeader(b)) => a == b,
+            (Cursor::Division(a), VisualItem::DivisionHeader(b)) => a == b,
+            (Cursor::Org(a), VisualItem::OrgHeader { key: b, .. }) => a == b,
             (Cursor::Backtest(BacktestCursor::Group), VisualItem::BacktestHeader) => true,
             (Cursor::Backtest(BacktestCursor::Fleet(a)), VisualItem::BacktestFleet(b)) => a == b,
             (Cursor::Backtest(BacktestCursor::Run(a)), VisualItem::BacktestRun { task_id: b, .. }) => a == b,
@@ -876,167 +964,22 @@ impl App {
     /// Sessions grouped by workflow run appear contiguously under a workflow
     /// subheader. Standalone sessions render first; each workflow group
     /// follows. Past workspaces are hidden — reachable via the A-O picker.
+    /// Task sub-view rows: the nested work tree (`app/tree.rs`).
     pub(super) fn visual_items_task(&self) -> Vec<VisualItem> {
-        let members = self.continuous_members();
-        // Visibility filter shared with the section rollup: open, not past,
-        // and not continuous-only (those render in the continuous column,
-        // never here — see `task_view_visible_workspaces`).
-        let visible = self.task_view_visible_workspaces(&members);
-        let mut items = Vec::new();
-
-        // Sections first, in display order. Each header is followed by its
-        // member workspaces (explicit assignment or inherited through the
-        // task tree — `section_of_workspace`) unless folded. An empty
-        // section still shows its header so it can be populated.
-        let mut loose: Vec<usize> = Vec::new();
-        let mut by_section: std::collections::HashMap<String, Vec<usize>> =
-            std::collections::HashMap::new();
-        for &wi in &visible {
-            match self.section_of_workspace(wi) {
-                Some(sid) => by_section.entry(sid).or_default().push(wi),
-                None => loose.push(wi),
-            }
-        }
-        for sec in &self.sections {
-            items.push(VisualItem::SectionHeader(sec.id.clone()));
-            if !sec.folded {
-                let mut first_in_section = true;
-                for wi in by_section.remove(&sec.id).unwrap_or_default() {
-                    if !first_in_section {
-                        items.push(VisualItem::Separator);
-                    }
-                    first_in_section = false;
-                    self.push_task_view_workspace(&mut items, wi, &members);
-                }
-            }
-            items.push(VisualItem::SectionEnd);
-        }
-        // Loose workspaces (no section) follow, exactly as pre-feature.
-        for wi in loose {
-            if !items.is_empty() && !matches!(items.last(), Some(VisualItem::SectionEnd)) {
-                items.push(VisualItem::Separator);
-            }
-            self.push_task_view_workspace(&mut items, wi, &members);
-        }
-        items
+        self.task_tree_shared().items.clone()
     }
 
-    /// One workspace's Task sub-view rows: the header, then its sessions
-    /// bucketed by task (subheaders) and workflow run (grouped).
-    fn push_task_view_workspace(
-        &self,
-        items: &mut Vec<VisualItem>,
-        wi: usize,
-        members: &std::collections::HashSet<(usize, usize)>,
-    ) {
-        let ws = &self.workspaces[wi];
-        {
-            items.push(VisualItem::WorkspaceHeader(wi));
+    /// `parent_task_id` of any task in the last planning snapshot, whatever
+    /// its status. `Some(None)` = top-level; `None` = not in the snapshot.
+    pub(crate) fn planning_task_parent(&self, task_id: &str) -> Option<Option<String>> {
+        self.sidebar_task_parents.get(task_id).cloned()
+    }
 
-            // Partition sessions by task_id bucket. Unbound sessions live in
-            // the `None` bucket and render at workspace level (no subheader).
-            // Continuous members are excluded (they live in the column).
-            let mut by_task: std::collections::BTreeMap<Option<String>, Vec<usize>> =
-                std::collections::BTreeMap::new();
-            for (si, ts) in ws.sessions.iter().enumerate() {
-                if members.contains(&(wi, si)) {
-                    continue;
-                }
-                by_task.entry(ts.task_id.clone()).or_default().push(si);
-            }
-
-            // Render buckets: unbound first, then task buckets in binding order.
-            let task_order: Vec<Option<String>> = {
-                let mut ordered: Vec<Option<String>> = Vec::new();
-                if by_task.contains_key(&None) {
-                    ordered.push(None);
-                }
-                // Tasks bound to this workspace, in insertion order of self.tasks.
-                for task in &self.tasks {
-                    if task.workspace_id.as_deref() != Some(ws.id.as_str()) {
-                        continue;
-                    }
-                    let Some(tid) = task.task_id.as_deref() else { continue };
-                    let key = Some(tid.to_string());
-                    if by_task.contains_key(&key) && !ordered.contains(&key) {
-                        ordered.push(key);
-                    }
-                }
-                // Catch any orphaned task_ids tagged on sessions but not in
-                // self.tasks (stale API state) — render them too so they don't
-                // silently disappear.
-                let mut tail: Vec<Option<String>> = by_task
-                    .keys()
-                    .filter(|k| k.is_some() && !ordered.contains(k))
-                    .cloned()
-                    .collect();
-                tail.sort();
-                ordered.extend(tail);
-                ordered
-            };
-
-            for bucket_key in task_order {
-                // Emit task subheader for task-scoped buckets.
-                if let Some(tid) = bucket_key.as_deref() {
-                    items.push(VisualItem::TaskHeader {
-                        ws_idx: wi,
-                        task_id: tid.to_string(),
-                    });
-                }
-                let indices = by_task.remove(&bucket_key).unwrap_or_default();
-
-                // Split each bucket into standalone + workflow groups.
-                let mut standalone: Vec<usize> = Vec::new();
-                let mut groups: std::collections::BTreeMap<String, Vec<usize>> =
-                    std::collections::BTreeMap::new();
-                for si in &indices {
-                    match &ws.sessions[*si].workflow_run_id {
-                        Some(run_id) => groups.entry(run_id.clone()).or_default().push(*si),
-                        None => standalone.push(*si),
-                    }
-                }
-                // Standalone: running first, then idle.
-                let (run_, other): (Vec<_>, Vec<_>) = standalone
-                    .into_iter()
-                    .partition(|si| ws.sessions[*si].status == SessionStatus::Running);
-                for si in run_ {
-                    items.push(VisualItem::Session(wi, si));
-                }
-                for si in other {
-                    items.push(VisualItem::Session(wi, si));
-                }
-                // Workflow groups.
-                for (run_id, session_indices) in groups {
-                    let is_active_run =
-                        self.workflow_runs.iter().any(|r| r.run_id == run_id);
-                    if !is_active_run {
-                        for si in session_indices {
-                            items.push(VisualItem::Session(wi, si));
-                        }
-                        continue;
-                    }
-                    items.push(VisualItem::WorkflowHeader {
-                        ws_idx: wi,
-                        run_id: run_id.clone(),
-                    });
-                    let role_order: Vec<String> = self
-                        .workflow_runs
-                        .iter()
-                        .find(|r| r.run_id == run_id)
-                        .and_then(|r| self.workflows.get(&r.workflow_name))
-                        .map(|wf| wf.role_order.clone())
-                        .unwrap_or_default();
-                    let mut ordered = session_indices.clone();
-                    ordered.sort_by_key(|si| {
-                        let role = ws.sessions[*si].workflow_role.as_deref().unwrap_or("");
-                        role_order.iter().position(|r| r == role).unwrap_or(usize::MAX)
-                    });
-                    for si in ordered {
-                        items.push(VisualItem::Session(wi, si));
-                    }
-                }
-            }
-        }
+    /// `(task, parent)` for every subtask in the last planning snapshot.
+    pub(crate) fn planning_task_edges(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.sidebar_task_parents
+            .iter()
+            .filter_map(|(task, parent)| Some((task.as_str(), parent.as_deref()?)))
     }
 
     /// Map each session task_id to its `parent_task_id`, including Done tasks.
@@ -1044,7 +987,7 @@ impl App {
     /// the orchestrator session's uid changes when it respawns (fresh context /
     /// restart), but the TASK tree doesn't, so a subtask's `parent_task_id`
     /// still points at the orchestrator's task.
-    fn task_parent_map(&self) -> std::collections::HashMap<&str, &str> {
+    pub(super) fn task_parent_map(&self) -> std::collections::HashMap<&str, &str> {
         self.sidebar_task_parents
             .iter()
             .filter_map(|(task, parent)| Some((task.as_str(), parent.as_deref()?)))
@@ -1056,7 +999,7 @@ impl App {
 
     /// Older adopted orchestrator rows sometimes lack task_id. The planning
     /// workspace binding is authoritative; labels and old manager UIDs aren't.
-    fn continuous_planning_task<'a>(&'a self, ws: &'a Workspace, ts: &'a TerminalSession) -> Option<&'a str> {
+    pub(super) fn continuous_planning_task<'a>(&'a self, ws: &'a Workspace, ts: &'a TerminalSession) -> Option<&'a str> {
         ts.task_id.as_deref().or_else(|| self.tasks.iter().find(|t|
             t.is_continuous && t.workspace_id.as_deref() == Some(ws.id.as_str()))
             .and_then(|t| t.task_id.as_deref()))
@@ -1183,6 +1126,17 @@ impl App {
     /// Closed workspaces skipped. Pure read — the render + cursor consume this;
     /// it's only drawn/navigated when the column is on.
     pub(super) fn visual_items_continuous(&self) -> Vec<ContinuousRow> {
+        let mut rows = self.continuous_rows_unfiltered();
+        if let Some(query) = self.sidebar_filter.as_deref() {
+            let query = query.to_lowercase();
+            rows.retain(|r| self.visual_item_matches(&r.visual_item(), &query));
+        }
+        rows
+    }
+
+    /// The continuous column's grouping before the sidebar filter (A-/)
+    /// applies. The org chart (F6) reuses it for its Continuous org.
+    pub(super) fn continuous_rows_unfiltered(&self) -> Vec<ContinuousRow> {
         // Orchestrators: (ws_idx, sess_idx, uid, task_id, label).
         let mut orchestrators: Vec<(usize, usize, &str, Option<&str>, &str)> = Vec::new();
         for (wi, ws) in self.workspaces.iter().enumerate() {
@@ -1360,10 +1314,6 @@ impl App {
                 rows.extend(group_rows);
             }
         }
-        if let Some(query) = self.sidebar_filter.as_deref() {
-            let query = query.to_lowercase();
-            rows.retain(|r| self.visual_item_matches(&r.visual_item(), &query));
-        }
         rows
     }
 
@@ -1441,6 +1391,28 @@ impl App {
     /// Navigate the cursor up or down. +1 = down, -1 = up.
     /// Skips non-selectable items (Separators, headers with sessions).
     pub(super) fn navigate(&mut self, direction: i32) {
+        self.navigate_step(direction, true);
+    }
+
+    /// A-u / A-d: move half the focused column's visible rows, like vim's
+    /// Ctrl-u / Ctrl-d. Stops at the first or last row instead of wrapping.
+    pub(super) fn page_sidebar(&mut self, direction: i32) {
+        let rows = if self.cursor_column == SidebarColumn::Continuous && self.continuous_column_on {
+            self.continuous_page_rows
+        } else {
+            self.sidebar_page_rows
+        };
+        let half = (rows / 2).max(1);
+        for _ in 0..half {
+            if !self.navigate_step(direction.signum(), false) {
+                break;
+            }
+        }
+    }
+
+    /// One cursor step. Returns false when nothing moved; without `wrap` a
+    /// step past either end is refused.
+    fn navigate_step(&mut self, direction: i32, wrap: bool) -> bool {
         // S4: in the continuous column, navigate over its own row list
         // (every row is a selectable session, so just wrap ±1).
         if self.cursor_column == SidebarColumn::Continuous && self.continuous_column_on {
@@ -1453,7 +1425,7 @@ impl App {
                     .take()
                     .unwrap_or(Cursor::Workspace(0));
                 self.cursor_column = SidebarColumn::Main;
-                return;
+                return false;
             }
             let cur = match &self.cursor {
                 Cursor::Workspace(wi) => rows.iter().position(|r| r.ws_idx == *wi && r.sess_idx.is_none()).unwrap_or(0),
@@ -1467,7 +1439,11 @@ impl App {
                 _ => 0,
             };
             let n = (rows.len() + backtests.len()) as i32;
-            let next = (cur as i32 + direction).rem_euclid(n) as usize;
+            let raw = cur as i32 + direction;
+            if !wrap && !(0..n).contains(&raw) {
+                return false;
+            }
+            let next = raw.rem_euclid(n) as usize;
             if next < rows.len() {
                 let r = rows[next];
                 self.cursor = r.cursor();
@@ -1479,25 +1455,26 @@ impl App {
                     _ => Cursor::Backtest(BacktestCursor::Group),
                 };
             }
-            return;
+            return true;
         }
 
         let items = self.visual_items();
         if items.is_empty() {
-            return;
+            return false;
         }
 
-        // Workspace headers are selectable only when the workspace has no
-        // sessions (otherwise the cursor lives on a child session).
-        // Task headers are always selectable — they support A-d / A-x / A-e
-        // etc. even when they have sessions underneath.
+        // In the Task sub-view workspace headers are always selectable: the
+        // workspace row stands for its task (A-D / A-e / A-i / fold), as the
+        // task header it replaced did. Elsewhere a workspace header is
+        // selectable only when the workspace has no sessions (otherwise the
+        // cursor lives on a child session).
+        let tree_rows = self.tree_view();
         let is_selectable = |item: &VisualItem| match item {
-            VisualItem::Session(_, _) => true,
+            VisualItem::Session(_, _) | VisualItem::ContinuousTeamSession(_, _) => true,
             VisualItem::WorkspaceHeader(wi) => self
                 .workspaces
                 .get(*wi)
-                .map_or(false, |w| w.sessions.is_empty()),
-            VisualItem::TaskHeader { .. } => true,
+                .map_or(false, |w| tree_rows || w.sessions.is_empty()),
             VisualItem::Separator | VisualItem::SectionEnd => false,
             VisualItem::WorkflowHeader { .. } => false,
             // 12e: host headers are presentation-only; skip
@@ -1505,6 +1482,9 @@ impl App {
             // Continuous header is presentation-only, like
             // other decorative headers; skip it in cursor navigation.
             VisualItem::ContinuousHeader => false,
+            VisualItem::ContinuousTeamHeader(_) => false,
+            // Team sub-view headers fold on Space/Enter.
+            VisualItem::OrgHeader { .. } => true,
             // Backtest rows are all selectable — the header and fleet rows
             // for the Space/Enter fold toggle, run rows for the A-i peek.
             VisualItem::BacktestHeader => true,
@@ -1512,23 +1492,21 @@ impl App {
             VisualItem::BacktestRun { .. } => true,
             // Section headers fold on Space/Enter and take A-e/A-x/A-n.
             VisualItem::SectionHeader(_) => true,
+            // Division headers fold on Space/Enter.
+            VisualItem::DivisionHeader(_) => true,
         };
 
         if !items.iter().any(is_selectable) {
-            return;
+            return false;
         }
 
         let cur_pos = items
             .iter()
             .position(|item| match (&self.cursor, item) {
                 (Cursor::Workspace(wi), VisualItem::WorkspaceHeader(vwi)) => wi == vwi,
-                (Cursor::Session(wi, si), VisualItem::Session(vwi, vsi)) => {
+                (Cursor::Session(wi, si), VisualItem::Session(vwi, vsi) | VisualItem::ContinuousTeamSession(vwi, vsi)) => {
                     wi == vwi && si == vsi
                 }
-                (
-                    Cursor::Task { ws_idx, task_id },
-                    VisualItem::TaskHeader { ws_idx: vwi, task_id: vtid },
-                ) => ws_idx == vwi && task_id == vtid,
                 (
                     Cursor::Backtest(BacktestCursor::Group),
                     VisualItem::BacktestHeader,
@@ -1542,6 +1520,8 @@ impl App {
                     VisualItem::BacktestRun { task_id: vtid, .. },
                 ) => tid == vtid,
                 (Cursor::Section(id), VisualItem::SectionHeader(vid)) => id == vid,
+                (Cursor::Division(id), VisualItem::DivisionHeader(vid)) => id == vid,
+                (Cursor::Org(key), VisualItem::OrgHeader { key: vkey, .. }) => key == vkey,
                 _ => false,
             })
             .map(|p| p as i32)
@@ -1549,22 +1529,25 @@ impl App {
 
         let len = items.len() as i32;
         let mut next = cur_pos;
+        let mut found = false;
         for _ in 0..items.len() {
-            next = (next + direction).rem_euclid(len);
+            let raw = next + direction;
+            if !wrap && !(0..len).contains(&raw) {
+                return false;
+            }
+            next = raw.rem_euclid(len);
             if is_selectable(&items[next as usize]) {
+                found = true;
                 break;
             }
         }
+        if !found {
+            return false;
+        }
 
         match &items[next as usize] {
-            VisualItem::Session(wi, si) => self.cursor = Cursor::Session(*wi, *si),
+            VisualItem::Session(wi, si) | VisualItem::ContinuousTeamSession(wi, si) => self.cursor = Cursor::Session(*wi, *si),
             VisualItem::WorkspaceHeader(wi) => self.cursor = Cursor::Workspace(*wi),
-            VisualItem::TaskHeader { ws_idx, task_id } => {
-                self.cursor = Cursor::Task {
-                    ws_idx: *ws_idx,
-                    task_id: task_id.clone(),
-                };
-            }
             VisualItem::BacktestHeader => {
                 self.cursor = Cursor::Backtest(BacktestCursor::Group);
             }
@@ -1577,8 +1560,15 @@ impl App {
             VisualItem::SectionHeader(id) => {
                 self.cursor = Cursor::Section(id.clone());
             }
+            VisualItem::DivisionHeader(id) => {
+                self.cursor = Cursor::Division(id.clone());
+            }
+            VisualItem::OrgHeader { key, .. } => {
+                self.cursor = Cursor::Org(key.clone());
+            }
             _ => {}
         }
+        true
     }
 
     /// A-g: jump the cursor to the next session that needs a human, in
@@ -1593,8 +1583,17 @@ impl App {
     pub(super) fn jump_to_next_attention(&mut self) {
         // (ws_idx, sess_idx, is_continuous_row) in sidebar visual order.
         let mut rows: Vec<(usize, usize, bool)> = Vec::new();
-        for vi in self.visual_items() {
-            if let VisualItem::Session(wi, si) = vi {
+        // Folded sessions count: an alert inside a fold must still be
+        // reachable (the jump unfolds it).
+        let main = if self.tree_view() {
+            self.filter_visual_items(self.task_tree_unfolded().items.clone())
+        } else if self.sidebar_view == SidebarView::Team {
+            self.filter_visual_items(self.visual_items_team_unfolded())
+        } else {
+            self.visual_items()
+        };
+        for vi in main {
+            if let VisualItem::Session(wi, si) | VisualItem::ContinuousTeamSession(wi, si) = vi {
                 rows.push((wi, si, false));
             }
         }
@@ -1603,14 +1602,15 @@ impl App {
                 if let Some(si) = r.sess_idx { rows.push((r.ws_idx, si, true)); }
             }
         }
-        let flags: Vec<(bool, bool, bool)> = rows
+        let tiers: Vec<Option<u8>> = rows
             .iter()
             .map(|(wi, si, _)| {
                 let ts = &self.workspaces[*wi].sessions[*si];
-                (
-                    self.session_has_alert(&ts.uid),
-                    ts.status == SessionStatus::Idle && !ts.session.exited,
+                super::agent_state::attention_tier(
+                    self.session_has_alert(&ts.uid, &ts.host_id),
                     ts.hidden,
+                    (!ts.session.exited).then(|| self.agent_activity(ts)).flatten(),
+                    ts.status == SessionStatus::Idle && !ts.session.exited,
                 )
             })
             .collect();
@@ -1620,7 +1620,7 @@ impl App {
                 .position(|(wi, si, _)| wi == cwi && si == csi),
             _ => None,
         };
-        let Some(next) = next_attention_index(&flags, current) else {
+        let Some(next) = next_attention_index_tiered(&tiers, current) else {
             self.set_status_msg("No sessions need attention");
             return;
         };
@@ -1638,13 +1638,14 @@ impl App {
             SidebarColumn::Main
         };
         self.cursor = Cursor::Session(wi, si);
+        self.reveal_cursor();
         self.needs_redraw = true;
     }
 
     /// uid → `(ws_idx, sess_idx)` among non-closed workspaces. `None`
     /// when the session is gone for good (workspace closed or session
     /// removed) — MRU jumps DROP such uids from the deque.
-    fn find_session_by_uid(&self, uid: &str) -> Option<(usize, usize)> {
+    pub(super) fn find_session_by_uid(&self, uid: &str) -> Option<(usize, usize)> {
         for (wi, ws) in self.workspaces.iter().enumerate() {
             if ws.is_closed {
                 continue;
@@ -1676,7 +1677,7 @@ impl App {
     /// `step_column` (so a later A-h/A-l lands back where you were). The
     /// terminal pane follows because it renders the cursor's session.
     /// Returns false when the uid doesn't resolve to a visible row.
-    fn jump_cursor_to_session_uid(&mut self, uid: &str) -> bool {
+    pub(super) fn jump_cursor_to_session_uid(&mut self, uid: &str) -> bool {
         let Some((wi, si, to_continuous)) = self.resolve_session_target(uid) else {
             return false;
         };
@@ -1692,6 +1693,7 @@ impl App {
             SidebarColumn::Main
         };
         self.cursor = Cursor::Session(wi, si);
+        self.reveal_cursor();
         self.needs_redraw = true;
         true
     }
@@ -1873,7 +1875,7 @@ impl App {
         }
     }
 
-    fn find_task_entry(&self, task_id: &str) -> Option<&TaskEntry> {
+    pub(super) fn find_task_entry(&self, task_id: &str) -> Option<&TaskEntry> {
         self.tasks
             .iter()
             .find(|t| t.task_id.as_deref() == Some(task_id))
@@ -1899,7 +1901,9 @@ impl App {
             .iter()
             .map(|ts| {
                 let status = if ts.session.exited {
-                    "exited".to_string()
+                    super::model::exit_note(ts.preserved_last_exit.as_ref())
+                        .unwrap_or("exited")
+                        .to_string()
                 } else {
                     match ts.status {
                         SessionStatus::Running => "running".to_string(),
@@ -1919,11 +1923,34 @@ impl App {
         )
     }
 
+    /// `claude: X (task) · codex: Y (inherited)` for the peek: each
+    /// engine's default as a spawn on this task would resolve it.
+    pub(crate) fn task_models_summary(&self, task_id: &str, setting: cm_daemon::models::Setting) -> String {
+        use cm_daemon::models::Setting;
+        let own = self.planning.task_own(task_id, setting);
+        ["claude", "codex"]
+            .into_iter()
+            .map(|engine| {
+                let fallback = match setting {
+                    Setting::Model => cm_daemon::models::default_model(engine),
+                    Setting::Effort => cm_daemon::models::default_effort(engine),
+                };
+                let (model, from) = match (own.get(engine), self.task_default(task_id, engine, setting)) {
+                    (Some(m), _) => (m.clone(), "task"),
+                    (None, Some(m)) => (m, "inherited"),
+                    (None, None) => (fallback.unwrap_or_default(), "default"),
+                };
+                format!("{engine}: {model} ({from})")
+            })
+            .collect::<Vec<_>>()
+            .join(" \u{00b7} ")
+    }
+
     /// Assemble the peek content for the focused row: bound-task detail
-    /// when a task resolves (session's `task_id` or the Task cursor's),
-    /// the workspace fallback otherwise; Session cursors get an identity
-    /// header block on top either way.
-    fn build_peek_lines(&self) -> Vec<PeekLine> {
+    /// when a task resolves (the session's `task_id`, or the workspace
+    /// row's tasks), the workspace otherwise; Session cursors get an
+    /// identity header block on top either way.
+    pub(crate) fn build_peek_lines(&self) -> Vec<PeekLine> {
         let mut out: Vec<PeekLine> = Vec::new();
         match &self.cursor {
             Cursor::Session(wi, si) => {
@@ -1940,6 +1967,46 @@ impl App {
                     ts.seeded_from_snapshot.as_deref(),
                     ts.last_delivery.as_ref().map(|(s, _)| s.as_str()),
                 ));
+                if ts.session_type == "bash" {
+                    out.push(PeekLine::Text("Shell terminal; no agent turns, transcript or work-item assignment.".into()));
+                    out.push(PeekLine::Field { label: "Workspace".into(), value: ws.name.clone() });
+                    if let Some(path) = &ws.worktree_path {
+                        out.push(PeekLine::Field { label: "Directory".into(), value: path.display().to_string() });
+                    }
+                    return out;
+                }
+                if let Some(model) = ts.model.as_deref() {
+                    out.push(PeekLine::Field {
+                        label: "Model".into(),
+                        value: super::model_field::with_source(model, ts.model_source.as_deref()),
+                    });
+                }
+                if let Some(effort) = ts.effort.as_deref() {
+                    out.push(PeekLine::Field {
+                        label: "Effort".into(),
+                        value: super::model_field::with_source(effort, ts.effort_source.as_deref()),
+                    });
+                }
+                // #24: the transcript's size, flagged past the rotation
+                // threshold.
+                if let Some(bytes) = self.transcript_bytes(ts) {
+                    let size = super::agent_state::short_size(bytes);
+                    let value = if bytes >= super::agent_state::HEAVY_TRANSCRIPT_BYTES {
+                        format!("{size} \u{29c9} past the rotation threshold: CM moves it to a fresh transcript at an idle point")
+                    } else {
+                        size
+                    };
+                    out.push(PeekLine::Field { label: "Transcript".into(), value });
+                }
+                if let Some(note) = super::model::exit_note(ts.preserved_last_exit.as_ref()) {
+                    out.push(PeekLine::Field { label: "Status".into(), value: note.to_string() });
+                }
+                // The activity badge in full (job labels, the waiting tool,
+                // the error kind), F9 toggle or not.
+                if let Some(b) = self.session_badge(ts) {
+                    let (mark, _) = super::symbols::doing(b.kind);
+                    out.push(PeekLine::Field { label: "Doing".into(), value: format!("{mark} {}", b.full) });
+                }
                 out.push(PeekLine::Blank);
                 match ts.task_id.as_deref().and_then(|t| self.find_task_entry(t)) {
                     Some(task) => {
@@ -1953,23 +2020,37 @@ impl App {
                     None => out.extend(self.workspace_peek_lines(ws)),
                 }
             }
-            Cursor::Task { ws_idx, task_id } => match self.find_task_entry(task_id) {
-                Some(task) => {
-                    let parent = task
-                        .parent_task_id
-                        .as_deref()
-                        .and_then(|p| self.find_task_entry(p))
-                        .map(|t| t.name.as_str());
-                    out.extend(peek_task_lines(task, parent));
-                }
-                None => {
-                    if let Some(ws) = self.workspaces.get(*ws_idx) {
-                        out.extend(self.workspace_peek_lines(ws));
-                    }
-                }
-            },
+            // The workspace row stands for its task (the task header it
+            // replaced showed this): the task first, with its default
+            // models, then the workspace.
             Cursor::Workspace(wi) => {
                 if let Some(ws) = self.workspaces.get(*wi) {
+                    let tasks = self.workspace_tasks(*wi);
+                    let known: Vec<&TaskEntry> = tasks.iter().filter_map(|t| self.find_task_entry(t)).collect();
+                    if let Some(task) = known.first() {
+                        let task_id = task.task_id.as_deref().unwrap_or_default();
+                        let parent = task
+                            .parent_task_id
+                            .as_deref()
+                            .and_then(|p| self.find_task_entry(p))
+                            .map(|t| t.name.as_str());
+                        let mut lines = peek_task_lines(task, parent);
+                        // Default models sit with the task's fields, before the prompt.
+                        let at = lines.iter().position(|l| *l == PeekLine::Blank).unwrap_or(lines.len());
+                        use cm_daemon::models::Setting;
+                        let mut fields = vec![
+                            PeekLine::Field { label: "Models".into(), value: self.task_models_summary(task_id, Setting::Model) },
+                            PeekLine::Field { label: "Efforts".into(), value: self.task_models_summary(task_id, Setting::Effort) },
+                        ];
+                        // Other tasks sharing the checkout: A-e edits them too.
+                        if known.len() > 1 {
+                            let names: Vec<&str> = known[1..].iter().map(|t| t.name.as_str()).collect();
+                            fields.push(PeekLine::Field { label: "Also here".into(), value: names.join(", ") });
+                        }
+                        lines.splice(at..at, fields);
+                        out.extend(lines);
+                        out.push(PeekLine::Blank);
+                    }
                     out.extend(self.workspace_peek_lines(ws));
                 }
             }
@@ -2003,6 +2084,20 @@ impl App {
                         "Space fold · A-e edit · A-x delete · A-J/K reorder · A-n new ws here".into(),
                     ));
                 }
+            }
+            Cursor::Division(key) => {
+                let id = &key.id;
+                let name = self.planning.division(id).map_or_else(|| id.clone(), |d| d.name);
+                out.push(PeekLine::Title(format!("Division: {name}")));
+                out.push(PeekLine::Field { label: "Initiative".into(), value: id.clone() });
+                out.push(PeekLine::Blank);
+                out.push(PeekLine::Text("Space/Enter fold · keys don't reach a terminal here".into()));
+            }
+            Cursor::Org(key) => {
+                out.push(PeekLine::Title(self.org_header_text(key)));
+                out.push(PeekLine::Field { label: "Row".into(), value: key.clone() });
+                out.push(PeekLine::Blank);
+                out.push(PeekLine::Text("Space/Enter fold · F6 shows the member's facts · keys don't reach a terminal here".into()));
             }
         }
         if out.is_empty() {
@@ -2181,6 +2276,19 @@ mod idle_attention_tests {
     const ALERT_HIDDEN: (bool, bool, bool) = (true, true, true);
 
     #[test]
+    fn tiered_picker_orders_alert_waiting_errored_idle_then_cycles() {
+        // Visual order: idle, errored, waiting, alert, running.
+        let rows = [Some(3), Some(2), Some(1), Some(0), None];
+        assert_eq!(next_attention_index_tiered(&rows, None), Some(3));
+        assert_eq!(next_attention_index_tiered(&rows, Some(3)), Some(2));
+        assert_eq!(next_attention_index_tiered(&rows, Some(2)), Some(1));
+        assert_eq!(next_attention_index_tiered(&rows, Some(1)), Some(0));
+        assert_eq!(next_attention_index_tiered(&rows, Some(0)), Some(3), "wraps");
+        assert_eq!(next_attention_index_tiered(&rows, Some(4)), Some(3), "off-candidate starts at the top");
+        assert_eq!(next_attention_index_tiered(&[None, None], None), None);
+    }
+
+    #[test]
     fn no_rows_or_no_candidates_yields_none() {
         assert_eq!(next_attention_index(&[], None), None);
         // Running rows and hidden alert-less idle rows are not candidates.
@@ -2234,6 +2342,7 @@ mod pinned_sort_tests {
 
     fn bare_ws(id: &str, pinned: bool) -> Workspace {
         Workspace {
+            org: None,
             id: id.to_string(),
             name: id.to_string(),
             is_closed: false,
@@ -2491,7 +2600,7 @@ mod nav_quickswitch_tests {
             value: "t0".into()
         }));
         // Missing prompt renders the placeholder rather than nothing.
-        assert!(without.contains(&PeekLine::Text("(no prompt)".into())));
+        assert!(without.contains(&PeekLine::Text("(no description)".into())));
     }
 
     #[test]
@@ -2514,11 +2623,20 @@ mod nav_quickswitch_tests {
             value: "/tmp/wt".into()
         }));
         assert!(lines.contains(&PeekLine::Field { label: "Host".into(), value: "local".into() }));
-        assert!(lines.contains(&PeekLine::Text("worker (claude) \u{2014} running".into())));
-        assert!(lines.contains(&PeekLine::Text("shell (bash) \u{2014} idle".into())));
+        assert!(lines.contains(&PeekLine::Text("worker (\u{273b} claude) \u{2014} running".into())));
+        assert!(lines.contains(&PeekLine::Text("shell ($ shell) \u{2014} idle".into())));
         // Empty roster shows the placeholder.
         let empty = peek_workspace_lines("ws", None, None, None, "local", &[]);
         assert!(empty.contains(&PeekLine::Text("(none)".into())));
+    }
+
+    #[test]
+    fn shell_peek_labels_the_terminal_and_omits_agent_prompt_provenance() {
+        let lines = peek_session_lines("terminal", "bash", "uid-shell", Some("old-snapshot"), Some("agent instructions"));
+        assert_eq!(lines, vec![
+            PeekLine::Field { label: "Shell".into(), value: "terminal ($ shell)".into() },
+            PeekLine::Field { label: "Uid".into(), value: "uid-shell".into() },
+        ]);
     }
 
     #[test]
@@ -2532,7 +2650,7 @@ mod nav_quickswitch_tests {
         );
         assert!(lines.contains(&PeekLine::Field {
             label: "Session".into(),
-            value: "worker (claude)".into()
+            value: "worker (\u{273b} claude)".into()
         }));
         assert!(lines.contains(&PeekLine::Field {
             label: "Seeded from".into(),
@@ -2696,5 +2814,61 @@ mod nav_quickswitch_tests {
         assert!(matches!(o, InputOutcome::Cancel));
         let o = handle_task_peek(&mut scroll, 0, &key(KeyCode::Char('q')));
         assert!(matches!(o, InputOutcome::Cancel));
+    }
+}
+
+#[cfg(test)]
+mod task_scope_tests {
+    //! The TUI-served descendant check reads the full planning ancestry, so
+    //! a done subtask (left out of the sidebar's running/blocked `tasks`)
+    //! stays in its parent's scope. Mirrors the daemon's planning fallback.
+    use crate::control::methods::task_is_self_or_descendant_of;
+
+    #[test]
+    fn done_subtasks_stay_in_scope_through_the_planning_ancestry() {
+        let mut app = crate::app::sections::layout_tests::test_app();
+        for (task, parent) in [
+            ("sub-done", Some("orch")),
+            ("sub-grand", Some("sub-done")),
+            ("unrelated", Some("other-root")),
+            ("other-root", None),
+            ("cyc-a", Some("cyc-b")),
+            ("cyc-b", Some("cyc-a")),
+        ] {
+            app.sidebar_task_parents.insert(task.into(), parent.map(str::to_string));
+        }
+        assert!(task_is_self_or_descendant_of(&app, "sub-done", "orch"));
+        assert!(task_is_self_or_descendant_of(&app, "sub-grand", "orch"));
+        assert!(!task_is_self_or_descendant_of(&app, "unrelated", "orch"));
+        assert!(!task_is_self_or_descendant_of(&app, "cyc-a", "orch"));
+        assert!(!task_is_self_or_descendant_of(&app, "never-seen", "orch"));
+        // Without the snapshot the old answer stands.
+        app.sidebar_task_parents.clear();
+        assert!(!task_is_self_or_descendant_of(&app, "sub-done", "orch"));
+    }
+
+    /// The daemon's `task.update_tree` carries every subtask edge from the
+    /// planning snapshot, not just the sidebar's running/blocked rows, so a
+    /// done subtask stays in its parent's scope on the daemon too.
+    #[test]
+    fn the_tree_push_carries_every_subtask_edge() {
+        let mut app = crate::app::sections::layout_tests::test_app();
+        for (task, parent) in [
+            ("sub-done", Some("orch")),
+            ("sub-backlog", Some("sub-done")),
+            ("orch", None),
+            ("old-root", None),
+        ] {
+            app.sidebar_task_parents.insert(task.into(), parent.map(str::to_string));
+        }
+        let rows = app.task_tree_push_entries();
+        assert_eq!(
+            rows,
+            vec![
+                ("sub-backlog".to_string(), Some("sub-done".to_string()), None),
+                ("sub-done".to_string(), Some("orch".to_string()), None),
+            ],
+            "subtask edges only; a top-level task the tree lacks already reads as top-level",
+        );
     }
 }

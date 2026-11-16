@@ -53,6 +53,24 @@ const TAIL_READ_BYTES: u64 = 256 * 1024;
 /// records) from turning the probe into a full-file parse.
 const MAX_SCAN_LINES: usize = 200;
 
+/// Bookkeeping records Claude Code 2.1.318+ appends between conversation
+/// rows: request/cache fingerprints, titles, mode and owner markers. They
+/// carry no turn, tool, or permission evidence, so every transcript reader
+/// skips them; an unknown type still ends a strict scan.
+pub(crate) fn is_claude_bookkeeping(kind: &str) -> bool {
+    matches!(
+        kind,
+        "api-request"
+            | "api-request-blob"
+            | "ai-title"
+            | "mode"
+            | "permission-mode"
+            | "session-owner"
+            | "atis-latch"
+            | "file-history-delta"
+    )
+}
+
 /// Shape of the transcript's last substantive record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TailShape {
@@ -75,6 +93,13 @@ pub enum TailShape {
 #[derive(Debug, Clone)]
 pub struct TailProbe {
     pub shape: TailShape,
+    /// Timestamped main-conversation boundary, independently validated against
+    /// the bound filename. Legacy shape/error hints alone are not turn edges.
+    pub claude_end: Option<crate::agent_state::LastTurn>,
+    pub claude_identity_mismatch: bool,
+    /// Machine-readable tag on the latest synthetic API-error assistant.
+    /// Presence consumers apply this only while the engine itself says idle.
+    pub api_error: Option<String>,
     /// `Some(banner text)` when the newest assistant record carries
     /// `error: "authentication_failed"` — e.g. `"Login expired · Please run
     /// /login"` or `"Please run /login · API Error: 401 OAuth access token
@@ -114,6 +139,8 @@ pub fn probe_transcript_tail(path: &Path) -> Option<TailProbe> {
     let mut shape: Option<TailShape> = None;
     let mut auth_error: Option<String> = None;
     let mut usage_limit: Option<String> = None;
+    let mut api_error: Option<String> = None;
+    let mut claude_identity_mismatch = false;
     for line in text.lines().rev().take(MAX_SCAN_LINES) {
         let line = line.trim();
         if line.is_empty() {
@@ -123,6 +150,18 @@ pub fn probe_transcript_tail(path: &Path) -> Option<TailProbe> {
             // A truncated first-line-of-tail or a corrupt record — skip.
             continue;
         };
+        if v.get("isSidechain").and_then(|v| v.as_bool()) == Some(true) { continue; }
+        let substantive = matches!(v.get("type").and_then(|v| v.as_str()), Some("assistant" | "user"))
+            || (v.get("type").and_then(|v| v.as_str()) == Some("system")
+                && v.get("subtype").and_then(|v| v.as_str()) == Some("turn_duration"));
+        if substantive && v.get("sessionId").and_then(|v| v.as_str()).is_some_and(|id|
+            path.file_stem().and_then(|s| s.to_str()) != Some(id)) {
+            claude_identity_mismatch = true;
+            // Shared scheduler consumers also read shape without consulting
+            // the presence-only identity flag. Never retain a terminal verdict.
+            shape = Some(TailShape::MidTurn);
+            break;
+        }
         match v.get("type").and_then(|t| t.as_str()) {
             Some("system") => {
                 if v.get("subtype").and_then(|s| s.as_str()) == Some("turn_duration")
@@ -135,6 +174,14 @@ pub fn probe_transcript_tail(path: &Path) -> Option<TailProbe> {
             }
             Some("assistant") => {
                 let text = assistant_text(&v);
+                if v.get("isApiErrorMessage").and_then(|v| v.as_bool()) == Some(true)
+                    || (v.pointer("/message/model").and_then(|v| v.as_str()) == Some("<synthetic>")
+                        && v.get("error").and_then(|v| v.as_str()).is_some())
+                {
+                    api_error = Some(v.get("error").and_then(|v| v.as_str())
+                        .filter(|kind| !kind.is_empty() && kind.len() <= 4096)
+                        .unwrap_or("api_error").to_string());
+                }
                 if v.get("error").and_then(|e| e.as_str()) == Some("authentication_failed") {
                     auth_error = Some(text.clone());
                 } else if is_usage_limit_banner(&text) {
@@ -158,12 +205,64 @@ pub fn probe_transcript_tail(path: &Path) -> Option<TailProbe> {
     }
     shape.map(|shape| TailProbe {
         shape,
+        claude_end: claude_boundary(&text, path),
+        claude_identity_mismatch,
+        api_error,
         auth_error,
         usage_limit,
         pool_unavailable: None,
         pool_transient: false,
         pool_capacity: false,
     })
+}
+
+fn claude_boundary(text: &str, path: &Path) -> Option<crate::agent_state::LastTurn> {
+    use crate::agent_state::{LastTurn, TurnStatus};
+    let native_id = path.file_stem()?.to_str()?;
+    let mut completed = None;
+    for line in text.lines().rev().filter(|line| !line.trim().is_empty()).take(MAX_SCAN_LINES) {
+        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        if v.get("isSidechain").and_then(|v| v.as_bool()) == Some(true) { continue; }
+        let kind = v.get("type")?.as_str()?;
+        match kind {
+            "file-history-snapshot" | "last-prompt" | "summary" | "attachment" | "progress" => continue,
+            kind if is_claude_bookkeeping(kind) => continue,
+            "system" if v.get("subtype").and_then(|v| v.as_str()) == Some("stop_hook_summary") => continue,
+            "system" | "assistant" | "user" => {},
+            _ => return None,
+        }
+        if v.get("sessionId").and_then(|v| v.as_str()) != Some(native_id) { return None; }
+        let stamp = v.get("timestamp")?.as_str()?;
+        if !stamp.ends_with('Z') { return None; }
+        let at = crate::workflow::history::iso8601_to_ms(stamp)? as f64 / 1000.0;
+        if at < 0.0 || completed.is_some_and(|end| at > end) { return None; }
+        match kind {
+            "system" if v.get("subtype").and_then(|v| v.as_str()) == Some("turn_duration") => {
+                if completed.is_some() { return None; }
+                completed = Some(at);
+            }
+            "assistant" => {
+                let failed = v.get("isApiErrorMessage").and_then(|v| v.as_bool()) == Some(true)
+                    || (v.pointer("/message/model").and_then(|v| v.as_str()) == Some("<synthetic>")
+                        && v.get("error").and_then(|v| v.as_str()).is_some())
+                    || v.get("error").and_then(|v| v.as_str()) == Some("authentication_failed")
+                    || is_usage_limit_banner(&assistant_text(&v));
+                // Assistant end_turn precedes the Stop hook, which can block
+                // and continue on inbox work. Only settled turn_duration or a
+                // synthetic terminal failure supplies a transcript boundary.
+                if failed || completed.is_some() {
+                    // An older error must not borrow a newer turn_duration's
+                    // timestamp and look like a failure of a subsequent turn.
+                    return Some(LastTurn { ended_at: Some(if failed { at } else { completed.unwrap_or(at) }),
+                        status: Some(if failed { TurnStatus::Failed } else { TurnStatus::Completed }) });
+                }
+                return None;
+            }
+            "user" => break,
+            _ => return None,
+        }
+    }
+    completed.map(|at| LastTurn { ended_at: Some(at), status: Some(TurnStatus::Completed) })
 }
 
 /// Match only Claude's first-person limit turn-enders. A loose search for
@@ -213,7 +312,8 @@ fn read_tail(path: &Path) -> Option<String> {
     let start = len.saturating_sub(TAIL_READ_BYTES);
     f.seek(SeekFrom::Start(start)).ok()?;
     let mut buf = Vec::with_capacity((len - start) as usize);
-    f.read_to_end(&mut buf).ok()?;
+    f.take(TAIL_READ_BYTES + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > TAIL_READ_BYTES { return None; }
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
@@ -324,6 +424,68 @@ mod tests {
     /// The incident's exact wedge shape: user prompt → synthetic 401 assistant
     /// → turn_duration → snapshot. Turn complete AND auth error.
     #[test]
+    fn foreign_history_cannot_leave_a_terminal_shape_for_shared_consumers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current.jsonl");
+        let foreign = serde_json::json!({"type":"assistant", "sessionId":"prior",
+            "timestamp":"1970-01-01T00:15:00Z", "isApiErrorMessage":true,
+            "error":"authentication_failed"});
+        let current = serde_json::json!({"type":"assistant", "sessionId":"current",
+            "timestamp":"1970-01-01T00:16:00Z", "message":{"stop_reason":"end_turn"}});
+        let duration = serde_json::json!({"type":"system", "subtype":"turn_duration", "sessionId":"current",
+            "timestamp":"1970-01-01T00:16:01Z"});
+        std::fs::write(&path, format!("{foreign}\n{duration}\n")).unwrap();
+        let probe = probe_transcript_tail(&path).unwrap();
+        assert!(probe.claude_identity_mismatch);
+        assert_eq!(probe.shape, TailShape::MidTurn,
+            "scheduler consumers must not wedge-close from a mixed-conversation tail");
+        assert!(probe.claude_end.is_none());
+        assert!(probe.auth_error.is_none());
+        std::fs::write(&path, format!("{foreign}\n{current}\n{duration}\n")).unwrap();
+        let probe = probe_transcript_tail(&path).unwrap();
+        assert!(!probe.claude_identity_mismatch, "copied history before a current turn remains supported");
+        assert_eq!(probe.shape, TailShape::TurnComplete);
+        assert_eq!(probe.claude_end.unwrap().ended_at, Some(961.0));
+        assert!(probe.auth_error.is_none());
+    }
+
+    /// Claude Code 2.1.318 writes bookkeeping rows around every request
+    /// (shapes from an F-Custody transcript, 2026-11-05). The boundary
+    /// reader skips them instead of losing the turn end.
+    #[test]
+    fn claude_2_1_318_bookkeeping_rows_keep_the_turn_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current.jsonl");
+        let row = |v: serde_json::Value| v.to_string();
+        let lines = [
+            row(serde_json::json!({"type":"assistant", "sessionId":"current",
+                "timestamp":"1970-01-01T00:16:00Z", "message":{"stop_reason":"end_turn"}})),
+            row(serde_json::json!({"type":"api-request-blob", "sessionId":"current",
+                "hash":"h", "message":{"role":"user"}})),
+            row(serde_json::json!({"type":"api-request", "sessionId":"current",
+                "timestamp":"1970-01-01T00:16:00.5Z", "id":"r"})),
+            row(serde_json::json!({"type":"system", "subtype":"turn_duration",
+                "sessionId":"current", "timestamp":"1970-01-01T00:16:01Z"})),
+            row(serde_json::json!({"type":"ai-title", "sessionId":"current", "aiTitle":"t"})),
+            row(serde_json::json!({"type":"mode", "sessionId":"current", "mode":"normal"})),
+            row(serde_json::json!({"type":"permission-mode", "sessionId":"current",
+                "permissionMode":"bypassPermissions"})),
+            row(serde_json::json!({"type":"session-owner", "sessionId":"current"})),
+            row(serde_json::json!({"type":"atis-latch", "sessionId":"current", "atis":1})),
+            row(serde_json::json!({"type":"file-history-delta", "messageId":"m",
+                "timestamp":"1970-01-01T00:16:02Z"})),
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let probe = probe_transcript_tail(&path).unwrap();
+        assert_eq!(probe.shape, TailShape::TurnComplete);
+        assert_eq!(probe.claude_end.unwrap().ended_at, Some(961.0));
+        std::fs::write(&path, format!("{}\n{}\n",
+            lines.join("\n"), r#"{"type":"brand-new-kind","sessionId":"current"}"#)).unwrap();
+        assert!(probe_transcript_tail(&path).unwrap().claude_end.is_none(),
+            "an unrecognised type still ends the strict boundary scan");
+    }
+
+    #[test]
     fn auth_error_turn_is_complete_with_auth_text() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_lines(
@@ -332,6 +494,7 @@ mod tests {
         );
         let p = probe_transcript_tail(&path).expect("probe");
         assert_eq!(p.shape, TailShape::TurnComplete);
+        assert_eq!(p.api_error.as_deref(), Some("authentication_failed"));
         assert_eq!(
             p.auth_error.as_deref(),
             Some("Login expired · Please run /login"),
@@ -350,7 +513,26 @@ mod tests {
         let p = probe_transcript_tail(&path).expect("probe");
         assert_eq!(p.shape, TailShape::TurnComplete);
         assert!(p.auth_error.is_none());
+        assert!(p.api_error.is_none());
         assert!(p.usage_limit.is_none());
+    }
+
+    #[test]
+    fn synthetic_api_tags_do_not_classify_ordinary_prose_or_cross_a_new_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        for kind in ["rate_limit", "server_error", "billing_error"] {
+            let line = serde_json::json!({"type":"assistant","isApiErrorMessage":true,"error":kind,"message":{"model":"<synthetic>"}}).to_string();
+            let path = write_lines(&dir, &[&line, TURN_DURATION_LINE]);
+            assert_eq!(probe_transcript_tail(&path).unwrap().api_error.as_deref(), Some(kind));
+            let path = write_lines(&dir, &[&line, TURN_DURATION_LINE, USER_LINE]);
+            assert!(probe_transcript_tail(&path).unwrap().api_error.is_none());
+        }
+        let ordinary = r#"{"type":"assistant","error":"server_error","message":{"model":"claude","content":[{"type":"text","text":"Explaining server_error"}]}}"#;
+        let benign_synthetic = r#"{"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"No response requested."}]}}"#;
+        for line in [ordinary, benign_synthetic, WEEKLY_LIMIT_LINE] {
+            let path = write_lines(&dir, &[line, TURN_DURATION_LINE]);
+            assert!(probe_transcript_tail(&path).unwrap().api_error.is_none());
+        }
     }
 
     /// A trailing tool_use assistant record = mid-turn (long tool call), never

@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Read this host's usage records (doc/usage-recording.md).
+
+    cm-usage                     # last hour, one summary row per sample
+    cm-usage --since 2d --format csv > usage.csv
+    cm-usage --type availability --since 7d --format json
+    cm-usage --all-hosts --since 6h          # one merged view of every host
+
+Reads ~/.cm/metrics/usage/YYYY-MM-DD.jsonl (and .jsonl.gz) directly, plus the
+same files on `--ssh HOST` / every ssh host in ~/.cm/hosts.toml
+(`--all-hosts`). Availability changes are replicated to every host, so they
+are de-duplicated by event id; with several hosts the summary is one row per
+minute summed across hosts. The daemon's `usage.read` RPC returns one host's
+records.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import gzip
+import json
+import re
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REMOTE_DIR = '~/.cm/metrics/usage'
+
+
+def parse_time(text: str | None, default: float) -> float:
+    if not text:
+        return default
+    m = re.fullmatch(r'(\d+(?:\.\d+)?)([mhd])', text)
+    if m:
+        return time.time() - float(m.group(1)) * {'m': 60, 'h': 3600, 'd': 86400}[m.group(2)]
+    try:
+        return float(text)
+    except ValueError:
+        return dt.datetime.fromisoformat(text.replace('Z', '+00:00')).timestamp()
+
+
+def in_range(name: str, since: float, until: float) -> bool:
+    try:
+        day = dt.date.fromisoformat(name[:10])
+    except ValueError:
+        return False
+    n = dt.datetime(day.year, day.month, day.day, tzinfo=dt.timezone.utc).timestamp() // 86400
+    return since // 86400 - 1 <= n <= until // 86400 + 1
+
+
+def parse_lines(lines, since: float, until: float, kind: str | None):
+    for line in lines:
+        try:
+            v = json.loads(line)
+        except ValueError:
+            continue
+        if since <= v.get('ts', 0) <= until and (kind is None or v.get('type') == kind):
+            yield v
+
+
+def records(directory: Path, since: float, until: float, kind: str | None):
+    for path in sorted(directory.glob('*.jsonl*')):
+        if not in_range(path.name, since, until):
+            continue
+        opener = gzip.open if path.suffix == '.gz' else open
+        with opener(path, 'rt') as stream:
+            yield from parse_lines(stream, since, until, kind)
+
+
+def remote_records(host: str, since: float, until: float, kind: str | None):
+    ssh = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', host]
+    listing = subprocess.run(ssh + [f'ls {REMOTE_DIR} 2>/dev/null'], capture_output=True, text=True, timeout=60)
+    names = [n for n in listing.stdout.split() if n.startswith('20') and in_range(n, since, until)]
+    if not names:
+        return []
+    files = ' '.join(f'{REMOTE_DIR}/{shlex.quote(n)}' for n in sorted(names))
+    out = subprocess.run(ssh + [f'zcat -f {files}'], capture_output=True, text=True, timeout=300)
+    if out.returncode != 0:
+        print(f'cm-usage: {host}: {out.stderr.strip()}', file=sys.stderr)
+    return list(parse_lines(out.stdout.splitlines(), since, until, kind))
+
+
+def config_hosts() -> list[str]:
+    """ssh hosts from ~/.cm/hosts.toml (ssh-unix transports)."""
+    try:
+        import tomllib
+        data = tomllib.loads((Path.home() / '.cm/hosts.toml').read_text())
+    except (OSError, ValueError, ImportError):
+        return []
+    return [h['ssh_host'] for h in data.get('host', []) if h.get('transport') == 'ssh-unix' and h.get('ssh_host')]
+
+
+def merge(groups) -> list[dict]:
+    """One timeline: availability changes replicate to every host, so keep
+    the first copy of each event id."""
+    seen, out = set(), []
+    for v in sorted((v for g in groups for v in g), key=lambda v: v.get('ts', 0)):
+        if v.get('type') == 'availability' and v.get('event_id'):
+            if v['event_id'] in seen:
+                continue
+            seen.add(v['event_id'])
+        out.append(v)
+    return out
+
+
+def flat(v: dict) -> dict:
+    a, s = v.get('agents', {}), v.get('subagents', {})
+    by = a.get('by_state', {})
+    return {
+        'time': dt.datetime.fromtimestamp(v['ts'], dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'host': v.get('host'), 'level': (v.get('owner') or {}).get('level'),
+        'agents': a.get('total', 0), 'continuous': a.get('continuous', 0), 'owner': a.get('owner', 0),
+        'working': by.get('working', 0), 'background': by.get('working-background', 0),
+        'idle': by.get('idle', 0), 'waiting_human': by.get('waiting-on-human', 0),
+        'errored': by.get('errored', 0), 'unknown': by.get('unknown', 0),
+        'subagents': s.get('total', 0), 'subagents_active': s.get('active', 0),
+        'shells_running': (v.get('shells') or {}).get('running', 0),
+        'owner_input_s': (v.get('owner_input') or {}).get('input_s') or 0,
+    }
+
+
+def by_minute(samples: list[dict]) -> list[dict]:
+    """Sum hosts into one row per minute (Owner input capped at 60 s)."""
+    rows: dict[str, dict] = {}
+    for r in samples:
+        key = r['time'][:16]
+        row = rows.setdefault(key, {**{k: 0 for k in r if k not in ('time', 'host', 'level')},
+                                    'time': key + 'Z', 'host': 'all', 'level': r['level']})
+        for k, val in r.items():
+            if isinstance(val, int) and k in row and k not in ('time', 'host', 'level'):
+                row[k] += val
+        row['owner_input_s'] = min(row['owner_input_s'], 60)
+        row['level'] = row['level'] or r['level']
+    return [rows[k] for k in sorted(rows)]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--since', default='1h', help='unix seconds, RFC 3339, or 30m/6h/2d (default 1h)')
+    ap.add_argument('--until', default=None)
+    ap.add_argument('--type', choices=['sample', 'availability'], default=None)
+    ap.add_argument('--format', choices=['summary', 'csv', 'json'], default='summary')
+    ap.add_argument('--dir', default=str(Path.home() / '.cm/metrics/usage'))
+    ap.add_argument('--ssh', action='append', default=[], metavar='HOST', help='also read HOST (repeatable)')
+    ap.add_argument('--all-hosts', action='store_true', help='also read every ssh host in ~/.cm/hosts.toml')
+    args = ap.parse_args()
+    since, until = parse_time(args.since, 0), parse_time(args.until, time.time())
+    hosts = list(dict.fromkeys(args.ssh + (config_hosts() if args.all_hosts else [])))
+    groups = [list(records(Path(args.dir), since, until, args.type))]
+    for host in hosts:
+        try:
+            groups.append(remote_records(host, since, until, args.type))
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f'cm-usage: {host}: {exc}', file=sys.stderr)
+    rows = merge(groups)
+    if args.format == 'json':
+        for v in rows:
+            print(json.dumps(v))
+        return 0
+    samples = [flat(v) for v in rows if v.get('type') == 'sample']
+    if len({r['host'] for r in samples}) > 1:
+        samples = by_minute(samples)
+    if args.format == 'csv':
+        if samples:
+            writer = csv.DictWriter(sys.stdout, fieldnames=list(samples[0]))
+            writer.writeheader()
+            writer.writerows(samples)
+        return 0
+    events = [(dt.datetime.fromtimestamp(v['ts'], dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+               f"availability {v.get('from')} -> {v.get('to')}") for v in rows if v.get('type') == 'availability']
+    lines = events + [(r['time'], r) for r in samples]
+    for t, r in sorted(lines, key=lambda x: x[0]):
+        if isinstance(r, str):
+            print(f'{t}  {r}')
+        else:
+            print(f"{r['time']}  {r['level'] or '-':8} agents {r['agents']:3} "
+                  f"(cont {r['continuous']}, owner {r['owner']})  work {r['working']} bg {r['background']} "
+                  f"idle {r['idle']} human {r['waiting_human']} err {r['errored']}  "
+                  f"subagents {r['subagents_active']}/{r['subagents']}  shells {r['shells_running']}  "
+                  f"owner input {r['owner_input_s']}s  [{r['host']}]")
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -57,6 +57,7 @@ Key fields in split mode:
 | `holder_pending_exit_events` | exits the brain hasn't durably acked yet | 0 at rest |
 | `holder_status_error` | the holder didn't answer `status` | absent |
 | `mcp_ok` | MCP preflight at brain boot | `true` |
+| `capabilities` | org-model capabilities per role (doc/org-model.md §12): `brain`, `holder` (from its hello/rehello; `[]` from a holder older than S0b), `rollback_pin` (from `~/.cm/brain-capabilities.json`, `[]` when the pin predates S0b) and `advertised` = their intersection | `advertised` contains `org_preserve_v1` once the holder is the S0b build **and** the pin is an S0b-or-later brain (i.e. from the second S0b-era brain deploy on) |
 
 **The all-clear after any deploy:** `holder_epoch` went up by exactly one,
 sessions unchanged, `breaker_state == "running"` and `holder_epoch` still the
@@ -76,6 +77,27 @@ Builds the workspace release, calls `daemon.restart`; in split mode that arms
 `restart_brain` (brain quiesces → checked persist → exits → holder execs the
 pinned new binary). The script verifies `holder_epoch` +1 exactly, soaks 90s,
 and prints the 10-minute note.
+
+After an acknowledged arm, the outgoing brain shuts down its channel's receive
+side and drains queued frames without blocking before exiting. This prevents
+unread holder frames from turning the close into `ECONNRESET` and causing an
+older holder to discard the armed pin. The change takes effect when a brain
+containing it performs the next restart; the first deploy from an older brain
+still uses that older brain's exit path.
+
+The holder also treats `ECONNRESET` as channel EOF, preserving an acknowledged
+arm when an older brain exits with unread frames. That change requires
+`daemon.upgrade_holder`; deploying only the brain does not update the running
+holder. Malformed frames and watchdog failures still take the crash path.
+
+**The org preservation bridge (S0b, doc/org-model.md §12)** needs the holder
+too: an older holder still runs an S0b brain fine (it carries no session
+metadata; the `org` object rides `daemon-sessions.json`), but its
+reverse-migration parse (`split_rollback`) drops `org`, and it reports no
+capabilities, so `daemon.health.capabilities.advertised` stays without
+`org_preserve_v1` until `daemon.upgrade_holder` runs with the S0b holder
+(crate 0.2.0). That upgrade is Owner's call; it is planned into a deploy, not
+run with it.
 
 **Check the pin first** (`ps -o cmd -p $(pgrep -f cm-holder)`): when the holder
 runs `--brain /opt/cm-daemon/cm-daemon` — true on cm-sessions since 2026-09-12
@@ -100,9 +122,62 @@ scripts/cm-op --ssh cm-manager daemon.health     # holder_epoch +1, sessions sam
 with "Text file busy"; `install` creates a new inode). The holder pins the
 binary by fd at exec time, so an in-flight `cp` can never half-apply.
 
+**Maintenance notice (announce the restart to agents).** A hub restart drops
+chat sync on every replica for a minute or more; without a notice agents read
+that as their own failure and resend. Set the notice on BOTH hosts before
+restarting the hub (cm-manager), and clear it once the replica has reconnected
+(`sync.connected` true in any `chat_open`):
+```
+# before: hub first, then each replica (cm-sessions, laptop as needed)
+scripts/cm-op --ssh cm-manager daemon.maintenance '{"action":"set","reason":"CM redeploy","expect_until":"2026-10-23T16:35:00Z"}'
+scripts/cm-op --ssh cm-sessions daemon.maintenance '{"action":"set","reason":"CM redeploy","expect_until":"2026-10-23T16:35:00Z"}'
+# … deploy (hub first, wait for messaging-sync.sock, then replicas) …
+# after the replica reconnects:
+scripts/cm-op --ssh cm-manager daemon.maintenance '{"action":"clear"}'
+scripts/cm-op --ssh cm-sessions daemon.maintenance '{"action":"clear"}'
+```
+`reason` defaults to "CM redeploy" and `expect_until` to 15 minutes from now
+(at most 4 hours ahead; set it again to extend); `{"action":"get"}` shows the
+state. Set and clear are refused while the brain is draining, so do both
+outside the restart itself. The notice is written to
+`~/.cm/maintenance.json`, so it survives the restart it announces, and expires
+on its own 15 minutes after `expect_until` if nobody clears it. The hub also
+replicates its notice to replicas, so a replica that loses the hub keeps
+showing it. While it is in force, `ping` and the chat tools carry a
+`maintenance` line ("CM redeploy in progress since 16:26Z (expected until
+~16:35Z): sends are saved locally …"), the TUI status bar shows `⟳ CM deploy`,
+and each host tells its agents that are mid-turn and used chat in the last
+hour, once per notice (idle agents are not woken; they see the line on their
+next chat call, and re-setting an active notice sends nothing new). Without a
+notice, a replica whose hub link drops with a transport error says only that
+the hub is restarting or unreachable; the hub never says that of itself.
+While a host's own messaging is still opening, the line says nothing was sent
+and to retry in about 30 seconds; still not open after 10 minutes, it reports
+a local failure to raise with Swarm-Coord instead.
+
 **MCP server / workflows on cm-manager:** scp as before, then the same
 `daemon.restart` — the brain restart re-runs the MCP preflight; no
 `systemctl restart` needed anymore.
+
+**Activating MCP code in running sessions**
+([mcp-managed-activation](doc/mcp-managed-activation.md)): after the
+complete payload is in place on the host, stamp it there, as the last step:
+```
+ssh <host> python3 /opt/cm-daemon/mcp_server/mcp_version.py stamp --git <sha>
+```
+Sessions behind the MCP proxy then activate the new code on their own, at
+their next idle minute (or sooner with `ack_reconnect`); nothing restarts.
+An unstamped payload never activates anything. Watch the rollout with
+`scripts/cm-mcp-versions --ssh <host>`. It lists every live MCP server
+stalest first, and flags sessions without the proxy, which still need one
+manual `/mcp`. The proxy is per host and per new spawn: `mcp_proxy = true`
+at the top level of that host's `daemon.toml`, read at each spawn, so no
+reload is needed (default off; `CM_MCP_PROXY_ENABLE=1|0` overrides it).
+Existing sessions keep the mode they were spawned with. To make every
+proxy-flagged reconnect go direct to `server.py` on a host, create
+`~/.cm/mcp/proxy.disabled` there. Tool schemas must stay compatible with
+running Codex threads (`mcp_server/tests/test_tool_schema_compat.py`;
+`mcp_version.py snapshot --write [--allow-breaking "tool: reason"]`).
 
 **Config value** (`mcp_server_path`, `api_*`, `notify_command`, …):
 `scripts/cm-op daemon.reload_config` or `kill -HUP <brain_pid>` (the holder
@@ -238,8 +313,9 @@ Rules that follow:
   brain gap may tombstone as a plain exit.
 - `daemon.restart`/`migrate_split` refuse on `[tls]`-configured daemons
   (listener handoff unimplemented; neither host uses TLS).
-- Skew matrix baseline is pinned at `924ff6a`; advancing it is a deprecation
-  event recorded in the design doc.
+- Skew matrix baseline is pinned at `5190083` (the shipped holder, since
+  2026-10-25; `CM_SKEW_OLDEST=4e1aead` adds the phase-3 cell); advancing it
+  is a deprecation event recorded in the design doc.
 
 ## 9. Tests
 
