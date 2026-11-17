@@ -1877,7 +1877,7 @@ class HubTests(HubHarness):
         self.poll()  # policy default_mode reaches the host
         self.assertEqual(self.state()["hub"]["reply"]["policy"]["default_mode"], "auto")
         self.hub("policy", "account_thresholds.alice@example.com", "94")
-        self.assertIn("switch at 94% (Owner keeps 6%)", self.hub("status")[1])
+        self.assertIn("switch at 94% (Owner's reserve)", self.hub("status")[1])
 
     def test_checkin_refuses_a_mismatched_or_bad_export(self):
         export = host_export("cm-sessions")

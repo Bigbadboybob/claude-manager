@@ -1910,7 +1910,7 @@ def print_hub_status(view: dict, now: float, out) -> None:
             tags.append("DRAINING")
         if a.get("account_threshold") is not None:
             threshold = a["account_threshold"]
-            tags.append(f"switch at {threshold:g}% (Owner keeps {100 - threshold:g}%)")
+            tags.append(f"switch at {threshold:g}% (Owner's reserve)")
         if not a["room"]:
             tags.append("NO ROOM")
         tags.append(f"saved on {', '.join(a['saved_on']) or 'no host'}")
