@@ -3751,6 +3751,34 @@ pub fn session_turn_ended(
 }
 
 
+/// A Claude session that moves itself into another checkout (Claude Code's
+/// `EnterWorktree`) keeps its conversation id but its transcript moves to
+/// the new checkout's `~/.claude/projects/<encoded>/` dir, outside the
+/// workspace's own dir. Accept that move only when the file name (the
+/// conversation id, a per-session UUID) is unchanged and the file stays
+/// directly inside a Claude projects dir, so a session still cannot claim
+/// another conversation's transcript. Pre-fix such a session kept its
+/// stale path forever: no turn ends were seen, so its monitors and idle
+/// alerts never fired (AnthFinances "About page", 2026-11-17).
+fn same_conversation_moved(current: Option<&str>, reported: &str) -> bool {
+    let Some(current) = current.map(std::path::Path::new) else { return false };
+    let reported = std::path::Path::new(reported);
+    if reported.extension().and_then(|e| e.to_str()) != Some("jsonl")
+        || current.file_name().is_none()
+        || current.file_name() != reported.file_name()
+    {
+        return false;
+    }
+    let projects_root = |p: &std::path::Path| p.parent().and_then(std::path::Path::parent).map(std::path::Path::to_path_buf);
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return false };
+    let root = home.join(".claude/projects");
+    let in_root = |p: &std::path::Path| {
+        projects_root(p).as_deref() == Some(root.as_path())
+            && !p.components().any(|c| matches!(c, std::path::Component::ParentDir))
+    };
+    in_root(current) && in_root(reported)
+}
+
 fn rebind_reported_transcript(state: &mut DaemonState, session_uid: &str, reported: Option<&str>) {
     let Some(session) = state.sessions.get(session_uid) else { return; };
     // fix-stale-resume: refresh the recorded resume key from the hook's
@@ -3773,7 +3801,8 @@ fn rebind_reported_transcript(state: &mut DaemonState, session_uid: &str, report
         let contained = own_dir
             .as_deref()
             .zip(std::path::Path::new(reported).parent())
-            .is_some_and(|(dir, parent)| dir == parent);
+            .is_some_and(|(dir, parent)| dir == parent)
+            || same_conversation_moved(session.transcript_path.as_deref(), reported);
         let changed = contained
             && session.transcript_path.as_deref() != Some(reported)
             // #114: never back onto the transcript a rotation is moving it off.
@@ -22924,6 +22953,50 @@ mod tests {
             Some(fresh.to_string_lossy().into_owned()),
             "a session must not be able to claim a transcript outside its own worktree",
         );
+    }
+
+    /// A Claude session that `EnterWorktree`s into another checkout keeps its
+    /// conversation id while its transcript moves to that checkout's projects
+    /// dir. The Stop hook's report of the moved file is accepted; a different
+    /// conversation in a foreign dir is still refused.
+    #[test]
+    fn turn_ended_follows_a_conversation_into_another_worktree() {
+        let dir = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let state = state_with_workspace("ws-m", &dir);
+        let uid = fresh_test_uid();
+        let own_dir = crate::transcript_detect::claude_transcript_dir_for(dir.path()).unwrap();
+        let moved_dir = crate::transcript_detect::claude_transcript_dir_for(other.path()).unwrap();
+        let original = own_dir.join("conv-1231.jsonl");
+        {
+            let mut s = state.lock().unwrap();
+            let mut sp = crate::session::SpawnParams::new(&uid, "worker", "/bin/sleep");
+            sp.args = vec!["60".to_string()];
+            sp.workspace_id = "ws-m".to_string();
+            sp.session_type = "claude-code".to_string();
+            let mut sess = crate::session::DaemonSession::spawn(sp).expect("spawn");
+            sess.transcript_path = Some(original.to_string_lossy().into_owned());
+            s.sessions.insert(uid.clone(), sess);
+        }
+        let path_of = |state: &Arc<Mutex<DaemonState>>| {
+            state.lock().unwrap().sessions.get(&uid).and_then(|x| x.transcript_path.clone())
+        };
+        let report = |p: &std::path::Path| {
+            session_turn_ended(&state, &json!({"session_uid": uid, "transcript_path": p.to_string_lossy()}), None)
+                .expect("turn_ended ok");
+        };
+
+        report(&moved_dir.join("someone-else.jsonl"));
+        assert_eq!(path_of(&state), Some(original.to_string_lossy().into_owned()),
+            "another conversation in a foreign dir must still be refused");
+
+        report(&moved_dir.join("conv-1231.jsonl"));
+        assert_eq!(path_of(&state), Some(moved_dir.join("conv-1231.jsonl").to_string_lossy().into_owned()),
+            "the same conversation moved to another checkout must be followed");
+
+        report(std::path::Path::new("/tmp/x/conv-1231.jsonl"));
+        assert_eq!(path_of(&state), Some(moved_dir.join("conv-1231.jsonl").to_string_lossy().into_owned()),
+            "the same name outside ~/.claude/projects must be refused");
     }
 
     /// fix-loud-preflight: a `None` preflight reports NOT ok. A health check
