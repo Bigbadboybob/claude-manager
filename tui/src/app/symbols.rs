@@ -37,10 +37,35 @@ pub(crate) fn engine_with_name(session_type: &str) -> String {
 
 pub(crate) const LOCAL: &str = "\u{2302}";
 
-/// ⌂ for this machine (as in the sidebar), else the host's first letter.
+/// ♻ marks the continuous host (cm-manager, the `manager` host), where
+/// continuous leads and their workers run (Owner, 2026-11-17).
+pub(crate) const CONTINUOUS_HOST: &str = "\u{267B}";
+
+/// Whether `id` is the continuous host. Continuous work stays on `manager`
+/// (see CLAUDE.md, "Persistent cloud sessions").
+pub(crate) fn is_continuous_host(id: &HostId) -> bool {
+    id.as_str() == "manager"
+}
+
+/// The sidebar's host tag: ` ⌂` for this machine, ` ♻` for the continuous
+/// host, nothing for other hosts.
+pub(crate) fn host_tag(id: &HostId) -> &'static str {
+    if *id == HostId::local() {
+        " \u{2302}"
+    } else if is_continuous_host(id) {
+        " \u{267B}"
+    } else {
+        ""
+    }
+}
+
+/// ⌂ for this machine (as in the sidebar), ♻ for the continuous host, else
+/// the host's first letter.
 pub(crate) fn host(id: &HostId) -> (String, Style) {
     if *id == HostId::local() {
         (LOCAL.into(), Style::default().fg(theme::DIM))
+    } else if is_continuous_host(id) {
+        (CONTINUOUS_HOST.into(), Style::default().fg(theme::REMOTE))
     } else {
         (id.as_str().chars().next().unwrap_or('?').to_string(), Style::default().fg(theme::REMOTE))
     }
@@ -258,5 +283,14 @@ mod tests {
         assert_eq!(held_mark([("active", false), ("blocked", false)]).unwrap().0, board_status("blocked").0);
         assert_eq!(held_mark([("open", false), ("active", true)]).unwrap().0, FLAG);
         assert!(held_mark(std::iter::empty::<(&str, bool)>()).is_none());
+    }
+
+    #[test]
+    fn host_tag_marks_local_and_continuous_hosts() {
+        assert_eq!(host_tag(&HostId::local()), " \u{2302}");
+        assert_eq!(host_tag(&HostId::new("manager")), " \u{267B}");
+        assert_eq!(host_tag(&HostId::new("sessions")), "");
+        assert_eq!(host(&HostId::new("manager")).0, CONTINUOUS_HOST);
+        assert_eq!(unicode_width::UnicodeWidthStr::width(CONTINUOUS_HOST), 1, "one cell, like the local mark");
     }
 }

@@ -2050,11 +2050,7 @@ impl App {
                         _ => false,
                     };
 
-                    let host_tag = if ws.host_id == cm_daemon::host_id::HostId::local() {
-                        " ⌂"
-                    } else {
-                        ""
-                    };
+                    let host_tag = super::symbols::host_tag(&ws.host_id);
 
                     // Reserve room for the tags so the name truncates before
                     // them (the pin glyph 📌 is double-width + a space).
@@ -2315,8 +2311,11 @@ impl App {
                     } else if let Some(note) = super::model::exit_note(ts.preserved_last_exit.as_ref()) {
                         tail.push(Span::styled(format!(" {note}"), Style::default().fg(theme::DIM)));
                     }
-                    if self.sidebar_view == SidebarView::Status && ts.host_id == cm_daemon::host_id::HostId::local() {
-                        tail.push(Span::styled(" ⌂", Style::default().fg(theme::DIM)));
+                    if self.sidebar_view == SidebarView::Status {
+                        let tag = super::symbols::host_tag(&ts.host_id);
+                        if !tag.is_empty() {
+                            tail.push(Span::styled(tag, Style::default().fg(theme::DIM)));
+                        }
                     }
                     // Live activity badge (agent_state.rs), right-aligned,
                     // at most BADGE_MAX cells. The name has priority: a row
