@@ -479,7 +479,11 @@ def limit_name(limit: dict) -> str:
 def threshold_for(limit: dict, config: dict) -> float:
     thresholds = {**DEFAULT_THRESHOLDS, **(config.get("thresholds") or {})}
     family = "session" if limit["kind"] == "session" else "weekly"
-    return thresholds.get(limit["kind"], thresholds[family])
+    threshold = thresholds.get(limit["kind"], thresholds[family])
+    account_threshold = config.get("account_threshold")
+    if family == "weekly" and account_threshold is not None:
+        threshold = min(threshold, account_threshold)
+    return threshold
 
 
 def describe_reset(resets_at: float | None, now: float) -> str:
@@ -1283,6 +1287,30 @@ def hub_emails(reports: dict[str, dict]) -> dict[str, str]:
     return out
 
 
+def account_threshold(policy: dict, email: str | None) -> float | None:
+    """Return an account's weekly switch point, matching its email case-insensitively."""
+    if not isinstance(email, str) or "@" not in email:
+        return None
+    overrides = policy.get("account_thresholds") or {}
+    value = overrides.get(email.lower())
+    if value is None:
+        value = next((v for key, v in overrides.items()
+                      if isinstance(key, str) and key.lower() == email.lower()), None)
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def hub_account_config(policy: dict, account: str | None = None,
+                       emails: dict[str, str] | None = None) -> dict:
+    """Build hub threshold config, folding an account's weekly override into it."""
+    email = account if isinstance(account, str) and "@" in account else (emails or {}).get(account)
+    config = {"thresholds": policy.get("thresholds") or {},
+              "switch_on_scoped": policy.get("switch_on_scoped", DEFAULT_SWITCH_ON_SCOPED)}
+    override = account_threshold(policy, email)
+    if override is not None:
+        config["account_threshold"] = override
+    return config
+
+
 def hub_checkin(hub: Hub, export: dict) -> dict:
     host = export.get("host")
     if not isinstance(host, str) or not PEER_NAME.match(host):
@@ -1559,16 +1587,17 @@ def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -
     policy = d["policy"]
     leftover_hosts = set(policy.get("leftover_hosts") or [])
     leftover = host in leftover_hosts
-    config = {"thresholds": policy.get("thresholds") or {},
-              "switch_on_scoped": policy.get("switch_on_scoped", DEFAULT_SWITCH_ON_SCOPED)
-              and not leftover}
     readings = {**load_json(hub.dir / "readings.json"), **hub_readings(reports)}
+    emails = hub_emails(reports)
     running = {(r.get("export") or {}).get("active") for h, r in reports.items()
                if h not in (host, POOL) and now - r.get("at", 0) <= HUB_REPORT_FRESH_SECONDS}
     leftover_room = float(policy.get("leftover_room", DEFAULT_LEFTOVER_ROOM))
     min_lend_room = float(policy.get("min_lend_room", DEFAULT_MIN_LEND_ROOM))
     out = []
     for uuid, rec in hub.pool().items():
+        email = rec["oauthAccount"].get("emailAddress") or emails.get(uuid)
+        config = hub_account_config(policy, email)
+        config["switch_on_scoped"] = config["switch_on_scoped"] and not leftover
         if uuid in d["draining"] or uuid in running \
                 or login_state(rec, now) in ("needs /login", "login expired"):
             continue
@@ -1620,7 +1649,7 @@ def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -
         # An account reserved for this host is its next account (Owner 11-15:
         # "F finishes out bender7, then moves to bender4").
         out.append(((last_resort, not mine, *order, ratio,
-                     rec["oauthAccount"].get("emailAddress") or uuid), uuid, why))
+                     email or uuid), uuid, why))
     return sorted(out)
 
 
@@ -1637,9 +1666,12 @@ def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: 
         target, reason = entry["account"], f"pinned (rev {hub.desired['revision']})"
     elif entry.get("mode") == "auto":
         policy = hub.desired["policy"]
-        config = {"thresholds": policy.get("thresholds") or {},
-                  "switch_on_scoped": policy.get("switch_on_scoped", DEFAULT_SWITCH_ON_SCOPED)
-                  and host not in set(policy.get("leftover_hosts") or [])}
+        emails = hub_emails(reports)
+        active_info = (export.get("accounts") or {}).get(active) or {}
+        active_email = active_info.get("email") or emails.get(active)
+        config = hub_account_config(policy, active_email or active, emails=emails)
+        config["switch_on_scoped"] = config["switch_on_scoped"] \
+            and host not in set(policy.get("leftover_hosts") or [])
         reading = ((export.get("accounts") or {}).get(active) or {}).get("reading") or {}
         over = over_threshold(reading.get("limits") or [], config, now, for_switch=True) if active else []
         res = hub.desired["reservations"].get(active) if active else None
@@ -1672,14 +1704,15 @@ def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: 
 def room_by_account(reports: dict[str, dict], policy: dict, now: float) -> dict[str, tuple[bool, str]]:
     """Every account any host knows: (has room, why) from its freshest reading.
     An account never read counts as having room ("not read yet")."""
-    config = {"thresholds": policy.get("thresholds") or {}}
     readings = hub_readings(reports)
+    emails = hub_emails(reports)
     out = {}
-    for uuid in hub_emails(reports):
+    for uuid in emails:
         reading = readings.get(uuid)
         if not reading:
             out[uuid] = (True, "not read yet")
             continue
+        config = hub_account_config(policy, uuid, emails)
         over = over_threshold(reading["limits"], config, now, for_switch=True)
         out[uuid] = (not over, ", ".join(f"{limit_name(l)} {l['percent']:.0f}%" for l in over) or "room")
     return out
@@ -1772,7 +1805,7 @@ def drain_plan(hub: Hub, uuid: str, now: float) -> list[tuple[str, str | None, s
     reports = hub.reports()
     d = hub.desired
     readings = hub_readings(reports)
-    config = {"thresholds": d["policy"].get("thresholds") or {}}
+    emails = hub_emails(reports)
     on = {}
     for host, rep in reports.items():
         if host == POOL:
@@ -1792,6 +1825,7 @@ def drain_plan(hub: Hub, uuid: str, now: float) -> list[tuple[str, str | None, s
             if res and host not in res.get("for", []):
                 continue
             reading = readings.get(cand)
+            config = hub_account_config(d["policy"], cand, emails)
             if reading and over_threshold(reading["limits"], config, now, for_switch=True):
                 continue
             live = [l for l in (reading or {}).get("limits", [])
@@ -1833,6 +1867,7 @@ def hub_status_view(hub: Hub, now: float) -> dict:
     accts = {}
     for uuid, email in sorted(emails.items(), key=lambda kv: kv[1]):
         accts[uuid] = {"email": email, "reading": readings.get(uuid),
+                       "account_threshold": account_threshold(d["policy"], email),
                        "room": room.get(uuid, (True, ""))[0],
                        "active_on": sorted(h for h, v in hosts.items() if v["active"] == uuid),
                        "saved_on": sorted(("pool" if h == POOL else h) for h, rep in reports.items()
@@ -1873,6 +1908,9 @@ def print_hub_status(view: dict, now: float, out) -> None:
                         + (f" ({a['reservation_note']})" if a["reservation_note"] else ""))
         if a["draining"]:
             tags.append("DRAINING")
+        if a.get("account_threshold") is not None:
+            threshold = a["account_threshold"]
+            tags.append(f"switch at {threshold:g}% (Owner keeps {100 - threshold:g}%)")
         if not a["room"]:
             tags.append("NO ROOM")
         tags.append(f"saved on {', '.join(a['saved_on']) or 'no host'}")
@@ -1997,8 +2035,25 @@ def cmd_hub(paths: Paths, args, out) -> int:
                     print(f"{k:22} {policy.get(k, '(default)')}", file=out)
                 for k, v in (policy.get("thresholds") or {}).items():
                     print(f"{'thresholds.' + k:22} {v:g}", file=out)
+                for k, v in sorted((policy.get("account_thresholds") or {}).items()):
+                    print(f"{'account_thresholds.' + k:22} {v:g}", file=out)
                 return 0
-            if args.key.startswith("thresholds."):
+            if args.key.startswith("account_thresholds."):
+                email = args.key.split(".", 1)[1].lower()
+                if "@" not in email:
+                    raise AccountError(f"{args.key}: account email must contain '@'")
+                args.key = f"account_thresholds.{email}"
+                overrides = policy.setdefault("account_thresholds", {})
+                if args.value == "default":
+                    overrides.pop(email, None)
+                else:
+                    value = parse_policy_float(args.value or "")
+                    if value is None:
+                        raise AccountError(f"{args.key}: invalid value {args.value!r}")
+                    overrides[email] = value
+                if not overrides:
+                    policy.pop("account_thresholds")
+            elif args.key.startswith("thresholds."):
                 kind = args.key.split(".", 1)[1]
                 if not re.fullmatch(r"[a-z_]+", kind):
                     raise AccountError(f"{args.key}: not a limit kind")

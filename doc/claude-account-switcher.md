@@ -379,7 +379,7 @@ fallback a host uses only when told to.
 | `hub reserve <account> --for <host>[,..] [--note …]` / `hub release <account>` | keep an account for named hosts (or `nobody`); auto and drains never pick it for others |
 | `hub drain <account> [--dry-run]` | stop placing work on it and pin each host using it to the best other account (most room, saved on that host, not reserved or draining, fewest hosts already on it); prints the plan |
 | `hub undrain <account>` | allow it again |
-| `hub policy <key> <value>` | thresholds, default mode, dwell, daily cap, sweep on/off, scoped-limit switching and minimum pool lend room |
+| `hub policy <key> <value>` | thresholds, per-account thresholds, default mode, dwell, daily cap, sweep on/off, scoped-limit switching and minimum pool lend room |
 | `hub history` | assignment changes, apply results, switches, sweeps |
 
 **Keeping switches rare:** a host moves only when the coordinator assigns
@@ -502,6 +502,7 @@ Owner's context: most accounts are full at any time, and about 3 accounts are bu
 
 - Only accounts with a usage reading are lent. A reading older than 3 h that has not passed a reset counts as no reading. (11-15 06:58Z incident: an unread account turned out to be rate limited, and about 14 sessions stopped.)
 - Only accounts below the switch point are lent. It is 98% for every limit (`hub policy thresholds.weekly 98`, `thresholds.session 98`; Owner 11-16: "switch right before we hit the limits").
+- `account_thresholds.<email>` lowers the weekly switch point for one account while leaving its 5-hour switch point unchanged. For example, on 2026-11-17 Owner kept about 5% of `bigbadbossbob@gmail.com` for personal use, so `hub policy account_thresholds.bigbadbossbob@gmail.com 94` switches it at 94% to absorb transfer overshoot; `default` removes the override.
 - The hub counts model-scoped limits at their family threshold by default (`hub policy switch_on_scoped false` disables that for non-leftover hosts).
 - Non-leftover hosts prefer accounts with at least 5% room on every counted limit (`hub policy min_lend_room <percent>`); a low-room account remains a last resort. Leftover-host ranking is unchanged.
 - Among those, the account whose weekly limit resets soonest goes first.

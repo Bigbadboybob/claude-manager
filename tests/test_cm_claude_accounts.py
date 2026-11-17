@@ -1513,6 +1513,67 @@ class PoolTests(HubHarness):
         self.poll()
         self.assertEqual(self.candidates(), ["carol-uuid-0000"])
 
+    def test_account_threshold_excludes_only_that_pool_account(self):
+        self.hub("policy", "thresholds.weekly", "98")
+        self.set_reading("bob", ("weekly_all", None, 95, 2 * 86400, True))
+        self.set_reading("carol", ("weekly_all", None, 95, 3 * 86400, True))
+        self.poll()
+        self.poll()
+        self.hub("policy", "account_thresholds.bob@example.com", "94")
+        self.assertEqual(self.candidates(), ["carol-uuid-0000"])
+
+    def test_account_threshold_triggers_auto_lend_but_global_threshold_does_not(self):
+        self.hub("policy", "thresholds.weekly", "98")
+        self.set_reading("bob", ("weekly_all", None, 10, 2 * 86400, True))
+        self.set_reading("carol", ("weekly_all", None, 20, 3 * 86400, True))
+        self.poll()
+        self.poll()
+        self.hub("assign", "laptop", "alice@example.com", "--auto")
+        self.hub("policy", "account_thresholds.alice@example.com", "94")
+        export = json.loads(self.run_cli("export")[1])
+        export["accounts"]["alice-uuid-0000"]["reading"]["limits"][0]["percent"] = 94.5
+        with accounts.Hub(self.hub_paths) as h:
+            lend = accounts.pool_lend(h, "laptop", export, h.reports(), time.time())
+        self.assertIsNotNone(lend)
+        self.assertTrue(lend["switch"])
+
+        self.poll()  # return the borrowed login before checking the unmodified policy
+        with accounts.Hub(self.hub_paths) as h:
+            h.desired["policy"].pop("account_thresholds", None)
+            h.save("remove test account threshold")
+            lend = accounts.pool_lend(h, "laptop", export, h.reports(), time.time())
+        self.assertIsNone(lend)
+
+    def test_account_threshold_applies_to_scoped_weekly_limits(self):
+        self.hub("policy", "thresholds.weekly", "98")
+        self.hub("policy", "switch_on_scoped", "true")
+        self.set_reading("bob", ("weekly_scoped", "Fable", 95, 2 * 86400, False))
+        self.set_reading("carol", ("weekly_all", None, 10, 3 * 86400, True))
+        self.poll()
+        self.poll()
+        self.hub("policy", "account_thresholds.bob@example.com", "94")
+        self.assertEqual(self.candidates(), ["carol-uuid-0000"])
+
+    def test_account_threshold_does_not_change_the_session_limit(self):
+        self.hub("policy", "thresholds.session", "98")
+        self.hub("policy", "thresholds.weekly", "98")
+        self.set_reading("bob", ("session", None, 96, 5 * 3600, True),
+                         ("weekly_all", None, 10, 2 * 86400, True))
+        self.set_reading("carol", ("weekly_all", None, 20, 3 * 86400, True))
+        self.poll()
+        self.poll()
+        self.hub("policy", "account_thresholds.bob@example.com", "94")
+        self.assertIn("bob-uuid-0000", self.candidates())
+
+    def test_room_by_account_uses_account_threshold(self):
+        self.hub("policy", "thresholds.weekly", "98")
+        self.hub("policy", "account_thresholds.bob@example.com", "94")
+        self.other_host(host_export("cm-sessions", active="bob", saved=["bob"],
+                                    bob=(0, ("weekly_all", None, 95, 86400, True))))
+        with accounts.Hub(self.hub_paths) as h:
+            room = accounts.room_by_account(h.reports(), h.desired["policy"], time.time())
+        self.assertFalse(room["bob-uuid-0000"][0])
+
     def test_the_hub_renews_pool_logins_before_they_expire(self):
         self.poll()
         self.poll()
@@ -1799,6 +1860,14 @@ class HubTests(HubHarness):
         self.assertEqual(self.hub("policy", "default_mode", "sometimes")[0], 1)
         self.assertEqual(self.hub("policy", "thresholds.weekly", "95")[0], 0)
         self.assertIn("thresholds.weekly      95", self.hub("policy")[1])
+        self.assertEqual(self.hub("policy", "account_thresholds.Bob@Example.com", "94")[0], 0)
+        self.assertIn("account_thresholds.bob@example.com 94", self.hub("policy")[1])
+        status_policy = json.loads(self.hub("status", "--json")[1])["policy"]
+        self.assertEqual(status_policy["account_thresholds"], {"bob@example.com": 94.0})
+        self.assertEqual(self.hub("policy", "account_thresholds.bad-value", "94")[0], 1)
+        self.assertEqual(self.hub("policy", "account_thresholds.bobexample.com", "94")[0], 1)
+        self.assertEqual(self.hub("policy", "account_thresholds.bob@example.com", "default")[0], 0)
+        self.assertNotIn("account_thresholds", json.loads(self.hub("status", "--json")[1])["policy"])
         code, text = self.hub("critical", "add", "the F build")
         self.assertIn("3. the F build", text)
         code, text = self.hub("critical", "remove", "1")
@@ -1807,6 +1876,8 @@ class HubTests(HubHarness):
         self.assertEqual(self.hub("critical", "remove", "9")[0], 1)
         self.poll()  # policy default_mode reaches the host
         self.assertEqual(self.state()["hub"]["reply"]["policy"]["default_mode"], "auto")
+        self.hub("policy", "account_thresholds.alice@example.com", "94")
+        self.assertIn("switch at 94% (Owner keeps 6%)", self.hub("status")[1])
 
     def test_checkin_refuses_a_mismatched_or_bad_export(self):
         export = host_export("cm-sessions")
