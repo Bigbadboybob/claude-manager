@@ -320,6 +320,16 @@ frontend connects over a private Unix websocket relay. CM inserts
 connection. Server approval requests and human decisions pass through unchanged.
 Native receipts require the named `function_call_output` transcript item.
 
+Codex compaction discards tool outputs from replacement history. On a live
+`item/completed` `contextCompaction` event for the selected thread, the relay
+therefore starts one user-input turn with up to eight recent inbound inbox
+messages (each truncated), and pointers to `get_current_task` and `chat_read`.
+The read does not acknowledge messages. A durable per-thread/item claim prevents
+replaying a compaction after reconnect or restart. The claim precedes submission
+because `turn/start` is not idempotent: an ambiguous failure is logged and is
+not retried, so recovery is not guaranteed after a transport failure. Old
+rollout records are not replayed on startup. Ordinary notices remain tool outputs.
+
 ### Codex restart permissions (CLI 0.154)
 
 `A-R`, startup restore and the resume picker keep the selected conversation.

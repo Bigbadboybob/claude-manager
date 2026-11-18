@@ -87,6 +87,95 @@ class ExternalEditorTests(unittest.TestCase):
                 self.assertEqual(dict(os.environ), expected)
 
 
+class CompactionRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_completed_compaction_reinjects_recent_inbox_once_across_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            queue = Queue("fixture", Path(tmp))
+            rollout = Path(tmp) / "rollout.jsonl"
+            rows = [
+                {"type": "response_item", "payload": {"type": "message", "role": "user", "content": "Old brief"}},
+                {"type": "response_item", "payload": {"type": "function_call_output", "name": "cm_notification", "output": "New task: fix the pipeline."}},
+                {"type": "compacted", "payload": {"replacement_history": [
+                    {"type": "message", "role": "user", "content": "Old brief"}]}},
+            ]
+            rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            self.assertNotIn("New task", json.dumps(rows[-1]["payload"]["replacement_history"]))
+            event = {"method": "item/completed", "params": {
+                "threadId": "thread-a", "item": {"type": "contextCompaction", "id": "compact-1"}}}
+            chat = {"items": [{"actor": {"name": "Lead"}, "created_at": "2026-11-18T01:00:00Z",
+                               "body": "New task: fix the pipeline."}]}
+            async def run_relay():
+                relay = Relay("unused", queue)
+                relay.thread = {"id": "thread-a", "path": str(rollout)}
+                relay.ready.set()
+                relay.call = mock.AsyncMock(return_value={"turn": {"id": "turn-1"}})
+                relay.observe(event)
+                await eventually(lambda: relay.call.called)
+                await relay.close()
+                return relay
+            with mock.patch("mcp_server.native_codex.control_client.call", return_value=chat) as read:
+                relay = await run_relay()
+                method, params = relay.call.call_args.args
+                self.assertEqual(method, "turn/start")
+                self.assertNotIn("toolOutput", params)
+                text = params["input"][0]["text"]
+                for phrase in ("New task: fix the pipeline.", "Lead", "2026-11-18T01:00:00Z",
+                               "get_current_task", "chat_read", "overrides older briefs"):
+                    self.assertIn(phrase, text)
+                self.assertFalse(read.call_args.args[1].get("mark_read", True))
+                restarted = Relay("unused", queue)
+                restarted.thread = {"id": "thread-a", "path": "fixture.jsonl"}
+                restarted.ready.set()
+                restarted.call = mock.AsyncMock()
+                restarted.observe(event)
+                await asyncio.sleep(0.05)
+                restarted.call.assert_not_called()
+                await restarted.close()
+
+    async def test_filters_events_bounds_chat_and_never_retries_ambiguous_submit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            queue = Queue("fixture", Path(tmp))
+            relay = Relay("unused", queue)
+            relay.thread = {"id": "thread-a"}
+            relay.ready.set()
+            relay.call = mock.AsyncMock(side_effect=TimeoutError())
+            event = {"method": "item/completed", "params": {
+                "threadId": "thread-a", "item": {"type": "contextCompaction", "id": "c1"}}}
+            chat = {"items": [{"actor": {"name": f"lead-{n}"}, "created_at": "time",
+                               "body": str(n) * 1500} for n in range(8)]}
+            with mock.patch("mcp_server.native_codex.control_client.call", return_value=chat), \
+                    mock.patch("mcp_server.native_codex.print"):
+                relay.observe({"method": "item/started", "params": event["params"]})
+                relay.observe({"method": "item/completed", "params": {**event["params"], "threadId": "other"}})
+                await asyncio.sleep(0.01)
+                relay.call.assert_not_called()
+                relay.observe(event)
+                await eventually(lambda: relay.call.called)
+                text = relay.call.call_args.args[1]["input"][0]["text"]
+                self.assertLess(len(text), 11000)
+                self.assertIn("[truncated]", text)
+                self.assertLess(text.index("lead-7"), text.index("lead-0"))
+                relay.observe(event)
+                await asyncio.sleep(0.05)
+                self.assertEqual(relay.call.call_count, 1)
+                await relay.close()
+
+    async def test_chat_unavailable_still_sends_recovery_and_next_compaction_is_new(self):
+        from mcp_server.control_client import TransportError
+        with tempfile.TemporaryDirectory() as tmp:
+            relay = Relay("unused", Queue("fixture", Path(tmp)))
+            relay.thread = {"id": "thread-a"}
+            relay.ready.set()
+            relay.call = mock.AsyncMock(return_value={"turn": {"id": "turn"}})
+            with mock.patch("mcp_server.native_codex.control_client.call", side_effect=TransportError("offline")):
+                for item_id in ("first", "second"):
+                    relay.observe({"method": "item/completed", "params": {
+                        "threadId": "thread-a", "item": {"type": "contextCompaction", "id": item_id}}})
+                await eventually(lambda: relay.call.call_count == 2)
+                self.assertIn("chat was unavailable", relay.call.call_args.args[1]["input"][0]["text"])
+                await relay.close()
+
+
 class QueueTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()

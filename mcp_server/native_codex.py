@@ -2,8 +2,8 @@
 
 The local websocket relay shares the frontend's upstream connection: approval
 requests keep their normal UI, and successful thread/start/resume/fork replies
-identify the conversation the user actually selected. CM inserts only named
-tool outputs, using its own RPC IDs, never keyboard bytes or human messages.
+identify the conversation the user actually selected. CM normally inserts named
+tool outputs; after compaction it also restores recent chat in one user message.
 """
 
 from __future__ import annotations
@@ -241,6 +241,7 @@ class Relay:
         # Serialize native wakes with a manager's interrupt-and-stop operation.
         self.delivery_lock = asyncio.Lock()
         self.interrupt_waiters = 0
+        self.compaction_tasks = set()
 
     def identity(self):
         return {
@@ -296,6 +297,15 @@ class Relay:
                 await self.frontend.send(json.dumps(message))
 
     def observe(self, message, *, method=None, params=None, select=False):
+        event = message.get("params", {})
+        item = event.get("item", {}) if isinstance(event, dict) else {}
+        if (message.get("method") == "item/completed"
+                and isinstance(item, dict) and item.get("type") == "contextCompaction"
+                and isinstance(item.get("id"), str) and item["id"]
+                and self.thread and event.get("threadId") == self.thread.get("id")):
+            task = asyncio.create_task(self.recover_compaction(event["threadId"], item["id"]))
+            self.compaction_tasks.add(task)
+            task.add_done_callback(self.compaction_tasks.discard)
         try:
             self.observe_legacy(
                 message,
@@ -336,6 +346,65 @@ class Relay:
             self.report_dirty.set()
         if select or message.get("method") == "turn/completed":
             self.background_dirty.set()
+
+    async def recover_compaction(self, thread_id, item_id):
+        """Restore recent inbound chat as user context once per live compaction.
+
+        Claim before submission: turn/start has no idempotency guarantee, so a
+        disconnected or timed-out submission is not retried as a duplicate.
+        """
+        try:
+            try:
+                result = await asyncio.to_thread(
+                    control_client.call, "messaging.read",
+                    {"inbox": True, "newest_first": True, "limit": 8, "mark_read": False},
+                    timeout=5,
+                )
+                items = result.get("items") or []
+                if not isinstance(items, list):
+                    items = []
+            except (control_client.ControlError, control_client.TransportError, OSError):
+                items = []
+            lines = []
+            for item in reversed(items[:8]):
+                if not isinstance(item, dict) or not isinstance(item.get("body"), str):
+                    continue
+                actor = item.get("actor") or {}
+                if not isinstance(actor, dict):
+                    actor = {}
+                sender = actor.get("name") or actor.get("id") or "unknown"
+                body = item["body"][:1200]
+                if len(item["body"]) > 1200:
+                    body += "… [truncated]"
+                lines.append(f"- {str(item.get('created_at') or 'unknown time')[:64]} "
+                             f"{str(sender)[:128]}: {body}")
+            text = (
+                "[CM compaction recovery] Context was compacted. Recent inbound chat "
+                "is quoted below and may be truncated; check the source for full context.\n"
+                "The newest lead instruction overrides older briefs. "
+                "Use get_current_task and chat_read to recover current instructions and inbox.\n"
+                + ("\n".join(lines) if lines else "Recent chat was unavailable or empty; use chat_read.")
+            )
+            # Same lock as native wakes: never race a manager's interrupt-and-stop.
+            async with self.delivery_lock:
+                if self.interrupt_waiters:
+                    print("CM Codex compaction recovery skipped: interrupt in progress", file=sys.stderr)
+                    return
+                if not self.ready.is_set() or self.selecting or (self.thread or {}).get("id") != thread_id:
+                    print("CM Codex compaction recovery skipped: selected thread changed or unavailable", file=sys.stderr)
+                    return
+                key = hashlib.sha256(f"{thread_id}\0{item_id}".encode()).hexdigest()
+                path = self.queue.path / f"{key}.compaction"
+                with self.queue.locked():
+                    if path.exists():
+                        return
+                    atomic_write(path, {"thread_id": thread_id, "item_id": item_id})
+                await self.call("turn/start", {
+                    "threadId": thread_id,
+                    "input": [{"type": "text", "text": text}],
+                })
+        except Exception as exc:
+            print(f"CM Codex compaction recovery failed: {type(exc).__name__}: {exc}", file=sys.stderr)
 
     def state_failed(self, operation, exc):
         was_enabled = self.state_enabled
@@ -925,7 +994,7 @@ class Relay:
         if self.reader:
             self.reader.cancel()
             await asyncio.gather(self.reader, return_exceptions=True)
-        tasks = [t for t in (self.publisher, self.background_poller) if t]
+        tasks = [t for t in (self.publisher, self.background_poller) if t] + list(self.compaction_tasks)
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
