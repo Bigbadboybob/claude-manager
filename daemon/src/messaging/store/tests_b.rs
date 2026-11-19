@@ -19,6 +19,33 @@ fn post(s: &mut Store, p: &Person, target: Value, key: &str, people: &[Person]) 
 }
 
 #[test]
+fn monitor_badges_skip_unrelated_unread_backlog() {
+    use super::watches::MONITOR_COUNT_VISITS;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Store::open(tmp.path()).unwrap();
+    let a = person(&s, "a");
+    let b = person(&s, "b");
+    let people = vec![a.clone(), b.clone()];
+    for i in 0..40 {
+        post(&mut s, &a, json!({"dm":b.id}), &format!("backlog-{i}"), &people);
+    }
+    let m = s.register_monitor(&b.id, &json!({"scope":{"channel":"general"},"mode":"continuous","request_id":"watch"}), &people).unwrap();
+    assert_eq!(m["unacknowledged"], 0);
+    MONITOR_COUNT_VISITS.with(|n| n.set(0));
+    assert_eq!(s.monitor_status(&b.id)["unacknowledged"], 0);
+    let visited = MONITOR_COUNT_VISITS.with(|n| n.get());
+    assert!(visited < 5, "empty monitor interval scanned {visited} unrelated messages");
+
+    post(&mut s, &a, json!({"channel":"general"}), "watched", &people);
+    MONITOR_COUNT_VISITS.with(|n| n.set(0));
+    assert_eq!(s.monitor_status(&b.id)["unacknowledged"], 1);
+    let visited = MONITOR_COUNT_VISITS.with(|n| n.get());
+    assert!(visited < 5, "one-hit monitor scanned {visited} unrelated messages");
+    s.mark_read(&b.id, &json!({"channel":"general"}), &people).unwrap();
+    assert_eq!(s.monitor_status(&b.id)["unacknowledged"], 0);
+}
+
+#[test]
 fn monitor_status_counts_receipts_without_delivery_reads() {
     let tmp = tempfile::tempdir().unwrap();
     let mut s = Store::open(tmp.path()).unwrap();

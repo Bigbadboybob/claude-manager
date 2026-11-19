@@ -263,6 +263,15 @@ fn p4_randomized_differential_intent_keys_and_order() {
         }
         for actor in &actors {
             assert_actor(&s, actor, &format!("seed {seed}"));
+            for m in s.personal[actor].monitors.values() {
+                let expected = s.visible_conversations(actor).into_iter()
+                    .flat_map(|(cid, _)| s.message_candidates(actor, cid, None, false, true, false))
+                    .filter(|e| e.position > m.acknowledged && e.position <= m.hit_high
+                        && s.monitor_matches(actor, m, e))
+                    .count();
+                assert_eq!(s.monitor_unseen_count(actor, m), expected,
+                    "seed {seed}, actor {actor}, monitor {}", m.id);
+            }
         }
         // Membership churn cannot reinterpret frozen mentions. DND suppresses
         // both direct and monitor intents, and toggling it restores the same set.

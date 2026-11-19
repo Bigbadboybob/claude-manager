@@ -2,6 +2,11 @@
 //! are reconstructed from retained publications, not an ever-growing ID array.
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static MONITOR_COUNT_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Scope {
     pub channel: Option<String>,
@@ -274,14 +279,41 @@ impl Store {
         Ok(())
     }
 
-    fn monitor_unseen_count(&self, actor: &str, m: &Monitor) -> usize {
+    pub(super) fn monitor_unseen_count(&self, actor: &str, m: &Monitor) -> usize {
         // A hit the reader has already read (an inbox page acknowledged, or a
         // bulk mark_read_before) is not outstanding, even before the monitor's
         // own result receipt is acknowledged: the two ack systems used to be
         // independent, so reading never lowered this count.
-        self.visible_conversations(actor).into_iter()
-            .flat_map(|(cid, _)|self.message_candidates(actor,cid,None,false,true,false))
-            .filter(|e| e.position > m.acknowledged && e.position <= m.hit_high && self.monitor_matches(actor,m,e)).count()
+        if m.acknowledged >= m.hit_high {
+            return 0;
+        }
+        self.visible_conversations(actor).into_iter().map(|(cid, index)| {
+            let read = self.reads.get(actor).and_then(|r| r.cursors.get(cid));
+            let unread_lo = read.map_or(0, |r| index.messages.partition_point(|(key, _)| key <= r));
+            let unread = &index.messages[unread_lo..];
+            let lo = index.arrivals.partition_point(|(position, _)| *position <= m.acknowledged);
+            let hi = index.arrivals.partition_point(|(position, _)| *position <= m.hit_high);
+            let arrivals = &index.arrivals[lo..hi];
+            // Arrival and read order may differ after replication. Iterate the
+            // narrower interval, then check the other boundary explicitly.
+            let visit = || {
+                #[cfg(test)]
+                MONITOR_COUNT_VISITS.with(|n| n.set(n.get() + 1));
+            };
+            if unread.len() < arrivals.len() {
+                unread.iter().filter(|(_, i)| {
+                    visit();
+                    let e = &self.events[*i];
+                    e.position > m.acknowledged && e.position <= m.hit_high && self.monitor_matches(actor, m, e)
+                }).count()
+            } else {
+                arrivals.iter().filter(|(_, i)| {
+                    visit();
+                    let e = &self.events[*i];
+                    read.is_none_or(|cursor| ReadCursor::of(&e.event) > *cursor) && self.monitor_matches(actor, m, e)
+                }).count()
+            }
+        }).sum()
     }
 
     fn monitor_summary(&self, actor: &str, m: &Monitor) -> Value {
