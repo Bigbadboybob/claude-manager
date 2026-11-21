@@ -355,7 +355,7 @@ impl App {
                     self.draw_transcript_picker(frame, area, candidates, *selected, target);
                 }
                 InputMode::WorkspaceSettings {
-                    workspace_id,
+                    workspace_id: _,
                     name,
                     color,
                     pinned,
@@ -364,7 +364,6 @@ impl App {
                     task_at,
                     active_field,
                 } => {
-                    self.section_note = self.nested_section_label(workspace_id);
                     self.draw_workspace_settings(
                         frame,
                         area,
@@ -507,11 +506,6 @@ impl App {
         let dim = Style::default().fg(theme::DIM);
         let white = Style::default().fg(theme::TEXT);
         let mut spans = vec![Span::styled(label.to_string(), if focused { white } else { dim })];
-        // A nested workspace shows the section it inherits, read-only.
-        if let Some(note) = self.section_note.clone() {
-            spans.push(Span::styled(note, white));
-            return Line::from(spans);
-        }
         let value = self.section_choice_label(section);
         let value_style = match section {
             Some(id) if !id.is_empty() => self
