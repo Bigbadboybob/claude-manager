@@ -1840,7 +1840,11 @@ def lend_copy_has_room(reading: dict | None, caps: dict | None, now: float) -> b
     limits = {l.get("kind"): l for l in reading.get("limits", [])}
     for kind, key in (("weekly_all", "week"), ("session", "five_hour")):
         limit, cap = limits.get(kind), caps.get(key)
-        if not isinstance(limit, dict) or not isinstance(cap, (int, float)):
+        if not isinstance(cap, (int, float)):
+            return False
+        if limit is None and kind == "session":
+            continue  # some accounts have no five-hour limit
+        if not isinstance(limit, dict):
             return False
         if (limit.get("resets_at") is None or limit["resets_at"] > now) and limit.get("percent", 100) >= cap:
             return False

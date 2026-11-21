@@ -517,10 +517,11 @@ primary: the two logins do not provide separate weekly or 5-hour capacity.
 The hub tracks the copy's borrower separately from the account UUID. Only
 one borrower may have it, and a host already holding that account is not
 offered it. Copies rank after every ordinary eligible pool login, including
-last-resort reservations. They need fresh readings for both `weekly_all` and
-`session` and both must be below their configured caps, regardless of
-`auto_allow_unread`. Recent readings from every host, including the primary
-holder, count against the caps. Without caps or either reading, they are not lent.
+last-resort reservations. They need a fresh `weekly_all` reading below the
+weekly cap, regardless of `auto_allow_unread`. If the account has a `session`
+limit, it too must be below its cap; accounts without one can still be lent.
+Both cap values must be configured. Recent readings from every host, including
+the primary holder, count against the caps.
 
 On cm-manager, after the updated hub has been reviewed and installed, Owner
 can create the separate login and set the example caps as follows:

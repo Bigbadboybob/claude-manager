@@ -1861,6 +1861,54 @@ class LendCopyTests(HubHarness):
             self.assertTrue(any(c[1] == "bob-uuid-0000~copy" for c in
                                 accounts.pool_candidates(h, "borrower", h.reports(), blocked + 1)))
 
+    def test_weekly_only_copy_lends_and_evicts_at_week_cap(self):
+        self.use_remote_holder(accounts.login_fingerprint(self.primary))
+        self.import_copy()
+        holder = self.remote_holder(accounts.login_fingerprint(self.primary))
+        holder["accounts"]["bob-uuid-0000"]["reading"]["limits"] = accounts.parse_limits(
+            usage(("weekly_all", None, 20, 86400, True),
+                  ("weekly_scoped", "opus", 30, 86400, False)))
+        self.other_host(holder)
+        reply = self.lend(self.borrower_export())
+        self.assertEqual(reply["lend"]["record"]["oauthAccount"]["accountUuid"], "bob-uuid-0000")
+        borrower = self.borrower_export("bob", ["bob"])
+        reading = borrower["accounts"]["bob-uuid-0000"]["reading"]
+        reading["limits"] = accounts.parse_limits(usage(("weekly_all", None, 79, 86400, True),
+                                                       ("weekly_scoped", "opus", 30, 86400, False)))
+        reply = self.lend(borrower)
+        self.assertNotIn("lend", reply)
+        self.assertNotEqual((reply.get("entry") or {}).get("account"), "alice-uuid-0000")
+        reading["limits"] = accounts.parse_limits(usage(("weekly_all", None, 80, 86400, True),
+                                                       ("weekly_scoped", "opus", 30, 86400, False)))
+        reply = self.lend(borrower)
+        self.assertEqual(reply["entry"]["account"], "alice-uuid-0000")
+        with accounts.Hub(self.hub_paths) as h:
+            self.assertTrue(h.copies()["bob-uuid-0000"]["evicting"])
+
+    def test_copy_without_weekly_reading_is_never_lent(self):
+        self.use_remote_holder(accounts.login_fingerprint(self.primary))
+        self.import_copy()
+        holder = self.remote_holder(accounts.login_fingerprint(self.primary))
+        reading = holder["accounts"]["bob-uuid-0000"]["reading"]
+        reading["limits"] = accounts.parse_limits(usage(("weekly_scoped", "opus", 20, 86400, False)))
+        self.other_host(holder)
+        # Replace the cached earlier complete reading with the current one.
+        with accounts.Hub(self.hub_paths) as h:
+            accounts.atomic_write(h.dir / "readings.json", {"bob-uuid-0000": reading})
+            self.assertFalse(any(c[1] == "bob-uuid-0000~copy" for c in
+                                 accounts.pool_candidates(h, "borrower", h.reports(), time.time())))
+        self.assertNotIn("lend", self.lend(self.borrower_export()))
+
+    def test_borrower_without_weekly_reading_is_evicted(self):
+        self.use_remote_holder(accounts.login_fingerprint(self.primary))
+        self.import_copy()
+        self.assertIn("lend", self.lend(self.borrower_export()))
+        borrower = self.borrower_export("bob", ["bob"])
+        borrower["accounts"]["bob-uuid-0000"]["reading"]["limits"] = accounts.parse_limits(
+            usage(("weekly_scoped", "opus", 20, 86400, False)))
+        reply = self.lend(borrower)
+        self.assertEqual(reply["entry"]["account"], "alice-uuid-0000")
+
     def test_holder_fingerprint_conflict_blocks_copy_and_records_event(self):
         self.use_remote_holder(accounts.login_fingerprint(self.primary))
         self.import_copy()
