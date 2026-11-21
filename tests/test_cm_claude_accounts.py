@@ -1760,10 +1760,12 @@ class LendCopyTests(HubHarness):
         code, text = self.hub("import-lend-copy", "bob@example.com", str(self.folder))
         self.assertEqual(code, 0, text)
 
-    def borrower_export(self, active=None, saved=(), week=20, session=30):
-        exp = host_export("borrower", active=active, saved=saved,
-            **({"bob": (0, ("weekly_all", None, week, 86400, True),
-                        ("session", None, session, 3600, True))} if active == "bob" else {}))
+    def borrower_export(self, active="alice", saved=(), week=20, session=30):
+        readings = {"alice": (0, ("weekly_all", None, 99, 86400, True))} if active == "alice" else {}
+        if active == "bob":
+            readings["bob"] = (0, ("weekly_all", None, week, 86400, True),
+                               ("session", None, session, 3600, True))
+        exp = host_export("borrower", active=active, saved=set(saved) | {"alice"}, **readings)
         exp["last_switch_at"] = 0
         return exp
 
@@ -1838,7 +1840,15 @@ class LendCopyTests(HubHarness):
                     self.assertIsNone(h.copies()["bob-uuid-0000"]["borrower"])
                     # Remove the unconfirmed carol lend for the next iteration.
                     (h.pool_dir / "lent" / "carol-uuid-0000.borrower.json").unlink(missing_ok=True)
+                with accounts.Hub(self.hub_paths) as h:
+                    copies = h.copies()
+                    copies["bob-uuid-0000"]["blocked_at"] = int(time.time()) - 1
+                    h.save_copies(copies)
                 self.manager_reading(20, 30)
+                with accounts.Hub(self.hub_paths) as h:
+                    report = h.reports()["cm-manager"]
+                    report["export"]["accounts"]["bob-uuid-0000"]["reading"]["at"] = int(time.time()) + 1
+                    accounts.atomic_write(h.dir / "reports/cm-manager.json", report)
 
     def test_same_second_reading_cannot_hide_borrower_cap(self):
         self.import_copy()
@@ -1901,6 +1911,162 @@ class LendCopyTests(HubHarness):
             self.assertEqual(returned["oauthAccount"], self.copy["oauthAccount"])
             self.assertIsNone(h.copies()["bob-uuid-0000"]["borrower"])
         self.assertEqual(json.loads((self.hub_paths.accounts / "bob-uuid-0000.json").read_text()), self.primary)
+
+    def test_reborrow_checks_all_newest_readings_when_timestamps_tie(self):
+        self.import_copy()
+        now = int(time.time())
+        with accounts.Hub(self.hub_paths) as h:
+            copies = h.copies()
+            copies["bob-uuid-0000"]["blocked_at"] = now - 1
+            h.save_copies(copies)
+            report = h.reports()["cm-manager"]
+            report["export"]["accounts"]["bob-uuid-0000"]["reading"]["at"] = now
+            accounts.atomic_write(h.dir / "reports/cm-manager.json", report)
+            accounts.atomic_write(h.dir / "readings.json", {"bob-uuid-0000": {"at": now,
+                "limits": accounts.parse_limits(usage(("weekly_all", None, 20, 86400, True),
+                                                      ("session", None, 60, 3600, True)))}})
+            self.assertFalse(any(c[1].endswith("~copy") for c in
+                                 accounts.pool_candidates(h, "borrower", h.reports(), now)))
+
+    def test_copy_is_not_lent_without_a_held_fallback(self):
+        self.import_copy()
+        exp = host_export("borrower")
+        exp["last_switch_at"] = 0
+        reply = self.lend(exp)
+        self.assertNotIn("lend", reply)
+        with accounts.Hub(self.hub_paths) as h:
+            self.assertTrue(h.copy_path("bob-uuid-0000").exists())
+            self.assertIsNone(h.copies()["bob-uuid-0000"]["borrower"])
+
+    def test_copy_can_use_another_held_login_if_the_previous_one_is_unusable(self):
+        self.import_copy()
+        exp = self.borrower_export("alice", ["alice", "carol"])
+        exp["accounts"]["alice-uuid-0000"]["login"] = "needs /login"
+        self.assertIn("lend", self.lend(exp))
+        exp = self.borrower_export("bob", ["alice", "bob", "carol"], session=60)
+        exp["accounts"]["alice-uuid-0000"]["login"] = "needs /login"
+        reply = self.lend(exp)
+        self.assertEqual(reply["entry"]["account"], "carol-uuid-0000")
+
+    def test_cap_with_empty_pool_switches_to_held_account_and_returns_copy(self):
+        self.import_copy()
+        for name in ("bob", "carol"):
+            (self.paths.accounts / f"{name}-uuid-0000.json").unlink()
+        self.age_last_switch(3600)
+        self.usage[self.live_token()] = usage(("weekly_all", None, 99, 86400, True))
+        copy_token = self.copy["claudeAiOauth"]["accessToken"]
+        self.usage[copy_token] = usage(("weekly_all", None, 20, 86400, True),
+                                       ("session", None, 30, 3600, True))
+        with accounts.Hub(self.hub_paths) as h:
+            h.desired["hosts"]["laptop"] = {"mode": "auto"}
+            h.save()
+        self.assertEqual(self.poll()[0], 0)
+        self.assertEqual(self.live_email(), "bob@example.com")
+        # The old login normally becomes a spare after 30 minutes. The hub
+        # must leave it on this host so it can be used for eviction later.
+        self.age_last_switch(3600)
+        state = self.state()
+        for event in state["history"]:
+            if event.get("event") == "borrowed":
+                event["at"] -= 3600
+        accounts.atomic_write(self.paths.state, state)
+        self.assertEqual(self.poll()[0], 0)
+        self.assertTrue((self.paths.accounts / "alice-uuid-0000.json").exists())
+        with accounts.Hub(self.hub_paths) as h:
+            self.assertEqual(h.pool(), {})
+            self.assertEqual(h.copies()["bob-uuid-0000"]["fallback"], "alice-uuid-0000")
+        self.usage[copy_token] = usage(("weekly_all", None, 20, 86400, True),
+                                       ("session", None, 60, 3600, True))
+        code, text = self.poll()
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.live_email(), "alice@example.com")  # 99% is still a valid fallback
+        self.assertEqual(self.state()["hub"]["reply"]["entry"]["mode"], "pin")
+        with accounts.Hub(self.hub_paths) as h:
+            self.assertEqual(h.desired["hosts"]["laptop"]["mode"], "auto")
+        self.age_last_switch(3600)
+        self.assertEqual(self.poll()[0], 0)
+        with accounts.Hub(self.hub_paths) as h:
+            self.assertIsNone(h.copies()["bob-uuid-0000"]["borrower"])
+            self.assertEqual(json.loads(h.copy_path("bob-uuid-0000").read_text())["claudeAiOauth"],
+                             self.copy["claudeAiOauth"])
+            blocked = h.copies()["bob-uuid-0000"]["blocked_at"]
+            self.assertFalse(any(c[1].endswith("~copy") for c in
+                                 accounts.pool_candidates(h, "laptop", h.reports(), time.time())))
+        # A reading taken after the eviction, with both limits under cap,
+        # makes the copy eligible again.
+        with accounts.Hub(self.hub_paths) as h:
+            report = h.reports()["cm-manager"]
+            reading = report["export"]["accounts"]["bob-uuid-0000"]["reading"]
+            reading["at"] = blocked + 1
+            accounts.atomic_write(h.dir / "reports/cm-manager.json", report)
+            self.assertTrue(any(c[1].endswith("~copy") for c in
+                                accounts.pool_candidates(h, "laptop", h.reports(), blocked + 1)))
+        self.usage[copy_token] = usage(("weekly_all", None, 20, 86400, True),
+                                       ("session", None, 30, 3600, True))
+        self.age_last_switch(3600)
+        self.assertEqual(self.poll()[0], 0)
+        self.assertEqual(self.live_email(), "bob@example.com")
+
+    def test_eviction_prefers_the_previous_account_over_another_held_login(self):
+        self.import_copy()
+        exp = host_export("borrower", active="zoe", saved=["alice", "zoe"],
+                          zoe=(0, ("weekly_all", None, 99, 86400, True)))
+        exp["last_switch_at"] = 0
+        self.assertIn("lend", self.lend(exp))
+        exp = self.borrower_export("bob", ["alice", "bob", "zoe"], session=60)
+        reply = self.lend(exp)
+        self.assertEqual(reply["entry"]["account"], "zoe-uuid-0000")
+
+    def test_eviction_retries_and_overrides_pin_until_return(self):
+        self.import_copy()
+        self.assertIn("lend", self.lend(self.borrower_export()))
+        with accounts.Hub(self.hub_paths) as h:
+            h.desired["hosts"]["borrower"] = {"mode": "pin", "account": "bob-uuid-0000"}
+            h.save()
+            exp = self.borrower_export("bob", ["bob"], session=60)
+            reply = accounts.hub_checkin(h, exp)
+            self.assertEqual(reply["entry"]["account"], "alice-uuid-0000")
+            # A lost reply and a later below-cap reading must not cancel eviction.
+            exp = self.borrower_export("bob", ["bob"], session=30)
+            exp["accounts"]["bob-uuid-0000"]["reading"]["at"] += 1
+            reports = h.reports()
+            reports["borrower"] = {"at": int(time.time()), "export": exp}
+            self.assertIsNone(accounts.borrowed_copy_over_cap(h, "borrower", exp, reports, time.time()))
+            reply = accounts.hub_checkin(h, exp)
+            self.assertEqual(reply["entry"]["account"], "alice-uuid-0000")
+            # Even the persisted pin to bob must not block its return.
+            exp = self.borrower_export("alice", ["alice", "bob"])
+            exp["returning"] = {"bob-uuid-0000": self.copy}
+            reply = accounts.hub_checkin(h, exp)
+            self.assertIn("bob-uuid-0000", reply["returned"])
+            self.assertEqual(h.desired["hosts"]["borrower"]["account"], "bob-uuid-0000")
+            self.assertTrue(h.copy_path("bob-uuid-0000").exists())
+
+    def test_missing_and_stale_borrower_readings_evict_without_pool(self):
+        self.import_copy()
+        for reading_kind in ("missing", "stale"):
+            with self.subTest(reading_kind=reading_kind):
+                self.assertIn("lend", self.lend(self.borrower_export()))
+                exp = self.borrower_export("bob", ["bob"])
+                if reading_kind == "missing":
+                    exp["accounts"]["bob-uuid-0000"]["reading"] = None
+                else:
+                    exp["accounts"]["bob-uuid-0000"]["reading"]["at"] -= 4 * 3600
+                reply = self.lend(exp)
+                self.assertEqual(reply["entry"]["mode"], "pin")
+                self.assertEqual(reply["entry"]["account"], "alice-uuid-0000")
+                self.assertNotIn("lend", reply)
+                exp = self.borrower_export("alice", ["bob", "alice"])
+                exp["returning"] = {"bob-uuid-0000": self.copy}
+                reply = self.lend(exp)
+                self.assertIn("bob-uuid-0000", reply["returned"])
+                with accounts.Hub(self.hub_paths) as h:
+                    self.assertFalse(any(c[1].endswith("~copy") for c in
+                                         accounts.pool_candidates(h, "borrower", h.reports(), time.time())))
+                    copies = h.copies()
+                    copies["bob-uuid-0000"]["blocked_at"] = int(time.time()) - 1
+                    h.save_copies(copies)
+                self.manager_reading(20, 30)
 
     def test_lost_return_ack_cannot_replace_primary(self):
         self.import_copy()

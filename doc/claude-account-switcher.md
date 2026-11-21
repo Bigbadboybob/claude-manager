@@ -544,22 +544,25 @@ the folder. `hub status --json` adds `accounts[uuid].lend_copy` with caps,
 availability and borrower; the policy is also in `policy.lend_caps`. Reset
 a cap with `hub policy lend_caps.<email> default` to stop new lending.
 
-The hub checks caps on auto borrowers at check-in and bypasses the normal
-dwell and switch-count gates when a cap is reached or the reading is missing.
-The reserved host uses its normal account thresholds. Existing hosts use the
-same pool protocol and need no update. Returned logins wait the existing
-30-minute host hold before returning to the separate slot; renewals use a
-separate in-flight slot and the common renewal breaker.
+The hub lends a copy only when the borrower has a usable saved login to
+fall back to. It prefers the active login and keeps that fallback on the host
+until the copy is returned. At a cap, or when the borrower's reading is stale or missing, the
+hub bypasses the dwell and switch-count gates. It first offers an eligible
+pool replacement. If there is none, it asks the host to switch back to the
+previous saved login using the existing pin assignment, even when that login
+is over its usage limit. The pin is temporary and does not change the hub's
+saved assignment. The host returns the copy after its usual 30-minute hold;
+the hub requires a new below-cap reading after eviction before lending it
+again. The reserved host keeps its normal thresholds. Existing hosts need no
+update, and renewals use separate slots and the common renewal breaker.
 
 **Operational limitation:** this is not an immediate or hard reservation of
 capacity. Hosts normally check in every two minutes and usage is normally
-read every nine minutes; a stale reading, network outage, 429 backoff, pinned
-or manual borrower, failed switch, or lack of an eligible replacement can
-leave the borrower on the account past a cap. Other activity on the same
-account also spends the shared window. Therefore the 60% cap alone cannot
-guarantee that cm-manager will never stall; that guarantee needs a stronger
-traffic-stop or capacity-reservation mechanism. Review this limitation before
-deploying or relying on the lend copy.
+read every nine minutes. An outage, 429 backoff, failed switch, or a fallback
+login that has been removed or has expired can leave a borrower on the
+account past a cap. Other activity on the same account also spends the shared
+window. Therefore the 60% cap alone cannot guarantee that cm-manager will
+never stall; review this limitation before deployment.
 
 **Hub upkeep, replacing decision 3 for pool logins only:**
 

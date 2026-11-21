@@ -1374,9 +1374,34 @@ def hub_checkin(hub: Hub, export: dict) -> dict:
              "hosts": {h: {"active": (r.get("export") or {}).get("active"), "at": r.get("at")}
                        for h, r in reports.items() if h != POOL}}
     if d["policy"].get("pool") and pool_capable(export):
-        lend = pool_lend(hub, host, export, reports, now)
+        copy_over = borrowed_copy_over_cap(hub, host, export, reports, now)
+        copies = hub.copies()
+        if copy_over:
+            copies[copy_over].update(blocked_at=now, evicting=True)
+            hub.save_copies(copies)
+        active = export.get("active")
+        pending = next((uuid for uuid, meta in copies.items()
+                        if meta.get("borrower") == host and meta.get("evicting")), None)
+        must_switch = pending if pending == active else None
+        # A previously issued eviction remains in force if its reply was lost.
+        lend = pool_lend(hub, host, export, reports, now) if not pending or copy_over else None
         if lend:
             reply["lend"] = lend
+        elif must_switch or (pending and (reply.get("entry") or {}).get("mode") == "pin"
+                             and (reply.get("entry") or {}).get("account") == pending):
+            # Use the existing pin response without changing the desired mode.
+            accounts = export.get("accounts") or {}
+            preferred = copies[pending].get("fallback")
+            targets = [u for u, info in accounts.items()
+                       if u != pending and isinstance(info, dict)
+                       and info.get("login") not in ("needs /login", "login expired")]
+            target = preferred if preferred in targets else next(iter(sorted(targets)), None)
+            if target:
+                reply["entry"] = {"mode": "pin", "account": target,
+                                  "email": accounts[target].get("email")}
+                hub.event("pool", f"evicting {pending[:8]} from {host}; switch to {target[:8]}", host=host)
+            else:
+                hub.event("owner-alert", f"cannot evict lend copy {pending[:8]} from {host}: no usable held login", host=host)
     return reply
 
 
@@ -1574,9 +1599,14 @@ def pool_take_returns(hub: Hub, host: str, export: dict, returning,
     ledger = load_json(hub.dir / "lent-logins.json")
     entry = hub.desired["hosts"].get(host) or {}
     pinned = entry.get("account") if entry.get("mode") == "pin" else None
+    copies = hub.copies()
+    protected = {meta.get("fallback") for meta in copies.values() if meta.get("borrower") == host}
     for uuid, rec in returning.items():
+        if uuid in protected:
+            continue  # retain the borrower's way back until the copy is returned
+        evicting = (copies.get(uuid) or {}).get("borrower") == host and (copies.get(uuid) or {}).get("evicting")
         if not valid_login_record(rec) or rec["oauthAccount"]["accountUuid"] != uuid \
-                or uuid in (export.get("active"), pinned):
+                or uuid == export.get("active") or (uuid == pinned and not evicting):
             continue  # a host keeps the account it is pinned to
         lent = ledger.get(login_fingerprint(rec))
         copy_meta = hub.copies().get(uuid) or {}
@@ -1601,7 +1631,13 @@ def pool_take_returns(hub: Hub, host: str, export: dict, returning,
                 continue
             atomic_write(path, rec)
             fp = login_fingerprint(rec)
+            if copy.get("evicting"):
+                # The borrower's last usage may have risen while switching.
+                # Require a new account reading after the return as well.
+                copy["blocked_at"] = int(time.time())
             copy.update(borrower=None, fingerprint=fp)
+            copy.pop("evicting", None)
+            copy.pop("fallback", None)
             hub.save_copies(copies)
             ledger[fp] = {"account": uuid, "host": host, "at": int(time.time()), "slot": "copy"}
             atomic_write(hub.dir / "lent-logins.json", ledger)
@@ -1645,6 +1681,8 @@ def pool_settle(hub: Hub, host: str, export: dict, returned: list[str]) -> None:
                 if not dest.exists():
                     os.rename(path, dest)
                     copy["borrower"] = None
+                    copy.pop("evicting", None)
+                    copy.pop("fallback", None)
                     hub.save_copies(copies)
                     hub.event("pool", f"lend copy of {uuid[:8]} to {host} not confirmed; back in the pool", host=host)
             continue
@@ -1743,12 +1781,28 @@ def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -
             continue
         email = rec["oauthAccount"].get("emailAddress") or emails.get(uuid)
         caps = (policy.get("lend_caps") or {}).get((email or "").lower())
-        reading = readings.get(uuid)
-        if not lend_copy_has_room(reading, caps, now):
+        latest = latest_copy_readings(hub, reports, uuid)
+        if not latest or any(not lend_copy_has_room(reading, caps, now) for reading in latest):
             continue
+        if meta.get("blocked_at") is not None and latest[0].get("at", 0) <= meta["blocked_at"]:
+            continue  # require a new below-cap reading after eviction
         out.append(((True, 1),
                     uuid + "~copy", "lend copy"))
     return sorted(out)
+
+
+def latest_copy_readings(hub: Hub, reports: dict[str, dict], uuid: str) -> list[dict]:
+    """Keep all readings tied for newest, so one low reading cannot hide a cap."""
+    readings = [load_json(hub.dir / "readings.json").get(uuid)]
+    for report in reports.values():
+        info = ((report.get("export") or {}).get("accounts") or {}).get(uuid)
+        if isinstance(info, dict):
+            readings.append(info.get("reading"))
+    readings = [r for r in readings if isinstance(r, dict) and isinstance(r.get("at"), (int, float))]
+    if not readings:
+        return []
+    latest = max(r["at"] for r in readings)
+    return [r for r in readings if r["at"] == latest]
 
 
 def lend_copy_has_room(reading: dict | None, caps: dict | None, now: float) -> bool:
@@ -1764,6 +1818,23 @@ def lend_copy_has_room(reading: dict | None, caps: dict | None, now: float) -> b
     return True
 
 
+def borrowed_copy_over_cap(hub: Hub, host: str, export: dict,
+                           reports: dict[str, dict], now: float) -> str | None:
+    """A missing or stale borrower reading also triggers a conservative eviction."""
+    active = export.get("active")
+    if not active or (hub.copies().get(active) or {}).get("borrower") != host:
+        return None
+    info = (export.get("accounts") or {}).get(active) or {}
+    email = info.get("email") or hub_emails(reports).get(active) or ""
+    caps = (hub.desired["policy"].get("lend_caps") or {}).get(email.lower())
+    reading = info.get("reading") or {}
+    latest = latest_copy_readings(hub, reports, active)
+    if not lend_copy_has_room(reading, caps, now) or not latest \
+            or any(not lend_copy_has_room(r, caps, now) for r in latest):
+        return active
+    return None
+
+
 def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: float) -> dict | None:
     """Hand a pool login to a host that needs one: its pinned account, or in
     auto mode a fresh account once its own is over threshold."""
@@ -1772,7 +1843,7 @@ def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: 
     held = set(export.get("accounts") or {}) | {active}
     pool = hub.pool()
     copies = hub.copies()
-    target, reason, switch = None, None, False
+    target, reason, switch, fallback = None, None, False, None
     if entry.get("mode") == "pin" and entry.get("account") not in (None, active) \
             and entry["account"] not in held and entry["account"] in pool:
         target, reason = entry["account"], f"pinned (rev {hub.desired['revision']})"
@@ -1790,15 +1861,7 @@ def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: 
         copy_borrowed = (copies.get(active) or {}).get("borrower") == host
         taken = bool(res and host not in res.get("for", []) and not res.get("last_resort")
                      and not copy_borrowed)
-        if copy_borrowed:
-            caps = (policy.get("lend_caps") or {}).get((active_email or "").lower())
-            latest = hub_readings(reports).get(active) or reading
-            # Timestamps have one-second precision: a simultaneous reading
-            # from the reserved host must not mask the borrower's own cap.
-            copy_over = (not lend_copy_has_room(reading, caps, now)
-                         or not lend_copy_has_room(latest, caps, now))
-        else:
-            copy_over = False
+        copy_over = bool(borrowed_copy_over_cap(hub, host, export, reports, now))
         needs = not active or over or taken or copy_over
         waited = now - (export.get("last_switch_at") or 0) >= POOL_DWELL_SECONDS
         capped = (export.get("auto_switches_24h") or 0) >= POOL_MAX_SWITCHES_PER_DAY
@@ -1806,7 +1869,12 @@ def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: 
             cands = pool_candidates(hub, host, reports, now)
             if cands:
                 # A host cannot safely receive another login for an account it holds.
-                cands = [c for c in cands if c[1].removesuffix("~copy") not in held]
+                usable_held = [uuid for uuid, info in (export.get("accounts") or {}).items()
+                               if isinstance(info, dict)
+                               and info.get("login") not in ("needs /login", "login expired")]
+                fallback = active if active in usable_held else next(iter(sorted(usable_held)), None)
+                cands = [c for c in cands if c[1].removesuffix("~copy") not in held
+                         and (not c[1].endswith("~copy") or fallback)]
             if cands:
                 _, target, why = cands[0]
                 what = ", ".join(f"{limit_name(l)} {l['percent']:.0f}%" for l in over) \
@@ -1824,7 +1892,7 @@ def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: 
     lent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if is_copy:
         os.rename(hub.copy_path(target), lent / f"{target}.copy.{host}.json")
-        copies[target]["borrower"] = host
+        copies[target].update(borrower=host, fallback=fallback)
         hub.save_copies(copies)
     else:
         os.rename(hub.pool_dir / f"{target}.json", lent / f"{target}.{host}.json")
