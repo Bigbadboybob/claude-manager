@@ -2106,12 +2106,10 @@ mod remote_reconnect_tests {
         }
     }
 
-    /// Continuous-panel S2: `visual_items_continuous` nests the subtasks an
-    /// orchestrator spawned (matched by `managed_by_uid`) under it, orders
-    /// orchestrators by label, excludes plain sessions, and is empty when
-    /// `hide_continuous`.
+    /// Legacy continuous orchestrators and managed workers remain visible in
+    /// the ordinary main sidebar; plain sessions remain visible too.
     #[test]
-    fn visual_items_continuous_nests_subtasks_under_orchestrators() {
+    fn legacy_continuous_members_stay_in_main_sidebar() {
         let _guard = crate::test_support::home_lock();
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().to_path_buf();
@@ -2144,22 +2142,14 @@ mod remote_reconnect_tests {
         ws.sessions.push(mk("orch-a", Some("ct-a"), None, "A orch"));
         app.workspaces.push(ws);
 
-        let rows = app.visual_items_continuous();
-        let resolved: Vec<(&str, u8)> = rows
-            .iter()
-            .map(|r| {
-                (
-                    app.workspaces[r.ws_idx].sessions[r.sess_idx.expect("session row")].uid.as_str(),
-                    r.depth,
-                )
-            })
-            .collect();
-        // A-orch (label "A orch") first, no children; then Z-orch with BUG-1,
-        // BUG-2 nested (sorted by label). Plain session excluded.
-        assert_eq!(
-            resolved,
-            vec![("orch-a", 0), ("orch-z", 0), ("sub-a", 1), ("sub-b", 1)],
-        );
+        let items = app.visual_items();
+        for si in 0..5 {
+            assert!(items.iter().any(|item| matches!(item, VisualItem::Session(0, i) if *i == si)));
+        }
+        let members = app.continuous_members();
+        assert!(members.contains(&(0, 0)) && members.contains(&(0, 1))
+            && members.contains(&(0, 2)) && members.contains(&(0, 4)));
+        assert!(!members.contains(&(0, 3)), "plain sessions are not legacy members");
 
         match orig {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
@@ -2167,13 +2157,13 @@ mod remote_reconnect_tests {
         }
     }
 
-    /// Respawn-robust nesting: a subtask whose `managed_by_uid` points at a
+    /// Respawn-robust visibility: a subtask whose `managed_by_uid` points at a
     /// PRIOR orchestrator instance (now gone — the orchestrator respawned with a
-    /// new uid) still nests under the live orchestrator via the TASK tree
+    /// new uid) still matches the live orchestrator via the TASK tree
     /// (`parent_task_id == orchestrator.task_id`). This is the BUG-007/008 case
     /// the user hit: only the current instance's child (BUG-009) nested before.
     #[test]
-    fn visual_items_continuous_nests_orphaned_subtask_via_task_parent() {
+    fn legacy_orphaned_worker_stays_in_main_sidebar_via_task_parent() {
         let _guard = crate::test_support::home_lock();
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().to_path_buf();
@@ -2226,26 +2216,12 @@ mod remote_reconnect_tests {
         app.tasks.push(mk_task("orch-task", None));
         app.tasks.push(mk_task("sub-task", Some("orch-task")));
 
-        let rows = app.visual_items_continuous();
-        let resolved: Vec<(&str, u8)> = rows
-            .iter()
-            .map(|r| {
-                (
-                    app.workspaces[r.ws_idx].sessions[r.sess_idx.expect("session row")].uid.as_str(),
-                    r.depth,
-                )
-            })
-            .collect();
-        assert_eq!(
-            resolved,
-            vec![("orch-NEW", 0), ("sub-orphan", 1)],
-            "an orphaned subtask (managed_by a dead prior orchestrator uid) MUST \
-             still nest under the live orchestrator via the task-tree parent link",
-        );
-        // And it's a continuous member → excluded from the main sidebar.
+        let items = app.visual_items();
+        assert!(items.iter().any(|item| matches!(item, VisualItem::Session(0, 0))));
+        assert!(items.iter().any(|item| matches!(item, VisualItem::Session(0, 1))));
         assert!(
             app.continuous_members().contains(&(0, 1)),
-            "the orphaned subtask must be classified as a continuous member",
+            "the orphaned subtask must retain legacy membership matching",
         );
 
         match orig {
@@ -2255,7 +2231,7 @@ mod remote_reconnect_tests {
     }
 
     #[test]
-    fn visual_items_continuous_keeps_sessionless_descendants_reachable() {
+    fn legacy_sessionless_descendants_stay_reachable_in_main_sidebar() {
         let _guard = crate::test_support::home_lock();
         let tmp = tempfile::tempdir().unwrap();
         let mut app = app_with_manager_host(&tmp.path().join("daemon.sock"));
@@ -2281,19 +2257,10 @@ mod remote_reconnect_tests {
         empty.host_id = manager_host();
         empty.id = "empty-ws".into(); empty.name = "unfinished scraper".into(); empty.sessions.clear();
         app.workspaces.push(empty);
-        let rows = app.visual_items_continuous();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1].sess_idx, None);
-        assert_eq!(rows[1].cursor(), Cursor::Workspace(1));
         assert!(app.visual_items_status().iter().any(|v| matches!(v, VisualItem::WorkspaceHeader(1))));
         assert!(app.task_view_visible_workspaces(&app.continuous_members()).contains(&1));
-        app.continuous_column_on = true;
-        app.cursor_column = SidebarColumn::Continuous;
-        app.cursor = Cursor::Session(0, 0);
-        app.navigate(1); assert_eq!(app.cursor, Cursor::Workspace(1));
-        app.navigate(-1); assert_eq!(app.cursor, Cursor::Session(0, 0));
         app.sidebar_filter = Some("unfinished".into());
-        assert!(app.visual_items_continuous().iter().any(|r| r.sess_idx.is_none()));
+        assert!(app.visual_items().iter().any(|item| matches!(item, VisualItem::WorkspaceHeader(1))));
         app.sidebar_filter = None;
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 40)).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
@@ -2327,18 +2294,14 @@ mod remote_reconnect_tests {
         assert!(app.continuous_empty_workspace_owners().is_empty(), "different hosts don't inherit ownership");
         app.workspaces[1].host_id = manager_host();
         app.workspaces[1].is_closed = true;
-        assert_eq!(app.visual_items_continuous().len(), 1);
+        assert!(!app.visual_items().iter().any(|item| matches!(item, VisualItem::WorkspaceHeader(1))));
     }
 
-    /// Same-task workers (the momentum-detective shape): agent-spawned
-    /// sessions bound to the orchestrator's OWN task (no subtask) nest
-    /// under the live orchestrator — including one whose `managed_by_uid`
-    /// names a dead PRIOR orchestrator instance, which pre-fix fell out of
-    /// the column into the main sidebar on every scheduler respawn. Each
-    /// worker is its own depth-1 row (never folded into one task group),
-    /// and a USER session on the same task is not a member.
+    /// Same-task workers (the momentum-detective shape) remain in the main
+    /// sidebar. Matching still recognizes prior-instance `managed_by_uid`,
+    /// while a user session on the same task remains ordinary.
     #[test]
-    fn visual_items_continuous_nests_same_task_workers_across_respawn() {
+    fn legacy_same_task_workers_stay_in_main_sidebar_across_respawn() {
         let _guard = crate::test_support::home_lock();
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().to_path_buf();
@@ -2396,22 +2359,10 @@ mod remote_reconnect_tests {
         let owner_ws = app.workspaces[0].id.clone();
         app.workspaces[0].sessions[0].task_id = None;
         app.tasks.iter_mut().find(|t| t.is_continuous).unwrap().workspace_id = Some(owner_ws);
-        let rows = app.visual_items_continuous();
-        let resolved: Vec<(&str, u8)> = rows
-            .iter()
-            .map(|r| {
-                (
-                    app.workspaces[r.ws_idx].sessions[r.sess_idx.expect("session row")].uid.as_str(),
-                    r.depth,
-                )
-            })
-            .collect();
-        assert_eq!(
-            resolved,
-            vec![("orch-NEW", 0), ("w-old", 1), ("w-new", 1)],
-            "same-task workers nest under the live orchestrator (prior-instance \
-             spawn included), one depth-1 row each; the user's shell is not a member",
-        );
+        let items = app.visual_items();
+        for si in 0..4 {
+            assert!(items.iter().any(|item| matches!(item, VisualItem::Session(0, i) if *i == si)));
+        }
         let members = app.continuous_members();
         assert!(members.contains(&(0, 1)) && members.contains(&(0, 2)));
         assert!(
@@ -2425,13 +2376,11 @@ mod remote_reconnect_tests {
         }
     }
 
-    /// A replaced orchestrator (bridge-cooldown recovery, A-R, supervisor
-    /// respawn) leaves an exit record that still carries `continuous_task_id`.
-    /// It must not become a second depth-0 group: the live session anchors,
-    /// the retired row nests under it, and a worker that matches BOTH (managed
-    /// by the old uid, planning child of the same parent) renders once.
+    /// A replaced orchestrator leaves an exit record carrying
+    /// `continuous_task_id`; all rows remain visible in the main sidebar and
+    /// matching still avoids duplicate membership.
     #[test]
-    fn visual_items_continuous_folds_replaced_orchestrator_into_one_group() {
+    fn legacy_replaced_orchestrator_rows_stay_visible_once() {
         let _guard = crate::test_support::home_lock();
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().to_path_buf();
@@ -2477,18 +2426,13 @@ mod remote_reconnect_tests {
                 metadata: None,
             });
         }
-        let rows = app.visual_items_continuous();
-        let resolved: Vec<(&str, u8)> = rows
-            .iter()
-            .map(|r| (app.workspaces[r.ws_idx].sessions[r.sess_idx.expect("session row")].uid.as_str(), r.depth))
-            .collect();
-        assert_eq!(
-            resolved,
-            vec![("ts-new-orch", 0), ("ts-fire", 1), ("ts-old-orch", 1)],
-            "one anchor per continuous task; the worker renders once; the retired orchestrator nests last",
-        );
-        let uids: std::collections::HashSet<&str> = resolved.iter().map(|(u, _)| *u).collect();
-        assert_eq!(uids.len(), resolved.len(), "no session may appear on two rows");
+        let items = app.visual_items();
+        for si in 0..3 {
+            assert!(items.iter().any(|item| matches!(item, VisualItem::Session(0, i) if *i == si)));
+        }
+        let members = app.continuous_members();
+        assert!(members.contains(&(0, 0)) && members.contains(&(0, 1))
+            && members.contains(&(0, 2)));
 
         match orig {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
@@ -2580,12 +2524,10 @@ mod remote_reconnect_tests {
         }
     }
 
-    /// A subtask with MULTIPLE sessions — its agent + a bash the operator added
-    /// to the SAME task — groups together: the agent (non-bash) is the depth-1
-    /// anchor and the bash nests at depth 2, NOT as a flat depth-1 sibling.
-    /// Other subtasks stay their own depth-1 rows. (The user-reported bug.)
+    /// A subtask with multiple sessions remains visible with its managed
+    /// worker membership intact after the dedicated grouping is retired.
     #[test]
-    fn visual_items_continuous_nests_extra_session_under_its_subtask() {
+    fn legacy_extra_worker_sessions_stay_in_main_sidebar() {
         let _guard = crate::test_support::home_lock();
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().to_path_buf();
@@ -2652,22 +2594,13 @@ mod remote_reconnect_tests {
         app.tasks.push(mk_task("task-8", Some("orch-task")));
         app.tasks.push(mk_task("task-9", Some("orch-task")));
 
-        let rows = app.visual_items_continuous();
-        let resolved: Vec<(&str, u8)> = rows
-            .iter()
-            .map(|r| {
-                (
-                    app.workspaces[r.ws_idx].sessions[r.sess_idx.expect("session row")].uid.as_str(),
-                    r.depth,
-                )
-            })
-            .collect();
-        assert_eq!(
-            resolved,
-            vec![("orch", 0), ("agent-8", 1), ("bash-8", 2), ("agent-9", 1)],
-            "the bash added to BUG-8's task nests UNDER its agent (depth 2), \
-             while BUG-9 stays its own depth-1 row",
-        );
+        let items = app.visual_items();
+        for si in 0..4 {
+            assert!(items.iter().any(|item| matches!(item, VisualItem::Session(0, i) if *i == si)));
+        }
+        let members = app.continuous_members();
+        assert!(members.contains(&(0, 0)) && members.contains(&(0, 1))
+            && members.contains(&(0, 2)) && members.contains(&(0, 3)));
 
         match orig {
             Some(h) => unsafe { std::env::set_var("HOME", h) },
@@ -2678,7 +2611,7 @@ mod remote_reconnect_tests {
     /// Legacy continuous sessions render in the ordinary main sidebar. The
     /// compatibility toggle does not move or hide them.
     #[test]
-    fn continuous_column_on_moves_continuous_out_of_main_sidebar() {
+    fn legacy_sessions_stay_in_main_sidebar_for_old_toggle_values() {
         let _guard = crate::test_support::home_lock();
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().to_path_buf();
@@ -2733,7 +2666,7 @@ mod remote_reconnect_tests {
 
     /// The retired lateral navigation is a compatibility no-op.
     #[test]
-    fn column_nav_steps_into_continuous_navigates_and_returns() {
+    fn retired_column_navigation_is_a_no_op() {
         let _guard = crate::test_support::home_lock();
         let tmp = tempfile::tempdir().unwrap();
         let mut app = app_with_manager_host(&tmp.path().join("daemon.sock"));

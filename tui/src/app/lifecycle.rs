@@ -5034,7 +5034,7 @@ mod slice_12e_tests {
     /// Legacy continuous members render in all main sidebar builders alongside
     /// ordinary sessions. The old compatibility toggle does not hide them.
     #[test]
-    fn continuous_members_excluded_from_all_main_builders() {
+    fn continuous_members_visible_in_all_main_builders() {
         let guard = crate::test_support::home_lock();
         let mk_ws = || {
             let mk = |uid: &str, label: &str, cont: Option<&str>, mgr: Option<&str>| {
