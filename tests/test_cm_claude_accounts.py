@@ -26,6 +26,62 @@ sys.modules[loader.name] = accounts  # dataclasses resolve annotations through i
 loader.exec_module(accounts)
 
 
+# Every test class, including those that do not inherit Harness, shares this
+# notifier sandbox. Unknown notification commands fail before any subprocess.
+_notifier_dir = None
+_notifier_paths = set()
+_test_subprocess_paths = set()
+_original_run = accounts.subprocess.run
+_original_notify = accounts.notify
+
+
+def guarded_subprocess_run(argv, *args, **kwargs):
+    command = argv[0] if isinstance(argv, (list, tuple)) and argv else argv
+    if not isinstance(command, (str, os.PathLike)) or str(command) not in _test_subprocess_paths:
+        raise AssertionError(f"tests must never invoke an unapproved subprocess: {command}")
+    return _original_run(argv, *args, **kwargs)
+
+
+def guarded_notify(state, paths, message, command):
+    if str(command) not in _notifier_paths:
+        raise AssertionError(f"test tried an unapproved notifier: {command}")
+    return _original_notify(state, paths, message, command)
+
+
+def setUpModule():
+    global _notifier_dir, _notifier_patches
+    _notifier_dir = tempfile.TemporaryDirectory(prefix="cm-accounts-notifier-")
+    fake = Path(_notifier_dir.name) / "fake-notify"
+    fake.write_text("#!/bin/sh\nexit 0\n")
+    fake.chmod(0o700)
+    _notifier_paths.add(str(fake))
+    _test_subprocess_paths.add(str(fake))
+    _notifier_patches = [mock.patch.object(accounts, "DEFAULT_NOTIFY", fake),
+                         mock.patch.object(accounts, "notify", guarded_notify),
+                         mock.patch.object(accounts.subprocess, "run", guarded_subprocess_run)]
+    for patch in _notifier_patches:
+        patch.start()
+
+
+def tearDownModule():
+    for patch in reversed(_notifier_patches):
+        patch.stop()
+    _notifier_paths.clear()
+    _test_subprocess_paths.clear()
+    _notifier_dir.cleanup()
+
+
+class NotifierGuardTests(unittest.TestCase):
+    def test_real_notifier_cannot_be_invoked(self):
+        self.assertNotEqual(Path(accounts.DEFAULT_NOTIFY).name, "cm-notify")
+        with self.assertRaisesRegex(AssertionError, "unapproved notifier"):
+            accounts.notify({}, None, "test", "/home/lucas/.cm/bin/cm-notify")
+        with self.assertRaisesRegex(AssertionError, "unapproved subprocess"):
+            accounts.subprocess.run(["/home/lucas/.cm/bin/cm-notify", "test"])
+        with self.assertRaisesRegex(AssertionError, "unapproved subprocess"):
+            accounts.subprocess.run(["/bin/sh", "-c", "/home/lucas/.cm/bin/cm-notify test"])
+
+
 def login(tag, refresh_expires_in=30 * 86400):
     now_ms = int(time.time() * 1000)
     return {
@@ -374,6 +430,10 @@ class PollHarness(Harness):
         self.notifier = root / "notify.sh"
         self.notifier.write_text(f'#!/bin/sh\nprintf "%s|%s\\n" "$CM_NOTIFY_TAG" "$1" >> {self.sent}\n')
         self.notifier.chmod(0o700)
+        _notifier_paths.add(str(self.notifier))
+        _test_subprocess_paths.add(str(self.notifier))
+        self.addCleanup(_notifier_paths.discard, str(self.notifier))
+        self.addCleanup(_test_subprocess_paths.discard, str(self.notifier))
         self.usage = {}  # access token -> usage response
         self.usage_error = None
         self.usage_calls = []
@@ -1118,6 +1178,10 @@ class SafeguardTests(AutoswitchHarness):
 
 
 class ConfigTests(AutoswitchHarness):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(mock.patch.object(accounts, "fetch_peer", side_effect=accounts.AccountError("offline test")))
+
     def test_show_set_and_reset(self):
         code, text = self.run_cli("config")
         self.assertEqual(code, 0)
@@ -1895,6 +1959,8 @@ class HubTests(HubHarness):
         script.parent.mkdir(parents=True, exist_ok=True)
         script.write_text(f'#!/bin/sh\nprintf "%s\\n" "$1" >> {wake}\n')
         script.chmod(0o700)
+        _test_subprocess_paths.add(str(script))
+        self.addCleanup(_test_subprocess_paths.discard, str(script))
         self.hub("policy", "coordinator_command", str(script))
         self.poll()  # gets the policy
         self.alerts_reset()
@@ -2162,6 +2228,8 @@ class LoginTests(Harness):
         self.run_cli("capture")
         root = self.paths.store.parent
         self.fake_claude = root / "fake-claude.sh"
+        _test_subprocess_paths.add(str(self.fake_claude))
+        self.addCleanup(_test_subprocess_paths.discard, str(self.fake_claude))
 
     def claude_that_logs_in_as(self, name):
         oauth = login(f"scratch-{name}")
