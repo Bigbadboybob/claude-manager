@@ -1797,6 +1797,115 @@ class LendCopyTests(HubHarness):
         self.assertIn("lend copy", self.hub("status")[1])
         self.assertEqual(json.loads((self.hub_paths.accounts / "bob-uuid-0000.json").read_text()), self.primary)
 
+    def remote_holder(self, fingerprint=None, week=20, session=30, age=0):
+        exp = host_export("holder", active="bob", saved=["bob"],
+                          bob=(age, ("weekly_all", None, week, 86400, True),
+                               ("session", None, session, 3600, True)))
+        if fingerprint is not None:
+            exp["accounts"]["bob-uuid-0000"]["login_fingerprint"] = fingerprint
+        return exp
+
+    def use_remote_holder(self, fingerprint=None):
+        (self.hub_paths.accounts / "bob-uuid-0000.json").unlink()
+        with accounts.Hub(self.hub_paths) as h:
+            h.desired["reservations"].pop("bob-uuid-0000", None)
+            h.save()
+            (h.dir / "reports/cm-manager.json").unlink()
+        self.other_host(self.remote_holder(fingerprint))
+
+    def test_import_remote_holder_requires_distinct_reported_fingerprint(self):
+        self.use_remote_holder()
+        code, message = self.hub("import-lend-copy", "bob@example.com", str(self.folder))
+        self.assertEqual(code, 1)
+        self.assertIn("missing login fingerprint from holder", message)
+        self.assertIn("update the host or wait for its next check-in", message)
+        self.other_host(self.remote_holder(accounts.login_fingerprint(self.copy)))
+        code, message = self.hub("import-lend-copy", "bob@example.com", str(self.folder))
+        self.assertEqual(code, 1)
+        self.assertIn("login matches an account held on holder", message)
+        self.other_host(self.remote_holder(accounts.login_fingerprint(self.primary)))
+        self.import_copy()
+        with accounts.Hub(self.hub_paths) as h:
+            self.assertEqual(h.copies()["bob-uuid-0000"]["fingerprint"], accounts.login_fingerprint(self.copy))
+
+    def test_remote_active_holder_copy_lending_and_shared_caps(self):
+        self.use_remote_holder(accounts.login_fingerprint(self.primary))
+        self.import_copy()
+        with accounts.Hub(self.hub_paths) as h:
+            self.assertTrue(any(c[1] == "bob-uuid-0000~copy" for c in
+                                accounts.pool_candidates(h, "borrower", h.reports(), time.time())))
+            self.assertFalse(any(c[1] == "bob-uuid-0000~copy" for c in
+                                 accounts.pool_candidates(h, "holder", h.reports(), time.time())))
+        self.assertIn("lend", self.lend(self.borrower_export()))
+        # A newer borrower reading cannot conceal the holder's recent cap.
+        holder = self.remote_holder(accounts.login_fingerprint(self.primary), week=80, age=1)
+        self.other_host(holder)
+        borrower = self.borrower_export("bob", ["bob"], week=20)
+        reply = self.lend(borrower)
+        self.assertEqual(reply["entry"]["account"], "alice-uuid-0000")
+        self.assertNotIn("lend", reply)
+        with accounts.Hub(self.hub_paths) as h:
+            self.assertTrue(h.copies()["bob-uuid-0000"]["evicting"])
+            self.assertIn("blocked_at", h.copies()["bob-uuid-0000"])
+        returned = self.borrower_export("alice", ["bob"])
+        returned["returning"] = {"bob-uuid-0000": self.copy}
+        self.assertIn("bob-uuid-0000", self.lend(returned)["returned"])
+        with accounts.Hub(self.hub_paths) as h:
+            blocked = h.copies()["bob-uuid-0000"]["blocked_at"]
+            self.assertFalse(any(c[1] == "bob-uuid-0000~copy" for c in
+                                 accounts.pool_candidates(h, "borrower", h.reports(), blocked)))
+        holder = self.remote_holder(accounts.login_fingerprint(self.primary))
+        holder["accounts"]["bob-uuid-0000"]["reading"]["at"] = blocked + 1
+        self.other_host(holder)
+        with accounts.Hub(self.hub_paths) as h:
+            self.assertTrue(any(c[1] == "bob-uuid-0000~copy" for c in
+                                accounts.pool_candidates(h, "borrower", h.reports(), blocked + 1)))
+
+    def test_holder_fingerprint_conflict_blocks_copy_and_records_event(self):
+        self.use_remote_holder(accounts.login_fingerprint(self.primary))
+        self.import_copy()
+        self.other_host(self.remote_holder(accounts.login_fingerprint(self.copy)))
+        with accounts.Hub(self.hub_paths) as h:
+            self.assertFalse(any(c[1] == "bob-uuid-0000~copy" for c in
+                                 accounts.pool_candidates(h, "borrower", h.reports(), time.time())))
+            events = [e for e in h.events() if "conflicts with login held on holder" in e.get("text", "")]
+            self.assertEqual(len(events), 1)
+        self.other_host(self.remote_holder(accounts.login_fingerprint(self.copy)))
+        with accounts.Hub(self.hub_paths) as h:
+            self.assertEqual(len([e for e in h.events() if "conflicts with login held on holder" in e.get("text", "")]), 1)
+        self.other_host(self.remote_holder(accounts.login_fingerprint(self.primary)))
+        with accounts.Hub(self.hub_paths) as h:
+            self.assertTrue(any(c[1] == "bob-uuid-0000~copy" for c in
+                                accounts.pool_candidates(h, "borrower", h.reports(), time.time())))
+        self.hub_files_have_no_tokens_except_copy()
+
+    def test_conflict_detects_borrower_rotation_and_survives_return(self):
+        self.use_remote_holder(accounts.login_fingerprint(self.primary))
+        self.import_copy()
+        self.assertIn("lend", self.lend(self.borrower_export()))
+        rotated = {**self.copy, "claudeAiOauth": {**self.copy["claudeAiOauth"],
+                   "refreshToken": "new-copy-refresh-token"}}
+        self.tokens.add(rotated["claudeAiOauth"]["refreshToken"])
+        exp = self.borrower_export("bob", ["bob"])
+        exp["accounts"]["bob-uuid-0000"]["login_fingerprint"] = accounts.login_fingerprint(rotated)
+        self.lend(exp)
+        self.other_host(self.remote_holder(accounts.login_fingerprint(rotated)))
+        exp = self.borrower_export("alice", ["bob"])
+        exp["returning"] = {"bob-uuid-0000": rotated}
+        self.assertIn("bob-uuid-0000", self.lend(exp)["returned"])
+        with accounts.Hub(self.hub_paths) as h:
+            self.assertFalse(any(c[1] == "bob-uuid-0000~copy" for c in
+                                 accounts.pool_candidates(h, "another", h.reports(), time.time())))
+            self.assertEqual(len([e for e in h.events() if "conflicts with login held on holder" in e.get("text", "")]), 1)
+        self.hub_files_have_no_tokens_except_copy()
+
+    def hub_files_have_no_tokens_except_copy(self):
+        with accounts.Hub(self.hub_paths) as h:
+            for path in h.dir.rglob("*"):
+                if path.is_file() and path != h.copy_path("bob-uuid-0000"):
+                    for token in self.tokens:
+                        self.assertNotIn(token, path.read_text(), path)
+
     def test_order_and_reserved_host_is_untouched(self):
         self.import_copy()
         carol = json.loads((self.paths.accounts / "carol-uuid-0000.json").read_text())

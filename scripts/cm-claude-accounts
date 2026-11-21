@@ -1328,6 +1328,7 @@ def hub_checkin(hub: Hub, export: dict) -> dict:
     if export.get("version") != EXPORT_VERSION or not isinstance(export.get("accounts"), dict):
         raise AccountError(f"{host}: unsupported export")
     returning = export.pop("returning", None) or {}  # tokens: never written to a report
+    old_reports, old_copies = hub.reports(), hub.copies()
     now = int(time.time())
     discard: list[str] = []
     returned = pool_take_returns(hub, host, export, returning, discard)
@@ -1358,6 +1359,10 @@ def hub_checkin(hub: Hub, export: dict) -> dict:
                                      if isinstance(e, dict) and isinstance(e.get("id"), int)})}
     atomic_write(hub.dir / "reports" / f"{host}.json", report)
     reports[host] = report
+    for uuid, meta in hub.copies().items():
+        before = set(copy_conflict_hosts(uuid, old_copies.get(uuid) or {}, old_reports))
+        for holder in sorted(set(copy_conflict_hosts(uuid, meta, reports)) - before):
+            hub.event("pool", f"lend copy of {uuid[:8]} conflicts with login held on {holder}", host=holder)
     cache = load_json(hub.dir / "readings.json")
     for uuid, reading in hub_readings({h: r for h, r in reports.items() if h != POOL}).items():
         if uuid not in cache or reading["at"] > cache[uuid].get("at", 0):
@@ -1697,6 +1702,18 @@ def pool_settle(hub: Hub, host: str, export: dict, returned: list[str]) -> None:
             hub.event("pool", f"lend of {uuid[:8]} to {host} not confirmed; back in the pool", host=host)
 
 
+def copy_conflict_hosts(uuid: str, meta: dict, reports: dict[str, dict]) -> list[str]:
+    """The borrower owns the copy; other matching reports are conflicts."""
+    borrower = meta.get("borrower")
+    borrower_info = host_accounts(reports.get(borrower) or {}).get(uuid) if borrower else None
+    fp = (borrower_info or {}).get("login_fingerprint") or meta.get("fingerprint")
+    if not fp:
+        return []
+    return sorted(h for h, report in reports.items() if h not in (POOL, borrower)
+                  and isinstance(host_accounts(report).get(uuid), dict)
+                  and host_accounts(report)[uuid].get("login_fingerprint") == fp)
+
+
 def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -> list[tuple]:
     """Pool accounts this host may borrow, best first: not draining, not
     reserved for others (a last-resort reservation ranks last), with room."""
@@ -1770,7 +1787,8 @@ def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -
     # Lend copies are a separate last tier, even after last-resort reservations.
     for uuid, meta in hub.copies().items():
         path = hub.copy_path(uuid)
-        if meta.get("borrower") or not path.exists() or uuid in d["draining"]:
+        if meta.get("borrower") or not path.exists() or uuid in d["draining"] \
+                or copy_conflict_hosts(uuid, meta, reports):
             continue
         if uuid in ((reports.get(host) or {}).get("export") or {}).get("accounts", {}):
             continue  # existing host protocol would overwrite its own login
@@ -1783,7 +1801,8 @@ def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -
         email = rec["oauthAccount"].get("emailAddress") or emails.get(uuid)
         caps = (policy.get("lend_caps") or {}).get((email or "").lower())
         latest = latest_copy_readings(hub, reports, uuid)
-        if not latest or any(not lend_copy_has_room(reading, caps, now) for reading in latest):
+        fresh = fresh_copy_readings(hub, reports, uuid, now)
+        if not latest or not fresh or any(not lend_copy_has_room(reading, caps, now) for reading in fresh):
             continue
         if meta.get("blocked_at") is not None and latest[0].get("at", 0) <= meta["blocked_at"]:
             continue  # require a new below-cap reading after eviction
@@ -1792,14 +1811,23 @@ def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -
     return sorted(out)
 
 
-def latest_copy_readings(hub: Hub, reports: dict[str, dict], uuid: str) -> list[dict]:
-    """Keep all readings tied for newest, so one low reading cannot hide a cap."""
+def copy_readings(hub: Hub, reports: dict[str, dict], uuid: str) -> list[dict]:
     readings = [load_json(hub.dir / "readings.json").get(uuid)]
     for report in reports.values():
         info = ((report.get("export") or {}).get("accounts") or {}).get(uuid)
         if isinstance(info, dict):
             readings.append(info.get("reading"))
-    readings = [r for r in readings if isinstance(r, dict) and isinstance(r.get("at"), (int, float))]
+    return [r for r in readings if isinstance(r, dict) and isinstance(r.get("at"), (int, float))]
+
+
+def fresh_copy_readings(hub: Hub, reports: dict[str, dict], uuid: str, now: float) -> list[dict]:
+    # Check every host's recent reading; a newer low value must not hide a cap.
+    return [r for r in copy_readings(hub, reports, uuid)
+            if now - r["at"] <= POOL_READING_STALE_SECONDS]
+
+
+def latest_copy_readings(hub: Hub, reports: dict[str, dict], uuid: str) -> list[dict]:
+    readings = copy_readings(hub, reports, uuid)
     if not readings:
         return []
     latest = max(r["at"] for r in readings)
@@ -1829,9 +1857,9 @@ def borrowed_copy_over_cap(hub: Hub, host: str, export: dict,
     email = info.get("email") or hub_emails(reports).get(active) or ""
     caps = (hub.desired["policy"].get("lend_caps") or {}).get(email.lower())
     reading = info.get("reading") or {}
-    latest = latest_copy_readings(hub, reports, active)
-    if not lend_copy_has_room(reading, caps, now) or not latest \
-            or any(not lend_copy_has_room(r, caps, now) for r in latest):
+    fresh = fresh_copy_readings(hub, reports, active, now)
+    if not lend_copy_has_room(reading, caps, now) or not fresh \
+            or any(not lend_copy_has_room(r, caps, now) for r in fresh):
         return active
     return None
 
@@ -2193,12 +2221,18 @@ def cmd_hub(paths: Paths, args, out) -> int:
             if uuid in copies:
                 raise AccountError("a lend copy already exists for this account")
             local_host = host_name(load_json(paths.state))
-            other_holders = [h for h, report in hub.reports().items()
-                             if h not in (POOL, local_host) and uuid in host_accounts(report)]
-            if other_holders:
-                raise AccountError("cannot verify distinct login: account is also held on "
-                                   + ", ".join(sorted(other_holders)))
+            other_holders = {h: host_accounts(report)[uuid] for h, report in hub.reports().items()
+                             if h not in (POOL, local_host) and uuid in host_accounts(report)}
             fp = login_fingerprint(record)
+            missing = sorted(h for h, info in other_holders.items()
+                             if not isinstance(info, dict) or not isinstance(info.get("login_fingerprint"), str)
+                             or not re.fullmatch(r"[0-9a-f]{32}", info["login_fingerprint"]))
+            if missing:
+                raise AccountError("cannot verify distinct login: missing login fingerprint from "
+                                   + ", ".join(missing) + "; update the host or wait for its next check-in")
+            matching = sorted(h for h, info in other_holders.items() if info["login_fingerprint"] == fp)
+            if matching:
+                raise AccountError("login matches an account held on " + ", ".join(matching))
             known = list(load_accounts(paths).values()) + list(hub.pool().values())
             known += [load_json(p) for p in hub.pool_dir.rglob("*.json")]
             try:

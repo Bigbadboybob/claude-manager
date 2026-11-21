@@ -509,17 +509,18 @@ Owner's context: most accounts are full at any time, and about 3 accounts are bu
 - A host reads its usage every ~100 s once any limit is at 95% or more.
 - The dwell is 10 min, with at most 24 automatic switches a day.
 
-### Reserved account lend copy
+### Lend copy of a held account
 
 A second OAuth login can be kept in `hub/pool/copies/` for an account whose
-primary login remains on its reserved host. Its usage is shared with the
+primary login remains on its host, whether or not the account is reserved. Its usage is shared with the
 primary: the two logins do not provide separate weekly or 5-hour capacity.
 The hub tracks the copy's borrower separately from the account UUID. Only
 one borrower may have it, and a host already holding that account is not
 offered it. Copies rank after every ordinary eligible pool login, including
 last-resort reservations. They need fresh readings for both `weekly_all` and
 `session` and both must be below their configured caps, regardless of
-`auto_allow_unread`. Without caps or either reading, they are not lent.
+`auto_allow_unread`. Recent readings from every host, including the primary
+holder, count against the caps. Without caps or either reading, they are not lent.
 
 On cm-manager, after the updated hub has been reviewed and installed, Owner
 can create the separate login and set the example caps as follows:
@@ -532,17 +533,27 @@ cm-claude-accounts hub status
 rm -r -- "$HOME/cm-bender5-lend-copy"
 ```
 
-Sign into bender5 during the first command. Confirm that the import succeeded
-before removing the source folder: it contains another copy of the credentials
-and must not be used after import. The hub verifies the account with the
-profile endpoint and refuses a known duplicate fingerprint. To avoid importing
-a login already held by a different reported host, it also refuses while any
-other host reports holding the account. Stale reports may therefore need to
-be resolved first. Fingerprints of unreported logins on other hosts cannot be
-verified by the existing host protocol; do not copy an existing login into
-the folder. `hub status --json` adds `accounts[uuid].lend_copy` with caps,
-availability and borrower; the policy is also in `policy.lend_caps`. Reset
-a cap with `hub policy lend_caps.<email> default` to stop new lending.
+For an account held on another host, first update that host and the hub to a
+version that exports login fingerprints, and wait for the holder to check in.
+Use the same commands with that account's email and a fresh login folder. Sign
+into the account during the first command to create a separate login; never
+copy the holder's credentials. Confirm that the import succeeded before
+removing the source folder: it contains credentials and must not be used
+after import.
+
+The hub verifies the account with the profile endpoint and compares the login
+fingerprint against local logins, the lending ledger and each reported holder.
+A match is refused; a holder without a fingerprint must be updated or allowed
+to check in. Stale reports of holders still count, so resolve obsolete reports
+before importing. The hub cannot check unreported logins. Each host's export
+adds `accounts[uuid].login_fingerprint`, a truncated SHA-256 of the refresh
+token, never the token itself. If a holder later reports the same fingerprint
+as the lend copy, the hub records an event and stops offering that copy while
+the conflict remains.
+
+`hub status --json` exposes `accounts[uuid].lend_copy` with caps, availability
+and borrower; the policy is also in `policy.lend_caps`. Reset a cap with
+`hub policy lend_caps.<email> default` to stop new lending.
 
 The hub lends a copy only when the borrower has a usable saved login to
 fall back to. It prefers the active login and keeps that fallback on the host
