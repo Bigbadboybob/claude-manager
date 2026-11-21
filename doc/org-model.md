@@ -974,6 +974,8 @@ clients working. Permission changes run in shadow before they enforce.
 | **S7 scope cutover** | per host, after a week of shadow logs with only expected differences: manager-chain scope and the new board-edit rule authoritative | rollback = shadow with bootstrap rules (§6.3) |
 | **S8 cleanup** | retire `agent_task_edges` and task bindings for scope (irreversible, announced); Task sub-view becomes a filter; full convergence of tasks into items (O6, §16.1 preconditions) | |
 
+**2026-11-21 (Owner):** S7 and S8's session half are brought forward as one change: sessions get one hierarchy (the org chart), board items keep their own, and session control moves to the manager chain. See [one-session-hierarchy.md](one-session-hierarchy.md).
+
 ### 13.1 v1 cut line
 
 - **Standalone, any time:** the staffing policy (§4.5).
