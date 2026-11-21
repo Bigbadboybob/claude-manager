@@ -4063,19 +4063,6 @@ impl App {
                 }
             }
         }
-        // A nested workspace's section comes from its root block: the A-e
-        // Section field shows that and does not cycle.
-        if let CrosstermEvent::Key(key) = event {
-            let section_field = match &self.input_mode {
-                InputMode::WorkspaceSettings { workspace_id, active_field: 3, .. } => Some(workspace_id.clone()),
-                _ => None,
-            };
-            if section_field.is_some_and(|id| self.nested_section_label(&id).is_some())
-                && matches!(key.code, KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right)
-            {
-                return true;
-            }
-        }
         if !self.refresh_session_settings_indices() {
             return true;
         }
@@ -4645,9 +4632,7 @@ impl App {
             }
             SubmitAction::SaveWorkspaceSettings { workspace_id, name, color, pinned, section, tasks } => {
                 let mut pinned_changed = false;
-                // A nested workspace's section is its root block's.
-                let nested = self.nested_section_label(&workspace_id).is_some();
-                if !nested && self.workspaces.iter().any(|w| w.id == workspace_id) {
+                if self.workspaces.iter().any(|w| w.id == workspace_id) {
                     // Sidecar map, not a Workspace field — write it before
                     // the save below so one manifest write carries both.
                     match section {

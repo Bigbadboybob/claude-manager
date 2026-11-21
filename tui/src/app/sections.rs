@@ -8,7 +8,11 @@
 //! workspace; a workspace with no explicit assignment INHERITS its section
 //! through the task tree (a subtask renders under its parent task's
 //! section, a `propose_task` row under its proposer's), and otherwise
-//! renders loose below every section.
+//! renders loose below every section. In the nested work tree, an explicit
+//! assignment that differs from the block's inherited root section detaches
+//! that workspace as a new top-level block; an explicit loose assignment
+//! detaches it into the loose list. An explicit assignment equal to the root
+//! section leaves the block nested.
 
 use super::*;
 use ratatui::style::Color;
@@ -292,12 +296,14 @@ impl App {
     }
 
     /// The section the cursor is "inside": the header itself, or the
-    /// resolved section of the row's workspace. Drives A-n inheritance
-    /// (a workspace created while focused inside a section joins it).
+    /// resolved section of the row's workspace. The tree's block roots have
+    /// already applied explicit detachments, so this also handles a detached
+    /// nested workspace. Drives A-n inheritance (a workspace created while
+    /// focused inside a section joins it).
     pub(crate) fn cursor_section_id(&self) -> Option<String> {
         match &self.cursor {
             Cursor::Section(id) => Some(id.clone()),
-            // A nested row belongs to the section its root block is drawn in.
+            // The tree's root reflects explicit section detachments.
             Cursor::Workspace(wi) | Cursor::Session(wi, _) => {
                 let root = self.task_tree_shared().block_root.get(wi).copied().unwrap_or(*wi);
                 self.section_of_workspace(root)
@@ -565,7 +571,7 @@ pub(crate) mod layout_tests {
     }
 
     /// a: explicit member. b: inherits via its task's parent (bound to a).
-    /// c: would inherit too but is explicitly pulled out. d: loose.
+    /// c: is explicitly detached into the loose list. d: loose.
     fn sectioned_app() -> App {
         let mut app = test_app();
         app.sidebar_view = SidebarView::Task;
@@ -592,9 +598,9 @@ pub(crate) mod layout_tests {
         assert_eq!(layout(&app), ["#s1", "a", "b", "c", "d"]);
         assert_eq!(app.section_of_workspace(1).as_deref(), Some("s1"), "b inherits via tb→ta");
         assert_eq!(app.section_of_workspace(2), None, "explicit none beats inheritance");
-        // c's task reports to ta, so its block nests under a's in the work
-        // tree (app/tree.rs) and follows a's section there.
-        assert_eq!(app.section_rollup("s1").0, 3);
+        // c's explicit none detaches its block from a, so only a and b are
+        // section members.
+        assert_eq!(app.section_rollup("s1").0, 2);
     }
 
     /// The tint test's fixture without nesting: two top-level blocks in s1
@@ -720,8 +726,8 @@ pub(crate) mod layout_tests {
         for _ in 0..30 { app.handle_event(&key(KeyCode::Left)); }
         let buffer = sidebar_buffer(&mut app, 20);
         assert_eq!(buffer[(38, 1)].bg, Color::Reset, "zero disables tint");
-        // Header, a, b and c (nested under a), then the rule.
-        assert_eq!(buffer[(2, 5)].symbol(), "━", "closing rule survives tint off");
+        // Header, a and b, then the rule; c is explicitly loose below it.
+        assert_eq!(buffer[(2, 4)].symbol(), "━", "closing rule survives tint off");
         app.handle_event(&key(KeyCode::Esc));
         assert_eq!(sidebar_buffer(&mut app, 20)[(38, 1)].bg, original);
     }
@@ -777,7 +783,7 @@ pub(crate) mod layout_tests {
         // parent; b inherits s1 through ta.
         app.sidebar_task_parents.insert("t-done".into(), Some("tb".into()));
         assert_eq!(app.section_of_workspace(4).as_deref(), Some("s1"));
-        assert_eq!(layout(&app), ["#s1", "a", "b", "c", "f", "d"]);
+        assert_eq!(layout(&app), ["#s1", "a", "b", "f", "c", "d"]);
         app.workspace_sections.insert("f".into(), SECTION_NONE.into());
         assert_eq!(app.section_of_workspace(4), None, "an explicit choice still wins");
     }
@@ -821,8 +827,8 @@ pub(crate) mod layout_tests {
     fn folded_section_hides_members_but_keeps_header() {
         let mut app = sectioned_app();
         app.sections[0].folded = true;
-        // c nests under a (its task reports to ta), so it folds away too.
-        assert_eq!(layout(&app), ["#s1", "d"]);
+        // c explicitly detached into the loose list stays visible.
+        assert_eq!(layout(&app), ["#s1", "c", "d"]);
         // Space on the header unfolds it again.
         app.cursor = Cursor::Section("s1".into());
         assert!(app.toggle_section_fold());
