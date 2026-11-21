@@ -2,7 +2,7 @@
 
 Status: plan agreed with Owner 2026-11-06. Phases 1–4 are live; phase 5
 (retire the legacy TUI column and reject new legacy creates) landed 2026-11-21.
-Phase 6 is the latency optimization team. The Ingest lead (Claude Opus, member
+Phase 6, the two latency optimization teams, went live the same day. The Ingest lead (Claude Opus, member
 `ingest`, division `ingest`, marked continuous) runs on cm-manager under
 [ingest-charter-draft.md](ingest-charter-draft.md) v3. A few legacy scheduler
 records remain and keep running until migration is complete.
@@ -72,14 +72,31 @@ triage and code bug hunt for the execution side.
 
 **Prob pipeline.** The same reliability team, for the prob pipeline side.
 
-**Latency optimization (new, Owner 2026-11-15).** A cross-functional
-team for **reception to signal emission**. That is everything on our end,
-from the moment we receive an article to the moment the signal is emitted.
-It works across the entire pipeline. It characterizes where the largest
-delays are and optimizes them down as far as possible. Publication to
-reception is out of scope, because that is scraper work and belongs to
-Ingest. Home org still to decide: its own org, or the execution pipeline.
-Timing (Owner, 2026-11-16): stand it up after phases 4 and 5.
+**Latency optimization (Owner 2026-11-15; set up 2026-11-21).** The goal is
+to shorten the time from receiving an article to the first trade decision.
+Owner chose two continuous teams, one under each pipeline lead (option A),
+over one cross-functional org:
+
+| Team | Lead (manager) | Stretch | Target |
+|---|---|---|---|
+| `latency-pp` | Latency-PP worker (PP-Lead) | article stored → signal emitted | set from the baseline |
+| `latency-ep` | Latency-EP worker (EP) | signal emitted → first decision | p99 ≤ 30 s |
+
+- Each team's lead member is one Codex Terra worker, marked continuous on
+  host `sessions` with a 3 h `session_wake_schedule`. The pipeline lead
+  admits fix lanes, and code lands through that lead's normal gates.
+- The handoff point is the signal-emission timestamp as PP records it.
+  Reports give p50/p90/p99 with n over a stated window, from replica rows,
+  and name the slowest step.
+- The two teams share `#latency` (EP, PP-Lead, Ingest-Lead, Owner). The brief
+  is pinned there. Ingest keeps published → stored and posts its numbers there
+  weekly.
+- Owner's sidebar groups both teams in one "Latency" section, assigned per
+  workspace. The teams themselves stay in their leads' orgs.
+
+Baselines and the reports from each pass are in
+`~/.local/share/latency-ep/BASELINE-1121.md` and
+`~/.local/share/latency-pp/BASELINE-1121.md`.
 
 **Leads (Owner, 2026-11-15).** Every continuous team lead is Claude Opus,
 the Ingest lead included.
@@ -174,7 +191,8 @@ read for a host-local dashboard or monitor.
    Existing records keep running while teams are migrated; scheduler internals
    remain until the legacy record count reaches zero. Docs now describe team
    setup.
-6. **Latency optimization team** (Owner, 2026-11-16: after phases 4 and 5).
+6. **Latency optimization teams** (Owner, 2026-11-16: after phases 4 and 5).
+   Live since 2026-11-21: `latency-ep` and `latency-pp`, as in the team map.
 
 ## Prerequisites
 
