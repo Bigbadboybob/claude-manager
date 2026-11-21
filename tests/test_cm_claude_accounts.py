@@ -1730,6 +1730,272 @@ class PoolTests(HubHarness):
         self.assertIn("switched no login -> carol@example.com", text)
 
 
+class LendCopyTests(HubHarness):
+    def setUp(self):
+        super().setUp()
+        self.assertEqual(self.hub("policy", "pool", "on")[0], 0)
+        self.assertEqual(self.hub("policy", "lend_caps.bob@example.com", "week=80,five_hour=60")[0], 0)
+        accounts.init_store(self.hub_paths)
+        state = {"config": {"host_name": "cm-manager"}}
+        accounts.atomic_write(self.hub_paths.state, state)
+        self.primary = json.loads((self.paths.accounts / "bob-uuid-0000.json").read_text())
+        accounts.save_account(self.hub_paths, self.primary)
+        self.folder = self.paths.store.parent / "lend-incoming"
+        (self.folder / "accounts").mkdir(parents=True, mode=0o700)
+        self.copy = {"oauthAccount": profile("bob"), "claudeAiOauth": login("bob-copy")}
+        self.tokens.update(self.copy["claudeAiOauth"][k] for k in ("accessToken", "refreshToken"))
+        self.anthropic[self.copy["claudeAiOauth"]["accessToken"]] = "bob-uuid-0000"
+        self.write_copy(self.copy)
+        self.manager_reading(20, 30)
+        self.assertEqual(self.hub("reserve", "bob@example.com", "--for", "cm-manager")[0], 0)
+
+    def write_copy(self, record):
+        accounts.atomic_write(self.folder / "accounts" / "bob-uuid-0000.json", record)
+
+    def manager_reading(self, week, session):
+        self.other_host(host_export("cm-manager", active="bob", saved=["bob"],
+            bob=(0, ("weekly_all", None, week, 86400, True), ("session", None, session, 3600, True))))
+
+    def import_copy(self):
+        code, text = self.hub("import-lend-copy", "bob@example.com", str(self.folder))
+        self.assertEqual(code, 0, text)
+
+    def borrower_export(self, active=None, saved=(), week=20, session=30):
+        exp = host_export("borrower", active=active, saved=saved,
+            **({"bob": (0, ("weekly_all", None, week, 86400, True),
+                        ("session", None, session, 3600, True))} if active == "bob" else {}))
+        exp["last_switch_at"] = 0
+        return exp
+
+    def lend(self, exp):
+        with accounts.Hub(self.hub_paths) as h:
+            h.desired["hosts"]["borrower"] = {"mode": "auto"}
+            h.save()
+            return accounts.hub_checkin(h, exp)
+
+    def test_import_validation_permissions_and_status(self):
+        self.write_copy(self.primary)
+        self.assertEqual(self.hub("import-lend-copy", "bob@example.com", str(self.folder))[0], 1)
+        self.write_copy(self.copy)
+        self.anthropic[self.copy["claudeAiOauth"]["accessToken"]] = "other-uuid"
+        self.assertEqual(self.hub("import-lend-copy", "bob@example.com", str(self.folder))[0], 1)
+        self.anthropic[self.copy["claudeAiOauth"]["accessToken"]] = "bob-uuid-0000"
+        self.assertEqual(self.hub("import-lend-copy", "unknown@example.com", str(self.folder))[0], 1)
+        self.import_copy()
+        self.assertEqual(self.hub("import-lend-copy", "bob@example.com", str(self.folder))[0], 1)
+        with accounts.Hub(self.hub_paths) as h:
+            self.assertEqual(stat.S_IMODE(h.copy_path("bob-uuid-0000").stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(h.copy_path("bob-uuid-0000").parent.stat().st_mode), 0o700)
+        view = json.loads(self.hub("status", "--json")[1])["accounts"]["bob-uuid-0000"]
+        self.assertEqual(view["lend_copy"]["caps"], {"week": 80, "five_hour": 60})
+        self.assertTrue(view["lend_copy"]["available"])
+        self.assertIn("lend copy", self.hub("status")[1])
+        self.assertEqual(json.loads((self.hub_paths.accounts / "bob-uuid-0000.json").read_text()), self.primary)
+
+    def test_order_and_reserved_host_is_untouched(self):
+        self.import_copy()
+        carol = json.loads((self.paths.accounts / "carol-uuid-0000.json").read_text())
+        with accounts.Hub(self.hub_paths) as h:
+            h.pool_put(carol)
+            h.desired["reservations"]["carol-uuid-0000"] = {"for": ["other"], "last_resort": True}
+            accounts.atomic_write(h.dir / "readings.json", {"carol-uuid-0000": {"at": int(time.time()),
+                "limits": accounts.parse_limits(usage(("weekly_all", None, 20, 86400, True)))}})
+            candidates = accounts.pool_candidates(h, "borrower", h.reports(), time.time())
+            self.assertEqual([c[1] for c in candidates], ["carol-uuid-0000", "bob-uuid-0000~copy"])
+            self.assertFalse(any(c[1].endswith("~copy") for c in accounts.pool_candidates(h, "cm-manager", h.reports(), time.time())))
+        self.assertEqual(json.loads((self.hub_paths.accounts / "bob-uuid-0000.json").read_text()), self.primary)
+
+    def test_caps_switch_and_return_to_copy_slot(self):
+        for week, session in ((80, 30), (20, 60)):
+            with self.subTest(week=week, session=session):
+                if not (self.hub_paths.store / "hub/lend-copies.json").exists():
+                    self.import_copy()
+                first = self.lend(self.borrower_export())
+                self.assertEqual(first["lend"]["record"]["claudeAiOauth"]["refreshToken"], self.copy["claudeAiOauth"]["refreshToken"])
+                with accounts.Hub(self.hub_paths) as h:
+                    self.assertFalse(any(c[1].endswith("~copy") for c in
+                                         accounts.pool_candidates(h, "another", h.reports(), time.time())))
+                    view = accounts.hub_status_view(h, time.time())
+                    self.assertEqual(view["accounts"]["bob-uuid-0000"]["lend_copy"]["borrower"], "borrower")
+                carol = json.loads((self.paths.accounts / "carol-uuid-0000.json").read_text())
+                with accounts.Hub(self.hub_paths) as h:
+                    h.pool_put(carol)
+                    accounts.atomic_write(h.dir / "readings.json", {"carol-uuid-0000": {"at": int(time.time()),
+                        "limits": accounts.parse_limits(usage(("weekly_all", None, 20, 86400, True)))}})
+                self.manager_reading(week, session)
+                exp = self.borrower_export("bob", ["bob"], week, session)
+                exp["last_switch_at"] = time.time()  # caps bypass dwell and daily switch limit
+                exp["auto_switches_24h"] = 24
+                reply = self.lend(exp)
+                self.assertEqual(reply["lend"]["record"]["oauthAccount"]["accountUuid"], "carol-uuid-0000")
+                exp = self.borrower_export("carol", ["bob", "carol"])
+                exp["returning"] = {"bob-uuid-0000": self.copy}
+                reply = self.lend(exp)
+                self.assertIn("bob-uuid-0000", reply["returned"])
+                with accounts.Hub(self.hub_paths) as h:
+                    self.assertEqual(json.loads(h.copy_path("bob-uuid-0000").read_text()), self.copy)
+                    self.assertFalse((h.pool_dir / "bob-uuid-0000.json").exists())
+                    self.assertIsNone(h.copies()["bob-uuid-0000"]["borrower"])
+                    # Remove the unconfirmed carol lend for the next iteration.
+                    (h.pool_dir / "lent" / "carol-uuid-0000.borrower.json").unlink(missing_ok=True)
+                self.manager_reading(20, 30)
+
+    def test_same_second_reading_cannot_hide_borrower_cap(self):
+        self.import_copy()
+        self.lend(self.borrower_export())
+        now = int(time.time())
+        borrower = self.borrower_export("bob", ["bob"], week=20, session=60)
+        manager = host_export("cm-manager", active="bob", saved=["bob"],
+                              bob=(0, ("weekly_all", None, 20, 86400, True),
+                                   ("session", None, 30, 3600, True)))
+        borrower["accounts"]["bob-uuid-0000"]["reading"]["at"] = now
+        manager["accounts"]["bob-uuid-0000"]["reading"]["at"] = now
+        with accounts.Hub(self.hub_paths) as h:
+            carol = json.loads((self.paths.accounts / "carol-uuid-0000.json").read_text())
+            h.pool_put(carol)
+            accounts.atomic_write(h.dir / "readings.json", {"carol-uuid-0000": {"at": now,
+                "limits": accounts.parse_limits(usage(("weekly_all", None, 20, 86400, True)))}})
+            reports = h.reports()
+            reports["cm-manager"] = {"at": now, "export": manager}
+            reports["borrower"] = {"at": now, "export": borrower}
+            reply = accounts.pool_lend(h, "borrower", borrower, reports, now)
+            self.assertEqual(reply["record"]["oauthAccount"]["accountUuid"], "carol-uuid-0000")
+
+    def test_existing_host_borrows_switches_and_returns_copy(self):
+        self.import_copy()
+        for name in ("bob", "carol"):
+            (self.paths.accounts / f"{name}-uuid-0000.json").unlink()
+        self.age_last_switch(3600)
+        self.usage[self.live_token()] = usage(("weekly_all", None, 99, 86400, True))
+        self.usage[self.copy["claudeAiOauth"]["accessToken"]] = usage(
+            ("weekly_all", None, 20, 86400, True), ("session", None, 30, 3600, True))
+        with accounts.Hub(self.hub_paths) as h:
+            h.desired["hosts"]["laptop"] = {"mode": "auto"}
+            h.save()
+        code, text = self.poll()
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.live_email(), "bob@example.com")
+        with accounts.Hub(self.hub_paths) as h:
+            self.assertEqual(h.copies()["bob-uuid-0000"]["borrower"], "laptop")
+            carol = {"oauthAccount": profile("carol"), "claudeAiOauth": login("carol-target")}
+            h.pool_put(carol)
+            accounts.atomic_write(h.dir / "readings.json", {"carol-uuid-0000": {"at": int(time.time()),
+                "limits": accounts.parse_limits(usage(("weekly_all", None, 20, 86400, True)))}})
+        self.usage[carol["claudeAiOauth"]["accessToken"]] = usage(("weekly_all", None, 20, 86400, True))
+        self.usage[self.copy["claudeAiOauth"]["accessToken"]] = usage(
+            ("weekly_all", None, 20, 86400, True), ("session", None, 60, 3600, True))
+        code, text = self.poll()
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.live_email(), "carol@example.com")
+        self.age_last_switch(3600)
+        state = self.state()
+        for event in state["history"]:
+            if event.get("event") == "borrowed":
+                event["at"] -= 3600
+        accounts.atomic_write(self.paths.state, state)
+        code, text = self.poll()
+        self.assertEqual(code, 0, text)
+        with accounts.Hub(self.hub_paths) as h:
+            returned = json.loads(h.copy_path("bob-uuid-0000").read_text())
+            self.assertEqual(returned["claudeAiOauth"], self.copy["claudeAiOauth"])
+            self.assertEqual(returned["oauthAccount"], self.copy["oauthAccount"])
+            self.assertIsNone(h.copies()["bob-uuid-0000"]["borrower"])
+        self.assertEqual(json.loads((self.hub_paths.accounts / "bob-uuid-0000.json").read_text()), self.primary)
+
+    def test_lost_return_ack_cannot_replace_primary(self):
+        self.import_copy()
+        self.lend(self.borrower_export())
+        with accounts.Hub(self.hub_paths) as h:
+            accounts.pool_settle(h, "borrower", self.borrower_export("bob", ["bob"]), [])
+            h.pool_put(self.primary)
+            rotated = {**self.copy, "claudeAiOauth": {**self.copy["claudeAiOauth"],
+                       "refreshToken": "rotated-copy-token"}}
+            self.tokens.add("rotated-copy-token")
+            discard = []
+            returned = accounts.pool_take_returns(h, "borrower", self.borrower_export("carol"),
+                                                  {"bob-uuid-0000": rotated}, discard)
+            self.assertEqual(returned, ["bob-uuid-0000"])
+            discard = []
+            returned = accounts.pool_take_returns(h, "borrower", self.borrower_export("carol"),
+                                                  {"bob-uuid-0000": rotated}, discard)
+            self.assertEqual(returned, [])
+            self.assertEqual(discard, ["bob-uuid-0000"])
+            self.assertEqual(h.pool()["bob-uuid-0000"], self.primary)
+            self.assertEqual(json.loads(h.copy_path("bob-uuid-0000").read_text()), rotated)
+
+    def test_unconfirmed_copy_returns_without_touching_primary(self):
+        self.import_copy()
+        self.lend(self.borrower_export())
+        with accounts.Hub(self.hub_paths) as h:
+            h.pool_put(self.primary)
+            accounts.pool_settle(h, "borrower", self.borrower_export(), [])
+            self.assertEqual(h.pool()["bob-uuid-0000"], self.primary)
+            self.assertEqual(json.loads(h.copy_path("bob-uuid-0000").read_text()), self.copy)
+            self.assertIsNone(h.copies()["bob-uuid-0000"]["borrower"])
+
+    def test_copy_fails_closed_on_missing_or_stale_readings(self):
+        self.import_copy()
+        for reading in (None, {"at": time.time(), "limits": []},
+                        {"at": time.time() - 4 * 3600,
+                         "limits": accounts.parse_limits(usage(("session", None, 1, 3600, True),
+                                                              ("weekly_all", None, 1, 86400, True)))}):
+            self.assertFalse(accounts.lend_copy_has_room(reading, {"week": 80, "five_hour": 60}, time.time()))
+        self.assertEqual(self.hub("policy", "lend_caps.bob@example.com", "week=80,five_hour=101")[0], 1)
+
+    def test_renewal_collision_preserves_both_logins(self):
+        self.import_copy()
+        with accounts.Hub(self.hub_paths) as h:
+            rec = {**self.primary, "claudeAiOauth": {**self.primary["claudeAiOauth"],
+                   "expiresAt": int(time.time() * 1000) + 1000}}
+            h.pool_put(rec)
+        returned = {**self.primary, "claudeAiOauth": login("bob-other")}
+        def renew(oauth):
+            with accounts.Hub(self.hub_paths) as h:
+                h.pool_put(returned)
+            return {**oauth, "refreshToken": oauth["refreshToken"] + "-rotated"}
+        with mock.patch.object(accounts, "refresh_login", side_effect=renew):
+            accounts.read_pool_usage(self.hub_paths, io.StringIO())
+        with accounts.Hub(self.hub_paths) as h:
+            self.assertEqual(h.pool()["bob-uuid-0000"], returned)
+            preserved = json.loads((h.pool_dir / "renewing" / "bob-uuid-0000.json").read_text())
+            self.assertTrue(preserved["claudeAiOauth"]["refreshToken"].endswith("bob-rotated"))
+            self.assertEqual(json.loads(h.copy_path("bob-uuid-0000").read_text()), self.copy)
+
+    def test_refused_copy_renewal_does_not_touch_primary(self):
+        self.import_copy()
+        with accounts.Hub(self.hub_paths) as h:
+            h.pool_put(self.primary)
+            path = h.copy_path("bob-uuid-0000")
+            rec = json.loads(path.read_text())
+            rec["claudeAiOauth"]["expiresAt"] = int(time.time() * 1000) + 1000
+            accounts.atomic_write(path, rec)
+        with mock.patch.object(accounts, "refresh_login", side_effect=accounts.TokenRejected("refused")):
+            accounts.read_pool_usage(self.hub_paths, io.StringIO())
+        with accounts.Hub(self.hub_paths) as h:
+            self.assertEqual(h.pool()["bob-uuid-0000"], self.primary)
+            self.assertTrue(json.loads(h.copy_path("bob-uuid-0000").read_text())["needs_login"])
+
+    def test_renewal_keeps_both_slots(self):
+        self.import_copy()
+        with accounts.Hub(self.hub_paths) as h:
+            h.pool_put(self.primary)
+            for path in (h.pool_dir / "bob-uuid-0000.json", h.copy_path("bob-uuid-0000")):
+                rec = json.loads(path.read_text())
+                rec["claudeAiOauth"]["expiresAt"] = int(time.time() * 1000) + 1000
+                accounts.atomic_write(path, rec)
+        def renew(oauth):
+            return {**oauth, "refreshToken": oauth["refreshToken"] + "-rotated",
+                    "expiresAt": int(time.time() * 1000) + 3600000}
+        with mock.patch.object(accounts, "refresh_login", side_effect=renew):
+            accounts.read_pool_usage(self.hub_paths, io.StringIO())
+        with accounts.Hub(self.hub_paths) as h:
+            primary = h.pool()["bob-uuid-0000"]
+            copy = json.loads(h.copy_path("bob-uuid-0000").read_text())
+        self.assertTrue(primary["claudeAiOauth"]["refreshToken"].endswith("bob-rotated"))
+        self.assertTrue(copy["claudeAiOauth"]["refreshToken"].endswith("bob-copy-rotated"))
+        self.assertEqual(json.loads((self.hub_paths.accounts / "bob-uuid-0000.json").read_text()), self.primary)
+
+
 class HubTests(HubHarness):
     def test_check_in_reports_without_tokens_and_status_shows_it(self):
         code, text = self.poll()

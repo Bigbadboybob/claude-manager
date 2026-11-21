@@ -1230,6 +1230,15 @@ class Hub:
         os.chmod(self.pool_dir, 0o700)
         atomic_write(self.pool_dir / f"{record['oauthAccount']['accountUuid']}.json", record)
 
+    def copies(self) -> dict:
+        return load_json(self.dir / "lend-copies.json")
+
+    def save_copies(self, copies: dict) -> None:
+        atomic_write(self.dir / "lend-copies.json", copies)
+
+    def copy_path(self, uuid: str) -> Path:
+        return self.pool_dir / "copies" / f"{uuid}.json"
+
     def event(self, kind: str, text: str, host: str | None = None, at: int | None = None) -> None:
         path = self.dir / "events.jsonl"
         with open(path, "a") as f:
@@ -1430,50 +1439,62 @@ def read_pool_usage(paths: Paths, out) -> None:
             return
         renewing = hub.pool_dir / "renewing"
         renewing.mkdir(parents=True, exist_ok=True, mode=0o700)
-        for path in renewing.glob("*.json"):  # left by a crash: put it back
-            if now - path.stat().st_mtime > 600 and not (hub.pool_dir / path.name).exists():
-                os.rename(path, hub.pool_dir / path.name)
+        for path in renewing.glob("*.json"):  # left by a crash: put it back in its own slot
+            slot = path.stem
+            dest = hub.copy_path(slot.removesuffix("~copy")) if slot.endswith("~copy") else hub.pool_dir / path.name
+            if now - path.stat().st_mtime > 600 and not dest.exists():
+                os.rename(path, dest)
         meta = load_json(hub.dir / "pool-reads.json")
         if meta.get("backoff_until", 0) > now:
             return
         renew_ok = meta.get("renew_paused_until", 0) <= now
         cache = load_json(hub.dir / "readings.json")
         renew, read = [], []
-        for uuid, rec in hub.pool().items():
+        slots = dict(hub.pool())
+        for uuid, meta in hub.copies().items():
+            path = hub.copy_path(uuid)
+            if not meta.get("borrower") and path.exists():
+                rec = load_json(path)
+                if valid_login_record(rec):
+                    slots[uuid + "~copy"] = rec
+        for slot, rec in slots.items():
+            uuid = slot.removesuffix("~copy")
             if rec.get("needs_login"):
                 continue
             expires = rec["claudeAiOauth"].get("expiresAt")
             stale = now - (cache.get(uuid) or {}).get("at", 0) >= POOL_READ_INTERVAL_SECONDS
             if not isinstance(expires, (int, float)) or expires / 1000 <= now + POOL_REFRESH_BEFORE_SECONDS:
-                renew.append(((cache.get(uuid) or {}).get("at", 0), uuid))
+                renew.append(((cache.get(uuid) or {}).get("at", 0), slot))
             elif stale:
-                read.append(((cache.get(uuid) or {}).get("at", 0), uuid, rec))
+                read.append(((cache.get(uuid) or {}).get("at", 0), slot, rec))
         jobs = []
-        for _, uuid in sorted(renew)[:POOL_REFRESHES_PER_RUN if renew_ok else 0]:
-            os.rename(hub.pool_dir / f"{uuid}.json", renewing / f"{uuid}.json")
-            jobs.append((uuid, load_json(renewing / f"{uuid}.json"), True))
-        for _, uuid, rec in sorted(read)[:POOL_READS_PER_RUN]:
-            jobs.append((uuid, rec, False))
+        for _, slot in sorted(renew)[:POOL_REFRESHES_PER_RUN if renew_ok else 0]:
+            src = hub.copy_path(slot.removesuffix("~copy")) if slot.endswith("~copy") else hub.pool_dir / f"{slot}.json"
+            os.rename(src, renewing / f"{slot}.json")
+            jobs.append((slot, load_json(renewing / f"{slot}.json"), True))
+        for _, slot, rec in sorted(read)[:POOL_READS_PER_RUN]:
+            jobs.append((slot, rec, False))
     readings, renewed, refused, backoff, failed = {}, {}, {}, None, None
-    for uuid, rec, renew_it in jobs:
+    for slot, rec, renew_it in jobs:
+        uuid = rec["oauthAccount"]["accountUuid"]
         email = rec["oauthAccount"].get("emailAddress") or uuid[:8]
         oauth = rec["claudeAiOauth"]
         try:
             if renew_it:
                 oauth = refresh_login(oauth)
-                renewed[uuid] = {**rec, "claudeAiOauth": oauth, "updated_at": int(time.time())}
+                renewed[slot] = {**rec, "claudeAiOauth": oauth, "updated_at": int(time.time())}
                 print(f"pool login renewed: {email}", file=out)
             limits = parse_limits(fetch_usage(oauth["accessToken"]))
         except RateLimited as exc:
             backoff = now + max(exc.retry_after or 0, RATE_LIMIT_BACKOFF_SECONDS)
             continue
         except TokenRejected as exc:
-            if renew_it and uuid not in renewed:
-                refused[uuid] = str(exc)
+            if renew_it and slot not in renewed:
+                refused[slot] = str(exc)
             print(f"pool login {email}: {exc}", file=out)
             continue
         except AccountError as exc:
-            if renew_it and uuid not in renewed:
+            if renew_it and slot not in renewed:
                 failed = f"{email}: {exc}"  # the server may have rotated it: stop and look
             print(f"pool login {email}: {exc}", file=out)
             continue
@@ -1483,18 +1504,28 @@ def read_pool_usage(paths: Paths, out) -> None:
                                                       for l in limits), file=out)
     with Hub(paths) as hub:
         renewing = hub.pool_dir / "renewing"
-        for uuid, rec, renew_it in jobs:
+        for slot, rec, renew_it in jobs:
             if not renew_it:
                 continue
-            held = renewing / f"{uuid}.json"
-            record = renewed.get(uuid) or load_json(held)
-            if uuid in refused:
+            uuid = rec["oauthAccount"]["accountUuid"]
+            held = renewing / f"{slot}.json"
+            record = renewed.get(slot) or load_json(held)
+            if slot in refused:
                 record["needs_login"] = True
                 hub.event("pool", f"{record['oauthAccount'].get('emailAddress') or uuid[:8]}: "
-                                  f"{refused[uuid]}")
-            if (hub.pool_dir / f"{uuid}.json").exists():
-                hub.event("pool", f"{uuid[:8]}: a host returned another login while this one "
-                                  "was renewed; kept the returned one")
+                                  f"{refused[slot]}")
+            dest = hub.copy_path(uuid) if slot.endswith("~copy") else hub.pool_dir / f"{uuid}.json"
+            if dest.exists():
+                # Preserve both for inspection; never discard a different login.
+                atomic_write(held, record)
+                hub.event("owner-alert", f"{uuid[:8]}: renewal slot collision; both logins kept")
+                continue
+            elif slot.endswith("~copy"):
+                atomic_write(dest, record)
+                copies = hub.copies()
+                if uuid in copies:
+                    copies[uuid]["fingerprint"] = login_fingerprint(record)
+                    hub.save_copies(copies)
             else:
                 hub.pool_put(record)
             held.unlink(missing_ok=True)
@@ -1548,6 +1579,11 @@ def pool_take_returns(hub: Hub, host: str, export: dict, returning,
                 or uuid in (export.get("active"), pinned):
             continue  # a host keeps the account it is pinned to
         lent = ledger.get(login_fingerprint(rec))
+        copy_meta = hub.copies().get(uuid) or {}
+        if lent and lent.get("slot") == "copy" and copy_meta.get("borrower") != host:
+            discard.append(uuid)
+            hub.event("pool", f"stale lend-copy return for {uuid[:8]} discarded", host=host)
+            continue
         if lent and lent.get("host") != host:
             # The same login was lent to another host after this one handed
             # it in (its reply was lost): this copy is stale and must go.
@@ -1556,7 +1592,29 @@ def pool_take_returns(hub: Hub, host: str, export: dict, returning,
                               f"login already lent to {lent.get('host')}; told {host} to delete it", host=host)
             continue
         rec.pop("needs_login", None)
-        hub.pool_put(rec)
+        copies = hub.copies()
+        copy = copies.get(uuid)
+        if copy and copy.get("borrower") == host:
+            # The borrower may have rotated its refresh token while active.
+            path = hub.copy_path(uuid)
+            if path.exists():
+                continue
+            atomic_write(path, rec)
+            fp = login_fingerprint(rec)
+            copy.update(borrower=None, fingerprint=fp)
+            hub.save_copies(copies)
+            ledger[fp] = {"account": uuid, "host": host, "at": int(time.time()), "slot": "copy"}
+            atomic_write(hub.dir / "lent-logins.json", ledger)
+        else:
+            primary = hub.pool_dir / f"{uuid}.json"
+            renewing = hub.pool_dir / "renewing" / f"{uuid}.json"
+            if renewing.exists():
+                continue  # retry after renewal; never replace the in-flight login
+            if primary.exists():
+                existing = load_json(primary)
+                if not valid_login_record(existing) or login_fingerprint(existing) != login_fingerprint(rec):
+                    continue  # the host keeps this distinct login
+            hub.pool_put(rec)
         hub.event("pool", f"{rec['oauthAccount'].get('emailAddress') or uuid[:8]} returned to the pool",
                   host=host)
         out.append(uuid)
@@ -1572,11 +1630,31 @@ def pool_settle(hub: Hub, host: str, export: dict, returned: list[str]) -> None:
     lent = hub.pool_dir / "lent"
     held = set(export.get("accounts") or {}) | {export.get("active")}
     for path in sorted(lent.glob(f"*.{host}.json")) if lent.is_dir() else []:
-        uuid = path.name.split(".", 1)[0]
+        parts = path.name.split(".")
+        uuid = parts[0]
+        is_copy = len(parts) >= 4 and parts[1] == "copy"
+        if is_copy:
+            copies = hub.copies()
+            copy = copies.get(uuid)
+            if not copy or copy.get("borrower") != host:
+                continue
+            if uuid in held:
+                path.unlink()
+            else:
+                dest = hub.copy_path(uuid)
+                if not dest.exists():
+                    os.rename(path, dest)
+                    copy["borrower"] = None
+                    hub.save_copies(copies)
+                    hub.event("pool", f"lend copy of {uuid[:8]} to {host} not confirmed; back in the pool", host=host)
+            continue
         if uuid in held:
             path.unlink()
         else:
-            os.rename(path, hub.pool_dir / f"{uuid}.json")
+            dest = hub.pool_dir / f"{uuid}.json"
+            if dest.exists() or (hub.pool_dir / "renewing" / f"{uuid}.json").exists():
+                continue
+            os.rename(path, dest)
             hub.event("pool", f"lend of {uuid[:8]} to {host} not confirmed; back in the pool", host=host)
 
 
@@ -1648,9 +1726,42 @@ def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -
             order = (room < min_lend_room, resets)
         # An account reserved for this host is its next account (Owner 11-15:
         # "F finishes out bender7, then moves to bender4").
-        out.append(((last_resort, not mine, *order, ratio,
+        out.append(((last_resort, 0, not mine, *order, ratio,
                      email or uuid), uuid, why))
+    # Lend copies are a separate last tier, even after last-resort reservations.
+    for uuid, meta in hub.copies().items():
+        path = hub.copy_path(uuid)
+        if meta.get("borrower") or not path.exists() or uuid in d["draining"]:
+            continue
+        if uuid in ((reports.get(host) or {}).get("export") or {}).get("accounts", {}):
+            continue  # existing host protocol would overwrite its own login
+        res = d["reservations"].get(uuid) or {}
+        if host in res.get("for", []):
+            continue
+        rec = load_json(path)
+        if not valid_login_record(rec) or login_state(rec, now) in ("needs /login", "login expired"):
+            continue
+        email = rec["oauthAccount"].get("emailAddress") or emails.get(uuid)
+        caps = (policy.get("lend_caps") or {}).get((email or "").lower())
+        reading = readings.get(uuid)
+        if not lend_copy_has_room(reading, caps, now):
+            continue
+        out.append(((True, 1),
+                    uuid + "~copy", "lend copy"))
     return sorted(out)
+
+
+def lend_copy_has_room(reading: dict | None, caps: dict | None, now: float) -> bool:
+    if not isinstance(caps, dict) or not isinstance(reading, dict) or now - reading.get("at", 0) > POOL_READING_STALE_SECONDS:
+        return False
+    limits = {l.get("kind"): l for l in reading.get("limits", [])}
+    for kind, key in (("weekly_all", "week"), ("session", "five_hour")):
+        limit, cap = limits.get(kind), caps.get(key)
+        if not isinstance(limit, dict) or not isinstance(cap, (int, float)):
+            return False
+        if (limit.get("resets_at") is None or limit["resets_at"] > now) and limit.get("percent", 100) >= cap:
+            return False
+    return True
 
 
 def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: float) -> dict | None:
@@ -1658,8 +1769,9 @@ def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: 
     auto mode a fresh account once its own is over threshold."""
     entry = hub.desired["hosts"].get(host) or {}
     active = export.get("active")
-    held = set(export.get("accounts") or {})
+    held = set(export.get("accounts") or {}) | {active}
     pool = hub.pool()
+    copies = hub.copies()
     target, reason, switch = None, None, False
     if entry.get("mode") == "pin" and entry.get("account") not in (None, active) \
             and entry["account"] not in held and entry["account"] in pool:
@@ -1675,26 +1787,51 @@ def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: 
         reading = ((export.get("accounts") or {}).get(active) or {}).get("reading") or {}
         over = over_threshold(reading.get("limits") or [], config, now, for_switch=True) if active else []
         res = hub.desired["reservations"].get(active) if active else None
-        taken = bool(res and host not in res.get("for", []) and not res.get("last_resort"))
-        needs = not active or over or taken  # an account reserved for others is handed over
+        copy_borrowed = (copies.get(active) or {}).get("borrower") == host
+        taken = bool(res and host not in res.get("for", []) and not res.get("last_resort")
+                     and not copy_borrowed)
+        if copy_borrowed:
+            caps = (policy.get("lend_caps") or {}).get((active_email or "").lower())
+            latest = hub_readings(reports).get(active) or reading
+            # Timestamps have one-second precision: a simultaneous reading
+            # from the reserved host must not mask the borrower's own cap.
+            copy_over = (not lend_copy_has_room(reading, caps, now)
+                         or not lend_copy_has_room(latest, caps, now))
+        else:
+            copy_over = False
+        needs = not active or over or taken or copy_over
         waited = now - (export.get("last_switch_at") or 0) >= POOL_DWELL_SECONDS
         capped = (export.get("auto_switches_24h") or 0) >= POOL_MAX_SWITCHES_PER_DAY
-        if needs and waited and not capped:
+        if needs and ((waited and not capped) or copy_over):
             cands = pool_candidates(hub, host, reports, now)
+            if cands:
+                # A host cannot safely receive another login for an account it holds.
+                cands = [c for c in cands if c[1].removesuffix("~copy") not in held]
             if cands:
                 _, target, why = cands[0]
                 what = ", ".join(f"{limit_name(l)} {l['percent']:.0f}%" for l in over) \
-                    or ("reserved for " + ", ".join(res["for"]) if taken else "no login")
+                    or ("lend-copy cap reached or reading unavailable" if copy_over else ("reserved for " + ", ".join(res["for"]) if taken else "no login"))
                 reason, switch = f"{what}; target {why}", True
     if not target:
         return None
-    record = pool[target]
+    is_copy = target.endswith("~copy")
+    if is_copy:
+        target = target.removesuffix("~copy")
+        record = load_json(hub.copy_path(target))
+    else:
+        record = pool[target]
     lent = hub.pool_dir / "lent"
     lent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.rename(hub.pool_dir / f"{target}.json", lent / f"{target}.{host}.json")
+    if is_copy:
+        os.rename(hub.copy_path(target), lent / f"{target}.copy.{host}.json")
+        copies[target]["borrower"] = host
+        hub.save_copies(copies)
+    else:
+        os.rename(hub.pool_dir / f"{target}.json", lent / f"{target}.{host}.json")
     ledger = {fp: e for fp, e in load_json(hub.dir / "lent-logins.json").items()
-              if now - e.get("at", 0) < LENT_LEDGER_SECONDS}
-    ledger[login_fingerprint(record)] = {"account": target, "host": host, "at": int(now)}
+              if e.get("slot") == "copy" or now - e.get("at", 0) < LENT_LEDGER_SECONDS}
+    ledger[login_fingerprint(record)] = {"account": target, "host": host, "at": int(now),
+                                         "slot": "copy" if is_copy else "primary"}
     atomic_write(hub.dir / "lent-logins.json", ledger)
     hub.event("pool", f"lent {record['oauthAccount'].get('emailAddress') or target[:8]} to {host} ({reason})",
               host=host)
@@ -1875,7 +2012,11 @@ def hub_status_view(hub: Hub, now: float) -> dict:
                        "reserved_for": (d["reservations"].get(uuid) or {}).get("for"),
                        "reservation_note": (d["reservations"].get(uuid) or {}).get("note"),
                        "last_resort": bool((d["reservations"].get(uuid) or {}).get("last_resort")),
-                       "draining": uuid in d["draining"]}
+                       "draining": uuid in d["draining"],
+                       "lend_copy": ({"borrower": hub.copies()[uuid].get("borrower"),
+                                      "caps": (d["policy"].get("lend_caps") or {}).get(email.lower()),
+                                      "available": hub.copy_path(uuid).exists()}
+                                     if uuid in hub.copies() else None)}
     policy = {**d["policy"],
               "switch_on_scoped": d["policy"].get("switch_on_scoped", DEFAULT_SWITCH_ON_SCOPED),
               "min_lend_room": d["policy"].get("min_lend_room", DEFAULT_MIN_LEND_ROOM)}
@@ -1906,6 +2047,9 @@ def print_hub_status(view: dict, now: float, out) -> None:
             tags.append(("last resort; first " if a.get("last_resort") else "")
                         + f"reserved for {', '.join(a['reserved_for']) or 'nobody'}"
                         + (f" ({a['reservation_note']})" if a["reservation_note"] else ""))
+        if a.get("lend_copy"):
+            copy = a["lend_copy"]
+            tags.append(f"lend copy: {copy['borrower'] or ('available' if copy['available'] else 'unavailable')}; caps {copy['caps'] or 'unset'}")
         if a["draining"]:
             tags.append("DRAINING")
         if a.get("account_threshold") is not None:
@@ -1960,7 +2104,53 @@ def cmd_hub(paths: Paths, args, out) -> int:
         out.write("\n")
         forward_alerts(paths, export, reply)
         return 0
+    if args.hub_command == "import-lend-copy":
+        with Hub(paths) as hub:
+            uuid = hub_resolve(hub.reports(), args.account)
+        folder = Path(args.folder)
+        records = load_accounts(Paths(folder, folder / ".claude.json", folder))
+        if len(records) != 1 or uuid not in records or not valid_login_record(records.get(uuid)):
+            raise AccountError("folder must contain exactly one login for the specified account")
+        record = records[uuid]
+        oauth = record["claudeAiOauth"]
+        # The profile request must not block other hosts' check-ins.
+        if identify(oauth, {})[0] != uuid:
+            raise AccountError("login belongs to a different account")
     with Hub(paths) as hub:
+        if args.hub_command == "import-lend-copy":
+            if hub_resolve(hub.reports(), args.account) != uuid:
+                raise AccountError("account changed while confirming login; retry")
+            copies = hub.copies()
+            if uuid in copies:
+                raise AccountError("a lend copy already exists for this account")
+            local_host = host_name(load_json(paths.state))
+            other_holders = [h for h, report in hub.reports().items()
+                             if h not in (POOL, local_host) and uuid in host_accounts(report)]
+            if other_holders:
+                raise AccountError("cannot verify distinct login: account is also held on "
+                                   + ", ".join(sorted(other_holders)))
+            fp = login_fingerprint(record)
+            known = list(load_accounts(paths).values()) + list(hub.pool().values())
+            known += [load_json(p) for p in hub.pool_dir.rglob("*.json")]
+            try:
+                live = read_login(paths)
+                if live.get("refreshToken") == oauth.get("refreshToken"):
+                    raise AccountError("login is already held by this host")
+            except NoLogin:
+                pass
+            if any(valid_login_record(r) and login_fingerprint(r) == fp for r in known) or fp in load_json(hub.dir / "lent-logins.json"):
+                raise AccountError("login is already held or has been lent")
+            hub.pool_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(hub.pool_dir, 0o700)
+            directory = hub.copy_path(uuid).parent
+            directory.mkdir(exist_ok=True, mode=0o700)
+            os.chmod(directory, 0o700)
+            atomic_write(hub.copy_path(uuid), record)
+            copies[uuid] = {"borrower": None, "fingerprint": fp}
+            hub.save_copies(copies)
+            hub.save(f"imported lend copy for {uuid[:8]}")
+            print("imported lend copy; remove the source folder securely after verifying the import", file=out)
+            return 0
         if args.hub_command == "status":
             view = hub_status_view(hub, now)
             if args.json:
@@ -2037,8 +2227,28 @@ def cmd_hub(paths: Paths, args, out) -> int:
                     print(f"{'thresholds.' + k:22} {v:g}", file=out)
                 for k, v in sorted((policy.get("account_thresholds") or {}).items()):
                     print(f"{'account_thresholds.' + k:22} {v:g}", file=out)
+                for k, v in sorted((policy.get("lend_caps") or {}).items()):
+                    print(f"lend_caps.{k} week={v['week']:g},five_hour={v['five_hour']:g}", file=out)
                 return 0
-            if args.key.startswith("account_thresholds."):
+            if args.key.startswith("lend_caps."):
+                email = args.key.split(".", 1)[1].lower()
+                if "@" not in email:
+                    raise AccountError("lend cap needs an account email")
+                caps = policy.setdefault("lend_caps", {})
+                if args.value == "default":
+                    caps.pop(email, None)
+                else:
+                    try:
+                        values = dict(part.split("=", 1) for part in (args.value or "").split(","))
+                        parsed = {k: parse_policy_float(v) for k, v in values.items()}
+                    except ValueError:
+                        parsed = {}
+                    if set(parsed) != {"week", "five_hour"} or any(v is None or v <= 0 for v in parsed.values()):
+                        raise AccountError("lend caps require week=N,five_hour=N (0 < N <= 100)")
+                    caps[email] = parsed
+                if not caps:
+                    policy.pop("lend_caps")
+            elif args.key.startswith("account_thresholds."):
                 email = args.key.split(".", 1)[1].lower()
                 if "@" not in email:
                     raise AccountError(f"{args.key}: account email must contain '@'")
@@ -2876,6 +3086,9 @@ def main(argv: list[str] | None = None, paths: Paths | None = None, out=None) ->
     p.add_argument("--dry-run", action="store_true")
     p = hsub.add_parser("undrain", help="let an account take work again")
     p.add_argument("account")
+    p = hsub.add_parser("import-lend-copy", help="import a separate login as an account's lend copy")
+    p.add_argument("account")
+    p.add_argument("folder")
     p = hsub.add_parser("policy", help="show or set hub policy (VALUE 'default' resets)")
     p.add_argument("key", nargs="?")
     p.add_argument("value", nargs="?")

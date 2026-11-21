@@ -509,6 +509,58 @@ Owner's context: most accounts are full at any time, and about 3 accounts are bu
 - A host reads its usage every ~100 s once any limit is at 95% or more.
 - The dwell is 10 min, with at most 24 automatic switches a day.
 
+### Reserved account lend copy
+
+A second OAuth login can be kept in `hub/pool/copies/` for an account whose
+primary login remains on its reserved host. Its usage is shared with the
+primary: the two logins do not provide separate weekly or 5-hour capacity.
+The hub tracks the copy's borrower separately from the account UUID. Only
+one borrower may have it, and a host already holding that account is not
+offered it. Copies rank after every ordinary eligible pool login, including
+last-resort reservations. They need fresh readings for both `weekly_all` and
+`session` and both must be below their configured caps, regardless of
+`auto_allow_unread`. Without caps or either reading, they are not lent.
+
+On cm-manager, after the updated hub has been reviewed and installed, Owner
+can create the separate login and set the example caps as follows:
+
+```sh
+cm-claude-accounts login --into "$HOME/cm-bender5-lend-copy"
+cm-claude-accounts hub policy lend_caps.bender5@kleinatc.com week=80,five_hour=60
+cm-claude-accounts hub import-lend-copy bender5@kleinatc.com "$HOME/cm-bender5-lend-copy"
+cm-claude-accounts hub status
+rm -r -- "$HOME/cm-bender5-lend-copy"
+```
+
+Sign into bender5 during the first command. Confirm that the import succeeded
+before removing the source folder: it contains another copy of the credentials
+and must not be used after import. The hub verifies the account with the
+profile endpoint and refuses a known duplicate fingerprint. To avoid importing
+a login already held by a different reported host, it also refuses while any
+other host reports holding the account. Stale reports may therefore need to
+be resolved first. Fingerprints of unreported logins on other hosts cannot be
+verified by the existing host protocol; do not copy an existing login into
+the folder. `hub status --json` adds `accounts[uuid].lend_copy` with caps,
+availability and borrower; the policy is also in `policy.lend_caps`. Reset
+a cap with `hub policy lend_caps.<email> default` to stop new lending.
+
+The hub checks caps on auto borrowers at check-in and bypasses the normal
+dwell and switch-count gates when a cap is reached or the reading is missing.
+The reserved host uses its normal account thresholds. Existing hosts use the
+same pool protocol and need no update. Returned logins wait the existing
+30-minute host hold before returning to the separate slot; renewals use a
+separate in-flight slot and the common renewal breaker.
+
+**Operational limitation:** this is not an immediate or hard reservation of
+capacity. Hosts normally check in every two minutes and usage is normally
+read every nine minutes; a stale reading, network outage, 429 backoff, pinned
+or manual borrower, failed switch, or lack of an eligible replacement can
+leave the borrower on the account past a cap. Other activity on the same
+account also spends the shared window. Therefore the 60% cap alone cannot
+guarantee that cm-manager will never stall; that guarantee needs a stronger
+traffic-stop or capacity-reservation mechanism. Review this limitation before
+deploying or relying on the lend copy.
+
 **Hub upkeep, replacing decision 3 for pool logins only:**
 
 - **Usage reads:** on its own poll, the hub reads usage for up to 3 pool logins per run, each at most every 30 min.
