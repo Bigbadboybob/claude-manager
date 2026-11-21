@@ -994,6 +994,9 @@ class PeerTests(AutoswitchHarness):
         self.assertEqual(set(data["accounts"]), {"alice-uuid-0000", "bob-uuid-0000", "carol-uuid-0000"})
         self.assertEqual(data["accounts"]["alice-uuid-0000"]["reading"]["limits"][0]["percent"], 95)
         self.assertIsNone(data["accounts"]["bob-uuid-0000"]["reading"])
+        for uuid, record in accounts.load_accounts(self.paths).items():
+            self.assertEqual(data["accounts"][uuid]["login_fingerprint"], accounts.login_fingerprint(record))
+            self.assertNotIn(record["claudeAiOauth"]["refreshToken"], text)
         self.assertNotIn("sk-ant", text)
 
     def test_export_does_not_wait_for_the_store_lock(self):

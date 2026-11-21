@@ -667,6 +667,7 @@ def export_view(paths: Paths, state: dict) -> dict:
     for uuid, rec in load_accounts(paths).items():
         out[uuid] = {"email": rec["oauthAccount"].get("emailAddress"),
                      "login": login_state(rec, now),
+                     "login_fingerprint": login_fingerprint(rec) if valid_login_record(rec) else None,
                      "reading": readings.get(uuid)}
     poll = state.get("poll") or {}
     return {"version": EXPORT_VERSION, "host": host_name(state), "at": int(now),
