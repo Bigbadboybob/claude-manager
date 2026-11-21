@@ -1,4 +1,9 @@
-# Continuous tasks: standing instructions vs. the per-fire dispatch
+# Legacy continuous tasks: standing instructions vs. the per-fire dispatch
+
+This file describes retained scheduler records. New continuous work is an org
+team with a lead session, wake schedule, queue binding, and team channel; see
+[`doc/continuous-teams.md`](continuous-teams.md). `continuous.create` refuses
+new records after phase 5.
 
 Owner question, 2026-09-14: the periodic orchestrator prompt is very long; is
 re-pasting it every fire the only way to keep it in context?

@@ -219,9 +219,8 @@ pub struct App {
     /// Execution contexts. Sidebar rendering iterates workspaces, not tasks.
     pub workspaces: Vec<Workspace>,
     pub cursor: Cursor,
-    /// Which sidebar column the cursor is in (S4). `Main` unless the user has
-    /// stepped right (`A-l`) into the continuous column. Forced back to `Main`
-    /// whenever the continuous column isn't shown.
+    /// Compatibility cursor-column state. The continuous column was retired
+    /// in phase 5, so production state always remains `Main`.
     pub cursor_column: SidebarColumn,
     /// The `Main`-column cursor stashed when stepping into the continuous
     /// column, restored on the way back (`A-h`) so a round-trip doesn't lose
@@ -360,12 +359,9 @@ pub struct App {
     /// column, off = hidden). Kept only so old manifests round-trip without a
     /// schema break; never consulted for rendering.
     pub hide_continuous: bool,
-    /// Continuous panel (DESIGN_CONTINUOUS_PANEL.md): the SINGLE continuous
-    /// control (toggled by `A-c`). When ON, a dedicated continuous COLUMN is
-    /// split off the right of the sidebar (orchestrators with nested subtasks);
-    /// when OFF, continuous tasks are hidden entirely. Either way the main
-    /// sidebar builders NEVER emit continuous sessions — they render only in the
-    /// column, never in both places. Off by default. Persisted in the manifest.
+    /// Deprecated continuous-column setting retained so old manifests still
+    /// deserialize. Phase 5 ignores it: legacy sessions render in the main
+    /// sidebar and the third pane no longer exists.
     pub continuous_column_on: bool,
     /// User-assigned accent colors for planning tasks, keyed by task id.
     /// Tasks live in the planning API, so their color rides in the local
@@ -708,7 +704,9 @@ impl App {
             _ => SidebarView::Status,
         };
         let hide_continuous = manifest.hide_continuous;
-        let continuous_column_on = manifest.continuous_column_on;
+        // A persisted pre-phase-5 `true` value must load harmlessly. The
+        // dedicated pane is retired, so never restore the old toggle.
+        let continuous_column_on = false;
         let keybinding_helper_visible = !manifest.hide_keybinding_helper;
         let mut planning = PlanningView::new();
         planning.keybinding_helper_visible = keybinding_helper_visible;

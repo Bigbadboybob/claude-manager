@@ -128,7 +128,9 @@ impl App {
             agent_task_edges: Default::default(),
             view: Some(view.to_string()),
             hide_continuous: self.hide_continuous,
-            continuous_column_on: self.continuous_column_on,
+            // Phase 5 retired the dedicated pane. Always write the
+            // compatibility field as false so an old setting cannot revive it.
+            continuous_column_on: false,
             hide_keybinding_helper: !self.keybinding_helper_visible,
             task_colors: self.task_colors.clone(),
             sections: self.sections.clone(),

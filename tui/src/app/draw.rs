@@ -201,23 +201,14 @@ impl App {
 
         match self.view_mode {
             ViewMode::Sessions => {
-                // Continuous panel: when `A-c` is on, split a third 36-col pane
-                // off the right for the dedicated continuous column
-                // (terminal | main | continuous). Off = terminal | main.
-                let cols = if self.continuous_column_on {
-                    Layout::horizontal([
-                        Constraint::Min(40),
-                        Constraint::Length(SIDEBAR_WIDTH),
-                        Constraint::Length(SIDEBAR_WIDTH),
-                    ])
-                    .split(content_area)
-                } else {
-                    Layout::horizontal([
-                        Constraint::Min(40),
-                        Constraint::Length(SIDEBAR_WIDTH),
-                    ])
-                    .split(content_area)
-                };
+                // Phase 5: the dedicated continuous pane is retired. Every
+                // session, including legacy continuous sessions, uses the
+                // ordinary main sidebar.
+                let cols = Layout::horizontal([
+                    Constraint::Min(40),
+                    Constraint::Length(SIDEBAR_WIDTH),
+                ])
+                .split(content_area);
 
                 let t = std::time::Instant::now();
                 self.draw_terminal(frame, cols[0]);
@@ -227,11 +218,6 @@ impl App {
                 self.draw_session_list(frame, cols[1]);
                 log_draw_section("sessions:list", t.elapsed());
 
-                if self.continuous_column_on {
-                    let t = std::time::Instant::now();
-                    self.draw_continuous_column(frame, cols[2]);
-                    log_draw_section("sessions:continuous", t.elapsed());
-                }
             }
             ViewMode::Planning => {
                 let t = std::time::Instant::now();
@@ -434,8 +420,7 @@ impl App {
             }
         }
         // Leave the task sidebar visible beside the live appearance preview.
-        let terminal_width = area.width.saturating_sub(SIDEBAR_WIDTH
-            * if self.continuous_column_on { 2 } else { 1 });
+        let terminal_width = area.width.saturating_sub(SIDEBAR_WIDTH);
         let settings_area = if self.view_mode == ViewMode::Sessions && terminal_width >= 40 {
             Rect { width: terminal_width, ..area }
         } else { area };
@@ -1815,7 +1800,7 @@ impl App {
         let help_entries: Vec<(&str, &str)> = if self.keybinding_helper_visible { vec![
             ("A-/    filter", "A-?  helper"),
             ("A-j/k  nav", "A-d  done"),
-            ("A-h/l  column", "A-x  delete"),
+            ("A-h/l  free", "A-x  delete"),
             ("A-a    attach", "A-v  view"),
             ("A-n    new ws", "A-r  refresh"),
             ("A-s    +session", "A-q  quit"),
@@ -1824,8 +1809,8 @@ impl App {
             ("A-e    settings", "F9   global"),
             ("A-H    hide", "A-z  catalog"),
             ("A-f    workflow", "A-t  planning"),
-            ("A-o    stop wf", "A-c  cont-col"),
-            ("A-C    cont-stop", "A-,  activity"),
+            ("A-o    stop wf", "A-C  dashboard"),
+            ("A-c    free", "A-,  activity"),
             ("A-b    snapshot", "A-g  attention"),
             ("A-O    reopen ws", "A-F  fork task"),
             ("A-N    +section", "A-J/K sect order"),
@@ -2295,6 +2280,25 @@ impl App {
                     *item = item.clone().bg(bg);
                 }
             }
+        }
+
+        // Backtests used to be drawn in the retired continuous pane. Keep
+        // them visible in the single sidebar and use the same renderer so
+        // folding and selection retain their existing appearance.
+        let backtests: Vec<VisualItem> = visual
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    VisualItem::BacktestHeader
+                        | VisualItem::BacktestFleet(_)
+                        | VisualItem::BacktestRun { .. }
+                )
+            })
+            .cloned()
+            .collect();
+        if !backtests.is_empty() {
+            items.extend(self.backtest_list_items(&backtests, inner.width, spinner, now));
         }
 
         let mut state = std::mem::take(&mut self.sidebar_list_state);

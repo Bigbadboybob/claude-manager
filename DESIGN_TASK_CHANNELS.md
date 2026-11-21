@@ -35,9 +35,11 @@ Source handoff: `~/.cm/handoffs/chat-migration-20260914/HANDOFF.md`.
    `<slug>` is the continuous `task_id` lowercased with `_` → `-`
    (`ct-` is the parent segment, auto-created). Display name = task label.
    Created as Owner on the messaging coordinator; on a replica the creation
-   is forwarded once the coordinator is reachable. `continuous.create`
-   creates and binds synchronously when it can and otherwise leaves it to
-   the refresh loop. `TaskChannelPolicy` on the record: `auto` (default),
+   is forwarded once the coordinator is reachable. Retained legacy records
+   created by `continuous.create` create and bind synchronously when possible
+   and otherwise leave it to the refresh loop. New continuous teams create
+   their normal task channel during team setup. `TaskChannelPolicy` on a
+   legacy record: `auto` (default),
    `manual` (operator supplies `messaging.channel_id`), `off`.
    The binding record gains `path` for display.
 2. **Members are computed, not declared.** Every refresh tick the daemon

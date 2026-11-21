@@ -1,6 +1,12 @@
-# Design: Continuous Tasks
+# Design: Continuous Tasks (legacy scheduler)
 
-> **Want to _create_ one, not understand the internals?** See **`HOWTO_CONTINUOUS_TASKS.md`** — the operator runbook (recipe, `continuous.create` params, prompt idioms, gotchas, review flow). This doc is the architecture.
+> **Phase 5 status (2026-11-21):** New continuous work uses the org-team model
+> in [doc/continuous-teams.md](doc/continuous-teams.md). `continuous.create`
+> refuses new legacy records; existing records keep their scheduler internals
+> until migration finishes. This file documents those retained internals.
+
+> **Want to stand up a team?** See **`HOWTO_CONTINUOUS_TASKS.md`** and
+> [doc/continuous-teams.md](doc/continuous-teams.md).
 
 **Current operating contract (2026-09-14):** schedules/consumer queues admit new work; each task's own chat channel (`ct/<slug>`, daemon-created and populated — [DESIGN_TASK_CHANNELS.md](DESIGN_TASK_CHANNELS.md)) carries routine reviews through native mention wakes both ways, and the operator's landing dispositions. Periodic reconciliation and completion monitors recover missed handoffs. A message wake does not claim another batch or restart a scan. Durable lifecycle stages distinguish queued review, active review and an Owner decision; idle session activity is not approval. Unfinished tasks retain live visible sessions. Read [continuous-review-routing.md](doc/continuous-review-routing.md) for current behavior; the phase history below is not a replacement for that contract. Native delivery must be verified for existing legacy sessions, not inferred from updated prompts.
 

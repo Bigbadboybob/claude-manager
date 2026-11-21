@@ -136,12 +136,7 @@ impl App {
             self.messages.error = format!("That session is not in the sidebar ({} on `{}`)", uid, host.as_str());
             return;
         };
-        let continuous = self.continuous_members().contains(&(wi, si));
-        if continuous && !self.continuous_column_on {
-            self.messages.error = "That session is in the continuous column: A-c shows it".into();
-            return;
-        }
-        self.cursor_column = if continuous { SidebarColumn::Continuous } else { SidebarColumn::Main };
+        self.cursor_column = SidebarColumn::Main;
         self.cursor = Cursor::Session(wi, si);
         self.acknowledge_owner_alerts_for_row(uid);
         self.alerts.remove(uid);
