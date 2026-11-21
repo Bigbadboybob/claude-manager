@@ -52,6 +52,12 @@ whether Codex can do it; usually it can:
   or architecture (the `design` / `architecture` rules), and Owner-facing
   judgment calls. Opus by default (`claude-opus-5-5`, the host default). Use Sonnet (`model="claude-sonnet-5-5"`) only for a session whose
   work is plainly simple or routine.
+**Leaders are always Claude** (Owner, 2026-11-21). A session that leads,
+coordinates or manages other sessions runs on Claude (Opus or Fable). Codex
+may own a path (section 13) only when it will not manage or lead other
+sessions. Codex Terra takes leaves that have a written spec and an
+acceptance test; Codex Luna takes chores.
+
 Set a task default with `create_subtask(model=...)` so a whole subtree
 inherits it. Effort works the same way (`effort=`, default `xhigh`; levels
 low/medium/high/xhigh, plus max on Claude): lower it for mechanical work.
@@ -292,3 +298,95 @@ orchestrator or steward, or the epic's current PoC chain may set the PoC.
 A session you add to a board stays on it until it leaves
 (`board(membership="leave")`), is removed (`membership="remove"`), or has been
 gone for 30 minutes.
+
+## 12. Build the path end to end first, then fill it in
+
+Owner policy, 2026-11-21 (house-assumptions review). Nothing here reduces
+the scope of any final artifact. It changes the order in which the pieces
+are built and proven, and it raises reuse.
+
+### 12.1 Walking skeleton before fan-out
+
+Any project with more than one component on a single execution path (a
+trainer, a release, a new service, a migration) starts with two artifacts,
+before any implementation fan-out:
+
+1. **A path audit.** One worker traces the target execution path statically,
+   from the entry command to the final output. It produces one table row per
+   site that is unbuilt, stubbed or refusing, with the owner of each row. It
+   takes about 30 minutes and is the plan's real to-do list.
+2. **A named end-to-end smoke command** on a small REAL slice: real data,
+   real config, the full chain, minutes not hours. It is written on the
+   project's board item before any worker starts.
+
+Rules for the skeleton:
+
+- **Unbuilt pieces are pass-throughs, not walls.** Each is a named, counted
+  stub: it returns a labelled placeholder, increments a counter and appears
+  in the run's receipt, so the chain runs from day one. A hard refusal is
+  right only for something that must never happen (look-ahead, a real-money
+  action, sealed data); there the refusal is the named stub.
+- **A counted stub during the build is a to-do marker, not a fallback.**
+  Stubs live on the project's integration line. What lands on the repo's
+  main line follows that repo's rules for scaffolding (in predictionTrading:
+  removed before landing, or the Owner's explicit call). The shipped
+  artifact has zero stubs.
+- **The smoke runs on every integration change** (every compose or merge to
+  the integration line) and at least daily. The board item shows its last
+  result. A green leaf whose integration breaks the smoke is not done.
+- **The stub count goes down monotonically.** It is the project's progress
+  number, and it is more honest than "tasks merged".
+- **Leaf tasks are briefed against the skeleton:** "replace stub X; the
+  smoke must still pass and the stub count drops by one".
+
+### 12.2 Reuse first
+
+Before writing a new implementation of anything that already exists in the
+codebase (a ledger, a book reader, a fill model, a belief step, a
+reservation rule, a retry, a time helper):
+
+- **Find the canonical one** (the project glossary, its duplication census,
+  or a search) and import it. If it is not callable the way you need, make
+  the canonical one callable: extract a pure function, add a parameter, or
+  expose a method. Do not create a second copy.
+- **Simulation, replay, backtest and RL code call prod code;** they do not
+  re-host it. A re-hosted prod rule silently drifts the first time someone
+  forgets to change both. If prod logic is tangled with I/O, the work item
+  is "extract the prod core so both call it", owned by whoever owns the prod
+  module.
+- **Every worker brief names the canonical modules** for each concept the
+  task touches. A brief that cannot name them gets a lookup first.
+- **Review question, always asked:** "does this diff add a second
+  implementation of something that exists?" If yes, it does not merge until
+  it imports instead, or until the lead records why reuse is impossible.
+
+## 13. One owner per path, few writers per file
+
+### 13.1 Path owner
+
+- Each execution path in a project has exactly one named **path owner**. A
+  path owner that leads other sessions is Claude (section 1); Codex may own
+  a path it works alone. The path owner owns the path audit, the smoke
+  command, the integration line and the "does it actually run" question.
+  Leaf workers own leaves; nobody else owns the whole.
+- **At most 3 concurrent implementation workers per path,** unless the path
+  owner splits it into file-disjoint sub-paths. More workers than that add
+  conflicts, chat volume and compose work faster than they add throughput.
+- **Staff by role, not by default:** path owners, integration and "why
+  doesn't it run" debugging on a strong Claude model; leaves with a written
+  spec and an acceptance test on Codex Terra; chores on Codex Luna.
+
+### 13.2 Hot-file leases
+
+- A file touched by 2 or more open branches at once is **hot**. A hot file
+  gets a **lease**: one holder at a time, recorded on the board item
+  (`lease: <path> -> <holder>`). Others send the holder their hunks, or
+  wait.
+- **List hot files before each fan-out:** open branches with commits in the
+  last 24 h, the files each touches against main, and the files with 2 or
+  more independent branches (predictionTrading:
+  `scripts/python/hot_files.py`).
+- **Repo-wide registry hotspots are design debt, not a leasing problem.** A
+  file every feature must edit (a stats registry, a god-class router, a code
+  generator's hand tables) gets a consolidation item that decentralizes it:
+  per-module registration plus a generated union, with a CI check.
