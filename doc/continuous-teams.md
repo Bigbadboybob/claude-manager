@@ -79,12 +79,15 @@ over one cross-functional org:
 
 | Team | Lead (manager) | Stretch | Target |
 |---|---|---|---|
-| `latency-pp` | Latency-PP worker (PP-Lead) | article stored → signal emitted | set from the baseline |
-| `latency-ep` | Latency-EP worker (EP) | signal emitted → first decision | p99 ≤ 30 s |
+| `latency-pp` | LatencyPP-Lead (PP-Lead) | article stored → signal emitted | set from the baseline |
+| `latency-ep` | LatencyEP-Lead (EP) | signal emitted → first decision | p99 ≤ 30 s |
 
-- Each team's lead member is one Codex Terra worker, marked continuous on
-  host `sessions` with a 3 h `session_wake_schedule`. The pipeline lead
-  admits fix lanes, and code lands through that lead's normal gates.
+- Each team's lead member is a Claude Opus session (Owner, 2026-11-21:
+  the leads reason about the whole stack and launch workers). It is marked
+  continuous on host `sessions` with a 3 h `session_wake_schedule`. The
+  Codex Terra workers that ran the first passes stay on as its measurement
+  workers, and it starts Codex Terra workers for fix lanes. The pipeline
+  lead admits fix lanes, and code lands through that lead's normal gates.
 - The handoff point is the signal-emission timestamp as PP records it.
   Reports give p50/p90/p99 with n over a stated window, from replica rows,
   and name the slowest step.
