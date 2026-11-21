@@ -115,7 +115,7 @@ Subtasks nest to arbitrary depth, and rendering that tree faithfully in one side
 ## Non-goals
 
 - Agents do not create, rename, delete, reorder, recolor, or fold sections. Those remain Owner controls; agents can change workspace membership within their normal scope.
-- No change to the planning view, the continuous column, or the `backtests` group.
+- No change to the planning view, the continuous-team block, or the `backtests` group.
 - No change to the Status sub-view (flat running/idle partition), which stays a "what is happening right now" view.
 - Not a replacement for subtasks: task hierarchy still lives in `parent_task_id`.
 
@@ -176,7 +176,7 @@ Continuous org teams are an additional boxed block in this Task view. The
 block stays with the team's org placement, uses the same F9 tint strength, and
 contains the lead and its managed sessions. Its header is the live marker
 summary (`⟳ every 6h · next 1h12m · ok`, or `⟳ queue · 3 pending · ok`); the
-legacy continuous column is unchanged.
+legacy continuous sessions remain ordinary sidebar rows.
 
 Select a section heading and press **Alt+E** to change its color. The palette is
 red, orange, yellow, green, cyan, blue, magenta, and pink, plus the neutral default.

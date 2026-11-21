@@ -240,13 +240,10 @@ pub struct App {
     /// Execution contexts. Sidebar rendering iterates workspaces, not tasks.
     pub workspaces: Vec<Workspace>,
     pub cursor: Cursor,
-    /// Which sidebar column the cursor is in (S4). `Main` unless the user has
-    /// stepped right (`A-l`) into the continuous column. Forced back to `Main`
-    /// whenever the continuous column isn't shown.
+    /// Which sidebar column the cursor is in. `Main` is the only rendered
+    /// column; `Continuous` remains as a compatibility value for old state.
     pub cursor_column: SidebarColumn,
-    /// The `Main`-column cursor stashed when stepping into the continuous
-    /// column, restored on the way back (`A-h`) so a round-trip doesn't lose
-    /// the main selection.
+    /// Compatibility cursor storage retained for old serialized state.
     pub saved_main_cursor: Option<Cursor>,
     /// A-; quick-switch: session uids in most-recently-focused-first order
     /// (the CURRENT focus is not in the deque — it's pushed when focus
@@ -258,14 +255,7 @@ pub struct App {
     /// In-progress A-; walk (frozen ring + position). `None` when no walk
     /// is active; reset by any other key press.
     mru_walk: Option<MruWalk>,
-    /// The `Continuous`-column position stashed when stepping back to main,
-    /// restored on the way in (`A-l`) so re-entering the column lands on the
-    /// row you left off at (not always the first). Stored as the session UID
-    /// (NOT a `(ws_idx, sess_idx)` index) so it survives a manifest refresh
-    /// reindexing the workspaces/sessions between leaving and returning — the
-    /// index-based form silently fell back to the first row after any poll.
-    /// Resolved against the live rows on restore — falls back to the first row
-    /// if the saved session is gone.
+    /// Compatibility cursor storage retained for old serialized state.
     pub saved_continuous_uid: Option<String>,
     pub sidebar_view: SidebarView,
     /// Case-insensitive filter applied to the sessions/tasks sidebar.
@@ -274,8 +264,8 @@ pub struct App {
     pub keybinding_helper_visible: bool,
     sidebar_list_state: ListState,
     continuous_list_state: ListState,
-    /// Rows the main sidebar list and the continuous column showed on the
-    /// last draw; A-u / A-d page by half of the focused one.
+    /// Rows the main sidebar list showed on the last draw; A-u / A-d page by
+    /// half of the focused one.
     pub(crate) sidebar_page_rows: u16,
     /// The open grid color picker over an A-e form, if any.
     pub(crate) color_grid: Option<color_grid::ColorGrid>,
@@ -403,19 +393,11 @@ pub struct App {
     /// Toggle for the bottom-of-screen activity strip. Off by default;
     /// `Alt-,` flips it.
     pub activity_visible: bool,
-    /// Continuous-Tasks Phase 1: when set, all three `visual_items_*`
-    /// builders skip the continuous group (its `ContinuousHeader` + the
-    /// sessions under it). DEPRECATED + unused — the master-hide concept was
-    /// folded into `continuous_column_on` (one toggle: column on = shown in the
-    /// column, off = hidden). Kept only so old manifests round-trip without a
-    /// schema break; never consulted for rendering.
+    /// Deprecated manifest compatibility flag. Kept so old manifests round-trip
+    /// without a schema break; never consulted for rendering.
     pub hide_continuous: bool,
-    /// Continuous panel (DESIGN_CONTINUOUS_PANEL.md): the SINGLE continuous
-    /// control (toggled by `A-c`). When ON, a dedicated continuous COLUMN is
-    /// split off the right of the sidebar (orchestrators with nested subtasks);
-    /// when OFF, continuous tasks are hidden entirely. Either way the main
-    /// sidebar builders NEVER emit continuous sessions — they render only in the
-    /// column, never in both places. Off by default. Persisted in the manifest.
+    /// Deprecated continuous-column toggle. It is always false in memory and
+    /// on persistence; retained so old manifests deserialize safely.
     pub continuous_column_on: bool,
     /// Legacy accent colors of planning tasks, keyed by task id, from the
     /// task-header era (`Manifest::task_colors`). A workspace header with no
@@ -468,8 +450,8 @@ pub struct App {
     /// When to make the one-time bash-only sweep offer; None once made (or
     /// made in an earlier run, per its marker file).
     bash_sweep_due: Option<Instant>,
-    /// Cloud backtest runs, rendered in the continuous panel's `backtests`
-    /// group instead of per-task workspaces (they never hold a local session).
+    /// Cloud backtest runs, rendered in the sidebar's `backtests` group instead
+    /// of per-task workspaces (they never hold a local session).
     /// Rebuilt from the API task list by `reconcile_tasks` →
     /// [`backtests::update_backtest_rows`]; in-memory only.
     pub(crate) backtest_rows: Vec<BacktestRow>,
@@ -820,7 +802,9 @@ impl App {
             _ => SidebarView::Status,
         };
         let hide_continuous = manifest.hide_continuous;
-        let continuous_column_on = manifest.continuous_column_on;
+        // A persisted pre-phase-5 `true` value must load harmlessly. The
+        // dedicated pane is retired, so never restore the old toggle.
+        let continuous_column_on = false;
         let keybinding_helper_visible = !manifest.hide_keybinding_helper;
         let mut planning = PlanningView::new();
         planning.keybinding_helper_visible = keybinding_helper_visible;
@@ -1009,7 +993,7 @@ impl App {
         } else {
             crate::client_session::spawn_session_pollers(&host_pool, &hosts)
         };
-        // Per-host dispatch-pending pollers (Continuous panel's ○ indicator).
+        // Per-host dispatch-pending pollers (continuous status ○ indicator).
         // Skipped under cfg(test) — like `attach_worker` — so unit tests never
         // spawn a thread that dials the developer's real local daemon socket.
         let (dispatch_pending_rx, _dispatch_pending_threads) = if cfg!(test) {

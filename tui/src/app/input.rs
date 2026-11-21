@@ -3222,32 +3222,6 @@ impl App {
                 self.needs_redraw = true;
                 return true;
             }
-            // Continuous panel: Alt+c toggles the dedicated continuous COLUMN
-            // (orchestrators + their nested subtasks, split off the right of the
-            // sidebar). It's the SINGLE continuous control — column ON shows the
-            // continuous tree in its own column; column OFF hides it entirely
-            // (continuous tasks never appear in the main sidebar either way).
-            // Persisted in the manifest. (The old Alt+Shift+C column toggle and
-            // the separate Alt+c master-hide were merged into this one key.)
-            if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('c') {
-                self.continuous_column_on = !self.continuous_column_on;
-                // Turning the column off strands a continuous-column cursor —
-                // pull it back to the main sidebar (restoring the saved spot).
-                // Stash the continuous spot first so toggling back on + stepping
-                // in lands where you left off.
-                if !self.continuous_column_on
-                    && self.cursor_column == SidebarColumn::Continuous
-                {
-                    self.saved_continuous_uid = self.cursor_session_uid();
-                    self.cursor = self
-                        .saved_main_cursor
-                        .take()
-                        .unwrap_or(Cursor::Workspace(0));
-                    self.cursor_column = SidebarColumn::Main;
-                }
-                self.needs_redraw = true;
-                return true;
-            }
         }
 
         // Delegate to planning view when in Planning mode.
@@ -3570,8 +3544,8 @@ impl App {
                     // `cycle_active_host`, both removed — host is now a
                     // per-workspace attribute, new sessions default to `local`).
                     // Some terminals deliver Alt+Shift+h as Char('h')+SHIFT,
-                    // others as Char('H'); match both. **Bare A-h is now FREE** —
-                    // it becomes continuous-panel column-nav LEFT (wired in S4).
+                    // others as Char('H'); match both. Bare A-h is free after
+                    // the continuous-column navigation was retired.
                     KeyCode::Char('H') => {
                         self.toggle_session_hidden();
                         return true;
@@ -3580,21 +3554,6 @@ impl App {
                         if key.modifiers.contains(KeyModifiers::SHIFT) =>
                     {
                         self.toggle_session_hidden();
-                        return true;
-                    }
-                    // Continuous-panel column nav (S4): bare A-h / A-l move the
-                    // cursor LEFT / RIGHT between the main sidebar and the
-                    // continuous column. No-op when the column isn't shown.
-                    KeyCode::Char('h') => {
-                        let prev = self.cursor_session_uid();
-                        self.step_column(-1);
-                        self.note_session_focus_change(prev);
-                        return true;
-                    }
-                    KeyCode::Char('l') => {
-                        let prev = self.cursor_session_uid();
-                        self.step_column(1);
-                        self.note_session_focus_change(prev);
                         return true;
                     }
                     KeyCode::Char('b') => {

@@ -377,10 +377,8 @@ pub enum BacktestCursor {
     Run(String),
 }
 
-/// Which sidebar column the cursor is navigating (two-column continuous panel,
-/// S4 of DESIGN_CONTINUOUS_PANEL.md). `Main` is the always-present sessions
-/// sidebar; `Continuous` is the dedicated column (only reachable when
-/// `continuous_column_on`). `A-h`/`A-l` move between them.
+/// Which sidebar column the cursor is navigating. `Main` is the only rendered
+/// sidebar; `Continuous` remains for compatibility with old cursor state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SidebarColumn {
     Main,
@@ -426,7 +424,7 @@ pub(super) enum VisualItem {
     /// A selectable session row inside a continuous org-model team block.
     ContinuousTeamSession(usize, usize),
     /// Cloud-backtests group header, appended at the bottom of the
-    /// continuous column when any backtest row is live. SELECTABLE
+    /// sidebar when any backtest row is live. SELECTABLE
     /// (unlike `ContinuousHeader`) so Space/Enter can fold the group.
     BacktestHeader,
     /// A fleet row inside the backtests group: ≥2 runs sharing a label
@@ -448,8 +446,7 @@ pub(super) enum VisualItem {
     OrgHeader { key: String, depth: u8 },
 }
 
-/// One row in the dedicated continuous column (the two-column panel, S2 of
-/// DESIGN_CONTINUOUS_PANEL.md). A continuous-task orchestrator (`depth == 0`)
+/// One row in the legacy continuous grouping helper. A continuous-task orchestrator (`depth == 0`)
 /// followed by the subtasks it spawned (`depth == 1`, matched by
 /// `managed_by_uid`). Carries `(ws_idx, sess_idx)` exactly like
 /// `VisualItem::Session`, so the cursor + `active_session()` resolve a row
@@ -739,15 +736,15 @@ impl App {
         }
     }
 
-    /// Build visual items for the current main sidebar view. Cloud backtests
-    /// are owned by the dedicated continuous column and are returned by
-    /// [`continuous_backtest_items`].
+    /// Build visual items for the current main sidebar view, including cloud
+    /// backtests.
     pub(super) fn visual_items(&self) -> Vec<VisualItem> {
-        let items = match self.sidebar_view {
+        let mut items = match self.sidebar_view {
             SidebarView::Status => self.visual_items_status(),
             SidebarView::Task => self.visual_items_task(),
             SidebarView::Team => self.visual_items_team(),
         };
+        self.append_backtest_items(&mut items);
         self.filter_visual_items(items)
     }
 
@@ -766,7 +763,7 @@ impl App {
         items
     }
 
-    /// Rows for the dedicated right-hand column after backtests moved there.
+    /// Legacy backtest rows helper retained for compatibility callers.
     pub(super) fn continuous_backtest_items(&self) -> Vec<VisualItem> {
         let mut items = Vec::new();
         self.append_backtest_items(&mut items);
@@ -912,8 +909,6 @@ impl App {
     /// A-O picker to reach them.
     ///
     pub(super) fn visual_items_status(&self) -> Vec<VisualItem> {
-        let members = self.continuous_members();
-        let empty_owners = self.continuous_empty_workspace_owners();
         let mut running: Vec<VisualItem> = Vec::new();
         let mut idle: Vec<VisualItem> = Vec::new();
         let mut no_session: Vec<VisualItem> = Vec::new();
@@ -922,20 +917,10 @@ impl App {
             if ws.is_closed || self.is_past_workspace(wi) {
                 continue;
             }
-            // Continuous-orchestrator sessions + their subtasks live ONLY in the
-            // dedicated continuous column (or are hidden when it's off) — exclude
-            // them from the main sidebar so a continuous task never shows twice.
-            let visible: Vec<usize> = (0..ws.sessions.len())
-                .filter(|si| !members.contains(&(wi, *si)))
-                .collect();
             if ws.sessions.is_empty() {
-                if empty_owners.contains_key(&wi) { continue; }
                 no_session.push(VisualItem::WorkspaceHeader(wi));
-            } else if visible.is_empty() {
-                // Continuous-only workspace → nothing in the main sidebar.
-                continue;
             } else {
-                for si in visible {
+                for si in 0..ws.sessions.len() {
                     let item = VisualItem::Session(wi, si);
                     match ws.sessions[si].status {
                         SessionStatus::Running => running.push(item),
@@ -1064,9 +1049,8 @@ impl App {
     /// respawned its parent (its `managed_by_uid` now names a dead uid,
     /// and there is no `parent_task_id` to fall back on).
     ///
-    /// These render ONLY in the dedicated continuous column (when it's on) or
-    /// nowhere (when it's off) — the main sidebar builders exclude them, so a
-    /// continuous task never appears in both places. Closed workspaces skipped.
+    /// This matching set is retained for the legacy grouping helper. Main
+    /// sidebar builders now keep these sessions visible.
     pub(super) fn continuous_members(&self) -> std::collections::HashSet<(usize, usize)> {
         use std::collections::HashSet;
         let mut orch_uids: HashSet<&str> = HashSet::new();
@@ -1114,7 +1098,7 @@ impl App {
         keys
     }
 
-    /// Build the dedicated continuous column's rows (DESIGN_CONTINUOUS_PANEL.md):
+    /// Build legacy continuous grouping rows (DESIGN_CONTINUOUS_PANEL.md):
     /// each continuous-task orchestrator (a session tagged `continuous_task_id`)
     /// at `depth 0`, followed by its subtasks nested at `depth 1`. A subtask
     /// nests under an orchestrator when its `managed_by_uid` is that
@@ -1134,8 +1118,8 @@ impl App {
         rows
     }
 
-    /// The continuous column's grouping before the sidebar filter (A-/)
-    /// applies. The org chart (F6) reuses it for its Continuous org.
+    /// Legacy continuous grouping before the sidebar filter (A-/) applies.
+    /// The org chart (F6) reuses it for its Continuous org.
     pub(super) fn continuous_rows_unfiltered(&self) -> Vec<ContinuousRow> {
         // Orchestrators: (ws_idx, sess_idx, uid, task_id, label).
         let mut orchestrators: Vec<(usize, usize, &str, Option<&str>, &str)> = Vec::new();
@@ -1317,14 +1301,7 @@ impl App {
         rows
     }
 
-    /// Move the cursor between sidebar columns (S4). `dir > 0` steps RIGHT
-    /// (toward the continuous column), `dir < 0` steps LEFT (back to main).
-    /// No-op when the continuous column isn't shown; entering an empty
-    /// continuous column is also a no-op. EACH column remembers the row you
-    /// left off at: the main cursor is stashed on the way in / restored on the
-    /// way out, and the continuous cursor likewise — so re-entering a column
-    /// lands where you were, not on its first row (the saved continuous spot is
-    /// validated against the live rows and falls back to the first if gone).
+    /// Compatibility no-op for the retired column navigation.
     /// The stable session UID at the current cursor — used to stash a column
     /// position that survives a manifest reindex (indices shift on a refresh;
     /// UIDs don't). None if the cursor isn't on a live session.
@@ -1340,52 +1317,10 @@ impl App {
     }
 
     pub(super) fn step_column(&mut self, dir: i32) {
-        if !self.continuous_column_on {
-            self.cursor_column = SidebarColumn::Main;
-            return;
-        }
-        match (self.cursor_column, dir) {
-            (SidebarColumn::Main, d) if d > 0 => {
-                let rows = self.visual_items_continuous();
-                let backtests = self.continuous_backtest_items();
-                if rows.is_empty() && backtests.is_empty() {
-                    return;
-                }
-                // Restore the last continuous spot by UID (stable across a
-                // manifest reindex) if that session is still a row; else the
-                // first row.
-                let target = self
-                    .saved_continuous_uid
-                    .as_deref()
-                    .and_then(|uid| {
-                        rows.iter().find(|r| {
-                            r.sess_idx.is_some_and(|si| self.workspaces[r.ws_idx].sessions[si].uid == uid)
-                        })
-                    })
-                    .map(ContinuousRow::cursor)
-                    .unwrap_or_else(|| {
-                        if rows.is_empty() {
-                            return Cursor::Backtest(BacktestCursor::Group);
-                        }
-                        let r = rows[0];
-                        r.cursor()
-                    });
-                self.saved_main_cursor = Some(self.cursor.clone());
-                self.cursor = target;
-                self.cursor_column = SidebarColumn::Continuous;
-                self.needs_redraw = true;
-            }
-            (SidebarColumn::Continuous, d) if d < 0 => {
-                self.saved_continuous_uid = self.cursor_session_uid();
-                self.cursor = self
-                    .saved_main_cursor
-                    .take()
-                    .unwrap_or(Cursor::Workspace(0));
-                self.cursor_column = SidebarColumn::Main;
-                self.needs_redraw = true;
-            }
-            _ => {}
-        }
+        // Phase 5 retired the dedicated pane. Keep old callers harmless.
+        let _ = dir;
+        self.cursor_column = SidebarColumn::Main;
+        self.saved_main_cursor = None;
     }
 
     /// Navigate the cursor up or down. +1 = down, -1 = up.
@@ -1413,7 +1348,7 @@ impl App {
     /// One cursor step. Returns false when nothing moved; without `wrap` a
     /// step past either end is refused.
     fn navigate_step(&mut self, direction: i32, wrap: bool) -> bool {
-        // S4: in the continuous column, navigate over its own row list
+        // Compatibility path for the retired continuous-column row list
         // (every row is a selectable session, so just wrap ±1).
         if self.cursor_column == SidebarColumn::Continuous && self.continuous_column_on {
             let rows = self.visual_items_continuous();
@@ -1573,8 +1508,7 @@ impl App {
 
     /// A-g: jump the cursor to the next session that needs a human, in
     /// priority order — pending `notify_user` alerts first, then idle
-    /// sessions (any age) — cycling in sidebar visual order (main column
-    /// rows first, then the continuous column's rows when it's shown).
+    /// sessions (any age) — cycling in the single sidebar's visual order.
     /// Hidden sessions are skipped unless they hold an alert (alerts
     /// override hidden, matching the sidebar indicator). Uses the same
     /// cursor assignment navigation uses, so the attached terminal
@@ -1582,7 +1516,7 @@ impl App {
     /// A-h/A-l lands back where you were.
     pub(super) fn jump_to_next_attention(&mut self) {
         // (ws_idx, sess_idx, is_continuous_row) in sidebar visual order.
-        let mut rows: Vec<(usize, usize, bool)> = Vec::new();
+        let mut rows: Vec<(usize, usize)> = Vec::new();
         // Folded sessions count: an alert inside a fold must still be
         // reachable (the jump unfolds it).
         let main = if self.tree_view() {
@@ -1594,17 +1528,12 @@ impl App {
         };
         for vi in main {
             if let VisualItem::Session(wi, si) | VisualItem::ContinuousTeamSession(wi, si) = vi {
-                rows.push((wi, si, false));
-            }
-        }
-        if self.continuous_column_on {
-            for r in self.visual_items_continuous() {
-                if let Some(si) = r.sess_idx { rows.push((r.ws_idx, si, true)); }
+                rows.push((wi, si));
             }
         }
         let tiers: Vec<Option<u8>> = rows
             .iter()
-            .map(|(wi, si, _)| {
+            .map(|(wi, si)| {
                 let ts = &self.workspaces[*wi].sessions[*si];
                 super::agent_state::attention_tier(
                     self.session_has_alert(&ts.uid, &ts.host_id),
@@ -1617,26 +1546,15 @@ impl App {
         let current = match &self.cursor {
             Cursor::Session(cwi, csi) => rows
                 .iter()
-                .position(|(wi, si, _)| wi == cwi && si == csi),
+                .position(|(wi, si)| wi == cwi && si == csi),
             _ => None,
         };
         let Some(next) = next_attention_index_tiered(&tiers, current) else {
             self.set_status_msg("No sessions need attention");
             return;
         };
-        let (wi, si, to_continuous) = rows[next];
-        // Crossing between columns keeps step_column's saved-spot invariants.
-        if to_continuous && self.cursor_column == SidebarColumn::Main {
-            self.saved_main_cursor = Some(self.cursor.clone());
-        }
-        if !to_continuous && self.cursor_column == SidebarColumn::Continuous {
-            self.saved_continuous_uid = self.cursor_session_uid();
-        }
-        self.cursor_column = if to_continuous {
-            SidebarColumn::Continuous
-        } else {
-            SidebarColumn::Main
-        };
+        let (wi, si) = rows[next];
+        self.cursor_column = SidebarColumn::Main;
         self.cursor = Cursor::Session(wi, si);
         self.reveal_cursor();
         self.needs_redraw = true;
@@ -1657,41 +1575,21 @@ impl App {
         None
     }
 
-    /// Resolve a uid to a jumpable cursor target: `(ws_idx, sess_idx,
-    /// lives_in_continuous_column)`. Continuous-member sessions are only
-    /// jumpable while the continuous column is shown — when it's off
-    /// they're hidden entirely, so a cursor there would sit on an
-    /// invisible row. Such uids are SKIPPED (kept in the MRU deque; they
-    /// come back when the column is toggled on), not dropped.
-    fn resolve_session_target(&self, uid: &str) -> Option<(usize, usize, bool)> {
+    /// Resolve a uid to a jumpable cursor target. Legacy continuous members
+    /// are ordinary main-sidebar sessions now.
+    fn resolve_session_target(&self, uid: &str) -> Option<(usize, usize)> {
         let (wi, si) = self.find_session_by_uid(uid)?;
-        let continuous = self.continuous_members().contains(&(wi, si));
-        if continuous && !self.continuous_column_on {
-            return None;
-        }
-        Some((wi, si, continuous))
+        Some((wi, si))
     }
 
-    /// Move the cursor onto session `uid`, crossing sidebar columns with
-    /// the same saved-spot bookkeeping as `jump_to_next_attention` /
-    /// `step_column` (so a later A-h/A-l lands back where you were). The
-    /// terminal pane follows because it renders the cursor's session.
+    /// Move the cursor onto session `uid`. The terminal pane follows because
+    /// it renders the cursor's session.
     /// Returns false when the uid doesn't resolve to a visible row.
     pub(super) fn jump_cursor_to_session_uid(&mut self, uid: &str) -> bool {
-        let Some((wi, si, to_continuous)) = self.resolve_session_target(uid) else {
+        let Some((wi, si)) = self.resolve_session_target(uid) else {
             return false;
         };
-        if to_continuous && self.cursor_column == SidebarColumn::Main {
-            self.saved_main_cursor = Some(self.cursor.clone());
-        }
-        if !to_continuous && self.cursor_column == SidebarColumn::Continuous {
-            self.saved_continuous_uid = self.cursor_session_uid();
-        }
-        self.cursor_column = if to_continuous {
-            SidebarColumn::Continuous
-        } else {
-            SidebarColumn::Main
-        };
+        self.cursor_column = SidebarColumn::Main;
         self.cursor = Cursor::Session(wi, si);
         self.reveal_cursor();
         self.needs_redraw = true;
@@ -1783,13 +1681,10 @@ impl App {
     /// row) and its sessions, in `self.workspaces` order (the stable
     /// backbone of sidebar order). Session rows show
     /// "workspace / label", plus "[role]" for workflow participants and
-    /// the bound task's name; continuous members get a "⟳cont" tag and
-    /// are listed only while the continuous column is on (off = they're
-    /// hidden entirely and unjumpable).
+    /// the bound task's name.
     fn build_palette_candidates(&self) -> Vec<PaletteCandidate> {
-        let members = self.continuous_members();
         let mut out: Vec<PaletteCandidate> = Vec::new();
-        for (wi, ws) in self.workspaces.iter().enumerate() {
+        for (_wi, ws) in self.workspaces.iter().enumerate() {
             if ws.is_closed {
                 continue;
             }
@@ -1797,11 +1692,7 @@ impl App {
                 target: PaletteTarget::Workspace { ws_id: ws.id.clone() },
                 display: ws.name.clone(),
             });
-            for (si, ts) in ws.sessions.iter().enumerate() {
-                let is_continuous = members.contains(&(wi, si));
-                if is_continuous && !self.continuous_column_on {
-                    continue;
-                }
+            for ts in &ws.sessions {
                 let mut display = format!("{} / {}", ws.name, ts.label);
                 if let Some(role) = ts.workflow_role.as_deref() {
                     display.push_str(&format!(" [{}]", role));
@@ -1812,9 +1703,6 @@ impl App {
                     .and_then(|tid| self.find_task_entry(tid))
                 {
                     display.push_str(&format!(" \u{00b7} {}", task.name));
-                }
-                if is_continuous {
-                    display.push_str(" \u{27f3}cont");
                 }
                 out.push(PaletteCandidate {
                     target: PaletteTarget::Session { uid: ts.uid.clone() },
@@ -1865,11 +1753,7 @@ impl App {
                         self.note_session_focus_change(prev);
                         self.needs_redraw = true;
                     }
-                    None => {
-                        self.set_status_msg(
-                            "Workspace's sessions are hidden (continuous column off)",
-                        );
-                    }
+                    None => self.set_status_msg("Workspace has no visible session"),
                 }
             }
         }

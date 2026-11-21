@@ -15727,6 +15727,32 @@ struct ContinuousCreateParams {
     wedge_grace_secs: Option<u64>,
 }
 
+/// `continuous.create` now refuses to mint new legacy scheduler records.
+/// Existing records are returned read-only so their scheduler state remains
+/// untouched while operators migrate them to org teams.
+pub fn continuous_create(
+    _state_arc: &Arc<Mutex<DaemonState>>,
+    params: &Value,
+) -> MethodResult {
+    let p: ContinuousCreateParams = serde_json::from_value(params.clone())
+        .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.create params: {}", e)))?;
+    crate::continuous::task::validate_task_id(&p.task_id)
+        .map_err(|e| (ErrorCode::InvalidParams, format!("continuous.create: {}", e)))?;
+    if let Some(existing) = crate::continuous::task::load_one(&p.task_id) {
+        return Ok(json!({
+            "created": false,
+            "task_id": existing.task_id,
+            "workspace_id": existing.workspace_id,
+            "worktree_path": existing.worktree_path,
+            "legacy": true,
+        }));
+    }
+    Err((
+        ErrorCode::InvalidParams,
+        "continuous.create no longer creates legacy continuous tasks; create an org team with a lead member, org mark_continuous, session_wake_schedule, and queue.bind. See doc/continuous-teams.md".into(),
+    ))
+}
+
 /// `continuous.create` — register a continuous task: resolve the repo, create
 /// the durable worktree ONCE, register the workspace, and write the
 /// authoritative `state.json`. Idempotent: a second create for the same id
@@ -15735,7 +15761,8 @@ struct ContinuousCreateParams {
 /// job. Operator-only (gated in `dispatch.rs`).
 ///
 /// Returns `{ created, task_id, workspace_id, worktree_path }`.
-pub fn continuous_create(
+#[cfg(test)]
+fn continuous_create_legacy(
     state_arc: &Arc<Mutex<DaemonState>>,
     params: &Value,
 ) -> MethodResult {
@@ -37330,6 +37357,26 @@ while True:
         }
     }
 
+    #[test]
+    fn continuous_create_rejects_new_legacy_records() {
+        with_continuous_home(|_home| {
+            let state = Arc::new(Mutex::new(DaemonState::new()));
+            let err = continuous_create(
+                &state,
+                &json!({
+                    "task_id": "new-legacy",
+                    "label": "New legacy",
+                    "default_prompt": "run",
+                    "repo_url": "repo",
+                }),
+            )
+            .expect_err("phase 5 refuses new legacy scheduler records");
+            assert_eq!(err.0, ErrorCode::InvalidParams);
+            assert!(err.1.contains("doc/continuous-teams.md"));
+            assert!(crate::continuous::task::load_one("new-legacy").is_none());
+        });
+    }
+
     /// `investigator_prompt` pins the EXACT `resolve_stuck` call (task_id + seq),
     /// enumerates the three verdicts, and points at the snapshot dir + worktree.
     #[test]
@@ -37954,7 +38001,7 @@ while True:
     fn continuous_create_then_list_round_trip() {
         with_home_and_repo("continuousrepo", |home, name| {
             let state = Arc::new(Mutex::new(DaemonState::new()));
-            let resp = continuous_create(
+            let resp = continuous_create_legacy(
                 &state,
                 &json!({
                     "task_id": "bug-triage",
@@ -37997,7 +38044,7 @@ while True:
             assert_eq!(on_disk.workspace_id, ws_id);
 
             // Idempotent: a second create reuses the record (created=false).
-            let resp2 = continuous_create(
+            let resp2 = continuous_create_legacy(
                 &state,
                 &json!({
                     "task_id": "bug-triage",
@@ -38037,7 +38084,7 @@ while True:
     fn continuous_pause_toggles_paused_flag() {
         with_home_and_repo("pauserepo", |_home, name| {
             let state = Arc::new(Mutex::new(DaemonState::new()));
-            continuous_create(
+            continuous_create_legacy(
                 &state,
                 &json!({
                     "task_id": "nightly",
@@ -38920,7 +38967,7 @@ while True:
     fn continuous_delete_retires_record_and_unregisters() {
         with_home_and_repo("deleterepo", |_home, name| {
             let state = Arc::new(Mutex::new(DaemonState::new()));
-            let created = continuous_create(
+            let created = continuous_create_legacy(
                 &state,
                 &json!({
                     "task_id": "ephemeral",

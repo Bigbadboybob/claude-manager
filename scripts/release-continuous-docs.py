@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Release the continuous-task documentation bundle and runtime guidance to a host.
+"""Release the continuous-team documentation bundle and runtime guidance to a host.
 
 Reproduces the layout at `~/.cm/docs/continuous-tasks/` (repo docs + doc/ +
 doc/messaging/ + mcp_server/AGENT_GUIDE.md + scripts/cm-op) with a hash-verified

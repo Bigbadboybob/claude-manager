@@ -24,8 +24,7 @@
 //!   carries its level's leader mark ([`leader_glyph`]); leaves carry none.
 //!
 //! Sections still group top-level blocks; a nested block follows its root
-//! block's section. The Status sub-view and the continuous column are
-//! unchanged.
+//! block's section. Legacy continuous sessions remain ordinary tree rows.
 
 use super::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -639,7 +638,10 @@ impl App {
                 return cached.clone();
             }
         }
-        let mut members = self.continuous_members();
+        // Legacy scheduler sessions are ordinary work-tree rows after phase
+        // 5. Only live org-model continuous teams are lifted into their boxed
+        // block below.
+        let mut members: HashSet<(usize, usize)> = HashSet::new();
         // Ordinary org-team leads and their managed sessions are hidden from
         // the loose work tree and re-emitted in their continuous team box.
         if let Some(snap) = self.org_live() {
@@ -738,8 +740,7 @@ impl App {
             }
             emit.entry(entry);
         }
-        // Continuous org teams stay in the main Task sidebar as a boxed
-        // block; the legacy dedicated continuous column remains untouched.
+        // Continuous org teams stay in the main Task sidebar as a boxed block.
         if let Some(snap) = self.org_live() {
             for team in snap.teams.iter().filter(|t| t.continuous.is_some() && !t.archived()) {
                 let mut rows = Vec::new();

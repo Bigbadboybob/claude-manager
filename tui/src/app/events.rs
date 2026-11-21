@@ -8760,7 +8760,7 @@ mod backtest_group_tests {
     }
 
     #[test]
-    fn reconcile_keeps_done_worker_sessions_in_continuous_tree() {
+    fn reconcile_keeps_done_legacy_worker_sessions_in_main_tree() {
         with_temp_home(|home| {
             let mut app = test_app(home);
             app.workspaces.clear();
@@ -8789,9 +8789,8 @@ mod backtest_group_tests {
                 app.reconcile_tasks(vec![orch_task.clone(), worker_task.clone()]);
                 let wi = app.workspaces.iter().position(|w| w.id == "worker-ws").unwrap();
                 assert!(app.continuous_members().contains(&(wi, 0)));
-                assert!(app.visual_items_continuous().iter().any(|r|
-                    r.ws_idx == wi && r.sess_idx == Some(0) && r.depth == 1));
-                assert!(!app.task_view_visible_workspaces(&app.continuous_members()).contains(&wi));
+                assert!(app.visual_items().iter().any(|item| matches!(item, VisualItem::Session(w, s) if *w == wi && *s == 0)));
+                assert!(app.task_view_visible_workspaces(&app.continuous_members()).contains(&wi));
                 assert_eq!(app.workspaces[wi].sessions[0].uid, uid);
                 assert!(!app.tasks.iter().any(|t| t.task_id.as_deref() == Some("worker")),
                     "Done tasks must not become active work or mint new workspaces");
@@ -8869,7 +8868,7 @@ mod backtest_group_tests {
         });
     }
 
-    /// Sidebar shape: the group rides at the bottom of the continuous panel;
+    /// Sidebar shape: the group rides at the bottom of the main sidebar;
     /// perf-bench fleet (shared label stem) renders as ONE fleet row —
     /// members hidden until unfolded — while an unrelated run stays flat.
     /// Folding the group collapses everything to the header.
@@ -8887,7 +8886,7 @@ mod backtest_group_tests {
 
             for view in [SidebarView::Status, SidebarView::Task] {
                 app.sidebar_view = view;
-                let items = app.continuous_backtest_items();
+                let items = app.visual_items();
                 assert!(
                     items.iter().any(|v| matches!(v, VisualItem::BacktestHeader)),
                     "group header present in both sub-views",
@@ -8916,7 +8915,7 @@ mod backtest_group_tests {
             app.cursor =
                 Cursor::Backtest(BacktestCursor::Fleet("perf-bench-hist-k3".into()));
             assert!(app.toggle_backtest_fold());
-            let items = app.continuous_backtest_items();
+            let items = app.visual_items();
             let members: Vec<&str> = items
                 .iter()
                 .filter_map(|v| match v {
@@ -8936,7 +8935,7 @@ mod backtest_group_tests {
                 Cursor::Backtest(BacktestCursor::Fleet("perf-bench-hist-k3".into())),
             );
             assert!(
-                !app.continuous_backtest_items()
+                !app.visual_items()
                     .iter()
                     .any(|v| matches!(v, VisualItem::BacktestRun { depth: 1, .. })),
             );
@@ -8944,7 +8943,7 @@ mod backtest_group_tests {
             // Fold the whole group → header only.
             app.cursor = Cursor::Backtest(BacktestCursor::Group);
             assert!(app.toggle_backtest_fold());
-            let items = app.continuous_backtest_items();
+            let items = app.visual_items();
             assert!(items.iter().any(|v| matches!(v, VisualItem::BacktestHeader)));
             assert!(!items.iter().any(|v| matches!(
                 v,
@@ -8975,21 +8974,9 @@ mod backtest_group_tests {
             app.cursor = Cursor::Session(0, 0);
             assert!(app.active_session().is_some(), "real session untouched");
 
+            assert!(app.visual_items().iter().any(|item| matches!(item, VisualItem::BacktestHeader)));
             app.step_column(1);
-            assert_eq!(app.cursor, Cursor::Backtest(BacktestCursor::Group));
-            assert!(
-                app.active_session().is_none(),
-                "no PTY behind backtest rows",
-            );
-            app.navigate(1);
-            assert_eq!(
-                app.cursor,
-                Cursor::Backtest(BacktestCursor::Run("solo".into())),
-            );
-            app.navigate(1);
-            assert_eq!(app.cursor, Cursor::Backtest(BacktestCursor::Group), "wraps inside continuous panel");
-            app.step_column(-1);
-            assert_eq!(app.cursor, Cursor::Session(0, 0), "returns to the main session");
+            assert_eq!(app.cursor, Cursor::Session(0, 0), "retired column navigation is a no-op");
 
             // Cursor on a row that then leaves the group → clamp steps up to
             // the header; group emptied entirely → falls back to workspaces.

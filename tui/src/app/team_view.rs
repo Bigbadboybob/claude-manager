@@ -125,10 +125,9 @@ impl App {
     /// Every Team row, ignoring folds (A-g reaches into folds through it).
     pub(super) fn visual_items_team_unfolded(&self) -> Vec<VisualItem> {
         let Some(snap) = self.org_live() else { return self.visual_items_task() };
-        let continuous = self.continuous_members();
         let shown = |wi: usize, si: usize| {
             let ws = &self.workspaces[wi];
-            !ws.is_closed && !self.is_past_workspace(wi) && !continuous.contains(&(wi, si))
+            !ws.is_closed && !self.is_past_workspace(wi)
         };
         let mut under: HashMap<Attach, Vec<(usize, usize)>> = HashMap::new();
         {

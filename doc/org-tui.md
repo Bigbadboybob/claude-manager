@@ -111,7 +111,7 @@ assistants, placed exactly as F6 places them
 chain, workspace). Another member's main session always stays with that
 member. Sessions Owner started that reach no member follow under **Owner's
 sessions**, the rare rest under **Unassigned**, and continuous sessions stay
-in the continuous column. Team and member rows are headers the cursor stops on;
+in the main sidebar. Team and member rows are headers the cursor stops on;
 Space or Enter folds one (`▸`, with the number of sessions it hides), and the
 folds are kept in the manifest (`folded_org`). `A-g` still reaches a session
 inside a fold.

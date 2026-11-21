@@ -628,17 +628,12 @@ pub struct Manifest {
     pub agent_task_edges: HashMap<String, String>,
     #[serde(default)]
     pub view: Option<String>,
-    /// Continuous-Tasks Phase 1: persisted `A-c` toggle that hides the
-    /// continuous section (header + its sessions) from all three sidebar
-    /// builders. Serde-default so old manifests without the key load as
-    /// `false` (section shown).
+    /// Retained for manifest compatibility. Phase 5 no longer hides legacy
+    /// continuous sessions from the main sidebar; old values are ignored.
     #[serde(default)]
     pub hide_continuous: bool,
-    /// Two-column continuous panel (DESIGN_CONTINUOUS_PANEL.md): persisted
-    /// `A-C` toggle. When `true` the TUI splits a dedicated continuous COLUMN
-    /// off the right of the sidebar (orchestrators + nested subtasks) instead
-    /// of the bottom-of-sidebar section. Serde-default `false` so old manifests
-    /// load as "column off" (today's single-sidebar layout).
+    /// Deprecated two-column panel toggle. Kept so old manifests deserialize;
+    /// phase 5 always loads and writes this as `false`.
     #[serde(default)]
     pub continuous_column_on: bool,
     /// Viewer shortcut hints (Alt+?): old manifests keep hints visible.

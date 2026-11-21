@@ -3,7 +3,7 @@
 //! Closes the operator-visibility gap found 2026-07-18: after `/triage-review`
 //! clears an index-level `blocked_reason` and writes a dated
 //! `# OPERATOR <date> ...` directive into an issue entry, the issue has no
-//! visible state in the TUI's Continuous panel until the orchestrator's next
+//! visible state in the TUI's continuous status until the orchestrator's next
 //! cycle acts on it (hours later). During that window the operator can't tell
 //! approved-awaiting-dispatch apart from untracked.
 //!

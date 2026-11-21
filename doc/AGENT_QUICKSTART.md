@@ -202,6 +202,12 @@ Use your normal session chat for routine updates and questions to Owner, and cha
 
 ## Continuous worker and orchestrator handoffs
 
+Continuous work now uses the org-team model: mark a durable lead with
+`org(action="mark_continuous", ...)`, give it a `session_wake_schedule`, and
+bind event queues with `queue_bind`. New legacy scheduler records must not be
+created with `continuous.create`; retained records are migration-only. Leads
+and workers stay in the normal org sidebar, and `Alt+C` opens the dashboard.
+
 Read `~/.cm/policies/continuous-review-routing.md` on your execution host. The repository source is [continuous-review-routing.md](continuous-review-routing.md). Every continuous task has its own channel, `ct/<task-slug>`; CM creates it, binds it to the task and joins the orchestrator and every worker it can attribute to the task. `chat_open().continuous` gives a member the channel and the CURRENT orchestrator's participant ID (`role` is `orchestrator` or `member`). Workers post each step, blocker and handoff there with `mentions=[<orchestrator id>]`; the orchestrator wakes on every channel post, reviews on that wake, and dispatches/returns/promotes work by mentioning the worker. The operator posts landing dispositions in the same channel. Scheduled scans and consumer queues admit NEW work only; a channel wake does not request a fresh scan. Persist the disposition, and retain periodic reconciliation and completion monitors as fallback. Verify an observed wake and persisted review rather than assuming a successful send proves the whole path.
 
 Workers enter `review_queued`; parents enter `reviewing` and advance to `owner_review` only for a concrete Owner decision. Internal review stays planning `running`. Stage is carried by the colored task text and legend; a spinner or idle dot only describes activity. `report_done` completes your work slice (or your parent's scheduled run), not the planning task. Unfinished work keeps a live visible session; missing sessions need recovery using the existing task/worktree. Terminal work needs a settled, evidence-backed cleanup disposition, and closing a session is distinct from reaping its checkout.

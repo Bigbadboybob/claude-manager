@@ -72,8 +72,10 @@ existing channel with the existing task API:
 {"task_id":"bug-triage","messaging":{"channel_id":"<channel UUID>"}}
 ```
 
-Pass this to `continuous.update` (or supply `messaging` to `continuous.create`;
-either sets `task_channel: "manual"`). `messaging: null` removes the configured
+Pass this to `continuous.update` on a retained legacy record (or supply
+`messaging` to the legacy-only `continuous.create`; either sets
+`task_channel: "manual"`). New continuous teams manage their normal task
+channel through team setup. `messaging: null` removes the configured
 subscription; `task_channel: "off"` disables the channel. These are scheduler
 operations, not agent-supplied assertions about a task slug. Channel creation
 and joins are coordinator mutations: on a replica the refresh loop defers them

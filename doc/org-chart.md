@@ -17,8 +17,9 @@ the chart's focused session selected.
     for each workspace whose sessions have no task. Such a workspace joins
     the project its repository is named after, else Other.
   - **Continuous**, only when the project has any: one box per continuous
-    orchestrator. Its workers sit under it, grouped exactly as in the
-    continuous column (`A-c`).
+    orchestrator. Its workers sit under it, grouped by the same
+    `managed_by_uid`, `parent_task_id`, and same-task rules used by the
+    Sessions sidebar.
   The split labels are constants at the top of `orgchart.rs`
   (`TEAMS_LABEL`, `CONTINUOUS_LABEL`, `OTHER_PROJECT_LABEL`).
 - Under each split or division come the root tasks, with subtasks nested along
@@ -236,5 +237,5 @@ pane's member and team lines) over the snapshot client in
 (`layout`), the keys, drawing and the board poll. The chart reuses
 `task_leads`, `task_level`, `leader_glyph` and `planning.task_division`
 (`app/tree.rs`), the palette jump,
-`task_parent_map` and the continuous column's `continuous_rows_unfiltered`
+`task_parent_map` and the legacy continuous grouping helper
 (`app/nav.rs`).

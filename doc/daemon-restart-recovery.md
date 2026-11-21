@@ -66,12 +66,12 @@ readable. The viewer also fills missing task/continuous/parent tags from the
 owning daemon's existing session poll, preserving the session UID and PTY.
 
 An open workspace whose tasks descend from a visible continuous orchestrator
-stays in the Continuous column when its last session exits. It renders as a dim
+stays in the main sidebar when its last session exits. It renders as a dim
 `(no session)` row and supports normal workspace navigation, inspection and
-closure. Shared or ambiguous workspaces stay in the main sidebar; unfinished
-work is never hidden merely because its worker died. Closed workspaces stay
-closed. This display change needs a laptop TUI install/relaunch; agent sessions
-keep running.
+closure. Shared or ambiguous workspaces stay where the task tree places them;
+unfinished work is never hidden merely because its worker died. Closed
+workspaces stay closed. This display change needs a laptop TUI install/relaunch;
+agent sessions keep running.
 
 The viewer retains planning ancestry for Done tasks separately from active
 work. SP-4/SP-23/SP-30-style retained sessions therefore stay under their
