@@ -14,8 +14,8 @@ or other actions, and does not expand permission to DM Owner or control sessions
 The session's host daemon saves the alert in `~/.cm/owner-attention.json`, then
 sends it through the existing operator-authenticated `manifest.watch` stream.
 The updated laptop TUI submits the normal desktop notification and sound, and
-blinks the session's sidebar indicator. **Alt+g** prioritizes these indicators,
-including in the continuous column. Selecting the row acknowledges the alert.
+blinks the session's sidebar indicator. **Alt+g** prioritizes these indicators
+in the single org sidebar. Selecting the row acknowledges the alert.
 When a continuous task has started a replacement tick, its pending indicator
 follows the matching continuous task on the same host.
 

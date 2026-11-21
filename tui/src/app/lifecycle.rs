@@ -5031,14 +5031,8 @@ mod slice_12e_tests {
         assert!(matches!(single_items.as_slice(), [VisualItem::Session(0, 0)]));
     }
 
-    /// Continuous members (orchestrators + their subtasks) are excluded from
-    /// ALL three main sidebar builders — they live only in the dedicated
-    /// continuous column. The normal (non-continuous) session stays. Holds
-    /// regardless of `continuous_column_on` (the column's render gate is
-    /// separate; the main builders never carry continuous sessions). Replaces
-    /// the retired `continuous_sessions_sort_below_under_a_header` /
-    /// `hide_continuous_removes_group_from_all_builders` — continuous tasks no
-    /// longer render in the main sidebar at all (no `ContinuousHeader` there).
+    /// Legacy continuous members render in all main sidebar builders alongside
+    /// ordinary sessions. The old compatibility toggle does not hide them.
     #[test]
     fn continuous_members_excluded_from_all_main_builders() {
         let guard = crate::test_support::home_lock();
@@ -5087,18 +5081,18 @@ mod slice_12e_tests {
                 tombstones: Vec::new(),
             }
         };
-        let assert_excluded = |items: &[VisualItem], builder: &str| {
+        let assert_visible = |items: &[VisualItem], builder: &str| {
             assert!(
                 !items.iter().any(|i| matches!(i, VisualItem::ContinuousHeader)),
                 "{builder}: no ContinuousHeader in the main sidebar; got: {items:?}",
             );
             assert!(
-                !items.iter().any(|i| matches!(i, VisualItem::Session(0, 1))),
-                "{builder}: the orchestrator MUST be excluded; got: {items:?}",
+                items.iter().any(|i| matches!(i, VisualItem::Session(0, 1))),
+                "{builder}: the orchestrator must be visible; got: {items:?}",
             );
             assert!(
-                !items.iter().any(|i| matches!(i, VisualItem::Session(0, 2))),
-                "{builder}: the subtask MUST be excluded; got: {items:?}",
+                items.iter().any(|i| matches!(i, VisualItem::Session(0, 2))),
+                "{builder}: the worker must be visible; got: {items:?}",
             );
             assert!(
                 items.iter().any(|i| matches!(i, VisualItem::Session(0, 0))),
@@ -5111,8 +5105,8 @@ mod slice_12e_tests {
             let (mut app, _tmp) = build_app_with_hosts(&[("local", true)], &guard);
             app.workspaces.push(mk_ws());
             app.continuous_column_on = on;
-            assert_excluded(&app.visual_items_status(), "visual_items_status");
-            assert_excluded(&app.visual_items_task(), "visual_items_task");
+            assert_visible(&app.visual_items_status(), "visual_items_status");
+            assert_visible(&app.visual_items_task(), "visual_items_task");
         }
         // Multi-host status builder (>1 host routes through the multihost path).
         for on in [false, true] {
@@ -5122,7 +5116,7 @@ mod slice_12e_tests {
             );
             app.workspaces.push(mk_ws());
             app.continuous_column_on = on;
-            assert_excluded(
+            assert_visible(
                 &app.visual_items_status(),
                 "visual_items_status_multihost",
             );

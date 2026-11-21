@@ -158,7 +158,7 @@ work. Owner requested the plan before execution starts.
    presentation from normal
    task rows. Use a subtle inline local marker (proposed: dim `⌂`) only for local
    tasks, without adding a row. Keep exact host information in the detail view.
-   Preserve the continuous column, grouping, order and collapsed state. Audit all
+   Preserve continuous-team blocks, grouping, order and collapsed state. Audit all
    launch/restart paths, especially Bash, empty workspaces, in-place work and
    Neovim actions that might still access local paths. Remove the legacy session
    push/pull actions, shortcuts, help entries and obsolete transfer-specific

@@ -150,12 +150,7 @@ impl App {
             self.needs_redraw = true;
             return;
         };
-        let continuous = self.continuous_members().contains(&(wi, si));
-        if continuous && !self.continuous_column_on {
-            self.messages.error = "That session is in the continuous column: A-c shows it".into();
-            return;
-        }
-        self.cursor_column = if continuous { SidebarColumn::Continuous } else { SidebarColumn::Main };
+        self.cursor_column = SidebarColumn::Main;
         self.cursor = Cursor::Session(wi, si);
         self.reveal_cursor();
         self.messages.visible = false;

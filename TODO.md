@@ -9,7 +9,9 @@ Open threads, refreshed 2026-06-29 (late session). Priority order; each item has
 - **P0 — Session durability (S1–S5)** — daemon persist + restore-at-same-uid + resume; live on cm-manager, exercised by ~5 restarts this session (bug restore, re-parent, deploys), each re-resumed all sessions, no orchestrator double-spawn. Detail in `DESIGN_SESSION_DURABILITY.md`.
 - **P1 — Frozen-pane UX** — resolved by P0 S4 (remote-reattach + `A-r` "reconnect now").
 - **P2 — Global-host removal (Phases A–D)** — `active_host`/`A-H` cycler/HostHeader highlight gone; host is per-workspace. `DESIGN_REMOVE_GLOBAL_HOST.md`.
-- **P2 — Two-column continuous panel** — shipped, then **reworked this session** (`DESIGN_CONTINUOUS_PANEL.md` revision): single `A-c` toggle (dropped `A-C` + master-hide), continuous tasks ONLY in the column (never main), respawn-robust nesting (`managed_by_uid` OR task-tree `parent_task_id`), and per-column cursor memory (re-entry lands where you left off).
+- **P2 — Two-column continuous panel** — retired in phase 5 after continuous
+  teams moved into the org sidebar. `A-c` is free; old persisted state is
+  ignored, and legacy scheduler sessions remain visible in the main sidebar.
 - **P3 — `continuous.update` + autocompact** — deployed; bug-triage orchestrator on `compact_every: 16`.
 
 ## ✅ Also done this session (not previously on the list)

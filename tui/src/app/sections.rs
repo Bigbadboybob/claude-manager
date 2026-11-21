@@ -388,20 +388,13 @@ impl App {
     /// filter for the layout builder and the folded-header rollup.
     pub(crate) fn task_view_visible_workspaces(
         &self,
-        members: &HashSet<(usize, usize)>,
+        _members: &HashSet<(usize, usize)>,
     ) -> Vec<usize> {
-        let empty_owners = self.continuous_empty_workspace_owners();
         self.workspaces
             .iter()
             .enumerate()
             .filter(|(wi, ws)| {
-                if ws.is_closed || self.is_past_workspace(*wi) || empty_owners.contains_key(wi) {
-                    return false;
-                }
-                // A workspace whose ONLY sessions are continuous members
-                // renders in the continuous column, never here.
-                !(!ws.sessions.is_empty()
-                    && (0..ws.sessions.len()).all(|si| members.contains(&(*wi, si))))
+                !ws.is_closed && !self.is_past_workspace(*wi)
             })
             .map(|(wi, _)| wi)
             .collect()

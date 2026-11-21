@@ -6,7 +6,7 @@
 //! then its other root tasks) and Continuous; under those, root tasks and
 //! their subtasks along `parent_task_id`. A task
 //! box holds that task's sessions with its lead (the shared lead rule) on
-//! top. The Continuous org reuses the continuous column's grouping
+//! top. The Continuous org reuses the legacy continuous grouping helper
 //! (`continuous_rows_unfiltered`). Reporting lines only: nothing here
 //! implies approval rights.
 //!
@@ -802,7 +802,7 @@ impl App {
             known_projects.contains(name).then(|| name.to_owned())
         };
 
-        // Continuous org: the continuous column's grouping, verbatim. Tasks
+        // Continuous org: the legacy continuous grouping, verbatim. Tasks
         // it places map to their boxes, so a deeper subtask the column
         // doesn't group still lands under its parent here.
         let mut orch_of_task: HashMap<String, usize> = HashMap::new();
@@ -1156,11 +1156,6 @@ impl App {
             self.needs_redraw = true;
             return;
         };
-        let continuous = self.find_session_by_uid(&s.uid).is_some_and(|k| self.continuous_members().contains(&k));
-        if continuous && !self.continuous_column_on {
-            self.continuous_column_on = true;
-            self.set_status_msg("Continuous column shown (A-c hides it)");
-        }
         // The palette jump unfolds the sidebar above the session (reveal_cursor).
         self.apply_palette_jump(PaletteTarget::Session { uid: s.uid });
         self.needs_redraw = true;

@@ -243,23 +243,14 @@ impl App {
 
         match self.view_mode {
             ViewMode::Sessions => {
-                // Continuous panel: when `A-c` is on, split a third 36-col pane
-                // off the right for the dedicated continuous column
-                // (terminal | main | continuous). Off = terminal | main.
-                let cols = if self.continuous_column_on {
-                    Layout::horizontal([
-                        Constraint::Min(40),
-                        Constraint::Length(SIDEBAR_WIDTH),
-                        Constraint::Length(SIDEBAR_WIDTH),
-                    ])
-                    .split(content_area)
-                } else {
-                    Layout::horizontal([
-                        Constraint::Min(40),
-                        Constraint::Length(SIDEBAR_WIDTH),
-                    ])
-                    .split(content_area)
-                };
+                // Phase 5: the dedicated continuous pane is retired. Every
+                // session, including legacy continuous sessions, uses the
+                // ordinary main sidebar.
+                let cols = Layout::horizontal([
+                    Constraint::Min(40),
+                    Constraint::Length(SIDEBAR_WIDTH),
+                ])
+                .split(content_area);
 
                 let t = std::time::Instant::now();
                 self.draw_terminal(frame, cols[0]);
@@ -269,11 +260,6 @@ impl App {
                 self.draw_session_list(frame, cols[1]);
                 log_draw_section("sessions:list", t.elapsed());
 
-                if self.continuous_column_on {
-                    let t = std::time::Instant::now();
-                    self.draw_continuous_column(frame, cols[2]);
-                    log_draw_section("sessions:continuous", t.elapsed());
-                }
             }
             ViewMode::Planning => {
                 let t = std::time::Instant::now();
@@ -477,8 +463,7 @@ impl App {
             }
         }
         // Leave the task sidebar visible beside the live appearance preview.
-        let terminal_width = area.width.saturating_sub(SIDEBAR_WIDTH
-            * if self.continuous_column_on { 2 } else { 1 });
+        let terminal_width = area.width.saturating_sub(SIDEBAR_WIDTH);
         let settings_area = if self.view_mode == ViewMode::Sessions && terminal_width >= 40 {
             Rect { width: terminal_width, ..area }
         } else { area };
@@ -1351,13 +1336,8 @@ impl App {
         }
     }
 
-    /// Render the dedicated continuous column (S3) — orchestrators (depth 0)
-    /// with their spawned subtasks nested (depth 1, `├`-prefixed) from
-    /// `visual_items_continuous()`. Reuses `draw_session_list`'s indicator
-    /// glyphs (reconnecting `⟳` / hidden / Running spinner / Idle `●` / alert).
-    /// The cursor highlight + the `├`/`└` corner polish land in S4/S5.
-    /// A continuous-column row needs the operator when its durable stage is
-    /// OwnerReview, including the legacy raw-`blocked` compatibility mapping.
+    /// A legacy continuous row needs the operator when its durable stage is
+    /// OwnerReview, including the raw-`blocked` compatibility mapping.
     /// Never derive review ownership from session activity or idle time.
     fn session_needs_human(&self, ts: &TerminalSession) -> bool {
         let Some(tid) = ts.task_id.as_deref() else {
@@ -1377,8 +1357,8 @@ impl App {
     /// immediate attention alert. This durable question is set through
     /// `update_task(metadata=…)` (daemon-routed, works headless) and it
     /// rides the existing task-metadata sync (`reconcile_tasks`) to here —
-    /// rendered as a distinct `◉` glyph + an inline text line in the continuous
-    /// column so a pending decision (e.g. a `needs_human_decision`) is visible
+    /// rendered as a distinct `◉` glyph + an inline text line in legacy
+    /// continuous grouping so a pending decision (e.g. a `needs_human_decision`) is visible
     /// without attaching. The orchestrator clears it by writing the key back to
     /// null once resolved (the question is pending until IT resolves, not until
     /// the operator glances). Empty/whitespace is treated as absent.
@@ -1448,6 +1428,9 @@ impl App {
         }
     }
 
+    /// Legacy continuous grouping renderer retained for compatibility; the
+    /// production layout no longer calls it. It renders orchestrators (depth
+    /// 0) and their spawned subtasks (depth 1) from `visual_items_continuous`.
     fn draw_continuous_column(&mut self, frame: &mut Frame, area: Rect) {
         let title = self
             .sidebar_filter
@@ -1901,7 +1884,7 @@ impl App {
         let help_entries: Vec<(&str, &str)> = if self.keybinding_helper_visible { vec![
             ("A-/    filter", "A-?  helper"),
             ("A-j/k  nav", "A-D  done"),
-            ("A-h/l  column", "A-x  delete"),
+            ("A-h/l  free", "A-x  delete"),
             ("A-a    attach", "A-v  view"),
             ("A-n    new ws", "A-r  refresh"),
             ("A-s    +session", "A-q  quit"),
@@ -1910,8 +1893,8 @@ impl App {
             ("A-e    settings", "F9   global"),
             ("A-H    hide", "A-z  catalog"),
             ("A-f    workflow", "A-t  planning"),
-            ("A-o    stop wf", "A-c  cont-col"),
-            ("A-C    cont-stop", "A-,  activity"),
+            ("A-o    stop wf", "A-C  dashboard"),
+            ("A-c    free", "A-,  activity"),
             ("A-b    snapshot", "A-g  attention"),
             ("A-O    reopen ws", "A-F  fork task"),
             ("A-N    +section", "A-J/K sect order"),
@@ -2557,6 +2540,24 @@ impl App {
                     *item = item.clone().bg(bg);
                 }
             }
+        }
+
+        // Backtests used to be drawn in the retired continuous pane. Keep
+        // them visible in the single sidebar with the existing renderer.
+        let backtests: Vec<VisualItem> = visual
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item,
+                    VisualItem::BacktestHeader
+                        | VisualItem::BacktestFleet(_)
+                        | VisualItem::BacktestRun { .. }
+                )
+            })
+            .cloned()
+            .collect();
+        if !backtests.is_empty() {
+            items.extend(self.backtest_list_items(&backtests, inner.width, spinner, now));
         }
 
         let mut state = std::mem::take(&mut self.sidebar_list_state);
@@ -4043,7 +4044,7 @@ mod continuous_team_sidebar_tests {
 
 #[cfg(test)]
 mod dispatch_pending_filter_tests {
-    //! Planning-liveness half of the Continuous panel's dispatch-pending
+    //! Planning-liveness half of the continuous status dispatch-pending
     //! (○) indicator: `issue_awaits_dispatch`. The parse half (cleared
     //! blocked_reason + dated OPERATOR directive + no ack) is tested
     //! daemon-side in `cm_daemon::continuous::dispatch_pending`.

@@ -8791,7 +8791,7 @@ mod backtest_group_tests {
                 assert!(app.continuous_members().contains(&(wi, 0)));
                 assert!(app.visual_items_continuous().iter().any(|r|
                     r.ws_idx == wi && r.sess_idx == Some(0) && r.depth == 1));
-                assert!(!app.task_view_visible_workspaces(&app.continuous_members()).contains(&wi));
+                assert!(app.task_view_visible_workspaces(&app.continuous_members()).contains(&wi));
                 assert_eq!(app.workspaces[wi].sessions[0].uid, uid);
                 assert!(!app.tasks.iter().any(|t| t.task_id.as_deref() == Some("worker")),
                     "Done tasks must not become active work or mint new workspaces");
@@ -8869,7 +8869,7 @@ mod backtest_group_tests {
         });
     }
 
-    /// Sidebar shape: the group rides at the bottom of the continuous panel;
+    /// Sidebar shape: the group rides at the bottom of the main sidebar;
     /// perf-bench fleet (shared label stem) renders as ONE fleet row —
     /// members hidden until unfolded — while an unrelated run stays flat.
     /// Folding the group collapses everything to the header.
@@ -8975,21 +8975,9 @@ mod backtest_group_tests {
             app.cursor = Cursor::Session(0, 0);
             assert!(app.active_session().is_some(), "real session untouched");
 
+            assert!(app.visual_items().iter().any(|item| matches!(item, VisualItem::BacktestHeader)));
             app.step_column(1);
-            assert_eq!(app.cursor, Cursor::Backtest(BacktestCursor::Group));
-            assert!(
-                app.active_session().is_none(),
-                "no PTY behind backtest rows",
-            );
-            app.navigate(1);
-            assert_eq!(
-                app.cursor,
-                Cursor::Backtest(BacktestCursor::Run("solo".into())),
-            );
-            app.navigate(1);
-            assert_eq!(app.cursor, Cursor::Backtest(BacktestCursor::Group), "wraps inside continuous panel");
-            app.step_column(-1);
-            assert_eq!(app.cursor, Cursor::Session(0, 0), "returns to the main session");
+            assert_eq!(app.cursor, Cursor::Session(0, 0), "retired column navigation is a no-op");
 
             // Cursor on a row that then leaves the group → clamp steps up to
             // the header; group emptied entirely → falls back to workspaces.

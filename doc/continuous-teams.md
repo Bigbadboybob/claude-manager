@@ -1,14 +1,11 @@
 # Continuous tasks become continuous teams
 
-Status: plan agreed with Owner 2026-11-06. Phase 1 cleanup done (45 stale items
-closed, 623 merged branches deleted). Phase 3 CM features deployed 2026-11-16
-(brain 01bca590, API migrations 037/038). Phase 2 under way: the Ingest lead
-(Claude Opus, member `ingest`, division `ingest`, marked continuous) runs on
-cm-manager since 2026-11-16 00:06Z under charter
-[ingest-charter-draft.md](ingest-charter-draft.md) v3. scraper-triage is
-paused (Ingest's 6h sweep replaces it); the other Ingest orchestrators are
-paused as Ingest binds their queues. Latency optimization starts after
-phases 4 and 5.
+Status: plan agreed with Owner 2026-11-06. Phases 1–4 are live; phase 5
+(retire the legacy TUI column and reject new legacy creates) landed 2026-11-21.
+Phase 6 is the latency optimization team. The Ingest lead (Claude Opus, member
+`ingest`, division `ingest`, marked continuous) runs on cm-manager under
+[ingest-charter-draft.md](ingest-charter-draft.md) v3. A few legacy scheduler
+records remain and keep running until migration is complete.
 
 ## Why
 
@@ -150,8 +147,8 @@ marker host is `unknown` until that host's projection is read. Queue rows retain
 stable `queue_list()` fields and are filtered to queues bound to the lead (or
 explicit queue names in the marker). The Task sidebar renders the lead's
 sessions in the org section as a tinted box. Its header is `⟳ every 6h · next
-1h12m · ok`; a queue-only lead uses `⟳ queue · 3 pending · ok`. The legacy
-continuous column remains unchanged until phase 5.
+1h12m · ok`; a queue-only lead uses `⟳ queue · 3 pending · ok`. The dedicated legacy continuous column is retired in phase 5; old scheduler
+sessions now render in this same org section.
 
 Live fields are refreshed even when the planning org version is unchanged.
 The laptop merges each marked team's projection from its `host_id` daemon;
@@ -173,8 +170,10 @@ read for a host-local dashboard or monitor.
    - The boxed sidebar block.
    - The dashboard, `#continuous`, and the monitor agent.
 4. **Move the execution policy and prob pipeline teams.**
-5. **Retire** the continuous column and the old scheduler paths. Rewrite
-   the docs on creating a continuous team.
+5. **Retire** the continuous column and reject new legacy scheduler creates.
+   Existing records keep running while teams are migrated; scheduler internals
+   remain until the legacy record count reaches zero. Docs now describe team
+   setup.
 6. **Latency optimization team** (Owner, 2026-11-16: after phases 4 and 5).
 
 ## Prerequisites

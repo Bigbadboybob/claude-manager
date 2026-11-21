@@ -39,8 +39,8 @@ pub struct TerminalSession {
     pub status: SessionStatus,
     /// Start of the CURRENT idle spell — `Some(instant the status last
     /// flipped Running→Idle)`, `None` while Running. Drives the idle-age
-    /// indicator buckets (afterglow / settled / stale) in the sidebar and
-    /// continuous column. In-memory only, never persisted: a TUI restart
+    /// indicator buckets (afterglow / settled / stale) in the sidebar.
+    /// In-memory only, never persisted: a TUI restart
     /// just loses the age, and an unknown age renders as the oldest
     /// bucket. Maintain via [`TerminalSession::set_status`] — direct
     /// `status` writes on genuine transitions would strand a stale value.
