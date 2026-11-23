@@ -1184,10 +1184,11 @@ pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodR
     }
     // task_id resolution. Allows binding to the caller's own task or
     // any descendant in the parent_task_id tree. Cross-task binding
-    // outside the descendant tree is unauthorized — UNLESS the caller
-    // is global, in which case it can bind the child to any task.
+    // outside the descendant tree requires global permissions or a
+    // persisted launch grant for this caller and task.
+    let grants = cm_daemon::items::grants::load(&cm_daemon::messaging::rpc::default_root());
     let task_id_for_new: Option<String> = match (p.task_id.as_deref(), caller.task_id.as_deref()) {
-        (Some(req), _) if caller.global_perms => Some(req.to_string()),
+        (Some(req), _) if caller.global_perms || cm_daemon::items::grants::find(&grants, caller_uid, req).is_some() => Some(req.to_string()),
         (Some(req), None) => {
             return Err((
                 ErrorCode::Unauthorized,
@@ -4027,6 +4028,26 @@ mod tests {
             unsafe { std::env::remove_var("HOME") };
         }
         std::mem::forget(tmp);
+    }
+
+    #[test]
+    fn taskless_launch_checks_persisted_proposal_grants() {
+        with_app_and_repo("tui-grant", |app, _repo| {
+            let wi = app.workspaces.len() - 1;
+            app.workspaces[wi].sessions.push(live_ts("caller", None));
+            let root = cm_daemon::messaging::rpc::default_root();
+            let mut grants = vec![];
+            cm_daemon::items::grants::persist(&mut grants, &root, vec![cm_daemon::items::grants::LaunchGrant {
+                proposal: true, task_id: "filed".into(), session_uid: "caller".into(),
+                pid: String::new(), board: None, n: None,
+            }]);
+            let denied = start_session(app, "caller", &json!({"type":"bash", "label":"other", "task_id":"unrelated", "allow_shared_workspace":true})).unwrap_err();
+            assert_eq!(denied.0, ErrorCode::Unauthorized);
+            // The grant passes authorization; the isolated test has no daemon
+            // to serve the subsequent spawn, so it may fail at that later step.
+            let result = start_session(app, "caller", &json!({"type":"bash", "label":"worker", "task_id":"filed", "allow_shared_workspace":true}));
+            if let Err(err) = result { assert_ne!(err.0, ErrorCode::Unauthorized, "{err:?}"); }
+        });
     }
 
     #[test]

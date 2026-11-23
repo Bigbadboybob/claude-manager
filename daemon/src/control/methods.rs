@@ -6844,6 +6844,22 @@ pub fn propose_task(
         api_token_override,
     ) {
         Ok(task) => {
+            // A taskless session has no task from which to derive a creator
+            // edge. Give that live session a durable, launch-only grant.
+            if let (Some(cuid), Some(task_id)) = (caller_uid, task.get("id").and_then(Value::as_str)) {
+                let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+                if state.lookup_session_any(cuid).is_some_and(|view| view.task_id.is_none())
+                    && !state.launch_grants.iter().any(|g| g.proposal && g.session_uid == cuid && g.task_id == task_id)
+                {
+                    let mut grants = state.launch_grants.clone();
+                    grants.push(crate::items::grants::LaunchGrant {
+                        proposal: true, task_id: task_id.into(), session_uid: cuid.into(),
+                        pid: String::new(), board: None, n: None,
+                    });
+                    let root = state.messaging_root.clone();
+                    crate::items::grants::persist(&mut state.launch_grants, &root, grants);
+                }
+            }
             // A reporting line wins: the overlay edge then mirrors the
             // planning row's real parent instead of contradicting it.
             if let Some(parent) = parent_task_id.as_deref() {
@@ -6862,8 +6878,8 @@ pub fn propose_task(
             // top-level (the backlog is the user's triage queue); only the
             // daemon's auth overlay knows the edge — see
             // `DaemonState::agent_task_edges`. Best-effort by design:
-            // Operator callers, taskless sessions, and unknown uids record
-            // nothing and keep today's propose-only behavior.
+            // Operator callers and unknown uids record no edge. Taskless
+            // sessions instead receive the launch-only grant above.
             if let Some(cuid) = caller_uid {
                 let new_task_id = task
                     .get("id")
@@ -32182,6 +32198,7 @@ while True:
             let err = mcp_start_session(&state, &params, Some("ts-caller")).unwrap_err();
             assert_eq!(err.0, ErrorCode::Unauthorized, "{err:?}");
             state.lock().unwrap().launch_grants.push(crate::items::grants::LaunchGrant {
+                proposal: false,
                 task_id: "task-9".into(),
                 session_uid: "ts-caller".into(),
                 pid: "agent:d1:ts-caller".into(),
@@ -42002,6 +42019,49 @@ printf ran > "$MAIN_REPO/setup-ran"
         drop(requests);
 
         kill_all_sessions(&state);
+    }
+
+    #[test]
+    fn taskless_proposer_can_launch_only_its_proposal_after_restart_and_heartbeat() {
+        with_temp_home(|| {
+            let state = make_state_arc();
+            seed_mcp_spawn_fixture(&state, "ts-proposer", None);
+            let stub = spawn_routed_stub(|method, path, _| match (method, path) {
+                ("GET", "/projects") => (200, r#"[{"name":"proj","repo_url":"git@x.com:a/b.git"}]"#.into()),
+                ("POST", "/tasks") => (200, r#"{"id":"task-proposed","status":"backlog"}"#.into()),
+                ("GET", "/tasks/task-proposed") => (200, r#"{"id":"task-proposed","status":"backlog","kind":"oneshot"}"#.into()),
+                ("PATCH", "/tasks/task-proposed") => (200, "{}".into()),
+                _ => (404, "{}".into()),
+            });
+            let root = tempfile::tempdir().unwrap();
+            {
+                let mut s = state.lock().unwrap();
+                s.messaging_root = root.path().into();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".into();
+            }
+            propose_task(&state, &json!({"project":"proj", "name":"work"}), Some("ts-proposer")).unwrap();
+            {
+                let mut s = state.lock().unwrap();
+                assert!(crate::items::grants::find(&s.launch_grants, "ts-proposer", "task-proposed").is_some());
+                s.launch_grants.clear();
+            }
+            propose_task(&state, &json!({"project":"proj", "name":"work", "reports_to":"parent"}), Some("ts-proposer")).unwrap();
+            {
+                let mut s = state.lock().unwrap();
+                s.launch_grants = crate::items::grants::load(root.path());
+                assert!(crate::items::grants::find(&s.launch_grants, "ts-proposer", "task-proposed").is_some());
+                crate::items::grants::replace(&mut s.launch_grants, root.path(), vec![]);
+                assert!(crate::items::grants::find(&crate::items::grants::load(root.path()), "ts-proposer", "task-proposed").is_some());
+            }
+            let denied = mcp_start_session(&state, &json!({"type":"bash", "label":"other", "task_id":"unrelated"}), Some("ts-proposer")).unwrap_err();
+            assert_eq!(denied.0, ErrorCode::Unauthorized);
+            set_spawn_program_override_for_test(Some(("/bin/sleep".into(), vec!["120".into()])));
+            let child = mcp_start_session(&state, &json!({"type":"bash", "label":"worker", "task_id":"task-proposed", "allow_shared_workspace":true}), Some("ts-proposer")).unwrap();
+            assert_eq!(child["task_id"], "task-proposed");
+            set_spawn_program_override_for_test(None);
+            kill_all_sessions(&state);
+        });
     }
 
     /// `org`: "me" walks the reporting chain and resolves leads from this

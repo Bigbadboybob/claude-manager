@@ -136,11 +136,7 @@ For a tutorial to hand to existing agents, use [Claude Manager: quick start for 
 
 ## Permission convention for agents (Phase 7)
 
-You have tools that can spawn subtasks, start sessions, send input to other sessions, kill sessions, start workflows, and create subtasks. **Before using any of them, state your intent in plain language and ask the user to confirm.** The tools will not refuse you, but the user expects to stay in the loop. Apply the same convention to anything destructive (killing a session, marking a subtask done, stopping a workflow).
-
-Read-only tools (`ping`, `list_sessions`, `list_sessions_grouped`, `read_session_output`, `get_workflow_state`, `list_workflows`, `list_subtasks`) don't need pre-approval — call them as needed.
-
-If you hold **global permissions** (`ping().global_perms == true`), you can reach sessions outside your own task tree. The convention matters *more*, not less, there: state your intent and confirm before driving unrelated work, and never pass `global_perms=true` to `start_session` without explicit user say-so.
+Agents start, prompt and launch sessions for their own work without asking. Do not drive other people's sessions or work outside your scope; grant `global_perms` only on Owner's say-so.
 
 ## On `signal 9` from a Bash tool
 

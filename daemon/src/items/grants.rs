@@ -4,11 +4,12 @@
 //! `item_resolve(launch)` an assistant for that task even where the scope
 //! rule would refuse (a taskless caller, or a task in another tree). The API
 //! writes the grant when the owner changes; every board heartbeat reply
-//! carries this daemon's full live set, which replaces the cache here and is
+//! carries this daemon's full live set, which replaces API grants and is
 //! persisted beside the messaging store, so a brain restart admits the same
 //! launches before its first beat (fail-static). It is not a task-parent or
 //! creator edge: a TUI tree push or a restart cannot drop it, and it grants
-//! launch only, not control of the task's other sessions.
+//! launch only, not control of the task's other sessions. Locally issued
+//! proposal grants survive heartbeat replacement and share the same store.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,6 +17,8 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchGrant {
+    #[serde(default)]
+    pub proposal: bool,
     pub task_id: String,
     pub session_uid: String,
     #[serde(default)]
@@ -46,6 +49,7 @@ pub fn from_reply(reply: &Value) -> Option<Vec<LaunchGrant>> {
         rows.iter()
             .filter_map(|r| {
                 Some(LaunchGrant {
+                    proposal: false,
                     task_id: r["task_id"].as_str()?.to_string(),
                     session_uid: r["session_uid"].as_str()?.to_string(),
                     pid: r["pid"].as_str().unwrap_or_default().to_string(),
@@ -58,11 +62,18 @@ pub fn from_reply(reply: &Value) -> Option<Vec<LaunchGrant>> {
 }
 
 /// Replace the cache; persist when it changed. Returns whether it did.
-pub fn replace(cache: &mut Vec<LaunchGrant>, root: &Path, grants: Vec<LaunchGrant>) -> bool {
+pub fn replace(cache: &mut Vec<LaunchGrant>, root: &Path, mut grants: Vec<LaunchGrant>) -> bool {
+    grants.extend(cache.iter().filter(|g| g.proposal).cloned());
+    persist(cache, root, grants)
+}
+
+/// Persist both API grants and locally issued proposal grants atomically.
+pub fn persist(cache: &mut Vec<LaunchGrant>, root: &Path, grants: Vec<LaunchGrant>) -> bool {
     if *cache == grants {
         return false;
     }
     *cache = grants;
+    let _ = std::fs::create_dir_all(root);
     let tmp = path(root).with_extension("json.tmp");
     if let Ok(bytes) = serde_json::to_vec_pretty(cache) {
         if std::fs::write(&tmp, bytes).is_ok() {
@@ -79,6 +90,10 @@ pub fn find<'a>(cache: &'a [LaunchGrant], session_uid: &str, task_id: &str) -> O
 
 /// One line per launch admitted by a grant, like the §6.3 bootstrap rules.
 pub fn log_use(grant: &LaunchGrant, caller: &str) {
+    if grant.proposal {
+        eprintln!("cm-daemon: launch grant: {caller} launched proposed task {}", grant.task_id);
+        return;
+    }
     eprintln!(
         "cm-daemon: launch grant: {caller} launched for task {} as the owner of {}#{}",
         grant.task_id,

@@ -6,7 +6,7 @@
 
 Give agents running inside the TUI the same control surface a human user has: spawn subtasks (in the same worktree or in a child worktree branched from the parent), spawn and manage sibling sessions, prompt and read other sessions, launch and steward workflows, and mark work done. Everything stays visible in the TUI sidebar with clear markers for "this is a subtask of X" and "this session is being driven by agent Y."
 
-Permission is a prompt-level convention ("ask the user before acting"), not a hard gate. The user remains in the loop via a real-time activity feed in the TUI.
+Agents operate within their assigned scope; the TUI activity feed shows session activity.
 
 This is a substantial expansion of the MCP surface and requires three foundational pieces of infra before the user-facing tools land:
 
@@ -214,7 +214,7 @@ Granting (two paths, both gated so a normal agent can never self-escalate):
 **The grant rides every respawn at the same uid.** `start_session` takes `global_perms` at spawn (operator-trusted; the TUI's `ClientSessionConfig::global_perms`), and the restore / `A-R` revive / forced-restart paths pass the manifest entry's grant, so a re-registered session comes back global. History (2026-08-21, the planning session): `A-R` on a live global session killed it and respawned the uid **without** the grant — the daemon registered it ungranted (`list_sessions_grouped` shrank to the session's own task tree) while the TUI row kept `true`, so the operator's A-e re-grant compared against the stale `true`, never sent the RPC, and nothing converged until the grant was re-issued directly. Symptom to recognize: `ping().global_perms == false` on a session the sidebar's A-e dialog shows as `[x] global perms`.
 - **Agent propagation**: a session that is *already* global may pass `global_perms=true` to `start_session` to mint a global child. The daemon's `mcp_start_session` enforces an **escalation guard** — the grant is honored only if the caller itself is global; otherwise `unauthorized`. A non-global agent therefore cannot create a privileged child to escape its own scope.
 
-Like the rest of this model, `global_perms` is an **accidental-misuse guardrail, not a security boundary** (same-user processes can already impersonate each other — see the soft-token note above). Its job is to let a deliberately-privileged orchestrator reach across the session graph while keeping ordinary agents scoped. The prompt-level convention still applies: a global agent should state its intent and ask the user before driving unrelated sessions.
+Like the rest of this model, `global_perms` is an **accidental-misuse guardrail, not a security boundary** (same-user processes can already impersonate each other — see the soft-token note above). Its job is to let a deliberately-privileged orchestrator reach across the session graph while keeping ordinary agents scoped. Global access does not authorize driving other people's sessions or work outside your scope.
 
 ---
 
@@ -753,11 +753,7 @@ Backed by a ring buffer in app state. Every control-socket mutation appends an e
 
 ## Phase 7 — Permission instructions
 
-Add a section to project `CLAUDE.md` and to agent activation prompts delivered by workflow templates:
-
-> You have tools that can spawn subtasks, start sessions, send input to other sessions, kill sessions, and start workflows. **Before using any of them, state your intent in plain language and ask the user to confirm.** The tools will not refuse you, but the user expects to stay in the loop. Apply the same convention to anything destructive (killing a session, marking a subtask done).
-
-No hard gates. The activity feed is the "trust but verify" layer.
+Agents start, prompt and launch sessions for their own work without asking. Do not drive other people's sessions or work outside your scope; grant `global_perms` only on Owner's say-so.
 
 ---
 

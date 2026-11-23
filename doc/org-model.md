@@ -568,7 +568,9 @@ description, `kind`).
   the launch authorization path, including for taskless callers. It is not a
   task-parent or creator edge, so a TUI tree push or restart does not drop it.
   It is logged like the §6.3 bootstrap rules and grants launch only, not
-  control of other sessions on the task.
+  control of other sessions on the task. A taskless session that files a task
+  also receives a persisted launch-only grant for that task; board heartbeats
+  do not replace these locally issued proposal grants.
 - Delivering an item to a session composes the brief from the item's title,
   description, epic and goal, board and links; the team's charter link; and the
   member's and team's standing rules (§8.4). `start_session(task_id=…)` keeps
