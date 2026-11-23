@@ -127,14 +127,14 @@ impl App {
         let Some(snap) = self.org_live() else { return self.visual_items_task() };
         let shown = |wi: usize, si: usize| {
             let ws = &self.workspaces[wi];
-            !ws.is_closed && !self.is_past_workspace(wi)
+            !ws.is_closed && (snap.host_daemons.contains_key(ws.sessions[si].host_id.as_str()) || !self.is_past_workspace(wi))
         };
         let mut under: HashMap<Attach, Vec<(usize, usize)>> = HashMap::new();
         {
             let attached = self.session_attachments(snap);
             for (wi, ws) in self.workspaces.iter().enumerate() {
                 for (si, ts) in ws.sessions.iter().enumerate() {
-                    if let Some((to, _)) = attached.get(&ts.uid) {
+                    if let Some((to, _)) = attached.for_session(snap, ts) {
                         under.entry(to.clone()).or_default().push((wi, si));
                     }
                 }
@@ -189,7 +189,10 @@ impl App {
             .filter(|&(wi, si)| shown(wi, si) && !claimed.contains(&(wi, si)))
             .collect();
         // Owner started it (no spawner), else Unassigned.
-        let (owners, orphans): (Vec<_>, Vec<_>) = rest.into_iter().partition(|&(wi, si)| self.workspaces[wi].sessions[si].managed_by_uid.is_none());
+        let (owners, orphans): (Vec<_>, Vec<_>) = rest.into_iter().partition(|&(wi, si)| {
+            let ts = &self.workspaces[wi].sessions[si];
+            snap.host_daemons.contains_key(ts.host_id.as_str()) || ts.managed_by_uid.is_none()
+        });
         for (key, rows) in [(OWNER_SESSIONS_KEY, owners), (UNASSIGNED_KEY, orphans)] {
             if rows.is_empty() {
                 continue;
@@ -206,7 +209,7 @@ impl App {
     /// A member's main session, then its assistants (spawn order), with the
     /// sessions of the teams it leads.
     fn member_rows(&self, snap: &OrgSnapshot, m: &Member, under: &HashMap<Attach, Vec<(usize, usize)>>) -> Vec<(usize, usize)> {
-        let mut out: Vec<(usize, usize)> = m.main_uid().and_then(|uid| self.find_session_by_uid(uid)).into_iter().collect();
+        let mut out: Vec<(usize, usize)> = self.find_member_main(snap, m).into_iter().collect();
         out.extend(under.get(&Attach::Member(m.id.clone())).into_iter().flatten().copied());
         for t in snap.teams.iter().filter(|t| !t.archived() && t.lead_member_id.as_deref() == Some(m.id.as_str())) {
             out.extend(under.get(&Attach::Team(t.id.clone())).into_iter().flatten().copied());

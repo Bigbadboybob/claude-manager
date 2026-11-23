@@ -431,6 +431,13 @@ pub struct App {
     /// out to loose). Absent = inherit through the task tree. Persisted as
     /// `Manifest::workspace_sections`.
     pub(crate) workspace_sections: HashMap<String, String>,
+    /// Member assignments survive replacing a member's main session.
+    pub(crate) member_sections: HashMap<String, String>,
+    pub(crate) member_section_migration_done: bool,
+    pub(crate) member_section_migration_issues: Vec<(String, String, String)>,
+    pub(crate) pending_member_sections: HashMap<String, String>,
+    pub(crate) fallback_only_workspace_sections: HashSet<String>,
+    pub(crate) member_section_migration_open: bool,
     pub(crate) sidebar_receipts: HashMap<String, cm_daemon::sidebar::Receipt>,
     pub(crate) sidebar_retry_at: Instant,
     pub(crate) sidebar_pending: HashMap<(cm_daemon::host_id::HostId, String), cm_daemon::sidebar::Assignment>,
@@ -1104,6 +1111,12 @@ impl App {
             last_drawn_cursor: None,
             sections,
             workspace_sections,
+            member_sections: manifest.member_sections.clone(),
+            member_section_migration_done: manifest.member_section_migration_done,
+            member_section_migration_issues: manifest.member_section_migration_issues.clone(),
+            pending_member_sections: manifest.pending_member_sections.clone(),
+            fallback_only_workspace_sections: manifest.fallback_only_workspace_sections.iter().cloned().collect(),
+            member_section_migration_open: false,
             sidebar_receipts: manifest.sidebar_receipts.clone(),
             sidebar_pending: HashMap::new(),
             sidebar_retry_at: Instant::now(),

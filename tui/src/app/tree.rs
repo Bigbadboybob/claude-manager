@@ -58,6 +58,15 @@ pub(super) fn migrate_workspace_folds<'a>(
 pub(super) enum Node {
     Division(DivisionKey),
     Workspace(usize),
+    Member(String),
+    Group(String),
+}
+
+fn member_fold_key(member: &str) -> String { format!("sidebar:member:{member}") }
+
+pub(super) fn checkout_key_workspace(key: &str) -> Option<String> {
+    let encoded = key.strip_prefix("sidebar:checkout:").or_else(|| key.strip_prefix("sidebar:continuation:"))?;
+    serde_json::from_str::<(String, String)>(encoded).ok().map(|(_, workspace)| workspace)
 }
 
 /// Tree metadata for one Task sub-view row.
@@ -100,6 +109,18 @@ pub(super) struct TaskTree {
     pub section_of: HashMap<usize, String>,
     /// Each section's visible workspaces, in workspace order.
     pub section_members: HashMap<String, Vec<usize>>,
+    pub section_sessions: HashMap<String, Vec<(usize, usize)>>,
+    /// Main session row → member block, and the blocks with hidden content.
+    pub member_headers: HashMap<(usize, usize), String>,
+    pub member_foldable: HashSet<String>,
+    /// Labels for synthetic member, team, and checkout rows.
+    pub org_labels: HashMap<String, String>,
+    /// Org rows can share a workspace across sections, so section is per row.
+    pub row_sections: HashMap<VisualItem, String>,
+    pub checkout_labels: HashMap<VisualItem, String>,
+    pub team_labels: HashMap<VisualItem, String>,
+    pub boxed_rows: HashSet<VisualItem>,
+    pub boxed_last: HashSet<VisualItem>,
 }
 
 /// Reporting lines and liveness, built once per frame and shared by the
@@ -226,6 +247,233 @@ struct Forest {
     children: HashMap<usize, Vec<usize>>,
 }
 
+/// The snapshot's host-qualified placement, before sections or folding.
+/// Sessions from older or unreachable hosts remain in the legacy forest.
+#[derive(Default)]
+pub(super) struct OrgPlacement {
+    pub(super) members: HashMap<String, Vec<(usize, usize)>>,
+    fallback: HashSet<(usize, usize)>,
+}
+
+#[derive(Debug)]
+struct OrgMemberBlock {
+    id: String,
+    main: Option<(usize, usize)>,
+    sessions: Vec<(usize, usize)>,
+    parent: Option<String>,
+    section: Option<String>,
+    team: Option<String>,
+    boxed: Option<String>,
+}
+
+#[derive(Debug)]
+struct OrgContinuation {
+    member: String,
+    workspace: usize,
+    section: Option<String>,
+    sessions: Vec<(usize, usize)>,
+}
+
+#[derive(Default)]
+struct OrgBlocks {
+    members: Vec<OrgMemberBlock>,
+    continuations: Vec<OrgContinuation>,
+}
+
+impl OrgPlacement {
+    /// A continuous lead owns every placed member below it. If continuous
+    /// teams nest, the outer lead claims the subtree first so a session can
+    /// never be emitted in two boxes.
+    pub(super) fn box_owners(&self, snap: &super::org_model::OrgSnapshot) -> HashMap<String, String> {
+        let depth = |id: &str| {
+            let mut seen = HashSet::new();
+            let mut current = Some(id);
+            while let Some(id) = current.filter(|id| seen.insert(*id)) {
+                current = snap.member(id).and_then(|m| m.manager_member_id.as_deref());
+            }
+            seen.len()
+        };
+        let mut teams: Vec<_> = snap.teams.iter().filter(|team| !team.archived()).filter_map(|team| {
+            Some((team, team.continuous.as_ref()?.lead_member_id.as_deref()?))
+        }).collect();
+        teams.sort_by(|(a, al), (b, bl)| depth(al).cmp(&depth(bl)).then(a.id.cmp(&b.id)));
+        let mut owners = HashMap::new();
+        for (team, lead) in teams {
+            for member in self.members.keys().filter(|id| snap.in_member_subtree(id, lead)) {
+                owners.entry(member.clone()).or_insert_with(|| team.id.clone());
+            }
+        }
+        owners
+    }
+}
+
+impl App {
+    /// Build member blocks independently of task ancestry. A checkout
+    /// override can detach a stream into a continuation, but never splits a
+    /// main's home checkout or a continuous box.
+    fn org_blocks(&self, snap: &super::org_model::OrgSnapshot, placement: &OrgPlacement) -> OrgBlocks {
+        let mut active: HashSet<String> = placement.members.keys().cloned().collect();
+        let mut expanded = placement.members.clone();
+        for id in active.clone() {
+            let mut seen = HashSet::from([id.clone()]);
+            let mut parent = snap.member(&id).and_then(|m| m.manager_member_id.clone());
+            while let Some(pid) = parent.filter(|p| seen.insert(p.clone())) {
+                let Some(manager) = snap.member(&pid) else { break; };
+                if manager.is_owner() || manager.retired() { break; }
+                // A main on an old/unreachable brain is already rendered by
+                // the legacy forest; do not invent a duplicate block for it.
+                if manager.main.as_ref().and_then(|m| m.daemon_id.as_deref()).is_some_and(|daemon|
+                    !snap.host_daemons.values().any(|known| known == daemon)) { break; }
+                active.insert(pid.clone());
+                expanded.entry(pid.clone()).or_default();
+                parent = manager.manager_member_id.clone();
+            }
+        }
+        let boxes = OrgPlacement { members: expanded, fallback: HashSet::new() }.box_owners(snap);
+        let mut result = OrgBlocks::default();
+        let mut section_by_member = HashMap::new();
+        for member in snap.members.iter().filter(|m| active.contains(&m.id) && !m.retired()) {
+            section_by_member.insert(member.id.clone(), super::sections::member_section(
+                snap, &self.member_sections, &self.sections, &member.id));
+        }
+        for member in snap.members.iter().filter(|m| active.contains(&m.id) && !m.retired()) {
+            let section = section_by_member.get(&member.id).cloned().flatten();
+            let boxed = boxes.get(&member.id).cloned();
+            let mut rows = placement.members.get(&member.id).cloned().unwrap_or_default();
+            let main = rows.iter().copied().find(|(wi, si)| {
+                let ts = &self.workspaces[*wi].sessions[*si];
+                member.main.as_ref().is_some_and(|m| m.session_uid.as_deref() == Some(&ts.uid)
+                    && m.daemon_id.as_deref() == snap.host_daemons.get(ts.host_id.as_str()).map(String::as_str))
+            });
+            let main_ws = main.map(|(wi, _)| wi);
+            let mut continuations: BTreeMap<(usize, Option<String>), Vec<(usize, usize)>> = BTreeMap::new();
+            rows.retain(|&(wi, si)| {
+                // A main's checkout stays in the member's section; conflicting
+                // overrides go on the review list. Only other checkouts get continuations.
+                if boxed.is_some() || Some(wi) == main_ws { return true; }
+                if self.fallback_only_workspace_sections.contains(&self.workspaces[wi].id) { return true; }
+                let Some(choice) = self.workspace_sections.get(&self.workspaces[wi].id) else { return true; };
+                let override_section = if choice.is_empty() { None } else if self.section_by_id(choice).is_some() {
+                    Some(choice.clone())
+                } else { return true; };
+                if override_section == section { return true; }
+                continuations.entry((wi, override_section)).or_default().push((wi, si));
+                false
+            });
+            rows.sort_by_key(|&(wi, si)| ((wi, si) != main.unwrap_or((usize::MAX, usize::MAX)), Some(wi) != main_ws, wi, si));
+            result.continuations.extend(continuations.into_iter().map(|((workspace, section), sessions)| OrgContinuation {
+                member: member.id.clone(), workspace, section, sessions,
+            }));
+            let parent = member.manager_member_id.as_ref().filter(|id| {
+                active.contains(*id) && snap.member(id).is_some_and(|m| !m.is_owner())
+                    && (boxed.is_some() && boxes.get(*id) == boxed.as_ref()
+                        || boxed.is_none() && !boxes.contains_key(*id) && section_by_member.get(*id) == section_by_member.get(&member.id))
+            }).cloned();
+            result.members.push(OrgMemberBlock {
+                id: member.id.clone(), main, sessions: rows, parent, section,
+                team: member.primary_team_id.clone(), boxed,
+            });
+        }
+        // A malformed manager cycle must not hide the entire cycle.
+        let parents: HashMap<_, _> = result.members.iter().filter_map(|m| Some((m.id.clone(), m.parent.clone()?))).collect();
+        for block in &mut result.members {
+            let mut seen = HashSet::from([block.id.as_str()]);
+            let mut parent = block.parent.as_deref();
+            while let Some(id) = parent {
+                if !seen.insert(id) { block.parent = None; break; }
+                parent = parents.get(id).map(String::as_str);
+            }
+        }
+        result
+    }
+
+    pub(super) fn org_placement(&self, snap: &super::org_model::OrgSnapshot) -> OrgPlacement {
+        let mut result = OrgPlacement::default();
+        let by_host_uid: HashMap<_, _> = self.workspaces.iter()
+            .flat_map(|w| &w.sessions).map(|session| ((session.host_id.as_str(), session.uid.as_str()), session)).collect();
+        for (wi, ws) in self.workspaces.iter().enumerate() {
+            if ws.is_closed { continue; }
+            let mut placed = Vec::new();
+            let mut members = HashSet::new();
+            let mut non_agents = Vec::new();
+            let mut unattributed_agent = false;
+            for (si, ts) in ws.sessions.iter().enumerate() {
+                let Some(daemon) = snap.host_daemons.get(ts.host_id.as_str()) else {
+                    unattributed_agent |= is_agent_engine(&ts.session_type);
+                    result.fallback.insert((wi, si));
+                    continue;
+                };
+                if !is_agent_engine(&ts.session_type) {
+                    non_agents.push(si);
+                } else if let Some(member) = snap.member_by_session(daemon, &ts.uid).or_else(|| {
+                    let mut seen = HashSet::from([ts.uid.as_str()]);
+                    let mut parent = ts.managed_by_uid.as_deref();
+                    while let Some(uid) = parent.filter(|uid| seen.insert(*uid)) {
+                        if let Some(member) = snap.member_by_session(daemon, uid) { return Some(member); }
+                        parent = by_host_uid.get(&(ts.host_id.as_str(), uid)).and_then(|session| session.managed_by_uid.as_deref());
+                    }
+                    snap.owner()
+                }) {
+                    members.insert(member.id.clone());
+                    placed.push((si, member.id.clone()));
+                } else {
+                    unattributed_agent = true;
+                    result.fallback.insert((wi, si));
+                }
+            }
+            // A shell follows its workspace's member. If the workspace does
+            // not identify one unique member, it belongs under Owner.
+            let shell_member = if members.len() == 1 && !unattributed_agent { members.iter().next().cloned() }
+                else { snap.owner().map(|owner| owner.id.clone()) };
+            for si in non_agents {
+                if let Some(member) = &shell_member { placed.push((si, member.clone())); }
+                else { result.fallback.insert((wi, si)); }
+            }
+            for (si, member) in placed {
+                result.members.entry(member).or_default().push((wi, si));
+            }
+        }
+        result
+    }
+
+    /// Marks belong only to a member's actual main, and use live org
+    /// relations rather than task ancestry. Shells never confer a mark.
+    pub(super) fn org_member_marks(&self, snap: &super::org_model::OrgSnapshot, placement: &OrgPlacement)
+        -> HashMap<(usize, usize), &'static str>
+    {
+        let mut marks = HashMap::new();
+        for member in &snap.members {
+            let Some(rows) = placement.members.get(&member.id) else { continue; };
+            let main = rows.iter().copied().find(|(wi, si)| {
+                let ts = &self.workspaces[*wi].sessions[*si];
+                member.main.as_ref().is_some_and(|m| m.session_uid.as_deref() == Some(&ts.uid)
+                    && m.daemon_id.as_deref() == snap.host_daemons.get(ts.host_id.as_str()).map(String::as_str))
+            });
+            let Some(main) = main else { continue; };
+            if member.is_owner() { marks.insert(main, super::symbols::OWNER); continue; }
+            let live = |wi: usize, si: usize| {
+                let ts = &self.workspaces[wi].sessions[si];
+                !ts.session.exited && is_agent_engine(&ts.session_type)
+            };
+            let assistant = rows.iter().any(|&(wi, si)| (wi, si) != main && live(wi, si));
+            let report = placement.members.iter().any(|(other, rows)| other != &member.id
+                && snap.in_member_subtree(other, &member.id) && rows.iter().any(|&(wi, si)| live(wi, si)));
+            if !assistant && !report { continue; }
+            let mut depth = 1;
+            let mut seen = HashSet::from([member.id.as_str()]);
+            let mut parent = member.manager_member_id.as_deref();
+            while let Some(id) = parent.filter(|id| seen.insert(*id)) {
+                let Some(manager) = snap.member(id) else { break; };
+                if manager.is_owner() { break; }
+                depth += 1;
+                parent = manager.manager_member_id.as_deref();
+            }
+            marks.insert(main, leader_glyph(depth));
+        }
+        marks
+    }
+}
+
 impl Forest {
     fn root(&self, wi: usize) -> Option<&String> {
         self.roots.get(&wi)?.first()
@@ -240,6 +488,164 @@ impl Forest {
         out.extend(self.sessions.get(&wi).into_iter().flatten().map(|si| (wi, *si)));
         for wj in self.nested_blocks(wi) {
             self.block_sessions(wj, out);
+        }
+    }
+}
+
+impl App {
+    fn org_emit_section(&self, out: &mut TaskTree, plan: &OrgBlocks, section: Option<&str>, folds: bool,
+        legacy_boxes: &mut HashMap<String, Vec<(usize, usize)>>)
+    {
+        let mut visited = HashSet::new();
+        let roots: Vec<_> = plan.members.iter().filter(|m| m.parent.is_none() && m.boxed.is_none()
+            && m.section.as_deref() == section).collect();
+        let mut groups: Vec<(Option<String>, Vec<&str>)> = Vec::new();
+        for root in roots {
+            if let Some((_, ids)) = groups.iter_mut().find(|(team, _)| team == &root.team && team.is_some()) {
+                ids.push(&root.id);
+            } else {
+                groups.push((root.team.clone(), vec![&root.id]));
+            }
+        }
+        for (team, ids) in groups {
+            let mut cells = Vec::new();
+            if let Some(team) = team {
+                let key = format!("sidebar:team:{}", serde_json::to_string(&(team.as_str(), section)).unwrap_or_default());
+                let node = Node::Group(key.clone());
+                let label = self.sidebar_org_live().and_then(|s| s.team(&team)).map_or_else(|| team.clone(), |t| t.name.clone());
+                out.org_labels.insert(key.clone(), label);
+                let row = VisualItem::OrgHeader { key: key.clone(), depth: 0 };
+                out.rows.insert(row.clone(), TreeRow { cells: Vec::new(), node: Some(node.clone()) });
+                out.row_sections.insert(row.clone(), section.unwrap_or("").into());
+                out.items.push(row);
+                if folds && self.tree_folded(&node) { continue; }
+                cells.push(node);
+            }
+            for id in ids { self.org_emit_block(out, plan, id, section, false, folds, cells.clone(), &mut visited); }
+        }
+        let mut box_ids = Vec::new();
+        for block in plan.members.iter().filter(|m| m.parent.is_none() && m.boxed.is_some() && m.section.as_deref() == section) {
+            let id = block.boxed.as_ref().unwrap();
+            if !box_ids.contains(id) { box_ids.push(id.clone()); }
+        }
+        for team in box_ids {
+            let header = VisualItem::ContinuousTeamHeader(team.clone());
+            out.row_sections.insert(header.clone(), section.unwrap_or("").into());
+            out.items.push(header);
+            let start = out.items.len();
+            for block in plan.members.iter().filter(|m| m.parent.is_none() && m.boxed.as_deref() == Some(team.as_str())) {
+                self.org_emit_block(out, plan, &block.id, section, true, folds, Vec::new(), &mut visited);
+            }
+            for (wi, si) in legacy_boxes.remove(&team).unwrap_or_default() {
+                let row = VisualItem::ContinuousTeamSession(wi, si);
+                out.boxed_rows.insert(row.clone());
+                out.row_sections.insert(row.clone(), section.unwrap_or("").into());
+                out.items.push(row);
+            }
+            if let Some(last) = out.items.get(start..).and_then(|rows| rows.last()).cloned() {
+                out.boxed_last.insert(last);
+            }
+        }
+        for continuation in plan.continuations.iter().filter(|c| c.section.as_deref() == section) {
+            let key = format!("sidebar:continuation:{}", serde_json::to_string(&(continuation.member.as_str(), self.workspaces[continuation.workspace].id.as_str())).unwrap_or_default());
+            let name = self.sidebar_org_live().map_or_else(|| continuation.member.clone(), |s| s.handle(&continuation.member));
+            out.org_labels.insert(key.clone(), format!("↳ {name} · {}", self.workspaces[continuation.workspace].name));
+            let header = VisualItem::OrgHeader { key, depth: 0 };
+            out.row_sections.insert(header.clone(), section.unwrap_or("").into());
+            out.items.push(header);
+            for &(wi, si) in &continuation.sessions {
+                let row = VisualItem::Session(wi, si);
+                out.rows.insert(row.clone(), TreeRow { cells: Vec::new(), node: Some(Node::Member(continuation.member.clone())) });
+                out.row_sections.insert(row.clone(), section.unwrap_or("").into());
+                out.items.push(row);
+            }
+        }
+    }
+
+    fn org_emit_block(&self, out: &mut TaskTree, plan: &OrgBlocks, id: &str,
+        section: Option<&str>, boxed: bool, folds: bool, cells: Vec<Node>, visited: &mut HashSet<String>)
+    {
+        if !visited.insert(id.to_owned()) { return; }
+        let Some(block) = plan.members.iter().find(|m| m.id == id) else { return; };
+        let node = Node::Member(id.into());
+        if let Some(parent) = cells.last() { out.parents.insert(node.clone(), parent.clone()); }
+        let children: Vec<&str> = plan.members.iter().filter(|m| m.parent.as_deref() == Some(id)).map(|m| m.id.as_str()).collect();
+        if block.sessions.iter().any(|row| Some(*row) != block.main) || !children.is_empty() {
+            out.member_foldable.insert(id.into());
+        }
+        let workspaces: HashSet<_> = block.sessions.iter().map(|(wi, _)| *wi).collect();
+        let mut own_cells = cells.clone();
+        own_cells.push(node.clone());
+        let header = if let Some((wi, si)) = block.main {
+            out.member_headers.insert((wi, si), id.into());
+            if boxed { VisualItem::ContinuousTeamSession(wi, si) } else { VisualItem::Session(wi, si) }
+        } else {
+            let key = member_fold_key(id);
+            let label = self.sidebar_org_live().map_or_else(|| id.to_owned(), |s| {
+                if s.member(id).is_some_and(|m| m.is_owner()) { format!("{} Owner", super::symbols::OWNER) } else { s.handle(id) }
+            });
+            out.org_labels.insert(key.clone(), label);
+            VisualItem::OrgHeader { key, depth: 0 }
+        };
+        out.rows.insert(header.clone(), TreeRow { cells: cells.clone(), node: Some(node.clone()) });
+        if let Some(team) = block.team.as_ref().filter(|team| {
+            block.parent.as_ref().and_then(|parent| plan.members.iter().find(|m| &m.id == parent))
+                .is_some_and(|parent| parent.team.as_ref() != Some(*team))
+        }) {
+            let label = self.sidebar_org_live().and_then(|snap| snap.team(team)).map_or_else(|| team.clone(), |t| t.name.clone());
+            out.team_labels.insert(header.clone(), label);
+        }
+        out.row_sections.insert(header.clone(), section.unwrap_or("").into());
+        if boxed { out.boxed_rows.insert(header.clone()); }
+        if let Some((wi, _)) = block.main {
+            if workspaces.len() > 1 { out.checkout_labels.insert(header.clone(), self.workspaces[wi].name.clone()); }
+            if let Some(sid) = section {
+                let entries = out.section_members.entry(sid.into()).or_default();
+                if !entries.contains(&wi) { entries.push(wi); }
+            }
+        }
+        out.items.push(header);
+        if folds && self.tree_folded(&node) && out.member_foldable.contains(id) {
+            let mut hidden = Vec::new();
+            for m in &plan.members {
+                let mut parent = m.parent.as_deref();
+                let mut seen = HashSet::new();
+                let mut nested = false;
+                while let Some(current) = parent.filter(|p| seen.insert(*p)) {
+                    if current == id { nested = true; break; }
+                    parent = plan.members.iter().find(|entry| entry.id == current).and_then(|entry| entry.parent.as_deref());
+                }
+                if m.id == id || nested {
+                    hidden.extend(m.sessions.iter().copied().filter(|row| m.id != id || Some(*row) != block.main));
+                }
+            }
+            out.folded.insert(node, self.rollup(hidden.iter().map(|(wi, si)| &self.workspaces[*wi].sessions[*si])));
+            return;
+        }
+        let mut last_checkout = block.main.map(|(wi, _)| wi);
+        for &(wi, si) in block.sessions.iter().filter(|row| Some(**row) != block.main) {
+            if workspaces.len() > 1 && last_checkout != Some(wi) {
+                let key = format!("sidebar:checkout:{}", serde_json::to_string(&(id, self.workspaces[wi].id.as_str())).unwrap_or_default());
+                out.org_labels.insert(key.clone(), format!("· {}", self.workspaces[wi].name));
+                let checkout = VisualItem::OrgHeader { key, depth: 0 };
+                out.rows.insert(checkout.clone(), TreeRow { cells: own_cells.clone(), node: Some(node.clone()) });
+                out.row_sections.insert(checkout.clone(), section.unwrap_or("").into());
+                if boxed { out.boxed_rows.insert(checkout.clone()); }
+                out.items.push(checkout);
+            }
+            last_checkout = Some(wi);
+            let row = if boxed { VisualItem::ContinuousTeamSession(wi, si) } else { VisualItem::Session(wi, si) };
+            out.rows.insert(row.clone(), TreeRow { cells: own_cells.clone(), node: Some(node.clone()) });
+            out.row_sections.insert(row.clone(), section.unwrap_or("").into());
+            if let Some(sid) = section {
+                let entries = out.section_members.entry(sid.into()).or_default();
+                if !entries.contains(&wi) { entries.push(wi); }
+            }
+            if boxed { out.boxed_rows.insert(row.clone()); }
+            out.items.push(row);
+        }
+        for child in children {
+            self.org_emit_block(out, plan, child, section, boxed, folds, own_cells.clone(), visited);
         }
     }
 }
@@ -472,9 +878,26 @@ impl App {
             }
             .hash(&mut h);
         }
-        if let Some(snap) = self.org_live() {
+        self.sidebar_org_live().is_some().hash(&mut h);
+        if let Some(snap) = self.sidebar_org_live() {
+            hash_unordered(&snap.host_daemons, &mut h);
+            for member in &snap.members {
+                member.id.hash(&mut h);
+                member.status.hash(&mut h);
+                member.manager_member_id.hash(&mut h);
+                if let Some(main) = &member.main {
+                    main.daemon_id.hash(&mut h);
+                    main.session_uid.hash(&mut h);
+                }
+                for session in &member.assistants {
+                    session.daemon_id.hash(&mut h);
+                    session.session_uid.hash(&mut h);
+                    session.acting_as.hash(&mut h);
+                }
+            }
             for team in &snap.teams {
                 team.id.hash(&mut h);
+                team.status.hash(&mut h);
                 if let Some(marker) = &team.continuous {
                     marker.lead_member_id.hash(&mut h);
                     marker.host_id.hash(&mut h);
@@ -548,6 +971,9 @@ impl App {
             section.folded.hash(&mut h);
         }
         hash_unordered(&self.workspace_sections, &mut h);
+        hash_unordered(&self.fallback_only_workspace_sections, &mut h);
+        hash_unordered(&self.member_sections, &mut h);
+        hash_unordered(&self.folded_org, &mut h);
         hash_unordered(&self.folded_divisions, &mut h);
         // What `divisions_by_task` and the closed set (`org_index`) read,
         // without building them.
@@ -583,7 +1009,11 @@ impl App {
         else {
             return false;
         };
-        self.reveal_row(VisualItem::Session(wi, si), wi, &Node::Workspace(wi))
+        let tree = self.task_tree_unfolded();
+        let boxed = VisualItem::ContinuousTeamSession(wi, si);
+        let row = if tree.rows.contains_key(&boxed) { boxed } else { VisualItem::Session(wi, si) };
+        let node = tree.rows.get(&row).and_then(|r| r.node.clone()).unwrap_or(Node::Workspace(wi));
+        self.reveal_row(row, wi, &node)
     }
 
     /// Reveal the cursor's row when a fold, a folded section or the filter
@@ -610,7 +1040,12 @@ impl App {
         let target = match &self.cursor {
             Cursor::Session(wi, si) => {
                 self.workspaces.get(*wi).and_then(|w| w.sessions.get(*si))?;
-                (VisualItem::Session(*wi, *si), *wi, Node::Workspace(*wi))
+                let tree = self.task_tree_unfolded();
+                let normal = VisualItem::Session(*wi, *si);
+                let boxed = VisualItem::ContinuousTeamSession(*wi, *si);
+                let row = if tree.rows.contains_key(&boxed) { boxed } else { normal };
+                let node = tree.rows.get(&row).and_then(|r| r.node.clone()).unwrap_or(Node::Workspace(*wi));
+                (row, *wi, node)
             }
             Cursor::Workspace(wi) => (VisualItem::WorkspaceHeader(*wi), *wi, Node::Workspace(*wi)),
             _ => return None,
@@ -642,13 +1077,14 @@ impl App {
             }
         }
         changed |= self.reveal_node(node);
-        let root = self
-            .task_tree_unfolded()
+        let tree = self.task_tree_unfolded();
+        let root = tree
             .block_root
             .get(&wi)
             .copied()
             .unwrap_or(wi);
-        if let Some(sid) = self.section_of_workspace(root) {
+        let section = tree.row_sections.get(&row).cloned().or_else(|| self.section_of_workspace(root));
+        if let Some(sid) = section {
             if let Some(sec) = self.sections.iter_mut().find(|s| s.id == sid && s.folded) {
                 sec.folded = false;
                 changed = true;
@@ -665,13 +1101,16 @@ impl App {
     fn reveal_node(&mut self, node: &Node) -> bool {
         let mut changed = false;
         let chain = self.task_tree_unfolded().chain(node);
-        for n in chain.into_iter().skip(1) {
+        let include_self = matches!(node, Node::Member(_));
+        for n in chain.into_iter().skip(usize::from(!include_self)) {
             changed |= match n {
                 Node::Workspace(wi) => match self.workspaces.get(wi) {
                     Some(ws) => self.folded_workspaces.remove(&ws.id),
                     None => false,
                 },
                 Node::Division(d) => self.folded_divisions.remove(&d.fold_key()),
+                Node::Member(id) => self.folded_org.remove(&member_fold_key(&id)),
+                Node::Group(key) => self.folded_org.remove(&key),
             };
         }
         if changed {
@@ -697,20 +1136,27 @@ impl App {
         // 5. Only live org-model continuous teams are lifted into their boxed
         // block below.
         let mut members: HashSet<(usize, usize)> = HashSet::new();
-        // Ordinary org-team leads and their managed sessions are hidden from
-        // the loose work tree and re-emitted in their continuous team box.
-        if let Some(snap) = self.org_live() {
+        let mut boxes: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+        let mut org_plan = None;
+        // Use the org manager subtree for hosts that identify their daemon.
+        // Older hosts keep the legacy matching until their brain is upgraded.
+        if let Some(snap) = self.sidebar_org_live() {
+            let placement = self.org_placement(snap);
+            if !snap.host_daemons.is_empty() {
+                org_plan = Some(self.org_blocks(snap, &placement));
+                members.extend(placement.members.values().flatten().copied());
+            }
             for team in snap.teams.iter().filter(|t| t.continuous.is_some() && !t.archived()) {
                 let lead_uid = team.continuous.as_ref().and_then(|m| m.lead_member_id.as_deref()).and_then(|id| snap.member(id)).and_then(|m| m.main_uid());
-                for (wi, ws) in self.workspaces.iter().enumerate() {
-                    if ws.is_closed || self.is_past_workspace(wi) { continue; }
-                    for (si, ts) in ws.sessions.iter().enumerate() {
-                        let belongs = lead_uid.is_some_and(|uid| ts.uid == uid || ts.managed_by_uid.as_deref() == Some(uid))
-                            || (lead_uid.is_none() && ts.host_id.as_str() == team.continuous.as_ref().and_then(|m| m.host_id.as_deref()).unwrap_or(""));
-                        if belongs { members.insert((wi, si)); }
-                    }
+                for &(wi, si) in &placement.fallback {
+                    let ts = &self.workspaces[wi].sessions[si];
+                    if snap.host_daemons.contains_key(ts.host_id.as_str()) { continue; }
+                    let belongs = lead_uid.is_some_and(|uid| ts.uid == uid || ts.managed_by_uid.as_deref() == Some(uid))
+                        || (lead_uid.is_none() && ts.host_id.as_str() == team.continuous.as_ref().and_then(|m| m.host_id.as_deref()).unwrap_or(""));
+                    if belongs && members.insert((wi, si)) { boxes.entry(team.id.clone()).or_default().push((wi, si)); }
                 }
             }
+            for rows in boxes.values_mut() { rows.sort_unstable(); }
         }
         let f = self.forest(&members);
         let by_task = self.planning.divisions_by_task();
@@ -729,6 +1175,15 @@ impl App {
             org: self.org_index(),
             section_of: HashMap::new(),
             section_members: HashMap::new(),
+            section_sessions: self.sections.iter().map(|s| (s.id.clone(), Vec::new())).collect(),
+            member_headers: HashMap::new(),
+            member_foldable: HashSet::new(),
+            org_labels: HashMap::new(),
+            row_sections: HashMap::new(),
+            checkout_labels: HashMap::new(),
+            team_labels: HashMap::new(),
+            boxed_rows: HashSet::new(),
+            boxed_last: HashSet::new(),
         };
         for &wi in &f.order {
             let mut top = wi;
@@ -764,7 +1219,31 @@ impl App {
                 continue;
             };
             out.section_members.entry(sid.clone()).or_default().push(wi);
+            out.section_sessions.entry(sid.clone()).or_default().extend(
+                f.sessions.get(&wi).into_iter().flatten().map(|si| (wi, *si)));
             out.section_of.insert(wi, sid);
+        }
+        if let Some(plan) = &org_plan {
+            for block in &plan.members {
+                let mut root = block;
+                let mut seen = HashSet::new();
+                while let Some(parent) = root.parent.as_deref().filter(|p| seen.insert(*p)) {
+                    let Some(next) = plan.members.iter().find(|m| m.id == parent) else { break; };
+                    root = next;
+                }
+                if let Some(sid) = &root.section {
+                    let entries = out.section_members.entry(sid.clone()).or_default();
+                    for (wi, _) in &block.sessions { if !entries.contains(wi) { entries.push(*wi); } }
+                    out.section_sessions.entry(sid.clone()).or_default().extend(block.sessions.iter().copied());
+                }
+            }
+            for continuation in &plan.continuations {
+                if let Some(sid) = &continuation.section {
+                    let entries = out.section_members.entry(sid.clone()).or_default();
+                    if !entries.contains(&continuation.workspace) { entries.push(continuation.workspace); }
+                    out.section_sessions.entry(sid.clone()).or_default().extend(continuation.sessions.iter().copied());
+                }
+            }
         }
         let mut emit = Emit {
             app: self,
@@ -786,6 +1265,9 @@ impl App {
                     }
                     emit.entry(entry);
                 }
+                if let Some(plan) = &org_plan {
+                    self.org_emit_section(emit.out, plan, Some(&sec.id), folds, &mut boxes);
+                }
             }
             emit.out.items.push(VisualItem::SectionEnd);
         }
@@ -797,19 +1279,14 @@ impl App {
             }
             emit.entry(entry);
         }
+        if let Some(plan) = &org_plan {
+            self.org_emit_section(emit.out, plan, None, folds, &mut boxes);
+        }
         // Continuous org teams stay in the main Task sidebar as a boxed block.
-        if let Some(snap) = self.org_live() {
+        if let Some(snap) = self.sidebar_org_live() {
             for team in snap.teams.iter().filter(|t| t.continuous.is_some() && !t.archived()) {
-                let mut rows = Vec::new();
-                let lead_uid = team.continuous.as_ref().and_then(|m| m.lead_member_id.as_deref()).and_then(|id| snap.member(id)).and_then(|m| m.main_uid());
-                for (wi, ws) in self.workspaces.iter().enumerate() {
-                    if ws.is_closed || self.is_past_workspace(wi) { continue; }
-                    for (si, ts) in ws.sessions.iter().enumerate() {
-                        let belongs = lead_uid.is_some_and(|uid| ts.uid == uid || ts.managed_by_uid.as_deref() == Some(uid))
-                            || (lead_uid.is_none() && ts.host_id.as_str() == team.continuous.as_ref().and_then(|m| m.host_id.as_deref()).unwrap_or(""));
-                        if belongs { rows.push((wi, si)); }
-                    }
-                }
+                if org_plan.as_ref().is_some_and(|plan| plan.members.iter().any(|m| m.boxed.as_deref() == Some(team.id.as_str()))) { continue; }
+                let rows = boxes.remove(&team.id).unwrap_or_default();
                 if rows.is_empty() { continue; }
                 if !out.items.is_empty() && !matches!(out.items.last(), Some(VisualItem::SectionEnd)) { out.items.push(VisualItem::Separator); }
                 out.items.push(VisualItem::ContinuousTeamHeader(team.id.clone()));
@@ -854,8 +1331,13 @@ impl App {
             Cursor::Workspace(wi) => Some(Node::Workspace(*wi)),
             Cursor::Session(wi, si) => {
                 self.workspaces.get(*wi)?.sessions.get(*si)?;
-                Some(Node::Workspace(*wi))
+                let tree = self.task_tree_unfolded();
+                tree.rows.get(&VisualItem::Session(*wi, *si))
+                    .or_else(|| tree.rows.get(&VisualItem::ContinuousTeamSession(*wi, *si)))
+                    .and_then(|r| r.node.clone()).or(Some(Node::Workspace(*wi)))
             }
+            Cursor::Org(key) if key.starts_with("sidebar:member:") => Some(Node::Member(key["sidebar:member:".len()..].into())),
+            Cursor::Org(key) if key.starts_with("sidebar:team:") => Some(Node::Group(key.clone())),
             Cursor::Backtest(_) | Cursor::Section(_) | Cursor::Org(_) => None,
         }
     }
@@ -867,6 +1349,8 @@ impl App {
                 .get(*wi)
                 .is_some_and(|ws| self.folded_workspaces.contains(&ws.id)),
             Node::Division(d) => self.folded_divisions.contains(&d.fold_key()),
+            Node::Member(id) => self.folded_org.contains(&member_fold_key(id)),
+            Node::Group(key) => self.folded_org.contains(key),
         }
     }
 
@@ -888,6 +1372,17 @@ impl App {
                 (&mut self.folded_workspaces, ws_id)
             }
             Cursor::Division(key) => (&mut self.folded_divisions, key.fold_key()),
+            Cursor::Session(wi, si) => {
+                let tree = self.task_tree_unfolded();
+                let Some(id) = tree.member_headers.get(&(wi, si)).filter(|id| tree.member_foldable.contains(*id)).cloned() else { return false; };
+                (&mut self.folded_org, member_fold_key(&id))
+            }
+            Cursor::Org(key) if checkout_key_workspace(&key).is_some() => return false,
+            Cursor::Org(key) if key.starts_with("sidebar:member:") => {
+                let id = &key["sidebar:member:".len()..];
+                if !self.task_tree_unfolded().member_foldable.contains(id) { return false; }
+                (&mut self.folded_org, key)
+            }
             Cursor::Org(key) => (&mut self.folded_org, key),
             _ => return false,
         };
@@ -1343,6 +1838,336 @@ mod tree_tests {
     use super::super::sections::layout_tests::{bare_ws, sidebar_buffer, task, test_app};
     use super::*;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn org_placement_qualifies_hosts_and_keeps_old_hosts_in_legacy_tree() {
+        use super::super::org_model::fixtures::{member, owner, snapshot, team};
+        use cm_daemon::host_id::HostId;
+        let mut app = test_app();
+        app.workspaces = ["one", "two", "old"].into_iter().map(bare_ws).collect();
+        session(&mut app, 0, "a", "same", "codex");
+        session(&mut app, 0, "shell", "shell", "bash");
+        session(&mut app, 1, "b", "same", "codex");
+        session(&mut app, 2, "old", "same", "codex");
+        for ts in &mut app.workspaces[0].sessions { ts.host_id = HostId::new("h1"); }
+        app.workspaces[1].sessions[0].host_id = HostId::new("h2");
+        app.workspaces[2].sessions[0].host_id = HostId::new("old");
+        let a = member("a", "A", Some("mem-owner"), None, Some("same"));
+        let mut b = member("b", "B", Some("a"), None, Some("same"));
+        b["main"]["daemon_id"] = serde_json::json!("d2");
+        let mut outer = team("outer", "Outer", None, Some("a"), &[]);
+        outer["continuous"] = serde_json::json!({"lead_member_id":"a"});
+        let mut inner = team("inner", "Inner", None, Some("b"), &[]);
+        inner["continuous"] = serde_json::json!({"lead_member_id":"b"});
+        // Put the inner team first to check that ancestor order wins.
+        let mut value = snapshot(1, vec![owner(), a, b], vec![inner, outer]);
+        value["host_daemons"] = serde_json::json!({"h1":"d1", "h2":"d2"});
+        let snap = serde_json::from_value(value).unwrap();
+        let result = app.org_placement(&snap);
+        assert_eq!(result.members["a"], vec![(0, 0), (0, 1)]);
+        assert_eq!(result.members["b"], vec![(1, 0)]);
+        assert_eq!(result.fallback, HashSet::from([(2, 0)]));
+        assert_eq!(result.box_owners(&snap), HashMap::from([("a".into(), "outer".into()), ("b".into(), "outer".into())]));
+    }
+
+    #[test]
+    fn unstamped_live_sessions_use_spawner_chain_then_owner_not_tasks() {
+        use super::super::org_model::fixtures::{member, owner, snapshot};
+        use cm_daemon::host_id::HostId;
+        let mut app = test_app();
+        app.workspaces = ["root", "stream", "owner"].into_iter().map(bare_ws).collect();
+        for (wi, uid) in [(0, "main"), (1, "child"), (1, "grandchild"), (2, "owner-started")] {
+            session(&mut app, wi, "unrelated-task", uid, "codex");
+            app.workspaces[wi].sessions.last_mut().unwrap().host_id = HostId::new("h1");
+        }
+        app.workspaces[1].sessions[0].managed_by_uid = Some("main".into());
+        app.workspaces[1].sessions[1].managed_by_uid = Some("child".into());
+        let mut value = snapshot(1, vec![owner(), member("m", "M", Some("mem-owner"), None, Some("main"))], vec![]);
+        value["host_daemons"] = serde_json::json!({"h1":"d1"});
+        let snap = serde_json::from_value(value).unwrap();
+        let placed = app.org_placement(&snap);
+        assert_eq!(placed.members["m"], vec![(0, 0), (1, 0), (1, 1)]);
+        assert_eq!(placed.members["mem-owner"], vec![(2, 0)]);
+        assert!(placed.fallback.is_empty());
+    }
+
+    #[test]
+    fn continuous_box_takes_the_whole_org_subtree_once() {
+        use super::super::org_model::fixtures::{member, owner, snapshot, team};
+        use cm_daemon::host_id::HostId;
+        let mut app = test_app();
+        app.sidebar_view = SidebarView::Task;
+        app.workspaces = ["lead", "report", "worker", "other", "grandchild"].into_iter().map(bare_ws).collect();
+        for (wi, uid) in [(0, "lead"), (1, "report"), (2, "worker"), (3, "other"), (4, "grandchild")] {
+            session(&mut app, wi, uid, uid, "codex");
+            app.workspaces[wi].sessions[0].host_id = HostId::new("h1");
+        }
+        app.sections.push(SidebarSection { id: "sec".into(), name: "Section".into(), ..Default::default() });
+        app.workspace_sections.insert("worker".into(), "sec".into());
+        let lead = member("lead", "Lead", Some("mem-owner"), None, Some("lead"));
+        let mut report = member("report", "Report", Some("lead"), None, Some("report"));
+        report["assistants"] = serde_json::json!([{"daemon_id":"d1", "session_uid":"worker", "acting_as":"worker"}]);
+        let grandchild = member("grandchild", "Grandchild", Some("report"), None, Some("grandchild"));
+        let other = member("other", "Other", Some("mem-owner"), None, Some("other"));
+        let mut ct = team("ct", "Continuous", None, Some("lead"), &[]);
+        ct["continuous"] = serde_json::json!({"lead_member_id":"lead", "health":"ok"});
+        let mut value = snapshot(1, vec![owner(), lead, report, grandchild, other], vec![ct]);
+        value["host_daemons"] = serde_json::json!({"h1":"d1"});
+        app.org.accept(value);
+        let tree = app.task_tree();
+        for wi in [0, 1, 2, 4] {
+            assert!(tree.items.contains(&VisualItem::ContinuousTeamSession(wi, 0)));
+            assert!(!tree.items.contains(&VisualItem::Session(wi, 0)));
+            assert!(!tree.items.contains(&VisualItem::WorkspaceHeader(wi)));
+        }
+        assert!(tree.items.contains(&VisualItem::Session(3, 0)));
+        app.org.fail(super::super::org_model::RpcFail { unsupported: false, message: "offline".into() });
+        let offline = app.task_tree();
+        assert!(!offline.items.iter().any(|item| matches!(item, VisualItem::ContinuousTeamHeader(_))));
+        for wi in 0..5 { assert!(offline.items.contains(&VisualItem::Session(wi, 0))); }
+    }
+
+    #[test]
+    fn sidebar_marks_follow_live_org_reports_and_assistants() {
+        use super::super::org_model::fixtures::{member, owner, snapshot};
+        use cm_daemon::host_id::HostId;
+        let mut app = test_app();
+        app.sidebar_view = SidebarView::Task;
+        app.workspaces = ["a", "b", "c", "worker", "leaf"].into_iter().map(bare_ws).collect();
+        for (wi, uid) in ["a", "b", "c", "worker", "leaf"].into_iter().enumerate() {
+            session(&mut app, wi, uid, uid, "codex");
+            app.workspaces[wi].sessions[0].host_id = HostId::new("h1");
+        }
+        let a = member("a", "A", Some("mem-owner"), None, Some("a"));
+        let b = member("b", "B", Some("a"), None, Some("b"));
+        let mut c = member("c", "C", Some("b"), None, Some("c"));
+        c["assistants"] = serde_json::json!([{"daemon_id":"d1", "session_uid":"worker", "acting_as":"assistant"}]);
+        let leaf = member("leaf", "Leaf", Some("mem-owner"), None, Some("leaf"));
+        let mut value = snapshot(1, vec![owner(), a, b, c, leaf], vec![]);
+        value["host_daemons"] = serde_json::json!({"h1":"d1"});
+        app.org.accept(value);
+        let snap = app.org_live().unwrap();
+        let marks = app.org_member_marks(snap, &app.org_placement(snap));
+        assert_eq!(marks.get(&(0, 0)), Some(&"★"));
+        assert_eq!(marks.get(&(1, 0)), Some(&"☆"));
+        assert_eq!(marks.get(&(2, 0)), Some(&"✦"));
+        assert!(!marks.contains_key(&(3, 0)) && !marks.contains_key(&(4, 0)));
+        let buffer = sidebar_buffer(&mut app, 30);
+        let lines: Vec<String> = (0..buffer.area.height).map(|y|
+            (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect()).collect();
+        assert!(lines.iter().any(|line| line.contains("★ a")), "{lines:?}");
+        assert!(lines.iter().any(|line| line.contains("☆ b")), "{lines:?}");
+        assert!(lines.iter().any(|line| line.contains("✦ c")), "{lines:?}");
+        app.workspaces[3].sessions[0].session.exited = true;
+        let snap = app.org_live().unwrap();
+        let marks = app.org_member_marks(snap, &app.org_placement(snap));
+        assert!(!marks.contains_key(&(2, 0)), "an exited assistant does not confer a mark");
+        assert_eq!(marks.get(&(1, 0)), Some(&"☆"), "the live report still confers a mark");
+    }
+
+    #[test]
+    fn org_blocks_nest_reports_and_split_only_stream_overrides() {
+        use super::super::org_model::fixtures::{member, owner, snapshot, team};
+        use cm_daemon::host_id::HostId;
+        let mut app = test_app();
+        let _home = crate::test_support::home_lock();
+        app.workspaces = ["home", "stream", "report", "worker", "grand"].into_iter().map(bare_ws).collect();
+        for (wi, uid) in ["lead", "stream", "report", "worker", "grand"].into_iter().enumerate() {
+            session(&mut app, wi, uid, uid, "codex");
+            app.workspaces[wi].sessions[0].host_id = HostId::new("h1");
+        }
+        app.sections = ["a", "b"].into_iter().map(|id| SidebarSection { id: id.into(), name: id.to_uppercase(), ..Default::default() }).collect();
+        app.member_sections.insert("lead".into(), "a".into());
+        app.workspace_sections.insert("home".into(), "b".into());
+        app.workspace_sections.insert("stream".into(), "b".into());
+        let mut lead = member("lead", "Lead", Some("mem-owner"), Some("ta"), Some("lead"));
+        lead["assistants"] = serde_json::json!([{"daemon_id":"d1", "session_uid":"stream", "acting_as":"assistant"}]);
+        let mut report = member("report", "Report", Some("lead"), Some("tb"), Some("report"));
+        report["assistants"] = serde_json::json!([{"daemon_id":"d1", "session_uid":"worker", "acting_as":"worker"}]);
+        let grand = member("grand", "Grand", Some("report"), Some("tb"), Some("grand"));
+        let mut value = snapshot(1, vec![owner(), lead, report, grand], vec![
+            team("ta", "Team A", None, Some("lead"), &[]),
+            team("tb", "Team B", None, Some("report"), &[]),
+        ]);
+        value["host_daemons"] = serde_json::json!({"h1":"d1"});
+        let mut snap: super::super::org_model::OrgSnapshot = serde_json::from_value(value.clone()).unwrap();
+        let plan = app.org_blocks(&snap, &app.org_placement(&snap));
+        assert_eq!(plan.members.len(), 3);
+        assert_eq!(plan.members[0].main, Some((0, 0)));
+        assert_eq!(plan.members[0].sessions, vec![(0, 0)], "main workspace override does not split the block");
+        assert_eq!(plan.members[1].parent.as_deref(), Some("lead"));
+        assert_eq!(plan.members[1].section.as_deref(), Some("a"));
+        assert_eq!(plan.members[1].sessions, vec![(2, 0), (3, 0)]);
+        assert_eq!(plan.members[2].parent.as_deref(), Some("report"));
+        assert_eq!(plan.continuations.len(), 1);
+        let continuation = &plan.continuations[0];
+        assert_eq!((&*continuation.member, continuation.workspace, continuation.section.as_deref(), &continuation.sessions),
+            ("lead", 1, Some("b"), &vec![(1, 0)]));
+        app.sidebar_view = SidebarView::Task;
+        app.org.accept(value.clone());
+        assert!(app.workspace_override_conflicts("home", Some("b")).iter().any(|(ws, choice, reason)|
+            ws == "home" && choice == "b" && reason.contains("home checkout of member lead")));
+        let tree = app.task_tree();
+        assert_eq!(tree.parents.get(&Node::Member("report".into())), Some(&Node::Member("lead".into())));
+        for wi in 0..5 {
+            assert_eq!(tree.items.iter().filter(|row| **row == VisualItem::Session(wi, 0)).count(), 1);
+            assert!(!tree.items.contains(&VisualItem::WorkspaceHeader(wi)));
+        }
+        assert!(tree.org_labels.values().any(|label| label.contains("↳ Lead · stream")));
+        assert_eq!(tree.row_sections.get(&VisualItem::Session(1, 0)).map(String::as_str), Some("b"));
+        let buffer = sidebar_buffer(&mut app, 24);
+        let screenshot = (0..buffer.area.height).map(|y|
+            (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n");
+        assert!(screenshot.contains("↳ Lead · stream"), "{screenshot}");
+        assert!(screenshot.contains("Team A") && screenshot.contains("Team B"), "cross-team report keeps its label: {screenshot}");
+        println!("{screenshot}");
+        app.cursor = Cursor::Session(0, 0);
+        assert!(app.toggle_tree_fold());
+        let folded = app.task_tree();
+        assert!(folded.items.contains(&VisualItem::Session(0, 0)));
+        assert!(!folded.items.contains(&VisualItem::Session(2, 0)));
+        assert!(!folded.items.contains(&VisualItem::Session(4, 0)));
+        assert!(folded.items.contains(&VisualItem::Session(1, 0)), "detached stream remains in its section");
+        assert!(app.handle_event(&Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::ALT))));
+        assert!(app.task_tree().items.contains(&VisualItem::Session(2, 0)), "Alt+Space unfolds the focused main");
+        app.open_session_settings();
+        assert!(matches!(&app.input_mode, InputMode::SessionSettings { member_section: Some(form), .. } if form.editable && form.choice.as_deref() == Some("a")));
+        if let InputMode::SessionSettings { active_field, .. } = &mut app.input_mode { *active_field = 8; }
+        app.handle_event(&Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)));
+        app.handle_event(&Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert_eq!(app.member_sections.get("lead").map(String::as_str), Some("b"));
+        app.cursor = Cursor::Session(1, 0);
+        app.open_session_settings();
+        assert!(matches!(&app.input_mode, InputMode::SessionSettings { member_section: Some(form), .. } if !form.editable));
+        app.input_mode = InputMode::Normal;
+        let continuation_key = tree.org_labels.iter().find(|(_, label)| label.contains("↳ Lead · stream")).unwrap().0.clone();
+        app.cursor = Cursor::Org(continuation_key);
+        app.open_session_settings();
+        assert!(matches!(&app.input_mode, InputMode::WorkspaceSettings { workspace_id, .. } if workspace_id == "stream"));
+        app.input_mode = InputMode::Normal;
+        app.member_sections.insert("lead".into(), "a".into());
+
+        let mut ct = team("ct", "Continuous", None, Some("lead"), &[]);
+        ct["continuous"] = serde_json::json!({"lead_member_id":"lead"});
+        value["teams"] = serde_json::json!([ct]);
+        snap = serde_json::from_value(value).unwrap();
+        let boxed = app.org_blocks(&snap, &app.org_placement(&snap));
+        assert!(boxed.continuations.is_empty());
+        assert_eq!(boxed.members[0].sessions, vec![(0, 0), (1, 0)]);
+        assert!(boxed.members.iter().all(|m| m.boxed.as_deref() == Some("ct")));
+        assert_eq!(boxed.members[1].parent.as_deref(), Some("lead"));
+    }
+
+    #[test]
+    fn migration_is_persisted_and_unresolved_list_is_shown_once() {
+        use super::super::org_model::fixtures::{member, owner, snapshot};
+        use cm_daemon::host_id::HostId;
+        let mut app = test_app();
+        let _home = crate::test_support::home_lock();
+        app.sessions_restored = true;
+        app.sidebar_view = SidebarView::Task;
+        app.workspaces = ["home", "stream", "other", "mixed"].into_iter().map(bare_ws).collect();
+        for (wi, uid) in [(0, "main"), (1, "stream"), (2, "other"), (3, "helper-a"), (3, "helper-b")] {
+            session(&mut app, wi, "unrelated", uid, "codex");
+            app.workspaces[wi].sessions.last_mut().unwrap().host_id = HostId::new("h1");
+        }
+        app.sections = ["a", "b"].into_iter().map(|id| SidebarSection { id: id.into(), name: id.into(), ..Default::default() }).collect();
+        app.workspace_sections = HashMap::from([("home".into(), "a".into()), ("stream".into(), "b".into()), ("mixed".into(), "a".into())]);
+        let mut main = member("m", "M", Some("mem-owner"), None, Some("main"));
+        main["assistants"] = serde_json::json!([
+            {"daemon_id":"d1", "session_uid":"stream", "acting_as":"assistant"},
+            {"daemon_id":"d1", "session_uid":"helper-a", "acting_as":"assistant"}]);
+        let mut other = member("n", "N", Some("mem-owner"), None, Some("other"));
+        other["assistants"] = serde_json::json!([{"daemon_id":"d1", "session_uid":"helper-b", "acting_as":"assistant"}]);
+        let mut value = snapshot(1, vec![owner(), main, other], vec![]);
+        app.org.accept(value.clone());
+        app.member_section_migration_tick();
+        assert!(!app.member_section_migration_done, "wait for the host identity before migrating");
+        assert_eq!(app.workspace_sections.len(), 3);
+        value["host_daemons"] = serde_json::json!({"h1":"d1"});
+        app.org.accept(value);
+        app.member_section_migration_tick();
+        assert!(app.member_section_migration_done);
+        assert_eq!(app.member_sections.get("m").map(String::as_str), Some("a"));
+        assert_eq!(app.workspace_sections.get("stream").map(String::as_str), Some("b"));
+        assert!(app.fallback_only_workspace_sections.contains("home") && app.fallback_only_workspace_sections.contains("mixed"));
+        assert!(!app.fallback_only_workspace_sections.contains("stream"));
+        assert_eq!(app.member_section_migration_issues.len(), 1);
+        assert!(matches!(&app.input_mode, InputMode::TaskPeek { lines, .. } if lines.iter().any(|line| matches!(line, PeekLine::Text(s) if s.contains("mixed")))));
+        let persisted = App::load_manifest();
+        assert!(persisted.member_section_migration_done);
+        assert_eq!(persisted.member_section_migration_issues.len(), 1);
+        app.input_mode = InputMode::Normal;
+        app.member_section_migration_tick();
+        assert!(app.member_section_migration_issues.is_empty());
+        assert!(App::load_manifest().member_section_migration_issues.is_empty());
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        app.org.fail(super::super::org_model::RpcFail { unsupported: false, message: "offline".into() });
+        assert_eq!(app.section_of_workspace(0).as_deref(), Some("a"), "legacy choice survives offline fallback");
+    }
+
+    #[test]
+    fn new_session_in_section_moves_assignment_to_member_when_stamp_arrives() {
+        use super::super::org_model::fixtures::{member, owner, snapshot};
+        use cm_daemon::host_id::HostId;
+        let mut app = test_app();
+        let _home = crate::test_support::home_lock();
+        app.sessions_restored = true;
+        app.member_section_migration_done = true;
+        app.workspaces = vec![bare_ws("new")];
+        session(&mut app, 0, "task", "main", "codex");
+        app.workspaces[0].sessions[0].host_id = HostId::new("h1");
+        app.sections.push(SidebarSection { id: "a".into(), name: "A".into(), ..Default::default() });
+        app.workspace_sections.insert("new".into(), "a".into());
+        app.pending_member_sections.insert("new".into(), "a".into());
+        let mut value = snapshot(1, vec![owner(), member("m", "M", Some("mem-owner"), None, None)], vec![]);
+        value["host_daemons"] = serde_json::json!({"h1":"d1"});
+        app.org.accept(value.clone());
+        app.member_section_migration_tick();
+        assert!(app.pending_member_sections.contains_key("new"));
+        value["members"][1]["main"] = serde_json::json!({"daemon_id":"d1", "session_uid":"main"});
+        app.org.accept(value.clone());
+        app.member_section_migration_tick();
+        assert_eq!(app.member_sections.get("m").map(String::as_str), Some("a"));
+        assert!(!app.pending_member_sections.contains_key("new") && !app.workspace_sections.contains_key("new"));
+        value["members"][1]["main"]["session_uid"] = serde_json::json!("replacement");
+        app.org.accept(value);
+        assert_eq!(super::super::sections::member_section(app.org_live().unwrap(), &app.member_sections, &app.sections, "m").as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn boxed_only_workspace_does_not_leave_an_empty_section_header() {
+        use super::super::org_model::fixtures::{member, owner, snapshot, team};
+        let mut app = test_app();
+        app.sidebar_view = SidebarView::Task;
+        app.workspaces = ["lead", "worker", "mixed"].into_iter().map(bare_ws).collect();
+        session(&mut app, 0, "lead-task", "ts-lead", "codex");
+        session(&mut app, 1, "worker-task", "ts-worker", "codex");
+        app.workspaces[1].sessions[0].managed_by_uid = Some("ts-lead".into());
+        session(&mut app, 2, "worker-task", "ts-other-worker", "codex");
+        app.workspaces[2].sessions[0].managed_by_uid = Some("ts-lead".into());
+        session(&mut app, 2, "other-task", "ts-unboxed", "codex");
+        app.sections.push(SidebarSection { id: "s1".into(), name: "Work".into(), ..Default::default() });
+        app.workspace_sections.insert("worker".into(), "s1".into());
+        app.workspace_sections.insert("mixed".into(), "s1".into());
+        let mut ct = team("ct", "Continuous", None, Some("lead"), &[("lead", "primary")]);
+        ct["continuous"] = serde_json::json!({"lead_member_id":"lead", "health":"ok"});
+        app.org.accept(snapshot(1, vec![owner(), member("lead", "Lead", Some("mem-owner"), Some("ct"), Some("ts-lead"))], vec![ct]));
+        let tree = app.task_tree();
+        assert!(!tree.items.contains(&VisualItem::WorkspaceHeader(1)));
+        assert!(tree.items.contains(&VisualItem::WorkspaceHeader(2)), "mixed workspace stays visible");
+        for (wi, si) in [(0, 0), (1, 0), (2, 0)] {
+            assert!(tree.items.contains(&VisualItem::ContinuousTeamSession(wi, si)));
+            assert!(!tree.items.contains(&VisualItem::Session(wi, si)));
+        }
+        assert!(tree.items.contains(&VisualItem::Session(2, 1)));
+        let buffer = sidebar_buffer(&mut app, 24);
+        let rendered = (0..buffer.area.height).map(|y| {
+            (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>()
+        }).collect::<Vec<_>>().join("\n");
+        assert!(rendered.contains("⟳"), "{rendered}");
+        println!("{rendered}");
+    }
 
     /// A session of `engine` on task `tid`, live, with a well-formed uid.
     fn session(app: &mut App, wi: usize, tid: &str, uid: &str, engine: &str) {

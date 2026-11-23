@@ -67,8 +67,29 @@ pub(super) enum Via {
     Main,
 }
 
-/// Session uid → whose box it goes under, and how.
-pub(super) type Attachments = HashMap<String, (Attach, Via)>;
+/// Host-qualified snapshot placements, plus the unchanged fallback for
+/// older daemons that do not identify themselves in the snapshot reply.
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct Attachments {
+    legacy: HashMap<String, (Attach, Via)>,
+    by_identity: HashMap<(String, String), (Attach, Via)>,
+    ambiguous_legacy_uids: HashSet<String>,
+}
+
+impl std::ops::Deref for Attachments {
+    type Target = HashMap<String, (Attach, Via)>;
+    fn deref(&self) -> &Self::Target { &self.legacy }
+}
+
+impl Attachments {
+    pub(super) fn for_session(&self, snap: &OrgSnapshot, ts: &TerminalSession) -> Option<&(Attach, Via)> {
+        match snap.host_daemons.get(ts.host_id.as_str()) {
+            Some(daemon) => self.by_identity.get(&(daemon.clone(), ts.uid.clone())),
+            None if !self.ambiguous_legacy_uids.contains(&ts.uid) => self.legacy.get(&ts.uid),
+            None => None,
+        }
+    }
+}
 
 /// The daemon's stamp on a session: `org.member_id`, `org.acting_as`.
 fn stamp_of(ts: &TerminalSession) -> (Option<&str>, Option<&str>) {
@@ -108,12 +129,12 @@ impl App {
         let people: Vec<&Member> = snap.members.iter().filter(|x| !x.is_owner() && !x.retired()).collect();
         // Every main session is its member's; every other session goes to
         // the member its stamp or spawner chain leads to.
-        let mains: HashSet<String> = people.iter().filter_map(|x| x.main_uid().map(str::to_owned)).collect();
+        let mains: HashSet<(usize, usize)> = people.iter().filter_map(|x| self.find_member_main(snap, x)).collect();
         let attached = self.session_attachments(snap);
         let mut under: HashMap<Attach, Vec<(usize, usize)>> = HashMap::new();
         for (wi, ws) in self.workspaces.iter().enumerate().filter(|(_, w)| !w.is_closed) {
             for (si, ts) in ws.sessions.iter().enumerate() {
-                if let Some((to, _)) = attached.get(&ts.uid) {
+                if let Some((to, _)) = attached.for_session(snap, ts) {
                     if !ts.session.exited && keep(ts) {
                         under.entry(to.clone()).or_default().push((wi, si));
                     }
@@ -331,7 +352,7 @@ impl App {
 
         // Attached to a member with no box of its own (a lead drawn under
         // another team): nobody; they would be lost, so Unassigned takes them.
-        let lost: HashSet<String> = under.values().flatten().filter_map(|&(wi, si)| self.workspaces.get(wi)?.sessions.get(si).map(|t| t.uid.clone())).collect();
+        let lost: HashSet<(usize, usize)> = under.values().flatten().copied().collect();
 
         // Everyone no member claims, by task, else workspace: what Owner
         // started (no spawner) under Owner's sessions, the rare rest (a
@@ -341,17 +362,18 @@ impl App {
         let mut boxes: HashMap<String, usize> = HashMap::new();
         for (wi, ws) in self.workspaces.iter().enumerate().filter(|(_, w)| !w.is_closed) {
             for (si, ts) in ws.sessions.iter().enumerate() {
-                let claimed = mains.contains(&ts.uid) || (attached.contains_key(&ts.uid) && !lost.contains(&ts.uid));
+                let claimed = mains.contains(&(wi, si)) || (attached.for_session(snap, ts).is_some() && !lost.contains(&(wi, si)));
                 if claimed || !keep(ts) {
                     continue;
                 }
-                let (group, label, prefix, rank) = if ts.managed_by_uid.is_none() && !lost.contains(&ts.uid) {
+                let known_host = snap.host_daemons.contains_key(ts.host_id.as_str());
+                let (group, label, prefix, rank) = if known_host || (ts.managed_by_uid.is_none() && !lost.contains(&(wi, si))) {
                     (OWNER_SESSIONS_KEY, OWNER_SESSIONS_LABEL, "", 8)
                 } else {
                     (UNASSIGNED_KEY, UNASSIGNED_LABEL, "u:", 9)
                 };
                 let u = *groups.entry(group).or_insert_with(|| m.push(Some(owner), group.into(), NodeKind::Org, label.into(), None, rank));
-                let (key, kind, title, task, rank) = match ts.task_id.as_deref() {
+                let (key, kind, title, task, rank) = match ts.task_id.as_deref().filter(|_| !known_host) {
                     Some(t) => (format!("{prefix}task:{t}"), NodeKind::Task, tasks.get(t).map_or_else(|| format!("task {}", t.chars().take(8).collect::<String>()), |r| r.name.clone()), Some(t.to_owned()), 1),
                     None => (format!("{prefix}ws:{}", ws.id), NodeKind::Workspace, ws.name.clone(), None, 2),
                 };
@@ -438,8 +460,28 @@ impl App {
     }
 
     /// A member's main session, as its box's lead line.
+    pub(super) fn find_member_main(&self, snap: &OrgSnapshot, x: &Member) -> Option<(usize, usize)> {
+        let main = x.main.as_ref()?;
+        let uid = main.session_uid.as_deref()?;
+        if let Some(daemon) = main.daemon_id.as_deref() {
+            if snap.host_daemons.values().any(|known| known == daemon) {
+                return self.workspaces.iter().enumerate().filter(|(_, ws)| !ws.is_closed).find_map(|(wi, ws)| {
+                    ws.sessions.iter().enumerate().find_map(|(si, ts)|
+                        (ts.uid == uid && snap.host_daemons.get(ts.host_id.as_str()).map(String::as_str) == Some(daemon)).then_some((wi, si)))
+                });
+            }
+        }
+        // An old host without a source identity retains its legacy lookup.
+        let mut candidates = self.workspaces.iter().enumerate().filter(|(_, ws)| !ws.is_closed).flat_map(|(wi, ws)| {
+            ws.sessions.iter().enumerate().filter_map(move |(si, ts)|
+                (ts.uid == uid && !snap.host_daemons.contains_key(ts.host_id.as_str())).then_some((wi, si)))
+        });
+        let first = candidates.next()?;
+        candidates.next().is_none().then_some(first)
+    }
+
     fn member_main(&self, x: &Member, keep: &dyn Fn(&TerminalSession) -> bool) -> Vec<ChartSession> {
-        let Some((wi, si)) = x.main_uid().and_then(|uid| self.find_session_by_uid(uid)) else { return Vec::new() };
+        let Some((wi, si)) = self.org_live().and_then(|snap| self.find_member_main(snap, x)) else { return Vec::new() };
         let ts = &self.workspaces[wi].sessions[si];
         if !keep(ts) {
             return Vec::new();
@@ -460,7 +502,7 @@ impl App {
         // box as session lines of their own, never in the assistants count.
         let (shells, extra): (Vec<_>, Vec<_>) = extra.into_iter().partition(|&(wi, si)| {
             let ts = &self.workspaces[wi].sessions[si];
-            ts.session_type == "bash" || matches!(attached.get(&ts.uid), Some((_, Via::Main)))
+            ts.session_type == "bash" || self.org_live().is_some_and(|snap| matches!(attached.for_session(snap, ts), Some((_, Via::Main))))
         });
         for (wi, si) in shells {
             let uid = self.workspaces[wi].sessions[si].uid.clone();
@@ -471,10 +513,13 @@ impl App {
         }
         let Some(card) = node.card.as_mut() else { return };
         for &(wi, si) in &extra {
-            let uid = &self.workspaces[wi].sessions[si].uid;
-            match attached.get(uid).map(|(_, v)| v) {
+            let ts = &self.workspaces[wi].sessions[si];
+            let uid = &ts.uid;
+            match self.org_live().and_then(|snap| attached.for_session(snap, ts)).map(|(_, v)| v) {
                 Some(Via::Spawned(by)) => {
-                    let who = self.find_session_by_uid(by).map_or_else(|| by.clone(), |(w, s)| self.workspaces[w].sessions[s].label.clone());
+                    let who = self.workspaces.iter().flat_map(|ws| &ws.sessions)
+                        .find(|parent| parent.host_id == ts.host_id && parent.uid == *by)
+                        .map_or_else(|| by.clone(), |parent| parent.label.clone());
                     card.via.insert(uid.clone(), format!("spawned by {who}"));
                 }
                 Some(Via::Stamp) => {
@@ -511,10 +556,21 @@ impl App {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             snap.version.hash(&mut h);
             snap.members.len().hash(&mut h);
+            let mut hosts: Vec<_> = snap.host_daemons.iter().collect();
+            hosts.sort();
+            hosts.hash(&mut h);
+            for member in &snap.members {
+                member.id.hash(&mut h);
+                member.manager_member_id.hash(&mut h);
+                if let Some(main) = &member.main { main.daemon_id.hash(&mut h); main.session_uid.hash(&mut h); }
+                for fact in &member.assistants {
+                    fact.daemon_id.hash(&mut h); fact.session_uid.hash(&mut h); fact.acting_as.hash(&mut h);
+                }
+            }
             for ws in &self.workspaces {
                 (ws.id.as_str(), ws.is_closed, ws.worktree_path.as_deref()).hash(&mut h);
                 for ts in &ws.sessions {
-                    (ts.uid.as_str(), ts.managed_by_uid.as_deref(), ts.session.exited).hash(&mut h);
+                    (ts.host_id.as_str(), ts.uid.as_str(), ts.managed_by_uid.as_deref(), ts.session_type.as_str(), ts.session.exited).hash(&mut h);
                     let (m, a) = stamp_of(ts);
                     (m, a).hash(&mut h);
                 }
@@ -532,6 +588,38 @@ impl App {
     }
 
     fn compute_attachments(&self, snap: &OrgSnapshot) -> Attachments {
+        let legacy = self.compute_legacy_attachments(snap);
+        let mut by_identity = HashMap::new();
+        if !snap.host_daemons.is_empty() {
+            let placement = self.org_placement(snap);
+            for (id, rows) in &placement.members {
+                let Some(member) = snap.member(id) else { continue; };
+                if member.is_owner() { continue; }
+                for &(wi, si) in rows {
+                    let ts = &self.workspaces[wi].sessions[si];
+                    let Some(daemon) = snap.host_daemons.get(ts.host_id.as_str()) else { continue; };
+                    if member.main.as_ref().is_some_and(|main| main.daemon_id.as_deref() == Some(daemon.as_str())
+                        && main.session_uid.as_deref() == Some(ts.uid.as_str())) { continue; }
+                    let via = if ts.session_type == "bash" { Via::Workspace }
+                        else if member.assistants.iter().any(|fact| &fact.daemon_id == daemon && fact.session_uid == ts.uid && fact.acting_as == "main") { Via::Main }
+                        else if member.assistants.iter().any(|fact| &fact.daemon_id == daemon && fact.session_uid == ts.uid) { Via::Stamp }
+                        else if let Some(parent) = &ts.managed_by_uid { Via::Spawned(parent.clone()) }
+                        else { Via::Stamp };
+                    by_identity.insert((daemon.clone(), ts.uid.clone()), (Attach::Member(id.clone()), via));
+                }
+            }
+        }
+        let mut seen: HashMap<&str, &str> = HashMap::new();
+        let mut ambiguous_legacy_uids = HashSet::new();
+        for ts in self.workspaces.iter().flat_map(|ws| &ws.sessions) {
+            if let Some(previous) = seen.insert(&ts.uid, ts.host_id.as_str()) {
+                if previous != ts.host_id.as_str() { ambiguous_legacy_uids.insert(ts.uid.clone()); }
+            }
+        }
+        Attachments { legacy, by_identity, ambiguous_legacy_uids }
+    }
+
+    fn compute_legacy_attachments(&self, snap: &OrgSnapshot) -> HashMap<String, (Attach, Via)> {
         // A stable order so ties (two mains on one task or in one
         // workspace) resolve the same way every rebuild: the more senior
         // member first (fewer steps up the manager chain to Owner), then by
@@ -565,7 +653,7 @@ impl App {
             .map(|(uid, _)| *uid)
             .collect();
         stamped_mains.sort_unstable();
-        let mut out: Attachments = HashMap::new();
+        let mut out: HashMap<String, (Attach, Via)> = HashMap::new();
         for uid in stamped_mains {
             let m = stamp_of(by_uid[uid].1).0.unwrap();
             main_of.insert(uid, members.get(m).copied().unwrap());
@@ -800,6 +888,35 @@ mod tests {
         terminal.draw(|frame| app.draw(frame)).unwrap();
         let buf = terminal.backend().buffer().clone();
         (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn f6_and_team_attach_duplicate_uids_by_daemon_identity() {
+        let mut app = test_app();
+        app.workspaces = vec![ws("main-a"), ws("main-b"), ws("helper-a"), ws("helper-b")];
+        for (wi, n, host) in [(0, 0x10, "h1"), (1, 0x10, "h2"), (2, 0x20, "h1"), (3, 0x20, "h2")] {
+            session(&mut app, wi, n, &format!("row-{wi}"), None);
+            app.workspaces[wi].sessions[0].host_id = HostId::new(host);
+        }
+        let mut a = member("a", "A", Some("mem-owner"), None, Some("ts-10-0"));
+        let mut b = member("b", "B", Some("mem-owner"), None, Some("ts-10-0"));
+        b["main"]["daemon_id"] = json!("d2");
+        a["assistants"] = json!([{"daemon_id":"d1", "session_uid":"ts-20-0", "acting_as":"assistant"}]);
+        b["assistants"] = json!([{"daemon_id":"d2", "session_uid":"ts-20-0", "acting_as":"assistant"}]);
+        let mut value = snapshot(1, vec![owner(), a, b], vec![]);
+        value["host_daemons"] = json!({"h1":"d1", "h2":"d2"});
+        app.org.accept(value);
+        let snap = app.org_live().unwrap();
+        let attachments = app.session_attachments(snap);
+        assert_eq!(attachments.for_session(snap, &app.workspaces[2].sessions[0]).unwrap().0, Attach::Member("a".into()));
+        assert_eq!(attachments.for_session(snap, &app.workspaces[3].sessions[0]).unwrap().0, Attach::Member("b".into()));
+        let chart = app.org_model(false);
+        assert_eq!(node(&chart, "member:a").sessions[0].wi, 0);
+        assert_eq!(node(&chart, "member:b").sessions[0].wi, 1);
+        assert_eq!(node(&chart, "member:a").card.as_ref().unwrap().folded, vec![(2, 0)]);
+        assert_eq!(node(&chart, "member:b").card.as_ref().unwrap().folded, vec![(3, 0)]);
+        let rows = app.visual_items_team_unfolded();
+        for wi in 0..4 { assert_eq!(rows.iter().filter(|row| **row == VisualItem::Session(wi, 0)).count(), 1); }
     }
 
     /// Swarm (lead ep, with an assistant) ⊃ Items (lead items); orgchart and

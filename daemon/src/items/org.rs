@@ -49,7 +49,13 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
                 // Live continuous fields change independently of the org
                 // version. Always fetch the full static snapshot so delta
                 // callers cannot retain a frozen schedule projection.
-                api(ctx.api.get("/org/snapshot", &[])).map(|v| decorate_snapshot(state, v))
+                api(ctx.api.get("/org/snapshot", &[])).map(|v| {
+                    let mut value = decorate_snapshot(state, v);
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("source_daemon_id".into(), json!(ctx.daemon_id));
+                    }
+                    value
+                })
             }
             "org.continuous_status" => {
                 let queues = live_queue_rows(state);
@@ -1164,7 +1170,9 @@ mod tests {
         let d = daemon_id(&state);
         let me = Caller::session("me-uid");
         let resp = call(&state, me.clone(), "org.snapshot", json!({"since_version": 7}));
-        assert_eq!(resp.result.unwrap()["unchanged"], true);
+        let snapshot = resp.result.unwrap();
+        assert_eq!(snapshot["unchanged"], true);
+        assert_eq!(snapshot["source_daemon_id"], d);
         assert!(call(&state, me.clone(), "org.member", json!({})).ok);
         let resp = call(&state, me.clone(), "org.move",
                         json!({"member": "main/ep", "manager": "owner", "reason": "r"}));

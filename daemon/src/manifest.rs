@@ -657,6 +657,20 @@ pub struct Manifest {
     /// renders under its parent's section) or renders loose.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub workspace_sections: HashMap<String, String>,
+    /// Stable org member id → explicit section choice (empty means loose).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub member_sections: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub member_section_migration_done: bool,
+    /// Unresolved legacy assignments, retained until Owner dismisses the list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_section_migration_issues: Vec<(String, String, String)>,
+    /// A-n assignments waiting for the newly launched main's org stamp.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub pending_member_sections: HashMap<String, String>,
+    /// Legacy workspace choices retained only for the offline tree.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub fallback_only_workspace_sections: BTreeSet<String>,
     /// Folded task headers in the Sessions view's nested work tree, by task
     /// id. Pure TUI display state, like `sections`.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -676,6 +690,8 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub auto_close_workspaces: Vec<String>,
 }
+
+fn is_false(value: &bool) -> bool { !*value }
 
 /// One sidebar section (see `Manifest::sections`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -742,6 +758,7 @@ pub(crate) mod tests {
         let m: Manifest = serde_json::from_str(legacy).unwrap();
         assert!(m.sections.is_empty());
         assert!(m.workspace_sections.is_empty());
+        assert!(m.member_sections.is_empty());
         assert!(m.auto_close_workspaces.is_empty());
         // Empty sections serialize to nothing — legacy files stay byte-stable.
         let s = serde_json::to_string(&m).unwrap();
@@ -755,11 +772,13 @@ pub(crate) mod tests {
             folded: true,
         });
         m2.workspace_sections.insert("ws-a".into(), "sec-1".into());
+        m2.member_sections.insert("member-a".into(), "sec-1".into());
         m2.auto_close_workspaces.push("ws-a".into());
         let s = serde_json::to_string(&m2).unwrap();
         let back: Manifest = serde_json::from_str(&s).unwrap();
         assert_eq!(back.sections, m2.sections);
         assert_eq!(back.workspace_sections.get("ws-a").map(String::as_str), Some("sec-1"));
+        assert_eq!(back.member_sections.get("member-a").map(String::as_str), Some("sec-1"));
         assert_eq!(back.auto_close_workspaces, vec!["ws-a"]);
     }
 

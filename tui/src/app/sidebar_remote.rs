@@ -2,7 +2,7 @@
 use super::*;
 use cm_daemon::{
     host_id::HostId,
-    sidebar::{Assignment, Publication, Receipt, Workspace as PublishedWorkspace},
+    sidebar::{Assignment, Publication, PublishedMember, Receipt, Workspace as PublishedWorkspace},
 };
 use std::collections::BTreeMap;
 
@@ -42,11 +42,26 @@ impl App {
                         )
                     })
                     .collect();
+                let members = self.sidebar_org_live().and_then(|snap| {
+                    let daemon = snap.host_daemons.get(h.id.as_str())?;
+                    Some(snap.members.iter().filter(|m| {
+                        m.main.as_ref().and_then(|main| main.daemon_id.as_deref()) == Some(daemon.as_str())
+                            || m.assistants.iter().any(|session| &session.daemon_id == daemon)
+                    }).map(|m| {
+                        let key = format!("member:{}", m.id);
+                        (m.id.clone(), PublishedMember {
+                            choice: self.member_sections.get(&m.id).cloned(),
+                            effective_section_id: super::sections::member_section(snap, &self.member_sections, &self.sections, &m.id),
+                            receipt: self.sidebar_receipts.get(&receipt_key(&h.id, &key)).cloned(),
+                        })
+                    }).collect())
+                });
                 (
                     h.id.clone(),
                     Publication {
                         sections: self.sections.clone(),
                         workspaces,
+                        members,
                     },
                 )
             })
@@ -65,7 +80,7 @@ impl App {
         self.sidebar_pending.retain(|(h, _), _| h != host);
         for request in requests.values() {
             self.sidebar_pending.insert(
-                (host.clone(), request.workspace_id.clone()),
+                (host.clone(), request.target_key()),
                 request.clone(),
             );
         }
@@ -73,7 +88,7 @@ impl App {
     }
     pub(crate) fn receive_sidebar_assignment(&mut self, host: &HostId, request: Assignment) {
         self.sidebar_pending
-            .insert((host.clone(), request.workspace_id.clone()), request);
+            .insert((host.clone(), request.target_key()), request);
         self.apply_pending_sidebar_assignments();
     }
     pub(crate) fn apply_pending_sidebar_assignments(&mut self) {
@@ -86,6 +101,43 @@ impl App {
         }
         let pending = self.sidebar_pending.clone();
         for ((host, key), a) in pending {
+            if !a.workspace {
+                let Some(member) = a.member_id.as_ref() else { continue; };
+                let receipt_key = receipt_key(&host, &key);
+                if self.sidebar_receipts.get(&receipt_key).is_some_and(|r| r.request_id == a.id) {
+                    self.push_sidebar_to_daemon();
+                    self.sidebar_pending.remove(&(host, key));
+                    continue;
+                }
+                let valid = a.choice.as_deref().is_none_or(|s| s.is_empty() || self.section_index(s).is_some());
+                let previous = self.member_sections.get(member).cloned();
+                let old_receipt = self.sidebar_receipts.get(&receipt_key).cloned();
+                if valid {
+                    match &a.choice {
+                        Some(section) => { self.member_sections.insert(member.clone(), section.clone()); }
+                        None => { self.member_sections.remove(member); }
+                    }
+                }
+                self.sidebar_receipts.insert(receipt_key.clone(), Receipt {
+                    request_id: a.id.clone(), status: if valid { "applied" } else { "section_deleted" }.into(),
+                });
+                if self.try_save_session_manifest() {
+                    self.sidebar_pending.remove(&(host, key));
+                    self.clamp_cursor();
+                    self.needs_redraw = true;
+                } else {
+                    self.sidebar_retry_at = Instant::now() + Duration::from_secs(5);
+                    match previous {
+                        Some(section) => { self.member_sections.insert(member.clone(), section); }
+                        None => { self.member_sections.remove(member); }
+                    }
+                    match old_receipt {
+                        Some(receipt) => { self.sidebar_receipts.insert(receipt_key, receipt); }
+                        None => { self.sidebar_receipts.remove(&receipt_key); }
+                    }
+                }
+                continue;
+            }
             // Same daemon identity only. A viewer adoption wrapper can have a
             // different ID, so match its retained session UID as a fallback.
             let wi = self.workspaces.iter().position(|w| {
@@ -114,8 +166,15 @@ impl App {
                 .as_deref()
                 .is_none_or(|s| s.is_empty() || self.section_index(s).is_some());
             let previous = self.workspace_sections.get(&ws_id).cloned();
+            let was_fallback_only = self.fallback_only_workspace_sections.contains(&ws_id);
+            let old_issues = self.member_section_migration_issues.clone();
             let old_receipt = self.sidebar_receipts.get(&receipt_key).cloned();
             if valid {
+                self.fallback_only_workspace_sections.remove(&ws_id);
+                let issues = self.workspace_override_conflicts(&ws_id, a.choice.as_deref());
+                self.member_section_migration_issues.extend(issues);
+                self.member_section_migration_issues.sort();
+                self.member_section_migration_issues.dedup();
                 match &a.choice {
                     Some(section) => {
                         self.workspace_sections
@@ -142,6 +201,8 @@ impl App {
                 self.needs_redraw = true;
             } else {
                 self.sidebar_retry_at = Instant::now() + Duration::from_secs(5);
+                self.member_section_migration_issues = old_issues;
+                if was_fallback_only { self.fallback_only_workspace_sections.insert(ws_id.clone()); }
                 match previous {
                     Some(s) => {
                         self.workspace_sections.insert(ws_id, s);
@@ -219,6 +280,8 @@ mod tests {
             workspace_id: "ws".into(),
             session_uid: "scout".into(),
             choice: choice.map(str::to_string),
+            workspace: true,
+            member_id: None,
         }
     }
     #[test]
@@ -246,6 +309,22 @@ mod tests {
                     "applied"
                 );
             }
+        });
+    }
+
+    #[test]
+    fn remote_member_assignment_persists_without_changing_workspace_override() {
+        with_app(|app| {
+            app.workspace_sections.insert("ws".into(), "".into());
+            let mut request = assignment("member-request", Some("s1"));
+            request.workspace = false;
+            request.member_id = Some("member-1".into());
+            app.receive_sidebar_assignment(&HostId::local(), request);
+            assert_eq!(app.member_sections.get("member-1").map(String::as_str), Some("s1"));
+            assert_eq!(app.workspace_sections.get("ws").map(String::as_str), Some(""));
+            let manifest = App::load_manifest();
+            assert_eq!(manifest.member_sections.get("member-1").map(String::as_str), Some("s1"));
+            assert!(manifest.sidebar_receipts.values().any(|r| r.request_id == "member-request" && r.status == "applied"));
         });
     }
     #[test]
@@ -347,7 +426,7 @@ mod tests {
                     id: "agent-move".into(),
                     method: "sidebar.assign".into(),
                     caller: Caller::session("scout"),
-                    params: serde_json::json!({"section":"Swarm"}),
+                    params: serde_json::json!({"section":"Swarm","workspace":true}),
                 },
             )
             .unwrap();

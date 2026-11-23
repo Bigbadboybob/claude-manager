@@ -1287,6 +1287,11 @@ impl DaemonState {
             folded_org: Default::default(),
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            member_sections: HashMap::new(),
+            member_section_migration_done: false,
+            member_section_migration_issues: Vec::new(),
+            pending_member_sections: HashMap::new(),
+            fallback_only_workspace_sections: Default::default(),
             sidebar_receipts: HashMap::new(),
             auto_close_workspaces: Vec::new(),
         }

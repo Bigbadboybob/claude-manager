@@ -682,7 +682,19 @@ impl App {
         }
         // A division header that no longer draws (its blocks closed, or the
         // initiative is no longer a division) falls back to the first row.
-        if matches!(self.cursor, Cursor::Org(_)) {
+        if let Cursor::Org(key) = &self.cursor {
+            if self.tree_view() && key.starts_with("sidebar:") {
+                let tree = self.task_tree_shared();
+                if !tree.items.iter().any(|item| matches!(item, VisualItem::OrgHeader { key: row, .. } if row == key)) {
+                    self.cursor = tree.items.iter().find_map(|item| match item {
+                        VisualItem::Session(wi, si) | VisualItem::ContinuousTeamSession(wi, si) => Some(Cursor::Session(*wi, *si)),
+                        VisualItem::WorkspaceHeader(wi) => Some(Cursor::Workspace(*wi)),
+                        VisualItem::SectionHeader(id) => Some(Cursor::Section(id.clone())),
+                        _ => None,
+                    }).unwrap_or(Cursor::Workspace(0));
+                }
+                return;
+            }
             self.clamp_org_cursor();
             return;
         }
@@ -798,7 +810,9 @@ impl App {
             VisualItem::BacktestHeader => contains("backtest") || self.backtest_rows.iter().any(|r| contains(&r.label)),
             VisualItem::BacktestFleet(stem) => contains(stem),
             VisualItem::BacktestRun { task_id, .. } => self.backtest_rows.iter().find(|r| r.task_id == *task_id).is_some_and(|r| contains(&r.label) || contains(task_id)),
-            VisualItem::OrgHeader { key, .. } => contains(&self.org_header_text(key)),
+            VisualItem::OrgHeader { key, .. } => self.tree_view().then(|| self.task_tree_unfolded())
+                .and_then(|tree| tree.org_labels.get(key).cloned())
+                .is_some_and(|label| contains(&label)) || contains(&self.org_header_text(key)),
             VisualItem::ContinuousHeader | VisualItem::ContinuousTeamHeader(_) | VisualItem::Separator | VisualItem::SectionEnd => false,
         }
     }
@@ -1978,6 +1992,10 @@ impl App {
                 out.push(PeekLine::Text("Space/Enter fold · keys don't reach a terminal here".into()));
             }
             Cursor::Org(key) => {
+                if let Some(ws) = super::tree::checkout_key_workspace(key)
+                    .and_then(|id| self.workspaces.iter().find(|ws| ws.id == id)) {
+                    return self.workspace_peek_lines(ws);
+                }
                 out.push(PeekLine::Title(self.org_header_text(key)));
                 out.push(PeekLine::Field { label: "Row".into(), value: key.clone() });
                 out.push(PeekLine::Blank);
