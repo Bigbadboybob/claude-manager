@@ -61,26 +61,31 @@ pub fn from_reply(reply: &Value) -> Option<Vec<LaunchGrant>> {
     )
 }
 
-/// Replace the cache; persist when it changed. Returns whether it did.
-pub fn replace(cache: &mut Vec<LaunchGrant>, root: &Path, mut grants: Vec<LaunchGrant>) -> bool {
+/// Replace the cache and persist it. Failed writes remain retryable.
+pub fn replace(cache: &mut Vec<LaunchGrant>, root: &Path, mut grants: Vec<LaunchGrant>) -> std::io::Result<bool> {
     grants.extend(cache.iter().filter(|g| g.proposal).cloned());
     persist(cache, root, grants)
 }
 
 /// Persist both API grants and locally issued proposal grants atomically.
-pub fn persist(cache: &mut Vec<LaunchGrant>, root: &Path, grants: Vec<LaunchGrant>) -> bool {
-    if *cache == grants {
-        return false;
-    }
+pub fn persist(cache: &mut Vec<LaunchGrant>, root: &Path, grants: Vec<LaunchGrant>) -> std::io::Result<bool> {
+    let changed = *cache != grants;
     *cache = grants;
-    let _ = std::fs::create_dir_all(root);
-    let tmp = path(root).with_extension("json.tmp");
-    if let Ok(bytes) = serde_json::to_vec_pretty(cache) {
-        if std::fs::write(&tmp, bytes).is_ok() {
-            let _ = std::fs::rename(&tmp, path(root));
-        }
+    // A previous write may have failed after the in-memory cache changed.
+    // Compare against the actual file, so an unchanged retry still repairs it.
+    let saved = std::fs::read(path(root)).ok()
+        .and_then(|bytes| serde_json::from_slice::<Vec<LaunchGrant>>(&bytes).ok());
+    if saved.as_ref() == Some(cache) {
+        // A prior durable write may have renamed successfully and then failed
+        // its file/directory sync. Matching bytes alone do not prove durability.
+        std::fs::File::open(path(root))?.sync_all()?;
+        std::fs::File::open(root)?.sync_all()?;
+        return Ok(changed);
     }
-    true
+    std::fs::create_dir_all(root)?;
+    let data = serde_json::to_string_pretty(cache).map_err(std::io::Error::other)?;
+    crate::state::write_json_atomic(&path(root), &data, true)?;
+    Ok(changed)
 }
 
 /// The grant letting `session_uid` launch for `task_id`, if any.
@@ -114,15 +119,29 @@ mod tests {
         let reply = json!({"launch_grants": [
             {"task_id": "t-1", "session_uid": "me-uid", "pid": "agent:d1:me-uid", "board": "sfd", "n": 4}
         ]});
-        assert!(replace(&mut cache, root.path(), from_reply(&reply).unwrap()));
+        assert!(replace(&mut cache, root.path(), from_reply(&reply).unwrap()).unwrap());
         assert!(find(&cache, "me-uid", "t-1").is_some());
         assert!(find(&cache, "me-uid", "t-2").is_none());
         assert_eq!(load(root.path()), cache, "a restart reads the same set");
         // An unchanged set writes nothing; a revoke is a row that disappears.
-        assert!(!replace(&mut cache, root.path(), from_reply(&reply).unwrap()));
-        assert!(replace(&mut cache, root.path(), from_reply(&json!({"launch_grants": []})).unwrap()));
+        assert!(!replace(&mut cache, root.path(), from_reply(&reply).unwrap()).unwrap());
+        assert!(replace(&mut cache, root.path(), from_reply(&json!({"launch_grants": []})).unwrap()).unwrap());
         assert!(load(root.path()).is_empty());
         // An older API sends no field: leave the cache alone.
         assert!(from_reply(&json!({"pushes": []})).is_none());
+    }
+
+    #[test]
+    fn failed_write_is_reported_and_an_unchanged_cache_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("blocked");
+        std::fs::write(&root, b"not a directory").unwrap();
+        let mut cache = Vec::new();
+        let grant = LaunchGrant { proposal: true, task_id: "task".into(), session_uid: "caller".into(), ..Default::default() };
+        assert!(persist(&mut cache, &root, vec![grant.clone()]).is_err());
+        assert_eq!(cache, vec![grant.clone()]);
+        std::fs::remove_file(&root).unwrap();
+        assert!(!persist(&mut cache, &root, vec![grant.clone()]).unwrap());
+        assert_eq!(load(&root), vec![grant]);
     }
 }

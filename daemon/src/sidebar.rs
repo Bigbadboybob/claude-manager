@@ -127,7 +127,7 @@ fn allowed(state: &DaemonState, caller: &Caller, uid: &str) -> bool {
         return false;
     }
     if state.config.session_scope == crate::config::SessionScope::ManagerChain {
-        return auth::manager_reaches_any(state, &c.session_uid, uid);
+        return auth::check_any_session_caller(state, &c.session_uid, uid);
     }
     let cview = state.lookup_session_any(&c.session_uid).unwrap();
     let target = state.lookup_session_any(uid).unwrap();
@@ -348,6 +348,8 @@ mod tests {
     fn fixture() -> (tempfile::TempDir, Arc<Mutex<DaemonState>>) {
         let dir = tempfile::tempdir().unwrap();
         let mut s = DaemonState::new();
+        // Most of these fixtures exercise the legacy task/workspace scope.
+        s.config.session_scope = crate::config::SessionScope::TaskTree;
         s.daemon_sessions_path = Some(dir.path().join("daemon-sessions.json"));
         for (uid, ws, task) in [
             ("parent", "parent-ws", "p"),
@@ -356,7 +358,7 @@ mod tests {
         ] {
             s.tui_sessions.insert(
                 uid.into(),
-                serde_json::from_value(json!({"uid":uid,"workspace_id":ws,"task_id":task}))
+                serde_json::from_value(json!({"uid":uid,"workspace_id":ws,"task_id":task,"type":"claude-code"}))
                     .unwrap(),
             );
         }
@@ -654,5 +656,32 @@ mod tests {
             );
             assert!(live(&s.lock().unwrap(), uid));
         }
+    }
+
+    #[test]
+    fn manager_scope_accepts_tui_self_global_and_operator() {
+        let _guard = crate::test_support::env_lock();
+        crate::items::org::reset_cache_for_test();
+        let (_dir, s) = fixture();
+        s.lock().unwrap().config.session_scope = crate::config::SessionScope::ManagerChain;
+        crate::items::org::absorb_reply(&json!({"org":{"members":{
+            "parent":{"id":"member-parent","acting_as":"main"}
+        }}}), 1_700_000_000.0);
+        let mut p = publication();
+        p.members = Some(BTreeMap::from([("member-parent".into(), PublishedMember::default())]));
+        assert!(call(&s, "sidebar.publish", Caller::operator("owner"), json!(p)).ok);
+        let own = call(&s, "sidebar.assign", Caller::session("parent"), json!({"section":"Swarm"}));
+        assert!(own.ok, "{:?}", own.error);
+        assert_eq!(own.result.unwrap()["assignment"]["member_id"], "member-parent");
+        assert!(call(&s, "sidebar.list", Caller::session("parent"), json!({}))
+            .result.unwrap()["workspaces"].get("parent-ws").is_some());
+        assert!(!call(&s, "sidebar.assign", Caller::session("parent"),
+            json!({"session_id":"scout","section":"none","workspace":true})).ok);
+        s.lock().unwrap().tui_sessions.get_mut("parent").unwrap().global_perms = true;
+        assert!(call(&s, "sidebar.assign", Caller::session("parent"),
+            json!({"session_id":"scout","section":"none","workspace":true})).ok);
+        assert!(call(&s, "sidebar.assign", Caller::operator("owner"),
+            json!({"session_id":"other","section":"none","workspace":true})).ok);
+        crate::items::org::reset_cache_for_test();
     }
 }

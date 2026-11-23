@@ -255,6 +255,7 @@ pub(crate) fn respawn_existing_with_workflow_mcp(
         if ts.model.is_some() { ts.model_source.as_deref() } else { task_model.map(|_| "task") },
         ts.effort.as_deref().or(task_effort),
         if ts.effort.is_some() { ts.effort_source.as_deref() } else { task_effort.map(|_| "task") },
+        ts.managed_by_uid.as_deref(),
     ) {
         Some(Ok(s)) => s,
         Some(Err(e)) => {

@@ -1350,7 +1350,8 @@ mod tests {
         let err = call(&state, owner, "org.member_update", json!({"title": "x"})).error.unwrap();
         assert!(matches!(err.code, ErrorCode::InvalidParams));
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 2, "refusals never reach the API: {seen:?}");
+        assert_eq!(seen.iter().filter(|(method, _, _)| method != "GET").count(), 2,
+            "refusals never reach the API; snapshot refreshes are allowed: {seen:?}");
         let (_, _, hire) = seen.iter().find(|(m, p, _)| m == "POST" && p == "/org/members").unwrap();
         assert_eq!((&hire["actor"]["pid"], &hire["handle"], &hire["manager"], &hire["request_id"]),
                    (&json!("owner"), &json!("rev"), &json!("main/ep"), &json!("h1")));
@@ -1457,8 +1458,9 @@ mod tests {
         assert!(response.ok, "{:?}", response.error);
         {
             let seen = seen.lock().unwrap();
-            assert_eq!(seen.len(), 1);
-            let (method, path, body) = &seen[0];
+            let writes: Vec<_> = seen.iter().filter(|(method, _, _)| method != "GET").collect();
+            assert_eq!(writes.len(), 1);
+            let (method, path, body) = writes[0];
             assert_eq!((method.as_str(), path.as_str()), ("POST", "/org/members/main/ep/rebind_main"));
             assert_eq!(body["pid"], format!("agent:{daemon}:new-uid"));
             assert_eq!(body["actor"]["pid"], format!("agent:{daemon}:me-uid"));
@@ -1474,7 +1476,8 @@ mod tests {
         let error = unknown.error.expect("unknown action must be rejected");
         assert!(matches!(error.code, ErrorCode::InvalidParams));
         assert!(error.message.contains("unknown action"), "{}", error.message);
-        assert_eq!(seen.lock().unwrap().len(), 1, "unknown action must not reach the API");
+        assert_eq!(seen.lock().unwrap().iter().filter(|(method, _, _)| method != "GET").count(), 1,
+            "unknown action must not reach the API");
     }
 
     #[test]

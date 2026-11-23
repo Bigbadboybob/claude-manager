@@ -4333,6 +4333,7 @@ mod remote_reconnect_tests {
             wt: &'a std::path::Path,
         ) -> crate::client_session::ClientSessionConfig<'a> {
             crate::client_session::ClientSessionConfig {
+                managed_by_uid: None,
                 model: None,
                 model_source: None,
                 effort: None,

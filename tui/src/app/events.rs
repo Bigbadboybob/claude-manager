@@ -1512,6 +1512,12 @@ impl App {
         // as Unix `fork()` inheriting the parent's working
         // directory.
         let caller_host = self.resolve_caller_host(caller_uid)?;
+        // The viewer row can be an alias for a daemon-owned session. The
+        // daemon's live registry must receive its own UID for the spawner.
+        let daemon_caller_uid = self.workspaces.iter().flat_map(|w| &w.sessions)
+            .find(|s| s.uid == caller_uid)
+            .map(|s| s.session.daemon_session_uid.as_deref().unwrap_or(caller_uid).to_owned())
+            .expect("resolve_caller_host found the caller");
 
         // 12e-r6: shared fail-fast helper. Pre-r8 this
         // checked active_host; round-8 routes the check
@@ -1585,6 +1591,7 @@ impl App {
             global_perms,
             model,
             effort,
+            Some(&daemon_caller_uid),
         ) {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
@@ -2663,6 +2670,7 @@ impl App {
 
         let op_token = self.host_pool.operator_token_for(&host_id);
         let config = crate::client_session::ClientSessionConfig {
+            managed_by_uid: None,
             model: None,
             model_source: None,
             effort: None,
@@ -6176,6 +6184,7 @@ pub(super) mod pending_workflow_events_tests {
         let uid = new_session_uid();
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
+            managed_by_uid: None,
             model: Some("test-model"),
             model_source: None,
             effort: Some("xhigh"),
@@ -6661,6 +6670,7 @@ pub(super) mod pending_workflow_events_tests {
         let uid = new_session_uid();
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
+            managed_by_uid: None,
             model: Some("test-model"),
             model_source: None,
             effort: Some("xhigh"),
@@ -6848,6 +6858,7 @@ pub(super) mod pending_workflow_events_tests {
         let uid = new_session_uid();
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
+            managed_by_uid: None,
             model: Some("test-model"),
             model_source: None,
             effort: Some("xhigh"),
@@ -7083,6 +7094,7 @@ pub(super) mod pending_workflow_events_tests {
         let uid = new_session_uid();
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
+            managed_by_uid: None,
             model: Some("test-model"),
             model_source: None,
             effort: Some("xhigh"),
@@ -7315,6 +7327,7 @@ pub(super) mod pending_workflow_events_tests {
         let uid_gone = new_session_uid(); // never spawned → attach will fail
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
+            managed_by_uid: None,
             model: Some("test-model"),
             model_source: None,
             effort: Some("xhigh"),
@@ -7951,6 +7964,7 @@ pub(super) mod pending_workflow_events_tests {
         let uid = new_session_uid();
         let argv = vec!["/bin/bash".to_string()];
         let cfg = crate::client_session::ClientSessionConfig {
+            managed_by_uid: None,
             model: Some("test-model"),
             model_source: None,
             effort: Some("xhigh"),
@@ -9075,8 +9089,18 @@ mod send_key_tests {
         sp.args = vec!["-c".into(), format!("printf '\\033[>1u'; stty raw -echo; exec cat > '{}'", file.display())];
         sp.workspace_id = "ws-k".into();
         sp.session_type = "codex".into();
+        sp.managed_by_uid = Some("ts-1-0".into());
         let sess = cm_daemon::session::DaemonSession::spawn(sp).unwrap();
-        state.lock().unwrap().sessions.insert("ts-31-0".into(), sess);
+        {
+            let mut s = state.lock().unwrap();
+            s.sessions.insert("ts-31-0".into(), sess);
+            s.session_scope_cache.daemon_id = "host".into();
+            for (uid, ws) in [("ts-1-0", "a"), ("ts-2-0", "a"), ("ts-3-0", "b")] {
+                s.tui_sessions.insert(uid.into(), serde_json::from_value(serde_json::json!({
+                    "uid":uid, "type":"codex", "workspace_id":ws
+                })).unwrap());
+            }
+        }
         std::thread::sleep(Duration::from_millis(300));
 
         let mut app = test_app();
@@ -9098,7 +9122,7 @@ mod send_key_tests {
         let reply = crate::control::methods::send_key(
             &mut app,
             "ts-1-0",
-            &serde_json::json!({"session_uids": ["ts-31-0", "ts-3-0", "ts-gone", "ts-2-0"], "key": "enter"}),
+            &serde_json::json!({"session_uids": ["ts-31-0", "ts-3-0", "ts-gone", "ts-1-0"], "key": "enter"}),
         )
         .unwrap();
         let statuses: Vec<&str> = reply["results"].as_array().unwrap().iter().map(|r| r["status"].as_str().unwrap()).collect();

@@ -1621,6 +1621,7 @@ impl App {
                         entry.global_perms, // global_perms
                         entry.model.as_deref(),
                         entry.effort.as_deref(),
+                        entry.managed_by_uid.as_deref(),
                     ) {
                         Some(Ok(s)) => Ok(s),
                         Some(Err(e)) => Err(e),
@@ -1654,6 +1655,7 @@ impl App {
                         entry.global_perms, // global_perms
                         entry.model.as_deref(),
                         entry.effort.as_deref(),
+                        entry.managed_by_uid.as_deref(),
                     ) {
                         Some(Ok(s)) => Ok(s),
                         Some(Err(e)) => Err(e),

@@ -174,6 +174,7 @@ pub(crate) fn attach_via_daemon(
     // ITS `CM_OPERATOR_TOKEN` (a remote one is unrelated to ours).
     let operator_token_id = host_pool.operator_token_for(host_id);
     let cs_config = crate::client_session::ClientSessionConfig {
+        managed_by_uid: None,
         model: None,
         model_source: None,
         effort: None,
@@ -374,6 +375,7 @@ pub(crate) fn try_spawn_via_daemon_with_deps(
     // configured default.
     effort: Option<&str>,
     effort_source: Option<&str>,
+    managed_by_uid: Option<&str>,
 ) -> Option<anyhow::Result<Session>> {
     // 10f: daemon-eligibility is now driven solely by
     // session_type. Pre-flip a `CM_USE_DAEMON_SOCKET` opt-in
@@ -508,6 +510,7 @@ pub(crate) fn try_spawn_via_daemon_with_deps(
     };
     let operator_token_id = host_pool.operator_token_for(host_id);
     let cs_config = crate::client_session::ClientSessionConfig {
+        managed_by_uid,
         daemon_socket: &daemon_socket,
         operator_token_id: &operator_token_id,
         uid: session_uid,
@@ -743,6 +746,7 @@ impl App {
         model: Option<&str>,
         // Explicit or recorded effort, resolved the same way.
         effort: Option<&str>,
+        managed_by_uid: Option<&str>,
     ) -> Option<anyhow::Result<Session>> {
         use cm_daemon::models::Setting;
         let resume = resume_session_id.map(|id| (worktree_path, transcript_path, id));
@@ -778,6 +782,7 @@ impl App {
             model_source,
             effort,
             effort_source,
+            managed_by_uid,
         )
     }
 
@@ -1167,6 +1172,7 @@ impl App {
                         false, // global_perms
                         tomb.entry.as_ref().and_then(|e| e.model.as_deref()),
                         tomb.entry.as_ref().and_then(|e| e.effort.as_deref()),
+                        tomb.managed_by_uid.as_deref(),
                     ) {
                         Some(Ok(s)) => Ok(s),
                         Some(Err(e)) => {
@@ -1405,6 +1411,7 @@ impl App {
                 false, // global_perms
                 tomb_model.as_deref(),
                 tomb_effort.as_deref(),
+                tomb.managed_by_uid.as_deref(),
             ) {
                 Some(Ok(s)) => {
                     let mut ts = make_simple_session_with_uid(
@@ -2404,6 +2411,7 @@ impl App {
             false, // global_perms
             model,
             effort,
+            None,
         ) {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
@@ -2907,6 +2915,7 @@ impl App {
                     false, // global_perms
                     None,
                     None,
+                    None,
                 ) {
                     Some(Ok(s)) => Some(make_simple_session_with_uid(
                         session_uid,
@@ -3281,6 +3290,7 @@ impl App {
             false, // global_perms
             model,
             effort,
+            None,
         ) {
             Some(Ok(s)) => Ok(s),
             Some(Err(e)) => {
@@ -4214,6 +4224,7 @@ impl App {
             false, // global_perms
             model,
             effort,
+            None,
         ) {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
