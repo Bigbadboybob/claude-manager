@@ -1571,6 +1571,134 @@ class PoolTests(HubHarness):
         self.poll()
         self.assertEqual(self.candidates(), ["carol-uuid-0000", "bob-uuid-0000"])
 
+    def test_room_tier_precedes_reservation_for_normal_and_leftover_hosts(self):
+        self.hub("policy", "thresholds.weekly", "98")
+        self.set_reading("bob", ("weekly_all", None, 97, 86400, True), hub="cm-manager", host_name="laptop")
+        self.set_reading("carol", ("weekly_all", None, 50, 2 * 86400, True), hub="cm-manager", host_name="laptop")
+        self.poll()
+        self.poll()
+        self.hub("reserve", "bob@example.com", "--for", "laptop")
+        self.assertEqual(self.candidates(), ["carol-uuid-0000", "bob-uuid-0000"])
+        self.hub("policy", "leftover_hosts", "laptop")
+        self.assertEqual(self.candidates(), ["carol-uuid-0000", "bob-uuid-0000"])
+        self.hub("policy", "leftover_room", "1")
+        self.assertEqual(self.candidates(), ["bob-uuid-0000", "carol-uuid-0000"])
+
+    def prepare_projection_pool(self):
+        self.hub("policy", "thresholds.weekly", "98")
+        self.hub("policy", "thresholds.session", "98")
+        self.set_reading("bob", ("weekly_all", None, 10, 86400, True), hub="cm-manager", host_name="laptop")
+        self.set_reading("carol", ("weekly_all", None, 20, 2 * 86400, True), hub="cm-manager", host_name="laptop")
+        self.poll()
+        self.poll()
+        self.hub("assign", "laptop", "alice@example.com", "--auto")
+
+    def test_dwell_only_yields_to_a_full_post_switch_reading_and_still_caps(self):
+        self.prepare_projection_pool()
+        now = int(time.time())
+        export = host_export("laptop", active="alice", saved=["alice"],
+                             alice=(0, ("session", None, 98, 3600, True)))
+        export.update(last_switch_at=now - 60, auto_switches_24h=0)
+        reading = export["accounts"]["alice-uuid-0000"]["reading"]
+        with accounts.Hub(self.hub_paths) as h:
+            for at, percent, count in ((now - 60, 98, 0), (now - 61, 98, 0),
+                                       (now + 1, 98, 0), (now, 97, 0), (now, 98, 24)):
+                reading["at"], reading["limits"][0]["percent"], export["auto_switches_24h"] = at, percent, count
+                self.assertFalse(bool(accounts.pool_lend(h, "laptop", export, h.reports(), now)))
+            reading["at"], reading["limits"][0]["percent"], export["auto_switches_24h"] = now, 98, 23
+            self.assertTrue(bool(accounts.pool_lend(h, "laptop", export, h.reports(), now)))
+
+    def test_projection_uses_previous_checkin_and_records_reason(self):
+        self.prepare_projection_pool()
+        now = int(time.time())
+        export = host_export("laptop", active="alice", saved=["alice"],
+                             alice=(600, ("session", None, 83, 3600, True)))
+        export.update(last_switch_at=now - 3600, auto_switches_24h=0)
+        with accounts.Hub(self.hub_paths) as h, mock.patch.object(accounts.time, "time", return_value=now):
+            self.assertNotIn("lend", accounts.hub_checkin(h, export))
+            reading = export["accounts"]["alice-uuid-0000"]["reading"]
+            reading["at"] = now
+            reading["limits"][0]["percent"] = 92
+            reply = accounts.hub_checkin(h, export)
+            self.assertIn("5h 92% (projected 101% by next reading); target", reply["lend"]["reason"])
+        self.assertIn("projected 101%", self.hub("history")[1])
+
+    def test_projection_requires_room_on_the_top_candidate(self):
+        self.prepare_projection_pool()
+        now = int(time.time())
+        export = host_export("laptop", active="alice", saved=["alice"],
+                             alice=(0, ("session", None, 92, 3600, True)))
+        export.update(last_switch_at=now - 3600, auto_switches_24h=0)
+        previous = json.loads(json.dumps(export))
+        old = previous["accounts"]["alice-uuid-0000"]["reading"]
+        old["at"] -= 600
+        old["limits"][0]["percent"] = 83
+        with accounts.Hub(self.hub_paths) as h:
+            reports = h.reports()
+            other = {**previous, "active": "bob-uuid-0000"}
+            self.assertFalse(bool(accounts.pool_lend(h, "laptop", export, reports, now, other)))
+            export["last_switch_at"] = now - 60
+            self.assertFalse(bool(accounts.pool_lend(h, "laptop", export, reports, now, previous)))
+            export["last_switch_at"] = now - 3600
+            export["auto_switches_24h"] = 24
+            self.assertFalse(bool(accounts.pool_lend(h, "laptop", export, reports, now, previous)))
+            export["auto_switches_24h"] = 0
+            cache = accounts.load_json(h.dir / "readings.json")
+            for uuid in ("bob-uuid-0000", "carol-uuid-0000"):
+                cache[uuid]["limits"][0]["percent"] = 97
+                for report in reports.values():
+                    info = (report.get("export", {}).get("accounts") or {}).get(uuid) or {}
+                    if info.get("reading"):
+                        info["reading"]["limits"][0]["percent"] = 97
+            accounts.atomic_write(h.dir / "readings.json", cache)
+            self.assertFalse(bool(accounts.pool_lend(h, "laptop", export, reports, now, previous)))
+            # Over threshold still uses low-room accounts as a last resort.
+            export["accounts"]["alice-uuid-0000"]["reading"]["limits"][0]["percent"] = 98
+            self.assertTrue(bool(accounts.pool_lend(h, "laptop", export, reports, now, previous)))
+
+    def test_projection_refuses_an_unread_target_even_when_policy_allows_it(self):
+        self.prepare_projection_pool()
+        self.hub("policy", "auto_allow_unread", "true")
+        now = int(time.time())
+        export = host_export("laptop", active="alice", saved=["alice"],
+                             alice=(0, ("session", None, 92, 3600, True)))
+        export.update(last_switch_at=now - 3600, auto_switches_24h=0)
+        previous = json.loads(json.dumps(export))
+        previous["accounts"]["alice-uuid-0000"]["reading"]["at"] -= 600
+        previous["accounts"]["alice-uuid-0000"]["reading"]["limits"][0]["percent"] = 83
+        with accounts.Hub(self.hub_paths) as h:
+            cache = accounts.load_json(h.dir / "readings.json")
+            cache.pop("bob-uuid-0000")
+            cache["carol-uuid-0000"]["limits"][0]["percent"] = 97
+            accounts.atomic_write(h.dir / "readings.json", cache)
+            self.assertEqual(accounts.pool_candidates(h, "laptop", h.reports(), now)[0][1], "bob-uuid-0000")
+            self.assertFalse(bool(accounts.pool_lend(h, "laptop", export, h.reports(), now, previous)))
+
+    def test_projection_rejects_invalid_history_and_respects_counted_limits(self):
+        now = int(time.time())
+        reset = now + 3600
+        limit = {"kind": "session", "scope": None, "group": "all", "percent": 92, "resets_at": reset}
+        reading = {"at": now, "limits": [limit]}
+        previous = {"at": now - 600, "limits": [{**limit, "percent": 83}]}
+        config = {"thresholds": {"session": 98, "weekly": 98}, "switch_on_scoped": False}
+        self.assertEqual(accounts.projected_limits(reading, previous, config, now)[0][1], 101)
+        for change in ({"at": now}, {"at": now + 1}, {"limits": []},
+                       {"limits": [{**limit, "percent": 93}]},
+                       {"limits": [{**limit, "percent": 83, "resets_at": reset + 1}]},
+                       {"limits": [{**limit, "percent": 83, "resets_at": None}]}):
+            self.assertEqual(accounts.projected_limits(reading, {**previous, **change}, config, now), [])
+        self.assertEqual(accounts.projected_limits(reading, {**previous, "at": now - 3600}, config, now), [])
+        scoped = {**limit, "kind": "weekly_scoped", "scope": "Fable"}
+        old_scoped = {**scoped, "percent": 83}
+        self.assertEqual(accounts.projected_limits({"at": now, "limits": [scoped]},
+                         {"at": now - 600, "limits": [old_scoped]}, config, now), [])
+        config["switch_on_scoped"] = True
+        self.assertTrue(accounts.projected_limits({"at": now, "limits": [scoped]},
+                        {"at": now - 600, "limits": [old_scoped]}, config, now))
+        config["account_threshold"] = 94
+        self.assertTrue(accounts.projected_limits({"at": now, "limits": [{**scoped, "percent": 90}]},
+                        {"at": now - 600, "limits": [{**scoped, "percent": 85}]}, config, now))
+
     def test_pool_candidates_exclude_a_full_scoped_limit(self):
         self.hub("policy", "thresholds.weekly", "98")
         self.set_reading("bob", ("weekly_scoped", "Fable", 98, 2 * 86400, False),

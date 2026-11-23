@@ -1865,7 +1865,7 @@ def hub_checkin(hub: Hub, export: dict) -> dict:
                         if meta.get("borrower") == host and meta.get("evicting")), None)
         must_switch = pending if pending == active else None
         # A previously issued eviction remains in force if its reply was lost.
-        lend = pool_lend(hub, host, export, reports, now) if not pending or copy_over else None
+        lend = pool_lend(hub, host, export, reports, now, previous) if not pending or copy_over else None
         if lend:
             reply["lend"] = lend
         elif must_switch or (pending and (reply.get("entry") or {}).get("mode") == "pin"
@@ -2269,9 +2269,8 @@ def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -
             room = min((threshold_for(l, config) - l["percent"] for l in counted), default=100.0) \
                 if reading else 100.0
             order = (room < min_lend_room, resets)
-        # An account reserved for this host is its next account (Owner 11-15:
-        # "F finishes out bender7, then moves to bender4").
-        out.append(((last_resort, 0, not mine, *order, ratio,
+        # Room tier first, then the host's reservation within that tier.
+        out.append(((last_resort, 0, order[0], not mine, *order[1:], ratio,
                      email or uuid), uuid, why))
     # Lend copies are a separate last tier, even after last-resort reservations.
     for uuid, meta in hub.copies().items():
@@ -2357,7 +2356,61 @@ def borrowed_copy_over_cap(hub: Hub, host: str, export: dict,
     return None
 
 
-def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: float) -> dict | None:
+def projected_limits(reading: dict, previous: dict, config: dict, now: float) -> list[tuple[dict, float]]:
+    """Project one observed reading interval ahead, only within a known reset window."""
+    at, old_at = reading.get("at"), previous.get("at")
+    if not (isinstance(at, (int, float)) and isinstance(old_at, (int, float))
+            and old_at < at <= now):
+        return []
+    old_limits = {(l.get("kind"), l.get("scope"), l.get("group")): l
+                  for l in previous.get("limits", []) if isinstance(l, dict)}
+    result = []
+    for limit in reading.get("limits", []):
+        if not isinstance(limit, dict):
+            continue
+        kind = limit.get("kind")
+        if kind not in ("session", "weekly_all") and not config.get("switch_on_scoped"):
+            continue
+        old = old_limits.get((kind, limit.get("scope"), limit.get("group"))) or {}
+        reset, percent, old_percent = limit.get("resets_at"), limit.get("percent"), old.get("percent")
+        if not (isinstance(kind, str) and isinstance(reset, (int, float)) and reset > now
+                and reset == old.get("resets_at") and isinstance(percent, (int, float))
+                and isinstance(old_percent, (int, float)) and percent >= old_percent):
+            continue
+        projected = percent + (percent - old_percent) * min(at - old_at, 900) / (at - old_at)
+        if projected >= threshold_for(limit, config):
+            result.append((limit, projected))
+    return result
+
+
+def pool_candidate_has_room(hub: Hub, host: str, candidate: str,
+                            reports: dict[str, dict], now: float) -> bool:
+    """Early switches require a fresh, known reading with enough counted room."""
+    is_copy = candidate.endswith("~copy")
+    uuid = candidate.removesuffix("~copy")
+    readings = fresh_copy_readings(hub, reports, uuid, now) if is_copy else [
+        ({**load_json(hub.dir / "readings.json"), **hub_readings(reports)}).get(uuid)]
+    rec = load_json(hub.copy_path(uuid)) if is_copy else hub.pool().get(uuid, {})
+    email = (rec.get("oauthAccount") or {}).get("emailAddress")
+    policy = hub.desired["policy"]
+    config = hub_account_config(policy, email)
+    config["switch_on_scoped"] = config["switch_on_scoped"] and host not in set(policy.get("leftover_hosts") or [])
+    minimum = float(policy.get("min_lend_room", DEFAULT_MIN_LEND_ROOM))
+    if not readings or any(not isinstance(r, dict) or not isinstance(r.get("at"), (int, float))
+                           or now - r["at"] > POOL_READING_STALE_SECONDS or r["at"] > now
+                           for r in readings):
+        return False
+    for reading in readings:
+        limits = [l for l in reading.get("limits", [])
+                  if (l.get("resets_at") is None or l["resets_at"] > now)
+                  and (l["kind"] in ("session", "weekly_all") or config.get("switch_on_scoped"))]
+        if not limits or any(threshold_for(l, config) - l["percent"] < minimum for l in limits):
+            return False
+    return True
+
+
+def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: float,
+              previous: dict | None = None) -> dict | None:
     """Hand a pool login to a host that needs one: its pinned account, or in
     auto mode a fresh account once its own is over threshold."""
     entry = hub.desired["hosts"].get(host) or {}
@@ -2384,10 +2437,16 @@ def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: 
         taken = bool(res and host not in res.get("for", []) and not res.get("last_resort")
                      and not copy_borrowed)
         copy_over = bool(borrowed_copy_over_cap(hub, host, export, reports, now))
-        needs = not active or over or taken or copy_over
+        old_reading = (((previous or {}).get("accounts") or {}).get(active) or {}).get("reading") or {} \
+            if (previous or {}).get("active") == active else {}
+        projected = projected_limits(reading, old_reading, config, now) if active else []
+        needs = not active or over or taken or copy_over or projected
         waited = now - (export.get("last_switch_at") or 0) >= POOL_DWELL_SECONDS
+        switch_at = export.get("last_switch_at") or 0
+        fresh_full = bool(over and switch_at and isinstance(reading.get("at"), (int, float))
+                          and switch_at < reading["at"] <= now)
         capped = (export.get("auto_switches_24h") or 0) >= POOL_MAX_SWITCHES_PER_DAY
-        if needs and ((waited and not capped) or copy_over):
+        if needs and (((waited or fresh_full) and not capped) or copy_over):
             cands = pool_candidates(hub, host, reports, now)
             if cands:
                 # A host cannot safely receive another login for an account it holds.
@@ -2398,9 +2457,15 @@ def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: 
                 cands = [c for c in cands if c[1].removesuffix("~copy") not in held
                          and (not c[1].endswith("~copy") or fallback)]
             if cands:
+                if not (over or taken or copy_over or not active) and not pool_candidate_has_room(
+                        hub, host, cands[0][1], reports, now):
+                    return None
                 _, target, why = cands[0]
                 what = ", ".join(f"{limit_name(l)} {l['percent']:.0f}%" for l in over) \
-                    or ("lend-copy cap reached or reading unavailable" if copy_over else ("reserved for " + ", ".join(res["for"]) if taken else "no login"))
+                    or ("lend-copy cap reached or reading unavailable" if copy_over else
+                        ("reserved for " + ", ".join(res["for"]) if taken else
+                         (", ".join(f"{limit_name(l)} {l['percent']:.0f}% (projected {p:.0f}% by next reading)"
+                                    for l, p in projected) if projected else "no login")))
                 reason, switch = f"{what}; target {why}", True
     if not target:
         return None
