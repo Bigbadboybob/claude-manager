@@ -1,5 +1,7 @@
 # Claude account switcher
 
+Usage history and the dashboard contract are described in [usage-dashboard.md](usage-dashboard.md).
+
 Status: design 2026-10-22 from an Owner discussion on cm-sessions (branch
 `cm/claudelb`). Built so far: `capture` / `list` / `switch` / `remove`
 (real switch passed on the laptop 2026-11-07) and `poll` / `status` /
