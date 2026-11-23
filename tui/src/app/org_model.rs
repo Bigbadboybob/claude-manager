@@ -500,6 +500,12 @@ impl App {
         self.org.live()
     }
 
+    /// The Sessions sidebar falls back to its existing view while the org
+    /// service is offline, even if another screen retains a cached snapshot.
+    pub(super) fn sidebar_org_live(&self) -> Option<&OrgSnapshot> {
+        self.org.error.is_empty().then(|| self.org_live()).flatten()
+    }
+
     /// Ask for the snapshot now (a screen just opened).
     /// Read the whole snapshot on the next tick (a screen opened, or a
     /// write landed).

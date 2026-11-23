@@ -26,7 +26,7 @@ pub(crate) const SECTION_NONE: &str = "";
 
 /// Resolve an explicit member assignment, then its manager's, with the
 /// empty sentinel stopping inheritance. Deleted section ids act as auto.
-fn member_section(
+pub(super) fn member_section(
     snap: &super::org_model::OrgSnapshot,
     assignments: &HashMap<String, String>,
     sections: &[SidebarSection],

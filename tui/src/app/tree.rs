@@ -229,8 +229,8 @@ struct Forest {
 /// The snapshot's host-qualified placement, before sections or folding.
 /// Sessions from older or unreachable hosts remain in the legacy forest.
 #[derive(Default)]
-struct OrgPlacement {
-    members: HashMap<String, Vec<(usize, usize)>>,
+pub(super) struct OrgPlacement {
+    pub(super) members: HashMap<String, Vec<(usize, usize)>>,
     fallback: HashSet<(usize, usize)>,
 }
 
@@ -262,7 +262,7 @@ impl OrgPlacement {
 }
 
 impl App {
-    fn org_placement(&self, snap: &super::org_model::OrgSnapshot) -> OrgPlacement {
+    pub(super) fn org_placement(&self, snap: &super::org_model::OrgSnapshot) -> OrgPlacement {
         let mut result = OrgPlacement::default();
         for (wi, ws) in self.workspaces.iter().enumerate() {
             if ws.is_closed || self.is_past_workspace(wi) { continue; }
@@ -299,6 +299,43 @@ impl App {
             }
         }
         result
+    }
+
+    /// Marks belong only to a member's actual main, and use live org
+    /// relations rather than task ancestry. Shells never confer a mark.
+    pub(super) fn org_member_marks(&self, snap: &super::org_model::OrgSnapshot, placement: &OrgPlacement)
+        -> HashMap<(usize, usize), &'static str>
+    {
+        let mut marks = HashMap::new();
+        for member in &snap.members {
+            let Some(rows) = placement.members.get(&member.id) else { continue; };
+            let main = rows.iter().copied().find(|(wi, si)| {
+                let ts = &self.workspaces[*wi].sessions[*si];
+                member.main.as_ref().is_some_and(|m| m.session_uid.as_deref() == Some(&ts.uid)
+                    && m.daemon_id.as_deref() == snap.host_daemons.get(ts.host_id.as_str()).map(String::as_str))
+            });
+            let Some(main) = main else { continue; };
+            if member.is_owner() { marks.insert(main, super::symbols::OWNER); continue; }
+            let live = |wi: usize, si: usize| {
+                let ts = &self.workspaces[wi].sessions[si];
+                !ts.session.exited && is_agent_engine(&ts.session_type)
+            };
+            let assistant = rows.iter().any(|&(wi, si)| (wi, si) != main && live(wi, si));
+            let report = placement.members.iter().any(|(other, rows)| other != &member.id
+                && snap.in_member_subtree(other, &member.id) && rows.iter().any(|&(wi, si)| live(wi, si)));
+            if !assistant && !report { continue; }
+            let mut depth = 1;
+            let mut seen = HashSet::from([member.id.as_str()]);
+            let mut parent = member.manager_member_id.as_deref();
+            while let Some(id) = parent.filter(|id| seen.insert(*id)) {
+                let Some(manager) = snap.member(id) else { break; };
+                if manager.is_owner() { break; }
+                depth += 1;
+                parent = manager.manager_member_id.as_deref();
+            }
+            marks.insert(main, leader_glyph(depth));
+        }
+        marks
     }
 }
 
@@ -548,7 +585,8 @@ impl App {
             }
             .hash(&mut h);
         }
-        if let Some(snap) = self.org_live() {
+        self.sidebar_org_live().is_some().hash(&mut h);
+        if let Some(snap) = self.sidebar_org_live() {
             hash_unordered(&snap.host_daemons, &mut h);
             for member in &snap.members {
                 member.id.hash(&mut h);
@@ -793,7 +831,7 @@ impl App {
         let mut boxes: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
         // Use the org manager subtree for hosts that identify their daemon.
         // Older hosts keep the legacy matching until their brain is upgraded.
-        if let Some(snap) = self.org_live() {
+        if let Some(snap) = self.sidebar_org_live() {
             let placement = self.org_placement(snap);
             let owners = placement.box_owners(snap);
             for (member, rows) in &placement.members {
@@ -901,7 +939,7 @@ impl App {
             emit.entry(entry);
         }
         // Continuous org teams stay in the main Task sidebar as a boxed block.
-        if let Some(snap) = self.org_live() {
+        if let Some(snap) = self.sidebar_org_live() {
             for team in snap.teams.iter().filter(|t| t.continuous.is_some() && !t.archived()) {
                 let rows = boxes.remove(&team.id).unwrap_or_default();
                 if rows.is_empty() { continue; }
@@ -1475,8 +1513,8 @@ mod tree_tests {
         use cm_daemon::host_id::HostId;
         let mut app = test_app();
         app.sidebar_view = SidebarView::Task;
-        app.workspaces = ["lead", "report", "worker", "other"].into_iter().map(bare_ws).collect();
-        for (wi, uid) in [(0, "lead"), (1, "report"), (2, "worker"), (3, "other")] {
+        app.workspaces = ["lead", "report", "worker", "other", "grandchild"].into_iter().map(bare_ws).collect();
+        for (wi, uid) in [(0, "lead"), (1, "report"), (2, "worker"), (3, "other"), (4, "grandchild")] {
             session(&mut app, wi, uid, uid, "codex");
             app.workspaces[wi].sessions[0].host_id = HostId::new("h1");
         }
@@ -1485,19 +1523,62 @@ mod tree_tests {
         let lead = member("lead", "Lead", Some("mem-owner"), None, Some("lead"));
         let mut report = member("report", "Report", Some("lead"), None, Some("report"));
         report["assistants"] = serde_json::json!([{"daemon_id":"d1", "session_uid":"worker", "acting_as":"worker"}]);
+        let grandchild = member("grandchild", "Grandchild", Some("report"), None, Some("grandchild"));
         let other = member("other", "Other", Some("mem-owner"), None, Some("other"));
         let mut ct = team("ct", "Continuous", None, Some("lead"), &[]);
         ct["continuous"] = serde_json::json!({"lead_member_id":"lead", "health":"ok"});
-        let mut value = snapshot(1, vec![owner(), lead, report, other], vec![ct]);
+        let mut value = snapshot(1, vec![owner(), lead, report, grandchild, other], vec![ct]);
         value["host_daemons"] = serde_json::json!({"h1":"d1"});
         app.org.accept(value);
         let tree = app.task_tree();
-        for wi in 0..3 {
+        for wi in [0, 1, 2, 4] {
             assert!(tree.items.contains(&VisualItem::ContinuousTeamSession(wi, 0)));
             assert!(!tree.items.contains(&VisualItem::Session(wi, 0)));
             assert!(!tree.items.contains(&VisualItem::WorkspaceHeader(wi)));
         }
         assert!(tree.items.contains(&VisualItem::Session(3, 0)));
+        app.org.fail(super::super::org_model::RpcFail { unsupported: false, message: "offline".into() });
+        let offline = app.task_tree();
+        assert!(!offline.items.iter().any(|item| matches!(item, VisualItem::ContinuousTeamHeader(_))));
+        for wi in 0..5 { assert!(offline.items.contains(&VisualItem::Session(wi, 0))); }
+    }
+
+    #[test]
+    fn sidebar_marks_follow_live_org_reports_and_assistants() {
+        use super::super::org_model::fixtures::{member, owner, snapshot};
+        use cm_daemon::host_id::HostId;
+        let mut app = test_app();
+        app.sidebar_view = SidebarView::Task;
+        app.workspaces = ["a", "b", "c", "worker", "leaf"].into_iter().map(bare_ws).collect();
+        for (wi, uid) in ["a", "b", "c", "worker", "leaf"].into_iter().enumerate() {
+            session(&mut app, wi, uid, uid, "codex");
+            app.workspaces[wi].sessions[0].host_id = HostId::new("h1");
+        }
+        let a = member("a", "A", Some("mem-owner"), None, Some("a"));
+        let b = member("b", "B", Some("a"), None, Some("b"));
+        let mut c = member("c", "C", Some("b"), None, Some("c"));
+        c["assistants"] = serde_json::json!([{"daemon_id":"d1", "session_uid":"worker", "acting_as":"assistant"}]);
+        let leaf = member("leaf", "Leaf", Some("mem-owner"), None, Some("leaf"));
+        let mut value = snapshot(1, vec![owner(), a, b, c, leaf], vec![]);
+        value["host_daemons"] = serde_json::json!({"h1":"d1"});
+        app.org.accept(value);
+        let snap = app.org_live().unwrap();
+        let marks = app.org_member_marks(snap, &app.org_placement(snap));
+        assert_eq!(marks.get(&(0, 0)), Some(&"★"));
+        assert_eq!(marks.get(&(1, 0)), Some(&"☆"));
+        assert_eq!(marks.get(&(2, 0)), Some(&"✦"));
+        assert!(!marks.contains_key(&(3, 0)) && !marks.contains_key(&(4, 0)));
+        let buffer = sidebar_buffer(&mut app, 30);
+        let lines: Vec<String> = (0..buffer.area.height).map(|y|
+            (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect()).collect();
+        assert!(lines.iter().any(|line| line.contains("★ a")), "{lines:?}");
+        assert!(lines.iter().any(|line| line.contains("☆ b")), "{lines:?}");
+        assert!(lines.iter().any(|line| line.contains("✦ c")), "{lines:?}");
+        app.workspaces[3].sessions[0].session.exited = true;
+        let snap = app.org_live().unwrap();
+        let marks = app.org_member_marks(snap, &app.org_placement(snap));
+        assert!(!marks.contains_key(&(2, 0)), "an exited assistant does not confer a mark");
+        assert_eq!(marks.get(&(1, 0)), Some(&"☆"), "the live report still confers a mark");
     }
 
     #[test]

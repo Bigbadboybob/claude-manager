@@ -2006,6 +2006,11 @@ impl App {
         };
         // Leader marks: the lead of each task with subtasks, by level.
         let marks = tree.as_ref().map_or_else(HashMap::new, |t| self.leader_marks(&t.org));
+        let org_placement = tree.as_ref().and_then(|_| self.sidebar_org_live()).map(|snap| self.org_placement(snap));
+        let org_marks = self.sidebar_org_live().zip(org_placement.as_ref())
+            .map_or_else(HashMap::new, |(snap, placement)| self.org_member_marks(snap, placement));
+        let org_rows: HashSet<_> = org_placement.as_ref().into_iter()
+            .flat_map(|placement| placement.members.values().flatten().copied()).collect();
         // Owner-led tasks (pinned, or standing in for a division root): their
         // workspace header carries the level's leader mark with Owner's ♔
         // beside it.
@@ -2058,7 +2063,11 @@ impl App {
                         _ => "",
                     };
                     let tail = fold_tail(&node);
-                    let owner = root_task.as_deref().and_then(|t| owner_mark(t));
+                    let owner = if ws.sessions.iter().enumerate().any(|(si, _)| org_rows.contains(&(*wi, si))) {
+                        None
+                    } else {
+                        root_task.as_deref().and_then(|t| owner_mark(t))
+                    };
                     let initiative_marker = root_task
                         .as_deref()
                         .map_or("", |t| initiative_markers.get(t).copied().unwrap_or(""));
@@ -2261,7 +2270,11 @@ impl App {
                     };
                     // The lead of a task with subtasks carries its level's
                     // leader mark in front of its label (app/tree.rs).
-                    let mark = marks.get(&ts.uid).copied();
+                    let mark = if org_rows.contains(&(*wi, *si)) {
+                        org_marks.get(&(*wi, *si)).copied()
+                    } else {
+                        marks.get(&ts.uid).copied()
+                    };
                     let (display, lead_mark) = match (mark, display.find(|c: char| c != ' ')) {
                         (Some(g), Some(at)) => (display[at..].to_string(), Some((display[..at].to_string(), g))),
                         _ => (display, None),
@@ -2279,7 +2292,9 @@ impl App {
                     }
                     if let Some((pad, glyph)) = lead_mark {
                         spans.push(Span::raw(pad));
-                        spans.push(Span::styled(format!("{glyph} "), Style::default().fg(theme::LEAD)));
+                        let style = if glyph == super::symbols::OWNER { super::symbols::owner_style() }
+                            else { Style::default().fg(theme::LEAD) };
+                        spans.push(Span::styled(format!("{glyph} "), style));
                     }
                     let mut tail: Vec<Span> = Vec::new();
                     if owner_blocked {
