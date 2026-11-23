@@ -780,7 +780,7 @@ The `Agent` trait's `read_messages` lives in Rust (used by the TUI for idle dete
 | 4 | Workflow MCP tools | Agent can launch a feedback workflow on its own task and observe transitions |
 | 5 | Subtask MCP tools; worktree-branch creation | Agent can create a `branch`-mode subtask, work in it, mark done, and see the worktree cleaned up |
 | 6 | Sidebar markers, focus mode polish, activity feed | All agent-initiated mutations visible in the feed |
-| 7 | CLAUDE.md additions; activation-prompt template additions | Agent visibly asks before acting in the manual smoke tests |
+| 7 | CLAUDE.md additions; activation-prompt template additions | Superseded 2026-11-23 (Owner): agents start and prompt their own sessions without asking |
 
 Each phase ends with a manual smoke test in the TUI before moving on.
 
