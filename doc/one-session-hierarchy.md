@@ -1,6 +1,6 @@
 # One session hierarchy
 
-Status: **draft for Owner review** (Swarm-Coord, 2026-11-21). This brings
+Status: **approved** (Owner, 2026-11-23; see §8). Swarm-Coord, 2026-11-21. This brings
 forward and finishes stages S7 and S8 of [org-model.md](org-model.md) §13.
 Owner asked for it after phase 6 of [continuous-teams.md](continuous-teams.md).
 
@@ -188,14 +188,31 @@ lanes. Piece 3 depends on 1. Every piece is tested with
 `scripts/cm-test-isolated` and lands on main. There is one combined deploy at
 the end: hub first, then cm-sessions, then the laptop.
 
-## 8. For Owner
+## 8. Owner's answers (2026-11-23)
 
-1. **Block unit.** In the sidebar, one block per *member*, with its
-   checkouts inside it, as above. The alternative is to keep one block per
-   *workspace*, nested by the org chart. Member blocks match "employees";
-   workspace blocks change the sidebar less.
-2. **Union window.** 48 h of logging before the cut. Longer if you want more
-   evidence.
-3. **Owner's own sessions.** Each one is an `agent` member directly under
-   you, at the top level, outside sections unless assigned. Or they could be
-   collected in one "Owner" group.
+1. **Block unit: member.** One sidebar block per member, with its checkouts
+   as small groups inside it (§4).
+2. **No union window.** The manager-chain rule is authoritative from the
+   deploy. Step 1 of the §5 rollout is dropped; the config flag back to the
+   old rule stays as the rollback.
+3. **Owner's own sessions** are `agent` members directly under Owner, at the
+   top level, outside sections unless assigned (§3 rule 3).
+
+## 9. After this: tasks become board items only
+
+Owner, 2026-11-23: sessions stop being linked to tasks at all; tasks are only
+board items. This change (§1–§7) removes tasks from placement, sections, marks
+and control. What is left of the link is plumbing (§6): a task row still mints
+the worktree and carries the brief for `start_session(task_id=…)`,
+`create_subtask` and `fork_session(task_name=…)`. The next change removes it:
+
+- `start_session` / `fork_session` mint a member or worker checkout directly
+  (`cm-ws/<member>/<slug>`), with the brief passed in the call or taken from a
+  board item (`start_session(item=…)`, org-model S6).
+- `create_subtask` becomes "create an item" plus an optional worker; the
+  `parent_task_id` tree stays only as "part of" inside the board.
+- `agent_task_edges`, task-bound workspaces and the Task sub-view retire
+  (org-model S8). Existing task-bound sessions keep working; nothing is
+  rebound.
+
+It is designed after §7 ships, as its own short doc.
