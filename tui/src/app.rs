@@ -70,6 +70,7 @@ mod messages;
 mod global_settings;
 mod staffing;
 mod availability;
+mod usage;
 mod agent_state;
 mod board;
 mod orgchart;
@@ -280,6 +281,7 @@ pub struct App {
     pub config: Config,
     global_settings: global_settings::GlobalSettings,
     availability: availability::Availability,
+    usage: usage::Usage,
     board: board::Board,
     /// F6 org chart overlay (app/orgchart.rs).
     orgchart: orgchart::OrgChart,
@@ -1046,6 +1048,7 @@ impl App {
             config,
             global_settings: global_settings::GlobalSettings::load(),
             availability: availability::Availability::load(),
+            usage: usage::Usage::default(),
             board: board::Board::default(),
             orgchart: orgchart::OrgChart::default(),
             org: org_model::OrgState::default(),

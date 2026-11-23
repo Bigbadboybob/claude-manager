@@ -1,0 +1,26 @@
+{
+  "schema": 1, "generated_at": 1795400000, "since": 1794795200, "granularity": "hour",
+  "accounts": [
+    {"engine": "claude", "email": "a@example.com", "alias": null, "status": null, "pool_host": null,
+     "active_on": ["cm-sessions"], "reserved_for": ["f-sessions"], "room": true,
+     "limits": [{"kind": "five_hour", "percent": 38.0, "resets_at": 1795410000, "read_at": 1795399800},
+                {"kind": "weekly_all", "percent": 10.0, "resets_at": 1795580000, "read_at": 1795399800},
+                {"kind": "weekly_fable", "percent": 7.0, "resets_at": 1795580000, "read_at": 1795399800}]},
+    {"engine": "codex", "email": "b@example.com", "alias": "802", "status": "active", "pool_host": "cm-sessions",
+     "active_on": [], "reserved_for": null, "room": null,
+     "limits": [{"kind": "primary", "percent": 4.0, "resets_at": 1795405000, "read_at": 1795399700},
+                {"kind": "secondary", "percent": 30.0, "resets_at": 1795900000, "read_at": 1795399700}]},
+    {"engine": "claude", "email": "c@example.com", "alias": null, "status": null, "pool_host": null,
+     "active_on": [], "reserved_for": [], "room": false,
+     "limits": [{"kind": "weekly_all", "percent": 99.0, "resets_at": 1795580000, "read_at": 1795399800}]}
+  ],
+  "limit_history": [{"engine": "claude", "email": "a@example.com", "kind": "weekly_all", "points": [[1795300000, 2.0], [1795399800, 10.0]]},
+                    {"engine": "claude", "email": "a@example.com", "kind": "weekly_fable", "points": [[1795300000, 7.0], [1795399800, 7.0]]}],
+  "tokens": {
+    "totals": [{"window": "24h", "engine": "claude", "host": null, "email": null, "input": 1, "output": 2, "cache_read": 3, "cache_write": 4, "reasoning": 0, "requests": 5},
+               {"window": "24h", "engine": "claude", "host": "cm-sessions", "email": null, "input": 10, "output": 20, "cache_read": 30, "cache_write": 40, "reasoning": 0, "requests": 5},
+               {"window": "7d", "engine": "codex", "host": null, "email": "b@example.com", "input": 1200000, "output": 2, "cache_read": 3, "cache_write": 0, "reasoning": 1, "requests": 4}],
+    "series": [{"bucket": 1795392000, "engine": "codex", "host": "cm-sessions", "email": "b@example.com", "input": 1, "output": 2, "cache_read": 3, "cache_write": 0, "reasoning": 1, "requests": 4},
+               {"bucket": 1795395600, "engine": "claude", "host": "f-sessions", "email": "a@example.com", "input": 4000, "output": 20, "cache_read": 300, "cache_write": 10, "reasoning": 0, "requests": 4}]
+  }
+}

@@ -6121,6 +6121,9 @@ pub(super) mod pending_workflow_events_tests {
                             };
                             use cm_daemon::control::dispatch::DispatchOutcome::*;
                             match cm_daemon::control::dispatch::dispatch_request(&st, &req) {
+                                Deferred(resp) => {
+                                    let _ = cm_daemon::control::wire::write_response(&mut stream, resp.response());
+                                }
                                 Done(resp) => {
                                     let _ = cm_daemon::control::wire::write_response(&mut stream, &resp);
                                 }
@@ -6289,6 +6292,9 @@ pub(super) mod pending_workflow_events_tests {
                             };
                             use cm_daemon::control::dispatch::DispatchOutcome::*;
                             match cm_daemon::control::dispatch::dispatch_request(&st, &req) {
+                                Deferred(resp) => {
+                                    let _ = cm_daemon::control::wire::write_response(&mut stream, resp.response());
+                                }
                                 Done(resp) => {
                                     let _ = cm_daemon::control::wire::write_response(&mut stream, &resp);
                                 }
@@ -6583,6 +6589,9 @@ pub(super) mod pending_workflow_events_tests {
                             };
                             use cm_daemon::control::dispatch::DispatchOutcome::*;
                             match cm_daemon::control::dispatch::dispatch_request(&st, &req) {
+                                Deferred(resp) => {
+                                    let _ = cm_daemon::control::wire::write_response(&mut stream, resp.response());
+                                }
                                 Done(resp) => {
                                     let _ = cm_daemon::control::wire::write_response(&mut stream, &resp);
                                 }
@@ -6802,6 +6811,9 @@ pub(super) mod pending_workflow_events_tests {
                             };
                             use cm_daemon::control::dispatch::DispatchOutcome::*;
                             match cm_daemon::control::dispatch::dispatch_request(&st, &req) {
+                                Deferred(resp) => {
+                                    let _ = cm_daemon::control::wire::write_response(&mut stream, resp.response());
+                                }
                                 Done(resp) => {
                                     let _ = cm_daemon::control::wire::write_response(&mut stream, &resp);
                                 }
@@ -7878,6 +7890,9 @@ pub(super) mod pending_workflow_events_tests {
                             };
                             use cm_daemon::control::dispatch::DispatchOutcome::*;
                             match cm_daemon::control::dispatch::dispatch_request(&st, &req) {
+                                Deferred(resp) => {
+                                    let _ = cm_daemon::control::wire::write_response(&mut stream, resp.response());
+                                }
                                 Done(resp) => {
                                     let _ = cm_daemon::control::wire::write_response(&mut stream, &resp);
                                 }
@@ -8425,6 +8440,9 @@ mod manifest_stream_reprime_tests {
                             match cm_daemon::control::dispatch::dispatch_request(
                                 &st, &req,
                             ) {
+                                Deferred(resp) => {
+                                    let _ = cm_daemon::control::wire::write_response(&mut stream, resp.response());
+                                }
                                 Done(resp) => {
                                     let _ = cm_daemon::control::wire::write_response(
                                         &mut stream,
