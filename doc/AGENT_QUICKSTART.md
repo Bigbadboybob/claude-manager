@@ -257,7 +257,7 @@ After dispatching, end your turn; the monitor, mention or board push wakes you. 
 | Watch worker completion | `monitor_sessions(session_uids=[...], until="final")`; a prompted `start_session` / `send_input` already registers a watch by default |
 | Report your own completion | `report_done(reason="...")` when your assignment is actually finished |
 
-Use the session UIDs returned by CM for session-control tools. Tool access is not permission to start unrelated work or control unrelated sessions; follow Owner's task authorization and your repository's instructions. Global permissions do not change that. Read-only inspection and communication do not expand your task scope.
+Start and prompt sessions for authorized work. Do not drive other people's sessions or work outside your scope; grant `global_perms` only on Owner's say-so. A technical refusal is not an Owner rule: look for a supported route, such as omitting `task_id`. Use CM session UIDs; read-only inspection and communication do not expand your scope.
 
 ### Controlling a session on another host
 

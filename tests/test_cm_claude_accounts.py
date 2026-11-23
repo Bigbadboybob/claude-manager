@@ -3563,6 +3563,73 @@ class UsageDashboardTests(unittest.TestCase):
             self.assertNotIn('reset_credits', self.collect()['usage']['codex'])
             network.assert_not_called()
 
+    def test_shared_codex_pools_merge_account_but_preserve_host_token_history(self):
+        def export(host, account_id, email, status, weekly_at, weekly_percent, session_at, credits):
+            return {'version':1, 'host':host, 'active':None, 'at':self.now, 'accounts':{}, 'events':[],
+                'usage':{'codex':{
+                    'accounts':[{'id':account_id, 'email':email, 'alias':host, 'status':status, 'plan_type':'plus'},
+                                {'id':'anonymous', 'email':None, 'alias':'unknown', 'status':'paused'}],
+                    'limits':[
+                        {'account_id':account_id, 'window':'primary', 'used_percent':weekly_percent,
+                         'reset_at':self.now+86400, 'recorded_at':weekly_at, 'window_minutes':10080},
+                        {'account_id':account_id, 'window':'secondary', 'used_percent':40,
+                         'reset_at':self.now+3600, 'recorded_at':session_at, 'window_minutes':300}],
+                    'reset_credits':[{'accountId':account_id, 'availableResetCredits':credits,
+                                      'resetCreditNearestExpiresAt':self.now+86400}],
+                    'rollups':[{'bucket_epoch':self.hour, 'account_id':account_id, 'model':'o3',
+                                'input':100, 'cache_read':20, 'output':4, 'requests':1}]}}}
+        manager = export('cm-manager', 'manager-id', 'Bender2@Example.com', 'active',
+                         self.now-120, 30, self.now-10, 2)
+        sessions = export('cm-sessions', 'sessions-id', 'bender2@example.com', 'paused',
+                          self.now-20, 60, self.now-90, 1)
+        with mock.patch.object(accounts.time, 'time', return_value=self.now-5):
+            self.checkin(manager)
+        self.checkin(sessions)
+        with accounts.Hub(self.hub_paths) as hub:
+            doc = accounts.usage_snapshot(hub, self.now, self.hour, 'hour')
+        codex = [a for a in doc['accounts'] if a['engine'] == 'codex']
+        self.assertEqual(len(codex), 3)  # shared login plus two distinct anonymous accounts
+        shared = next(a for a in codex if a['email'])
+        self.assertEqual(shared['email'], 'bender2@example.com')
+        self.assertEqual(shared['pool_host'], 'cm-manager')  # freshest reading, not report
+        self.assertEqual(shared['pool_hosts'], ['cm-manager', 'cm-sessions'])
+        self.assertEqual(shared['pool_status'], {'cm-manager':'active', 'cm-sessions':'paused'})
+        self.assertEqual(shared['status'], 'active')
+        limits = {l['kind']: l for l in shared['limits']}
+        self.assertEqual((limits['primary']['percent'], limits['primary']['read_at']), (60, self.now-20))
+        self.assertEqual(limits['secondary']['read_at'], self.now-10)
+        self.assertEqual(shared['resets'][0]['count'], 1)  # newest report, not sum
+        self.assertEqual(shared['resets'][0]['as_of'], self.now)
+        outlook = next(o for o in doc['outlook'] if o['engine'] == 'codex')
+        self.assertEqual((outlook['accounts'], outlook['accounts_with_room']), (3, 1))
+        self.assertAlmostEqual(outlook['room_weeks'], .4)
+        self.assertEqual(len(outlook['refills']), 1)
+        self.assertEqual({r['host'] for r in doc['tokens']['series']}, {'cm-manager', 'cm-sessions'})
+        self.assertEqual([r['input'] for r in doc['tokens']['series']], [80, 80])
+        totals = [r for r in doc['tokens']['totals'] if r['window'] == 'all' and r['host'] is None
+                  and r['email'] is None and r['engine'] == 'codex']
+        self.assertEqual(totals[0]['input'], 160)
+
+    def test_shared_codex_missing_readings_and_newest_unknown_credit(self):
+        def check(host, status, at, credit):
+            codex = {'accounts':[{'id':host, 'email':'Mixed@Example.com', 'status':status}], 'limits':[]}
+            if credit:
+                codex['reset_credits'] = [{'accountId':host, 'availableResetCredits':1}]
+            export = {'version':1, 'host':host, 'active':None, 'accounts':{}, 'events':[],
+                      'usage':{'codex':codex}}
+            with mock.patch.object(accounts.time, 'time', return_value=at):
+                self.checkin(export)
+        check('cm-manager', 'paused', self.now-10, True)
+        check('cm-sessions', 'disabled', self.now, False)
+        with accounts.Hub(self.hub_paths) as hub:
+            account = next(a for a in accounts.usage_snapshot(hub, self.now, 0, 'hour')['accounts']
+                           if a['engine'] == 'codex')
+        self.assertEqual(account['pool_host'], 'cm-sessions')
+        self.assertEqual(account['status'], 'disabled')
+        self.assertEqual(account['pool_status'], {'cm-manager':'paused', 'cm-sessions':'disabled'})
+        self.assertIsNone(account['resets'])
+        self.assertEqual(account['limits'], [])
+
     def test_claude_thresholds_windows_and_cached_lent_resets(self):
         self.export['accounts']['alice']['reading']['limits'].append(
             {'kind':'weekly_all','scope':None,'percent':75.0,'resets_at':self.now+86400})

@@ -1405,10 +1405,8 @@ def propose_task(
     sees it on the planning board and may reprioritize, edit or drop it; it
     does not wait for an accept before it can be launched.
 
-    If YOU have a bound task, the task you propose counts as part of
-    your own scope: you can later `start_session(task_id=<proposed id>)`
-    to run it yourself (with the user's approval) and drive the worker
-    you spawned. Prefer `create_subtask` when the work should live in
+    A task you propose can be launched with `start_session(task_id=<proposed
+    id>)` and you can drive the worker you spawned for authorized work. Prefer `create_subtask` when the work should live in
     its own worktree under your task; prefer propose_task when the user
     should triage it on the planning board first.
 
@@ -2573,8 +2571,8 @@ async def start_session(
         task_id: Optional task to bind to. Omitted = your own task (if
             any) or no task. You may bind to your own task, any of its
             descendants, or a task YOU created via `propose_task` /
-            `create_subtask` (the daemon records a creator edge at mint
-            time, so propose-then-launch works). Any other cross-task
+            `create_subtask` (a taskless proposer receives a launch grant;
+            a tasked proposer receives a creator edge). Any other cross-task
             binding is rejected — UNLESS you hold global permissions, in
             which case you may bind the child to any task.
             **A task with no worktree of its own gets one minted**: a
@@ -2732,10 +2730,6 @@ async def start_session(
         - isolated=true: `task_id` / `worktree_path` name the branched
           subtask and its fresh checkout, whatever `wait` is.
 
-    State your intent in plain language and ask the user to confirm
-    before calling this tool. The user expects to be in the loop on
-    every spawn — doubly so when `global_perms=true`, which mints a child
-    that can reach across the whole session graph.
     """
     if type == "bash" and schema is not None:
         return shell_refusal("start_session(schema=...)")
@@ -3049,8 +3043,6 @@ async def fork_session(
     capped at 10; `commits_not_carried_truncated`), engine, target,
     prompt_source ("caller" | "none"), uncommitted_left_behind, ...}`.
 
-    State your intent in plain language and ask the user to confirm
-    before calling this tool.
     """
     params: dict = {
         "source_uid": session_uid,
@@ -3155,7 +3147,6 @@ async def send_input(
     Bash targets receive a shell command followed by a newline.
     They do not register agent completion monitors.
 
-    State your intent and ask the user before calling this tool.
     """
     res = await asyncio.to_thread(
         control_client.call,
@@ -3248,7 +3239,6 @@ async def send_key(
     result in `results`: status `ok`, `not_found`, `unauthorized`,
     `exited`, or `error`; one bad target never stops the rest.
 
-    State your intent and ask the user before calling this tool.
     """
     uids = [session_uids] if isinstance(session_uids, str) else list(session_uids)
     if len(uids) > SEND_KEY_MAX_TARGETS:
@@ -3407,8 +3397,8 @@ def kill_session(session_uid: str) -> dict:
     exited at <ts>") rather than implying a bad uid. That is a no-op,
     not a failure — the session you wanted closed is closed.
 
-    Ask the user before calling. Killing a session is destructive —
-    pending work in that agent stops.
+    Killing a session stops pending work. Killing another person's session
+    requires that owner's or Owner's say-so.
     """
     return control_client.call("kill_session", {"session_uid": session_uid})
 
@@ -3685,7 +3675,6 @@ def start_workflow(
 
     Returns: {"run_id": "<id>"}.
 
-    State your intent and ask the user to confirm before calling.
     """
     params: dict = {"task_id": task_id, "workflow_name": workflow_name}
     if goal:
@@ -3712,7 +3701,7 @@ def stop_workflow(run_id: str) -> dict:
     but no further transitions fire. Caller must have authority over
     the workflow's task.
 
-    Ask the user before calling — stopping a workflow is destructive.
+    Stopping another person's workflow requires that owner's or Owner's say-so.
     """
     return control_client.call("stop_workflow", {"run_id": run_id})
 
@@ -4606,8 +4595,6 @@ async def send_input_and_wait(
         JSON value, or null if it never conformed) and `schema_error` (null
         on success, else why validation failed after all retries).
 
-    State your intent and ask the user before calling — this delivers
-    input to another session, same as `send_input`.
     """
     deadline = time.monotonic() + max(1.0, min(timeout_s, 86400.0))
     interval = max(0.5, min(poll_interval_s, 30.0))
@@ -4803,8 +4790,7 @@ async def monitor_sessions(
     ALSO retained and readable via `list_monitors` (e.g. if the wake-up
     delivery could not be verified).
 
-    Registering a monitor is read-only-plus-a-future-self-message — no
-    pre-approval needed.
+    Registering a monitor is read-only plus a future message to yourself.
     """
     try:
         return async_monitor.register_monitor(
@@ -4903,8 +4889,6 @@ def create_subtask(
     spawns a session; call `start_session(task_id=<task_id>, prompt=...)`
     next to actually put an agent on it.
 
-    State your intent and ask the user before calling. Subtasks are a
-    real fork — branch mode creates real git state.
     """
     params: dict = {
         "name": name,
@@ -4992,8 +4976,7 @@ def mark_subtask_done(
     Inherit-mode subtasks have nothing to remove; close_worktree is
     ignored.
 
-    Ask the user before calling — this is a multi-step destructive
-    operation.
+    Tearing down another person's work requires that owner's or Owner's say-so.
     """
     return control_client.call(
         "mark_subtask_done",
@@ -5077,8 +5060,6 @@ def trigger(
             "busy" | "paused" | "persistent_not_yet_implemented"}. "busy"
             means a concurrent trigger is still inside the spawn window.
 
-    State your intent and ask the user to confirm before calling — this spawns
-    a session.
     """
     params: dict = {"task_id": task_id}
     if prompt:
@@ -5126,9 +5107,8 @@ def enqueue(
         {"enqueued": bool, "deduped": bool, "id": str | None, "depth": int}
         where depth is the queue's pending count after the call.
 
-    Enqueueing only buffers data — it does not spawn anything itself, so you
-    do NOT need to ask the user first (the consuming task's own schedule
-    governs when work runs).
+    Enqueueing only buffers data; the consuming task's schedule governs when
+    work runs.
     """
     params: dict = {"queue": queue, "payload": payload}
     if dedupe_key:
@@ -5450,8 +5430,8 @@ def resolve_stuck(
         action: One of "mark_unstuck", "restart", "escalate".
         reason: Optional explanation; surfaced to the user on "escalate".
 
-    State your intent and ask the user to confirm before calling — `restart` and
-    `escalate` kill (and `restart` re-fires) a session.
+    `restart` and `escalate` kill a session. Killing another person's session
+    requires that owner's or Owner's say-so.
     """
     params: dict = {"task_id": task_id, "seq": seq, "action": action}
     if reason:

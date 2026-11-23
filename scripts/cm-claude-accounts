@@ -558,6 +558,7 @@ def usage_snapshot_accounts(hub, now):
             reservation_note=info.get('reservation_note'), limits=limits,
             resets=cached.get('resets') if isinstance(cached.get('resets'), list) else None,
             projection=None, _switch_on_scoped=config.get('switch_on_scoped', True)))
+    codex_groups = {}
     for host, report in hub.reports().items():
         codex = (((report.get('export') or {}).get('usage') or {}).get('codex') or {})
         credits = {r.get('accountId'): r for r in codex.get('reset_credits') or [] if isinstance(r, dict)}
@@ -570,9 +571,39 @@ def usage_snapshot_accounts(hub, now):
             resets = ([dict(type='codex', count=credit['availableResetCredits'],
                             expires_at=usage_epoch(credit.get('resetCreditNearestExpiresAt')),
                             as_of=usage_epoch(report.get('at')))] if credit else None)
-            accounts.append(dict(engine='codex', email=a.get('email'), alias=a.get('alias'),
-                status=a.get('status'), pool_host=host, active_on=[], reserved_for=None, room=None,
-                plan_type=a.get('plan_type'), limits=limits, resets=resets, projection=None))
+            email = a.get('email')
+            email = email.strip().lower() if isinstance(email, str) and email.strip() else None
+            # No email means there is no reliable cross-pool identity.
+            key = ('email', email) if email else ('anonymous', object())
+            report_at = usage_epoch(report.get('at'))
+            reading_at = max((l['read_at'] for l in limits if l['read_at'] is not None), default=None)
+            codex_groups.setdefault(key, []).append(dict(host=host, account=a, email=email,
+                limits=limits, resets=resets, report_at=report_at, reading_at=reading_at))
+    def stamp(value):
+        return value if value is not None else float('-inf')
+    def report_rank(copy):
+        return (stamp(copy['report_at']), copy['host'], str(copy['account'].get('id') or ''))
+    for copies in codex_groups.values():
+        freshest = max(copies, key=lambda c: (stamp(c['reading_at']), *report_rank(c)))
+        newest_report = max(copies, key=report_rank)
+        selected_limits = {}
+        for copy in copies:
+            for limit in copy['limits']:
+                kind = limit['kind']
+                rank = (stamp(limit['read_at']), *report_rank(copy))
+                if kind not in selected_limits or rank > selected_limits[kind][0]:
+                    selected_limits[kind] = (rank, limit)
+        statuses = {}
+        for copy in sorted(copies, key=report_rank):
+            host, status = copy['host'], copy['account'].get('status')
+            if statuses.get(host) != 'active':
+                statuses[host] = status
+        status = 'active' if 'active' in statuses.values() else freshest['account'].get('status')
+        accounts.append(dict(engine='codex', email=freshest['email'], alias=freshest['account'].get('alias'),
+            status=status, pool_host=freshest['host'], pool_hosts=sorted(statuses),
+            pool_status=dict(sorted(statuses.items())), active_on=[], reserved_for=None, room=None,
+            plan_type=freshest['account'].get('plan_type'),
+            limits=[v[1] for v in selected_limits.values()], resets=newest_report['resets'], projection=None))
     return accounts
 
 
@@ -596,7 +627,8 @@ def usage_enrich(accounts, db, now):
         if not isinstance(reset, (int, float)) or reset <= now:
             continue
         start = max(now - 6 * 3600, reset - 10080 * 60)
-        points = db.execute('SELECT at,percent FROM limit_readings WHERE engine=? AND account=? '
+        account_match = 'account=? COLLATE NOCASE' if account['engine'] == 'codex' else 'account=?'
+        points = db.execute('SELECT at,percent FROM limit_readings WHERE engine=? AND ' + account_match + ' '
             'AND limit_kind=? AND at>=? AND at<=? AND resets_at BETWEEN ? AND ? ORDER BY at',
             (account['engine'], account['email'], weekly['kind'], start, now, reset-3600, reset+3600)).fetchall()
         if len(points) < 2 or points[-1][0] - points[0][0] < 1800:

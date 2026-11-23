@@ -164,32 +164,32 @@ impl App {
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
+        if self.usage.open {
+            self.draw_usage(frame, frame.area());
+            return;
+        }
         if self.roster.visible {
             self.draw_roster(frame);
             self.global_settings.draw(frame, frame.area());
             self.draw_availability(frame, frame.area());
-            self.draw_usage(frame, frame.area());
             return;
         }
         if self.orgchart.visible {
             self.draw_orgchart(frame);
             self.global_settings.draw(frame, frame.area());
             self.draw_availability(frame, frame.area());
-            self.draw_usage(frame, frame.area());
             return;
         }
         if self.board.visible {
             self.draw_board(frame);
             self.global_settings.draw(frame, frame.area());
             self.draw_availability(frame, frame.area());
-            self.draw_usage(frame, frame.area());
             return;
         }
         if self.messages.visible {
             self.draw_messages(frame);
             self.global_settings.draw(frame, frame.area());
             self.draw_availability(frame, frame.area());
-            self.draw_usage(frame, frame.area());
             return;
         }
         let area = frame.area();
@@ -472,7 +472,6 @@ impl App {
         } else { area };
         self.global_settings.draw(frame, settings_area);
         self.draw_availability(frame, area);
-        self.draw_usage(frame, area);
     }
 
     /// The Lead field's text: the pinned session's label, or what the
