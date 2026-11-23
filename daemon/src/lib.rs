@@ -88,6 +88,7 @@ pub mod maintenance;
 pub mod manifest;
 pub mod messaging;
 mod memory_snapshot;
+mod usage_snapshot;
 mod memory_trim;
 pub mod mcp_config;
 pub mod migrate;
@@ -1497,6 +1498,11 @@ fn handle_connection_with_timeouts(
                 } else {
                     eprintln!("cm-daemon: write_response error: {}", e);
                 }
+            }
+        }
+        control::dispatch::DispatchOutcome::Deferred(response) => {
+            if let Err(e) = control::wire::write_response_or_error(stream, response.response()) {
+                eprintln!("cm-daemon: deferred response write failed: {}", e);
             }
         }
         control::dispatch::DispatchOutcome::AttachStream { response, handle } => {

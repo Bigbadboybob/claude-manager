@@ -2588,7 +2588,8 @@ fn last_assistant_message_text(
 
 impl App {
     pub fn is_input_mode(&self) -> bool {
-        self.global_settings.is_open()
+        self.usage.open
+            || self.global_settings.is_open()
             || self.availability.is_open()
             || self.board.visible
             || !matches!(self.input_mode, InputMode::Normal)
@@ -3121,6 +3122,7 @@ impl App {
             _ => {}
         }
         self.needs_redraw = true;
+        if self.usage_event(event) { return true; }
         if let CrosstermEvent::Key(key) = event {
             if self.global_settings.is_open() && key.code == KeyCode::Char('c') {
                 self.global_settings.close();

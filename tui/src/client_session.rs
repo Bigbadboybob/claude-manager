@@ -2762,6 +2762,9 @@ pub(crate) mod tests {
                             // handle (slice-10c-e-2 review-2 TOCTOU
                             // fix), used by handle_attach_stream.
                             match cm_daemon::control::dispatch::dispatch_request(&state, &req) {
+                                cm_daemon::control::dispatch::DispatchOutcome::Deferred(resp) => {
+                                    let _ = cm_daemon::control::wire::write_response(&mut stream, resp.response());
+                                }
                                 cm_daemon::control::dispatch::DispatchOutcome::Done(resp) => {
                                     let _ = cm_daemon::control::wire::write_response(
                                         &mut stream,

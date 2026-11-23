@@ -34,6 +34,14 @@ mod tests {
     }
 
     #[test]
+    fn usage_host_defaults_and_loads_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.toml");
+        assert_eq!(GlobalSettings::load_from(path.clone()).usage_host(), "manager");
+        std::fs::write(&path, "usage_host = \"sessions\"\n").unwrap();
+        assert_eq!(GlobalSettings::load_from(path).usage_host(), "sessions");
+    }
+    #[test]
     fn global_settings_defaults_and_rejects_invalid_values_without_rewriting() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.toml");
@@ -235,6 +243,7 @@ pub(super) struct GlobalSettings {
     saved: Preferences,
     /// File-only `[models]` section (no F9 row). See `cm_daemon::models`.
     models: cm_daemon::models::ModelConfig,
+    usage_host: String,
     load_error: Option<String>,
     dialog: Option<Dialog>,
 }
@@ -292,8 +301,14 @@ impl GlobalSettings {
                 cm_daemon::models::ModelConfig::default()
             }
         };
+        let usage_host = read_document(&path)
+            .ok()
+            .and_then(|d| d.get("usage_host").and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty()).map(str::to_owned))
+            .unwrap_or_else(|| "manager".into());
         Self {
             staffing: Default::default(),
+            usage_host,
             path,
             saved,
             models,
@@ -307,6 +322,10 @@ impl GlobalSettings {
     #[cfg(test)]
     pub(super) fn models(&self) -> &cm_daemon::models::ModelConfig {
         &self.models
+    }
+
+    pub(super) fn usage_host(&self) -> &str {
+        &self.usage_host
     }
 
     pub(super) fn tint_strength(&self) -> f64 {

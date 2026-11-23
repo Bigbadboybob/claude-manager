@@ -146,14 +146,29 @@ pub struct AttachStreamHandle {
     pub heartbeat: bool,
 }
 
-/// What `dispatch_request` returns. Most arms produce `Done` with
-/// the response that should be written verbatim. The `attach.open`
-/// arm produces `AttachStream { response, handle }` so
-/// `handle_connection` can write the response AND then run the
-/// stream loop with the held subscription — closing the TOCTOU
-/// the slice-10c-e-2 review-2 flagged.
+/// A worker whose result is written by the connection after dispatch returns.
+pub struct DeferredResponse {
+    response: std::sync::OnceLock<Response>,
+    worker: Mutex<Option<std::thread::JoinHandle<Response>>>,
+    request_id: String,
+}
+impl DeferredResponse {
+    pub fn response(&self) -> &Response {
+        self.response.get_or_init(|| {
+            self.worker
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+                .and_then(|worker| worker.join().ok())
+                .unwrap_or_else(|| Response::err(self.request_id.clone(), ErrorCode::Internal, "usage worker failed"))
+        })
+    }
+}
+/// Dispatch returns either a response, a deferred response, or a stream.
 pub enum DispatchOutcome {
     Done(Response),
+    /// The connection waits for a worker, after dispatch has returned.
+    Deferred(DeferredResponse),
     AttachStream {
         response: Response,
         handle: AttachStreamHandle,
@@ -183,6 +198,7 @@ impl DispatchOutcome {
     pub fn response(&self) -> &Response {
         match self {
             DispatchOutcome::Done(r) => r,
+            DispatchOutcome::Deferred(r) => r.response(),
             DispatchOutcome::AttachStream { response, .. } => response,
             DispatchOutcome::ManifestWatchStream { response, .. } => response,
             DispatchOutcome::EventsSubscribeStream { response, .. } => response,
@@ -195,6 +211,7 @@ impl DispatchOutcome {
     pub fn into_response(self) -> Response {
         match self {
             DispatchOutcome::Done(r) => r,
+            DispatchOutcome::Deferred(r) => r.response().clone(),
             DispatchOutcome::AttachStream { response, .. } => response,
             DispatchOutcome::ManifestWatchStream { response, .. } => response,
             DispatchOutcome::EventsSubscribeStream { response, .. } => response,
@@ -659,6 +676,25 @@ pub fn dispatch_request_with_peer_pid(
         // fix-loud-preflight: post-restart health probe. Operator-only —
         // it reports host-environment diagnosis, not per-session state.
         "daemon.health" => DispatchOutcome::Done(dispatch_daemon_health(state, req)),
+        "usage.snapshot" => {
+            if let Err(response) = crate::usage_snapshot::validate(req) {
+                return DispatchOutcome::Done(response);
+            }
+            let request = req.clone();
+            match std::thread::Builder::new()
+                .name("cm-usage-snapshot".into())
+                .spawn(move || crate::usage_snapshot::dispatch(&request))
+            {
+                Ok(worker) => DispatchOutcome::Deferred(DeferredResponse {
+                    response: std::sync::OnceLock::new(),
+                    worker: Mutex::new(Some(worker)),
+                    request_id: req.id.clone(),
+                }),
+                Err(e) => DispatchOutcome::Done(Response::err(
+                    req.id.clone(), ErrorCode::Internal, format!("cannot start usage worker: {e}"),
+                )),
+            }
+        }
         "daemon.memory_snapshot" => DispatchOutcome::Done(crate::memory_snapshot::dispatch(state, req)),
         "daemon.memory_trim" => DispatchOutcome::Done(crate::memory_trim::dispatch(req)),
         "daemon.reload_config" => {
