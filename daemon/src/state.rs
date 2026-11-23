@@ -58,6 +58,9 @@ pub const RECENTLY_EXITED_CAP: usize = 256;
 /// swap instead of dying with the old image (the P4b known gap).
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ExitedTombstone {
+    /// Membership observed in the last successful snapshot at exit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_member: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_failure: Option<crate::control::prompt_delivery::StartupFailure>,
     pub session_uid: String,
@@ -963,6 +966,14 @@ impl DaemonState {
         crate::items::heartbeat::poke();
     }
 
+    /// Stamp only a newly observed exit. Replaying an older sidecar must not
+    /// attach a current UID's membership to a different incarnation.
+    pub fn record_exited_scoped(&mut self, mut tomb: ExitedTombstone) {
+        let key = cm_holder_proto::session_scope::session_key(&self.session_scope_cache.daemon_id, &tomb.session_uid);
+        tomb.scope_member = self.session_scope_cache.graph.sessions.get(&key).map(|fact| fact.member.clone());
+        self.record_exited(tomb);
+    }
+
     /// Owner used `uid` just now (viewed it in the TUI, revived or resumed
     /// it). Read by the terminal-task sweep's grace rule.
     pub fn note_owner_activity(&mut self, uid: &str) {
@@ -1632,6 +1643,7 @@ mod tests {
 
     fn tomb(uid: &str) -> ExitedTombstone {
         ExitedTombstone {
+            scope_member: None,
             startup_failure: None,
             org: None,
             incarnation: None,

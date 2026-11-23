@@ -254,6 +254,44 @@ fn decorate_team(state: &Arc<Mutex<DaemonState>>, mut team: Value, queue_rows: &
 // Session authorization uses `items::session_scope`'s shared snapshot
 // evaluator. Central org writes still use the API's authority checks.
 
+pub(crate) fn member_authority(
+    state: &Arc<Mutex<DaemonState>>,
+    req: &Request,
+    member_id: &str,
+    self_ok: bool,
+    target_uid: &str,
+) -> RpcResult<Value> {
+    let ctx = Ctx::capture(state, req)?;
+    let mut body = Map::new();
+    body.insert("self_ok".into(), json!(self_ok));
+    // The API confirms the target is still that member's session.
+    body.insert("session".into(), json!(format!("agent:{}:{target_uid}", ctx.daemon_id)));
+    api(ctx.api.post(&format!("/org/members/{}/authority", encode(member_id)), &with_actor(&ctx, body)))
+}
+
+/// A session's org member, optionally tied to one concrete pid.  List reads
+/// submit one target per distinct member; a single-session read supplies the
+/// pid so the planning API can verify the attribution before opening the
+/// transcript.
+#[derive(Clone, Debug)]
+pub(crate) struct ReadAuthorityTarget {
+    pub member_id: String,
+    pub session_uid: Option<String>,
+}
+
+/// Identity checked before and after the planning-API read.  A session UID is
+/// reusable across revive/rotation, so the UID alone cannot bind an old org
+/// grant to the transcript we are about to return.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReadTargetIdentity {
+    pub member_id: String,
+    pub task_id: Option<String>,
+    pub workspace_id: String,
+    pub generation: u64,
+    pub transcript_path: Option<String>,
+    pub process_identity: u64,
+}
+
 /// Identity of the session asking to read.  The org grant is made for this
 /// exact caller incarnation; a reused UID must not inherit it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -279,6 +317,172 @@ pub(crate) fn caller_identity(state: &DaemonState, caller_uid: &str) -> Option<R
         global_perms: session.global_perms,
         process_identity: session.pid as u64,
     })
+}
+
+/// Snapshot the current org/task/transcript identity for one target.  The
+/// caller must hold no other lock; this helper only borrows the supplied
+/// state and never performs network I/O.
+pub(crate) fn target_identity(state: &DaemonState, target_uid: &str) -> Option<ReadTargetIdentity> {
+    if let Some(session) = state.sessions.get(target_uid) {
+        let membership = crate::assistants::of_session(session)?;
+        return Some(ReadTargetIdentity {
+            member_id: membership.member_id,
+            task_id: session.task_id.clone(),
+            workspace_id: session.workspace_id.clone(),
+            generation: session.generation,
+            transcript_path: session.transcript_path.clone(),
+            process_identity: session.pid as u64,
+        });
+    }
+    let tomb = state.exited_tombstone(target_uid)?;
+    let membership = crate::assistants::membership(target_uid, tomb.org.as_ref())?;
+    Some(ReadTargetIdentity {
+        member_id: membership.member_id,
+        task_id: tomb.task_id.clone(),
+        workspace_id: tomb.workspace_id.clone(),
+        generation: tomb.generation,
+        transcript_path: tomb.transcript_path.clone(),
+        process_identity: tomb.incarnation.unwrap_or_default(),
+    })
+}
+
+/// Ask the planning API for the subset of member sessions this caller may
+/// read.  The request is deliberately best-effort: an unavailable or older
+/// API returns `None`, and callers keep today's task/workspace scope.  The
+/// mutex is released before the network call so a slow API cannot stall the
+/// daemon's session registry.
+fn read_authority_batch(
+    state: &Arc<Mutex<DaemonState>>,
+    caller_uid: &str,
+    targets: &[ReadAuthorityTarget],
+) -> Option<HashSet<String>> {
+    read_authority_batch_inner(state, caller_uid, targets, || {})
+}
+
+/// Implementation split out so the lock-order regression test can observe
+/// the exact seam: the state mutex is released before the messaging slot is
+/// acquired.  Production callers use the no-op hook above.
+fn read_authority_batch_inner<F: FnOnce()>(
+    state: &Arc<Mutex<DaemonState>>,
+    caller_uid: &str,
+    targets: &[ReadAuthorityTarget],
+    after_state_snapshot: F,
+) -> Option<HashSet<String>> {
+    if targets.is_empty() {
+        return Some(HashSet::new());
+    }
+    let (api_url, api_token, messaging, task_id) = {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        let caller = s.sessions.get(caller_uid)?;
+        if caller.global_perms {
+            return Some(HashSet::new());
+        }
+        (
+            s.config.api_url.clone(),
+            s.config.api_token.clone(),
+            s.messaging.clone(),
+            caller.task_id.clone(),
+        )
+    };
+    // Do not acquire messaging while the DaemonState mutex is held.  The
+    // messaging initializer can hold its slot and then acquire state.
+    after_state_snapshot();
+    let daemon_id = messaging
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .map(|store| store.daemon_id.clone())?;
+    let mut seen = HashSet::new();
+    let wire_targets: Vec<Value> = targets
+        .iter()
+        .filter(|target| seen.insert((target.member_id.clone(), target.session_uid.clone())))
+        .map(|target| {
+            json!({
+                "member": target.member_id,
+                "session": target.session_uid.as_ref().map(|uid| format!("agent:{daemon_id}:{uid}")),
+            })
+        })
+        .collect();
+    if wire_targets.is_empty() {
+        return Some(HashSet::new());
+    }
+    let client = super::api::Api::from_config(&api_url, &api_token).ok()?;
+    let body = json!({
+        "actor": {
+            "pid": format!("agent:{daemon_id}:{caller_uid}"),
+            "session_uid": caller_uid,
+            "daemon_id": daemon_id,
+            "task_id": task_id,
+        },
+        "targets": wire_targets,
+        "self_ok": true,
+    });
+    let response = client.post("/org/members/authority-batch", &body).ok()?;
+    let allowed = response["allowed"].as_array()?;
+    Some(
+        allowed
+            .iter()
+            .filter_map(|entry| entry["member_id"].as_str().map(str::to_string))
+            .collect(),
+    )
+}
+
+/// Members reachable through the manager chain for the caller's default
+/// session listing.  This is one API request for the whole host, never one
+/// request per row.  `None` means the API could not answer, so the caller
+/// must retain the old task/workspace filter.
+pub(crate) fn read_scope_members(
+    state: &Arc<Mutex<DaemonState>>,
+    caller_uid: &str,
+    include_exited: bool,
+) -> Option<HashSet<String>> {
+    let targets = {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut members = HashSet::new();
+        for session in s.sessions.values() {
+            if let Some(membership) = crate::assistants::of_session(session) {
+                members.insert(membership.member_id);
+            }
+        }
+        if include_exited {
+            for tomb in &s.recently_exited {
+                if let Some(membership) = crate::assistants::membership(
+                    &tomb.session_uid,
+                    tomb.org.as_ref(),
+                ) {
+                    members.insert(membership.member_id);
+                }
+            }
+        }
+        members
+            .into_iter()
+            .map(|member_id| ReadAuthorityTarget { member_id, session_uid: None })
+            .collect::<Vec<_>>()
+    };
+    read_authority_batch(state, caller_uid, &targets)
+}
+
+/// Whether a caller may read one target under the org manager chain.  This is
+/// used by `resolve_authorized_session` after the ordinary task/workspace
+/// check denies the target.  `None` means the API was unavailable or denied.
+pub(crate) fn read_authorized_target(
+    state: &Arc<Mutex<DaemonState>>,
+    caller_uid: &str,
+    target_uid: &str,
+) -> Option<ReadTargetIdentity> {
+    let identity = {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        target_identity(&s, target_uid)
+    }?;
+    let allowed = read_authority_batch(
+        state,
+        caller_uid,
+        &[ReadAuthorityTarget {
+            member_id: identity.member_id.clone(),
+            session_uid: Some(target_uid.to_string()),
+        }],
+    )?;
+    allowed.contains(&identity.member_id).then_some(identity)
 }
 
 fn params(raw: &Value) -> RpcResult<Map<String, Value>> {

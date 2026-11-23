@@ -2579,11 +2579,13 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
     // A member's main session or assistant is only unassigned, never
     // closed, and its workspace is kept (lifecycle_guard_v1, O5;
     // doc/org-model.md §4.3, §7.1).
-    let candidates: Vec<String> = app.workspaces.iter()
-        .flat_map(|w| w.sessions.iter())
-        .filter(|ts| ts.task_id.as_deref() == Some(target_task.as_str()))
-        .map(|ts| ts.uid.clone())
-        .collect();
+    let candidates = subtask_candidates(&app.workspaces, &target_task);
+    let caller_host = find_live_session(&app.workspaces, caller_uid)
+        .map(|(wi, si)| app.workspaces[wi].sessions[si].host_id.clone());
+    if cleanup_target.as_ref().is_some_and(|(wi, _, _)| caller_host.as_ref() != Some(&app.workspaces[*wi].host_id)) {
+        workspace_kept = Some("remote_host");
+        cleanup_target = None;
+    }
     let mode = find_live_session(&app.workspaces, caller_uid).and_then(|(wi, si)| {
         let source = &app.workspaces[wi].sessions[si];
         let uid = source.session.daemon_session_uid.as_deref().unwrap_or(caller_uid);
@@ -2592,23 +2594,19 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
                 &app.host_pool.operator_token_for(&source.host_id), uid).ok().flatten())
     });
     let mut left_running = Vec::new();
-    let spared = if mode.as_deref() == Some("task_tree") {
-        let targets = app.owner_rpc_targets();
-        member_sessions(&candidates, |uid| targets.iter().any(|(_, socket, token)| {
-            crate::client_session::rpc_messaging_board(socket, token, "org.member", json!({"session_uid": uid}))
-                .is_ok_and(|v| v["acting_as"] == "main" || v["acting_as"] == "assistant")
-        }))
-    } else {
-        // Unknown mode fails safe: task completion is not session authority.
-        for uid in &candidates {
-            if let Some((wi, si)) = find_live_session(&app.workspaces, uid) {
-                let label = &app.workspaces[wi].sessions[si].label;
-                eprintln!("cm-tui: INFO task completion leaves session running task={target_task:?} session={uid:?}");
-                left_running.push(json!({"session_uid":uid, "label":label, "reason":"task completion does not close sessions"}));
-            }
+    let mut spared = std::collections::HashSet::new();
+    for (uid, label, host) in &candidates {
+        if !subtask_host_sweep_allowed(caller_host.as_ref(), host, mode.as_deref()) {
+            eprintln!("cm-tui: INFO task completion leaves session running task={target_task:?} session={uid:?}");
+            left_running.push(json!({"session_uid":uid, "label":label, "reason":"outside local task teardown scope"}));
+            spared.insert(uid.clone());
+        } else if app.host_pool.for_host(host).ok().and_then(|h| h.socket_path())
+            .is_some_and(|socket| crate::client_session::rpc_messaging_board(&socket,
+                &app.host_pool.operator_token_for(host), "org.member", json!({"session_uid": uid}))
+                .is_ok_and(|v| v["acting_as"] == "main" || v["acting_as"] == "assistant")) {
+            spared.insert(uid.clone());
         }
-        candidates.iter().cloned().collect()
-    };
+    }
     // A checkout used by a session we will preserve cannot be removed, so
     // it also must not block the task status update on the dirty-worktree check.
     if let Some((wi, _, _)) = &cleanup_target {
@@ -2764,6 +2762,17 @@ fn subtask_done_closes(ts: &TerminalSession, task: &str, spared: &std::collectio
     ts.task_id.as_deref() == Some(task) && !spared.contains(&ts.uid) && ts.session_type != "bash"
 }
 
+fn subtask_candidates(workspaces: &[Workspace], task: &str) -> Vec<(String, String, crate::hosts::HostId)> {
+    workspaces.iter().flat_map(|w| &w.sessions)
+        .filter(|ts| ts.task_id.as_deref() == Some(task))
+        .map(|ts| (ts.uid.clone(), ts.label.clone(), ts.host_id.clone()))
+        .collect()
+}
+
+fn subtask_host_sweep_allowed(caller: Option<&crate::hosts::HostId>, target: &crate::hosts::HostId, mode: Option<&str>) -> bool {
+    caller == Some(target) && mode == Some("task_tree")
+}
+
 /// Why `mark_subtask_done` must keep the task's checkout, if it must: a
 /// spared member's session or a shell still lives in it.
 fn subtask_done_keeps(sessions: &[TerminalSession], spared: &std::collections::HashSet<String>) -> Option<&'static str> {
@@ -2781,6 +2790,7 @@ fn subtask_done_keeps(sessions: &[TerminalSession], spared: &std::collections::H
 /// Which of `uids` are members' sessions (main or assistant), by
 /// `is_member` (the host daemon's `org.member`). A lookup that fails counts
 /// as not a member, as on a host without org S2.
+#[cfg(test)]
 fn member_sessions(uids: &[String], is_member: impl Fn(&str) -> bool) -> std::collections::HashSet<String> {
     uids.iter().filter(|uid| is_member(uid)).cloned().collect()
 }
@@ -3217,6 +3227,21 @@ mod tests {
         assert_eq!(subtask_done_keeps(&[shell(), worker()], &none), Some("shell"));
         assert_eq!(subtask_done_keeps(&[main(), shell()], &spared), Some("member"));
         assert_eq!(subtask_done_keeps(&[worker()], &none), Some("live_session"));
+    }
+
+    #[test]
+    fn task_teardown_never_crosses_hosts_or_uses_manager_mode() {
+        let local = crate::hosts::HostId::local();
+        let remote = crate::hosts::HostId("remote".into());
+        assert!(subtask_host_sweep_allowed(Some(&local), &local, Some("task_tree")));
+        assert!(!subtask_host_sweep_allowed(Some(&local), &remote, Some("task_tree")));
+        assert!(!subtask_host_sweep_allowed(Some(&local), &local, Some("manager_chain")));
+        assert!(!subtask_host_sweep_allowed(Some(&local), &local, None));
+        let mut far = live_ts("same-uid", Some("t"));
+        far.host_id = remote.clone();
+        let rows = subtask_candidates(&[workspace_with(vec![live_ts("same-uid", Some("t")), far], vec![])], "t");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|(_, _, host)| !subtask_host_sweep_allowed(Some(&local), host, Some("task_tree"))));
     }
 
     /// O5: A-D and A-w read a row's own stamp (no daemon round trip on the
@@ -4092,7 +4117,7 @@ mod tests {
     }
 
     #[test]
-    fn send_input_shell_submits_a_command_without_an_agent_prompt_queue() {
+    fn send_input_shell_is_owner_only() {
         with_app_and_repo("shell-send", |app, repo| {
             let wi = app.workspaces.len() - 1;
             app.workspaces[wi].sessions.push(live_ts("caller", None));
@@ -4104,21 +4129,15 @@ mod tests {
             ).expect("shell PTY");
             app.workspaces[wi].sessions.push(shell);
 
-            let reply = send_input(app, "caller", &json!({
+            let error = send_input(app, "caller", &json!({
                 "session_uid": "shell",
                 "text": "printf 'submitted' > shell-result",
                 "submit": true,
-            })).expect("shell send");
-            assert_eq!(reply["kind"], "shell");
-            assert_eq!(reply["submitted"], true);
+            })).expect_err("session callers cannot send to Owner's shell");
+            assert_eq!(error.0, ErrorCode::Unauthorized);
+            assert!(error.1.contains("Owner-only"));
             assert!(app.workspaces[wi].sessions[1].pending_prompt.is_none());
-
-            let marker = repo.join("shell-result");
-            let deadline = Instant::now() + std::time::Duration::from_secs(3);
-            while std::fs::read_to_string(&marker).ok().as_deref() != Some("submitted") {
-                assert!(Instant::now() < deadline, "submitted shell command did not execute");
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
+            assert!(!repo.join("shell-result").exists());
         });
     }
 

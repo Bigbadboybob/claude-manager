@@ -417,6 +417,9 @@ mod tests {
         assert_eq!(check_session_caller(&state, "lead", "new"), AuthDecision::Allow);
         state.sessions.get_mut("new").unwrap().managed_by_uid = Some("assistant".into());
         assert_eq!(check_session_caller(&state, "assistant", "new"), AuthDecision::Allow);
+        state.session_scope_cache.graph.sessions.remove(&cm_holder_proto::session_scope::session_key("host", "assistant"));
+        assert_eq!(check_session_caller(&state, "assistant", "new"), AuthDecision::Allow,
+            "an assistant spawned since the last snapshot retains its local children during an outage");
         assert_eq!(check_session_caller(&state, "sibling", "new"), AuthDecision::OutOfScope);
         state.sessions.get_mut("new").unwrap().managed_by_uid = Some("report-main".into());
         assert_eq!(check_session_caller(&state, "lead", "new"), AuthDecision::Allow);

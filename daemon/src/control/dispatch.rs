@@ -2464,7 +2464,7 @@ fn authorize_target(
             Err((ErrorCode::Unauthorized, "shell sessions are Owner-only".into()))
         };
     }
-    let (decision, label, refusal) = {
+    let (decision, label, refusal, rollback, caller_identity, target_identity, member) = {
         let st = state.lock().unwrap_or_else(|p| p.into_inner());
         let Some(t) = st.sessions.get(target) else {
             return Err((ErrorCode::NotFound, format!("session '{target}' is not live on this host")));
@@ -2477,11 +2477,23 @@ fn authorize_target(
             Some("workflow participants are driven by their run")
         } else { None };
         (crate::control::auth::check_session_caller(&st, caller, target),
-         st.sessions.get(caller).map(|c| c.to_manifest_entry().label).unwrap_or_default(), refusal)
+         st.sessions.get(caller).map(|c| c.to_manifest_entry().label).unwrap_or_default(), refusal,
+         st.config.session_scope == crate::config::SessionScope::TaskTree,
+         crate::items::org::caller_identity(&st, caller),
+         crate::items::org::target_identity(&st, target), crate::assistants::of_session(t))
     };
     let by = Some(if label.is_empty() { caller.to_string() } else { format!("{label} ({caller})") });
     if !decision.is_allow() {
-        return Err((ErrorCode::Unauthorized, format!("'{caller}' has no authority over session '{target}'")));
+        let granted = rollback && target_identity.is_some() && member.as_ref().is_some_and(|m| {
+            crate::items::org::member_authority(state, req, &m.member_id,
+                m.acting_as != crate::assistants::MAIN, target).is_ok()
+        });
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+        if !granted || st.config.session_scope != crate::config::SessionScope::TaskTree
+            || caller_identity != crate::items::org::caller_identity(&st, caller)
+            || target_identity != crate::items::org::target_identity(&st, target) {
+            return Err((ErrorCode::Unauthorized, format!("'{caller}' has no authority over session '{target}'")));
+        }
     }
     if let Some(why) = refusal {
         return Err((ErrorCode::Conflict, why.into()));
@@ -4233,11 +4245,13 @@ mod tests {
                 200,
                 serde_json::json!({"allowed": [{"member_id": "mem-report"}]}).to_string(),
             ),
+            ("POST", "/org/members/mem-report/authority") => (200, "{}".into()),
             _ => (500, "{}".into()),
         });
         let state = Arc::new(Mutex::new(DaemonState::default()));
         {
             let mut st = state.lock().unwrap();
+            st.config.session_scope = crate::config::SessionScope::TaskTree;
             st.messaging_root = root.path().into();
             st.config.api_url = url;
             st.config.api_token = "tok".into();
@@ -4304,6 +4318,12 @@ mod tests {
             .filter(|(method, path, _)| method == "POST" && path == "/org/members/authority-batch")
             .count();
         assert_eq!(calls, 2, "one batch for listing plus one concrete-session check");
+        let request = session_request("session.handoff", serde_json::json!({}), "lead-uid");
+        assert!(authorize_target(&state, &request, "report-uid").is_ok());
+        state.lock().unwrap().config.session_scope = crate::config::SessionScope::ManagerChain;
+        assert!(authorize_target(&state, &request, "report-uid").is_err());
+        assert!(!dispatch_resolve_authorized_session(&state, &session_request(
+            "resolve_authorized_session", serde_json::json!({"session_uid":"report-uid"}), "lead-uid")).ok);
         for session in state.lock().unwrap().sessions.values_mut() {
             let _ = session.kill();
         }
@@ -4319,6 +4339,7 @@ mod tests {
         let state = Arc::new(Mutex::new(DaemonState::default()));
         {
             let mut st = state.lock().unwrap();
+            st.config.session_scope = crate::config::SessionScope::TaskTree;
             st.messaging_root = root.path().into();
             st.config.api_url = url;
             st.config.api_token = "tok".into();
@@ -4387,6 +4408,7 @@ mod tests {
         let state = Arc::new(Mutex::new(DaemonState::default()));
         {
             let mut st = state.lock().unwrap();
+            st.config.session_scope = crate::config::SessionScope::TaskTree;
             st.messaging_root = root.path().into();
             st.config.api_url = url;
             st.config.api_token = "tok".into();
@@ -4462,6 +4484,7 @@ mod tests {
         let state = Arc::new(Mutex::new(DaemonState::default()));
         {
             let mut st = state.lock().unwrap();
+            st.config.session_scope = crate::config::SessionScope::TaskTree;
             st.messaging_root = root.path().into();
             st.config.api_url = url;
             st.config.api_token = "tok".into();

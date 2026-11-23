@@ -30,7 +30,20 @@ impl Cache {
     /// Member, manager and role facts always come from the retained snapshot.
     pub fn reaches_local(&self, state: &DaemonState, caller: &str, target: &str) -> bool {
         let prefix = format!("agent:{}:", self.daemon_id);
-        self.graph.reaches_with_spawners(&session_key(&self.daemon_id, caller),
+        let mut graph = std::borrow::Cow::Borrowed(&self.graph);
+        // Retain the last confirmed member at exit, even after heartbeat no
+        // longer reports the session. Never apply this stamp to a live UID.
+        if !state.sessions.contains_key(target) && !state.tui_sessions.contains_key(target) {
+            for tomb in &state.recently_exited {
+                if state.sessions.contains_key(&tomb.session_uid) || state.tui_sessions.contains_key(&tomb.session_uid) { continue; }
+                if let Some(member) = tomb.scope_member.as_ref() {
+                    graph.to_mut().sessions.insert(session_key(&self.daemon_id, &tomb.session_uid), cm_holder_proto::session_scope::Session {
+                        member: member.clone(), role: cm_holder_proto::session_scope::Role::Worker, spawned_by: None,
+                    });
+                }
+            }
+        }
+        graph.reaches_with_spawners(&session_key(&self.daemon_id, caller),
             &session_key(&self.daemon_id, target), |key| {
                 let uid = key.strip_prefix(&prefix)?;
                 if let Some(session) = state.sessions.get(uid) {
