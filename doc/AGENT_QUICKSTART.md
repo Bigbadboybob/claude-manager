@@ -259,6 +259,8 @@ After dispatching, end your turn; the monitor, mention or board push wakes you. 
 
 Start and prompt sessions for authorized work. Do not drive other people's sessions or work outside your scope; grant `global_perms` only on Owner's say-so. A technical refusal is not an Owner rule: look for a supported route, such as omitting `task_id`. Use CM session UIDs; read-only inspection and communication do not expand your scope.
 
+Session control follows the manager chain and the live spawner link; cached org facts are fail-static during outages. `session_scope = "task_tree"` rolls back session checks. TUI cross-host control is host-local except for global/Owner; use `cm-op --ssh` for authorized remote control. In manager mode `mark_subtask_done` never kills sessions and returns `left_running`. Taskless sessions can launch tasks they filed. See `doc/one-session-hierarchy.md`.
+
 ### Controlling a session on another host
 
 Chat and session control have different routing. Chat spans enrolled hosts; `list_sessions`, `send_input`, `read_session_output`, `read_last_turn` and worker monitors address the daemon attached to your MCP process. They do not search other hosts for a UID. `global_perms` broadens task access on that daemon; it does not make the tools reach another daemon. The laptop TUI's multi-host view does not make an agent's MCP multi-host.
@@ -310,10 +312,7 @@ is refused. An omitted/blank prompt uses the stored task brief, if present.
 
 The result includes `uid` (also `session_uid`), `worktree_path`, `task_id` and
 normal prompt-delivery metadata. Acceptance or a pending prompt receipt does
-not prove the engine started a turn. `managed_by_uid` is attribution and monitor
-routing metadata only: control still follows existing task/global scope. A lead
-whose task tree contains the child's task can control it on the same daemon;
-this RPC adds no cross-host MCP routing or new authorization edge.
+not prove the engine started a turn. `managed_by_uid` records the spawner link used for placement and session scope, as well as monitor routing. Control follows the manager and spawner rules; this RPC adds no cross-host MCP routing.
 
 Retry an uncertain response with **identical fields and the same request_id on
 the same host**. CM durably saves an intent before effects and retains completed

@@ -212,6 +212,12 @@ In manager-chain mode, finishing a task does not close its sessions; retained
 sessions and their live checkouts remain visible for deliberate cleanup. The
 historical task-status sweep is restored by the `task_tree` rollback setting.
 
+## Rollout
+
+Deploy the hub `cm-manager` first, then `cm-sessions`, then `f-sessions`, and finally the laptop daemon and TUI. On each daemon, the default is `session_scope = "manager_chain"`. To roll back session-control checks, set `session_scope = "task_tree"` in `~/.cm/daemon.toml` and call `daemon.reload_config` or send SIGHUP.
+
+Review the daemon logs for the one-time `leadless-team migration` list: these sessions need Owner review. The laptop TUI also shows a one-time **Sidebar section assignments needing review** list for migration conflicts and overrides that would split a block.
+
 ## 9. After this: tasks become board items only
 
 Owner, 2026-11-23: sessions stop being linked to tasks at all; tasks are only
