@@ -360,20 +360,52 @@ async def version(conn) -> int:
     return int(await conn.fetchval("SELECT coalesce(max(seq), 0) FROM org_changes"))
 
 
-async def snapshot(pool, since_version: int | None = None) -> dict:
+async def snapshot(pool, since_version: int | None = None, *, legacy_placement: bool = False) -> dict:
     """Every member and every live team, at one feed version."""
     async with pool.acquire() as conn:
         async with conn.transaction(isolation="repeatable_read", readonly=True):
             current = await version(conn)
-            if since_version is not None and current <= since_version:
+            if not legacy_placement and since_version is not None and current <= since_version:
                 return {"unchanged": True, "version": current}
             members = await _members(conn)
+            facts = await conn.fetch(
+                """SELECT coalesce(i.member_id, f.member_id) AS member_id,
+                          f.pid, f.daemon_id, f.session_uid,
+                          CASE WHEN i.member_id IS NOT NULL THEN 'main'
+                               ELSE f.acting_as END AS acting_as,
+                          f.managed_by_uid, f.workspace_id, f.spawned_at
+                     FROM org_session_facts f
+                     JOIN session_states s ON s.pid = f.pid
+                     LEFT JOIN incarnations i ON i.pid = f.pid AND i.ended_at IS NULL
+                                                   AND i.role = 'main'
+                    WHERE (i.member_id IS NOT NULL OR f.acting_as IN ('assistant', 'worker'))
+                      AND s.exited_at IS NULL AND s.state <> 'exited'
+                    ORDER BY coalesce(i.member_id, f.member_id), f.daemon_id, f.session_uid""")
+            assistants = {}
+            for row in facts:
+                item = _json_safe(dict(row))
+                spawner = item.pop("managed_by_uid")
+                item["spawned_by"] = ({"daemon_id": item["daemon_id"], "session_uid": spawner}
+                                      if spawner else None)
+                assistants.setdefault(item.pop("member_id"), []).append(item)
+            for member in members:
+                member["assistants"] = assistants.get(member["id"], [])
             teams = await _teams(
                 conn,
                 """WHERE i.status NOT IN ('archived', 'cancelled')
                       OR i.lead_member_id IS NOT NULL
                       OR EXISTS (SELECT 1 FROM team_memberships tm WHERE tm.team_id = i.id)""")
-    return {"version": current, "members": members, "teams": teams}
+            legacy_tasks = None
+            if legacy_placement:
+                rows = await conn.fetch("""SELECT i.member_id, s.task_id FROM incarnations i
+                    JOIN session_states s ON s.pid = i.pid
+                    WHERE i.role = 'main' AND i.ended_at IS NULL
+                      AND s.exited_at IS NULL AND s.state <> 'exited' AND s.task_id IS NOT NULL""")
+                legacy_tasks = {r["member_id"]: str(r["task_id"]) for r in rows}
+    result = {"version": current, "members": members, "teams": teams}
+    if legacy_placement:
+        result["legacy_main_tasks"] = legacy_tasks
+    return result
 
 
 async def changes(pool, since: int, limit: int = 500) -> dict:
@@ -2090,6 +2122,7 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
     prefix = f"agent:{daemon_id}:"
     now = utcnow()
     facts = []
+    unresolved = []
     requires_org_lock = False
     for raw in sessions or []:
         if not isinstance(raw, dict):
@@ -2100,6 +2133,8 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
         uid = _clip(raw.get("session_uid"), 200)
         if not uid:
             continue
+        if raw.get("auto_place_unresolved") is True:
+            unresolved.append(pid)
         requires_org_lock |= any(raw.get(key) for key in (
             "auto_place_owner", "managed_by_uid", "continuous_task_id", "workflow_run_id"))
         age = raw.get("spawned_age_s")
@@ -2113,7 +2148,8 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
                       _clip(raw.get("workflow_run_id"), 200), spawned,
                       _clip(raw.get("member_id"), 64) if raw.get("acting_as") in STAMPED_ROLES else None,
                       raw.get("acting_as") if raw.get("acting_as") in STAMPED_ROLES else None,
-                      raw.get("auto_place_owner") is True))
+                      raw.get("auto_place_owner") is True,
+                      raw.get("auto_place_unresolved") is True))
     auto_placed = []
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -2122,6 +2158,7 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
             # a lifecycle tag that can cancel one), take the same lock before
             # the heartbeat upsert so row-lock → advisory-lock inversion is
             # impossible. Idle beats stay lock-free.
+            requires_org_lock |= bool(unresolved)
             if not requires_org_lock and acked_mark_ids:
                 requires_org_lock = bool(await conn.fetchval(
                     """SELECT EXISTS (SELECT 1 FROM org_workspace_marks
@@ -2151,9 +2188,9 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
                                                       member_id, acting_as, auto_place_owner, reported_at)
                        VALUES ($1, $13, $2, $3, $4, $5, $6, $7, $8, $9,
                                CASE WHEN $9::text IS NULL THEN NULL ELSE $10 END,
-                               CASE WHEN $5::text IS NOT NULL OR $6::text IS NOT NULL
+                               CASE WHEN NOT $14 AND ($5::text IS NOT NULL OR $6::text IS NOT NULL
                                          OR $7::text IS NOT NULL
-                                    THEN FALSE ELSE $11 END, $12)
+                                    ) THEN FALSE ELSE $11 END, $12)
                        ON CONFLICT (pid) DO UPDATE SET
                            member_id = coalesce(EXCLUDED.member_id, org_session_facts.member_id),
                            acting_as = CASE WHEN org_session_facts.acting_as IN ('closed', 'promoted')
@@ -2168,14 +2205,14 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
                            auto_place_owner = CASE
                                WHEN org_session_facts.member_id IS NOT NULL
                                THEN FALSE
-                               WHEN EXCLUDED.workflow_run_id IS NOT NULL
+                               WHEN NOT $14 AND (EXCLUDED.workflow_run_id IS NOT NULL
                                  OR EXCLUDED.continuous_task_id IS NOT NULL
-                                 OR EXCLUDED.managed_by_uid IS NOT NULL
+                                 OR EXCLUDED.managed_by_uid IS NOT NULL)
                                THEN FALSE
                                ELSE org_session_facts.auto_place_owner OR EXCLUDED.auto_place_owner
                            END,
                            reported_at = EXCLUDED.reported_at""",
-                    *f, now, daemon_id)
+                    *f[:11], now, daemon_id, f[11])
             # Fresh top-level agent sessions carry a durable operator intent
             # from the daemon. Seat them under Owner while the heartbeat
             # transaction is already authoritative for liveness. The advisory
@@ -2187,18 +2224,19 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
                                 WHERE s.daemon_id = $1 AND s.exited_at IS NULL AND s.state <> 'exited'
                                   AND s.engine = ANY($2::text[])
                                   AND f.auto_place_owner AND f.member_id IS NULL
-                                  AND f.managed_by_uid IS NULL
-                                  AND f.continuous_task_id IS NULL
-                                  AND f.workflow_run_id IS NULL
+                                  AND (f.pid = ANY($3::text[]) OR
+                                       (f.managed_by_uid IS NULL
+                                        AND f.continuous_task_id IS NULL
+                                        AND f.workflow_run_id IS NULL))
                                   AND NOT EXISTS (SELECT 1 FROM incarnations i
                                                    WHERE i.pid = s.pid AND i.ended_at IS NULL)
                                 ORDER BY s.pid"""
             # Idle heartbeats must stay lock-free. Only a beat carrying a
             # placement intent takes the feed lock, then it rechecks the
             # candidates under that lock before creating members.
-            candidates = await conn.fetch(candidate_sql, daemon_id, sorted(AGENT_ENGINES))
+            candidates = await conn.fetch(candidate_sql, daemon_id, sorted(AGENT_ENGINES), unresolved)
             if candidates and requires_org_lock:
-                candidates = await conn.fetch(candidate_sql, daemon_id, sorted(AGENT_ENGINES))
+                candidates = await conn.fetch(candidate_sql, daemon_id, sorted(AGENT_ENGINES), unresolved)
             elif candidates:
                 # A concurrent placement/adoption may have committed after
                 # the lock-free preflight. Never acquire the advisory lock

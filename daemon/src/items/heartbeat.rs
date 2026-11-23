@@ -168,6 +168,12 @@ fn capture(state: &Arc<Mutex<DaemonState>>) -> Option<Snapshot> {
             "name": clip(&name, 200),
             "engine": t.session_type.as_deref().map(|e| clip(e, 40)),
             "state": "unknown",
+            "workspace_id": t.workspace_id,
+            "worktree_path": t.worktree_path,
+            // TUI-owned agents are operator-launched. The API seats them
+            // under Owner idempotently; no local session stamp is needed.
+            "auto_place_owner": matches!(t.session_type.as_deref(), Some("claude" | "claude-code" | "codex"))
+                && crate::assistants::main_member(uid).is_none(),
         }));
     }
     let api = Api::from_config(&s.config.api_url, &s.config.api_token).ok();
@@ -324,6 +330,10 @@ impl Beat {
         if reply["org"]["members"].is_object() {
             super::org::save_cache(&snap.root);
         }
+        // Fetch the complete org only while legacy sessions need migration.
+        // An unavailable snapshot leaves them untouched for the next beat.
+        let needs_migration = crate::assistants::migration_needed(&state.lock().unwrap_or_else(|p| p.into_inner()));
+        let legacy_snapshot = needs_migration.then(|| api.get("/org/snapshot", &[("legacy_placement", "true".into())]).ok()).flatten();
         let applied = {
             let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
             let applied = super::org::apply_marks(&mut s, &reply);
@@ -332,9 +342,20 @@ impl Beat {
             // clear it locally so a later same-UID revive cannot look like a
             // fresh operator hire after the old facts age out.
             let mut placement_cleared = false;
+            let mut seated = Vec::new();
             if let Some(members) = reply["org"]["members"].as_object() {
                 for uid in members.keys() {
-                    placement_cleared |= crate::assistants::clear_owner_placement(&mut s, uid);
+                    if let Some(member) = crate::assistants::main_member(uid) {
+                        if let Some(sess) = s.sessions.get_mut(uid) {
+                            if crate::assistants::wants_owner_placement(sess.org.as_ref()) {
+                                crate::assistants::stamp(&mut sess.org, &member, crate::assistants::MAIN, "owner:placement");
+                            }
+                        }
+                    }
+                    if crate::assistants::clear_owner_placement(&mut s, uid) {
+                        placement_cleared = true;
+                        seated.push(uid.clone());
+                    }
                 }
             }
             // A promote whose local half was lost (the brain died after the
@@ -355,7 +376,10 @@ impl Beat {
             }
             // O5: sessions a member's session spawned, or that work under a
             // member's task, are that member's assistants.
-            let stamped = crate::assistants::backfill(&mut s);
+            let mut stamped = legacy_snapshot.as_ref().map(|snapshot|
+                crate::assistants::migrate(&mut s, snapshot, &snap.daemon_id)).unwrap_or_default();
+            stamped.extend(crate::assistants::backfill(&mut s));
+            stamped.extend(seated);
             // A stream whose assistant has been gone 7 days goes back to
             // normal reaper eligibility.
             let (released, changed) =
@@ -371,6 +395,7 @@ impl Beat {
                 eprintln!("cm org: stamped {} session(s) as members' assistants: {}",
                           stamped.len(), stamped.join(", "));
                 s.persist_sessions_best_effort();
+                poke(); // publish the durable placement or Owner intent promptly
                 // The TUI's chart reads `member` off manifest diffs.
                 for uid in &stamped {
                     let org = s.sessions.get(uid).and_then(|sess| sess.org.clone());
@@ -661,6 +686,8 @@ mod tests {
         assert_eq!(bodies[0]["acked_push_ids"], json!([]));
         assert_eq!(bodies[0]["sessions"].as_array().unwrap().len(), 1);
         assert_eq!(bodies[0]["sessions"][0]["state"], "unknown"); // TUI-only row
+        assert_eq!(bodies[0]["sessions"][0]["auto_place_owner"], true);
+        assert_eq!(bodies[1]["sessions"][0]["auto_place_owner"], false, "seated TUI agent is not re-queued");
         assert_eq!(bodies[1]["acked_push_ids"], json!([41, 42]));
         // Every beat sends what the host advertises (doc/org-model.md
         // §12); with org's mark-apply and items' sweep guard both in, this

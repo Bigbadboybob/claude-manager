@@ -876,6 +876,14 @@ fn start_session_with_origin(
     spawn_params.org = {
         let st = state_arc.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut org = p.org.clone().or_else(|| persisted_org(&st, &session_uid));
+        let recorded = st.workspaces.values().any(|w| w.sessions.iter().any(|e| e.uid == session_uid))
+            || st.exited_tombstone(&session_uid).is_some()
+            || crate::resume_identity::lookup_uid(&st, &session_uid).ok().flatten().is_some();
+        if !recorded && p.org.is_none() && p.transcript_path.is_none()
+            && params.get("resume_id").and_then(Value::as_str).is_none()
+        {
+            cm_holder_proto::org::set(&mut org, crate::assistants::PLACEMENT_V1, json!(true));
+        }
         // O5: an agent spawned by a member's session (main or assistant)
         // is that member's assistant (its checkout is claimed as a `stream`
         // once the spawn succeeded, below). A continuous member's spawns are
