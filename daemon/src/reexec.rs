@@ -2509,6 +2509,7 @@ fn swap_exit_tombstone(
         }
     });
     crate::state::ExitedTombstone {
+        scope_member: None,
         startup_failure: None,
         session_uid: rec.uid.clone(),
         transcript_path: rec.transcript_path.clone(),
@@ -2912,7 +2913,7 @@ fn rehydrate_transaction(
                 });
             }
         }
-        st.record_exited(swap_exit_tombstone(rec, worktree_path, exited_at));
+        st.record_exited_scoped(swap_exit_tombstone(rec, worktree_path, exited_at));
         // Phase 4g (audit gap 7): a swap-dead CONTINUOUS tick gets the
         // same run-close flip `handle_session_exit` gives a live exit,
         // instead of leaving its run `Running` for `reconcile_orphans`

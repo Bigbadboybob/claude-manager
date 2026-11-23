@@ -4204,8 +4204,18 @@ mod remote_reconnect_tests {
         }
 
         let (mut app, ghost) = app_with_ghost_unix_host(&cm_dir);
-        // A live caller (no task scope, same workspace → authorized to kill)
-        // plus the reconnecting target.
+        // The owning daemon decides session scope before the TUI removes the
+        // reconnecting row. Exercise that RPC without requiring a live daemon.
+        let listener = std::os::unix::net::UnixListener::bind(cm_dir.join("ghost-nonexistent.sock")).unwrap();
+        let scope_server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let req = cm_daemon::control::wire::read_request(&mut stream).unwrap().unwrap();
+            assert_eq!(req.method, "session.scope_check");
+            assert_eq!(req.params["session_uid"], "uid-remote");
+            cm_daemon::control::wire::write_response(&mut stream,
+                &cm_daemon::control::protocol::Response::ok(req.id, serde_json::json!({"allowed": true}))).unwrap();
+        });
+        // A live caller plus the reconnecting target.
         let (caller, _c_tx, _c_t) =
             session_with_injected_exit("caller", ghost.clone(), false);
         let (target, _tx, _teof) =
@@ -4227,6 +4237,7 @@ mod remote_reconnect_tests {
             &serde_json::json!({ "session_uid": "uid-remote" }),
         );
         assert!(res.is_ok(), "kill_session should succeed: {:?}", res.err());
+        scope_server.join().unwrap();
 
         assert!(
             app.reconnecting_sessions.is_empty(),

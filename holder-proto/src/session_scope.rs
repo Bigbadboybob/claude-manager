@@ -95,20 +95,24 @@ impl Snapshot {
         &self, caller: &str, target: &str,
         parent_of: impl Fn(&str) -> Option<String>,
     ) -> bool {
-        let Some(source) = self.sessions.get(caller) else { return false };
-        let Some(org) = self.members.get(&source.member).map(|m| m.org_id.as_str()) else { return false };
+        // The local registry is authoritative even when either endpoint has
+        // not appeared in the last successful org snapshot.
         let mut current = target.to_owned();
         let mut seen = HashSet::new();
         while seen.insert(current.clone()) {
-            if source.role == Role::Main {
-                if let Some(session) = self.sessions.get(&current) {
-                    return self.member_in_scope(&source.member, &session.member);
-                }
-            } else if let Some(session) = self.sessions.get(&current) {
-                if self.members.get(&session.member).is_none_or(|m| m.org_id != org) { return false; }
+            let Some(parent) = parent_of(&current) else { break };
+            if parent == caller { return true; }
+            current = parent;
+        }
+        let Some(source) = self.sessions.get(caller) else { return false };
+        if source.role != Role::Main { return false; }
+        let mut current = target.to_owned();
+        let mut seen = HashSet::new();
+        while seen.insert(current.clone()) {
+            if let Some(session) = self.sessions.get(&current) {
+                return self.member_in_scope(&source.member, &session.member);
             }
             let Some(parent) = parent_of(&current) else { return false };
-            if source.role != Role::Main && parent == caller { return true; }
             current = parent;
         }
         false
@@ -181,5 +185,19 @@ mod tests {
         assert!(!s.reaches("lead-main", "worker"));
         s.sessions.get_mut("b").unwrap().spawned_by = Some("b".into());
         assert!(!s.reaches("a", "b"));
+    }
+
+    #[test]
+    fn live_spawner_chain_precedes_all_cached_membership() {
+        let mut s = sample();
+        s.members.get_mut("report").unwrap().org_id = "other".into();
+        let parents = HashMap::from([
+            ("new-child", "new-assistant"),
+            ("worker", "lead-main"),
+        ]);
+        let parent = |key: &str| parents.get(key).map(|s| (*s).to_owned());
+        assert!(s.reaches_with_spawners("new-assistant", "new-child", parent));
+        assert!(s.reaches_with_spawners("lead-main", "worker", parent));
+        assert!(!s.reaches_with_spawners("new-assistant", "worker", parent));
     }
 }

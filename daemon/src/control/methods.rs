@@ -1628,6 +1628,7 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
             .or_else(|| memory_cap_kill.then(|| MEMORY_CAP_KILLER.to_string()));
         let report = sess.reported_done();
         crate::state::ExitedTombstone {
+            scope_member: None,
             startup_failure: super::prompt_delivery::startup_failure(sess,
                 last_exit_opt.as_ref().and_then(|e| e.code), exited_at, killed),
             session_uid: uid.to_string(),
@@ -1728,7 +1729,7 @@ pub(crate) fn handle_session_exit(state: &mut DaemonState, uid: &str) {
         });
     }
     if let Some(tomb) = tombstone {
-        state.record_exited(tomb);
+        state.record_exited_scoped(tomb);
     }
     // Continuous Tasks Phase 3b completion signal (b): a continuous-task session
     // exiting CLEANLY clears its ACTIVE run. Guards, kill-path analysis, and the
@@ -2917,7 +2918,15 @@ pub fn list_sessions(
     let include_shells = p.include_shells.unwrap_or(caller_uid.is_none());
     let caller_is_global_snapshot = caller_uid.and_then(|uid| state_arc.lock().unwrap_or_else(|p| p.into_inner())
         .sessions.get(uid).map(|s| s.global_perms)).unwrap_or(false);
+    let list_caller_identity = caller_uid.and_then(|uid| crate::items::org::caller_identity(
+        &state_arc.lock().unwrap_or_else(|p| p.into_inner()), uid));
+    let org_read_members = if p.task_id.is_none() && caller_uid.is_some() && !caller_is_global_snapshot
+        && state_arc.lock().unwrap_or_else(|p| p.into_inner()).config.session_scope == crate::config::SessionScope::TaskTree {
+        crate::items::org::read_scope_members(state_arc, caller_uid.unwrap(), p.include_exited)
+    } else { None };
     let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    let org_read_members = org_read_members.filter(|_| caller_uid.is_some_and(|uid|
+        list_caller_identity.is_some() && list_caller_identity == crate::items::org::caller_identity(&state, uid)));
 
     // Global-permissions grant: a global caller sees EVERY session
     // (across all tasks and workspaces), not just its task-tree
@@ -3049,7 +3058,10 @@ pub fn list_sessions(
             // No scope, Operator caller: every session.
             (None, None) => true,
         };
-        legacy
+        legacy || org_read_members.as_ref().is_some_and(|allowed| {
+            state.sessions.get(uid).and_then(crate::assistants::of_session)
+                .is_some_and(|m| allowed.contains(&m.member_id))
+        })
     };
 
     // Daemon-owned sessions (live PTY in `state.sessions`).
@@ -3228,11 +3240,15 @@ pub fn list_sessions(
                     crate::control::auth::task_in_scope(&state, t, scope)))
                     && caller_uid.is_none_or(|cuid| crate::control::auth::manager_reaches_any(&state, cuid, uid))
             } else {
-                match (scope_task.as_deref(), caller_uid) {
+                let legacy = match (scope_task.as_deref(), caller_uid) {
                     (Some(scope), _) => tomb.task_id.as_deref().is_some_and(|t| crate::control::auth::task_in_scope(&state, t, scope)),
                     (None, Some(cuid)) => crate::control::auth::check_session_caller_for_exited(&state, cuid, uid, tomb.task_id.as_deref(), &tomb.workspace_id).is_allow(),
                     (None, None) => true,
-                }
+                };
+                legacy || org_read_members.as_ref().is_some_and(|allowed| {
+                    crate::assistants::membership(uid, tomb.org.as_ref())
+                        .is_some_and(|m| allowed.contains(&m.member_id))
+                })
             };
             if !include || (tomb.session_type == "bash" && (!include_shells || caller_uid.is_some())) {
                 continue;
@@ -3372,10 +3388,70 @@ pub fn resolve_authorized_session(
             )
         })?;
 
+    // Keep the ordinary task/workspace decision local and cheap.  If it
+    // denies, release the registry lock before asking the planning API for
+    // the same manager-chain read authority used by session handoff.  An API
+    // failure falls back to this denial, so the old scope remains fail-closed.
+    let (initial_decision, initial_caller_identity) = if let Some(cuid) = caller_uid {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            resolve_read_decision(&state, cuid, &p.session_uid),
+            crate::items::org::caller_identity(&state, cuid),
+        )
+    } else {
+        (crate::control::auth::AuthDecision::Allow, None)
+    };
+    let rollback = state_arc.lock().unwrap_or_else(|p| p.into_inner()).config.session_scope == crate::config::SessionScope::TaskTree;
+    let org_identity = if rollback && !initial_decision.is_allow() {
+        caller_uid.and_then(|cuid| {
+            crate::items::org::read_authorized_target(
+                state_arc,
+                cuid,
+                &p.session_uid,
+            )
+        })
+    } else {
+        None
+    };
+    if !initial_decision.is_allow() && org_identity.is_none() {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        let decision = caller_uid
+            .map(|cuid| resolve_read_decision(&state, cuid, &p.session_uid))
+            .unwrap_or(crate::control::auth::AuthDecision::Allow);
+        if let Some(cuid) = caller_uid {
+            return_auth_error_if_denied_with_state(
+                decision,
+                cuid,
+                &p.session_uid,
+                Some(&state),
+            )?;
+        }
+    }
     let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(cuid) = caller_uid {
-        let decision = resolve_read_decision(&state, cuid, &p.session_uid);
-        return_auth_error_if_denied_with_state(decision, cuid, &p.session_uid, Some(&state))?;
+        let current_caller_identity = crate::items::org::caller_identity(&state, cuid);
+        if current_caller_identity != initial_caller_identity {
+            return Err((
+                ErrorCode::Unauthorized,
+                "caller session changed during read authorization; retry".into(),
+            ));
+        }
+        let current_decision = resolve_read_decision(&state, cuid, &p.session_uid);
+        let attribution_changed = org_identity.as_ref().is_some_and(|granted| {
+            crate::items::org::target_identity(&state, &p.session_uid).as_ref() != Some(granted)
+        });
+        // Re-check the current target after the API call.  A reused UID may
+        // now name a different task/member/transcript; the old grant cannot
+        // authorize that replacement.  If the current task scope itself now
+        // allows the target, the ordinary scope is sufficient.
+        if attribution_changed || org_identity.is_none() {
+            return_auth_error_if_denied_with_state(
+                current_decision,
+                cuid,
+                &p.session_uid,
+                Some(&state),
+            )?;
+        }
     }
     // Auth passed (or Operator caller). Resolve the target: live session first,
     // then a recently-exited tombstone (read-after-exit), else NotFound.
@@ -13731,7 +13807,10 @@ pub fn trigger(
             let allowed = if state.config.session_scope == crate::config::SessionScope::TaskTree {
                 sess.global_perms || sess.task_id.as_deref().is_some_and(|own|
                     crate::control::auth::task_in_scope(&state, &p.task_id, own))
-            } else if sess.global_perms { true } else {
+            } else if sess.global_perms {
+                // Global callers deliberately bypass the known-lead requirement.
+                true
+            } else {
                 task.current_session_uid.as_deref().is_some_and(|uid| {
                     let cache = &state.session_scope_cache;
                     let key = cm_holder_proto::session_scope::session_key(&cache.daemon_id, uid);
@@ -27931,6 +28010,7 @@ while True:
 
     fn tombstone(uid: &str, engine: &str) -> crate::state::ExitedTombstone {
         crate::state::ExitedTombstone {
+            scope_member: None,
             startup_failure: None,
             org: None,
             model: None,
@@ -28914,6 +28994,7 @@ while True:
             ws.sessions = vec![e];
             s.workspaces.insert("ws-rv".into(), ws);
             s.record_exited(crate::state::ExitedTombstone {
+                scope_member: None,
                 startup_failure: None,
                 org: None,
                 model: None,
@@ -29026,6 +29107,7 @@ while True:
             ws.worktree_path = Some(wt.clone());
             s.workspaces.insert("ws-org".into(), ws);
             s.record_exited(crate::state::ExitedTombstone {
+                scope_member: None,
                 startup_failure: None,
                 org: Some(org.clone()),
                 model: None,
@@ -29191,6 +29273,7 @@ while True:
         let wt = std::env::temp_dir();
         let state = make_state_arc();
         state.lock().unwrap().record_exited(crate::state::ExitedTombstone {
+                scope_member: None,
             startup_failure: None,
             org: None,
             model: None,
@@ -39384,6 +39467,54 @@ while True:
             )
             .expect_err("explicit parent outside the caller's tree");
             assert_eq!(err.0, ErrorCode::Unauthorized, "{:?}", err);
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn report_tombstone_remains_visible_and_fork_authorized_after_snapshot_refresh() {
+        use cm_holder_proto::session_scope::{session_key, Member, Role, Session};
+        with_home_and_repo("forktombscope", |home, name| {
+            let repo = home.join("code/projects").join(name);
+            let state = make_state_arc();
+            seed_fork_source(&state, &repo, name);
+            seed_tasked_caller(&state, "ts-lead", "ws-lead", "task-lead");
+            {
+                let mut s = state.lock().unwrap();
+                s.config.session_scope = crate::config::SessionScope::ManagerChain;
+                s.session_scope_cache.daemon_id = "host".into();
+                for (id, manager) in [("lead", None), ("report", Some("lead"))] {
+                    s.session_scope_cache.graph.members.insert(id.into(), Member {
+                        org_id: "org".into(), manager: manager.map(str::to_owned), active: true,
+                    });
+                }
+                for (uid, member) in [("ts-lead", "lead"), ("ts-src", "report")] {
+                    s.session_scope_cache.graph.sessions.insert(session_key("host", uid), Session {
+                        member: member.into(), role: Role::Main, spawned_by: None,
+                    });
+                }
+                let mut source = s.sessions.remove("ts-src").unwrap();
+                let mut tomb = tombstone("ts-src", "claude-code");
+                tomb.transcript_path = source.transcript_path.clone();
+                tomb.workspace_id = source.workspace_id.clone();
+                tomb.task_id = source.task_id.clone();
+                tomb.worktree_path = Some(repo.display().to_string());
+                let _ = source.kill();
+                s.record_exited_scoped(tomb);
+                // A refreshed API snapshot no longer includes the exited row.
+                s.session_scope_cache.graph.sessions.remove(&session_key("host", "ts-src"));
+                let restored = serde_json::from_str(&serde_json::to_string(s.exited_tombstone("ts-src").unwrap()).unwrap()).unwrap();
+                s.recently_exited.clear();
+                s.record_exited(restored);
+                s.task_tree.insert("task-other".into(), None);
+            }
+            let rows = list_sessions(&state, &json!({"include_exited": true}), Some("ts-lead")).unwrap();
+            assert!(rows.as_array().unwrap().iter().any(|row| row["session_uid"] == "ts-src"));
+            assert_eq!(resolve_authorized_session(&state, &json!({"session_uid":"ts-src"}), Some("ts-lead")).unwrap()["state"], "exited");
+            let err = session_fork(&state, &json!({"source_uid":"ts-src", "task_name":"x", "parent_task_id":"task-other"}), Some("ts-lead")).unwrap_err();
+            assert!(err.1.contains("not the caller's task or a descendant"), "{err:?}");
+            state.lock().unwrap().session_scope_cache.graph.members.get_mut("report").unwrap().manager = None;
+            assert!(resolve_authorized_session(&state, &json!({"session_uid":"ts-src"}), Some("ts-lead")).is_err());
             kill_all_sessions(&state);
         });
     }
