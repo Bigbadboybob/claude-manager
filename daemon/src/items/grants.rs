@@ -5,8 +5,8 @@
 //! rule would refuse (a taskless caller, or a task in another tree). The API
 //! writes the grant when the owner changes; every board heartbeat reply
 //! carries this daemon's full live set, which replaces API grants and is
-//! persisted beside the messaging store, so a brain restart admits the same
-//! launches before its first beat (fail-static). It is not a task-parent or
+//! persisted beside the messaging store. Board grants are revalidated on a
+//! brain restart because a failed revocation write can leave stale bytes. It is not a task-parent or
 //! creator edge: a TUI tree push or a restart cannot drop it, and it grants
 //! launch only, not control of the task's other sessions. Locally issued
 //! proposal grants survive heartbeat replacement and share the same store.
@@ -41,6 +41,12 @@ pub fn load(root: &Path) -> Vec<LaunchGrant> {
         .unwrap_or_default()
 }
 
+/// On restart, only local proposals are safe to restore. A failed revocation
+/// may have left a readable old board grant on disk.
+pub fn load_after_restart(root: &Path) -> Vec<LaunchGrant> {
+    load(root).into_iter().filter(|g| g.proposal).collect()
+}
+
 /// The grants a heartbeat reply carries, or None from an API that predates
 /// them (the cache is then left as it is).
 pub fn from_reply(reply: &Value) -> Option<Vec<LaunchGrant>> {
@@ -73,19 +79,29 @@ pub fn persist(cache: &mut Vec<LaunchGrant>, root: &Path, grants: Vec<LaunchGran
     *cache = grants;
     // A previous write may have failed after the in-memory cache changed.
     // Compare against the actual file, so an unchanged retry still repairs it.
-    let saved = std::fs::read(path(root)).ok()
-        .and_then(|bytes| serde_json::from_slice::<Vec<LaunchGrant>>(&bytes).ok());
-    if saved.as_ref() == Some(cache) {
-        // A prior durable write may have renamed successfully and then failed
-        // its file/directory sync. Matching bytes alone do not prove durability.
-        std::fs::File::open(path(root))?.sync_all()?;
-        std::fs::File::open(root)?.sync_all()?;
-        return Ok(changed);
+    let result = (|| {
+        let saved = std::fs::read(path(root)).ok()
+            .and_then(|bytes| serde_json::from_slice::<Vec<LaunchGrant>>(&bytes).ok());
+        if saved.as_ref() == Some(cache) {
+            // Matching bytes alone do not prove the previous rename was durable.
+            std::fs::File::open(path(root))?.sync_all()?;
+            std::fs::File::open(root)?.sync_all()?;
+            return Ok(changed);
+        }
+        std::fs::create_dir_all(root)?;
+        let data = serde_json::to_string_pretty(cache).map_err(std::io::Error::other)?;
+        crate::state::write_json_atomic(&path(root), &data, true)?;
+        Ok(changed)
+    })();
+    if result.is_err() {
+        // Never leave a stale grant readable when the directory permits removal.
+        // If unlink itself fails, live readers use the cache and restart drops
+        // board grants until the next heartbeat revalidates them.
+        if std::fs::remove_file(path(root)).is_ok() {
+            let _ = std::fs::File::open(root).and_then(|dir| dir.sync_all());
+        }
     }
-    std::fs::create_dir_all(root)?;
-    let data = serde_json::to_string_pretty(cache).map_err(std::io::Error::other)?;
-    crate::state::write_json_atomic(&path(root), &data, true)?;
-    Ok(changed)
+    result
 }
 
 /// The grant letting `session_uid` launch for `task_id`, if any.
@@ -144,4 +160,22 @@ mod tests {
         assert!(!persist(&mut cache, &root, vec![grant.clone()]).unwrap());
         assert_eq!(load(&root), vec![grant]);
     }
+    #[test]
+    fn failed_revocation_is_refused_live_and_after_restart_and_retries() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let board = LaunchGrant { task_id: "task".into(), session_uid: "caller".into(), ..Default::default() };
+        let mut cache = vec![];
+        persist(&mut cache, root, vec![board.clone()]).unwrap();
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(replace(&mut cache, root, vec![]).is_err());
+        assert!(find(&cache, "caller", "task").is_none());
+        assert_eq!(load(root), vec![board]); // old readable file survives the error
+        assert!(load_after_restart(root).is_empty());
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        replace(&mut cache, root, vec![]).unwrap();
+        assert!(load(root).is_empty());
+    }
+
 }

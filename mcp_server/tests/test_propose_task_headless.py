@@ -229,3 +229,27 @@ class FiledTaskDefaultsTests(unittest.TestCase):
         self.assertIn("not a codex level", f(None, "max", "codex")[2])
         self.assertIn("not a claude level", f("claude-opus-5-5", "extreme", None)[2])
         self.assertIn("is a codex model", f("gpt-6-luna", None, "claude")[2])
+
+class TasklessTuiProposalTests(unittest.TestCase):
+    def test_taskless_session_uses_tui_daemon_proxy(self):
+        from mcp_server import server, control_client
+        route = types.SimpleNamespace(chose_daemon=False, path='/tmp/tui.sock')
+        with mock.patch.object(control_client, 'resolve_socket_route', return_value=route), \
+             mock.patch.object(server, '_caller_filer_context', return_value={'session_id': 'alias'}), \
+             mock.patch.object(server, '_git_origin_url', return_value='git@x:o/p.git'), \
+             mock.patch.object(server, 'PlanningClient', side_effect=AssertionError('direct API used')), \
+             mock.patch.object(control_client, 'call', return_value={'id': 'new-task'}) as call:
+            out = server.propose_task('p', 'new')
+        self.assertIn('new-task', out)
+        self.assertEqual(call.call_args.args[0], 'propose_task')
+        self.assertEqual(call.call_args.kwargs['socket_path'], '/tmp/tui.sock')
+
+    def test_proxy_failure_never_creates_direct_task(self):
+        from mcp_server import server, control_client
+        route = types.SimpleNamespace(chose_daemon=False, path='/tmp/tui.sock')
+        with mock.patch.object(control_client, 'resolve_socket_route', return_value=route), \
+             mock.patch.object(server, '_caller_filer_context', return_value={'session_id': 'alias'}), \
+             mock.patch.object(server, 'PlanningClient', side_effect=AssertionError('direct API used')), \
+             mock.patch.object(control_client, 'call', side_effect=control_client.TransportError('down')):
+            with self.assertRaises(control_client.TransportError):
+                server.propose_task('p', 'new')

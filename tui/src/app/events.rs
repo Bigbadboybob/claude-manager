@@ -1418,6 +1418,7 @@ impl App {
                 methods::resolve_authorized_session(self, caller, &req.params)
             }
             "get_caller_task" => methods::get_caller_task(self, caller, &req.params),
+            "propose_task" => methods::propose_task(self, caller, &req.params),
             "list_sessions" => methods::list_sessions(self, caller, &req.params),
             "send_input" => methods::send_input(self, caller, &req.params),
             "send_key" => methods::send_key(self, caller, &req.params),
@@ -1664,7 +1665,7 @@ impl App {
             global_perms,
             pending_enter: None,
             created_at: Instant::now(),
-            managed_by_uid: Some(caller_uid.to_string()),
+            managed_by_uid: Some(daemon_caller_uid),
             seeded_from_snapshot: None,
             preserved_last_exit: None,
             // 12e-r8 F1: tag with the CALLER's host_id —

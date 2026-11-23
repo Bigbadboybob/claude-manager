@@ -1450,9 +1450,9 @@ def propose_task(
     # Sub-2b-2 (10d-mcp-surface-2b-2): route through the daemon
     # when CM_DAEMON_SOCKET is set. Daemon now owns the planning
     # API talk (centralizes auth/audit/policy; survives TUI
-    # restarts). Falls back to the direct PlanningClient path
-    # when no daemon socket is configured — ad-hoc CLI usage,
-    # tests, agents not spawned through the TUI.
+    # restarts). A taskless TUI caller also forwards via its TUI to the
+    # owning daemon so the daemon records its proposal grant. Other
+    # unpinned callers retain the direct PlanningClient path.
     #
     # Wire shape: `repo_url` is the CALLER's checkout (the daemon doesn't
     # know the agent's cwd). It is only a fallback: the row gets the target
@@ -1466,7 +1466,9 @@ def propose_task(
     # so the daemon-vs-PlanningClient branch decision AND the
     # actual dial are bound to the same resolution.
     route = control_client.resolve_socket_route()
-    if route.chose_daemon:
+    filer = None if route.chose_daemon else _caller_filer_context("mcp.propose_task")
+    taskless_session = bool(filer and filer.get("session_id") and not filer.get("task_id"))
+    if route.chose_daemon or taskless_session:
         # Detect the repo URL to forward to the daemon with a plain
         # `git remote get-url origin` shell-out (see _git_origin_url) — NOT via
         # cli.planning_client, which isn't deployed on headless/remote hosts
@@ -1505,7 +1507,6 @@ def propose_task(
             return f"propose_task failed ({e.code}): {e.message}"
     else:
         client = PlanningClient()
-        filer = _caller_filer_context("mcp.propose_task")
         metadata: dict = {"filer": filer}
         models, efforts, error = _filed_task_defaults(model, effort, model_engine)
         if error:
@@ -2212,7 +2213,7 @@ def _annotate_shared_worktrees(sessions: list[dict]) -> None:
     already filtered down to what this caller may see. Both host
     implementations authorize per row before emitting it (the daemon's
     `list_sessions` runs every row through `should_include`, which walks
-    the caller's task tree / workspace via `check_session_caller`; the
+    manager-chain and spawner scope via `check_session_caller`; the
     TUI twin runs `caller_authorized_for` per row). So this can only
     ever name a session the caller could already list. Never re-query
     the host for a wider set to build this — that would leak session
@@ -2284,8 +2285,8 @@ def session_roster(
 ) -> dict:
     """Read a bounded cross-host roster of visible sessions and their holds.
 
-    Scope is your org subtree plus task tree, or your local workspace when
-    taskless. Assistants and workers receive their member's subtree for this
+    Scope is your member and its manager-chain subtree plus live workspace
+    peers. Assistants and workers receive their member's subtree for this
     read. Owner and global-permissions callers have fleet-wide read-only
     visibility. Filters narrow that scope. Host is an exact daemon ID or an
     unambiguous visible host label. Shells and unknown session kinds are
@@ -2312,13 +2313,11 @@ def list_sessions(
     Shells are omitted by default. Set include_shells=true to include
     terminal panes labelled kind="shell"; they are never agent workers.
 
-    Scope: your own task tree (or your whole workspace if you have no
-    task). A member lead also sees sessions attributed to members below it in
-    the org manager chain, including their assistants and workers; this
-    read-only widening is API-backed and falls back to the old scope if the
-    planning API is unavailable. If you hold global permissions (check
-    `ping().global_perms`), this returns EVERY session across all tasks and
-    workspaces. For a readable tree grouped by workspace → task, use
+    Scope: a member's main session can see its own assistants and workers
+    and sessions of members below it in the manager chain. Assistants and
+    workers can see their own spawner descendants. Org relations are cached
+    during API outages; global permissions bypass this scope. Shell control
+    is Owner-only. For a readable tree grouped by workspace → task, use
     `list_sessions_grouped` instead.
 
     Args:
@@ -3234,9 +3233,10 @@ async def send_key(
     A key is not new work: it does not supersede a session's `reported`
     status (`report_done`) and does not re-arm watches on it.
 
-    Scope is send_input's: your own task's sessions and its descendants
-    (any session with global permissions). Every session gets its own
-    result in `results`: status `ok`, `not_found`, `unauthorized`,
+    Scope is send_input's: a main session controls its assistants, workers,
+    and reports' sessions; an assistant or worker controls its spawner
+    descendants. Global permissions bypass scope; shells are Owner-only.
+    Every session gets its own result in `results`: status `ok`, `not_found`, `unauthorized`,
     `exited`, or `error`; one bad target never stops the rest.
 
     """
@@ -5266,10 +5266,9 @@ def rotate_transcript(reason: str = "", status: bool = False, session_uid: str =
 
     Another session: pass `session_uid` to ask for a session you have
     authority over, the same authority CM already enforces for controlling
-    sessions: a session in your task tree (the send_input / kill_session
-    scope; everything with global permissions), or, as a lead, a session
-    of a member below you in the org (its main session, assistants or
-    workers). Anything else is refused as unauthorized, and so are shells,
+    sessions: your spawner descendants, plus, for a member main session,
+    sessions of members below it in the manager chain. Global permissions
+    bypass that scope. Anything else is refused as unauthorized, and so are shells,
     continuous sessions and workflow participants. It waits for that
     session's own safe boundary (never `now`), and its notice says you
     asked.
@@ -5322,10 +5321,9 @@ def request_handoff(
 
     Another session: pass `session_uid` to ask for a session you have
     authority over, the same authority CM already enforces for controlling
-    sessions: a session in your task tree (the send_input / kill_session
-    scope; everything with global permissions), or, as a lead, a session
-    of a member below you in the org (its main session, assistants or
-    workers). Anything else is refused as unauthorized, and so are shells,
+    sessions: your spawner descendants, plus, for a member main session,
+    sessions of members below it in the manager chain. Global permissions
+    bypass that scope. Anything else is refused as unauthorized, and so are shells,
     continuous sessions and workflow participants. It waits for that
     session's own safe boundary (never `now`), and its notice says you
     asked.

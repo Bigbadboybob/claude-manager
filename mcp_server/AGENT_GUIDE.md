@@ -246,9 +246,8 @@ Work-sidebar organization: `list_sidebar_sections` shows published choices. `set
 member's main session can control its own assistants and workers and sessions of reports below it; assistants and workers control their own spawner descendants. The roster may show workspace co-tenants without granting control.
 Use `include_shells=true` to inspect bash terminals; they carry `kind: "shell"`
 and `status: "shell"` (or `exited`). Shells are never teammates, item holders,
-roster candidates, or free capacity. `send_input` explicitly runs shell commands
-with a newline and skips agent completion monitoring. Redirect command output
-to a file. `wait_for_session_idle`, `start_session(type="bash", wait=true)`,
+roster candidates, or free capacity. Shell control, including `send_input`, is
+reserved for Owner; agent sessions cannot read or control shell panes. `wait_for_session_idle`, `start_session(type="bash", wait=true)`,
 `monitor_sessions(until="turn_end")` and `cm-wait` wait for PTY quiet or exit
 and return shell-labelled results without an assistant reply. Quiet output
 does not prove a command succeeded. Transcript reads, assistant reply waits,

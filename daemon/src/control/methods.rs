@@ -42133,7 +42133,16 @@ printf ran > "$MAIN_REPO/setup-ran"
                 s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
                 s.config.api_token = "tok".into();
             }
-            propose_task(&state, &json!({"project":"proj", "name":"work"}), Some("ts-proposer")).unwrap();
+            let request = crate::control::protocol::Request {
+                id: "tui-proposal".into(), caller: crate::control::protocol::Caller::operator("op-default"),
+                method: "propose_task_for_session".into(),
+                params: json!({"caller_uid":"ts-proposer", "proposal":{"project":"proj", "name":"work"}}),
+            };
+            let result = crate::control::dispatch::dispatch_request(&state, &request).into_response();
+            assert!(result.ok, "{result:?}");
+            let mut forged = request.clone();
+            forged.caller = crate::control::protocol::Caller::session("ts-proposer");
+            assert!(!crate::control::dispatch::dispatch_request(&state, &forged).into_response().ok);
             {
                 let mut s = state.lock().unwrap();
                 assert!(crate::items::grants::find(&s.launch_grants, "ts-proposer", "task-proposed").is_some());

@@ -52,7 +52,7 @@ This is a substantial expansion of the MCP surface and requires three foundation
 └──────────────────────────────┘
 ```
 
-Reads of session output use a two-step pattern. Each `read_session_output` call first hits the socket with `resolve_authorized_session(target_session_uid)`; the TUI authorizes the request (descendant-only check) and returns:
+Reads of session output use a two-step pattern. Each `read_session_output` call first hits the socket with `resolve_authorized_session(target_session_uid)`; the TUI authorizes the request (manager-chain and spawner check) and returns:
 
 ```
 {
@@ -187,23 +187,20 @@ Today only **workflow-participant** spawns inject MCP config / env vars (`tui/sr
 
 Without this step, Phase 3+ tools are dead code from the perspective of regular sessions.
 
-These act as **soft capability tokens**, not a security boundary. Same-user processes can read each other's environments (`/proc/<pid>/environ` on Linux), and the agents themselves can run shell commands as the same user — so any process running on the box could in principle observe these values and impersonate a session. The descendant-only auth check is therefore an **accidental-misuse guardrail**, not a defense against a malicious local process. Its job is to keep an honest agent from drifting into unrelated work, and to make agent-driven changes traceable in the activity feed. If you ever need a real security boundary (cross-user, multi-tenant, untrusted code), this design has to be revisited — short-lived signed tokens issued per-call would be a starting point, but it's out of scope here.
+These act as **soft capability tokens**, not a security boundary. Same-user processes can read each other's environments (`/proc/<pid>/environ` on Linux), and the agents themselves can run shell commands as the same user — so any process running on the box could in principle observe these values and impersonate a session. The session-scope auth check is therefore an **accidental-misuse guardrail**, not a defense against a malicious local process. Its job is to keep an honest agent from drifting into unrelated work, and to make agent-driven changes traceable in the activity feed. If you ever need a real security boundary (cross-user, multi-tenant, untrusted code), this design has to be revisited — short-lived signed tokens issued per-call would be a starting point, but it's out of scope here.
 
 When the MCP server receives a tool call, it includes its `CM_TUI_SESSION_ID` in the socket request. The TUI looks up the caller's workspace and task from the live manifest, then authorizes:
 
-- **Caller has a task** (workflow-launched or planning-launched): authorize per the **task tree** rule. Read/mutate target T allowed iff `T.task_id` is `caller.task_id` or a descendant in the parent_task_id tree. Same for sessions, scoped via the session's bound task.
-  - The tree covers every status. The TUI's `task.update_tree` push carries the parent edge of every subtask in its planning snapshot (done, backlog, draft and archived too). On a host no TUI pushes to, the daemon's background refresher (`daemon/src/task_parent_refresh.rs`) reads the missing edges from the planning API every 60 s. The pushed edges win, and no RPC makes an HTTP call for scope. An orchestrator therefore keeps scope over its own done subtasks, and their live workers stay in its continuous channel.
-  - **Reparenting** (`update_task(parent_task_id=…)`): both the task and its new parent must be in the caller's tree, unless the caller holds global perms. The daemon route checks this itself. The MCP server's direct-API route asks the daemon's `task.scope_check` (at most 64 ids per call) and refuses when it can't get an answer. Detaching (`"null"`) is always allowed.
-  - **Known limit:** the guard lives in CM's tools, not in the planning API. An agent holding the API token can still `PATCH /tasks/{id}` with any `parent_task_id` directly and bypass it. As above, the scope rule is an accidental-misuse guardrail, not a security boundary.
-- **Caller is taskless** (regular `A-n` session): authorize per the **workspace** rule. Read/mutate target allowed iff target is in the same workspace as the caller. The taskless agent can manage sibling sessions in its workspace and create child sessions there, but cannot see or touch tasks (it has none) or other workspaces.
+- **Session operations:** a member's main session controls its assistants and workers and sessions of members below it in the manager chain. An assistant or worker controls its own spawner descendants. Org relations are cached during API outages; live local spawner links remain authoritative. Global permissions bypass this scope; shell control is Owner-only. Set `session_scope = "task_tree"` for the rollback rule.
+- **Task-object operations:** the task tree still governs creating, updating and listing subtasks, including reparenting. Both the task and new parent must be in scope unless the caller has global permissions. Detaching is allowed.
 - **`create_subtask` from a taskless caller**: errors. Subtasks need a parent task. The taskless agent should call `propose_task` instead to add a top-level task (existing tool, unchanged).
-- **Resolve transcript path for session S**: same workspace-or-task rule as above. Returns `{state, engine, transcript_path, generation}` (full contract in the Architecture section). `transcript_path` is `null` when `state == "pending"`; resolution falls back to the workspace's tombstone list when `state == "exited"`.
+- **Resolve transcript path for session S**: same session scope as above. Returns `{state, engine, transcript_path, generation}` (full contract in the Architecture section). `transcript_path` is `null` when `state == "pending"`; resolution falls back to the workspace's tombstone list when `state == "exited"`.
 
 By default there's no global access — an agent can't see or touch unrelated work. The one exception is **global-permissions** sessions (below).
 
 #### Global permissions
 
-A session may carry a **`global_perms`** flag. When set, that session's caller short-circuits the scope rule above to authorized for **any** target: it can `list_sessions` across every task and workspace, and `send_input` / `read_session_output` / `kill_session` / `start_session` against any session — not just its task-tree descendants. This is the "privileged orchestrator" capability for an agent meant to supervise unrelated work.
+A session may carry a **`global_perms`** flag. When set, that session's caller short-circuits the scope rule above to authorized for **any** target: it can `list_sessions` across every task and workspace, and `send_input` / `read_session_output` / `kill_session` / `start_session` against any agent session; shells remain Owner-only. This is the "privileged orchestrator" capability for an agent meant to supervise unrelated work.
 
 The flag lives on the session record on both sides of the auth split: `DaemonSession.global_perms` (daemon — gates daemon-routed `kill_session` / `read_session_output` / `list_sessions` / `start_session`) and `TerminalSession.global_perms` (TUI — gates the TUI-routed `send_input`). It persists in the manifest (`ManifestEntry.global_perms`) so the grant survives restart, and is checked in `daemon/src/control/auth.rs::check_session_caller` (short-circuit to `Allow`) and its TUI mirror `tui/src/control/methods.rs::caller_authorized_for`.
 
@@ -664,7 +661,7 @@ monitor_sessions(session_uids, mode="any", until="turn_end", note?,
 
 Re-resolving every call (rather than caching) handles `/clear`-driven transcript rebinds correctly: when a target runs `/clear`, the TUI binds it to a new JSONL file and bumps `generation`. The next `read_session_output` resolves to the new path automatically. Callers that want to cache across a burst of reads can compare `generation` to detect staleness, but the default code path doesn't bother — the resolve call is cheaper than parsing even a few JSONL lines.
 
-This preserves the descendant-only authorization model (every read clears auth first) while keeping the actual parsing off the TUI main loop.
+This preserves the session-scope authorization model (every read clears auth first) while keeping the actual parsing off the TUI main loop.
 
 ---
 

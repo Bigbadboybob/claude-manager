@@ -509,7 +509,21 @@ pub fn dispatch_request_with_peer_pid(
                 crate::config::SessionScope::ManagerChain => "manager_chain",
                 crate::config::SessionScope::TaskTree => "task_tree",
             };
-            DispatchOutcome::Done(Response::ok(req.id.clone(), json!({"allowed": crate::control::auth::check_any_session_caller(&st, caller, target), "global_perms": global, "target_role": role, "session_scope": scope_mode})))
+            DispatchOutcome::Done(Response::ok(req.id.clone(), json!({"allowed": crate::control::auth::check_any_session_caller(&st, caller, target), "global_perms": global, "target_role": role, "session_scope": scope_mode, "launch_grant": st.lookup_session_any(caller).is_some() && req.params["task_id"].as_str().is_some_and(|task| crate::items::grants::find(&st.launch_grants, caller, task).is_some())})))
+        }
+        "propose_task_for_session" => {
+            if let Err(resp) = require_operator(req, "propose_task_for_session requires an operator") {
+                return DispatchOutcome::Done(resp);
+            }
+            let uid = req.params["caller_uid"].as_str().unwrap_or("");
+            if !state.lock().unwrap_or_else(|p| p.into_inner()).lookup_session_any(uid).is_some() {
+                return DispatchOutcome::Done(Response::err(req.id.clone(), ErrorCode::Unauthorized, "caller session not found"));
+            }
+            let response = match methods::propose_task(state, &req.params["proposal"], Some(uid)) {
+                Ok(value) => Response::ok(req.id.clone(), value),
+                Err((code, message)) => Response::err(req.id.clone(), code, message),
+            };
+            DispatchOutcome::Done(response)
         }
         "staffing.get" | "staffing.set" => DispatchOutcome::Done(crate::staffing::dispatch(state, req)),
         "owner.board_token" => DispatchOutcome::Done(super::board_token::manage(state, req)),

@@ -34,11 +34,12 @@ pub fn poke() {
 
 pub fn start(state: &Arc<Mutex<DaemonState>>) {
     {
-        // Fail-static launch grants: what the last beat granted holds until
-        // the API answers again (doc/org-model.md §7.4).
+        // Proposal grants survive restart; board grants need revalidation.
         let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
         let root = s.messaging_root.clone();
-        s.launch_grants = crate::items::grants::load(&root);
+        // An unpersisted revocation cannot be distinguished from an old board
+        // grant after a crash. Reconfirm board grants on the next heartbeat.
+        s.launch_grants = crate::items::grants::load_after_restart(&root);
         // Members' main sessions stay protected across a brain restart.
         super::org::load_cache(&root);
     }

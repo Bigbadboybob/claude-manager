@@ -1170,6 +1170,18 @@ fn task_autodelivery_prompt(
     Some(crate::planning::compose_launch_prompt("", stored, &task.name))
 }
 
+pub fn propose_task(app: &App, caller_uid: &str, params: &Value) -> MethodResult {
+    let caller = live_caller_ctx(&app.workspaces, caller_uid)?;
+    let wi = caller.workspace_index.ok_or((ErrorCode::NotFound, "caller session not found".into()))?;
+    let session = app.workspaces[wi].sessions.iter().find(|s| s.uid == caller_uid)
+        .ok_or((ErrorCode::NotFound, "caller session not found".into()))?;
+    let host = app.host_pool.for_host(&session.host_id).map_err(|e| (ErrorCode::Internal, e.to_string()))?;
+    let socket = host.socket_path().ok_or((ErrorCode::Internal, "daemon socket unavailable".into()))?;
+    let uid = session.session.daemon_session_uid.as_deref().unwrap_or(caller_uid);
+    crate::client_session::rpc_propose_for_session(&socket, &app.host_pool.operator_token_for(&session.host_id), uid, params)
+        .map_err(|e| (ErrorCode::Internal, format!("proposal daemon unavailable or rejected request: {e}")))
+}
+
 pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodResult {
     let p: StartSessionParams = serde_json::from_value(params.clone())
         .map_err(|e| (ErrorCode::InvalidParams, format!("params: {}", e)))?;
@@ -1196,10 +1208,17 @@ pub fn start_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodR
     // task_id resolution. Allows binding to the caller's own task or
     // any descendant in the parent_task_id tree. Cross-task binding
     // outside the descendant tree requires global permissions or a
-    // persisted launch grant for this caller and task.
-    let grants = cm_daemon::items::grants::load(&cm_daemon::messaging::rpc::default_root());
+    // live daemon launch grant for this caller and task.
+    let grant = |task: &str| -> bool {
+        let session = app.workspaces[caller_wi].sessions.iter().find(|s| s.uid == caller_uid);
+        let Some(session) = session else { return false };
+        let Ok(host) = app.host_pool.for_host(&session.host_id) else { return false };
+        let Some(socket) = host.socket_path() else { return false };
+        let uid = session.session.daemon_session_uid.as_deref().unwrap_or(caller_uid);
+        crate::client_session::rpc_launch_grant(&socket, &app.host_pool.operator_token_for(&session.host_id), uid, task).unwrap_or(false)
+    };
     let task_id_for_new: Option<String> = match (p.task_id.as_deref(), caller.task_id.as_deref()) {
-        (Some(req), _) if caller.global_perms || cm_daemon::items::grants::find(&grants, caller_uid, req).is_some() => Some(req.to_string()),
+        (Some(req), _) if caller.global_perms || grant(req) => Some(req.to_string()),
         (Some(req), None) => {
             return Err((
                 ErrorCode::Unauthorized,
@@ -4097,22 +4116,28 @@ mod tests {
     }
 
     #[test]
-    fn taskless_launch_checks_persisted_proposal_grants() {
-        with_app_and_repo("tui-grant", |app, _repo| {
+    fn stale_grant_file_does_not_authorize_tui_launch() {
+        with_app_and_repo("tui-stale-grant", |app, _| {
             let wi = app.workspaces.len() - 1;
             app.workspaces[wi].sessions.push(live_ts("caller", None));
             let root = cm_daemon::messaging::rpc::default_root();
-            let mut grants = vec![];
-            cm_daemon::items::grants::persist(&mut grants, &root, vec![cm_daemon::items::grants::LaunchGrant {
-                proposal: true, task_id: "filed".into(), session_uid: "caller".into(),
-                pid: String::new(), board: None, n: None,
+            let mut old = vec![];
+            cm_daemon::items::grants::persist(&mut old, &root, vec![cm_daemon::items::grants::LaunchGrant {
+                task_id: "filed".into(), session_uid: "caller".into(), ..Default::default()
             }]).unwrap();
-            let denied = start_session(app, "caller", &json!({"type":"bash", "label":"other", "task_id":"unrelated", "allow_shared_workspace":true})).unwrap_err();
+            let (socket, _, state, stop, handle) = crate::client_session::tests::start_test_daemon("ws-caller");
+            app.host_pool = std::sync::Arc::new(crate::host_pool::HostPool::from_config(&crate::hosts::HostsConfig {
+                hosts: vec![crate::hosts::HostConfig { id: cm_daemon::host_id::HostId::local(),
+                    transport: crate::hosts::HostTransport::Unix { socket: socket.clone() },
+                    default: true, operator_token: None, operator_token_file: None }],
+            }).unwrap());
+            state.lock().unwrap().tui_sessions.insert("caller".into(),
+                serde_json::from_value(json!({"uid":"caller","workspace_id":"ws-caller","type":"codex"})).unwrap());
+            let denied = start_session(app, "caller", &json!({"type":"codex", "label":"worker", "task_id":"filed", "allow_shared_workspace":true})).unwrap_err();
             assert_eq!(denied.0, ErrorCode::Unauthorized);
-            // The grant passes authorization; the isolated test has no daemon
-            // to serve the subsequent spawn, so it may fail at that later step.
-            let result = start_session(app, "caller", &json!({"type":"bash", "label":"worker", "task_id":"filed", "allow_shared_workspace":true}));
-            if let Err(err) = result { assert_ne!(err.0, ErrorCode::Unauthorized, "{err:?}"); }
+            crate::client_session::tests::stop_test_daemon(&socket, stop, handle);
+            let denied = start_session(app, "caller", &json!({"type":"codex", "label":"worker", "task_id":"filed", "allow_shared_workspace":true})).unwrap_err();
+            assert_eq!(denied.0, ErrorCode::Unauthorized, "an unreachable daemon cannot revive a stale file");
         });
     }
 
@@ -4136,18 +4161,21 @@ mod tests {
                 }],
             }).unwrap());
             let wi = app.workspaces.len() - 1;
-            app.workspaces[wi].sessions.push(live_ts("caller", None));
+            app.workspaces[wi].sessions.push(live_ts("viewer-alias", None));
+            app.workspaces[wi].sessions.last_mut().unwrap().session.daemon_session_uid = Some("caller".into());
             state.lock().unwrap().tui_sessions.insert("caller".into(),
                 serde_json::from_value(json!({"uid":"caller","workspace_id":"ws-caller","type":"codex"})).unwrap());
-            let root = cm_daemon::messaging::rpc::default_root();
-            let mut grants = vec![];
-            cm_daemon::items::grants::persist(&mut grants, &root, vec![cm_daemon::items::grants::LaunchGrant {
+            state.lock().unwrap().launch_grants.push(cm_daemon::items::grants::LaunchGrant {
                 proposal: true, task_id: "filed".into(), session_uid: "caller".into(), ..Default::default()
-            }]).unwrap();
-            let response = start_session(app, "caller", &json!({
+            });
+            let response = start_session(app, "viewer-alias", &json!({
                 "type":"codex", "label":"worker", "task_id":"filed", "allow_shared_workspace":true
             })).expect("grant-backed TUI launch");
             let child = response["session_uid"].as_str().unwrap();
+            let entry = app.workspaces[wi].sessions.iter().find(|s| s.uid == child).unwrap().to_manifest_entry();
+            let bytes = serde_json::to_vec(&entry).unwrap();
+            let entry: cm_daemon::manifest::ManifestEntry = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(entry.managed_by_uid.as_deref(), Some("caller"));
             {
                 let mut s = state.lock().unwrap();
                 assert_eq!(s.sessions[child].managed_by_uid.as_deref(), Some("caller"));
@@ -4155,6 +4183,28 @@ mod tests {
                 for session in s.sessions.values_mut() { let _ = session.kill(); }
             }
             crate::client_session::tests::stop_test_daemon(&socket, stop, handle);
+            // Recreate the daemon and follow the same manifest fields as restore.
+            let (socket2, _, state2, stop2, handle2) = crate::client_session::tests::start_test_daemon("ws-caller");
+            app.host_pool = std::sync::Arc::new(crate::host_pool::HostPool::from_config(&crate::hosts::HostsConfig {
+                hosts: vec![crate::hosts::HostConfig { id: cm_daemon::host_id::HostId::local(),
+                    transport: crate::hosts::HostTransport::Unix { socket: socket2.clone() },
+                    default: true, operator_token: None, operator_token_file: None }],
+            }).unwrap());
+            state2.lock().unwrap().tui_sessions.insert("caller".into(),
+                serde_json::from_value(json!({"uid":"caller","workspace_id":"ws-caller","type":"codex"})).unwrap());
+            let restored = app.try_spawn_via_daemon(&entry.uid, "ws-caller", repo, &entry.session_type,
+                &entry.label, entry.transcript_id.as_deref(), 80, 24, entry.task_id.as_deref(),
+                entry.workflow_run_id.as_deref(), entry.workflow_role.as_deref(), &entry.host_id,
+                None, false, entry.global_perms, entry.model.as_deref(), entry.effort.as_deref(),
+                entry.managed_by_uid.as_deref()).unwrap().unwrap();
+            {
+                let mut s = state2.lock().unwrap();
+                assert_eq!(s.sessions[child].managed_by_uid.as_deref(), Some("caller"));
+                assert!(cm_daemon::control::auth::check_any_session_caller(&s, "caller", child));
+                for session in s.sessions.values_mut() { let _ = session.kill(); }
+            }
+            drop(restored);
+            crate::client_session::tests::stop_test_daemon(&socket2, stop2, handle2);
             unsafe { std::env::set_var("PATH", old_path) };
         });
     }
