@@ -740,6 +740,105 @@ def usage_snapshot(hub, now, since, granularity, account_snapshot=None):
         db.close()
 
 
+def plan_label(value):
+    """Accept short machine-readable tier labels, never arbitrary record text."""
+    return value if isinstance(value, str) and re.fullmatch(r'[a-z][a-z0-9_]{0,79}', value) else None
+
+
+def plan_tiers_from_files(hub):
+    """Read only tier fields from hub-held logins, including in-flight lends."""
+    paths = list(hub.paths.accounts.glob('*.json'))
+    for directory in (hub.pool_dir, hub.pool_dir / 'lent', hub.pool_dir / 'copies', hub.pool_dir / 'renewing'):
+        paths.extend(directory.glob('*.json'))
+    tiers = {}
+    for path in sorted(paths):
+        try:
+            record = load_json(path)
+            profile, oauth = record.get('oauthAccount'), record.get('claudeAiOauth')
+            if not isinstance(profile, dict) or not isinstance(oauth, dict):
+                continue
+            account = profile.get('accountUuid')
+            subscription = plan_label(oauth.get('subscriptionType'))
+            rate = plan_label(oauth.get('rateLimitTier'))
+            if isinstance(account, str) and account and subscription and rate:
+                tiers[account] = dict(subscription_type=subscription, rate_limit_tier=rate)
+        except (OSError, ValueError, AccountError):
+            continue
+    return tiers
+
+
+def plan_tiers_refresh(hub, now):
+    """Called only by the detached worker; persist no login fields except tiers."""
+    raw = load_json(hub.dir / 'plan-tiers.json')
+    cache = {}
+    for account, item in raw.items():
+        if not isinstance(item, dict):
+            continue
+        subscription, rate, seen = (plan_label(item.get('subscription_type')),
+                                    plan_label(item.get('rate_limit_tier')), item.get('seen_at'))
+        if subscription and rate and isinstance(seen, int) and not isinstance(seen, bool):
+            cache[account] = dict(subscription_type=subscription, rate_limit_tier=rate, seen_at=seen)
+    changed = cache != raw
+    for account, tier in plan_tiers_from_files(hub).items():
+        previous = cache.get(account)
+        if not isinstance(previous, dict) or any(previous.get(k) != v for k, v in tier.items()):
+            cache[account] = {**tier, 'seen_at': int(now)}
+            changed = True
+    if changed:
+        atomic_write(hub.dir / 'plan-tiers.json', cache)
+
+
+def hub_plans(hub, now):
+    view = hub_status_view(hub, now)
+    cached = load_json(hub.dir / 'plan-tiers.json')
+    current = plan_tiers_from_files(hub)
+    tier_counts, unknown = {}, 0
+    for account in view['accounts']:
+        tier = current.get(account) or cached.get(account) or {}
+        subscription = plan_label(tier.get('subscription_type')) if isinstance(tier, dict) else None
+        rate = plan_label(tier.get('rate_limit_tier')) if isinstance(tier, dict) else None
+        if not subscription or not rate:
+            unknown += 1
+        else:
+            tier_counts[(subscription, rate)] = tier_counts.get((subscription, rate), 0) + 1
+    codex, anonymous, with_data, without_data = {}, 0, [], []
+    for host, report in sorted(hub.reports().items()):
+        if host == POOL:
+            continue
+        usage = ((report.get('export') or {}).get('usage') or {})
+        data = usage.get('codex') if isinstance(usage, dict) else None
+        if not isinstance(data, dict) or not isinstance(data.get('accounts'), list):
+            without_data.append(host)
+            continue
+        with_data.append(host)
+        report_at = usage_epoch(report.get('at'))
+        for account in data['accounts']:
+            if not isinstance(account, dict):
+                continue
+            email = account.get('email')
+            if not isinstance(email, str) or not email.strip():
+                anonymous += 1
+                continue
+            key = email.strip().lower()
+            plan = plan_label(account.get('plan_type'))
+            rank = (plan is not None, report_at if report_at is not None else float('-inf'), host,
+                    str(account.get('id') or ''))
+            if key not in codex or rank > codex[key][0]:
+                codex[key] = (rank, plan)
+    plan_counts = {}
+    for _, plan in codex.values():
+        if plan:
+            plan_counts[plan] = plan_counts.get(plan, 0) + 1
+    return {'schema': 1, 'generated_at': int(now),
+            'claude': {'accounts': len(view['accounts']), 'unknown': unknown,
+                       'by_tier': [dict(subscription_type=s, rate_limit_tier=r, count=count)
+                                   for (s, r), count in sorted(tier_counts.items())]},
+            'codex': {'accounts': len(codex) + anonymous,
+                      'unknown': anonymous + sum(plan is None for _, plan in codex.values()),
+                      'by_plan': [dict(plan_type=plan, count=count) for plan, count in sorted(plan_counts.items())],
+                      'hosts_with_codex_data': with_data, 'hosts_without_codex_data': without_data}}
+
+
 
 # --- reset credit cache ------------------------------------------------------
 
@@ -804,6 +903,10 @@ def _refresh_reset_grants(paths, force=False, account_uuid=None, limit=2, budget
     start = time.monotonic()
     jobs = []
     with Hub(paths, lock_timeout=0.25) as hub:
+        try:
+            plan_tiers_refresh(hub, time.time())
+        except (OSError, ValueError, AccountError):
+            pass  # Tier caching is best-effort and never affects a sweep.
         cache = load_json(hub.dir / 'reset-grants.json')
         now = time.time()
         for account, record in sorted(hub.pool().items()):
@@ -890,7 +993,8 @@ def launch_reset_sweep(paths):
     """Detach a bounded worker; check-ins never wait for a network request."""
     try:
         directory = paths.store / 'hub' / 'pool'
-        if not directory.is_dir() or not any(directory.glob('*.json')):
+        if not any(any(d.glob('*.json')) for d in (directory, directory / 'lent', directory / 'copies',
+                                                    directory / 'renewing', paths.accounts)):
             return
         subprocess.Popen([sys.executable, os.path.abspath(__file__), 'hub', 'resets',
                           '--refresh', '--due-only'], stdin=subprocess.DEVNULL,
@@ -3175,6 +3279,12 @@ def cmd_hub(paths: Paths, args, out) -> int:
         json.dump(usage_snapshot(hub, now, since, args.granularity, account_snapshot), out)
         out.write("\n")
         return 0
+    if args.hub_command == "plans":
+        with Hub(paths, read_only=True) as hub:
+            result = hub_plans(hub, now)
+        json.dump(result, out)
+        out.write("\n")
+        return 0
     if args.hub_command == "usage-reset-codex":
         with Hub(paths) as hub:
             usage_reset_codex(hub, args.host)
@@ -4155,6 +4265,8 @@ def main(argv: list[str] | None = None, paths: Paths | None = None, out=None) ->
     p.add_argument("--json", action="store_true", required=True)
     p.add_argument("--since", type=int)
     p.add_argument("--granularity", choices=("hour", "day"), default="hour")
+    p = hsub.add_parser("plans", help="aggregate account plan counts")
+    p.add_argument("--json", action="store_true", required=True)
     p = hsub.add_parser("resets", help="show or refresh the pool's cached reset credits")
     p.add_argument("--refresh", action="store_true")
     p.add_argument("--json", action="store_true")

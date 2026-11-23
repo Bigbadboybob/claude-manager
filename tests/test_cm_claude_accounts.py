@@ -3149,6 +3149,78 @@ class UsageDashboardTests(unittest.TestCase):
         with accounts.Hub(self.hub_paths) as hub:
             return accounts.hub_checkin(hub, export)
 
+    def test_hub_plans_counts_only_and_is_read_only(self):
+        def record(name, tier='max', rate='default_claude_max_20x'):
+            oauth = login(name)
+            oauth.update(subscriptionType=tier, rateLimitTier=rate)
+            return {'claudeAiOauth':oauth, 'oauthAccount':profile(name)}
+        export = {'version':1, 'host':'cm-manager', 'active':None, 'events':[],
+            'accounts':{name+'-uuid-0000':{'email':name+'@example.com', 'login':'ok'}
+                        for name in ('alice','bob','carol','dave','mystery')},
+            'usage':{'codex':{'accounts':[
+                {'id':'manager-id', 'email':'SHARED@example.com', 'plan_type':'pro', 'alias':'private-alias'},
+                {'id':'anon-id', 'email':None, 'plan_type':'pro'},
+                {'id':'other-id', 'email':'other@example.com', 'plan_type':'promax'}]}}}
+        self.checkin(export)
+        second = {'version':1, 'host':'cm-sessions', 'active':None, 'events':[], 'accounts':{},
+                  'usage':{'codex':{'accounts':[{'id':'other-host-id','email':'shared@example.com',
+                                                'plan_type':'pro'}]}}}
+        self.checkin(second)
+        for host in ('f-sessions','laptop'):
+            self.checkin({'version':1, 'host':host, 'active':None, 'events':[], 'accounts':{}})
+        with accounts.Hub(self.hub_paths) as hub:
+            hub.pool_put(record('alice'))
+            accounts.atomic_write(hub.pool_dir / 'lent' / 'bob-uuid-0000.cm-sessions.json', record('bob'))
+            hub.copy_path('carol-uuid-0000').parent.mkdir(parents=True, exist_ok=True)
+            accounts.atomic_write(hub.copy_path('carol-uuid-0000'), record('carol', 'pro', 'default_claude_pro'))
+            accounts.save_account(self.hub_paths, record('dave'))
+        def contents():
+            return {str(p.relative_to(self.hub_paths.store)):p.read_bytes()
+                    for p in self.hub_paths.store.rglob('*') if p.is_file()}
+        before = contents()
+        out = io.StringIO()
+        self.assertEqual(accounts.main(['hub','plans','--json'], paths=self.hub_paths, out=out), 0)
+        self.assertEqual(contents(), before)
+        self.assertFalse((self.hub_paths.store / 'hub' / 'plan-tiers.json').exists())
+        raw = out.getvalue()
+        for forbidden in ('@example.com', 'uuid', 'alice', 'bob', 'carol', 'dave', 'mystery',
+                          'private-alias', 'manager-id', 'sk-ant'):
+            self.assertNotIn(forbidden, raw)
+        doc = json.loads(raw)
+        self.assertEqual(doc['schema'], 1)
+        self.assertEqual(doc['generated_at'], self.now)
+        self.assertEqual(doc['claude'], {'accounts':5, 'unknown':1, 'by_tier':[
+            {'subscription_type':'max', 'rate_limit_tier':'default_claude_max_20x', 'count':3},
+            {'subscription_type':'pro', 'rate_limit_tier':'default_claude_pro', 'count':1}]})
+        self.assertEqual(doc['codex'], {'accounts':3, 'unknown':1, 'by_plan':[
+            {'plan_type':'pro', 'count':1}, {'plan_type':'promax', 'count':1}],
+            'hosts_with_codex_data':['cm-manager','cm-sessions'],
+            'hosts_without_codex_data':['f-sessions','laptop']})
+
+    def test_plan_tier_cache_survives_lending_and_never_stores_credentials(self):
+        record = {'claudeAiOauth':login('alice'), 'oauthAccount':profile('alice')}
+        with accounts.Hub(self.hub_paths) as hub:
+            hub.pool_put(record)
+        with mock.patch.object(accounts, 'reset_cli_user_agent', return_value='claude-cli/test'), \
+             mock.patch.object(accounts.urllib.request, 'urlopen', side_effect=OSError('offline')):
+            accounts.refresh_reset_grants(self.hub_paths)
+        path = self.hub_paths.store / 'hub' / 'plan-tiers.json'
+        cache = json.loads(path.read_text())
+        self.assertEqual(cache['alice-uuid-0000'], {'subscription_type':'max',
+                         'rate_limit_tier':'default_claude_max_20x', 'seen_at':self.now})
+        self.assertNotIn(record['claudeAiOauth']['accessToken'], path.read_text())
+        self.assertNotIn(record['claudeAiOauth']['refreshToken'], path.read_text())
+        (self.hub_paths.store / 'hub' / 'pool' / 'alice-uuid-0000.json').unlink()
+        export = json.loads(json.dumps(self.export))
+        export['accounts'] = {'alice-uuid-0000':export['accounts']['alice']}
+        export['active'] = 'alice-uuid-0000'
+        self.checkin(export)
+        out = io.StringIO()
+        self.assertEqual(accounts.main(['hub','plans','--json'], paths=self.hub_paths, out=out), 0)
+        claude = json.loads(out.getvalue())['claude']
+        self.assertEqual((claude['accounts'], claude['unknown']), (1, 0))
+        self.assertEqual(claude['by_tier'][0]['count'], 1)
+
     def test_collection_snapshot_and_acknowledgement(self):
         export = self.collect()
         text = json.dumps(export)
