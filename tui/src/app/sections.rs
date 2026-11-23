@@ -278,8 +278,9 @@ impl App {
                                 self.member_sections.insert(member.clone(), choice.clone());
                             }
                         }
-                        if self.workspace_sections.get(ws) == Some(choice) { self.workspace_sections.remove(ws); }
-                        self.fallback_only_workspace_sections.remove(ws);
+                        // Keep the original choice for offline and old-viewer
+                        // fallback, but never treat it as a live override.
+                        self.fallback_only_workspace_sections.insert(ws.clone());
                         self.pending_member_sections.remove(ws);
                         changed = true;
                     }
