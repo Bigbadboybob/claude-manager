@@ -90,6 +90,31 @@ Hub side:
   Collection skips the Codex part if there are over 500 accounts or 1,000
   latest limit rows, to keep exports bounded. SQLite is opened with `mode=ro`;
   authentication columns are never selected.
+- Codex `input_tokens` includes `cached_input_tokens`. The hub stores the raw
+  counters and, when producing totals or series, reports fresh input as
+  `max(input - cache_read, 0)` per stored hour/account/model row. Claude input
+  is already exclusive of cache. Codex reasoning is included in output, so
+  output is left unchanged and reasoning is reported separately as a subset.
+  The collector includes both `is_deleted` values and sums rows sharing a
+  bucket, account ID and model; deleted-account history remains in the totals.
+  The hub keys missing-email accounts by their codex-lb internal account ID so
+  they cannot overwrite one another; snapshots aggregate them as unknown and
+  do not expose the IDs. Already overwritten history requires a re-backfill
+  from the original host's codex-lb store.
+- To request that re-backfill, run `cm-claude-accounts hub usage-reset-codex
+  HOST` on the hub after installing the updated tool there. The host needs no
+  update: the hub keeps requesting a reset until the host sends the first page
+  from the beginning. Only then, in the transaction accepting that page, the
+  hub removes **all** of that host's Codex token rows, including email-keyed
+  rows. Claude rows and other hosts' data are retained. Run this only after
+  confirming the source still contains the desired history: after replacement,
+  rows no longer present in the source cannot be recovered from the hub.
+  Repeated reset requests and page retries are idempotent. History may
+  temporarily be incomplete as pages arrive; a missing or unavailable source
+  leaves the old rows intact. For 6,053 source
+  rows, at most 21 full pages of 300 grouped rows take about 42 minutes at a
+  two-minute check-in cadence, plus the reset handshake, payload limits and
+  retries.
 - The snapshot defaults to the last seven days and hourly series. Totals use
   hourly bucket start times for window boundaries, and `all` starts at epoch
   zero. Unattributed token rows use null account/email and contribute to engine and host totals; they do not produce a per-account total, since null there means all accounts. Series include both `account` (as in the binding example) and the additive `email` alias for consumers. Old limit readings are

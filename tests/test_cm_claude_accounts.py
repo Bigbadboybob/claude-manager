@@ -3111,12 +3111,12 @@ class UsageDashboardTests(unittest.TestCase):
                   used_percent REAL,reset_at INTEGER,recorded_at INTEGER);
                 CREATE TABLE request_usage_hourly_rollups(bucket_epoch INTEGER,account_id TEXT,model TEXT,
                   input_tokens INTEGER,output_tokens INTEGER,cached_input_tokens INTEGER,reasoning_tokens INTEGER,
-                  request_count INTEGER,cost_usd REAL);
+                  request_count INTEGER,cost_usd REAL, is_deleted INTEGER DEFAULT 0);
                 INSERT INTO accounts VALUES('a','codex@example.com','802','active','plus','SECRET_A','SECRET_B');
                 INSERT INTO usage_history VALUES(1,'a','primary',4,1795410000,1795399700);
                 INSERT INTO usage_history VALUES(2,'a','primary',8,1795410000,1795399800);
             ''')
-            db.execute('INSERT INTO request_usage_hourly_rollups VALUES(?,?,?,?,?,?,?,?,?)',
+            db.execute('INSERT INTO request_usage_hourly_rollups VALUES(?,?,?,?,?,?,?,?,?,0)',
                        (self.hour, 'a', 'o3', 10, 20, 3, 4, 2, .01))
         self.state = {'config': {'host_name':'cm-sessions', 'codex_lb_store':str(self.dbpath)},
                       'history':[{'event':'capture', 'at':self.hour-1, 'account':'alice'}]}
@@ -3170,7 +3170,7 @@ class UsageDashboardTests(unittest.TestCase):
             {'bucket':self.hour,'engine':'claude','host':'cm-sessions','account':'alice@example.com','email':'alice@example.com',
              'input':16,'output':18,'cache_read':6,'cache_write':8,'reasoning':0,'requests':2},
             {'bucket':self.hour,'engine':'codex','host':'cm-sessions','account':'codex@example.com','email':'codex@example.com',
-             'input':10,'output':20,'cache_read':3,'cache_write':0,'reasoning':4,'requests':2}])
+             'input':7,'output':20,'cache_read':3,'cache_write':0,'reasoning':4,'requests':2}])
         self.assertEqual({a['engine'] for a in doc['accounts']}, {'claude','codex'})
         self.assertEqual({x['kind'] for x in doc['limit_history']}, {'five_hour','primary'})
         # A later final content block revises an already acknowledged hour.
@@ -3183,6 +3183,129 @@ class UsageDashboardTests(unittest.TestCase):
             day = accounts.usage_snapshot(hub, self.now, self.hour, 'day')
         self.assertEqual(day['tokens']['series'][0]['input'], 26)
         self.assertEqual(day['tokens']['series'][0]['bucket'], self.hour // 86400 * 86400)
+
+    def test_existing_codex_rows_are_normalized_per_row_without_modifying_storage(self):
+        with accounts.Hub(self.hub_paths) as hub:
+            db = accounts.usage_hub_db(hub)
+            rows = [
+                ('codex', 'cm-sessions', 'codex@example.com', 'one', self.hour, 100, 18, 80, 0, 9, 2, None),
+                ('codex', 'cm-sessions', 'codex@example.com', 'two', self.hour, 1, 2, 4, 0, 1, 1, None),
+                ('claude', 'cm-sessions', 'alice@example.com', 'claude', self.hour, 5, 2, 100, 3, 0, 1, None),
+            ]
+            db.executemany('INSERT INTO token_hours VALUES(?,?,?,?,?,?,?,?,?,?,?,?)', rows)
+            db.commit()
+            for granularity in ('hour', 'day'):
+                doc = accounts.usage_snapshot(hub, self.now, self.hour, granularity)
+                codex = next(r for r in doc['tokens']['series'] if r['engine'] == 'codex')
+                self.assertEqual((codex['input'], codex['output'], codex['cache_read'], codex['reasoning']),
+                                 (20, 20, 84, 10))
+                claude = next(r for r in doc['tokens']['series'] if r['engine'] == 'claude')
+                self.assertEqual((claude['input'], claude['cache_read']), (5, 100))
+                totals = [r for r in doc['tokens']['totals'] if r['engine'] == 'codex']
+                self.assertEqual(len(totals), 12)  # four windows, each with three dimensions
+                self.assertTrue(all((r['input'], r['output'], r['cache_read'], r['reasoning']) ==
+                                    (20, 20, 84, 10) for r in totals))
+            self.assertEqual(db.execute("SELECT input,cache_read FROM token_hours WHERE model='one'").fetchone(),
+                             (100, 80))
+            db.close()
+
+    def test_deleted_codex_rollups_are_collected_and_not_duplicated(self):
+        with sqlite3.connect(self.dbpath) as db:
+            # Deleted and live rows can share a bucket/account/model; a deleted
+            # account can also be absent from the current accounts table.
+            db.execute('INSERT INTO request_usage_hourly_rollups VALUES(?,?,?,?,?,?,?,?,?,1)',
+                       (self.hour, 'a', 'o3', 9, 8, 8, 2, 1, .02))
+            db.execute('INSERT INTO request_usage_hourly_rollups VALUES(?,?,?,?,?,?,?,?,?,1)',
+                       (self.hour, 'gone', 'o4', 6, 5, 5, 1, 1, .03))
+            db.execute('INSERT INTO request_usage_hourly_rollups VALUES(?,?,?,?,?,?,?,?,?,1)',
+                       (self.hour, 'gone-too', 'o4', 8, 7, 6, 2, 2, .04))
+        export = self.collect()
+        rollups = export['usage']['codex']['rollups']
+        self.assertEqual(len(rollups), 3)
+        shared = next(r for r in rollups if r['account_id'] == 'a')
+        self.assertEqual((shared['input'], shared['cache_read'], shared['output'], shared['requests']),
+                         (19, 11, 28, 3))
+        self.assertEqual(next(r for r in rollups if r['account_id'] == 'gone')['input'], 6)
+        self.checkin(export)
+        self.checkin(json.loads(json.dumps(export)))  # retry is an upsert
+        with accounts.Hub(self.hub_paths) as hub:
+            doc = accounts.usage_snapshot(hub, self.now, self.hour, 'hour')
+            db = accounts.usage_hub_db(hub)
+            self.assertEqual({r[0] for r in db.execute("SELECT account FROM token_hours WHERE model='o4'")},
+                             {'codex-id:gone', 'codex-id:gone-too'})
+            db.close()
+        self.assertNotIn('codex-id:', json.dumps(doc))
+        unknown = [r for r in doc['tokens']['series'] if r['engine'] == 'codex' and r['account'] is None]
+        self.assertEqual(len(unknown), 1)
+        self.assertEqual((unknown[0]['input'], unknown[0]['output'], unknown[0]['requests']), (3, 12, 3))
+        total = next(r for r in doc['tokens']['totals'] if r['window'] == 'all' and
+                     r['engine'] == 'codex' and r['host'] is None and r['email'] is None)
+        self.assertEqual((total['input'], total['cache_read'], total['output'], total['requests']),
+                         (11, 22, 40, 6))
+
+    def test_codex_rebackfill_reset_is_retry_safe_and_host_scoped(self):
+        with sqlite3.connect(self.dbpath) as db:
+            db.execute('INSERT INTO request_usage_hourly_rollups VALUES(?,?,?,?,?,?,?,?,?,1)',
+                       (self.hour, 'gone', 'o4', 6, 5, 5, 1, 1, .03))
+            db.execute('INSERT INTO request_usage_hourly_rollups VALUES(?,?,?,?,?,?,?,?,?,1)',
+                       (self.hour, 'gone-too', 'o4', 8, 7, 6, 2, 2, .04))
+        with accounts.Hub(self.hub_paths) as hub:
+            db = accounts.usage_hub_db(hub)
+            db.executemany('INSERT INTO token_hours VALUES(?,?,?,?,?,?,?,?,?,?,?,?)', [
+                ('codex', 'cm-sessions', '', 'o4', self.hour, 8, 7, 6, 0, 2, 2, .04),
+                ('codex', 'cm-sessions', 'previous@example.com', 'o4', self.hour, 6, 5, 5, 0, 1, 1, .03),
+                ('codex', 'cm-sessions', 'codex-id:prior', 'old', self.hour, 3, 1, 1, 0, 0, 1, .01),
+                ('codex', 'other-host', '', 'o4', self.hour, 8, 7, 6, 0, 2, 2, .04),
+                ('claude', 'cm-sessions', '', 'claude', self.hour, 2, 1, 0, 0, 0, 1, None),
+            ])
+            db.commit()
+            db.close()
+        self.state['usage_collection'] = {'watermarks': {'codex': self.hour,
+                                                         'codex_cursor': [self.hour, 'a', 'o3']}}
+        for _ in range(2):  # repeated requests do not remove data before the host reconnects
+            out = io.StringIO()
+            self.assertEqual(accounts.main(['hub', 'usage-reset-codex', 'cm-sessions'],
+                                           paths=self.hub_paths, out=out), 0)
+        stale = self.collect()
+        reply = self.checkin(stale)
+        self.assertEqual((reply['usage_watermarks']['codex'], reply['usage_watermarks']['codex_cursor']),
+                         (-1, None))
+        self.assertEqual(self.checkin(json.loads(json.dumps(stale)))['usage_watermarks']['codex_cursor'], None)
+        with accounts.Hub(self.hub_paths) as hub:
+            db = accounts.usage_hub_db(hub)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM token_hours WHERE engine='codex' AND "
+                                        "host='cm-sessions'").fetchone()[0], 3)
+            db.close()
+        accounts.usage_ack_local(self.paths, self.state, reply)
+        restarted = self.collect()
+        self.assertEqual((restarted['usage']['codex_watermark'], restarted['usage']['codex_cursor']), (-1, None))
+        broken = json.loads(json.dumps(restarted))
+        broken['usage']['codex']['rollups'] = [{'account_id': 'gone'}]
+        self.assertNotIn('usage_watermarks', self.checkin(broken))
+        with accounts.Hub(self.hub_paths) as hub:
+            db = accounts.usage_hub_db(hub)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM token_hours WHERE engine='codex' AND "
+                                        "host='cm-sessions'").fetchone()[0], 3)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM codex_rebackfill').fetchone()[0], 1)
+            db.close()
+        completed = self.checkin(restarted)
+        self.assertEqual(completed['usage_watermarks']['codex'], self.hour)
+        self.checkin(json.loads(json.dumps(restarted)))  # lost reply: replay is idempotent
+        with accounts.Hub(self.hub_paths) as hub:
+            db = accounts.usage_hub_db(hub)
+            self.assertEqual(db.execute("SELECT account FROM token_hours WHERE engine='codex' AND "
+                "host='cm-sessions' ORDER BY account").fetchall(),
+                [('codex-id:gone',), ('codex-id:gone-too',), ('codex@example.com',)])
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM token_hours WHERE host='other-host' AND account=''")
+                             .fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM token_hours WHERE engine='claude' AND host='cm-sessions' "
+                                        "AND account=''").fetchone()[0], 1)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM codex_rebackfill').fetchone()[0], 0)
+            db.close()
+            doc = accounts.usage_snapshot(hub, self.now, self.hour, 'hour')
+        total = next(r for r in doc['tokens']['totals'] if r['window'] == 'all' and
+                     r['engine'] == 'codex' and r['host'] == 'cm-sessions')
+        self.assertEqual((total['input'], total['cache_read'], total['output']), (10, 14, 32))
 
     def test_laptop_opt_in_and_missing_sources(self):
         self.state['config']['host_name'] = 'laptop'
@@ -3203,9 +3326,9 @@ class UsageDashboardTests(unittest.TestCase):
 
     def test_large_hour_pages_without_losing_rows_and_resends_open_hour(self):
         with sqlite3.connect(self.dbpath) as db:
-            db.executemany('INSERT INTO request_usage_hourly_rollups VALUES(?,?,?,?,?,?,?,?,?)',
+            db.executemany('INSERT INTO request_usage_hourly_rollups VALUES(?,?,?,?,?,?,?,?,?,0)',
                 [(self.hour, 'a', f'model-{i:03}', 1, 1, 0, 0, 1, 0) for i in range(305)])
-            db.execute('INSERT INTO request_usage_hourly_rollups VALUES(?,?,?,?,?,?,?,?,?)',
+            db.execute('INSERT INTO request_usage_hourly_rollups VALUES(?,?,?,?,?,?,?,?,?,0)',
                 (self.now // 3600 * 3600, 'a', 'open-model', 1, 2, 0, 0, 1, 0))
         first = self.collect()
         self.assertLess(len(json.dumps(first)), 256 * 1024)
@@ -3246,7 +3369,7 @@ class UsageDashboardTests(unittest.TestCase):
 
     def test_missing_watermarks_do_not_restart_codex_backfill(self):
         with sqlite3.connect(self.dbpath) as db:
-            db.executemany('INSERT INTO request_usage_hourly_rollups VALUES(?,?,?,?,?,?,?,?,?)',
+            db.executemany('INSERT INTO request_usage_hourly_rollups VALUES(?,?,?,?,?,?,?,?,?,0)',
                 [(self.hour, 'a', f'model-{i:03}', 1, 1, 0, 0, 1, 0) for i in range(305)])
         self.state['config']['hub'] = 'cm-manager'
         sent = []

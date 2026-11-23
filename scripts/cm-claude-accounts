@@ -94,6 +94,7 @@ class Paths:
 USAGE_SCAN_BYTES = 32 * 1024 * 1024
 USAGE_PAYLOAD_BYTES = 180 * 1024
 USAGE_BATCH_ROWS = 300
+CODEX_UNKNOWN_PREFIX = 'codex-id:'
 
 
 def usage_enabled(state):
@@ -369,6 +370,7 @@ def usage_hub_db(hub):
               resets_at REAL, at REAL, source_host TEXT, PRIMARY KEY(engine,account,limit_kind,at));
             CREATE INDEX IF NOT EXISTS limit_readings_at ON limit_readings(at);
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS codex_rebackfill(host TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS token_hours(engine TEXT, host TEXT, account TEXT NOT NULL, model TEXT,
               bucket INTEGER, input INTEGER, output INTEGER, cache_read INTEGER, cache_write INTEGER,
               reasoning INTEGER, requests INTEGER, cost_usd REAL,
@@ -407,6 +409,18 @@ def usage_record_claude(db, export, host):
              for l in reading.get('limits') or [] if isinstance(l, dict)], host)
 
 
+def usage_reset_codex(hub, host):
+    """Request a host's complete resend without touching its existing history."""
+    if not PEER_NAME.fullmatch(host):
+        raise AccountError(f"bad host name {host!r}")
+    db = usage_hub_db(hub)
+    try:
+        db.execute('INSERT OR IGNORE INTO codex_rebackfill(host) VALUES(?)', (host,))
+        db.commit()
+    finally:
+        db.close()
+
+
 def usage_ingest(hub, export, now):
     host = export['host']
     payload = export.get('usage') or {}
@@ -415,17 +429,31 @@ def usage_ingest(hub, export, now):
     try:
         usage_record_claude(db, export, host)
         codex = payload.get('codex') or {}
+        pending = db.execute('SELECT 1 FROM codex_rebackfill WHERE host=?', (host,)).fetchone()
+        reset_received = (pending and isinstance(codex, dict) and 'rollups' in codex and
+                          payload.get('codex_watermark') == -1 and
+                          'codex_cursor' in payload and payload['codex_cursor'] is None)
+        if reset_received:
+            # Replace the host's complete Codex history from its source, so
+            # previously email-keyed accounts cannot duplicate new ID keys.
+            # Wait until the source supplies its first page; this deletion,
+            # the page, and clearing the request commit together.
+            db.execute("DELETE FROM token_hours WHERE engine='codex' AND host=?", (host,))
+            db.execute('DELETE FROM codex_rebackfill WHERE host=?', (host,))
+        rollups = (codex.get('rollups') or []) if not pending or reset_received else []
         emails = {a.get('id'): a.get('email') for a in codex.get('accounts') or [] if isinstance(a, dict)}
         for r in codex.get('limits') or []:
             usage_add_readings(db, 'codex', emails.get(r.get('account_id')),
                                [(r.get('window'), r.get('used_percent'), r.get('reset_at'), r.get('recorded_at'))], host)
-        for r in codex.get('rollups') or []:
-            account = emails.get(r.get('account_id')) or ''
+        for r in rollups:
+            account_id = r.get('account_id')
+            account = emails.get(account_id) or (CODEX_UNKNOWN_PREFIX + account_id
+                                                  if isinstance(account_id, str) and account_id else '')
             db.execute('INSERT OR REPLACE INTO token_hours VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
                 ('codex', host, account, r['model'], r['bucket_epoch'], r.get('input') or 0,
                  r.get('output') or 0, r.get('cache_read') or 0, 0, r.get('reasoning') or 0,
                  r.get('requests') or 0, r.get('cost_usd')))
-        closed = [r for r in codex.get('rollups') or [] if r['bucket_epoch'] < now // 3600 * 3600]
+        closed = [r for r in rollups if r['bucket_epoch'] < now // 3600 * 3600]
         prior = payload.get('codex_watermark', -1)
         ack['codex'] = prior if isinstance(prior, int) else -1
         prior_cursor = payload.get('codex_cursor')
@@ -444,6 +472,11 @@ def usage_ingest(hub, export, now):
                  r.get('output', 0), r.get('cache_read', 0), r.get('cache_write', 0),
                  r.get('reasoning', 0), r.get('requests', 0), None))
             ack['claude_ack'].append([r['bucket'], r.get('account'), r['model'], r['revision']])
+        if pending and not reset_received:
+            # Keep asking until the host proves it sent the first page. A
+            # lost reply therefore cannot silently cancel the re-backfill.
+            ack['codex'] = -1
+            ack['codex_cursor'] = None
         # Collapse old raw readings to the maximum within each hour.
         last_collapse = db.execute("SELECT value FROM meta WHERE key='last_collapse'").fetchone()
         if last_collapse is None or now - last_collapse[0] >= 3600:
@@ -510,22 +543,31 @@ def usage_snapshot(hub, now, since, granularity, account_snapshot=None):
                 points = [points[i * (len(points)-1) // 199] for i in range(200)]
             limit_history.append(dict(engine=engine, email=email, kind=kind, points=points))
         fields = ('input', 'output', 'cache_read', 'cache_write', 'reasoning', 'requests')
-        sums = ','.join('COALESCE(SUM(' + x + '),0) AS ' + x for x in fields)
+        # codex-lb input includes cache reads; Claude input does not. Keep the
+        # stored values raw and normalize each row before grouping so a bad
+        # cached count cannot make another model's fresh input disappear.
+        sums = ("COALESCE(SUM(CASE WHEN engine='codex' THEN "
+                "MAX(COALESCE(input,0)-COALESCE(cache_read,0),0) ELSE input END),0) AS input,"
+                + ','.join('COALESCE(SUM(' + x + '),0) AS ' + x for x in fields[1:]))
         totals = []
         for window, start in [('24h', now-86400), ('7d', now-7*86400), ('30d', now-30*86400), ('all', 0)]:
             for group in ('engine', 'engine,host', 'engine,account'):
-                predicate = " AND account<>''" if group == 'engine,account' else ''
+                predicate = (" AND account<>'' AND NOT (engine='codex' AND substr(account,1,9)='codex-id:')"
+                             if group == 'engine,account' else '')
                 for r in db.execute(f'SELECT {group},{sums} FROM token_hours WHERE bucket>=?{predicate} GROUP BY {group}', (start,)):
                     totals.append(dict(window=window, engine=r['engine'], host=r['host'] if group == 'engine,host' else None,
                         email=(r['account'] or None) if group == 'engine,account' else None,
                         **{k:r[k] for k in fields}))
         size = 3600 if granularity == 'hour' else 86400
         series = []
-        for r in db.execute(f'SELECT CAST(bucket/? AS INTEGER)*? AS b,engine,host,account,{sums} '
-                            'FROM token_hours WHERE bucket>=? GROUP BY b,engine,host,account ORDER BY b,engine,host,account',
+        for r in db.execute(f"SELECT CAST(bucket/? AS INTEGER)*? AS b,engine,host,"
+                            f"CASE WHEN engine='codex' AND substr(account,1,9)='codex-id:' "
+                            f"THEN '' ELSE account END AS display_account,{sums} "
+                            'FROM token_hours WHERE bucket>=? GROUP BY b,engine,host,display_account '
+                            'ORDER BY b,engine,host,display_account',
                             (size, size, since)):
-            series.append(dict(bucket=r['b'], engine=r['engine'], host=r['host'], account=r['account'] or None,
-                               email=r['account'] or None, **{k:r[k] for k in fields}))
+            series.append(dict(bucket=r['b'], engine=r['engine'], host=r['host'], account=r['display_account'] or None,
+                               email=r['display_account'] or None, **{k:r[k] for k in fields}))
         return dict(schema=1, generated_at=int(now), since=since, granularity=granularity,
                     accounts=accounts, limit_history=limit_history, tokens=dict(totals=totals, series=series))
     finally:
@@ -2767,6 +2809,12 @@ def cmd_hub(paths: Paths, args, out) -> int:
         json.dump(usage_snapshot(hub, now, since, args.granularity, account_snapshot), out)
         out.write("\n")
         return 0
+    if args.hub_command == "usage-reset-codex":
+        with Hub(paths) as hub:
+            usage_reset_codex(hub, args.host)
+        print(f"Codex re-backfill requested for {args.host}; its Codex history will be replaced "
+              "starting with the first page", file=out)
+        return 0
     if args.hub_command == "import-lend-copy":
         with Hub(paths) as hub:
             uuid = hub_resolve(hub.reports(), args.account)
@@ -3740,6 +3788,8 @@ def main(argv: list[str] | None = None, paths: Paths | None = None, out=None) ->
     p.add_argument("--json", action="store_true", required=True)
     p.add_argument("--since", type=int)
     p.add_argument("--granularity", choices=("hour", "day"), default="hour")
+    p = hsub.add_parser("usage-reset-codex", help="request one host's Codex history again")
+    p.add_argument("host")
     p = hsub.add_parser("assign", help="choose a host's account; ACCOUNT 'none' clears it")
     p.add_argument("host")
     p.add_argument("account")
