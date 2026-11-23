@@ -21,6 +21,8 @@ struct Account {
     alias: Option<String>,
     status: Option<String>,
     pool_host: Option<String>,
+    pool_hosts: Option<Vec<String>>,
+    pool_status: Option<BTreeMap<String, String>>,
     active_on: Vec<String>,
     reserved_for: Option<Vec<String>>,
     room: Option<bool>,
@@ -587,6 +589,29 @@ fn fit(s: &str, width: usize) -> String {
     out.push_str(&" ".repeat(width.saturating_sub(used)));
     out
 }
+// Keep styled indicators inside their fixed-width column, including wide glyphs.
+fn fit_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    use unicode_width::UnicodeWidthChar;
+    let mut remaining = width;
+    let mut out = Vec::new();
+    for span in spans {
+        let mut text = String::new();
+        for c in span.content.chars() {
+            let cells = c.width().unwrap_or(0);
+            if cells > remaining {
+                break;
+            }
+            text.push(c);
+            remaining -= cells;
+        }
+        out.push(Span::styled(text, span.style));
+        if remaining == 0 {
+            break;
+        }
+    }
+    out.push(Span::raw(" ".repeat(remaining)));
+    out
+}
 fn bar(l: Option<&Limit>, width: usize, at: i64) -> Vec<Span<'static>> {
     let Some(l) = l else {
         return vec![Span::styled(
@@ -786,6 +811,12 @@ fn account_list_lines(
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut focus_row = 0;
     let mut previous = "";
+    let name_width = if width >= 65 { 13 } else { 9 }.min(width.saturating_sub(2));
+    let prefix_width = 3 + name_width;
+    // Percent, reset countdown, 5h indicator, reset credits, and status markers.
+    let bar_width = width
+        .saturating_sub(prefix_width + 5 + 8 + 7 + 9 + 3)
+        .clamp(1, 70);
     for (i, a) in accounts.iter().enumerate() {
         if a.engine != previous {
             previous = &a.engine;
@@ -800,44 +831,68 @@ fn account_list_lines(
             focus_row = lines.len();
         }
         let w = weekly_limit(a);
-        let name_width = if width >= 65 { 13 } else { 9 }.min(width.saturating_sub(2));
-        let name = fit(short_name(a), name_width);
-        let mut suffix = vec![Span::styled(
-            w.map(|l| format!(" {:>3.0}%", l.percent))
-                .unwrap_or_else(|| "   ?%".into()),
-            limit_style(w, at),
-        )];
-        if let Some(l) = w.filter(|l| l.resets_at.is_some()) {
-            suffix.push(Span::styled(
-                format!(" r:{}", countdown(l.resets_at)),
-                Style::default().fg(theme::MUTED),
-            ));
-        }
-        if let Some(five) = five_limit(a).filter(|l| !limit_stale(l, at)) {
-            suffix.push(Span::styled(
-                format!(" {}5h{:.0}%", spark(&[five.percent]), five.percent),
-                limit_style(Some(five), at),
-            ));
-        }
-        let icons = reset_icons(a, false);
-        if !icons.is_empty() {
-            suffix.push(Span::raw(" "));
-            suffix.extend(icons);
-        }
-        if !a.active_on.is_empty() {
-            suffix.push(Span::styled(" ●", Style::default().fg(theme::HEADER)));
-        }
-        if room(a) == Some(false) {
-            suffix.push(Span::styled(" ✕", Style::default().fg(theme::ERROR)));
-        }
-        if w.is_none_or(|l| limit_stale(l, at)) {
-            suffix.push(Span::styled(" ◌", Style::default().fg(theme::DIM)));
-        }
+        let pool_suffix = a
+            .pool_hosts
+            .as_ref()
+            .filter(|hosts| a.engine == "codex" && hosts.len() > 1)
+            .map(|hosts| format!(" ×{}", hosts.len()))
+            .unwrap_or_default();
         use unicode_width::UnicodeWidthStr;
-        let suffix_width: usize = suffix.iter().map(|s| s.content.width()).sum();
-        let bar_width = width
-            .saturating_sub(3 + name_width + suffix_width)
-            .clamp(1, 70);
+        let short = fit(
+            short_name(a),
+            name_width.saturating_sub(pool_suffix.width()),
+        );
+        let name = fit(&format!("{}{pool_suffix}", short.trim_end()), name_width);
+        let mut suffix = fit_spans(
+            vec![Span::styled(
+                w.map(|l| format!(" {:>3.0}%", l.percent))
+                    .unwrap_or_else(|| "   ?%".into()),
+                limit_style(w, at),
+            )],
+            5,
+        );
+        suffix.extend(fit_spans(
+            w.filter(|l| l.resets_at.is_some())
+                .map(|l| {
+                    vec![Span::styled(
+                        format!(" r:{}", countdown(l.resets_at)),
+                        Style::default().fg(theme::MUTED),
+                    )]
+                })
+                .unwrap_or_default(),
+            8,
+        ));
+        suffix.extend(fit_spans(
+            five_limit(a)
+                .filter(|l| !limit_stale(l, at))
+                .map(|l| {
+                    vec![Span::styled(
+                        format!("{}5h{:.0}%", spark(&[l.percent]), l.percent),
+                        limit_style(Some(l), at),
+                    )]
+                })
+                .unwrap_or_default(),
+            7,
+        ));
+        let mut icons = vec![Span::raw(" ")];
+        icons.extend(reset_icons(a, false));
+        suffix.extend(fit_spans(icons, 9));
+        suffix.push(Span::styled(
+            if a.active_on.is_empty() { " " } else { "●" },
+            Style::default().fg(theme::HEADER),
+        ));
+        suffix.push(Span::styled(
+            if room(a) == Some(false) { "✕" } else { " " },
+            Style::default().fg(theme::ERROR),
+        ));
+        suffix.push(Span::styled(
+            if w.is_none_or(|l| limit_stale(l, at)) {
+                "◌"
+            } else {
+                " "
+            },
+            Style::default().fg(theme::DIM),
+        ));
         let mut spans = vec![
             Span::styled(
                 if i == selected { "▸ " } else { "  " },
@@ -860,8 +915,11 @@ fn account_list_lines(
         lines.push(Line::from(spans));
         if u.expanded {
             let f = five_limit(a);
-            let mut extra = vec![Span::styled("    5h ", Style::default().fg(theme::MUTED))];
-            extra.extend(bar(f, bar_width.min(30), at));
+            let mut extra = vec![Span::styled(
+                fit("    5h", prefix_width),
+                Style::default().fg(theme::MUTED),
+            )];
+            extra.extend(bar(f, bar_width, at));
             extra.push(Span::styled(
                 f.map(|l| format!(" {:.0}% used", l.percent))
                     .unwrap_or_else(|| " unknown".into()),
@@ -884,7 +942,7 @@ fn account_list_lines(
 }
 fn limit_detail_line(prefix: &str, l: Option<&Limit>, width: usize, at: i64) -> Line<'static> {
     let mut spans = vec![Span::styled(
-        format!("{:<12} ", prefix),
+        format!("{} ", fit(prefix, 12)),
         Style::default().fg(theme::MUTED),
     )];
     spans.extend(bar(l, width.saturating_sub(29).clamp(1, 48), at));
@@ -1033,12 +1091,7 @@ fn account_detail_lines(d: &Snapshot, a: &Account, width: usize, at: i64) -> Vec
         if w.is_some_and(|x| std::ptr::eq(x, l)) || f.is_some_and(|x| std::ptr::eq(x, l)) {
             continue;
         }
-        out.push(limit_detail_line(
-            &window_label(a, l),
-            Some(l),
-            width.min(45),
-            at,
-        ));
+        out.push(limit_detail_line(&window_label(a, l), Some(l), width, at));
     }
     let mut resets = vec![Span::styled("Resets   ", Style::default().fg(theme::MUTED))];
     for span in reset_icons(a, true) {
@@ -1107,11 +1160,31 @@ fn account_detail_lines(d: &Snapshot, a: &Account, width: usize, at: i64) -> Vec
     if a.engine == "codex" {
         out.push(Line::styled(
             format!(
-                "Codex    status {} · plan {} · pool {}",
+                "Codex    status {} · plan {}",
                 a.status.as_deref().unwrap_or("?"),
-                a.plan_type.as_deref().unwrap_or("?"),
-                a.pool_host.as_deref().unwrap_or("?")
+                a.plan_type.as_deref().unwrap_or("?")
             ),
+            Style::default().fg(theme::MUTED),
+        ));
+        let pools = match a.pool_hosts.as_ref().filter(|hosts| !hosts.is_empty()) {
+            Some(hosts) => hosts
+                .iter()
+                .map(|host| {
+                    match a
+                        .pool_status
+                        .as_ref()
+                        .and_then(|statuses| statuses.get(host))
+                    {
+                        Some(status) => format!("{host} ({status})"),
+                        None => host.clone(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            None => a.pool_host.as_deref().unwrap_or("?").to_string(),
+        };
+        out.push(Line::styled(
+            format!("Pools: {pools}"),
             Style::default().fg(theme::MUTED),
         ));
     }
@@ -1626,7 +1699,7 @@ mod tests {
         assert_eq!(a.usage.selected, 0);
         a.handle_event(&key(KeyCode::Char('x')));
         assert!(a.usage.expanded);
-        assert!(screen(&mut a, 160, 40).contains("5h █"));
+        assert!(screen(&mut a, 160, 40).contains("    5h"));
         a.handle_event(&key(KeyCode::Tab));
         assert_eq!(a.usage.tab, 1);
         a.handle_event(&key(KeyCode::Char('d')));
@@ -1681,6 +1754,86 @@ mod tests {
             .map(|s| s.content.chars().count())
             .sum();
         assert!(width >= 20, "bar was {width} cells");
+    }
+    #[test]
+    fn account_bars_align_in_test_backend() {
+        let d = fixture();
+        for width in [64, 78, 100] {
+            let mut u = Usage::default();
+            u.expanded = true;
+            let lines = account_list_lines(&d, &u, width, 30, now());
+            let mut terminal = Terminal::new(TestBackend::new(width as u16, 30)).unwrap();
+            terminal
+                .draw(|f| f.render_widget(Paragraph::new(lines), f.area()))
+                .unwrap();
+            let b = terminal.backend().buffer();
+            let mut bars = Vec::new();
+            for y in 0..30 {
+                let is_bar = |x| matches!(b[(x, y)].symbol(), "█" | "░" | "─");
+                if let Some(start) = (0..width as u16).find(|&x| is_bar(x)) {
+                    let len = (start..width as u16).take_while(|&x| is_bar(x)).count();
+                    bars.push((start, len));
+                }
+            }
+            assert_eq!(bars.len(), d.accounts.len() * 2, "{bars:?}");
+            assert!(bars.iter().all(|bar| *bar == bars[0]), "{bars:?}");
+            assert!(bars[0].1 >= 20, "{bars:?}");
+
+            let account = d
+                .accounts
+                .iter()
+                .find(|a| a.email == "a@example.com")
+                .unwrap();
+            let lines = account_detail_lines(&d, account, width, now());
+            let mut terminal = Terminal::new(TestBackend::new(width as u16, 30)).unwrap();
+            terminal
+                .draw(|f| f.render_widget(Paragraph::new(lines), f.area()))
+                .unwrap();
+            let b = terminal.backend().buffer();
+            let mut bars = Vec::new();
+            for y in 0..30 {
+                let label: String = (0..12).map(|x| b[(x, y)].symbol()).collect();
+                if !["Week", "5h", "fable week"].contains(&label.trim()) {
+                    continue;
+                }
+                let is_bar = |x| matches!(b[(x, y)].symbol(), "█" | "░" | "─");
+                if let Some(start) = (0..width as u16).find(|&x| is_bar(x)) {
+                    let len = (start..width as u16).take_while(|&x| is_bar(x)).count();
+                    bars.push((start, len));
+                }
+            }
+            assert_eq!(bars.len(), 3, "{bars:?}");
+            assert!(bars.iter().all(|bar| *bar == bars[0]), "{bars:?}");
+        }
+    }
+    #[test]
+    fn codex_multiple_pools_and_legacy_fallback_render() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/usage-snapshot.json")).unwrap();
+        let account = json["accounts"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|a| a["engine"] == "codex")
+            .unwrap();
+        account["pool_hosts"] = serde_json::json!(["cm-manager", "cm-sessions"]);
+        account["pool_status"] =
+            serde_json::json!({"cm-manager": "active", "cm-sessions": "paused"});
+        let d: Snapshot = serde_json::from_value(json).unwrap();
+        let mut app = app();
+        app.usage.data = Some(d);
+        app.usage.open = true;
+        app.usage.selected = 2;
+        let text = screen(&mut app, 160, 40);
+        assert!(text.contains("802 ×2"), "{text}");
+        assert!(
+            text.contains("Pools: cm-manager (active), cm-sessions (paused)"),
+            "{text}"
+        );
+        app.usage.data = Some(fixture());
+        let legacy = screen(&mut app, 160, 40);
+        assert!(legacy.contains("Pools: cm-sessions"), "{legacy}");
+        assert!(!legacy.contains("802 ×2"), "{legacy}");
     }
     #[test]
     fn codex_primary_can_be_weekly_and_zero_credits_are_distinct_from_unknown() {

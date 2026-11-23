@@ -13,7 +13,8 @@ first or last. Weekly bars are the main view; x expands or collapses full 5h
 bars. On screens narrower than 100 columns, Enter opens the focused account's
 full-width detail and Enter or Backspace returns to the list. Page Up/Down scrolls
 the detail, and ? toggles key help. The detail includes limits, reset times,
-credits, projections, hosts, a seven-day chart and account token totals.
+credits, projections, hosts, a seven-day chart and account token totals. Codex
+accounts in multiple pools show ×N in the list and each pool's status in detail.
 
 Green is below 50% used, yellow is 50–80%, orange is 80% to the switch threshold,
 and bold red is at or above the threshold. Grey and ◌ mean unknown or stale:
