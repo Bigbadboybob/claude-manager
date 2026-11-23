@@ -6,7 +6,7 @@ The Workspaces (`Task`) sub-view draws org member blocks. Each block has the mem
 
 Owner creates sections with Alt+N. On a member's main row, Alt+e offers **Section (member)**: `auto` follows the manager's section, `none` leaves the member loose, and an explicit section assigns the member. Assistants and workers follow their member. Alt+n inside a section assigns the new member there. Section headers support Space/Enter to fold, Alt+e to edit, Alt+x to delete, and Alt+J/Alt+K to reorder.
 
-Alt+e on a workspace offers **Section override (this checkout)**. A checkout assigned to a different section appears there as a `↳ M · <checkout>` continuation. Overrides that would split a block—on the checkout holding a member's main or inside a continuous box—are ignored and shown on the one-time conflict list. Migration copied the old workspace sections: main checkouts supply member assignments, unambiguous other checkouts become overrides, and unresolved choices appear on the conflict list.
+Ctrl+Alt+e on any session row opens its checkout's workspace settings, which offer **Section override (this checkout)** (Alt+e on that row stays the session/member form). A checkout assigned to a different section appears there as a `↳ M · <checkout>` continuation. Overrides that would split a block—on the checkout holding a member's main or inside a continuous box—are ignored and shown on the one-time conflict list. Migration copied the old workspace sections: main checkouts supply member assignments, unambiguous other checkouts become overrides, and unresolved choices appear on the conflict list.
 
 ## Agent tools: remote section assignment
 
