@@ -234,6 +234,31 @@ pub(super) struct OrgPlacement {
     fallback: HashSet<(usize, usize)>,
 }
 
+#[derive(Debug)]
+struct OrgMemberBlock {
+    id: String,
+    main: Option<(usize, usize)>,
+    sessions: Vec<(usize, usize)>,
+    parent: Option<String>,
+    section: Option<String>,
+    team: Option<String>,
+    boxed: Option<String>,
+}
+
+#[derive(Debug)]
+struct OrgContinuation {
+    member: String,
+    workspace: usize,
+    section: Option<String>,
+    sessions: Vec<(usize, usize)>,
+}
+
+#[derive(Default)]
+struct OrgBlocks {
+    members: Vec<OrgMemberBlock>,
+    continuations: Vec<OrgContinuation>,
+}
+
 impl OrgPlacement {
     /// A continuous lead owns every placed member below it. If continuous
     /// teams nest, the outer lead claims the subtree first so a session can
@@ -262,6 +287,82 @@ impl OrgPlacement {
 }
 
 impl App {
+    /// Build member blocks independently of task ancestry. A checkout
+    /// override can detach a stream into a continuation, but never splits a
+    /// main's home checkout or a continuous box.
+    fn org_blocks(&self, snap: &super::org_model::OrgSnapshot, placement: &OrgPlacement) -> OrgBlocks {
+        let mut active: HashSet<String> = placement.members.keys().cloned().collect();
+        let mut expanded = placement.members.clone();
+        for id in active.clone() {
+            let mut seen = HashSet::from([id.clone()]);
+            let mut parent = snap.member(&id).and_then(|m| m.manager_member_id.clone());
+            while let Some(pid) = parent.filter(|p| seen.insert(p.clone())) {
+                let Some(manager) = snap.member(&pid) else { break; };
+                if manager.is_owner() || manager.retired() { break; }
+                // A main on an old/unreachable brain is already rendered by
+                // the legacy forest; do not invent a duplicate block for it.
+                if manager.main.as_ref().and_then(|m| m.daemon_id.as_deref()).is_some_and(|daemon|
+                    !snap.host_daemons.values().any(|known| known == daemon)) { break; }
+                active.insert(pid.clone());
+                expanded.entry(pid.clone()).or_default();
+                parent = manager.manager_member_id.clone();
+            }
+        }
+        let boxes = OrgPlacement { members: expanded, fallback: HashSet::new() }.box_owners(snap);
+        let mut result = OrgBlocks::default();
+        let mut section_by_member = HashMap::new();
+        for member in snap.members.iter().filter(|m| active.contains(&m.id) && !m.retired()) {
+            section_by_member.insert(member.id.clone(), super::sections::member_section(
+                snap, &self.member_sections, &self.sections, &member.id));
+        }
+        for member in snap.members.iter().filter(|m| active.contains(&m.id) && !m.retired()) {
+            let section = section_by_member.get(&member.id).cloned().flatten();
+            let boxed = boxes.get(&member.id).cloned();
+            let mut rows = placement.members.get(&member.id).cloned().unwrap_or_default();
+            let main = rows.iter().copied().find(|(wi, si)| {
+                let ts = &self.workspaces[*wi].sessions[*si];
+                member.main.as_ref().is_some_and(|m| m.session_uid.as_deref() == Some(&ts.uid)
+                    && m.daemon_id.as_deref() == snap.host_daemons.get(ts.host_id.as_str()).map(String::as_str))
+            });
+            let main_ws = main.map(|(wi, _)| wi);
+            let mut continuations: BTreeMap<(usize, Option<String>), Vec<(usize, usize)>> = BTreeMap::new();
+            rows.retain(|&(wi, si)| {
+                if boxed.is_some() || Some(wi) == main_ws { return true; }
+                let Some(choice) = self.workspace_sections.get(&self.workspaces[wi].id) else { return true; };
+                let override_section = if choice.is_empty() { None } else if self.section_by_id(choice).is_some() {
+                    Some(choice.clone())
+                } else { return true; };
+                if override_section == section { return true; }
+                continuations.entry((wi, override_section)).or_default().push((wi, si));
+                false
+            });
+            rows.sort_by_key(|&(wi, si)| ((wi, si) != main.unwrap_or((usize::MAX, usize::MAX)), Some(wi) != main_ws, wi, si));
+            result.continuations.extend(continuations.into_iter().map(|((workspace, section), sessions)| OrgContinuation {
+                member: member.id.clone(), workspace, section, sessions,
+            }));
+            let parent = member.manager_member_id.as_ref().filter(|id| {
+                active.contains(*id) && snap.member(id).is_some_and(|m| !m.is_owner())
+                    && (boxed.is_some() && boxes.get(*id) == boxed.as_ref()
+                        || boxed.is_none() && !boxes.contains_key(*id) && section_by_member.get(*id) == section_by_member.get(&member.id))
+            }).cloned();
+            result.members.push(OrgMemberBlock {
+                id: member.id.clone(), main, sessions: rows, parent, section,
+                team: member.primary_team_id.clone(), boxed,
+            });
+        }
+        // A malformed manager cycle must not hide the entire cycle.
+        let parents: HashMap<_, _> = result.members.iter().filter_map(|m| Some((m.id.clone(), m.parent.clone()?))).collect();
+        for block in &mut result.members {
+            let mut seen = HashSet::from([block.id.as_str()]);
+            let mut parent = block.parent.as_deref();
+            while let Some(id) = parent {
+                if !seen.insert(id) { block.parent = None; break; }
+                parent = parents.get(id).map(String::as_str);
+            }
+        }
+        result
+    }
+
     pub(super) fn org_placement(&self, snap: &super::org_model::OrgSnapshot) -> OrgPlacement {
         let mut result = OrgPlacement::default();
         for (wi, ws) in self.workspaces.iter().enumerate() {
@@ -1579,6 +1680,50 @@ mod tree_tests {
         let marks = app.org_member_marks(snap, &app.org_placement(snap));
         assert!(!marks.contains_key(&(2, 0)), "an exited assistant does not confer a mark");
         assert_eq!(marks.get(&(1, 0)), Some(&"☆"), "the live report still confers a mark");
+    }
+
+    #[test]
+    fn org_blocks_nest_reports_and_split_only_stream_overrides() {
+        use super::super::org_model::fixtures::{member, owner, snapshot, team};
+        use cm_daemon::host_id::HostId;
+        let mut app = test_app();
+        app.workspaces = ["home", "stream", "report", "worker"].into_iter().map(bare_ws).collect();
+        for (wi, uid) in ["lead", "stream", "report", "worker"].into_iter().enumerate() {
+            session(&mut app, wi, uid, uid, "codex");
+            app.workspaces[wi].sessions[0].host_id = HostId::new("h1");
+        }
+        app.sections = ["a", "b"].into_iter().map(|id| SidebarSection { id: id.into(), ..Default::default() }).collect();
+        app.member_sections.insert("lead".into(), "a".into());
+        app.workspace_sections.insert("home".into(), "b".into());
+        app.workspace_sections.insert("stream".into(), "b".into());
+        let mut lead = member("lead", "Lead", Some("mem-owner"), None, Some("lead"));
+        lead["assistants"] = serde_json::json!([{"daemon_id":"d1", "session_uid":"stream", "acting_as":"assistant"}]);
+        let mut report = member("report", "Report", Some("lead"), None, Some("report"));
+        report["assistants"] = serde_json::json!([{"daemon_id":"d1", "session_uid":"worker", "acting_as":"worker"}]);
+        let mut value = snapshot(1, vec![owner(), lead, report], vec![]);
+        value["host_daemons"] = serde_json::json!({"h1":"d1"});
+        let mut snap: super::super::org_model::OrgSnapshot = serde_json::from_value(value.clone()).unwrap();
+        let plan = app.org_blocks(&snap, &app.org_placement(&snap));
+        assert_eq!(plan.members.len(), 2);
+        assert_eq!(plan.members[0].main, Some((0, 0)));
+        assert_eq!(plan.members[0].sessions, vec![(0, 0)], "main workspace override does not split the block");
+        assert_eq!(plan.members[1].parent.as_deref(), Some("lead"));
+        assert_eq!(plan.members[1].section.as_deref(), Some("a"));
+        assert_eq!(plan.members[1].sessions, vec![(2, 0), (3, 0)]);
+        assert_eq!(plan.continuations.len(), 1);
+        let continuation = &plan.continuations[0];
+        assert_eq!((&*continuation.member, continuation.workspace, continuation.section.as_deref(), &continuation.sessions),
+            ("lead", 1, Some("b"), &vec![(1, 0)]));
+
+        let mut ct = team("ct", "Continuous", None, Some("lead"), &[]);
+        ct["continuous"] = serde_json::json!({"lead_member_id":"lead"});
+        value["teams"] = serde_json::json!([ct]);
+        snap = serde_json::from_value(value).unwrap();
+        let boxed = app.org_blocks(&snap, &app.org_placement(&snap));
+        assert!(boxed.continuations.is_empty());
+        assert_eq!(boxed.members[0].sessions, vec![(0, 0), (1, 0)]);
+        assert!(boxed.members.iter().all(|m| m.boxed.as_deref() == Some("ct")));
+        assert_eq!(boxed.members[1].parent.as_deref(), Some("lead"));
     }
 
     #[test]
