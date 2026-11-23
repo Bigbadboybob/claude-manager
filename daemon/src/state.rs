@@ -772,6 +772,8 @@ pub struct DaemonState {
     /// `DaemonConfig::default()` so an in-test `DaemonState::new()`
     /// doesn't touch the filesystem.
     pub config: crate::config::DaemonConfig,
+    /// Last complete session-scope snapshot; failed refreshes preserve it.
+    pub session_scope_cache: crate::items::session_scope::Cache,
     /// DESIGN_SEAMLESS_RESTART phase 3b: raw fd NUMBER of the bound
     /// control-socket listener, stamped by `run()` right after
     /// bind/adopt. **Manifest input only**: `crate::reexec` copies
@@ -929,6 +931,7 @@ impl Default for DaemonState {
                 crate::workflow::events::WorkflowEventWatcher::new(),
             ),
             config: crate::config::DaemonConfig::default(),
+            session_scope_cache: Default::default(),
             draining: false,
             restarting: false,
             restart_coordinator: Arc::new(

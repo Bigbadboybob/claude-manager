@@ -198,6 +198,20 @@ the end: hub first, then cm-sessions, then the laptop.
 3. **Owner's own sessions** are `agent` members directly under Owner, at the
    top level, outside sections unless assigned (§3 rule 3).
 
+The daemon defaults to `session_scope = "manager_chain"` in `~/.cm/daemon.toml`.
+To roll back session-control checks, set `session_scope = "task_tree"` and
+call `daemon.reload_config` (or send SIGHUP); task-object checks continue to
+use task scope in both modes. The daemon logs a caller, target, and method
+when the manager rule refuses an operation the old rule would have allowed.
+The local spawner chain stays live during API outages; membership, acting role
+and manager relationships continue to come from the last complete snapshot.
+The separate `session_roster` metadata view also keeps visibility of agents
+sharing the caller's workspace, so co-tenants can see who is in the checkout;
+that visibility does not grant session control.
+In manager-chain mode, finishing a task does not close its sessions; retained
+sessions and their live checkouts remain visible for deliberate cleanup. The
+historical task-status sweep is restored by the `task_tree` rollback setting.
+
 ## 9. After this: tasks become board items only
 
 Owner, 2026-11-23: sessions stop being linked to tasks at all; tasks are only

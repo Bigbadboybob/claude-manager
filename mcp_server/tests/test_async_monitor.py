@@ -473,6 +473,17 @@ class CancelTests(_MonitorEnv):
         self.assertEqual(self.sent, [])
 
 
+class MonitorAuthorizationTests(unittest.TestCase):
+    def test_refused_or_unavailable_target_does_not_register(self):
+        async def scenario(error):
+            with mock.patch.dict(os.environ, {"CM_TUI_SESSION_ID": "caller"}), \
+                 mock.patch.object(control_client, "call", side_effect=error):
+                with self.assertRaises(async_monitor.RegistrationError):
+                    async_monitor.register_monitor(["outside"])
+        asyncio.run(scenario(control_client.ControlError("unauthorized", "outside scope")))
+        asyncio.run(scenario(control_client.TransportError("offline")))
+
+
 class FingerprintTests(unittest.TestCase):
     """The edge baseline: last_completed_turn_fingerprint."""
 

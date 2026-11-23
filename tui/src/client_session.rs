@@ -2641,6 +2641,33 @@ pub(crate) mod tests {
         drop(handle);
     }
 
+    #[test]
+    fn session_scope_check_uses_daemon_decision_and_caller_identity() {
+        use cm_daemon::control::{wire, protocol::Response};
+        use std::os::unix::net::UnixListener;
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("scope.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (allowed, global) in [(false, false), (true, false), (true, true), (true, false), (true, false)] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = wire::read_request(&mut stream).unwrap().unwrap();
+                wire::write_response(&mut stream, &Response::ok(req.id.clone(), serde_json::json!({"allowed": allowed, "global_perms": global, "session_scope": "manager_chain"}))).unwrap();
+                requests.push(req);
+            }
+            requests
+        });
+        assert!(!rpc_session_scope_check(&socket, "operator", "a", "b", "send_input").unwrap());
+        assert!(rpc_session_scope_check(&socket, "operator", "a", "b", "send_input").unwrap());
+        assert!(rpc_session_scope_global(&socket, "operator", "a", "send_input").unwrap());
+        assert!(!rpc_session_scope_global(&socket, "operator", "a", "send_input").unwrap());
+        assert_eq!(rpc_session_scope_mode(&socket, "operator", "a").unwrap().as_deref(), Some("manager_chain"));
+        let requests = server.join().unwrap();
+        assert_eq!(requests[0].method, "session.scope_check");
+        assert_eq!(requests[0].params, serde_json::json!({"caller_uid":"a", "session_uid":"b", "method":"send_input"}));
+    }
+
     /// `parse_daemon_session_summary` reads the full adoption metadata from
     /// a new daemon, tolerates a partial entry from an old daemon (missing
     /// fields → None), and rejects an entry with no `session_uid`.
@@ -5658,6 +5685,33 @@ pub const MESSAGING_BOARD_RPC_READ_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// [`rpc_messaging`] for the message board's worker thread, which may wait on
 /// the coordinator. Never call this from the UI thread.
+/// The legacy TUI route shares the daemon's cached session authorization.
+/// A stalled host fails closed promptly instead of blocking the UI for the
+/// much longer messaging timeout.
+pub fn rpc_session_scope_check(socket: &Path, token: &str, caller: &str, target: &str, method: &str) -> anyhow::Result<bool> {
+    let req = Request { id: next_request_id(), caller: Caller::operator(token), method: "session.scope_check".into(),
+        params: serde_json::json!({"caller_uid": caller, "session_uid": target, "method": method}) };
+    let response = rpc_round_trip_with_read_timeout(socket, &req, Duration::from_secs(1))?;
+    Ok(response.ok && response.result.as_ref().and_then(|v| v["allowed"].as_bool()) == Some(true))
+}
+
+/// Read the caller host's current rollback setting for task teardown.
+pub fn rpc_session_scope_mode(socket: &Path, token: &str, caller: &str) -> anyhow::Result<Option<String>> {
+    let req = Request { id: next_request_id(), caller: Caller::operator(token), method: "session.scope_check".into(),
+        params: serde_json::json!({"caller_uid": caller, "session_uid": caller, "method": "mark_subtask_done"}) };
+    let response = rpc_round_trip_with_read_timeout(socket, &req, Duration::from_secs(1))?;
+    Ok(response.result.as_ref().and_then(|v| v["session_scope"].as_str()).map(str::to_owned))
+}
+
+/// Read the caller's current global grant from its owning daemon.
+pub fn rpc_session_scope_global(socket: &Path, token: &str, caller: &str, method: &str) -> anyhow::Result<bool> {
+    let req = Request { id: next_request_id(), caller: Caller::operator(token), method: "session.scope_check".into(),
+        params: serde_json::json!({"caller_uid": caller, "session_uid": caller, "method": method}) };
+    let response = rpc_round_trip_with_read_timeout(socket, &req, Duration::from_secs(1))?;
+    Ok(response.ok && response.result.as_ref().is_some_and(|v|
+        v["allowed"].as_bool() == Some(true) && v["global_perms"].as_bool() == Some(true)))
+}
+
 pub fn rpc_messaging_board(socket: &Path, token: &str, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
     let req = Request { id: next_request_id(), caller: Caller::operator(token), method: method.into(), params };
     Ok(rpc_round_trip_with_read_timeout(socket, &req, MESSAGING_BOARD_RPC_READ_TIMEOUT)?.result.unwrap_or(serde_json::Value::Null))

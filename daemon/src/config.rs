@@ -406,6 +406,9 @@ impl Default for SchedulerConfig {
 /// Parsed `daemon.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DaemonConfig {
+    /// Session authorization rule; task_tree is the rollback setting.
+    #[serde(default)]
+    pub session_scope: SessionScope,
     /// Automatically resume a Claude session once after a proven subscription
     /// limit clears. Set false and reload config to disable new attempts.
     #[serde(default = "default_claude_limit_recovery")]
@@ -616,9 +619,19 @@ impl DaemonConfig {
     }
 }
 
+/// Which rule authorizes session operations. Task-object authorization is separate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionScope {
+    #[default]
+    ManagerChain,
+    TaskTree,
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            session_scope: SessionScope::default(),
             claude_limit_recovery: true,
             claude_limit_menu_clear: default_claude_limit_menu_clear(),
             memory: MemoryConfig::default(),
@@ -922,8 +935,18 @@ mode = "ssh-trust"
     /// — the doc-prescribed shape parses back to byte-equal
     /// values across the field set.
     #[test]
+    fn session_scope_defaults_to_manager_chain_and_accepts_rollback() {
+        let default: DaemonConfig = toml::from_str("").unwrap();
+        assert_eq!(default.session_scope, SessionScope::ManagerChain);
+        let rollback: DaemonConfig = toml::from_str("session_scope = \"task_tree\"").unwrap();
+        assert_eq!(rollback.session_scope, SessionScope::TaskTree);
+        assert!(toml::from_str::<DaemonConfig>("session_scope = \"union\"").is_err());
+    }
+
+    #[test]
     fn serde_round_trip() {
         let original = DaemonConfig {
+            session_scope: SessionScope::TaskTree,
             claude_limit_recovery: true,
             claude_limit_menu_clear: false,
             memory: MemoryConfig::default(),

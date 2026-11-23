@@ -7,6 +7,7 @@ fence. The shared API bearer authenticates a host, not an individual session.
 from __future__ import annotations
 
 from collections import deque
+import logging
 from datetime import timedelta
 
 from dispatch import session_roster_cursor as cursors
@@ -16,6 +17,7 @@ from dispatch.session_roster_projection import project_activity
 # An explicit fail-closed engineering ceiling, not a production measurement.
 # A very large scope must use a separately reviewed graph strategy.
 MAX_TASK_SCOPE = 10_000
+_LOG = logging.getLogger(__name__)
 
 # All candidate authorization happens here, before filters or counts. UNION
 # makes both graph walks terminate even with corrupt cycles; it never widens
@@ -114,6 +116,35 @@ scoped AS MATERIALIZED (
 """
 
 
+# The manager-chain roster retains co-tenants as a safety view, and uses
+# the API's reported spawner links for sessions created by the caller. The
+# daemon supplies and rechecks the host-local workspace membership.
+_SPAWNER_CTE = r"""
+spawner_scope(daemon_id, session_uid) AS (
+    SELECT $5::text, substring($4::text FROM length('agent:' || $5::text || ':') + 1)
+    UNION
+    SELECT f.daemon_id, f.session_uid FROM org_session_facts f
+      JOIN spawner_scope p ON f.daemon_id = p.daemon_id AND f.managed_by_uid = p.session_uid
+),
+"""
+_MANAGER_SCOPED = (_SCOPED
+    .replace("facts AS MATERIALIZED (", _SPAWNER_CTE + "facts AS MATERIALIZED (", 1)
+    .replace(" OR f.task_id IN (SELECT id FROM task_scope)", "", 1)
+    .replace("($1::text IS NULL AND f.daemon_id = $5 AND f.session_uid = ANY($6::text[]))",
+             "(f.daemon_id = $5 AND f.session_uid = ANY($6::text[]))", 1))
+
+
+def _scope_sql(mode, role):
+    if mode != "manager_chain":
+        return _SCOPED
+    if role not in ("main", "assistant", "worker"):
+        return _MANAGER_SCOPED
+    return _MANAGER_SCOPED.replace(
+        "OR f.resolved_member IN (SELECT id FROM member_scope)",
+        "OR f.resolved_member IN (SELECT id FROM member_scope) "
+        "OR (f.daemon_id, f.session_uid) IN (SELECT daemon_id, session_uid FROM spawner_scope)", 1)
+
+
 async def _caller(conn, pid):
     row = await conn.fetchrow("""
         SELECT i.id AS incarnation_id, i.occupancy_generation AS incarnation_generation,
@@ -198,7 +229,8 @@ async def read(pool, caller, filters, secret):
             task_version = await conn.fetchrow("""SELECT epoch, pruned_through,
                 greatest(pruned_through, (SELECT coalesce(max(seq),0) FROM task_changes)) AS seq
                 FROM task_change_meta""")
-            basis = {**identity, "task_roots": [caller["task_id"]] if caller["task_id"] else [],
+            scope_mode = caller.get("session_scope", "task_tree")
+            basis = {**identity, "session_scope": scope_mode, "task_roots": [caller["task_id"]] if caller["task_id"] else [],
                      "global": caller["global"], "owner": caller["owner"],
                      "org_version": org_version, "task_epoch": task_version["epoch"],
                      "task_version": task_version["seq"]}
@@ -209,15 +241,17 @@ async def read(pool, caller, filters, secret):
                 after = cursors.read(filters["cursor"], binding, secret) if filters.get("cursor") else None
             except cursors.InvalidCursor as exc:
                 raise ItemsError(409, "cursor_changed", str(exc)) from None
-            params = [caller["task_id"], identity["member_id"], caller["global"] or caller["owner"],
+            scope_sql = _scope_sql(scope_mode, identity["role"])
+            member_scope = identity["member_id"] if scope_mode == "task_tree" or identity["role"] == "main" else None
+            params = [caller["task_id"], member_scope, caller["global"] or caller["owner"],
                       caller["pid"], caller["daemon_id"], caller["workspace_uids"], filters["include_exited"]]
-            if caller["task_id"] and not (caller["global"] or caller["owner"]):
+            if scope_mode == "task_tree" and caller["task_id"] and not (caller["global"] or caller["owner"]):
                 await _check_task_graph(conn, params)
             # Resolve a label only inside the authorized set; duplicate labels
             # report ambiguity without disclosing unrelated host identities.
             host = filters.get("host")
             if host:
-                hosts = await conn.fetch(_SCOPED + """
+                hosts = await conn.fetch(scope_sql + """
                     SELECT DISTINCT daemon_id, (daemon_id = $8) AS exact FROM scoped
                     WHERE daemon_id = $8 OR host_label = $8
                     ORDER BY exact DESC LIMIT 3""", *params, host)
@@ -241,9 +275,19 @@ async def read(pool, caller, filters, secret):
                             ELSE visible_state = $11 END)
                   AND ($12::text IS NULL OR task_id::text = $12)
             """
-            unknown = await conn.fetchval(_SCOPED + "SELECT count(*) FROM scoped " + where +
+            if scope_mode == "manager_chain" and not (caller["owner"] or caller["global"]):
+                # Compute the old-only set inside the same read snapshot and
+                # log identities server-side; it is never returned to the caller.
+                old_sql = _SCOPED.replace("id = $2", "id = $13", 1)
+                old_rows = old_sql + "SELECT pid FROM scoped " + where + " AND engine IN ('claude-code','claude','codex')"
+                new_rows = scope_sql + "SELECT pid FROM scoped " + where + " AND engine IN ('claude-code','claude','codex')"
+                diff = "SELECT pid FROM (" + old_rows + ") old_scope EXCEPT SELECT pid FROM (" + new_rows + ") new_scope"
+                async for row in conn.cursor(diff, *args, identity["member_id"], prefetch=100):
+                    _LOG.warning("session scope refused old-rule grant caller=%r target=%r method=session_roster",
+                                 caller["pid"], row["pid"])
+            unknown = await conn.fetchval(scope_sql + "SELECT count(*) FROM scoped " + where +
                 " AND (engine IS NULL OR engine NOT IN ('claude-code','claude','codex','bash','shell'))", *args)
-            hosts = await conn.fetch(_SCOPED + """
+            hosts = await conn.fetch(scope_sql + """
                 , visible_hosts AS (
                     SELECT daemon_id, max(reported_at) AS session_as_of
                     FROM scoped """ + where + """
@@ -260,7 +304,7 @@ async def read(pool, caller, filters, secret):
                  ORDER BY h.daemon_id LIMIT 101""", *args,
                 bool((caller["owner"] or caller["global"]) and
                      not any(filters.get(k) for k in ("host", "member", "manager", "state", "task"))))
-            page = await conn.fetch(_SCOPED + "SELECT * FROM scoped " + where + """
+            page = await conn.fetch(scope_sql + "SELECT * FROM scoped " + where + """
                   AND engine IN ('claude-code','claude','codex')
                   AND ($13::text IS NULL OR (daemon_id,session_uid,pid) > ($13,$14,$15))
                 ORDER BY daemon_id,session_uid,pid LIMIT $16""", *args,

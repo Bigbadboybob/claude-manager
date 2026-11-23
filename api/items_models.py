@@ -5,7 +5,7 @@ rules in `dispatch.items_rules` do the semantic validation, so these models
 only fix the wire shape.
 """
 
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -284,6 +284,8 @@ class RosterCaller(_Strict):
     process_identity: int | None = Field(default=None, ge=0)
     global_: bool = Field(default=False, alias="global")
     owner: bool = False
+    # Old daemons omit this field and retain their pre-cutover view.
+    session_scope: Literal["manager_chain", "task_tree"] = "task_tree"
 
 
 class RosterFilters(_Strict):

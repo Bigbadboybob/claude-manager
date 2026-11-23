@@ -1,64 +1,40 @@
-//! Session-caller authorization. Slice 10d-mcp-surface.
+//! Session-control authorization and the separate task-object scope walk.
 //!
-//! When the daemon dispatches a Session-caller MCP request (an agent
-//! running inside a daemon-spawned session calling tools like
-//! `send_input`, `kill_session`, `read_session_output`, `start_session`),
-//! the dispatch arm calls into this module to answer:
-//! "Is this caller authorized to act on this target?"
-//!
-//! ## Sub-2a: TUI-mirror task-tree + workspace
-//!
-//! Mirrors `tui/src/control/methods.rs::caller_authorized_for` so the
-//! daemon and the TUI agree on who can act on what. Two regimes:
-//!
-//!   - **Tasked caller** (`caller.task_id = Some(_)`): authorized iff
-//!     the target's `task_id` is the caller's task itself or a
-//!     descendant of it via the planning task tree's
-//!     `parent_task_id` chain. **Purely task-tree** — no workspace
-//!     constraint. (Branch-mode subtasks live in fresh child
-//!     workspaces, so the caller's workspace and the target's
-//!     workspace are typically different.) A tasked caller CANNOT
-//!     reach a taskless target — that's the `.unwrap_or(false)` arm
-//!     in the TUI rule.
-//!   - **Taskless caller** (`caller.task_id = None`, `A-n` shape):
-//!     authorized iff the target is in the same workspace as the
-//!     caller. Same workspace, any task or no task.
-//!
-//! Plus the foundational gates:
-//!   - Self: `caller_uid == target_uid` → `Allow` (mirrors the
-//!     TUI's implicit "I can act on myself" — the helper above
-//!     bails before that on `caller_wi.is_none()`, but our daemon
-//!     puts self-call ahead of the regime split for clarity).
-//!   - Caller not in registry → `CallerNotInRegistry`.
-//!   - Target not in registry → `TargetNotInRegistry`.
-//!
-//! ## Task-tree source of truth
-//!
-//! `DaemonState.task_tree: HashMap<task_id, Option<parent_task_id>>`
-//! is a **TUI-pushed snapshot** updated via the `task.update_tree`
-//! RPC whenever `App.tasks` mutates. Two reasons over "daemon owns
-//! the task tree":
-//!   1. Cheaper to land — no planning-API HTTP refactor needed.
-//!   2. The dependency unwinds cleanly when the workflow controller
-//!      relocates daemon-side (slice 10d-workflow-controller / sub-2c
-//!      territory): the controller will own task transitions and
-//!      write to `DaemonState.task_tree` directly, replacing the RPC
-//!      push.
-//!
-//! Until the TUI side wires the push, `DaemonState.task_tree` stays
-//! empty. The auth check then behaves as if every tasked caller's
-//! task has no descendants — `task_is_self_or_descendant_of`
-//! returns true only for `target == caller` (self-task), false
-//! otherwise. Safer-than-TUI default until snapshots land.
-//!
-//! ## Why this is its own module
-//!
-//! The auth check is shared across every Session-callable dispatch arm
-//! (`send_input`, `kill_session`, `read_session_output`, `start_session`,
-//! `list_sessions`, and future MCP tools). Extracting it here keeps the
-//! dispatch.rs arms readable and gives the rule a single test surface.
+//! Session operations default to a complete, fail-static org snapshot. Main
+//! sessions control their own member and its reports; assistants and workers
+//! control only their spawner descendants. `session_scope = "task_tree"`
+//! restores the previous task/workspace rule. Task-object operations continue
+//! using `task_in_scope` regardless of that setting. Shells are Owner-only.
 
 use crate::state::DaemonState;
+
+thread_local! { static METHOD: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) }; }
+/// Binds diagnostics to the current request, including nested dispatches.
+pub struct MethodGuard(Option<String>);
+pub fn method_guard(method: &str) -> MethodGuard {
+    MethodGuard(METHOD.with(|m| m.replace(Some(method.to_owned()))))
+}
+impl Drop for MethodGuard {
+    fn drop(&mut self) { METHOD.with(|m| { m.replace(self.0.take()); }); }
+}
+
+fn log_old_only(state: &DaemonState, caller_uid: &str, target_uid: &str) {
+    let Some(caller) = state.lookup_session_any(caller_uid) else { return };
+    let (task, workspace) = if let Some(t) = state.sessions.get(target_uid) {
+        (t.task_id.as_deref(), Some(t.workspace_id.as_str()))
+    } else if let Some(t) = state.tui_sessions.get(target_uid) {
+        (t.task_id.as_deref(), t.workspace_id.as_deref())
+    } else if let Some(t) = state.exited_tombstone(target_uid) {
+        (t.task_id.as_deref(), Some(t.workspace_id.as_str()))
+    } else { return };
+    let old_allowed = caller.global_perms || caller_uid == target_uid || workspace.is_some_and(|ws|
+        caller.workspace_id.as_deref().is_some_and(|cws| caller_reaches_target(state, &caller.task_id, cws, task, ws).is_allow()));
+    if old_allowed {
+        METHOD.with(|method| if let Some(method) = method.borrow().as_deref() {
+            eprintln!("cm-daemon: session scope refused old-rule grant caller={caller_uid:?} target={target_uid:?} method={method:?}");
+        });
+    }
+}
 
 /// Outcome of the Session-caller authorization check. The error
 /// variants carry concrete reasons rather than a single `Unauthorized`
@@ -179,20 +155,7 @@ fn walk_to_ancestor(
     false
 }
 
-/// Sub-2a Session-caller authorization. Mirrors
-/// `tui/src/control/methods.rs::caller_authorized_for` so the
-/// daemon and TUI agree on the rule.
-///
-/// Decision order:
-///   1. Caller missing from registry → `CallerNotInRegistry`.
-///   2. Self-call (`caller_uid == target_uid`) → `Allow`.
-///   3. Target missing from registry → `TargetNotInRegistry`.
-///   4. Regime split on `caller.task_id`:
-///      - `Some(caller_task)`: target must have `task_id` AND it
-///        must be self-or-descendant of `caller_task` in
-///        `state.task_tree`.
-///      - `None` (taskless): target must be in the same workspace.
-///   5. Otherwise → `OutOfScope`.
+/// Authorize a live session caller against a live target.
 pub fn check_session_caller(
     state: &DaemonState,
     caller_uid: &str,
@@ -203,45 +166,66 @@ pub fn check_session_caller(
         None => return AuthDecision::CallerNotInRegistry,
     };
 
-    // Self-call short-circuits any further check. Both the TUI
-    // rule and the daemon implicitly allow this (every TUI rule
-    // branch admits self).
-    if caller_uid == target_uid {
-        return AuthDecision::Allow;
-    }
-
     let target = match state.sessions.get(target_uid) {
         Some(s) => s,
         None => return AuthDecision::TargetNotInRegistry,
     };
-
-    // Global-perms grant: a global caller reaches ANY live target,
-    // bypassing the task-tree / workspace scope rule. The
-    // caller-exists and target-exists gates above still apply (a
-    // global caller acting on a missing target still gets a clean
-    // `TargetNotInRegistry`), so the only thing the grant skips is
-    // the scope decision below. See `DaemonSession.global_perms`.
-    if caller.global_perms {
-        return AuthDecision::Allow;
+    // Shells are Owner-only, even for globally privileged agent sessions.
+    if state.config.session_scope == crate::config::SessionScope::ManagerChain {
+        return if manager_reaches_any(state, caller_uid, target_uid) {
+            AuthDecision::Allow
+        } else {
+            AuthDecision::OutOfScope
+        };
     }
-
+    if matches!(target.session_type.as_str(), "bash" | "shell") { return AuthDecision::OutOfScope; }
+    if caller_uid == target_uid || caller.global_perms { return AuthDecision::Allow; }
     caller_reaches_target(
-        state,
-        &caller.task_id,
-        &caller.workspace_id,
-        target.task_id.as_deref(),
-        &target.workspace_id,
+        state, &caller.task_id, &caller.workspace_id,
+        target.task_id.as_deref(), &target.workspace_id,
     )
 }
 
-/// Authorize a live `caller_uid` against a target that has EXITED — its
-/// identity comes from an [`crate::state::ExitedTombstone`] rather than a live
-/// `state.sessions` entry, since the session was removed from the registry on
-/// exit. Used by `resolve_authorized_session` / `list_sessions` so the SAME
-/// descendant-task / same-workspace scope rule applies to read-after-exit as to
-/// a live read (an agent must not read an out-of-scope session's final output
-/// just because it has since exited). The caller is still live; only the target
-/// identity is supplied explicitly.
+/// Manager-chain decision for a live, viewer-owned, or exited session row.
+pub fn manager_reaches_any(state: &DaemonState, caller_uid: &str, target_uid: &str) -> bool {
+    let Some(caller) = state.sessions.get(caller_uid) else { return false };
+    let kind = state.sessions.get(target_uid).map(|s| s.session_type.as_str())
+        .or_else(|| state.tui_sessions.get(target_uid).and_then(|s| s.session_type.as_deref()))
+        .or_else(|| state.exited_tombstone(target_uid).map(|t| t.session_type.as_str()));
+    let Some(kind) = kind else { return false };
+    let allowed = !matches!(kind, "bash" | "shell") && (caller_uid == target_uid || caller.global_perms || state.session_scope_cache.reaches_local(state, caller_uid, target_uid));
+    if !allowed { log_old_only(state, caller_uid, target_uid); }
+    allowed
+}
+
+/// Scope for the legacy TUI mirror, including TUI-owned rows.
+pub fn check_any_session_caller(state: &DaemonState, caller_uid: &str, target_uid: &str) -> bool {
+    let Some(caller) = state.lookup_session_any(caller_uid) else { return false };
+    let target = state.lookup_session_any(target_uid);
+    let tomb = state.exited_tombstone(target_uid);
+    let (task, workspace, shell) = if let Some(target) = target {
+        let kind = state.sessions.get(target_uid).map(|s| s.session_type.as_str())
+            .or_else(|| state.tui_sessions.get(target_uid).and_then(|s| s.session_type.as_deref()));
+        let Some(kind) = kind else { return false };
+        (target.task_id, target.workspace_id, matches!(kind, "bash" | "shell"))
+    } else if let Some(t) = tomb {
+        (t.task_id.clone(), Some(t.workspace_id.clone()), matches!(t.session_type.as_str(), "bash" | "shell"))
+    } else { return false };
+    if shell {
+        if state.config.session_scope == crate::config::SessionScope::ManagerChain { log_old_only(state, caller_uid, target_uid); }
+        return false;
+    }
+    if caller_uid == target_uid || caller.global_perms { return true; }
+    if state.config.session_scope == crate::config::SessionScope::ManagerChain {
+        let allowed = state.session_scope_cache.reaches_local(state, caller_uid, target_uid);
+        if !allowed { log_old_only(state, caller_uid, target_uid); }
+        return allowed;
+    }
+    workspace.as_deref().is_some_and(|ws| caller.workspace_id.as_deref().is_some_and(|cws|
+        caller_reaches_target(state, &caller.task_id, cws, task.as_deref(), ws).is_allow()))
+}
+
+/// Apply the same scope to a retained exited session.
 pub fn check_session_caller_for_exited(
     state: &DaemonState,
     caller_uid: &str,
@@ -253,23 +237,13 @@ pub fn check_session_caller_for_exited(
         Some(s) => s,
         None => return AuthDecision::CallerNotInRegistry,
     };
-    if caller_uid == target_uid {
-        return AuthDecision::Allow;
+    if state.config.session_scope == crate::config::SessionScope::ManagerChain {
+        return if manager_reaches_any(state, caller_uid, target_uid) { AuthDecision::Allow } else { AuthDecision::OutOfScope };
     }
-    // Global-perms grant applies to read-after-exit too: a global
-    // caller can read any exited session's final output, not just
-    // its own task tree's. Mirrors the live-target short-circuit in
-    // `check_session_caller`.
-    if caller.global_perms {
-        return AuthDecision::Allow;
-    }
-    caller_reaches_target(
-        state,
-        &caller.task_id,
-        &caller.workspace_id,
-        target_task_id,
-        target_workspace_id,
-    )
+    if state.exited_tombstone(target_uid).is_some_and(|t| matches!(t.session_type.as_str(), "bash" | "shell")) { return AuthDecision::OutOfScope; }
+    if caller_uid == target_uid || caller.global_perms { return AuthDecision::Allow; }
+    caller_reaches_target(state, &caller.task_id, &caller.workspace_id,
+        target_task_id, target_workspace_id)
 }
 
 /// Core scope rule shared by the live ([`check_session_caller`]) and exited
@@ -362,10 +336,102 @@ mod tests {
 
     fn state_with(sessions: Vec<DaemonSession>) -> DaemonState {
         let mut state = DaemonState::new();
+        state.config.session_scope = crate::config::SessionScope::TaskTree;
         for s in sessions {
             state.sessions.insert(s.uid.clone(), s);
         }
         state
+    }
+
+    fn manager_state() -> DaemonState {
+        use cm_holder_proto::session_scope::{Member, Role, Session, session_key};
+        let mut state = state_with(vec![make_session("lead", "w1"), make_session("assistant", "w1"),
+            make_session("sibling", "w1"), make_session("worker", "w2"), make_session("new", "w2")]);
+        state.config.session_scope = crate::config::SessionScope::ManagerChain;
+        let cache = &mut state.session_scope_cache;
+        cache.daemon_id = "host".into();
+        cache.graph.members.insert("lead-member".into(), Member { org_id: "org".into(), manager: None, active: true });
+        cache.graph.members.insert("report".into(), Member { org_id: "org".into(), manager: Some("lead-member".into()), active: true });
+        for (uid, member, role, parent) in [
+            ("lead", "lead-member", Role::Main, None),
+            ("assistant", "lead-member", Role::Assistant, Some("lead")),
+            ("sibling", "lead-member", Role::Assistant, Some("lead")),
+            ("worker", "report", Role::Worker, None),
+        ] {
+            cache.graph.sessions.insert(session_key("host", uid), Session { member: member.into(), role,
+                spawned_by: parent.map(|p| session_key("host", p)) });
+        }
+        state
+    }
+
+    #[test]
+    fn manager_chain_scope_and_rollback() {
+        let mut state = manager_state();
+        assert_eq!(check_session_caller(&state, "lead", "worker"), AuthDecision::Allow);
+        assert_eq!(check_session_caller(&state, "assistant", "sibling"), AuthDecision::OutOfScope);
+        assert_eq!(check_session_caller(&state, "lead", "new"), AuthDecision::OutOfScope);
+        state.sessions.get_mut("assistant").unwrap().global_perms = true;
+        assert_eq!(check_session_caller(&state, "assistant", "worker"), AuthDecision::Allow);
+        state.sessions.get_mut("assistant").unwrap().global_perms = false;
+        state.config.session_scope = crate::config::SessionScope::TaskTree;
+        assert_eq!(check_session_caller(&state, "assistant", "sibling"), AuthDecision::Allow);
+        assert_eq!(check_session_caller(&state, "lead", "worker"), AuthDecision::OutOfScope);
+        state.sessions.get_mut("worker").unwrap().session_type = "bash".into();
+        state.sessions.get_mut("assistant").unwrap().global_perms = true;
+        assert_eq!(check_session_caller(&state, "assistant", "worker"), AuthDecision::OutOfScope);
+    }
+
+    #[test]
+    fn listings_and_transcript_resolution_use_the_same_scope() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(manager_state()));
+        let rows = crate::control::methods::list_sessions(&state, &serde_json::Value::Null, Some("lead")).unwrap();
+        let uids = rows.as_array().unwrap().iter().filter_map(|row| row["session_uid"].as_str()).collect::<Vec<_>>();
+        assert!(uids.contains(&"worker"));
+        assert!(!uids.contains(&"new"));
+        let rows = crate::control::methods::list_sessions(&state, &serde_json::Value::Null, Some("assistant")).unwrap();
+        let uids = rows.as_array().unwrap().iter().filter_map(|row| row["session_uid"].as_str()).collect::<Vec<_>>();
+        assert!(!uids.contains(&"sibling"));
+        let denied = crate::control::methods::resolve_authorized_session(&state,
+            &serde_json::json!({"session_uid": "sibling"}), Some("assistant"));
+        assert!(denied.is_err());
+    }
+
+    #[test]
+    fn failed_refresh_keeps_org_scope_and_honors_live_spawner() {
+        let mut initial = manager_state();
+        let report_main = make_session("report-main", "w2");
+        initial.sessions.insert("report-main".into(), report_main);
+        initial.session_scope_cache.graph.sessions.insert(
+            cm_holder_proto::session_scope::session_key("host", "report-main"),
+            cm_holder_proto::session_scope::Session { member: "report".into(),
+                role: cm_holder_proto::session_scope::Role::Main, spawned_by: None });
+        let state = std::sync::Arc::new(std::sync::Mutex::new(initial));
+        // No messaging/API connection: refresh cannot install a new graph.
+        assert!(!crate::items::session_scope::refresh(&state));
+        let mut state = state.lock().unwrap();
+        assert_eq!(check_session_caller(&state, "lead", "worker"), AuthDecision::Allow);
+        assert_eq!(check_session_caller(&state, "lead", "new"), AuthDecision::OutOfScope);
+        // The new worker is absent from the snapshot, but its local spawner
+        // link is authoritative even while the API is unavailable.
+        state.sessions.get_mut("new").unwrap().managed_by_uid = Some("lead".into());
+        assert_eq!(check_session_caller(&state, "lead", "new"), AuthDecision::Allow);
+        state.sessions.get_mut("new").unwrap().managed_by_uid = Some("assistant".into());
+        assert_eq!(check_session_caller(&state, "assistant", "new"), AuthDecision::Allow);
+        assert_eq!(check_session_caller(&state, "sibling", "new"), AuthDecision::OutOfScope);
+        state.sessions.get_mut("new").unwrap().managed_by_uid = Some("report-main".into());
+        assert_eq!(check_session_caller(&state, "lead", "new"), AuthDecision::Allow);
+    }
+
+    #[test]
+    fn continuous_lead_can_explicitly_close_its_spawned_worker() {
+        let mut state = manager_state();
+        state.sessions.get_mut("lead").unwrap().continuous_task_id = Some("continuous-team".into());
+        let worker = state.sessions.get_mut("new").unwrap();
+        worker.managed_by_uid = Some("lead".into());
+        crate::assistants::stamp(&mut worker.org, "lead-member", crate::assistants::WORKER, "spawn:lead");
+        let state = std::sync::Arc::new(std::sync::Mutex::new(state));
+        crate::control::methods::kill_session(&state, &serde_json::json!({"session_uid":"new"}), Some("lead")).unwrap();
+        assert!(state.lock().unwrap().sessions["new"].last_exit.operator_kill_requested());
     }
 
     #[test]

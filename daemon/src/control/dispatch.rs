@@ -330,6 +330,7 @@ pub struct EventsSubscribeHandle {
 /// comment in [`dispatch_request`]).
 pub(crate) const RESTART_BARRIER_READ_ONLY_METHODS: &[&str] = &[
     "ping",
+    "session.scope_check",
     "staffing.get",
     "list_sessions",
     "session.roster",
@@ -458,6 +459,7 @@ pub fn dispatch_request_with_peer_pid(
     // the backend process happens to have an agent-session ancestor.
     let peer_pid = if delegated.is_some() { None } else { peer_pid };
     let req = delegated.as_ref().unwrap_or(req);
+    let _scope_method = crate::control::auth::method_guard(&req.method);
     // DESIGN_SEAMLESS_RESTART phase 2d (R2): in-flight mutation guard,
     // taken BEFORE the method body runs and dropped when this function
     // RETURNS — which for the streaming outcomes (`attach.open`,
@@ -489,6 +491,26 @@ pub fn dispatch_request_with_peer_pid(
         None
     };
     match req.method.as_str() {
+        "session.scope_check" => {
+            if let Err(resp) = require_operator(req, "session.scope_check requires an operator") {
+                return DispatchOutcome::Done(resp);
+            }
+            let caller = req.params["caller_uid"].as_str().unwrap_or("");
+            let target = req.params["session_uid"].as_str().unwrap_or("");
+            let _method = crate::control::auth::method_guard(req.params["method"].as_str().unwrap_or("session.scope_check"));
+            let st = state.lock().unwrap_or_else(|p| p.into_inner());
+            let global = st.lookup_session_any(caller).is_some_and(|session| session.global_perms);
+            let role = st.session_scope_cache.role(target).map(|role| match role {
+                cm_holder_proto::session_scope::Role::Main => "main",
+                cm_holder_proto::session_scope::Role::Assistant => "assistant",
+                cm_holder_proto::session_scope::Role::Worker => "worker",
+            });
+            let scope_mode = match st.config.session_scope {
+                crate::config::SessionScope::ManagerChain => "manager_chain",
+                crate::config::SessionScope::TaskTree => "task_tree",
+            };
+            DispatchOutcome::Done(Response::ok(req.id.clone(), json!({"allowed": crate::control::auth::check_any_session_caller(&st, caller, target), "global_perms": global, "target_role": role, "session_scope": scope_mode})))
+        }
         "staffing.get" | "staffing.set" => DispatchOutcome::Done(crate::staffing::dispatch(state, req)),
         "owner.board_token" => DispatchOutcome::Done(super::board_token::manage(state, req)),
         "messaging.sync" => DispatchOutcome::Done(crate::messaging::rpc::dispatch_with_peer_pid(state, req, peer_pid)),
@@ -2374,9 +2396,7 @@ fn dispatch_session_rotate_transcript(state: &Arc<Mutex<DaemonState>>, req: &Req
             (asked.unwrap_or(&s.session_uid).to_string(), crate::rotation::Origin::Agent)
         }
     };
-    // #25 follow-up: a session may ask for another session it has authority
-    // over (its task tree / global perms, or as a lead up the target
-    // member's manager chain). Status reads need the same authority.
+    // Session mutation and status reads use the same configured scope.
     let requested_by = match authorize_target(state, req, &uid) {
         Ok(by) => by,
         Err((code, message)) => return Response::err(req.id.clone(), code, message),
@@ -2437,9 +2457,14 @@ fn authorize_target(
     let Caller::Session(s) = &req.caller else { return Ok(None) };
     let caller = s.session_uid.as_str();
     if caller == target {
-        return Ok(None);
+        let st = state.lock().unwrap_or_else(|p| p.into_inner());
+        return if crate::control::auth::check_session_caller(&st, caller, target).is_allow() {
+            Ok(None)
+        } else {
+            Err((ErrorCode::Unauthorized, "shell sessions are Owner-only".into()))
+        };
     }
-    let (decision, member, label, refusal) = {
+    let (decision, label, refusal) = {
         let st = state.lock().unwrap_or_else(|p| p.into_inner());
         let Some(t) = st.sessions.get(target) else {
             return Err((ErrorCode::NotFound, format!("session '{target}' is not live on this host")));
@@ -2450,42 +2475,13 @@ fn authorize_target(
             Some("continuous sessions are scheduler-owned: change the continuous task instead")
         } else if t.workflow_run_id.is_some() {
             Some("workflow participants are driven by their run")
-        } else {
-            None
-        };
-        (
-            crate::control::auth::check_session_caller(&st, caller, target),
-            crate::assistants::of_session(t),
-            st.sessions.get(caller).map(|c| c.to_manifest_entry().label).unwrap_or_default(),
-            refusal,
-        )
+        } else { None };
+        (crate::control::auth::check_session_caller(&st, caller, target),
+         st.sessions.get(caller).map(|c| c.to_manifest_entry().label).unwrap_or_default(), refusal)
     };
-    // Authority first: an unauthorized caller learns nothing about the
-    // target beyond "no authority".
     let by = Some(if label.is_empty() { caller.to_string() } else { format!("{label} ({caller})") });
-    if !matches!(decision, crate::control::auth::AuthDecision::Allow) {
-        let lead_refusal = match member {
-            Some(m) => match crate::items::org::member_authority(
-                state,
-                req,
-                &m.member_id,
-                m.acting_as != crate::assistants::MAIN,
-                target,
-            ) {
-                Ok(_) => String::new(),
-                Err((_, e)) => format!("; not up member {}'s manager chain ({e})", m.member_id),
-            },
-            None => "; no org member it works for".to_string(),
-        };
-        if !lead_refusal.is_empty() {
-            return Err((
-                ErrorCode::Unauthorized,
-                format!(
-                    "'{caller}' has no authority over session '{target}': it is not in your task tree \
-                     (the send_input / kill_session scope){lead_refusal}"
-                ),
-            ));
-        }
+    if !decision.is_allow() {
+        return Err((ErrorCode::Unauthorized, format!("'{caller}' has no authority over session '{target}'")));
     }
     if let Some(why) = refusal {
         return Err((ErrorCode::Conflict, why.into()));
@@ -11762,6 +11758,7 @@ mod tests {
         {
             let mut st = state.lock().unwrap();
             st.config = crate::config::DaemonConfig {
+                session_scope: crate::config::SessionScope::TaskTree,
                 claude_limit_recovery: true,
                 claude_limit_menu_clear: true,
                 memory: Default::default(),
@@ -11874,6 +11871,7 @@ mod tests {
     fn set_stub_api_config(state: &Arc<Mutex<DaemonState>>, port: u16) {
         let mut st = state.lock().unwrap();
         st.config = crate::config::DaemonConfig {
+            session_scope: crate::config::SessionScope::TaskTree,
             claude_limit_recovery: true,
             claude_limit_menu_clear: true,
                 memory: Default::default(),

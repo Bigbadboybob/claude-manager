@@ -165,6 +165,7 @@ fn a_continuous_members_spawns_are_workers_attributed_but_torn_down_as_today() {
     let state = Arc::new(Mutex::new(DaemonState::new()));
     {
         let mut st = state.lock().unwrap();
+        st.config.session_scope = crate::config::SessionScope::TaskTree;
         st.sessions.insert("cw-orch".into(), session("cw-orch", Some("t-bt"), None, "ws-bt"));
         let mut org = None;
         assert_eq!(stamp_spawn(&st, "cw-1", Some("cw-orch"), "claude-code", &mut org), Some(WORKER));
@@ -284,6 +285,7 @@ fn an_assistant_survives_its_subtasks_done_and_the_terminal_sweep_and_a_plain_wo
     let state = Arc::new(Mutex::new(DaemonState::new()));
     {
         let mut st = state.lock().unwrap();
+        st.config.session_scope = crate::config::SessionScope::TaskTree;
         st.sessions.insert("sw-main".into(), session("sw-main", Some("t-ep"), None, "ws-home"));
         st.sessions.insert("sw-asst".into(), assistant("sw-asst", Some("t-done"), "sw-main", "ws-asst", "mem_ep"));
         st.sessions.insert("sw-plain".into(), session("sw-plain", Some("t-done"), None, "ws-plain"));
@@ -350,6 +352,16 @@ fn an_agents_kill_session_ends_an_assistant_like_a_close_and_operator_kills_stay
     let state = Arc::new(Mutex::new(DaemonState::new()));
     {
         let mut st = state.lock().unwrap();
+        use cm_holder_proto::session_scope::{Member, Role, Session, session_key};
+        st.session_scope_cache.daemon_id = "fixture".into();
+        st.session_scope_cache.graph.members.insert("mem_ep".into(), Member {
+            org_id: "org".into(), manager: None, active: true,
+        });
+        for (uid, role) in [("dk-main", Role::Main), ("dk-a", Role::Assistant), ("dk-b", Role::Assistant)] {
+            st.session_scope_cache.graph.sessions.insert(session_key("fixture", uid), Session {
+                member: "mem_ep".into(), role, spawned_by: None,
+            });
+        }
         st.sessions.insert("dk-main".into(), session("dk-main", Some("t-ep"), None, "ws-home"));
         for (uid, ws) in [("dk-a", "ws-a"), ("dk-b", "ws-b")] {
             st.sessions.insert(uid.into(), assistant(uid, Some("t-ep"), "dk-main", ws, "mem_ep"));
@@ -624,6 +636,7 @@ fn shells_survive_the_sweeps_and_keep_their_checkout() {
     let state = Arc::new(Mutex::new(DaemonState::new()));
     {
         let mut st = state.lock().unwrap();
+        st.config.session_scope = crate::config::SessionScope::TaskTree;
         st.sessions.insert("sh-1".into(), session_of("sh-1", Some("t-done"), None, "ws-t", "bash"));
         st.sessions.insert("sh-w".into(), session("sh-w", Some("t-done"), None, "ws-t"));
         st.workspaces.insert("ws-t".into(), workspace("ws-t", Some("ephemeral")));
@@ -807,7 +820,7 @@ fn a_retried_promote_reaches_the_apis_replay_and_a_bare_one_does_not() {
     assert!(again.ok, "{:?}", again.error);
     let again = again.result.unwrap();
     assert_eq!((again["member"]["id"].as_str(), again["was_assistant_of"].as_str()), (Some("mem_new"), Some("mem_ep")));
-    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert_eq!(seen.lock().unwrap().iter().filter(|(method, path, _)| method == "POST" && path == "/org/assistants/promote").count(), 2);
     {
         let st = state.lock().unwrap();
         let ws = st.workspaces["ws-asst"].org.clone().unwrap();
@@ -819,7 +832,7 @@ fn a_retried_promote_reaches_the_apis_replay_and_a_bare_one_does_not() {
         params: json!({"action": "promote", "session": "ca-asst", "handle": "x", "reason": "r"}),
     });
     assert!(bare.error.unwrap().message.starts_with("already_member"));
-    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert_eq!(seen.lock().unwrap().iter().filter(|(method, path, _)| method == "POST" && path == "/org/assistants/promote").count(), 2);
     kill_all(&state);
     crate::items::org::reset_cache_for_test();
 }
