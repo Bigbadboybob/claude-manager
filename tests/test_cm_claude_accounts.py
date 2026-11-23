@@ -34,6 +34,7 @@ _notifier_paths = set()
 _test_subprocess_paths = set()
 _original_run = accounts.subprocess.run
 _original_notify = accounts.notify
+_original_launch_reset_sweep = accounts.launch_reset_sweep
 
 
 def guarded_subprocess_run(argv, *args, **kwargs):
@@ -59,7 +60,10 @@ def setUpModule():
     _test_subprocess_paths.add(str(fake))
     _notifier_patches = [mock.patch.object(accounts, "DEFAULT_NOTIFY", fake),
                          mock.patch.object(accounts, "notify", guarded_notify),
-                         mock.patch.object(accounts.subprocess, "run", guarded_subprocess_run)]
+                         mock.patch.object(accounts.subprocess, "run", guarded_subprocess_run),
+                         mock.patch.object(accounts.urllib.request, "urlopen",
+                                           side_effect=accounts.urllib.error.URLError('test network disabled')),
+                         mock.patch.object(accounts, "launch_reset_sweep")]
     for patch in _notifier_patches:
         patch.start()
 
@@ -3108,13 +3112,13 @@ class UsageDashboardTests(unittest.TestCase):
                 CREATE TABLE accounts(id TEXT,email TEXT,alias TEXT,status TEXT,plan_type TEXT,
                   access_token_encrypted TEXT,refresh_token_encrypted TEXT);
                 CREATE TABLE usage_history(id INTEGER PRIMARY KEY,account_id TEXT,window TEXT,
-                  used_percent REAL,reset_at INTEGER,recorded_at INTEGER);
+                  used_percent REAL,reset_at INTEGER,recorded_at INTEGER,window_minutes INTEGER);
                 CREATE TABLE request_usage_hourly_rollups(bucket_epoch INTEGER,account_id TEXT,model TEXT,
                   input_tokens INTEGER,output_tokens INTEGER,cached_input_tokens INTEGER,reasoning_tokens INTEGER,
                   request_count INTEGER,cost_usd REAL, is_deleted INTEGER DEFAULT 0);
                 INSERT INTO accounts VALUES('a','codex@example.com','802','active','plus','SECRET_A','SECRET_B');
-                INSERT INTO usage_history VALUES(1,'a','primary',4,1795410000,1795399700);
-                INSERT INTO usage_history VALUES(2,'a','primary',8,1795410000,1795399800);
+                INSERT INTO usage_history VALUES(1,'a','primary',4,1795410000,1795399700,10080);
+                INSERT INTO usage_history VALUES(2,'a','primary',8,1795410000,1795399800,10080);
             ''')
             db.execute('INSERT INTO request_usage_hourly_rollups VALUES(?,?,?,?,?,?,?,?,?,0)',
                        (self.hour, 'a', 'o3', 10, 20, 3, 4, 2, .01))
@@ -3162,10 +3166,11 @@ class UsageDashboardTests(unittest.TestCase):
         self.assertEqual(self.collect()['usage']['codex']['rollups'], [])
         with accounts.Hub(self.hub_paths) as hub:
             doc = accounts.usage_snapshot(hub, self.now, self.hour, 'hour')
-        self.assertEqual(set(doc), {'schema','generated_at','since','granularity','accounts','limit_history','tokens'})
+        self.assertEqual(set(doc), {'schema','generated_at','since','granularity','accounts','limit_history','tokens','outlook'})
         self.assertEqual(doc['schema'], 1)
         fixture = Path(__file__).parent / 'fixtures/usage-dashboard.json'
-        self.assertEqual(doc, json.loads(fixture.read_text()))
+        self.assertEqual(json.loads(fixture.read_text()), json.loads(
+            (Path(__file__).resolve().parents[1] / 'tui/tests/fixtures/usage-snapshot.json').read_text()))
         self.assertEqual(doc['tokens']['series'], [
             {'bucket':self.hour,'engine':'claude','host':'cm-sessions','account':'alice@example.com','email':'alice@example.com',
              'input':16,'output':18,'cache_read':6,'cache_write':8,'reasoning':0,'requests':2},
@@ -3528,6 +3533,227 @@ class UsageDashboardTests(unittest.TestCase):
         self.assertEqual(reply['version'], accounts.HUB_VERSION)
         with accounts.Hub(self.hub_paths) as hub:
             self.assertEqual(accounts.usage_snapshot(hub, self.now, 0, 'hour')['limit_history'][0]['kind'], 'five_hour')
+
+
+    def test_codex_credit_api_uses_only_public_fields_and_weekly_window(self):
+        body = {'accounts': [{'accountId': 'a', 'availableResetCredits': 2,
+                              'resetCreditNearestExpiresAt': 1796000000,
+                              'auth': {'accessToken': 'NEVER-COPY-THIS'}}]}
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(body).encode()
+        with mock.patch.object(accounts.urllib.request, 'urlopen', return_value=response) as network:
+            export = self.collect()
+        self.assertEqual(network.call_args.kwargs['timeout'], 1)
+        self.assertEqual(network.call_args.args[0], 'http://127.0.0.1:2455/api/accounts')
+        self.assertNotIn('NEVER-COPY-THIS', json.dumps(export))
+        self.assertEqual(export['usage']['codex']['limits'][0]['window_minutes'], 10080)
+        self.checkin(export)
+        with accounts.Hub(self.hub_paths) as hub:
+            doc = accounts.usage_snapshot(hub, self.now, self.hour, 'hour')
+        codex = next(a for a in doc['accounts'] if a['engine'] == 'codex')
+        self.assertEqual(codex['limits'][0]['window_minutes'], 10080)
+        self.assertEqual(codex['limits'][0]['switch_at'], 100.0)
+        self.assertEqual(codex['resets'], [{'type':'codex','count':2,'expires_at':1796000000,'as_of':self.now}])
+        self.state['config']['codex_lb_api'] = 'off'
+        with mock.patch.object(accounts.urllib.request, 'urlopen') as network:
+            self.assertNotIn('reset_credits', self.collect()['usage']['codex'])
+            network.assert_not_called()
+        self.state['config']['codex_lb_api'] = 'http://example.com/api/accounts'
+        with mock.patch.object(accounts.urllib.request, 'urlopen') as network:
+            self.assertNotIn('reset_credits', self.collect()['usage']['codex'])
+            network.assert_not_called()
+
+    def test_claude_thresholds_windows_and_cached_lent_resets(self):
+        self.export['accounts']['alice']['reading']['limits'].append(
+            {'kind':'weekly_all','scope':None,'percent':75.0,'resets_at':self.now+86400})
+        self.checkin(self.export)
+        with accounts.Hub(self.hub_paths) as hub:
+            hub.desired['policy']['thresholds'] = {'session':98, 'weekly':98}
+            hub.desired['policy']['account_thresholds'] = {'alice@example.com':94}
+            hub.save()
+            accounts.atomic_write(hub.dir / 'reset-grants.json', {'alice': {
+                'email':'alice@example.com', 'resets':[{'type':'claude_full','count':1,
+                'expires_at':self.now+86400, 'as_of':self.now-30}]}})
+        with accounts.Hub(self.hub_paths) as hub:
+            account = accounts.usage_snapshot(hub, self.now, self.hour, 'hour')['accounts'][0]
+        self.assertEqual([(x['kind'],x['window_minutes'],x['switch_at']) for x in account['limits']],
+                         [('five_hour',300,98.0), ('weekly_all',10080,94.0)])
+        self.assertEqual(account['resets'][0]['type'], 'claude_full')
+        self.assertEqual(account['resets'][0]['as_of'], self.now-30)
+
+    def test_weekly_projection_and_outlook_count_refills_before_dry(self):
+        reset = self.now + 3 * 3600
+        sample = [{'engine':'claude','email':'alice@example.com','active_on':['cm-sessions'],
+                   'room':True,'status':None,'limits':[{'kind':'weekly_all','window_minutes':10080,
+                       'percent':90.0,'switch_at':98.0,'resets_at':reset}]}]
+        with accounts.Hub(self.hub_paths) as hub:
+            db = accounts.usage_hub_db(hub)
+            db.executemany('INSERT INTO limit_readings VALUES(?,?,?,?,?,?,?)', [
+                ('claude','alice@example.com','weekly_all',84.0,reset,self.now-3*3600,'cm-sessions'),
+                ('claude','alice@example.com','weekly_all',90.0,reset,self.now,'cm-sessions'),
+                ('claude','alice@example.com','weekly_all',1.0,reset-7*86400,self.now-4*3600,'cm-sessions')])
+            db.commit()
+            outlook = accounts.usage_enrich(sample, db, self.now)
+            db.close()
+        self.assertEqual(sample[0]['projection'], {'kind':'weekly_all','rate_per_hour':2.0,
+            'basis_hours':3.0,'at_switch':None,'at_reset_percent':96.0})
+        claude = outlook[0]
+        self.assertAlmostEqual(claude['room_weeks'], .08)
+        self.assertAlmostEqual(claude['burn_per_hour'], .02)
+        self.assertEqual(claude['refills'], [{'at':reset,'email':'alice@example.com','frees':.9}])
+        self.assertEqual(claude['dry_at'], self.now+49*3600)
+        self.assertEqual(outlook[1]['engine'], 'codex')
+
+    def test_projection_requires_two_current_window_readings_and_30_minutes(self):
+        reset = self.now + 86400
+        sample = [{'engine':'codex','email':'codex@example.com','active_on':[], 'status':'active',
+                   'room':None,'limits':[{'kind':'primary','window_minutes':10080,'percent':50.0,
+                                          'switch_at':100.0,'resets_at':reset}]}]
+        with accounts.Hub(self.hub_paths) as hub:
+            db = accounts.usage_hub_db(hub)
+            db.executemany('INSERT INTO limit_readings VALUES(?,?,?,?,?,?,?)', [
+                ('codex','codex@example.com','primary',49.0,reset,self.now-1000,'host'),
+                ('codex','codex@example.com','primary',50.0,reset,self.now,'host'),
+                ('codex','codex@example.com','primary',1.0,reset-7*86400,self.now-4000,'host')])
+            db.commit()
+            outlook = accounts.usage_enrich(sample, db, self.now)
+            first_projection = sample[0]['projection']
+            db.execute('INSERT INTO limit_readings VALUES(?,?,?,?,?,?,?)',
+                       ('codex','codex@example.com','primary',48.0,reset,self.now-3600,'host'))
+            db.commit()
+            active_outlook = accounts.usage_enrich(sample, db, self.now)
+            db.close()
+        self.assertIsNone(first_projection)
+        self.assertEqual(outlook[1]['accounts_with_room'], 1)
+        self.assertEqual(outlook[1]['burn_per_hour'], 0)
+        self.assertIsNone(outlook[1]['dry_at'])
+        self.assertEqual(sample[0]['projection']['rate_per_hour'], 2.0)
+        self.assertEqual(sample[0]['projection']['at_reset_percent'], 98.0)
+        self.assertAlmostEqual(active_outlook[1]['burn_per_hour'], .02)
+
+    def test_projection_reports_switch_time_when_it_precedes_reset(self):
+        reset = self.now + 10 * 3600
+        sample = [{'engine':'claude','email':'alice@example.com','active_on':['host'], 'room':True,
+                   'limits':[{'kind':'weekly_all','window_minutes':10080,'percent':90.0,
+                              'switch_at':98.0,'resets_at':reset}]}]
+        with accounts.Hub(self.hub_paths) as hub:
+            db = accounts.usage_hub_db(hub)
+            db.executemany('INSERT INTO limit_readings VALUES(?,?,?,?,?,?,?)', [
+                ('claude','alice@example.com','weekly_all',84.0,reset,self.now-3*3600,'host'),
+                ('claude','alice@example.com','weekly_all',90.0,reset,self.now,'host')])
+            db.commit()
+            accounts.usage_enrich(sample, db, self.now)
+            db.close()
+        self.assertEqual(sample[0]['projection']['at_switch'], self.now + 4 * 3600)
+        self.assertEqual(sample[0]['projection']['at_reset_percent'], 100.0)
+
+    def test_binding_projection_respects_disabled_scoped_switching(self):
+        reset = self.now + 86400
+        self.export['accounts']['alice']['reading']['limits'].extend([
+            {'kind':'weekly_all', 'scope':None, 'percent':70.0, 'resets_at':reset},
+            {'kind':'weekly_scoped', 'scope':'Fable', 'percent':95.0, 'resets_at':reset}])
+        self.checkin(self.export)
+        with accounts.Hub(self.hub_paths) as hub:
+            hub.desired['policy']['switch_on_scoped'] = False
+            hub.save()
+            db = accounts.usage_hub_db(hub)
+            accounts.usage_add_readings(db, 'claude', 'alice@example.com', [
+                ('weekly_all', 60.0, reset, self.now-3600),
+                ('weekly_fable', 80.0, reset, self.now-3600)], 'cm-sessions')
+            db.commit()
+            db.close()
+            doc = accounts.usage_snapshot(hub, self.now, self.hour, 'hour')
+        alice = next(a for a in doc['accounts'] if a['email'] == 'alice@example.com')
+        self.assertEqual(alice['projection']['kind'], 'weekly_all')
+        self.assertNotIn('_switch_on_scoped', alice)
+
+    def test_reset_sweep_is_cached_throttled_and_never_persists_tokens(self):
+        record = {'claudeAiOauth': login('sweep'), 'oauthAccount': profile('alice')}
+        token = record['claudeAiOauth']['accessToken']
+        with accounts.Hub(self.hub_paths) as hub:
+            hub.pool_put(record)
+        payload = {'cedar_ember': {'grants': [
+            {'type':'launch-2026-fable', 'resets_left':2, 'ends_at':self.now+86400, 'usable_now':True},
+            {'type':'full-reset-weekly', 'resets_left':1, 'ends_at':self.now+2*86400, 'usable_now':False},
+            {'type':'other', 'resets_left':5, 'usable_now':True, 'id':'SECRET-GRANT-ID'}]}}
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(payload).encode()
+        with mock.patch.object(accounts.urllib.request, 'urlopen', return_value=response) as network:
+            self.assertEqual(accounts.refresh_reset_grants(self.hub_paths), 1)
+            req = network.call_args.args[0]
+            self.assertEqual(req.full_url, accounts.RESET_URL)
+            self.assertEqual(req.get_header('User-agent'), accounts.RESET_CLI_UA)
+            self.assertEqual(network.call_args.kwargs['timeout'], 1.0)
+            self.assertEqual(accounts.refresh_reset_grants(self.hub_paths), 0)
+            self.assertEqual(network.call_count, 1)
+        with accounts.Hub(self.hub_paths, read_only=True) as hub:
+            cache = accounts.load_json(hub.dir / 'reset-grants.json')
+        text = json.dumps(cache)
+        self.assertNotIn(token, text)
+        self.assertNotIn('SECRET-GRANT-ID', text)
+        entry = cache['alice-uuid-0000']
+        self.assertEqual([(r['type'],r['count']) for r in entry['resets']],
+                         [('claude_fable',2),('claude_full',0)])
+        with mock.patch.object(accounts.urllib.request, 'urlopen',
+                               side_effect=accounts.urllib.error.URLError('secret should not be logged')):
+            self.assertEqual(accounts.refresh_reset_grants(self.hub_paths, force=True), 1)
+        out = io.StringIO()
+        self.assertEqual(accounts.main(['hub','resets','--json'], paths=self.hub_paths, out=out), 0)
+        self.assertNotIn(token, out.getvalue())
+        self.assertNotIn('secret should not be logged', out.getvalue())
+        shown = json.loads(out.getvalue())['accounts'][0]
+        self.assertEqual(shown['error'], 'URLError')
+        self.assertEqual(shown['resets'][0]['count'], 2)  # retain last good value
+        with mock.patch.object(accounts.urllib.request, 'urlopen', return_value=response) as network:
+            out = io.StringIO()
+            self.assertEqual(accounts.main(['hub','resets','--refresh','--json'], paths=self.hub_paths, out=out), 0)
+            self.assertEqual(network.call_count, 1)  # explicit refresh bypasses the six-hour sweep interval
+        self.assertIsNone(json.loads(out.getvalue())['accounts'][0]['error'])
+
+    def test_reset_sweep_skips_expired_tokens(self):
+        record = {'claudeAiOauth': login('expired'), 'oauthAccount': profile('alice')}
+        record['claudeAiOauth']['expiresAt'] = (self.now-1)*1000
+        with accounts.Hub(self.hub_paths) as hub:
+            hub.pool_put(record)
+        with mock.patch.object(accounts.urllib.request, 'urlopen') as network:
+            self.assertEqual(accounts.refresh_reset_grants(self.hub_paths, force=True), 0)
+            network.assert_not_called()
+
+    def test_reset_sweep_does_not_wait_indefinitely_for_hub_lock(self):
+        with accounts.Hub(self.hub_paths) as hub:
+            hub.pool_put({'claudeAiOauth': login('locked'), 'oauthAccount': profile('alice')})
+            with mock.patch.object(accounts.urllib.request, 'urlopen') as network:
+                self.assertEqual(accounts.refresh_reset_grants(self.hub_paths), 0)
+                network.assert_not_called()
+
+    def test_checkin_schedules_sweep_only_after_unlock_and_swallows_failure(self):
+        export = json.loads(json.dumps(self.export))
+        called = []
+
+        def schedule(paths):
+            with (paths.store / 'hub' / 'lock').open('r+') as lock:
+                accounts.fcntl.flock(lock, accounts.fcntl.LOCK_EX | accounts.fcntl.LOCK_NB)
+                called.append(True)
+            raise RuntimeError('worker launch failure')
+
+        with mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(export))), \
+             mock.patch.object(accounts, 'launch_reset_sweep', side_effect=schedule):
+            out = io.StringIO()
+            self.assertEqual(accounts.main(['hub','checkin','cm-sessions'], paths=self.hub_paths, out=out), 0)
+        self.assertEqual(called, [True])
+        self.assertEqual(json.loads(out.getvalue())['version'], accounts.HUB_VERSION)
+
+    def test_reset_worker_is_detached_and_contains_no_credentials_in_argv(self):
+        record = {'claudeAiOauth': login('background'), 'oauthAccount': profile('alice')}
+        with accounts.Hub(self.hub_paths) as hub:
+            hub.pool_put(record)
+        with mock.patch.object(accounts.subprocess, 'Popen') as spawn:
+            _original_launch_reset_sweep(self.hub_paths)
+        argv = spawn.call_args.args[0]
+        self.assertEqual(argv[-4:], ['hub','resets','--refresh','--due-only'])
+        self.assertNotIn(record['claudeAiOauth']['accessToken'], ' '.join(argv))
+        self.assertTrue(spawn.call_args.kwargs['start_new_session'])
+        self.assertEqual(spawn.call_args.kwargs['stderr'], accounts.subprocess.DEVNULL)
 
 
 if __name__ == "__main__":

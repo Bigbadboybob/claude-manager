@@ -125,3 +125,36 @@ Hub side:
   The usage command copies account information under the hub lock, then reads
   SQLite in read-only mode after releasing it. A missing database yields empty
   history and token lists without creating one.
+
+## Usage panel v2 data
+
+The additive schema-1 fields and calculations are specified in
+[usage-panel-v2.md](usage-panel-v2.md). Claude `switch_at` reflects the actual
+hub threshold policy and account override; an unconfigured hub still uses the
+switcher's existing 80% session / 90% weekly defaults. Codex uses 100% until a
+Codex-specific policy exists. Unknown weekly readings contribute no calculated
+room or burn. The binding weekly limit is the one with the highest used-to-
+switch-threshold ratio among limits that participate in switching; scoped
+Claude limits are excluded when the hub disables scoped switching. Projections use the first and last readings within the
+last six hours and the current reset window, allowing one hour of reset-time
+jitter. Negative slopes are clamped to zero; refills use the last known used
+percentage and the outlook assumes a constant observed burn for seven days.
+
+Claude reset grants are cached in `hub/reset-grants.json`. Check-ins launch a
+separate bounded worker after releasing the hub lock; the worker reads at most
+two due pool accounts, each with a one-second network timeout, and never renews
+logins. It skips access tokens that expire within one minute, matching the
+claim helper's conservative expiry check. Automatic attempts are at least six
+hours apart per account; explicit
+`hub resets --refresh` or a post-claim refresh bypasses that interval. Manual
+refresh is bounded to eight seconds and can be repeated. Errors are recorded by
+type while the last successful values and their `as_of` time remain visible.
+Unavailable grants report zero usable credits. The read-only request uses the
+CLI's `claude-cli/2.1.326 (external, cli)` User-Agent.
+
+Hosts read reset credits only from the configured local loopback endpoint
+`codex_lb_api` (default `http://127.0.0.1:2455/api/accounts`; set `off` to
+disable). Only account ID, available count and nearest expiry are copied;
+authentication objects are discarded. A patch for the separately installed
+claim helper is provided as [claim-reset-refresh.patch](claim-reset-refresh.patch);
+apply it to that helper only as part of the authorized deployment.

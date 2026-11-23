@@ -1,0 +1,14 @@
+--- a/claim-reset.py
++++ b/claim-reset.py
+@@ -108,6 +108,11 @@
+     print(f"claim result: {res.get('result')} reason={res.get('reason')} resets_left={res.get('resets_left')} "
+           f"cleared={res.get('cleared')} weekly_resets_at={res.get('weekly_resets_at')}")
+     time.sleep(3)
++    try:
++        if not cca.refresh_reset_grants(cca.Paths.default(), force=True, account_uuid=uuid, limit=1):
++            print("warning: reset-grant cache refresh unavailable", file=sys.stderr)
++    except Exception:
++        print("warning: reset-grant cache refresh unavailable", file=sys.stderr)
+     after_usage = cca.fetch_usage(token)
+     limits = cca.parse_limits(after_usage)
+     del token

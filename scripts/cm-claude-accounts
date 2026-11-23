@@ -30,7 +30,9 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 
 
 LOCK_WAIT_SECONDS = 10.0
@@ -262,7 +264,7 @@ def usage_codex(paths, state):
         accounts = [dict(r) for r in db.execute('SELECT id,email,alias,status,plan_type FROM accounts LIMIT 501')]
         if len(accounts) > 500:
             raise ValueError('too many accounts for a bounded check-in')
-        limits = [dict(r) for r in db.execute('''SELECT h.account_id,h.window,h.used_percent,h.reset_at,h.recorded_at
+        limits = [dict(r) for r in db.execute('''SELECT h.account_id,h.window,h.used_percent,h.reset_at,h.recorded_at,h.window_minutes
           FROM usage_history h WHERE h.id=(SELECT h2.id FROM usage_history h2
           WHERE h2.account_id=h.account_id AND h2.window=h.window ORDER BY h2.recorded_at DESC,h2.id DESC LIMIT 1)
           LIMIT 1001''')]
@@ -301,6 +303,34 @@ def usage_codex(paths, state):
         db.close()
 
 
+def usage_codex_credits(state):
+    """Read only the three public credit fields from the local LB response."""
+    url = (state.get('config') or {}).get('codex_lb_api', 'http://127.0.0.1:2455/api/accounts')
+    if url in ('off', 'none', '', None):
+        return None
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != 'http' or parsed.hostname not in ('127.0.0.1', 'localhost', '::1') or parsed.username:
+        return None
+    with urllib.request.urlopen(url, timeout=1) as response:
+        raw = response.read(2 * 1024 * 1024 + 1)
+    if len(raw) > 2 * 1024 * 1024:
+        return None
+    data = json.loads(raw)
+    items = data.get('accounts') if isinstance(data, dict) else data
+    if not isinstance(items, list) or len(items) > 500:
+        return None
+    out = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        account, count = item.get('accountId'), item.get('availableResetCredits')
+        if not isinstance(account, str) or not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            continue
+        out.append({'accountId': account, 'availableResetCredits': count,
+                    'resetCreditNearestExpiresAt': usage_epoch(item.get('resetCreditNearestExpiresAt'))})
+    return out
+
+
 def usage_collect(paths, state, export):
     if not usage_enabled(state):
         return
@@ -309,6 +339,13 @@ def usage_collect(paths, state, export):
         payload['codex'] = usage_codex(paths, state)
     except (OSError, sqlite3.Error, ValueError, TypeError):
         pass
+    if 'codex' in payload:
+        try:
+            credits = usage_codex_credits(state)
+            if credits is not None:
+                payload['codex']['reset_credits'] = credits
+        except (OSError, ValueError, TypeError, urllib.error.URLError):
+            pass
     try:
         payload['claude_tokens'] = usage_scan(paths, state, export['accounts'])
     except (OSError, sqlite3.Error, ValueError, TypeError):
@@ -497,42 +534,139 @@ def usage_epoch(value):
     return int(parsed) if parsed is not None else None
 
 
+def usage_window_minutes(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
 def usage_snapshot_accounts(hub, now):
     view = hub_status_view(hub, now)
+    reset_cache = load_json(hub.dir / 'reset-grants.json')
     accounts = []
-    for info in view['accounts'].values():
+    for uuid, info in view['accounts'].items():
         reading = info.get('reading') or {}
+        config = hub_account_config(hub.desired['policy'], uuid, {uuid: info['email']})
+        limits = []
+        for limit in reading.get('limits') or []:
+            kind = usage_kind(limit)
+            window = 300 if kind == 'five_hour' else 10080 if kind.startswith('weekly') else None
+            limits.append(dict(kind=kind, percent=limit.get('percent'),
+                resets_at=usage_epoch(limit.get('resets_at')), read_at=usage_epoch(reading.get('at')),
+                window_minutes=window, switch_at=float(threshold_for(limit, config))))
+        cached = reset_cache.get(uuid) or {}
         accounts.append(dict(engine='claude', email=info['email'], alias=None, status=None,
             pool_host=None, active_on=info['active_on'], reserved_for=info['reserved_for'], room=info['room'],
-            limits=[dict(kind=usage_kind(l), percent=l.get('percent'), resets_at=usage_epoch(l.get('resets_at')),
-                         read_at=usage_epoch(reading.get('at'))) for l in reading.get('limits') or []]))
+            reservation_note=info.get('reservation_note'), limits=limits,
+            resets=cached.get('resets') if isinstance(cached.get('resets'), list) else None,
+            projection=None, _switch_on_scoped=config.get('switch_on_scoped', True)))
     for host, report in hub.reports().items():
         codex = (((report.get('export') or {}).get('usage') or {}).get('codex') or {})
+        credits = {r.get('accountId'): r for r in codex.get('reset_credits') or [] if isinstance(r, dict)}
         for a in codex.get('accounts') or []:
             limits = [dict(kind=r.get('window'), percent=r.get('used_percent'),
-                           resets_at=usage_epoch(r.get('reset_at')), read_at=usage_epoch(r.get('recorded_at')))
+                           resets_at=usage_epoch(r.get('reset_at')), read_at=usage_epoch(r.get('recorded_at')),
+                           window_minutes=usage_window_minutes(r.get('window_minutes')), switch_at=100.0)
                       for r in codex.get('limits') or [] if r.get('account_id') == a.get('id')]
+            credit = credits.get(a.get('id'))
+            resets = ([dict(type='codex', count=credit['availableResetCredits'],
+                            expires_at=usage_epoch(credit.get('resetCreditNearestExpiresAt')),
+                            as_of=usage_epoch(report.get('at')))] if credit else None)
             accounts.append(dict(engine='codex', email=a.get('email'), alias=a.get('alias'),
-                status=a.get('status'), pool_host=host, active_on=[], reserved_for=None, room=None, limits=limits))
+                status=a.get('status'), pool_host=host, active_on=[], reserved_for=None, room=None,
+                plan_type=a.get('plan_type'), limits=limits, resets=resets, projection=None))
     return accounts
+
+
+def usage_weekly_limit(account):
+    limits = [l for l in account.get('limits') or [] if l.get('window_minutes') == 10080
+              and isinstance(l.get('percent'), (int, float))
+              and isinstance(l.get('switch_at'), (int, float)) and l['switch_at'] > 0
+              and (account.get('engine') != 'claude' or account.get('_switch_on_scoped', True)
+                   or l.get('kind') == 'weekly_all')]
+    return max(limits, key=lambda l: l['percent'] / l['switch_at'], default=None)
+
+
+def usage_enrich(accounts, db, now):
+    outlook = []
+    for account in accounts:
+        weekly = usage_weekly_limit(account)
+        account['projection'] = None
+        if not weekly or db is None or not account.get('email'):
+            continue
+        reset = weekly.get('resets_at')
+        if not isinstance(reset, (int, float)) or reset <= now:
+            continue
+        start = max(now - 6 * 3600, reset - 10080 * 60)
+        points = db.execute('SELECT at,percent FROM limit_readings WHERE engine=? AND account=? '
+            'AND limit_kind=? AND at>=? AND at<=? AND resets_at BETWEEN ? AND ? ORDER BY at',
+            (account['engine'], account['email'], weekly['kind'], start, now, reset-3600, reset+3600)).fetchall()
+        if len(points) < 2 or points[-1][0] - points[0][0] < 1800:
+            continue
+        hours = (points[-1][0] - points[0][0]) / 3600
+        rate = max(0.0, (points[-1][1] - points[0][1]) / hours)
+        at_switch = None
+        if rate > 1e-9:
+            crossing = now + max(weekly['switch_at'] - weekly['percent'], 0) / rate * 3600
+            if crossing < reset:
+                at_switch = int(crossing)
+        account['projection'] = dict(kind=weekly['kind'], rate_per_hour=rate, basis_hours=hours,
+            at_switch=at_switch, at_reset_percent=min(100.0, max(0.0, weekly['percent'] + rate * (reset-now)/3600)))
+    for engine in ('claude', 'codex'):
+        rows = [a for a in accounts if a['engine'] == engine]
+        room_weeks, burn, with_room, refills = 0.0, 0.0, 0, []
+        for account in rows:
+            weekly = usage_weekly_limit(account)
+            if not weekly:
+                continue
+            available = account.get('room') is True if engine == 'claude' else account.get('status') == 'active'
+            available = available and weekly['percent'] < weekly['switch_at']
+            if available:
+                with_room += 1
+                room_weeks += max(weekly['switch_at'] - weekly['percent'], 0) / 100
+            projection = account.get('projection')
+            active = bool(account.get('active_on')) if engine == 'claude' else account.get('status') == 'active'
+            if active and projection:
+                burn += projection['rate_per_hour'] / 100
+            reset = weekly.get('resets_at')
+            if isinstance(reset, (int, float)) and now < reset <= now + 7 * 86400:
+                refills.append(dict(at=int(reset), email=account.get('email'), frees=max(weekly['percent'], 0)/100))
+        refills.sort(key=lambda r: (r['at'], r['email'] or ''))
+        dry, remaining, at = None, room_weeks, now
+        if burn > 0:
+            for refill in refills + [dict(at=now + 7 * 86400, frees=0)]:
+                crossing = at + remaining / burn * 3600
+                if crossing < refill['at']:
+                    dry = int(crossing)
+                    break
+                remaining = max(0.0, remaining - burn * (refill['at'] - at) / 3600) + refill['frees']
+                at = refill['at']
+        outlook.append(dict(engine=engine, accounts=len(rows), accounts_with_room=with_room,
+                            room_weeks=room_weeks, burn_per_hour=burn, dry_at=dry, refills=refills))
+    return outlook
 
 
 def usage_snapshot(hub, now, since, granularity, account_snapshot=None):
     accounts = account_snapshot if account_snapshot is not None else usage_snapshot_accounts(hub, now)
     path = hub.dir / 'usage.db'
-    empty = dict(schema=1, generated_at=int(now), since=since, granularity=granularity,
-                 accounts=accounts, limit_history=[], tokens=dict(totals=[], series=[]))
+    def empty_snapshot():
+        outlook = usage_enrich(accounts, None, now)
+        for account in accounts:
+            account.pop('_switch_on_scoped', None)
+        return dict(schema=1, generated_at=int(now), since=since, granularity=granularity,
+                    accounts=accounts, limit_history=[], tokens=dict(totals=[], series=[]), outlook=outlook)
     if not path.exists():
-        return empty
+        return empty_snapshot()
     try:
         db = sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True, timeout=2.0)
     except sqlite3.OperationalError:
         if not path.exists():  # It disappeared between the existence check and open.
-            return empty
+            return empty_snapshot()
         raise
     db.row_factory = sqlite3.Row
     try:
         db.execute('BEGIN')  # Keep totals and series on the same read snapshot.
+        outlook = usage_enrich(accounts, db, now)
+        for account in accounts:
+            account.pop('_switch_on_scoped', None)
         history = {}
         for r in db.execute('SELECT engine,account,limit_kind,at,percent FROM limit_readings WHERE at>=? '
                             'ORDER BY at', (since,)):
@@ -569,9 +703,143 @@ def usage_snapshot(hub, now, since, granularity, account_snapshot=None):
             series.append(dict(bucket=r['b'], engine=r['engine'], host=r['host'], account=r['display_account'] or None,
                                email=r['display_account'] or None, **{k:r[k] for k in fields}))
         return dict(schema=1, generated_at=int(now), since=since, granularity=granularity,
-                    accounts=accounts, limit_history=limit_history, tokens=dict(totals=totals, series=series))
+                    accounts=accounts, limit_history=limit_history, tokens=dict(totals=totals, series=series), outlook=outlook)
     finally:
         db.close()
+
+
+
+# --- reset credit cache ------------------------------------------------------
+
+RESET_SWEEP_INTERVAL = 6 * 3600
+RESET_REQUEST_TIMEOUT = 1.0
+RESET_CLI_UA = 'claude-cli/2.1.326 (external, cli)'
+RESET_URL = 'https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1'
+
+
+def reset_grants_parse(usage, now):
+    """Return only public grant counts and expiry; never persist grant IDs."""
+    cedar = usage.get('cedar_ember') if isinstance(usage, dict) else None
+    if not isinstance(cedar, dict) or not isinstance(cedar.get('grants'), list):
+        raise ValueError('missing grant list')
+    result = []
+    for grant in cedar['grants']:
+        if not isinstance(grant, dict):
+            continue
+        kind = grant.get('type')
+        if not isinstance(kind, str):
+            continue
+        kind = kind.lower()
+        if kind.startswith('launch-') and 'fable' in kind:
+            name = 'claude_fable'
+        elif kind.startswith('full-reset-'):
+            name = 'claude_full'
+        else:
+            continue
+        count = grant.get('resets_left')
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            continue
+        result.append(dict(type=name, count=count if grant.get('usable_now') is True else 0,
+                           expires_at=usage_epoch(grant.get('ends_at')), as_of=int(now)))
+    return result
+
+
+def _refresh_reset_grants(paths, force=False, account_uuid=None, limit=2, budget=5.0):
+    """Read pool grants outside the hub lock. Failures retain the last result."""
+    start = time.monotonic()
+    jobs = []
+    with Hub(paths, lock_timeout=0.25) as hub:
+        cache = load_json(hub.dir / 'reset-grants.json')
+        now = time.time()
+        for account, record in sorted(hub.pool().items()):
+            if account_uuid is not None and account != account_uuid:
+                continue
+            oauth = record.get('claudeAiOauth') or {}
+            expires, token = oauth.get('expiresAt'), oauth.get('accessToken')
+            if not isinstance(expires, (int, float)) or expires / 1000 <= now + 60 or not isinstance(token, str) or not token:
+                continue
+            entry = cache.get(account) or {}
+            previous_attempt = entry.get('attempted_at', 0)
+            if not isinstance(previous_attempt, (int, float)):
+                previous_attempt = 0
+            if not force and now - previous_attempt < RESET_SWEEP_INTERVAL:
+                continue
+            previous_error = entry.get('error')
+            attempt = uuid.uuid4().hex
+            entry.update(error='pending', email=record['oauthAccount'].get('emailAddress'), attempted_at=int(now), attempt=attempt)
+            cache[account] = entry
+            jobs.append((account, token, attempt, previous_attempt, previous_error))
+            if len(jobs) >= limit:
+                break
+        if jobs:
+            atomic_write(hub.dir / 'reset-grants.json', cache)
+    processed = set()
+    for account, token, attempt, previous_attempt, previous_error in jobs:
+        if time.monotonic() - start >= budget:
+            break
+        processed.add(account)
+        try:
+            req = urllib.request.Request(RESET_URL, headers={'Authorization': 'Bearer ' + token,
+                'Content-Type': 'application/json', 'User-Agent': RESET_CLI_UA,
+                'anthropic-beta': 'oauth-2025-04-20'})
+            with urllib.request.urlopen(req, timeout=RESET_REQUEST_TIMEOUT) as response:
+                raw = response.read(1024 * 1024 + 1)
+            if len(raw) > 1024 * 1024:
+                raise ValueError('response too large')
+            grants = reset_grants_parse(json.loads(raw), time.time())
+            error = None
+        except Exception as exc:
+            grants, error = None, type(exc).__name__
+        with Hub(paths, lock_timeout=0.25) as hub:
+            cache = load_json(hub.dir / 'reset-grants.json')
+            entry = cache.get(account) or {}
+            if entry.get('attempt') != attempt:
+                continue  # A newer refresh wins, e.g. a claim completed meanwhile.
+            entry.pop('attempt', None)
+            if grants is not None:
+                entry.update(resets=grants, as_of=int(time.time()))
+                entry.pop('error', None)
+            else:
+                entry['error'] = error
+            cache[account] = entry
+            atomic_write(hub.dir / 'reset-grants.json', cache)
+    remaining = [(account, attempt, previous, error) for account, _, attempt, previous, error in jobs if account not in processed]
+    if remaining:
+        with Hub(paths, lock_timeout=0.25) as hub:
+            cache = load_json(hub.dir / 'reset-grants.json')
+            for account, attempt, previous, error in remaining:
+                entry = cache.get(account) or {}
+                if entry.get('attempt') == attempt:
+                    entry.pop('attempt', None)
+                    entry['attempted_at'] = previous
+                    if error is None:
+                        entry.pop('error', None)
+                    else:
+                        entry['error'] = error
+            atomic_write(hub.dir / 'reset-grants.json', cache)
+    return len(jobs)
+
+
+def refresh_reset_grants(paths, force=False, account_uuid=None, limit=2, budget=5.0):
+    try:
+        return _refresh_reset_grants(paths, force, account_uuid, limit, budget)
+    except (OSError, ValueError, TypeError, KeyError):
+        return 0  # A busy or unavailable hub never interferes with switching.
+
+
+def launch_reset_sweep(paths):
+    """Detach a bounded worker; check-ins never wait for a network request."""
+    try:
+        directory = paths.store / 'hub' / 'pool'
+        if not directory.is_dir() or not any(directory.glob('*.json')):
+            return
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), 'hub', 'resets',
+                          '--refresh', '--due-only'], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         close_fds=True, start_new_session=True)
+    except (OSError, ValueError):
+        pass
+
 
 
 # --- files -----------------------------------------------------------------
@@ -1527,6 +1795,10 @@ def hub_exchange(paths: Paths, state: dict, out) -> dict | None:
         if hub == "local":
             with Hub(paths) as h:
                 reply = hub_checkin(h, export)
+            try:
+                launch_reset_sweep(paths)
+            except Exception:
+                pass  # Scheduling must never interfere with switching.
         else:
             reply = remote_checkin(hub, export)
     except AccountError as exc:
@@ -1656,10 +1928,11 @@ def apply_assignment(paths: Paths, state: dict, accounts: dict[str, dict], reply
 class Hub:
     """The hub's files, under its own lock. Never held across a network call."""
 
-    def __init__(self, paths: Paths, read_only: bool = False):
+    def __init__(self, paths: Paths, read_only: bool = False, lock_timeout: float | None = None):
         self.paths = paths
         self.dir = paths.store / "hub"
         self.read_only = read_only
+        self.lock_timeout = lock_timeout
 
     def __enter__(self) -> "Hub":
         self.lock = None
@@ -1676,7 +1949,20 @@ class Hub:
             os.chmod(self.dir, 0o700)
             fd = os.open(self.dir / "lock", os.O_CREAT | os.O_RDWR, 0o600)
             self.lock = os.fdopen(fd)
-            fcntl.flock(self.lock, fcntl.LOCK_EX)
+            if self.lock_timeout is None:
+                fcntl.flock(self.lock, fcntl.LOCK_EX)
+            else:
+                deadline = time.monotonic() + self.lock_timeout
+                while True:
+                    try:
+                        fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            self.lock.close()
+                            self.lock = None
+                            raise TimeoutError('hub lock busy') from None
+                        time.sleep(0.02)
         self.desired = load_json(self.dir / "desired.json")
         self.desired.setdefault("revision", 0)
         for key in ("hosts", "reservations"):
@@ -1867,7 +2153,7 @@ def hub_checkin(hub: Hub, export: dict) -> dict:
     usage = report_export.pop('usage', None)
     if isinstance(usage, dict) and isinstance(usage.get('codex'), dict):
         codex = usage['codex']
-        report_export['usage'] = {'codex': {k: codex[k] for k in ('accounts', 'limits') if k in codex}}
+        report_export['usage'] = {'codex': {k: codex[k] for k in ('accounts', 'limits', 'reset_credits') if k in codex}}
     report = {"at": now, "export": report_export,
               "events_seen": sorted({e.get("id") for e in export.get("events") or []
                                      if isinstance(e, dict) and isinstance(e.get("id"), int)})}
@@ -2800,6 +3086,27 @@ def cmd_hub(paths: Paths, args, out) -> int:
         json.dump(reply, out)
         out.write("\n")
         forward_alerts(paths, export, reply)
+        try:
+            launch_reset_sweep(paths)
+        except Exception:
+            pass  # Scheduling must never interfere with check-ins.
+        return 0
+    if args.hub_command == "resets":
+        if args.refresh:
+            refresh_reset_grants(paths, force=not args.due_only, limit=2 if args.due_only else 100,
+                                 budget=5.0 if args.due_only else 8.0)
+        with Hub(paths, read_only=True) as hub:
+            cache = load_json(hub.dir / 'reset-grants.json')
+        entries = [dict(email=v.get('email'), resets=v.get('resets'), as_of=v.get('as_of'),
+                        attempted_at=v.get('attempted_at'), error=v.get('error'))
+                   for _, v in sorted(cache.items()) if isinstance(v, dict)]
+        if args.json:
+            json.dump(dict(generated_at=int(now), accounts=entries), out)
+            out.write("\n")
+        else:
+            for entry in entries:
+                print(f"{entry['email'] or '?'}: {json.dumps(entry['resets'])} "
+                      f"as_of={entry['as_of']} error={entry['error'] or 'none'}", file=out)
         return 0
     if args.hub_command == "usage":
         since = args.since if args.since is not None else int(now) - 7 * 86400
@@ -3385,6 +3692,7 @@ CONFIG_KEYS = {
     "usage_interval_minutes": (lambda v: int(v) if v.isdigit() else None, "9"),
     "usage_collect": (lambda v: {"true": True, "false": False}.get(v), "true (off on laptop)"),
     "codex_lb_store": (lambda v: v or None, "~/.local/share/cm-codex-lb/data/store.db"),
+    "codex_lb_api": (lambda v: v or None, "http://127.0.0.1:2455/api/accounts (off disables)"),
     "peers": (lambda v: [h for h in v.split(",") if h] if all(
         PEER_NAME.match(h) for h in v.split(",") if h) else None, "none"),
 }
@@ -3788,6 +4096,10 @@ def main(argv: list[str] | None = None, paths: Paths | None = None, out=None) ->
     p.add_argument("--json", action="store_true", required=True)
     p.add_argument("--since", type=int)
     p.add_argument("--granularity", choices=("hour", "day"), default="hour")
+    p = hsub.add_parser("resets", help="show or refresh the pool's cached reset credits")
+    p.add_argument("--refresh", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--due-only", action="store_true", help=argparse.SUPPRESS)
     p = hsub.add_parser("usage-reset-codex", help="request one host's Codex history again")
     p.add_argument("host")
     p = hsub.add_parser("assign", help="choose a host's account; ACCOUNT 'none' clears it")
