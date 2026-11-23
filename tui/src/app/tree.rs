@@ -1936,6 +1936,81 @@ mod tree_tests {
     }
 
     #[test]
+    fn member_main_row_opens_its_checkout_settings_without_an_extra_row() {
+        use super::super::org_model::fixtures::{member, owner, snapshot, team};
+        use cm_daemon::host_id::HostId;
+        let mut app = test_app();
+        let _home = crate::test_support::home_lock();
+        app.sessions_restored = true;
+        app.sidebar_view = SidebarView::Task;
+        app.workspaces = ["home", "other"].into_iter().map(bare_ws).collect();
+        session(&mut app, 0, "lead", "lead", "codex");
+        session(&mut app, 1, "other", "other", "codex");
+        for ws in &mut app.workspaces { ws.sessions[0].host_id = HostId::new("h1"); }
+        app.sections.push(SidebarSection { id: "a".into(), name: "A".into(), ..Default::default() });
+        let mut ct = team("ct", "Continuous", None, Some("lead"), &[]);
+        ct["continuous"] = serde_json::json!({"lead_member_id":"lead", "health":"ok"});
+        let mut value = snapshot(1, vec![owner(), member("lead", "Lead", Some("mem-owner"), None, Some("lead")),
+            member("other", "Other", Some("mem-owner"), None, Some("other"))], vec![ct]);
+        value["host_daemons"] = serde_json::json!({"h1":"d1"});
+        app.org.accept(value);
+        let tree = app.task_tree();
+        assert_eq!(tree.items.iter().filter(|row| **row == VisualItem::ContinuousTeamSession(0, 0)).count(), 1);
+        assert!(!tree.items.contains(&VisualItem::WorkspaceHeader(0)));
+
+        app.cursor = Cursor::Session(0, 0);
+        let key = |code, mods| Event::Key(KeyEvent::new(code, mods));
+        assert!(app.handle_event(&key(KeyCode::Char('e'), KeyModifiers::ALT)));
+        assert!(matches!(app.input_mode, InputMode::SessionSettings { .. }), "A-e still edits the session");
+        app.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.handle_event(&key(KeyCode::Char('e'), KeyModifiers::ALT | KeyModifiers::CONTROL)));
+        assert!(matches!(&app.input_mode, InputMode::WorkspaceSettings { workspace_id, .. } if workspace_id == "home"));
+        // Rename, pick a color, pin, and set the checkout override through
+        // the same user-facing form reached from the member row.
+        app.handle_event(&key(KeyCode::Char('!'), KeyModifiers::NONE));
+        app.handle_event(&key(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_event(&key(KeyCode::Right, KeyModifiers::NONE));
+        app.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE));
+        let selected = match &app.input_mode {
+            InputMode::WorkspaceSettings { color: Some(color), .. } => color.clone(),
+            _ => panic!("color was not selected"),
+        };
+        app.handle_event(&key(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_event(&key(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.handle_event(&key(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_event(&key(KeyCode::Right, KeyModifiers::NONE));
+        app.handle_event(&key(KeyCode::Right, KeyModifiers::NONE));
+        app.workspaces.swap(0, 1); // the form uses the stable workspace id
+        app.handle_event(&key(KeyCode::Enter, KeyModifiers::NONE));
+        let home = app.workspaces.iter().find(|ws| ws.id == "home").unwrap();
+        assert_eq!(home.name, "home!");
+        assert_eq!(home.color.as_deref(), Some(selected.as_str()));
+        assert!(home.pinned);
+        assert_eq!(app.workspace_sections.get("home").map(String::as_str), Some("a"));
+        let saved = App::load_manifest();
+        assert_eq!(saved.workspace_sections.get("home").map(String::as_str), Some("a"));
+        assert!(app.member_section_migration_issues.iter().any(|(ws, _, _)| ws == "home"));
+
+        app.keybinding_helper_visible = true;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 50)).unwrap();
+        terminal.draw(|frame| app.draw_session_list(frame, frame.area())).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = (0..buffer.area.height).map(|y|
+            (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>().join("\n");
+        assert!(text.contains("C-A-e workspace"), "{text}");
+        app.cursor = Cursor::Session(1, 0);
+        app.control_bound = true;
+        app.status_msg = None;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 20)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let status: String = (0..buffer.area.width).map(|x| buffer[(x, buffer.area.height - 1)].symbol()).collect();
+        assert!(status.contains("C-A-e workspace"), "{status}");
+    }
+
+    #[test]
     fn continuous_box_with_unreachable_lead_does_not_duplicate_reports_across_sections() {
         use super::super::org_model::fixtures::{member, owner, snapshot, team};
         use cm_daemon::host_id::HostId;

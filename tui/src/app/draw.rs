@@ -1901,7 +1901,7 @@ impl App {
         let help_entries: Vec<(&str, &str)> = if self.keybinding_helper_visible { vec![
             ("A-/    filter", "A-?  helper"),
             ("A-j/k  nav", "A-D  done"),
-            ("A-Space fold", ""),
+            ("A-Space fold", "C-A-e workspace"),
             ("A-h/l  free", "A-x  delete"),
             ("A-a    attach", "A-v  view"),
             ("A-n    new ws", "A-r  refresh"),
@@ -2792,6 +2792,13 @@ impl App {
         } else {
             center
         };
+        let focused_session = self.view_mode == ViewMode::Sessions
+            && matches!(self.cursor, Cursor::Session(wi, si)
+                if self.workspaces.get(wi).and_then(|ws| ws.sessions.get(si)).is_some());
+        let center = if focused_session {
+            if center.is_empty() { "C-A-e workspace".to_string() }
+            else { format!("C-A-e workspace · {center}") }
+        } else { center };
 
         let mouse_off = !self.mouse_capture_enabled;
         let mouse_indicator = if mouse_off { " [mouse off] " } else { "" };
@@ -2892,7 +2899,7 @@ impl App {
         }
 
         let left1 = format!(" {} ", conn_indicator);
-        let left2 = "claude-manager ";
+        let left2 = if focused_session && area.width < 48 { "cm " } else { "claude-manager " };
         // Owner availability (F7), e.g. `● focused 14m`; absent while unset.
         let availability = self.availability.status_span();
         let availability_width = availability.as_ref().map_or(0, |s| s.content.chars().count() as u16);

@@ -3548,6 +3548,18 @@ impl App {
                         self.open_handoff();
                         return true;
                     }
+                    // A member's main row is also its checkout's only visible
+                    // row. Give it a separate action without replacing A-e.
+                    KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if let Cursor::Session(wi, si) = self.cursor {
+                            if self.workspaces.get(wi).and_then(|ws| ws.sessions.get(si)).is_some() {
+                                self.open_workspace_settings(wi);
+                            }
+                        } else {
+                            self.set_status_msg("Checkout settings: focus a session first");
+                        }
+                        return true;
+                    }
                     KeyCode::Char('e') => {
                         self.open_session_settings();
                         return true;
