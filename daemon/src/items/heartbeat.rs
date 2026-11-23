@@ -270,6 +270,15 @@ const CAPS_RETRY: std::time::Duration = std::time::Duration::from_secs(600);
 
 impl Beat {
     pub(crate) fn run(&mut self, state: &Arc<Mutex<DaemonState>>) {
+        // Retry a failed local proposal write even while the API is down.
+        {
+            let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
+            let root = s.messaging_root.clone();
+            let grants = s.launch_grants.clone();
+            if let Err(e) = crate::items::grants::persist(&mut s.launch_grants, &root, grants) {
+                eprintln!("cm items: could not persist launch grants; will retry: {e}");
+            }
+        }
         let Some(snap) = capture(state) else { return };
         let Some(api) = snap.api.clone() else {
             if !self.warned {
@@ -324,7 +333,9 @@ impl Beat {
         if let Some(grants) = crate::items::grants::from_reply(&reply) {
             let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
             let root = s.messaging_root.clone();
-            crate::items::grants::replace(&mut s.launch_grants, &root, grants);
+            if let Err(e) = crate::items::grants::replace(&mut s.launch_grants, &root, grants) {
+                eprintln!("cm items: could not persist launch grants; will retry: {e}");
+            }
         }
         super::org::absorb_reply(&reply, crate::agent_state::unix_now());
         if reply["org"]["members"].is_object() {
@@ -493,6 +504,22 @@ impl Beat {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pending_launch_grant_is_retried_without_an_api() {
+        let _env = crate::test_support::env_lock();
+        let root = tempfile::tempdir().unwrap();
+        let mut st = super::DaemonState::default();
+        st.messaging_root = root.path().into();
+        st.config.api_url = "http://127.0.0.1:1".into();
+        st.config.api_token = "test".into();
+        st.launch_grants.push(crate::items::grants::LaunchGrant {
+            proposal: true, task_id: "task".into(), session_uid: "caller".into(), ..Default::default()
+        });
+        let state = std::sync::Arc::new(std::sync::Mutex::new(st));
+        // No messaging store or planning API is available yet.
+        super::Beat::default().run(&state);
+        assert!(crate::items::grants::find(&crate::items::grants::load(root.path()), "caller", "task").is_some());
+    }
     use super::*;
 
     fn push(extra: Value) -> Value {

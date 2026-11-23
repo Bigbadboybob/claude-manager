@@ -102,6 +102,8 @@ pub struct ClientSessionConfig<'a> {
     /// validation + collision check); a daemon-minted alternative
     /// would silently desync every downstream consumer.
     pub uid: &'a str,
+    /// Live daemon spawner, present for managed launches and their restores.
+    pub managed_by_uid: Option<&'a str>,
     /// Explicit intent to place a fresh operator/TUI agent under Owner.
     /// Restore, resume, workflow, continuous-task and shell callers leave
     /// this false; it is never inferred from argv or transcript metadata.
@@ -910,6 +912,9 @@ pub(crate) fn rpc_start_session_full(
         "cols": config.cols,
         "rows": config.rows,
     });
+    if let Some(uid) = config.managed_by_uid {
+        params["managed_by_uid"] = serde_json::Value::String(uid.to_string());
+    }
     if let Some(wt) = config.worktree_path {
         params["worktree_path"] = serde_json::Value::String(wt.display().to_string());
     }
@@ -2892,6 +2897,7 @@ pub(crate) mod tests {
         rows: u16,
     ) -> ClientSessionConfig<'a> {
         ClientSessionConfig {
+            managed_by_uid: None,
             model: None,
             model_source: None,
             effort: None,
@@ -2979,6 +2985,7 @@ time.sleep(60)
         let argv = vec!["/usr/bin/python3".to_string(), "-c".to_string(), script];
         let uid = test_uid();
         let config = ClientSessionConfig {
+            managed_by_uid: None,
             model: None,
             model_source: None,
             effort: None,
@@ -3113,6 +3120,34 @@ time.sleep(60)
         // Kick the accept loop out of WouldBlock.
         let _ = std::os::unix::net::UnixStream::connect(socket_path);
         let _ = handle.join();
+    }
+
+    #[test]
+    fn managed_operator_launch_preserves_live_spawner_authority() {
+        let (socket, working_dir, state, stop, handle) = start_test_daemon("ws-spawner");
+        let parent = test_uid();
+        let child = test_uid();
+        let argv = vec!["/bin/sleep".to_string(), "60".to_string()];
+        let mut parent_config = bash_config(&socket, &working_dir, "op", &parent,
+            "ws-spawner", "parent", &argv, 80, 24);
+        parent_config.session_type = "codex";
+        parent_config.model = Some("gpt-6.1-terra");
+        parent_config.effort = Some("xhigh");
+        rpc_start_session_full(&parent_config).unwrap();
+        let mut child_config = bash_config(&socket, &working_dir, "op", &child,
+            "ws-spawner", "child", &argv, 80, 24);
+        child_config.session_type = "codex";
+        child_config.model = Some("gpt-6.1-terra");
+        child_config.effort = Some("xhigh");
+        child_config.managed_by_uid = Some(&parent);
+        rpc_start_session_full(&child_config).unwrap();
+        {
+            let mut s = state.lock().unwrap();
+            assert_eq!(s.sessions[&child].managed_by_uid.as_deref(), Some(parent.as_str()));
+            assert!(cm_daemon::control::auth::check_session_caller(&s, &parent, &child).is_allow());
+            for session in s.sessions.values_mut() { let _ = session.kill(); }
+        }
+        stop_test_daemon(&socket, stop, handle);
     }
 
     #[test]
@@ -5302,6 +5337,7 @@ while True:
             let argv = vec!["/bin/bash".to_string()];
             let uid = test_uid();
             let config = ClientSessionConfig {
+                managed_by_uid: None,
                 model: None,
                 model_source: None,
                 effort: None,
@@ -5467,6 +5503,7 @@ while True:
             "/sys/fs/cgroup/user.slice/HOSTILE-CALLER-SUPPLIED.scope",
         );
         let config = ClientSessionConfig {
+            managed_by_uid: None,
             model: None,
             model_source: None,
             effort: None,
@@ -5561,6 +5598,7 @@ while True:
         let argv = vec!["/bin/cat".to_string()];
         let uid_pre = test_uid();
         let config = ClientSessionConfig {
+            managed_by_uid: None,
             model: None,
             model_source: None,
             effort: None,

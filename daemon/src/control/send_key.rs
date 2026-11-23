@@ -252,10 +252,13 @@ mod tests {
         let state = Arc::new(Mutex::new(DaemonState::new()));
         let (a, b) = (dir.path().join("a"), dir.path().join("b"));
         spawn(&state, "ts-10-0", "ws-a", "codex", "sleep 30"); // the caller (taskless: its workspace)
-        recorder(&state, "ts-11-0", "ws-a", "bash", "", &a);
-        recorder(&state, "ts-12-0", "ws-a", "bash", "", &b);
-        spawn(&state, "ts-13-0", "ws-other", "bash", "sleep 30");
-        spawn(&state, "ts-14-0", "ws-a", "bash", "exit 0");
+        recorder(&state, "ts-11-0", "ws-a", "codex", "", &a);
+        recorder(&state, "ts-12-0", "ws-a", "codex", "", &b);
+        spawn(&state, "ts-13-0", "ws-other", "codex", "sleep 30");
+        spawn(&state, "ts-14-0", "ws-a", "codex", "exit 0");
+        for uid in ["ts-11-0", "ts-12-0", "ts-14-0"] {
+            state.lock().unwrap().sessions.get_mut(uid).unwrap().managed_by_uid = Some("ts-10-0".into());
+        }
         let deadline = Instant::now() + Duration::from_secs(5);
         while state.lock().unwrap().sessions.get_mut("ts-14-0").unwrap().try_wait().is_none() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
@@ -284,7 +287,7 @@ mod tests {
         let state = Arc::new(Mutex::new(DaemonState::new()));
         let other = dir.path().join("other");
         spawn(&state, "ts-20-0", "ws-a", "codex", "sleep 30");
-        recorder(&state, "ts-21-0", "ws-b", "bash", "", &other);
+        recorder(&state, "ts-21-0", "ws-b", "codex", "", &other);
         settle(&state, "ts-21-0");
         let reply = send_key(&state, &json!({"session_uids": "ts-21-0", "key": "enter"}), Some("ts-20-0")).unwrap();
         assert_eq!(statuses(&reply), [("ts-21-0".to_owned(), "unauthorized".to_owned())]);
@@ -295,6 +298,14 @@ mod tests {
         let reply = send_key(&state, &json!({"session_uids": "ts-21-0", "key": "enter"}), Some("ts-20-0")).unwrap();
         assert_eq!(reply["sent"], 1);
         assert_eq!(wait_for(&other, 1), b"\r");
+        let shell = dir.path().join("shell");
+        recorder(&state, "ts-22-0", "ws-a", "bash", "", &shell);
+        settle(&state, "ts-22-0");
+        let denied = send_key(&state, &json!({"session_uids": "ts-22-0", "key": "enter"}), Some("ts-20-0")).unwrap();
+        assert_eq!(statuses(&denied), [("ts-22-0".to_owned(), "unauthorized".to_owned())]);
+        let owner = send_key(&state, &json!({"session_uids": "ts-22-0", "key": "enter"}), None).unwrap();
+        assert_eq!(owner["sent"], 1);
+        assert_eq!(wait_for(&shell, 1), b"\r");
         let err = send_key(&state, &json!({"session_uids": "ts-21-0", "key": "enter"}), Some("ts-ghost")).unwrap_err();
         assert_eq!(err.0, ErrorCode::Unauthorized);
         for (params, why) in [

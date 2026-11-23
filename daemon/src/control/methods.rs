@@ -3452,7 +3452,8 @@ pub fn resolve_authorized_session(
         // now name a different task/member/transcript; the old grant cannot
         // authorize that replacement.  If the current task scope itself now
         // allows the target, the ordinary scope is sufficient.
-        if attribution_changed || org_identity.is_none() {
+        if state.config.session_scope != crate::config::SessionScope::TaskTree
+            || attribution_changed || org_identity.is_none() {
             return_auth_error_if_denied_with_state(
                 current_decision,
                 cuid,
@@ -6834,16 +6835,19 @@ pub fn propose_task(
             // edge. Give that live session a durable, launch-only grant.
             if let (Some(cuid), Some(task_id)) = (caller_uid, task.get("id").and_then(Value::as_str)) {
                 let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-                if state.lookup_session_any(cuid).is_some_and(|view| view.task_id.is_none())
-                    && !state.launch_grants.iter().any(|g| g.proposal && g.session_uid == cuid && g.task_id == task_id)
-                {
+                if state.lookup_session_any(cuid).is_some_and(|view| view.task_id.is_none()) {
                     let mut grants = state.launch_grants.clone();
-                    grants.push(crate::items::grants::LaunchGrant {
-                        proposal: true, task_id: task_id.into(), session_uid: cuid.into(),
-                        pid: String::new(), board: None, n: None,
-                    });
+                    if !grants.iter().any(|g| g.proposal && g.session_uid == cuid && g.task_id == task_id) {
+                        grants.push(crate::items::grants::LaunchGrant {
+                            proposal: true, task_id: task_id.into(), session_uid: cuid.into(),
+                            pid: String::new(), board: None, n: None,
+                        });
+                    }
                     let root = state.messaging_root.clone();
-                    crate::items::grants::persist(&mut state.launch_grants, &root, grants);
+                    crate::items::grants::persist(&mut state.launch_grants, &root, grants).map_err(|e| (
+                        ErrorCode::Internal,
+                        format!("task '{task_id}' was created, but its launch grant could not be saved: {e}; the daemon will retry persistence"),
+                    ))?;
                 }
             }
             // A reporting line wins: the overlay edge then mirrors the
@@ -8377,6 +8381,9 @@ mod operator_quiet_tests {
 
     #[test]
     fn s4_existing_input_unit_finishes_enter_with_queued_writer() {
+        // Retirement gates are keyed under HOME. Keep that path stable while
+        // the delivery and writer threads each look up the gate.
+        let _env = crate::test_support::env_lock();
         let _serial = crate::writer_gate::TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let uid = format!("ts-{}-0", uuid::Uuid::new_v4().simple());
         let gate = crate::continuous::retirement::gate(&uid);
@@ -27083,6 +27090,7 @@ while True:
     #[test]
     fn kill_session_auth_allow_signals_target_and_reaper_removes() {
         let state = Arc::new(Mutex::new(DaemonState::new()));
+        state.lock().unwrap().config.session_scope = crate::config::SessionScope::TaskTree;
         insert_session(&state, "ts-caller", "ws-shared");
         insert_session(&state, "ts-victim", "ws-shared");
         let params = json!({ "session_uid": "ts-victim" });
@@ -27104,6 +27112,7 @@ while True:
     #[test]
     fn kill_session_by_agent_records_caller_on_the_exit_tombstone() {
         let state = Arc::new(Mutex::new(DaemonState::new()));
+        state.lock().unwrap().config.session_scope = crate::config::SessionScope::TaskTree;
         insert_session(&state, "ts-killer", "ws-shared");
         insert_session(&state, "ts-target", "ws-shared");
         kill_session(
@@ -27163,6 +27172,7 @@ while True:
     #[test]
     fn kill_session_by_agent_on_exited_target_reports_already_exited() {
         let state = Arc::new(Mutex::new(DaemonState::new()));
+        state.lock().unwrap().config.session_scope = crate::config::SessionScope::TaskTree;
         insert_session(&state, "ts-agent", "ws-shared");
         insert_session(&state, "ts-gone", "ws-shared");
         kill_session(&state, &json!({ "session_uid": "ts-gone" }), Some("ts-agent"))
@@ -27275,6 +27285,7 @@ while True:
     fn concurrent_kill_session_yields_consistent_outcomes() {
         use std::sync::Barrier;
         let state = Arc::new(Mutex::new(DaemonState::new()));
+        state.lock().unwrap().config.session_scope = crate::config::SessionScope::TaskTree;
         insert_session(&state, "ts-caller-a", "ws-shared");
         insert_session(&state, "ts-caller-b", "ws-shared");
         insert_session(&state, "ts-victim", "ws-shared");
@@ -31319,7 +31330,9 @@ while True:
                     &gen1,
                     &json!({
                         "uid": uid,
-                        "session_type": "bash",
+                        "session_type": "codex",
+                        "model": "gpt-6.1-terra",
+                        "effort": "xhigh",
                         "workspace_id": ws,
                         "working_dir": wt.to_str().unwrap(),
                         "worktree_path": wt.to_str().unwrap(),
@@ -31359,7 +31372,9 @@ while True:
             // Generation 2: rebuild from the durable registry alone.
             let gen2 = make_state_arc();
             gen2.lock().unwrap().daemon_sessions_path = Some(path.clone());
+            recovery_test_restore_program(true);
             restore_sessions(&gen2);
+            recovery_test_restore_program(false);
             let st = gen2.lock().unwrap();
             let restored = st
                 .sessions
@@ -40207,6 +40222,9 @@ while True:
             assert!(r.ok, "done subtask: {:?}", r.error);
             let r = scope_call(&state, "ts-orch", "set_subtask_status", json!({"task_id": "sub-grand", "status": "running"}));
             assert!(r.ok, "done grandchild: {:?}", r.error);
+            let manager_scope = scope_call(&state, "ts-orch", "send_key", json!({"session_uids": ["ts-worker"], "key": "escape"}));
+            assert_eq!(manager_scope.result.unwrap()["results"][0]["status"], "unauthorized");
+            state.lock().unwrap().config.session_scope = crate::config::SessionScope::TaskTree;
             let r = scope_call(&state, "ts-orch", "send_key", json!({"session_uids": ["ts-worker", "ts-stranger"], "key": "escape"}));
             let statuses: Vec<String> = r.result.as_ref().unwrap()["results"].as_array().unwrap().iter()
                 .map(|x| x["status"].as_str().unwrap().to_string()).collect();
@@ -42126,7 +42144,7 @@ printf ran > "$MAIN_REPO/setup-ran"
                 let mut s = state.lock().unwrap();
                 s.launch_grants = crate::items::grants::load(root.path());
                 assert!(crate::items::grants::find(&s.launch_grants, "ts-proposer", "task-proposed").is_some());
-                crate::items::grants::replace(&mut s.launch_grants, root.path(), vec![]);
+                crate::items::grants::replace(&mut s.launch_grants, root.path(), vec![]).unwrap();
                 assert!(crate::items::grants::find(&crate::items::grants::load(root.path()), "ts-proposer", "task-proposed").is_some());
             }
             let denied = mcp_start_session(&state, &json!({"type":"bash", "label":"other", "task_id":"unrelated"}), Some("ts-proposer")).unwrap_err();
@@ -42135,6 +42153,40 @@ printf ran > "$MAIN_REPO/setup-ran"
             let child = mcp_start_session(&state, &json!({"type":"bash", "label":"worker", "task_id":"task-proposed", "allow_shared_workspace":true}), Some("ts-proposer")).unwrap();
             assert_eq!(child["task_id"], "task-proposed");
             set_spawn_program_override_for_test(None);
+            kill_all_sessions(&state);
+        });
+    }
+
+    #[test]
+    fn propose_task_reports_grant_persistence_failure_and_retains_retry() {
+        with_temp_home(|| {
+            let state = make_state_arc();
+            seed_mcp_spawn_fixture(&state, "ts-proposer", None);
+            let stub = spawn_routed_stub(|method, path, _| match (method, path) {
+                ("GET", "/projects") => (200, r#"[{"name":"proj","repo_url":"git@x.com:a/b.git"}]"#.into()),
+                ("POST", "/tasks") => (200, r#"{"id":"task-proposed","status":"backlog"}"#.into()),
+                _ => (404, "{}".into()),
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let blocked = dir.path().join("blocked");
+            std::fs::write(&blocked, b"not a directory").unwrap();
+            {
+                let mut s = state.lock().unwrap();
+                s.messaging_root = blocked.clone();
+                s.config.api_url = format!("http://127.0.0.1:{}", stub.port);
+                s.config.api_token = "tok".into();
+            }
+            let err = propose_task(&state, &json!({"project":"proj","name":"work"}), Some("ts-proposer")).unwrap_err();
+            assert_eq!(err.0, ErrorCode::Internal);
+            assert!(err.1.contains("task-proposed") && err.1.contains("created") && err.1.contains("retry"));
+            std::fs::remove_file(&blocked).unwrap();
+            {
+                let mut s = state.lock().unwrap();
+                let retry = s.launch_grants.clone();
+                assert!(crate::items::grants::find(&retry, "ts-proposer", "task-proposed").is_some());
+                crate::items::grants::persist(&mut s.launch_grants, &blocked, retry).unwrap();
+            }
+            assert!(crate::items::grants::find(&crate::items::grants::load(&blocked), "ts-proposer", "task-proposed").is_some());
             kill_all_sessions(&state);
         });
     }

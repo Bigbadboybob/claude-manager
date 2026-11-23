@@ -411,7 +411,7 @@ mod tests {
             let (socket, state, stop, handle) = start_push_test_daemon();
             state.lock().unwrap().tui_sessions.insert(
                 "scout".into(),
-                serde_json::from_value(serde_json::json!({"uid":"scout","workspace_id":"ws"}))
+                serde_json::from_value(serde_json::json!({"uid":"scout","workspace_id":"ws","type":"codex"}))
                     .unwrap(),
             );
             app.push_worker = crate::push_worker::PushWorker::spawn(local_pool_for(&socket));

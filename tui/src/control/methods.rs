@@ -4106,13 +4106,56 @@ mod tests {
             cm_daemon::items::grants::persist(&mut grants, &root, vec![cm_daemon::items::grants::LaunchGrant {
                 proposal: true, task_id: "filed".into(), session_uid: "caller".into(),
                 pid: String::new(), board: None, n: None,
-            }]);
+            }]).unwrap();
             let denied = start_session(app, "caller", &json!({"type":"bash", "label":"other", "task_id":"unrelated", "allow_shared_workspace":true})).unwrap_err();
             assert_eq!(denied.0, ErrorCode::Unauthorized);
             // The grant passes authorization; the isolated test has no daemon
             // to serve the subsequent spawn, so it may fail at that later step.
             let result = start_session(app, "caller", &json!({"type":"bash", "label":"worker", "task_id":"filed", "allow_shared_workspace":true}));
             if let Err(err) = result { assert_ne!(err.0, ErrorCode::Unauthorized, "{err:?}"); }
+        });
+    }
+
+    #[test]
+    fn taskless_grant_launch_records_spawner_at_the_daemon() {
+        with_app_and_repo("tui-grant-spawner", |app, repo| {
+            use std::os::unix::fs::PermissionsExt;
+            let bin = repo.join("fake-bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let codex = bin.join("codex");
+            std::fs::write(&codex, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
+            std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let old_path = std::env::var_os("PATH").unwrap_or_default();
+            unsafe { std::env::set_var("PATH", format!("{}:{}", bin.display(), old_path.to_string_lossy())) };
+            let (socket, _, state, stop, handle) = crate::client_session::tests::start_test_daemon("ws-caller");
+            app.host_pool = std::sync::Arc::new(crate::host_pool::HostPool::from_config(&crate::hosts::HostsConfig {
+                hosts: vec![crate::hosts::HostConfig {
+                    id: cm_daemon::host_id::HostId::local(),
+                    transport: crate::hosts::HostTransport::Unix { socket: socket.clone() },
+                    default: true, operator_token: None, operator_token_file: None,
+                }],
+            }).unwrap());
+            let wi = app.workspaces.len() - 1;
+            app.workspaces[wi].sessions.push(live_ts("caller", None));
+            state.lock().unwrap().tui_sessions.insert("caller".into(),
+                serde_json::from_value(json!({"uid":"caller","workspace_id":"ws-caller","type":"codex"})).unwrap());
+            let root = cm_daemon::messaging::rpc::default_root();
+            let mut grants = vec![];
+            cm_daemon::items::grants::persist(&mut grants, &root, vec![cm_daemon::items::grants::LaunchGrant {
+                proposal: true, task_id: "filed".into(), session_uid: "caller".into(), ..Default::default()
+            }]).unwrap();
+            let response = start_session(app, "caller", &json!({
+                "type":"codex", "label":"worker", "task_id":"filed", "allow_shared_workspace":true
+            })).expect("grant-backed TUI launch");
+            let child = response["session_uid"].as_str().unwrap();
+            {
+                let mut s = state.lock().unwrap();
+                assert_eq!(s.sessions[child].managed_by_uid.as_deref(), Some("caller"));
+                assert!(cm_daemon::control::auth::check_any_session_caller(&s, "caller", child));
+                for session in s.sessions.values_mut() { let _ = session.kill(); }
+            }
+            crate::client_session::tests::stop_test_daemon(&socket, stop, handle);
+            unsafe { std::env::set_var("PATH", old_path) };
         });
     }
 
