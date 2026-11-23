@@ -712,9 +712,26 @@ def usage_snapshot(hub, now, since, granularity, account_snapshot=None):
 # --- reset credit cache ------------------------------------------------------
 
 RESET_SWEEP_INTERVAL = 6 * 3600
-RESET_REQUEST_TIMEOUT = 1.0
-RESET_CLI_UA = 'claude-cli/2.1.326 (external, cli)'
+RESET_REQUEST_TIMEOUT = 5.0
+RESET_SWEEP_BUDGET = 15.0
+_reset_cli_ua = None
 RESET_URL = 'https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1'
+
+
+def reset_cli_user_agent(timeout=2.0):
+    """Look up the CLI version once per process, with a bounded fallback."""
+    global _reset_cli_ua
+    if _reset_cli_ua is None:
+        try:
+            output = subprocess.run(['claude', '--version'], capture_output=True,
+                                    text=True, timeout=timeout).stdout
+            version = output.split()[0]
+            if not re.fullmatch(r'\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?', version):
+                raise ValueError('invalid version')
+        except (OSError, subprocess.TimeoutExpired, IndexError, ValueError):
+            version = '2.1.326'
+        _reset_cli_ua = f'claude-cli/{version} (external, cli)'
+    return _reset_cli_ua
 
 
 def reset_grants_parse(usage, now):
@@ -722,29 +739,35 @@ def reset_grants_parse(usage, now):
     cedar = usage.get('cedar_ember') if isinstance(usage, dict) else None
     if not isinstance(cedar, dict) or not isinstance(cedar.get('grants'), list):
         raise ValueError('missing grant list')
-    result = []
+    result = {}
     for grant in cedar['grants']:
         if not isinstance(grant, dict):
             continue
-        kind = grant.get('type')
+        kind = grant.get('id')
         if not isinstance(kind, str):
-            continue
+            kind = ''
         kind = kind.lower()
-        if kind.startswith('launch-') and 'fable' in kind:
+        if grant.get('gives_back_weekly') is True or 'fable' in kind:
             name = 'claude_fable'
-        elif kind.startswith('full-reset-'):
+        elif kind.startswith('full-reset'):
             name = 'claude_full'
         else:
             continue
         count = grant.get('resets_left')
         if not isinstance(count, int) or isinstance(count, bool) or count < 0:
             continue
-        result.append(dict(type=name, count=count if grant.get('usable_now') is True else 0,
-                           expires_at=usage_epoch(grant.get('ends_at')), as_of=int(now)))
-    return result
+        entry = result.setdefault(name, dict(type=name, count=0, usable_now=False,
+                                             expires_at=None, as_of=int(now)))
+        entry['count'] += count
+        if count:
+            entry['usable_now'] |= grant.get('usable_now') is True
+            expiry = usage_epoch(grant.get('ends_at'))
+            if expiry is not None and (entry['expires_at'] is None or expiry < entry['expires_at']):
+                entry['expires_at'] = expiry
+    return list(result.values())
 
 
-def _refresh_reset_grants(paths, force=False, account_uuid=None, limit=2, budget=5.0):
+def _refresh_reset_grants(paths, force=False, account_uuid=None, limit=2, budget=RESET_SWEEP_BUDGET):
     """Read pool grants outside the hub lock. Failures retain the last result."""
     start = time.monotonic()
     jobs = []
@@ -777,12 +800,16 @@ def _refresh_reset_grants(paths, force=False, account_uuid=None, limit=2, budget
     for account, token, attempt, previous_attempt, previous_error in jobs:
         if time.monotonic() - start >= budget:
             break
-        processed.add(account)
         try:
+            ua = reset_cli_user_agent(timeout=min(2.0, max(0.001, budget - (time.monotonic() - start))))
+            remaining = budget - (time.monotonic() - start)
+            if remaining <= 0:
+                break
+            processed.add(account)
             req = urllib.request.Request(RESET_URL, headers={'Authorization': 'Bearer ' + token,
-                'Content-Type': 'application/json', 'User-Agent': RESET_CLI_UA,
+                'Content-Type': 'application/json', 'User-Agent': ua,
                 'anthropic-beta': 'oauth-2025-04-20'})
-            with urllib.request.urlopen(req, timeout=RESET_REQUEST_TIMEOUT) as response:
+            with urllib.request.urlopen(req, timeout=min(RESET_REQUEST_TIMEOUT, remaining)) as response:
                 raw = response.read(1024 * 1024 + 1)
             if len(raw) > 1024 * 1024:
                 raise ValueError('response too large')
@@ -820,7 +847,7 @@ def _refresh_reset_grants(paths, force=False, account_uuid=None, limit=2, budget
     return len(jobs)
 
 
-def refresh_reset_grants(paths, force=False, account_uuid=None, limit=2, budget=5.0):
+def refresh_reset_grants(paths, force=False, account_uuid=None, limit=2, budget=RESET_SWEEP_BUDGET):
     try:
         return _refresh_reset_grants(paths, force, account_uuid, limit, budget)
     except (OSError, ValueError, TypeError, KeyError):
@@ -3094,7 +3121,7 @@ def cmd_hub(paths: Paths, args, out) -> int:
     if args.hub_command == "resets":
         if args.refresh:
             refresh_reset_grants(paths, force=not args.due_only, limit=2 if args.due_only else 100,
-                                 budget=5.0 if args.due_only else 8.0)
+                                 budget=RESET_SWEEP_BUDGET)
         with Hub(paths, read_only=True) as hub:
             cache = load_json(hub.dir / 'reset-grants.json')
         entries = [dict(email=v.get('email'), resets=v.get('resets'), as_of=v.get('as_of'),

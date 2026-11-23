@@ -3573,7 +3573,7 @@ class UsageDashboardTests(unittest.TestCase):
             hub.save()
             accounts.atomic_write(hub.dir / 'reset-grants.json', {'alice': {
                 'email':'alice@example.com', 'resets':[{'type':'claude_full','count':1,
-                'expires_at':self.now+86400, 'as_of':self.now-30}]}})
+                'expires_at':self.now+86400, 'as_of':self.now-30, 'usable_now':True}]}})
         with accounts.Hub(self.hub_paths) as hub:
             account = accounts.usage_snapshot(hub, self.now, self.hour, 'hour')['accounts'][0]
         self.assertEqual([(x['kind'],x['window_minutes'],x['switch_at']) for x in account['limits']],
@@ -3673,28 +3673,42 @@ class UsageDashboardTests(unittest.TestCase):
         with accounts.Hub(self.hub_paths) as hub:
             hub.pool_put(record)
         payload = {'cedar_ember': {'grants': [
-            {'type':'launch-2026-fable', 'resets_left':2, 'ends_at':self.now+86400, 'usable_now':True},
-            {'type':'full-reset-weekly', 'resets_left':1, 'ends_at':self.now+2*86400, 'usable_now':False},
-            {'type':'other', 'resets_left':5, 'usable_now':True, 'id':'SECRET-GRANT-ID'}]}}
+            {'id':'launch-2610-fable', 'type':'full', 'resets_left':2, 'resets_total':2,
+             'ends_at':self.now+86400, 'usable_now':False, 'gives_back_weekly':True},
+            {'id':'launch-2610-fable-6mo', 'type':'full', 'resets_left':1, 'resets_total':1,
+             'ends_at':self.now+2*86400, 'usable_now':True, 'gives_back_weekly':False},
+            {'id':'full-reset-2611', 'type':'weekly', 'resets_left':1, 'resets_total':1,
+             'ends_at':self.now+3*86400, 'usable_now':False, 'gives_back_weekly':False},
+            {'id':'full-reset-empty', 'type':'weekly', 'resets_left':0, 'resets_total':1,
+             'ends_at':self.now+100, 'usable_now':True},
+            {'id':'SECRET-GRANT-ID', 'type':'full-reset-weekly', 'resets_left':5, 'usable_now':True}]}}
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = json.dumps(payload).encode()
-        with mock.patch.object(accounts.urllib.request, 'urlopen', return_value=response) as network:
+        with mock.patch.object(accounts, '_reset_cli_ua', None), \
+             mock.patch.object(accounts.subprocess, 'run', return_value=mock.Mock(stdout='2.3.456 (Claude Code)')) as version, \
+             mock.patch.object(accounts.urllib.request, 'urlopen', return_value=response) as network:
             self.assertEqual(accounts.refresh_reset_grants(self.hub_paths), 1)
             req = network.call_args.args[0]
             self.assertEqual(req.full_url, accounts.RESET_URL)
-            self.assertEqual(req.get_header('User-agent'), accounts.RESET_CLI_UA)
-            self.assertEqual(network.call_args.kwargs['timeout'], 1.0)
+            self.assertEqual(req.get_header('User-agent'), 'claude-cli/2.3.456 (external, cli)')
+            self.assertEqual(network.call_args.kwargs['timeout'], 5.0)
             self.assertEqual(accounts.refresh_reset_grants(self.hub_paths), 0)
             self.assertEqual(network.call_count, 1)
+            self.assertEqual(accounts.reset_cli_user_agent(), 'claude-cli/2.3.456 (external, cli)')
+            version.assert_called_once_with(['claude', '--version'], capture_output=True, text=True, timeout=mock.ANY)
         with accounts.Hub(self.hub_paths, read_only=True) as hub:
             cache = accounts.load_json(hub.dir / 'reset-grants.json')
         text = json.dumps(cache)
         self.assertNotIn(token, text)
         self.assertNotIn('SECRET-GRANT-ID', text)
+        self.assertNotIn('launch-2610-fable', text)
+        self.assertNotIn('full-reset-2611', text)
         entry = cache['alice-uuid-0000']
-        self.assertEqual([(r['type'],r['count']) for r in entry['resets']],
-                         [('claude_fable',2),('claude_full',0)])
-        with mock.patch.object(accounts.urllib.request, 'urlopen',
+        self.assertEqual(entry['resets'], [
+            {'type':'claude_fable', 'count':3, 'usable_now':True, 'expires_at':self.now+86400, 'as_of':mock.ANY},
+            {'type':'claude_full', 'count':1, 'usable_now':False, 'expires_at':self.now+3*86400, 'as_of':mock.ANY}])
+        with mock.patch.object(accounts, '_reset_cli_ua', 'claude-cli/2.1.326 (external, cli)'), \
+             mock.patch.object(accounts.urllib.request, 'urlopen',
                                side_effect=accounts.urllib.error.URLError('secret should not be logged')):
             self.assertEqual(accounts.refresh_reset_grants(self.hub_paths, force=True), 1)
         out = io.StringIO()
@@ -3703,12 +3717,33 @@ class UsageDashboardTests(unittest.TestCase):
         self.assertNotIn('secret should not be logged', out.getvalue())
         shown = json.loads(out.getvalue())['accounts'][0]
         self.assertEqual(shown['error'], 'URLError')
-        self.assertEqual(shown['resets'][0]['count'], 2)  # retain last good value
-        with mock.patch.object(accounts.urllib.request, 'urlopen', return_value=response) as network:
+        self.assertEqual(shown['resets'][0]['count'], 3)  # retain last good value
+        with mock.patch.object(accounts, '_reset_cli_ua', 'claude-cli/2.1.326 (external, cli)'), \
+             mock.patch.object(accounts.urllib.request, 'urlopen', return_value=response) as network:
             out = io.StringIO()
             self.assertEqual(accounts.main(['hub','resets','--refresh','--json'], paths=self.hub_paths, out=out), 0)
             self.assertEqual(network.call_count, 1)  # explicit refresh bypasses the six-hour sweep interval
         self.assertIsNone(json.loads(out.getvalue())['accounts'][0]['error'])
+
+    def test_reset_cli_user_agent_falls_back_and_caches(self):
+        for result in (FileNotFoundError(), accounts.subprocess.TimeoutExpired(['claude'], 2),
+                       mock.Mock(stdout=''), mock.Mock(stdout='invalid')):
+            with self.subTest(result=result), mock.patch.object(accounts, '_reset_cli_ua', None):
+                kwargs = {'side_effect': result} if isinstance(result, Exception) else {'return_value': result}
+                with mock.patch.object(accounts.subprocess, 'run', **kwargs) as run:
+                    self.assertEqual(accounts.reset_cli_user_agent(), 'claude-cli/2.1.326 (external, cli)')
+                    self.assertEqual(accounts.reset_cli_user_agent(), 'claude-cli/2.1.326 (external, cli)')
+                    run.assert_called_once()
+
+    def test_reset_grants_classification_and_zero_count(self):
+        grants = {'cedar_ember': {'grants': [
+            {'id':'full-reset-but-fable', 'type':'weekly', 'resets_left':2, 'usable_now':False, 'ends_at':200},
+            {'id':'other', 'type':'full', 'gives_back_weekly':True, 'resets_left':1, 'usable_now':True, 'ends_at':100},
+            {'id':'full-reset-2611', 'type':'weekly', 'resets_left':0, 'usable_now':True, 'ends_at':50},
+            {'id':'launch-fable-empty', 'type':'full', 'resets_left':0, 'usable_now':True, 'ends_at':10}]}}
+        self.assertEqual(accounts.reset_grants_parse(grants, 42), [
+            {'type':'claude_fable', 'count':3, 'usable_now':True, 'expires_at':100, 'as_of':42},
+            {'type':'claude_full', 'count':0, 'usable_now':False, 'expires_at':None, 'as_of':42}])
 
     def test_reset_sweep_skips_expired_tokens(self):
         record = {'claudeAiOauth': login('expired'), 'oauthAccount': profile('alice')}

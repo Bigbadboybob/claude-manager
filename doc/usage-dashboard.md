@@ -142,15 +142,20 @@ percentage and the outlook assumes a constant observed burn for seven days.
 
 Claude reset grants are cached in `hub/reset-grants.json`. Check-ins launch a
 separate bounded worker after releasing the hub lock; the worker reads at most
-two due pool accounts, each with a one-second network timeout, and never renews
+two due pool accounts, each with a five-second network timeout, and never renews
 logins. It skips access tokens that expire within one minute, matching the
 claim helper's conservative expiry check. Automatic attempts are at least six
 hours apart per account; explicit
 `hub resets --refresh` or a post-claim refresh bypasses that interval. Manual
-refresh is bounded to eight seconds and can be repeated. Errors are recorded by
+refresh has a 15-second budget and can be repeated. Errors are recorded by
 type while the last successful values and their `as_of` time remain visible.
-Unavailable grants report zero usable credits. The read-only request uses the
-CLI's `claude-cli/2.1.326 (external, cli)` User-Agent.
+Claude grant counts sum all remaining credits by category, including unavailable
+credits. `usable_now` says whether any remaining credit in that category is
+usable; `expires_at` is the nearest expiry among grants with credits left.
+Fable grants are identified by `gives_back_weekly` or `fable` in their ID;
+full resets have IDs beginning `full-reset`. The read-only request uses the
+version from `claude --version` in the CLI User-Agent, cached per process,
+falling back to `2.1.326` if unavailable.
 
 Hosts read reset credits only from the configured local loopback endpoint
 `codex_lb_api` (default `http://127.0.0.1:2455/api/accounts`; set `off` to
