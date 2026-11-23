@@ -110,6 +110,10 @@ fn now() -> i64 {
         .unwrap_or_default()
         .as_secs() as i64
 }
+fn since_for_granularity(epoch: i64, granularity: &str) -> i64 {
+    let days = if granularity == "day" { 30 } else { 7 };
+    (epoch.saturating_sub(days * 86_400) / 3_600) * 3_600
+}
 fn compact(n: u64) -> String {
     for (size, suffix) in [(1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")] {
         if n >= size {
@@ -268,7 +272,13 @@ impl App {
                     .live_socket_path(&id)
                     .ok_or_else(|| format!("{host}: host unreachable"))?;
                 let token = pool.operator_token_for(&id);
-                let v=crate::client_session::rpc_messaging_board(&socket,&token,"usage.snapshot",serde_json::json!({"since":(now().saturating_sub(7*86400) / 3600) * 3600,"granularity":g})).map_err(|e| format!("{host}: {e:#}"))?;
+                let v = crate::client_session::rpc_messaging_board(
+                    &socket,
+                    &token,
+                    "usage.snapshot",
+                    serde_json::json!({"since":since_for_granularity(now(),g),"granularity":g}),
+                )
+                .map_err(|e| format!("{host}: {e:#}"))?;
                 let d: Snapshot = serde_json::from_value(v)
                     .map_err(|e| format!("invalid usage snapshot: {e}"))?;
                 if d.schema != 1 {
@@ -714,6 +724,48 @@ mod tests {
         assert!(s.contains("weekly_all"));
         a.handle_event(&key(KeyCode::Char('q')));
         assert!(!a.usage.open);
+    }
+    #[test]
+    fn token_granularity_sets_hour_rounded_history_window() {
+        let epoch = 1_795_400_123;
+        let hour = since_for_granularity(epoch, "hour");
+        let day = since_for_granularity(epoch, "day");
+        assert_eq!(hour, (epoch - 7 * 86_400) / 3_600 * 3_600);
+        assert_eq!(day, (epoch - 30 * 86_400) / 3_600 * 3_600);
+        assert_eq!(hour - day, 23 * 86_400);
+    }
+    #[test]
+    fn history_chart_excludes_readings_older_than_seven_days() {
+        let mut d = Snapshot {
+            generated_at: 1_795_400_000.0,
+            ..Snapshot::default()
+        };
+        d.accounts.push(Account {
+            engine: "claude".into(),
+            email: "a@example.com".into(),
+            ..Account::default()
+        });
+        d.limit_history.push(History {
+            engine: "claude".into(),
+            email: "a@example.com".into(),
+            kind: "weekly_all".into(),
+            points: vec![
+                (d.generated_at - 8.0 * 86_400.0, 20.0),
+                (d.generated_at - 86_400.0, 80.0),
+            ],
+        });
+        let mut lines = Vec::new();
+        history_lines(&d, 0, 60, &mut lines);
+        assert!(!lines
+            .iter()
+            .find(|l| l.starts_with(" 20%"))
+            .unwrap()
+            .contains('1'));
+        assert!(lines
+            .iter()
+            .find(|l| l.starts_with(" 80%"))
+            .unwrap()
+            .contains('1'));
     }
     #[test]
     fn sparkline_spans_the_entire_week() {

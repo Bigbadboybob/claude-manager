@@ -11,7 +11,7 @@ Tab or 1–3 selects Accounts, Tokens or History. Accounts lists each limit and
 reset, host, reservation and weekly history; j/k scrolls. Codex room is inferred
 from an active status and all available limits being below 98%; a missing status
 or limits displays unknown. Tokens shows the four totals windows, then a chart:
-h/d selects hourly or daily buckets, e cycles engines, g groups by account or
-host, and j/k scrolls. Solid bars show input plus output and shaded bars show
-cache read plus write. History uses j/k to choose an account and plots its limit
+h/d selects hourly buckets over seven days or daily buckets over 30 days; e cycles
+engines, g groups by account or host, and j/k scrolls. Solid bars show input plus
+output and shaded bars show cache read plus write. History uses j/k to choose an account and plots its limit
 readings over seven days, with the 98% switch line. Page Up and Page Down scroll on every tab.
