@@ -167,6 +167,26 @@ pub(super) struct HomeWorkspace {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
+pub(super) struct SessionIdentity {
+    pub daemon_id: String,
+    pub session_uid: String,
+}
+
+/// A host-qualified session placement from the org snapshot.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub(super) struct MemberSession {
+    pub pid: String,
+    pub daemon_id: String,
+    pub session_uid: String,
+    pub acting_as: String,
+    pub spawned_by: Option<SessionIdentity>,
+    pub workspace_id: Option<String>,
+    pub spawned_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
 pub(super) struct Member {
     pub id: String,
     pub org_id: Option<String>,
@@ -188,6 +208,7 @@ pub(super) struct Member {
     /// Set only while vacant: the deputy, else the manager.
     pub stand_in: Option<String>,
     pub home_workspace: Option<HomeWorkspace>,
+    pub assistants: Vec<MemberSession>,
     pub revision: i64,
 }
 

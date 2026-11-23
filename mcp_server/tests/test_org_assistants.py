@@ -56,6 +56,7 @@ class AssistantsDb(unittest.IsolatedAsyncioTestCase):
                    "worktree_path": s.get("path"), "continuous_task_id": s.get("continuous"),
                    "managed_by_uid": s.get("managed_by"), "workflow_run_id": s.get("workflow"),
                    "auto_place_owner": s.get("auto_place_owner", False),
+                   "auto_place_unresolved": s.get("auto_place_unresolved", False),
                    "spawned_age_s": s.get("age_s", 3 * 86400)}
             for key in ("member_id", "acting_as"):
                 if s.get(key):
@@ -118,6 +119,53 @@ class AssistantsDb(unittest.IsolatedAsyncioTestCase):
         # A session nobody claims is nobody's.
         r = await self.http.get("/org/members/by-pid", params={"pid": pid(self.orch) + "-x"})
         self.assertIsNone(r.json()["member"])
+
+    async def test_snapshot_lists_live_assistant_and_worker_facts_by_member(self):
+        await self.members()
+        worker = uid_at(0.1, 19)
+        await self.report([{"uid": worker, "name": "worker", "ws": "ws-worker",
+                            "managed_by": self.lane, "member_id": self.ids["org"],
+                            "acting_as": "worker"}])
+        snapshot = await self.snapshot()
+        member = next(m for m in snapshot["members"] if m["id"] == self.ids["org"])
+        rows = {a["session_uid"]: a for a in member["assistants"]}
+        self.assertIsInstance(rows[worker].pop("spawned_at"), str)
+        self.assertEqual(rows[worker], {"pid": pid(worker), "daemon_id": D1,
+                         "session_uid": worker, "acting_as": "worker",
+                         "spawned_by": {"daemon_id": D1, "session_uid": self.lane},
+                         "workspace_id": "ws-worker"})
+        self.assertEqual(rows[self.lane]["acting_as"], "main")
+        self.assertEqual(rows[self.lane]["pid"], pid(self.lane))
+        legacy = (await self.http.get("/org/snapshot", params={"legacy_placement": "true"})).json()
+        self.assertEqual(legacy["legacy_main_tasks"][self.ids["org"]], self.lane_task)
+        self.assertNotIn("legacy_main_tasks", snapshot)
+        self.assertEqual(rows[self.helper]["acting_as"], "assistant")
+        self.assertTrue(all("assistants" in m for m in snapshot["members"]))
+        # UIDs are scoped to hosts, and missing spawners remain null.
+        await self.beat("d2", [{"uid": worker, "name": "other-host", "member_id": self.ids["org"],
+                                "acting_as": "worker"}])
+        snapshot = await self.snapshot()
+        member = next(m for m in snapshot["members"] if m["id"] == self.ids["org"])
+        duplicates = [a for a in member["assistants"] if a["session_uid"] == worker]
+        self.assertEqual({a["daemon_id"] for a in duplicates}, {D1, "d2"})
+        self.assertIsNone(next(a for a in duplicates if a["daemon_id"] == "d2")["spawned_by"])
+        await self.close(OWNER["pid"], pid(self.helper))
+        snapshot = await self.snapshot()
+        member = next(m for m in snapshot["members"] if m["id"] == self.ids["org"])
+        self.assertNotIn(self.helper, [a["session_uid"] for a in member["assistants"]])
+
+    async def test_explicit_unresolved_placement_seats_a_spawned_agent_once(self):
+        uid = uid_at(0.1, 55)
+        session = {"uid": uid, "name": "orphan", "managed_by": "gone",
+                   "auto_place_owner": True, "auto_place_unresolved": True}
+        await self.beat(D1, [session])
+        first = await self.snapshot()
+        member = next(m for m in first["members"] if m["main"] and m["main"]["pid"] == pid(uid))
+        self.assertEqual((member["kind"], member["manager_member_id"]), ("agent", "mem_owner"))
+        await self.beat(D1, [session])
+        again = await self.snapshot()
+        self.assertEqual(sum(bool(m["main"] and m["main"]["pid"] == pid(uid))
+                             for m in again["members"]), 1)
 
     async def test_close_authority_main_chain_and_owner_allowed_others_refused(self):
         await self.members()

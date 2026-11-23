@@ -16,11 +16,9 @@
 //!   empty ∅ box naming their stand-in.
 //! - Every other session goes under the member responsible for it
 //!   ([`App::session_attachments`]), walking up until it reaches a member's
-//!   main session or a team's task: its spawner (`managed_by_uid`), then its
-//!   task's `parent_task_id` chain (a task a member's main session is bound
-//!   to, or a team's coordinator task), then its workspace (the member's home
-//!   workspace, else its main session's). Workspace ones are assistants, the
-//!   rest workers. They fold under the box as a count with state glyphs; `a`
+//!   main session or stamp through its spawner (`managed_by_uid`). Shells
+//!   are displayed in their member's workspace. Sessions fold under the box
+//!   as a count with state glyphs; `a`
 //!   expands them. Exited ones are hidden.
 //!   Placement depends only on that path, never on how long a session lives.
 //! - Sessions Owner started (no spawner) that reach no member sit in an
@@ -30,7 +28,7 @@
 //!   own stacks those in one column (as leaders do), so a wide fan-out never
 //!   needs horizontal scrolling.
 use super::org_model::{Member, OrgSnapshot, Team};
-use super::orgchart::{plural, ChartModel, ChartNode, ChartSession, NodeKind, OrgCard};
+use super::orgchart::{ChartModel, ChartNode, ChartSession, NodeKind, OrgCard};
 use super::*;
 use std::collections::{HashMap, HashSet};
 
@@ -62,8 +60,6 @@ pub(super) enum Via {
     Workspace,
     /// Spawned (`managed_by_uid`) by this session, or by one under it.
     Spawned(String),
-    /// Through this task of the session's `parent_task_id` chain.
-    Task(String),
     /// The daemon's member stamp (`org.member_id`, S4).
     Stamp,
     /// Stamped `acting_as = main`: a member's main session the snapshot
@@ -111,7 +107,7 @@ impl App {
 
         let people: Vec<&Member> = snap.members.iter().filter(|x| !x.is_owner() && !x.retired()).collect();
         // Every main session is its member's; every other session goes to
-        // the member (or team) its spawner, task chain or workspace leads to.
+        // the member its stamp or spawner chain leads to.
         let mains: HashSet<String> = people.iter().filter_map(|x| x.main_uid().map(str::to_owned)).collect();
         let attached = self.session_attachments(snap);
         let mut under: HashMap<Attach, Vec<(usize, usize)>> = HashMap::new();
@@ -487,11 +483,6 @@ impl App {
                 Some(Via::Workspace) => {
                     card.via.insert(uid.clone(), "in the member's workspace".into());
                 }
-                Some(Via::Task(t)) => {
-                    let name = self.tasks.iter().find(|r| r.task_id.as_deref() == Some(t.as_str())).map_or_else(|| t.chars().take(8).collect(), |r| r.name.clone());
-                    card.via.insert(uid.clone(), format!("task {name}"));
-                    card.via_task += 1;
-                }
                 _ => {}
             }
         }
@@ -500,9 +491,6 @@ impl App {
             for (wi, si) in extra {
                 let uid = self.workspaces[wi].sessions[si].uid.clone();
                 node.sessions.push(ChartSession { uid, wi, si, lead: false, mark: None });
-            }
-            if card.via_task > 0 {
-                card.bottom.push((format!("{} via the task tree", plural(card.via_task, "assistant")), Style::default().fg(theme::DIM)));
             }
         } else {
             card.folded.extend(extra);
@@ -517,8 +505,7 @@ impl App {
     /// home workspace, else the one its main session is in). Main sessions
     /// and sessions with no path are absent. Also the roster's filter.
     pub(super) fn session_attachments(&self, snap: &OrgSnapshot) -> std::rc::Rc<Attachments> {
-        // Cached on what the walk reads: the snapshot's version, every
-        // session's links and stamp, workspace closure and the task tree.
+        // Cached on the snapshot, session links and stamps, and workspaces.
         let key = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -527,13 +514,10 @@ impl App {
             for ws in &self.workspaces {
                 (ws.id.as_str(), ws.is_closed, ws.worktree_path.as_deref()).hash(&mut h);
                 for ts in &ws.sessions {
-                    (ts.uid.as_str(), ts.managed_by_uid.as_deref(), ts.task_id.as_deref(), ts.session.exited).hash(&mut h);
+                    (ts.uid.as_str(), ts.managed_by_uid.as_deref(), ts.session.exited).hash(&mut h);
                     let (m, a) = stamp_of(ts);
                     (m, a).hash(&mut h);
                 }
-            }
-            for t in &self.tasks {
-                (t.task_id.as_deref(), t.parent_task_id.as_deref()).hash(&mut h);
             }
             h.finish()
         };
@@ -594,25 +578,6 @@ impl App {
                 _ => None,
             }
         };
-        // Tasks the mains are bound to (first member in order wins), and the
-        // teams' own tasks.
-        let mut task_to: HashMap<&str, Attach> = HashMap::new();
-        for t in snap.teams.iter().filter(|t| !t.archived()) {
-            if let Some(task) = t.coordinator_task_id.as_deref() {
-                task_to.entry(task).or_insert_with(|| Attach::Team(t.id.clone()));
-            }
-        }
-        let mut member_tasks: HashMap<&str, Attach> = HashMap::new();
-        let mut mains_sorted: Vec<(&str, &str)> = main_of.iter().map(|(u, m)| (*u, *m)).collect();
-        let rank: HashMap<&str, usize> = people.iter().enumerate().map(|(i, x)| (x.id.as_str(), i)).collect();
-        mains_sorted.sort_by_key(|(u, m)| (rank.get(m).copied().unwrap_or(usize::MAX), *u));
-        for (uid, member) in mains_sorted {
-            if let Some(task) = by_uid.get(uid).and_then(|(_, ts)| ts.task_id.as_deref()) {
-                member_tasks.entry(task).or_insert_with(|| Attach::Member(member.to_owned()));
-            }
-        }
-        task_to.extend(member_tasks);
-        let parent: HashMap<&str, &str> = self.tasks.iter().filter_map(|t| Some((t.task_id.as_deref()?, t.parent_task_id.as_deref()?))).collect();
         // Workspaces: a member's home workspace, then its main's.
         let mut ws_to: HashMap<usize, &str> = HashMap::new();
         for x in &people {
@@ -632,24 +597,16 @@ impl App {
                 ws_to.entry(wi).or_insert(x.id.as_str());
             }
         }
-        let by_task = |start: &str| -> Option<(Attach, Via)> {
-            let mut cur = Some(start);
-            let mut seen = HashSet::new();
-            while let Some(t) = cur.filter(|t| seen.insert(*t) && seen.len() <= 64) {
-                if let Some(to) = task_to.get(t) {
-                    return Some((to.clone(), Via::Task(t.to_owned())));
-                }
-                cur = parent.get(t).copied();
-            }
-            None
-        };
-        let own = |wi: usize, ts: &TerminalSession| -> Option<(Attach, Via)> {
-            ts.task_id.as_deref().and_then(by_task).or_else(|| ws_to.get(&wi).map(|m| (Attach::Member((*m).to_owned()), Via::Workspace)))
-        };
         let mut uids: Vec<&str> = by_uid.keys().copied().collect();
         uids.sort_unstable();
         for uid in uids {
             if main_of.contains_key(uid) || out.contains_key(uid) {
+                continue;
+            }
+            if by_uid[uid].1.session_type == "bash" {
+                if let Some(member) = ws_to.get(&by_uid[uid].0) {
+                    out.insert(uid.to_owned(), (Attach::Member((*member).to_owned()), Via::Workspace));
+                }
                 continue;
             }
             // The spawner chain up from the session: [uid, its spawner, …].
@@ -669,7 +626,7 @@ impl App {
                     top = Some((Attach::Member((*member).to_owned()), Via::Spawned(sp.to_owned())));
                     break;
                 }
-                if let Some((to, _)) = out.get(sp) {
+                if let Some((to, _)) = out.get(sp).filter(|_| by_uid.get(sp).is_some_and(|(_, s)| s.session_type != "bash")) {
                     top = Some((to.clone(), Via::Spawned(sp.to_owned())));
                     break;
                 }
@@ -678,20 +635,7 @@ impl App {
                 }
                 chain.push(sp);
             }
-            // Found up the chain: its top element takes it. Otherwise the
-            // highest session that resolves on its own (task, workspace)
-            // places itself and everyone below it.
-            let mut from = chain.len() - 1;
-            if top.is_none() {
-                for (k, &c) in chain.iter().enumerate().rev() {
-                    let (wi, ts) = by_uid[c];
-                    if let Some(found) = own(wi, ts) {
-                        top = Some(found);
-                        from = k;
-                        break;
-                    }
-                }
-            }
+            let from = chain.len() - 1;
             let Some((to, via)) = top else { continue };
             out.insert(chain[from].to_owned(), (to.clone(), via));
             for k in (0..from).rev() {
@@ -866,6 +810,7 @@ mod tests {
         app.workspaces = vec![ws("w-ep"), ws("w-oc"), ws("w-items"), ws("w-loose")];
         session(&mut app, 0, 0x10, "ep-main", None);
         session(&mut app, 0, 0x11, "ep-helper", None);
+        app.workspaces[0].sessions[1].org = json!({"member_id":"m1", "acting_as":"assistant"}).as_object().cloned();
         session(&mut app, 1, 0x20, "orgchart", None);
         session(&mut app, 2, 0x30, "items-lead", None);
         session(&mut app, 3, 0x90, "stray", Some("loose"));
@@ -1155,6 +1100,7 @@ mod tests {
         spawned_by(&mut app, 2, "ts-20-0");
         session(&mut app, 3, 0x30, "via-task", Some("deep"));
         session(&mut app, 4, 0x31, "via-coord", Some("under-coord"));
+        for wi in [3, 4] { app.workspaces[wi].sessions[0].org = json!({"member_id":"m1", "acting_as":"assistant"}).as_object().cloned(); }
         session(&mut app, 5, 0x40, "owner-shell", Some("owner-thing"));
         session(&mut app, 6, 0x50, "orphan", None);
         spawned_by(&mut app, 6, "ts-gone-0");
@@ -1181,9 +1127,9 @@ mod tests {
         assert_eq!(attached["ts-20-0"], (Attach::Member("m1".into()), Via::Spawned("ts-10-0".into())));
         assert_eq!(attached["ts-21-0"], (Attach::Member("m1".into()), Via::Spawned("ts-20-0".into())));
         // Through the task chain: deep → mid → ep-task, EP's main's task.
-        assert_eq!(attached["ts-30-0"], (Attach::Member("m1".into()), Via::Task("ep-task".into())));
+        assert_eq!(attached["ts-30-0"], (Attach::Member("m1".into()), Via::Stamp));
         // Up to the team's coordinator task: the team.
-        assert_eq!(attached["ts-31-0"], (Attach::Team("t1".into()), Via::Task("coord".into())));
+        assert_eq!(attached["ts-31-0"], (Attach::Member("m1".into()), Via::Stamp));
         // The daemon's member stamp wins.
         assert_eq!(attached["ts-60-0"], (Attach::Member("m2".into()), Via::Stamp));
         // Mains, Owner's own and orphans have no attachment.
@@ -1197,7 +1143,7 @@ mod tests {
         assert_eq!(swarm.sessions.iter().map(|s| s.uid.as_str()).collect::<Vec<_>>(), ["ts-10-0"]);
         assert_eq!(uids(&app, &card.folded), ["ts-20-0", "ts-21-0", "ts-30-0", "ts-31-0"]);
         assert_eq!(card.via["ts-21-0"], "spawned by ep-assistant");
-        assert_eq!(card.via["ts-30-0"], "task ep-task");
+        assert_eq!(card.via["ts-30-0"], "member stamp");
         assert_eq!(uids(&app, &node(&m, "member:m2").card.as_ref().unwrap().folded), ["ts-60-0"]);
         // Owner's own session, and the one orphan.
         let own = node(&m, OWNER_SESSIONS_KEY);
@@ -1234,6 +1180,16 @@ mod tests {
     }
 
     #[test]
+    fn unstamped_agent_does_not_inherit_a_task_or_workspace() {
+        let mut app = attach_app();
+        app.workspaces[3].sessions[0].org = None;
+        session(&mut app, 0, 0x99, "unstamped in home", Some("ep-task"));
+        let attached = app.session_attachments(app.org_live().unwrap());
+        assert!(!attached.contains_key("ts-30-0"));
+        assert!(!attached.contains_key("ts-99-0"));
+    }
+
+    #[test]
     fn placement_is_the_same_every_rebuild() {
         let mut app = attach_app();
         // Both mains on one task: the via-task session goes to the more
@@ -1258,7 +1214,7 @@ mod tests {
         app.workspaces[7].sessions[0].task_id = Some("ep-task".into());
         for _ in 0..50 {
             *app.attach_cache.borrow_mut() = None;
-            assert_eq!(app.session_attachments(app.org_live().unwrap())["ts-30-0"].0, Attach::Member("m2".into()), "beta < ep");
+            assert_eq!(app.session_attachments(app.org_live().unwrap())["ts-30-0"].0, Attach::Member("m1".into()), "stamp is independent of task");
         }
     }
 
@@ -1282,7 +1238,7 @@ mod tests {
         let a = app.session_attachments(app.org_live().unwrap());
         let b = app.session_attachments(app.org_live().unwrap());
         assert!(std::rc::Rc::ptr_eq(&a, &b));
-        app.workspaces[3].sessions[0].task_id = None;
+        app.workspaces[3].sessions[0].org = None;
         let c = app.session_attachments(app.org_live().unwrap());
         assert!(!std::rc::Rc::ptr_eq(&a, &c));
         assert!(!c.contains_key("ts-30-0"));
@@ -1300,7 +1256,7 @@ mod tests {
         let swarm = node(&m, "team:t1");
         let shown: Vec<&str> = swarm.sessions.iter().map(|s| s.uid.as_str()).collect();
         assert_eq!(shown, ["ts-10-0", "ts-20-0", "ts-21-0", "ts-30-0", "ts-31-0"]);
-        assert!(swarm.card.as_ref().unwrap().bottom.iter().any(|(t, _)| t == "2 assistants via the task tree"));
+        assert!(swarm.card.as_ref().unwrap().bottom.iter().all(|(t, _)| !t.contains("via the task tree")));
         let s = screen(&mut app, 200, 50);
         for want in ["ep-assistant", "sub-worker", "via-task"] {
             assert!(s.contains(want), "missing {want}:\n{s}");

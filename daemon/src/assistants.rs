@@ -15,17 +15,14 @@
 //! through `mark_subtask_done` and continuous hosts run near their worktree
 //! cap.
 //!
-//! Only spawned sessions are stamped. A session with no spawner
-//! (`managed_by_uid` null) was started by Owner or an operator and is nobody's
-//! assistant, and shells (`bash`) are never stamped: only Owner closes,
-//! kills or restarts a shell.
+//! Every agent is placed by its stamp or its spawner chain. A session with
+//! no member on that chain is seated as a member directly under Owner.
+//! Shells (`bash`) are never members.
 //!
 //! The stamp lives in the session's org object (doc/org-model.md §12):
 //! `member_id`, `acting_as` (`assistant` / `worker`) and `member_via` (how it
 //! was learned: `spawn:<uid>`, `spawner:<uid>`, `fork:<uid>`, `task:<id>`).
-//! Mains are never stamped here: whether a session is a member's main comes
-//! only from the API's member cache ([`crate::items::org::cached_member`]),
-//! and it wins over any stamp.
+//! The API's current main-member cache wins over any older local stamp.
 //!
 //! A stream checkout is not protected forever by a dead assistant: once no
 //! assistant has been live in it for [`STREAM_RELEASE_SECS`] it goes back to
@@ -40,7 +37,9 @@ use crate::session::DaemonSession;
 use crate::state::DaemonState;
 use cm_holder_proto::org::{self as bridge, OrgObject};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+mod migration;
+
+pub(crate) use migration::{needed as migration_needed, run as migrate};
 
 /// Advertised in every board heartbeat (brain-only, [`crate::capabilities::BRAIN_ONLY`]).
 pub const CAPABILITY: &str = "assistant_guard_v1";
@@ -50,9 +49,12 @@ pub const ACTING_AS: &str = "acting_as";
 pub const MEMBER_VIA: &str = "member_via";
 /// Set on a fresh top-level agent session created by the TUI/operator. The
 /// org heartbeat consumes this durable intent and seats the session under
-/// Owner; it is never set for restores, assistants, shells, continuous runs,
-/// or workflow participants.
+/// Owner. Legacy and otherwise unresolved sessions use the companion marker.
 pub const AUTO_PLACE_OWNER: &str = "auto_place_owner";
+/// Distinguishes the §3 orphan rule from fresh operator placement.
+pub const AUTO_PLACE_UNRESOLVED: &str = "auto_place_unresolved";
+/// A new session, or a legacy session whose one-time migration was considered.
+pub const PLACEMENT_V1: &str = "placement_v1";
 pub const ASSISTANT: &str = "assistant";
 /// A continuous member's spawn: attributed, not durable.
 pub const WORKER: &str = "worker";
@@ -97,7 +99,7 @@ fn acting(text: &str) -> Option<&'static str> {
     }
 }
 
-/// The open stamp in an org object (assistant or worker), when there is one.
+/// The open assistant or worker stamp in an org object, when there is one.
 pub fn stamped(org: Option<&OrgObject>) -> Option<(String, &'static str)> {
     let org = org?;
     if org.contains_key(CLOSED_AT) {
@@ -118,6 +120,11 @@ pub fn stamped_member(org: Option<&OrgObject>) -> Option<String> {
 pub fn membership(uid: &str, org: Option<&OrgObject>) -> Option<Membership> {
     if let Some(member_id) = main_member(uid) {
         return Some(Membership { member_id, acting_as: MAIN });
+    }
+    if let Some(member_id) = org.filter(|o| !o.contains_key(CLOSED_AT) && o.get(ACTING_AS).and_then(Value::as_str) == Some(MAIN))
+        .and_then(|o| o.get(MEMBER_ID)).and_then(Value::as_str).filter(|m| !m.is_empty())
+    {
+        return Some(Membership { member_id: member_id.to_owned(), acting_as: MAIN });
     }
     stamped(org).map(|(member_id, acting_as)| Membership { member_id, acting_as })
 }
@@ -173,7 +180,9 @@ pub fn mark_owner_placement(state: &mut DaemonState, uid: &str) -> bool {
 pub fn clear_owner_placement(state: &mut DaemonState, uid: &str) -> bool {
     let Some(session) = state.sessions.get_mut(uid) else { return false };
     let Some(org) = session.org.as_mut() else { return false };
-    org.remove(AUTO_PLACE_OWNER).is_some()
+    let a = org.remove(AUTO_PLACE_OWNER).is_some();
+    let b = org.remove(AUTO_PLACE_UNRESOLVED).is_some();
+    a || b
 }
 
 /// Stamp `org` as `acting_as` ([`ASSISTANT`] / [`WORKER`]) of `member_id`.
@@ -193,8 +202,10 @@ fn has_member_key(org: Option<&OrgObject>) -> bool {
 /// continuous member's are workers; otherwise it inherits the spawner's
 /// kind (a main's spawns are assistants, a worker's spawns stay workers).
 fn child_role(m: &Membership) -> &'static str {
+    if is_continuous_member(&m.member_id) {
+        return WORKER;
+    }
     match m.acting_as {
-        MAIN if is_continuous_member(&m.member_id) => WORKER,
         MAIN => ASSISTANT,
         other => other,
     }
@@ -477,48 +488,36 @@ pub fn cap_hint(state: &DaemonState, caller_uid: &str) -> Option<String> {
 /// 1. By spawner: walk `managed_by_uid` up to the first session with a
 ///    membership (main by the cache, or a stamp); the role follows
 ///    [`child_role`] at that link and is inherited below it.
-/// 2. Only when that chain is broken (a spawner gone with no record; a chain
-///    ending at a live non-member stays unstamped): walk the session's task
-///    and its parents (the pushed task tree, then the refresher's planning
-///    parents) to the first task with a member's main session on this daemon.
-///
-/// A session with no spawner (Owner- or operator-started) and a shell are
-/// never stamped. Runs only once the member cache has heard from the API at
-/// least once. Stamps are never changed here, only added; the nearest
-/// member wins. Returns the stamped uids.
+/// An unresolved new session is queued for Owner placement. Legacy sessions
+/// wait for the separate migration pass to finish their old placement first.
+/// Shells are excluded. Stamps are only added, never changed here.
 pub fn backfill(state: &mut DaemonState) -> Vec<String> {
     if !crate::items::org::cache_loaded() {
         return Vec::new();
     }
     let mut uids: Vec<&String> = state.sessions.keys().collect();
     uids.sort();
-    // Task → the member whose main session works on it (lowest uid first,
-    // so the answer is deterministic when two mains share a task).
-    let mut task_main: HashMap<String, String> = HashMap::new();
-    for uid in &uids {
-        let s = &state.sessions[*uid];
-        if let (Some(task), Some(member)) = (s.task_id.as_ref(), main_member(uid)) {
-            task_main.entry(task.clone()).or_insert(member);
-        }
-    }
     let mut stamped: Vec<(String, String, &'static str, String)> = Vec::new();
+    let mut owner = Vec::new();
     for uid in uids {
         let s = &state.sessions[uid];
         if has_member_key(s.org.as_ref())
             || main_member(uid).is_some()
             || is_shell(&s.session_type)
-            || s.managed_by_uid.is_none()
+            || wants_owner_placement(s.org.as_ref())
         {
             continue;
         }
         let found = match by_spawner(state, s) {
-            Chain::Member(found) => Some(found),
-            // The chain reached a live (or recorded) session that belongs
-            // to no member: so does this one. Live 2026-10-25 on cm-sessions
-            // the task chain would have made Swarm-Coord's lanes
-            // initiative-bridge's assistants through the hub task.
-            Chain::NoMember => None,
-            Chain::Broken => by_task(state, s, &task_main),
+            Some(found) => Some(found),
+            None => {
+                if s.org.as_ref().and_then(|o| o.get(PLACEMENT_V1)).and_then(Value::as_bool) == Some(true)
+                    && !spawner_is_awaiting_owner(state, s)
+                {
+                    owner.push(uid.clone());
+                }
+                None
+            },
         };
         if let Some((member, role, via)) = found {
             stamped.push((uid.clone(), member, role, via));
@@ -538,59 +537,48 @@ pub fn backfill(state: &mut DaemonState) -> Vec<String> {
         }
         out.push(uid);
     }
+    for uid in owner {
+        if let Some(s) = state.sessions.get_mut(&uid) {
+            bridge::set(&mut s.org, AUTO_PLACE_OWNER, json!(true));
+            bridge::set(&mut s.org, AUTO_PLACE_UNRESOLVED, json!(true));
+            out.push(uid);
+        }
+    }
     out
 }
 
-enum Chain {
-    Member((String, &'static str, String)),
-    /// The chain ends at a session (live or recorded) with no member.
-    NoMember,
-    /// A spawner on the chain is gone with no record: unknown.
-    Broken,
+/// A child must wait for its spawner's pending Owner seat so it can inherit
+/// that member instead of racing it into a second top-level member.
+fn spawner_is_awaiting_owner(state: &DaemonState, s: &DaemonSession) -> bool {
+    let mut cur = s.managed_by_uid.as_deref();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(uid) = cur.filter(|uid| seen.insert(*uid) && seen.len() <= 32) {
+        let Some(parent) = state.sessions.get(uid) else { break };
+        if wants_owner_placement(parent.org.as_ref()) { return true; }
+        cur = parent.managed_by_uid.as_deref();
+    }
+    false
 }
 
-fn by_spawner(state: &DaemonState, s: &DaemonSession) -> Chain {
-    let Some(mut cur) = s.managed_by_uid.clone() else { return Chain::NoMember };
+fn by_spawner(state: &DaemonState, s: &DaemonSession) -> Option<(String, &'static str, String)> {
+    let mut cur = s.managed_by_uid.clone()?;
     for _ in 0..32 {
         if cur == s.uid {
-            return Chain::NoMember;
+            return None;
         }
         let Some(spawner) = state.sessions.get(&cur) else {
             // An exited spawner still left its record (and stamp) behind.
             let org = crate::control::methods::persisted_org(state, &cur);
-            return match membership(&cur, org.as_ref()) {
-                Some(m) => Chain::Member((m.member_id.clone(), child_role(&m), format!("spawner:{cur}"))),
-                None if org.is_some() || state.exited_tombstone(&cur).is_some() => Chain::NoMember,
-                None => Chain::Broken,
-            };
+            return membership(&cur, org.as_ref())
+                .map(|m| (m.member_id.clone(), child_role(&m), format!("spawner:{cur}")));
         };
         if let Some(m) = of_session(spawner) {
-            return Chain::Member((m.member_id.clone(), child_role(&m), format!("spawner:{cur}")));
+            return Some((m.member_id.clone(), child_role(&m), format!("spawner:{cur}")));
         }
         match spawner.managed_by_uid.clone() {
             Some(next) => cur = next,
-            None => return Chain::NoMember,
+            None => return None,
         }
-    }
-    Chain::NoMember
-}
-
-fn by_task(
-    state: &DaemonState,
-    s: &DaemonSession,
-    task_main: &HashMap<String, String>,
-) -> Option<(String, &'static str, String)> {
-    let mut task = s.task_id.clone()?;
-    let mut seen = std::collections::HashSet::new();
-    for _ in 0..64 {
-        if !seen.insert(task.clone()) {
-            return None;
-        }
-        if let Some(member) = task_main.get(&task) {
-            let role = if is_continuous_member(member) { WORKER } else { ASSISTANT };
-            return Some((member.clone(), role, format!("task:{task}")));
-        }
-        task = crate::control::auth::known_parent(state, &task).flatten()?;
     }
     None
 }

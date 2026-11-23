@@ -171,6 +171,11 @@ fn a_continuous_members_spawns_are_workers_attributed_but_torn_down_as_today() {
         let mut w1 = session("cw-1", Some("t-fix"), Some("cw-orch"), "ws-fix");
         w1.org = org;
         st.sessions.insert("cw-1".into(), w1);
+        let mut legacy = session("cw-legacy", None, Some("cw-orch"), "ws-legacy");
+        stamp(&mut legacy.org, "mem_bt", ASSISTANT, "legacy");
+        st.sessions.insert("cw-legacy".into(), legacy);
+        let mut child = None;
+        assert_eq!(stamp_spawn(&st, "cw-legacy-child", Some("cw-legacy"), "codex", &mut child), Some(WORKER));
         // A worker's spawn stays a worker.
         let mut org = None;
         assert_eq!(stamp_spawn(&st, "cw-2", Some("cw-1"), "codex", &mut org), Some(WORKER));
@@ -246,13 +251,12 @@ fn the_backfill_stamps_only_spawned_sessions_by_spawner_then_task_and_mains_win(
               ("bf-org", "mem_org", "agent"), ("bf-bridge", "mem_bridge", "agent")]);
     let mut stamped = backfill(&mut st);
     stamped.sort();
-    assert_eq!(stamped, ["bf-gone", "bf-out", "bf-w1", "bf-w2"]);
-    for uid in ["bf-w1", "bf-w2", "bf-gone"] {
+    assert_eq!(stamped, ["bf-out", "bf-w1", "bf-w2"]);
+    for uid in ["bf-w1", "bf-w2"] {
         assert_eq!(role_of(&st, uid), Some(("mem_items".into(), ASSISTANT)), "{uid}: the nearest member");
     }
     assert_eq!(st.sessions["bf-w1"].org.as_ref().unwrap()[MEMBER_VIA], "spawner:bf-items");
-    assert_eq!(st.sessions["bf-gone"].org.as_ref().unwrap()[MEMBER_VIA], "task:t-items",
-               "the spawner chain did not resolve, so the task chain decides");
+    assert!(st.sessions["bf-gone"].org.is_none(), "steady state does not use the task tree");
     assert_eq!(role_of(&st, "bf-out"), Some(("mem_bridge".into(), ASSISTANT)), "spawned by the bridge's main");
     // Mains win, and Owner-started sessions are nobody's: Swarm-Coord is
     // never the bridge's assistant.
@@ -272,6 +276,78 @@ fn the_backfill_stamps_only_spawned_sessions_by_spawner_then_task_and_mains_win(
     assert_eq!(wire("bf-items", None), json!({"member_id": "mem_items", "acting_as": "main"}));
     assert_eq!(wire("bf-solo", None), Value::Null);
 
+    kill_st(&mut st);
+    crate::items::org::reset_cache_for_test();
+}
+
+#[test]
+fn legacy_migration_uses_task_workspace_then_owner_and_is_idempotent() {
+    let _env = crate::test_support::env_lock();
+    crate::items::org::reset_cache_for_test();
+    members(&[("m-main", "mem_m", "agent")]);
+    let mut st = DaemonState::default();
+    for (uid, task, spawner, ws) in [
+        ("m-main", Some("main-task"), None, "home"),
+        ("m-task", Some("child"), Some("gone"), "other"),
+        ("m-ws", None, None, "home"),
+        ("m-spawn", Some("team-task"), Some("m-main"), "other"),
+        ("m-remote", Some("remote-child"), None, "other"),
+        ("m-team", Some("team-task"), None, "other"),
+        ("m-unknown", Some("not-loaded"), None, "other"),
+        ("m-shell", Some("child"), None, "other"),
+    ] {
+        let engine = if uid == "m-shell" { "bash" } else { "codex" };
+        st.sessions.insert(uid.into(), session_of(uid, task, spawner, ws, engine));
+    }
+    st.task_tree.insert("child".into(), Some("main-task".into()));
+    st.task_tree.insert("remote-child".into(), Some("remote-task".into()));
+    st.workspaces.insert("home".into(), workspace("home", None));
+    st.workspaces.insert("other".into(), workspace("other", None));
+    let snap = json!({"members":[{"id":"mem_owner","kind":"owner"},
+        {"id":"mem_m","kind":"agent","handle":"m","status":"active",
+         "manager_member_id":"mem_owner","main":{"daemon_id":"d1","session_uid":"m-main"}},
+        {"id":"mem_remote","kind":"agent","handle":"remote","status":"active",
+         "manager_member_id":"mem_owner","main":{"daemon_id":"d2","session_uid":"remote-main"}}],
+        "teams":[{"id":"t1","name":"Leadless","coordinator_task_id":"team-task"}],
+        "legacy_main_tasks":{"mem_m":"main-task", "mem_remote":"remote-task"}});
+    let mut changed = migrate(&mut st, &snap, "d1");
+    changed.sort();
+    assert_eq!(changed, ["m-main", "m-remote", "m-spawn", "m-task", "m-team", "m-ws"]);
+    assert_eq!(role_of(&st, "m-remote"), Some(("mem_remote".into(), ASSISTANT)));
+    assert_eq!(role_of(&st, "m-spawn"), Some(("mem_m".into(), ASSISTANT)), "spawner wins over task");
+    assert_eq!(role_of(&st, "m-task"), Some(("mem_m".into(), ASSISTANT)));
+    assert_eq!(role_of(&st, "m-ws"), Some(("mem_m".into(), ASSISTANT)));
+    assert_eq!(role_of(&st, "m-main"), Some(("mem_m".into(), MAIN)));
+    assert!(wants_owner_placement(st.sessions["m-team"].org.as_ref()));
+    assert!(st.sessions["m-shell"].org.is_none());
+    assert!(st.sessions["m-unknown"].org.is_none(), "unknown parent defers migration");
+    assert!(migrate(&mut st, &snap, "d1").is_empty());
+    st.task_tree.insert("not-loaded".into(), None);
+    assert_eq!(migrate(&mut st, &snap, "d1"), ["m-unknown"]);
+    assert!(wants_owner_placement(st.sessions["m-unknown"].org.as_ref()));
+    kill_st(&mut st);
+    crate::items::org::reset_cache_for_test();
+}
+
+#[test]
+fn child_waits_for_spawners_pending_owner_seat() {
+    let _env = crate::test_support::env_lock();
+    crate::items::org::reset_cache_for_test();
+    members(&[]);
+    let mut st = DaemonState::default();
+    let mut parent = session("pending-parent", None, None, "p");
+    bridge::set(&mut parent.org, PLACEMENT_V1, json!(true));
+    bridge::set(&mut parent.org, AUTO_PLACE_OWNER, json!(true));
+    bridge::set(&mut parent.org, AUTO_PLACE_UNRESOLVED, json!(true));
+    st.sessions.insert(parent.uid.clone(), parent);
+    let mut child = session("pending-child", None, Some("pending-parent"), "c");
+    bridge::set(&mut child.org, PLACEMENT_V1, json!(true));
+    st.sessions.insert(child.uid.clone(), child);
+    assert!(backfill(&mut st).is_empty());
+    assert!(!wants_owner_placement(st.sessions["pending-child"].org.as_ref()));
+    members(&[("pending-parent", "mem_parent", "agent")]);
+    assert_eq!(backfill(&mut st), ["pending-child"]);
+    assert_eq!(role_of(&st, "pending-child"), Some(("mem_parent".into(), ASSISTANT)));
     kill_st(&mut st);
     crate::items::org::reset_cache_for_test();
 }
@@ -720,7 +796,8 @@ fn promoting_an_assistant_makes_it_a_main_with_a_home_and_a_notice() {
         let org = st.sessions["ca-asst"].org.clone().unwrap();
         assert_eq!((org.get(MEMBER_ID), org.get(ACTING_AS)), (Some(&json!("mem_new")), Some(&json!(MAIN))));
         crate::items::org::reset_cache_for_test();
-        assert!(of_session(&st.sessions["ca-asst"]).is_none());
+        assert_eq!(of_session(&st.sessions["ca-asst"]).map(|m| (m.member_id, m.acting_as)),
+                   Some(("mem_new".into(), MAIN)));
         assert!(!backfill(&mut st).contains(&"ca-asst".to_string()));
         assert!(!st.workspaces["ws-asst"].org.as_ref().unwrap().contains_key(IDLE_SINCE));
     }
