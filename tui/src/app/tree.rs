@@ -234,6 +234,33 @@ struct OrgPlacement {
     fallback: HashSet<(usize, usize)>,
 }
 
+impl OrgPlacement {
+    /// A continuous lead owns every placed member below it. If continuous
+    /// teams nest, the outer lead claims the subtree first so a session can
+    /// never be emitted in two boxes.
+    fn box_owners(&self, snap: &super::org_model::OrgSnapshot) -> HashMap<String, String> {
+        let depth = |id: &str| {
+            let mut seen = HashSet::new();
+            let mut current = Some(id);
+            while let Some(id) = current.filter(|id| seen.insert(*id)) {
+                current = snap.member(id).and_then(|m| m.manager_member_id.as_deref());
+            }
+            seen.len()
+        };
+        let mut teams: Vec<_> = snap.teams.iter().filter(|team| !team.archived()).filter_map(|team| {
+            Some((team, team.continuous.as_ref()?.lead_member_id.as_deref()?))
+        }).collect();
+        teams.sort_by(|(a, al), (b, bl)| depth(al).cmp(&depth(bl)).then(a.id.cmp(&b.id)));
+        let mut owners = HashMap::new();
+        for (team, lead) in teams {
+            for member in self.members.keys().filter(|id| snap.in_member_subtree(id, lead)) {
+                owners.entry(member.clone()).or_insert_with(|| team.id.clone());
+            }
+        }
+        owners
+    }
+}
+
 impl App {
     fn org_placement(&self, snap: &super::org_model::OrgSnapshot) -> OrgPlacement {
         let mut result = OrgPlacement::default();
@@ -522,8 +549,24 @@ impl App {
             .hash(&mut h);
         }
         if let Some(snap) = self.org_live() {
+            hash_unordered(&snap.host_daemons, &mut h);
+            for member in &snap.members {
+                member.id.hash(&mut h);
+                member.status.hash(&mut h);
+                member.manager_member_id.hash(&mut h);
+                if let Some(main) = &member.main {
+                    main.daemon_id.hash(&mut h);
+                    main.session_uid.hash(&mut h);
+                }
+                for session in &member.assistants {
+                    session.daemon_id.hash(&mut h);
+                    session.session_uid.hash(&mut h);
+                    session.acting_as.hash(&mut h);
+                }
+            }
             for team in &snap.teams {
                 team.id.hash(&mut h);
+                team.status.hash(&mut h);
                 if let Some(marker) = &team.continuous {
                     marker.lead_member_id.hash(&mut h);
                     marker.host_id.hash(&mut h);
@@ -747,20 +790,30 @@ impl App {
         // 5. Only live org-model continuous teams are lifted into their boxed
         // block below.
         let mut members: HashSet<(usize, usize)> = HashSet::new();
-        // Ordinary org-team leads and their managed sessions are hidden from
-        // the loose work tree and re-emitted in their continuous team box.
+        let mut boxes: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+        // Use the org manager subtree for hosts that identify their daemon.
+        // Older hosts keep the legacy matching until their brain is upgraded.
         if let Some(snap) = self.org_live() {
-            for team in snap.teams.iter().filter(|t| t.continuous.is_some() && !t.archived()) {
-                let lead_uid = team.continuous.as_ref().and_then(|m| m.lead_member_id.as_deref()).and_then(|id| snap.member(id)).and_then(|m| m.main_uid());
-                for (wi, ws) in self.workspaces.iter().enumerate() {
-                    if ws.is_closed || self.is_past_workspace(wi) { continue; }
-                    for (si, ts) in ws.sessions.iter().enumerate() {
-                        let belongs = lead_uid.is_some_and(|uid| ts.uid == uid || ts.managed_by_uid.as_deref() == Some(uid))
-                            || (lead_uid.is_none() && ts.host_id.as_str() == team.continuous.as_ref().and_then(|m| m.host_id.as_deref()).unwrap_or(""));
-                        if belongs { members.insert((wi, si)); }
+            let placement = self.org_placement(snap);
+            let owners = placement.box_owners(snap);
+            for (member, rows) in &placement.members {
+                if let Some(team) = owners.get(member) {
+                    for row in rows {
+                        if members.insert(*row) { boxes.entry(team.clone()).or_default().push(*row); }
                     }
                 }
             }
+            for team in snap.teams.iter().filter(|t| t.continuous.is_some() && !t.archived()) {
+                let lead_uid = team.continuous.as_ref().and_then(|m| m.lead_member_id.as_deref()).and_then(|id| snap.member(id)).and_then(|m| m.main_uid());
+                for &(wi, si) in &placement.fallback {
+                    let ts = &self.workspaces[wi].sessions[si];
+                    if snap.host_daemons.contains_key(ts.host_id.as_str()) { continue; }
+                    let belongs = lead_uid.is_some_and(|uid| ts.uid == uid || ts.managed_by_uid.as_deref() == Some(uid))
+                        || (lead_uid.is_none() && ts.host_id.as_str() == team.continuous.as_ref().and_then(|m| m.host_id.as_deref()).unwrap_or(""));
+                    if belongs && members.insert((wi, si)) { boxes.entry(team.id.clone()).or_default().push((wi, si)); }
+                }
+            }
+            for rows in boxes.values_mut() { rows.sort_unstable(); }
         }
         let f = self.forest(&members);
         let by_task = self.planning.divisions_by_task();
@@ -850,16 +903,7 @@ impl App {
         // Continuous org teams stay in the main Task sidebar as a boxed block.
         if let Some(snap) = self.org_live() {
             for team in snap.teams.iter().filter(|t| t.continuous.is_some() && !t.archived()) {
-                let mut rows = Vec::new();
-                let lead_uid = team.continuous.as_ref().and_then(|m| m.lead_member_id.as_deref()).and_then(|id| snap.member(id)).and_then(|m| m.main_uid());
-                for (wi, ws) in self.workspaces.iter().enumerate() {
-                    if ws.is_closed || self.is_past_workspace(wi) { continue; }
-                    for (si, ts) in ws.sessions.iter().enumerate() {
-                        let belongs = lead_uid.is_some_and(|uid| ts.uid == uid || ts.managed_by_uid.as_deref() == Some(uid))
-                            || (lead_uid.is_none() && ts.host_id.as_str() == team.continuous.as_ref().and_then(|m| m.host_id.as_deref()).unwrap_or(""));
-                        if belongs { rows.push((wi, si)); }
-                    }
-                }
+                let rows = boxes.remove(&team.id).unwrap_or_default();
                 if rows.is_empty() { continue; }
                 if !out.items.is_empty() && !matches!(out.items.last(), Some(VisualItem::SectionEnd)) { out.items.push(VisualItem::Separator); }
                 out.items.push(VisualItem::ContinuousTeamHeader(team.id.clone()));
@@ -1396,7 +1440,7 @@ mod tree_tests {
 
     #[test]
     fn org_placement_qualifies_hosts_and_keeps_old_hosts_in_legacy_tree() {
-        use super::super::org_model::fixtures::{member, owner, snapshot};
+        use super::super::org_model::fixtures::{member, owner, snapshot, team};
         use cm_daemon::host_id::HostId;
         let mut app = test_app();
         app.workspaces = ["one", "two", "old"].into_iter().map(bare_ws).collect();
@@ -1410,13 +1454,50 @@ mod tree_tests {
         let a = member("a", "A", Some("mem-owner"), None, Some("same"));
         let mut b = member("b", "B", Some("a"), None, Some("same"));
         b["main"]["daemon_id"] = serde_json::json!("d2");
-        let mut value = snapshot(1, vec![owner(), a, b], vec![]);
+        let mut outer = team("outer", "Outer", None, Some("a"), &[]);
+        outer["continuous"] = serde_json::json!({"lead_member_id":"a"});
+        let mut inner = team("inner", "Inner", None, Some("b"), &[]);
+        inner["continuous"] = serde_json::json!({"lead_member_id":"b"});
+        // Put the inner team first to check that ancestor order wins.
+        let mut value = snapshot(1, vec![owner(), a, b], vec![inner, outer]);
         value["host_daemons"] = serde_json::json!({"h1":"d1", "h2":"d2"});
         let snap = serde_json::from_value(value).unwrap();
         let result = app.org_placement(&snap);
         assert_eq!(result.members["a"], vec![(0, 0), (0, 1)]);
         assert_eq!(result.members["b"], vec![(1, 0)]);
         assert_eq!(result.fallback, HashSet::from([(2, 0)]));
+        assert_eq!(result.box_owners(&snap), HashMap::from([("a".into(), "outer".into()), ("b".into(), "outer".into())]));
+    }
+
+    #[test]
+    fn continuous_box_takes_the_whole_org_subtree_once() {
+        use super::super::org_model::fixtures::{member, owner, snapshot, team};
+        use cm_daemon::host_id::HostId;
+        let mut app = test_app();
+        app.sidebar_view = SidebarView::Task;
+        app.workspaces = ["lead", "report", "worker", "other"].into_iter().map(bare_ws).collect();
+        for (wi, uid) in [(0, "lead"), (1, "report"), (2, "worker"), (3, "other")] {
+            session(&mut app, wi, uid, uid, "codex");
+            app.workspaces[wi].sessions[0].host_id = HostId::new("h1");
+        }
+        app.sections.push(SidebarSection { id: "sec".into(), name: "Section".into(), ..Default::default() });
+        app.workspace_sections.insert("worker".into(), "sec".into());
+        let lead = member("lead", "Lead", Some("mem-owner"), None, Some("lead"));
+        let mut report = member("report", "Report", Some("lead"), None, Some("report"));
+        report["assistants"] = serde_json::json!([{"daemon_id":"d1", "session_uid":"worker", "acting_as":"worker"}]);
+        let other = member("other", "Other", Some("mem-owner"), None, Some("other"));
+        let mut ct = team("ct", "Continuous", None, Some("lead"), &[]);
+        ct["continuous"] = serde_json::json!({"lead_member_id":"lead", "health":"ok"});
+        let mut value = snapshot(1, vec![owner(), lead, report, other], vec![ct]);
+        value["host_daemons"] = serde_json::json!({"h1":"d1"});
+        app.org.accept(value);
+        let tree = app.task_tree();
+        for wi in 0..3 {
+            assert!(tree.items.contains(&VisualItem::ContinuousTeamSession(wi, 0)));
+            assert!(!tree.items.contains(&VisualItem::Session(wi, 0)));
+            assert!(!tree.items.contains(&VisualItem::WorkspaceHeader(wi)));
+        }
+        assert!(tree.items.contains(&VisualItem::Session(3, 0)));
     }
 
     #[test]

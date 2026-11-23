@@ -49,6 +49,7 @@ fn member_section(
 struct MigrationWorkspace {
     mains: HashSet<String>,
     members: HashSet<String>,
+    boxed_members: HashSet<String>,
     complete: bool,
 }
 
@@ -78,6 +79,9 @@ fn migrate_sections(
             }
         } else if info.complete && info.members.len() == 1 {
             result.overrides.insert(ws.clone(), choice.clone());
+            for member in &info.boxed_members {
+                result.unresolved.push((ws.clone(), choice.clone(), format!("member {member}: kept in continuous box")));
+            }
         } else {
             result.unresolved.push((ws.clone(), choice.clone(), "workspace membership is ambiguous".into()));
         }
@@ -175,13 +179,18 @@ impl App {
     fn section_migration_evidence(&self, snap: &super::org_model::OrgSnapshot) -> HashMap<String, MigrationWorkspace> {
         let mut result = HashMap::new();
         for ws in &self.workspaces {
-            let mut info = MigrationWorkspace { mains: HashSet::new(), members: HashSet::new(), complete: true };
+            let mut info = MigrationWorkspace { mains: HashSet::new(), members: HashSet::new(), boxed_members: HashSet::new(), complete: true };
             for ts in &ws.sessions {
                 if !super::tree::is_agent_engine(&ts.session_type) { continue; }
                 let member = snap.host_daemons.get(ts.host_id.as_str())
                     .and_then(|daemon| snap.member_by_session(daemon, &ts.uid));
                 let Some(member) = member else { info.complete = false; continue; };
                 info.members.insert(member.id.clone());
+                if snap.teams.iter().filter(|team| !team.archived()).filter_map(|team|
+                    team.continuous.as_ref()?.lead_member_id.as_deref()).any(|lead|
+                    snap.in_member_subtree(&member.id, lead)) {
+                    info.boxed_members.insert(member.id.clone());
+                }
                 if member.main.as_ref().is_some_and(|main|
                     main.session_uid.as_deref() == Some(ts.uid.as_str())
                         && main.daemon_id.as_deref() == snap.host_daemons.get(ts.host_id.as_str()).map(String::as_str)) {
@@ -566,7 +575,7 @@ mod section_choice_tests {
         ]);
         let info = |mains: &[&str], members: &[&str], complete| MigrationWorkspace {
             mains: mains.iter().map(|s| (*s).into()).collect(),
-            members: members.iter().map(|s| (*s).into()).collect(), complete,
+            members: members.iter().map(|s| (*s).into()).collect(), boxed_members: HashSet::new(), complete,
         };
         let evidence = HashMap::from([
             ("mains".into(), info(&["one", "two"], &["one", "two"], true)),
@@ -585,6 +594,13 @@ mod section_choice_tests {
         assert_eq!(result.overrides.get("stream").map(String::as_str), Some("b"));
         assert_eq!(result.unresolved.iter().map(|(ws, _, _)| ws.as_str()).collect::<Vec<_>>(),
             ["conflict1", "conflict2", "existing", "mixed"]);
+
+        let mut boxed_evidence = evidence;
+        boxed_evidence.get_mut("stream").unwrap().boxed_members.insert("one".into());
+        let boxed = migrate_sections(&old, &existing, &boxed_evidence);
+        assert_eq!(boxed.overrides.get("stream").map(String::as_str), Some("b"));
+        assert!(boxed.unresolved.iter().any(|(ws, choice, reason)|
+            ws == "stream" && choice == "b" && reason == "member one: kept in continuous box"));
     }
 
     #[test]
