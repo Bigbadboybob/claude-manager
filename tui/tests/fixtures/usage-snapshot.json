@@ -48,13 +48,15 @@
           "type": "claude_fable",
           "count": 1,
           "expires_at": 1800000000,
-          "as_of": 1795399900
+          "as_of": 1795399900,
+          "usable_now": false
         },
         {
           "type": "claude_full",
           "count": 1,
           "expires_at": 1796500000,
-          "as_of": 1795399900
+          "as_of": 1795399900,
+          "usable_now": true
         }
       ],
       "projection": {
