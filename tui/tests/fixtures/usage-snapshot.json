@@ -1,26 +1,269 @@
 {
-  "schema": 1, "generated_at": 1795400000, "since": 1794795200, "granularity": "hour",
+  "schema": 1,
+  "generated_at": 1795400000,
+  "since": 1794795200,
+  "granularity": "hour",
   "accounts": [
-    {"engine": "claude", "email": "a@example.com", "alias": null, "status": null, "pool_host": null,
-     "active_on": ["cm-sessions"], "reserved_for": ["f-sessions"], "room": true,
-     "limits": [{"kind": "five_hour", "percent": 38.0, "resets_at": 1795410000, "read_at": 1795399800},
-                {"kind": "weekly_all", "percent": 10.0, "resets_at": 1795580000, "read_at": 1795399800},
-                {"kind": "weekly_fable", "percent": 7.0, "resets_at": 1795580000, "read_at": 1795399800}]},
-    {"engine": "codex", "email": "b@example.com", "alias": "802", "status": "active", "pool_host": "cm-sessions",
-     "active_on": [], "reserved_for": null, "room": null,
-     "limits": [{"kind": "primary", "percent": 4.0, "resets_at": 1795405000, "read_at": 1795399700},
-                {"kind": "secondary", "percent": 30.0, "resets_at": 1795900000, "read_at": 1795399700}]},
-    {"engine": "claude", "email": "c@example.com", "alias": null, "status": null, "pool_host": null,
-     "active_on": [], "reserved_for": [], "room": false,
-     "limits": [{"kind": "weekly_all", "percent": 99.0, "resets_at": 1795580000, "read_at": 1795399800}]}
+    {
+      "engine": "claude",
+      "email": "a@example.com",
+      "alias": null,
+      "status": null,
+      "pool_host": null,
+      "active_on": [
+        "cm-sessions"
+      ],
+      "reserved_for": [
+        "f-sessions"
+      ],
+      "room": true,
+      "limits": [
+        {
+          "kind": "five_hour",
+          "percent": 38.0,
+          "resets_at": 1795410000,
+          "read_at": 1795399800,
+          "window_minutes": 300,
+          "switch_at": 98.0
+        },
+        {
+          "kind": "weekly_all",
+          "percent": 10.0,
+          "resets_at": 1795580000,
+          "read_at": 1795399800,
+          "window_minutes": 10080,
+          "switch_at": 98.0
+        },
+        {
+          "kind": "weekly_fable",
+          "percent": 7.0,
+          "resets_at": 1795580000,
+          "read_at": 1795399800,
+          "window_minutes": 10080,
+          "switch_at": 98.0
+        }
+      ],
+      "resets": [
+        {
+          "type": "claude_fable",
+          "count": 1,
+          "expires_at": 1800000000,
+          "as_of": 1795399900
+        },
+        {
+          "type": "claude_full",
+          "count": 1,
+          "expires_at": 1796500000,
+          "as_of": 1795399900
+        }
+      ],
+      "projection": {
+        "kind": "weekly_all",
+        "rate_per_hour": 2.0,
+        "basis_hours": 6.0,
+        "at_switch": 1795558400,
+        "at_reset_percent": 100.0
+      }
+    },
+    {
+      "engine": "codex",
+      "email": "b@example.com",
+      "alias": "802",
+      "status": "active",
+      "pool_host": "cm-sessions",
+      "active_on": [],
+      "reserved_for": null,
+      "room": null,
+      "limits": [
+        {
+          "kind": "primary",
+          "percent": 4.0,
+          "resets_at": 1795405000,
+          "read_at": 1795399700,
+          "window_minutes": 300,
+          "switch_at": 100.0
+        },
+        {
+          "kind": "secondary",
+          "percent": 30.0,
+          "resets_at": 1795900000,
+          "read_at": 1795399700,
+          "window_minutes": 10080,
+          "switch_at": 100.0
+        }
+      ],
+      "resets": [
+        {
+          "type": "codex",
+          "count": 2,
+          "expires_at": 1798000000,
+          "as_of": 1795399950
+        }
+      ],
+      "projection": {
+        "kind": "secondary",
+        "rate_per_hour": 0.5,
+        "basis_hours": 6.0,
+        "at_switch": null,
+        "at_reset_percent": 99.4444444444
+      }
+    },
+    {
+      "engine": "claude",
+      "email": "c@example.com",
+      "alias": null,
+      "status": null,
+      "pool_host": null,
+      "active_on": [],
+      "reserved_for": [],
+      "room": false,
+      "limits": [
+        {
+          "kind": "weekly_all",
+          "percent": 99.0,
+          "resets_at": 1795580000,
+          "read_at": 1795399800,
+          "window_minutes": 10080,
+          "switch_at": 98.0
+        }
+      ],
+      "resets": null,
+      "projection": null
+    }
   ],
-  "limit_history": [{"engine": "claude", "email": "a@example.com", "kind": "weekly_all", "points": [[1795300000, 2.0], [1795399800, 10.0]]},
-                    {"engine": "claude", "email": "a@example.com", "kind": "weekly_fable", "points": [[1795300000, 7.0], [1795399800, 7.0]]}],
+  "limit_history": [
+    {
+      "engine": "claude",
+      "email": "a@example.com",
+      "kind": "weekly_all",
+      "points": [
+        [
+          1795300000,
+          2.0
+        ],
+        [
+          1795399800,
+          10.0
+        ]
+      ]
+    },
+    {
+      "engine": "claude",
+      "email": "a@example.com",
+      "kind": "weekly_fable",
+      "points": [
+        [
+          1795300000,
+          7.0
+        ],
+        [
+          1795399800,
+          7.0
+        ]
+      ]
+    }
+  ],
   "tokens": {
-    "totals": [{"window": "24h", "engine": "claude", "host": null, "email": null, "input": 1, "output": 2, "cache_read": 3, "cache_write": 4, "reasoning": 0, "requests": 5},
-               {"window": "24h", "engine": "claude", "host": "cm-sessions", "email": null, "input": 10, "output": 20, "cache_read": 30, "cache_write": 40, "reasoning": 0, "requests": 5},
-               {"window": "7d", "engine": "codex", "host": null, "email": "b@example.com", "input": 1200000, "output": 2, "cache_read": 3, "cache_write": 0, "reasoning": 1, "requests": 4}],
-    "series": [{"bucket": 1795392000, "engine": "codex", "host": "cm-sessions", "email": "b@example.com", "input": 1, "output": 2, "cache_read": 3, "cache_write": 0, "reasoning": 1, "requests": 4},
-               {"bucket": 1795395600, "engine": "claude", "host": "f-sessions", "email": "a@example.com", "input": 4000, "output": 20, "cache_read": 300, "cache_write": 10, "reasoning": 0, "requests": 4}]
-  }
+    "totals": [
+      {
+        "window": "24h",
+        "engine": "claude",
+        "host": null,
+        "email": null,
+        "input": 1,
+        "output": 2,
+        "cache_read": 3,
+        "cache_write": 4,
+        "reasoning": 0,
+        "requests": 5
+      },
+      {
+        "window": "24h",
+        "engine": "claude",
+        "host": "cm-sessions",
+        "email": null,
+        "input": 10,
+        "output": 20,
+        "cache_read": 30,
+        "cache_write": 40,
+        "reasoning": 0,
+        "requests": 5
+      },
+      {
+        "window": "7d",
+        "engine": "codex",
+        "host": null,
+        "email": "b@example.com",
+        "input": 1200000,
+        "output": 2,
+        "cache_read": 3,
+        "cache_write": 0,
+        "reasoning": 1,
+        "requests": 4
+      }
+    ],
+    "series": [
+      {
+        "bucket": 1795392000,
+        "engine": "codex",
+        "host": "cm-sessions",
+        "email": "b@example.com",
+        "input": 1,
+        "output": 2,
+        "cache_read": 3,
+        "cache_write": 0,
+        "reasoning": 1,
+        "requests": 4
+      },
+      {
+        "bucket": 1795395600,
+        "engine": "claude",
+        "host": "f-sessions",
+        "email": "a@example.com",
+        "input": 4000,
+        "output": 20,
+        "cache_read": 300,
+        "cache_write": 10,
+        "reasoning": 0,
+        "requests": 4
+      }
+    ]
+  },
+  "outlook": [
+    {
+      "engine": "claude",
+      "accounts": 2,
+      "accounts_with_room": 1,
+      "room_weeks": 0.88,
+      "burn_per_hour": 0.02,
+      "dry_at": 1795558400,
+      "refills": [
+        {
+          "at": 1795580000,
+          "email": "a@example.com",
+          "frees": 0.1
+        },
+        {
+          "at": 1795580000,
+          "email": "c@example.com",
+          "frees": 0.99
+        }
+      ]
+    },
+    {
+      "engine": "codex",
+      "accounts": 1,
+      "accounts_with_room": 1,
+      "room_weeks": 0.7,
+      "burn_per_hour": 0.005,
+      "dry_at": null,
+      "refills": [
+        {
+          "at": 1795900000,
+          "email": "b@example.com",
+          "frees": 0.3
+        }
+      ]
+    }
+  ]
 }
