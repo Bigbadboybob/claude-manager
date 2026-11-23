@@ -3064,6 +3064,15 @@ class UsageDashboardTests(unittest.TestCase):
         self.assertIn('claude_tokens', self.collect()['usage'])
         self.assertNotIn('codex', self.collect()['usage'])
 
+    def test_disabled_laptop_checkin_does_not_create_collection_state(self):
+        self.state['config'].update(host_name='laptop', hub='cm-manager')
+        with mock.patch.object(accounts, 'export_view', return_value=self.export.copy()), \
+             mock.patch.object(accounts, 'remote_checkin', return_value={
+                 'version': 1, 'usage_watermarks': {'codex': -1, 'claude_ack': []}}):
+            accounts.hub_exchange(self.paths, self.state, io.StringIO())
+        self.assertNotIn('usage_collection', self.state)
+        self.assertFalse((self.paths.store / 'usage-collect.db').exists())
+
     def test_large_hour_pages_without_losing_rows_and_resends_open_hour(self):
         with sqlite3.connect(self.dbpath) as db:
             db.executemany('INSERT INTO request_usage_hourly_rollups VALUES(?,?,?,?,?,?,?,?,?)',
@@ -3092,12 +3101,171 @@ class UsageDashboardTests(unittest.TestCase):
         self.export['accounts']['alice']['reading']['at'] = old + 60
         self.export['accounts']['alice']['reading']['limits'][0]['percent'] = 49
         self.checkin(self.export)
+        # Compaction runs at most hourly, even if an older reading arrives later.
+        with accounts.Hub(self.hub_paths) as hub:
+            db = accounts.usage_hub_db(hub)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM limit_readings').fetchone()[0], 2)
+            self.assertEqual(db.execute('PRAGMA journal_mode').fetchone()[0], 'wal')
+            db.close()
+        with mock.patch.object(accounts.time, 'time', return_value=self.now + 3601):
+            self.checkin(self.export)
         out = io.StringIO()
         self.assertEqual(accounts.main(['hub','usage','--json','--since','0','--granularity','day'],
                                        paths=self.hub_paths, out=out), 0)
         doc = json.loads(out.getvalue())
         self.assertEqual(doc['granularity'], 'day')
         self.assertEqual(doc['limit_history'][0]['points'], [[old + 60, 49.0]])
+
+    def test_missing_watermarks_do_not_restart_codex_backfill(self):
+        with sqlite3.connect(self.dbpath) as db:
+            db.executemany('INSERT INTO request_usage_hourly_rollups VALUES(?,?,?,?,?,?,?,?,?)',
+                [(self.hour, 'a', f'model-{i:03}', 1, 1, 0, 0, 1, 0) for i in range(305)])
+        self.state['config']['hub'] = 'cm-manager'
+        sent = []
+
+        def exchange(_hub, export):
+            sent.append(json.loads(json.dumps(export)))
+            if len(sent) == 2:  # An old hub or a failed usage.db ingest.
+                return {'version': 1}
+            return self.checkin(export)
+
+        with mock.patch.object(accounts, 'export_view', side_effect=lambda *_: json.loads(json.dumps(self.export))), \
+             mock.patch.object(accounts, 'remote_checkin', side_effect=exchange):
+            accounts.hub_exchange(self.paths, self.state, io.StringIO())
+            cursor = self.state['usage_collection']['watermarks']['codex_cursor']
+            accounts.hub_exchange(self.paths, self.state, io.StringIO())
+            self.assertEqual(self.state['usage_collection']['watermarks']['codex_cursor'], cursor)
+            accounts.hub_exchange(self.paths, self.state, io.StringIO())
+        first = sent[0]['usage']['codex']['rollups']
+        second = sent[1]['usage']['codex']['rollups']
+        third = sent[2]['usage']['codex']['rollups']
+        self.assertEqual(len(first), 300)
+        self.assertEqual(second, third)
+        self.assertFalse({r['model'] for r in first} & {r['model'] for r in second})
+        self.assertEqual(self.state['usage_collection']['watermarks']['codex'], self.hour)
+
+    def test_history_and_hub_emails_are_cached_after_accounts_leave(self):
+        self.export['accounts'] = {}
+        self.state['history'] = [
+            {'event': 'borrowed', 'at': self.hour - 3, 'account': 'borrowed', 'email': 'past@example.com'},
+            {'event': 'switch', 'at': self.hour - 2, 'account': 'borrowed'},
+        ]
+        self.state['hub'] = {'reply': {'readings': {'other': {'email': 'other@example.com'}},
+                                       'account_emails': {'third': 'third@example.com'}}}
+        self.assertEqual(self.collect()['usage']['claude_tokens'][0]['account'], 'past@example.com')
+        # The label-bearing events and hub reply may both disappear while the
+        # switch remains in history and newly discovered lines are backfilled.
+        self.state['history'] = [self.state['history'][1]]
+        self.state['hub'] = {'reply': {}}
+        self.state['history'].append({'event': 'switch', 'at': self.hour + 10, 'account': 'other'})
+        self.state['history'].append({'event': 'switch', 'at': self.hour + 20, 'account': 'third'})
+        with self.transcript.open('a') as f:
+            f.write(self.line('r3', 'm3', 1, 1))
+        rows = self.collect()['usage']['claude_tokens']
+        self.assertEqual({r['account'] for r in rows}, {'past@example.com', 'third@example.com'})
+        with sqlite3.connect(self.paths.store / 'usage-collect.db') as db:
+            self.assertEqual(dict(db.execute('SELECT uuid,email FROM account_emails')),
+                             {'borrowed': 'past@example.com', 'other': 'other@example.com',
+                              'third': 'third@example.com'})
+
+    def test_recent_transcripts_are_scanned_before_backfill(self):
+        old = self.transcript
+        recent = self.paths.claude_dir / 'projects' / 'one' / 'subagents' / 'agent.jsonl'
+        os.utime(old, (self.now - 100, self.now - 100))
+        os.utime(recent, (self.now, self.now))
+        with mock.patch.object(accounts, 'USAGE_SCAN_BYTES', len(recent.read_bytes())):
+            rows = self.collect()['usage']['claude_tokens']
+        self.assertEqual(rows[0]['input'], 5)
+        self.assertEqual(rows[0]['requests'], 1)
+
+    def test_hub_reports_keep_only_codex_accounts_and_limits(self):
+        export = self.collect()
+        self.checkin(export)
+        with accounts.Hub(self.hub_paths) as hub:
+            saved = hub.reports()['cm-sessions']['export']['usage']
+            self.assertEqual(set(saved), {'codex'})
+            self.assertEqual(set(saved['codex']), {'accounts', 'limits'})
+            self.assertEqual(len(accounts.usage_snapshot(hub, self.now, self.hour, 'hour')['tokens']['series']), 2)
+
+    def test_hub_ingest_succeeds_during_a_read_transaction(self):
+        self.checkin(self.collect())
+        with accounts.Hub(self.hub_paths) as hub:
+            reader = accounts.usage_hub_db(hub)
+        try:
+            reader.execute('BEGIN')
+            reader.execute('SELECT COUNT(*) FROM limit_readings').fetchone()
+            self.export['accounts']['alice']['reading']['at'] = self.now
+            reply = self.checkin(self.collect())
+            self.assertIn('usage_watermarks', reply)
+        finally:
+            reader.close()
+
+    def test_failed_ingest_does_not_store_bulk_usage(self):
+        export = self.collect()
+        with mock.patch.object(accounts, 'usage_ingest', side_effect=sqlite3.OperationalError('locked')):
+            reply = self.checkin(export)
+        self.assertNotIn('usage_watermarks', reply)
+        with accounts.Hub(self.hub_paths) as hub:
+            self.assertEqual(set(hub.reports()['cm-sessions']['export']['usage']['codex']),
+                             {'accounts', 'limits'})
+
+    def test_usage_command_without_database_returns_empty_history(self):
+        with accounts.Hub(self.hub_paths) as hub:
+            accounts.atomic_write(hub.dir / 'reports' / 'cm-sessions.json',
+                                  {'at': self.now, 'export': self.export})
+            db_path = hub.dir / 'usage.db'
+        out = io.StringIO()
+        self.assertEqual(accounts.main(['hub', 'usage', '--json', '--since', '0'],
+                                       paths=self.hub_paths, out=out), 0)
+        doc = json.loads(out.getvalue())
+        self.assertEqual(doc['accounts'][0]['email'], 'alice@example.com')
+        self.assertEqual(doc['limit_history'], [])
+        self.assertEqual(doc['tokens'], {'totals': [], 'series': []})
+        self.assertFalse(db_path.exists())
+
+    def test_usage_command_does_not_initialize_an_absent_hub(self):
+        self.assertFalse(self.hub_paths.store.exists())
+        out = io.StringIO()
+        self.assertEqual(accounts.main(['hub', 'usage', '--json'], paths=self.hub_paths, out=out), 0)
+        doc = json.loads(out.getvalue())
+        self.assertEqual(doc['accounts'], [])
+        self.assertEqual(doc['limit_history'], [])
+        self.assertEqual(doc['tokens'], {'totals': [], 'series': []})
+        self.assertFalse(self.hub_paths.store.exists())
+
+    def test_usage_history_query_runs_after_releasing_hub_lock(self):
+        self.checkin(self.collect())
+        original = accounts.usage_snapshot
+
+        def snapshot(hub, *args):
+            with (hub.dir / 'lock').open('r+') as lock:
+                accounts.fcntl.flock(lock, accounts.fcntl.LOCK_EX | accounts.fcntl.LOCK_NB)
+                return original(hub, *args)
+
+        with mock.patch.object(accounts, 'usage_snapshot', side_effect=snapshot):
+            out = io.StringIO()
+            self.assertEqual(accounts.main(['hub', 'usage', '--json'], paths=self.hub_paths, out=out), 0)
+        self.assertTrue(json.loads(out.getvalue())['tokens']['series'])
+
+    def test_usage_history_database_opens_read_only(self):
+        self.checkin(self.collect())
+        connect = sqlite3.connect
+        opened = []
+
+        def connect_read_only(path, *args, **kwargs):
+            opened.append(path)
+            self.assertTrue(str(path).endswith('?mode=ro'))
+            self.assertTrue(kwargs.get('uri'))
+            db = connect(path, *args, **kwargs)
+            with self.assertRaises(sqlite3.OperationalError):
+                db.execute('CREATE TABLE must_not_be_created(id INTEGER)')
+            return db
+
+        with mock.patch.object(accounts.sqlite3, 'connect', side_effect=connect_read_only):
+            out = io.StringIO()
+            self.assertEqual(accounts.main(['hub', 'usage', '--json'], paths=self.hub_paths, out=out), 0)
+        self.assertEqual(len(opened), 1)
+        self.assertTrue(json.loads(out.getvalue())['tokens']['series'])
 
     def test_old_hub_and_host_compatibility(self):
         first = self.collect()

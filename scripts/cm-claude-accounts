@@ -10,6 +10,7 @@ See doc/claude-account-switcher.md.
 from __future__ import annotations
 
 import argparse
+import bisect
 import email.utils
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -100,12 +101,31 @@ def usage_enabled(state):
     return config.get('usage_collect', host_name(state).lower() != 'laptop') is True
 
 
-def usage_account_at(state, accounts, at):
-    events = [e for e in state.get('history', []) if e.get('event') in
-              ('switch', 'capture', 'login', 'external-login') and
-              isinstance(e.get('at'), (int, float)) and e['at'] <= at and e.get('account')]
-    uuid = max(events, key=lambda e: e['at'])['account'] if events else None
-    return (accounts.get(uuid) or {}).get('email') or ''
+def usage_identity_index(db, state, accounts):
+    """Cache known labels separately from the logins currently on this host."""
+    known = {}
+    reply = last_hub_reply(state) or {}
+    for uuid, email in (reply.get('account_emails') or {}).items():
+        if isinstance(uuid, str) and isinstance(email, str) and email:
+            known[uuid] = email
+    for uuid, reading in (reply.get('readings') or {}).items():
+        if isinstance(reading, dict) and isinstance(reading.get('email'), str) and reading['email']:
+            known[uuid] = reading['email']
+    history = state.get('history') or []
+    for event in history:
+        if isinstance(event, dict) and isinstance(event.get('account'), str) and \
+                isinstance(event.get('email'), str) and event['email']:
+            known[event['account']] = event['email']
+    for uuid, info in accounts.items():
+        if isinstance(info, dict) and isinstance(info.get('email'), str) and info['email']:
+            known[uuid] = info['email']
+    db.executemany('INSERT OR REPLACE INTO account_emails(uuid,email) VALUES(?,?)', known.items())
+    emails = dict(db.execute('SELECT uuid,email FROM account_emails'))
+    events = sorted((event['at'], i, event['account']) for i, event in enumerate(history)
+                    if isinstance(event, dict) and event.get('event') in
+                    ('switch', 'capture', 'login', 'external-login') and
+                    isinstance(event.get('at'), (int, float)) and isinstance(event.get('account'), str))
+    return [e[0] for e in events], [emails.get(e[2], '') for e in events]
 
 
 def usage_local_db(paths):
@@ -116,6 +136,7 @@ def usage_local_db(paths):
           model TEXT, input INTEGER, output INTEGER, cache_read INTEGER, cache_write INTEGER,
           PRIMARY KEY(request,message));
         CREATE INDEX IF NOT EXISTS requests_bucket ON requests(bucket,account,model);
+        CREATE TABLE IF NOT EXISTS account_emails(uuid TEXT PRIMARY KEY, email TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS dirty(bucket INTEGER, account TEXT, model TEXT, revision INTEGER,
           acknowledged INTEGER DEFAULT 0, PRIMARY KEY(bucket,account,model));
     ''')
@@ -130,12 +151,21 @@ def usage_mark_dirty(db, bucket, account, model):
 
 def usage_scan(paths, state, accounts):
     root = paths.claude_dir / 'projects'
-    if not root.is_dir():
-        return []
     db = usage_local_db(paths)
     try:
+        times, emails = usage_identity_index(db, state, accounts)
+        if not root.is_dir():
+            db.commit()
+            return []
+        files = []
+        for path in root.rglob('*.jsonl'):
+            try:
+                files.append((path.stat().st_mtime_ns, path))
+            except OSError:
+                continue
+        files.sort(key=lambda item: (-item[0], str(item[1])))
         remaining = USAGE_SCAN_BYTES
-        for path in sorted(root.rglob('*.jsonl')):
+        for _, path in files:
             if remaining <= 0:
                 break
             try:
@@ -176,7 +206,8 @@ def usage_scan(paths, state, accounts):
                             if any(not isinstance(v, int) or isinstance(v, bool) or v < 0 for v in values):
                                 continue
                             bucket = int(at) // 3600 * 3600
-                            account = usage_account_at(state, accounts, at)
+                            index = bisect.bisect_right(times, at) - 1
+                            account = emails[index] if index >= 0 else ''
                             old = db.execute('SELECT bucket,account,model,input,output,cache_read,cache_write '
                                              'FROM requests WHERE request=? AND message=?', (req, mid)).fetchone()
                             new = (bucket, account, model, *values)
@@ -212,6 +243,15 @@ def usage_scan(paths, state, accounts):
         db.close()
 
 
+def usage_watermarks(state):
+    saved = (state.get('usage_collection') or {}).get('watermarks')
+    if isinstance(saved, dict):
+        return saved
+    # Upgrade an existing host without discarding its last acknowledged page.
+    previous = (last_hub_reply(state) or {}).get('usage_watermarks')
+    return previous if isinstance(previous, dict) else {}
+
+
 def usage_codex(paths, state):
     config = state.get('config') or {}
     path = Path(config.get('codex_lb_store') or Path.home() / '.local/share/cm-codex-lb/data/store.db').expanduser()
@@ -227,7 +267,7 @@ def usage_codex(paths, state):
           LIMIT 1001''')]
         if len(limits) > 1000:
             raise ValueError('too many limits for a bounded check-in')
-        watermarks = (last_hub_reply(state) or {}).get('usage_watermarks') or {}
+        watermarks = usage_watermarks(state)
         ack = watermarks.get('codex', -1)
         ack = ack if isinstance(ack, int) else -1
         cursor = watermarks.get('codex_cursor')
@@ -285,14 +325,22 @@ def usage_collect(paths, state, export):
             payload.pop('codex')
         else:
             break
-    prior = (last_hub_reply(state) or {}).get('usage_watermarks') or {}
+    prior = usage_watermarks(state)
     payload['codex_watermark'] = prior.get('codex', -1)
     payload['codex_cursor'] = prior.get('codex_cursor')
     export['usage'] = payload
 
 
 def usage_ack_local(paths, state, reply):
-    ack = (reply.get('usage_watermarks') or {}).get('claude_ack')
+    # A missing acknowledgement does not revoke earlier progress. Only retain
+    # the small Codex cursor here; Claude revisions are acknowledged in SQLite.
+    saved = {k: v for k, v in usage_watermarks(state).items() if k in ('codex', 'codex_cursor')}
+    incoming = reply.get('usage_watermarks')
+    if isinstance(incoming, dict):
+        saved.update({k: incoming[k] for k in ('codex', 'codex_cursor') if k in incoming})
+    if saved:
+        state.setdefault('usage_collection', {})['watermarks'] = saved
+    ack = incoming.get('claude_ack') if isinstance(incoming, dict) else None
     if not isinstance(ack, list):
         return
     try:
@@ -312,17 +360,24 @@ def usage_ack_local(paths, state, reply):
 
 
 def usage_hub_db(hub):
-    db = sqlite3.connect(hub.dir / 'usage.db', timeout=0.1)
-    db.executescript('''
-        CREATE TABLE IF NOT EXISTS limit_readings(engine TEXT, account TEXT, limit_kind TEXT, percent REAL,
-          resets_at REAL, at REAL, source_host TEXT, PRIMARY KEY(engine,account,limit_kind,at));
-        CREATE TABLE IF NOT EXISTS token_hours(engine TEXT, host TEXT, account TEXT NOT NULL, model TEXT,
-          bucket INTEGER, input INTEGER, output INTEGER, cache_read INTEGER, cache_write INTEGER,
-          reasoning INTEGER, requests INTEGER, cost_usd REAL,
-          PRIMARY KEY(engine,host,account,model,bucket));
-    ''')
-    return db
-
+    db = sqlite3.connect(hub.dir / 'usage.db', timeout=2.0)
+    try:
+        if db.execute('PRAGMA journal_mode').fetchone()[0].lower() != 'wal':
+            db.execute('PRAGMA journal_mode=WAL')
+        db.executescript('''
+            CREATE TABLE IF NOT EXISTS limit_readings(engine TEXT, account TEXT, limit_kind TEXT, percent REAL,
+              resets_at REAL, at REAL, source_host TEXT, PRIMARY KEY(engine,account,limit_kind,at));
+            CREATE INDEX IF NOT EXISTS limit_readings_at ON limit_readings(at);
+            CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS token_hours(engine TEXT, host TEXT, account TEXT NOT NULL, model TEXT,
+              bucket INTEGER, input INTEGER, output INTEGER, cache_read INTEGER, cache_write INTEGER,
+              reasoning INTEGER, requests INTEGER, cost_usd REAL,
+              PRIMARY KEY(engine,host,account,model,bucket));
+        ''')
+        return db
+    except Exception:
+        db.close()
+        raise
 
 def usage_kind(limit):
     kind = limit.get('kind', '')
@@ -390,11 +445,14 @@ def usage_ingest(hub, export, now):
                  r.get('reasoning', 0), r.get('requests', 0), None))
             ack['claude_ack'].append([r['bucket'], r.get('account'), r['model'], r['revision']])
         # Collapse old raw readings to the maximum within each hour.
-        cutoff = now - 30 * 86400
-        db.execute('''DELETE FROM limit_readings WHERE at<? AND rowid NOT IN
-            (SELECT rowid FROM (SELECT rowid, ROW_NUMBER() OVER (PARTITION BY engine,account,limit_kind,
-             CAST(at/3600 AS INTEGER) ORDER BY percent DESC,at DESC) AS rn FROM limit_readings WHERE at<?)
-             WHERE rn=1)''', (cutoff, cutoff))
+        last_collapse = db.execute("SELECT value FROM meta WHERE key='last_collapse'").fetchone()
+        if last_collapse is None or now - last_collapse[0] >= 3600:
+            cutoff = now - 30 * 86400
+            db.execute('''DELETE FROM limit_readings WHERE at<? AND rowid NOT IN
+                (SELECT rowid FROM (SELECT rowid, ROW_NUMBER() OVER (PARTITION BY engine,account,limit_kind,
+                 CAST(at/3600 AS INTEGER) ORDER BY percent DESC,at DESC) AS rn FROM limit_readings WHERE at<?)
+                 WHERE rn=1)''', (cutoff, cutoff))
+            db.execute("INSERT OR REPLACE INTO meta VALUES('last_collapse',?)", (now,))
         db.commit()
         return ack
     finally:
@@ -406,26 +464,42 @@ def usage_epoch(value):
     return int(parsed) if parsed is not None else None
 
 
-def usage_snapshot(hub, now, since, granularity):
-    db = usage_hub_db(hub)
+def usage_snapshot_accounts(hub, now):
+    view = hub_status_view(hub, now)
+    accounts = []
+    for info in view['accounts'].values():
+        reading = info.get('reading') or {}
+        accounts.append(dict(engine='claude', email=info['email'], alias=None, status=None,
+            pool_host=None, active_on=info['active_on'], reserved_for=info['reserved_for'], room=info['room'],
+            limits=[dict(kind=usage_kind(l), percent=l.get('percent'), resets_at=usage_epoch(l.get('resets_at')),
+                         read_at=usage_epoch(reading.get('at'))) for l in reading.get('limits') or []]))
+    for host, report in hub.reports().items():
+        codex = (((report.get('export') or {}).get('usage') or {}).get('codex') or {})
+        for a in codex.get('accounts') or []:
+            limits = [dict(kind=r.get('window'), percent=r.get('used_percent'),
+                           resets_at=usage_epoch(r.get('reset_at')), read_at=usage_epoch(r.get('recorded_at')))
+                      for r in codex.get('limits') or [] if r.get('account_id') == a.get('id')]
+            accounts.append(dict(engine='codex', email=a.get('email'), alias=a.get('alias'),
+                status=a.get('status'), pool_host=host, active_on=[], reserved_for=None, room=None, limits=limits))
+    return accounts
+
+
+def usage_snapshot(hub, now, since, granularity, account_snapshot=None):
+    accounts = account_snapshot if account_snapshot is not None else usage_snapshot_accounts(hub, now)
+    path = hub.dir / 'usage.db'
+    empty = dict(schema=1, generated_at=int(now), since=since, granularity=granularity,
+                 accounts=accounts, limit_history=[], tokens=dict(totals=[], series=[]))
+    if not path.exists():
+        return empty
+    try:
+        db = sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True, timeout=2.0)
+    except sqlite3.OperationalError:
+        if not path.exists():  # It disappeared between the existence check and open.
+            return empty
+        raise
     db.row_factory = sqlite3.Row
     try:
-        view = hub_status_view(hub, now)
-        accounts = []
-        for info in view['accounts'].values():
-            reading = info.get('reading') or {}
-            accounts.append(dict(engine='claude', email=info['email'], alias=None, status=None,
-                pool_host=None, active_on=info['active_on'], reserved_for=info['reserved_for'], room=info['room'],
-                limits=[dict(kind=usage_kind(l), percent=l.get('percent'), resets_at=usage_epoch(l.get('resets_at')),
-                             read_at=usage_epoch(reading.get('at'))) for l in reading.get('limits') or []]))
-        for host, report in hub.reports().items():
-            codex = (((report.get('export') or {}).get('usage') or {}).get('codex') or {})
-            for a in codex.get('accounts') or []:
-                limits = [dict(kind=r.get('window'), percent=r.get('used_percent'),
-                               resets_at=usage_epoch(r.get('reset_at')), read_at=usage_epoch(r.get('recorded_at')))
-                          for r in codex.get('limits') or [] if r.get('account_id') == a.get('id')]
-                accounts.append(dict(engine='codex', email=a.get('email'), alias=a.get('alias'),
-                    status=a.get('status'), pool_host=host, active_on=[], reserved_for=None, room=None, limits=limits))
+        db.execute('BEGIN')  # Keep totals and series on the same read snapshot.
         history = {}
         for r in db.execute('SELECT engine,account,limit_kind,at,percent FROM limit_readings WHERE at>=? '
                             'ORDER BY at', (since,)):
@@ -1418,7 +1492,8 @@ def hub_exchange(paths: Paths, state: dict, out) -> dict | None:
         entry.update(ok=False, error=str(exc), tried_at=now)
         print(f"hub check-in failed: {exc}", file=sys.stderr)
         return None
-    usage_ack_local(paths, state, reply)
+    if usage_enabled(state):
+        usage_ack_local(paths, state, reply)
     lend = reply.pop("lend", None)  # carries tokens: never kept in state
     state["hub"] = {"at": now, "ok": True, "reply": reply}
     sent = {e.get("id") for e in export["events"]}
@@ -1539,17 +1614,27 @@ def apply_assignment(paths: Paths, state: dict, accounts: dict[str, dict], reply
 class Hub:
     """The hub's files, under its own lock. Never held across a network call."""
 
-    def __init__(self, paths: Paths):
+    def __init__(self, paths: Paths, read_only: bool = False):
         self.paths = paths
         self.dir = paths.store / "hub"
+        self.read_only = read_only
 
     def __enter__(self) -> "Hub":
-        init_store(self.paths)
-        (self.dir / "reports").mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.dir, 0o700)
-        fd = os.open(self.dir / "lock", os.O_CREAT | os.O_RDWR, 0o600)
-        self.lock = os.fdopen(fd)
-        fcntl.flock(self.lock, fcntl.LOCK_EX)
+        self.lock = None
+        if self.read_only:
+            try:
+                self.lock = (self.dir / "lock").open('r')
+            except FileNotFoundError:
+                pass  # An uninitialized hub has no state or lock to read.
+            if self.lock:
+                fcntl.flock(self.lock, fcntl.LOCK_SH)
+        else:
+            init_store(self.paths)
+            (self.dir / "reports").mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(self.dir, 0o700)
+            fd = os.open(self.dir / "lock", os.O_CREAT | os.O_RDWR, 0o600)
+            self.lock = os.fdopen(fd)
+            fcntl.flock(self.lock, fcntl.LOCK_EX)
         self.desired = load_json(self.dir / "desired.json")
         self.desired.setdefault("revision", 0)
         for key in ("hosts", "reservations"):
@@ -1560,7 +1645,8 @@ class Hub:
         return self
 
     def __exit__(self, *exc) -> None:
-        self.lock.close()
+        if self.lock:
+            self.lock.close()
 
     def save(self, change: str | None = None) -> None:
         if change:
@@ -1735,7 +1821,12 @@ def hub_checkin(hub: Hub, export: dict) -> dict:
     if (export.get("apply") or {}) != (previous.get("apply") or {}) and export.get("apply"):
         a = export["apply"]
         hub.event("apply", f"rev {a.get('revision')}: {a.get('result')}", host=host)
-    report = {"at": now, "export": export,
+    report_export = dict(export)
+    usage = report_export.pop('usage', None)
+    if isinstance(usage, dict) and isinstance(usage.get('codex'), dict):
+        codex = usage['codex']
+        report_export['usage'] = {'codex': {k: codex[k] for k in ('accounts', 'limits') if k in codex}}
+    report = {"at": now, "export": report_export,
               "events_seen": sorted({e.get("id") for e in export.get("events") or []
                                      if isinstance(e, dict) and isinstance(e.get("id"), int)})}
     atomic_write(hub.dir / "reports" / f"{host}.json", report)
@@ -1757,7 +1848,8 @@ def hub_checkin(hub: Hub, export: dict) -> dict:
     reply = {"version": HUB_VERSION, "revision": d["revision"], "host": host,
              "entry": d["hosts"].get(host), "reservations": d["reservations"],
              "draining": d["draining"], "policy": reply_policy,
-             "readings": hub_readings(reports), "returned": returned, "discard": discard,
+             "readings": hub_readings(reports), "account_emails": hub_emails(reports),
+             "returned": returned, "discard": discard,
              "hosts": {h: {"active": (r.get("export") or {}).get("active"), "at": r.get("at")}
                        for h, r in reports.items() if h != POOL}}
     if usage_watermarks is not None:
@@ -2602,6 +2694,14 @@ def cmd_hub(paths: Paths, args, out) -> int:
         out.write("\n")
         forward_alerts(paths, export, reply)
         return 0
+    if args.hub_command == "usage":
+        since = args.since if args.since is not None else int(now) - 7 * 86400
+        with Hub(paths, read_only=True) as hub:
+            account_snapshot = usage_snapshot_accounts(hub, now)
+        # SQLite scans and JSON serialization do not hold the hub check-in lock.
+        json.dump(usage_snapshot(hub, now, since, args.granularity, account_snapshot), out)
+        out.write("\n")
+        return 0
     if args.hub_command == "import-lend-copy":
         with Hub(paths) as hub:
             uuid = hub_resolve(hub.reports(), args.account)
@@ -2654,11 +2754,6 @@ def cmd_hub(paths: Paths, args, out) -> int:
             hub.save_copies(copies)
             hub.save(f"imported lend copy for {uuid[:8]}")
             print("imported lend copy; remove the source folder securely after verifying the import", file=out)
-            return 0
-        if args.hub_command == "usage":
-            since = args.since if args.since is not None else int(now) - 7 * 86400
-            json.dump(usage_snapshot(hub, now, since, args.granularity), out)
-            out.write("\n")
             return 0
         if args.hub_command == "status":
             view = hub_status_view(hub, now)

@@ -75,7 +75,8 @@ Hub side:
   default local SQLite path. A collection error is silent and does not stop a
   check-in. A hub which does not return usage acknowledgements causes retries.
 - Claude collection keeps per-file inode/offset state and a local SQLite cache
-  of request IDs and counts, never transcript content. A completed bucket can
+  of request IDs, counts and known account emails, never transcript content.
+  It scans recently modified files first. A completed bucket can
   be revised by a late transcript line; an acknowledgement includes its local
   revision so that revision is retransmitted. Files predating the retained
   account history have unknown attribution. Lines larger than 32 MiB are skipped
@@ -84,6 +85,8 @@ Hub side:
 - Codex backfill uses a bucket watermark and a composite cursor so an hour with
   more than 300 account/model rows can span check-ins. Up to 50 open-hour rows
   are resent; a larger open hour completes through the closed-hour backfill.
+  A host retains its acknowledged watermark and cursor across replies that omit
+  usage acknowledgements.
   Collection skips the Codex part if there are over 500 accounts or 1,000
   latest limit rows, to keep exports bounded. SQLite is opened with `mode=ro`;
   authentication columns are never selected.
@@ -91,5 +94,9 @@ Hub side:
   hourly bucket start times for window boundaries, and `all` starts at epoch
   zero. Unattributed token rows use null account/email and contribute to engine and host totals; they do not produce a per-account total, since null there means all accounts. Series include both `account` (as in the binding example) and the additive `email` alias for consumers. Old limit readings are
   compacted to the highest recorded percentage per hour, retaining that
-  reading's original timestamp and reset. History is sampled uniformly in
-  time-order to at most 200 points per account and kind.
+  reading's original timestamp and reset; compaction runs at most hourly. Hub
+  reports retain Codex account metadata and limits, not bulk token rows. History
+  is sampled uniformly in time-order to at most 200 points per account and kind.
+  The usage command copies account information under the hub lock, then reads
+  SQLite in read-only mode after releasing it. A missing database yields empty
+  history and token lists without creating one.
