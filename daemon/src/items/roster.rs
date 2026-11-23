@@ -7,10 +7,12 @@ use crate::control::operator;
 use crate::control::protocol::{Caller, ErrorCode, Request, Response};
 use crate::state::DaemonState;
 
-// A taskless caller's workspace authority comes from this daemon's current
-// registry, never a stale remote workspace stamp. Sorted for stable cursors.
+// Co-tenant visibility comes from this daemon's current registry, never a
+// stale remote workspace stamp. Rollback retains the taskless-only behavior.
+// Sorted for stable cursors.
 fn workspace_uids(s: &DaemonState, identity: &super::org::ReadCallerIdentity) -> Vec<String> {
-    if identity.task_id.is_some() || identity.global_perms { return Vec::new(); }
+    if identity.global_perms || (identity.task_id.is_some()
+        && s.config.session_scope == crate::config::SessionScope::TaskTree) { return Vec::new(); }
     let mut ids: Vec<String> = s.sessions.iter()
         .filter(|(_, session)| session.workspace_id == identity.workspace_id)
         .map(|(uid, _)| uid.clone()).collect();
@@ -41,7 +43,7 @@ fn read(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, (ErrorC
         Caller::Operator(_) => { operator::require_strong_operator(&req.caller)?; None }
     };
     for attempt in 0..2 {
-        let (identity, workspace, handle, url, token) = {
+        let (identity, workspace, handle, url, token, session_scope) = {
             let s = state.lock().unwrap_or_else(|p| p.into_inner());
             let identity = match uid {
                 Some(uid) => {
@@ -57,24 +59,28 @@ fn read(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, (ErrorC
             if workspace.len() > 2000 {
                 return Err((ErrorCode::Conflict, "roster workspace scope exceeds bound".into()));
             }
-            (identity, workspace, s.messaging.clone(), s.config.api_url.clone(), s.config.api_token.clone())
+            (identity, workspace, s.messaging.clone(), s.config.api_url.clone(), s.config.api_token.clone(), s.config.session_scope)
         };
         let daemon_id = handle.lock().unwrap_or_else(|p| p.into_inner()).as_ref()
             .map(|h| h.daemon_id.clone())
             .ok_or_else(|| (ErrorCode::Internal, "daemon_id_unavailable".into()))?;
         let client = super::api::Api::from_config(&url, &token)?;
         let pid = uid.map(|u| format!("agent:{daemon_id}:{u}")).unwrap_or_else(|| "owner".into());
+        let scope_name = match session_scope {
+            crate::config::SessionScope::ManagerChain => "manager_chain",
+            crate::config::SessionScope::TaskTree => "task_tree",
+        };
         let caller = if let Some(id) = identity.as_ref() {
             json!({"pid": pid, "daemon_id": daemon_id, "session_uid": uid,
                    "task_id": id.task_id, "workspace_id": id.workspace_id,
                    "workspace_uids": workspace,
                    "generation": id.generation, "process_identity": id.process_identity,
-                   "global": id.global_perms, "owner": false})
+                   "global": id.global_perms, "owner": false, "session_scope": scope_name})
         } else {
             json!({"pid": "owner", "daemon_id": daemon_id, "session_uid": null,
                    "task_id": null, "workspace_id": null, "generation": null,
                    "workspace_uids": [],
-                   "process_identity": null, "global": false, "owner": true})
+                   "process_identity": null, "global": false, "owner": true, "session_scope": scope_name})
         };
         let response = client.post("/session-roster", &json!({"caller": caller, "filters": filters}))?;
         let basis = response.get("scope_basis").and_then(Value::as_object)
@@ -85,7 +91,8 @@ fn read(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, (ErrorC
             // unavailability fails closed rather than widening the result.
             let member = client.get("/org/members/by-pid", &[("pid", pid.clone())])?;
             let central = &member["member"];
-            valid = basis.get("member_id") == Some(&central["id"])
+            valid = basis.get("session_scope").and_then(Value::as_str) == Some(scope_name)
+                && basis.get("member_id") == Some(&central["id"])
                 && basis.get("revision") == Some(&central["revision"])
                 && basis.get("role") == member.get("acting_as")
                 && basis.get("member_id").and_then(Value::as_str) == id.member_id.as_deref()
@@ -103,10 +110,12 @@ fn read(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<Value, (ErrorC
                 && super::org::caller_identity(&s, uid.unwrap()).as_ref() == Some(id)
                 && workspace_uids(&s, id) == workspace
                 && std::sync::Arc::ptr_eq(&s.messaging, &handle)
-                && s.config.api_url == url && s.config.api_token == token;
+                && s.config.api_url == url && s.config.api_token == token
+                && s.config.session_scope == session_scope;
         } else {
             operator::require_strong_operator(&req.caller)?;
-            valid &= basis.get("owner").and_then(Value::as_bool) == Some(true);
+            valid &= basis.get("owner").and_then(Value::as_bool) == Some(true)
+                && basis.get("session_scope").and_then(Value::as_str) == Some(scope_name);
         }
         let current_daemon = handle.lock().unwrap_or_else(|p| p.into_inner()).as_ref()
             .map(|h| h.daemon_id.clone());
@@ -134,7 +143,7 @@ mod tests {
             if method == "POST" && path == "/session-roster" {
                 let c = &body["caller"];
                 return (200, json!({"scope_basis": {"member_id":null,"role":null,"revision":null,
-                    "global":c["global"],"owner":false,"task_roots":[]}, "rows": []}).to_string());
+                    "global":c["global"],"owner":false,"task_roots":[],"session_scope":c["session_scope"]}, "rows": []}).to_string());
             }
             if method == "GET" && path.starts_with("/org/members/by-pid?") {
                 let n = observed.fetch_add(1, Ordering::SeqCst);
@@ -208,7 +217,7 @@ mod tests {
                     session.global_perms = !session.global_perms;
                 }
                 return (200, json!({"scope_basis": {"member_id":null,"role":null,"revision":null,
-                    "global":body["caller"]["global"],"owner":false,"task_roots":[]},
+                    "global":body["caller"]["global"],"owner":false,"task_roots":[],"session_scope":body["caller"]["session_scope"]},
                     "rows":[{"sensitive":"old scope"}]}).to_string());
             }
             if method == "GET" && path.starts_with("/org/members/by-pid?") {

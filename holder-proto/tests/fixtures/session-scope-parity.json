@@ -1,0 +1,24 @@
+{
+  "version": 7,
+  "members": [
+    {"id":"mem_lead","org_id":"default","status":"active","manager_member_id":null,"assistants":[
+      {"daemon_id":"d1","session_uid":"lead","acting_as":"main","spawned_by":null},
+      {"daemon_id":"d1","session_uid":"helper","acting_as":"assistant","spawned_by":{"daemon_id":"d1","session_uid":"lead"}},
+      {"daemon_id":"d1","session_uid":"sibling","acting_as":"assistant","spawned_by":{"daemon_id":"d1","session_uid":"lead"}}
+    ]},
+    {"id":"mem_child","org_id":"default","status":"active","manager_member_id":"mem_lead","assistants":[
+      {"daemon_id":"d2","session_uid":"child","acting_as":"main","spawned_by":null},
+      {"daemon_id":"d2","session_uid":"worker","acting_as":"worker","spawned_by":{"daemon_id":"d2","session_uid":"child"}}
+    ]},
+    {"id":"mem_other","org_id":"default","status":"active","manager_member_id":null,"assistants":[
+      {"daemon_id":"d2","session_uid":"other","acting_as":"main","spawned_by":null}
+    ]}
+  ],
+  "cases": [
+    {"caller":"agent:d1:lead","target":"agent:d2:worker","allowed":true},
+    {"caller":"agent:d1:lead","target":"agent:d1:helper","allowed":true},
+    {"caller":"agent:d1:lead","target":"agent:d2:other","allowed":false},
+    {"caller":"agent:d1:helper","target":"agent:d1:sibling","allowed":false},
+    {"caller":"agent:d1:lead","target":"agent:d2:unknown","allowed":false}
+  ]
+}

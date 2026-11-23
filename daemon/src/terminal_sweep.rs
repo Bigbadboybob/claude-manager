@@ -1,4 +1,5 @@
-//! Close the workers a finished task still owns.
+//! Observe workers of finished tasks. In manager-chain mode they are left
+//! running; task-tree rollback retains the historical automatic sweep.
 //!
 //! THE BUG THIS EXISTS FOR (2026-09-18). The daemon has always had
 //! `sweep_task_sessions`: kill every session bound to a task, so its checkout
@@ -127,6 +128,7 @@ pub struct TerminalTaskSweeper {
     done_delay: Duration,
     /// When each candidate task was first seen terminal by this brain.
     terminal_since: Mutex<HashMap<String, Instant>>,
+    preserved_logged: Mutex<BTreeSet<String>>,
 }
 
 impl TerminalTaskSweeper {
@@ -146,6 +148,7 @@ impl TerminalTaskSweeper {
             grace: OwnerGrace { window: owner_grace, floor: Instant::now() },
             done_delay,
             terminal_since: Mutex::new(HashMap::new()),
+            preserved_logged: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -174,6 +177,8 @@ impl TerminalTaskSweeper {
             (state.config.api_url.clone(), state.config.api_token.clone())
         };
         let mut closed = Vec::new();
+        let live: BTreeSet<String> = self.state.lock().unwrap_or_else(|p| p.into_inner()).sessions.keys().cloned().collect();
+        self.preserved_logged.lock().unwrap_or_else(|p| p.into_inner()).retain(|uid| live.contains(uid));
         let candidates = candidate_task_ids(&self.state);
         {
             // Forget tasks that no longer own a sweepable session.
@@ -209,6 +214,27 @@ impl TerminalTaskSweeper {
                 }
             };
             if !self.due(&task_id, &status) {
+                continue;
+            }
+            // A task status is not a session-control grant. Log each worker
+            // once while it remains live, so operators can see retained work.
+            let preserved = {
+                let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                if state.config.session_scope == crate::config::SessionScope::ManagerChain {
+                    Some(state.sessions.iter().filter(|(_, s)| s.task_id.as_deref() == Some(task_id.as_str())
+                        && s.continuous_task_id.is_none() && s.workflow_run_id.is_none()
+                        && !crate::assistants::is_shell(&s.session_type)
+                        && !crate::assistants::is_member_session(s) && !s.last_exit.kernel_set())
+                        .map(|(uid, _)| uid.clone()).collect::<Vec<_>>())
+                } else { None }
+            };
+            if let Some(preserved) = preserved {
+                let mut logged = self.preserved_logged.lock().unwrap_or_else(|p| p.into_inner());
+                for uid in preserved {
+                    if logged.insert(uid.clone()) {
+                        eprintln!("cm-daemon: INFO terminal task leaves worker running task={task_id:?} session={uid:?}");
+                    }
+                }
                 continue;
             }
             // A board-originated close (the status mirror) only unassigns:

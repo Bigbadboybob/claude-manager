@@ -13,6 +13,7 @@ pub mod heartbeat;
 pub mod held;
 pub mod org;
 pub mod roster;
+pub mod session_scope;
 pub mod rpc;
 pub(crate) mod s4_attribution;
 
@@ -20,5 +21,6 @@ pub(crate) mod s4_attribution;
 /// gate-receipt refresh, doc/gate-receipts.md §8).
 pub fn start(state: &std::sync::Arc<std::sync::Mutex<crate::state::DaemonState>>) {
     heartbeat::start(state);
+    session_scope::start(state);
     gate::start_refresh(state);
 }

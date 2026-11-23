@@ -104,6 +104,9 @@ fn allowed(state: &DaemonState, caller: &Caller, uid: &str) -> bool {
     if !live(state, &c.session_uid) {
         return false;
     }
+    if state.config.session_scope == crate::config::SessionScope::ManagerChain {
+        return auth::manager_reaches_any(state, &c.session_uid, uid);
+    }
     let cview = state.lookup_session_any(&c.session_uid).unwrap();
     let target = state.lookup_session_any(uid).unwrap();
     if c.session_uid == uid || cview.global_perms {

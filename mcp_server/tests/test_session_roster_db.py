@@ -1,12 +1,14 @@
 """Roster contracts against a disposable scratch Postgres only."""
 
 import os
+import json
+from pathlib import Path
 import unittest
 import uuid
 
 os.environ.setdefault("CM_DB_DSN", "postgres://stub")
 os.environ.setdefault("CM_API_TOKEN", "stub")
-from dispatch import db, session_roster  # noqa: E402
+from dispatch import db, org_db, session_roster  # noqa: E402
 from dispatch.items_rules import ItemsError  # noqa: E402
 
 DSN = os.environ.get("CM_ITEMS_TEST_DSN")
@@ -64,6 +66,62 @@ class RosterDb(unittest.IsolatedAsyncioTestCase):
 
     async def query(self, c=None, f=None):
         return await session_roster.read(self.pool, c or caller(task_id=str(self.root)), f or filters(), b"fixture-key")
+
+    async def test_shared_manager_scope_fixture(self):
+        fixture = json.loads((Path(__file__).resolve().parents[2] /
+            "holder-proto/tests/fixtures/session-scope-parity.json").read_text())
+        facts = {f"agent:{entry['daemon_id']}:{entry['session_uid']}": (member['id'], entry['acting_as'])
+                 for member in fixture['members'] for entry in member['assistants']}
+        # Exercise the actual roster CTE and central authority code over the
+        # same manager graph the Rust evaluator consumes.
+        prefix = session_roster._SCOPED.split("facts AS MATERIALIZED", 1)[0].rstrip().rstrip(",")
+        async with self.pool.acquire() as conn:
+            for case in fixture['cases']:
+                actor = facts.get(case['caller'])
+                target = facts.get(case['target'])
+                allowed = False
+                roster_allowed = False
+                if actor and target and actor[1] == 'main':
+                    rows = await conn.fetch(prefix + " SELECT id FROM member_scope", None, actor[0])
+                    roster_allowed = target[0] in {r['id'] for r in rows}
+                    try:
+                        await org_db._require_chain(conn, {'pid': case['caller']}, target[0], 'control', self_ok=True)
+                        allowed = True
+                    except org_db.OrgError:
+                        pass
+                self.assertEqual(allowed, case['allowed'], case)
+                self.assertEqual(roster_allowed, case['allowed'], case)
+
+    async def test_manager_scope_excludes_tasks_but_keeps_reports_and_cotenants(self):
+        with self.assertLogs("dispatch.session_roster", level="WARNING") as logs:
+            out = await self.query(c=caller(task_id=str(self.root), session_scope="manager_chain"))
+        self.assertTrue(any("agent:d1:lead" in line and "agent:d2:tasked" in line
+                            and "method=session_roster" in line for line in logs.output))
+        self.assertEqual({r["session"]["uid"] for r in out["rows"]}, {"lead", "child", "assistant"})
+        # The rollback flag retains the old task-descendant visibility.
+        rollback = await self.query(c=caller(task_id=str(self.root), session_scope="task_tree"))
+        self.assertIn("tasked", {r["session"]["uid"] for r in rollback["rows"]})
+        # A co-tenant remains visible even for a tasked caller.
+        peer = await self.query(c=caller(task_id=str(self.root), session_scope="manager_chain",
+                                         workspace_uids=["unknown"]))
+        self.assertEqual(peer["coverage"]["unknown_kind_omitted"], 1)
+
+    async def test_manager_scope_assistant_sees_spawns_not_member_siblings(self):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""INSERT INTO org_session_facts
+                (pid, daemon_id, session_uid, member_id, acting_as, managed_by_uid, reported_at)
+                VALUES ('agent:d2:spawn','d2','spawn','mem_child','worker','assistant',now())""")
+            await conn.execute("""INSERT INTO session_states
+                (pid,daemon_id,session_uid,host_label,name,engine,state,reported_at,
+                 roster_stamp_member,roster_stamp_role,roster_stamp_as_of)
+                VALUES ('agent:d2:spawn','d2','spawn','same','spawn','codex','idle',now(),
+                        'mem_child','worker',now())""")
+        scoped = await self.query(c=caller(pid="agent:d2:assistant", daemon_id="d2",
+                                           session_uid="assistant", session_scope="manager_chain"))
+        self.assertEqual({r["session"]["uid"] for r in scoped["rows"]}, {"assistant", "spawn"})
+        scoped_peer = await self.query(c=caller(pid="agent:d2:assistant", daemon_id="d2",
+            session_uid="assistant", session_scope="manager_chain", workspace_uids=["other"]))
+        self.assertEqual({r["session"]["uid"] for r in scoped_peer["rows"]}, {"assistant", "spawn", "other"})
 
     async def test_union_scope_filter_before_count_and_ambiguous_host(self):
         out = await self.query()

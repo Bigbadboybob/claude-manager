@@ -130,15 +130,16 @@ def _capture_baseline(uid: str, *, until: str = "turn_end") -> tuple[dict | None
     be captured BEFORE a just-sent prompt can start its turn (the
     daemon's PTY delivery gives ~4s of runway; registration follows the
     send within milliseconds), or a fast worker could complete the new
-    turn before an async capture ran and the edge would never fire. One
-    socket round-trip + one bounded tail read; any failure degrades to
-    a level trigger (None) rather than blocking registration."""
+    turn before an async capture ran and the edge would never fire. The
+    resolve also authorizes the watch; failure refuses registration."""
     try:
         resolved = control_client.call(
             "resolve_authorized_session", {"session_uid": uid}
         )
-    except (control_client.ControlError, control_client.TransportError):
-        return None, False, None
+    except control_client.ControlError as exc:
+        raise RegistrationError(exc.code, f"cannot monitor {uid}: {exc.message}") from exc
+    except control_client.TransportError as exc:
+        raise RegistrationError("unavailable", f"cannot authorize monitor for {uid}: {exc}") from exc
     if is_shell(resolved):
         if until == "final":
             raise RegistrationError("agent_only", shell_refusal("monitor_sessions(until=final)")["message"])

@@ -409,6 +409,16 @@ impl Beat {
             applied
         };
         self.mark_acks.extend(applied);
+        // Facts for a newly spawned local session have just reached the API.
+        // Fetch a fresh scope rather than leaving that session unusable until
+        // the periodic five-minute refresh.
+        let has_unknown = {
+            let s = state.lock().unwrap_or_else(|p| p.into_inner());
+            s.sessions.values().any(|session| session.session_type != "bash"
+                && !s.session_scope_cache.graph.sessions.contains_key(
+                    &cm_holder_proto::session_scope::session_key(&snap.daemon_id, &session.uid)))
+        };
+        if has_unknown { super::session_scope::request_refresh(); }
         for push in reply["pushes"].as_array().into_iter().flatten() {
             let Some(id) = push["id"].as_i64() else { continue };
             if self.deliver(state, &snap.root, push) {

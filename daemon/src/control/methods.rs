@@ -1953,8 +1953,7 @@ fn return_auth_error_if_denied_with_state(
         AuthDecision::OutOfScope => Err((
             ErrorCode::Unauthorized,
             format!(
-                "Session caller '{}' is not authorized for target '{}' \
-                 (outside caller's task subtree / workspace per TUI-mirror rule)",
+                "Session caller '{}' is not authorized for target '{}' (outside session scope)",
                 caller_uid, target_uid
             ),
         )),
@@ -2924,28 +2923,8 @@ pub fn list_sessions(
             .map_err(|e| (ErrorCode::InvalidParams, format!("list_sessions params: {}", e)))?
     };
     let include_shells = p.include_shells.unwrap_or(caller_uid.is_none());
-    // Org-report visibility is a read-only widening of the default scope.
-    // Snapshot the caller's global grant first, then make one batched API
-    // request before taking the registry lock used to build the rows.  An API
-    // outage leaves this `None`, which deliberately preserves today's scope.
-    let caller_is_global_snapshot = caller_uid
-        .and_then(|cuid| {
-            state_arc
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .sessions
-                .get(cuid)
-                .map(|s| s.global_perms)
-        })
-        .unwrap_or(false);
-    let org_read_members = if p.task_id.is_none()
-        && caller_uid.is_some()
-        && !caller_is_global_snapshot
-    {
-        crate::items::org::read_scope_members(state_arc, caller_uid.unwrap(), p.include_exited)
-    } else {
-        None
-    };
+    let caller_is_global_snapshot = caller_uid.and_then(|uid| state_arc.lock().unwrap_or_else(|p| p.into_inner())
+        .sessions.get(uid).map(|s| s.global_perms)).unwrap_or(false);
     let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
 
     // Global-permissions grant: a global caller sees EVERY session
@@ -2966,7 +2945,7 @@ pub fn list_sessions(
     //   - Taskless Session caller + explicit task_id: Unauthorized.
     //   - Tasked Session caller + explicit task_id: must be
     //     self-or-descendant of caller's task.
-    if let Some(req_task) = p.task_id.as_deref() {
+    if let Some(req_task) = p.task_id.as_deref().filter(|_| state.config.session_scope == crate::config::SessionScope::TaskTree) {
         if let Some(cuid) = caller_uid {
             if caller_is_global {
                 // Global caller may scope to any task — skip the
@@ -3016,7 +2995,7 @@ pub fn list_sessions(
     // no implicit own-task scope, so they default to seeing every
     // session.
     let scope_task: Option<String> = p.task_id.clone().or_else(|| {
-        if caller_is_global {
+        if caller_is_global || state.config.session_scope == crate::config::SessionScope::ManagerChain {
             return None;
         }
         caller_uid
@@ -3031,6 +3010,12 @@ pub fn list_sessions(
     // the current scope_task / caller_uid context? Used by both
     // the daemon-owned and TUI-owned loops below.
     let should_include = |uid: &str, task_id: Option<&str>| -> bool {
+        if state.config.session_scope == crate::config::SessionScope::ManagerChain {
+            let filter_ok = p.task_id.as_deref().is_none_or(|scope| task_id
+                .is_some_and(|t| crate::control::auth::task_in_scope(&state, t, scope)));
+            if !filter_ok { return false; }
+            return caller_uid.is_none_or(|cuid| crate::control::auth::manager_reaches_any(&state, cuid, uid));
+        }
         // Global caller: see everything. Honor an explicit task
         // scope if one was passed, otherwise include unconditionally.
         // (Routing a global caller through `check_session_caller`
@@ -3072,24 +3057,12 @@ pub fn list_sessions(
             // No scope, Operator caller: every session.
             (None, None) => true,
         };
-        if legacy {
-            return true;
-        }
-        // A lead's org-chain read is additive only for the default listing
-        // (no explicit task filter).  The target must carry the same member
-        // attribution the API checked in the batch response.
-        org_read_members.as_ref().is_some_and(|allowed| {
-            state
-                .sessions
-                .get(uid)
-                .and_then(crate::assistants::of_session)
-                .is_some_and(|m| allowed.contains(&m.member_id))
-        })
+        legacy
     };
 
     // Daemon-owned sessions (live PTY in `state.sessions`).
     for (uid, session) in state.sessions.iter() {
-        if (!include_shells && session.session_type == "bash")
+        if (session.session_type == "bash" && (!include_shells || caller_uid.is_some()))
             || !should_include(uid, session.task_id.as_deref()) {
             continue;
         }
@@ -3202,7 +3175,7 @@ pub fn list_sessions(
         return Ok(Value::Array(sessions));
     }
     for (uid, snap) in state.tui_sessions.iter() {
-        if !include_shells && snap.session_type.as_deref() == Some("bash") { continue; }
+        if snap.session_type.as_deref() == Some("bash") && (!include_shells || caller_uid.is_some()) { continue; }
         if state.sessions.contains_key(uid) {
             continue;
         }
@@ -3258,33 +3231,18 @@ pub fn list_sessions(
             if state.sessions.contains_key(uid) || state.tui_sessions.contains_key(uid) {
                 continue;
             }
-            let legacy_include = match (scope_task.as_deref(), caller_uid) {
-                (Some(scope), _) => tomb
-                    .task_id
-                    .as_deref()
-                    .map(|t| {
-                        crate::control::auth::task_in_scope(
-                            &state,
-                            t,
-                            scope,
-                        )
-                    })
-                    .unwrap_or(false),
-                (None, Some(cuid)) => crate::control::auth::check_session_caller_for_exited(
-                    &state,
-                    cuid,
-                    uid,
-                    tomb.task_id.as_deref(),
-                    &tomb.workspace_id,
-                )
-                .is_allow(),
-                (None, None) => true,
+            let include = if state.config.session_scope == crate::config::SessionScope::ManagerChain {
+                p.task_id.as_deref().is_none_or(|scope| tomb.task_id.as_deref().is_some_and(|t|
+                    crate::control::auth::task_in_scope(&state, t, scope)))
+                    && caller_uid.is_none_or(|cuid| crate::control::auth::manager_reaches_any(&state, cuid, uid))
+            } else {
+                match (scope_task.as_deref(), caller_uid) {
+                    (Some(scope), _) => tomb.task_id.as_deref().is_some_and(|t| crate::control::auth::task_in_scope(&state, t, scope)),
+                    (None, Some(cuid)) => crate::control::auth::check_session_caller_for_exited(&state, cuid, uid, tomb.task_id.as_deref(), &tomb.workspace_id).is_allow(),
+                    (None, None) => true,
+                }
             };
-            let include = legacy_include || org_read_members.as_ref().is_some_and(|allowed| {
-                crate::assistants::membership(uid, tomb.org.as_ref())
-                    .is_some_and(|m| allowed.contains(&m.member_id))
-            });
-            if !include || (!include_shells && tomb.session_type == "bash") {
+            if !include || (tomb.session_type == "bash" && (!include_shells || caller_uid.is_some())) {
                 continue;
             }
             sessions.push(json!({
@@ -3422,69 +3380,10 @@ pub fn resolve_authorized_session(
             )
         })?;
 
-    // Keep the ordinary task/workspace decision local and cheap.  If it
-    // denies, release the registry lock before asking the planning API for
-    // the same manager-chain read authority used by session handoff.  An API
-    // failure falls back to this denial, so the old scope remains fail-closed.
-    let (initial_decision, initial_caller_identity) = if let Some(cuid) = caller_uid {
-        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-        (
-            resolve_read_decision(&state, cuid, &p.session_uid),
-            crate::items::org::caller_identity(&state, cuid),
-        )
-    } else {
-        (crate::control::auth::AuthDecision::Allow, None)
-    };
-    let org_identity = if !initial_decision.is_allow() {
-        caller_uid.and_then(|cuid| {
-            crate::items::org::read_authorized_target(
-                state_arc,
-                cuid,
-                &p.session_uid,
-            )
-        })
-    } else {
-        None
-    };
-    if !initial_decision.is_allow() && org_identity.is_none() {
-        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-        let decision = caller_uid
-            .map(|cuid| resolve_read_decision(&state, cuid, &p.session_uid))
-            .unwrap_or(crate::control::auth::AuthDecision::Allow);
-        if let Some(cuid) = caller_uid {
-            return_auth_error_if_denied_with_state(
-                decision,
-                cuid,
-                &p.session_uid,
-                Some(&state),
-            )?;
-        }
-    }
     let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(cuid) = caller_uid {
-        let current_caller_identity = crate::items::org::caller_identity(&state, cuid);
-        if current_caller_identity != initial_caller_identity {
-            return Err((
-                ErrorCode::Unauthorized,
-                "caller session changed during read authorization; retry".into(),
-            ));
-        }
-        let current_decision = resolve_read_decision(&state, cuid, &p.session_uid);
-        let attribution_changed = org_identity.as_ref().is_some_and(|granted| {
-            crate::items::org::target_identity(&state, &p.session_uid).as_ref() != Some(granted)
-        });
-        // Re-check the current target after the API call.  A reused UID may
-        // now name a different task/member/transcript; the old grant cannot
-        // authorize that replacement.  If the current task scope itself now
-        // allows the target, the ordinary scope is sufficient.
-        if attribution_changed || org_identity.is_none() {
-            return_auth_error_if_denied_with_state(
-                current_decision,
-                cuid,
-                &p.session_uid,
-                Some(&state),
-            )?;
-        }
+        let decision = resolve_read_decision(&state, cuid, &p.session_uid);
+        return_auth_error_if_denied_with_state(decision, cuid, &p.session_uid, Some(&state))?;
     }
     // Auth passed (or Operator caller). Resolve the target: live session first,
     // then a recently-exited tombstone (read-after-exit), else NotFound.
@@ -4942,6 +4841,9 @@ pub fn reload_config(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
             // short control lock is never held by allocator calls and the trim
             // worker never takes the daemon state lock.
             crate::memory_trim::reload(applied.memory.clone());
+            if st.config.api_url != applied.api_url {
+                st.session_scope_cache = Default::default();
+            }
             st.config = applied;
         }
         (changed, requires_restart)
@@ -13823,45 +13725,32 @@ pub fn trigger(
     crate::continuous::task::validate_task_id(&p.task_id)
         .map_err(|e| (ErrorCode::InvalidParams, format!("trigger: {}", e)))?;
 
-    // Session-caller scope gate (Phase 2: self-or-descendant only — the
-    // downstream-allowlist fan-out edge is Phase 6). Operator callers bypass:
-    // their token was already validated at dispatch. Capture the caller's PTY
-    // size in the SAME brief lock so a Session-fired task inherits the caller's
-    // width; an Operator/headless fire has no terminal → 80×24 (same default as
-    // start_workflow). A taskless Session caller (own_task None) fails the gate,
-    // identical to start_workflow.
+    // Trigger identifies a continuous task, so authorize its known main
+    // session. Unknown associations fail closed; a global caller may trigger
+    // even when no main is currently known.
+    let task = crate::continuous::task::load_one(&p.task_id).ok_or((
+        ErrorCode::NotFound, format!("trigger: continuous task '{}' not found", p.task_id),
+    ))?;
     let caller_size: Option<(u16, u16)> = match caller {
         Caller::Operator(_) => None,
-        Caller::Session(s) => {
+        Caller::Session(c) => {
             let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-            let sess = state.sessions.get(&s.session_uid);
-            let own_task = sess.and_then(|x| x.task_id.clone());
-            let size = sess.map(|x| (x.last_cols, x.last_rows));
-            let ok = own_task.as_deref().map_or(false, |own| {
-                crate::control::auth::task_in_scope(
-                    &state,
-                    &p.task_id,
-                    own,
-                )
-            });
-            if !ok {
-                return Err((
-                    ErrorCode::Unauthorized,
-                    format!(
-                        "trigger: continuous task '{}' is not the caller's task or a descendant",
-                        p.task_id
-                    ),
-                ));
-            }
-            size
+            let sess = state.sessions.get(&c.session_uid).ok_or((ErrorCode::Unauthorized, "trigger caller not found".into()))?;
+            let allowed = if state.config.session_scope == crate::config::SessionScope::TaskTree {
+                sess.global_perms || sess.task_id.as_deref().is_some_and(|own|
+                    crate::control::auth::task_in_scope(&state, &p.task_id, own))
+            } else if sess.global_perms { true } else {
+                task.current_session_uid.as_deref().is_some_and(|uid| {
+                    let cache = &state.session_scope_cache;
+                    let key = cm_holder_proto::session_scope::session_key(&cache.daemon_id, uid);
+                    cache.graph.sessions.get(&key).is_some_and(|f| f.role == cm_holder_proto::session_scope::Role::Main)
+                        && crate::control::auth::manager_reaches_any(&state, &c.session_uid, uid)
+                })
+            };
+            if !allowed { return Err((ErrorCode::Unauthorized, format!("trigger: no authority for continuous task '{}'", p.task_id))); }
+            Some((sess.last_cols, sess.last_rows))
         }
     };
-
-    // Load the durable record (None → NotFound).
-    let task = crate::continuous::task::load_one(&p.task_id).ok_or((
-        ErrorCode::NotFound,
-        format!("trigger: continuous task '{}' not found", p.task_id),
-    ))?;
 
     // A paused or incompletely adopted task cannot reach any executor.
     if task.paused || task.adoption_pending.is_some() {
@@ -21879,6 +21768,9 @@ pub(crate) fn sweep_terminal_task_sessions(
     via_item: bool,
 ) -> Vec<String> {
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+    // A task status alone does not confer session authority. The background
+    // sweep has no authenticated session caller; only rollback retains it.
+    if state.config.session_scope == crate::config::SessionScope::ManagerChain { return Vec::new(); }
     let targets: Vec<String> = state
         .sessions
         .iter()
@@ -21930,20 +21822,34 @@ pub(crate) fn sweep_terminal_task_sessions(
 
 /// fast the children die.
 pub(crate) fn sweep_task_sessions(state_arc: &Arc<Mutex<DaemonState>>, task_id: &str, killer: &str) -> Vec<String> {
+    sweep_task_sessions_scoped(state_arc, task_id, killer, None).0
+}
+
+fn sweep_task_sessions_scoped(
+    state_arc: &Arc<Mutex<DaemonState>>, task_id: &str, killer: &str, caller: Option<&str>,
+) -> (Vec<String>, Vec<Value>) {
     let mut state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-    let targets: Vec<String> = state
-        .sessions
-        .iter()
-        // A member's main session or assistant is only unassigned
-        // (lifecycle_guard_v1, assistant_guard_v1).
-        // A shell is Owner's alone to close, kill or restart.
-        .filter(|(_, s)| {
-            s.task_id.as_deref() == Some(task_id)
-                && !crate::assistants::is_member_session(s)
-                && !crate::assistants::is_shell(&s.session_type)
-        })
-        .map(|(uid, _)| uid.clone())
-        .collect();
+    if state.config.session_scope == crate::config::SessionScope::ManagerChain {
+        let left = state.sessions.iter().filter(|(_, s)| s.task_id.as_deref() == Some(task_id)
+            && !s.last_exit.kernel_set()).map(|(uid, s)| {
+                eprintln!("cm-daemon: INFO task completion leaves session running task={task_id:?} session={uid:?}");
+                json!({"session_uid": uid, "label": s.title, "reason": "task completion does not close sessions"})
+            }).collect();
+        return (Vec::new(), left);
+    }
+    let candidates: Vec<(String, String)> = state.sessions.iter()
+        .filter(|(_, s)| s.task_id.as_deref() == Some(task_id)
+            && !crate::assistants::is_member_session(s) && !crate::assistants::is_shell(&s.session_type))
+        .map(|(uid, s)| (uid.clone(), s.title.clone())).collect();
+    let mut targets = Vec::new();
+    let mut left_running = Vec::new();
+    for (uid, label) in candidates {
+        if caller.is_some_and(|c| !crate::control::auth::check_session_caller(&state, c, &uid).is_allow()) {
+            left_running.push(json!({"session_uid": uid, "label": label, "reason": "out of session scope"}));
+        } else {
+            targets.push(uid);
+        }
+    }
     let swept_at = now_unix_f64();
     let killer = format!("{} (mark_subtask_done)", killer);
     let mut recovery_blocked = Vec::new();
@@ -21953,14 +21859,34 @@ pub(crate) fn sweep_task_sessions(state_arc: &Arc<Mutex<DaemonState>>, task_id: 
         if crate::claude_recovery::admission_refusal(&uid).is_some() || crate::claude_recovery::has_pending_input(&uid) { recovery_blocked.push(uid); continue; }
         if let Some(sess) = state.sessions.get_mut(&uid) {
             sess.last_exit.mark_operator_kill_requested();
-            // O4 routing: the verb-routed kill carries the sweep's
-            // attribution through the holder echo (no-op monolith).
             sess.set_kill_attribution(&killer);
             let _ = sess.kill();
         }
         state.record_kill_request(&uid, &killer, swept_at);
     }
-    recovery_blocked
+    (recovery_blocked, left_running)
+}
+
+/// Whether cleanup must keep the checkout because a live session in it will
+/// not be swept. The same session-scope check is repeated under the sweep lock.
+fn task_cleanup_keeps_live(state: &DaemonState, ws: &str, task: &str, caller: Option<&str>) -> bool {
+    if crate::assistants::workspace_kept(state, ws).is_some() { return true; }
+    if state.config.session_scope == crate::config::SessionScope::ManagerChain {
+        return state.sessions.values().any(|s| s.workspace_id == ws && !s.last_exit.kernel_set());
+    }
+    state.sessions.iter().any(|(uid, session)| {
+        if session.workspace_id != ws || session.last_exit.kernel_set() { return false; }
+        let role = state.session_scope_cache.role(uid);
+        let worker = state.config.session_scope == crate::config::SessionScope::TaskTree
+            || role == Some(cm_holder_proto::session_scope::Role::Worker)
+            || (role.is_none() && caller.is_none());
+        let eligible = session.task_id.as_deref() == Some(task)
+            && !crate::assistants::is_member_session(session)
+            && !crate::assistants::is_shell(&session.session_type)
+            && worker
+            && caller.is_none_or(|c| crate::control::auth::check_session_caller(state, c, uid).is_allow());
+        !eligible
+    })
 }
 
 fn teardown_subtask_done(
@@ -21971,6 +21897,7 @@ fn teardown_subtask_done(
     // Attribution for the session sweep below: the calling agent's uid on the
     // Session route, `"operator"` on the operator route.
     killer: &str,
+    session_caller: Option<&str>,
 ) -> MethodResult {
     // Rebuild the params struct so the teardown body below stays verbatim from
     // the original single-function implementation.
@@ -22019,7 +21946,11 @@ fn teardown_subtask_done(
     // accepted the loss). Committed work is preserved by the branch ref, so
     // only the working tree is at risk. `is_in_place` worktrees ARE the main
     // checkout (wt == main_repo) — never our dirt to judge; skip them.
-    if p.close_worktree && was_branch_mode && !p.force {
+    let keep_before_sweep = cleanup.as_ref().is_some_and(|(ws_id, _, _)| {
+        let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
+        task_cleanup_keeps_live(&state, ws_id, &p.task_id, session_caller)
+    });
+    if p.close_worktree && was_branch_mode && !p.force && !keep_before_sweep {
         if let Some((_, Some(wt), mr_opt)) = &cleanup {
             let is_in_place = mr_opt.as_ref() == Some(wt);
             if !is_in_place {
@@ -22058,7 +21989,7 @@ fn teardown_subtask_done(
     // regardless of worktree_mode / close_worktree (the daemon previously only
     // closed them inside the branch-mode + close_worktree path, stranding live
     // sessions on inherit / in-place / close_worktree=false done subtasks).
-    let recovery_blocked = sweep_task_sessions(state_arc, &p.task_id, killer);
+    let (recovery_blocked, left_running) = sweep_task_sessions_scoped(state_arc, &p.task_id, killer, session_caller);
     if !recovery_blocked.is_empty() {
         return Err((ErrorCode::Conflict, format!(
             "task teardown deferred while background recovery is pending for: {}",
@@ -22078,7 +22009,10 @@ fn teardown_subtask_done(
     // of 6522623, O5), so it is kept as "member" / "assistant".
     let workspace_kept: Option<&'static str> = cleanup.as_ref().and_then(|(ws_id, _, _)| {
         let state = state_arc.lock().unwrap_or_else(|p| p.into_inner());
-        crate::assistants::workspace_kept(&state, ws_id)
+        crate::assistants::workspace_kept(&state, ws_id).or_else(|| {
+            state.sessions.values().any(|s| s.workspace_id == *ws_id && !s.last_exit.kernel_set())
+                .then_some("live_session")
+        })
     });
     if p.close_worktree && was_branch_mode && workspace_kept.is_none() {
         let (ws_id, wt_opt, mr_opt) = cleanup.ok_or((
@@ -22142,7 +22076,7 @@ fn teardown_subtask_done(
     }
     api_update_task(&creds, &p.task_id, &done).map_err(|e| e.to_method_err())?;
 
-    let mut out = json!({ "ok": true, "worktree_removed": worktree_removed });
+    let mut out = json!({ "ok": true, "worktree_removed": worktree_removed, "left_running": left_running });
     if let Some(kind) = workspace_kept {
         out["workspace_kept"] = json!(kind);
     }
@@ -22183,7 +22117,7 @@ pub fn mark_subtask_done(
     }
 
     let killer = caller_uid.unwrap_or(OPERATOR_KILLER).to_string();
-    teardown_subtask_done(state_arc, &p.task_id, p.close_worktree, p.force, &killer)
+    teardown_subtask_done(state_arc, &p.task_id, p.close_worktree, p.force, &killer, caller_uid)
 }
 
 /// Operator-scoped counterpart to [`mark_subtask_done`]: tears down and marks
@@ -22210,6 +22144,7 @@ pub fn operator_mark_subtask_done(
         p.close_worktree,
         p.force,
         OPERATOR_KILLER,
+        None,
     )
 }
 
@@ -24743,6 +24678,7 @@ mod tests {
                 },
             );
             s.config = crate::config::DaemonConfig {
+                session_scope: crate::config::SessionScope::TaskTree,
                 claude_limit_recovery: true,
                 claude_limit_menu_clear: true,
                 memory: Default::default(),
@@ -42289,6 +42225,47 @@ printf ran > "$MAIN_REPO/setup-ran"
     }
 
     #[test]
+    fn task_done_preserves_live_worker_and_dirty_checkout_in_manager_mode() {
+        let _g = crate::test_support::env_lock();
+        let state = make_state_arc();
+        seed_tasked_caller(&state, "ts-orch", "ws-parent", "task-parent");
+        let wt = tempfile::tempdir().unwrap();
+        run_git(wt.path(), &["init", "-q"]);
+        std::fs::write(wt.path().join("wip.txt"), "keep me").unwrap();
+        {
+            let mut s = state.lock().unwrap();
+            s.config.session_scope = crate::config::SessionScope::ManagerChain;
+            s.task_tree.insert("task-parent".into(), None);
+            s.task_tree.insert("child-1".into(), Some("task-parent".into()));
+            s.workspaces.insert("ws-child".into(), ManifestWorkspace {
+                id: "ws-child".into(), worktree_path: Some(wt.path().to_path_buf()),
+                main_repo_path: Some("/some/main".into()), ..Default::default()
+            });
+            s.task_workspaces.insert("child-1".into(), "ws-child".into());
+            let mut p = crate::session::SpawnParams::new("osh2-test-worker", "osh2-test-worker", "/bin/sleep");
+            p.args = vec!["30".into()]; p.workspace_id = "ws-child".into();
+            let mut worker = crate::session::DaemonSession::spawn(p).unwrap();
+            worker.task_id = Some("child-1".into());
+            s.sessions.insert("osh2-test-worker".into(), worker);
+        }
+        let stub = spawn_routed_stub(|method, path, _| match (method, path) {
+            ("GET", "/tasks/child-1") => (200, r#"{"id":"child-1","worktree_mode":"branch","status":"running"}"#.into()),
+            ("PATCH", "/tasks/child-1") => (200, r#"{"id":"child-1","status":"done"}"#.into()),
+            _ => (404, "{}".into()),
+        });
+        set_api_env(stub.port);
+        let out = mark_subtask_done(&state, &json!({"task_id":"child-1", "close_worktree":true}), Some("ts-orch")).unwrap();
+        assert_eq!(out["workspace_kept"], "live_session");
+        assert_eq!(out["worktree_removed"], false);
+        assert!(out["left_running"].as_array().unwrap().iter().any(|row| row["session_uid"] == "osh2-test-worker"));
+        assert!(wt.path().join("wip.txt").exists());
+        assert!(!state.lock().unwrap().sessions["osh2-test-worker"].last_exit.operator_kill_requested());
+        assert!(stub.requests.lock().unwrap().iter().any(|r| r.method == "PATCH"));
+        kill_all_sessions(&state);
+        clear_api_env();
+    }
+
+    #[test]
     fn mark_subtask_done_refuses_dirty_branch_worktree_without_force() {
         // Safety guard: a branch subtask with uncommitted work must NOT be
         // torn down (git worktree remove --force would destroy it). The call
@@ -42857,6 +42834,7 @@ printf ran > "$MAIN_REPO/setup-ran"
     fn state_core_terminal_sweep_spares_quiet_work_but_closes_engine_boundaries() {
         use crate::agent_state::{PresenceObs, PresenceStatus};
         let state = make_state_arc();
+        state.lock().unwrap().config.session_scope = crate::config::SessionScope::TaskTree;
         for (uid, status, valid, quiet) in [
             ("ts-working", PresenceStatus::Busy, true, true),
             ("ts-background", PresenceStatus::Shell, true, true),
@@ -42897,8 +42875,48 @@ printf ran > "$MAIN_REPO/setup-ran"
     }
 
     #[test]
+    fn task_sweep_preserves_out_of_scope_worker_and_live_checkout() {
+        use cm_holder_proto::session_scope::{Member, Role, Session, session_key};
+        let state = make_state_arc();
+        {
+            let mut s = state.lock().unwrap();
+            s.config.session_scope = crate::config::SessionScope::ManagerChain;
+            s.session_scope_cache.daemon_id = "host".into();
+            for (id, manager) in [("lead-member", None), ("other", None)] {
+                s.session_scope_cache.graph.members.insert(id.into(), Member {
+                    org_id: "org".into(), manager, active: true,
+                });
+            }
+            for (uid, member, role) in [("boss", "lead-member", Role::Main),
+                ("owned", "lead-member", Role::Worker), ("foreign", "other", Role::Worker)] {
+                let mut p = crate::session::SpawnParams::new(uid, uid, "/bin/sleep");
+                p.args = vec!["60".into()];
+                p.workspace_id = if uid == "boss" { "boss-ws" } else { "ws" }.into();
+                let mut session = crate::session::DaemonSession::spawn(p).unwrap();
+                session.task_id = Some(if uid == "boss" { "parent" } else { "done-task" }.into());
+                s.sessions.insert(uid.into(), session);
+                s.session_scope_cache.graph.sessions.insert(session_key("host", uid), Session {
+                    member: member.into(), role, spawned_by: None,
+                });
+            }
+            assert!(task_cleanup_keeps_live(&s, "ws", "done-task", Some("boss")));
+        }
+        assert!(sweep_terminal_task_sessions(&state, "done-task", "terminal-task-sweep", None, false).is_empty());
+        let (blocked, left) = sweep_task_sessions_scoped(&state, "done-task", "boss", Some("boss"));
+        assert!(blocked.is_empty());
+        assert_eq!(left.len(), 2);
+        assert!(left.iter().any(|entry| entry["session_uid"] == "foreign"));
+        let s = state.lock().unwrap();
+        assert!(!s.sessions["owned"].last_exit.operator_kill_requested());
+        assert!(!s.sessions["foreign"].last_exit.operator_kill_requested());
+        drop(s);
+        kill_all_sessions(&state);
+    }
+
+    #[test]
     fn task_sweeps_do_not_signal_a_recovery_reserved_uid() {
         let state = make_state_arc();
+        state.lock().unwrap().config.session_scope = crate::config::SessionScope::TaskTree;
         let uid = "ts-sweep-recovery";
         let mut params = crate::session::SpawnParams::new(uid, "worker", "/bin/sleep");
         params.args = vec!["60".into()];
@@ -42923,6 +42941,7 @@ printf ran > "$MAIN_REPO/setup-ran"
         // refusal in the reaper and blocks the inactivity clock from starting.
         // It must still leave the two lifecycles it does not own alone.
         let state = Arc::new(Mutex::new(DaemonState::new()));
+        state.lock().unwrap().config.session_scope = crate::config::SessionScope::TaskTree;
         let mut make = |uid: &str, task: &str| {
             let mut sp = crate::session::SpawnParams::new(uid, "worker", "/bin/sleep");
             sp.args = vec!["60".to_string()];
@@ -43021,6 +43040,7 @@ printf ran > "$MAIN_REPO/setup-ran"
     #[test]
     fn subtask_done_sweep_attributes_its_kills() {
         let state = Arc::new(Mutex::new(DaemonState::new()));
+        state.lock().unwrap().config.session_scope = crate::config::SessionScope::TaskTree;
         insert_session(&state, "ts-sweep-a", "ws-sweep");
         insert_session(&state, "ts-sweep-b", "ws-sweep");
         insert_session(&state, "ts-other", "ws-sweep");
@@ -43061,6 +43081,7 @@ printf ran > "$MAIN_REPO/setup-ran"
     fn terminal_sweep_spares_sessions_owner_used_and_labels_the_rest() {
         use std::time::{Duration, Instant};
         let state = Arc::new(Mutex::new(DaemonState::new()));
+        state.lock().unwrap().config.session_scope = crate::config::SessionScope::TaskTree;
         let long_ago = Instant::now()
             .checked_sub(Duration::from_secs(3 * 3600))
             .expect("host uptime above three hours");

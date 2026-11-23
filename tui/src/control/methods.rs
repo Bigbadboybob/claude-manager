@@ -1,17 +1,5 @@
-//! Method handlers for the control socket. Each handler takes `&mut App`
-//! plus the request params and returns a `serde_json::Value` (or an
-//! `ErrorCode` + message). Dispatch lives in `App::dispatch_control`.
-//!
-//! Auth model (per AGENT_ORCHESTRATION.md):
-//!   - Caller's workspace + (optional) task is looked up server-side
-//!     from the request's `caller.session_uid`. The MCP server only
-//!     ever sends the UID; task is derived here, never trusted.
-//!   - Tasked caller (workflow- or planning-launched): can act on its
-//!     own task. Phase 5 will extend to descendants once subtasks exist.
-//!   - Taskless caller (`A-n`): can act on any session in its own
-//!     workspace, but `task_id` parameters are rejected.
-//!   - Tombstones are visible to the same scope rule (so an agent can
-//!     read what its own sibling did before exiting).
+//! TUI control handlers. Session scope is checked by the owning daemon so
+//! its cached manager graph and rollback setting are authoritative here too.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -149,6 +137,7 @@ pub fn locate_target(workspaces: &[Workspace], uid: &str) -> Option<TargetLocati
 /// scope reads and mutations.
 #[derive(Debug)]
 pub struct CallerCtx {
+    pub uid: String,
     pub workspace_index: Option<usize>,
     pub task_id: Option<String>,
     /// Global-permissions grant. When true, `caller_authorized_for`
@@ -173,6 +162,7 @@ pub struct CallerCtx {
 pub fn caller_ctx_or_tombstone(workspaces: &[Workspace], caller_uid: &str) -> Option<CallerCtx> {
     if let Some((wi, si)) = find_live_session(workspaces, caller_uid) {
         return Some(CallerCtx {
+            uid: caller_uid.to_string(),
             workspace_index: Some(wi),
             task_id: workspaces[wi].sessions[si].task_id.clone(),
             global_perms: workspaces[wi].sessions[si].global_perms,
@@ -181,6 +171,7 @@ pub fn caller_ctx_or_tombstone(workspaces: &[Workspace], caller_uid: &str) -> Op
     }
     if let Some((wi, ti)) = find_tombstone(workspaces, caller_uid) {
         return Some(CallerCtx {
+            uid: caller_uid.to_string(),
             workspace_index: Some(wi),
             task_id: workspaces[wi].tombstones[ti].task_id.clone(),
             // Tombstoned callers never carry the grant (see CallerCtx doc).
@@ -200,6 +191,7 @@ pub fn live_caller_ctx(
 ) -> Result<CallerCtx, (ErrorCode, String)> {
     if let Some((wi, si)) = find_live_session(workspaces, caller_uid) {
         return Ok(CallerCtx {
+            uid: caller_uid.to_string(),
             workspace_index: Some(wi),
             task_id: workspaces[wi].sessions[si].task_id.clone(),
             global_perms: workspaces[wi].sessions[si].global_perms,
@@ -228,7 +220,7 @@ pub fn live_caller_ctx(
 ///     A tasked caller cannot reach a target without a task_id.
 ///   - Taskless caller (`A-n`): authorized iff the target is in the
 ///     same workspace as the caller, regardless of its task_id.
-pub fn caller_authorized_for(
+pub fn legacy_caller_authorized_for(
     caller: &CallerCtx,
     tasks: &(impl TaskParents + ?Sized),
     target_wi: usize,
@@ -249,6 +241,62 @@ pub fn caller_authorized_for(
             .unwrap_or(false),
         None => caller_wi == target_wi,
     }
+}
+
+/// Ask the owning daemon, which holds the fail-static snapshot and rollback
+/// setting. The TUI must never recreate a task-tree grant independently.
+fn caller_authorized_for(caller: &CallerCtx, app: &App, target_uid: &str, method: &str) -> bool {
+    // The legacy wire carries only a UID; never guess which host owns a
+    // duplicated UID. The daemon's actual snapshot keys include daemon_id.
+    let count = |uid: &str| app.workspaces.iter().flat_map(|w| &w.sessions).filter(|s| s.uid == uid).count();
+    if count(&caller.uid) != 1 || count(target_uid) > 1 { return false; }
+    let Some((cwi, csi)) = find_live_session(&app.workspaces, &caller.uid) else { return false };
+    let c = &app.workspaces[cwi].sessions[csi];
+    let (host, target, shell, target_wi, target_task) = if let Some((wi, si)) = find_live_session(&app.workspaces, target_uid) {
+        let target = &app.workspaces[wi].sessions[si];
+        (&target.host_id, target.session.daemon_session_uid.as_deref().unwrap_or(target_uid), target.session_type == "bash", wi, target.task_id.as_deref())
+    } else if let Some((wi, ti)) = find_tombstone(&app.workspaces, target_uid) {
+        let target = &app.workspaces[wi].tombstones[ti];
+        (&app.workspaces[wi].host_id, target_uid, target.session_type == "bash", wi, target.task_id.as_deref())
+    } else { return false };
+    if shell || (host != &c.host_id && !caller.global_perms) {
+        if legacy_caller_authorized_for(caller, app, target_wi, target_task) {
+            eprintln!("cm-tui: session scope refused old-rule grant caller={:?} target={:?} method={method:?}", caller.uid, target_uid);
+        }
+        return false;
+    }
+    // The viewer has an operator connection to both hosts; an explicitly
+    // global caller retains its cross-host bypass there.
+    let caller_uid = c.session.daemon_session_uid.as_deref().unwrap_or(&caller.uid);
+    if host != &c.host_id {
+        let Ok(source) = app.host_pool.for_host(&c.host_id) else { return false };
+        let Some(socket) = source.socket_path() else { return false };
+        return crate::client_session::rpc_session_scope_global(&socket,
+            &app.host_pool.operator_token_for(&c.host_id), caller_uid, method).unwrap_or(false);
+    }
+    let Ok(h) = app.host_pool.for_host(host) else { return false };
+    let Some(socket) = h.socket_path() else { return false };
+    crate::client_session::rpc_session_scope_check(&socket, &app.host_pool.operator_token_for(host), caller_uid, target, method)
+        .unwrap_or(false)
+}
+
+fn scope_denied_message(app: &App, caller_uid: &str, target_uid: &str) -> String {
+    let shell = find_live_session(&app.workspaces, target_uid)
+        .is_some_and(|(wi, si)| app.workspaces[wi].sessions[si].session_type == "bash")
+        || find_tombstone(&app.workspaces, target_uid)
+            .is_some_and(|(wi, ti)| app.workspaces[wi].tombstones[ti].session_type == "bash");
+    if shell { return "shell sessions are Owner-only".into(); }
+    let caller = find_live_session(&app.workspaces, caller_uid)
+        .map(|(wi, si)| &app.workspaces[wi].sessions[si].host_id);
+    let target = find_live_session(&app.workspaces, target_uid)
+        .map(|(wi, si)| &app.workspaces[wi].sessions[si].host_id)
+        .or_else(|| find_tombstone(&app.workspaces, target_uid).map(|(wi, _)| &app.workspaces[wi].host_id));
+    if let (Some(caller), Some(target)) = (caller, target) {
+        if caller != target {
+            return format!("session is on another host; use cm-op --ssh {} for authorized cross-host control", target.as_str());
+        }
+    }
+    "session is outside caller's scope".into()
 }
 
 /// Cap on the parent_task_id walk. Defends against cycles or
@@ -451,10 +499,10 @@ pub fn resolve_authorized_session(app: &App, caller_uid: &str, params: &Value) -
     match target {
         TargetLocation::Live { wi, si } => {
             let ts = &app.workspaces[wi].sessions[si];
-            if !caller_authorized_for(&caller, app, wi, ts.task_id.as_deref()) {
+            if !caller_authorized_for(&caller, app, &ts.uid, "resolve_authorized_session") {
                 return Err((
                     ErrorCode::Unauthorized,
-                    "session is outside caller's scope".into(),
+                    scope_denied_message(app, caller_uid, &p.session_uid),
                 ));
             }
             let engine = engine_str(&ts.session_type);
@@ -478,10 +526,10 @@ pub fn resolve_authorized_session(app: &App, caller_uid: &str, params: &Value) -
         }
         TargetLocation::Exited { wi, ti } => {
             let tomb = &app.workspaces[wi].tombstones[ti];
-            if !caller_authorized_for(&caller, app, wi, tomb.task_id.as_deref()) {
+            if !caller_authorized_for(&caller, app, &tomb.uid, "resolve_authorized_session") {
                 return Err((
                     ErrorCode::Unauthorized,
-                    "session is outside caller's scope".into(),
+                    scope_denied_message(app, caller_uid, &p.session_uid),
                 ));
             }
             let engine = engine_str(&tomb.session_type);
@@ -625,41 +673,7 @@ pub fn list_sessions(app: &App, caller_uid: &str, params: &Value) -> MethodResul
         ));
     }
 
-    // Resolve scope: explicit task_id must be authorized (caller's own
-    // or a descendant). Default = whatever the caller can see by auth.
-    // Global callers may scope to any task and otherwise see every
-    // session (no implicit own-task scope) — mirrors the daemon.
-    if let Some(req) = p.task_id.as_deref() {
-        if !caller.global_perms {
-            match caller.task_id.as_deref() {
-                None => {
-                    // Taskless caller passing a task_id: unauthorized.
-                    return Err((
-                        ErrorCode::Unauthorized,
-                        format!("taskless caller cannot scope to task {}", req),
-                    ));
-                }
-                Some(own) => {
-                    if !task_is_self_or_descendant_of(app, req, own) {
-                        return Err((
-                            ErrorCode::Unauthorized,
-                            format!(
-                                "task {} is not the caller's task or a descendant",
-                                req
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    let scope_task: Option<String> = p.task_id.clone().or_else(|| {
-        if caller.global_perms {
-            None
-        } else {
-            caller.task_id.clone()
-        }
-    });
+    let scope_task = p.task_id.clone();
 
     // Iterate every workspace — branch-mode subtasks live in their own
     // workspace different from the caller's, but they're still within
@@ -668,19 +682,19 @@ pub fn list_sessions(app: &App, caller_uid: &str, params: &Value) -> MethodResul
     // from `resolve_authorized_session`.
     let mut out: Vec<Value> = Vec::new();
     for (wi, ws) in app.workspaces.iter().enumerate() {
-        let included_by_explicit_filter = |task: Option<&str>| -> bool {
-            match scope_task.as_deref() {
+        let included_by_explicit_filter = |task: Option<&str>, uid: &str| -> bool {
+            (match scope_task.as_deref() {
                 // Explicit scope: only that task's own + descendants.
                 Some(scope) => task
                     .map(|t| task_is_self_or_descendant_of(app, t, scope))
                     .unwrap_or(false),
                 // Default scope (no explicit task_id): everything the
                 // caller is authorized to see.
-                None => caller_authorized_for(&caller, app, wi, task),
-            }
+                None => true,
+            }) && caller_authorized_for(&caller, app, uid, "list_sessions")
         };
         for ts in &ws.sessions {
-            if !included_by_explicit_filter(ts.task_id.as_deref()) {
+            if !included_by_explicit_filter(ts.task_id.as_deref(), &ts.uid) {
                 continue;
             }
         // Both `state` and `idle` flow from the same helper as the
@@ -730,8 +744,8 @@ pub fn list_sessions(app: &App, caller_uid: &str, params: &Value) -> MethodResul
                     Some(scope) => task
                         .map(|t| task_is_self_or_descendant_of(app, t, scope))
                         .unwrap_or(false),
-                    None => caller_authorized_for(&caller, app, wi, task),
-                };
+                    None => true,
+                } && caller_authorized_for(&caller, app, &tomb.uid, "list_sessions");
                 if !included || (!p.include_shells && tomb.session_type == "bash") {
                     continue;
                 }
@@ -789,11 +803,10 @@ pub fn send_input(app: &mut App, caller_uid: &str, params: &Value) -> MethodResu
     let caller = live_caller_ctx(&app.workspaces, caller_uid)?;
     let (wi, si) = find_live_session(&app.workspaces, &p.session_uid)
         .ok_or((ErrorCode::NotFound, "session_uid not found".into()))?;
-    let target_task = app.workspaces[wi].sessions[si].task_id.clone();
-    if !caller_authorized_for(&caller, app, wi, target_task.as_deref()) {
+    if !caller_authorized_for(&caller, app, &p.session_uid, "send_input") {
         return Err((
             ErrorCode::Unauthorized,
-            "session is outside caller's scope".into(),
+            scope_denied_message(app, caller_uid, &p.session_uid),
         ));
     }
     if !p.submit {
@@ -907,9 +920,8 @@ pub fn send_key(app: &mut App, caller_uid: &str, params: &Value) -> MethodResult
             results.insert(uid.clone(), r);
             continue;
         };
-        let target_task = app.workspaces[wi].sessions[si].task_id.clone();
-        if !caller_authorized_for(&caller, app, wi, target_task.as_deref()) {
-            results.insert(uid.clone(), outcome(uid, "unauthorized", "session is outside the caller's scope".into()));
+        if !caller_authorized_for(&caller, app, uid, "send_key") {
+            results.insert(uid.clone(), outcome(uid, "unauthorized", scope_denied_message(app, caller_uid, uid)));
             continue;
         }
         let ts = &app.workspaces[wi].sessions[si];
@@ -1032,11 +1044,10 @@ pub fn kill_session(app: &mut App, caller_uid: &str, params: &Value) -> MethodRe
             ));
         }
     };
-    let target_task = app.workspaces[wi].sessions[si].task_id.clone();
-    if !caller_authorized_for(&caller, app, wi, target_task.as_deref()) {
+    if !caller_authorized_for(&caller, app, &p.session_uid, "kill_session") {
         return Err((
             ErrorCode::Unauthorized,
-            "session is outside caller's scope".into(),
+            scope_denied_message(app, caller_uid, &p.session_uid),
         ));
     }
     // Tombstone-then-drop. Mark the PTY exited so the drainer cleans up.
@@ -2508,7 +2519,7 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
     // (lifecycle_guard_v1, doc/org-model.md §7.1). Home/stream kinds join
     // this once the TUI records them (S0b).
     let mut workspace_kept: Option<&'static str> = None;
-    let cleanup_target = if p.close_worktree && was_branch_mode {
+    let mut cleanup_target = if p.close_worktree && was_branch_mode {
         let ws_id = task.workspace_id.clone().ok_or((
             ErrorCode::Conflict,
             format!(
@@ -2563,6 +2574,49 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
         None
     };
 
+    let target_task = p.task_id.clone();
+    // A member's main session or assistant is only unassigned, never
+    // closed, and its workspace is kept (lifecycle_guard_v1, O5;
+    // doc/org-model.md §4.3, §7.1).
+    let candidates: Vec<String> = app.workspaces.iter()
+        .flat_map(|w| w.sessions.iter())
+        .filter(|ts| ts.task_id.as_deref() == Some(target_task.as_str()))
+        .map(|ts| ts.uid.clone())
+        .collect();
+    let mode = find_live_session(&app.workspaces, caller_uid).and_then(|(wi, si)| {
+        let source = &app.workspaces[wi].sessions[si];
+        let uid = source.session.daemon_session_uid.as_deref().unwrap_or(caller_uid);
+        app.host_pool.for_host(&source.host_id).ok().and_then(|h| h.socket_path())
+            .and_then(|socket| crate::client_session::rpc_session_scope_mode(&socket,
+                &app.host_pool.operator_token_for(&source.host_id), uid).ok().flatten())
+    });
+    let mut left_running = Vec::new();
+    let spared = if mode.as_deref() == Some("task_tree") {
+        let targets = app.owner_rpc_targets();
+        member_sessions(&candidates, |uid| targets.iter().any(|(_, socket, token)| {
+            crate::client_session::rpc_messaging_board(socket, token, "org.member", json!({"session_uid": uid}))
+                .is_ok_and(|v| v["acting_as"] == "main" || v["acting_as"] == "assistant")
+        }))
+    } else {
+        // Unknown mode fails safe: task completion is not session authority.
+        for uid in &candidates {
+            if let Some((wi, si)) = find_live_session(&app.workspaces, uid) {
+                let label = &app.workspaces[wi].sessions[si].label;
+                eprintln!("cm-tui: INFO task completion leaves session running task={target_task:?} session={uid:?}");
+                left_running.push(json!({"session_uid":uid, "label":label, "reason":"task completion does not close sessions"}));
+            }
+        }
+        candidates.iter().cloned().collect()
+    };
+    // A checkout used by a session we will preserve cannot be removed, so
+    // it also must not block the task status update on the dirty-worktree check.
+    if let Some((wi, _, _)) = &cleanup_target {
+        if app.workspaces[*wi].sessions.iter().any(|ts| !subtask_done_closes(ts, &target_task, &spared)) {
+            workspace_kept = Some("live_session");
+            cleanup_target = None;
+        }
+    }
+
     // Safety guard (checked BEFORE Phase 2 closes any sessions): refuse to
     // tear down a branch worktree that has uncommitted changes.
     // `remove_worktree` runs `git worktree remove --force`, which would
@@ -2612,23 +2666,6 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
     //     keep running.
     //   - branch-mode subtasks (own workspace): every session in
     //     that workspace closes, since they're all subtask-tagged.
-    let target_task = p.task_id.clone();
-    // A member's main session or assistant is only unassigned, never
-    // closed, and its workspace is kept (lifecycle_guard_v1, O5;
-    // doc/org-model.md §4.3, §7.1).
-    let candidates: Vec<String> = app.workspaces.iter()
-        .flat_map(|w| w.sessions.iter())
-        .filter(|ts| ts.task_id.as_deref() == Some(target_task.as_str()) && ts.session_type != "bash")
-        .map(|ts| ts.uid.clone())
-        .collect();
-    let targets = app.owner_rpc_targets();
-    let spared = member_sessions(&candidates, |uid| {
-        targets.iter().any(|(_, socket, token)| {
-            crate::client_session::rpc_messaging_board(socket, token, "org.member",
-                                                       json!({"session_uid": uid}))
-                .is_ok_and(|v| v["acting_as"] == "main" || v["acting_as"] == "assistant")
-        })
-    });
     // A shell is Owner's alone to close, kill or restart: it is spared too,
     // and its checkout kept while it lives.
     for wi in 0..app.workspaces.len() {
@@ -2712,7 +2749,7 @@ pub fn mark_subtask_done(app: &mut App, caller_uid: &str, params: &Value) -> Met
         .filter(|t| t.task_id.as_deref() == Some(p.task_id.as_str()))
         .for_each(|t| t.api_status = crate::app::TaskStatus::Done);
 
-    let mut out = json!({"ok": true, "worktree_removed": worktree_removed});
+    let mut out = json!({"ok": true, "worktree_removed": worktree_removed, "left_running": left_running});
     if let Some(kind) = workspace_kept {
         out["workspace_kept"] = json!(kind);
     }
@@ -2733,6 +2770,8 @@ fn subtask_done_keeps(sessions: &[TerminalSession], spared: &std::collections::H
         Some("member")
     } else if sessions.iter().any(|ts| ts.session_type == "bash") {
         Some("shell")
+    } else if !sessions.is_empty() {
+        Some("live_session")
     } else {
         None
     }
@@ -3176,7 +3215,7 @@ mod tests {
         let none = std::collections::HashSet::new();
         assert_eq!(subtask_done_keeps(&[shell(), worker()], &none), Some("shell"));
         assert_eq!(subtask_done_keeps(&[main(), shell()], &spared), Some("member"));
-        assert_eq!(subtask_done_keeps(&[worker()], &none), None);
+        assert_eq!(subtask_done_keeps(&[worker()], &none), Some("live_session"));
     }
 
     /// O5: A-D and A-w read a row's own stamp (no daemon round trip on the
@@ -3637,6 +3676,7 @@ mod tests {
 
     fn caller_with_task(task: &str) -> CallerCtx {
         CallerCtx {
+            uid: "test-caller".into(),
             workspace_index: Some(0),
             task_id: Some(task.into()),
             global_perms: false,
@@ -3658,10 +3698,10 @@ mod tests {
         let mut caller = caller_with_task("A");
         caller.global_perms = true;
         // target_wi=9 (a different workspace), target task "B" (unrelated).
-        assert!(caller_authorized_for(&caller, &tasks, 9, Some("B")));
+        assert!(legacy_caller_authorized_for(&caller, &tasks, 9, Some("B")));
         // Non-global caller with the identical shape is denied.
         let plain = caller_with_task("A");
-        assert!(!caller_authorized_for(&plain, &tasks, 9, Some("B")));
+        assert!(!legacy_caller_authorized_for(&plain, &tasks, 9, Some("B")));
     }
 
     #[test]
@@ -3782,6 +3822,7 @@ mod tests {
         let tasks = vec![task_with_parent("A", None, "a")];
         let run = make_workflow_run(Some("A"), "ws-1");
         let caller = CallerCtx {
+            uid: "test-caller".into(),
             workspace_index: Some(0),
             task_id: None,
             is_tombstone: false,

@@ -33,6 +33,7 @@ pub mod channel;
 pub mod holder_manifest;
 pub mod org;
 pub mod reexec_manifest;
+pub mod session_scope;
 
 #[cfg(test)]
 mod test_support;
