@@ -108,6 +108,12 @@
         "basis_hours": 6.0,
         "at_switch": null,
         "at_reset_percent": 99.4444444444
+      },
+      "pool_hosts": [
+        "cm-sessions"
+      ],
+      "pool_status": {
+        "cm-sessions": "active"
       }
     },
     {

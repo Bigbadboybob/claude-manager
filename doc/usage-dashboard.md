@@ -140,6 +140,16 @@ last six hours and the current reset window, allowing one hour of reset-time
 jitter. Negative slopes are clamped to zero; refills use the last known used
 percentage and the outlook assumes a constant observed burn for seven days.
 
+Codex pool entries with the same case-insensitive email are one account in the
+snapshot and outlook; email-less entries remain separate. `pool_hosts` lists
+all pools in sorted order and `pool_status` maps each host to its status. The
+combined status is active if any copy is active. `pool_host`, alias and plan
+come from the copy with the newest limit reading; without readings, the newest
+report wins. Each limit kind uses its newest reading independently. Reset
+credits come from the newest report, even if that report has no credit data;
+credits are never summed. Ties use report time, host and account ID for a
+stable result. Token history and its host attribution are unchanged.
+
 Claude reset grants are cached in `hub/reset-grants.json`. Check-ins launch a
 separate bounded worker after releasing the hub lock; the worker reads at most
 two due pool accounts, each with a five-second network timeout, and never renews
