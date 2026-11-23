@@ -1,5 +1,7 @@
 # Claude account switcher
 
+Usage history and the dashboard contract are described in [usage-dashboard.md](usage-dashboard.md).
+
 Status: design 2026-10-22 from an Owner discussion on cm-sessions (branch
 `cm/claudelb`). Built so far: `capture` / `list` / `switch` / `remove`
 (real switch passed on the laptop 2026-11-07) and `poll` / `status` /
@@ -383,10 +385,11 @@ fallback a host uses only when told to.
 | `hub history` | assignment changes, apply results, switches, sweeps |
 
 **Keeping switches rare:** a host moves only when the coordinator assigns
-it, a drain moves it, or (in `auto`) it crosses a threshold. Assigning the
+it, a drain moves it, or (in `auto`) it crosses or is projected to cross a threshold. Assigning the
 current account is a no-op. `hub status` shows each host's live session
 count, so the coordinator can move the host where a switch costs least.
-Dwell time and the daily cap still bound `auto`.
+Dwell time and the daily cap bound `auto`, with the post-switch full-reading
+exception described below.
 
 **Priorities** stay with the coordinator: claudelb reports which hosts (and
 so which sessions) draw on each account; the coordinator tells
@@ -492,7 +495,7 @@ Owner's context: most accounts are full at any time, and about 3 accounts are bu
 **Mechanism** (`hub policy pool on`):
 
 - **Hosts hand unused logins to the hub.** The pool lives in `hub/pool/` on cm-manager (0700/0600; never in reports, state or events).
-- **The hub lends a login to one host at a time.** It lends when a host is pinned to that account, or, in auto mode, when the host's account reaches the switch point.
+- **The hub lends a login to one host at a time.** It lends when a host is pinned to that account, or, in auto mode, when the host's account reaches the switch point or is projected to reach it by the next reading.
 - **A lend is final once the host lists the account.** A lend the host never confirms goes back to the pool.
 - **Stale copies are refused.** The hub keeps a fingerprint (a truncated sha256, never the token) of every login it lends. A returned copy of a login already lent to another host is refused, and that host deletes its copy.
 - **Recently used accounts stay put.** An account used in the last 30 min stays on its host.
@@ -504,10 +507,11 @@ Owner's context: most accounts are full at any time, and about 3 accounts are bu
 - Only accounts below the switch point are lent. It is 98% for every limit (`hub policy thresholds.weekly 98`, `thresholds.session 98`; Owner 11-16: "switch right before we hit the limits").
 - `account_thresholds.<email>` lowers the weekly switch point for one account while leaving its 5-hour switch point unchanged. For example, on 2026-11-17 Owner kept about 5% of `bigbadbossbob@gmail.com` for personal use, so `hub policy account_thresholds.bigbadbossbob@gmail.com 94` switches it at 94% to absorb transfer overshoot; `default` removes the override.
 - The hub counts model-scoped limits at their family threshold by default (`hub policy switch_on_scoped false` disables that for non-leftover hosts).
-- Non-leftover hosts prefer accounts with at least 5% room on every counted limit (`hub policy min_lend_room <percent>`); a low-room account remains a last resort. Leftover-host ranking is unchanged.
-- Among those, the account whose weekly limit resets soonest goes first.
+- Non-leftover hosts prefer accounts with at least 5% room on every counted limit (`hub policy min_lend_room <percent>`); a low-room account remains a last resort even if reserved for that host. Within each room tier, the host's own reservation comes first, then the account whose weekly limit resets soonest. Reservations for other hosts marked last resort and lend copies remain later tiers.
+- Leftover hosts retain their preference for the least room above `leftover_room`, but likewise rank accounts below that cutoff after accounts above it, including the host's own reservation.
+- For an early switch, the hub compares consecutive readings of the active account on that host for each counted limit. It requires an unchanged, unexpired reset time and a non-decreasing percentage; it projects over the observed interval, capped at 15 minutes. It lends early only if the best eligible target has a fresh reading with at least `min_lend_room` on every counted limit. Missing history or target readings do not trigger an early switch. The lend reason records the projection.
 - A host reads its usage every ~100 s once any limit is at 95% or more.
-- The dwell is 10 min, with at most 24 automatic switches a day.
+- The dwell is 10 min, with at most 24 automatic switches a day. The hub skips the dwell if a reading taken after the last switch shows the active account at or above its threshold; the daily cap still applies. Lend-copy eviction has the separate emergency behavior described below.
 
 ### Lend copy of a held account
 

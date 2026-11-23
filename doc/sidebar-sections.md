@@ -2,7 +2,7 @@
 
 ## Summary
 
-Owner-created, collapsible sections in the Sessions-view sidebar (Workspaces sub-view, `Task` in the code) that group workspaces by project. A section is a display construct stored in the TUI manifest. The viewer publishes its catalogue to each daemon; agent tools can queue durable workspace assignment changes. Sections remain separate from planning initiatives. Membership is explicit per workspace, and a workspace without an explicit assignment inherits its parent task's section through the task tree, so an agent's `create_subtask` lands under its parent's section automatically. Since 2026-10-20 the Task sub-view is a nested work tree (`tui/src/app/tree.rs`): sections group the top-level blocks, and a block nested under another task's block follows that root's section even when it was assigned elsewhere. Since 2026-11-05 it has no task subheaders (tasks live on the board): each workspace shows its sessions directly under it, and its header is titled "Workspaces".
+Owner-created, collapsible sections in the Sessions-view sidebar (Workspaces sub-view, `Task` in the code) that group workspaces by project. A section is a display construct stored in the TUI manifest. The viewer publishes its catalogue to each daemon; agent tools can queue durable workspace assignment changes. Sections remain separate from planning initiatives. Membership is explicit per workspace, and a workspace without an explicit assignment inherits its parent task's section through the task tree, so an agent's `create_subtask` lands under its parent's section automatically. Since 2026-10-20 the Task sub-view is a nested work tree (`tui/src/app/tree.rs`): sections group the top-level blocks. A nested workspace with an explicit assignment stays nested when that assignment equals its root block's effective section; an assignment to another section detaches it as a new top-level block in that section, and explicit `none` detaches it into the loose list. `auto` removes the override and re-nests it. Since 2026-11-05 it has no task subheaders (tasks live on the board): each workspace shows its sessions directly under it, and its header is titled "Workspaces".
 
 **Work tree display (2026-10-21).** Every block draws at the top-level indent, whatever its depth; only sessions keep their indent under their workspace row. The hierarchy shows through two cues instead:
 - **Group strip.** The focused row's group (its workspace and everything below it) shows as a narrow coloured strip (`▏`) at the sidebar's left edge, clear of the row text. The group has no background tint, so section tints show unchanged.
@@ -109,7 +109,7 @@ Subtasks nest to arbitrary depth, and rendering that tree faithfully in one side
 - Create, rename, recolor, reorder, fold, and delete sections from the Sessions view.
 - Assign a workspace to a section from the A-e settings form on a workspace row.
 - A new workspace created with A-n while the cursor is inside a section joins that section.
-- A subtask (task with `parent_task_id`) whose parent's workspace is in a section renders in that section without any assignment.
+- A subtask (task with `parent_task_id`) whose parent's workspace is in a section renders in that section without any assignment; an explicit different section detaches its workspace, while explicit `none` detaches it into the loose list.
 - Everything persists in `~/.cm/tui-sessions.json`, including fold state.
 
 ## Non-goals
@@ -154,7 +154,7 @@ Mirrored on `App` as `sections` and `workspace_sections`. Membership is a sideca
 2. Inherited: for each task bound to this workspace, follow `parent_task_id` (and, for `propose_task` rows, `metadata.filer.parent_task`) to the parent task, take the parent's workspace, and recurse. Bounded depth with a visited set.
 3. Otherwise loose (no section).
 
-Explicit assignment always wins, so the Owner can pull a subtask out of its parent's section. Deleting a section drops its explicit assignments; inherited members follow whatever their parent resolves to.
+Explicit assignment always wins. In the nested work tree, `auto` follows the task-tree root, an explicit assignment equal to that root's section stays nested, and a different section detaches the workspace as a top-level block. Explicit `none` detaches it into the loose list. A detached block keeps its own nested children, subject to their own explicit overrides. The workspace A-e Section field is editable at every depth; choosing `auto` re-nests the workspace. Deleting a section drops its explicit assignments; inherited members follow whatever their parent resolves to.
 
 ### Layout
 

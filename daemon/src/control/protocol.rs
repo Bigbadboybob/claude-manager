@@ -123,6 +123,8 @@ pub enum ErrorCode {
     Unauthorized,
     /// Target session/task doesn't exist (or not visible to caller).
     NotFound,
+    /// This host does not have the account usage hub.
+    NotHub,
     /// Method params don't match the schema.
     InvalidParams,
     /// Method name unknown.

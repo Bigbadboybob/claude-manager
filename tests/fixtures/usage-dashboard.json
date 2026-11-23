@@ -1,0 +1,390 @@
+{
+  "schema": 1,
+  "generated_at": 1795400000,
+  "since": 1795392000,
+  "granularity": "hour",
+  "accounts": [
+    {
+      "engine": "claude",
+      "email": "alice@example.com",
+      "alias": null,
+      "status": null,
+      "pool_host": null,
+      "active_on": [
+        "cm-sessions"
+      ],
+      "reserved_for": null,
+      "room": true,
+      "limits": [
+        {
+          "kind": "five_hour",
+          "percent": 38.0,
+          "resets_at": 1795403600,
+          "read_at": 1795399900
+        }
+      ]
+    },
+    {
+      "engine": "codex",
+      "email": "codex@example.com",
+      "alias": "802",
+      "status": "active",
+      "pool_host": "cm-sessions",
+      "active_on": [],
+      "reserved_for": null,
+      "room": null,
+      "limits": [
+        {
+          "kind": "primary",
+          "percent": 8.0,
+          "resets_at": 1795410000,
+          "read_at": 1795399800
+        }
+      ]
+    }
+  ],
+  "limit_history": [
+    {
+      "engine": "claude",
+      "email": "alice@example.com",
+      "kind": "five_hour",
+      "points": [
+        [
+          1795399900,
+          38.0
+        ]
+      ]
+    },
+    {
+      "engine": "codex",
+      "email": "codex@example.com",
+      "kind": "primary",
+      "points": [
+        [
+          1795399800,
+          8.0
+        ]
+      ]
+    }
+  ],
+  "tokens": {
+    "totals": [
+      {
+        "window": "24h",
+        "engine": "claude",
+        "host": null,
+        "email": null,
+        "input": 16,
+        "output": 18,
+        "cache_read": 6,
+        "cache_write": 8,
+        "reasoning": 0,
+        "requests": 2
+      },
+      {
+        "window": "24h",
+        "engine": "codex",
+        "host": null,
+        "email": null,
+        "input": 7,
+        "output": 20,
+        "cache_read": 3,
+        "cache_write": 0,
+        "reasoning": 4,
+        "requests": 2
+      },
+      {
+        "window": "24h",
+        "engine": "claude",
+        "host": "cm-sessions",
+        "email": null,
+        "input": 16,
+        "output": 18,
+        "cache_read": 6,
+        "cache_write": 8,
+        "reasoning": 0,
+        "requests": 2
+      },
+      {
+        "window": "24h",
+        "engine": "codex",
+        "host": "cm-sessions",
+        "email": null,
+        "input": 7,
+        "output": 20,
+        "cache_read": 3,
+        "cache_write": 0,
+        "reasoning": 4,
+        "requests": 2
+      },
+      {
+        "window": "24h",
+        "engine": "claude",
+        "host": null,
+        "email": "alice@example.com",
+        "input": 16,
+        "output": 18,
+        "cache_read": 6,
+        "cache_write": 8,
+        "reasoning": 0,
+        "requests": 2
+      },
+      {
+        "window": "24h",
+        "engine": "codex",
+        "host": null,
+        "email": "codex@example.com",
+        "input": 7,
+        "output": 20,
+        "cache_read": 3,
+        "cache_write": 0,
+        "reasoning": 4,
+        "requests": 2
+      },
+      {
+        "window": "7d",
+        "engine": "claude",
+        "host": null,
+        "email": null,
+        "input": 16,
+        "output": 18,
+        "cache_read": 6,
+        "cache_write": 8,
+        "reasoning": 0,
+        "requests": 2
+      },
+      {
+        "window": "7d",
+        "engine": "codex",
+        "host": null,
+        "email": null,
+        "input": 7,
+        "output": 20,
+        "cache_read": 3,
+        "cache_write": 0,
+        "reasoning": 4,
+        "requests": 2
+      },
+      {
+        "window": "7d",
+        "engine": "claude",
+        "host": "cm-sessions",
+        "email": null,
+        "input": 16,
+        "output": 18,
+        "cache_read": 6,
+        "cache_write": 8,
+        "reasoning": 0,
+        "requests": 2
+      },
+      {
+        "window": "7d",
+        "engine": "codex",
+        "host": "cm-sessions",
+        "email": null,
+        "input": 7,
+        "output": 20,
+        "cache_read": 3,
+        "cache_write": 0,
+        "reasoning": 4,
+        "requests": 2
+      },
+      {
+        "window": "7d",
+        "engine": "claude",
+        "host": null,
+        "email": "alice@example.com",
+        "input": 16,
+        "output": 18,
+        "cache_read": 6,
+        "cache_write": 8,
+        "reasoning": 0,
+        "requests": 2
+      },
+      {
+        "window": "7d",
+        "engine": "codex",
+        "host": null,
+        "email": "codex@example.com",
+        "input": 7,
+        "output": 20,
+        "cache_read": 3,
+        "cache_write": 0,
+        "reasoning": 4,
+        "requests": 2
+      },
+      {
+        "window": "30d",
+        "engine": "claude",
+        "host": null,
+        "email": null,
+        "input": 16,
+        "output": 18,
+        "cache_read": 6,
+        "cache_write": 8,
+        "reasoning": 0,
+        "requests": 2
+      },
+      {
+        "window": "30d",
+        "engine": "codex",
+        "host": null,
+        "email": null,
+        "input": 7,
+        "output": 20,
+        "cache_read": 3,
+        "cache_write": 0,
+        "reasoning": 4,
+        "requests": 2
+      },
+      {
+        "window": "30d",
+        "engine": "claude",
+        "host": "cm-sessions",
+        "email": null,
+        "input": 16,
+        "output": 18,
+        "cache_read": 6,
+        "cache_write": 8,
+        "reasoning": 0,
+        "requests": 2
+      },
+      {
+        "window": "30d",
+        "engine": "codex",
+        "host": "cm-sessions",
+        "email": null,
+        "input": 7,
+        "output": 20,
+        "cache_read": 3,
+        "cache_write": 0,
+        "reasoning": 4,
+        "requests": 2
+      },
+      {
+        "window": "30d",
+        "engine": "claude",
+        "host": null,
+        "email": "alice@example.com",
+        "input": 16,
+        "output": 18,
+        "cache_read": 6,
+        "cache_write": 8,
+        "reasoning": 0,
+        "requests": 2
+      },
+      {
+        "window": "30d",
+        "engine": "codex",
+        "host": null,
+        "email": "codex@example.com",
+        "input": 7,
+        "output": 20,
+        "cache_read": 3,
+        "cache_write": 0,
+        "reasoning": 4,
+        "requests": 2
+      },
+      {
+        "window": "all",
+        "engine": "claude",
+        "host": null,
+        "email": null,
+        "input": 16,
+        "output": 18,
+        "cache_read": 6,
+        "cache_write": 8,
+        "reasoning": 0,
+        "requests": 2
+      },
+      {
+        "window": "all",
+        "engine": "codex",
+        "host": null,
+        "email": null,
+        "input": 7,
+        "output": 20,
+        "cache_read": 3,
+        "cache_write": 0,
+        "reasoning": 4,
+        "requests": 2
+      },
+      {
+        "window": "all",
+        "engine": "claude",
+        "host": "cm-sessions",
+        "email": null,
+        "input": 16,
+        "output": 18,
+        "cache_read": 6,
+        "cache_write": 8,
+        "reasoning": 0,
+        "requests": 2
+      },
+      {
+        "window": "all",
+        "engine": "codex",
+        "host": "cm-sessions",
+        "email": null,
+        "input": 7,
+        "output": 20,
+        "cache_read": 3,
+        "cache_write": 0,
+        "reasoning": 4,
+        "requests": 2
+      },
+      {
+        "window": "all",
+        "engine": "claude",
+        "host": null,
+        "email": "alice@example.com",
+        "input": 16,
+        "output": 18,
+        "cache_read": 6,
+        "cache_write": 8,
+        "reasoning": 0,
+        "requests": 2
+      },
+      {
+        "window": "all",
+        "engine": "codex",
+        "host": null,
+        "email": "codex@example.com",
+        "input": 7,
+        "output": 20,
+        "cache_read": 3,
+        "cache_write": 0,
+        "reasoning": 4,
+        "requests": 2
+      }
+    ],
+    "series": [
+      {
+        "bucket": 1795392000,
+        "engine": "claude",
+        "host": "cm-sessions",
+        "account": "alice@example.com",
+        "email": "alice@example.com",
+        "input": 16,
+        "output": 18,
+        "cache_read": 6,
+        "cache_write": 8,
+        "reasoning": 0,
+        "requests": 2
+      },
+      {
+        "bucket": 1795392000,
+        "engine": "codex",
+        "host": "cm-sessions",
+        "account": "codex@example.com",
+        "email": "codex@example.com",
+        "input": 7,
+        "output": 20,
+        "cache_read": 3,
+        "cache_write": 0,
+        "reasoning": 4,
+        "requests": 2
+      }
+    ]
+  }
+}

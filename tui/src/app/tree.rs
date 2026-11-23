@@ -23,8 +23,10 @@
 //! - The lead session (see [`task_lead`]) of a task with subtasks
 //!   carries its level's leader mark ([`leader_glyph`]); leaves carry none.
 //!
-//! Sections still group top-level blocks; a nested block follows its root
-//! block's section. Legacy continuous sessions remain ordinary tree rows.
+//! Sections still group top-level blocks. A nested block follows its root
+//! block's section unless an explicit assignment pulls it into a different
+//! section (or explicitly loose), in which case it becomes a new top-level
+//! block. Legacy continuous sessions remain ordinary tree rows.
 
 use super::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -93,8 +95,8 @@ pub(super) struct TaskTree {
     /// Reporting lines for this frame: levels and live reports (the tasks
     /// whose lead carries a leader mark).
     pub org: OrgIndex,
-    /// The section each visible workspace draws in (its root block's);
-    /// loose workspaces are absent.
+    /// The section each visible workspace draws in (its effective block
+    /// root's); loose workspaces are absent.
     pub section_of: HashMap<usize, String>,
     /// Each section's visible workspaces, in workspace order.
     pub section_members: HashMap<String, Vec<usize>>,
@@ -366,6 +368,47 @@ impl App {
             .collect();
         for wi in looping {
             f.attach.remove(&wi);
+        }
+        // An explicit section assignment is a placement override. A nested
+        // block stays nested when its assignment agrees with the section of
+        // its current root; a different section, or explicit loose, detaches
+        // it. Iterate because detaching a parent can change the root section
+        // against which one of its children must be compared.
+        loop {
+            let mut changed = false;
+            for &wi in &f.order {
+                let Some(choice) = self.workspace_sections.get(&self.workspaces[wi].id) else {
+                    continue; // auto: inherit the task-tree placement
+                };
+                if choice == super::sections::SECTION_NONE {
+                    if f.attach.remove(&wi).is_some() {
+                        changed = true;
+                    }
+                    continue;
+                }
+                // A deleted section is treated as auto by section resolution;
+                // do the same for placement so stale manifest ids cannot
+                // unexpectedly detach a block.
+                if self.section_by_id(choice).is_none() || !f.attach.contains_key(&wi) {
+                    continue;
+                }
+                let mut root = wi;
+                let mut seen = HashSet::from([wi]);
+                while let Some(parent) = f.attach.get(&root).copied() {
+                    if !seen.insert(parent) {
+                        break;
+                    }
+                    root = parent;
+                }
+                let root_section = self.section_of_workspace(root);
+                if root_section.as_deref() != Some(choice.as_str()) {
+                    f.attach.remove(&wi);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
         }
         for &wi in &f.order {
             if let Some(parent) = f.attach.get(&wi) {
@@ -701,7 +744,9 @@ impl App {
                 None => loose.push(wi),
             }
         }
-        // A nested block draws in its root block's section.
+        // A nested block draws in its effective root block's section. The
+        // forest has already detached explicit overrides, so a detached
+        // workspace is its own root here.
         for &wi in &f.order {
             let Some(sid) = out.section_of.get(&out.block_root[&wi]).cloned() else {
                 continue;
@@ -2198,8 +2243,8 @@ mod tree_tests {
         assert_eq!(pin(&app).as_deref(), Some("ts-99-0"), "a newer pin is kept");
     }
 
-    /// Review (6): a nested row belongs to its root block's section: A-n
-    /// lands there, and A-e's Section field says it inherits.
+    /// Review (6): a nested row with an assignment equal to its root block's
+    /// section stays nested, and A-e exposes that assignment for editing.
     #[test]
     fn a_nested_row_takes_its_root_blocks_section() {
         let mut app = org_app();
@@ -2210,8 +2255,7 @@ mod tree_tests {
             folded: false,
         });
         app.workspace_sections.insert("r".into(), "s1".into());
-        app.workspace_sections
-            .insert("g".into(), super::super::sections::SECTION_NONE.into());
+        app.workspace_sections.insert("g".into(), "s1".into());
         app.cursor = Cursor::Session(2, 0);
         assert_eq!(app.cursor_section_id().as_deref(), Some("s1"));
         assert_eq!(
@@ -2223,17 +2267,14 @@ mod tree_tests {
             None,
             "a top-level block chooses its own"
         );
-        // The Section field (A-e on the workspace header) does not cycle.
+        // The Section field (A-e on the workspace header) cycles even when
+        // the workspace is nested.
         app.cursor = Cursor::Workspace(2);
         app.open_session_settings();
         let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         for _ in 0..3 {
             app.handle_event(&tab);
         }
-        app.handle_event(&Event::Key(KeyEvent::new(
-            KeyCode::Right,
-            KeyModifiers::NONE,
-        )));
         let InputMode::WorkspaceSettings {
             section,
             active_field,
@@ -2245,9 +2286,93 @@ mod tree_tests {
         assert_eq!(*active_field, 3);
         assert_eq!(
             section.as_deref(),
-            Some(super::super::sections::SECTION_NONE),
-            "unchanged"
+            Some("s1"),
+            "the nested workspace's explicit choice is editable"
         );
+        app.handle_event(&Event::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        )));
+        let InputMode::WorkspaceSettings { section, .. } = &app.input_mode else {
+            panic!("ws settings")
+        };
+        assert_eq!(*section, None, "Right from the matching section chooses auto");
+    }
+
+    #[test]
+    fn explicit_nested_section_overrides_detach_and_auto_renests() {
+        let mut app = org_app();
+        for (id, name) in [("s1", "Project"), ("s2", "Latency")] {
+            app.sections.push(cm_daemon::manifest::SidebarSection {
+                id: id.into(), name: name.into(), color: None, folded: false,
+            });
+        }
+        app.workspace_sections.insert("r".into(), "s1".into());
+        app.workspace_sections.insert("g".into(), "s2".into());
+        let tree = app.task_tree();
+        assert_eq!(tree.block_root[&1], 0, "c remains under r");
+        assert_eq!(tree.block_root[&2], 2, "g is detached into s2");
+        assert_eq!(tree.section_of[&2], "s2");
+        assert_eq!(tree.section_members.get("s2"), Some(&vec![2]));
+        app.cursor = Cursor::Session(2, 0);
+        assert_eq!(app.cursor_section_id().as_deref(), Some("s2"));
+        assert!(outline(&app).contains(&"ws:g".to_string()));
+
+        // A child with no override follows the detached block.
+        app.workspaces.push(bare_ws("z"));
+        app.tasks.push(task("tz", "z", Some("tg")));
+        session(&mut app, 5, "tz", "ts-16-0", "codex");
+        let tree = app.task_tree();
+        assert_eq!(tree.block_root[&5], 2, "detached block keeps its child");
+        assert_eq!(tree.section_of[&5], "s2");
+
+        // Explicit none also detaches, as a loose top-level block.
+        app.workspace_sections.insert("g".into(), super::super::sections::SECTION_NONE.into());
+        let tree = app.task_tree();
+        assert_eq!(tree.block_root[&2], 2);
+        assert!(!tree.section_of.contains_key(&2));
+
+        // Auto removes the override and restores the task-tree nesting.
+        app.workspace_sections.remove("g");
+        let tree = app.task_tree();
+        assert_eq!(tree.block_root[&2], 0, "auto re-nests under r");
+        assert_eq!(tree.section_of[&2], "s1");
+
+        // Cursor clamping remains valid while the workspace changes roots.
+        app.cursor = Cursor::Workspace(2);
+        app.clamp_cursor();
+        assert_eq!(app.cursor, Cursor::Workspace(2));
+    }
+
+    #[test]
+    fn nested_workspace_section_field_saves_detach_and_auto() {
+        let mut app = org_app();
+        for (id, name) in [("s1", "Project"), ("s2", "Latency")] {
+            app.sections.push(cm_daemon::manifest::SidebarSection {
+                id: id.into(), name: name.into(), color: None, folded: false,
+            });
+        }
+        app.workspace_sections.insert("r".into(), "s1".into());
+        app.workspace_sections.insert("g".into(), "s1".into());
+        app.cursor = Cursor::Workspace(2);
+        app.open_session_settings();
+        let InputMode::WorkspaceSettings { section, .. } = &mut app.input_mode else {
+            panic!("workspace settings")
+        };
+        *section = Some("s2".into());
+        app.handle_event(&Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert_eq!(app.workspace_sections.get("g").map(String::as_str), Some("s2"));
+        assert_eq!(app.task_tree().block_root[&2], 2, "saved override detaches it");
+
+        app.cursor = Cursor::Workspace(2);
+        app.open_session_settings();
+        let InputMode::WorkspaceSettings { section, .. } = &mut app.input_mode else {
+            panic!("workspace settings")
+        };
+        *section = None;
+        app.handle_event(&Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(!app.workspace_sections.contains_key("g"));
+        assert_eq!(app.task_tree().block_root[&2], 0, "saved auto re-nests it");
     }
 
     /// The workspace row stands for its task (Owner, 2026-11-05: the task

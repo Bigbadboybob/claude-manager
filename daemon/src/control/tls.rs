@@ -367,6 +367,9 @@ fn handle_tls_connection(
         DispatchOutcome::Done(response) => {
             let _ = write_response(&mut stream, &response);
         }
+        DispatchOutcome::Deferred(response) => {
+            let _ = write_response(&mut stream, response.response());
+        }
         DispatchOutcome::AttachStream { response, handle } => {
             if write_response(&mut stream, &response).is_err() {
                 return;

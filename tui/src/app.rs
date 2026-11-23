@@ -70,6 +70,7 @@ mod messages;
 mod global_settings;
 mod staffing;
 mod availability;
+mod usage;
 mod agent_state;
 mod board;
 mod orgchart;
@@ -280,6 +281,7 @@ pub struct App {
     pub config: Config,
     global_settings: global_settings::GlobalSettings,
     availability: availability::Availability,
+    usage: usage::Usage,
     board: board::Board,
     /// F6 org chart overlay (app/orgchart.rs).
     orgchart: orgchart::OrgChart,
@@ -418,9 +420,6 @@ pub struct App {
     /// changes; keeping it across draws avoids rebuilding the full forest on
     /// every frame when a large group is expanded.
     pub(crate) task_tree_cache: std::cell::RefCell<Option<(u64, std::rc::Rc<tree::TaskTree>)>>,
-    /// Set per frame while an A-e form is open on a nested workspace: the
-    /// read-only Section value it inherits (`App::nested_section_label`).
-    pub(crate) section_note: Option<String>,
     /// The cursor at the last sidebar draw: a draw reveals the cursor's row
     /// only when the cursor moved since (a jump, spawn, fork, restore or an
     /// event), never against Owner's own filter or folds.
@@ -1049,6 +1048,7 @@ impl App {
             config,
             global_settings: global_settings::GlobalSettings::load(),
             availability: availability::Availability::load(),
+            usage: usage::Usage::default(),
             board: board::Board::default(),
             orgchart: orgchart::OrgChart::default(),
             org: org_model::OrgState::default(),
@@ -1101,7 +1101,6 @@ impl App {
             folded_org,
             attach_cache: Default::default(),
             task_tree_cache: Default::default(),
-            section_note: None,
             last_drawn_cursor: None,
             sections,
             workspace_sections,

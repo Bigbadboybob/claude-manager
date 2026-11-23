@@ -168,24 +168,28 @@ impl App {
             self.draw_roster(frame);
             self.global_settings.draw(frame, frame.area());
             self.draw_availability(frame, frame.area());
+            self.draw_usage(frame, frame.area());
             return;
         }
         if self.orgchart.visible {
             self.draw_orgchart(frame);
             self.global_settings.draw(frame, frame.area());
             self.draw_availability(frame, frame.area());
+            self.draw_usage(frame, frame.area());
             return;
         }
         if self.board.visible {
             self.draw_board(frame);
             self.global_settings.draw(frame, frame.area());
             self.draw_availability(frame, frame.area());
+            self.draw_usage(frame, frame.area());
             return;
         }
         if self.messages.visible {
             self.draw_messages(frame);
             self.global_settings.draw(frame, frame.area());
             self.draw_availability(frame, frame.area());
+            self.draw_usage(frame, frame.area());
             return;
         }
         let area = frame.area();
@@ -355,7 +359,7 @@ impl App {
                     self.draw_transcript_picker(frame, area, candidates, *selected, target);
                 }
                 InputMode::WorkspaceSettings {
-                    workspace_id,
+                    workspace_id: _,
                     name,
                     color,
                     pinned,
@@ -364,7 +368,6 @@ impl App {
                     task_at,
                     active_field,
                 } => {
-                    self.section_note = self.nested_section_label(workspace_id);
                     self.draw_workspace_settings(
                         frame,
                         area,
@@ -469,6 +472,7 @@ impl App {
         } else { area };
         self.global_settings.draw(frame, settings_area);
         self.draw_availability(frame, area);
+        self.draw_usage(frame, area);
     }
 
     /// The Lead field's text: the pinned session's label, or what the
@@ -507,11 +511,6 @@ impl App {
         let dim = Style::default().fg(theme::DIM);
         let white = Style::default().fg(theme::TEXT);
         let mut spans = vec![Span::styled(label.to_string(), if focused { white } else { dim })];
-        // A nested workspace shows the section it inherits, read-only.
-        if let Some(note) = self.section_note.clone() {
-            spans.push(Span::styled(note, white));
-            return Line::from(spans);
-        }
         let value = self.section_choice_label(section);
         let value_style = match section {
             Some(id) if !id.is_empty() => self
