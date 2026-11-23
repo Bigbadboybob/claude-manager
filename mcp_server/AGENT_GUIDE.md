@@ -244,7 +244,7 @@ Work-sidebar organization: `list_sidebar_sections` shows published choices. `set
 
 `list_sessions` and `list_sessions_grouped` show agent workers by default. A
 member's main session can control its own assistants and workers and sessions of reports below it; assistants and workers control their own spawner descendants. The roster may show workspace co-tenants without granting control.
-Use `include_shells=true` to inspect bash terminals; they carry `kind: "shell"`
+Owner and global callers can pass `include_shells=true` to inspect bash terminals; they carry `kind: "shell"`
 and `status: "shell"` (or `exited`). Shells are never teammates, item holders,
 roster candidates, or free capacity. Shell control, including `send_input`, is
 reserved for Owner; agent sessions cannot read or control shell panes. `wait_for_session_idle`, `start_session(type="bash", wait=true)`,

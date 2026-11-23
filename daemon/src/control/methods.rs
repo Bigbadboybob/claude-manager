@@ -10446,7 +10446,8 @@ fn start_agent_with_context(
         let granted = p.task_id.as_deref().and_then(|req| {
             crate::items::grants::find(&state.launch_grants, cuid, req).cloned()
         });
-        if let Some(req_task) = p.task_id.as_deref().filter(|_| granted.is_none()) {
+        // A global caller may bind to any task, as on the TUI route.
+        if let Some(req_task) = p.task_id.as_deref().filter(|_| granted.is_none() && !caller.global_perms) {
             match caller.task_id.as_deref() {
                 None => {
                     return Err((

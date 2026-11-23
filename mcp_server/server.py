@@ -2310,8 +2310,9 @@ def list_sessions(
 ) -> list[dict]:
     """List sessions visible to you.
 
-    Shells are omitted by default. Set include_shells=true to include
-    terminal panes labelled kind="shell"; they are never agent workers.
+    Shells are omitted. include_shells=true includes terminal panes
+    (kind="shell") only for Owner and global callers; shells are never
+    agent workers.
 
     Scope: a member's main session can see its own assistants and workers
     and sessions of members below it in the manager chain. Assistants and
@@ -2321,10 +2322,8 @@ def list_sessions(
     `list_sessions_grouped` instead.
 
     Args:
-        task_id: Optional explicit task scope. Leave unset for the default
-            (your task tree, or whole workspace if taskless; everything if
-            you're global). A non-global taskless caller passing `task_id`
-            gets `unauthorized`.
+        task_id: Optional filter to one task's sessions, applied inside
+            your session scope above (everything if you're global).
         include_exited: When true, also include closed sessions
             (state=`exited`). Default false. Read-after-exit still
             works via `read_session_output` regardless of this flag.

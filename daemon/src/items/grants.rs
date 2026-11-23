@@ -93,14 +93,9 @@ pub fn persist(cache: &mut Vec<LaunchGrant>, root: &Path, grants: Vec<LaunchGran
         crate::state::write_json_atomic(&path(root), &data, true)?;
         Ok(changed)
     })();
-    if result.is_err() {
-        // Never leave a stale grant readable when the directory permits removal.
-        // If unlink itself fails, live readers use the cache and restart drops
-        // board grants until the next heartbeat revalidates them.
-        if std::fs::remove_file(path(root)).is_ok() {
-            let _ = std::fs::File::open(root).and_then(|dir| dir.sync_all());
-        }
-    }
+    // On failure keep the old file: restart restores only proposal grants
+    // (load_after_restart) and the TUI asks the daemon's live cache, so a stale
+    // board grant on disk is never trusted, while durable proposals survive.
     result
 }
 
