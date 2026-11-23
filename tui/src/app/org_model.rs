@@ -528,6 +528,7 @@ impl App {
                 Err(f) => self.org.fail(f),
             }
         }
+        self.member_section_migration_tick();
         if !self.org_wanted() || self.org.rx.is_some() {
             return;
         }

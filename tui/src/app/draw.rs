@@ -338,7 +338,7 @@ impl App {
                         *active_field,
                     );
                 }
-                InputMode::SessionSettings { name, idle_timeout, burst_threshold, hidden, notify_on_idle, global_perms, color, seeded_from_snapshot, transcript_id, session_type, active_field, .. } => {
+                InputMode::SessionSettings { name, idle_timeout, burst_threshold, hidden, notify_on_idle, global_perms, color, seeded_from_snapshot, transcript_id, session_type, member_section, active_field, .. } => {
                     self.draw_session_settings(
                         frame,
                         area,
@@ -352,6 +352,7 @@ impl App {
                         seeded_from_snapshot.as_deref(),
                         transcript_id.as_deref(),
                         session_type,
+                        member_section.as_ref(),
                         *active_field,
                     );
                 }
@@ -359,7 +360,7 @@ impl App {
                     self.draw_transcript_picker(frame, area, candidates, *selected, target);
                 }
                 InputMode::WorkspaceSettings {
-                    workspace_id: _,
+                    workspace_id,
                     name,
                     color,
                     pinned,
@@ -371,6 +372,7 @@ impl App {
                     self.draw_workspace_settings(
                         frame,
                         area,
+                        workspace_id,
                         name,
                         color.as_deref(),
                         *pinned,
@@ -902,6 +904,7 @@ impl App {
         seeded_from_snapshot: Option<&str>,
         transcript_id: Option<&str>,
         session_type: &str,
+        member_section: Option<&super::input::MemberSectionForm>,
         active_field: u8,
     ) {
         let width = 55u16.min(area.width.saturating_sub(4));
@@ -910,7 +913,8 @@ impl App {
         // size so the unrelated common case doesn't grow. +2 rows for the
         // global-perms field (blank + line), +2 for the color picker,
         // +2 for the transcript field.
-        let height = if seeded_from_snapshot.is_some() { 23u16 } else { 21u16 };
+        let height = (if seeded_from_snapshot.is_some() { 23u16 } else { 21u16 })
+            .saturating_add(if member_section.is_some() { 2 } else { 0 }).min(area.height.saturating_sub(2).max(1));
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -1032,6 +1036,18 @@ impl App {
             },
         ];
 
+        if let Some(member) = member_section {
+            lines.push(Line::from(""));
+            let value = if member.editable && member.choice.is_none() { format!("auto ({})", member.effective_label) }
+                else if member.editable { self.section_choice_label(member.choice.as_deref()) }
+                else { format!("{} (read-only)", member.effective_label) };
+            lines.push(Line::from(vec![
+                Span::styled("Section (member): ", if active_field == 8 { white } else { dim }),
+                Span::styled(value, white),
+                Span::styled(if member.editable && active_field == 8 { "  ←/→" } else { "" }, dim),
+            ]));
+        }
+
         if let Some(snap) = seeded_from_snapshot {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
@@ -1123,6 +1139,7 @@ impl App {
         &self,
         frame: &mut Frame,
         area: Rect,
+        workspace_id: &str,
         name: &str,
         color: Option<&str>,
         pinned: bool,
@@ -1133,7 +1150,8 @@ impl App {
     ) {
         let width = 60u16.min(area.width.saturating_sub(4));
         // The workspace's task adds its name, lead and default models.
-        let height = if tasks.is_empty() { 11u16 } else { 16u16 };
+        let conflict = !self.workspace_override_conflicts(workspace_id, section).is_empty();
+        let height = (if tasks.is_empty() { 11u16 } else { 16u16 }).saturating_add(u16::from(conflict));
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
         let dialog_area = Rect::new(x, y, width, height);
@@ -1182,9 +1200,10 @@ impl App {
                 ),
             ]),
             Line::from(""),
-            self.section_picker_line(" Section: ", section, active_field == 3),
+            self.section_picker_line(if self.sidebar_org_live().is_some() { "Section override (this checkout): " } else { " Section: " }, section, active_field == 3),
             Line::from(""),
         ];
+        if conflict { lines.push(Line::from(Span::styled("This override will appear on the conflict list", Style::default().fg(theme::ATTN)))); }
         if let Some(task) = tasks.get(task_at.min(tasks.len().saturating_sub(1))) {
             let field = |n: u8| if active_field == n { white } else { dim };
             let mut name_line = vec![
@@ -1883,6 +1902,7 @@ impl App {
         let help_entries: Vec<(&str, &str)> = if self.keybinding_helper_visible { vec![
             ("A-/    filter", "A-?  helper"),
             ("A-j/k  nav", "A-D  done"),
+            ("A-Space fold", ""),
             ("A-h/l  free", "A-x  delete"),
             ("A-a    attach", "A-v  view"),
             ("A-n    new ws", "A-r  refresh"),
@@ -1986,7 +2006,12 @@ impl App {
             } else {
                 Span::raw(" ")
             };
-            vec![edge, Span::raw(indent(wi))]
+            let row = tree.as_ref().and_then(|t| t.rows.get(vi));
+            let depth = row.map_or(0, |r| r.cells.iter().filter(|n| matches!(n, super::tree::Node::Member(_))).count());
+            let section_pad = if let Some(section) = tree.as_ref().and_then(|t| t.row_sections.get(vi)) {
+                if section.is_empty() { "" } else { " " }
+            } else { indent(wi) };
+            vec![edge, Span::raw(format!("{section_pad}{}", "  ".repeat(depth)))]
         };
         let fold_tail = |node: &super::tree::Node| -> String {
             let Some((n, running, idle, alerting)) = tree.as_ref().and_then(|t| t.folded.get(node)) else {
@@ -2026,7 +2051,11 @@ impl App {
         };
 
         let initiative_markers = self.planning.initiative_markers();
-        let section_backgrounds = self.sidebar_section_backgrounds(&visual, &section_of);
+        let empty_sections = HashMap::new();
+        let empty_boxed = HashSet::new();
+        let section_backgrounds = self.sidebar_section_backgrounds(&visual, &section_of,
+            tree.as_ref().map_or(&empty_sections, |t| &t.row_sections),
+            tree.as_ref().map_or(&empty_boxed, |t| &t.boxed_rows));
         for (row_index, (vi, background)) in visual.iter().zip(section_backgrounds).enumerate() {
             let first_item = items.len();
             match vi {
@@ -2260,6 +2289,13 @@ impl App {
 
                     let mut spans = if tree.is_some() {
                         let mut spans = tree_prefix(vi, *wi);
+                        if let Some((t, member)) = tree.as_ref().and_then(|t|
+                            t.member_headers.get(&(*wi, *si)).map(|id| (t, id))) {
+                            if t.member_foldable.contains(member) {
+                                let node = super::tree::Node::Member(member.clone());
+                                spans.push(Span::raw(if self.tree_folded(&node) { "▸ " } else { "▾ " }));
+                            }
+                        }
                         spans.push(Span::styled(format!("{} ", indicator), indicator_style));
                         spans
                     } else {
@@ -2297,6 +2333,12 @@ impl App {
                         spans.push(Span::styled(format!("{glyph} "), style));
                     }
                     let mut tail: Vec<Span> = Vec::new();
+                    if let Some(team) = tree.as_ref().and_then(|t| t.team_labels.get(vi)) {
+                        tail.push(Span::styled(format!(" · {team}"), Style::default().fg(theme::DIM)));
+                    }
+                    if let Some(checkout) = tree.as_ref().and_then(|t| t.checkout_labels.get(vi)) {
+                        tail.push(Span::styled(format!(" · {checkout}"), Style::default().fg(theme::DIM)));
+                    }
                     if owner_blocked {
                         tail.push(super::owner_blocked::owner_tag());
                     }
@@ -2369,8 +2411,10 @@ impl App {
                     };
                     let mut lines = vec![line];
                     if boxed {
-                        let last = visual.get(row_index + 1);
-                        if !matches!(last, Some(VisualItem::ContinuousTeamSession(..))) {
+                        let ends_box = tree.as_ref().filter(|t| t.boxed_rows.contains(vi))
+                            .map_or_else(|| !matches!(visual.get(row_index + 1), Some(VisualItem::ContinuousTeamSession(..))),
+                                |t| t.boxed_last.contains(vi));
+                        if ends_box {
                             lines.push(Line::from(Span::styled(continuous_team_box_footer(), Style::default().fg(theme::HEADER))));
                         }
                     }
@@ -2539,7 +2583,29 @@ impl App {
                     items.push(ListItem::new(Line::from(Span::styled(line, Style::default().fg(theme::HEADER).add_modifier(Modifier::BOLD)))));
                 }
                 VisualItem::OrgHeader { key, depth } => {
-                    items.push(ListItem::new(self.org_header_line(key, *depth, inner.width as usize)));
+                    if let Some((t, label)) = tree.as_ref().and_then(|t| t.org_labels.get(key).map(|label| (t, label))) {
+                        let glyph = if key.starts_with("sidebar:member:") {
+                            let id = &key["sidebar:member:".len()..];
+                            if t.member_foldable.contains(id) { if self.tree_folded(&super::tree::Node::Member(id.into())) { "▸ " } else { "▾ " } } else { "" }
+                        } else if key.starts_with("sidebar:team:") {
+                            if self.folded_org.contains(key) { "▸ ◆ " } else { "▾ ◆ " }
+                        } else { "" };
+                        let mut spans = tree_prefix(vi, usize::MAX);
+                        spans.push(Span::styled(format!("{glyph}{label}"), Style::default().fg(theme::HEADER)));
+                        if let Some(team) = t.team_labels.get(vi) { spans.push(Span::styled(format!(" · {team}"), Style::default().fg(theme::DIM))); }
+                        if t.boxed_rows.contains(vi) {
+                            spans.insert(0, Span::styled("│ ", Style::default().fg(theme::HEADER)));
+                            spans.push(Span::styled(" │", Style::default().fg(theme::HEADER)));
+                        }
+                        let mut lines = vec![Line::from(spans)];
+                        if t.boxed_last.contains(vi) { lines.push(Line::from(Span::styled(continuous_team_box_footer(), Style::default().fg(theme::HEADER)))); }
+                        let style = if matches!(&self.cursor, Cursor::Org(selected) if selected == key) {
+                            Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
+                        } else { Style::default() };
+                        items.push(ListItem::new(lines).style(style));
+                    } else {
+                        items.push(ListItem::new(self.org_header_line(key, *depth, inner.width as usize)));
+                    }
                 }
                 VisualItem::BacktestHeader
                 | VisualItem::BacktestFleet(_)

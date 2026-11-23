@@ -284,6 +284,7 @@ impl App {
         self.workspaces.push(ws);
         if let Some(sid) = spec.section {
             // Same A-n-inside-a-section inheritance as the local path.
+            self.pending_member_sections.insert(new_ws_id.clone(), sid.clone());
             self.workspace_sections.insert(new_ws_id, sid);
         }
         self.cursor = Cursor::Session(new_wi, 0);

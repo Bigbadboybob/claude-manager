@@ -18,6 +18,8 @@ class SidebarToolsTests(unittest.TestCase):
                 call.assert_called_with("sidebar.assign", {"section":choice,"session_id":"scout"})
             server.set_session_section("auto")
             call.assert_called_with("sidebar.assign", {"section":"auto"})
+            server.set_session_section("none", "scout", workspace=True)
+            call.assert_called_with("sidebar.assign", {"section":"none","session_id":"scout","workspace":True})
             server.list_sidebar_sections()
             call.assert_called_with("sidebar.list", {})
         with mock.patch.object(control_client,"call",side_effect=control_client.ControlError("unauthorized","outside task tree")):

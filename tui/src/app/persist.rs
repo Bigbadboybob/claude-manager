@@ -176,6 +176,10 @@ impl App {
             sections: self.sections.clone(),
             workspace_sections: self.workspace_sections.clone(),
             member_sections: self.member_sections.clone(),
+            member_section_migration_done: self.member_section_migration_done,
+            member_section_migration_issues: self.member_section_migration_issues.clone(),
+            pending_member_sections: self.pending_member_sections.clone(),
+            fallback_only_workspace_sections: self.fallback_only_workspace_sections.iter().cloned().collect(),
             sidebar_receipts: self.sidebar_receipts.clone(),
             auto_close_workspaces: self.auto_close_workspaces.iter()
                 .filter(|id| self.workspaces.iter().any(|ws| &ws.id == *id))

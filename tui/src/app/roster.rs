@@ -146,18 +146,23 @@ impl App {
         let mut rows: Vec<Row> = (0..self.roster.reply.proposals.len()).map(Row::Proposal).collect();
         let snap = self.org.snapshot.as_ref();
         let attached = snap.map(|s| self.session_attachments(s)).unwrap_or_default();
-        let proposed = |uid: &str| self.roster.reply.proposals.iter().any(|p| p.pids.iter().any(|pid| pid.rsplit(':').next() == Some(uid)));
+        let proposed = |ts: &TerminalSession| self.roster.reply.proposals.iter().any(|p| p.pids.iter().any(|pid| {
+            match snap.and_then(|s| s.host_daemons.get(ts.host_id.as_str())) {
+                Some(daemon) => *pid == format!("agent:{daemon}:{}", ts.uid),
+                None => pid.rsplit(':').next() == Some(ts.uid.as_str()),
+            }
+        }));
         let mut sessions: Vec<(String, Row)> = Vec::new();
-        for ws in self.workspaces.iter().filter(|w| !w.is_closed) {
-            for ts in &ws.sessions {
+        for (wi, ws) in self.workspaces.iter().enumerate().filter(|(_, w)| !w.is_closed) {
+            for (si, ts) in ws.sessions.iter().enumerate() {
                 let agent = matches!(ts.session_type.as_str(), "claude" | "claude-code" | "codex");
                 // A member's main (the snapshot's, or stamped `main`).
-                let main = matches!(attached.get(&ts.uid), Some((_, super::orgchart_teams::Via::Main)));
-                let member = main || snap.is_some_and(|s| s.member_by_main(&ts.uid).is_some());
-                if !agent || ts.session.exited || member || proposed(&ts.uid) {
+                let main = snap.is_some_and(|s| matches!(attached.for_session(s, ts), Some((_, super::orgchart_teams::Via::Main))));
+                let member = main || snap.is_some_and(|s| s.members.iter().any(|m| self.find_member_main(s, m) == Some((wi, si))));
+                if !agent || ts.session.exited || member || proposed(ts) {
                     continue;
                 }
-                let of = attached.get(&ts.uid).map(|(to, _)| match to {
+                let of = snap.and_then(|s| attached.for_session(s, ts)).map(|(to, _)| match to {
                     super::orgchart_teams::Attach::Member(m) => m.clone(),
                     super::orgchart_teams::Attach::Team(t) => {
                         let lead = snap.and_then(|s| s.team(t)).and_then(|t| t.lead_member_id.clone()).filter(|l| snap.and_then(|s| s.member(l)).is_some_and(|l| !l.is_owner() && !l.retired()));

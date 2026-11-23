@@ -2036,6 +2036,9 @@
     },
     "session_id": {
      "type": "string"
+    },
+    "workspace": {
+     "type": "boolean"
     }
    },
    "required": [

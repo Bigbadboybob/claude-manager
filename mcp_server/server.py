@@ -3319,14 +3319,14 @@ def list_sidebar_sections() -> dict:
 
 
 @mcp.tool()
-def set_session_section(section: str, session_id: str | None = None) -> dict:
-    """Move a session's WHOLE workspace to a work-sidebar subsection.
+def set_session_section(section: str, session_id: str | None = None, workspace: bool = False) -> dict:
+    """Assign a session's org member to a work-sidebar subsection.
 
     section: stable ID or unique exact name from list_sidebar_sections;
-      "auto" restores parent-task inheritance, "none" explicitly leaves it loose.
+      "auto" inherits from the manager, "none" explicitly leaves it loose.
     session_id defaults to yourself; use a CM session UID from list_sessions.
-    Requires ordinary session-control scope for every live workspace member.
-    Auto descendants follow their parent; explicit descendant choices remain.
+    Set workspace=true to override just this checkout; that requires scope for
+    every live session in it. Auto descendants follow their manager.
     This is a durable queued display change, applied when the updated viewer
     connects. Read list_sidebar_sections again to verify its observed choice
     and receipt. Does not move files, change initiative/task ownership, create
@@ -3335,6 +3335,8 @@ def set_session_section(section: str, session_id: str | None = None) -> dict:
     params = {"section": section}
     if session_id is not None:
         params["session_id"] = session_id
+    if workspace:
+        params["workspace"] = True
     return control_client.call("sidebar.assign", params)
 
 

@@ -2497,6 +2497,7 @@ impl App {
         self.workspaces.push(ws);
         if let Some(sid) = inherit_section {
             // Persisted by the manifest save further down this path.
+            self.pending_member_sections.insert(new_ws_id.clone(), sid.clone());
             self.workspace_sections.insert(new_ws_id, sid);
         }
         // Sub-2b-1 review-r#2 #3: seeded sessions have a known
@@ -6276,6 +6277,10 @@ mod slice_12e_tests {
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
             member_sections: HashMap::new(),
+            member_section_migration_done: false,
+            member_section_migration_issues: Vec::new(),
+            pending_member_sections: HashMap::new(),
+            fallback_only_workspace_sections: Default::default(),
             sidebar_receipts: HashMap::new(),
             auto_close_workspaces: Vec::new(),
         };
@@ -6477,6 +6482,10 @@ remote_socket = "/remote/manager.sock"
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
             member_sections: HashMap::new(),
+            member_section_migration_done: false,
+            member_section_migration_issues: Vec::new(),
+            pending_member_sections: HashMap::new(),
+            fallback_only_workspace_sections: Default::default(),
             sidebar_receipts: HashMap::new(),
             auto_close_workspaces: Vec::new(),
         };

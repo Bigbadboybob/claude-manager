@@ -20,6 +20,18 @@ pub struct Assignment {
     pub session_uid: String,
     /// null = Auto; empty string = None; otherwise a stable section ID.
     pub choice: Option<String>,
+    /// Old queued assignments had workspace semantics.
+    #[serde(default = "default_workspace")]
+    pub workspace: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_id: Option<String>,
+}
+fn default_workspace() -> bool { true }
+impl Assignment {
+    pub fn target_key(&self) -> String {
+        self.member_id.as_ref().filter(|_| !self.workspace)
+            .map_or_else(|| self.workspace_id.clone(), |id| format!("member:{id}"))
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Receipt {
@@ -39,6 +51,16 @@ pub struct Workspace {
 pub struct Publication {
     pub sections: Vec<SidebarSection>,
     pub workspaces: BTreeMap<String, Workspace>,
+    /// Presence advertises a viewer that can apply member assignments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members: Option<BTreeMap<String, PublishedMember>>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PublishedMember {
+    pub choice: Option<String>,
+    pub effective_section_id: Option<String>,
+    pub receipt: Option<Receipt>,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Store {
@@ -152,10 +174,16 @@ fn list(state: &DaemonState, req: &Request) -> Result<Value> {
     authenticate(state, &req.caller)?;
     let store = read(state)?;
     let mut rows = BTreeMap::new();
+    let mut member_rows: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for uid in session_ids(state)
         .into_iter()
         .filter(|uid| allowed(state, &req.caller, uid))
     {
+        let org = state.sessions.get(&uid).map(|s| s.org.clone())
+            .unwrap_or_else(|| crate::control::methods::persisted_org(state, &uid));
+        if let Some(m) = crate::assistants::membership(&uid, org.as_ref()) {
+            member_rows.entry(m.member_id).or_default().push(uid.clone());
+        }
         let Some(ws) = workspace(state, &uid) else {
             continue;
         };
@@ -172,9 +200,14 @@ fn list(state: &DaemonState, req: &Request) -> Result<Value> {
             "pending": store.pending.get(&ws).map(|a| json!({"id":a.id,"choice":a.choice})),
         }));
     }
+    let member_rows: BTreeMap<_, _> = member_rows.into_iter().map(|(id, sessions)| {
+        let observed = store.publication.as_ref().and_then(|p| p.members.as_ref()).and_then(|m| m.get(&id));
+        let pending = store.pending.get(&format!("member:{id}"));
+        (id, json!({"session_ids":sessions, "observed":observed, "pending":pending}))
+    }).collect();
     Ok(json!({"viewer_published":store.publication.is_some(),
         "sections":store.publication.as_ref().map(|p| &p.sections).cloned().unwrap_or_default(),
-        "workspaces":rows, "scope":"this daemon; workspace-level membership",
+        "workspaces":rows, "members":member_rows, "scope":"this daemon; member assignments and workspace overrides",
         "note":"Observed choices are the last viewer publication; pending requests apply when the updated viewer connects."}))
 }
 #[derive(Deserialize)]
@@ -182,6 +215,8 @@ fn list(state: &DaemonState, req: &Request) -> Result<Value> {
 struct AssignParams {
     session_id: Option<String>,
     section: String,
+    #[serde(default)]
+    workspace: bool,
 }
 fn assign(state: &DaemonState, req: &Request) -> Result<Value> {
     authenticate(state, &req.caller)?;
@@ -206,12 +241,21 @@ fn assign(state: &DaemonState, req: &Request) -> Result<Value> {
     let ws =
         workspace(state, &uid).ok_or((ErrorCode::Conflict, "Target has no workspace".into()))?;
     let members = workspace_ids(state, &ws);
-    if !members.iter().all(|id| allowed(state, &req.caller, id)) {
+    if p.workspace && !members.iter().all(|id| allowed(state, &req.caller, id)) {
         return Err((ErrorCode::Unauthorized, "Section membership affects the whole workspace, which includes sessions outside your scope".into()));
     }
+    let member_id = if p.workspace { None } else {
+        let org = state.sessions.get(&uid).map(|s| s.org.clone())
+            .unwrap_or_else(|| crate::control::methods::persisted_org(state, &uid));
+        Some(crate::assistants::membership(&uid, org.as_ref()).map(|m| m.member_id)
+            .ok_or((ErrorCode::Conflict, "Target has no known org member; retry after its org placement is available".into()))?)
+    };
     let mut store = read(state)?;
     let publication = store.publication.as_ref().ok_or((ErrorCode::Conflict,
         "No updated viewer has published sections yet. Install/reopen the updated laptop TUI first.".into()))?;
+    if member_id.is_some() && publication.members.is_none() {
+        return Err((ErrorCode::Conflict, "The viewer has not published member section support yet".into()));
+    }
     let choice = match p.section.as_str() {
         "auto" => None,
         "none" => Some(String::new()),
@@ -227,7 +271,8 @@ fn assign(state: &DaemonState, req: &Request) -> Result<Value> {
             Some(section.id.clone())
         }
     };
-    if let Some(old) = store.pending.get(&ws).filter(|a| a.choice == choice) {
+    let key = member_id.as_ref().map_or_else(|| ws.clone(), |id| format!("member:{id}"));
+    if let Some(old) = store.pending.get(&key).filter(|a| a.choice == choice) {
         return Ok(json!({"status":"queued", "assignment":old, "workspace_session_ids":members}));
     }
     let assignment = Assignment {
@@ -235,8 +280,10 @@ fn assign(state: &DaemonState, req: &Request) -> Result<Value> {
         workspace_id: ws.clone(),
         session_uid: uid.clone(),
         choice,
+        workspace: p.workspace,
+        member_id,
     };
-    store.pending.insert(ws, assignment.clone());
+    store.pending.insert(key, assignment.clone());
     save(state, &store)?;
     state.manifest_watcher.broadcast(ManifestDiff::Updated {
         uid,
@@ -244,7 +291,7 @@ fn assign(state: &DaemonState, req: &Request) -> Result<Value> {
     });
     Ok(
         json!({"status":"queued", "assignment":assignment, "workspace_session_ids":members,
-        "note":"Workspace-level display change; the viewer applies it without restarting sessions. Auto descendants follow existing inheritance."}),
+        "note":"The viewer applies this display change without restarting sessions."}),
     )
 }
 fn publish(state: &DaemonState, req: &Request) -> Result<Value> {
@@ -265,10 +312,9 @@ fn publish(state: &DaemonState, req: &Request) -> Result<Value> {
     // Compare request IDs: a delayed publication cannot acknowledge a newer move.
     let before = store.pending.len();
     store.pending.retain(|_, a| {
-        !p.workspaces.values().any(|w| {
-            w.receipt.as_ref().is_some_and(|r| {
-                r.request_id == a.id && matches!(r.status.as_str(), "applied" | "section_deleted")
-            })
+        !p.workspaces.values().filter_map(|w| w.receipt.as_ref())
+        .chain(p.members.iter().flat_map(|members| members.values()).filter_map(|m| m.receipt.as_ref())).any(|r| {
+            r.request_id == a.id && matches!(r.status.as_str(), "applied" | "section_deleted")
         })
     });
     if store.publication.as_ref() != Some(&p) || store.pending.len() != before {
@@ -359,7 +405,7 @@ mod tests {
             s,
             "sidebar.assign",
             Caller::session("parent"),
-            json!({"session_id":"scout","section":section}),
+            json!({"session_id":"scout","section":section,"workspace":true}),
         )
     }
     #[test]
@@ -379,7 +425,7 @@ mod tests {
                     &s,
                     "sidebar.assign",
                     Caller::session(caller),
-                    json!({"session_id":"scout","section":"none"})
+                    json!({"session_id":"scout","section":"none","workspace":true})
                 )
                 .error
                 .unwrap()
@@ -550,6 +596,36 @@ mod tests {
         assert_eq!(std::fs::read(p).unwrap(), b"broken");
     }
     #[test]
+    fn member_assignment_is_independent_of_workspace_override_and_acknowledged() {
+        let _guard = crate::test_support::env_lock();
+        let (_dir, s) = fixture();
+        let mut spawn = crate::session::SpawnParams::new("member-session", "Member", "/bin/sleep");
+        spawn.args = vec!["30".into()];
+        spawn.workspace_id = "shared".into();
+        spawn.task_id = Some("p".into());
+        let mut session = crate::session::DaemonSession::spawn(spawn).unwrap();
+        crate::assistants::stamp(&mut session.org, "member-1", crate::assistants::ASSISTANT, "test");
+        {
+            let mut state = s.lock().unwrap();
+            state.sessions.insert("member-session".into(), session);
+            state.tui_sessions.get_mut("other").unwrap().workspace_id = Some("shared".into());
+        }
+        let mut p = publication();
+        p.members = Some(BTreeMap::from([("member-1".into(), PublishedMember::default())]));
+        assert!(call(&s, "sidebar.publish", Caller::operator("owner"), json!(p)).ok);
+        let result = call(&s, "sidebar.assign", Caller::session("member-session"), json!({"section":"Swarm"}));
+        assert!(result.ok, "{:?}", result.error);
+        let assignment: Assignment = serde_json::from_value(result.result.unwrap()["assignment"].clone()).unwrap();
+        assert_eq!(assignment.member_id.as_deref(), Some("member-1"));
+        assert!(!assignment.workspace);
+        assert!(snapshot(&s.lock().unwrap()).unwrap().contains_key("member:member-1"));
+        assert_eq!(call(&s, "sidebar.assign", Caller::session("member-session"), json!({"section":"none","workspace":true}))
+            .error.unwrap().code, ErrorCode::Unauthorized);
+        p.members.as_mut().unwrap().get_mut("member-1").unwrap().receipt = Some(Receipt { request_id: assignment.id, status: "applied".into() });
+        assert!(call(&s, "sidebar.publish", Caller::operator("owner"), json!(p)).ok);
+        assert!(snapshot(&s.lock().unwrap()).unwrap().is_empty());
+    }
+    #[test]
     fn sidebar_native_cloud_continuous_and_local_self_keep_processes_untouched() {
         let _guard = crate::test_support::env_lock();
         let (_dir, s) = fixture();
@@ -569,7 +645,7 @@ mod tests {
                     &s,
                     "sidebar.assign",
                     Caller::session(uid),
-                    json!({"section":"none"})
+                    json!({"section":"none","workspace":true})
                 )
                 .ok
             );

@@ -660,6 +660,17 @@ pub struct Manifest {
     /// Stable org member id → explicit section choice (empty means loose).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub member_sections: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub member_section_migration_done: bool,
+    /// Unresolved legacy assignments, retained until Owner dismisses the list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_section_migration_issues: Vec<(String, String, String)>,
+    /// A-n assignments waiting for the newly launched main's org stamp.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub pending_member_sections: HashMap<String, String>,
+    /// Legacy workspace choices retained only for the offline tree.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub fallback_only_workspace_sections: BTreeSet<String>,
     /// Folded task headers in the Sessions view's nested work tree, by task
     /// id. Pure TUI display state, like `sections`.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -679,6 +690,8 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub auto_close_workspaces: Vec<String>,
 }
+
+fn is_false(value: &bool) -> bool { !*value }
 
 /// One sidebar section (see `Manifest::sections`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

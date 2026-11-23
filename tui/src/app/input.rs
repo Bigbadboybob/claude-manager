@@ -96,6 +96,7 @@ pub(super) enum InputMode {
         /// The row's engine, so the Transcript field can read `[N/A]`
         /// for bash.
         session_type: String,
+        member_section: Option<MemberSectionForm>,
         /// 0 = name, 1 = idle timeout, 2 = burst threshold, 3 = hidden,
         /// 4 = notify on idle, 5 = global perms, 6 = color,
         /// 7 = transcript (Enter opens the picker)
@@ -597,6 +598,7 @@ pub(crate) enum SubmitAction {
         notify_on_idle: bool,
         global_perms: bool,
         color: Option<String>,
+        member_section: Option<(String, Option<String>)>,
     },
     SaveWorkspaceSettings {
         workspace_id: String,
@@ -719,6 +721,14 @@ pub(crate) struct SessionSettingsMut<'a> {
     pub global_perms: &'a mut bool,
     pub color: &'a mut Option<String>,
     pub active_field: &'a mut u8,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct MemberSectionForm {
+    pub(super) member_id: String,
+    pub(super) choice: Option<String>,
+    pub(super) effective_label: String,
+    pub(super) editable: bool,
 }
 
 pub(crate) struct WorkspaceSettingsMut<'a> {
@@ -1488,6 +1498,7 @@ pub(crate) fn handle_session_settings(
                 notify_on_idle: *state.notify_on_idle,
                 global_perms: *state.global_perms,
                 color: state.color.clone(),
+                member_section: None,
             })
         }
         KeyCode::Backspace => {
@@ -2871,6 +2882,7 @@ impl App {
     pub(super) fn open_session_settings(&mut self) {
         match self.cursor.clone() {
             Cursor::Session(wi, si) => {
+                let member_section = self.member_section_form(wi, si);
                 if let Some(ws) = self.workspaces.get(wi) {
                     if let Some(ts) = ws.sessions.get(si) {
                         let timeout = ts.idle_timeout_secs;
@@ -2898,35 +2910,13 @@ impl App {
                             seeded_from_snapshot: ts.seeded_from_snapshot.clone(),
                             transcript_id: ts.transcript_id.clone(),
                             session_type: ts.session_type.clone(),
+                            member_section,
                             active_field: 0,
                         };
                     }
                 }
             }
-            Cursor::Workspace(wi) => {
-                if let Some(ws) = self.workspaces.get(wi) {
-                    // The workspace row stands for its tasks: their name,
-                    // lead and default models edit here too.
-                    let task_ids = self.workspace_tasks(wi);
-                    // A task colour from the task-header era prefills a
-                    // workspace without a colour of its own.
-                    let color = ws
-                        .color
-                        .clone()
-                        .or_else(|| task_ids.iter().find_map(|t| self.task_colors.get(t).cloned()));
-                    let tasks = task_ids.iter().map(|t| self.workspace_task_edit(t)).collect();
-                    self.input_mode = InputMode::WorkspaceSettings {
-                        workspace_id: ws.id.clone(),
-                        name: ws.name.clone(),
-                        color,
-                        pinned: ws.pinned,
-                        section: self.workspace_sections.get(&ws.id).cloned(),
-                        tasks,
-                        task_at: 0,
-                        active_field: 0,
-                    };
-                }
-            }
+            Cursor::Workspace(wi) => self.open_workspace_settings(wi),
             Cursor::Backtest(_) => {
                 self.set_status_msg(
                     "Backtest runs have no settings here — A-i peeks details",
@@ -2945,9 +2935,27 @@ impl App {
             Cursor::Division(_) => {
                 self.set_status_msg("Divisions are edited in planning (update_initiative) — Space/Enter folds");
             }
-            Cursor::Org(_) => {
-                self.set_status_msg("Members and teams are edited in the roster (F6, then R) — Space/Enter folds");
+            Cursor::Org(key) => {
+                let wi = super::tree::checkout_key_workspace(&key)
+                    .and_then(|id| self.workspaces.iter().position(|ws| ws.id == id));
+                if let Some(wi) = wi { self.open_workspace_settings(wi); }
+                else { self.set_status_msg("Members and teams are edited in the roster (F6, then R) — Space/Enter folds"); }
             }
+        }
+    }
+
+    fn open_workspace_settings(&mut self, wi: usize) {
+        if let Some(ws) = self.workspaces.get(wi) {
+            let task_ids = self.workspace_tasks(wi);
+            let color = ws.color.clone().or_else(|| task_ids.iter().find_map(|t| self.task_colors.get(t).cloned()));
+            let tasks = task_ids.iter().map(|t| self.workspace_task_edit(t)).collect();
+            self.input_mode = InputMode::WorkspaceSettings {
+                workspace_id: ws.id.clone(), name: ws.name.clone(), color, pinned: ws.pinned,
+                section: if self.sidebar_org_live().is_some() && self.fallback_only_workspace_sections.contains(&ws.id) {
+                    None
+                } else { self.workspace_sections.get(&ws.id).cloned() },
+                tasks, task_at: 0, active_field: 0,
+            };
         }
     }
 
@@ -3325,6 +3333,9 @@ impl App {
         if let CrosstermEvent::Key(key) = event {
             if key.modifiers.contains(KeyModifiers::ALT) {
                 match key.code {
+                    KeyCode::Char(' ') if self.tree_view() && matches!(self.cursor, Cursor::Session(..)) => {
+                        if self.toggle_tree_fold() { return true; }
+                    }
                     KeyCode::Char('q') => {
                         self.save_session_manifest();
                         self.clear_tui_sessions_on_daemon();
@@ -4154,9 +4165,28 @@ impl App {
                 seeded_from_snapshot: _,
                 transcript_id: _,
                 session_type,
+                member_section,
                 active_field,
-            } => handle_session_settings(
-                SessionSettingsMut {
+            } => {
+                let editable = member_section.as_ref().is_some_and(|m| m.editable);
+                match event {
+                    CrosstermEvent::Key(key) if editable && key.code == KeyCode::Tab && *active_field == 7 => {
+                        *active_field = 8; InputOutcome::Consumed
+                    }
+                    CrosstermEvent::Key(key) if editable && key.code == KeyCode::BackTab && *active_field == 0 => {
+                        *active_field = 8; InputOutcome::Consumed
+                    }
+                    CrosstermEvent::Key(key) if editable && *active_field == 8 && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) => {
+                        *active_field = if key.code == KeyCode::Tab { 0 } else { 7 }; InputOutcome::Consumed
+                    }
+                    CrosstermEvent::Key(key) if editable && *active_field == 8 && matches!(key.code, KeyCode::Left | KeyCode::Right) => {
+                        if let Some(member) = member_section.as_mut() {
+                            member.choice = super::sections::cycle_section_choice(member.choice.as_deref(), &section_ids, key.code == KeyCode::Right);
+                        }
+                        InputOutcome::Consumed
+                    }
+                    _ => {
+                    let mut outcome = handle_session_settings(SessionSettingsMut {
                     is_shell: session_type.as_str() == "bash",
                     ws_index: *ws_index,
                     session_index: *session_index,
@@ -4168,10 +4198,14 @@ impl App {
                     global_perms,
                     color,
                     active_field,
-                },
-                InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids },
-                event,
-            ),
+                    }, InputCtx { repo_urls: &urls, host_ids: &host_ids, section_ids: &section_ids }, event);
+                    if let InputOutcome::Submit(SubmitAction::SaveSessionSettings { member_section: target, .. }) = &mut outcome {
+                        *target = member_section.as_ref().filter(|m| m.editable).map(|m| (m.member_id.clone(), m.choice.clone()));
+                    }
+                    outcome
+                    }
+                }
+            },
             InputMode::WorkspaceSettings {
                 workspace_id,
                 name,
@@ -4592,6 +4626,7 @@ impl App {
                 notify_on_idle,
                 global_perms,
                 color,
+                member_section,
             } => {
                 // Apply the plain fields in place, and capture the uid +
                 // the grant the operator asked for. The grant has to
@@ -4624,6 +4659,12 @@ impl App {
                         perms_push = Some((ts.uid.clone(), global_perms, local_changed));
                     }
                 }
+                if let Some((member, choice)) = member_section {
+                    match choice {
+                        Some(section) => { self.member_sections.insert(member, section); }
+                        None => { self.member_sections.remove(&member); }
+                    }
+                }
                 self.save_session_manifest();
                 match perms_push {
                     Some((uid, value, local_changed)) => {
@@ -4637,14 +4678,24 @@ impl App {
                 if self.workspaces.iter().any(|w| w.id == workspace_id) {
                     // Sidecar map, not a Workspace field — write it before
                     // the save below so one manifest write carries both.
-                    match section {
+                    let keep_fallback = self.sidebar_org_live().is_some()
+                        && self.fallback_only_workspace_sections.contains(&workspace_id) && section.is_none();
+                    if !keep_fallback && self.workspace_sections.get(&workspace_id) != section.as_ref() {
+                        self.fallback_only_workspace_sections.remove(&workspace_id);
+                        self.pending_member_sections.remove(&workspace_id);
+                        let issues = self.workspace_override_conflicts(&workspace_id, section.as_deref());
+                        self.member_section_migration_issues.extend(issues);
+                        self.member_section_migration_issues.sort();
+                        self.member_section_migration_issues.dedup();
+                    }
+                    if !keep_fallback { match section {
                         Some(sid) => {
                             self.workspace_sections.insert(workspace_id.clone(), sid);
                         }
                         None => {
                             self.workspace_sections.remove(&workspace_id);
                         }
-                    }
+                    } }
                 }
                 if let Some(ws) = self.workspaces.iter_mut().find(|w| w.id == workspace_id) {
                     // An emptied name keeps the old one (matches the old
@@ -7258,6 +7309,7 @@ mod input_handler_tests {
                 notify_on_idle,
                 global_perms: _,
                 color: _,
+                ..
             }) => {
                 assert_eq!(ws_index, 4);
                 assert_eq!(session_index, 9);

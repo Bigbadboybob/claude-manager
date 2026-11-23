@@ -173,6 +173,145 @@ pub(crate) struct SectionLookup<'a> {
 }
 
 impl App {
+    pub(super) fn workspace_override_conflicts(&self, ws: &str, choice: Option<&str>) -> Vec<(String, String, String)> {
+        let (Some(snap), Some(choice)) = (self.sidebar_org_live(), choice) else { return Vec::new(); };
+        let evidence = self.section_migration_evidence(snap);
+        let Some(info) = evidence.get(ws) else { return Vec::new(); };
+        let wanted = (!choice.is_empty()).then_some(choice);
+        let mut issues = Vec::new();
+        for id in &info.mains {
+            let effective = member_section(snap, &self.member_sections, &self.sections, id);
+            if effective.as_deref() != wanted {
+                issues.push((ws.into(), choice.into(), format!("override ignored: home checkout of member {id}")));
+            }
+        }
+        let box_owners = self.org_placement(snap).box_owners(snap);
+        for id in &info.boxed_members {
+            if let Some(lead) = box_owners.get(id).and_then(|team| snap.team(team))
+                .and_then(|team| team.continuous.as_ref()?.lead_member_id.as_deref()) {
+                if member_section(snap, &self.member_sections, &self.sections, lead).as_deref() != wanted {
+                    issues.push((ws.into(), choice.into(), format!("member {id}: kept in continuous box")));
+                }
+            }
+        }
+        issues.sort();
+        issues.dedup();
+        issues
+    }
+
+    pub(super) fn member_section_form(&self, wi: usize, si: usize) -> Option<super::input::MemberSectionForm> {
+        let snap = self.sidebar_org_live()?;
+        let placement = self.org_placement(snap);
+        let (id, _) = placement.members.iter().find(|(_, rows)| rows.contains(&(wi, si)))?;
+        let member = snap.member(id)?;
+        let ts = self.workspaces.get(wi)?.sessions.get(si)?;
+        let editable = member.main.as_ref().is_some_and(|main|
+            main.session_uid.as_deref() == Some(ts.uid.as_str())
+                && main.daemon_id.as_deref() == snap.host_daemons.get(ts.host_id.as_str()).map(String::as_str));
+        let effective = member_section(snap, &self.member_sections, &self.sections, id);
+        Some(super::input::MemberSectionForm {
+            member_id: id.clone(),
+            choice: self.member_sections.get(id).cloned(),
+            effective_label: effective.as_deref().map_or_else(|| "none".into(), |sid| self.section_choice_label(Some(sid))),
+            editable,
+        })
+    }
+
+    /// Apply the legacy migration once a complete org/host view and restored
+    /// sessions are available. Persist the results and the Owner's unresolved
+    /// list atomically; a failed save leaves the old assignments in place.
+    pub(super) fn member_section_migration_tick(&mut self) {
+        if !self.sessions_restored || self.defer_manifest_save.get() { return; }
+        if self.member_section_migration_open && !matches!(self.input_mode, InputMode::TaskPeek { .. }) {
+            let issues = std::mem::take(&mut self.member_section_migration_issues);
+            if !self.try_save_session_manifest() { self.member_section_migration_issues = issues; }
+            self.member_section_migration_open = false;
+        }
+        if !self.member_section_migration_done || !self.pending_member_sections.is_empty() {
+            if let Some(snap) = self.sidebar_org_live().cloned() {
+                let complete_hosts = self.workspaces.iter().filter(|w| !w.is_closed)
+                    .flat_map(|w| &w.sessions).filter(|s| super::tree::is_agent_engine(&s.session_type))
+                    .all(|s| snap.host_daemons.contains_key(s.host_id.as_str()));
+                if complete_hosts {
+                    let evidence = self.section_migration_evidence(&snap);
+                    let old_workspaces = self.workspace_sections.clone();
+                    let old_members = self.member_sections.clone();
+                    let old_pending = self.pending_member_sections.clone();
+                    let old_fallback = self.fallback_only_workspace_sections.clone();
+                    let old_issues = self.member_section_migration_issues.clone();
+                    let old_done = self.member_section_migration_done;
+                    let mut changed = false;
+                    if !self.member_section_migration_done {
+                        // A-n workspaces awaiting their main's stamp are new,
+                        // not legacy assignments; keep their temporary choices
+                        // until the member is known.
+                        let mut legacy = self.workspace_sections.clone();
+                        for ws in self.pending_member_sections.keys() { legacy.remove(ws); }
+                        let mut migrated = migrate_sections(&legacy, &self.member_sections, &evidence);
+                        for ws in self.pending_member_sections.keys() {
+                            if let Some(choice) = self.workspace_sections.get(ws) {
+                                migrated.overrides.insert(ws.clone(), choice.clone());
+                            }
+                        }
+                        self.member_sections = migrated.members;
+                        // Retain migrated choices for offline/old-viewer fallback;
+                        // only the genuine single-member stream overrides stay live.
+                        self.fallback_only_workspace_sections.extend(legacy.keys()
+                            .filter(|ws| !migrated.overrides.contains_key(*ws)).cloned());
+                        self.member_section_migration_issues.extend(migrated.unresolved);
+                        self.member_section_migration_done = true;
+                        changed = true;
+                    }
+                    for (ws, choice) in old_pending.iter() {
+                        if old_workspaces.get(ws) != Some(choice) {
+                            self.pending_member_sections.remove(ws);
+                            changed = true;
+                            continue;
+                        }
+                        let Some(info) = evidence.get(ws).filter(|info| !info.mains.is_empty()) else { continue; };
+                        for member in &info.mains {
+                            if let Some(existing) = self.member_sections.get(member) {
+                                if existing != choice {
+                                    self.member_section_migration_issues.push((ws.clone(), choice.clone(), format!("member {member} already has an assignment")));
+                                }
+                            } else {
+                                self.member_sections.insert(member.clone(), choice.clone());
+                            }
+                        }
+                        if self.workspace_sections.get(ws) == Some(choice) { self.workspace_sections.remove(ws); }
+                        self.fallback_only_workspace_sections.remove(ws);
+                        self.pending_member_sections.remove(ws);
+                        changed = true;
+                    }
+                    if changed {
+                        self.member_section_migration_issues.sort();
+                        self.member_section_migration_issues.dedup();
+                        if !self.try_save_session_manifest() {
+                            self.workspace_sections = old_workspaces;
+                            self.member_sections = old_members;
+                            self.pending_member_sections = old_pending;
+                            self.fallback_only_workspace_sections = old_fallback;
+                            self.member_section_migration_issues = old_issues;
+                            self.member_section_migration_done = old_done;
+                        } else { self.needs_redraw = true; }
+                    }
+                }
+            }
+        }
+        if !self.member_section_migration_open && !self.member_section_migration_issues.is_empty()
+            && self.focused && self.view_mode == ViewMode::Sessions && matches!(self.input_mode, InputMode::Normal)
+        {
+            let mut lines = vec![PeekLine::Title("Sidebar section assignments needing review".into()), PeekLine::Blank];
+            for (workspace, choice, reason) in &self.member_section_migration_issues {
+                let name = self.workspaces.iter().find(|ws| ws.id == *workspace).map_or(workspace.as_str(), |ws| ws.name.as_str());
+                lines.push(PeekLine::Text(format!("{name} ({workspace}) · {} · {reason}", self.section_choice_label(Some(choice)))));
+            }
+            self.input_mode = InputMode::TaskPeek { lines, scroll: 0, max_scroll: 0 };
+            self.member_section_migration_open = true;
+            self.needs_redraw = true;
+        }
+    }
+
     /// Evidence is tied to the daemon UUID, not the viewer's host alias.
     /// Shells follow the workspace's agent member and do not themselves
     /// become members. Missing identities make an override ambiguous.
@@ -211,16 +350,18 @@ impl App {
         &self,
         rows: &'s [VisualItem],
         section_of: &dyn Fn(usize) -> Option<&'s str>,
+        row_sections: &'s HashMap<VisualItem, String>,
+        boxed_rows: &HashSet<VisualItem>,
     ) -> Vec<Option<Color>> {
         if !self.tree_view() {
             return vec![None; rows.len()];
         }
-        let mut sections: Vec<Option<&str>> = rows.iter().map(|row| match row {
+        let mut sections: Vec<Option<&str>> = rows.iter().map(|row| row_sections.get(row).map(String::as_str).or_else(|| match row {
             VisualItem::SectionHeader(id) => Some(id.as_str()),
             VisualItem::WorkspaceHeader(wi) | VisualItem::Session(wi, _)
             | VisualItem::WorkflowHeader { ws_idx: wi, .. } => section_of(*wi),
             _ => None,
-        }).collect();
+        })).collect();
         // A division header sits inside the section of the rows before it.
         for i in 0..rows.len() {
             if matches!(rows[i], VisualItem::DivisionHeader(_)) {
@@ -240,7 +381,7 @@ impl App {
             } else {
                 sections[i]
             };
-            if matches!(row, VisualItem::ContinuousTeamHeader(_) | VisualItem::ContinuousTeamSession(..)) {
+            if matches!(row, VisualItem::ContinuousTeamHeader(_) | VisualItem::ContinuousTeamSession(..)) || boxed_rows.contains(row) {
                 Some(theme::sidebar_section_bg(Some("magenta"), self.global_settings.tint_strength()))
             } else {
                 section.and_then(|id| self.section_by_id(id))
@@ -413,12 +554,27 @@ impl App {
     pub(crate) fn cursor_section_id(&self) -> Option<String> {
         match &self.cursor {
             Cursor::Section(id) => Some(id.clone()),
+            Cursor::Session(wi, si) => {
+                let tree = self.task_tree_shared();
+                let row = VisualItem::Session(*wi, *si);
+                let boxed = VisualItem::ContinuousTeamSession(*wi, *si);
+                match tree.row_sections.get(&row).or_else(|| tree.row_sections.get(&boxed)) {
+                    Some(section) => (!section.is_empty()).then(|| section.clone()),
+                    None => {
+                        let root = tree.block_root.get(wi).copied().unwrap_or(*wi);
+                        self.section_of_workspace(root)
+                    }
+                }
+            }
             // The tree's root reflects explicit section detachments.
-            Cursor::Workspace(wi) | Cursor::Session(wi, _) => {
+            Cursor::Workspace(wi) => {
                 let root = self.task_tree_shared().block_root.get(wi).copied().unwrap_or(*wi);
                 self.section_of_workspace(root)
             }
-            Cursor::Backtest(_) | Cursor::Division(_) | Cursor::Org(_) => None,
+            Cursor::Org(key) if key.starts_with("sidebar:") => self.task_tree_shared().row_sections.get(&VisualItem::OrgHeader { key: key.clone(), depth: 0 })
+                .filter(|section| !section.is_empty()).cloned(),
+            Cursor::Division(key) => key.section.clone(),
+            Cursor::Backtest(_) | Cursor::Org(_) => None,
         }
     }
 
@@ -456,7 +612,9 @@ impl App {
     pub(crate) fn delete_section(&mut self, id: &str) {
         self.sections.retain(|s| s.id != id);
         self.workspace_sections.retain(|_, sid| sid != id);
+        self.fallback_only_workspace_sections.retain(|ws| self.workspace_sections.contains_key(ws));
         self.member_sections.retain(|_, sid| sid != id);
+        self.pending_member_sections.retain(|_, sid| sid != id);
         if matches!(&self.cursor, Cursor::Section(cid) if cid == id) {
             self.cursor = Cursor::Workspace(0);
         }
@@ -538,7 +696,10 @@ impl App {
     /// `section_rollup` against an already-built tree (one per frame).
     pub(super) fn section_rollup_in(&self, id: &str, tree: &super::tree::TaskTree) -> (usize, usize, usize) {
         let members = self.section_members_in(id, tree);
-        let (_, running, idle, _) = self.rollup(members.iter().flat_map(|wi| &self.workspaces[*wi].sessions));
+        let (_, running, idle, _) = match tree.section_sessions.get(id) {
+            Some(rows) => self.rollup(rows.iter().map(|(wi, si)| &self.workspaces[*wi].sessions[*si])),
+            None => self.rollup(members.iter().flat_map(|wi| &self.workspaces[*wi].sessions)),
+        };
         (members.len(), running, idle)
     }
 }
