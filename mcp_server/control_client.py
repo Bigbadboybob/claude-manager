@@ -94,7 +94,7 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     "messaging.norms", "messaging.monitor", "messaging.monitors", "messaging.follow",
     "messaging.availability", "messaging.attention",
     "messaging.counts", "messaging.mark_read", "messaging.react",
-    "ping", "staffing.get", "staffing.set", "session.roster", "session.scope_check",
+    "ping", "staffing.get", "staffing.set", "session.roster", "session.scope_check", "propose_task_for_session",
     "notify_user",
     "owner_attention.ack",
     # Owner-only surfaces (TUI / web board), daemon-routed for correctness.

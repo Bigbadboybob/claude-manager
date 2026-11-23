@@ -5733,6 +5733,22 @@ pub fn rpc_session_scope_check(socket: &Path, token: &str, caller: &str, target:
     Ok(response.ok && response.result.as_ref().and_then(|v| v["allowed"].as_bool()) == Some(true))
 }
 
+/// Consult live daemon grants; a missing daemon or malformed reply denies access.
+pub fn rpc_launch_grant(socket: &Path, token: &str, caller: &str, task: &str) -> anyhow::Result<bool> {
+    let req = Request { id: next_request_id(), caller: Caller::operator(token), method: "session.scope_check".into(),
+        params: serde_json::json!({"caller_uid": caller, "session_uid": caller, "task_id": task}) };
+    let response = rpc_round_trip_with_read_timeout(socket, &req, Duration::from_secs(1))?;
+    Ok(response.ok && response.result.as_ref().and_then(|v| v["launch_grant"].as_bool()) == Some(true))
+}
+
+pub fn rpc_propose_for_session(socket: &Path, token: &str, caller: &str, proposal: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let req = Request { id: next_request_id(), caller: Caller::operator(token), method: "propose_task_for_session".into(),
+        params: serde_json::json!({"caller_uid": caller, "proposal": proposal}) };
+    let response = rpc_round_trip_with_read_timeout(socket, &req, Duration::from_secs(30))?;
+    if !response.ok { anyhow::bail!("daemon rejected proposal: {:?}", response.error); }
+    response.result.ok_or_else(|| anyhow::anyhow!("daemon returned no proposal"))
+}
+
 /// Read the caller host's current rollback setting for task teardown.
 pub fn rpc_session_scope_mode(socket: &Path, token: &str, caller: &str) -> anyhow::Result<Option<String>> {
     let req = Request { id: next_request_id(), caller: Caller::operator(token), method: "session.scope_check".into(),
