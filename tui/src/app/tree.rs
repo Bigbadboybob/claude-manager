@@ -337,8 +337,16 @@ impl App {
                 snap, &self.member_sections, &self.sections, &member.id));
         }
         for member in snap.members.iter().filter(|m| active.contains(&m.id) && !m.retired()) {
-            let section = section_by_member.get(&member.id).cloned().flatten();
             let boxed = boxes.get(&member.id).cloned();
+            // A continuous team has one box in its lead's section, even if
+            // the lead's host is unavailable and several reports are roots.
+            let section = if let Some(team) = boxed.as_deref() {
+                snap.team(team).and_then(|team| team.continuous.as_ref())
+                    .and_then(|continuous| continuous.lead_member_id.as_deref())
+                    .and_then(|lead| super::sections::member_section(snap, &self.member_sections, &self.sections, lead))
+            } else {
+                section_by_member.get(&member.id).cloned().flatten()
+            };
             let mut rows = placement.members.get(&member.id).cloned().unwrap_or_default();
             let main = rows.iter().copied().find(|(wi, si)| {
                 let ts = &self.workspaces[*wi].sessions[*si];
@@ -533,7 +541,7 @@ impl App {
             out.row_sections.insert(header.clone(), section.unwrap_or("").into());
             out.items.push(header);
             let start = out.items.len();
-            for block in plan.members.iter().filter(|m| m.parent.is_none() && m.boxed.as_deref() == Some(team.as_str())) {
+            for block in plan.members.iter().filter(|m| m.parent.is_none() && m.boxed.as_deref() == Some(team.as_str()) && m.section.as_deref() == section) {
                 self.org_emit_block(out, plan, &block.id, section, true, folds, Vec::new(), &mut visited);
             }
             for (wi, si) in legacy_boxes.remove(&team).unwrap_or_default() {
@@ -1928,6 +1936,49 @@ mod tree_tests {
     }
 
     #[test]
+    fn continuous_box_with_unreachable_lead_does_not_duplicate_reports_across_sections() {
+        use super::super::org_model::fixtures::{member, owner, snapshot, team};
+        use cm_daemon::host_id::HostId;
+        let mut app = test_app();
+        app.sidebar_view = SidebarView::Task;
+        app.workspaces = ["first", "second"].into_iter().map(bare_ws).collect();
+        for (wi, uid) in ["first", "second"].into_iter().enumerate() {
+            session(&mut app, wi, uid, uid, "codex");
+            app.workspaces[wi].sessions[0].host_id = HostId::new("h1");
+        }
+        app.sections = ["a", "b"].into_iter().map(|id| SidebarSection {
+            id: id.into(), name: id.to_uppercase(), ..Default::default()
+        }).collect();
+        app.member_sections = HashMap::from([
+            ("lead".into(), "a".into()), ("first".into(), "a".into()), ("second".into(), "b".into())
+        ]);
+        let mut lead = member("lead", "Lead", Some("mem-owner"), None, Some("lead"));
+        lead["main"]["daemon_id"] = serde_json::json!("unreachable");
+        let first = member("first", "First", Some("lead"), None, Some("first"));
+        let second = member("second", "Second", Some("lead"), None, Some("second"));
+        let mut ct = team("ct", "Continuous", None, Some("lead"), &[]);
+        ct["continuous"] = serde_json::json!({"lead_member_id":"lead", "health":"ok"});
+        let mut value = snapshot(1, vec![owner(), lead, first, second], vec![ct]);
+        value["host_daemons"] = serde_json::json!({"h1":"d1"});
+        app.org.accept(value);
+
+        let tree = app.task_tree();
+        assert_eq!(tree.items.iter().filter(|item| **item == VisualItem::ContinuousTeamHeader("ct".into())).count(), 1);
+        for wi in 0..2 {
+            let row = VisualItem::ContinuousTeamSession(wi, 0);
+            assert_eq!(tree.items.iter().filter(|item| **item == row).count(), 1);
+            assert!(!tree.items.contains(&VisualItem::Session(wi, 0)));
+            assert_eq!(tree.row_sections.get(&row).map(String::as_str), Some("a"));
+        }
+        let buffer = sidebar_buffer(&mut app, 24);
+        let rendered = (0..buffer.area.height).map(|y|
+            (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>().join("\n");
+        assert_eq!(rendered.matches("first").count(), 1, "{rendered}");
+        assert_eq!(rendered.matches("second").count(), 1, "{rendered}");
+    }
+
+    #[test]
     fn sidebar_marks_follow_live_org_reports_and_assistants() {
         use super::super::org_model::fixtures::{member, owner, snapshot};
         use cm_daemon::host_id::HostId;
@@ -2107,7 +2158,7 @@ mod tree_tests {
     }
 
     #[test]
-    fn new_session_in_section_moves_assignment_to_member_when_stamp_arrives() {
+    fn new_session_in_section_copies_assignment_to_member_when_stamp_arrives() {
         use super::super::org_model::fixtures::{member, owner, snapshot};
         use cm_daemon::host_id::HostId;
         let mut app = test_app();
@@ -2129,10 +2180,17 @@ mod tree_tests {
         app.org.accept(value.clone());
         app.member_section_migration_tick();
         assert_eq!(app.member_sections.get("m").map(String::as_str), Some("a"));
-        assert!(!app.pending_member_sections.contains_key("new") && !app.workspace_sections.contains_key("new"));
+        assert!(!app.pending_member_sections.contains_key("new"));
+        assert_eq!(app.workspace_sections.get("new").map(String::as_str), Some("a"));
+        assert!(app.fallback_only_workspace_sections.contains("new"));
+        let persisted = App::load_manifest();
+        assert_eq!(persisted.workspace_sections.get("new").map(String::as_str), Some("a"));
+        assert!(persisted.fallback_only_workspace_sections.contains("new"));
         value["members"][1]["main"]["session_uid"] = serde_json::json!("replacement");
         app.org.accept(value);
         assert_eq!(super::super::sections::member_section(app.org_live().unwrap(), &app.member_sections, &app.sections, "m").as_deref(), Some("a"));
+        app.org.fail(super::super::org_model::RpcFail { unsupported: false, message: "offline".into() });
+        assert_eq!(app.section_of_workspace(0).as_deref(), Some("a"));
     }
 
     #[test]

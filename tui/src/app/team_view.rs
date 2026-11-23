@@ -363,11 +363,15 @@ mod tests {
         for (n, label) in [(1u32, "ep-main"), (2, "helper"), (3, "stray")] {
             push(&mut app, 0, &format!("ts-{n:x}-0"), label);
         }
+        // Agent assistants follow their spawner, not their checkout.
+        app.workspaces[0].sessions[1].managed_by_uid = Some("ts-1-0".into());
         let mut ep = member("m1", "ep", Some("mem-owner"), Some("t1"), Some("ts-1-0"));
         ep["home_workspace"] = serde_json::json!({"workspace_id": "other"});
         let lead_team = team("t1", "Swarm", None, Some("m1"), &[("m1", "lead"), ("m2", "member")]);
         // beta's main session sits in ep's workspace: it stays beta's.
-        app.org.accept(snapshot(3, vec![owner(), ep, member("m2", "beta", Some("m1"), Some("t1"), Some("ts-3-0"))], vec![lead_team]));
+        let mut value = snapshot(3, vec![owner(), ep, member("m2", "beta", Some("m1"), Some("t1"), Some("ts-3-0"))], vec![lead_team]);
+        value["host_daemons"] = serde_json::json!({"local": "d1"});
+        app.org.accept(value);
         app
     }
 
@@ -399,8 +403,7 @@ mod tests {
                 other => format!("{other:?}"),
             })
             .collect();
-        // ep's main session is s0; its home workspace isn't open, so its main
-        // session's workspace supplies the rest (s1, not beta's s2).
+        // ep's assistant s1 follows its spawner; beta's main s2 stays beta's.
         assert_eq!(keys, ["0:team:t1", "1:member:m1", "s0", "s1", "1:member:m2", "s2"]);
         let line = app.org_header_line("team:t1", 0, 60).to_string();
         assert!(line.contains("Swarm") && line.contains("\u{2605} ep"), "{line}");
@@ -418,9 +421,15 @@ mod tests {
         let at = items.iter().position(|i| matches!(i, VisualItem::OrgHeader { key, .. } if key == OWNER_SESSIONS_KEY)).unwrap();
         assert_eq!(items[at + 1], VisualItem::Session(1, 0));
         assert!(!items.iter().any(|i| matches!(i, VisualItem::OrgHeader { key, .. } if key == UNASSIGNED_KEY)));
-        // Spawned by a session that is gone: the rare Unassigned.
+        // With a known host, a missing spawner falls back to Owner.
         push(&mut app, 1, "ts-a-0", "orphan");
         app.workspaces[1].sessions[1].managed_by_uid = Some("ts-gone-0".into());
+        let items = app.visual_items();
+        let at = items.iter().position(|i| matches!(i, VisualItem::OrgHeader { key, .. } if key == OWNER_SESSIONS_KEY)).unwrap();
+        assert!(items[at + 1..].contains(&VisualItem::Session(1, 1)));
+        assert!(!items.iter().any(|i| matches!(i, VisualItem::OrgHeader { key, .. } if key == UNASSIGNED_KEY)));
+        // An old daemon has no identity map and keeps the legacy Unassigned row.
+        app.org.snapshot.as_mut().unwrap().host_daemons.clear();
         let items = app.visual_items();
         let at = items.iter().position(|i| matches!(i, VisualItem::OrgHeader { key, .. } if key == UNASSIGNED_KEY)).unwrap();
         assert_eq!(items[at + 1], VisualItem::Session(1, 1));
