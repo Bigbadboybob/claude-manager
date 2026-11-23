@@ -150,6 +150,17 @@ credits come from the newest report, even if that report has no credit data;
 credits are never summed. Ties use report time, host and account ID for a
 stable result. Token history and its host attribution are unchanged.
 
+`cm-claude-accounts hub plans --json` is a read-only, schema-1 count of Claude
+subscription/rate tiers and Codex plan types for the portal. Claude counts use
+the same account set as `hub status`. The command reads tiers from hub-held
+saved, pool, lent, copy and renewing login files plus `hub/plan-tiers.json`;
+the detached reset worker refreshes that cache with tier fields and `seen_at`
+only. Missing or incomplete tiers count as unknown. Codex counts distinct
+case-insensitive emails across reports; each email-less row counts as unknown.
+When copies disagree, the newest report with a known plan wins. Checked-in hosts
+with and without Codex account data are listed separately. Only aggregate counts,
+plan labels and host names appear in the output; there is no portal push.
+
 Claude reset grants are cached in `hub/reset-grants.json`. Check-ins launch a
 separate bounded worker after releasing the hub lock; the worker reads at most
 two due pool accounts, each with a five-second network timeout, and never renews
