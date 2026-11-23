@@ -303,8 +303,20 @@ impl App {
     }
 
     fn forest(&self, members: &HashSet<(usize, usize)>) -> Forest {
+        // A workspace whose every session was lifted into a continuous team
+        // box has nothing left to show here; drawing its header anyway left
+        // an empty duplicate of each boxed worker in its section (Owner,
+        // 2026-11-23, the LEP-*/LPP5 rows). Sessionless workspaces still show.
+        let order = self
+            .task_view_visible_workspaces(members)
+            .into_iter()
+            .filter(|&wi| {
+                let n = self.workspaces[wi].sessions.len();
+                n == 0 || (0..n).any(|si| !members.contains(&(wi, si)))
+            })
+            .collect();
         let mut f = Forest {
-            order: self.task_view_visible_workspaces(members),
+            order,
             ..Forest::default()
         };
         let parents = self.task_parent_map();
@@ -1395,6 +1407,33 @@ mod tree_tests {
                 Some(format!("{}{label}", ">".repeat(row.cells.len())))
             })
             .collect()
+    }
+
+    /// Owner, 2026-11-23: a workspace whose every session is lifted into a
+    /// continuous team box must not stay behind as an empty header (the
+    /// duplicated LEP-*/LPP5 rows). A workspace that keeps any session, and
+    /// blocks nested under the hidden one, still render.
+    #[test]
+    fn fully_boxed_workspace_leaves_no_empty_header() {
+        use super::super::org_model::fixtures::{member, owner, snapshot, team};
+        let mut app = org_app();
+        // Lead = ts-10-0 (in r); c's only session is its worker.
+        app.workspaces[1].sessions[0].managed_by_uid = Some("ts-10-0".into());
+        let mut t = team("t-lat", "Latency", None, Some("m-lead"), &[("m-lead", "primary")]);
+        t["continuous"] = serde_json::json!({"lead_member_id": "m-lead", "health": "ok"});
+        app.org.accept(snapshot(
+            1,
+            vec![owner(), member("m-lead", "lead", Some("mem-owner"), Some("t-lat"), Some("ts-10-0"))],
+            vec![t],
+        ));
+        let lines = outline(&app);
+        assert!(!lines.iter().any(|l| l.ends_with("ws:c")), "fully boxed c must not draw: {lines:?}");
+        assert!(lines.iter().any(|l| l.ends_with("ws:r")), "r keeps ts-11-0: {lines:?}");
+        assert!(lines.iter().any(|l| l.ends_with("ws:g")), "g still renders: {lines:?}");
+        assert!(!lines.iter().any(|l| l.ends_with("ts-12-0") || l.ends_with("ts-10-0")), "boxed sessions only in the box: {lines:?}");
+        let tree = app.task_tree();
+        let boxed: Vec<_> = tree.items.iter().filter(|v| matches!(v, VisualItem::ContinuousTeamSession(..))).collect();
+        assert_eq!(boxed.len(), 2, "lead + worker in the box");
     }
 
     /// Owner, 2026-11-05: no task subheaders. A workspace shows its
