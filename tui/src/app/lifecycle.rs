@@ -6275,6 +6275,7 @@ mod slice_12e_tests {
             hide_keybinding_helper: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            member_sections: HashMap::new(),
             sidebar_receipts: HashMap::new(),
             auto_close_workspaces: Vec::new(),
         };
@@ -6475,6 +6476,7 @@ remote_socket = "/remote/manager.sock"
             hide_keybinding_helper: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            member_sections: HashMap::new(),
             sidebar_receipts: HashMap::new(),
             auto_close_workspaces: Vec::new(),
         };

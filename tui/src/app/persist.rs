@@ -175,6 +175,7 @@ impl App {
             folded_org: self.folded_org.iter().cloned().collect(),
             sections: self.sections.clone(),
             workspace_sections: self.workspace_sections.clone(),
+            member_sections: self.member_sections.clone(),
             sidebar_receipts: self.sidebar_receipts.clone(),
             auto_close_workspaces: self.auto_close_workspaces.iter()
                 .filter(|id| self.workspaces.iter().any(|ws| &ws.id == *id))

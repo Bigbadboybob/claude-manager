@@ -226,6 +226,55 @@ struct Forest {
     children: HashMap<usize, Vec<usize>>,
 }
 
+/// The snapshot's host-qualified placement, before sections or folding.
+/// Sessions from older or unreachable hosts remain in the legacy forest.
+#[derive(Default)]
+struct OrgPlacement {
+    members: HashMap<String, Vec<(usize, usize)>>,
+    fallback: HashSet<(usize, usize)>,
+}
+
+impl App {
+    fn org_placement(&self, snap: &super::org_model::OrgSnapshot) -> OrgPlacement {
+        let mut result = OrgPlacement::default();
+        for (wi, ws) in self.workspaces.iter().enumerate() {
+            if ws.is_closed || self.is_past_workspace(wi) { continue; }
+            let mut placed = Vec::new();
+            let mut members = HashSet::new();
+            let mut non_agents = Vec::new();
+            let mut unattributed_agent = false;
+            for (si, ts) in ws.sessions.iter().enumerate() {
+                let Some(daemon) = snap.host_daemons.get(ts.host_id.as_str()) else {
+                    unattributed_agent |= is_agent_engine(&ts.session_type);
+                    result.fallback.insert((wi, si));
+                    continue;
+                };
+                if !is_agent_engine(&ts.session_type) {
+                    non_agents.push(si);
+                } else if let Some(member) = snap.member_by_session(daemon, &ts.uid) {
+                    members.insert(member.id.clone());
+                    placed.push((si, member.id.clone()));
+                } else {
+                    unattributed_agent = true;
+                    result.fallback.insert((wi, si));
+                }
+            }
+            // A shell follows its workspace's member. If the workspace does
+            // not identify one unique member, it belongs under Owner.
+            let shell_member = if members.len() == 1 && !unattributed_agent { members.iter().next().cloned() }
+                else { snap.owner().map(|owner| owner.id.clone()) };
+            for si in non_agents {
+                if let Some(member) = &shell_member { placed.push((si, member.clone())); }
+                else { result.fallback.insert((wi, si)); }
+            }
+            for (si, member) in placed {
+                result.members.entry(member).or_default().push((wi, si));
+            }
+        }
+        result
+    }
+}
+
 impl Forest {
     fn root(&self, wi: usize) -> Option<&String> {
         self.roots.get(&wi)?.first()
@@ -548,6 +597,7 @@ impl App {
             section.folded.hash(&mut h);
         }
         hash_unordered(&self.workspace_sections, &mut h);
+        hash_unordered(&self.member_sections, &mut h);
         hash_unordered(&self.folded_divisions, &mut h);
         // What `divisions_by_task` and the closed set (`org_index`) read,
         // without building them.
@@ -1343,6 +1393,65 @@ mod tree_tests {
     use super::super::sections::layout_tests::{bare_ws, sidebar_buffer, task, test_app};
     use super::*;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn org_placement_qualifies_hosts_and_keeps_old_hosts_in_legacy_tree() {
+        use super::super::org_model::fixtures::{member, owner, snapshot};
+        use cm_daemon::host_id::HostId;
+        let mut app = test_app();
+        app.workspaces = ["one", "two", "old"].into_iter().map(bare_ws).collect();
+        session(&mut app, 0, "a", "same", "codex");
+        session(&mut app, 0, "shell", "shell", "bash");
+        session(&mut app, 1, "b", "same", "codex");
+        session(&mut app, 2, "old", "same", "codex");
+        for ts in &mut app.workspaces[0].sessions { ts.host_id = HostId::new("h1"); }
+        app.workspaces[1].sessions[0].host_id = HostId::new("h2");
+        app.workspaces[2].sessions[0].host_id = HostId::new("old");
+        let a = member("a", "A", Some("mem-owner"), None, Some("same"));
+        let mut b = member("b", "B", Some("a"), None, Some("same"));
+        b["main"]["daemon_id"] = serde_json::json!("d2");
+        let mut value = snapshot(1, vec![owner(), a, b], vec![]);
+        value["host_daemons"] = serde_json::json!({"h1":"d1", "h2":"d2"});
+        let snap = serde_json::from_value(value).unwrap();
+        let result = app.org_placement(&snap);
+        assert_eq!(result.members["a"], vec![(0, 0), (0, 1)]);
+        assert_eq!(result.members["b"], vec![(1, 0)]);
+        assert_eq!(result.fallback, HashSet::from([(2, 0)]));
+    }
+
+    #[test]
+    fn boxed_only_workspace_does_not_leave_an_empty_section_header() {
+        use super::super::org_model::fixtures::{member, owner, snapshot, team};
+        let mut app = test_app();
+        app.sidebar_view = SidebarView::Task;
+        app.workspaces = ["lead", "worker", "mixed"].into_iter().map(bare_ws).collect();
+        session(&mut app, 0, "lead-task", "ts-lead", "codex");
+        session(&mut app, 1, "worker-task", "ts-worker", "codex");
+        app.workspaces[1].sessions[0].managed_by_uid = Some("ts-lead".into());
+        session(&mut app, 2, "worker-task", "ts-other-worker", "codex");
+        app.workspaces[2].sessions[0].managed_by_uid = Some("ts-lead".into());
+        session(&mut app, 2, "other-task", "ts-unboxed", "codex");
+        app.sections.push(SidebarSection { id: "s1".into(), name: "Work".into(), ..Default::default() });
+        app.workspace_sections.insert("worker".into(), "s1".into());
+        app.workspace_sections.insert("mixed".into(), "s1".into());
+        let mut ct = team("ct", "Continuous", None, Some("lead"), &[("lead", "primary")]);
+        ct["continuous"] = serde_json::json!({"lead_member_id":"lead", "health":"ok"});
+        app.org.accept(snapshot(1, vec![owner(), member("lead", "Lead", Some("mem-owner"), Some("ct"), Some("ts-lead"))], vec![ct]));
+        let tree = app.task_tree();
+        assert!(!tree.items.contains(&VisualItem::WorkspaceHeader(1)));
+        assert!(tree.items.contains(&VisualItem::WorkspaceHeader(2)), "mixed workspace stays visible");
+        for (wi, si) in [(0, 0), (1, 0), (2, 0)] {
+            assert!(tree.items.contains(&VisualItem::ContinuousTeamSession(wi, si)));
+            assert!(!tree.items.contains(&VisualItem::Session(wi, si)));
+        }
+        assert!(tree.items.contains(&VisualItem::Session(2, 1)));
+        let buffer = sidebar_buffer(&mut app, 24);
+        let rendered = (0..buffer.area.height).map(|y| {
+            (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>()
+        }).collect::<Vec<_>>().join("\n");
+        assert!(rendered.contains("⟳"), "{rendered}");
+        println!("{rendered}");
+    }
 
     /// A session of `engine` on task `tid`, live, with a well-formed uid.
     fn session(app: &mut App, wi: usize, tid: &str, uid: &str, engine: &str) {

@@ -431,6 +431,8 @@ pub struct App {
     /// out to loose). Absent = inherit through the task tree. Persisted as
     /// `Manifest::workspace_sections`.
     pub(crate) workspace_sections: HashMap<String, String>,
+    /// Member assignments survive replacing a member's main session.
+    pub(crate) member_sections: HashMap<String, String>,
     pub(crate) sidebar_receipts: HashMap<String, cm_daemon::sidebar::Receipt>,
     pub(crate) sidebar_retry_at: Instant,
     pub(crate) sidebar_pending: HashMap<(cm_daemon::host_id::HostId, String), cm_daemon::sidebar::Assignment>,
@@ -1104,6 +1106,7 @@ impl App {
             last_drawn_cursor: None,
             sections,
             workspace_sections,
+            member_sections: manifest.member_sections.clone(),
             sidebar_receipts: manifest.sidebar_receipts.clone(),
             sidebar_pending: HashMap::new(),
             sidebar_retry_at: Instant::now(),

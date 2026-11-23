@@ -6946,6 +6946,7 @@ pub(super) mod pending_workflow_events_tests {
             hide_keybinding_helper: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            member_sections: HashMap::new(),
             sidebar_receipts: HashMap::new(),
             auto_close_workspaces: Vec::new(),
         };
@@ -7175,6 +7176,7 @@ pub(super) mod pending_workflow_events_tests {
             hide_keybinding_helper: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            member_sections: HashMap::new(),
             sidebar_receipts: HashMap::new(),
             auto_close_workspaces: Vec::new(),
         };
@@ -7401,6 +7403,7 @@ pub(super) mod pending_workflow_events_tests {
             hide_keybinding_helper: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            member_sections: HashMap::new(),
             sidebar_receipts: HashMap::new(),
             auto_close_workspaces: Vec::new(),
         };
@@ -7563,6 +7566,7 @@ pub(super) mod pending_workflow_events_tests {
             hide_keybinding_helper: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            member_sections: HashMap::new(),
             sidebar_receipts: HashMap::new(),
             auto_close_workspaces: Vec::new(),
         };
@@ -7715,6 +7719,7 @@ pub(super) mod pending_workflow_events_tests {
             hide_keybinding_helper: false,
             sections: Vec::new(),
             workspace_sections: HashMap::new(),
+            member_sections: HashMap::new(),
             sidebar_receipts: HashMap::new(),
             auto_close_workspaces: Vec::new(),
         };

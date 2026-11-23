@@ -24,6 +24,83 @@ pub(crate) use cm_daemon::manifest::SidebarSection;
 /// inherit. Distinct from an absent key, which means "auto / inherit".
 pub(crate) const SECTION_NONE: &str = "";
 
+/// Resolve an explicit member assignment, then its manager's, with the
+/// empty sentinel stopping inheritance. Deleted section ids act as auto.
+fn member_section(
+    snap: &super::org_model::OrgSnapshot,
+    assignments: &HashMap<String, String>,
+    sections: &[SidebarSection],
+    member: &str,
+) -> Option<String> {
+    let mut seen = HashSet::new();
+    let mut current = Some(member);
+    while let Some(id) = current.filter(|id| seen.insert(*id)) {
+        if let Some(choice) = assignments.get(id) {
+            if choice == SECTION_NONE { return None; }
+            if sections.iter().any(|s| s.id == *choice) { return Some(choice.clone()); }
+        }
+        current = snap.member(id).and_then(|m| m.manager_member_id.as_deref());
+    }
+    None
+}
+
+/// Evidence for a legacy workspace assignment. `complete` is false if even
+/// one session could not be attributed, including an offline host.
+struct MigrationWorkspace {
+    mains: HashSet<String>,
+    members: HashSet<String>,
+    complete: bool,
+}
+
+#[derive(Default)]
+struct SectionMigration {
+    members: HashMap<String, String>,
+    overrides: HashMap<String, String>,
+    /// (workspace id, old choice, explanation), in deterministic order.
+    unresolved: Vec<(String, String, String)>,
+}
+
+fn migrate_sections(
+    old: &HashMap<String, String>,
+    existing: &HashMap<String, String>,
+    evidence: &HashMap<String, MigrationWorkspace>,
+) -> SectionMigration {
+    let mut result = SectionMigration { members: existing.clone(), ..Default::default() };
+    let mut candidates: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+    for (ws, choice) in old {
+        let Some(info) = evidence.get(ws) else {
+            result.unresolved.push((ws.clone(), choice.clone(), "workspace unavailable".into()));
+            continue;
+        };
+        if !info.mains.is_empty() {
+            for member in &info.mains {
+                candidates.entry(member).or_default().push((ws, choice));
+            }
+        } else if info.complete && info.members.len() == 1 {
+            result.overrides.insert(ws.clone(), choice.clone());
+        } else {
+            result.unresolved.push((ws.clone(), choice.clone(), "workspace membership is ambiguous".into()));
+        }
+    }
+    for (member, rows) in candidates {
+        if let Some(current) = existing.get(member) {
+            for (ws, choice) in rows {
+                if choice != current {
+                    result.unresolved.push((ws.into(), choice.into(), format!("member {member} already has an assignment")));
+                }
+            }
+        } else if rows.iter().all(|(_, choice)| *choice == rows[0].1) {
+            result.members.insert(member.into(), rows[0].1.into());
+        } else {
+            for (ws, choice) in rows {
+                result.unresolved.push((ws.into(), choice.into(), format!("conflicting assignments for member {member}")));
+            }
+        }
+    }
+    result.unresolved.sort();
+    result
+}
+
 /// Generate a fresh section id — same collision-avoidance idiom as
 /// `new_workspace_id`.
 pub(crate) fn new_section_id() -> String {
@@ -92,6 +169,30 @@ pub(crate) struct SectionLookup<'a> {
 }
 
 impl App {
+    /// Evidence is tied to the daemon UUID, not the viewer's host alias.
+    /// Shells follow the workspace's agent member and do not themselves
+    /// become members. Missing identities make an override ambiguous.
+    fn section_migration_evidence(&self, snap: &super::org_model::OrgSnapshot) -> HashMap<String, MigrationWorkspace> {
+        let mut result = HashMap::new();
+        for ws in &self.workspaces {
+            let mut info = MigrationWorkspace { mains: HashSet::new(), members: HashSet::new(), complete: true };
+            for ts in &ws.sessions {
+                if !super::tree::is_agent_engine(&ts.session_type) { continue; }
+                let member = snap.host_daemons.get(ts.host_id.as_str())
+                    .and_then(|daemon| snap.member_by_session(daemon, &ts.uid));
+                let Some(member) = member else { info.complete = false; continue; };
+                info.members.insert(member.id.clone());
+                if member.main.as_ref().is_some_and(|main|
+                    main.session_uid.as_deref() == Some(ts.uid.as_str())
+                        && main.daemon_id.as_deref() == snap.host_daemons.get(ts.host_id.as_str()).map(String::as_str)) {
+                    info.mains.insert(member.id.clone());
+                }
+            }
+            result.insert(ws.id.clone(), info);
+        }
+        result
+    }
+
     /// Resolve each displayed row independently so filtering or scrolling away
     /// a section heading cannot lose its tint. Only gaps within the same
     /// section share the surface; boundaries and loose rows stay transparent.
@@ -346,6 +447,7 @@ impl App {
     pub(crate) fn delete_section(&mut self, id: &str) {
         self.sections.retain(|s| s.id != id);
         self.workspace_sections.retain(|_, sid| sid != id);
+        self.member_sections.retain(|_, sid| sid != id);
         if matches!(&self.cursor, Cursor::Section(cid) if cid == id) {
             self.cursor = Cursor::Workspace(0);
         }
@@ -435,6 +537,55 @@ impl App {
 #[cfg(test)]
 mod section_choice_tests {
     use super::*;
+
+    #[test]
+    fn member_sections_inherit_from_nearest_manager_and_stop_at_none() {
+        use super::super::org_model::{fixtures::{member, owner, snapshot}, OrgSnapshot};
+        let snap: OrgSnapshot = serde_json::from_value(snapshot(1, vec![
+            owner(), member("lead", "Lead", Some("mem-owner"), None, None),
+            member("report", "Report", Some("lead"), None, None),
+            member("leaf", "Leaf", Some("report"), None, None),
+        ], vec![])).unwrap();
+        let sections = vec![SidebarSection { id: "one".into(), ..Default::default() }, SidebarSection { id: "two".into(), ..Default::default() }];
+        let mut assignments = HashMap::from([("lead".into(), "one".into())]);
+        assert_eq!(member_section(&snap, &assignments, &sections, "leaf").as_deref(), Some("one"));
+        assignments.insert("report".into(), "two".into());
+        assert_eq!(member_section(&snap, &assignments, &sections, "leaf").as_deref(), Some("two"));
+        assignments.insert("report".into(), SECTION_NONE.into());
+        assert_eq!(member_section(&snap, &assignments, &sections, "leaf"), None);
+        assignments.insert("report".into(), "deleted".into());
+        assert_eq!(member_section(&snap, &assignments, &sections, "leaf").as_deref(), Some("one"));
+    }
+
+    #[test]
+    fn migration_keeps_unambiguous_choices_and_lists_conflicts() {
+        let old = HashMap::from([
+            ("mains".into(), "a".into()), ("stream".into(), "b".into()),
+            ("mixed".into(), "a".into()), ("conflict1".into(), "a".into()),
+            ("conflict2".into(), "b".into()), ("existing".into(), "b".into()),
+        ]);
+        let info = |mains: &[&str], members: &[&str], complete| MigrationWorkspace {
+            mains: mains.iter().map(|s| (*s).into()).collect(),
+            members: members.iter().map(|s| (*s).into()).collect(), complete,
+        };
+        let evidence = HashMap::from([
+            ("mains".into(), info(&["one", "two"], &["one", "two"], true)),
+            ("stream".into(), info(&[], &["one"], true)),
+            ("mixed".into(), info(&[], &["one", "two"], true)),
+            ("conflict1".into(), info(&["three"], &["three"], true)),
+            ("conflict2".into(), info(&["three"], &["three"], true)),
+            ("existing".into(), info(&["four"], &["four"], true)),
+        ]);
+        let existing = HashMap::from([("four".into(), "a".into())]);
+        let result = migrate_sections(&old, &existing, &evidence);
+        assert_eq!(result.members.get("one").map(String::as_str), Some("a"));
+        assert_eq!(result.members.get("two").map(String::as_str), Some("a"));
+        assert_eq!(result.members.get("four").map(String::as_str), Some("a"));
+        assert!(!result.members.contains_key("three"));
+        assert_eq!(result.overrides.get("stream").map(String::as_str), Some("b"));
+        assert_eq!(result.unresolved.iter().map(|(ws, _, _)| ws.as_str()).collect::<Vec<_>>(),
+            ["conflict1", "conflict2", "existing", "mixed"]);
+    }
 
     #[test]
     fn cycle_walks_auto_none_sections_and_wraps() {

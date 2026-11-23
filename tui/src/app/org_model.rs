@@ -87,9 +87,13 @@ pub(super) fn owner_org_snapshot(targets: &[(String, PathBuf, String)], params: 
     let mut errors = Vec::new();
     let mut unsupported = !targets.is_empty();
     let mut merged: Option<Value> = None;
+    let mut host_daemons = serde_json::Map::new();
     for (host, socket, token) in targets {
         match crate::client_session::rpc_messaging_board(socket, token, "org.snapshot", params.clone()) {
             Ok(value) => {
+                if let Some(daemon) = value.get("source_daemon_id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    host_daemons.insert(host.clone(), Value::String(daemon.to_owned()));
+                }
                 if value["unchanged"] == true {
                     continue;
                 }
@@ -105,7 +109,10 @@ pub(super) fn owner_org_snapshot(targets: &[(String, PathBuf, String)], params: 
             }
         }
     }
-    if let Some(value) = merged {
+    if let Some(mut value) = merged {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("host_daemons".into(), Value::Object(host_daemons));
+        }
         return Ok(value);
     }
     let message = if errors.is_empty() { "No daemon is reachable".to_owned() } else { errors.join("; ") };
@@ -305,6 +312,8 @@ pub(super) struct OrgSnapshot {
     pub version: i64,
     pub members: Vec<Member>,
     pub teams: Vec<Team>,
+    /// Configured viewer host alias → the daemon UUID that answered there.
+    pub host_daemons: HashMap<String, String>,
 }
 
 impl OrgSnapshot {
@@ -355,6 +364,30 @@ impl OrgSnapshot {
     /// The member whose main session is `uid`.
     pub(super) fn member_by_main(&self, uid: &str) -> Option<&Member> {
         self.members.iter().find(|m| !m.retired() && m.main_uid() == Some(uid))
+    }
+
+    /// Resolve only a host-qualified identity. A duplicated fact is
+    /// ambiguous; do not silently attach it to whichever member appears first.
+    pub(super) fn member_by_session(&self, daemon: &str, uid: &str) -> Option<&Member> {
+        let mut matches = self.members.iter().filter(|m| {
+            !m.retired() && (m.main.as_ref().is_some_and(|main|
+                main.daemon_id.as_deref() == Some(daemon) && main.session_uid.as_deref() == Some(uid))
+                || m.assistants.iter().any(|s| s.daemon_id == daemon && s.session_uid == uid))
+        });
+        let member = matches.next()?;
+        matches.next().is_none().then_some(member)
+    }
+
+    /// Follow the manager chain, including the member itself. Malformed
+    /// cycles terminate without treating unrelated members as descendants.
+    pub(super) fn in_member_subtree(&self, member: &str, root: &str) -> bool {
+        let mut seen = HashSet::new();
+        let mut current = Some(member);
+        while let Some(id) = current.filter(|id| seen.insert(*id)) {
+            if id == root { return true; }
+            current = self.member(id).and_then(|m| m.manager_member_id.as_deref());
+        }
+        false
     }
 }
 
@@ -456,7 +489,8 @@ impl App {
     /// viewer is unfocused.
     fn org_background_wanted(&self) -> bool {
         let board_groups = self.board.visible && self.board.groups().is_some_and(|g| !g.is_empty());
-        self.focused && (self.team_view_shown() || board_groups || self.place_strip_shown())
+        self.focused && ((self.view_mode == ViewMode::Sessions && self.tree_view())
+            || self.team_view_shown() || board_groups || self.place_strip_shown())
     }
 
 
@@ -555,6 +589,24 @@ pub(super) mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::*;
+
+    #[test]
+    fn session_identity_and_subtree_are_host_qualified_and_cycle_safe() {
+        let mut lead = member("lead", "Lead", Some("mem-owner"), None, Some("same"));
+        lead["assistants"] = json!([{"daemon_id":"d1", "session_uid":"helper", "acting_as":"assistant"}]);
+        let mut report = member("report", "Report", Some("lead"), None, Some("same"));
+        report["main"]["daemon_id"] = json!("d2");
+        let leaf = member("leaf", "Leaf", Some("report"), None, None);
+        let a = member("a", "A", Some("b"), None, None);
+        let b = member("b", "B", Some("a"), None, None);
+        let snap: OrgSnapshot = serde_json::from_value(snapshot(1, vec![owner(), lead, report, leaf, a, b], vec![])).unwrap();
+        assert_eq!(snap.member_by_session("d1", "same").unwrap().id, "lead");
+        assert_eq!(snap.member_by_session("d2", "same").unwrap().id, "report");
+        assert_eq!(snap.member_by_session("d1", "helper").unwrap().id, "lead");
+        assert!(snap.member_by_session("d3", "same").is_none());
+        assert!(snap.in_member_subtree("leaf", "lead"));
+        assert!(!snap.in_member_subtree("a", "lead"));
+    }
 
     fn rpc_err(code: ErrorCode, message: &str) -> anyhow::Error {
         anyhow::Error::new(DaemonRpcError { method: "org.snapshot".into(), code, message: message.into() })
