@@ -150,6 +150,17 @@ credits come from the newest report, even if that report has no credit data;
 credits are never summed. Ties use report time, host and account ID for a
 stable result. Token history and its host attribution are unchanged.
 
+Billing guard: the hub's detached worker sends a one-token Claude Code canary
+for pool logins and available lend copies at most every 15 minutes. A 403
+permission error or explicit billing/payment message marks the login blocked in
+`hub/billing.json`; blocked logins are never lent, and a later successful canary
+clears the mark. The cache contains only status, timestamps and a bounded error
+detail. Active hosts whose usage poll is returning HTTP 429 after a switch and
+whose reading is stale for 20 minutes are marked suspect; their automatic
+switch bypasses dwell but still obeys the daily cap and requires a recently
+checked, billing-ok target. Expired tokens and probe failures remain unknown and
+never trigger a switch.
+
 `cm-claude-accounts hub plans --json` is a read-only, schema-1 count of Claude
 subscription/rate tiers and Codex plan types for the portal. Claude counts use
 the same account set as `hub status`. The command reads tiers from hub-held

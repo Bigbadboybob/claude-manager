@@ -554,6 +554,7 @@ def usage_snapshot_accounts(hub, now):
                 window_minutes=window, switch_at=float(threshold_for(limit, config))))
         cached = reset_cache.get(uuid) or {}
         accounts.append(dict(engine='claude', email=info['email'], alias=None, status=None,
+            billing=info.get('billing'),
             pool_host=None, active_on=info['active_on'], reserved_for=info['reserved_for'], room=info['room'],
             reservation_note=info.get('reservation_note'), limits=limits,
             resets=cached.get('resets') if isinstance(cached.get('resets'), list) else None,
@@ -600,6 +601,7 @@ def usage_snapshot_accounts(hub, now):
                 statuses[host] = status
         status = 'active' if 'active' in statuses.values() else freshest['account'].get('status')
         accounts.append(dict(engine='codex', email=freshest['email'], alias=freshest['account'].get('alias'),
+            billing=None,
             status=status, pool_host=freshest['host'], pool_hosts=sorted(statuses),
             pool_status=dict(sorted(statuses.items())), active_on=[], reserved_for=None, room=None,
             plan_type=freshest['account'].get('plan_type'),
@@ -847,6 +849,13 @@ RESET_REQUEST_TIMEOUT = 5.0
 RESET_SWEEP_BUDGET = 15.0
 _reset_cli_ua = None
 RESET_URL = 'https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1'
+BILLING_URL = 'https://api.anthropic.com/v1/messages?beta=true'
+BILLING_MODEL = 'claude-haiku-5-5'
+BILLING_INTERVAL = 15 * 60
+BILLING_FRESH = 30 * 60
+BILLING_BUDGET = 15.0
+BILLING_REQUEST_TIMEOUT = 5.0
+BILLING_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
 
 
 def reset_cli_user_agent(timeout=2.0):
@@ -863,6 +872,141 @@ def reset_cli_user_agent(timeout=2.0):
             version = '2.1.326'
         _reset_cli_ua = f'claude-cli/{version} (external, cli)'
     return _reset_cli_ua
+
+
+def _billing_detail(text, token=None):
+    text = re.sub(r'\s+', ' ', str(text or '')).strip()
+    if token:
+        text = text.replace(token, '[redacted]')
+    return text[:200]
+
+
+def billing_probe(record, now=None, timeout=BILLING_REQUEST_TIMEOUT):
+    """Probe one saved OAuth login; None means it was not eligible to probe."""
+    now = time.time() if now is None else now
+    oauth = record.get('claudeAiOauth') if isinstance(record, dict) else None
+    token = oauth.get('accessToken') if isinstance(oauth, dict) else None
+    expires = oauth.get('expiresAt') if isinstance(oauth, dict) else None
+    if not isinstance(token, str) or not token or not isinstance(expires, (int, float)) \
+            or expires / 1000 <= now + 60:
+        return None
+    body = json.dumps({'model': BILLING_MODEL, 'max_tokens': 1,
+                       'system': BILLING_SYSTEM,
+                       'messages': [{'role': 'user', 'content': 'ok'}]}).encode()
+    req = urllib.request.Request(BILLING_URL, data=body, method='POST', headers={
+        'Authorization': 'Bearer ' + token, 'anthropic-version': '2023-06-01',
+        'anthropic-beta': 'oauth-2025-04-20,claude-code-20250219',
+        'Content-Type': 'application/json', 'User-Agent': reset_cli_user_agent(), 'x-app': 'cli'})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            status = getattr(response, 'status', 200)
+        return {'status': 'ok', 'detail': '200 OK'}
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read(65536) or b'{}')
+        except (OSError, ValueError):
+            payload = {}
+        error = payload.get('error') if isinstance(payload, dict) else {}
+        error = error if isinstance(error, dict) else {}
+        kind, message = str(error.get('type') or ''), str(error.get('message') or '')
+        detail = _billing_detail(f'{kind}: {message}', token)
+        words = (kind + ' ' + message).lower()
+        blocked = (exc.code == 403 and kind == 'permission_error') or any(
+            word in words for word in ('past due', 'billing', 'payment', 'unpaid'))
+        return {'status': 'blocked' if blocked else 'unknown', 'detail': detail or f'HTTP {exc.code}'}
+    except Exception as exc:
+        return {'status': 'unknown', 'detail': _billing_detail(f'network: {type(exc).__name__}', token)}
+
+
+def billing_cache_load(hub):
+    raw = load_json(hub.dir / 'billing.json')
+    return {uuid: item for uuid, item in raw.items()
+            if isinstance(uuid, str) and isinstance(item, dict)
+            and item.get('status') in ('ok', 'blocked', 'unknown')
+            and isinstance(item.get('checked_at'), (int, float))}
+
+
+def billing_records(hub):
+    records = {}
+    for uuid, record in hub.pool().items():
+        records[uuid] = record
+    for uuid, meta in hub.copies().items():
+        path = hub.copy_path(uuid)
+        if meta.get('borrower') or not path.exists():
+            continue
+        try:
+            record = load_json(path)
+        except (OSError, ValueError, AccountError):
+            continue
+        if valid_login_record(record):
+            records[uuid] = record
+    return records
+
+
+def billing_refresh(paths, budget=BILLING_BUDGET):
+    """Probe pool/copy records with no network while holding the hub lock."""
+    started = time.monotonic()
+    jobs = []
+    try:
+        with Hub(paths, lock_timeout=0.25) as hub:
+            cache = billing_cache_load(hub)
+            now = time.time()
+            for uuid, record in sorted(billing_records(hub).items()):
+                checked = cache.get(uuid, {}).get('checked_at', 0)
+                if isinstance(checked, (int, float)) and now - checked < BILLING_INTERVAL:
+                    continue
+                oauth = record.get('claudeAiOauth') or {}
+                expires = oauth.get('expiresAt')
+                if not isinstance(expires, (int, float)) or expires / 1000 <= now + 60:
+                    continue
+                jobs.append((uuid, record))
+    except (OSError, TimeoutError, ValueError, AccountError):
+        return 0
+    for uuid, record in jobs:
+        if time.monotonic() - started >= budget:
+            break
+        remaining = budget - (time.monotonic() - started)
+        if remaining <= 0:
+            break
+        result = billing_probe(record, now=time.time(), timeout=min(BILLING_REQUEST_TIMEOUT, remaining))
+        if result is None:
+            continue
+        now = int(time.time())
+        try:
+            with Hub(paths, lock_timeout=0.25) as hub:
+                cache = billing_cache_load(hub)
+                alerts = load_json(hub.dir / 'billing-alerts.json')
+                previous = cache.get(uuid) or {}
+                old_status = previous.get('status')
+                status = result['status']
+                since = previous.get('since') if status in ('blocked', 'unknown') else None
+                name = (record.get('oauthAccount') or {}).get('emailAddress') or uuid[:8]
+                if status == 'blocked' and old_status != 'blocked':
+                    since = now
+                    hub.event('billing', f'{name} billing blocked (payment past due?): {result["detail"]}', host=POOL, at=now)
+                    notified = alerts.get(uuid, 0)
+                    if not isinstance(notified, (int, float)) or now - notified >= 86400:
+                        command = hub.desired['policy'].get('notify_command') or str(DEFAULT_NOTIFY)
+                        try:
+                            notify({}, paths, f'Claude account {name} is refused (payment past due?). '
+                                   'The hub will not lend it until it works again; please check its billing.', command)
+                        except Exception:
+                            pass
+                        alerts[uuid] = now
+                        atomic_write(hub.dir / 'billing-alerts.json', alerts)
+                elif old_status == 'blocked' and status == 'ok':
+                    hub.event('billing', f'{name} billing cleared (probe OK)', host=POOL, at=now)
+                entry = {'status': status, 'checked_at': now, 'detail': result['detail'][:200], 'since': since}
+                cache[uuid] = entry
+                atomic_write(hub.dir / 'billing.json', cache)
+        except (OSError, TimeoutError, ValueError, AccountError):
+            continue
+    return len(jobs)
+
+
+def billing_for(hub, uuid):
+    item = billing_cache_load(hub).get(uuid) or {}
+    return {'status': item.get('status', 'unknown'), 'checked_at': item.get('checked_at')}
 
 
 def reset_grants_parse(usage, now):
@@ -2707,8 +2851,11 @@ def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -
                if h not in (host, POOL) and now - r.get("at", 0) <= HUB_REPORT_FRESH_SECONDS}
     leftover_room = float(policy.get("leftover_room", DEFAULT_LEFTOVER_ROOM))
     min_lend_room = float(policy.get("min_lend_room", DEFAULT_MIN_LEND_ROOM))
+    billing_cache = billing_cache_load(hub)
     out = []
     for uuid, rec in hub.pool().items():
+        if (billing_cache.get(uuid) or {}).get('status') == 'blocked':
+            continue
         email = rec["oauthAccount"].get("emailAddress") or emails.get(uuid)
         config = hub_account_config(policy, email)
         config["switch_on_scoped"] = config["switch_on_scoped"] and not leftover
@@ -2765,6 +2912,8 @@ def pool_candidates(hub: Hub, host: str, reports: dict[str, dict], now: float) -
                      email or uuid), uuid, why))
     # Lend copies are a separate last tier, even after last-resort reservations.
     for uuid, meta in hub.copies().items():
+        if (billing_cache.get(uuid) or {}).get('status') == 'blocked':
+            continue
         path = hub.copy_path(uuid)
         if meta.get("borrower") or not path.exists() or uuid in d["draining"] \
                 or copy_conflict_hosts(uuid, meta, reports):
@@ -2900,6 +3049,24 @@ def pool_candidate_has_room(hub: Hub, host: str, candidate: str,
     return True
 
 
+def billing_host_suspect(export, now):
+    active = export.get('active')
+    switch_at = export.get('last_switch_at')
+    poll = export.get('poll') or {}
+    if not active or not isinstance(switch_at, (int, float)) or not switch_at \
+            or poll.get('ok') is not False or '429' not in str(poll.get('reason', '')) \
+            or not isinstance(poll.get('at'), (int, float)) or poll['at'] < switch_at:
+        return False, ''
+    info = (export.get('accounts') or {}).get(active) or {}
+    reading = info.get('reading') if isinstance(info, dict) else None
+    reading_at = reading.get('at') if isinstance(reading, dict) else None
+    latest = max(v for v in (reading_at, switch_at) if isinstance(v, (int, float)))
+    if now - latest < 20 * 60:
+        return False, ''
+    age = int((now - latest) // 60)
+    return True, f'usage poll 429 for {age} min'
+
+
 def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: float,
               previous: dict | None = None) -> dict | None:
     """Hand a pool login to a host that needs one: its pinned account, or in
@@ -2910,9 +3077,20 @@ def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: 
     pool = hub.pool()
     copies = hub.copies()
     target, reason, switch, fallback = None, None, False, None
+    suspect, suspect_reason = billing_host_suspect(export, now)
+    if suspect:
+        uuid = export.get('active')
+        name = ((export.get('accounts') or {}).get(uuid) or {}).get('email') or str(uuid)[:8]
+        marker = f'{name} suspected past due ({suspect_reason})'
+        recent = [e for e in hub.events() if e.get('kind') == 'billing' and e.get('host') == host
+                  and now - (e.get('at') or 0) < 6 * 3600]
+        if not any(str(e.get('text', '')).startswith(f'{name} suspected past due') for e in recent):
+            hub.event('billing', marker, host=host, at=int(now))
     if entry.get("mode") == "pin" and entry.get("account") not in (None, active) \
             and entry["account"] not in held and entry["account"] in pool:
         target, reason = entry["account"], f"pinned (rev {hub.desired['revision']})"
+        if (billing_cache_load(hub).get(target) or {}).get('status') == 'blocked':
+            target = None
     elif entry.get("mode") == "auto":
         policy = hub.desired["policy"]
         emails = hub_emails(reports)
@@ -2931,14 +3109,21 @@ def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: 
         old_reading = (((previous or {}).get("accounts") or {}).get(active) or {}).get("reading") or {} \
             if (previous or {}).get("active") == active else {}
         projected = projected_limits(reading, old_reading, config, now) if active else []
-        needs = not active or over or taken or copy_over or projected
+        needs = not active or over or taken or copy_over or projected or suspect
         waited = now - (export.get("last_switch_at") or 0) >= POOL_DWELL_SECONDS
         switch_at = export.get("last_switch_at") or 0
         fresh_full = bool(over and switch_at and isinstance(reading.get("at"), (int, float))
                           and switch_at < reading["at"] <= now)
         capped = (export.get("auto_switches_24h") or 0) >= POOL_MAX_SWITCHES_PER_DAY
-        if needs and (((waited or fresh_full) and not capped) or copy_over):
+        if needs and (((waited or fresh_full or suspect) and not capped) or copy_over):
             cands = pool_candidates(hub, host, reports, now)
+            if suspect:
+                cache = billing_cache_load(hub)
+                cands = [candidate for candidate in cands
+                         if (item := cache.get(candidate[1].removesuffix('~copy')))
+                         and item.get('status') == 'ok'
+                         and isinstance(item.get('checked_at'), (int, float))
+                         and now - item['checked_at'] <= BILLING_FRESH]
             if cands:
                 # A host cannot safely receive another login for an account it holds.
                 usable_held = [uuid for uuid, info in (export.get("accounts") or {}).items()
@@ -2948,16 +3133,23 @@ def pool_lend(hub: Hub, host: str, export: dict, reports: dict[str, dict], now: 
                 cands = [c for c in cands if c[1].removesuffix("~copy") not in held
                          and (not c[1].endswith("~copy") or fallback)]
             if cands:
-                if not (over or taken or copy_over or not active) and not pool_candidate_has_room(
+                if not (over or taken or copy_over or not active or suspect) and not pool_candidate_has_room(
                         hub, host, cands[0][1], reports, now):
                     return None
                 _, target, why = cands[0]
-                what = ", ".join(f"{limit_name(l)} {l['percent']:.0f}%" for l in over) \
+                what = f"suspected past due ({suspect_reason})" if suspect else (", ".join(f"{limit_name(l)} {l['percent']:.0f}%" for l in over) \
                     or ("lend-copy cap reached or reading unavailable" if copy_over else
                         ("reserved for " + ", ".join(res["for"]) if taken else
                          (", ".join(f"{limit_name(l)} {l['percent']:.0f}% (projected {p:.0f}% by next reading)"
-                                    for l, p in projected) if projected else "no login")))
+                                    for l, p in projected) if projected else "no login"))))
                 reason, switch = f"{what}; target {why}", True
+    if target:
+        item = billing_cache_load(hub).get(target.removesuffix('~copy'))
+        if (item or {}).get('status') == 'blocked' or (suspect and not (
+                item and item.get('status') == 'ok'
+                and isinstance(item.get('checked_at'), (int, float))
+                and now - item['checked_at'] <= BILLING_FRESH)):
+            target = None
     if not target:
         return None
     is_copy = target.endswith("~copy")
@@ -3136,6 +3328,7 @@ def hub_status_view(hub: Hub, now: float) -> dict:
     d = hub.desired
     emails = hub_emails(reports)
     readings = hub_readings(reports)
+    billing = billing_cache_load(hub)
     room = room_by_account(reports, d["policy"], now)
     hosts = {}
     for host in sorted((set(reports) | set(d["hosts"])) - {POOL}):
@@ -3150,6 +3343,8 @@ def hub_status_view(hub: Hub, now: float) -> dict:
     accts = {}
     for uuid, email in sorted(emails.items(), key=lambda kv: kv[1]):
         accts[uuid] = {"email": email, "reading": readings.get(uuid),
+                       "billing": {"status": (billing.get(uuid) or {}).get("status", "unknown"),
+                                   "checked_at": (billing.get(uuid) or {}).get("checked_at")},
                        "account_threshold": account_threshold(d["policy"], email),
                        "room": room.get(uuid, (True, ""))[0],
                        "active_on": sorted(h for h, v in hosts.items() if v["active"] == uuid),
@@ -3198,6 +3393,8 @@ def print_hub_status(view: dict, now: float, out) -> None:
             tags.append(f"lend copy: {copy['borrower'] or ('available' if copy['available'] else 'unavailable')}; caps {copy['caps'] or 'unset'}")
         if a["draining"]:
             tags.append("DRAINING")
+        if a.get("billing", {}).get("status") == "blocked":
+            tags.append("BILLING BLOCKED")
         if a.get("account_threshold") is not None:
             threshold = a["account_threshold"]
             tags.append(f"switch at {threshold:g}% (Owner's reserve)")
@@ -3256,6 +3453,7 @@ def cmd_hub(paths: Paths, args, out) -> int:
         return 0
     if args.hub_command == "resets":
         if args.refresh:
+            billing_refresh(paths, budget=BILLING_BUDGET)
             refresh_reset_grants(paths, force=not args.due_only, limit=2 if args.due_only else 100,
                                  budget=RESET_SWEEP_BUDGET)
         with Hub(paths, read_only=True) as hub:

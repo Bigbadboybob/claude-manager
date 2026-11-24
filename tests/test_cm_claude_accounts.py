@@ -3861,7 +3861,9 @@ class UsageDashboardTests(unittest.TestCase):
              mock.patch.object(accounts.urllib.request, 'urlopen', return_value=response) as network:
             out = io.StringIO()
             self.assertEqual(accounts.main(['hub','resets','--refresh','--json'], paths=self.hub_paths, out=out), 0)
-            self.assertEqual(network.call_count, 1)  # explicit refresh bypasses the six-hour sweep interval
+            reset_calls = [c for c in network.call_args_list
+                           if getattr(c.args[0], 'full_url', '').startswith(accounts.RESET_URL)]
+            self.assertEqual(len(reset_calls), 1)  # explicit refresh bypasses the six-hour sweep interval
         self.assertIsNone(json.loads(out.getvalue())['accounts'][0]['error'])
 
     def test_reset_cli_user_agent_falls_back_and_caches(self):
@@ -3928,6 +3930,78 @@ class UsageDashboardTests(unittest.TestCase):
         self.assertNotIn(record['claudeAiOauth']['accessToken'], ' '.join(argv))
         self.assertTrue(spawn.call_args.kwargs['start_new_session'])
         self.assertEqual(spawn.call_args.kwargs['stderr'], accounts.subprocess.DEVNULL)
+
+    def test_billing_probe_classifies_blocked_ok_and_unknown_without_token(self):
+        record = {'claudeAiOauth': login('billing'), 'oauthAccount': profile('billing')}
+        token = record['claudeAiOauth']['accessToken']
+        ok_response = mock.MagicMock(status=200)
+        blocked = accounts.urllib.error.HTTPError(accounts.BILLING_URL, 403, 'forbidden', {},
+            io.BytesIO(json.dumps({'error': {'type':'permission_error',
+                'message':'OAuth authentication is currently not allowed for this organization.'}}).encode()))
+        unknown = accounts.urllib.error.HTTPError(accounts.BILLING_URL, 429, 'busy', {},
+            io.BytesIO(b'{"error":{"type":"rate_limit_error","message":"try later"}}'))
+        with mock.patch.object(accounts, 'reset_cli_user_agent', return_value='claude-cli/test'), \
+             mock.patch.object(accounts.urllib.request, 'urlopen', side_effect=[ok_response, blocked, unknown]) as network:
+            self.assertEqual(accounts.billing_probe(record, self.now)['status'], 'ok')
+            self.assertEqual(accounts.billing_probe(record, self.now)['status'], 'blocked')
+            self.assertEqual(accounts.billing_probe(record, self.now)['status'], 'unknown')
+        request = network.call_args_list[0].args[0]
+        self.assertEqual(request.get_header('Anthropic-beta'), 'oauth-2025-04-20,claude-code-20250219')
+        self.assertEqual(json.loads(request.data)['messages'][0]['content'], 'ok')
+        self.assertNotIn(token, json.dumps([accounts.billing_probe.__name__]))
+
+    def test_billing_cache_clears_and_notifies_only_once_per_day(self):
+        record = {'claudeAiOauth': login('billing'), 'oauthAccount': profile('billing')}
+        with accounts.Hub(self.hub_paths) as hub:
+            hub.pool_put(record)
+        blocked = {'status':'blocked', 'detail':'permission_error: payment past due'}
+        with mock.patch.object(accounts, 'billing_probe', return_value=blocked), \
+             mock.patch.object(accounts, 'notify', return_value=True) as notify:
+            accounts.billing_refresh(self.hub_paths)
+            self.assertEqual(notify.call_count, 1)
+            accounts.atomic_write(self.hub_paths.store / 'hub' / 'billing.json',
+                                  {'billing-uuid-0000': {'status':'blocked', 'checked_at':self.now-3600,
+                                   'detail':'old', 'since':self.now-3600, 'notified_at':self.now}})
+            accounts.billing_refresh(self.hub_paths)
+            self.assertEqual(notify.call_count, 1)
+        with mock.patch.object(accounts, 'billing_probe', return_value={'status':'ok', 'detail':'200 OK'}):
+            accounts.atomic_write(self.hub_paths.store / 'hub' / 'billing.json',
+                                  {'billing-uuid-0000': {'status':'blocked', 'checked_at':self.now-3600,
+                                   'detail':'old', 'since':self.now-3600, 'notified_at':self.now}})
+            accounts.billing_refresh(self.hub_paths)
+        cache = json.loads((self.hub_paths.store / 'hub' / 'billing.json').read_text())
+        self.assertEqual(cache['billing-uuid-0000']['status'], 'ok')
+        self.assertIsNone(cache['billing-uuid-0000']['since'])
+        self.assertTrue(any(e['kind'] == 'billing' and 'cleared' in e['text']
+                            for e in accounts.Hub(self.hub_paths, read_only=True).events()))
+
+    def test_blocked_candidates_and_suspect_switch_require_billing_ok(self):
+        record = {'claudeAiOauth': login('target'), 'oauthAccount': profile('target')}
+        export = {'version':1, 'host':'cm-sessions', 'active':'active-uuid-0000',
+                  'last_switch_at':self.now-1800, 'auto_switches_24h':0,
+                  'poll':{'at':self.now-100, 'ok':False, 'reason':'HTTP 429 rate limited'},
+                  'accounts':{'active-uuid-0000': {'email':'active@example.com',
+                      'reading':{'at':self.now-1400, 'limits':[]}, 'login':'ok'}}, 'events':[]}
+        with accounts.Hub(self.hub_paths) as hub:
+            hub.pool_put(record)
+            hub.desired['policy'].update(pool=True, auto_allow_unread=True)
+            hub.desired['hosts']['cm-sessions'] = {'mode':'auto'}
+            accounts.atomic_write(hub.dir / 'billing.json',
+                                  {'target-uuid-0000': {'status':'blocked', 'checked_at':self.now,
+                                   'detail':'past due', 'since':self.now}})
+            self.assertEqual(accounts.pool_candidates(hub, 'cm-sessions', {}, self.now), [])
+            with mock.patch.object(accounts, 'POOL_DWELL_SECONDS', 3600):
+                result = accounts.pool_lend(hub, 'cm-sessions', export, {}, self.now)
+            self.assertIsNone(result)
+            accounts.atomic_write(hub.dir / 'billing.json',
+                                  {'target-uuid-0000': {'status':'ok', 'checked_at':self.now-60,
+                                   'detail':'200 OK', 'since':None}})
+            result = accounts.pool_lend(hub, 'cm-sessions', export, {}, self.now)
+            self.assertIsNotNone(result)
+            self.assertTrue(result['switch'])
+            self.assertIn('suspected past due', result['reason'])
+            export['auto_switches_24h'] = accounts.POOL_MAX_SWITCHES_PER_DAY
+            self.assertIsNone(accounts.pool_lend(hub, 'cm-sessions', export, {}, self.now))
 
 
 if __name__ == "__main__":
