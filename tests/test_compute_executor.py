@@ -33,3 +33,50 @@ def test_cutover_is_fail_closed_and_enable_requires_both_drains(monkeypatch, tmp
     assert calls[-1][1] == {'box': 'box', 'local_drained': True, 'node_drained': True}
     executor.enable_drained_boxes(cfg, enabled)
     assert calls.count('local') == 1
+
+
+def test_failed_extension_requires_explicit_node_absence(monkeypatch):
+    import subprocess
+    import pytest
+    action = {'kind': 'extend', 'lease_id': 'lease-id',
+              'payload': {'box': 'box', 'expires_epoch': 123}}
+    routes = {'box': {'argv': ['gcloud', 'compute', 'ssh', 'vm']}}
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if len(calls) == 1:
+            raise subprocess.CalledProcessError(3, argv)
+        return SimpleNamespace(stdout='{"lease_id":"lease-id","exists":false,"unit_inactive":true}')
+    monkeypatch.setattr(executor.subprocess, 'run', run)
+    assert executor.execute(action, routes) == {'lease_id': 'lease-id', 'absent': True, 'unit_inactive': True}
+    assert ' probe ' in calls[1][-1]
+    calls.clear()
+    def transport_timeout(argv, **kwargs):
+        calls.append(argv)
+        raise subprocess.TimeoutExpired(argv, 90)
+    monkeypatch.setattr(executor.subprocess, 'run', transport_timeout)
+    with pytest.raises(subprocess.TimeoutExpired):
+        executor.execute(action, routes)
+    assert len(calls) == 1
+
+
+def test_failed_extension_does_not_infer_absence_from_uncertain_probe(monkeypatch):
+    import subprocess
+    import pytest
+    action = {'kind': 'extend', 'lease_id': 'lease-id',
+              'payload': {'box': 'box', 'expires_epoch': 123}}
+    routes = {'box': {'argv': ['gcloud', 'compute', 'ssh', 'vm']}}
+    replies = iter([subprocess.CalledProcessError(255, 'ssh'),
+                    SimpleNamespace(stdout='{"lease_id":"lease-id","exists":true}')])
+    def run(*args, **kwargs):
+        result = next(replies)
+        if isinstance(result, Exception):
+            raise result
+        return result
+    monkeypatch.setattr(executor.subprocess, 'run', run)
+    with pytest.raises(ValueError, match='did not confirm'):
+        executor.execute(action, routes)
+    replies = iter([subprocess.CalledProcessError(3, 'extend'),
+                    subprocess.TimeoutExpired('probe', 90)])
+    with pytest.raises(subprocess.TimeoutExpired):
+        executor.execute(action, routes)

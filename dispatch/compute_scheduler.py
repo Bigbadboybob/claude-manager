@@ -54,8 +54,8 @@ def select_box(lease: Mapping, leases: Sequence[Mapping], boxes: Sequence[Box],
     """Find capacity without oversubscription. Slot lists are disjoint CPU sets.
 
     Session limits are hard; team limits are soft and apply only when another
-    team is waiting. The caller processes queue_order strictly, stopping when
-    its first lease cannot run, so a later request cannot jump that lease.
+    team is waiting. The caller processes queue_order and may skip requests
+    that cannot currently run, preserving order among eligible requests.
     """
     count = slots_needed(lease, policy)
     if count > policy.max_slots_per_lease and not str(lease.get("purpose") or "").strip():

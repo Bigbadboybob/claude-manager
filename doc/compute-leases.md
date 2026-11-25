@@ -23,15 +23,18 @@ IAP routes. The SSH aliases must use the approved IAP route and be available
 on the calling cm-sessions host. This does not install keys or authorize a new
 route from cm-manager. Reservations remain occupied until release is confirmed.
 
-For the eventual cutover, Compute-Manager stops new `lq` work and lets old
-runs drain. Set `cutover_ready` only after that freeze. The executor must
-confirm each box is drained before enabling it; leave the pool and executor
-examples disabled until those checks and the deployment review pass. Keep
-`lq` unchanged during this implementation and retire it separately after the
-agreed week.
+At cutover:
 
-Extensions are currently refused while any other session is queued, including
-requests for other boxes. The configured total-duration cap is strict in v1;
+1. Compute-Manager makes `lq` refuse new `NAME.in` submissions.
+2. Let existing runs drain, then set `cutover_ready`. The executor confirms
+   each box is drained before enabling it.
+3. Leave the pool and executor examples disabled until those checks and the
+   deployment review pass. Retire `lq` separately after the agreed week.
+
+This branch does not change `lq`.
+
+Extensions are refused while another session has a queued request that can fit
+the lease's box. The configured total-duration cap is strict in v1;
 longer work must request a fresh lease. The `lucas` Unix account is shared: anyone who can
 use the privileged script can run in or release another known lease ID.
 Agents must use the prefix for work to be accounted and protected by the slice.
@@ -69,6 +72,9 @@ environment file supplies `CM_API_URL`, `CM_API_TOKEN`, and
 `CM_COMPUTE_EXECUTOR_CONFIG`. Install the pool JSON on the API host and set
 `CM_COMPUTE_POOL_CONFIG`. Leave `cutover_ready` false and boxes disabled until
 the freeze and drain checks above have been completed.
+Install the updated node script before the executor: recovery from a lost
+extension requires the node's `probe` command. An unreachable or uncertain
+node never frees its reservation.
 
 Idle, reclaim and expiry notices use the native board-push delivery channel.
 The API counts an idle notice only after the recipient daemon reports that the

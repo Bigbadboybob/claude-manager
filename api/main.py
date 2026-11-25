@@ -90,6 +90,10 @@ async def lifespan(app: FastAPI):
     # Startup
     app.state.pool = await db.get_pool()
     await db.init_db(app.state.pool)
+    # A previous API version may have written samples without interval-level
+    # activity tracking. Re-establish a fresh window after every API start.
+    async with app.state.pool.acquire() as conn:
+        await conn.execute('DELETE FROM compute_lease_sampling_epochs')
     app.state.pending_vm_deletions: set[asyncio.Task] = set()
     # Two independent loops so a slow warm-pool maintenance pass (serial
     # gcloud probes, gcloud instances create) doesn't drift the dispatch

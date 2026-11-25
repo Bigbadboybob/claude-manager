@@ -101,3 +101,32 @@ def test_workdir_creation_drops_privileges_before_touching_user_path(monkeypatch
     node.create_workdir(tmp_path / LEASE, 'agent:daemon:owner', LEASE, 2000, 'lucas')
     assert calls[0][:5] == ('/usr/sbin/runuser', '-u', 'lucas', '--', '/usr/bin/python3')
     assert not (tmp_path / LEASE).exists()
+
+
+def test_probe_requires_missing_record_and_inactive_empty_slice(context, monkeypatch):
+    cfg, args, calls = context
+    monkeypatch.setattr(node, 'run', lambda *a: 'LoadState=loaded\nActiveState=inactive\nControlGroup=')
+    assert node.probe(LEASE) == {'lease_id': LEASE, 'exists': False, 'unit_inactive': True}
+    monkeypatch.setattr(node, 'run', lambda *a: 'LoadState=loaded\nActiveState=active\nControlGroup=/active')
+    with pytest.raises(node.Refused):
+        node.probe(LEASE)
+    node.save(LEASE, {'lease_id': LEASE})
+    assert node.probe(LEASE)['exists'] is True
+    node.save(LEASE, {})
+    assert node.probe(LEASE)['exists'] is True
+
+
+def test_reap_continues_after_one_lease_fails(context, monkeypatch):
+    node.save(LEASE, {'expires': 1})
+    second = 'a4c4e6cf-bfad-4e66-8a63-d1fce23ba171'
+    node.save(second, {'expires': 1})
+    def release(ident):
+        if ident == LEASE:
+            raise OSError('stop failed')
+        return {'lease_id': ident, 'released': True}
+    monkeypatch.setattr(node, 'release', release)
+    result = node.reap()
+    assert result['released'] == [{'lease_id': second, 'released': True}]
+    assert result['failed'][0]['lease_id'] == LEASE
+    assert 'stop failed' in result['failed'][0]['error']
+    assert 'stop failed' in node.LOG.read_text()

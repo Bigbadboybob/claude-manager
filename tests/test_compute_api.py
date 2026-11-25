@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 os.environ.setdefault('CM_DB_DSN', 'postgresql://unused')
 os.environ.setdefault('CM_API_TOKEN', 'unused')
@@ -50,7 +51,7 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         self.pool = await asyncpg.create_pool(host=str(self.root), port=55483, database='postgres',
                                                min_size=1, max_size=4, init=db._init_connection)
         async with self.pool.acquire() as conn:
-            await conn.execute('DROP TABLE IF EXISTS compute_lease_notices, compute_lease_samples, compute_lease_actions, compute_leases, compute_boxes, item_pushes, incarnations, members CASCADE')
+            await conn.execute('DROP TABLE IF EXISTS compute_lease_sampling_epochs, compute_lease_notices, compute_lease_samples, compute_lease_actions, compute_leases, compute_boxes, item_pushes, incarnations, members CASCADE')
             await conn.execute('CREATE TABLE members (id text PRIMARY KEY, primary_team_id uuid)')
             await conn.execute('CREATE TABLE incarnations (member_id text, pid text, ended_at timestamptz)')
             await conn.execute('''CREATE TABLE item_pushes (id bigserial PRIMARY KEY, daemon_id text, session_uid text,
@@ -58,6 +59,9 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             sql = (ROOT / 'sql/040_compute_leases.sql').read_text()
             await conn.execute(sql)
             await conn.execute(sql)
+            answer_sql = (ROOT / 'sql/041_compute_notice_answers.sql').read_text()
+            await conn.execute(answer_sql)
+            await conn.execute(answer_sql)
             await conn.execute("INSERT INTO compute_boxes (name, enabled, checked_at, evidence) VALUES ('d6', true, now(), '{}'::jsonb)")
         self.request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(pool=self.pool)))
 
@@ -162,6 +166,7 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
                 for i in range(7):
                     await conn.execute('INSERT INTO compute_lease_samples (lease_id,sampled_at,usage_usec) VALUES ($1,$2,$3)',
                         granted['lease_id'], now-timedelta(seconds=60-i*10), i*1_000_000)
+                await conn.execute('INSERT INTO compute_lease_sampling_epochs (lease_id) VALUES ($1)', granted['lease_id'])
             await api.sample(api.SampleReceipt(lease_id=granted['lease_id'], cpu_usage_usec=6_000_000), self.request)
             await api.executor_poll(self.request)
             async with self.pool.acquire() as conn:
@@ -169,6 +174,9 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
                 push = await conn.fetchval("SELECT n.push_id FROM compute_lease_notices n JOIN compute_lease_actions a ON a.id=n.action_id WHERE a.kind='reclaim_notice'")
                 self.assertIsNotNone(push)
                 await conn.execute('UPDATE item_pushes SET delivered_at=now() WHERE id=$1', push)
+            self.assertIsNone((await api.executor_poll(self.request))['action'])
+            # A fresh interval after the final notice is required before kill.
+            await api.sample(api.SampleReceipt(lease_id=granted['lease_id'], cpu_usage_usec=6_000_000), self.request)
             release = (await api.executor_poll(self.request))['action']
             self.assertEqual(release['kind'], 'release')
             async with self.pool.acquire() as conn:
@@ -217,3 +225,271 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await conn.fetchval('SELECT delivered_at FROM item_pushes WHERE id=$1', ident))
             await items_db._ack_pushes(conn, 'd', [], [ident], now)
             self.assertIsNotNone(await conn.fetchval('SELECT delivered_at FROM item_pushes WHERE id=$1', ident))
+
+    async def test_resumed_interval_resets_clock_before_any_reclaim(self):
+        from datetime import datetime, timedelta, timezone
+        owner = self.body('one')
+        granted = await api.request_lease(owner, self.request)
+        action = (await api.executor_poll(self.request))['action']
+        await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+            'lease_id': str(action['lease_id']), 'configured': True, 'workdir': '/work/id'}), self.request)
+        await api.request_lease(self.body('two'), self.request)
+        cfg_path = self.root / 'pool.json'
+        original = cfg_path.read_text()
+        cfg = json.loads(original)
+        cfg['policy'].update(idle_threshold_seconds=600, idle_answer_seconds=60,
+                             sample_max_gap_seconds=20, notice_expiry_guard_seconds=30)
+        cfg_path.write_text(json.dumps(cfg))
+        try:
+            now = datetime.now(timezone.utc)
+            async with self.pool.acquire() as conn, conn.transaction():
+                await conn.execute('UPDATE compute_leases SET last_activity_at=$2, expires_at=$3 WHERE id=$1',
+                    granted['lease_id'], now-timedelta(hours=3), now+timedelta(hours=1))
+                row = await conn.fetchrow('SELECT * FROM compute_leases WHERE id=$1', granted['lease_id'])
+                for age in (130, 65):
+                    await api._notice_action(conn, row, 'idle_notice')
+                    notice = await conn.fetchrow('SELECT action_id,push_id FROM compute_lease_notices WHERE sent_at IS NULL ORDER BY push_id DESC LIMIT 1')
+                    await conn.execute("UPDATE compute_lease_actions SET status='done' WHERE id=$1", notice['action_id'])
+                    await conn.execute('UPDATE compute_lease_notices SET sent_at=$2 WHERE action_id=$1', notice['action_id'], now-timedelta(seconds=age))
+                    await conn.execute('UPDATE item_pushes SET delivered_at=$2 WHERE id=$1', notice['push_id'], now-timedelta(seconds=age))
+                # A final notice has been observed, but no new CPU interval has been read yet.
+                await api._notice_action(conn, row, 'reclaim_notice')
+                push = await conn.fetchval('SELECT push_id FROM compute_lease_notices WHERE sent_at IS NULL')
+                await conn.execute('UPDATE item_pushes SET delivered_at=now() WHERE id=$1', push)
+                for i in range(61):
+                    await conn.execute('INSERT INTO compute_lease_samples (lease_id,sampled_at,usage_usec) VALUES ($1,$2,0)',
+                        granted['lease_id'], now-timedelta(seconds=610-i*10))
+                await conn.execute('INSERT INTO compute_lease_sampling_epochs (lease_id) VALUES ($1)', granted['lease_id'])
+            self.assertIsNone((await api.executor_poll(self.request))['action'])
+            # One full-speed interval is only ~1.67% of the 10-minute window.
+            await api.sample(api.SampleReceipt(lease_id=granted['lease_id'], cpu_usage_usec=20_000_000), self.request)
+            async with self.pool.acquire() as conn:
+                self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', granted['lease_id']), 'active')
+                self.assertTrue(await conn.fetchval("SELECT last_activity_at > now()-interval '10 seconds' FROM compute_leases WHERE id=$1", granted['lease_id']))
+                self.assertEqual(await conn.fetchval('SELECT count(*) FROM compute_lease_notices WHERE lease_id=$1 AND invalidated_at IS NULL', granted['lease_id']), 0)
+        finally:
+            cfg_path.write_text(original)
+
+    async def test_api_restart_requires_fresh_idle_window(self):
+        from datetime import datetime, timedelta, timezone
+        from fastapi import FastAPI
+        from api import main
+
+        owner = self.body('one')
+        granted = await api.request_lease(owner, self.request)
+        action = (await api.executor_poll(self.request))['action']
+        await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+            'lease_id': str(action['lease_id']), 'configured': True, 'workdir': '/work/id'}), self.request)
+        now = datetime.now(timezone.utc)
+        async with self.pool.acquire() as conn, conn.transaction():
+            await conn.execute("UPDATE compute_leases SET last_activity_at=$2 WHERE id=$1",
+                               granted['lease_id'], now-timedelta(hours=3))
+            row = await conn.fetchrow('SELECT * FROM compute_leases WHERE id=$1', granted['lease_id'])
+            await api._notice_action(conn, row, 'idle_notice')
+            await conn.execute('INSERT INTO compute_lease_samples (lease_id,sampled_at,usage_usec) VALUES ($1,$2,0)',
+                               granted['lease_id'], now-timedelta(seconds=10))
+            await conn.execute('INSERT INTO compute_lease_sampling_epochs (lease_id) VALUES ($1)', granted['lease_id'])
+
+        async def wait_forever(*args):
+            await asyncio.Event().wait()
+
+        broker = MagicMock()
+        broker.stop = AsyncMock()
+        # Keep the real test pool open for tearDown while exercising startup.
+        pool_proxy = SimpleNamespace(acquire=self.pool.acquire, close=AsyncMock())
+        with patch.object(main.db, 'get_pool', AsyncMock(return_value=pool_proxy)), \
+             patch.object(main.db, 'init_db', AsyncMock()), \
+             patch.object(main, 'dispatch_loop', wait_forever), \
+             patch.object(main, 'warm_pool_loop', wait_forever), \
+             patch.object(main, 'change_log_maintenance_loop', wait_forever), \
+             patch.object(main, 'board_loop', wait_forever), \
+             patch.object(main, 'ChangeBroker', return_value=broker):
+            async with main.lifespan(FastAPI()):
+                async with self.pool.acquire() as conn:
+                    self.assertEqual(await conn.fetchval('SELECT count(*) FROM compute_lease_sampling_epochs'), 0)
+                await api.sample(api.SampleReceipt(lease_id=granted['lease_id'], cpu_usage_usec=0), self.request)
+                async with self.pool.acquire() as conn:
+                    self.assertTrue(await conn.fetchval("SELECT last_activity_at > now()-interval '10 seconds' FROM compute_leases WHERE id=$1", granted['lease_id']))
+                    self.assertEqual(await conn.fetchval('SELECT count(*) FROM compute_lease_notices WHERE invalidated_at IS NULL'), 0)
+
+    async def test_status_answer_precedes_delayed_delivery_ack(self):
+        owner = self.body('one')
+        granted = await api.request_lease(owner, self.request)
+        action = (await api.executor_poll(self.request))['action']
+        await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+            'lease_id': str(action['lease_id']), 'configured': True, 'workdir': '/work/id'}), self.request)
+        async with self.pool.acquire() as conn, conn.transaction():
+            row = await conn.fetchrow('SELECT * FROM compute_leases WHERE id=$1', granted['lease_id'])
+            await api._notice_action(conn, row, 'idle_notice')
+            push = await conn.fetchval('SELECT push_id FROM compute_lease_notices WHERE lease_id=$1', granted['lease_id'])
+        await api.status(api.StatusRequest(actor=owner.actor, lease_id=granted['lease_id']), self.request)
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE item_pushes SET delivered_at=now()+interval '1 second' WHERE id=$1", push)
+        await api.executor_poll(self.request)
+        async with self.pool.acquire() as conn:
+            notice = await conn.fetchrow('SELECT n.answered_at,n.sent_at,l.last_activity_at FROM compute_lease_notices n JOIN compute_leases l ON l.id=n.lease_id WHERE n.push_id=$1', push)
+            self.assertIsNotNone(notice['answered_at'])
+            self.assertGreater(notice['sent_at'], notice['last_activity_at'])
+            self.assertEqual(await conn.fetchval("""SELECT count(*) FROM compute_lease_notices n
+                JOIN compute_lease_actions a ON a.id=n.action_id WHERE n.lease_id=$1
+                AND a.kind='idle_notice' AND n.answered_at IS NULL""", granted['lease_id']), 0)
+
+    async def test_confirmed_missing_extension_retains_slot_until_release_ack(self):
+        owner = self.body('one')
+        granted = await api.request_lease(owner, self.request)
+        action = (await api.executor_poll(self.request))['action']
+        await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+            'lease_id': str(action['lease_id']), 'configured': True, 'workdir': '/work/id'}), self.request)
+        await api.extend(api.LeaseChange(actor=owner.actor, lease_id=granted['lease_id'], duration=60), self.request)
+        extend_action = (await api.executor_poll(self.request))['action']
+        self.assertEqual(extend_action['kind'], 'extend')
+        await api.executor_complete(api.ActionReceipt(action_id=extend_action['action_id'], result={
+            'lease_id': str(granted['lease_id']), 'absent': True, 'unit_inactive': True}), self.request)
+        waiting = await api.request_lease(self.body('two'), self.request)
+        self.assertEqual(waiting['status'], 'queued')
+        release = (await api.executor_poll(self.request))['action']
+        self.assertEqual(release['kind'], 'release')
+        await api.executor_complete(api.ActionReceipt(action_id=release['action_id'], result={
+            'lease_id': str(granted['lease_id']), 'released': True, 'already_absent': True}), self.request)
+        async with self.pool.acquire() as conn:
+            self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', waiting['lease_id']), 'granting')
+            self.assertIn('node lease absent', await conn.fetchval('SELECT error FROM compute_leases WHERE id=$1', granted['lease_id']))
+            result = json.loads(await conn.fetchval('SELECT result FROM compute_lease_actions WHERE id=$1', extend_action['action_id']))
+            self.assertIs(result['ok'], False)
+        status = await api.status(api.StatusRequest(actor=owner.actor, lease_id=granted['lease_id']), self.request)
+        terminal = next(lease for lease in status['leases'] if lease['id'] == granted['lease_id'])
+        self.assertEqual(terminal['status'], 'released')
+        self.assertIn('extension failed', terminal['error'])
+
+    async def test_soft_cap_ineligible_head_yields_to_other_team(self):
+        import uuid
+        cfg_path = self.root / 'pool.json'
+        original = cfg_path.read_text()
+        cfg = json.loads(original)
+        cfg['boxes'][0]['slots'] = ['0,8', '1,9']
+        cfg['policy']['max_slots_per_team'] = 1
+        cfg_path.write_text(json.dumps(cfg))
+        try:
+            teams = {'a': uuid.uuid4(), 'b': uuid.uuid4(), 'c': uuid.uuid4()}
+            async with self.pool.acquire() as conn:
+                for uid, team in [('a1', 'a'), ('a2', 'a'), ('b', 'b'), ('c', 'c')]:
+                    await conn.execute('INSERT INTO members (id,primary_team_id) VALUES ($1,$2)', uid, teams[team])
+                    await conn.execute('INSERT INTO incarnations (member_id,pid) VALUES ($1,$2)', uid, f'agent:d:{uid}')
+            async def activate(uid):
+                body = self.body(uid)
+                lease = await api.request_lease(body, self.request)
+                action = (await api.executor_poll(self.request))['action']
+                await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+                    'lease_id': str(action['lease_id']), 'configured': True, 'workdir': '/work/id'}), self.request)
+                return body, lease
+            _, first = await activate('a1')
+            c_body, c = await activate('c')
+            a_wait = await api.request_lease(self.body('a2'), self.request)
+            b_wait = await api.request_lease(self.body('b'), self.request)
+            self.assertEqual((a_wait['status'], b_wait['status']), ('queued', 'queued'))
+            await api.release(api.LeaseChange(actor=c_body.actor, lease_id=c['lease_id']), self.request)
+            action = (await api.executor_poll(self.request))['action']
+            self.assertEqual(action['kind'], 'release')
+            await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+                'lease_id': str(c['lease_id']), 'released': True}), self.request)
+            async with self.pool.acquire() as conn:
+                self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', a_wait['lease_id']), 'queued')
+                self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', b_wait['lease_id']), 'granting')
+                self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', first['lease_id']), 'active')
+        finally:
+            cfg_path.write_text(original)
+
+    async def test_extension_ignores_queue_that_cannot_fit_this_box(self):
+        cfg_path = self.root / 'pool.json'
+        original = cfg_path.read_text()
+        cfg = json.loads(original)
+        cfg['boxes'].append({'name':'wide', 'ssh_target':'wide', 'enabled':True,
+                             'slots':['0,8','1,9']})
+        cfg_path.write_text(json.dumps(cfg))
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute("INSERT INTO compute_boxes (name, enabled, checked_at, evidence) VALUES ('wide',true,now(),'{}'::jsonb)")
+            owner = self.body('one')
+            small = await api.request_lease(owner, self.request)
+            action = (await api.executor_poll(self.request))['action']
+            await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+                'lease_id':str(action['lease_id']), 'configured':True, 'workdir':'/work/small'}), self.request)
+            wide_owner = self.body('wide-owner')
+            wide_owner.cpus, wide_owner.mem_gb = 4, 32
+            wide = await api.request_lease(wide_owner, self.request)
+            action = (await api.executor_poll(self.request))['action']
+            await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+                'lease_id':str(action['lease_id']), 'configured':True, 'workdir':'/work/wide'}), self.request)
+            waiter = self.body('wide-waiter')
+            waiter.cpus, waiter.mem_gb = 4, 32
+            self.assertEqual((await api.request_lease(waiter, self.request))['status'], 'queued')
+            extension = await api.extend(api.LeaseChange(actor=owner.actor, lease_id=small['lease_id'], duration=60), self.request)
+            self.assertEqual(extension['status'], 'extending')
+            action = (await api.executor_poll(self.request))['action']
+            self.assertEqual(action['kind'], 'extend')
+            await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+                'lease_id':str(small['lease_id']), 'expires':action['payload']['expires_epoch']}), self.request)
+            await api.request_lease(self.body('small-waiter'), self.request)
+            with self.assertRaises(api.HTTPException) as exc:
+                await api.extend(api.LeaseChange(actor=owner.actor, lease_id=small['lease_id'], duration=60), self.request)
+            self.assertEqual(exc.exception.status_code, 409)
+        finally:
+            cfg_path.write_text(original)
+
+    async def test_upgrade_does_not_reclaim_using_legacy_notice_or_samples(self):
+        from datetime import datetime, timedelta, timezone
+        owner = self.body('one')
+        granted = await api.request_lease(owner, self.request)
+        action = (await api.executor_poll(self.request))['action']
+        await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+            'lease_id':str(action['lease_id']), 'configured':True, 'workdir':'/work/id'}), self.request)
+        await api.request_lease(self.body('two'), self.request)
+        now = datetime.now(timezone.utc)
+        async with self.pool.acquire() as conn, conn.transaction():
+            await conn.execute('UPDATE compute_leases SET last_activity_at=$2, expires_at=$3 WHERE id=$1',
+                granted['lease_id'], now-timedelta(hours=3), now+timedelta(hours=1))
+            row = await conn.fetchrow('SELECT * FROM compute_leases WHERE id=$1', granted['lease_id'])
+            await api._notice_action(conn, row, 'idle_notice')
+            await conn.execute('UPDATE compute_lease_notices SET answer_tracking=false WHERE lease_id=$1', granted['lease_id'])
+            await conn.execute('INSERT INTO compute_lease_samples (lease_id,sampled_at,usage_usec) VALUES ($1,$2,0)',
+                granted['lease_id'], now-timedelta(seconds=10))
+        await api.sample(api.SampleReceipt(lease_id=granted['lease_id'], cpu_usage_usec=0), self.request)
+        async with self.pool.acquire() as conn:
+            self.assertTrue(await conn.fetchval("SELECT last_activity_at > now()-interval '10 seconds' FROM compute_leases WHERE id=$1", granted['lease_id']))
+            self.assertTrue(await conn.fetchval('SELECT invalidated_at IS NOT NULL FROM compute_lease_notices WHERE lease_id=$1', granted['lease_id']))
+            self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', granted['lease_id']), 'active')
+
+    async def test_legacy_notices_cannot_authorize_reclaim_after_upgrade(self):
+        from datetime import datetime, timedelta, timezone
+        owner = self.body('one')
+        granted = await api.request_lease(owner, self.request)
+        action = (await api.executor_poll(self.request))['action']
+        await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+            'lease_id':str(action['lease_id']), 'configured':True, 'workdir':'/work/id'}), self.request)
+        await api.request_lease(self.body('two'), self.request)
+        cfg_path = self.root / 'pool.json'
+        original = cfg_path.read_text()
+        cfg = json.loads(original)
+        cfg['policy'].update(idle_threshold_seconds=60, idle_answer_seconds=60,
+                             sample_max_gap_seconds=15, notice_expiry_guard_seconds=30)
+        cfg_path.write_text(json.dumps(cfg))
+        try:
+            now = datetime.now(timezone.utc)
+            async with self.pool.acquire() as conn, conn.transaction():
+                await conn.execute('UPDATE compute_leases SET last_activity_at=$2, expires_at=$3 WHERE id=$1',
+                    granted['lease_id'], now-timedelta(hours=3), now+timedelta(hours=1))
+                row = await conn.fetchrow('SELECT * FROM compute_leases WHERE id=$1', granted['lease_id'])
+                for age in (130,65):
+                    await api._notice_action(conn, row, 'idle_notice')
+                    await conn.execute('''UPDATE compute_lease_notices SET answer_tracking=false,sent_at=$2
+                        WHERE action_id=(SELECT action_id FROM compute_lease_notices
+                        WHERE lease_id=$1 AND sent_at IS NULL ORDER BY push_id DESC LIMIT 1)''',
+                        granted['lease_id'], now-timedelta(seconds=age))
+                for i in range(7):
+                    await conn.execute('INSERT INTO compute_lease_samples (lease_id,sampled_at,usage_usec) VALUES ($1,$2,0)',
+                        granted['lease_id'], now-timedelta(seconds=60-i*10))
+                p, boxes = api.settings()
+                decision = await api._idle_decision(conn, dict(row), p, boxes, now)
+                self.assertNotEqual(decision, 'reclaim')
+        finally:
+            cfg_path.write_text(original)

@@ -43,7 +43,22 @@ def execute(action, routes):
     route = routes[action['payload']['box']]
     # Routes are configured locally, not supplied by an agent or the API.
     command = [*route['argv'], '--command', command_for(action)]
-    completed = subprocess.run(command, check=True, text=True, capture_output=True, timeout=90)
+    try:
+        completed = subprocess.run(command, check=True, text=True, capture_output=True, timeout=90)
+    except subprocess.CalledProcessError:
+        if action['kind'] != 'extend':
+            raise
+        # A failed SSH command says nothing about node state. A separate,
+        # successful, locked node probe must prove record and slice absence.
+        probe = shlex.join(['sudo', '-n', '/usr/local/bin/cm-lease', 'probe',
+                            '--lease-id', str(action['lease_id'])])
+        checked = subprocess.run([*route['argv'], '--command', probe], check=True,
+                                 text=True, capture_output=True, timeout=90)
+        evidence = json.loads(checked.stdout)
+        if (evidence.get('lease_id') != str(action['lease_id']) or
+                evidence.get('exists') is not False or evidence.get('unit_inactive') is not True):
+            raise ValueError('node did not confirm lease absence')
+        return {'lease_id': str(action['lease_id']), 'absent': True, 'unit_inactive': True}
     result = json.loads(completed.stdout)
     if result.get('lease_id') != str(action['lease_id']):
         raise ValueError('node result does not match lease')
