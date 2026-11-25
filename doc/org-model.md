@@ -141,6 +141,19 @@ Members are created deliberately and rarely. Everything else is an assistant.
 | A restored/resumed session with no spawner | not a new hire; its existing member/assistant identity is preserved |
 | Bash sessions, backtest watch views, cloud dispatch workers | not members and never assistants. Bash/watch views belong to the workspace's member for display only, and only Owner closes, kills or restarts a shell. Cloud workers stay as today (§9.4) |
 
+A live assistant can be reassigned with `org(action="reassign", session=uid,
+member=handle, reason=...)`. Its eligible live spawn descendants on that host
+move with it; the walk stops at any other member main. Owner/operator, or a
+member main authorized over both the old and destination members, may act.
+Member mains, continuous orchestrators and workers, shells and non-live roots
+are refused. Each moved session gets an org event. Attribution is durable
+across daemon restarts and stale heartbeats. The daemon compares its live
+subtree against API facts before the write; a mismatch returns
+`stale_session_facts` so the caller can retry after a heartbeat. Promotion moves the promoted
+assistant's eligible subtree to the new member by default; pass
+`with_subtree=false` to retain the prior attributions. Neither operation
+changes spawn links, session identities, conversation history, or board holds.
+
 Assistants are not temporary. Finishing an item or a task does not end an
 assistant: it stays in its member's office with its context and is the first
 choice for the member's next piece of work (reuse before spawning). An

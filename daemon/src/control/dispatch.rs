@@ -1063,7 +1063,7 @@ pub fn dispatch_request_with_peer_pid(
         // adoption, proxied like items. Roster and adoption are Owner's.
         "org.snapshot" | "org.continuous_status" | "org.member" | "org.team" | "org.roster" | "org.roster_apply"
         | "org.adopt" | "org.team_create" | "org.team_update" | "org.move" | "org.retire"
-        | "org.reinstate" | "org.close_assistant" | "org.promote" | "org.rebind_main" | "org.hire"
+        | "org.reinstate" | "org.close_assistant" | "org.reassign" | "org.promote" | "org.rebind_main" | "org.hire"
         | "org.member_update" | "org.team_mark_continuous" => {
             DispatchOutcome::Done(crate::items::org::dispatch(state, req))
         }
@@ -2028,7 +2028,7 @@ pub(crate) fn dispatch_org(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Re
     // `org(action="promote", session, handle, title?, team?, manager?, reason)`
     // (§4.2) likewise: the API decides who may promote whose assistant.
     // `rebind_main` likewise forwards the member and target to the API.
-    if let Some(verb @ ("close_assistant" | "promote" | "rebind_main")) = req.params["action"].as_str() {
+    if let Some(verb @ ("close_assistant" | "promote" | "reassign" | "rebind_main")) = req.params["action"].as_str() {
         let mut fwd = req.clone();
         fwd.method = format!("org.{verb}");
         if let Some(obj) = fwd.params.as_object_mut() {

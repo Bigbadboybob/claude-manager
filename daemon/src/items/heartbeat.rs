@@ -349,6 +349,11 @@ impl Beat {
         let applied = {
             let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
             let applied = super::org::apply_marks(&mut s, &reply);
+            // The API's explicit assignments outlive a lost RPC response or
+            // brain restart and override an older locally persisted stamp.
+            if !crate::assistants::reconcile_assignments(&mut s, &reply["org"]["assignments"]).is_empty() {
+                s.persist_sessions_best_effort();
+            }
             // The API returns every main session it has seated on this
             // daemon. Once a durable placement marker has been consumed,
             // clear it locally so a later same-UID revive cannot look like a

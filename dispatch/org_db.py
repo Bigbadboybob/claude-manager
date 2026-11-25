@@ -1580,9 +1580,94 @@ async def _promote_home(conn, facts, pid: str, boss: str, refused: str | None):
     return home, None
 
 
+async def _reassign_tree(conn, actor, pid, destination, reason, request_id, *, include_root=True, expected_sessions=None):
+    """Move eligible live descendants on the root's host, stopping at member mains."""
+    rows = await conn.fetch("""WITH RECURSIVE tree AS (
+        SELECT f.pid, f.daemon_id, f.session_uid, f.managed_by_uid, f.member_id,
+               f.acting_as, f.continuous_task_id, s.engine, s.exited_at, s.state,
+               ARRAY[f.session_uid] AS path
+          FROM org_session_facts f JOIN session_states s ON s.pid = f.pid WHERE f.pid = $1
+        UNION ALL
+        SELECT f.pid, f.daemon_id, f.session_uid, f.managed_by_uid, f.member_id,
+               f.acting_as, f.continuous_task_id, s.engine, s.exited_at, s.state,
+               t.path || f.session_uid
+          FROM tree t JOIN org_session_facts f ON f.daemon_id = t.daemon_id
+                    AND f.managed_by_uid = t.session_uid
+          JOIN session_states s ON s.pid = f.pid
+         WHERE NOT f.session_uid = ANY(t.path)
+           AND t.continuous_task_id IS NULL
+           AND NOT EXISTS (SELECT 1 FROM members cm WHERE cm.id = t.member_id AND cm.kind = 'continuous')
+           AND NOT EXISTS (SELECT 1 FROM incarnations i WHERE i.pid = t.pid
+                           AND i.role = 'main' AND i.ended_at IS NULL AND t.pid <> $1)
+    ) SELECT t.*, EXISTS (SELECT 1 FROM incarnations i WHERE i.pid = t.pid
+                          AND i.role = 'main' AND i.ended_at IS NULL) AS is_main,
+             m.kind AS member_kind
+        FROM tree t LEFT JOIN members m ON m.id = t.member_id ORDER BY cardinality(t.path), t.pid""", pid)
+    if not rows or rows[0]["exited_at"] is not None or rows[0]["state"] == "exited":
+        raise _err(404, "not_found", f"{pid} is not a live session")
+    root = rows[0]
+    if include_root:
+        if root["is_main"]:
+            raise _err(409, "already_member", f"{pid} is a member main")
+        if root["engine"] not in (None, "claude-code", "claude", "codex"):
+            raise _err(409, "not_an_agent", f"{pid} is not an agent")
+        if root["continuous_task_id"] or root["member_kind"] == "continuous":
+            raise _err(409, "continuous", f"{pid} is a continuous session")
+        if root["acting_as"] not in ("assistant", "worker") or not root["member_id"]:
+            raise _err(409, "not_an_assistant", f"{pid} is not an assistant")
+    selected = [r for r in rows if (include_root or r["pid"] != pid)
+                and not r["is_main"] and r["exited_at"] is None and r["state"] != "exited"
+                and r["engine"] in (None, "claude-code", "claude", "codex")
+                and not r["continuous_task_id"] and r["acting_as"] in ("assistant", "worker")
+                and r["member_id"] and r["member_kind"] != "continuous"]
+    if expected_sessions is not None and set(expected_sessions) != {r["session_uid"] for r in selected}:
+        raise _err(409, "stale_session_facts", "the daemon and API disagree about this subtree; retry after a heartbeat")
+    for old in {r["member_id"] for r in selected}:
+        await _require_chain(conn, actor, old, "reassign an assistant of", self_ok=True)
+    moved = []
+    for row in selected:
+        await conn.execute("""UPDATE org_session_facts SET member_id = $2, acting_as = 'assistant',
+                              assignment_authoritative = TRUE WHERE pid = $1""", row["pid"], destination)
+        await _event(conn, "member", destination, "assistant_reassigned", actor,
+                     prev={"pid": row["pid"], "member_id": row["member_id"]},
+                     new={"pid": row["pid"], "member_id": destination}, reason=reason, request_id=request_id)
+        moved.append({"pid": row["pid"], "session_uid": row["session_uid"], "previous_member_id": row["member_id"]})
+    if moved:
+        for member_id in sorted({destination, *(r["member_id"] for r in selected)}):
+            await conn.execute("SELECT org_changes_note('member', $1, 'upsert')", member_id)
+    return moved
+
+
+async def _current_assignments(conn, sessions):
+    pids = [row["pid"] for row in sessions]
+    rows = await conn.fetch("""SELECT f.session_uid, f.member_id FROM org_session_facts f
+        WHERE f.pid = ANY($1::text[]) AND f.acting_as = 'assistant'
+          AND NOT EXISTS (SELECT 1 FROM incarnations i WHERE i.pid = f.pid
+                          AND i.role = 'main' AND i.ended_at IS NULL)""", pids)
+    return {r["session_uid"]: r["member_id"] for r in rows}
+
+
+async def reassign(pool, actor: dict, *, pid: str, member: str, reason: str, request_id: str | None = None, expected_sessions=None) -> dict:
+    if not reason or not str(reason).strip():
+        raise _err(422, "invalid_field", "reassigning an assistant needs a reason")
+    async def body(conn):
+        destination = await _resolve_member_id(conn, member)
+        row = await conn.fetchrow("SELECT id, kind, status FROM members WHERE id = $1", destination) if destination else None
+        if not row or row["status"] != "active" or row["kind"] != "agent":
+            raise _err(422, "unknown_member", f"no active agent member {member!r}")
+        await _require_chain(conn, actor, destination, "reassign an assistant to", self_ok=True)
+        moved = await _reassign_tree(conn, actor, pid, destination, reason, request_id, expected_sessions=expected_sessions)
+        return {"member_id": destination, "sessions": moved}
+    response = await _member_write(pool, actor, request_id, "reassign", body)
+    async with pool.acquire() as conn:
+        return {**response, "current_assignments": await _current_assignments(conn, response["sessions"]),
+                "version": await version(conn)}
+
+
 async def promote(pool, actor: dict, *, pid: str, handle: str, title: str | None = None,
                   team=None, manager: str | None = None, reason: str,
-                  home_refused: str | None = None, request_id: str | None = None) -> dict:
+                  home_refused: str | None = None, request_id: str | None = None,
+                  with_subtree: bool = True, expected_sessions=None) -> dict:
     """Promote a member's assistant to a new member (doc/org-model.md §4.2):
     the session becomes the main session of a new member managed by the
     assistant's member M, keeping its session, uid, context, checkout and
@@ -1649,15 +1734,17 @@ async def promote(pool, actor: dict, *, pid: str, handle: str, title: str | None
         await _event(conn, "member", boss, "assistant_promoted", actor,
                      prev={"assistant": pid}, new={"member_id": member_id, "handle": handle},
                      reason=reason, request_id=request_id)
+        moved = await _reassign_tree(conn, actor, pid, member_id, reason, request_id, include_root=False, expected_sessions=expected_sessions) if with_subtree else []
         detail = await _detail(conn, member_id)
         home_mark = detail["member"]["home_workspace"]
-        return {"member": detail["member"], "promoted_from": boss, "notes": notes,
+        return {"member": detail["member"], "promoted_from": boss, "notes": notes, "sessions": moved,
                 "home": home, "home_reason": home_reason,
                 "home_mark": {"state": home_mark["state"]} if home_mark else None}
 
     response = await _member_write(pool, actor, request_id, "promote", body)
     async with pool.acquire() as conn:
-        return {**response, "version": await version(conn)}
+        return {**response, "current_assignments": await _current_assignments(conn, response.get("sessions", [])),
+                "version": await version(conn)}
 
 
 async def move(pool, actor: dict, ref: str, *, reason: str, manager=None, primary_team_id=None,
@@ -2192,8 +2279,9 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
                                          OR $7::text IS NOT NULL
                                     ) THEN FALSE ELSE $11 END, $12)
                        ON CONFLICT (pid) DO UPDATE SET
-                           member_id = coalesce(EXCLUDED.member_id, org_session_facts.member_id),
-                           acting_as = CASE WHEN org_session_facts.acting_as IN ('closed', 'promoted')
+                           member_id = CASE WHEN org_session_facts.assignment_authoritative THEN org_session_facts.member_id
+                                            ELSE coalesce(EXCLUDED.member_id, org_session_facts.member_id) END,
+                           acting_as = CASE WHEN org_session_facts.assignment_authoritative OR org_session_facts.acting_as IN ('closed', 'promoted')
                                             THEN org_session_facts.acting_as
                                             ELSE coalesce(EXCLUDED.acting_as, org_session_facts.acting_as) END,
                            session_uid = EXCLUDED.session_uid, workspace_id = EXCLUDED.workspace_id,
@@ -2299,12 +2387,15 @@ async def heartbeat_extras(pool, daemon_id: str, sessions: list, *, capabilities
                     RETURNING w.id, w.workspace_id, w.path, w.kind, w.member_id, m.handle""",
                     daemon_id, MAX_MARK_ATTEMPTS, now)
                 marks = [dict(r) for r in rows]
+            assignments = await conn.fetch("""SELECT session_uid, member_id FROM org_session_facts
+                WHERE daemon_id = $1 AND assignment_authoritative AND acting_as = 'assistant'""", daemon_id)
             members = await conn.fetch(
                 f"""{_MEMBER_SELECT}
                      WHERE inc.daemon_id = $1 AND left(inc.pid, length($2)) = $2""", daemon_id, prefix)
     return {
         "members": {r["main_session_uid"]: {**member_summary(_shape_member(r)), "acting_as": "main"}
                     for r in members},
+        "assignments": {r["session_uid"]: r["member_id"] for r in assignments},
         "workspace_marks": marks,
         "auto_placed": auto_placed,
         "capable": bool(capable),

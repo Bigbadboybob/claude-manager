@@ -945,3 +945,37 @@ fn a_promote_whose_local_half_was_lost_is_finished_from_the_member_cache() {
     kill_all(&state);
     crate::items::org::reset_cache_for_test();
 }
+
+#[test]
+fn authoritative_assignment_recovers_a_stale_restored_stamp() {
+    let _env = crate::test_support::env_lock();
+    let mut state = DaemonState::default();
+    state.sessions.insert("child".into(), assistant("child", None, "parent", "ws", "old"));
+    // Simulate a restart from the old persisted record after the API committed.
+    let restored = state.sessions["child"].org.clone();
+    let assignments = json!({"child": "new"});
+    assert_eq!(reconcile_assignments(&mut state, &assignments), vec!["child"]);
+    assert_eq!(stamped_member(state.sessions["child"].org.as_ref()).as_deref(), Some("new"));
+    assert!(reconcile_assignments(&mut state, &assignments).is_empty());
+    state.sessions.get_mut("child").unwrap().org = restored;
+    assert_eq!(reconcile_assignments(&mut state, &assignments), vec!["child"]);
+    assert_eq!(role_of(&state, "child"), Some(("new".into(), ASSISTANT)));
+    kill_st(&mut state);
+}
+
+#[test]
+fn expected_subtree_stops_at_a_nested_member_main() {
+    let _env = crate::test_support::env_lock();
+    crate::items::org::reset_cache_for_test();
+    members(&[("nested", "mem_nested", "agent")]);
+    let mut state = DaemonState::default();
+    state.sessions.insert("root".into(), assistant("root", None, "boss", "w", "old"));
+    state.sessions.insert("child".into(), assistant("child", None, "root", "w", "old"));
+    state.sessions.insert("sibling".into(), assistant("sibling", None, "boss", "w", "old"));
+    state.sessions.insert("nested".into(), session("nested", None, Some("child"), "w"));
+    state.sessions.insert("beyond".into(), assistant("beyond", None, "nested", "w", "mem_nested"));
+    assert_eq!(crate::items::org::expected_subtree(&state, "root", true), vec!["child", "root"]);
+    assert_eq!(crate::items::org::expected_subtree(&state, "root", false), vec!["child"]);
+    kill_st(&mut state);
+    crate::items::org::reset_cache_for_test();
+}

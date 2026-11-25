@@ -85,6 +85,17 @@ class PromoteBody(_Strict):
     # The owning daemon's verdict on the checkout (e.g. "shared_checkout"):
     # when set, the new member gets no home.
     home_refused: Short | None = None
+    with_subtree: bool = True
+    expected_sessions: list[str] | None = None
+    request_id: RequestId | None = None
+
+
+class ReassignBody(_Strict):
+    expected_sessions: list[str] | None = None
+    actor: Actor
+    pid: Annotated[str, Field(min_length=1, max_length=300)]
+    member: Short
+    reason: Annotated[str, Field(min_length=1, max_length=500)]
     request_id: RequestId | None = None
 
 
@@ -315,7 +326,14 @@ async def promote_assistant(body: PromoteBody, request: Request):
     return await _call(org_db.promote(
         _pool(request), body.actor.model_dump(), pid=body.pid, handle=body.handle,
         title=body.title, team=body.team, manager=body.manager, reason=body.reason,
-        home_refused=body.home_refused, request_id=body.request_id))
+        home_refused=body.home_refused, request_id=body.request_id, with_subtree=body.with_subtree, expected_sessions=body.expected_sessions))
+
+
+@router.post("/assistants/reassign")
+async def reassign_assistant(body: ReassignBody, request: Request):
+    return await _call(org_db.reassign(
+        _pool(request), body.actor.model_dump(), pid=body.pid, member=body.member,
+        reason=body.reason, request_id=body.request_id, expected_sessions=body.expected_sessions))
 
 
 @router.post("/assistants/close")

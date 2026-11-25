@@ -33,7 +33,7 @@ class PromoteDb(unittest.IsolatedAsyncioTestCase):
 
     async def report(self, extra=()):
         """AssistantsDb's beat, with the helper in its own stream checkout."""
-        await self.beat(D1, [
+        return await self.beat(D1, [
             {"uid": self.coord, "name": "Swarm-Coord", "task_id": self.root, "ws": "ws-coord", "path": "/w/coord"},
             {"uid": self.lane, "name": "org", "task_id": self.lane_task, "ws": "ws-org", "path": "/w/org",
              "managed_by": self.coord},
