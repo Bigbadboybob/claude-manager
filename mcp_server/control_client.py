@@ -358,6 +358,12 @@ DAEMON_METHODS: frozenset[str] = frozenset({
     # daemon-routed under a daemon pin.
     "backtest.submit",
     "backtest.result",
+    "compute.request", "compute.extend", "compute.release", "compute.status",
+    # Existing daemon-only methods that had drifted out of the routing set.
+    "session.shell_busy", "session.launch", "continuous.adopt_existing",
+    "session.background_recovery_preflight", "session.background_recovery_reconcile",
+    "session.background_recovery_status", "session.background_recovery_confirm",
+    "daemon.memory_trim", "daemon.memory_snapshot", "usage.snapshot", "org.reassign",
     # Work items and boards (doc/items-board.md): daemon-only proxies to the
     # planning API. The daemon stamps the caller as actor and resolves holder
     # names; there is no TUI handler and no PlanningClient fallback.

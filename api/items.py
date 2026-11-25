@@ -232,7 +232,7 @@ async def heartbeat(body: HeartbeatBody, request: Request,
     reply = await _call(items_db.heartbeat(
         _pool(request), daemon_id, host_label=body.host_label,
         sessions=body.sessions, exited=body.exited,
-        acked_push_ids=body.acked_push_ids))
+        acked_push_ids=body.acked_push_ids, observed_lease_push_ids=body.observed_lease_push_ids))
     # The org half (session facts, capabilities, home marks, the member
     # cache for ping). Best-effort: it never fails the items beat.
     try:

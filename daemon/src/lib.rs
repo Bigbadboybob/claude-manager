@@ -77,6 +77,7 @@ pub mod env_sanitize;
 pub mod fanout_persist;
 pub mod graphics_file;
 pub mod continuous;
+pub mod compute;
 pub mod control;
 pub mod holder_mode;
 pub mod host_id;

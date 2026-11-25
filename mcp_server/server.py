@@ -5597,6 +5597,35 @@ def _caller_filer_context(submitted_via: str = "mcp.submit_backtest") -> dict:
 
 
 @mcp.tool()
+def compute_request(cpus: int, mem_gb: int, duration: int, priority: str, purpose: str,
+                    lease_class: Annotated[str, Field(alias="class")] = "burst",
+                    pinned: bool = False) -> dict:
+    """Request a compute lease; duration is in seconds. Poll compute_status for a queued grant."""
+    return control_client.call("compute.request", {"cpus": cpus, "mem_gb": mem_gb,
+        "duration": duration, "priority": priority, "purpose": purpose,
+        "class": lease_class, "pinned": pinned})
+
+
+@mcp.tool()
+def compute_extend(lease_id: str, duration: int) -> dict:
+    """Request an extension in seconds for your active lease."""
+    return control_client.call("compute.extend", {"lease_id": lease_id, "duration": duration})
+
+
+@mcp.tool()
+def compute_release(lease_id: str) -> dict:
+    """Release or cancel your compute lease."""
+    return control_client.call("compute.release", {"lease_id": lease_id})
+
+
+@mcp.tool()
+def compute_status(lease_id: str = "") -> dict:
+    """Inspect your leases, the pool and queue; specifying a lease acknowledges its idle notice."""
+    params = {"lease_id": lease_id} if lease_id else {}
+    return control_client.call("compute.status", params)
+
+
+@mcp.tool()
 def submit_backtest(
     branch: str,
     config: str,

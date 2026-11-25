@@ -95,6 +95,7 @@ class RequeueDbEmptyListTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_none_requeues_all_claimed(self):
         conn = mock.AsyncMock()
+        conn.fetchval.return_value = None  # no queue binding table in this test
         conn.execute.return_value = "UPDATE 4"
         pool = mock.MagicMock()
         pool.acquire.return_value.__aenter__.return_value = conn

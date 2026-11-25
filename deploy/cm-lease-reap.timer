@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Claude Manager compute lease expirations
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Unit=cm-lease-reap.service
+
+[Install]
+WantedBy=timers.target

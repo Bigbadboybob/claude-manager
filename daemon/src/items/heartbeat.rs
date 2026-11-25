@@ -226,6 +226,7 @@ pub(crate) fn plan(push: &Value, engine_of: impl Fn(&str) -> Option<String>) -> 
     let uid = push["session_uid"].as_str().unwrap_or_default().to_string();
     let text = push["text"].as_str().unwrap_or_default().to_string();
     let board = push["board"].as_str().unwrap_or("board");
+    let is_lease = push["kind"] == "compute_lease";
     if push["owner_alert"] == true {
         let source = format!("board:{}", push["board_id"].as_str().unwrap_or(board));
         // Keyed by board and session so a pending notify_user alert on the
@@ -242,10 +243,10 @@ pub(crate) fn plan(push: &Value, engine_of: impl Fn(&str) -> Option<String>) -> 
             // its own marker so an old inbound board notice cannot confirm a
             // later event that merely has the same board label.
             text: {
-                let marker = format!("[cm-board {board} push:{id}]");
+                let marker = if is_lease { format!("[cm-board lease push:{id}]") } else { format!("[cm-board {board} push:{id}]") };
                 if text.contains(&marker) { text } else { format!("{text} {marker}") }
             },
-            marker: format!("[cm-board {board} push:{id}]"),
+            marker: if is_lease { format!("[cm-board lease push:{id}]") } else { format!("[cm-board {board} push:{id}]") },
         },
         Some(engine) => Plan::Drop { reason: format!("{engine} session cannot receive pushes") },
         None => Plan::Drop { reason: "session is not live on this daemon".into() },
@@ -256,6 +257,7 @@ pub(crate) fn plan(push: &Value, engine_of: impl Fn(&str) -> Option<String>) -> 
 pub(crate) struct Beat {
     /// Pushes handled since the last successful beat, acked on the next one.
     acks: BTreeSet<i64>,
+    lease_acks: BTreeSet<i64>,
     /// Home/stream workspace marks applied since the last successful beat
     /// (org model S2), acked on the next one as `acked_mark_ids`.
     mark_acks: BTreeSet<i64>,
@@ -289,12 +291,16 @@ impl Beat {
             return;
         };
         let acked: Vec<i64> = self.acks.iter().copied().collect();
+        let lease_acked: Vec<i64> = self.lease_acks.iter().copied().collect();
         let mut body = json!({
             "host_label": snap.host_label,
             "sessions": snap.sessions,
             "exited": [],
             "acked_push_ids": acked,
         });
+        if !lease_acked.is_empty() {
+            body["observed_lease_push_ids"] = json!(lease_acked);
+        }
         // Only an API that hands out marks (org S2+) knows this field.
         let mark_acked: Vec<i64> = self.mark_acks.iter().copied().collect();
         if !mark_acked.is_empty() {
@@ -308,6 +314,8 @@ impl Beat {
         }
         let path = format!("/hosts/{}/heartbeat", snap.daemon_id);
         let mut result = api.post(&path, &body);
+        let mut lease_ack_sent = !lease_acked.is_empty();
+        let mut lease_ack_rejected = false;
         if send_caps {
             if let Err((crate::control::protocol::ErrorCode::InvalidParams, message)) = &result {
                 if message.contains("capabilities") {
@@ -315,6 +323,18 @@ impl Beat {
                     self.caps_refused_at = Some(std::time::Instant::now());
                     body.as_object_mut().map(|b| b.remove("capabilities"));
                     result = api.post(&path, &body);
+                }
+            }
+        }
+        if lease_ack_sent {
+            if let Err((crate::control::protocol::ErrorCode::InvalidParams, message)) = &result {
+                if message.contains("observed_lease_push_ids") {
+                    // A rolled-back API cannot prove the delivery receipt.
+                    // Keep it locally and preserve the rest of the heartbeat.
+                    body.as_object_mut().map(|b| b.remove("observed_lease_push_ids"));
+                    result = api.post(&path, &body);
+                    lease_ack_sent = false;
+                    lease_ack_rejected = true;
                 }
             }
         }
@@ -327,6 +347,11 @@ impl Beat {
         };
         for id in &acked {
             self.acks.remove(id);
+        }
+        if lease_ack_sent {
+            for id in &lease_acked {
+                self.lease_acks.remove(id);
+            }
         }
         for id in &mark_acked {
             self.mark_acks.remove(id);
@@ -439,10 +464,11 @@ impl Beat {
         for push in reply["pushes"].as_array().into_iter().flatten() {
             let Some(id) = push["id"].as_i64() else { continue };
             if self.deliver(state, &snap.root, push) {
-                self.acks.insert(id);
+                if push["kind"] == "compute_lease" { self.lease_acks.insert(id); }
+                else { self.acks.insert(id); }
             }
         }
-        if !self.acks.is_empty() || !self.mark_acks.is_empty() {
+        if !self.acks.is_empty() || (!lease_ack_rejected && !self.lease_acks.is_empty()) || !self.mark_acks.is_empty() {
             poke(); // ack promptly rather than in 30 s
         }
         // Existing background heartbeat supplies an as-of S4 snapshot. No
@@ -468,13 +494,15 @@ impl Beat {
         match planned {
             Plan::Publish { uid, id, text, marker } => {
                 match crate::notifications::publish(root, &uid, &id, "board", &text, &marker) {
-                    Ok(_) => true,
+                    // A lease notice may authorize later reclamation: merely
+                    // queuing it is not proof the session observed it.
+                    Ok(event) => push_acknowledged(push, &event),
                     Err(e) => {
                         eprintln!("cm items: push {id} to {uid}: {e}");
                         // A content conflict or an unsendable text can never
                         // succeed: settle it. Other errors retry; the API
                         // gives up after a bounded number of attempts.
-                        matches!(e.kind(), std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::InvalidInput)
+                        push["kind"] != "compute_lease" && matches!(e.kind(), std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::InvalidInput)
                     }
                 }
             }
@@ -502,14 +530,33 @@ impl Beat {
             }
             Plan::Drop { reason } => {
                 eprintln!("cm items: dropping push {}: {reason}", push["id"]);
-                true
+                push["kind"] != "compute_lease"
             }
         }
     }
 }
 
+fn push_acknowledged(push: &Value, event: &Value) -> bool {
+    push["kind"] != "compute_lease" || event["status"] == "observed"
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lease_push_requires_observed_delivery() {
+        use serde_json::json;
+        let push = json!({"kind":"compute_lease"});
+        assert!(!super::push_acknowledged(&push, &json!({"status":"pending"})));
+        assert!(!super::push_acknowledged(&push, &json!({"status":"submitted"})));
+        assert!(super::push_acknowledged(&push, &json!({"status":"observed"})));
+        assert!(super::push_acknowledged(&json!({"kind":"board"}), &json!({"status":"pending"})));
+        let p = json!({"id":7,"session_uid":"s","kind":"compute_lease","text":"[cm-lease] idle"});
+        assert_eq!(super::plan(&p, |_| Some("codex".into())), super::Plan::Publish {
+            uid: "s".into(), id: "board-push:7".into(),
+            text: "[cm-lease] idle [cm-board lease push:7]".into(),
+            marker: "[cm-board lease push:7]".into(),
+        });
+    }
     #[test]
     fn pending_launch_grant_is_retried_without_an_api() {
         let _env = crate::test_support::env_lock();

@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Standalone lease action executor. Run only on a host with the approved IAP route."""
+import json
+import logging
+import os
+import re
+import shlex
+import subprocess
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+LOG = logging.getLogger('cm-compute-executor')
+
+
+def api(path, data):
+    base = os.environ['CM_API_URL'].rstrip('/')
+    req = urllib.request.Request(base + path, data=json.dumps(data).encode(), method='POST',
+        headers={'Authorization': 'Bearer ' + os.environ['CM_API_TOKEN'], 'Content-Type': 'application/json'})
+    with urllib.request.urlopen(req, timeout=20) as response:
+        return json.load(response)
+
+
+def command_for(action):
+    payload = action['payload']
+    ident = str(action['lease_id'])
+    args = ['sudo', '-n', '/usr/local/bin/cm-lease', action['kind'], '--lease-id', ident]
+    if action['kind'] == 'grant':
+        args += ['--owner', payload['owner'], '--slots', str(payload['slots']),
+                 '--mem-gb', str(payload['mem_gb']), '--expires-epoch', str(payload['expires_epoch'])]
+        if payload.get('pin'):
+            args += ['--pin', payload['pin']]
+    elif action['kind'] == 'extend':
+        args += ['--expires-epoch', str(payload['expires_epoch'])]
+    elif action['kind'] != 'release':
+        raise ValueError('unknown action')
+    return shlex.join(args)
+
+
+def execute(action, routes):
+    route = routes[action['payload']['box']]
+    # Routes are configured locally, not supplied by an agent or the API.
+    command = [*route['argv'], '--command', command_for(action)]
+    completed = subprocess.run(command, check=True, text=True, capture_output=True, timeout=90)
+    result = json.loads(completed.stdout)
+    if result.get('lease_id') != str(action['lease_id']):
+        raise ValueError('node result does not match lease')
+    return result
+
+
+def local_drained(box, directory):
+    directory = Path(directory)
+    if not directory.is_dir():
+        return False
+    listing = subprocess.run(['ps', '-eo', 'args='], check=True, text=True,
+                             capture_output=True, timeout=10).stdout
+    # Mirror lq_busy's own driver discovery; a missing/unreadable candidate
+    # cannot be treated as evidence of an empty pool.
+    for name in set(re.findall(r'\bbash ([A-Za-z0-9_]+\.sh)\b', listing)):
+        script = directory / name
+        if not script.exists():
+            continue
+        content = script.read_text(errors='strict')
+        if re.search(r'\blane_run_' + re.escape(box) + r'\b', content):
+            return False
+    return True
+
+
+def enable_drained_boxes(cfg, enabled):
+    if cfg.get('cutover_ready') is not True:
+        return
+    for box, route in cfg['routes'].items():
+        try:
+            if box in enabled or not local_drained(box, cfg['lq_directory']):
+                continue
+            remote = subprocess.run([*route['argv'], '--command',
+                                     'sudo -n /usr/local/bin/cm-lease drain-check'],
+                                    check=True, text=True, capture_output=True, timeout=90)
+            if json.loads(remote.stdout).get('drained') is True:
+                api('/compute/executor/enable', {'box': box, 'local_drained': True,
+                                                  'node_drained': True})
+                enabled.add(box)
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError, urllib.error.URLError):
+            LOG.exception('box %s remains disabled', box)
+
+
+def sample_leases(cfg):
+    def sample_one(target):
+        route = cfg['routes'][target['box']]
+        command = shlex.join(['sudo', '-n', '/usr/local/bin/cm-lease', 'status',
+                              '--lease-id', str(target['lease_id'])])
+        try:
+            completed = subprocess.run([*route['argv'], '--command', command], check=True,
+                                       text=True, capture_output=True, timeout=90)
+            result = json.loads(completed.stdout)
+            if result.get('lease_id') != str(target['lease_id']):
+                raise ValueError('sample lease mismatch')
+            api('/compute/executor/sample', {'lease_id': target['lease_id'],
+                                             'cpu_usage_usec': result['cpu_usage_usec']})
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError, urllib.error.URLError):
+            # Missing measurements are not evidence of idleness.
+            LOG.exception('could not sample lease %s', target['lease_id'])
+    targets = api('/compute/executor/samples', {})['leases']
+    with ThreadPoolExecutor(max_workers=cfg['sample_parallelism']) as pool:
+        list(pool.map(sample_one, targets))
+
+
+def main():
+    logging.basicConfig(level=logging.INFO)
+    cfg = json.loads(Path(os.environ['CM_COMPUTE_EXECUTOR_CONFIG']).read_text())
+    enabled = set()
+    next_sample = 0.0
+    next_enable = 0.0
+    workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix='compute')
+    sample_future = None
+    enable_future = None
+    while True:
+        try:
+            if sample_future is not None and sample_future.done():
+                completed = sample_future
+                sample_future = None
+                completed.result()
+            if enable_future is not None and enable_future.done():
+                completed = enable_future
+                enable_future = None
+                completed.result()
+            if time.monotonic() >= next_enable and (enable_future is None or enable_future.done()):
+                enable_future = workers.submit(enable_drained_boxes, cfg, enabled)
+                next_enable = time.monotonic() + cfg['enable_retry_seconds']
+            if time.monotonic() >= next_sample and (sample_future is None or sample_future.done()):
+                sample_future = workers.submit(sample_leases, cfg)
+                next_sample = time.monotonic() + cfg['sample_seconds']
+            action = api('/compute/executor/poll', {})['action']
+            if action:
+                result = execute(action, cfg['routes'])
+                api('/compute/executor/complete', {'action_id': action['action_id'], 'result': result})
+                continue
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError, urllib.error.URLError):
+            # An uncertain result is retried with the same action ID. Never
+            # acknowledge an action merely because the transport returned.
+            LOG.exception('lease action failed; retaining reservation')
+        time.sleep(cfg['poll_seconds'])
+
+
+if __name__ == '__main__':
+    main()

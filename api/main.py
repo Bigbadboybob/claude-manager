@@ -29,6 +29,7 @@ from api.items import router as items_router
 from api.staffing import router as staffing_router
 from api.continuous_registration import router as continuous_registration_router
 from api.org import router as org_router
+from api.compute_leases import router as compute_leases_router
 from api.task_changes import ChangeBroker, change_log_maintenance_loop
 from dispatch import db, org_db, task_text
 from dispatch.config import DB_DSN, REPOS
@@ -135,6 +136,7 @@ app.include_router(items_router)
 app.include_router(staffing_router)
 app.include_router(continuous_registration_router)
 app.include_router(org_router)
+app.include_router(compute_leases_router)
 
 
 @app.exception_handler(RequestValidationError)

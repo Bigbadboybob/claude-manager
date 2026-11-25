@@ -1037,6 +1037,8 @@ pub fn dispatch_request_with_peer_pid(
         // so headless agents work without `cli/`.
         "backtest.submit" => DispatchOutcome::Done(dispatch_backtest_submit(state, req)),
         "backtest.result" => DispatchOutcome::Done(dispatch_backtest_result(state, req)),
+        "compute.request" | "compute.extend" | "compute.release" | "compute.status" =>
+            DispatchOutcome::Done(crate::compute::dispatch(state, req)),
 
         // Work items and boards (doc/items-board.md): Session + Operator
         // callable proxies to the planning API. The daemon stamps the
@@ -11983,6 +11985,32 @@ mod tests {
     }
 
     // -- Cloud auto-backtest (backtest.submit / backtest.result) -----------
+
+    #[test]
+    fn compute_proxy_stamps_the_authenticated_session() {
+        let _g = crate::planning_client::test_env_lock();
+        let (port, captured) = crate::planning_client::spawn_stub_api_for_test(
+            200, r#"{"lease_id":"lease-1","status":"queued"}"#);
+        let state = state_with_session_in_workspace("ts-compute", "ws-1");
+        set_stub_api_config(&state, port);
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::messaging::Store::open(root.path()).unwrap();
+        let daemon_id = store.daemon_id.clone();
+        {
+            let mut st = state.lock().unwrap();
+            st.sessions.get_mut("ts-compute").unwrap().session_type = "codex".into();
+            *st.messaging.lock().unwrap() = Some(store);
+        }
+        let resp = dispatch_request(&state, &session_request("compute.request",
+            serde_json::json!({"cpus":2,"mem_gb":16,"duration":300,"priority":"normal",
+                "purpose":"test", "class":"burst", "actor":{"pid":"forged"}}), "ts-compute"))
+            .into_response();
+        assert!(resp.ok, "{:?}", resp.error);
+        let body = captured.lock().unwrap().body_json();
+        assert_eq!(body["actor"]["pid"], format!("agent:{daemon_id}:ts-compute"));
+        assert_eq!(body["actor"]["session_uid"], "ts-compute");
+        assert_eq!(body["cpus"], 2);
+    }
 
     /// Point state.config at a stub API on `port` (bogus env cleared by the
     /// caller under the env lock).

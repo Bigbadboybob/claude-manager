@@ -106,7 +106,7 @@ class PlanningApiFailureTests(unittest.IsolatedAsyncioTestCase):
         ]
         captured: dict = {}
 
-        async def fake_list(_pool, *, status=None, project=None, include_archived=False):
+        async def fake_list(_pool, *, status=None, project=None, initiative_id=None, include_archived=False):
             captured.update(
                 status=status,
                 project=project,
@@ -243,7 +243,7 @@ class McpPlanningEndToEndTests(unittest.TestCase):
             return row
 
         async def list_tasks(
-            _pool, *, status=None, project=None, include_archived=False
+            _pool, *, status=None, project=None, initiative_id=None, include_archived=False
         ):
             return [
                 row

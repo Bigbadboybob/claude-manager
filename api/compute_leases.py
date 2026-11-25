@@ -1,0 +1,513 @@
+"""Compute lease API. Node operations are performed by the external executor.
+
+All reservation transitions run under one PostgreSQL transaction advisory
+lock. An uncertain remote operation holds capacity until reconciled.
+"""
+import json
+import logging
+import os
+import re
+import shlex
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, ConfigDict, Field
+
+from api.auth import verify_token
+from dispatch.compute_scheduler import Box, Policy, queue_eta, queue_order, select_box, slots_needed
+from dispatch.compute_idle import Sample, idle_average, next_idle_action
+
+router = APIRouter(prefix='/compute', dependencies=[Depends(verify_token)])
+logger = logging.getLogger('cm.api.compute')
+LOCK_KEY = 746392015
+
+
+class Actor(BaseModel):
+    pid: str
+    session_uid: str
+    daemon_id: str
+    task_id: str | None = None
+
+    def checked(self):
+        if not self.session_uid or not self.daemon_id or self.pid != f'agent:{self.daemon_id}:{self.session_uid}':
+            raise HTTPException(422, 'invalid caller identity')
+        return self.pid
+
+
+class LeaseRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    actor: Actor
+    cpus: int = Field(gt=0, strict=True)
+    mem_gb: int = Field(gt=0, strict=True)
+    duration: int = Field(gt=0, strict=True)
+    priority: str
+    purpose: str = Field(min_length=1, max_length=2000)
+    lease_class: str = Field(alias='class')
+    pinned: bool = False
+
+
+class LeaseChange(BaseModel):
+    actor: Actor
+    lease_id: uuid.UUID
+    duration: int | None = Field(default=None, gt=0, strict=True)
+
+
+class StatusRequest(BaseModel):
+    actor: Actor
+    lease_id: uuid.UUID | None = None
+
+
+def settings():
+    path = os.environ.get('CM_COMPUTE_POOL_CONFIG')
+    if not path:
+        raise HTTPException(503, 'compute pool is not configured')
+    try:
+        data = json.loads(Path(path).read_text())
+        p = data['policy']
+        for key in ('cpus_per_slot', 'mem_gb_per_slot', 'max_slots_per_session',
+                    'max_slots_per_lease', 'max_slots_per_team', 'burst_max_seconds',
+                    'long_max_seconds', 'absolute_max_seconds', 'idle_threshold_seconds',
+                    'idle_answer_seconds', 'sample_max_gap_seconds', 'notice_limit',
+                    'notice_expiry_guard_seconds', 'expiry_warning_seconds'):
+            if not isinstance(p[key], int) or isinstance(p[key], bool) or p[key] <= 0:
+                raise ValueError(f'{key} must be a positive integer')
+        if not isinstance(p['idle_percent'], (int, float)) or isinstance(p['idle_percent'], bool) or not 0 < p['idle_percent'] <= 100:
+            raise ValueError('idle_percent must be in (0, 100]')
+        policy = Policy(**{k: p[k] for k in Policy.__dataclass_fields__})
+        boxes = []
+        names = set()
+        for item in data['boxes']:
+            if (item['name'] in names or
+                    not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}', item['ssh_target'])):
+                raise ValueError('duplicate name or missing ssh target')
+            names.add(item['name'])
+            slots = item['slots']
+            cpus = [int(cpu) for slot in slots for cpu in slot.split(',')]
+            if len(cpus) != len(set(cpus)) or any(len(s.split(',')) != policy.cpus_per_slot for s in slots):
+                raise ValueError('slot CPU lists overlap or have the wrong size')
+            boxes.append(Box(item['name'], item['ssh_target'], tuple(slots), item.get('enabled') is True))
+        return p, boxes
+    except (OSError, KeyError, ValueError, TypeError) as exc:
+        raise HTTPException(503, f'invalid compute pool configuration: {exc}') from exc
+
+
+def _pool(request):
+    return request.app.state.pool
+
+
+async def _lock(conn):
+    await conn.execute('SELECT pg_advisory_xact_lock($1)', LOCK_KEY)
+
+
+async def _rows(conn):
+    return [dict(row) for row in await conn.fetch(
+        "SELECT * FROM compute_leases WHERE status IN ('queued','granting','active','releasing')")]
+
+
+async def _action(conn, lease_id, kind, payload):
+    action_id = uuid.uuid4()
+    await conn.execute('INSERT INTO compute_lease_actions (id, lease_id, kind, payload) VALUES ($1,$2,$3,$4::jsonb)',
+                       action_id, lease_id, kind, json.dumps(payload))
+    return action_id
+
+
+async def _notice_action(conn, row, kind, extra=None):
+    payload = {'box': row['box'], 'owner': row['owner'], **(extra or {})}
+    action_id = await _action(conn, row['id'], kind, payload)
+    pieces = row['owner'].split(':', 2)
+    if len(pieces) != 3 or pieces[0] != 'agent' or not pieces[1] or not pieces[2]:
+        raise ValueError('invalid stored owner identity')
+    text = {
+        'idle_notice': f"[cm-lease] lease {row['id']} is idle; release, extend, or check its status",
+        'reclaim_notice': f"[cm-lease] lease {row['id']} may be reclaimed after two unanswered idle notices",
+        'expiry_notice': f"[cm-lease] lease {row['id']} is approaching expiry",
+    }[kind]
+    push_id = await conn.fetchval("""INSERT INTO item_pushes
+        (daemon_id, session_uid, pid, kind, text, dedupe)
+        VALUES ($1,$2,$3,'compute_lease',$4,$5) RETURNING id""",
+        pieces[1], pieces[2], row['owner'], text, f'compute-lease:{action_id}')
+    await conn.execute('INSERT INTO compute_lease_notices (action_id, lease_id, push_id) VALUES ($1,$2,$3)',
+                       action_id, row['id'], push_id)
+
+
+async def _schedule(conn, policy_data, boxes):
+    enabled = {r['name'] for r in await conn.fetch('SELECT name FROM compute_boxes WHERE enabled')}
+    boxes = [box for box in boxes if box.configured_enabled and box.name in enabled]
+    policy = Policy(**{k: policy_data[k] for k in Policy.__dataclass_fields__})
+    rows = await _rows(conn)
+    for row in queue_order(rows):
+        choice = select_box(row, rows, boxes, policy)
+        if not choice:
+            break
+        box, selected = choice
+        expires = datetime.now(timezone.utc) + timedelta(seconds=row['duration_seconds'])
+        cpuset = ','.join(selected)
+        await conn.execute("UPDATE compute_leases SET status='granting', box=$2, cpuset=$3, slot_ids=$4, expires_at=$5, ssh_target=$6 WHERE id=$1",
+                           row['id'], box.name, cpuset, list(selected), expires, box.ssh_target)
+        await _action(conn, row['id'], 'grant', dict(box=box.name, owner=row['owner'],
+                      slots=len(selected), mem_gb=row['mem_gb'], pin=cpuset if row['pinned'] else None,
+                      expires_epoch=int(expires.timestamp())))
+        row.update(status='granting', box=box.name, slot_ids=list(selected), expires_at=expires)
+
+
+def _public(row, boxes):
+    result = dict(row)
+    if row['status'] == 'active':
+        if row['ssh_target'] and row['workdir']:
+            result['run_prefix'] = (f"ssh {shlex.quote(row['ssh_target'])} sudo -n /usr/local/bin/cm-lease run "
+                                    f"--lease-id {row['id']} --")
+    return result
+
+
+@router.post('/request')
+async def request_lease(body: LeaseRequest, request: Request):
+    owner = body.actor.checked()
+    p, boxes = settings()
+    if body.priority not in ('v221-gate', 'normal', 'low') or body.lease_class not in ('burst', 'long'):
+        raise HTTPException(422, 'invalid priority or class')
+    if not body.purpose.strip() or body.duration > p[body.lease_class + '_max_seconds']:
+        raise HTTPException(422, 'invalid purpose or duration')
+    policy = Policy(**{k: p[k] for k in Policy.__dataclass_fields__})
+    if slots_needed(body.model_dump(), policy) > policy.max_slots_per_session:
+        raise HTTPException(422, 'request exceeds the configured per-session limit')
+    ident = uuid.uuid4()
+    async with _pool(request).acquire() as conn, conn.transaction():
+        await _lock(conn)
+        team = await conn.fetchval("""SELECT m.primary_team_id::text FROM incarnations i
+            JOIN members m ON m.id=i.member_id WHERE i.pid=$1 AND i.ended_at IS NULL""", owner)
+        await conn.execute("""INSERT INTO compute_leases
+            (id,owner,team,purpose,priority,class,cpus,mem_gb,duration_seconds,pinned,status)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'queued')""", ident, owner,
+            team, body.purpose, body.priority, body.lease_class, body.cpus,
+            body.mem_gb, body.duration, body.pinned)
+        await _schedule(conn, p, boxes)
+        rows = await _rows(conn)
+        row = next(x for x in rows if x['id'] == ident)
+        if row['status'] == 'queued':
+            ordered = queue_order(rows)
+            result = {'lease_id': ident, 'status': 'queued', 'queue_position': 1 + ordered.index(row),
+                      'eta': queue_eta(rows, datetime.now(timezone.utc)),
+                      'eta_basis': 'earliest_capacity_change_not_guaranteed_start'}
+        else:
+            result = {'lease_id': ident, 'status': row['status'], 'queue_position': 0,
+                      'eta': None}
+    if body.priority == 'v221-gate':
+        logger.info('v221-gate request lease=%s owner=%r team=%r purpose=%r time=%s',
+                    ident, owner, team, body.purpose, row['created_at'].isoformat())
+    return result
+
+
+@router.post('/status')
+async def status(body: StatusRequest, request: Request):
+    owner = body.actor.checked()
+    p, boxes = settings()
+    async with _pool(request).acquire() as conn, conn.transaction():
+        await _lock(conn)
+        if body.lease_id:
+            row = await conn.fetchrow('SELECT * FROM compute_leases WHERE id=$1 AND owner=$2', body.lease_id, owner)
+            if not row:
+                raise HTTPException(404, 'lease not found')
+            await conn.execute('UPDATE compute_leases SET last_activity_at=now() WHERE id=$1', body.lease_id)
+        rows = await _rows(conn)
+        mine = [_public(r, boxes) for r in rows if r['owner'] == owner]
+        ordered = queue_order(rows)
+        queue = [{'lease_id': r['id'], 'priority': r['priority'], 'cpus': r['cpus'],
+                  'owner': r['owner'], 'team': r['team'], 'purpose': r['purpose'],
+                  'position': i + 1} for i, r in enumerate(ordered)]
+        enabled = {r['name'] for r in await conn.fetch('SELECT name FROM compute_boxes WHERE enabled')}
+        occupancy = [{'box': b.name, 'enabled': b.configured_enabled and b.name in enabled,
+                      'total_slots': len(b.slots),
+                      'occupied_slots': sum(len(r['slot_ids'] or []) for r in rows
+                                            if r['box'] == b.name and r['status'] in ('granting', 'active', 'releasing'))}
+                     for b in boxes]
+        return {'leases': mine, 'queue': queue, 'pool': occupancy,
+                'eta': queue_eta(rows, datetime.now(timezone.utc))}
+
+
+@router.post('/release')
+async def release(body: LeaseChange, request: Request):
+    owner = body.actor.checked()
+    p, boxes = settings()
+    # This is evidence of attention even if the requested transition is busy.
+    async with _pool(request).acquire() as conn, conn.transaction():
+        await _lock(conn)
+        await conn.execute('UPDATE compute_leases SET last_activity_at=now() WHERE id=$1 AND owner=$2', body.lease_id, owner)
+    async with _pool(request).acquire() as conn, conn.transaction():
+        await _lock(conn)
+        row = await conn.fetchrow('SELECT * FROM compute_leases WHERE id=$1 AND owner=$2', body.lease_id, owner)
+        if not row:
+            raise HTTPException(404, 'lease not found')
+        if row['status'] == 'queued':
+            await conn.execute("UPDATE compute_leases SET status='released', released_at=now(), last_activity_at=now() WHERE id=$1", body.lease_id)
+            await _schedule(conn, p, boxes)
+            return {'lease_id': body.lease_id, 'status': 'released'}
+        if row['status'] == 'granting':
+            # The remote grant may already be in flight. Keep capacity until
+            # it is confirmed and then immediately dispatch teardown.
+            await conn.execute('UPDATE compute_leases SET release_requested=true WHERE id=$1', body.lease_id)
+            return {'lease_id': body.lease_id, 'status': 'release_requested'}
+        if row['status'] == 'active':
+            pending = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM compute_lease_actions WHERE lease_id=$1 AND kind='extend' AND status <> 'done')", body.lease_id)
+            if pending:
+                raise HTTPException(409, 'extension in progress; retry')
+            await conn.execute("UPDATE compute_leases SET status='releasing', last_activity_at=now() WHERE id=$1", body.lease_id)
+            await _action(conn, body.lease_id, 'release', {'box': row['box']})
+            return {'lease_id': body.lease_id, 'status': 'releasing'}
+        if row['status'] in ('released', 'releasing'):
+            return {'lease_id': body.lease_id, 'status': row['status']}
+        raise HTTPException(409, 'lease transition in progress; retry')
+
+
+@router.post('/extend')
+async def extend(body: LeaseChange, request: Request):
+    owner = body.actor.checked()
+    if body.duration is None:
+        raise HTTPException(422, 'duration is required')
+    p, boxes = settings()
+    # Commit the acknowledgment separately: a denied extension rolls back its
+    # transition, but must not erase evidence that its owner is paying attention.
+    async with _pool(request).acquire() as conn, conn.transaction():
+        await _lock(conn)
+        await conn.execute('UPDATE compute_leases SET last_activity_at=now() WHERE id=$1 AND owner=$2', body.lease_id, owner)
+    async with _pool(request).acquire() as conn, conn.transaction():
+        await _lock(conn)
+        row = await conn.fetchrow('SELECT * FROM compute_leases WHERE id=$1 AND owner=$2', body.lease_id, owner)
+        if not row:
+            raise HTTPException(404, 'lease not found')
+        if row['status'] != 'active':
+            raise HTTPException(409, 'lease is not active')
+        if row['expires_at'] <= datetime.now(timezone.utc):
+            raise HTTPException(409, 'lease has expired')
+        rows = await _rows(conn)
+        if any(r['status'] == 'queued' and r['owner'] != owner for r in rows):
+            raise HTTPException(409, 'other sessions are waiting')
+        if body.duration > p[row['class'] + '_max_seconds']:
+            raise HTTPException(422, 'extension exceeds class duration limit')
+        expires = row['expires_at'] + timedelta(seconds=body.duration)
+        if not row['granted_at'] or expires > row['granted_at'] + timedelta(seconds=p['absolute_max_seconds']):
+            raise HTTPException(422, 'extension exceeds configured total duration')
+        pending = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM compute_lease_actions WHERE lease_id=$1 AND kind='extend' AND status <> 'done')", body.lease_id)
+        if pending:
+            raise HTTPException(409, 'extension already pending')
+        await conn.execute('UPDATE compute_leases SET last_activity_at=now() WHERE id=$1', body.lease_id)
+        await _action(conn, body.lease_id, 'extend', {'box': row['box'], 'expires_epoch': int(expires.timestamp())})
+        return {'lease_id': body.lease_id, 'status': 'extending', 'requested_expires_at': expires}
+
+
+class ActionReceipt(BaseModel):
+    action_id: uuid.UUID
+    result: dict
+
+
+class BoxEnable(BaseModel):
+    box: str
+    local_drained: bool
+    node_drained: bool
+
+
+async def _reconcile_notices(conn, p, boxes):
+    notices = await conn.fetch("""SELECT n.action_id, n.lease_id, a.kind,
+            ip.delivered_at, ip.dropped_reason
+        FROM compute_lease_notices n JOIN compute_lease_actions a ON a.id=n.action_id
+        JOIN item_pushes ip ON ip.id=n.push_id
+        WHERE a.status <> 'done' AND ip.delivered_at IS NOT NULL""")
+    for notice in notices:
+        await conn.execute("UPDATE compute_lease_actions SET status='done', result=$2::jsonb WHERE id=$1",
+            notice['action_id'], json.dumps({'delivered': notice['dropped_reason'] is None}))
+        if notice['dropped_reason'] is not None:
+            continue
+        await conn.execute('UPDATE compute_lease_notices SET sent_at=$2 WHERE action_id=$1',
+                           notice['action_id'], notice['delivered_at'])
+        if notice['kind'] == 'reclaim_notice':
+            row = await conn.fetchrow('SELECT * FROM compute_leases WHERE id=$1', notice['lease_id'])
+            if row and row['status'] == 'active':
+                decision = await _idle_decision(conn, dict(row), p, boxes, datetime.now(timezone.utc))
+                pending = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM compute_lease_actions WHERE lease_id=$1 AND kind='extend' AND status <> 'done')", row['id'])
+                if decision == 'reclaim' and not pending:
+                    await conn.execute("UPDATE compute_leases SET status='releasing' WHERE id=$1", row['id'])
+                    await _action(conn, row['id'], 'release', {'box': row['box']})
+
+
+@router.post('/executor/enable')
+async def executor_enable(body: BoxEnable, request: Request):
+    p, boxes = settings()
+    if body.box not in {b.name for b in boxes if b.configured_enabled} or not body.local_drained or not body.node_drained:
+        raise HTTPException(409, 'box is not configured for cutover or has not drained')
+    async with _pool(request).acquire() as conn, conn.transaction():
+        await _lock(conn)
+        await conn.execute("""INSERT INTO compute_boxes (name, enabled, checked_at, evidence)
+            VALUES ($1,true,now(),$2::jsonb) ON CONFLICT (name) DO UPDATE
+            SET enabled=true, checked_at=now(), evidence=EXCLUDED.evidence""",
+            body.box, json.dumps({'local_drained': True, 'node_drained': True}))
+        await _schedule(conn, p, boxes)
+    return {'enabled': True, 'box': body.box}
+
+
+@router.post('/executor/poll')
+async def executor_poll(request: Request):
+    p, boxes = settings()
+    async with _pool(request).acquire() as conn, conn.transaction():
+        await _lock(conn)
+        await _reconcile_notices(conn, p, boxes)
+        due = await conn.fetch("""SELECT * FROM compute_leases WHERE status='active'
+            AND expires_at > now() AND expires_at <= now() + make_interval(secs => $1)""",
+            float(p['expiry_warning_seconds']))
+        for row in due:
+            epoch = int(row['expires_at'].timestamp())
+            warned = await conn.fetchval("""SELECT EXISTS(SELECT 1 FROM compute_lease_actions
+                WHERE lease_id=$1 AND kind='expiry_notice' AND (payload->>'expires_epoch')::bigint=$2)""",
+                row['id'], epoch)
+            if not warned:
+                await _notice_action(conn, row, 'expiry_notice', {'expires_epoch': epoch})
+        # Do not free a reservation merely because its clock elapsed. The
+        # node release must be confirmed first, even across API restarts.
+        expired = await conn.fetch("SELECT * FROM compute_leases WHERE status='active' AND expires_at <= now()")
+        for row in expired:
+            if await conn.fetchval("SELECT EXISTS(SELECT 1 FROM compute_lease_actions WHERE lease_id=$1 AND kind IN ('grant','extend','release') AND status <> 'done')", row['id']):
+                continue
+            await conn.execute("""UPDATE item_pushes SET delivered_at=now(), dropped_reason='lease expired'
+                WHERE id IN (SELECT n.push_id FROM compute_lease_notices n JOIN compute_lease_actions a ON a.id=n.action_id
+                             WHERE n.lease_id=$1 AND a.status <> 'done') AND delivered_at IS NULL""", row['id'])
+            await conn.execute("""UPDATE compute_lease_actions SET status='done', result='{"cancelled":"expired"}'::jsonb
+                WHERE lease_id=$1 AND kind IN ('idle_notice','reclaim_notice','expiry_notice') AND status <> 'done'""", row['id'])
+            await conn.execute("UPDATE compute_leases SET status='releasing' WHERE id=$1", row['id'])
+            await _action(conn, row['id'], 'release', {'box': row['box']})
+        await _schedule(conn, p, boxes)
+        action = await conn.fetchrow("""SELECT * FROM compute_lease_actions
+            WHERE kind IN ('grant','extend','release') AND
+                  (status='pending' OR (status='claimed' AND claimed_until < now()))
+            ORDER BY created_at, id LIMIT 1 FOR UPDATE""")
+        if not action:
+            return {'action': None}
+        await conn.execute("UPDATE compute_lease_actions SET status='claimed', claimed_until=now() + interval '2 minutes' WHERE id=$1", action['id'])
+        payload = action['payload']
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        return {'action': {'action_id': action['id'], 'lease_id': action['lease_id'],
+                           'kind': action['kind'], 'payload': payload}}
+
+
+@router.post('/executor/complete')
+async def executor_complete(body: ActionReceipt, request: Request):
+    p, boxes = settings()
+    async with _pool(request).acquire() as conn, conn.transaction():
+        await _lock(conn)
+        action = await conn.fetchrow('SELECT * FROM compute_lease_actions WHERE id=$1 FOR UPDATE', body.action_id)
+        if not action:
+            raise HTTPException(404, 'action not found')
+        if action['status'] == 'done':
+            return {'ok': True, 'already_done': True}
+        if body.result.get('lease_id') != str(action['lease_id']):
+            raise HTTPException(422, 'node result lease ID mismatch')
+        lease = await conn.fetchrow('SELECT * FROM compute_leases WHERE id=$1', action['lease_id'])
+        if action['kind'] == 'grant':
+            if lease['status'] != 'granting':
+                raise HTTPException(409, 'unexpected or incomplete grant result')
+            if body.result.get('expired') is True and body.result.get('released') is True:
+                await conn.execute("UPDATE compute_leases SET status='released', released_at=now() WHERE id=$1", lease['id'])
+            elif body.result.get('configured') and body.result.get('workdir'):
+                if lease['release_requested']:
+                    await conn.execute("UPDATE compute_leases SET status='releasing', granted_at=now(), workdir=$2 WHERE id=$1", lease['id'], body.result['workdir'])
+                    await _action(conn, lease['id'], 'release', {'box': lease['box']})
+                else:
+                    await conn.execute("UPDATE compute_leases SET status='active', granted_at=now(), workdir=$2 WHERE id=$1", lease['id'], body.result['workdir'])
+            else:
+                raise HTTPException(409, 'unexpected or incomplete grant result')
+        elif action['kind'] == 'extend':
+            if lease['status'] != 'active':
+                raise HTTPException(409, 'unexpected extension result')
+            payload = action['payload']
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            if body.result.get('expires') != payload['expires_epoch']:
+                raise HTTPException(422, 'node expiry mismatch')
+            await conn.execute('UPDATE compute_leases SET expires_at=to_timestamp($2) WHERE id=$1', lease['id'], payload['expires_epoch'])
+        elif action['kind'] == 'release':
+            if lease['status'] != 'releasing' or body.result.get('released') is not True:
+                raise HTTPException(409, 'unexpected release result')
+            await conn.execute("UPDATE compute_leases SET status='released', released_at=now() WHERE id=$1", lease['id'])
+            await conn.execute('DELETE FROM compute_lease_samples WHERE lease_id=$1', lease['id'])
+        else:
+            raise HTTPException(409, 'notice delivery is acknowledged by the owner daemon')
+        await conn.execute("UPDATE compute_lease_actions SET status='done', result=$2::jsonb WHERE id=$1", body.action_id, json.dumps(body.result))
+        await _schedule(conn, p, boxes)
+        return {'ok': True}
+
+
+class SampleReceipt(BaseModel):
+    lease_id: uuid.UUID
+    cpu_usage_usec: int = Field(ge=0)
+
+
+@router.post('/executor/samples')
+async def sample_targets(request: Request):
+    async with _pool(request).acquire() as conn:
+        rows = await conn.fetch("SELECT id, box FROM compute_leases WHERE status='active'")
+        return {'leases': [{'lease_id': r['id'], 'box': r['box']} for r in rows]}
+
+
+async def _idle_decision(conn, row, p, boxes, now):
+    records = await conn.fetch("""SELECT sampled_at, usage_usec FROM compute_lease_samples
+        WHERE lease_id=$1 AND sampled_at >= $2 ORDER BY sampled_at""", row['id'],
+        now - timedelta(seconds=p['idle_threshold_seconds'] + p['sample_max_gap_seconds']))
+    samples = [Sample(r['sampled_at'], r['usage_usec']) for r in records]
+    average = idle_average(samples, now, len(row['slot_ids']) * p['cpus_per_slot'],
+                           p['idle_threshold_seconds'], p['sample_max_gap_seconds'])
+    if average is not None and average >= p['idle_percent']:
+        await conn.execute('UPDATE compute_leases SET last_activity_at=$2 WHERE id=$1', row['id'], now)
+        return None
+    notices = await conn.fetch("""SELECT n.sent_at FROM compute_lease_notices n
+        JOIN compute_lease_actions a ON a.id=n.action_id
+        WHERE n.lease_id=$1 AND a.kind='idle_notice' AND n.sent_at>$2 ORDER BY n.sent_at""",
+                               row['id'], row['last_activity_at'])
+    rows = await _rows(conn)
+    enabled = await conn.fetchval('SELECT enabled FROM compute_boxes WHERE name=$1', row['box'])
+    target = next((b for b in boxes if b.name == row['box'] and b.configured_enabled and enabled), None)
+    policy = Policy(**{k: p[k] for k in Policy.__dataclass_fields__})
+    without = [r for r in rows if r['id'] != row['id']]
+    fits = bool(target and any(select_box(q, without, [target], policy) for q in queue_order(without)))
+    return next_idle_action(now=now, average=average, threshold=p['idle_percent'],
+        last_activity=row['last_activity_at'], notices=[n['sent_at'] for n in notices],
+        idle_seconds=p['idle_threshold_seconds'], answer_seconds=p['idle_answer_seconds'],
+        notice_limit=p['notice_limit'], expires_at=row['expires_at'],
+        expiry_guard_seconds=p['notice_expiry_guard_seconds'], queued_fit=fits)
+
+
+@router.post('/executor/sample')
+async def sample(body: SampleReceipt, request: Request):
+    p, boxes = settings()
+    async with _pool(request).acquire() as conn, conn.transaction():
+        await _lock(conn)
+        row = await conn.fetchrow("SELECT * FROM compute_leases WHERE id=$1 AND status='active'", body.lease_id)
+        if not row:
+            return {'accepted': False}
+        now = datetime.now(timezone.utc)
+        await conn.execute('INSERT INTO compute_lease_samples (lease_id, sampled_at, usage_usec) VALUES ($1,$2,$3)',
+                           body.lease_id, now, body.cpu_usage_usec)
+        await conn.execute('DELETE FROM compute_lease_samples WHERE lease_id=$1 AND sampled_at<$2', body.lease_id,
+            now - timedelta(seconds=p['idle_threshold_seconds'] + 2*p['sample_max_gap_seconds']))
+        pending = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM compute_lease_actions WHERE lease_id=$1 AND kind IN ('idle_notice','reclaim_notice') AND status <> 'done')", body.lease_id)
+        decision = await _idle_decision(conn, dict(row), p, boxes, now)
+        if decision and not pending:
+            if decision == 'reclaim':
+                notified = await conn.fetchval("""SELECT EXISTS(SELECT 1 FROM compute_lease_notices n
+                    JOIN compute_lease_actions a ON a.id=n.action_id WHERE n.lease_id=$1
+                    AND a.kind='reclaim_notice' AND n.sent_at>$2)""", row['id'], row['last_activity_at'])
+                pending_extend = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM compute_lease_actions WHERE lease_id=$1 AND kind='extend' AND status <> 'done')", row['id'])
+                if notified and not pending_extend:
+                    await conn.execute("UPDATE compute_leases SET status='releasing' WHERE id=$1", row['id'])
+                    await _action(conn, row['id'], 'release', {'box': row['box']})
+                elif not notified:
+                    await _notice_action(conn, row, 'reclaim_notice')
+            else:
+                # Failed deliveries do not count as unanswered notices and do
+                # not cause a tight requeue loop when a session is offline.
+                attempted = await conn.fetchval("""SELECT EXISTS(SELECT 1 FROM compute_lease_actions
+                    WHERE lease_id=$1 AND kind='idle_notice' AND created_at>$2
+                    AND created_at>now()-make_interval(secs => $3))""",
+                    row['id'], row['last_activity_at'], float(p['idle_answer_seconds']))
+                if not attempted:
+                    await _notice_action(conn, row, 'idle_notice')
+        return {'accepted': True}

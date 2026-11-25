@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""Privileged node-side lease operations; configuration is required.
+
+This program is installed root-owned and called through a narrowly scoped
+sudoers entry. It deliberately never accepts an arbitrary unit name or path.
+"""
+import argparse
+import fcntl
+import json
+import os
+import pwd
+import re
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+CONFIG = Path('/etc/cm-lease.json')
+STATE = Path('/run/cm-lease')
+LOG = Path('/var/log/cm-lease.log')
+
+
+class Refused(Exception):
+    pass
+
+
+def lease_id(value):
+    try:
+        canonical = str(uuid.UUID(value))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError('expected a UUID') from exc
+    if value != canonical:
+        raise argparse.ArgumentTypeError('expected a canonical UUID')
+    return canonical
+
+
+def config():
+    # The sudo boundary must not read user-controlled config or follow a link.
+    st = CONFIG.lstat()
+    if not CONFIG.is_file() or CONFIG.is_symlink() or st.st_uid != 0 or st.st_mode & 0o022:
+        raise Refused('config must be root-owned, non-symlink and not group/world writable')
+    data = json.loads(CONFIG.read_text())
+    for k in ('max_slots', 'cpus_per_slot', 'mem_gb_per_slot', 'max_duration_seconds', 'workdir_root', 'user'):
+        if k not in data:
+            raise Refused('missing config key ' + k)
+    if any(not isinstance(data[k], int) or isinstance(data[k], bool) or data[k] <= 0
+           for k in ('max_slots', 'cpus_per_slot', 'mem_gb_per_slot', 'max_duration_seconds')):
+        raise Refused('invalid numeric config')
+    root = Path(data['workdir_root'])
+    if not root.is_absolute() or not root.is_dir() or root.is_symlink():
+        raise Refused('workdir_root must be an existing absolute directory')
+    return data
+
+
+def run(*args):
+    return subprocess.run(args, check=True, text=True, capture_output=True).stdout.strip()
+
+
+def record_path(ident):
+    return STATE / (ident + '.json')
+
+
+def load(ident):
+    try:
+        return json.loads(record_path(ident).read_text())
+    except FileNotFoundError:
+        return None
+
+
+def save(ident, value):
+    path = record_path(ident)
+    tmp = path.with_suffix('.tmp')
+    with tmp.open('w') as f:
+        json.dump(value, f, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def unit(ident):
+    return f'cmlease-{ident}.slice'
+
+
+def audit(action, ident):
+    with LOG.open('a') as f:
+        f.write(json.dumps({'time': int(time.time()), 'action': action, 'lease_id': ident}) + '\n')
+
+
+def create_workdir(path, owner, ident, expires, user):
+    # The parent lives under a shared user's home. Never create or write a
+    # user-controlled path as root: a concurrent rename/symlink must not turn
+    # this sudo entry into a privileged file-write primitive.
+    code = '''import os, pathlib, sys, time
+p = pathlib.Path(sys.argv[1])
+p.mkdir(mode=0o700, exist_ok=False)
+fd = os.open(p / "OWNER.md", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+with os.fdopen(fd, "w") as f:
+    f.write("owner: %s\\nlease: %s\\ncreated: %s\\nexpires: %s\\ndelete-after: release, after owner review\\n" % (sys.argv[2], sys.argv[3], int(time.time()), sys.argv[4]))
+'''
+    run('/usr/sbin/runuser', '-u', user, '--', '/usr/bin/python3', '-c', code,
+        str(path), owner, ident, str(expires))
+
+
+def workdir_size_and_remove_if_empty(path, user):
+    # Like creation, cleanup is performed with the owning user's credentials.
+    if not path.exists():
+        return 0
+    out = run('/usr/sbin/runuser', '-u', user, '--', '/usr/bin/du', '-sb', '--', str(path))
+    subprocess.run(['/usr/sbin/runuser', '-u', user, '--', '/usr/bin/rmdir', '--', str(path)],
+                   check=False, capture_output=True)
+    return int(out.split()[0])
+
+
+def expiry(value, cfg):
+    now = int(time.time())
+    if value <= now or value > now + cfg['max_duration_seconds']:
+        raise Refused('expiry outside configured window')
+
+
+def grant(args, cfg):
+    if args.slots <= 0 or args.mem_gb <= 0:
+        raise Refused('slots and memory must be positive')
+    if args.mem_gb > args.slots * cfg['mem_gb_per_slot']:
+        raise Refused('memory exceeds the reserved slot capacity')
+    if not re.fullmatch(r'[A-Za-z0-9_.:@-]{1,200}', args.owner):
+        raise Refused('invalid owner')
+    if args.pin:
+        if not re.fullmatch(r'\d+(?:,\d+)*', args.pin):
+            raise Refused('invalid CPU list')
+        cpus = [int(c) for c in args.pin.split(',')]
+        if len(set(cpus)) != args.slots * cfg['cpus_per_slot'] or len(cpus) != len(set(cpus)):
+            raise Refused('CPU list does not match slot count')
+    old = load(args.lease_id)
+    proposed = {'lease_id': args.lease_id, 'owner': args.owner, 'user': cfg['user'],
+                'slots': args.slots, 'mem_gb': args.mem_gb, 'pin': args.pin,
+                'expires': args.expires_epoch}
+    if args.expires_epoch <= int(time.time()):
+        if old and any(old.get(k) != v for k, v in proposed.items()):
+            raise Refused('lease id already exists with different parameters')
+        if old:
+            release(args.lease_id)
+        return {'lease_id': args.lease_id, 'expired': True, 'released': True}
+    expiry(args.expires_epoch, cfg)
+    if old:
+        if any(old.get(k) != v for k, v in proposed.items()):
+            raise Refused('lease id already exists with different parameters')
+        proposed = old
+    else:
+        used = sum(json.loads(p.read_text())['slots'] for p in STATE.glob('*.json'))
+        if used + args.slots > cfg['max_slots']:
+            raise Refused('box capacity exceeded')
+        workdir = Path(cfg['workdir_root']) / args.lease_id
+        pwd.getpwnam(cfg['user'])
+        create_workdir(workdir, args.owner, args.lease_id, args.expires_epoch, cfg['user'])
+        proposed.update(created=int(time.time()), workdir=str(workdir), slice=unit(args.lease_id))
+        # Persist before creating the unit; a crash cannot make allocated
+        # capacity look free. A retry repeats configuration idempotently.
+        save(args.lease_id, proposed)
+    try:
+        run('/usr/bin/systemctl', 'start', unit(args.lease_id))
+        props = [f'MemoryMax={args.mem_gb}G']
+        if args.pin:
+            props.append(f'AllowedCPUs={args.pin}')
+        else:
+            props.append(f'CPUQuota={args.slots * cfg["cpus_per_slot"] * 100}%')
+        run('/usr/bin/systemctl', 'set-property', '--runtime', unit(args.lease_id), *props)
+    except Exception:
+        # Keep the reservation: a timeout may have succeeded remotely.
+        raise
+    proposed['configured'] = True
+    save(args.lease_id, proposed)
+    audit('grant', args.lease_id)
+    return proposed
+
+
+def release(ident):
+    row = load(ident)
+    if not row:
+        return {'lease_id': ident, 'released': True, 'already_absent': True}
+    # systemd stops the slice and all child units with their normal TERM grace;
+    # TimeoutStopSec is configured on the lease's run scope.
+    run('/usr/bin/systemctl', 'stop', unit(ident))
+    record_path(ident).unlink()
+    audit('release', ident)
+    path = Path(row['workdir'])
+    return {'lease_id': ident, 'released': True, 'workdir': str(path),
+            'workdir_bytes': workdir_size_and_remove_if_empty(path, row['user'])}
+
+
+def parser():
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest='action', required=True)
+    g = sub.add_parser('grant')
+    g.add_argument('--lease-id', type=lease_id, required=True)
+    g.add_argument('--owner', required=True)
+    g.add_argument('--slots', type=int, required=True)
+    g.add_argument('--mem-gb', type=int, required=True)
+    g.add_argument('--pin')
+    g.add_argument('--expires-epoch', type=int, required=True)
+    for action in ('release', 'status', 'run'):
+        q = sub.add_parser(action)
+        q.add_argument('--lease-id', type=lease_id, required=True)
+        if action == 'run':
+            q.add_argument('command', nargs=argparse.REMAINDER)
+    e = sub.add_parser('extend')
+    e.add_argument('--lease-id', type=lease_id, required=True)
+    e.add_argument('--expires-epoch', type=int, required=True)
+    sub.add_parser('reap')
+    sub.add_parser('drain-check')
+    return p
+
+
+def main():
+    args = parser().parse_args()
+    if os.geteuid() != 0:
+        raise Refused('must run as root')
+    cfg = config()
+    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    state_info = STATE.lstat()
+    if STATE.is_symlink() or state_info.st_uid != 0 or state_info.st_mode & 0o077:
+        raise Refused('state directory must be root-owned and private')
+    with (STATE / '.lock').open('w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if args.action == 'grant':
+            result = grant(args, cfg)
+        elif args.action == 'release':
+            result = release(args.lease_id)
+        elif args.action == 'reap':
+            result = {'released': [release(p.stem) for p in STATE.glob('*.json')
+                                   if json.loads(p.read_text())['expires'] <= int(time.time())]}
+            audit('reap', '*')
+        elif args.action == 'drain-check':
+            # A failed /proc read is not evidence that the box is empty.
+            busy = []
+            for proc in Path('/proc').iterdir():
+                if not proc.name.isdecimal():
+                    continue
+                try:
+                    cmdline = (proc / 'cmdline').read_bytes().replace(b'\0', b' ')
+                except FileNotFoundError:
+                    continue
+                try:
+                    cwd = os.readlink(proc / 'cwd')
+                except FileNotFoundError:
+                    continue
+                if b'/ep-lanes/' in cmdline or '/ep-lanes/' in cwd:
+                    busy.append(int(proc.name))
+            result = {'drained': not busy, 'matching_pids': busy}
+            audit('drain-check', '*')
+        else:
+            row = load(args.lease_id)
+            if not row:
+                raise Refused('unknown lease')
+            if args.action == 'extend':
+                expiry(args.expires_epoch, cfg)
+                if args.expires_epoch < row['expires']:
+                    raise Refused('cannot shorten lease')
+                row['expires'] = args.expires_epoch
+                save(args.lease_id, row)
+                audit('extend', args.lease_id)
+                result = row
+            elif args.action == 'status':
+                group = run('/usr/bin/systemctl', 'show', '--property=ControlGroup',
+                            '--value', unit(args.lease_id))
+                if not group.startswith('/') or '..' in Path(group).parts:
+                    raise Refused('invalid cgroup')
+                cgroup = Path('/sys/fs/cgroup') / group.lstrip('/')
+                cpu = dict(line.split() for line in (cgroup / 'cpu.stat').read_text().splitlines())
+                result = dict(row, cpu_usage_usec=int(cpu['usage_usec']),
+                              memory_current=int((cgroup / 'memory.current').read_text()),
+                              memory_peak=int((cgroup / 'memory.peak').read_text()))
+                audit('status', args.lease_id)
+            else:
+                if not row.get('configured'):
+                    raise Refused('lease has not finished configuring')
+                if row['expires'] <= int(time.time()):
+                    raise Refused('lease expired')
+                command = args.command
+                if command and command[0] == '--':
+                    command = command[1:]
+                if not command:
+                    raise Refused('missing command')
+                command = ['/usr/sbin/runuser', '-u', row['user'], '--', *command]
+                if row['pin']:
+                    command = ['/usr/sbin/runuser', '-u', row['user'], '--',
+                               '/usr/bin/taskset', '-c', row['pin'], *command[4:]]
+                # Serialize starting the scope with release. Unlock only once
+                # systemd has made the scope active (or the process exited).
+                # Otherwise release could tear down the slice between checking
+                # the lease and starting a job, letting a late job recreate it.
+                scope = 'cmlease-job-' + uuid.uuid4().hex + '.scope'
+                audit('run', args.lease_id)
+                process = subprocess.Popen(['/usr/bin/systemd-run', '--quiet', '--scope',
+                          '--unit=' + scope, '--slice=' + row['slice'],
+                          '--property=TimeoutStopSec=30s', '--', *command])
+                deadline = time.monotonic() + 30
+                while process.poll() is None:
+                    active = subprocess.run(['/usr/bin/systemctl', 'is-active', '--quiet', scope],
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+                    if active:
+                        break
+                    if time.monotonic() >= deadline:
+                        process.terminate()
+                        process.wait()
+                        subprocess.run(['/usr/bin/systemctl', 'stop', scope], check=False)
+                        raise Refused('scope did not become active')
+                    time.sleep(.05)
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                sys.exit(process.wait())
+        print(json.dumps(result, sort_keys=True))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (Refused, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        if os.geteuid() == 0:
+            try:
+                audit('refused:' + (sys.argv[1] if len(sys.argv) > 1 else 'unknown'), '*')
+            except OSError:
+                pass
+        print(json.dumps({'error': str(exc)}), file=sys.stderr)
+        sys.exit(3)

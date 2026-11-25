@@ -642,6 +642,70 @@
     "reason"
    ]
   },
+  "compute_extend": {
+   "params": {
+    "duration": {
+     "type": "integer"
+    },
+    "lease_id": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "duration",
+    "lease_id"
+   ]
+  },
+  "compute_release": {
+   "params": {
+    "lease_id": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "lease_id"
+   ]
+  },
+  "compute_request": {
+   "params": {
+    "class": {
+     "type": "string"
+    },
+    "cpus": {
+     "type": "integer"
+    },
+    "duration": {
+     "type": "integer"
+    },
+    "mem_gb": {
+     "type": "integer"
+    },
+    "pinned": {
+     "type": "boolean"
+    },
+    "priority": {
+     "type": "string"
+    },
+    "purpose": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "cpus",
+    "duration",
+    "mem_gb",
+    "priority",
+    "purpose"
+   ]
+  },
+  "compute_status": {
+   "params": {
+    "lease_id": {
+     "type": "string"
+    }
+   },
+   "required": []
+  },
   "create_subtask": {
    "params": {
     "base": {
@@ -1572,6 +1636,9 @@
     },
     "view": {
      "type": "string"
+    },
+    "with_subtree": {
+     "type": "boolean"
     }
    },
    "required": []

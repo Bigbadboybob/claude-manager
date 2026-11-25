@@ -1233,8 +1233,22 @@ async def _record_engine_switch(conn, daemon_id: str, pid: str, old: str, new: s
             {"engine": new, "pid": pid, "role": r["role"]})
 
 
+async def _ack_pushes(conn, daemon_id, acked_push_ids, observed_lease_push_ids, now):
+    if acked_push_ids:
+        await conn.execute(
+            """UPDATE item_pushes SET delivered_at = $3
+                WHERE daemon_id = $1 AND id = ANY($2::bigint[]) AND delivered_at IS NULL
+                  AND kind <> 'compute_lease'""", daemon_id, list(acked_push_ids), now)
+    if observed_lease_push_ids:
+        await conn.execute(
+            """UPDATE item_pushes SET delivered_at = $3
+                WHERE daemon_id = $1 AND id = ANY($2::bigint[]) AND delivered_at IS NULL
+                  AND kind = 'compute_lease'""", daemon_id, list(observed_lease_push_ids), now)
+
+
 async def heartbeat(pool, daemon_id: str, *, host_label: str | None, sessions: list[dict],
-                    exited: list[str], acked_push_ids: list[int]) -> dict:
+                    exited: list[str], acked_push_ids: list[int],
+                    observed_lease_push_ids: list[int] | None = None) -> dict:
     """Record one daemon's full session snapshot, ack delivered pushes, and
     return the pushes still pending for it.
 
@@ -1322,12 +1336,7 @@ async def heartbeat(pool, daemon_id: str, *, host_label: str | None, sessions: l
             # free capacity and edit rights never accumulate.
             from dispatch import board_members
             await board_members.end_exited(conn, daemon_id)
-            if acked_push_ids:
-                await conn.execute(
-                    """UPDATE item_pushes SET delivered_at = $3
-                        WHERE daemon_id = $1 AND id = ANY($2::bigint[]) AND delivered_at IS NULL""",
-                    daemon_id, list(acked_push_ids), now,
-                )
+            await _ack_pushes(conn, daemon_id, acked_push_ids, observed_lease_push_ids, now)
             # Give up on pushes handed out too often without an ack.
             await conn.execute(
                 """UPDATE item_pushes

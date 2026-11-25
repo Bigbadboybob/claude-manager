@@ -131,6 +131,8 @@ class DeliveryHealthTests(unittest.TestCase):
         self.assertTrue(delivery_health([legacy, stuck], now)["stalled"])
         legacy["marker"] = "[cm-board sfd push:1]"
         self.assertFalse(delivery_health([legacy, stuck], now)["stalled"])
+        legacy["marker"] = "[cm-board lease push:1]"
+        self.assertFalse(delivery_health([legacy, stuck], now)["stalled"])
 
     def test_persisted_legacy_observation_stays_untrusted_after_queue_restart(self):
         with tempfile.TemporaryDirectory() as tmp:

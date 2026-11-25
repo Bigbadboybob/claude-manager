@@ -1,0 +1,15 @@
+[Unit]
+Description=Claude Manager compute lease executor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/cm-compute-executor/environment
+ExecStart=%h/.local/bin/cm-compute-executor
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
