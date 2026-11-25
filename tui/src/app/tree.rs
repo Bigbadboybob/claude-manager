@@ -22,6 +22,13 @@
 //!   edge (no tint).
 //! - The lead session (see [`task_lead`]) of a task with subtasks
 //!   carries its level's leader mark ([`leader_glyph`]); leaves carry none.
+//! - Inside an org member block (continuous boxes included) each assistant
+//!   or worker row nests under the session that spawned it
+//!   (`managed_by_uid`) when that session is drawn in the same block, at any
+//!   depth (Owner, 2026-11-25). Rows spawned by the main session, by a
+//!   session drawn elsewhere, or by none stay at the block's top level; a
+//!   spawn cycle breaks at its lowest row. Alt+Space folds a sub-lead's
+//!   spawns behind its row with a rollup, like a main row folds its block.
 //!
 //! Sections still group top-level blocks. A nested block follows its root
 //! block's section unless an explicit assignment pulls it into a different
@@ -60,9 +67,52 @@ pub(super) enum Node {
     Workspace(usize),
     Member(String),
     Group(String),
+    /// The sessions a sub-lead spawned inside its member block, by the
+    /// sub-lead's fold key ([`spawn_fold_key`]).
+    Spawn(String),
 }
 
 fn member_fold_key(member: &str) -> String { format!("sidebar:member:{member}") }
+
+/// A sub-lead's fold key: its session, host-qualified. Session uids are
+/// host-local, so the host is part of the identity.
+fn spawn_fold_key(host: &str, uid: &str) -> String {
+    format!("sidebar:spawn:{}", serde_json::to_string(&(host, uid)).unwrap_or_default())
+}
+
+/// Spawn nesting inside one member block (Owner, 2026-11-25): each row
+/// hangs under the row that spawned it (`managed_by_uid` on the same host)
+/// when that row is drawn in the same block. Rows are `(row, host, uid,
+/// spawner)`, the member's main excluded, so a row spawned by the main, by
+/// a session drawn elsewhere or by none stays at the block's top level. A
+/// spawn cycle breaks at its lowest row, which becomes a top-level row.
+fn spawn_parents(rows: &[((usize, usize), &str, &str, Option<&str>)]) -> HashMap<(usize, usize), (usize, usize)> {
+    let mut by_uid: HashMap<(&str, &str), (usize, usize)> = HashMap::new();
+    for &(row, host, uid, _) in rows {
+        by_uid.entry((host, uid)).or_insert(row);
+    }
+    let mut parent = HashMap::new();
+    for &(row, host, _, spawner) in rows {
+        if let Some(p) = spawner.and_then(|uid| by_uid.get(&(host, uid)).copied()).filter(|p| *p != row) {
+            parent.insert(row, p);
+        }
+    }
+    for &(row, ..) in rows {
+        let mut seen = vec![row];
+        let mut cur = row;
+        while let Some(&p) = parent.get(&cur) {
+            if let Some(at) = seen.iter().position(|s| *s == p) {
+                if let Some(lowest) = seen[at..].iter().min().copied() {
+                    parent.remove(&lowest);
+                }
+                break;
+            }
+            seen.push(p);
+            cur = p;
+        }
+    }
+    parent
+}
 
 pub(super) fn checkout_key_workspace(key: &str) -> Option<String> {
     let encoded = key.strip_prefix("sidebar:checkout:").or_else(|| key.strip_prefix("sidebar:continuation:"))?;
@@ -113,6 +163,9 @@ pub(super) struct TaskTree {
     /// Main session row → member block, and the blocks with hidden content.
     pub member_headers: HashMap<(usize, usize), String>,
     pub member_foldable: HashSet<String>,
+    /// Sub-lead rows (a session with spawns nested under it in its member
+    /// block) → their fold key. Alt+Space folds them like a main row.
+    pub spawn_headers: HashMap<(usize, usize), String>,
     /// Labels for synthetic member, team, and checkout rows.
     pub org_labels: HashMap<String, String>,
     /// Org rows can share a workspace across sections, so section is per row.
@@ -278,6 +331,18 @@ struct OrgContinuation {
 struct OrgBlocks {
     members: Vec<OrgMemberBlock>,
     continuations: Vec<OrgContinuation>,
+}
+
+/// What every row of one member block shares while its spawn subtrees are
+/// emitted.
+struct SpawnEmit<'a> {
+    section: Option<&'a str>,
+    boxed: bool,
+    folds: bool,
+    /// The block spans several checkouts: rows name theirs.
+    multi_checkout: bool,
+    /// Rows nested under each spawner row, in block order.
+    spawned: HashMap<(usize, usize), Vec<(usize, usize)>>,
 }
 
 impl OrgPlacement {
@@ -630,8 +695,22 @@ impl App {
             out.folded.insert(node, self.rollup(hidden.iter().map(|(wi, si)| &self.workspaces[*wi].sessions[*si])));
             return;
         }
+        // Rows nest under the row that spawned them; the top-level rows keep
+        // the block's order and its checkout subheadings, and a nested row
+        // in another checkout than its spawner names it.
+        let rest: Vec<(usize, usize)> = block.sessions.iter().copied().filter(|row| Some(*row) != block.main).collect();
+        let spawn_rows: Vec<_> = rest.iter().map(|&(wi, si)| {
+            let ts = &self.workspaces[wi].sessions[si];
+            ((wi, si), ts.host_id.as_str(), ts.uid.as_str(), ts.managed_by_uid.as_deref())
+        }).collect();
+        let spawned_by = spawn_parents(&spawn_rows);
+        let mut ctx = SpawnEmit { section, boxed, folds, multi_checkout: workspaces.len() > 1, spawned: HashMap::new() };
+        for row in &rest {
+            if let Some(spawner) = spawned_by.get(row) { ctx.spawned.entry(*spawner).or_default().push(*row); }
+        }
+        let mut emitted = HashSet::new();
         let mut last_checkout = block.main.map(|(wi, _)| wi);
-        for &(wi, si) in block.sessions.iter().filter(|row| Some(**row) != block.main) {
+        for &(wi, si) in rest.iter().filter(|row| !spawned_by.contains_key(*row)) {
             if workspaces.len() > 1 && last_checkout != Some(wi) {
                 let key = format!("sidebar:checkout:{}", serde_json::to_string(&(id, self.workspaces[wi].id.as_str())).unwrap_or_default());
                 out.org_labels.insert(key.clone(), format!("· {}", self.workspaces[wi].name));
@@ -642,18 +721,56 @@ impl App {
                 out.items.push(checkout);
             }
             last_checkout = Some(wi);
-            let row = if boxed { VisualItem::ContinuousTeamSession(wi, si) } else { VisualItem::Session(wi, si) };
-            out.rows.insert(row.clone(), TreeRow { cells: own_cells.clone(), node: Some(node.clone()) });
-            out.row_sections.insert(row.clone(), section.unwrap_or("").into());
-            if let Some(sid) = section {
-                let entries = out.section_members.entry(sid.into()).or_default();
-                if !entries.contains(&wi) { entries.push(wi); }
-            }
-            if boxed { out.boxed_rows.insert(row.clone()); }
-            out.items.push(row);
+            self.org_emit_spawned(out, &ctx, (wi, si), own_cells.clone(), node.clone(), &mut emitted);
         }
         for child in children {
             self.org_emit_block(out, plan, child, section, boxed, folds, own_cells.clone(), visited);
+        }
+    }
+
+    /// One row of a member block, then the rows it spawned, nested one
+    /// level deeper (recursively). A folded sub-lead keeps its own row and
+    /// rolls up everything it spawned.
+    fn org_emit_spawned(&self, out: &mut TaskTree, ctx: &SpawnEmit, row: (usize, usize),
+        cells: Vec<Node>, node: Node, emitted: &mut HashSet<(usize, usize)>)
+    {
+        if !emitted.insert(row) { return; }
+        let item = |(wi, si): (usize, usize)| if ctx.boxed { VisualItem::ContinuousTeamSession(wi, si) } else { VisualItem::Session(wi, si) };
+        let (wi, si) = row;
+        let header = item(row);
+        out.rows.insert(header.clone(), TreeRow { cells: cells.clone(), node: Some(node.clone()) });
+        out.row_sections.insert(header.clone(), ctx.section.unwrap_or("").into());
+        if let Some(sid) = ctx.section {
+            let entries = out.section_members.entry(sid.into()).or_default();
+            if !entries.contains(&wi) { entries.push(wi); }
+        }
+        if ctx.boxed { out.boxed_rows.insert(header.clone()); }
+        out.items.push(header);
+        let Some(spawned) = ctx.spawned.get(&row) else { return; };
+        let ts = &self.workspaces[wi].sessions[si];
+        let key = spawn_fold_key(ts.host_id.as_str(), &ts.uid);
+        out.spawn_headers.insert(row, key.clone());
+        let sub = Node::Spawn(key);
+        out.parents.insert(sub.clone(), node);
+        if ctx.folds && self.tree_folded(&sub) {
+            let mut hidden = Vec::new();
+            let mut stack: Vec<(usize, usize)> = spawned.iter().rev().copied().collect();
+            let mut seen = HashSet::from([row]);
+            while let Some(r) = stack.pop() {
+                if !seen.insert(r) { continue; }
+                hidden.push(r);
+                stack.extend(ctx.spawned.get(&r).into_iter().flatten().rev().copied());
+            }
+            out.folded.insert(sub, self.rollup(hidden.iter().map(|(wi, si)| &self.workspaces[*wi].sessions[*si])));
+            return;
+        }
+        let mut sub_cells = cells;
+        sub_cells.push(sub.clone());
+        for &child in spawned {
+            if ctx.multi_checkout && child.0 != wi {
+                out.checkout_labels.insert(item(child), self.workspaces[child.0].name.clone());
+            }
+            self.org_emit_spawned(out, ctx, child, sub_cells.clone(), sub.clone(), emitted);
         }
     }
 }
@@ -1109,7 +1226,7 @@ impl App {
     fn reveal_node(&mut self, node: &Node) -> bool {
         let mut changed = false;
         let chain = self.task_tree_unfolded().chain(node);
-        let include_self = matches!(node, Node::Member(_));
+        let include_self = matches!(node, Node::Member(_) | Node::Spawn(_));
         for n in chain.into_iter().skip(usize::from(!include_self)) {
             changed |= match n {
                 Node::Workspace(wi) => match self.workspaces.get(wi) {
@@ -1118,7 +1235,7 @@ impl App {
                 },
                 Node::Division(d) => self.folded_divisions.remove(&d.fold_key()),
                 Node::Member(id) => self.folded_org.remove(&member_fold_key(&id)),
-                Node::Group(key) => self.folded_org.remove(&key),
+                Node::Group(key) | Node::Spawn(key) => self.folded_org.remove(&key),
             };
         }
         if changed {
@@ -1186,6 +1303,7 @@ impl App {
             section_sessions: self.sections.iter().map(|s| (s.id.clone(), Vec::new())).collect(),
             member_headers: HashMap::new(),
             member_foldable: HashSet::new(),
+            spawn_headers: HashMap::new(),
             org_labels: HashMap::new(),
             row_sections: HashMap::new(),
             checkout_labels: HashMap::new(),
@@ -1332,7 +1450,9 @@ impl App {
         (n, running, idle, alerting)
     }
 
-    /// The row the cursor is on, as a tree node.
+    /// The row the cursor is on, as a tree node. A row nested under its
+    /// spawner stands for its member block, so the focus strip still marks
+    /// the whole block.
     pub(super) fn cursor_node(&self) -> Option<Node> {
         match &self.cursor {
             Cursor::Division(id) => Some(Node::Division(id.clone())),
@@ -1340,9 +1460,14 @@ impl App {
             Cursor::Session(wi, si) => {
                 self.workspaces.get(*wi)?.sessions.get(*si)?;
                 let tree = self.task_tree_unfolded();
-                tree.rows.get(&VisualItem::Session(*wi, *si))
+                let node = tree.rows.get(&VisualItem::Session(*wi, *si))
                     .or_else(|| tree.rows.get(&VisualItem::ContinuousTeamSession(*wi, *si)))
-                    .and_then(|r| r.node.clone()).or(Some(Node::Workspace(*wi)))
+                    .and_then(|r| r.node.clone());
+                match node {
+                    Some(Node::Spawn(_)) => node.and_then(|n| tree.chain(&n).into_iter().find(|n| !matches!(n, Node::Spawn(_)))),
+                    Some(n) => Some(n),
+                    None => Some(Node::Workspace(*wi)),
+                }
             }
             Cursor::Org(key) if key.starts_with("sidebar:member:") => Some(Node::Member(key["sidebar:member:".len()..].into())),
             Cursor::Org(key) if key.starts_with("sidebar:team:") => Some(Node::Group(key.clone())),
@@ -1358,7 +1483,7 @@ impl App {
                 .is_some_and(|ws| self.folded_workspaces.contains(&ws.id)),
             Node::Division(d) => self.folded_divisions.contains(&d.fold_key()),
             Node::Member(id) => self.folded_org.contains(&member_fold_key(id)),
-            Node::Group(key) => self.folded_org.contains(key),
+            Node::Group(key) | Node::Spawn(key) => self.folded_org.contains(key),
         }
     }
 
@@ -1382,8 +1507,14 @@ impl App {
             Cursor::Division(key) => (&mut self.folded_divisions, key.fold_key()),
             Cursor::Session(wi, si) => {
                 let tree = self.task_tree_unfolded();
-                let Some(id) = tree.member_headers.get(&(wi, si)).filter(|id| tree.member_foldable.contains(*id)).cloned() else { return false; };
-                (&mut self.folded_org, member_fold_key(&id))
+                let key = match tree.member_headers.get(&(wi, si)).filter(|id| tree.member_foldable.contains(*id)) {
+                    Some(id) => member_fold_key(id),
+                    None => match tree.spawn_headers.get(&(wi, si)) {
+                        Some(key) => key.clone(),
+                        None => return false,
+                    },
+                };
+                (&mut self.folded_org, key)
             }
             Cursor::Org(key) if checkout_key_workspace(&key).is_some() => return false,
             Cursor::Org(key) if key.starts_with("sidebar:member:") => {
@@ -2300,6 +2431,226 @@ mod tree_tests {
         }).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("⟳"), "{rendered}");
         println!("{rendered}");
+    }
+
+    /// Org rows as `<cells>label`: sessions (boxed or not) by uid, org
+    /// headers by label, so nesting depth reads off the `>` count.
+    fn org_outline(app: &App) -> Vec<String> {
+        let tree = app.task_tree();
+        tree.items.iter().filter_map(|vi| {
+            let label = match vi {
+                VisualItem::Session(wi, si) | VisualItem::ContinuousTeamSession(wi, si) =>
+                    app.workspaces[*wi].sessions[*si].uid.clone(),
+                VisualItem::OrgHeader { key, .. } => tree.org_labels.get(key)?.clone(),
+                _ => return None,
+            };
+            Some(format!("{}{label}", ">".repeat(tree.rows.get(vi)?.cells.len())))
+        }).collect()
+    }
+
+    fn rendered(app: &mut App, height: u16) -> Vec<String> {
+        let buffer = sidebar_buffer(app, height);
+        (0..buffer.area.height).map(|y|
+            (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect()).collect()
+    }
+
+    /// EP's main spawned notes, lead and report; lead spawned broker (in
+    /// its own checkout) and sub (in another); sub spawned leaf.
+    fn spawn_chain_app() -> App {
+        use super::super::org_model::fixtures::{member, owner, snapshot};
+        use cm_daemon::host_id::HostId;
+        let mut app = test_app();
+        app.sidebar_view = SidebarView::Task;
+        app.workspaces = ["home", "lead-ck", "sub-ck", "side"].into_iter().map(bare_ws).collect();
+        for (wi, uid, spawner) in [(0, "main", None), (0, "notes", Some("main")), (1, "lead", Some("main")),
+            (1, "broker", Some("lead")), (2, "sub", Some("lead")), (2, "leaf", Some("sub")), (3, "report", Some("main"))]
+        {
+            session(&mut app, wi, uid, uid, "codex");
+            let ts = app.workspaces[wi].sessions.last_mut().unwrap();
+            ts.host_id = HostId::new("h1");
+            ts.managed_by_uid = spawner.map(String::from);
+        }
+        let mut ep = member("ep", "EP", Some("mem-owner"), None, Some("main"));
+        ep["assistants"] = serde_json::json!(["notes", "lead", "broker", "sub", "leaf", "report"].iter()
+            .map(|uid| serde_json::json!({"daemon_id":"d1", "session_uid": uid, "acting_as":"assistant"})).collect::<Vec<_>>());
+        let mut value = snapshot(1, vec![owner(), ep], vec![]);
+        value["host_daemons"] = serde_json::json!({"h1":"d1"});
+        app.org.accept(value);
+        app
+    }
+
+    /// Owner, 2026-11-25: a member's assistants nest under the session
+    /// that spawned them, at any depth, instead of one flat list.
+    #[test]
+    fn a_three_level_spawn_chain_nests_under_its_spawners_and_folds() {
+        let mut app = spawn_chain_app();
+        let nested = vec!["main", ">notes", ">· lead-ck", ">lead", ">>broker", ">>sub", ">>>leaf", ">· side", ">report"];
+        assert_eq!(org_outline(&app), nested);
+        let tree = app.task_tree();
+        let lead_key = spawn_fold_key("h1", "lead");
+        let sub_key = spawn_fold_key("h1", "sub");
+        assert_eq!(tree.spawn_headers, HashMap::from([((1, 0), lead_key.clone()), ((2, 0), sub_key.clone())]));
+        assert_eq!(tree.parents.get(&Node::Spawn(lead_key.clone())), Some(&Node::Member("ep".into())));
+        assert_eq!(tree.parents.get(&Node::Spawn(sub_key.clone())), Some(&Node::Spawn(lead_key.clone())));
+        assert_eq!(tree.rows[&VisualItem::Session(2, 1)].node, Some(Node::Spawn(sub_key.clone())));
+        assert!(tree.within(&Node::Spawn(sub_key.clone()), &Node::Member("ep".into())));
+        app.cursor = Cursor::Session(2, 1);
+        assert_eq!(app.cursor_node(), Some(Node::Member("ep".into())), "the focus strip still spans the whole block");
+        // A nested row in another checkout than its spawner names it; the
+        // top-level rows keep their checkout subheadings.
+        assert_eq!(tree.checkout_labels.get(&VisualItem::Session(2, 0)).map(String::as_str), Some("sub-ck"));
+        assert!(!tree.checkout_labels.contains_key(&VisualItem::Session(1, 1)));
+        assert!(!tree.checkout_labels.contains_key(&VisualItem::Session(2, 1)));
+
+        let lines = rendered(&mut app, 30);
+        let screenshot = lines.join("\n");
+        println!("{screenshot}");
+        // `(line, column)` of a whole-word label (not `lead` in `lead-ck`).
+        let find = |lines: &[String], name: &str| lines.iter().find_map(|l| {
+            let chars: Vec<char> = l.chars().collect();
+            let word: Vec<char> = name.chars().collect();
+            (1..chars.len()).find(|&i| chars[i - 1] == ' ' && chars[i..].starts_with(&word)
+                && chars.get(i + word.len()).is_none_or(|c| *c == ' ')).map(|at| (l.clone(), at))
+        }).unwrap_or_else(|| panic!("{name} not drawn: {lines:#?}"));
+        let col = |name: &str| find(&lines, name).1;
+        assert_eq!(col("broker"), col("lead"), "a sub-lead's spawns align under its label: {screenshot}");
+        assert!(col("lead") > col("notes") && col("leaf") > col("broker"), "{screenshot}");
+        assert_eq!(col("notes"), col("report"));
+        let line = |name: &str| find(&lines, name).0;
+        assert!(line("lead").contains('▾') && line("sub").contains('▾') && !line("broker").contains('▾'), "{screenshot}");
+        assert!(line("sub").contains("· sub-ck"), "{screenshot}");
+
+        // Alt+Space on a sub-lead folds what it spawned behind a rollup.
+        let alt_space = Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::ALT));
+        app.cursor = Cursor::Session(1, 0);
+        assert!(app.handle_event(&alt_space));
+        assert_eq!(org_outline(&app), vec!["main", ">notes", ">· lead-ck", ">lead", ">· side", ">report"]);
+        assert_eq!(app.task_tree().folded.get(&Node::Spawn(lead_key.clone())).map(|r| r.0), Some(3));
+        let lines = rendered(&mut app, 30);
+        let lead_line = find(&lines, "lead").0;
+        println!("{}", lines.join("\n"));
+        assert!(lead_line.contains('▸') && lead_line.contains("(3)"), "{lines:#?}");
+        assert!(app.handle_event(&alt_space));
+        assert_eq!(org_outline(&app), nested, "Alt+Space unfolds it again");
+
+        // Nested folds are independent; a jump to a hidden row opens them.
+        app.cursor = Cursor::Session(2, 0);
+        assert!(app.toggle_tree_fold());
+        assert!(!org_outline(&app).contains(&">>>leaf".to_string()));
+        assert!(org_outline(&app).contains(&">>broker".to_string()));
+        app.cursor = Cursor::Session(1, 0);
+        assert!(app.toggle_tree_fold());
+        assert!(app.reveal_session("leaf"));
+        assert_eq!(org_outline(&app), nested);
+
+        // The member fold still hides the whole block, nested rows included.
+        app.cursor = Cursor::Session(0, 0);
+        assert!(app.toggle_tree_fold());
+        assert_eq!(org_outline(&app), vec!["main"]);
+        assert_eq!(app.task_tree().folded.get(&Node::Member("ep".into())).map(|r| r.0), Some(6));
+        assert!(app.toggle_tree_fold());
+
+        // A continuous box draws the same chain.
+        use super::super::org_model::fixtures::{member, owner, snapshot, team};
+        let mut ep = member("ep", "EP", Some("mem-owner"), Some("ct"), Some("main"));
+        ep["assistants"] = serde_json::json!(["notes", "lead", "broker", "sub", "leaf", "report"].iter()
+            .map(|uid| serde_json::json!({"daemon_id":"d1", "session_uid": uid, "acting_as":"worker"})).collect::<Vec<_>>());
+        let mut ct = team("ct", "Continuous", None, Some("ep"), &[("ep", "primary")]);
+        ct["continuous"] = serde_json::json!({"lead_member_id":"ep", "health":"ok"});
+        let mut value = snapshot(2, vec![owner(), ep], vec![ct]);
+        value["host_daemons"] = serde_json::json!({"h1":"d1"});
+        app.org.accept(value);
+        assert_eq!(org_outline(&app), nested);
+        let tree = app.task_tree();
+        assert!(tree.items.contains(&VisualItem::ContinuousTeamSession(2, 1)) && !tree.items.contains(&VisualItem::Session(2, 1)));
+        assert_eq!(tree.spawn_headers.len(), 2);
+        app.cursor = Cursor::Session(1, 0);
+        assert!(app.handle_event(&alt_space));
+        assert!(!app.task_tree().items.contains(&VisualItem::ContinuousTeamSession(1, 1)), "boxed sub-leads fold too");
+    }
+
+    /// A spawner drawn in another member's block, in a continuation or on
+    /// another host never captures a row: it stays where it was.
+    #[test]
+    fn a_spawner_outside_the_block_does_not_capture() {
+        use super::super::org_model::fixtures::{member, owner, snapshot};
+        use cm_daemon::host_id::HostId;
+        let mut app = test_app();
+        app.sidebar_view = SidebarView::Task;
+        app.workspaces = ["a-home", "b-home", "stream", "remote"].into_iter().map(bare_ws).collect();
+        for (wi, uid, spawner, host) in [
+            (0, "a", None, "h1"), (0, "a-helper", Some("a"), "h1"), (0, "a-child", Some("a-stream"), "h1"),
+            (1, "b", None, "h1"), (1, "x", Some("a-helper"), "h1"),
+            (2, "a-stream", Some("a"), "h1"),
+            (3, "y", Some("a-helper"), "h2"),
+        ] {
+            session(&mut app, wi, uid, uid, "codex");
+            let ts = app.workspaces[wi].sessions.last_mut().unwrap();
+            ts.host_id = HostId::new(host);
+            ts.managed_by_uid = spawner.map(String::from);
+        }
+        app.sections = ["s1", "s2"].into_iter().map(|id| SidebarSection { id: id.into(), name: id.to_uppercase(), ..Default::default() }).collect();
+        app.member_sections.insert("a".into(), "s1".into());
+        app.workspace_sections.insert("stream".into(), "s2".into());
+        let mut a = member("a", "A", Some("mem-owner"), None, Some("a"));
+        a["assistants"] = serde_json::json!([
+            {"daemon_id":"d1", "session_uid":"a-helper", "acting_as":"assistant"},
+            {"daemon_id":"d1", "session_uid":"a-child", "acting_as":"assistant"},
+            {"daemon_id":"d1", "session_uid":"a-stream", "acting_as":"assistant"},
+            {"daemon_id":"d2", "session_uid":"y", "acting_as":"assistant"}]);
+        let mut b = member("b", "B", Some("mem-owner"), None, Some("b"));
+        b["assistants"] = serde_json::json!([{"daemon_id":"d1", "session_uid":"x", "acting_as":"assistant"}]);
+        let mut value = snapshot(1, vec![owner(), a, b], vec![]);
+        value["host_daemons"] = serde_json::json!({"h1":"d1", "h2":"d2"});
+        app.org.accept(value);
+        let tree = app.task_tree();
+        assert!(tree.spawn_headers.is_empty(), "{:?}", org_outline(&app));
+        let cells = |wi: usize, si: usize| tree.rows[&VisualItem::Session(wi, si)].cells.clone();
+        assert_eq!(cells(1, 1), vec![Node::Member("b".into())], "x stays in B's block, under B");
+        assert_eq!(cells(0, 2), vec![Node::Member("a".into())], "a-child's spawner is in a continuation");
+        assert_eq!(cells(3, 0), vec![Node::Member("a".into())], "y's spawner uid is on another host");
+        assert!(tree.org_labels.values().any(|label| label.contains("↳ A · stream")));
+        for (wi, ws) in app.workspaces.iter().enumerate() {
+            for si in 0..ws.sessions.len() {
+                assert_eq!(tree.items.iter().filter(|row| **row == VisualItem::Session(wi, si)).count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn spawn_cycles_and_missing_spawners_stay_safe() {
+        let rows = [((0, 0), "h", "p", Some("q")), ((0, 1), "h", "q", Some("p")), ((0, 2), "h", "s", Some("s")),
+            ((0, 3), "h", "t", Some("gone")), ((0, 4), "h", "u", Some("p")), ((0, 5), "h", "v", None)];
+        assert_eq!(spawn_parents(&rows), HashMap::from([((0, 1), (0, 0)), ((0, 4), (0, 0))]),
+            "the cycle breaks at its lowest row; self, missing and absent spawners stay top-level");
+        let three = [((1, 2), "h", "a", Some("c")), ((1, 0), "h", "b", Some("a")), ((1, 1), "h", "c", Some("b")),
+            ((1, 3), "h", "d", Some("b"))];
+        assert_eq!(spawn_parents(&three), HashMap::from([((1, 1), (1, 0)), ((1, 2), (1, 1)), ((1, 3), (1, 0))]));
+
+        use super::super::org_model::fixtures::{member, owner, snapshot};
+        use cm_daemon::host_id::HostId;
+        let mut app = test_app();
+        app.sidebar_view = SidebarView::Task;
+        app.workspaces = vec![bare_ws("home")];
+        for (uid, spawner) in [("m", None), ("p", Some("q")), ("q", Some("p")), ("lost", Some("gone-uid")), ("self", Some("self"))] {
+            session(&mut app, 0, uid, uid, "codex");
+            let ts = app.workspaces[0].sessions.last_mut().unwrap();
+            ts.host_id = HostId::new("h1");
+            ts.managed_by_uid = spawner.map(String::from);
+        }
+        let mut m = member("m", "M", Some("mem-owner"), None, Some("m"));
+        m["assistants"] = serde_json::json!(["p", "q", "lost", "self"].iter()
+            .map(|uid| serde_json::json!({"daemon_id":"d1", "session_uid": uid, "acting_as":"assistant"})).collect::<Vec<_>>());
+        let mut value = snapshot(1, vec![owner(), m], vec![]);
+        value["host_daemons"] = serde_json::json!({"h1":"d1"});
+        app.org.accept(value);
+        assert_eq!(org_outline(&app), vec!["m", ">p", ">>q", ">lost", ">self"]);
+        app.cursor = Cursor::Session(0, 1);
+        assert!(app.toggle_tree_fold());
+        assert_eq!(org_outline(&app), vec!["m", ">p", ">lost", ">self"]);
+        assert_eq!(app.task_tree().folded.get(&Node::Spawn(spawn_fold_key("h1", "p"))).map(|r| r.0), Some(1));
+        app.cursor = Cursor::Session(0, 3);
+        assert!(!app.toggle_tree_fold(), "a row without spawns has nothing to fold");
     }
 
     /// A session of `engine` on task `tid`, live, with a well-formed uid.
