@@ -434,6 +434,7 @@ pub struct PlanningParent {
 pub struct DaemonState {
     pub staffing: Arc<Mutex<crate::staffing::Cache>>,
     pub messaging: Arc<Mutex<Option<crate::messaging::Store>>>,
+    pub messaging_health: Arc<crate::messaging::health::Health>,
     /// One background opener per brain; rebuilding never holds daemon/store locks.
     pub messaging_startup: Arc<std::sync::atomic::AtomicBool>,
     /// Name recovery must not persist the session registry before adoption finishes.
@@ -917,6 +918,7 @@ impl Default for DaemonState {
             workflow_definitions: HashMap::new(),
             base_workflow_definitions: HashMap::new(),
             messaging: Arc::new(Mutex::new(None)),
+            messaging_health: Arc::new(crate::messaging::health::Health::default()),
             staffing: Arc::new(Mutex::new(crate::staffing::Cache::default())),
             messaging_startup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             messaging_registry_restored: false,

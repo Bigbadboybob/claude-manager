@@ -574,7 +574,7 @@ pub(crate) fn refresh(state: &Arc<Mutex<DaemonState>>) -> Result<RefreshOutcome,
         .map(|t| (t.task_id.clone(), t))
         .collect();
     {
-        let slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+        let slot = super::health::store_lock(&handle);
         if let Some(store) = slot.as_ref() {
             for id in store.configured_task_ids() {
                 if !records.contains_key(&id) {
@@ -585,7 +585,7 @@ pub(crate) fn refresh(state: &Arc<Mutex<DaemonState>>) -> Result<RefreshOutcome,
             }
         }
     }
-    let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+    let mut slot = super::health::store_lock(&handle);
     let Some(store) = slot.as_mut() else { return Ok(RefreshOutcome::Deferred); };
     if store.messaging_frozen() {
         return Ok(RefreshOutcome::Deferred);

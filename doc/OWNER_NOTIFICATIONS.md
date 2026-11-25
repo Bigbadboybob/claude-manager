@@ -146,3 +146,40 @@ Regression coverage is in `daemon/src/owner_attention.rs`,
 checks the production desktop transport against a private D-Bus receiver; it
 does not establish that a popup was visible on Owner's laptop. Run Rust tests only through
 `scripts/cm-test-isolated` with a private `CARGO_TARGET_DIR`.
+
+## Messaging RPC health
+
+Each daemon keeps host-local, in-memory one-minute buckets for messaging RPCs.
+`daemon.health.messaging_health` reports the last 15 minutes by default:
+completed RPC count, p50/p95/max store-lock wait in milliseconds, cumulative
+and maximum total RPC time, slow count, sheds, errors, and the same figures by
+method. `top_holders` ranks messaging methods by cumulative store-lock hold
+time, including an active holder; `by_method.*.total_hold_ms` counts completed
+RPCs. Completed holds are split across the minutes when the lock was held; active
+holds contribute only their time inside the window. Background store users are not attributed
+to messaging RPC methods. Wait percentiles are upper bounds from a bounded histogram; max is
+exact. With a non-default wait threshold, a histogram bound can make a
+minute appear bad slightly before its actual p95 crosses that threshold.
+`in_flight_waits` and `max_in_flight_wait_ms` expose requests still
+waiting for the store, which are not yet included in completed RPC counts.
+Wait is the sum of measured store-lock acquisitions on the RPC thread; total
+includes the whole dispatch. Slow means total time exceeds `slow_total_ms`.
+
+A minute is bad when its completed-RPC p95 wait exceeds 10 seconds, any read
+is shed as busy, or a store wait still in flight exceeds 10 seconds. Three bad
+minutes among the last five make the state `degraded` and raise one blocking
+Owner attention alert with the host, five-minute p95/max wait, sheds, top measured store-lock holder, and host
+load averages. The in-flight maximum also contributes to the alert's max, so
+stuck requests can trigger the alarm before they finish. While degraded, an
+acknowledged alert can recur after 30 minutes; pending alerts coalesce. Five
+minutes without a bad observation return the state to `ok` and withdraw the
+alert. State transitions are logged as structured `messaging_health` lines.
+A daemon restart resets the measurement window; the alert episode and cooldown
+are retained, and an existing episode takes five healthy minutes to clear.
+
+These hot-reloadable `[messaging_health]` keys in `daemon.toml` have defaults:
+`window_minutes = 15`, `evaluation_minutes = 5`, `bad_minutes = 3`,
+`wait_threshold_ms = 10000`, `slow_total_ms = 10000`,
+`recovery_minutes = 5`, and `realert_minutes = 30`. Windows are bounded to
+1–60 minutes, bad minutes to 1–evaluation minutes, and recovery/cooldown to
+1–1440 minutes. This alarm observes chat; it adds no chat admission rule.

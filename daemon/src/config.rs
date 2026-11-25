@@ -430,6 +430,9 @@ pub struct DaemonConfig {
     /// disables search. Applied on the next messaging RPC after config reload.
     #[serde(default = "default_chat_search_budget_bytes")]
     pub chat_search_budget_bytes: usize,
+    /// Host-local chat latency window and alarm thresholds.
+    #[serde(default)]
+    pub messaging_health: crate::messaging::health::Config,
     /// Project Claude presence into the legacy idle boolean. Disable and call
     /// daemon.reload_config to restore PTY-based idle while keeping agent_state.
     #[serde(default = "default_presence_idle_enabled")]
@@ -637,6 +640,7 @@ impl Default for DaemonConfig {
             memory: MemoryConfig::default(),
             s4_min_write: false,
             chat_search_budget_bytes: default_chat_search_budget_bytes(),
+            messaging_health: crate::messaging::health::Config::default(),
             presence_idle_enabled: default_presence_idle_enabled(),
             workflow_state_gate: false,
             mcp_server_path: String::new(),
@@ -953,6 +957,7 @@ mode = "ssh-trust"
             s4_min_write: true,
             transcript_rotation: Default::default(),
             chat_search_budget_bytes: 128 * 1024 * 1024,
+            messaging_health: Default::default(),
             presence_idle_enabled: false,
             workflow_state_gate: true,
             mcp_server_path: "/opt/x.py".into(),
