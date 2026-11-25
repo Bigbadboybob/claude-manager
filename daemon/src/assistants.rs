@@ -347,6 +347,22 @@ pub fn home_refusal(state: &DaemonState, uid: &str, member_id: &str) -> Option<&
     other_main.then_some("shared_checkout")
 }
 
+/// Reconcile explicit API assignments after a lost response or restart.
+pub fn reconcile_assignments(state: &mut DaemonState, assignments: &Value) -> Vec<String> {
+    let mut changed = Vec::new();
+    if let Some(assignments) = assignments.as_object() {
+        for (uid, member) in assignments {
+            if let (Some(sess), Some(member_id)) = (state.sessions.get_mut(uid), member.as_str()) {
+                if stamped_member(sess.org.as_ref()).as_deref() != Some(member_id) {
+                    stamp(&mut sess.org, member_id, ASSISTANT, "reassign:api");
+                    changed.push(uid.clone());
+                }
+            }
+        }
+    }
+    changed
+}
+
 /// A promote whose local half never ran (the brain died between the API's
 /// commit and the stamp): the member cache now says `uid` is a member's main
 /// while its own record still says assistant. Record it as that member's

@@ -32,6 +32,7 @@ pub const METHODS: &[&str] = &[
     "org.reinstate",
     "org.close_assistant",
     "org.promote",
+    "org.reassign",
     "org.rebind_main",
     "org.hire",
     "org.member_update",
@@ -125,6 +126,7 @@ pub fn dispatch(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Response {
             }
             "org.close_assistant" => close_assistant(state, &ctx, p),
             "org.promote" => promote(state, &ctx, p),
+            "org.reassign" => reassign(state, &ctx, p),
             "org.rebind_main" => rebind_main(state, &ctx, p),
             other => Err((ErrorCode::UnknownMethod, format!("unknown org method {other}"))),
         }
@@ -755,6 +757,65 @@ fn rebind_main(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, mut p: Map<String, Va
     Ok(out)
 }
 
+// Compare the local live subtree with the API's heartbeat facts before a
+// write. A newly spawned but unreported child must not be silently omitted.
+pub(crate) fn expected_subtree(state: &DaemonState, root: &str, include_root: bool) -> Vec<String> {
+    let mut result = Vec::new();
+    for (uid, sess) in &state.sessions {
+        if uid == root && !include_root { continue; }
+        if !matches!(sess.session_type.as_str(), "claude-code" | "codex" | "claude")
+            || sess.continuous_task_id.is_some()
+            || crate::agent_state::current(sess).state.as_str() == "exited" { continue; }
+        if crate::assistants::of_session(sess).is_some_and(|membership|
+            membership.acting_as == crate::assistants::MAIN
+                || crate::assistants::is_continuous_member(&membership.member_id)) { continue; }
+        let mut cursor = Some(uid.as_str());
+        let mut seen = HashSet::new();
+        while let Some(current) = cursor {
+            if current == root { result.push(uid.clone()); break; }
+            if !seen.insert(current) { break; }
+            let Some(parent) = state.sessions.get(current) else { break };
+            if current != uid && (parent.continuous_task_id.is_some()
+                || crate::assistants::of_session(parent).is_some_and(|m| m.acting_as == crate::assistants::MAIN
+                    || crate::assistants::is_continuous_member(&m.member_id))) { break; }
+            cursor = parent.managed_by_uid.as_deref();
+        }
+    }
+    result.sort();
+    result
+}
+
+fn stamp_reassigned(state: &mut DaemonState, reply: &Value) {
+    if !crate::assistants::reconcile_assignments(state, &reply["current_assignments"]).is_empty() {
+        state.persist_sessions_best_effort();
+    }
+}
+
+fn reassign(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, mut p: Map<String, Value>) -> RpcResult {
+    let uid = match take_str(&mut p, "session")? {
+        Some(uid) => uid,
+        None => take_str(&mut p, "session_uid")?.ok_or_else(|| bad("org.reassign needs session"))?,
+    };
+    let member = take_str(&mut p, "member")?.ok_or_else(|| bad("org.reassign needs member"))?;
+    let reason = take_str(&mut p, "reason")?.ok_or_else(|| bad("org.reassign needs reason"))?;
+    let expected = {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        if !s.sessions.contains_key(&uid) {
+            return Err((ErrorCode::NotFound, format!("not_found: no session '{uid}' on this daemon")));
+        }
+        expected_subtree(&s, &uid, true)
+    };
+    let mut body = Map::new();
+    body.insert("expected_sessions".into(), json!(expected));
+    body.insert("pid".into(), json!(format!("agent:{}:{uid}", ctx.daemon_id)));
+    body.insert("member".into(), json!(member));
+    body.insert("reason".into(), json!(reason));
+    if let Some(v) = p.get("request_id") { body.insert("request_id".into(), v.clone()); }
+    let reply = api(ctx.api.post("/org/assistants/reassign", &with_actor(ctx, body)))?;
+    stamp_reassigned(&mut state.lock().unwrap_or_else(|p| p.into_inner()), &reply);
+    Ok(reply)
+}
+
 /// `org.promote` (doc/org-model.md §4.2): one of a member's assistants on
 /// this daemon becomes the main session of a new member managed by that
 /// member. The planning API decides who may (the member's main session, a
@@ -775,7 +836,7 @@ fn promote(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, mut p: Map<String, Value>
     // promoted: the API answers a stored request id with the first result
     // (and refuses any other), so let it decide.
     let retry = p.get("request_id").is_some_and(|v| v.is_string());
-    let (boss, home_refused) = {
+    let (boss, home_refused, expected) = {
         let s = state.lock().unwrap_or_else(|p| p.into_inner());
         let Some(sess) = s.sessions.get(&uid) else {
             return Err((ErrorCode::NotFound, format!("not_found: no live session '{uid}' on this daemon")));
@@ -800,14 +861,15 @@ fn promote(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, mut p: Map<String, Value>
                 return Err((ErrorCode::Conflict, format!("not_an_assistant: '{uid}' is not an assistant of a member")));
             }
         };
-        (boss.clone(), crate::assistants::home_refusal(&s, &uid, &boss))
+        (boss.clone(), crate::assistants::home_refusal(&s, &uid, &boss), expected_subtree(&s, &uid, false))
     };
     let pid = format!("agent:{}:{uid}", ctx.daemon_id);
     let mut body = Map::new();
     body.insert("pid".into(), json!(pid));
     body.insert("handle".into(), json!(handle));
     body.insert("reason".into(), json!(reason));
-    for key in ["title", "team", "manager", "request_id"] {
+    body.insert("expected_sessions".into(), json!(expected));
+    for key in ["title", "team", "manager", "request_id", "with_subtree"] {
         if let Some(v) = p.get(key).filter(|v| !v.is_null()) {
             body.insert(key.into(), v.clone());
         }
@@ -823,6 +885,7 @@ fn promote(state: &Arc<Mutex<DaemonState>>, ctx: &Ctx, mut p: Map<String, Value>
     let (root, ws_marked) = {
         let mut s = state.lock().unwrap_or_else(|p| p.into_inner());
         note_main(&uid, &member);
+        stamp_reassigned(&mut s, &reply);
         let ws_id = match s.sessions.get_mut(&uid) {
             Some(sess) => {
                 // A main's record: the stamp's keys now name the new member as

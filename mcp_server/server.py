@@ -1666,6 +1666,7 @@ def org(
     poc_of: str | None = None,
     hire: dict | None = None,
     continuous: dict | None = None,
+    with_subtree: bool = True,
 ) -> dict:
     """Find your place in the org: your boss, your reports, your division.
 
@@ -1741,12 +1742,18 @@ def org(
         manager chain, or Owner. Its board holds go back to the member's
         main session; its own checkout then goes through the reaper's usual
         protections.
+      - `action="reassign", session=<uid>, member=<handle|id>, reason=...`:
+        move the live assistant and its eligible spawn subtree to another member.
+        Owner or a main session up both members' manager chains may do this.
+        Member mains, continuous sessions, shells and non-live sessions are refused.
+        `stale_session_facts` means retry after the next heartbeat.
       - `action="promote", session=<uid>, handle=..., title=None, team=None,
-        manager=None, reason=...`: the assistant becomes the main session of
+        manager=None, reason=..., with_subtree=True`: the assistant becomes the main session of
         a new member `handle` reporting to its member (or to `manager`: you
         or a member below you, else `needs_owner`; `team` only one you
         lead). It keeps its uid, conversation, checkout and board holds,
-        and gets a notice. The checkout becomes the new member's home only
+        and gets a notice. Its eligible spawn subtree becomes its assistants by default;
+        set `with_subtree=False` to retain their current attribution. The checkout becomes the new member's home only
         when it is no one else's; an assistant working in its member's own
         checkout gets no home (`home: null`, `home_reason:
         "shared_checkout"`). Allowed for the
@@ -1788,7 +1795,7 @@ def org(
             "items": items, "poc_of": poc_of, "hire": hire,
         }.items() if value not in (None, "", [])}
         return {"session_uid": session_uid, "setup": _setup_session(session_uid, spec)}
-    if action in ("move", "retire", "reinstate", "close_assistant", "promote", "rebind_main") and request_id is None:
+    if action in ("move", "retire", "reinstate", "close_assistant", "promote", "reassign", "rebind_main") and request_id is None:
         request_id = f"org-{action}-{uuid.uuid4()}"
     params = {key: value for key, value in {
         "view": view, "action": action, "task_id": task_id,
@@ -1796,6 +1803,7 @@ def org(
         "member": member, "team": team, "manager": manager,
         "reason": reason, "request_id": request_id, "session": session,
         "handle": handle, "title": title,
+        "with_subtree": with_subtree if action == "promote" else None,
     }.items() if value is not None}
     route = control_client.resolve_socket_route()
     if not route.chose_daemon:
