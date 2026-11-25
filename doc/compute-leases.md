@@ -87,4 +87,7 @@ Idle, reclaim and expiry notices use the native board-push delivery channel.
 The API counts an idle notice only after the recipient daemon reports that the
 session observed it; failed or ambiguous delivery cannot authorize reclaim.
 Release and expiry stop the slice even if the workdir cannot be safely cleaned;
-the node result reports a `cleanup_skipped` reason in that case.
+`compute_status` includes the owner's 50 most recent released or failed leases,
+and a specific older lease can still be requested by ID. Released leases show
+`released_at`, `workdir_bytes` when measured, and `cleanup_skipped` when
+cleanup was skipped; unavailable values are null.

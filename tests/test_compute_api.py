@@ -93,6 +93,73 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         async with self.pool.acquire() as conn:
             self.assertEqual(await conn.fetchval("SELECT count(*) FROM compute_leases WHERE status='granting'"), 1)
 
+    async def test_release_cleanup_results_are_visible_only_to_owner(self):
+        async def finish(owner, cleanup):
+            body = self.body(owner)
+            lease = await api.request_lease(body, self.request)
+            action = (await api.executor_poll(self.request))['action']
+            await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+                'lease_id': str(lease['lease_id']), 'configured': True, 'workdir': '/work/id'}), self.request)
+            await api.release(api.LeaseChange(actor=body.actor, lease_id=lease['lease_id']), self.request)
+            action = (await api.executor_poll(self.request))['action']
+            await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+                'lease_id': str(lease['lease_id']), 'released': True, **cleanup}), self.request)
+            return body, lease['lease_id']
+
+        owner, measured = await finish('owner', {'workdir_bytes': 123})
+        _, skipped = await finish('owner', {'cleanup_skipped': 'unsafe workdir'})
+        _, private = await finish('other', {'workdir_bytes': 456})
+        # Accept both JSONB objects and the JSON-encoded strings written by
+        # earlier executor receipts.
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE compute_lease_actions SET result=$2::jsonb WHERE lease_id=$1 AND kind='release'",
+                               measured, {'lease_id': str(measured), 'released': True, 'workdir_bytes': 123})
+        result = await api.status(api.StatusRequest(actor=owner.actor), self.request)
+        recent = {lease['id']: lease for lease in result['leases']}
+        self.assertEqual(set(recent), {measured, skipped})
+        self.assertIsNotNone(recent[measured]['released_at'])
+        self.assertEqual(recent[measured]['workdir_bytes'], 123)
+        self.assertIsNone(recent[measured]['cleanup_skipped'])
+        self.assertIsNotNone(recent[skipped]['released_at'])
+        self.assertEqual(recent[skipped]['cleanup_skipped'], 'unsafe workdir')
+        self.assertIsNone(recent[skipped]['workdir_bytes'])
+        selected = await api.status(api.StatusRequest(actor=owner.actor, lease_id=skipped), self.request)
+        self.assertEqual(next(x for x in selected['leases'] if x['id'] == skipped)['cleanup_skipped'], 'unsafe workdir')
+        with self.assertRaises(api.HTTPException) as exc:
+            await api.status(api.StatusRequest(actor=owner.actor, lease_id=private), self.request)
+        self.assertEqual(exc.exception.status_code, 404)
+
+    async def test_expired_grant_release_cleanup_is_visible(self):
+        owner = self.body('owner')
+        lease = await api.request_lease(owner, self.request)
+        action = (await api.executor_poll(self.request))['action']
+        await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'expired': True, 'released': True,
+            'cleanup_skipped': 'invalid workdir root'}), self.request)
+        status = await api.status(api.StatusRequest(actor=owner.actor, lease_id=lease['lease_id']), self.request)
+        result = next(x for x in status['leases'] if x['id'] == lease['lease_id'])
+        self.assertIsNotNone(result['released_at'])
+        self.assertEqual(result['cleanup_skipped'], 'invalid workdir root')
+        self.assertIsNone(result['workdir_bytes'])
+
+    async def test_recent_history_is_bounded_but_explicit_old_lease_is_available(self):
+        import uuid
+        owner = self.body('owner')
+        ids = [uuid.uuid4() for _ in range(api.RECENT_LEASE_LIMIT + 1)]
+        async with self.pool.acquire() as conn:
+            for i, ident in enumerate(ids):
+                await conn.execute("""INSERT INTO compute_leases
+                    (id,owner,purpose,priority,class,cpus,mem_gb,duration_seconds,status,released_at)
+                    VALUES ($1,$2,'history','normal','burst',2,16,300,'released',now()+make_interval(secs => $3))""",
+                    ident, owner.actor.pid, i)
+        result = await api.status(api.StatusRequest(actor=owner.actor), self.request)
+        self.assertEqual(len(result['leases']), api.RECENT_LEASE_LIMIT)
+        self.assertNotIn(ids[0], [lease['id'] for lease in result['leases']])
+        result = await api.status(api.StatusRequest(actor=owner.actor, lease_id=ids[0]), self.request)
+        oldest = next(lease for lease in result['leases'] if lease['id'] == ids[0])
+        self.assertIsNone(oldest['cleanup_skipped'])
+        self.assertIsNone(oldest['workdir_bytes'])
+
     async def test_configured_box_stays_off_until_confirmed_drained(self):
         async with self.pool.acquire() as conn:
             await conn.execute('DELETE FROM compute_boxes')

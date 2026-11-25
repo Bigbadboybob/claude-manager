@@ -22,6 +22,7 @@ from dispatch.compute_idle import Sample, idle_average, next_idle_action
 router = APIRouter(prefix='/compute', dependencies=[Depends(verify_token)])
 logger = logging.getLogger('cm.api.compute')
 LOCK_KEY = 746392015
+RECENT_LEASE_LIMIT = 50
 
 
 class Actor(BaseModel):
@@ -262,8 +263,45 @@ async def status(body: StatusRequest, request: Request):
         for lease in mine:
             if lease['id'] in no_fit:
                 lease['waiting'] = 'no enabled box fits'
-        if body.lease_id and row['status'] not in ('queued', 'granting', 'active', 'releasing'):
+        recent = await conn.fetch("""SELECT * FROM compute_leases
+            WHERE owner=$1 AND status IN ('released','failed')
+            ORDER BY COALESCE(released_at, created_at) DESC, id DESC LIMIT $2""",
+                                  owner, RECENT_LEASE_LIMIT)
+        mine.extend(_public(dict(r), boxes) for r in recent)
+        if (body.lease_id and row['status'] not in ('queued', 'granting', 'active', 'releasing')
+                and not any(lease['id'] == row['id'] for lease in mine)):
             mine.append(_public(dict(row), boxes))
+        released = {lease['id']: lease for lease in mine if lease['status'] == 'released'}
+        if released:
+            # An expired grant can itself release the node lease. Otherwise
+            # the completed release action contains the cleanup outcome.
+            results = await conn.fetch("""SELECT lease_id, kind, result
+                FROM compute_lease_actions WHERE lease_id=ANY($1::uuid[]) AND status='done'
+                AND kind IN ('release', 'grant')
+                ORDER BY lease_id, (kind='release') DESC, created_at DESC, id DESC""", list(released))
+            for lease in released.values():
+                lease.update(cleanup_skipped=None, workdir_bytes=None)
+            seen = set()
+            for action in results:
+                if action['lease_id'] in seen:
+                    continue
+                result = action['result']
+                # Older writes may be JSON strings inside JSONB. A pool with
+                # the JSONB codec already decodes the outer layer; a pool
+                # without it returns both layers as text.
+                for _ in range(2):
+                    if not isinstance(result, str):
+                        break
+                    try:
+                        result = json.loads(result)
+                    except ValueError:
+                        break
+                if (isinstance(result, dict) and result.get('released') is True and
+                        (action['kind'] == 'release' or result.get('expired') is True)):
+                    released[action['lease_id']].update(
+                        cleanup_skipped=result.get('cleanup_skipped'),
+                        workdir_bytes=result.get('workdir_bytes'))
+                    seen.add(action['lease_id'])
         ordered = queue_order(rows)
         queue = [{'lease_id': r['id'], 'priority': r['priority'], 'cpus': r['cpus'],
                   'owner': r['owner'], 'team': r['team'], 'purpose': r['purpose'],
