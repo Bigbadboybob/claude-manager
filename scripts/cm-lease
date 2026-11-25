@@ -180,8 +180,6 @@ def grant(args, cfg):
         props = [f'MemoryMax={args.mem_gb}G']
         if args.pin:
             props.append(f'AllowedCPUs={args.pin}')
-        else:
-            props.append(f'CPUQuota={args.slots * cfg["cpus_per_slot"] * 100}%')
         run('/usr/bin/systemctl', 'set-property', '--runtime', unit(args.lease_id), *props)
     except Exception:
         # Keep the reservation: a timeout may have succeeded remotely.

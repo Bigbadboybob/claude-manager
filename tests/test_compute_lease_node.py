@@ -38,15 +38,14 @@ def context(tmp_path, monkeypatch):
     return cfg, args, calls
 
 
-def test_grant_is_idempotent_and_loose_limits_memory_and_cpu(context):
+def test_grant_is_idempotent_and_loose_limits_memory_only(context):
     cfg, args, calls = context
     first = node.grant(args, cfg)
     second = node.grant(args, cfg)
     assert first == second
     properties = [call for call in calls if 'set-property' in call]
     assert len(properties) == 2
-    assert all('MemoryMax=16G' in call and 'CPUQuota=200%' in call for call in properties)
-    assert all(not any('AllowedCPUs' in value for value in call) for call in properties)
+    assert all(call[4:] == ('MemoryMax=16G',) for call in properties)
 
 
 def test_interrupted_grant_remains_reserved_and_is_reconfigured(context, monkeypatch):
@@ -66,7 +65,8 @@ def test_pinned_grant_and_release_address_only_lease_slice(context):
     cfg, args, calls = context
     args.pin = '0,8'
     node.grant(args, cfg)
-    assert any('AllowedCPUs=0,8' in call for call in calls)
+    properties = next(call for call in calls if 'set-property' in call)
+    assert properties[4:] == ('MemoryMax=16G', 'AllowedCPUs=0,8')
     result = node.release(LEASE, cfg)
     assert result['released']
     assert calls[-1] == ('/usr/bin/systemctl', 'stop', 'cmlease-' + LEASE + '.slice')

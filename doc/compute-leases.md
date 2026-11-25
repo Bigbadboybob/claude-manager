@@ -9,7 +9,8 @@ pinned)` with duration in seconds, then `compute_status(lease_id)` while
 waiting. Priorities are `v221-gate`, `normal`, and `low`; classes are `burst`
 and `long`. A granted lease identifies its box, CPU slots, expiry, SSH alias,
 workdir, and command prefix. Pinned requests restrict CPU placement; loose
-requests have memory and CPU quota limits. Release with `compute_release`.
+requests have a memory limit and share CPUs through the OS scheduler. Release
+with `compute_release`.
 Only work run under the returned prefix is accounted to the lease.
 Use `v221-gate` only for work named by EP or the deploy lead, and put the
 authorizing ruling ID in the purpose. Requests above the normal per-lease slot
