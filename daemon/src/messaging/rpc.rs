@@ -417,12 +417,36 @@ fn execute_sync_admin(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<
     }
     result
 }
+/// Reads that waited this long for the store are dropped unexecuted. The MCP
+/// daemon-socket timeout (30 s) is longer, so a caller still waiting gets a clear
+/// retryable error instead of a timeout.
+const STALE_READ_AFTER: std::time::Duration = std::time::Duration::from_secs(25);
+
+fn shed_stale_read(method: &str, waited: std::time::Duration) -> bool {
+    waited >= STALE_READ_AFTER
+        && matches!(method, "messaging.read" | "messaging.dms" | "messaging.open" | "messaging.people" | "messaging.counts")
+}
+
+#[cfg(test)]
+mod shed_tests {
+    use super::*;
+    use std::time::Duration;
+    #[test]
+    fn sheds_only_stale_reads() {
+        assert!(shed_stale_read("messaging.read", Duration::from_secs(26)));
+        assert!(!shed_stale_read("messaging.read", Duration::from_secs(5)));
+        assert!(!shed_stale_read("messaging.send", Duration::from_secs(300)));
+        assert!(!shed_stale_read("messaging.mark_read", Duration::from_secs(300)));
+    }
+}
+
 fn execute_with_freshness(
     state: &Arc<Mutex<DaemonState>>,
     req: &Request,
     caught_up: bool,
     peer_pid: Option<u32>,
 ) -> Result<Value, ChatError> {
+    let arrived = std::time::Instant::now();
     let s4_snapshot = match &req.caller {
         Caller::Session(c) if req.method == "messaging.send" =>
             crate::items::s4_attribution::current().0.get(&c.session_uid).cloned(),
@@ -513,6 +537,16 @@ fn execute_with_freshness(
     let _delivery_guard =
         coordinates_delivery.then(|| delivery_gate.lock().unwrap_or_else(|p| p.into_inner()));
     let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+    // Load shedding: a read that queued longer than the MCP client's own
+    // timeout has no one waiting for it. Running it anyway (a full candidate
+    // scan under the store lock) is what turned a post-restart burst into a
+    // standing queue on cm-sessions on 2026-11-25. Writes are never shed.
+    if shed_stale_read(req.method.as_str(), arrived.elapsed()) {
+        return Err(ChatError {
+            code: "busy".into(),
+            message: "CM messaging on this host is overloaded; nothing changed. Retry in a few seconds.".into(),
+        });
+    }
     let store = slot.as_mut().ok_or_else(super::startup::starting)?;
     store.configure_search(&handle, search_budget);
     let actor = if kind == "owner" {
