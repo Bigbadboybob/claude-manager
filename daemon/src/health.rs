@@ -124,6 +124,7 @@ pub fn spawn(state: Arc<Mutex<DaemonState>>) {
         .spawn(move || {
             let mut disk = DiskWatch::default();
             let mut next_disk = Instant::now();
+            let mut next_chat = Instant::now();
             let mut expected = Instant::now() + TICK;
             loop {
                 std::thread::sleep(expected.saturating_duration_since(Instant::now()));
@@ -137,6 +138,10 @@ pub fn spawn(state: Arc<Mutex<DaemonState>>) {
                 }
                 expected = now + TICK;
                 flush_idle_burst(now);
+                if now >= next_chat {
+                    next_chat = now + Duration::from_secs(10);
+                    crate::messaging::health::alarm_pass(&state);
+                }
                 if now >= next_disk {
                     next_disk = now + DISK_EVERY;
                     disk.check(&state, &DISK_MOUNTS);

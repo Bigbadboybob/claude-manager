@@ -4792,6 +4792,7 @@ pub fn daemon_health(state_arc: &Arc<Mutex<DaemonState>>) -> MethodResult {
         "holder_status_error": holder_status_err,
         "mcp_ok": mcp_ok,
         "mcp_detail": mcp_detail,
+        "messaging_health": state.messaging_health.snapshot(&state.config.messaging_health),
         "messaging_sync": messaging_sync,
         "messaging_sync_state": messaging_sync_state,
         "owner_notifications": state.owner_notifications.health(),
@@ -23080,6 +23081,8 @@ mod tests {
         let state = Arc::new(Mutex::new(DaemonState::new()));
         let unrun = daemon_health(&state).expect("health ok");
         assert_eq!(unrun["mcp_ok"], json!(false));
+        assert_eq!(unrun["messaging_health"]["state"], "ok");
+        assert_eq!(unrun["messaging_health"]["window_minutes"], 15);
 
         state.lock().unwrap().mcp_preflight = Some(Err("no venv".into()));
         let failed = daemon_health(&state).expect("health ok");
@@ -24788,6 +24791,7 @@ mod tests {
                 s4_min_write: false,
                 transcript_rotation: Default::default(),
                 chat_search_budget_bytes: 512 * 1024 * 1024,
+                messaging_health: Default::default(),
                 presence_idle_enabled: true,
                 workflow_state_gate: false,
                 mcp_server_path:
