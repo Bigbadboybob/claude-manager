@@ -49,7 +49,8 @@ def queue_order(leases: Sequence[Mapping]) -> list[Mapping]:
                   key=lambda x: (PRIORITIES[x["priority"]], x["created_at"], str(x["id"])))
 
 
-def limit_reason(lease: Mapping, leases: Sequence[Mapping], policy: Policy) -> str | None:
+def limit_reason(lease: Mapping, leases: Sequence[Mapping], policy: Policy,
+                 enabled_boxes: Sequence[Box]) -> str | None:
     """Distinguish the team soft cap from limits that must retain queue order."""
     count = slots_needed(lease, policy)
     if count > policy.max_slots_per_lease and not str(lease.get("purpose") or "").strip():
@@ -58,7 +59,9 @@ def limit_reason(lease: Mapping, leases: Sequence[Mapping], policy: Policy) -> s
     if sum(slots_needed(x, policy) for x in occupied if x["owner"] == lease["owner"]) + count > policy.max_slots_per_session:
         return 'hard'
     team = lease.get("team")
-    other_waiters = team and any(x["status"] == "queued" and x.get("team") != team for x in leases)
+    other_waiters = team and any(x["status"] == "queued" and x.get("team") != team and
+        any(box.configured_enabled and len(box.slots) >= slots_needed(x, policy) for box in enabled_boxes)
+        for x in leases)
     # Gate work bypasses the team soft cap, never the session hard cap above.
     if (lease.get('priority') != 'v221-gate' and other_waiters and
             sum(slots_needed(x, policy) for x in occupied if x.get("team") == team) + count > policy.max_slots_per_team):
@@ -67,9 +70,9 @@ def limit_reason(lease: Mapping, leases: Sequence[Mapping], policy: Policy) -> s
 
 
 def select_box(lease: Mapping, leases: Sequence[Mapping], boxes: Sequence[Box],
-               policy: Policy) -> tuple[Box, tuple[str, ...]] | None:
+               policy: Policy, *, enabled_boxes: Sequence[Box] | None = None) -> tuple[Box, tuple[str, ...]] | None:
     """Find capacity without oversubscription. Slot lists are disjoint CPU sets."""
-    if limit_reason(lease, leases, policy):
+    if limit_reason(lease, leases, policy, boxes if enabled_boxes is None else enabled_boxes):
         return None
     count = slots_needed(lease, policy)
     occupied = [x for x in leases if x['status'] in OCCUPYING]

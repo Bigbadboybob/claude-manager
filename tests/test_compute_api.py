@@ -131,7 +131,9 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
                              slots=[f'{i},{i+8}' for i in range(7)]),
                         dict(name='df2', ssh_target='df2', enabled=True,
                              slots=[f'{i},{i+8}' for i in range(8)])]
-        cfg['policy']['max_slots_per_team'] = 12
+        # A is already at its soft cap. B's eight-slot waiter fits only the
+        # disabled box and therefore must not activate the cap for A.
+        cfg['policy']['max_slots_per_team'] = 5
         cfg_path.write_text(json.dumps(cfg))
         try:
             team_a, team_b = uuid.uuid4(), uuid.uuid4()

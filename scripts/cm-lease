@@ -41,17 +41,29 @@ def config():
     if not CONFIG.is_file() or CONFIG.is_symlink() or st.st_uid != 0 or st.st_mode & 0o022:
         raise Refused('config must be root-owned, non-symlink and not group/world writable')
     data = json.loads(CONFIG.read_text())
-    for k in ('max_slots', 'cpus_per_slot', 'mem_gb_per_slot', 'max_duration_seconds', 'workdir_root', 'user'):
+    for k in ('max_slots', 'cpus_per_slot', 'mem_gb_per_slot', 'max_duration_seconds', 'user'):
         if k not in data:
             raise Refused('missing config key ' + k)
     if any(not isinstance(data[k], int) or isinstance(data[k], bool) or data[k] <= 0
            for k in ('max_slots', 'cpus_per_slot', 'mem_gb_per_slot', 'max_duration_seconds')):
         raise Refused('invalid numeric config')
-    root = Path(data['workdir_root'])
-    if not root.is_absolute() or not root.is_dir() or any(p.is_symlink() for p in (root, *root.parents)):
-        raise Refused('workdir_root must be an existing absolute directory without symlink ancestors')
-    data['workdir_root'] = str(root.resolve(strict=True))
+    # A broken workdir must not prevent status, expiry or release. Grant and
+    # cleanup validate it again before using it.
+    try:
+        data['workdir_root'] = str(workdir_root(data))
+    except Refused:
+        pass
     return data
+
+
+def workdir_root(cfg):
+    try:
+        root = Path(cfg['workdir_root'])
+        if not root.is_absolute() or not root.is_dir() or any(p.is_symlink() for p in (root, *root.parents)):
+            raise Refused('workdir_root must be an existing absolute directory without symlink ancestors')
+        return root.resolve(strict=True)
+    except (KeyError, TypeError, ValueError, OSError, RuntimeError) as exc:
+        raise Refused('invalid workdir_root: ' + str(exc)) from exc
 
 
 def run(*args):
@@ -143,8 +155,10 @@ def grant(args, cfg):
         if old and any(old.get(k) != v for k, v in proposed.items()):
             raise Refused('lease id already exists with different parameters')
         if old:
-            release(args.lease_id, cfg)
+            result = release(args.lease_id, cfg)
+            return {**result, 'expired': True}
         return {'lease_id': args.lease_id, 'expired': True, 'released': True}
+    root = workdir_root(cfg)
     expiry(args.expires_epoch, cfg)
     if old:
         if any(old.get(k) != v for k, v in proposed.items()):
@@ -154,7 +168,7 @@ def grant(args, cfg):
         used = sum(json.loads(p.read_text())['slots'] for p in STATE.glob('*.json'))
         if used + args.slots > cfg['max_slots']:
             raise Refused('box capacity exceeded')
-        workdir = Path(cfg['workdir_root']) / args.lease_id
+        workdir = root / args.lease_id
         pwd.getpwnam(cfg['user'])
         create_workdir(workdir, args.owner, args.lease_id, args.expires_epoch, cfg['user'])
         proposed.update(created=int(time.time()), workdir=str(workdir), slice=unit(args.lease_id))
@@ -182,21 +196,21 @@ def release(ident, cfg):
     row = load(ident)
     if not row:
         return {'lease_id': ident, 'released': True, 'already_absent': True}
-    path = Path(row['workdir'])
-    root = Path(cfg['workdir_root'])
-    try:
-        resolved = path.resolve()
-    except (OSError, RuntimeError) as exc:
-        raise Refused('cannot resolve lease workdir') from exc
-    if resolved != root / ident:
-        raise Refused('workdir realpath must be the lease directory directly under workdir_root')
     # systemd stops the slice and all child units with their normal TERM grace;
     # TimeoutStopSec is configured on the lease's run scope.
     run('/usr/bin/systemctl', 'stop', unit(ident))
     record_path(ident).unlink()
     audit('release', ident)
-    return {'lease_id': ident, 'released': True, 'workdir': str(path),
-            'workdir_bytes': workdir_size_and_remove_if_empty(path, row['user'])}
+    result = {'lease_id': ident, 'released': True, 'workdir': row.get('workdir')}
+    try:
+        root = workdir_root(cfg)
+        path = Path(row['workdir'])
+        if path.resolve() != root / ident:
+            raise Refused('workdir realpath must be the lease directory directly under workdir_root')
+        result['workdir_bytes'] = workdir_size_and_remove_if_empty(path, row['user'])
+    except (Refused, KeyError, TypeError, ValueError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        result['cleanup_skipped'] = str(exc)
+    return result
 
 
 def probe(ident):

@@ -48,8 +48,8 @@ def test_session_limit_takes_precedence_over_soft_team_deferral():
     active = lease('active', owner='same', team='a', status='active', box='lane', slot_ids=['0,8'])
     request = lease('request', owner='same', team='a')
     other = lease('other', team='b')
-    assert limit_reason(request, [active, request, other], policy) == 'hard'
-    assert limit_reason(lease('another', team='a'), [active, request, other], policy) == 'soft_team'
+    assert limit_reason(request, [active, request, other], policy, [BOX]) == 'hard'
+    assert limit_reason(lease('another', team='a'), [active, request, other], policy, [BOX]) == 'soft_team'
 
 
 def test_gate_ignores_team_soft_cap_but_obeys_session_cap():
@@ -57,10 +57,26 @@ def test_gate_ignores_team_soft_cap_but_obeys_session_cap():
     active = lease('active', owner='same', team='a', status='active', box='lane', slot_ids=['0,8'])
     other = lease('other', team='b')
     gate = lease('gate', team='a', priority='v221-gate', cpus=8, mem_gb=64)
-    assert limit_reason(gate, [active, other, gate], policy) is None
+    assert limit_reason(gate, [active, other, gate], policy, [BOX]) is None
     active.update(cpus=10, mem_gb=80, slot_ids=[f'{i},{i+8}' for i in range(5)])
     gate['owner'] = 'same'
-    assert limit_reason(gate, [active, other, gate], policy) == 'hard'
+    assert limit_reason(gate, [active, other, gate], policy, [BOX]) == 'hard'
+
+
+def test_soft_cap_counts_only_waiters_that_fit_an_enabled_box():
+    policy = Policy(2, 16, 8, 4, 1)
+    small = Box('small', 'small', ('0,8', '1,9'))
+    disabled = Box('disabled', 'disabled', BOX.slots, configured_enabled=False)
+    active = lease('active', team='a', status='active', box='small', slot_ids=['0,8'])
+    request = lease('request', team='a')
+    other = lease('other', team='b', cpus=8, mem_gb=64)
+    rows = [active, request, other]
+    assert limit_reason(request, rows, policy, [small, disabled]) is None
+    assert select_box(request, rows, [small], policy, enabled_boxes=[small, disabled]) == (small, ('1,9',))
+    # A fitting waiter still counts when its enabled box is reserved for an
+    # earlier request and is absent from this placement's candidate list.
+    assert limit_reason(request, rows, policy, [small, BOX]) == 'soft_team'
+    assert select_box(request, rows, [small], policy, enabled_boxes=[small, BOX]) is None
 
 
 def test_eta_is_earliest_possible_release_not_claimed_start():

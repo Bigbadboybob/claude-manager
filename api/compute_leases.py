@@ -169,10 +169,11 @@ async def _schedule(conn, policy_data, boxes):
         # requests pass its soft-cap-deferred head.
         if row['team'] in deferred_teams:
             continue
-        if limit_reason(row, rows, policy) == 'soft_team':
+        if limit_reason(row, rows, policy, boxes) == 'soft_team':
             deferred_teams.add(row['team'])
             continue
-        choice = select_box(row, rows, [b for b in boxes if b.name not in held_boxes], policy)
+        choice = select_box(row, rows, [b for b in boxes if b.name not in held_boxes], policy,
+                            enabled_boxes=boxes)
         if not choice:
             # Keep all boxes that could accommodate this request available for
             # it, even if their current free slots would fit a later request.
@@ -523,11 +524,13 @@ async def _idle_decision(conn, row, p, boxes, now):
           AND n.sent_at>$2 ORDER BY n.sent_at""",
                                row['id'], row['last_activity_at'])
     rows = await _rows(conn)
-    enabled = await conn.fetchval('SELECT enabled FROM compute_boxes WHERE name=$1', row['box'])
-    target = next((b for b in boxes if b.name == row['box'] and b.configured_enabled and enabled), None)
+    enabled = {r['name'] for r in await conn.fetch('SELECT name FROM compute_boxes WHERE enabled')}
+    enabled_boxes = [b for b in boxes if b.configured_enabled and b.name in enabled]
+    target = next((b for b in enabled_boxes if b.name == row['box']), None)
     policy = Policy(**{k: p[k] for k in Policy.__dataclass_fields__})
     without = [r for r in rows if r['id'] != row['id']]
-    fits = bool(target and any(select_box(q, without, [target], policy) for q in queue_order(without)))
+    fits = bool(target and any(select_box(q, without, [target], policy, enabled_boxes=enabled_boxes)
+                               for q in queue_order(without)))
     return next_idle_action(now=now, average=average, threshold=p['idle_percent'],
         last_activity=row['last_activity_at'], notices=[n['sent_at'] for n in notices],
         idle_seconds=p['idle_threshold_seconds'], answer_seconds=p['idle_answer_seconds'],

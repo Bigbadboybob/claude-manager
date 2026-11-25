@@ -90,7 +90,8 @@ def test_expired_grant_retry_releases_the_node_reservation(context, monkeypatch)
     cfg, args, calls = context
     node.grant(args, cfg)
     monkeypatch.setattr(node.time, 'time', lambda: 2001)
-    assert node.grant(args, cfg) == {'lease_id': LEASE, 'expired': True, 'released': True}
+    result = node.grant(args, cfg)
+    assert result['lease_id'] == LEASE and result['expired'] and result['released']
     assert node.load(LEASE) is None
     assert calls[-1] == ('/usr/bin/systemctl', 'stop', 'cmlease-' + LEASE + '.slice')
 
@@ -132,7 +133,7 @@ def test_reap_continues_after_one_lease_fails(context, monkeypatch):
     assert 'stop failed' in node.LOG.read_text()
 
 
-def test_config_resolves_root_and_rejects_symlink_ancestors(tmp_path, monkeypatch):
+def test_config_resolves_root_but_defers_invalid_root_to_grant_or_cleanup(tmp_path, monkeypatch):
     real = tmp_path / 'real'
     real.mkdir()
     work = real / 'work'
@@ -155,14 +156,16 @@ def test_config_resolves_root_and_rejects_symlink_ancestors(tmp_path, monkeypatc
     monkeypatch.setattr(node, 'CONFIG', RootOwnedConfig())
     assert node.config()['workdir_root'] == str(work.resolve())
     cfg['workdir_root'] = str(link / 'work')
+    loaded = node.config()  # invalid root does not prevent status or release setup
     with pytest.raises(node.Refused, match='symlink ancestors'):
-        node.config()
+        node.workdir_root(loaded)
     cfg['workdir_root'] = str(link)
+    loaded = node.config()
     with pytest.raises(node.Refused, match='symlink ancestors'):
-        node.config()
+        node.workdir_root(loaded)
 
 
-def test_release_refuses_workdir_resolving_outside_root(context, tmp_path):
+def test_release_stops_slice_and_skips_workdir_resolving_outside_root(context, tmp_path):
     cfg, args, calls = context
     node.grant(args, cfg)
     path = node.Path(cfg['workdir_root']) / LEASE
@@ -172,13 +175,14 @@ def test_release_refuses_workdir_resolving_outside_root(context, tmp_path):
     outside.mkdir()
     path.symlink_to(outside, target_is_directory=True)
     calls.clear()
-    with pytest.raises(node.Refused, match='workdir realpath'):
-        node.release(LEASE, cfg)
-    assert node.load(LEASE) is not None
-    assert calls == []
+    result = node.release(LEASE, cfg)
+    assert result['released'] and 'workdir realpath' in result['cleanup_skipped']
+    assert node.load(LEASE) is None
+    assert calls == [('/usr/bin/systemctl', 'stop', 'cmlease-' + LEASE + '.slice')]
+    assert outside.exists()
 
 
-def test_release_refuses_symlink_to_another_lease_directory(context):
+def test_release_skips_symlink_to_another_lease_directory(context):
     cfg, args, calls = context
     node.grant(args, cfg)
     root = node.Path(cfg['workdir_root'])
@@ -188,18 +192,133 @@ def test_release_refuses_symlink_to_another_lease_directory(context):
     sibling = root / 'another'
     sibling.mkdir()
     path.symlink_to(sibling, target_is_directory=True)
-    with pytest.raises(node.Refused, match='workdir realpath'):
-        node.release(LEASE, cfg)
-    assert node.load(LEASE) is not None
+    result = node.release(LEASE, cfg)
+    assert result['released'] and 'workdir realpath' in result['cleanup_skipped']
+    assert node.load(LEASE) is None
+    assert sibling.exists()
 
 
-def test_release_refuses_unresolvable_workdir(context):
+def test_release_skips_unresolvable_workdir(context):
     cfg, args, calls = context
     node.grant(args, cfg)
     path = node.Path(cfg['workdir_root']) / LEASE
     (path / 'OWNER.md').unlink()
     path.rmdir()
     path.symlink_to(path)
-    with pytest.raises(node.Refused, match='resolve lease workdir'):
+    result = node.release(LEASE, cfg)
+    assert result['released'] and result['cleanup_skipped']
+    assert node.load(LEASE) is None
+
+
+def test_reap_stops_slice_and_skips_workdir_resolving_outside_root(context, tmp_path, monkeypatch):
+    cfg, args, calls = context
+    node.grant(args, cfg)
+    path = node.Path(cfg['workdir_root']) / LEASE
+    (path / 'OWNER.md').unlink()
+    path.rmdir()
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    path.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(node.time, 'time', lambda: 2001)
+    calls.clear()
+    result = node.reap(cfg)
+    assert result['failed'] == []
+    assert result['released'][0]['released']
+    assert 'workdir realpath' in result['released'][0]['cleanup_skipped']
+    assert node.load(LEASE) is None
+    assert calls == [('/usr/bin/systemctl', 'stop', 'cmlease-' + LEASE + '.slice')]
+    assert outside.exists()
+
+
+@pytest.mark.parametrize('bad_root', ['missing', 'symlink', 'absent_key', 'invalid_type'])
+def test_bad_root_cannot_prevent_release(context, tmp_path, bad_root):
+    cfg, args, calls = context
+    node.grant(args, cfg)
+    if bad_root == 'missing':
+        cfg['workdir_root'] = str(tmp_path / 'missing')
+    elif bad_root == 'symlink':
+        link = tmp_path / 'link'
+        link.symlink_to(cfg['workdir_root'], target_is_directory=True)
+        cfg['workdir_root'] = str(link)
+    elif bad_root == 'absent_key':
+        del cfg['workdir_root']
+    else:
+        cfg['workdir_root'] = None
+    with pytest.raises(node.Refused):
+        node.grant(args, cfg)
+    calls.clear()
+    result = node.release(LEASE, cfg)
+    assert result['released'] and result['cleanup_skipped']
+    assert node.load(LEASE) is None
+    assert calls == [('/usr/bin/systemctl', 'stop', 'cmlease-' + LEASE + '.slice')]
+
+
+def test_bad_root_cannot_prevent_reap(context, tmp_path, monkeypatch):
+    cfg, args, calls = context
+    node.grant(args, cfg)
+    cfg['workdir_root'] = str(tmp_path / 'missing')
+    monkeypatch.setattr(node.time, 'time', lambda: 2001)
+    calls.clear()
+    result = node.reap(cfg)
+    assert result['failed'] == [] and result['released'][0]['cleanup_skipped']
+    assert node.load(LEASE) is None
+    assert calls == [('/usr/bin/systemctl', 'stop', 'cmlease-' + LEASE + '.slice')]
+
+
+def test_failed_slice_stop_keeps_record_even_when_root_is_invalid(context, tmp_path, monkeypatch):
+    cfg, args, calls = context
+    node.grant(args, cfg)
+    cfg['workdir_root'] = str(tmp_path / 'missing')
+    def fail(*args):
+        raise OSError('systemctl failed')
+    monkeypatch.setattr(node, 'run', fail)
+    with pytest.raises(OSError, match='systemctl failed'):
         node.release(LEASE, cfg)
     assert node.load(LEASE) is not None
+
+
+def test_cleanup_failure_does_not_reverse_confirmed_release(context, monkeypatch):
+    cfg, args, calls = context
+    node.grant(args, cfg)
+    def fail(*args):
+        raise OSError('du failed')
+    monkeypatch.setattr(node, 'workdir_size_and_remove_if_empty', fail)
+    result = node.release(LEASE, cfg)
+    assert result['released'] and 'du failed' in result['cleanup_skipped']
+    assert node.load(LEASE) is None
+    assert calls[-1] == ('/usr/bin/systemctl', 'stop', 'cmlease-' + LEASE + '.slice')
+
+
+def test_status_works_with_bad_workdir_root(context, tmp_path, monkeypatch, capsys):
+    cfg, args, calls = context
+    node.grant(args, cfg)
+    cfg['workdir_root'] = str(tmp_path / 'missing')
+    state = node.STATE
+    cgroup = tmp_path / 'cgroup' / 'lease'
+    cgroup.mkdir(parents=True)
+    (cgroup / 'cpu.stat').write_text('usage_usec 123\n')
+    (cgroup / 'memory.current').write_text('4')
+    (cgroup / 'memory.peak').write_text('5')
+
+    class RootOwnedConfig:
+        def lstat(self): return SimpleNamespace(st_uid=0, st_mode=0o600)
+        def is_file(self): return True
+        def is_symlink(self): return False
+        def read_text(self): return json.dumps(cfg)
+
+    class RootOwnedState:
+        def mkdir(self, **kwargs): return state.mkdir(**kwargs)
+        def lstat(self): return SimpleNamespace(st_uid=0, st_mode=0o700)
+        def is_symlink(self): return False
+        def __truediv__(self, name): return state / name
+
+    real_path = node.Path
+    monkeypatch.setattr(node, 'CONFIG', RootOwnedConfig())
+    monkeypatch.setattr(node, 'STATE', RootOwnedState())
+    monkeypatch.setattr(node, 'Path', lambda value: tmp_path / 'cgroup' if value == '/sys/fs/cgroup' else real_path(value))
+    monkeypatch.setattr(node.os, 'geteuid', lambda: 0)
+    monkeypatch.setattr(node, 'run', lambda *args: '/lease')
+    monkeypatch.setattr(node.sys, 'argv', ['cm-lease', 'status', '--lease-id', LEASE])
+    node.main()
+    result = json.loads(capsys.readouterr().out)
+    assert result['lease_id'] == LEASE and result['cpu_usage_usec'] == 123

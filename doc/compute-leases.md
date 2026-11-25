@@ -21,7 +21,8 @@ An ETA is the earliest known capacity change, not a promised start; it can be
 unknown. A queue position of zero means a grant is being installed.
 Requests too large for every configured box are rejected. A queued request
 shows `waiting: no enabled box fits` until a box large enough is enabled; it
-does not prevent smaller requests from its team from running.
+does not prevent smaller requests from its team from running or count as an
+opposing waiter for the team soft cap.
 
 The planning API persists reservations and queues node actions. The separate
 user service on cm-sessions invokes the node script through configured gcloud
@@ -85,3 +86,5 @@ node never frees its reservation.
 Idle, reclaim and expiry notices use the native board-push delivery channel.
 The API counts an idle notice only after the recipient daemon reports that the
 session observed it; failed or ambiguous delivery cannot authorize reclaim.
+Release and expiry stop the slice even if the workdir cannot be safely cleaned;
+the node result reports a `cleanup_skipped` reason in that case.
