@@ -399,6 +399,57 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         finally:
             cfg_path.write_text(original)
 
+    async def _capacity_order_scenario(self, first_priority, later_priority, other_box=False):
+        cfg_path = self.root / 'pool.json'
+        original = cfg_path.read_text()
+        cfg = json.loads(original)
+        cfg['boxes'][0]['slots'] = ['0,8', '1,9', '2,10', '3,11']
+        if other_box:
+            cfg['boxes'].append({'name': 'small', 'ssh_target': 'small', 'enabled': True,
+                                 'slots': ['0,8', '1,9']})
+        cfg_path.write_text(json.dumps(cfg))
+        try:
+            if other_box:
+                async with self.pool.acquire() as conn:
+                    await conn.execute("INSERT INTO compute_boxes (name,enabled,checked_at,evidence) VALUES ('small',true,now(),'{}'::jsonb)")
+            busy_body = self.body('busy')
+            busy_body.cpus, busy_body.mem_gb = 4, 32
+            busy = await api.request_lease(busy_body, self.request)
+            action = (await api.executor_poll(self.request))['action']
+            await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+                'lease_id': str(busy['lease_id']), 'configured': True, 'workdir': '/work/busy'}), self.request)
+            first = self.body('first')
+            first.cpus, first.mem_gb, first.priority = 8, 64, first_priority
+            earlier = await api.request_lease(first, self.request)
+            self.assertEqual(earlier['status'], 'queued')
+            later = self.body('later')
+            later.cpus, later.mem_gb, later.priority = 4, 32, later_priority
+            second = await api.request_lease(later, self.request)
+            self.assertEqual(second['status'], 'granting' if other_box else 'queued')
+            if other_box:
+                async with self.pool.acquire() as conn:
+                    self.assertEqual(await conn.fetchval('SELECT box FROM compute_leases WHERE id=$1', second['lease_id']), 'small')
+                return
+            await api.release(api.LeaseChange(actor=busy_body.actor, lease_id=busy['lease_id']), self.request)
+            action = (await api.executor_poll(self.request))['action']
+            self.assertEqual(action['kind'], 'release')
+            await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+                'lease_id': str(busy['lease_id']), 'released': True}), self.request)
+            async with self.pool.acquire() as conn:
+                self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', earlier['lease_id']), 'granting')
+                self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', second['lease_id']), 'queued')
+        finally:
+            cfg_path.write_text(original)
+
+    async def test_capacity_blocked_gate_holds_box_from_low_priority(self):
+        await self._capacity_order_scenario('v221-gate', 'low')
+
+    async def test_capacity_blocked_request_holds_box_within_priority_class(self):
+        await self._capacity_order_scenario('normal', 'normal')
+
+    async def test_capacity_blocked_request_allows_use_of_too_small_box(self):
+        await self._capacity_order_scenario('v221-gate', 'low', other_box=True)
+
     async def test_extension_ignores_queue_that_cannot_fit_this_box(self):
         cfg_path = self.root / 'pool.json'
         original = cfg_path.read_text()

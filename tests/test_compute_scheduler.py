@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from dispatch.compute_scheduler import Box, Policy, queue_eta, queue_order, select_box, slots_needed
+from dispatch.compute_scheduler import Box, Policy, limit_reason, queue_eta, queue_order, select_box, slots_needed
 
 NOW = datetime(2026, 11, 25, tzinfo=timezone.utc)
 POLICY = Policy(cpus_per_slot=2, mem_gb_per_slot=16, max_slots_per_session=8,
@@ -41,6 +41,15 @@ def test_memory_also_consumes_slots_and_session_limit_is_enforced():
                       cpus=8, mem_gb=64)]
     limit = Policy(2, 16, 4, 4, 12)
     assert select_box(lease("b", owner="same"), existing, [BOX, Box("other", "x", BOX.slots)], limit) is None
+
+
+def test_session_limit_takes_precedence_over_soft_team_deferral():
+    policy = Policy(2, 16, 1, 4, 1)
+    active = lease('active', owner='same', team='a', status='active', box='lane', slot_ids=['0,8'])
+    request = lease('request', owner='same', team='a')
+    other = lease('other', team='b')
+    assert limit_reason(request, [active, request, other], policy) == 'hard'
+    assert limit_reason(lease('another', team='a'), [active, request, other], policy) == 'soft_team'
 
 
 def test_eta_is_earliest_possible_release_not_claimed_start():

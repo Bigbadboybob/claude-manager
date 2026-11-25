@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from api.auth import verify_token
-from dispatch.compute_scheduler import Box, Policy, queue_eta, queue_order, select_box, slots_needed
+from dispatch.compute_scheduler import Box, Policy, limit_reason, queue_eta, queue_order, select_box, slots_needed
 from dispatch.compute_idle import Sample, idle_average, next_idle_action
 
 router = APIRouter(prefix='/compute', dependencies=[Depends(verify_token)])
@@ -154,9 +154,17 @@ async def _schedule(conn, policy_data, boxes):
     boxes = [box for box in boxes if box.configured_enabled and box.name in enabled]
     policy = Policy(**{k: policy_data[k] for k in Policy.__dataclass_fields__})
     rows = await _rows(conn)
+    held_boxes = set()
     for row in queue_order(rows):
-        choice = select_box(row, rows, boxes, policy)
+        if limit_reason(row, rows, policy) == 'soft_team':
+            continue
+        choice = select_box(row, rows, [b for b in boxes if b.name not in held_boxes], policy)
         if not choice:
+            # Keep all boxes that could accommodate this request available for
+            # it, even if their current free slots would fit a later request.
+            # Boxes too small for it may still serve later requests.
+            needed = slots_needed(row, policy)
+            held_boxes.update(b.name for b in boxes if len(b.slots) >= needed)
             continue
         box, selected = choice
         expires = datetime.now(timezone.utc) + timedelta(seconds=row['duration_seconds'])

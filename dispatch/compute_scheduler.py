@@ -49,24 +49,28 @@ def queue_order(leases: Sequence[Mapping]) -> list[Mapping]:
                   key=lambda x: (PRIORITIES[x["priority"]], x["created_at"], str(x["id"])))
 
 
-def select_box(lease: Mapping, leases: Sequence[Mapping], boxes: Sequence[Box],
-               policy: Policy) -> tuple[Box, tuple[str, ...]] | None:
-    """Find capacity without oversubscription. Slot lists are disjoint CPU sets.
-
-    Session limits are hard; team limits are soft and apply only when another
-    team is waiting. The caller processes queue_order and may skip requests
-    that cannot currently run, preserving order among eligible requests.
-    """
+def limit_reason(lease: Mapping, leases: Sequence[Mapping], policy: Policy) -> str | None:
+    """Distinguish the team soft cap from limits that must retain queue order."""
     count = slots_needed(lease, policy)
     if count > policy.max_slots_per_lease and not str(lease.get("purpose") or "").strip():
-        return None
+        return 'hard'
     occupied = [x for x in leases if x["status"] in OCCUPYING]
     if sum(slots_needed(x, policy) for x in occupied if x["owner"] == lease["owner"]) + count > policy.max_slots_per_session:
-        return None
+        return 'hard'
     team = lease.get("team")
     other_waiters = team and any(x["status"] == "queued" and x.get("team") != team for x in leases)
     if other_waiters and sum(slots_needed(x, policy) for x in occupied if x.get("team") == team) + count > policy.max_slots_per_team:
+        return 'soft_team'
+    return None
+
+
+def select_box(lease: Mapping, leases: Sequence[Mapping], boxes: Sequence[Box],
+               policy: Policy) -> tuple[Box, tuple[str, ...]] | None:
+    """Find capacity without oversubscription. Slot lists are disjoint CPU sets."""
+    if limit_reason(lease, leases, policy):
         return None
+    count = slots_needed(lease, policy)
+    occupied = [x for x in leases if x['status'] in OCCUPYING]
     for box in boxes:
         used: set[str] = set()
         for current in occupied:
