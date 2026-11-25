@@ -235,4 +235,4 @@ the worktree and carries the brief for `start_session(task_id=…)`,
   (org-model S8). Existing task-bound sessions keep working; nothing is
   rebound.
 
-It is designed after §7 ships, as its own short doc.
+Design: [tasks-as-board-items.md](tasks-as-board-items.md) (draft, 2026-11-25).
