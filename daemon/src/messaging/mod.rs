@@ -1,5 +1,6 @@
 //! File-backed messaging. The store owns a separate lock from session/PTY state.
 pub mod delivery;
+pub mod health;
 pub mod sync;
 pub mod rpc;
 pub mod startup;

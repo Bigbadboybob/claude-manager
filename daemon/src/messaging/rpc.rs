@@ -134,7 +134,7 @@ pub fn initialize(state: &Arc<Mutex<DaemonState>>) -> Result<(), ChatError> {
         .messaging_delivery
         .clone();
     let _delivery_guard = delivery_gate.lock().unwrap_or_else(|p| p.into_inner());
-    let slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+    let slot = super::health::store_lock(&handle);
     let store = slot.as_ref().ok_or_else(super::startup::starting)?;
     project_names(state, store, false);
     Ok(())
@@ -190,29 +190,33 @@ pub fn dispatch_with_peer_pid(
     req: &Request,
     peer_pid: Option<u32>,
 ) -> Response {
-    if let Caller::Session(c) = &req.caller {
-        crate::maintenance::stamp_chat(state, &c.session_uid);
-    }
-    match execute(state, req, peer_pid) {
-        Ok(mut v) => {
-            // Agents see why sync looks broken during a deploy or hub outage.
-            if matches!(req.caller, Caller::Session(_)) && v.is_object() {
-                if let Some(m) = crate::maintenance::field_for(state) {
-                    v["maintenance"] = json!(m);
-                }
-            }
-            if matches!(
-                req.method.as_str(),
-                "messaging.send"
-                    | "messaging.read"
-                    | "messaging.follow"
-                    | "messaging.monitor"
-                    | "messaging.monitors"
-            ) {
-                super::delivery::signal(state);
-            }
-            Response::ok(req.id.clone(), v)
+    let started = std::time::Instant::now();
+    let (health, config) = {
+        let s = state.lock().unwrap_or_else(|p| p.into_inner());
+        (s.messaging_health.clone(), s.config.messaging_health.clone())
+    };
+    let result = super::health::measure(health, config, &req.method, started, || {
+        if let Caller::Session(c) = &req.caller {
+            crate::maintenance::stamp_chat(state, &c.session_uid);
         }
+        let mut v = execute(state, req, peer_pid)?;
+        // Agents see why sync looks broken during a deploy or hub outage.
+        if matches!(req.caller, Caller::Session(_)) && v.is_object() {
+            if let Some(m) = crate::maintenance::field_for(state) {
+                v["maintenance"] = json!(m);
+            }
+        }
+        if matches!(
+            req.method.as_str(),
+            "messaging.send" | "messaging.read" | "messaging.follow"
+                | "messaging.monitor" | "messaging.monitors"
+        ) {
+            super::delivery::signal(state);
+        }
+        Ok(v)
+    });
+    match result {
+        Ok(v) => Response::ok(req.id.clone(), v),
         Err(e) => Response::err(
             req.id.clone(),
             match e.code.as_str() {
@@ -230,7 +234,7 @@ pub fn dispatch_with_peer_pid(
 /// (#28's spawn-time setup renames at that revision).
 pub fn current_name(state: &Arc<Mutex<DaemonState>>, uid: &str) -> Option<(String, u64)> {
     let handle = state.lock().unwrap_or_else(|p| p.into_inner()).messaging.clone();
-    let slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+    let slot = super::health::store_lock(&handle);
     let store = slot.as_ref()?;
     store.names.get(&store.participant_id(uid)).filter(|n| !n.released).map(|n| (n.name.clone(), n.revision))
 }
@@ -314,7 +318,7 @@ fn execute(
     // A readiness check must not take the delivery gate: plain sends are
     // deliberately allowed while another thread is publishing a wake.
     let handle = state.lock().unwrap_or_else(|p| p.into_inner()).messaging.clone();
-    if handle.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+    if super::health::store_lock(&handle).is_none() {
         return Err(super::startup::starting());
     }
     if req.method == "messaging.sync" {
@@ -330,7 +334,7 @@ fn execute(
             (s.messaging.clone(), s.messaging_sync.clone())
         };
         let remote_bell = {
-            let slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+            let slot = super::health::store_lock(&handle);
             slot.as_ref().is_some_and(|s| {
                 !s.is_coordinator()
                     && s.cached_owner_snapshot()
@@ -364,7 +368,7 @@ fn execute_sync_admin(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<
     // store directly without projecting names or taking the delivery gate.
     if req.params["action"].as_str().unwrap_or("status") == "status" {
         let handle = state.lock().unwrap_or_else(|p| p.into_inner()).messaging.clone();
-        let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+        let mut slot = super::health::store_lock(&handle);
         let store = slot.as_mut().ok_or_else(super::startup::starting)?;
         return store.sync_admin(&req.params, &[]);
     }
@@ -391,7 +395,7 @@ fn execute_sync_admin(state: &Arc<Mutex<DaemonState>>, req: &Request) -> Result<
         )
     };
     let result = {
-        let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+        let mut slot = super::health::store_lock(&handle);
         let store = slot.as_mut().unwrap();
         let people = people
             .into_iter()
@@ -536,7 +540,7 @@ fn execute_with_freshness(
         .clone();
     let _delivery_guard =
         coordinates_delivery.then(|| delivery_gate.lock().unwrap_or_else(|p| p.into_inner()));
-    let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+    let mut slot = super::health::store_lock(&handle);
     // Load shedding: a read that queued longer than the MCP client's own
     // timeout has no one waiting for it. Running it anyway (a full candidate
     // scan under the store lock) is what turned a post-restart burst into a
@@ -686,7 +690,7 @@ fn execute_with_freshness(
             if forward {
                 let submitted_at = chrono::Utc::now();
                 let mut result = sync.request(&actor, &req.method, &forwarded)?;
-                let mut slot = handle.lock().unwrap_or_else(|p| p.into_inner());
+                let mut slot = super::health::store_lock(&handle);
                 let store = slot.as_mut().unwrap();
                 if req.method == "messaging.send" {
                     result["coordinator_position"] = result["position"].clone();
