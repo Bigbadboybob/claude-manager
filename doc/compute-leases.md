@@ -19,6 +19,9 @@ a request is deferred by the team cap, later requests from that team wait;
 other teams can use available capacity.
 An ETA is the earliest known capacity change, not a promised start; it can be
 unknown. A queue position of zero means a grant is being installed.
+Requests too large for every configured box are rejected. A queued request
+shows `waiting: no enabled box fits` until a box large enough is enabled; it
+does not prevent smaller requests from its team from running.
 
 The planning API persists reservations and queues node actions. The separate
 user service on cm-sessions invokes the node script through configured gcloud

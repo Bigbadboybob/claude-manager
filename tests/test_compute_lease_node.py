@@ -67,11 +67,11 @@ def test_pinned_grant_and_release_address_only_lease_slice(context):
     args.pin = '0,8'
     node.grant(args, cfg)
     assert any('AllowedCPUs=0,8' in call for call in calls)
-    result = node.release(LEASE)
+    result = node.release(LEASE, cfg)
     assert result['released']
     assert calls[-1] == ('/usr/bin/systemctl', 'stop', 'cmlease-' + LEASE + '.slice')
     assert (node.Path(cfg['workdir_root']) / LEASE / 'OWNER.md').exists()
-    assert node.release(LEASE)['already_absent']
+    assert node.release(LEASE, cfg)['already_absent']
 
 
 def test_grant_rejects_conflicting_duplicate_and_invalid_cpu_count(context):
@@ -120,13 +120,86 @@ def test_reap_continues_after_one_lease_fails(context, monkeypatch):
     node.save(LEASE, {'expires': 1})
     second = 'a4c4e6cf-bfad-4e66-8a63-d1fce23ba171'
     node.save(second, {'expires': 1})
-    def release(ident):
+    def release(ident, cfg):
         if ident == LEASE:
             raise OSError('stop failed')
         return {'lease_id': ident, 'released': True}
     monkeypatch.setattr(node, 'release', release)
-    result = node.reap()
+    result = node.reap(context[0])
     assert result['released'] == [{'lease_id': second, 'released': True}]
     assert result['failed'][0]['lease_id'] == LEASE
     assert 'stop failed' in result['failed'][0]['error']
     assert 'stop failed' in node.LOG.read_text()
+
+
+def test_config_resolves_root_and_rejects_symlink_ancestors(tmp_path, monkeypatch):
+    real = tmp_path / 'real'
+    real.mkdir()
+    work = real / 'work'
+    work.mkdir()
+    link = tmp_path / 'link'
+    link.symlink_to(real, target_is_directory=True)
+    cfg = dict(user='lucas', max_slots=4, cpus_per_slot=2, mem_gb_per_slot=16,
+               max_duration_seconds=3600, workdir_root=str(work / '..' / 'work'))
+
+    class RootOwnedConfig:
+        def lstat(self):
+            return SimpleNamespace(st_uid=0, st_mode=0o600)
+        def is_file(self):
+            return True
+        def is_symlink(self):
+            return False
+        def read_text(self):
+            return json.dumps(cfg)
+
+    monkeypatch.setattr(node, 'CONFIG', RootOwnedConfig())
+    assert node.config()['workdir_root'] == str(work.resolve())
+    cfg['workdir_root'] = str(link / 'work')
+    with pytest.raises(node.Refused, match='symlink ancestors'):
+        node.config()
+    cfg['workdir_root'] = str(link)
+    with pytest.raises(node.Refused, match='symlink ancestors'):
+        node.config()
+
+
+def test_release_refuses_workdir_resolving_outside_root(context, tmp_path):
+    cfg, args, calls = context
+    node.grant(args, cfg)
+    path = node.Path(cfg['workdir_root']) / LEASE
+    (path / 'OWNER.md').unlink()
+    path.rmdir()
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    path.symlink_to(outside, target_is_directory=True)
+    calls.clear()
+    with pytest.raises(node.Refused, match='workdir realpath'):
+        node.release(LEASE, cfg)
+    assert node.load(LEASE) is not None
+    assert calls == []
+
+
+def test_release_refuses_symlink_to_another_lease_directory(context):
+    cfg, args, calls = context
+    node.grant(args, cfg)
+    root = node.Path(cfg['workdir_root'])
+    path = root / LEASE
+    (path / 'OWNER.md').unlink()
+    path.rmdir()
+    sibling = root / 'another'
+    sibling.mkdir()
+    path.symlink_to(sibling, target_is_directory=True)
+    with pytest.raises(node.Refused, match='workdir realpath'):
+        node.release(LEASE, cfg)
+    assert node.load(LEASE) is not None
+
+
+def test_release_refuses_unresolvable_workdir(context):
+    cfg, args, calls = context
+    node.grant(args, cfg)
+    path = node.Path(cfg['workdir_root']) / LEASE
+    (path / 'OWNER.md').unlink()
+    path.rmdir()
+    path.symlink_to(path)
+    with pytest.raises(node.Refused, match='resolve lease workdir'):
+        node.release(LEASE, cfg)
+    assert node.load(LEASE) is not None

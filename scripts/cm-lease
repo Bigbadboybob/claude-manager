@@ -48,8 +48,9 @@ def config():
            for k in ('max_slots', 'cpus_per_slot', 'mem_gb_per_slot', 'max_duration_seconds')):
         raise Refused('invalid numeric config')
     root = Path(data['workdir_root'])
-    if not root.is_absolute() or not root.is_dir() or root.is_symlink():
-        raise Refused('workdir_root must be an existing absolute directory')
+    if not root.is_absolute() or not root.is_dir() or any(p.is_symlink() for p in (root, *root.parents)):
+        raise Refused('workdir_root must be an existing absolute directory without symlink ancestors')
+    data['workdir_root'] = str(root.resolve(strict=True))
     return data
 
 
@@ -142,7 +143,7 @@ def grant(args, cfg):
         if old and any(old.get(k) != v for k, v in proposed.items()):
             raise Refused('lease id already exists with different parameters')
         if old:
-            release(args.lease_id)
+            release(args.lease_id, cfg)
         return {'lease_id': args.lease_id, 'expired': True, 'released': True}
     expiry(args.expires_epoch, cfg)
     if old:
@@ -177,16 +178,23 @@ def grant(args, cfg):
     return proposed
 
 
-def release(ident):
+def release(ident, cfg):
     row = load(ident)
     if not row:
         return {'lease_id': ident, 'released': True, 'already_absent': True}
+    path = Path(row['workdir'])
+    root = Path(cfg['workdir_root'])
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise Refused('cannot resolve lease workdir') from exc
+    if resolved != root / ident:
+        raise Refused('workdir realpath must be the lease directory directly under workdir_root')
     # systemd stops the slice and all child units with their normal TERM grace;
     # TimeoutStopSec is configured on the lease's run scope.
     run('/usr/bin/systemctl', 'stop', unit(ident))
     record_path(ident).unlink()
     audit('release', ident)
-    path = Path(row['workdir'])
     return {'lease_id': ident, 'released': True, 'workdir': str(path),
             'workdir_bytes': workdir_size_and_remove_if_empty(path, row['user'])}
 
@@ -203,12 +211,12 @@ def probe(ident):
     return {'lease_id': ident, 'exists': False, 'unit_inactive': True}
 
 
-def reap():
+def reap(cfg):
     released, failed = [], []
     for path in STATE.glob('*.json'):
         try:
             if json.loads(path.read_text())['expires'] <= int(time.time()):
-                released.append(release(path.stem))
+                released.append(release(path.stem, cfg))
         except Exception as exc:  # a corrupt record or failed stop must not block later leases
             failed.append({'lease_id': path.stem, 'error': str(exc)})
             try:
@@ -256,9 +264,9 @@ def main():
         if args.action == 'grant':
             result = grant(args, cfg)
         elif args.action == 'release':
-            result = release(args.lease_id)
+            result = release(args.lease_id, cfg)
         elif args.action == 'reap':
-            result = reap()
+            result = reap(cfg)
         elif args.action == 'probe':
             result = probe(args.lease_id)
             audit('probe', args.lease_id)

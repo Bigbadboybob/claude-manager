@@ -108,6 +108,74 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         async with self.pool.acquire() as conn:
             self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', result['lease_id']), 'granting')
 
+    async def test_request_rejects_resources_larger_than_any_configured_box(self):
+        body = self.body('large')
+        body.cpus, body.mem_gb = 4, 16  # configured box has only one slot
+        with self.assertRaises(api.HTTPException) as exc:
+            await api.request_lease(body, self.request)
+        self.assertEqual(exc.exception.status_code, 422)
+        self.assertIn('cannot fit any configured box', exc.exception.detail)
+        async with self.pool.acquire() as conn:
+            self.assertEqual(await conn.fetchval('SELECT count(*) FROM compute_leases'), 0)
+        body.cpus, body.mem_gb = 2, 17  # memory also makes this a two-slot request
+        with self.assertRaises(api.HTTPException) as exc:
+            await api.request_lease(body, self.request)
+        self.assertIn('cannot fit any configured box', exc.exception.detail)
+
+    async def test_unavailable_wide_box_does_not_pin_team_queue(self):
+        import uuid
+        cfg_path = self.root / 'pool.json'
+        original = cfg_path.read_text()
+        cfg = json.loads(original)
+        cfg['boxes'] = [dict(name='d6', ssh_target='d6', enabled=True,
+                             slots=[f'{i},{i+8}' for i in range(7)]),
+                        dict(name='df2', ssh_target='df2', enabled=True,
+                             slots=[f'{i},{i+8}' for i in range(8)])]
+        cfg['policy']['max_slots_per_team'] = 12
+        cfg_path.write_text(json.dumps(cfg))
+        try:
+            team_a, team_b = uuid.uuid4(), uuid.uuid4()
+            async with self.pool.acquire() as conn:
+                await conn.execute("INSERT INTO compute_boxes (name,enabled,checked_at,evidence) VALUES ('df2',false,now(),'{}'::jsonb)")
+                for uid, team in [('a-big', team_a), ('a-small', team_a), ('b-big', team_b)]:
+                    await conn.execute('INSERT INTO members (id,primary_team_id) VALUES ($1,$2)', uid, team)
+                    await conn.execute('INSERT INTO incarnations (member_id,pid) VALUES ($1,$2)', uid, f'agent:d:{uid}')
+                for i in range(5):
+                    await conn.execute("""INSERT INTO compute_leases
+                        (id,owner,team,purpose,priority,class,cpus,mem_gb,duration_seconds,status,box,slot_ids,expires_at)
+                        VALUES ($1,$2,$3,'running','normal','burst',2,16,300,'active','d6',$4,now()+interval '5 minutes')""",
+                        uuid.uuid4(), f'agent:d:running{i}', str(team_a), [cfg['boxes'][0]['slots'][i]])
+            a_big, b_big = self.body('a-big'), self.body('b-big')
+            a_big.cpus, a_big.mem_gb = 16, 128
+            b_big.cpus, b_big.mem_gb = 16, 128
+            first = await api.request_lease(a_big, self.request)
+            second = await api.request_lease(b_big, self.request)
+            self.assertEqual((first['status'], second['status']), ('queued', 'queued'))
+            small = await api.request_lease(self.body('a-small'), self.request)
+            self.assertEqual(small['status'], 'granting')
+            status = await api.status(api.StatusRequest(actor=a_big.actor, lease_id=first['lease_id']), self.request)
+            self.assertEqual(status['leases'][0]['waiting'], 'no enabled box fits')
+            waiting = {entry['lease_id']: entry.get('waiting') for entry in status['queue']}
+            self.assertEqual(waiting[first['lease_id']], 'no enabled box fits')
+            self.assertEqual(waiting[second['lease_id']], 'no enabled box fits')
+            # Configuration-level disablement has the same status semantics.
+            cfg['boxes'][1]['enabled'] = False
+            cfg_path.write_text(json.dumps(cfg))
+            status = await api.status(api.StatusRequest(actor=a_big.actor, lease_id=first['lease_id']), self.request)
+            self.assertEqual(status['leases'][0]['waiting'], 'no enabled box fits')
+            config_disabled = self.body('config-disabled')
+            config_disabled.cpus, config_disabled.mem_gb = 16, 128
+            self.assertEqual((await api.request_lease(config_disabled, self.request))['status'], 'queued')
+            cfg['boxes'][1]['enabled'] = True
+            cfg_path.write_text(json.dumps(cfg))
+            async with self.pool.acquire() as conn:
+                await conn.execute("UPDATE compute_boxes SET enabled=true WHERE name='df2'")
+            status = await api.status(api.StatusRequest(actor=a_big.actor, lease_id=first['lease_id']), self.request)
+            self.assertNotIn('waiting', status['leases'][0])
+            self.assertNotIn('waiting', status['queue'][0])
+        finally:
+            cfg_path.write_text(original)
+
     async def test_refused_extension_still_acknowledges_idle_notice(self):
         owner = self.body('one')
         result = await api.request_lease(owner, self.request)

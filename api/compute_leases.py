@@ -106,6 +106,10 @@ async def _rows(conn):
         "SELECT * FROM compute_leases WHERE status IN ('queued','granting','active','releasing')")]
 
 
+def _fits_any_box(row, policy, boxes):
+    return any(len(box.slots) >= slots_needed(row, policy) for box in boxes)
+
+
 async def _record_activity(conn, lease_id, owner=None, *, answer=True):
     """Reset idleness and close out every notice already issued for this lease.
 
@@ -157,6 +161,10 @@ async def _schedule(conn, policy_data, boxes):
     held_boxes = set()
     deferred_teams = set()
     for row in queue_order(rows):
+        # A box that is disabled or too small cannot help this request yet;
+        # it must not hold up its team or reserve other boxes.
+        if not _fits_any_box(row, policy, boxes):
+            continue
         # Yield capacity to other teams, but never let this team's later
         # requests pass its soft-cap-deferred head.
         if row['team'] in deferred_teams:
@@ -201,8 +209,11 @@ async def request_lease(body: LeaseRequest, request: Request):
     if not body.purpose.strip() or body.duration > p[body.lease_class + '_max_seconds']:
         raise HTTPException(422, 'invalid purpose or duration')
     policy = Policy(**{k: p[k] for k in Policy.__dataclass_fields__})
-    if slots_needed(body.model_dump(), policy) > policy.max_slots_per_session:
+    requested = body.model_dump()
+    if slots_needed(requested, policy) > policy.max_slots_per_session:
         raise HTTPException(422, 'request exceeds the configured per-session limit')
+    if not _fits_any_box(requested, policy, boxes):
+        raise HTTPException(422, 'request cannot fit any configured box')
     ident = uuid.uuid4()
     async with _pool(request).acquire() as conn, conn.transaction():
         await _lock(conn)
@@ -242,14 +253,21 @@ async def status(body: StatusRequest, request: Request):
                 raise HTTPException(404, 'lease not found')
             await _record_activity(conn, body.lease_id, owner)
         rows = await _rows(conn)
+        enabled = {r['name'] for r in await conn.fetch('SELECT name FROM compute_boxes WHERE enabled')}
+        enabled_boxes = [b for b in boxes if b.configured_enabled and b.name in enabled]
+        policy = Policy(**{k: p[k] for k in Policy.__dataclass_fields__})
+        no_fit = {r['id'] for r in rows if r['status'] == 'queued' and not _fits_any_box(r, policy, enabled_boxes)}
         mine = [_public(r, boxes) for r in rows if r['owner'] == owner]
+        for lease in mine:
+            if lease['id'] in no_fit:
+                lease['waiting'] = 'no enabled box fits'
         if body.lease_id and row['status'] not in ('queued', 'granting', 'active', 'releasing'):
             mine.append(_public(dict(row), boxes))
         ordered = queue_order(rows)
         queue = [{'lease_id': r['id'], 'priority': r['priority'], 'cpus': r['cpus'],
                   'owner': r['owner'], 'team': r['team'], 'purpose': r['purpose'],
-                  'position': i + 1} for i, r in enumerate(ordered)]
-        enabled = {r['name'] for r in await conn.fetch('SELECT name FROM compute_boxes WHERE enabled')}
+                  'position': i + 1, **({'waiting': 'no enabled box fits'} if r['id'] in no_fit else {})}
+                 for i, r in enumerate(ordered)]
         occupancy = [{'box': b.name, 'enabled': b.configured_enabled and b.name in enabled,
                       'total_slots': len(b.slots),
                       'occupied_slots': sum(len(r['slot_ids'] or []) for r in rows
