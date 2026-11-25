@@ -2006,7 +2006,8 @@ impl App {
                 Span::raw(" ")
             };
             let row = tree.as_ref().and_then(|t| t.rows.get(vi));
-            let depth = row.map_or(0, |r| r.cells.iter().filter(|n| matches!(n, super::tree::Node::Member(_))).count());
+            let depth = row.map_or(0, |r| r.cells.iter()
+                .filter(|n| matches!(n, super::tree::Node::Member(_) | super::tree::Node::Spawn(_))).count());
             let section_pad = if let Some(section) = tree.as_ref().and_then(|t| t.row_sections.get(vi)) {
                 if section.is_empty() { "" } else { " " }
             } else { indent(wi) };
@@ -2294,6 +2295,10 @@ impl App {
                                 let node = super::tree::Node::Member(member.clone());
                                 spans.push(Span::raw(if self.tree_folded(&node) { "▸ " } else { "▾ " }));
                             }
+                        } else if let Some(key) = tree.as_ref().and_then(|t| t.spawn_headers.get(&(*wi, *si))) {
+                            // A sub-lead: what it spawned nests under it.
+                            let node = super::tree::Node::Spawn(key.clone());
+                            spans.push(Span::raw(if self.tree_folded(&node) { "▸ " } else { "▾ " }));
                         }
                         spans.push(Span::styled(format!("{} ", indicator), indicator_style));
                         spans
@@ -2332,6 +2337,11 @@ impl App {
                         spans.push(Span::styled(format!("{glyph} "), style));
                     }
                     let mut tail: Vec<Span> = Vec::new();
+                    // A folded sub-lead rolls up what it spawned.
+                    if let Some(key) = tree.as_ref().and_then(|t| t.spawn_headers.get(&(*wi, *si))) {
+                        let rolled = fold_tail(&super::tree::Node::Spawn(key.clone()));
+                        if !rolled.is_empty() { tail.push(Span::styled(rolled, Style::default().fg(theme::DIM))); }
+                    }
                     if let Some(team) = tree.as_ref().and_then(|t| t.team_labels.get(vi)) {
                         tail.push(Span::styled(format!(" · {team}"), Style::default().fg(theme::DIM)));
                     }

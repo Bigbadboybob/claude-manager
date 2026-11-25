@@ -4,6 +4,19 @@
 
 The Workspaces (`Task`) sub-view draws org member blocks. Each block has the member's main row, assistants and workers, with reports nested under their manager. Team labels group members, and continuous teams appear in boxes with their member subtrees. Leader marks follow the manager hierarchy. Space or Enter folds synthetic headers; Alt+Space folds a member block on its main row. When `org.snapshot` is unavailable, the sidebar uses the old workspace tree.
 
+Inside a block, and inside a continuous box, an assistant or worker nests under the session that spawned it when that session is in the same block, at any depth, so a sub-lead's workers sit under the sub-lead. Sessions spawned by the main session, by a session shown in another block or continuation, or by no live spawner stay directly under the main row. A nested session in a different checkout from its spawner shows its checkout name after its label. Alt+Space on a sub-lead's row folds what it spawned and shows the hidden count with running/idle totals, as a folded workspace header does:
+
+```
+▾ ● EP                         ▾ ● EP
+  ● Notes                        ● Notes
+  ▾ ● MNX-Lead                   ▸ ● MNX-Lead  (4) ⠿2 ●2
+    ● Broker-Desk · broker       ● Report
+    ▾ ● HL-Adapter-Lead
+      ● MNX-SilentBook
+    ● PerpsFutures-Lead
+  ● Report
+```
+
 Owner creates sections with Alt+N. On a member's main row, Alt+e offers **Section (member)**: `auto` follows the manager's section, `none` leaves the member loose, and an explicit section assigns the member. Assistants and workers follow their member. Alt+n inside a section assigns the new member there. Section headers support Space/Enter to fold, Alt+e to edit, Alt+x to delete, and Alt+J/Alt+K to reorder.
 
 Ctrl+Alt+e on any session row opens its checkout's workspace settings, which offer **Section override (this checkout)** (Alt+e on that row stays the session/member form). A checkout assigned to a different section appears there as a `↳ M · <checkout>` continuation. Overrides that would split a block—on the checkout holding a member's main or inside a continuous box—are ignored and shown on the one-time conflict list. Migration copied the old workspace sections: main checkouts supply member assignments, unambiguous other checkouts become overrides, and unresolved choices appear on the conflict list.
