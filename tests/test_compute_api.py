@@ -399,6 +399,73 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         finally:
             cfg_path.write_text(original)
 
+    async def _setup_two_busy_teams(self):
+        import uuid
+        cfg_path = self.root / 'pool.json'
+        original = cfg_path.read_text()
+        cfg = json.loads(original)
+        cfg['boxes'] = [dict(name=f'box{i}', ssh_target=f'box{i}', enabled=True,
+                             slots=[f'{j},{j+8}' for j in range(8)]) for i in range(4)]
+        cfg['policy']['max_slots_per_team'] = 12
+        cfg_path.write_text(json.dumps(cfg))
+        async with self.pool.acquire() as conn:
+            for box in cfg['boxes']:
+                await conn.execute("INSERT INTO compute_boxes (name,enabled,checked_at,evidence) VALUES ($1,true,now(),'{}'::jsonb)", box['name'])
+            for i in range(22):
+                box, slot = cfg['boxes'][i // 8], i % 8
+                await conn.execute("""INSERT INTO compute_leases
+                    (id,owner,team,purpose,priority,class,cpus,mem_gb,duration_seconds,status,box,slot_ids,expires_at)
+                    VALUES ($1,$2,$3,'running','normal','burst',2,16,300,'active',$4,$5,now()+interval '5 minutes')""",
+                    uuid.uuid4(), f'agent:d:running{i}', 'a' if i % 2 == 0 else 'b', box['name'], [box['slots'][slot]])
+        return cfg_path, original
+
+    async def _queue_for_team(self, conn, team, slots, order, priority='normal'):
+        import uuid
+        ident = uuid.uuid4()
+        await conn.execute("""INSERT INTO compute_leases
+            (id,owner,team,purpose,priority,class,cpus,mem_gb,duration_seconds,status,created_at)
+            VALUES ($1,$2,$3,'queued test',$4,'burst',$5,$6,300,'queued',now()+make_interval(secs => $7))""",
+            ident, f'agent:d:{team}-{order}', team, priority, slots * 2, slots * 16, order)
+        return ident
+
+    async def test_soft_deferred_head_blocks_later_requests_from_each_team(self):
+        cfg_path, original = await self._setup_two_busy_teams()
+        try:
+            p, boxes = api.settings()
+            async with self.pool.acquire() as conn, conn.transaction():
+                a_big = await self._queue_for_team(conn, 'a', 4, 1)
+                b_big = await self._queue_for_team(conn, 'b', 4, 2)
+                a_small = await self._queue_for_team(conn, 'a', 1, 3)
+                b_small = await self._queue_for_team(conn, 'b', 1, 4, 'low')
+                c_small = await self._queue_for_team(conn, 'c', 1, 5, 'low')
+                await api._schedule(conn, p, boxes)
+                await api._schedule(conn, p, boxes)  # another poll must not rotate small leases in
+                for ident in (a_big, b_big, a_small, b_small):
+                    self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', ident), 'queued')
+                self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', c_small), 'granting')
+                # Once A's head goes away, its later request is eligible again.
+                await conn.execute("UPDATE compute_leases SET status='failed' WHERE id=$1", a_big)
+                await api._schedule(conn, p, boxes)
+                self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', a_small), 'granting')
+                self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', b_small), 'queued')
+        finally:
+            cfg_path.write_text(original)
+
+    async def test_gate_above_team_soft_cap_is_scheduled(self):
+        cfg_path, original = await self._setup_two_busy_teams()
+        try:
+            p, boxes = api.settings()
+            async with self.pool.acquire() as conn, conn.transaction():
+                gate = await self._queue_for_team(conn, 'a', 4, 1, 'v221-gate')
+                other = await self._queue_for_team(conn, 'b', 4, 2)
+                small = await self._queue_for_team(conn, 'a', 1, 3)
+                await api._schedule(conn, p, boxes)
+                self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', gate), 'granting')
+                self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', other), 'queued')
+                self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', small), 'queued')
+        finally:
+            cfg_path.write_text(original)
+
     async def _capacity_order_scenario(self, first_priority, later_priority, other_box=False):
         cfg_path = self.root / 'pool.json'
         original = cfg_path.read_text()

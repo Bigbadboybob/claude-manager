@@ -14,6 +14,9 @@ Only work run under the returned prefix is accounted to the lease.
 Use `v221-gate` only for work named by EP or the deploy lead, and put the
 authorizing ruling ID in the purpose. Requests above the normal per-lease slot
 limit should explain their size in the purpose; the session limit still applies.
+Gate requests bypass the team soft cap, but still obey the session limit. When
+a request is deferred by the team cap, later requests from that team wait;
+other teams can use available capacity.
 An ETA is the earliest known capacity change, not a promised start; it can be
 unknown. A queue position of zero means a grant is being installed.
 

@@ -59,7 +59,9 @@ def limit_reason(lease: Mapping, leases: Sequence[Mapping], policy: Policy) -> s
         return 'hard'
     team = lease.get("team")
     other_waiters = team and any(x["status"] == "queued" and x.get("team") != team for x in leases)
-    if other_waiters and sum(slots_needed(x, policy) for x in occupied if x.get("team") == team) + count > policy.max_slots_per_team:
+    # Gate work bypasses the team soft cap, never the session hard cap above.
+    if (lease.get('priority') != 'v221-gate' and other_waiters and
+            sum(slots_needed(x, policy) for x in occupied if x.get("team") == team) + count > policy.max_slots_per_team):
         return 'soft_team'
     return None
 

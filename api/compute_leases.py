@@ -155,8 +155,14 @@ async def _schedule(conn, policy_data, boxes):
     policy = Policy(**{k: policy_data[k] for k in Policy.__dataclass_fields__})
     rows = await _rows(conn)
     held_boxes = set()
+    deferred_teams = set()
     for row in queue_order(rows):
+        # Yield capacity to other teams, but never let this team's later
+        # requests pass its soft-cap-deferred head.
+        if row['team'] in deferred_teams:
+            continue
         if limit_reason(row, rows, policy) == 'soft_team':
+            deferred_teams.add(row['team'])
             continue
         choice = select_box(row, rows, [b for b in boxes if b.name not in held_boxes], policy)
         if not choice:
