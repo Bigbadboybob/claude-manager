@@ -11,8 +11,9 @@ use serde_json::{json, Value};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, VecDeque},
+    ops::{Deref, DerefMut},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, MutexGuard,
     },
     time::Instant,
@@ -81,17 +82,19 @@ struct Stats {
     max_wait: u64,
     total_ms: u64,
     max_total: u64,
+    total_hold_ms: u64,
     slow: u64,
     sheds: u64,
     errors: u64,
 }
 impl Stats {
-    fn add(&mut self, wait: u64, total: u64, slow: bool, shed: bool, error: bool) {
+    fn add(&mut self, wait: u64, hold: u64, total: u64, slow: bool, shed: bool, error: bool) {
         self.count += 1;
         self.waits[BOUNDS.iter().position(|&b| wait <= b).unwrap()] += 1;
         self.max_wait = self.max_wait.max(wait);
         self.total_ms = self.total_ms.saturating_add(total);
         self.max_total = self.max_total.max(total);
+        self.total_hold_ms = self.total_hold_ms.saturating_add(hold);
         self.slow += u64::from(slow);
         self.sheds += u64::from(shed);
         self.errors += u64::from(error);
@@ -104,6 +107,7 @@ impl Stats {
         self.max_wait = self.max_wait.max(other.max_wait);
         self.total_ms = self.total_ms.saturating_add(other.total_ms);
         self.max_total = self.max_total.max(other.max_total);
+        self.total_hold_ms = self.total_hold_ms.saturating_add(other.total_hold_ms);
         self.slow += other.slow;
         self.sheds += other.sheds;
         self.errors += other.errors;
@@ -123,7 +127,7 @@ impl Stats {
         0
     }
     fn value(&self) -> Value {
-        json!({"count":self.count,"p50_wait_ms":self.percentile(50),"p95_wait_ms":self.percentile(95),"max_wait_ms":self.max_wait,"total_ms":self.total_ms,"max_total_ms":self.max_total,"slow_count":self.slow,"sheds":self.sheds,"errors":self.errors})
+        json!({"count":self.count,"p50_wait_ms":self.percentile(50),"p95_wait_ms":self.percentile(95),"max_wait_ms":self.max_wait,"total_ms":self.total_ms,"max_total_ms":self.max_total,"total_hold_ms":self.total_hold_ms,"slow_count":self.slow,"sheds":self.sheds,"errors":self.errors})
     }
 }
 #[derive(Default)]
@@ -136,6 +140,9 @@ struct Bucket {
 }
 struct Pending {
     started: Instant,
+    method: String,
+    // Milliseconds from Health::started plus one; zero means still waiting.
+    acquired_ms: AtomicU64,
     done: AtomicBool,
 }
 #[derive(Default)]
@@ -203,6 +210,7 @@ impl Health {
         &self,
         method: &str,
         wait: u64,
+        holds: &[(u64, u64)],
         total: u64,
         shed: bool,
         error: bool,
@@ -215,7 +223,7 @@ impl Health {
         }
         let b = Self::bucket(&mut inner, self.seconds() / 60);
         let slow = total > config.slow_total_ms;
-        b.stats.add(wait, total, slow, shed, error);
+        b.stats.add(wait, 0, total, slow, shed, error);
         let key = if b.methods.contains_key(method) || b.methods.len() < MAX_METHODS {
             method.chars().take(100).collect()
         } else {
@@ -224,7 +232,71 @@ impl Health {
         b.methods
             .entry(key)
             .or_default()
-            .add(wait, total, slow, shed, error);
+            .add(wait, 0, total, slow, shed, error);
+        // Attribute each completed hold to the minutes in which it occurred.
+        // At most the 60 retained minutes are touched, even for a stuck RPC.
+        let oldest = self.seconds().saturating_div(60).saturating_sub(59);
+        for &(start, end) in holds {
+            if end <= start {
+                continue;
+            }
+            let first = (start / 60_000).max(oldest);
+            let last = (end - 1) / 60_000;
+            if first > last {
+                continue;
+            }
+            for minute in first..=last {
+                let from = start.max(minute.saturating_mul(60_000));
+                let to = end.min(minute.saturating_add(1).saturating_mul(60_000));
+                let hold = to.saturating_sub(from);
+                let b = Self::bucket(&mut inner, minute);
+                b.stats.total_hold_ms = b.stats.total_hold_ms.saturating_add(hold);
+                let key = if b.methods.contains_key(method) || b.methods.len() < MAX_METHODS {
+                    method.chars().take(100).collect()
+                } else {
+                    "other".to_string()
+                };
+                let m = b.methods.entry(key).or_default();
+                m.total_hold_ms = m.total_hold_ms.saturating_add(hold);
+            }
+        }
+    }
+    fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis().min(u64::MAX as u128) as u64
+    }
+    fn top_holders(
+        &self,
+        inner: &Inner,
+        methods: &BTreeMap<String, Stats>,
+        window_minutes: u64,
+    ) -> Vec<Value> {
+        let mut holds: BTreeMap<String, (u64, u64)> = methods
+            .iter()
+            .map(|(name, stats)| (name.clone(), (stats.total_hold_ms, 0)))
+            .collect();
+        let now_ms = self.elapsed_ms();
+        for p in inner
+            .pending
+            .values()
+            .filter(|p| !p.done.load(Ordering::Relaxed))
+        {
+            let acquired = p.acquired_ms.load(Ordering::Relaxed);
+            if acquired != 0 {
+                let start_of_window = (now_ms / 60_000).saturating_sub(window_minutes - 1) * 60_000;
+                let active = now_ms.saturating_sub((acquired - 1).max(start_of_window));
+                let entry = holds.entry(p.method.clone()).or_default();
+                entry.1 = entry.1.saturating_add(active);
+            }
+        }
+        let mut rows: Vec<_> = holds
+            .into_iter()
+            .map(|(method, (completed, active))| {
+                (method, completed.saturating_add(active), completed, active)
+            })
+            .filter(|r| r.1 > 0)
+            .collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        rows.into_iter().map(|(method, total, completed, active)| json!({"method":method,"total_hold_ms":total,"completed_hold_ms":completed,"in_flight_hold_ms":active})).collect()
     }
     fn snapshot_at(&self, seconds: u64, config: &Config) -> Value {
         let c = config.normalized();
@@ -245,7 +317,9 @@ impl Health {
         let max_pending = inner
             .pending
             .values()
-            .filter(|p| !p.done.load(Ordering::Relaxed))
+            .filter(|p| {
+                !p.done.load(Ordering::Relaxed) && p.acquired_ms.load(Ordering::Relaxed) == 0
+            })
             .map(|p| p.started.elapsed().as_millis().min(u64::MAX as u128) as u64)
             .max()
             .unwrap_or(0);
@@ -255,9 +329,12 @@ impl Health {
         value["in_flight_waits"] = json!(inner
             .pending
             .values()
-            .filter(|p| !p.done.load(Ordering::Relaxed))
+            .filter(
+                |p| !p.done.load(Ordering::Relaxed) && p.acquired_ms.load(Ordering::Relaxed) == 0
+            )
             .count());
         value["max_in_flight_wait_ms"] = json!(max_pending);
+        value["top_holders"] = json!(self.top_holders(&inner, &methods, c.window_minutes));
         value["by_method"] = json!(methods
             .into_iter()
             .map(|(k, v)| (k, v.value()))
@@ -274,7 +351,9 @@ impl Health {
         let pending_max = inner
             .pending
             .values()
-            .filter(|p| !p.done.load(Ordering::Relaxed))
+            .filter(|p| {
+                !p.done.load(Ordering::Relaxed) && p.acquired_ms.load(Ordering::Relaxed) == 0
+            })
             .map(|p| p.started.elapsed().as_millis().min(u64::MAX as u128) as u64)
             .max()
             .unwrap_or(0);
@@ -300,11 +379,16 @@ impl Health {
             })
             .count() as u64;
         let mut stats = Stats::default();
+        let mut methods = BTreeMap::<String, Stats>::new();
         let mut max_pending = 0;
         for b in recent {
             stats.merge(&b.stats);
+            for (name, s) in &b.methods {
+                methods.entry(name.clone()).or_default().merge(s);
+            }
             max_pending = max_pending.max(b.pending_max);
         }
+        let holders = self.top_holders(&inner, &methods, c.evaluation_minutes);
         let was_degraded = inner.degraded;
         let action = if !inner.degraded && bad >= c.bad_minutes {
             inner.degraded = true;
@@ -324,7 +408,7 @@ impl Health {
             Action::None
         };
         let changed = was_degraded != inner.degraded;
-        let summary = json!({"p95_wait_ms":stats.percentile(95),"max_wait_ms":stats.max_wait.max(max_pending),"sheds":stats.sheds,"bad_minutes":bad,"evaluation_minutes":c.evaluation_minutes});
+        let summary = json!({"p95_wait_ms":stats.percentile(95),"max_wait_ms":stats.max_wait.max(max_pending),"sheds":stats.sheds,"bad_minutes":bad,"evaluation_minutes":c.evaluation_minutes,"top_holder":holders.first()});
         (action, changed, summary)
     }
 }
@@ -338,10 +422,41 @@ thread_local! { static CURRENT: RefCell<Option<Current>> = const { RefCell::new(
 struct Current {
     health: Arc<Health>,
     wait_ms: u64,
+    holds: Vec<(u64, u64)>,
+    method: String,
     pending_ids: Vec<u64>,
 }
-/// Instrument only store acquisitions on the RPC thread, including refresh.
-pub fn store_lock<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
+/// Record the hold without taking telemetry or daemon locks while owning the store.
+pub struct StoreGuard<'a, T> {
+    guard: MutexGuard<'a, T>,
+    held_since_ms: Option<u64>,
+    pending: Option<Arc<Pending>>,
+}
+impl<T> Deref for StoreGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+impl<T> DerefMut for StoreGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.guard
+    }
+}
+impl<T> Drop for StoreGuard<'_, T> {
+    fn drop(&mut self) {
+        if let Some(p) = &self.pending {
+            p.done.store(true, Ordering::Relaxed);
+        }
+        CURRENT.with(|c| {
+            if let (Some(c), Some(start)) = (c.borrow_mut().as_mut(), self.held_since_ms) {
+                c.holds.push((start, c.health.elapsed_ms()));
+            }
+        });
+    }
+}
+/// Instrument store acquisitions on the RPC thread, including task refresh.
+pub fn store_lock<T>(lock: &Mutex<T>) -> StoreGuard<'_, T> {
     let started = Instant::now();
     let pending = CURRENT.with(|c| {
         c.borrow_mut().as_mut().and_then(|c| {
@@ -351,18 +466,24 @@ pub fn store_lock<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
             }
             i.next_id = i.next_id.wrapping_add(1);
             let id = i.next_id;
-            let wait = Arc::new(Pending {
+            let p = Arc::new(Pending {
                 started,
+                method: c.method.clone(),
+                acquired_ms: AtomicU64::new(0),
                 done: AtomicBool::new(false),
             });
-            i.pending.insert(id, wait.clone());
+            i.pending.insert(id, p.clone());
             c.pending_ids.push(id);
-            Some(wait)
+            Some((p, c.health.clone()))
         })
     });
     let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(pending) = pending {
-        pending.done.store(true, Ordering::Relaxed);
+    let held_since_ms = CURRENT.with(|c| c.borrow().as_ref().map(|c| c.health.elapsed_ms()));
+    if let Some((p, _)) = &pending {
+        p.acquired_ms.store(
+            held_since_ms.unwrap_or(0).saturating_add(1),
+            Ordering::Relaxed,
+        );
     }
     CURRENT.with(|c| {
         if let Some(c) = c.borrow_mut().as_mut() {
@@ -371,7 +492,11 @@ pub fn store_lock<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
                 .saturating_add(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
         }
     });
-    guard
+    StoreGuard {
+        guard,
+        held_since_ms,
+        pending: pending.map(|(p, _)| p),
+    }
 }
 pub fn measure<F, T>(
     health: Arc<Health>,
@@ -387,6 +512,8 @@ where
         c.borrow_mut().replace(Current {
             health: health.clone(),
             wait_ms: 0,
+            holds: Vec::with_capacity(16),
+            method: method.chars().take(100).collect(),
             pending_ids: Vec::new(),
         })
     });
@@ -397,6 +524,7 @@ where
     health.record(
         method,
         current.wait_ms,
+        &current.holds,
         start.elapsed().as_millis().min(u64::MAX as u128) as u64,
         result.as_ref().err().is_some_and(|e| e.code == "busy"),
         result.is_err(),
@@ -472,7 +600,17 @@ pub fn alarm_pass(state: &Arc<Mutex<DaemonState>>) {
     let s = state.lock().unwrap_or_else(|p| p.into_inner());
     match action {
         Action::Alert => {
-            let msg = format!("{host}: CM chat degraded over {} minutes: p95 wait {} ms, max wait {} ms, {} sheds; load averages (1/5/15 min) {load}.", stats["evaluation_minutes"], stats["p95_wait_ms"], stats["max_wait_ms"], stats["sheds"]);
+            let holder = stats["top_holder"]
+                .as_object()
+                .map(|h| {
+                    format!(
+                        "{} ({} ms)",
+                        h["method"].as_str().unwrap_or("unknown"),
+                        h["total_hold_ms"]
+                    )
+                })
+                .unwrap_or_else(|| "unknown (no measured RPC holds)".into());
+            let msg = format!("{host}: CM chat degraded over {} minutes: p95 wait {} ms, max wait {} ms, {} sheds; top store-lock holder {holder}; load averages (1/5/15 min) {load}.", stats["evaluation_minutes"], stats["p95_wait_ms"], stats["max_wait_ms"], stats["sheds"]);
             let e = Escalation {
                 source: "messaging-health".into(),
                 dedupe_key: KEY.into(),
@@ -529,7 +667,7 @@ mod tests {
         let mut inner = h.lock();
         Health::bucket(&mut inner, minute)
             .stats
-            .add(wait, wait + 7, wait > 10_000, shed, shed);
+            .add(wait, 0, wait + 7, wait > 10_000, shed, shed);
     }
 
     #[test]
@@ -573,6 +711,8 @@ mod tests {
         let c = Config::default();
         let pending = Arc::new(Pending {
             started: Instant::now() - Duration::from_secs(20),
+            method: "messaging.read".into(),
+            acquired_ms: AtomicU64::new(0),
             done: AtomicBool::new(false),
         });
         h.lock().pending.insert(1, pending);
@@ -648,6 +788,82 @@ mod tests {
     }
 
     #[test]
+    fn completed_hold_is_split_across_window_minutes() {
+        let h = Health {
+            started: Instant::now() - Duration::from_secs(70),
+            inner: Mutex::new(Inner::default()),
+        };
+        let mut c = Config::default();
+        h.record(
+            "messaging.read",
+            0,
+            &[(50_000, 70_000)],
+            20_000,
+            false,
+            false,
+            &c,
+            &[],
+        );
+        c.window_minutes = 2;
+        assert_eq!(
+            h.snapshot_at(70, &c)["by_method"]["messaging.read"]["total_hold_ms"],
+            20_000
+        );
+        c.window_minutes = 1;
+        assert_eq!(
+            h.snapshot_at(70, &c)["by_method"]["messaging.read"]["total_hold_ms"],
+            10_000
+        );
+    }
+
+    #[test]
+    fn live_and_completed_holds_are_ranked_by_method() {
+        let health = Arc::new(Health::default());
+        let store = Arc::new(Mutex::new(()));
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_health = health.clone();
+        let worker_store = store.clone();
+        let worker = std::thread::spawn(move || {
+            measure(
+                worker_health,
+                Config::default(),
+                "messaging.read",
+                Instant::now(),
+                || {
+                    let _guard = store_lock(&worker_store);
+                    held_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap();
+        });
+        held_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        std::thread::sleep(Duration::from_millis(15));
+        let live = health.snapshot(&Config::default());
+        assert_eq!(live["in_flight_waits"], 0);
+        assert_eq!(live["top_holders"][0]["method"], "messaging.read");
+        assert!(
+            live["top_holders"][0]["in_flight_hold_ms"]
+                .as_u64()
+                .unwrap()
+                >= 10
+        );
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        let completed = health.snapshot(&Config::default());
+        assert_eq!(completed["top_holders"][0]["method"], "messaging.read");
+        assert!(
+            completed["by_method"]["messaging.read"]["total_hold_ms"]
+                .as_u64()
+                .unwrap()
+                >= 10
+        );
+        assert_eq!(completed["top_holders"][0]["in_flight_hold_ms"], 0);
+    }
+
+    #[test]
     fn alarm_delivers_blocking_attention_and_persists_episode() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = DaemonState::new();
@@ -662,6 +878,11 @@ mod tests {
         });
         for minute in 0..3 {
             sample(&h, minute, 20_000, false);
+            Health::bucket(&mut h.lock(), minute)
+                .methods
+                .entry("messaging.send".into())
+                .or_default()
+                .add(20_000, 8_000, 28_000, true, false, false);
         }
         state.messaging_health = h;
         let state = Arc::new(Mutex::new(state));
@@ -671,6 +892,9 @@ mod tests {
         assert_eq!(alert.urgency.as_deref(), Some("blocking"));
         assert!(alert.message.contains("p95 wait"));
         assert!(alert.message.contains("load averages"));
+        assert!(alert
+            .message
+            .contains("top store-lock holder messaging.send (24000 ms)"));
         let saved: Persisted = serde_json::from_slice(
             &std::fs::read(tmp.path().join("messaging-health-alarm.json")).unwrap(),
         )
