@@ -68,12 +68,13 @@ def settings():
     try:
         data = json.loads(Path(path).read_text())
         p = data['policy']
+        p.setdefault('transport_failure_threshold', 3)
         for key in ('cpus_per_slot', 'mem_gb_per_slot', 'max_slots_per_session',
                     'max_slots_per_lease', 'max_slots_per_team', 'burst_max_seconds',
                     'long_max_seconds', 'absolute_max_seconds', 'idle_threshold_seconds',
                     'idle_answer_seconds', 'sample_max_gap_seconds', 'notice_limit',
                     'notice_expiry_guard_seconds', 'expiry_warning_seconds',
-                    'reclaim_notice_grace_seconds'):
+                    'reclaim_notice_grace_seconds', 'transport_failure_threshold'):
             if not isinstance(p[key], int) or isinstance(p[key], bool) or p[key] <= 0:
                 raise ValueError(f'{key} must be a positive integer')
         operator = p.get('quarantine_operator_pid')
@@ -199,7 +200,7 @@ async def _quarantine_box(conn, box, reason, lease, policy, *, transport=False):
         evidence['transport_outage_id'] = str(uuid.uuid4())
     await conn.execute("""UPDATE compute_boxes SET enabled=false, ever_enabled=true, checked_at=now(),
         evidence=$2::jsonb WHERE name=$1""", box, evidence)
-    if transport and existing_outage:
+    if transport and existing_outage and original:
         return False
     logger.warning('compute box %s quarantined: %s', box, reason)
     operator = policy.get('quarantine_operator_pid')
@@ -208,6 +209,29 @@ async def _quarantine_box(conn, box, reason, lease, policy, *, transport=False):
             f"[cm-lease] box {box} quarantined: {reason}; manual review required",
             f'compute-box-quarantine-operator:{uuid.uuid4()}')
     return True
+
+
+async def _record_transport_failure(conn, lease, policy):
+    box = lease['box']
+    evidence = _json_object(await conn.fetchval('SELECT evidence FROM compute_boxes WHERE name=$1', box)) or {}
+    evidence.setdefault('transport_outage_id', str(uuid.uuid4()))
+    count = evidence.get('consecutive_transport_failures', 0)
+    count = count if type(count) is int and count >= 0 else 0
+    evidence['consecutive_transport_failures'] = count + 1
+    await conn.execute('UPDATE compute_boxes SET evidence=$2::jsonb WHERE name=$1', box, evidence)
+    if count + 1 >= policy['transport_failure_threshold']:
+        reason = 'consecutive transport failures'
+        await _quarantine_box(conn, box, reason, lease, policy, transport=True)
+        await _outage_owner_push(conn, lease,
+            f"[cm-lease] box {box} quarantined after transport failures; lease {lease['id']} is awaiting reconciliation")
+
+
+async def _record_transport_success(conn, box):
+    evidence = _json_object(await conn.fetchval('SELECT evidence FROM compute_boxes WHERE name=$1', box)) or {}
+    evidence.pop('consecutive_transport_failures', None)
+    if not evidence.get('quarantine_reason'):
+        evidence.pop('transport_outage_id', None)
+    await conn.execute('UPDATE compute_boxes SET evidence=$2::jsonb WHERE name=$1', box, evidence)
 
 
 async def _outage_owner_push(conn, lease, text):
@@ -451,7 +475,8 @@ async def release(body: LeaseChange, request: Request):
         if row['status'] == 'active':
             pending = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM compute_lease_actions WHERE lease_id=$1 AND kind='extend' AND status <> 'done')", body.lease_id)
             if pending:
-                raise HTTPException(409, 'extension in progress; retry')
+                await conn.execute('UPDATE compute_leases SET release_requested=true WHERE id=$1', body.lease_id)
+                return {'lease_id': body.lease_id, 'status': 'release_requested'}
             await conn.execute("UPDATE compute_leases SET status='releasing', last_activity_at=now() WHERE id=$1", body.lease_id)
             await _action(conn, body.lease_id, 'release', {'box': row['box']})
             return {'lease_id': body.lease_id, 'status': 'releasing'}
@@ -648,6 +673,10 @@ async def executor_complete(body: ActionReceipt, request: Request):
             raise HTTPException(422, 'node result lease ID mismatch')
         lease = await conn.fetchrow('SELECT * FROM compute_leases WHERE id=$1', action['lease_id'])
         recorded_result = body.result
+        if body.result.get('transport_error') is True and body.result.get('retryable') is True:
+            await _record_transport_failure(conn, lease, p)
+        elif body.result.get('retryable') is not True or body.result.get('transport_error') is False:
+            await _record_transport_success(conn, lease['box'])
         if action['kind'] == 'grant':
             if lease['status'] != 'granting':
                 raise HTTPException(409, 'unexpected or incomplete grant result')
@@ -724,6 +753,11 @@ async def executor_complete(body: ActionReceipt, request: Request):
                     await conn.execute("UPDATE compute_lease_actions SET status='done', result=$2::jsonb WHERE id=$1",
                                        action['id'], body.result)
                     return {'ok': True, 'releasing': True}
+                if lease['release_requested']:
+                    await conn.execute("UPDATE compute_leases SET status='releasing' WHERE id=$1", lease['id'])
+                    await _action(conn, lease['id'], 'release', {'box': lease['box']})
+                    await conn.execute("UPDATE compute_lease_actions SET status='done', result=$2::jsonb WHERE id=$1", action['id'], body.result)
+                    return {'ok': True, 'releasing': True}
                 return {'ok': True, 'retryable': True}
             if body.result.get('absent') is True and body.result.get('unit_inactive') is True:
                 # The extend failed and a node probe proved the slice absent.
@@ -738,6 +772,9 @@ async def executor_complete(body: ActionReceipt, request: Request):
                 if body.result.get('expires') != payload['expires_epoch']:
                     raise HTTPException(422, 'node expiry mismatch')
                 await conn.execute('UPDATE compute_leases SET expires_at=to_timestamp($2), error=NULL WHERE id=$1', lease['id'], payload['expires_epoch'])
+                if lease['release_requested']:
+                    await conn.execute("UPDATE compute_leases SET status='releasing' WHERE id=$1", lease['id'])
+                    await _action(conn, lease['id'], 'release', {'box': lease['box']})
         elif action['kind'] == 'release':
             if lease['status'] != 'releasing':
                 raise HTTPException(409, 'unexpected release result')

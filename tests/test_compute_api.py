@@ -331,6 +331,50 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             evidence = api._json_object(await conn.fetchval("SELECT evidence FROM compute_boxes WHERE name='d6'"))
             self.assertEqual(len(evidence['quarantine_reasons']), 2)
 
+    async def test_transport_threshold_quarantines_and_success_resets_count(self):
+        owner = self.body('owner')
+        lease = await api.request_lease(owner, self.request)
+        action = (await api.executor_poll(self.request))['action']
+        fail = api.ActionReceipt(action_id=action['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'retryable': True, 'transport_error': True, 'error': 'IAP down'})
+        await api.executor_complete(fail, self.request)
+        async with self.pool.acquire() as conn:
+            self.assertTrue(await conn.fetchval("SELECT enabled FROM compute_boxes WHERE name='d6'"))
+        await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'configured': True, 'workdir': '/work/id'}), self.request)
+        async with self.pool.acquire() as conn:
+            self.assertNotIn('consecutive_transport_failures', api._json_object(await conn.fetchval("SELECT evidence FROM compute_boxes WHERE name='d6'")))
+        await api.release(api.LeaseChange(actor=owner.actor, lease_id=lease['lease_id']), self.request)
+        release = (await api.executor_poll(self.request))['action']
+        fail = api.ActionReceipt(action_id=release['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'retryable': True, 'transport_error': True, 'error': 'IAP down'})
+        await api.executor_complete(fail, self.request)
+        await api.executor_complete(fail, self.request)
+        async with self.pool.acquire() as conn:
+            self.assertTrue(await conn.fetchval("SELECT enabled FROM compute_boxes WHERE name='d6'"))
+        await api.executor_complete(fail, self.request)
+        async with self.pool.acquire() as conn:
+            self.assertFalse(await conn.fetchval("SELECT enabled FROM compute_boxes WHERE name='d6'"))
+            self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', lease['lease_id']), 'releasing')
+            self.assertEqual(await conn.fetchval('SELECT count(*) FROM item_pushes WHERE pid=$1', owner.actor.pid), 1)
+
+    async def test_release_wins_pending_extension_after_uncertain_result(self):
+        owner = self.body('owner')
+        lease = await api.request_lease(owner, self.request)
+        grant = (await api.executor_poll(self.request))['action']
+        await api.executor_complete(api.ActionReceipt(action_id=grant['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'configured': True, 'workdir': '/work/id'}), self.request)
+        await api.extend(api.LeaseChange(actor=owner.actor, lease_id=lease['lease_id'], duration=60), self.request)
+        extend = (await api.executor_poll(self.request))['action']
+        self.assertEqual((await api.release(api.LeaseChange(actor=owner.actor, lease_id=lease['lease_id']), self.request))['status'], 'release_requested')
+        receipt = api.ActionReceipt(action_id=extend['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'retryable': True, 'transport_error': True, 'error': 'IAP down'})
+        self.assertTrue((await api.executor_complete(receipt, self.request))['releasing'])
+        release = (await api.executor_poll(self.request))['action']
+        self.assertEqual(release['kind'], 'release')
+        async with self.pool.acquire() as conn:
+            self.assertTrue(await conn.fetchval('SELECT slot_ids FROM compute_leases WHERE id=$1', lease['lease_id']))
+
     async def test_retryable_grant_error_clears_on_success(self):
         owner = self.body('owner')
         lease = await api.request_lease(owner, self.request)

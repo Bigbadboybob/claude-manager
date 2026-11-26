@@ -61,7 +61,7 @@ def _execute(action, routes):
                         isinstance(error.get('error'), str) and error['error'].strip()):
                     # This may follow a partial node operation: retain the
                     # reservation and claimed action, but record the reason.
-                    return {'lease_id': str(action['lease_id']), 'retryable': True, 'error': error['error']}
+                    return {'lease_id': str(action['lease_id']), 'retryable': True, 'transport_error': False, 'error': error['error']}
         if action['kind'] != 'extend':
             raise
         # A failed SSH command says nothing about node state. A separate,
@@ -92,6 +92,7 @@ def execute(action, routes):
         # A node or transport failure proves neither success nor absence.
         # Report uncertainty so the API can reconcile it at expiry.
         reason = str(exc)
+        transport_error = True
         if isinstance(exc, subprocess.CalledProcessError):
             for line in reversed((exc.stderr or '').splitlines()):
                 try:
@@ -100,8 +101,10 @@ def execute(action, routes):
                     continue
                 if isinstance(detail, dict) and isinstance(detail.get('error'), str) and detail['error'].strip():
                     reason = detail['error']
+                    if exc.returncode == 3 and isinstance(detail.get('refused'), bool):
+                        transport_error = False
                     break
-        return {'lease_id': str(action['lease_id']), 'retryable': True, 'error': reason or type(exc).__name__}
+        return {'lease_id': str(action['lease_id']), 'retryable': True, 'transport_error': transport_error, 'error': reason or type(exc).__name__}
 
 
 def local_drained(box, directory):

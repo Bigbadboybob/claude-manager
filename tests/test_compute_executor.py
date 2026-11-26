@@ -98,7 +98,7 @@ def test_node_grant_refusal_and_transport_failure_are_reported(monkeypatch):
     monkeypatch.setattr(executor.subprocess, 'run', fail(3, 'banner\n{"refused":true,"error":"box capacity exceeded"}\n'))
     assert executor.execute(action, routes) == {'lease_id': 'lease-id', 'refused': True, 'error': 'box capacity exceeded'}
     monkeypatch.setattr(executor.subprocess, 'run', fail(3, '{"error":"unknown user","refused":false}'))
-    assert executor.execute(action, routes) == {'lease_id': 'lease-id', 'retryable': True, 'error': 'unknown user'}
+    assert executor.execute(action, routes) == {'lease_id': 'lease-id', 'retryable': True, 'transport_error': False, 'error': 'unknown user'}
     for code, stderr in [(255, '{"refused":true,"error":"connection lost"}'),
                          (3, 'transport failed')]:
         monkeypatch.setattr(executor.subprocess, 'run', fail(code, stderr))
@@ -181,7 +181,7 @@ def test_release_failure_is_reported_as_uncertain(monkeypatch):
     def failed(argv, **kwargs):
         raise subprocess.CalledProcessError(3, argv, stderr='{"refused":false,"error":"bad node config"}')
     monkeypatch.setattr(executor.subprocess, 'run', failed)
-    assert executor.execute(action, routes) == {'lease_id': 'lease-id', 'retryable': True, 'error': 'bad node config'}
+    assert executor.execute(action, routes) == {'lease_id': 'lease-id', 'retryable': True, 'transport_error': False, 'error': 'bad node config'}
     def timed_out(argv, **kwargs):
         raise subprocess.TimeoutExpired(argv, 90)
     monkeypatch.setattr(executor.subprocess, 'run', timed_out)

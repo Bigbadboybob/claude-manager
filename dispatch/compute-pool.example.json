@@ -16,6 +16,7 @@
     "reclaim_notice_grace_seconds": 600,
     "notice_expiry_guard_seconds": 600,
     "expiry_warning_seconds": 300,
+    "transport_failure_threshold": 3,
     "quarantine_operator_pid": null
   },
   "boxes": [
