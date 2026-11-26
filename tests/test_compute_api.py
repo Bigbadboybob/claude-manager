@@ -144,8 +144,11 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(waiting['status'], 'queued')
                 self.assertIsNone((await api.executor_poll(self.request))['action'])
             self.assertIn('skipping box d6', '\n'.join(logs.output))
+            self.assertEqual(sum('skipping box d6' in line for line in logs.output), 1)
             status = await api.status(api.StatusRequest(actor=owner.actor), self.request)
             self.assertEqual(status['pool'][0]['occupied_slots'], 2)
+            self.assertTrue(status['pool'][0]['quarantined'])
+            self.assertIn('does not match configured slots', status['pool'][0]['quarantine_reason'])
         finally:
             cfg_path.write_text(original)
 
@@ -354,6 +357,9 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             box = await conn.fetchrow("SELECT enabled,evidence FROM compute_boxes WHERE name='d6'")
             self.assertFalse(box['enabled'])
             self.assertEqual(api._json_object(box['evidence'])['quarantine_reason'], 'node refused grant: box capacity exceeded')
+        status = await api.status(api.StatusRequest(actor=owner.actor, lease_id=granted['lease_id']), self.request)
+        self.assertTrue(status['pool'][0]['quarantined'])
+        self.assertEqual(status['pool'][0]['quarantine_reason'], 'node refused grant: box capacity exceeded')
         with self.assertRaises(api.HTTPException) as exc:
             await api.executor_enable(api.BoxEnable(box='d6', local_drained=True, node_drained=True,
                                                    node_max_slots=1), self.request)

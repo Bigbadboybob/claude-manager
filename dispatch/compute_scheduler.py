@@ -12,6 +12,7 @@ from typing import Mapping, Sequence
 PRIORITIES = {"v221-gate": 0, "normal": 1, "low": 2}
 OCCUPYING = frozenset({"granting", "active", "releasing"})
 logger = logging.getLogger('cm.compute.scheduler')
+_logged_quarantines: dict[str, set[str]] = {}
 
 
 @dataclass(frozen=True)
@@ -82,31 +83,34 @@ def limit_reason(lease: Mapping, leases: Sequence[Mapping], policy: Policy,
     return None
 
 
+def reservation_state(box: Box, leases: Sequence[Mapping], policy: Policy) -> tuple[set[str], str | None]:
+    used: set[str] = set()
+    for current in leases:
+        if current['status'] in OCCUPYING and current.get('box') == box.name:
+            reservation = current.get('slot_ids')
+            if (not reservation or len(reservation) != slots_needed(current, policy)
+                    or len(set(reservation)) != len(reservation)
+                    or not set(reservation).issubset(set(box.slots)) or used.intersection(reservation)):
+                return used, f"reservation {current.get('id')} does not match configured slots"
+            used.update(reservation)
+    return used, None
+
+
 def select_box(lease: Mapping, leases: Sequence[Mapping], boxes: Sequence[Box],
                policy: Policy, *, enabled_boxes: Sequence[Box] | None = None) -> tuple[Box, tuple[str, ...]] | None:
     """Find capacity without oversubscription. Slot lists are disjoint CPU sets."""
     if limit_reason(lease, leases, policy, boxes if enabled_boxes is None else enabled_boxes):
         return None
     count = slots_needed(lease, policy)
-    occupied = [x for x in leases if x['status'] in OCCUPYING]
     for box in boxes:
-        used: set[str] = set()
-        inconsistent = False
-        for current in occupied:
-            if current.get("box") == box.name:
-                # A malformed reservation must never silently free capacity.
-                reservation = current.get("slot_ids")
-                if (not reservation or len(reservation) != slots_needed(current, policy)
-                        or len(set(reservation)) != len(reservation)
-                        or not set(reservation).issubset(set(box.slots))
-                        or used.intersection(reservation)):
-                    logger.error('skipping box %s: reservation %s does not match configured slots',
-                                 box.name, current.get('id'))
-                    inconsistent = True
-                    break
-                used.update(reservation)
-        if inconsistent:
+        used, reason = reservation_state(box, leases, policy)
+        if reason:
+            seen = _logged_quarantines.setdefault(box.name, set())
+            if reason not in seen:
+                logger.error('skipping box %s: %s', box.name, reason)
+                seen.add(reason)
             continue
+        _logged_quarantines.pop(box.name, None)
         free = tuple(slot for slot in box.slots if slot not in used)
         if len(free) >= count:
             return box, free[:count]

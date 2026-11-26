@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from api.auth import verify_token
-from dispatch.compute_scheduler import Box, Policy, justification_missing, limit_reason, queue_eta, queue_order, select_box, session_cap_blocked, slots_needed
+from dispatch.compute_scheduler import Box, Policy, justification_missing, limit_reason, queue_eta, queue_order, reservation_state, select_box, session_cap_blocked, slots_needed
 from dispatch.compute_idle import Sample, idle_average, next_idle_action
 
 router = APIRouter(prefix='/compute', dependencies=[Depends(verify_token)])
@@ -305,7 +305,9 @@ async def status(body: StatusRequest, request: Request):
                 raise HTTPException(404, 'lease not found')
             await _record_activity(conn, body.lease_id, owner, only_issued_notice=True)
         rows = await _rows(conn)
-        enabled = {r['name'] for r in await conn.fetch('SELECT name FROM compute_boxes WHERE enabled')}
+        box_rows = await conn.fetch('SELECT name,enabled,evidence FROM compute_boxes')
+        box_state = {r['name']: r for r in box_rows}
+        enabled = {r['name'] for r in box_rows if r['enabled']}
         enabled_boxes = [b for b in boxes if b.configured_enabled and b.name in enabled]
         policy = Policy(**{k: p[k] for k in Policy.__dataclass_fields__})
         no_fit = {r['id'] for r in rows if r['status'] == 'queued' and not _fits_any_box(r, policy, enabled_boxes)}
@@ -358,11 +360,16 @@ async def status(body: StatusRequest, request: Request):
                   'owner': r['owner'], 'team': r['team'], 'purpose': r['purpose'], 'justification': r['justification'],
                   'position': i + 1, **({'waiting': 'no enabled box fits'} if r['id'] in no_fit else {})}
                  for i, r in enumerate(ordered)]
-        occupancy = [{'box': b.name, 'enabled': b.configured_enabled and b.name in enabled,
-                      'total_slots': len(b.slots),
-                      'occupied_slots': sum(len(r['slot_ids'] or []) for r in rows
-                                            if r['box'] == b.name and r['status'] in ('granting', 'active', 'releasing'))}
-                     for b in boxes]
+        occupancy = []
+        for b in boxes:
+            evidence = _json_object(box_state[b.name]['evidence']) if b.name in box_state else {}
+            _, reservation_error = reservation_state(b, rows, policy)
+            reason = (evidence or {}).get('quarantine_reason') or reservation_error
+            occupancy.append({'box': b.name, 'enabled': b.configured_enabled and b.name in enabled,
+                              'total_slots': len(b.slots),
+                              'occupied_slots': sum(len(r['slot_ids'] or []) for r in rows
+                                                    if r['box'] == b.name and r['status'] in ('granting', 'active', 'releasing')),
+                              'quarantined': bool(reason), 'quarantine_reason': reason})
         return {'leases': mine, 'queue': queue, 'pool': occupancy,
                 'eta': queue_eta(rows, datetime.now(timezone.utc))}
 

@@ -41,7 +41,9 @@ A node capacity-exceeded refusal disables and quarantines that box persistently.
 After investigating and draining it, an operator can explicitly clear the
 quarantine through the executor enable endpoint with `clear_quarantine=true`,
 the drain checks and the verified node limit; the executor does not clear it
-automatically on restart.
+automatically on restart. `compute_status` reports `quarantined` and
+`quarantine_reason` for both node-capacity refusals and reservations that no
+longer match the configured slots.
 
 At cutover:
 

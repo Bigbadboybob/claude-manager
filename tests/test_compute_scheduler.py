@@ -43,6 +43,12 @@ def test_reservations_survive_inflight_grant_and_release(caplog):
     assert 'skipping box lane' in caplog.text
     other = Box('other', 'other', BOX.slots)
     assert select_box(request, existing, [BOX, other], POLICY) == (other, ('0,8', '1,9'))
+    assert sum('skipping box lane' in record.message for record in caplog.records) == 1
+    existing[0]['slot_ids'] = ['0,8']
+    assert select_box(request, existing, [BOX], POLICY) is not None
+    existing[0]['slot_ids'] = None
+    assert select_box(request, existing, [BOX], POLICY) is None
+    assert sum('skipping box lane' in record.message for record in caplog.records) == 2
 
 
 def test_memory_also_consumes_slots_and_session_limit_is_enforced():
