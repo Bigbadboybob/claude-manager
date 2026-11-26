@@ -5612,11 +5612,14 @@ def _compute_class_alias(fn):
 @_compute_class_alias
 def compute_request(cpus: int, mem_gb: int, duration: int, priority: str, purpose: str,
                     lease_class: Annotated[str, Field(alias="class")] = "burst",
-                    pinned: bool = False) -> dict:
+                    pinned: bool = False, justification: str = "") -> dict:
     """Request a compute lease; duration is in seconds. Poll compute_status for a queued grant."""
-    return control_client.call("compute.request", {"cpus": cpus, "mem_gb": mem_gb,
+    params = {"cpus": cpus, "mem_gb": mem_gb,
         "duration": duration, "priority": priority, "purpose": purpose,
-        "class": lease_class, "pinned": pinned})
+        "class": lease_class, "pinned": pinned}
+    if justification:
+        params['justification'] = justification
+    return control_client.call("compute.request", params)
 
 
 @mcp.tool()

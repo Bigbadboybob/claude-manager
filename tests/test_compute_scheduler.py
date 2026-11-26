@@ -96,9 +96,11 @@ def test_eta_is_earliest_possible_release_not_claimed_start():
     assert queue_eta([], NOW) is None
 
 
-def test_above_normal_lease_size_requires_a_visible_purpose():
+def test_above_normal_lease_size_requires_explicit_justification():
     box = Box('big', 'big', tuple(f'{i},{i+8}' for i in range(8)))
     big = lease('big', cpus=10, mem_gb=80)
     assert select_box(big, [], [box], POLICY) is None
-    big['purpose'] = 'explain why five slots are needed'
+    big['purpose'] = 'ordinary required purpose'
+    assert select_box(big, [], [box], POLICY) is None
+    big['justification'] = 'explain why five slots are needed'
     assert select_box(big, [], [box], POLICY) == (box, box.slots[:5])

@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from api.auth import verify_token
-from dispatch.compute_scheduler import Box, Policy, limit_reason, queue_eta, queue_order, select_box, session_cap_blocked, slots_needed
+from dispatch.compute_scheduler import Box, Policy, justification_missing, limit_reason, queue_eta, queue_order, select_box, session_cap_blocked, slots_needed
 from dispatch.compute_idle import Sample, idle_average, next_idle_action
 
 router = APIRouter(prefix='/compute', dependencies=[Depends(verify_token)])
@@ -47,6 +47,7 @@ class LeaseRequest(BaseModel):
     purpose: str = Field(min_length=1, max_length=2000)
     lease_class: str = Field(alias='class')
     pinned: bool = False
+    justification: str = Field(default='', max_length=2000)
 
 
 class LeaseChange(BaseModel):
@@ -175,7 +176,7 @@ async def _schedule(conn, policy_data, boxes):
         # it must not hold up its team or reserve other boxes.
         if not _fits_any_box(row, policy, boxes):
             continue
-        if session_cap_blocked(row, rows, policy):
+        if session_cap_blocked(row, rows, policy) or justification_missing(row, policy):
             continue
         # Yield capacity to other teams, but never let this team's later
         # requests pass its soft-cap-deferred head.
@@ -235,6 +236,8 @@ async def request_lease(body: LeaseRequest, request: Request):
     requested = body.model_dump()
     if slots_needed(requested, policy) > policy.max_slots_per_session:
         raise HTTPException(422, 'request exceeds the configured per-session limit')
+    if slots_needed(requested, policy) > policy.max_slots_per_lease and not body.justification.strip():
+        raise HTTPException(422, 'justification is required for requests above the per-lease slot cap')
     if not _fits_any_box(requested, policy, boxes):
         raise HTTPException(422, 'request cannot fit any configured box')
     ident = uuid.uuid4()
@@ -247,10 +250,10 @@ async def request_lease(body: LeaseRequest, request: Request):
         team = await conn.fetchval("""SELECT m.primary_team_id::text FROM incarnations i
             JOIN members m ON m.id=i.member_id WHERE i.pid=$1 AND i.ended_at IS NULL""", owner)
         await conn.execute("""INSERT INTO compute_leases
-            (id,owner,team,purpose,priority,class,cpus,mem_gb,duration_seconds,pinned,status)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'queued')""", ident, owner,
+            (id,owner,team,purpose,priority,class,cpus,mem_gb,duration_seconds,pinned,justification,status)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'queued')""", ident, owner,
             team, body.purpose, body.priority, body.lease_class, body.cpus,
-            body.mem_gb, body.duration, body.pinned)
+            body.mem_gb, body.duration, body.pinned, body.justification.strip() or None)
         await _schedule(conn, p, boxes)
         rows = await _rows(conn)
         row = next(x for x in rows if x['id'] == ident)
@@ -329,7 +332,7 @@ async def status(body: StatusRequest, request: Request):
                     seen.add(action['lease_id'])
         ordered = queue_order(rows)
         queue = [{'lease_id': r['id'], 'priority': r['priority'], 'cpus': r['cpus'],
-                  'owner': r['owner'], 'team': r['team'], 'purpose': r['purpose'],
+                  'owner': r['owner'], 'team': r['team'], 'purpose': r['purpose'], 'justification': r['justification'],
                   'position': i + 1, **({'waiting': 'no enabled box fits'} if r['id'] in no_fit else {})}
                  for i, r in enumerate(ordered)]
         occupancy = [{'box': b.name, 'enabled': b.configured_enabled and b.name in enabled,
@@ -401,6 +404,7 @@ async def extend(body: LeaseChange, request: Request):
             raise HTTPException(503, 'lease box is missing from the pool configuration')
         policy = Policy(**{k: p[k] for k in Policy.__dataclass_fields__})
         if any(r['status'] == 'queued' and r['owner'] != owner and not session_cap_blocked(r, rows, policy) and
+               not justification_missing(r, policy) and
                slots_needed(r, policy) <= len(target.slots) for r in rows):
             raise HTTPException(409, 'other sessions are waiting')
         if body.duration > p[row['class'] + '_max_seconds']:

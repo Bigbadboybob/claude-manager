@@ -5,7 +5,7 @@ systemd behavior on a drained, approved box before enabling the rest of the
 pool; the implementation tests do not contact lane boxes.
 
 Agents use `compute_request(cpus, mem_gb, duration, priority, purpose, class,
-pinned)` with duration in seconds, then `compute_status(lease_id)` while
+pinned, justification)` with duration in seconds, then `compute_status(lease_id)` while
 waiting. Priorities are `v221-gate`, `normal`, and `low`; classes are `burst`
 and `long`. A granted lease identifies its box, CPU slots, expiry, SSH alias,
 workdir, and command prefix. Pinned requests restrict CPU placement; loose
@@ -14,7 +14,7 @@ with `compute_release`.
 Only work run under the returned prefix is accounted to the lease.
 Use `v221-gate` only for work named by EP or the deploy lead, and put the
 authorizing ruling ID in the purpose. Requests above the normal per-lease slot
-limit should explain their size in the purpose; the session limit still applies.
+limit require a separate `justification`; the session limit still applies.
 Gate requests bypass the team soft cap, but still obey the session limit. When
 a request is deferred by the team cap, later requests from that team wait;
 other teams can use available capacity.

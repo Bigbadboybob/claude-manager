@@ -677,6 +677,9 @@
     "duration": {
      "type": "integer"
     },
+    "justification": {
+     "type": "string"
+    },
     "mem_gb": {
      "type": "integer"
     },

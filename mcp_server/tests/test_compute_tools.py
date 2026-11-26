@@ -45,4 +45,13 @@ def test_compute_request_accepts_class_alias_through_mcp_validation(requested_cl
     assert call.call_args.args[1]['class'] == (requested_class or 'burst')
     schema = server.mcp._tool_manager.get_tool('compute_request').parameters
     assert schema['properties']['class']['default'] == 'burst'
+    assert schema['properties']['justification']['default'] == ''
     assert set(schema['required']) == {'cpus', 'mem_gb', 'duration', 'priority', 'purpose'}
+
+
+def test_compute_request_forwards_explicit_justification():
+    args = {'cpus': 10, 'mem_gb': 80, 'duration': 300, 'priority': 'normal',
+            'purpose': 'tests', 'justification': 'five parallel workers'}
+    with patch.object(server.control_client, 'call', return_value={'status': 'queued'}) as call:
+        asyncio.run(server.mcp._tool_manager.call_tool('compute_request', args))
+    assert call.call_args.args[1]['justification'] == 'five parallel workers'

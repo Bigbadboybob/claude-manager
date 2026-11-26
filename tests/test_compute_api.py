@@ -62,6 +62,9 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             answer_sql = (ROOT / 'sql/041_compute_notice_answers.sql').read_text()
             await conn.execute(answer_sql)
             await conn.execute(answer_sql)
+            justification_sql = (ROOT / 'sql/042_compute_lease_justification.sql').read_text()
+            await conn.execute(justification_sql)
+            await conn.execute(justification_sql)
             await conn.execute("INSERT INTO compute_boxes (name, enabled, checked_at, evidence) VALUES ('d6', true, now(), '{}'::jsonb)")
         self.request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(pool=self.pool)))
 
@@ -373,6 +376,36 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             await api.request_lease(body, self.request)
         self.assertIn('cannot fit any configured box', exc.exception.detail)
 
+    async def test_real_request_requires_separate_justification_above_four_slots(self):
+        import httpx
+        import uuid
+        from fastapi import FastAPI
+        cfg_path = self.root / 'pool.json'
+        original = cfg_path.read_text()
+        cfg = json.loads(original)
+        cfg['boxes'][0]['slots'] = [f'{i},{i+8}' for i in range(8)]
+        cfg_path.write_text(json.dumps(cfg))
+        try:
+            app = FastAPI()
+            app.state.pool = self.pool
+            app.dependency_overrides[api.verify_token] = lambda: None
+            app.include_router(api.router)
+            request = {'actor': self.body('large').actor.model_dump(), 'cpus': 10, 'mem_gb': 80,
+                       'duration': 300, 'priority': 'normal', 'purpose': 'tests', 'class': 'burst'}
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+                denied = await client.post('/compute/request', json=request)
+                self.assertEqual(denied.status_code, 422)
+                self.assertIn('justification', denied.json()['detail'])
+                request['justification'] = 'five slots are needed for this parallel test'
+                accepted = await client.post('/compute/request', json=request)
+                self.assertEqual(accepted.status_code, 200)
+                self.assertEqual(accepted.json()['status'], 'granting')
+            async with self.pool.acquire() as conn:
+                self.assertEqual(await conn.fetchval('SELECT justification FROM compute_leases WHERE id=$1',
+                    uuid.UUID(accepted.json()['lease_id'])), request['justification'])
+        finally:
+            cfg_path.write_text(original)
+
     async def test_unavailable_wide_box_does_not_pin_team_queue(self):
         import uuid
         cfg_path = self.root / 'pool.json'
@@ -420,6 +453,7 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(status['leases'][0]['waiting'], 'no enabled box fits')
             config_disabled = self.body('config-disabled')
             config_disabled.cpus, config_disabled.mem_gb = 16, 128
+            config_disabled.justification = 'requires eight slots'
             with self.assertRaises(api.HTTPException) as exc:
                 await api.request_lease(config_disabled, self.request)
             self.assertEqual(exc.exception.status_code, 409)
