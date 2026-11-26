@@ -139,7 +139,8 @@ try:
         info = os.fstat(f.fileno())
         if (marker and stat.S_ISREG(info.st_mode) and info.st_dev == marker.get("device")
                 and info.st_ino == marker.get("inode") and info.st_size <= 65536
-                and hashlib.sha256(f.read()).hexdigest() == marker.get("sha256")):
+                and hashlib.sha256(f.read()).hexdigest() == marker.get("sha256")
+                and set(os.listdir(p)) == {"OWNER.md"}):
             (p / "OWNER.md").unlink()
 except OSError:
     pass

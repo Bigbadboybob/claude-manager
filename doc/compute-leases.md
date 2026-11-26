@@ -103,5 +103,6 @@ cleanup was skipped; unavailable values are null.
 Node slices use `cmlease-<32 hex digits>.slice` under `cmlease.slice`. Job
 scopes use `CollectMode=inactive-or-failed`, and after a job exits the node
 also resets any failed job scope. Release removes the generated
-`OWNER.md` only if its recorded identity and contents still match, then removes
-the workdir if empty; any other files or changed marker remain in place.
+`OWNER.md` only if its recorded identity and contents still match and it is
+the only file, then removes the workdir. Other files and their ownership
+marker remain in place.

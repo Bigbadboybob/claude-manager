@@ -145,7 +145,7 @@ def test_release_removes_unchanged_generated_owner_file_and_empty_directory(cont
     assert ('/usr/bin/systemctl', 'stop', node.unit(LEASE)) in calls
 
 
-def test_release_preserves_user_files_and_removes_only_generated_marker(context, monkeypatch):
+def test_release_preserves_user_files_and_generated_marker(context, monkeypatch):
     cfg, args, _ = context
     _use_local_workdir_commands(monkeypatch)
     row = node.grant(args, cfg)
@@ -154,7 +154,7 @@ def test_release_preserves_user_files_and_removes_only_generated_marker(context,
     result = node.release(LEASE, cfg)
     assert result['released'] and result['workdir_bytes'] > 0
     assert (path / 'results.txt').read_text() == 'keep this'
-    assert not (path / 'OWNER.md').exists()
+    assert (path / 'OWNER.md').is_file()
 
 
 @pytest.mark.parametrize('change', ['edited', 'replaced', 'symlink', 'no_marker'])
