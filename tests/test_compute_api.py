@@ -278,6 +278,37 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         async with self.pool.acquire() as conn:
             self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', lease['lease_id']), 'released')
 
+    async def test_expired_uncertain_extension_quarantines_then_releases(self):
+        owner = self.body('owner')
+        lease = await api.request_lease(owner, self.request)
+        grant = (await api.executor_poll(self.request))['action']
+        await api.executor_complete(api.ActionReceipt(action_id=grant['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'configured': True, 'workdir': '/work/id'}), self.request)
+        await api.extend(api.LeaseChange(actor=owner.actor, lease_id=lease['lease_id'], duration=60), self.request)
+        extend = (await api.executor_poll(self.request))['action']
+        self.assertEqual(extend['kind'], 'extend')
+        receipt = api.ActionReceipt(action_id=extend['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'retryable': True, 'error': 'ssh exit 255'})
+        self.assertTrue((await api.executor_complete(receipt, self.request))['retryable'])
+        async with self.pool.acquire() as conn:
+            self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', lease['lease_id']), 'active')
+            await conn.execute("UPDATE compute_leases SET expires_at=now()-interval '1 second' WHERE id=$1", lease['lease_id'])
+        self.assertTrue((await api.executor_complete(receipt, self.request))['releasing'])
+        self.assertTrue((await api.executor_complete(receipt, self.request))['already_done'])
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow('SELECT status,slot_ids,error FROM compute_leases WHERE id=$1', lease['lease_id'])
+            self.assertEqual(row['status'], 'releasing')
+            self.assertTrue(row['slot_ids'])
+            self.assertIn('ssh exit 255', row['error'])
+            self.assertFalse(await conn.fetchval("SELECT enabled FROM compute_boxes WHERE name='d6'"))
+            self.assertEqual(await conn.fetchval("SELECT count(*) FROM item_pushes WHERE text LIKE '%extension remains unconfirmed%'"), 1)
+        release = (await api.executor_poll(self.request))['action']
+        self.assertEqual(release['kind'], 'release')
+        await api.executor_complete(api.ActionReceipt(action_id=release['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'released': True}), self.request)
+        async with self.pool.acquire() as conn:
+            self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', lease['lease_id']), 'released')
+
     async def test_retryable_grant_error_clears_on_success(self):
         owner = self.body('owner')
         lease = await api.request_lease(owner, self.request)

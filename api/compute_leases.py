@@ -689,6 +689,26 @@ async def executor_complete(body: ActionReceipt, request: Request):
         elif action['kind'] == 'extend':
             if lease['status'] != 'active':
                 raise HTTPException(409, 'unexpected extension result')
+            if body.result.get('retryable') is True:
+                reason = body.result.get('error')
+                if not isinstance(reason, str) or not reason.strip():
+                    raise HTTPException(422, 'retryable extension error must include a reason')
+                reason = 'extension attempt failed: ' + reason[:2000]
+                await conn.execute('UPDATE compute_leases SET error=$2 WHERE id=$1', lease['id'], reason)
+                if lease['expires_at'] and lease['expires_at'] <= datetime.now(timezone.utc):
+                    quarantine = 'expired extension remains unconfirmed after retryable node error'
+                    await _quarantine_box(conn, lease['box'], quarantine, lease, p)
+                    await _owner_push(conn, lease,
+                        f"[cm-lease] lease {lease['id']} expired while extension remains unconfirmed; box {lease['box']} quarantined: {reason}",
+                        f"compute-lease-extend-retry-expired:{lease['id']}")
+                    # An extension may have reached the node. Reconcile by
+                    # releasing it, retaining the reservation until confirmed.
+                    await conn.execute("UPDATE compute_leases SET status='releasing' WHERE id=$1", lease['id'])
+                    await _action(conn, lease['id'], 'release', {'box': lease['box']})
+                    await conn.execute("UPDATE compute_lease_actions SET status='done', result=$2::jsonb WHERE id=$1",
+                                       action['id'], body.result)
+                    return {'ok': True, 'releasing': True}
+                return {'ok': True, 'retryable': True}
             if body.result.get('absent') is True and body.result.get('unit_inactive') is True:
                 # The extend failed and a node probe proved the slice absent.
                 # Still keep the reservation until release is acknowledged.
@@ -701,7 +721,7 @@ async def executor_complete(body: ActionReceipt, request: Request):
                     payload = json.loads(payload)
                 if body.result.get('expires') != payload['expires_epoch']:
                     raise HTTPException(422, 'node expiry mismatch')
-                await conn.execute('UPDATE compute_leases SET expires_at=to_timestamp($2) WHERE id=$1', lease['id'], payload['expires_epoch'])
+                await conn.execute('UPDATE compute_leases SET expires_at=to_timestamp($2), error=NULL WHERE id=$1', lease['id'], payload['expires_epoch'])
         elif action['kind'] == 'release':
             if lease['status'] != 'releasing':
                 raise HTTPException(409, 'unexpected release result')

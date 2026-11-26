@@ -85,7 +85,7 @@ def test_pre_enable_check_failure_keeps_boxes_disabled(monkeypatch, tmp_path):
     assert not enabled
 
 
-def test_node_grant_refusal_is_reported_but_transport_failure_is_not(monkeypatch):
+def test_node_grant_refusal_and_transport_failure_are_reported(monkeypatch):
     import subprocess
     import pytest
     action = {'kind': 'grant', 'lease_id': 'lease-id', 'payload': {'box': 'box', 'owner': 'agent:d:s',
@@ -102,8 +102,8 @@ def test_node_grant_refusal_is_reported_but_transport_failure_is_not(monkeypatch
     for code, stderr in [(255, '{"refused":true,"error":"connection lost"}'),
                          (3, 'transport failed')]:
         monkeypatch.setattr(executor.subprocess, 'run', fail(code, stderr))
-        with pytest.raises(subprocess.CalledProcessError):
-            executor.execute(action, routes)
+        result = executor.execute(action, routes)
+        assert result['retryable'] is True and 'absent' not in result
 
 
 def test_failed_extension_requires_explicit_node_absence(monkeypatch):
@@ -126,8 +126,8 @@ def test_failed_extension_requires_explicit_node_absence(monkeypatch):
         calls.append(argv)
         raise subprocess.TimeoutExpired(argv, 90)
     monkeypatch.setattr(executor.subprocess, 'run', transport_timeout)
-    with pytest.raises(subprocess.TimeoutExpired):
-        executor.execute(action, routes)
+    result = executor.execute(action, routes)
+    assert result['retryable'] is True and 'absent' not in result
     assert len(calls) == 1
 
 
@@ -145,12 +145,13 @@ def test_failed_extension_does_not_infer_absence_from_uncertain_probe(monkeypatc
             raise result
         return result
     monkeypatch.setattr(executor.subprocess, 'run', run)
-    with pytest.raises(ValueError, match='did not confirm'):
-        executor.execute(action, routes)
+    result = executor.execute(action, routes)
+    assert result['retryable'] is True and 'absent' not in result
+    assert 'did not confirm' in result['error']
     replies = iter([subprocess.CalledProcessError(3, 'extend'),
                     subprocess.TimeoutExpired('probe', 90)])
-    with pytest.raises(subprocess.TimeoutExpired):
-        executor.execute(action, routes)
+    result = executor.execute(action, routes)
+    assert result['retryable'] is True and 'absent' not in result
 
 
 def test_quarantine_skips_drain_and_inventory_logs_only_on_change(monkeypatch, tmp_path, caplog):

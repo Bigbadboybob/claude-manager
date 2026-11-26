@@ -87,10 +87,10 @@ def execute(action, routes):
     try:
         return _execute(action, routes)
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
-        if action['kind'] != 'release':
+        if action['kind'] not in ('grant', 'extend', 'release'):
             raise
-        # Neither a node failure nor a transport failure proves release.
-        # Report uncertainty so the API can quarantine after expiry.
+        # A node or transport failure proves neither success nor absence.
+        # Report uncertainty so the API can reconcile it at expiry.
         reason = str(exc)
         if isinstance(exc, subprocess.CalledProcessError):
             for line in reversed((exc.stderr or '').splitlines()):
