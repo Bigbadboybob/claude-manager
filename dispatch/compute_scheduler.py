@@ -50,6 +50,11 @@ def queue_order(leases: Sequence[Mapping]) -> list[Mapping]:
                   key=lambda x: (PRIORITIES[x["priority"]], x["created_at"], str(x["id"])))
 
 
+def session_cap_blocked(lease: Mapping, leases: Sequence[Mapping], policy: Policy) -> bool:
+    occupied = (x for x in leases if x['status'] in OCCUPYING and x['owner'] == lease['owner'])
+    return sum(slots_needed(x, policy) for x in occupied) + slots_needed(lease, policy) > policy.max_slots_per_session
+
+
 def limit_reason(lease: Mapping, leases: Sequence[Mapping], policy: Policy,
                  enabled_boxes: Sequence[Box]) -> str | None:
     """Distinguish the team soft cap from limits that must retain queue order."""
@@ -57,10 +62,11 @@ def limit_reason(lease: Mapping, leases: Sequence[Mapping], policy: Policy,
     if count > policy.max_slots_per_lease and not str(lease.get("purpose") or "").strip():
         return 'hard'
     occupied = [x for x in leases if x["status"] in OCCUPYING]
-    if sum(slots_needed(x, policy) for x in occupied if x["owner"] == lease["owner"]) + count > policy.max_slots_per_session:
-        return 'hard'
+    if session_cap_blocked(lease, leases, policy):
+        return 'session_cap'
     team = lease.get("team")
     other_waiters = team and any(x["status"] == "queued" and x.get("team") != team and
+        not session_cap_blocked(x, leases, policy) and
         any(box.configured_enabled and len(box.slots) >= slots_needed(x, policy) for box in enabled_boxes)
         for x in leases)
     # Gate work bypasses the team soft cap, never the session hard cap above.

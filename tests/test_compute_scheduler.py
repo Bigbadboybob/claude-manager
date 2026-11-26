@@ -58,7 +58,7 @@ def test_session_limit_takes_precedence_over_soft_team_deferral():
     active = lease('active', owner='same', team='a', status='active', box='lane', slot_ids=['0,8'])
     request = lease('request', owner='same', team='a')
     other = lease('other', team='b')
-    assert limit_reason(request, [active, request, other], policy, [BOX]) == 'hard'
+    assert limit_reason(request, [active, request, other], policy, [BOX]) == 'session_cap'
     assert limit_reason(lease('another', team='a'), [active, request, other], policy, [BOX]) == 'soft_team'
 
 
@@ -70,7 +70,7 @@ def test_gate_ignores_team_soft_cap_but_obeys_session_cap():
     assert limit_reason(gate, [active, other, gate], policy, [BOX]) is None
     active.update(cpus=10, mem_gb=80, slot_ids=[f'{i},{i+8}' for i in range(5)])
     gate['owner'] = 'same'
-    assert limit_reason(gate, [active, other, gate], policy, [BOX]) == 'hard'
+    assert limit_reason(gate, [active, other, gate], policy, [BOX]) == 'session_cap'
 
 
 def test_soft_cap_counts_only_waiters_that_fit_an_enabled_box():

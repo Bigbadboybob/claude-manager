@@ -93,6 +93,34 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         async with self.pool.acquire() as conn:
             self.assertEqual(await conn.fetchval("SELECT count(*) FROM compute_leases WHERE status='granting'"), 1)
 
+    async def test_session_capped_waiter_does_not_block_other_grants_or_extensions(self):
+        import uuid
+        cfg_path = self.root / 'pool.json'
+        original = cfg_path.read_text()
+        cfg = json.loads(original)
+        cfg['boxes'][0]['slots'] = [f'{i},{i+12}' for i in range(12)]
+        cfg_path.write_text(json.dumps(cfg))
+        try:
+            async with self.pool.acquire() as conn:
+                for i in range(8):
+                    await conn.execute("""INSERT INTO compute_leases
+                        (id,owner,purpose,priority,class,cpus,mem_gb,duration_seconds,status,box,slot_ids,granted_at,expires_at)
+                        VALUES ($1,'agent:d:a','running','normal','burst',2,16,300,'active','d6',$2,now(),now()+interval '5 minutes')""",
+                        uuid.uuid4(), [cfg['boxes'][0]['slots'][i]])
+            a = await api.request_lease(self.body('a'), self.request)
+            self.assertEqual(a['status'], 'queued')
+            b_body = self.body('b')
+            b = await api.request_lease(b_body, self.request)
+            self.assertEqual(b['status'], 'granting')
+            action = (await api.executor_poll(self.request))['action']
+            self.assertEqual(action['lease_id'], b['lease_id'])
+            await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+                'lease_id': str(b['lease_id']), 'configured': True, 'workdir': '/work/b'}), self.request)
+            result = await api.extend(api.LeaseChange(actor=b_body.actor, lease_id=b['lease_id'], duration=60), self.request)
+            self.assertEqual(result['status'], 'extending')
+        finally:
+            cfg_path.write_text(original)
+
     async def test_release_cleanup_results_are_visible_only_to_owner(self):
         async def finish(owner, cleanup):
             body = self.body(owner)

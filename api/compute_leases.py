@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from api.auth import verify_token
-from dispatch.compute_scheduler import Box, Policy, limit_reason, queue_eta, queue_order, select_box, slots_needed
+from dispatch.compute_scheduler import Box, Policy, limit_reason, queue_eta, queue_order, select_box, session_cap_blocked, slots_needed
 from dispatch.compute_idle import Sample, idle_average, next_idle_action
 
 router = APIRouter(prefix='/compute', dependencies=[Depends(verify_token)])
@@ -170,6 +170,8 @@ async def _schedule(conn, policy_data, boxes):
         # A box that is disabled or too small cannot help this request yet;
         # it must not hold up its team or reserve other boxes.
         if not _fits_any_box(row, policy, boxes):
+            continue
+        if session_cap_blocked(row, rows, policy):
             continue
         # Yield capacity to other teams, but never let this team's later
         # requests pass its soft-cap-deferred head.
@@ -394,7 +396,7 @@ async def extend(body: LeaseChange, request: Request):
         if target is None:
             raise HTTPException(503, 'lease box is missing from the pool configuration')
         policy = Policy(**{k: p[k] for k in Policy.__dataclass_fields__})
-        if any(r['status'] == 'queued' and r['owner'] != owner and
+        if any(r['status'] == 'queued' and r['owner'] != owner and not session_cap_blocked(r, rows, policy) and
                slots_needed(r, policy) <= len(target.slots) for r in rows):
             raise HTTPException(409, 'other sessions are waiting')
         if body.duration > p[row['class'] + '_max_seconds']:
