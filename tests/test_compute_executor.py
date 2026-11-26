@@ -3,6 +3,8 @@ import importlib.util
 import shlex
 from types import SimpleNamespace
 
+import pytest
+
 loader = importlib.machinery.SourceFileLoader('cm_compute_executor', 'scripts/cm-compute-executor')
 spec = importlib.util.spec_from_loader(loader.name, loader)
 executor = importlib.util.module_from_spec(spec)
@@ -23,7 +25,12 @@ def test_cutover_is_fail_closed_and_enable_requires_both_drains(monkeypatch, tmp
            'routes': {'box': {'argv': ['gcloud', 'compute', 'ssh', 'vm']}}}
     monkeypatch.setattr(executor, 'local_drained', lambda *_: calls.append('local') or True)
     monkeypatch.setattr(executor.subprocess, 'run', lambda *a, **kw: SimpleNamespace(stdout='{"drained":true,"max_slots":7}'))
-    monkeypatch.setattr(executor, 'api', lambda path, body: calls.append((path, body)))
+    def api(path, body):
+        calls.append((path, body))
+        if path == '/compute/executor/pre-enable':
+            return {'queued_count': 0, 'queued': [], 'enabled_boxes': []}
+        return {'enabled': True}
+    monkeypatch.setattr(executor, 'api', api)
     enabled = set()
     executor.enable_drained_boxes(cfg, enabled)
     assert not calls and not enabled
@@ -33,6 +40,47 @@ def test_cutover_is_fail_closed_and_enable_requires_both_drains(monkeypatch, tmp
     assert calls[-1][1] == {'box': 'box', 'local_drained': True, 'node_drained': True, 'node_max_slots': 7}
     executor.enable_drained_boxes(cfg, enabled)
     assert calls.count('local') == 1
+
+
+def test_pre_enable_lists_old_queue_and_blocks_first_enable_until_review(monkeypatch, tmp_path, caplog):
+    calls = []
+    queued = [{'lease_id': 'old', 'missing_justification': True}]
+    report = {'queued_count': 1, 'queued': queued, 'enabled_boxes': []}
+    cfg = {'cutover_ready': True, 'lq_directory': str(tmp_path),
+           'routes': {'box': {'argv': ['gcloud', 'compute', 'ssh', 'vm']}}}
+    monkeypatch.setattr(executor, 'local_drained', lambda *_: calls.append('local') or True)
+    monkeypatch.setattr(executor.subprocess, 'run', lambda *a, **kw: SimpleNamespace(stdout='{"drained":true,"max_slots":7}'))
+    def api(path, body):
+        calls.append(path)
+        if path == '/compute/executor/pre-enable':
+            return report
+        return {'enabled': True}
+    monkeypatch.setattr(executor, 'api', api)
+    enabled = set()
+    with caplog.at_level('INFO', logger='cm-compute-executor'):
+        executor.enable_drained_boxes(cfg, enabled)
+    assert calls == ['/compute/executor/pre-enable'] and not enabled
+    assert 'old' in caplog.text and 'missing_justification' in caplog.text
+    cfg['allow_queued_at_cutover'] = True
+    executor.enable_drained_boxes(cfg, enabled)
+    assert enabled == {'box'}
+    # Once another box is enabled, ordinary queued work must not prevent
+    # later boxes from joining the pool.
+    cfg['allow_queued_at_cutover'] = False
+    report['enabled_boxes'] = ['another']
+    enabled.clear()
+    executor.enable_drained_boxes(cfg, enabled)
+    assert enabled == {'box'}
+
+
+def test_pre_enable_check_failure_keeps_boxes_disabled(monkeypatch, tmp_path):
+    cfg = {'cutover_ready': True, 'lq_directory': str(tmp_path),
+           'routes': {'box': {'argv': ['gcloud', 'compute', 'ssh', 'vm']}}}
+    monkeypatch.setattr(executor, 'api', lambda *_: {'queued_count': 0, 'queued': ['inconsistent'], 'enabled_boxes': []})
+    monkeypatch.setattr(executor, 'local_drained', lambda *_: pytest.fail('must not start drain check'))
+    enabled = set()
+    executor.enable_drained_boxes(cfg, enabled)
+    assert not enabled
 
 
 def test_node_grant_refusal_is_reported_but_transport_failure_is_not(monkeypatch):

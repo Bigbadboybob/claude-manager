@@ -311,10 +311,15 @@ async def status(body: StatusRequest, request: Request):
         enabled_boxes = [b for b in boxes if b.configured_enabled and b.name in enabled]
         policy = Policy(**{k: p[k] for k in Policy.__dataclass_fields__})
         no_fit = {r['id'] for r in rows if r['status'] == 'queued' and not _fits_any_box(r, policy, enabled_boxes)}
+        unjustified = {r['id'] for r in rows if r['status'] == 'queued' and justification_missing(r, policy)}
         mine = [_public(r, boxes) for r in rows if r['owner'] == owner]
         for lease in mine:
             if lease['id'] in no_fit:
                 lease['waiting'] = 'no enabled box fits'
+            elif lease['id'] in unjustified:
+                lease['waiting'] = 'justification required'
+            if lease['id'] in unjustified:
+                lease['missing_justification'] = True
         recent = await conn.fetch("""SELECT * FROM compute_leases
             WHERE owner=$1 AND status IN ('released','failed')
             ORDER BY COALESCE(released_at, created_at) DESC, id DESC LIMIT $2""",
@@ -358,7 +363,10 @@ async def status(body: StatusRequest, request: Request):
         ordered = queue_order(rows)
         queue = [{'lease_id': r['id'], 'priority': r['priority'], 'cpus': r['cpus'],
                   'owner': r['owner'], 'team': r['team'], 'purpose': r['purpose'], 'justification': r['justification'],
-                  'position': i + 1, **({'waiting': 'no enabled box fits'} if r['id'] in no_fit else {})}
+                  'position': i + 1,
+                  **({'missing_justification': True} if r['id'] in unjustified else {}),
+                  **({'waiting': 'no enabled box fits'} if r['id'] in no_fit else
+                     {'waiting': 'justification required'} if r['id'] in unjustified else {})}
                  for i, r in enumerate(ordered)]
         occupancy = []
         for b in boxes:
@@ -461,6 +469,24 @@ class BoxEnable(BaseModel):
     node_drained: bool
     node_max_slots: int = Field(gt=0, strict=True)
     clear_quarantine: bool = False
+
+
+@router.post('/executor/pre-enable')
+async def executor_pre_enable(request: Request):
+    """Read-only inventory of queued work before the first box is enabled."""
+    p, boxes = settings()
+    policy = Policy(**{k: p[k] for k in Policy.__dataclass_fields__})
+    async with _pool(request).acquire() as conn, conn.transaction(isolation='repeatable_read', readonly=True):
+        rows = await _rows(conn)
+        enabled = {r['name'] for r in await conn.fetch('SELECT name FROM compute_boxes WHERE enabled')}
+        queued = [{'lease_id': row['id'], 'owner': row['owner'], 'team': row['team'],
+                   'priority': row['priority'], 'cpus': row['cpus'], 'mem_gb': row['mem_gb'],
+                   'purpose': row['purpose'], 'created_at': row['created_at'],
+                   'missing_justification': justification_missing(row, policy)}
+                  for row in queue_order(rows)]
+        return {'queued_count': len(queued), 'queued': queued,
+                'enabled_boxes': [box.name for box in boxes if box.configured_enabled and box.name in enabled
+                                  and not reservation_state(box, rows, policy)[1]]}
 
 
 async def _reconcile_notices(conn, p, boxes):

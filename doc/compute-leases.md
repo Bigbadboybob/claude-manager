@@ -45,14 +45,35 @@ automatically on restart. `compute_status` reports `quarantined` and
 `quarantine_reason` for both node-capacity refusals and reservations that no
 longer match the configured slots.
 
+Before starting the updated API, apply SQL migrations through
+`042_compute_lease_justification.sql` and install the reviewed pool config,
+including `reclaim_notice_grace_seconds` and each box's `run_argv`.
+
 At cutover:
 
 1. Compute-Manager makes `lq` refuse new `NAME.in` submissions.
-2. Let existing runs drain, then set `cutover_ready`. The executor confirms
+2. Before the first box is enabled, inspect the read-only
+   `/compute/executor/pre-enable` response. It counts and lists queued rows,
+   including `missing_justification` for legacy requests above the slot cap.
+   `compute_status` also marks such requests as waiting for justification.
+   Review each old request with its owner; the check never cancels rows.
+   The executor logs this inventory and keeps all boxes disabled while the
+   first-enable queue is nonempty unless an operator explicitly sets
+   `allow_queued_at_cutover=true` after review.
+3. Let existing runs drain, then set `cutover_ready`. The executor confirms
    each box is drained and its node `max_slots` covers the configured pool
    slots before enabling it.
-3. Leave the pool and executor examples disabled until those checks and the
+4. Leave the pool and executor examples disabled until those checks and the
    deployment review pass. Retire `lq` separately after the agreed week.
+
+With the executor's existing environment loaded, the inventory can be read
+without changing any leases:
+
+```sh
+curl -fsS "$CM_API_URL/compute/executor/pre-enable" \
+  -H "Authorization: Bearer $CM_API_TOKEN" -H 'Content-Type: application/json' \
+  -d '{}'
+```
 
 This branch does not change `lq`.
 

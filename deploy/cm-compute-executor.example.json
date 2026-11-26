@@ -4,6 +4,7 @@
   "sample_parallelism": 4,
   "enable_retry_seconds": 300,
   "cutover_ready": false,
+  "allow_queued_at_cutover": false,
   "lq_directory": "/home/lucas/.local/share/compute-manager/wm-wh-1119",
   "routes": {
     "d6": {"argv": ["gcloud", "compute", "ssh", "integ-devbox6-20261010", "--project=prediction-market-scalper", "--zone=us-east4-b", "--tunnel-through-iap"]},

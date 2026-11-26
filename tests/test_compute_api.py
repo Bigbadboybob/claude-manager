@@ -374,6 +374,34 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
                                                node_max_slots=1, clear_quarantine=True), self.request)
         self.assertEqual((await api.request_lease(self.body('two'), self.request))['status'], 'granting')
 
+    async def test_pre_enable_reports_legacy_queue_without_modifying_rows(self):
+        async with self.pool.acquire() as conn:
+            await conn.execute('UPDATE compute_boxes SET enabled=false')
+            big = await self._queue_for_team(conn, 'a', 8, 1)
+            small = await self._queue_for_team(conn, 'b', 1, 2)
+        result = await api.executor_pre_enable(self.request)
+        self.assertEqual(result['queued_count'], 2)
+        self.assertEqual(result['enabled_boxes'], [])
+        rows = {row['lease_id']: row for row in result['queued']}
+        self.assertTrue(rows[big]['missing_justification'])
+        self.assertFalse(rows[small]['missing_justification'])
+        async with self.pool.acquire() as conn:
+            self.assertEqual(await conn.fetchval("SELECT count(*) FROM compute_leases WHERE status='queued'"), 2)
+        cfg_path = self.root / 'pool.json'
+        original = cfg_path.read_text()
+        cfg = json.loads(original)
+        cfg['boxes'][0]['slots'] = [f'{i},{i+8}' for i in range(8)]
+        cfg_path.write_text(json.dumps(cfg))
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute('UPDATE compute_boxes SET enabled=true')
+            status = await api.status(api.StatusRequest(actor=self.body('a-1').actor, lease_id=big), self.request)
+            lease = next(item for item in status['leases'] if item['id'] == big)
+            self.assertTrue(lease['missing_justification'])
+            self.assertEqual(lease['waiting'], 'justification required')
+        finally:
+            cfg_path.write_text(original)
+
     async def test_box_disabled_in_config_cannot_accept_requests(self):
         cfg_path = self.root / 'pool.json'
         original = cfg_path.read_text()
@@ -572,8 +600,8 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             async with self.pool.acquire() as conn:
                 await conn.execute("UPDATE compute_boxes SET enabled=true WHERE name='df2'")
             status = await api.status(api.StatusRequest(actor=a_big.actor, lease_id=first['lease_id']), self.request)
-            self.assertNotIn('waiting', status['leases'][0])
-            self.assertNotIn('waiting', status['queue'][0])
+            self.assertEqual(status['leases'][0]['waiting'], 'justification required')
+            self.assertEqual(status['queue'][0]['waiting'], 'justification required')
         finally:
             cfg_path.write_text(original)
 

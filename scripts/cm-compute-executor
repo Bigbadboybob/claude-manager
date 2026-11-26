@@ -100,6 +100,21 @@ def local_drained(box, directory):
 def enable_drained_boxes(cfg, enabled):
     if cfg.get('cutover_ready') is not True:
         return
+    try:
+        queued = api('/compute/executor/pre-enable', {})
+        if (not isinstance(queued, dict) or type(queued.get('queued_count')) is not int
+                or queued['queued_count'] < 0 or not isinstance(queued.get('queued'), list)
+                or not isinstance(queued.get('enabled_boxes'), list)
+                or any(not isinstance(name, str) or not name for name in queued['enabled_boxes'])
+                or queued['queued_count'] != len(queued['queued'])):
+            raise ValueError('invalid pre-enable queue response')
+        LOG.info('pre-enable queue count=%s rows=%s', queued['queued_count'], json.dumps(queued['queued']))
+        if queued['queued_count'] and not queued['enabled_boxes'] and cfg.get('allow_queued_at_cutover') is not True:
+            LOG.warning('keeping boxes disabled until queued requests are reviewed')
+            return
+    except (OSError, ValueError, KeyError, urllib.error.URLError):
+        LOG.exception('pre-enable queue check failed; keeping boxes disabled')
+        return
     for box, route in cfg['routes'].items():
         try:
             if box in enabled or not local_drained(box, cfg['lq_directory']):
