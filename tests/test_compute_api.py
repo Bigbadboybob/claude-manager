@@ -321,18 +321,18 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         granted = await api.request_lease(owner, self.request)
         action = (await api.executor_poll(self.request))['action']
         refusal = api.ActionReceipt(action_id=action['action_id'], result={
-            'lease_id': str(granted['lease_id']), 'refused': True, 'error': 'box capacity exceeded'})
+            'lease_id': str(granted['lease_id']), 'refused': True, 'error': 'invalid owner'})
         await api.executor_complete(refusal, self.request)
         await api.executor_complete(refusal, self.request)  # duplicate receipt is idempotent
         waiting = await api.request_lease(self.body('two'), self.request)
         self.assertEqual(waiting['status'], 'queued')
         async with self.pool.acquire() as conn:
             self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', granted['lease_id']), 'releasing')
-            self.assertIn('box capacity exceeded', await conn.fetchval('SELECT error FROM compute_leases WHERE id=$1', granted['lease_id']))
+            self.assertIn('invalid owner', await conn.fetchval('SELECT error FROM compute_leases WHERE id=$1', granted['lease_id']))
             pushes = await conn.fetch("SELECT pid,text FROM item_pushes WHERE kind='compute_lease'")
             self.assertEqual(len(pushes), 1)
             self.assertEqual(pushes[0]['pid'], owner.actor.pid)
-            self.assertIn('box capacity exceeded', pushes[0]['text'])
+            self.assertIn('invalid owner', pushes[0]['text'])
         release = (await api.executor_poll(self.request))['action']
         self.assertEqual(release['kind'], 'release')
         await api.executor_complete(api.ActionReceipt(action_id=release['action_id'], result={
@@ -340,9 +340,33 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         status = await api.status(api.StatusRequest(actor=owner.actor, lease_id=granted['lease_id']), self.request)
         failed = next(x for x in status['leases'] if x['id'] == granted['lease_id'])
         self.assertEqual(failed['status'], 'failed')
-        self.assertIn('box capacity exceeded', failed['error'])
+        self.assertIn('invalid owner', failed['error'])
         async with self.pool.acquire() as conn:
             self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', waiting['lease_id']), 'granting')
+
+    async def test_capacity_refusal_quarantines_box_until_explicit_clear(self):
+        owner = self.body('one')
+        granted = await api.request_lease(owner, self.request)
+        action = (await api.executor_poll(self.request))['action']
+        await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+            'lease_id': str(granted['lease_id']), 'refused': True, 'error': 'box capacity exceeded'}), self.request)
+        async with self.pool.acquire() as conn:
+            box = await conn.fetchrow("SELECT enabled,evidence FROM compute_boxes WHERE name='d6'")
+            self.assertFalse(box['enabled'])
+            self.assertEqual(api._json_object(box['evidence'])['quarantine_reason'], 'node refused grant: box capacity exceeded')
+        with self.assertRaises(api.HTTPException) as exc:
+            await api.executor_enable(api.BoxEnable(box='d6', local_drained=True, node_drained=True,
+                                                   node_max_slots=1), self.request)
+        self.assertEqual(exc.exception.status_code, 409)
+        self.assertIn('quarantined', exc.exception.detail)
+        release = (await api.executor_poll(self.request))['action']
+        await api.executor_complete(api.ActionReceipt(action_id=release['action_id'], result={
+            'lease_id': str(granted['lease_id']), 'released': True, 'already_absent': True}), self.request)
+        status = await api.status(api.StatusRequest(actor=owner.actor, lease_id=granted['lease_id']), self.request)
+        self.assertEqual(next(x for x in status['leases'] if x['id'] == granted['lease_id'])['status'], 'failed')
+        await api.executor_enable(api.BoxEnable(box='d6', local_drained=True, node_drained=True,
+                                               node_max_slots=1, clear_quarantine=True), self.request)
+        self.assertEqual((await api.request_lease(self.body('two'), self.request))['status'], 'granting')
 
     async def test_box_disabled_in_config_cannot_accept_requests(self):
         cfg_path = self.root / 'pool.json'

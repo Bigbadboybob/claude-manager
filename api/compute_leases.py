@@ -120,6 +120,18 @@ def _fits_any_box(row, policy, boxes):
     return any(len(box.slots) >= slots_needed(row, policy) for box in boxes)
 
 
+def _json_object(value):
+    # Some older writes stored a JSON string inside JSONB.
+    for _ in range(2):
+        if not isinstance(value, str):
+            break
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    return value if isinstance(value, dict) else None
+
+
 async def _record_activity(conn, lease_id, owner=None, *, answer=True, only_issued_notice=False):
     """Reset idleness and close out every notice already issued for this lease.
 
@@ -441,6 +453,7 @@ class BoxEnable(BaseModel):
     local_drained: bool
     node_drained: bool
     node_max_slots: int = Field(gt=0, strict=True)
+    clear_quarantine: bool = False
 
 
 async def _reconcile_notices(conn, p, boxes):
@@ -475,6 +488,12 @@ async def executor_enable(body: BoxEnable, request: Request):
         raise HTTPException(409, 'configured pool slots exceed node max_slots')
     async with _pool(request).acquire() as conn, conn.transaction():
         await _lock(conn)
+        existing = await conn.fetchrow('SELECT evidence FROM compute_boxes WHERE name=$1', body.box)
+        evidence = _json_object(existing['evidence']) if existing else {}
+        if evidence is None:
+            raise HTTPException(409, 'box evidence is invalid; manual review is required')
+        if evidence.get('quarantine_reason') and not body.clear_quarantine:
+            raise HTTPException(409, 'box is quarantined; manual review is required')
         await conn.execute("""INSERT INTO compute_boxes (name, enabled, checked_at, evidence)
             VALUES ($1,true,now(),$2::jsonb) ON CONFLICT (name) DO UPDATE
             SET enabled=true, checked_at=now(), evidence=EXCLUDED.evidence""",
@@ -561,6 +580,9 @@ async def executor_complete(body: ActionReceipt, request: Request):
                 reason = reason[:2000]
                 await conn.execute("UPDATE compute_leases SET status='releasing', error=$2 WHERE id=$1",
                                    lease['id'], 'node refused grant: ' + reason)
+                if reason == 'box capacity exceeded':
+                    await conn.execute('UPDATE compute_boxes SET enabled=false, checked_at=now(), evidence=$2::jsonb WHERE name=$1',
+                        lease['box'], json.dumps({'quarantine_reason': 'node refused grant: box capacity exceeded'}))
                 # A refusal may follow a partial node operation. Keep the slot
                 # until release confirms that the node is no longer using it.
                 await _action(conn, lease['id'], 'release', {'box': lease['box'], 'failed_grant': True})
