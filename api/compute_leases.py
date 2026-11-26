@@ -163,7 +163,7 @@ async def _record_activity(conn, lease_id, owner=None, *, answer=True, only_issu
 async def _action(conn, lease_id, kind, payload):
     action_id = uuid.uuid4()
     await conn.execute('INSERT INTO compute_lease_actions (id, lease_id, kind, payload) VALUES ($1,$2,$3,$4::jsonb)',
-                       action_id, lease_id, kind, json.dumps(payload))
+                       action_id, lease_id, kind, payload)
     return action_id
 
 
@@ -531,7 +531,7 @@ async def _reconcile_notices(conn, p, boxes):
         WHERE a.status <> 'done' AND ip.delivered_at IS NOT NULL""")
     for notice in notices:
         await conn.execute("UPDATE compute_lease_actions SET status='done', result=$2::jsonb WHERE id=$1",
-            notice['action_id'], json.dumps({'delivered': notice['dropped_reason'] is None}))
+            notice['action_id'], {'delivered': notice['dropped_reason'] is None})
         if notice['dropped_reason'] is not None:
             continue
         await conn.execute('UPDATE compute_lease_notices SET sent_at=$2 WHERE action_id=$1',
@@ -564,8 +564,8 @@ async def executor_enable(body: BoxEnable, request: Request):
         await conn.execute("""INSERT INTO compute_boxes (name, enabled, checked_at, evidence, ever_enabled)
             VALUES ($1,true,now(),$2::jsonb,true) ON CONFLICT (name) DO UPDATE
             SET enabled=true, checked_at=now(), evidence=EXCLUDED.evidence, ever_enabled=true""",
-            body.box, json.dumps({'local_drained': True, 'node_drained': True,
-                                  'node_max_slots': body.node_max_slots}))
+            body.box, {'local_drained': True, 'node_drained': True,
+                       'node_max_slots': body.node_max_slots})
         await _schedule(conn, p, boxes)
     return {'enabled': True, 'box': body.box}
 
@@ -581,9 +581,11 @@ async def executor_poll(request: Request):
             float(p['expiry_warning_seconds']))
         for row in due:
             epoch = int(row['expires_at'].timestamp())
-            warned = await conn.fetchval("""SELECT EXISTS(SELECT 1 FROM compute_lease_actions
-                WHERE lease_id=$1 AND kind='expiry_notice' AND (payload->>'expires_epoch')::bigint=$2)""",
-                row['id'], epoch)
+            # Pre-fix JSONB rows can contain a JSON string instead of an
+            # object. Recognize both forms to avoid reissuing old warnings.
+            previous = await conn.fetch("SELECT payload FROM compute_lease_actions WHERE lease_id=$1 AND kind='expiry_notice'", row['id'])
+            warned = any((_json_object(action['payload']) or {}).get('expires_epoch') == epoch
+                         for action in previous)
             if not warned:
                 await _notice_action(conn, row, 'expiry_notice', {'expires_epoch': epoch})
         # Do not free a reservation merely because its clock elapsed. The
@@ -649,7 +651,7 @@ async def executor_complete(body: ActionReceipt, request: Request):
                     await conn.execute("UPDATE compute_leases SET status='releasing' WHERE id=$1", lease['id'])
                     await _action(conn, lease['id'], 'release', {'box': lease['box'], 'failed_grant': True})
                     await conn.execute("UPDATE compute_lease_actions SET status='done', result=$2::jsonb WHERE id=$1",
-                                       action['id'], json.dumps(body.result))
+                                       action['id'], body.result)
                     return {'ok': True, 'releasing': True}
                 # Preserve claimed_until to avoid a tight retry loop.
                 return {'ok': True, 'retryable': True}
@@ -728,7 +730,7 @@ async def executor_complete(body: ActionReceipt, request: Request):
             await conn.execute('DELETE FROM compute_lease_sampling_epochs WHERE lease_id=$1', lease['id'])
         else:
             raise HTTPException(409, 'notice delivery is acknowledged by the owner daemon')
-        await conn.execute("UPDATE compute_lease_actions SET status='done', result=$2::jsonb WHERE id=$1", body.action_id, json.dumps(recorded_result))
+        await conn.execute("UPDATE compute_lease_actions SET status='done', result=$2::jsonb WHERE id=$1", body.action_id, recorded_result)
         await _schedule(conn, p, boxes)
         return {'ok': True}
 

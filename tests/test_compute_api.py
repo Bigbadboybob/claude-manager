@@ -340,6 +340,28 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(api._json_object(evidence)['quarantine_reason'], 'original capacity reason')
             self.assertEqual(await conn.fetchval("SELECT count(*) FROM item_pushes WHERE kind='compute_lease'"), 1)
 
+    async def test_expiry_notices_deduplicate_legacy_and_new_jsonb_payloads(self):
+        owner = self.body('owner')
+        lease = await api.request_lease(owner, self.request)
+        action = (await api.executor_poll(self.request))['action']
+        await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'configured': True, 'workdir': '/work/id'}), self.request)
+        async with self.pool.acquire() as conn:
+            epoch = await conn.fetchval("UPDATE compute_leases SET expires_at=date_trunc('second', now())+interval '2 minutes' WHERE id=$1 RETURNING extract(epoch from expires_at)::bigint", lease['lease_id'])
+            # Through the actual codec, this is a JSON string inside JSONB.
+            await conn.execute("INSERT INTO compute_lease_actions (id,lease_id,kind,payload) VALUES (gen_random_uuid(),$1,'expiry_notice',$2::jsonb)", lease['lease_id'], json.dumps({'expires_epoch': epoch}))
+        for _ in range(3):
+            await api.executor_poll(self.request)
+        async with self.pool.acquire() as conn:
+            self.assertEqual(await conn.fetchval("SELECT count(*) FROM compute_lease_actions WHERE lease_id=$1 AND kind='expiry_notice'", lease['lease_id']), 1)
+            await conn.execute("UPDATE compute_leases SET expires_at=expires_at+interval '10 seconds' WHERE id=$1", lease['lease_id'])
+        for _ in range(3):
+            await api.executor_poll(self.request)
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("SELECT payload, jsonb_typeof(payload) AS json_type FROM compute_lease_actions WHERE lease_id=$1 AND kind='expiry_notice' ORDER BY created_at", lease['lease_id'])
+            self.assertEqual([row['json_type'] for row in rows], ['string', 'object'])
+            self.assertEqual(await conn.fetchval("SELECT count(*) FROM item_pushes WHERE kind='compute_lease'"), 1)
+
     async def test_recent_history_is_bounded_but_explicit_old_lease_is_available(self):
         import uuid
         owner = self.body('owner')
