@@ -124,8 +124,6 @@ def local_drained(box, directory):
 
 def enable_drained_boxes(cfg, enabled):
     global _last_queue_inventory, _last_quarantined_boxes
-    if cfg.get('cutover_ready') is not True:
-        return
     try:
         queued = api('/compute/executor/pre-enable', {})
         if (not isinstance(queued, dict) or type(queued.get('queued_count')) is not int
@@ -141,6 +139,8 @@ def enable_drained_boxes(cfg, enabled):
         if quarantined != _last_quarantined_boxes:
             LOG.warning('quarantined compute boxes: %s', ', '.join(sorted(quarantined)) or '(none)')
             _last_quarantined_boxes = quarantined
+        if cfg.get('cutover_ready') is not True:
+            return
         inventory = json.dumps(queued['queued'], sort_keys=True)
         if not queued['has_ever_enabled'] and inventory != _last_queue_inventory:
             LOG.info('pre-enable queue count=%s rows=%s', queued['queued_count'], inventory)

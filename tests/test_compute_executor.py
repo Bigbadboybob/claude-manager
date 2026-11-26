@@ -33,7 +33,8 @@ def test_cutover_is_fail_closed_and_enable_requires_both_drains(monkeypatch, tmp
     monkeypatch.setattr(executor, 'api', api)
     enabled = set()
     executor.enable_drained_boxes(cfg, enabled)
-    assert not calls and not enabled
+    assert calls == [('/compute/executor/pre-enable', {})] and not enabled
+    calls.clear()
     cfg['cutover_ready'] = True
     executor.enable_drained_boxes(cfg, enabled)
     assert enabled == {'box'}
@@ -191,7 +192,7 @@ def test_release_failure_is_reported_as_uncertain(monkeypatch):
 def test_quarantined_boxes_are_logged_only_on_change(monkeypatch, tmp_path, caplog):
     report = {'queued_count': 0, 'queued': [], 'enabled_boxes': [],
               'has_ever_enabled': True, 'quarantined_boxes': ['d6']}
-    cfg = {'cutover_ready': True, 'lq_directory': str(tmp_path), 'routes': {}}
+    cfg = {'cutover_ready': False, 'lq_directory': str(tmp_path), 'routes': {}}
     monkeypatch.setattr(executor, '_last_quarantined_boxes', frozenset())
     monkeypatch.setattr(executor, 'api', lambda *_: report)
     with caplog.at_level('WARNING', logger='cm-compute-executor'):
