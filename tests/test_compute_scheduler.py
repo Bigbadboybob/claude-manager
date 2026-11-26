@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta, timezone
+import json
+from pathlib import Path
 
 import pytest
 
@@ -8,6 +10,14 @@ NOW = datetime(2026, 11, 25, tzinfo=timezone.utc)
 POLICY = Policy(cpus_per_slot=2, mem_gb_per_slot=16, max_slots_per_session=8,
                 max_slots_per_lease=4, max_slots_per_team=12)
 BOX = Box("lane", "lane-alias", ("0,8", "1,9", "2,10", "3,11"))
+
+
+def test_pool_example_uses_executor_iap_routes():
+    root = Path(__file__).resolve().parents[1]
+    pool = json.loads((root / 'dispatch/compute-pool.example.json').read_text())
+    executor = json.loads((root / 'deploy/cm-compute-executor.example.json').read_text())
+    for box in pool['boxes']:
+        assert box['run_argv'] == executor['routes'][box['name']]['argv']
 
 
 def lease(ident, **overrides):

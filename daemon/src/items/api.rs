@@ -185,4 +185,12 @@ mod tests {
         let (_, msg) = map_error(401, r#"{"detail":"Invalid token"}"#);
         assert_eq!(msg, "Invalid token");
     }
+
+    #[test]
+    fn compute_disabled_conflict_keeps_api_message() {
+        let detail = "no compute box is enabled for this request yet; use lq until cutover";
+        let (code, message) = map_error(409, &serde_json::json!({"detail": detail}).to_string());
+        assert!(matches!(code, ErrorCode::Conflict));
+        assert_eq!(message, detail);
+    }
 }

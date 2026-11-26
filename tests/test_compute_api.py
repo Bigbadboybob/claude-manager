@@ -163,17 +163,122 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_configured_box_stays_off_until_confirmed_drained(self):
         async with self.pool.acquire() as conn:
             await conn.execute('DELETE FROM compute_boxes')
-        result = await api.request_lease(self.body('one'), self.request)
-        self.assertEqual(result['status'], 'queued')
+        with self.assertRaises(api.HTTPException) as exc:
+            await api.request_lease(self.body('one'), self.request)
+        self.assertEqual(exc.exception.status_code, 409)
+        self.assertEqual(exc.exception.detail, 'no compute box is enabled for this request yet; use lq until cutover')
         status = await api.status(api.StatusRequest(actor=self.body('one').actor), self.request)
         self.assertFalse(status['pool'][0]['enabled'])
-        self.assertEqual(status['queue'][0]['purpose'], 'test a job')
-        self.assertEqual(status['queue'][0]['owner'], 'agent:d:one')
+        self.assertEqual(status['queue'], [])
         with self.assertRaises(api.HTTPException):
             await api.executor_enable(api.BoxEnable(box='d6', local_drained=True, node_drained=False), self.request)
         await api.executor_enable(api.BoxEnable(box='d6', local_drained=True, node_drained=True), self.request)
+        result = await api.request_lease(self.body('one'), self.request)
+        self.assertEqual(result['status'], 'granting')
         async with self.pool.acquire() as conn:
             self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', result['lease_id']), 'granting')
+
+    async def test_enabled_box_too_small_is_refused_until_wide_box_enabled(self):
+        cfg_path = self.root / 'pool.json'
+        original = cfg_path.read_text()
+        cfg = json.loads(original)
+        cfg['boxes'].append({'name': 'wide', 'ssh_target': 'wide', 'enabled': True,
+                             'slots': ['0,8', '1,9']})
+        cfg_path.write_text(json.dumps(cfg))
+        try:
+            body = self.body('wide')
+            body.cpus, body.mem_gb = 4, 32
+            with self.assertRaises(api.HTTPException) as exc:
+                await api.request_lease(body, self.request)
+            self.assertEqual(exc.exception.status_code, 409)
+            self.assertEqual(exc.exception.detail, 'no compute box is enabled for this request yet; use lq until cutover')
+            async with self.pool.acquire() as conn:
+                self.assertEqual(await conn.fetchval('SELECT count(*) FROM compute_leases'), 0)
+                await conn.execute("INSERT INTO compute_boxes (name,enabled,checked_at,evidence) VALUES ('wide',true,now(),'{}'::jsonb)")
+            self.assertEqual((await api.request_lease(body, self.request))['status'], 'granting')
+        finally:
+            cfg_path.write_text(original)
+
+    async def test_box_disabled_in_config_cannot_accept_requests(self):
+        cfg_path = self.root / 'pool.json'
+        original = cfg_path.read_text()
+        cfg = json.loads(original)
+        cfg['boxes'][0]['enabled'] = False  # database row is still enabled
+        cfg_path.write_text(json.dumps(cfg))
+        try:
+            with self.assertRaises(api.HTTPException) as exc:
+                await api.request_lease(self.body('config-off'), self.request)
+            self.assertEqual(exc.exception.status_code, 409)
+            self.assertEqual(exc.exception.detail, 'no compute box is enabled for this request yet; use lq until cutover')
+            async with self.pool.acquire() as conn:
+                self.assertEqual(await conn.fetchval('SELECT count(*) FROM compute_leases'), 0)
+        finally:
+            cfg_path.write_text(original)
+
+    async def test_configured_iap_prefix_preserves_job_arguments(self):
+        import shlex
+        fake_gcloud = self.root / 'gcloud stub'
+        fake_gcloud.write_text('#!/usr/bin/python3\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n')
+        fake_gcloud.chmod(0o700)
+        cfg_path = self.root / 'pool.json'
+        original = cfg_path.read_text()
+        cfg = json.loads(original)
+        route = [str(fake_gcloud), 'compute', 'ssh', 'instance-name', '--project=prediction-market-scalper',
+                 '--zone=us-east4-b', '--tunnel-through-iap']
+        cfg['boxes'][0]['run_argv'] = route
+        cfg_path.write_text(json.dumps(cfg))
+        try:
+            owner = self.body('prefix')
+            granted = await api.request_lease(owner, self.request)
+            action = (await api.executor_poll(self.request))['action']
+            await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+                'lease_id': str(granted['lease_id']), 'configured': True, 'workdir': '/work/id'}), self.request)
+            status = await api.status(api.StatusRequest(actor=owner.actor, lease_id=granted['lease_id']), self.request)
+            lease = next(x for x in status['leases'] if x['id'] == granted['lease_id'])
+            self.assertEqual(lease['ssh_target'], 'd6')
+            job = ['/bin/echo', 'space value', "single'quote", '$(not-executed);`also-not`', '', 'line\n\n']
+            command = lease['run_prefix'] + ' ' + shlex.join(job)
+            output = subprocess.run(['/bin/sh', '-c', command], check=True, capture_output=True, text=True).stdout
+            arguments = json.loads(output)
+            self.assertEqual(arguments[:-2], route[1:])
+            self.assertEqual(arguments[-2], '--command')
+            self.assertEqual(shlex.split(arguments[-1]), ['sudo', '-n', '/usr/local/bin/cm-lease',
+                             'run', '--lease-id', str(granted['lease_id']), '--', *job])
+        finally:
+            cfg_path.write_text(original)
+
+    async def test_ssh_alias_prefix_remains_available_without_run_argv(self):
+        cfg_path = self.root / 'pool.json'
+        original = cfg_path.read_text()
+        cfg = json.loads(original)
+        cfg['boxes'][0].pop('run_argv', None)
+        cfg_path.write_text(json.dumps(cfg))
+        try:
+            owner = self.body('alias')
+            granted = await api.request_lease(owner, self.request)
+            action = (await api.executor_poll(self.request))['action']
+            await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+                'lease_id': str(granted['lease_id']), 'configured': True, 'workdir': '/work/id'}), self.request)
+            status = await api.status(api.StatusRequest(actor=owner.actor), self.request)
+            lease = next(x for x in status['leases'] if x['id'] == granted['lease_id'])
+            self.assertEqual(lease['run_prefix'], f"ssh d6 sudo -n /usr/local/bin/cm-lease run --lease-id {granted['lease_id']} --")
+        finally:
+            cfg_path.write_text(original)
+
+    async def test_invalid_run_argv_is_rejected_as_configuration_error(self):
+        cfg_path = self.root / 'pool.json'
+        original = cfg_path.read_text()
+        cfg = json.loads(original)
+        try:
+            for value in ([], ['gcloud', ''], ['gcloud', 1], ['gcloud', 'bad\0arg'], 'gcloud'):
+                cfg['boxes'][0]['run_argv'] = value
+                cfg_path.write_text(json.dumps(cfg))
+                with self.subTest(value=value), self.assertRaises(api.HTTPException) as exc:
+                    api.settings()
+                self.assertEqual(exc.exception.status_code, 503)
+                self.assertIn('run_argv', exc.exception.detail)
+        finally:
+            cfg_path.write_text(original)
 
     async def test_request_rejects_resources_larger_than_any_configured_box(self):
         body = self.body('large')
@@ -214,12 +319,14 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
                         (id,owner,team,purpose,priority,class,cpus,mem_gb,duration_seconds,status,box,slot_ids,expires_at)
                         VALUES ($1,$2,$3,'running','normal','burst',2,16,300,'active','d6',$4,now()+interval '5 minutes')""",
                         uuid.uuid4(), f'agent:d:running{i}', str(team_a), [cfg['boxes'][0]['slots'][i]])
-            a_big, b_big = self.body('a-big'), self.body('b-big')
-            a_big.cpus, a_big.mem_gb = 16, 128
-            b_big.cpus, b_big.mem_gb = 16, 128
-            first = await api.request_lease(a_big, self.request)
-            second = await api.request_lease(b_big, self.request)
-            self.assertEqual((first['status'], second['status']), ('queued', 'queued'))
+            # Rows already queued before this admission check still must not
+            # pin the team or activate the soft cap after df2 is disabled.
+            async with self.pool.acquire() as conn:
+                first = {'lease_id': await self._queue_for_team(conn, str(team_a), 8, 1)}
+                second = {'lease_id': await self._queue_for_team(conn, str(team_b), 8, 2)}
+                await conn.execute("UPDATE compute_leases SET created_at=created_at-interval '1 minute' WHERE id=ANY($1::uuid[])",
+                                   [first['lease_id'], second['lease_id']])
+            a_big = self.body(f'{team_a}-1')
             small = await api.request_lease(self.body('a-small'), self.request)
             self.assertEqual(small['status'], 'granting')
             status = await api.status(api.StatusRequest(actor=a_big.actor, lease_id=first['lease_id']), self.request)
@@ -234,7 +341,9 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(status['leases'][0]['waiting'], 'no enabled box fits')
             config_disabled = self.body('config-disabled')
             config_disabled.cpus, config_disabled.mem_gb = 16, 128
-            self.assertEqual((await api.request_lease(config_disabled, self.request))['status'], 'queued')
+            with self.assertRaises(api.HTTPException) as exc:
+                await api.request_lease(config_disabled, self.request)
+            self.assertEqual(exc.exception.status_code, 409)
             cfg['boxes'][1]['enabled'] = True
             cfg_path.write_text(json.dumps(cfg))
             async with self.pool.acquire() as conn:

@@ -88,7 +88,12 @@ def settings():
             cpus = [int(cpu) for slot in slots for cpu in slot.split(',')]
             if len(cpus) != len(set(cpus)) or any(len(s.split(',')) != policy.cpus_per_slot for s in slots):
                 raise ValueError('slot CPU lists overlap or have the wrong size')
-            boxes.append(Box(item['name'], item['ssh_target'], tuple(slots), item.get('enabled') is True))
+            run_argv = item.get('run_argv')
+            if run_argv is not None and (not isinstance(run_argv, list) or not run_argv or
+                    any(not isinstance(arg, str) or not arg or '\0' in arg for arg in run_argv)):
+                raise ValueError('run_argv must be a non-empty list of non-empty command arguments')
+            boxes.append(Box(item['name'], item['ssh_target'], tuple(slots), item.get('enabled') is True,
+                             tuple(run_argv) if run_argv is not None else None))
         return p, boxes
     except (OSError, KeyError, ValueError, TypeError) as exc:
         raise HTTPException(503, f'invalid compute pool configuration: {exc}') from exc
@@ -197,8 +202,18 @@ def _public(row, boxes):
     result = dict(row)
     if row['status'] == 'active':
         if row['ssh_target'] and row['workdir']:
-            result['run_prefix'] = (f"ssh {shlex.quote(row['ssh_target'])} sudo -n /usr/local/bin/cm-lease run "
-                                    f"--lease-id {row['id']} --")
+            box = next((b for b in boxes if b.name == row['box']), None)
+            if box and box.run_argv:
+                remote = ['sudo', '-n', '/usr/local/bin/cm-lease', 'run', '--lease-id', str(row['id']), '--']
+                # `gcloud --command` takes one shell string. Quote each
+                # appended job argument remotely, preserving the prefix API.
+                code = (f'import os, shlex, sys; argv = {list(box.run_argv)!r}; '
+                        f'command = {remote!r} + sys.argv[1:]; '
+                        "os.execvp(argv[0], argv + ['--command', shlex.join(command)])")
+                result['run_prefix'] = shlex.join(['python3', '-c', code])
+            else:
+                result['run_prefix'] = (f"ssh {shlex.quote(row['ssh_target'])} sudo -n /usr/local/bin/cm-lease run "
+                                        f"--lease-id {row['id']} --")
     return result
 
 
@@ -219,6 +234,10 @@ async def request_lease(body: LeaseRequest, request: Request):
     ident = uuid.uuid4()
     async with _pool(request).acquire() as conn, conn.transaction():
         await _lock(conn)
+        enabled = {r['name'] for r in await conn.fetch('SELECT name FROM compute_boxes WHERE enabled')}
+        enabled_boxes = [b for b in boxes if b.configured_enabled and b.name in enabled]
+        if not _fits_any_box(requested, policy, enabled_boxes):
+            raise HTTPException(409, 'no compute box is enabled for this request yet; use lq until cutover')
         team = await conn.fetchval("""SELECT m.primary_team_id::text FROM incarnations i
             JOIN members m ON m.id=i.member_id WHERE i.pid=$1 AND i.ended_at IS NULL""", owner)
         await conn.execute("""INSERT INTO compute_leases

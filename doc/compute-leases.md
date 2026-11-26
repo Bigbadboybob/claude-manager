@@ -20,16 +20,21 @@ a request is deferred by the team cap, later requests from that team wait;
 other teams can use available capacity.
 An ETA is the earliest known capacity change, not a promised start; it can be
 unknown. A queue position of zero means a grant is being installed.
-Requests too large for every configured box are rejected. A queued request
-shows `waiting: no enabled box fits` until a box large enough is enabled; it
-does not prevent smaller requests from its team from running or count as an
-opposing waiter for the team soft cap.
+Requests too large for every configured box are rejected. If no enabled box
+can fit a new request, use `lq` until cutover. Existing queued requests show
+`waiting: no enabled box fits` until a suitable box is enabled; they do not
+prevent smaller requests from their team from running or count as opposing
+waiters for the team soft cap.
 
 The planning API persists reservations and queues node actions. The separate
 user service on cm-sessions invokes the node script through configured gcloud
-IAP routes. The SSH aliases must use the approved IAP route and be available
-on the calling cm-sessions host. This does not install keys or authorize a new
-route from cm-manager. Reservations remain occupied until release is confirmed.
+IAP routes. Each pool box may specify `run_argv`, the command arguments before
+gcloud's `--command`; the example uses the same IAP routes as the executor.
+The returned prefix uses local Python 3 and quotes each appended job argument
+for the remote command. Callers need Python 3, gcloud and the existing approved
+IAP access. Without `run_argv`, the prefix uses the configured SSH alias.
+This does not install keys or authorize a new route from cm-manager.
+Reservations remain occupied until release is confirmed.
 
 At cutover:
 

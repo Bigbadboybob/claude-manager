@@ -2,6 +2,7 @@
 
 import asyncio
 from contextlib import asynccontextmanager, suppress
+from functools import wraps
 import json
 import os
 from pathlib import Path
@@ -5596,7 +5597,19 @@ def _caller_filer_context(submitted_via: str = "mcp.submit_backtest") -> dict:
     return context
 
 
+def _compute_class_alias(fn):
+    # FastMCP validates the published `class` alias but invokes the callable
+    # with that alias as a keyword. Python source cannot name that parameter.
+    @wraps(fn)
+    def call(*args, **kwargs):
+        if 'class' in kwargs:
+            kwargs['lease_class'] = kwargs.pop('class')
+        return fn(*args, **kwargs)
+    return call
+
+
 @mcp.tool()
+@_compute_class_alias
 def compute_request(cpus: int, mem_gb: int, duration: int, priority: str, purpose: str,
                     lease_class: Annotated[str, Field(alias="class")] = "burst",
                     pinned: bool = False) -> dict:

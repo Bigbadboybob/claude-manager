@@ -18,6 +18,7 @@ class Box:
     ssh_target: str
     slots: tuple[str, ...]
     configured_enabled: bool = True
+    run_argv: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)

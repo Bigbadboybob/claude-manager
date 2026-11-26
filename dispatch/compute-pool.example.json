@@ -17,9 +17,9 @@
     "expiry_warning_seconds": 300
   },
   "boxes": [
-    {"name": "d6", "ssh_target": "d6", "enabled": false, "slots": ["0,8", "2,10", "3,11", "5,13", "6,14", "7,15", "4,12"]},
-    {"name": "df1", "ssh_target": "df1", "enabled": false, "slots": ["0,8", "2,10", "3,11", "5,13", "6,14", "7,15"]},
-    {"name": "df2", "ssh_target": "df2", "enabled": false, "slots": ["0,8", "5,13", "6,14", "1,9", "2,10", "3,11", "4,12", "7,15"]},
-    {"name": "d7", "ssh_target": "d7", "enabled": false, "slots": ["1,9", "5,13", "0,8", "6,14", "7,15", "4,12"]}
+    {"name": "d6", "ssh_target": "d6", "enabled": false, "run_argv": ["gcloud", "compute", "ssh", "integ-devbox6-20261010", "--project=prediction-market-scalper", "--zone=us-east4-b", "--tunnel-through-iap"], "slots": ["0,8", "2,10", "3,11", "5,13", "6,14", "7,15", "4,12"]},
+    {"name": "df1", "ssh_target": "df1", "enabled": false, "run_argv": ["gcloud", "compute", "ssh", "f-devbox1-20261029", "--project=prediction-market-scalper", "--zone=us-east4-b", "--tunnel-through-iap"], "slots": ["0,8", "2,10", "3,11", "5,13", "6,14", "7,15"]},
+    {"name": "df2", "ssh_target": "df2", "enabled": false, "run_argv": ["gcloud", "compute", "ssh", "f-devbox2-20261029", "--project=prediction-market-scalper", "--zone=us-east4-b", "--tunnel-through-iap"], "slots": ["0,8", "5,13", "6,14", "1,9", "2,10", "3,11", "4,12", "7,15"]},
+    {"name": "d7", "ssh_target": "d7", "enabled": false, "run_argv": ["gcloud", "compute", "ssh", "integ-devbox7-20261028", "--project=prediction-market-scalper", "--zone=us-east4-b", "--tunnel-through-iap"], "slots": ["1,9", "5,13", "0,8", "6,14", "7,15", "4,12"]}
   ]
 }
