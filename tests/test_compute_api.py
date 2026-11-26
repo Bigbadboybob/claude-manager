@@ -65,6 +65,9 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             justification_sql = (ROOT / 'sql/042_compute_lease_justification.sql').read_text()
             await conn.execute(justification_sql)
             await conn.execute(justification_sql)
+            history_sql = (ROOT / 'sql/043_compute_box_ever_enabled.sql').read_text()
+            await conn.execute(history_sql)
+            await conn.execute(history_sql)
             await conn.execute("INSERT INTO compute_boxes (name, enabled, checked_at, evidence) VALUES ('d6', true, now(), '{}'::jsonb)")
         self.request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(pool=self.pool)))
 
@@ -400,6 +403,19 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         await api.executor_enable(api.BoxEnable(box='d6', local_drained=True, node_drained=True,
                                                node_max_slots=1, clear_quarantine=True), self.request)
         self.assertEqual((await api.request_lease(self.body('two'), self.request))['status'], 'granting')
+
+    async def test_pre_enable_remembers_quarantined_or_mismatched_boxes(self):
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE compute_boxes SET enabled=false, ever_enabled=true WHERE name='d6'")
+        report = await api.executor_pre_enable(self.request)
+        self.assertTrue(report['has_ever_enabled'])
+        self.assertEqual(report['enabled_boxes'], [])
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE compute_boxes SET ever_enabled=false, evidence='{}'::jsonb WHERE name='d6'")
+        self.assertFalse((await api.executor_pre_enable(self.request))['has_ever_enabled'])
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE compute_boxes SET evidence=$1::jsonb WHERE name='d6'", json.dumps({'quarantine_reason': 'old refusal'}))
+        self.assertTrue((await api.executor_pre_enable(self.request))['has_ever_enabled'])
 
     async def test_pre_enable_reports_legacy_queue_without_modifying_rows(self):
         async with self.pool.acquire() as conn:

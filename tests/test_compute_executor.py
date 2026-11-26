@@ -28,7 +28,7 @@ def test_cutover_is_fail_closed_and_enable_requires_both_drains(monkeypatch, tmp
     def api(path, body):
         calls.append((path, body))
         if path == '/compute/executor/pre-enable':
-            return {'queued_count': 0, 'queued': [], 'enabled_boxes': []}
+            return {'queued_count': 0, 'queued': [], 'enabled_boxes': [], 'has_ever_enabled': False}
         return {'enabled': True}
     monkeypatch.setattr(executor, 'api', api)
     enabled = set()
@@ -45,7 +45,7 @@ def test_cutover_is_fail_closed_and_enable_requires_both_drains(monkeypatch, tmp
 def test_pre_enable_lists_old_queue_and_blocks_first_enable_until_review(monkeypatch, tmp_path, caplog):
     calls = []
     queued = [{'lease_id': 'old', 'missing_justification': True}]
-    report = {'queued_count': 1, 'queued': queued, 'enabled_boxes': []}
+    report = {'queued_count': 1, 'queued': queued, 'enabled_boxes': [], 'has_ever_enabled': False}
     cfg = {'cutover_ready': True, 'lq_directory': str(tmp_path),
            'routes': {'box': {'argv': ['gcloud', 'compute', 'ssh', 'vm']}}}
     monkeypatch.setattr(executor, 'local_drained', lambda *_: calls.append('local') or True)
@@ -67,7 +67,8 @@ def test_pre_enable_lists_old_queue_and_blocks_first_enable_until_review(monkeyp
     # Once another box is enabled, ordinary queued work must not prevent
     # later boxes from joining the pool.
     cfg['allow_queued_at_cutover'] = False
-    report['enabled_boxes'] = ['another']
+    report['enabled_boxes'] = []  # all live boxes may now be quarantined
+    report['has_ever_enabled'] = True
     enabled.clear()
     executor.enable_drained_boxes(cfg, enabled)
     assert enabled == {'box'}
@@ -76,7 +77,7 @@ def test_pre_enable_lists_old_queue_and_blocks_first_enable_until_review(monkeyp
 def test_pre_enable_check_failure_keeps_boxes_disabled(monkeypatch, tmp_path):
     cfg = {'cutover_ready': True, 'lq_directory': str(tmp_path),
            'routes': {'box': {'argv': ['gcloud', 'compute', 'ssh', 'vm']}}}
-    monkeypatch.setattr(executor, 'api', lambda *_: {'queued_count': 0, 'queued': ['inconsistent'], 'enabled_boxes': []})
+    monkeypatch.setattr(executor, 'api', lambda *_: {'queued_count': 0, 'queued': ['inconsistent'], 'enabled_boxes': [], 'has_ever_enabled': False})
     monkeypatch.setattr(executor, 'local_drained', lambda *_: pytest.fail('must not start drain check'))
     enabled = set()
     executor.enable_drained_boxes(cfg, enabled)

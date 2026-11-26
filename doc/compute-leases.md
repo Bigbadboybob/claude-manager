@@ -46,7 +46,7 @@ automatically on restart. `compute_status` reports `quarantined` and
 longer match the configured slots.
 
 Before starting the updated API, apply SQL migrations through
-`042_compute_lease_justification.sql` and install the reviewed pool config,
+`043_compute_box_ever_enabled.sql` and install the reviewed pool config,
 including `reclaim_notice_grace_seconds` and each box's `run_argv`.
 
 At cutover:
