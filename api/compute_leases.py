@@ -169,7 +169,8 @@ async def _owner_push(conn, row, text, dedupe):
         raise ValueError('invalid stored owner identity')
     return await conn.fetchval("""INSERT INTO item_pushes
         (daemon_id, session_uid, pid, kind, text, dedupe)
-        VALUES ($1,$2,$3,'compute_lease',$4,$5) RETURNING id""",
+        VALUES ($1,$2,$3,'compute_lease',$4,$5)
+        ON CONFLICT (dedupe) DO NOTHING RETURNING id""",
         pieces[1], pieces[2], row['owner'], text, dedupe)
 
 
@@ -601,8 +602,15 @@ async def executor_complete(body: ActionReceipt, request: Request):
                 reason = body.result.get('error')
                 if not isinstance(reason, str) or not reason.strip():
                     raise HTTPException(422, 'retryable grant error must include a reason')
-                await conn.execute('UPDATE compute_leases SET error=$2 WHERE id=$1',
-                                   lease['id'], 'grant attempt failed: ' + reason[:2000])
+                reason = 'grant attempt failed: ' + reason[:2000]
+                await conn.execute('UPDATE compute_leases SET error=$2 WHERE id=$1', lease['id'], reason)
+                if lease['expires_at'] and lease['expires_at'] <= datetime.now(timezone.utc):
+                    quarantine = 'expired grant remains unconfirmed after retryable node error'
+                    await conn.execute('UPDATE compute_boxes SET enabled=false, checked_at=now(), evidence=$2::jsonb WHERE name=$1',
+                        lease['box'], json.dumps({'quarantine_reason': quarantine}))
+                    await _owner_push(conn, lease,
+                        f"[cm-lease] lease {lease['id']} expired while grant remains unconfirmed; box {lease['box']} quarantined: {reason}",
+                        f"compute-lease-grant-retry-expired:{lease['id']}")
                 # Preserve claimed_until so an uncertain node operation is
                 # retried on the existing lease instead of in a tight loop.
                 return {'ok': True, 'retryable': True}

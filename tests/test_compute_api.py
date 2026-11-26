@@ -239,6 +239,33 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row['status'], 'active')
             self.assertIsNone(row['error'])
 
+    async def test_expired_retryable_grant_quarantines_and_notifies_once_without_freeing(self):
+        owner = self.body('owner')
+        lease = await api.request_lease(owner, self.request)
+        action = (await api.executor_poll(self.request))['action']
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE compute_leases SET expires_at=now()-interval '1 second' WHERE id=$1", lease['lease_id'])
+        receipt = api.ActionReceipt(action_id=action['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'retryable': True, 'error': 'invalid node config'})
+        await api.executor_complete(receipt, self.request)
+        await api.executor_complete(receipt, self.request)
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow('SELECT status,error,slot_ids FROM compute_leases WHERE id=$1', lease['lease_id'])
+            self.assertEqual(row['status'], 'granting')
+            self.assertIn('invalid node config', row['error'])
+            self.assertTrue(row['slot_ids'])
+            self.assertEqual(await conn.fetchval('SELECT status FROM compute_lease_actions WHERE id=$1', action['action_id']), 'claimed')
+            pushes = await conn.fetch("SELECT pid,text FROM item_pushes WHERE kind='compute_lease'")
+            self.assertEqual(len(pushes), 1)
+            self.assertEqual(pushes[0]['pid'], owner.actor.pid)
+            self.assertIn('invalid node config', pushes[0]['text'])
+        status = await api.status(api.StatusRequest(actor=owner.actor, lease_id=lease['lease_id']), self.request)
+        self.assertTrue(status['pool'][0]['quarantined'])
+        self.assertFalse(status['pool'][0]['enabled'])
+        with self.assertRaises(api.HTTPException) as exc:
+            await api.request_lease(self.body('other'), self.request)
+        self.assertEqual(exc.exception.status_code, 409)
+
     async def test_recent_history_is_bounded_but_explicit_old_lease_is_available(self):
         import uuid
         owner = self.body('owner')
