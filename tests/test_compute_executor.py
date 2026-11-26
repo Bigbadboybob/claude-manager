@@ -184,3 +184,21 @@ def test_release_failure_is_reported_as_uncertain(monkeypatch):
         raise subprocess.TimeoutExpired(argv, 90)
     monkeypatch.setattr(executor.subprocess, 'run', timed_out)
     assert executor.execute(action, routes)['retryable'] is True
+
+
+def test_quarantined_boxes_are_logged_only_on_change(monkeypatch, tmp_path, caplog):
+    report = {'queued_count': 0, 'queued': [], 'enabled_boxes': [],
+              'has_ever_enabled': True, 'quarantined_boxes': ['d6']}
+    cfg = {'cutover_ready': True, 'lq_directory': str(tmp_path), 'routes': {}}
+    monkeypatch.setattr(executor, '_last_quarantined_boxes', frozenset())
+    monkeypatch.setattr(executor, 'api', lambda *_: report)
+    with caplog.at_level('WARNING', logger='cm-compute-executor'):
+        executor.enable_drained_boxes(cfg, set())
+        executor.enable_drained_boxes(cfg, set())
+        report['quarantined_boxes'] = ['d7', 'd6']
+        executor.enable_drained_boxes(cfg, set())
+        report['quarantined_boxes'] = []
+        executor.enable_drained_boxes(cfg, set())
+    records = [r.message for r in caplog.records if r.message.startswith('quarantined compute boxes:')]
+    assert records == ['quarantined compute boxes: d6', 'quarantined compute boxes: d6, d7',
+                       'quarantined compute boxes: (none)']

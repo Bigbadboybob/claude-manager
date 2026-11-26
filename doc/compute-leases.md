@@ -37,6 +37,11 @@ This does not install keys or authorize a new route from cm-manager.
 Reservations remain occupied until release is confirmed.
 An explicit node grant refusal is reported to the owner; its lease becomes
 failed after the node confirms release, so a transport error never frees capacity.
+Set pool policy `quarantine_operator_pid` to the operator session's stable
+`agent:<daemon_id>:<session_uid>` identity to receive native system notices on
+new quarantines. A null or omitted value disables this optional recipient; the
+lease owner still receives a notice and the executor logs quarantine changes.
+
 A node capacity-exceeded refusal disables and quarantines that box persistently.
 After investigating and draining it, an operator can explicitly clear the
 quarantine through the executor enable endpoint with `clear_quarantine=true`,

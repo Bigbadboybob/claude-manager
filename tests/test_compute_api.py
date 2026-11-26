@@ -460,6 +460,7 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(logs.output), 1)
         async with self.pool.acquire() as conn:
             self.assertEqual(await conn.fetchval("SELECT count(*) FROM item_pushes WHERE text LIKE '%box d6 quarantined%'"), 1)
+            self.assertEqual(await conn.fetchval("SELECT count(*) FROM item_pushes WHERE pid=$1", owner.actor.pid), 1)
             box = await conn.fetchrow("SELECT enabled,evidence FROM compute_boxes WHERE name='d6'")
             self.assertFalse(box['enabled'])
             self.assertEqual(api._json_object(box['evidence'])['quarantine_reason'], 'node refused grant: box capacity exceeded')
@@ -479,6 +480,30 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         await api.executor_enable(api.BoxEnable(box='d6', local_drained=True, node_drained=True,
                                                node_max_slots=1, clear_quarantine=True), self.request)
         self.assertEqual((await api.request_lease(self.body('two'), self.request))['status'], 'granting')
+
+    async def test_quarantine_notifies_configured_operator_once(self):
+        config = self.root / 'pool.json'
+        original = config.read_text()
+        cfg = json.loads(original)
+        cfg['policy']['quarantine_operator_pid'] = 'agent:operator-daemon:operator-session'
+        config.write_text(json.dumps(cfg))
+        try:
+            lease = await api.request_lease(self.body('owner'), self.request)
+            action = (await api.executor_poll(self.request))['action']
+            async with self.pool.acquire() as conn:
+                await conn.execute("UPDATE compute_leases SET expires_at=now()-interval '1 second' WHERE id=$1", lease['lease_id'])
+            receipt = api.ActionReceipt(action_id=action['action_id'], result={
+                'lease_id': str(lease['lease_id']), 'retryable': True, 'error': 'bad config'})
+            await api.executor_complete(receipt, self.request)
+            await api.executor_complete(receipt, self.request)
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch("SELECT pid,text FROM item_pushes WHERE kind='compute_lease'")
+                self.assertEqual(len(rows), 2)
+                operator = next(row for row in rows if row['pid'] == cfg['policy']['quarantine_operator_pid'])
+                self.assertIn('box d6 quarantined', operator['text'])
+                self.assertEqual(await conn.fetchval("SELECT count(*) FROM item_pushes WHERE pid=$1", self.body('owner').actor.pid), 1)
+        finally:
+            config.write_text(original)
 
     async def test_pre_enable_remembers_quarantined_or_mismatched_boxes(self):
         async with self.pool.acquire() as conn:

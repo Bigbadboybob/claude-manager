@@ -15,7 +15,8 @@
     "notice_limit": 2,
     "reclaim_notice_grace_seconds": 600,
     "notice_expiry_guard_seconds": 600,
-    "expiry_warning_seconds": 300
+    "expiry_warning_seconds": 300,
+    "quarantine_operator_pid": null
   },
   "boxes": [
     {"name": "d6", "ssh_target": "d6", "enabled": false, "run_argv": ["gcloud", "compute", "ssh", "integ-devbox6-20261010", "--project=prediction-market-scalper", "--zone=us-east4-b", "--tunnel-through-iap"], "slots": ["0,8", "2,10", "3,11", "5,13", "6,14", "7,15", "4,12"]},
