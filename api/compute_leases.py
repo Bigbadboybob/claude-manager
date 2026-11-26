@@ -174,6 +174,22 @@ async def _owner_push(conn, row, text, dedupe):
         pieces[1], pieces[2], row['owner'], text, dedupe)
 
 
+async def _quarantine_box(conn, box, reason):
+    # The caller holds the scheduling advisory lock. Older writes may have
+    # encoded JSON twice, so inspect the decoded object rather than SQL ->>.
+    row = await conn.fetchrow('SELECT evidence FROM compute_boxes WHERE name=$1', box)
+    if row is None:
+        raise ValueError(f'unknown compute box {box}')
+    evidence = _json_object(row['evidence']) or {}
+    if evidence.get('quarantine_reason'):
+        await conn.execute('UPDATE compute_boxes SET enabled=false WHERE name=$1', box)
+        return False
+    await conn.execute("""UPDATE compute_boxes SET enabled=false, ever_enabled=true, checked_at=now(),
+        evidence=$2::jsonb WHERE name=$1""", box, {'quarantine_reason': reason})
+    logger.warning('compute box %s quarantined: %s', box, reason)
+    return True
+
+
 async def _notice_action(conn, row, kind, extra=None):
     payload = {'box': row['box'], 'owner': row['owner'], **(extra or {})}
     action_id = await _action(conn, row['id'], kind, payload)
@@ -614,12 +630,7 @@ async def executor_complete(body: ActionReceipt, request: Request):
                 await conn.execute('UPDATE compute_leases SET error=$2 WHERE id=$1', lease['id'], reason)
                 if lease['expires_at'] and lease['expires_at'] <= datetime.now(timezone.utc):
                     quarantine = 'expired grant remains unconfirmed after retryable node error'
-                    changed = await conn.fetchval('''UPDATE compute_boxes SET enabled=false, ever_enabled=true,
-                        checked_at=now(), evidence=$2::jsonb WHERE name=$1
-                        AND COALESCE(evidence->>'quarantine_reason', '') = '' RETURNING name''',
-                        lease['box'], json.dumps({'quarantine_reason': quarantine}))
-                    if changed:
-                        logger.warning('compute box %s quarantined: %s', lease['box'], quarantine)
+                    await _quarantine_box(conn, lease['box'], quarantine)
                     await _owner_push(conn, lease,
                         f"[cm-lease] lease {lease['id']} expired while grant remains unconfirmed; box {lease['box']} quarantined: {reason}",
                         f"compute-lease-grant-retry-expired:{lease['id']}")
@@ -642,12 +653,8 @@ async def executor_complete(body: ActionReceipt, request: Request):
                                    lease['id'], 'node refused grant: ' + reason)
                 if reason == 'box capacity exceeded':
                     quarantine = 'node refused grant: box capacity exceeded'
-                    changed = await conn.fetchval('''UPDATE compute_boxes SET enabled=false, ever_enabled=true,
-                        checked_at=now(), evidence=$2::jsonb WHERE name=$1
-                        AND COALESCE(evidence->>'quarantine_reason', '') = '' RETURNING name''',
-                        lease['box'], json.dumps({'quarantine_reason': quarantine}))
+                    changed = await _quarantine_box(conn, lease['box'], quarantine)
                     if changed:
-                        logger.warning('compute box %s quarantined: %s', lease['box'], quarantine)
                         await _owner_push(conn, lease,
                             f"[cm-lease] box {lease['box']} quarantined: {quarantine}; manual review required",
                             f"compute-box-quarantined:{action['id']}")

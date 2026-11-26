@@ -289,6 +289,26 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             await api.request_lease(self.body('other'), self.request)
         self.assertEqual(exc.exception.status_code, 409)
 
+    async def test_quarantine_preserves_double_encoded_existing_reason(self):
+        lease = await api.request_lease(self.body('owner'), self.request)
+        action = (await api.executor_poll(self.request))['action']
+        async with self.pool.acquire() as conn:
+            # The real codec encodes this string as a JSON string in jsonb.
+            await conn.execute("UPDATE compute_boxes SET evidence=$1::jsonb WHERE name='d6'",
+                               json.dumps({'quarantine_reason': 'original capacity reason'}))
+            await conn.execute("UPDATE compute_leases SET expires_at=now()-interval '1 second' WHERE id=$1", lease['lease_id'])
+        receipt = api.ActionReceipt(action_id=action['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'retryable': True, 'error': 'broken config'})
+        with patch.object(api.logger, 'warning') as warning:
+            await api.executor_complete(receipt, self.request)
+            await api.executor_complete(receipt, self.request)
+        warning.assert_not_called()
+        async with self.pool.acquire() as conn:
+            evidence = await conn.fetchval("SELECT evidence FROM compute_boxes WHERE name='d6'")
+            self.assertIsInstance(evidence, str)
+            self.assertEqual(api._json_object(evidence)['quarantine_reason'], 'original capacity reason')
+            self.assertEqual(await conn.fetchval("SELECT count(*) FROM item_pushes WHERE kind='compute_lease'"), 1)
+
     async def test_recent_history_is_bounded_but_explicit_old_lease_is_available(self):
         import uuid
         owner = self.body('owner')
