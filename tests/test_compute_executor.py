@@ -184,6 +184,8 @@ def test_release_failure_is_reported_as_uncertain(monkeypatch):
         raise subprocess.TimeoutExpired(argv, 90)
     monkeypatch.setattr(executor.subprocess, 'run', timed_out)
     assert executor.execute(action, routes)['retryable'] is True
+    monkeypatch.setattr(executor.subprocess, 'run', lambda *a, **kw: SimpleNamespace(stdout='{"lease_id":"lease-id","released":false}'))
+    assert executor.execute(action, routes)['error'] == 'node did not confirm release'
 
 
 def test_quarantined_boxes_are_logged_only_on_change(monkeypatch, tmp_path, caplog):

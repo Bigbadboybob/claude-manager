@@ -76,8 +76,10 @@ def _execute(action, routes):
             raise ValueError('node did not confirm lease absence')
         return {'lease_id': str(action['lease_id']), 'absent': True, 'unit_inactive': True}
     result = json.loads(completed.stdout)
-    if result.get('lease_id') != str(action['lease_id']):
+    if not isinstance(result, dict) or result.get('lease_id') != str(action['lease_id']):
         raise ValueError('node result does not match lease')
+    if action['kind'] == 'release' and result.get('released') is not True:
+        raise ValueError('node did not confirm release')
     return result
 
 
