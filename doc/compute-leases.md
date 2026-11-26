@@ -110,3 +110,18 @@ also resets any failed job scope. Release removes the generated
 `OWNER.md` only if its recorded identity and contents still match and it is
 the only file, then removes the workdir. Other files and their ownership
 marker remain in place.
+
+## Access decisions before widening
+
+- **Separate executor identity:** With Owner approval, provision a distinct
+  executor Unix/IAP identity and access route, give it sudo permission for the
+  management subcommands, and limit agent sudo permission to `cm-lease run`.
+  Update the executor service and route configuration, then verify both that
+  management operations work for the executor and that agents cannot invoke
+  them. This requires an approved identity/key or equivalent access path; it
+  is not installed by this branch.
+- **Separate executor API token:** Introduce a distinct executor credential,
+  authenticate `/compute/executor/*` with it rather than the shared planning
+  token, provision it only to the executor, and add authorization and rotation
+  tests. Coordinate issuance and deployment after Owner's decision; the shared
+  token remains the current implementation until then.
