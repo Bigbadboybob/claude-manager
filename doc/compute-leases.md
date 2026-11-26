@@ -92,3 +92,7 @@ Release and expiry stop the slice even if the workdir cannot be safely cleaned;
 and a specific older lease can still be requested by ID. Released leases show
 `released_at`, `workdir_bytes` when measured, and `cleanup_skipped` when
 cleanup was skipped; unavailable values are null.
+Node slices use `cmlease-<32 hex digits>.slice` under `cmlease.slice`. After a
+job exits the node resets any failed job scope. Release removes the generated
+`OWNER.md` only if its recorded identity and contents still match, then removes
+the workdir if empty; any other files or changed marker remain in place.

@@ -92,7 +92,7 @@ def save(ident, value):
 
 
 def unit(ident):
-    return f'cmlease-{ident}.slice'
+    return f'cmlease-{uuid.UUID(ident).hex}.slice'
 
 
 def audit(action, ident, detail=None):
@@ -107,24 +107,49 @@ def create_workdir(path, owner, ident, expires, user):
     # The parent lives under a shared user's home. Never create or write a
     # user-controlled path as root: a concurrent rename/symlink must not turn
     # this sudo entry into a privileged file-write primitive.
-    code = '''import os, pathlib, sys, time
+    code = '''import hashlib, json, os, pathlib, sys, time
 p = pathlib.Path(sys.argv[1])
 p.mkdir(mode=0o700, exist_ok=False)
 fd = os.open(p / "OWNER.md", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-with os.fdopen(fd, "w") as f:
-    f.write("owner: %s\\nlease: %s\\ncreated: %s\\nexpires: %s\\ndelete-after: release, after owner review\\n" % (sys.argv[2], sys.argv[3], int(time.time()), sys.argv[4]))
+content = ("owner: %s\\nlease: %s\\ncreated: %s\\nexpires: %s\\ndelete-after: release, after owner review\\n" % (sys.argv[2], sys.argv[3], int(time.time()), sys.argv[4])).encode()
+with os.fdopen(fd, "wb") as f:
+    f.write(content)
+    f.flush()
+    info = os.fstat(f.fileno())
+print(json.dumps({"device": info.st_dev, "inode": info.st_ino, "sha256": hashlib.sha256(content).hexdigest()}))
 '''
-    run('/usr/sbin/runuser', '-u', user, '--', '/usr/bin/python3', '-c', code,
-        str(path), owner, ident, str(expires))
+    output = run('/usr/sbin/runuser', '-u', user, '--', '/usr/bin/python3', '-c', code,
+                 str(path), owner, ident, str(expires))
+    return json.loads(output)
 
 
-def workdir_size_and_remove_if_empty(path, user):
+def workdir_size_and_remove_if_empty(path, user, owner_marker):
     # Like creation, cleanup is performed with the owning user's credentials.
     if not path.exists():
         return 0
     out = run('/usr/sbin/runuser', '-u', user, '--', '/usr/bin/du', '-sb', '--', str(path))
-    subprocess.run(['/usr/sbin/runuser', '-u', user, '--', '/usr/bin/rmdir', '--', str(path)],
-                   check=False, capture_output=True)
+    # The marker is removed only when it is the same regular file and still
+    # has exactly the contents created for this lease. Run as the lease user.
+    code = '''import hashlib, json, os, pathlib, stat, sys
+p = pathlib.Path(sys.argv[1])
+marker = json.loads(sys.argv[2])
+try:
+    fd = os.open(p / "OWNER.md", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as f:
+        info = os.fstat(f.fileno())
+        if (marker and stat.S_ISREG(info.st_mode) and info.st_dev == marker.get("device")
+                and info.st_ino == marker.get("inode") and info.st_size <= 65536
+                and hashlib.sha256(f.read()).hexdigest() == marker.get("sha256")):
+            (p / "OWNER.md").unlink()
+except OSError:
+    pass
+try:
+    p.rmdir()
+except OSError:
+    pass
+'''
+    run('/usr/sbin/runuser', '-u', user, '--', '/usr/bin/python3', '-c', code,
+        str(path), json.dumps(owner_marker))
     return int(out.split()[0])
 
 
@@ -170,8 +195,8 @@ def grant(args, cfg):
             raise Refused('box capacity exceeded')
         workdir = root / args.lease_id
         pwd.getpwnam(cfg['user'])
-        create_workdir(workdir, args.owner, args.lease_id, args.expires_epoch, cfg['user'])
-        proposed.update(created=int(time.time()), workdir=str(workdir), slice=unit(args.lease_id))
+        marker = create_workdir(workdir, args.owner, args.lease_id, args.expires_epoch, cfg['user'])
+        proposed.update(created=int(time.time()), workdir=str(workdir), slice=unit(args.lease_id), owner_marker=marker)
         # Persist before creating the unit; a crash cannot make allocated
         # capacity look free. A retry repeats configuration idempotently.
         save(args.lease_id, proposed)
@@ -205,7 +230,7 @@ def release(ident, cfg):
         path = Path(row['workdir'])
         if path.resolve() != root / ident:
             raise Refused('workdir realpath must be the lease directory directly under workdir_root')
-        result['workdir_bytes'] = workdir_size_and_remove_if_empty(path, row['user'])
+        result['workdir_bytes'] = workdir_size_and_remove_if_empty(path, row['user'], row.get('owner_marker'))
     except (Refused, KeyError, TypeError, ValueError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
         result['cleanup_skipped'] = str(exc)
     return result
@@ -260,6 +285,31 @@ def parser():
     sub.add_parser('reap')
     sub.add_parser('drain-check')
     return p
+
+
+def wait_for_scope(process, scope, lock):
+    try:
+        deadline = time.monotonic() + 30
+        while process.poll() is None:
+            active = subprocess.run(['/usr/bin/systemctl', 'is-active', '--quiet', scope],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+            if active:
+                break
+            if time.monotonic() >= deadline:
+                process.terminate()
+                process.wait()
+                subprocess.run(['/usr/bin/systemctl', 'stop', scope], check=False)
+                raise Refused('scope did not become active')
+            time.sleep(.05)
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        return process.wait()
+    finally:
+        if process.poll() is not None:
+            try:
+                subprocess.run(['/usr/bin/systemctl', 'reset-failed', scope], check=False,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError:
+                pass  # cleanup must not replace the job's exit status
 
 
 def main():
@@ -346,20 +396,7 @@ def main():
                 process = subprocess.Popen(['/usr/bin/systemd-run', '--quiet', '--scope',
                           '--unit=' + scope, '--slice=' + row['slice'],
                           '--property=TimeoutStopSec=30s', '--', *command])
-                deadline = time.monotonic() + 30
-                while process.poll() is None:
-                    active = subprocess.run(['/usr/bin/systemctl', 'is-active', '--quiet', scope],
-                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-                    if active:
-                        break
-                    if time.monotonic() >= deadline:
-                        process.terminate()
-                        process.wait()
-                        subprocess.run(['/usr/bin/systemctl', 'stop', scope], check=False)
-                        raise Refused('scope did not become active')
-                    time.sleep(.05)
-                fcntl.flock(lock, fcntl.LOCK_UN)
-                sys.exit(process.wait())
+                sys.exit(wait_for_scope(process, scope, lock))
         print(json.dumps(result, sort_keys=True))
         if args.action == 'reap' and result['failed']:
             sys.exit(3)
