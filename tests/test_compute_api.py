@@ -349,9 +349,17 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         fail = api.ActionReceipt(action_id=release['action_id'], result={
             'lease_id': str(lease['lease_id']), 'retryable': True, 'transport_error': True, 'error': 'IAP down'})
         await api.executor_complete(fail, self.request)
+        await api.executor_complete(fail, self.request)  # duplicate receipt is one attempt
+        async with self.pool.acquire() as conn:
+            evidence = api._json_object(await conn.fetchval("SELECT evidence FROM compute_boxes WHERE name='d6'"))
+            self.assertEqual(evidence['consecutive_transport_failures'], 1)
+            await conn.execute("UPDATE compute_lease_actions SET claimed_until=now()-interval '1 second' WHERE id=$1", release['action_id'])
+        await api.executor_poll(self.request)
         await api.executor_complete(fail, self.request)
         async with self.pool.acquire() as conn:
             self.assertTrue(await conn.fetchval("SELECT enabled FROM compute_boxes WHERE name='d6'"))
+            await conn.execute("UPDATE compute_lease_actions SET claimed_until=now()-interval '1 second' WHERE id=$1", release['action_id'])
+        await api.executor_poll(self.request)
         await api.executor_complete(fail, self.request)
         async with self.pool.acquire() as conn:
             self.assertFalse(await conn.fetchval("SELECT enabled FROM compute_boxes WHERE name='d6'"))

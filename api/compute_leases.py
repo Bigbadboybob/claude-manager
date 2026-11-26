@@ -217,9 +217,13 @@ async def _quarantine_box(conn, box, reason, lease, policy, *, transport=False):
     return True
 
 
-async def _record_transport_failure(conn, lease, policy):
+async def _record_transport_failure(conn, lease, policy, action):
     box = lease['box']
     evidence = _json_object(await conn.fetchval('SELECT evidence FROM compute_boxes WHERE name=$1', box)) or {}
+    attempt = f"{action['id']}:{action['claimed_until']}"
+    if evidence.get('last_transport_failure_attempt') == attempt:
+        return
+    evidence['last_transport_failure_attempt'] = attempt
     evidence.setdefault('transport_outage_id', str(uuid.uuid4()))
     count = evidence.get('consecutive_transport_failures', 0)
     count = count if type(count) is int and count >= 0 else 0
@@ -235,6 +239,7 @@ async def _record_transport_failure(conn, lease, policy):
 async def _record_transport_success(conn, box):
     evidence = _json_object(await conn.fetchval('SELECT evidence FROM compute_boxes WHERE name=$1', box)) or {}
     evidence.pop('consecutive_transport_failures', None)
+    evidence.pop('last_transport_failure_attempt', None)
     if not evidence.get('quarantine_reason'):
         evidence.pop('transport_outage_id', None)
     await conn.execute('UPDATE compute_boxes SET evidence=$2::jsonb WHERE name=$1', box, evidence)
@@ -692,7 +697,7 @@ async def executor_complete(body: ActionReceipt, request: Request):
         lease = await conn.fetchrow('SELECT * FROM compute_leases WHERE id=$1', action['lease_id'])
         recorded_result = body.result
         if body.result.get('transport_error') is True and body.result.get('retryable') is True:
-            await _record_transport_failure(conn, lease, p)
+            await _record_transport_failure(conn, lease, p, action)
         elif body.result.get('retryable') is not True or body.result.get('transport_error') is False:
             await _record_transport_success(conn, lease['box'])
         if action['kind'] == 'grant':
