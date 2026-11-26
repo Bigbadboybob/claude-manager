@@ -612,8 +612,11 @@ async def executor_complete(body: ActionReceipt, request: Request):
                 await conn.execute('UPDATE compute_leases SET error=$2 WHERE id=$1', lease['id'], reason)
                 if lease['expires_at'] and lease['expires_at'] <= datetime.now(timezone.utc):
                     quarantine = 'expired grant remains unconfirmed after retryable node error'
-                    await conn.execute('UPDATE compute_boxes SET enabled=false, ever_enabled=true, checked_at=now(), evidence=$2::jsonb WHERE name=$1',
+                    changed = await conn.fetchval('''UPDATE compute_boxes SET enabled=false, ever_enabled=true,
+                        checked_at=now(), evidence=$2::jsonb WHERE name=$1 AND enabled RETURNING name''',
                         lease['box'], json.dumps({'quarantine_reason': quarantine}))
+                    if changed:
+                        logger.warning('compute box %s quarantined: %s', lease['box'], quarantine)
                     await _owner_push(conn, lease,
                         f"[cm-lease] lease {lease['id']} expired while grant remains unconfirmed; box {lease['box']} quarantined: {reason}",
                         f"compute-lease-grant-retry-expired:{lease['id']}")
@@ -628,8 +631,15 @@ async def executor_complete(body: ActionReceipt, request: Request):
                 await conn.execute("UPDATE compute_leases SET status='releasing', error=$2 WHERE id=$1",
                                    lease['id'], 'node refused grant: ' + reason)
                 if reason == 'box capacity exceeded':
-                    await conn.execute('UPDATE compute_boxes SET enabled=false, ever_enabled=true, checked_at=now(), evidence=$2::jsonb WHERE name=$1',
-                        lease['box'], json.dumps({'quarantine_reason': 'node refused grant: box capacity exceeded'}))
+                    quarantine = 'node refused grant: box capacity exceeded'
+                    changed = await conn.fetchval('''UPDATE compute_boxes SET enabled=false, ever_enabled=true,
+                        checked_at=now(), evidence=$2::jsonb WHERE name=$1 AND enabled RETURNING name''',
+                        lease['box'], json.dumps({'quarantine_reason': quarantine}))
+                    if changed:
+                        logger.warning('compute box %s quarantined: %s', lease['box'], quarantine)
+                        await _owner_push(conn, lease,
+                            f"[cm-lease] box {lease['box']} quarantined: {quarantine}; manual review required",
+                            f"compute-box-quarantined:{action['id']}")
                 # A refusal may follow a partial node operation. Keep the slot
                 # until release confirms that the node is no longer using it.
                 await _action(conn, lease['id'], 'release', {'box': lease['box'], 'failed_grant': True})

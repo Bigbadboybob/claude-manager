@@ -381,9 +381,14 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         owner = self.body('one')
         granted = await api.request_lease(owner, self.request)
         action = (await api.executor_poll(self.request))['action']
-        await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
-            'lease_id': str(granted['lease_id']), 'refused': True, 'error': 'box capacity exceeded'}), self.request)
+        receipt = api.ActionReceipt(action_id=action['action_id'], result={
+            'lease_id': str(granted['lease_id']), 'refused': True, 'error': 'box capacity exceeded'})
+        with self.assertLogs('cm.api.compute', level='WARNING') as logs:
+            await api.executor_complete(receipt, self.request)
+            await api.executor_complete(receipt, self.request)
+        self.assertEqual(len(logs.output), 1)
         async with self.pool.acquire() as conn:
+            self.assertEqual(await conn.fetchval("SELECT count(*) FROM item_pushes WHERE text LIKE '%box d6 quarantined%'"), 1)
             box = await conn.fetchrow("SELECT enabled,evidence FROM compute_boxes WHERE name='d6'")
             self.assertFalse(box['enabled'])
             self.assertEqual(api._json_object(box['evidence'])['quarantine_reason'], 'node refused grant: box capacity exceeded')
