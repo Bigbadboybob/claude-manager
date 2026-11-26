@@ -505,6 +505,33 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         finally:
             config.write_text(original)
 
+    async def test_multiple_expired_grants_warn_and_notify_operator_once_per_box(self):
+        config = self.root / 'pool.json'
+        original = config.read_text()
+        cfg = json.loads(original)
+        cfg['boxes'][0]['slots'] = ['0,8', '1,9']
+        cfg['policy']['quarantine_operator_pid'] = 'agent:ops:watcher'
+        config.write_text(json.dumps(cfg))
+        try:
+            leases = [await api.request_lease(self.body(name), self.request) for name in ('one', 'two')]
+            actions = [(await api.executor_poll(self.request))['action'] for _ in leases]
+            async with self.pool.acquire() as conn:
+                await conn.execute("UPDATE compute_leases SET expires_at=now()-interval '1 second'")
+            with self.assertLogs('cm.api.compute', level='WARNING') as logs:
+                for action in actions:
+                    receipt = api.ActionReceipt(action_id=action['action_id'], result={
+                        'lease_id': str(action['lease_id']), 'retryable': True, 'error': 'bad config'})
+                    await api.executor_complete(receipt, self.request)
+                    await api.executor_complete(receipt, self.request)
+            self.assertEqual(len(logs.output), 1)
+            async with self.pool.acquire() as conn:
+                self.assertEqual(await conn.fetchval("SELECT count(*) FROM item_pushes WHERE pid='agent:ops:watcher'"), 1)
+                for name in ('one', 'two'):
+                    self.assertEqual(await conn.fetchval("SELECT count(*) FROM item_pushes WHERE pid=$1", self.body(name).actor.pid), 1)
+                self.assertEqual(await conn.fetchval("SELECT count(*) FROM compute_leases WHERE status='granting'"), 2)
+        finally:
+            config.write_text(original)
+
     async def test_pre_enable_remembers_quarantined_or_mismatched_boxes(self):
         async with self.pool.acquire() as conn:
             await conn.execute("UPDATE compute_boxes SET enabled=false, ever_enabled=true WHERE name='d6'")
