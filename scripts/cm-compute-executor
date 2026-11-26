@@ -55,6 +55,11 @@ def execute(action, routes):
                 if (isinstance(error, dict) and error.get('refused') is True and
                         isinstance(error.get('error'), str) and error['error'].strip()):
                     return {'lease_id': str(action['lease_id']), 'refused': True, 'error': error['error']}
+                if (isinstance(error, dict) and error.get('refused') is False and
+                        isinstance(error.get('error'), str) and error['error'].strip()):
+                    # This may follow a partial node operation: retain the
+                    # reservation and claimed action, but record the reason.
+                    return {'lease_id': str(action['lease_id']), 'retryable': True, 'error': error['error']}
         if action['kind'] != 'extend':
             raise
         # A failed SSH command says nothing about node state. A separate,

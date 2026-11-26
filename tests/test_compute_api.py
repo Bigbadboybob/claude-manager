@@ -195,8 +195,46 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         status = await api.status(api.StatusRequest(actor=owner.actor, lease_id=lease['lease_id']), self.request)
         result = next(x for x in status['leases'] if x['id'] == lease['lease_id'])
         self.assertIsNotNone(result['released_at'])
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['error'], 'grant expired before activation')
         self.assertEqual(result['cleanup_skipped'], 'invalid workdir root')
         self.assertIsNone(result['workdir_bytes'])
+
+    async def test_retryable_node_error_is_recorded_and_expired_grant_fails_and_notifies(self):
+        owner = self.body('owner')
+        lease = await api.request_lease(owner, self.request)
+        action = (await api.executor_poll(self.request))['action']
+        result = await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'retryable': True, 'error': 'getpwnam: unknown user'}), self.request)
+        self.assertTrue(result['retryable'])
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow('SELECT status,error FROM compute_leases WHERE id=$1', lease['lease_id'])
+            self.assertEqual(row['status'], 'granting')
+            self.assertIn('getpwnam: unknown user', row['error'])
+            self.assertEqual(await conn.fetchval('SELECT status FROM compute_lease_actions WHERE id=$1', action['action_id']), 'claimed')
+        await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'expired': True, 'released': True}), self.request)
+        status = await api.status(api.StatusRequest(actor=owner.actor, lease_id=lease['lease_id']), self.request)
+        failed = next(x for x in status['leases'] if x['id'] == lease['lease_id'])
+        self.assertEqual(failed['status'], 'failed')
+        self.assertIn('getpwnam: unknown user', failed['error'])
+        async with self.pool.acquire() as conn:
+            push = await conn.fetchrow("SELECT pid,text FROM item_pushes WHERE kind='compute_lease'")
+            self.assertEqual(push['pid'], owner.actor.pid)
+            self.assertIn('getpwnam: unknown user', push['text'])
+
+    async def test_retryable_grant_error_clears_on_success(self):
+        owner = self.body('owner')
+        lease = await api.request_lease(owner, self.request)
+        action = (await api.executor_poll(self.request))['action']
+        await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'retryable': True, 'error': 'temporary error'}), self.request)
+        await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'configured': True, 'workdir': '/work/id'}), self.request)
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow('SELECT status,error FROM compute_leases WHERE id=$1', lease['lease_id'])
+            self.assertEqual(row['status'], 'active')
+            self.assertIsNone(row['error'])
 
     async def test_recent_history_is_bounded_but_explicit_old_lease_is_available(self):
         import uuid

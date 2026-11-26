@@ -307,7 +307,8 @@ async def status(body: StatusRequest, request: Request):
         if (body.lease_id and row['status'] not in ('queued', 'granting', 'active', 'releasing')
                 and not any(lease['id'] == row['id'] for lease in mine)):
             mine.append(_public(dict(row), boxes))
-        released = {lease['id']: lease for lease in mine if lease['status'] == 'released'}
+        released = {lease['id']: lease for lease in mine
+                    if lease['status'] == 'released' or (lease['status'] == 'failed' and lease['released_at'])}
         if released:
             # An expired grant can itself release the node lease. Otherwise
             # the completed release action contains the cleanup outcome.
@@ -542,6 +543,15 @@ async def executor_complete(body: ActionReceipt, request: Request):
         if action['kind'] == 'grant':
             if lease['status'] != 'granting':
                 raise HTTPException(409, 'unexpected or incomplete grant result')
+            if body.result.get('retryable') is True:
+                reason = body.result.get('error')
+                if not isinstance(reason, str) or not reason.strip():
+                    raise HTTPException(422, 'retryable grant error must include a reason')
+                await conn.execute('UPDATE compute_leases SET error=$2 WHERE id=$1',
+                                   lease['id'], 'grant attempt failed: ' + reason[:2000])
+                # Preserve claimed_until so an uncertain node operation is
+                # retried on the existing lease instead of in a tight loop.
+                return {'ok': True, 'retryable': True}
             if body.result.get('refused') is True:
                 reason = body.result.get('error')
                 if not isinstance(reason, str) or not reason.strip():
@@ -555,13 +565,20 @@ async def executor_complete(body: ActionReceipt, request: Request):
                 await _owner_push(conn, lease, f"[cm-lease] lease {lease['id']} grant refused: {reason}",
                                   f"compute-lease-grant-refused:{action['id']}")
             elif body.result.get('expired') is True and body.result.get('released') is True:
-                await conn.execute("UPDATE compute_leases SET status='released', released_at=now() WHERE id=$1", lease['id'])
+                if lease['granted_at'] is None:
+                    reason = lease['error'] or 'grant expired before activation'
+                    await conn.execute("UPDATE compute_leases SET status='failed', released_at=now(), error=$2 WHERE id=$1",
+                                       lease['id'], reason)
+                    await _owner_push(conn, lease, f"[cm-lease] lease {lease['id']} failed: {reason}",
+                                      f"compute-lease-grant-expired:{action['id']}")
+                else:
+                    await conn.execute("UPDATE compute_leases SET status='released', released_at=now() WHERE id=$1", lease['id'])
             elif body.result.get('configured') and body.result.get('workdir'):
                 if lease['release_requested']:
-                    await conn.execute("UPDATE compute_leases SET status='releasing', granted_at=now(), workdir=$2 WHERE id=$1", lease['id'], body.result['workdir'])
+                    await conn.execute("UPDATE compute_leases SET status='releasing', granted_at=now(), workdir=$2, error=NULL WHERE id=$1", lease['id'], body.result['workdir'])
                     await _action(conn, lease['id'], 'release', {'box': lease['box']})
                 else:
-                    await conn.execute("UPDATE compute_leases SET status='active', granted_at=now(), workdir=$2 WHERE id=$1", lease['id'], body.result['workdir'])
+                    await conn.execute("UPDATE compute_leases SET status='active', granted_at=now(), workdir=$2, error=NULL WHERE id=$1", lease['id'], body.result['workdir'])
             else:
                 raise HTTPException(409, 'unexpected or incomplete grant result')
         elif action['kind'] == 'extend':
