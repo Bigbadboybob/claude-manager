@@ -206,3 +206,40 @@ def test_quarantined_boxes_are_logged_only_on_change(monkeypatch, tmp_path, capl
     records = [r.message for r in caplog.records if r.message.startswith('quarantined compute boxes:')]
     assert records == ['quarantined compute boxes: d6', 'quarantined compute boxes: d6, d7',
                        'quarantined compute boxes: (none)']
+
+
+def test_blocked_box_does_not_hold_healthy_box(monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    started, finish, healthy = threading.Event(), threading.Event(), threading.Event()
+    cfg = {'routes': {'d6': {}, 'd7': {}}}
+    actions = [{'action_id': 'slow', 'lease_id': 'one', 'kind': 'grant', 'payload': {'box': 'd6'}},
+               {'action_id': 'fast', 'lease_id': 'two', 'kind': 'grant', 'payload': {'box': 'd7'}}]
+    def fake_api(path, body):
+        if path == '/compute/executor/poll':
+            for action in actions:
+                if action['payload']['box'] not in body['exclude_boxes']:
+                    actions.remove(action)
+                    return {'action': action}
+            return {'action': None}
+        if body['action_id'] == 'fast':
+            healthy.set()
+        return {'ok': True}
+    def fake_execute(action, routes):
+        if action['action_id'] == 'slow':
+            started.set()
+            assert finish.wait(5)
+        return {'lease_id': action['lease_id'], 'configured': True, 'workdir': '/work'}
+    monkeypatch.setattr(executor, 'api', fake_api)
+    monkeypatch.setattr(executor, 'execute', fake_execute)
+    inflight = {}
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert executor.dispatch_once(cfg, pool, inflight)
+            assert started.wait(5)
+            assert executor.dispatch_once(cfg, pool, inflight)
+            assert healthy.wait(5)
+            assert not inflight['d6'].done()
+            finish.set()
+    finally:
+        finish.set()

@@ -192,6 +192,32 @@ def sample_leases(cfg):
         list(pool.map(sample_one, targets))
 
 
+def run_action(action, routes):
+    result = execute(action, routes)
+    api('/compute/executor/complete', {'action_id': action['action_id'], 'result': result})
+
+
+def dispatch_once(cfg, pool, inflight):
+    # One node operation per box; other boxes continue even if one times out.
+    for box, future in list(inflight.items()):
+        if future.done():
+            del inflight[box]
+            try:
+                future.result()
+            except (OSError, ValueError, KeyError, subprocess.SubprocessError, urllib.error.URLError):
+                LOG.exception('lease action failed; retaining reservation')
+    if len(inflight) >= len(cfg['routes']):
+        return False
+    action = api('/compute/executor/poll', {'exclude_boxes': sorted(inflight)})['action']
+    if not action:
+        return False
+    box = action['payload']['box']
+    if box in inflight or box not in cfg['routes']:
+        raise ValueError('API selected an unavailable box')
+    inflight[box] = pool.submit(run_action, action, cfg['routes'])
+    return True
+
+
 def main():
     logging.basicConfig(level=logging.INFO)
     cfg = json.loads(Path(os.environ['CM_COMPUTE_EXECUTOR_CONFIG']).read_text())
@@ -199,6 +225,8 @@ def main():
     next_sample = 0.0
     next_enable = 0.0
     workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix='compute')
+    action_workers = ThreadPoolExecutor(max_workers=max(1, len(cfg['routes'])), thread_name_prefix='compute-action')
+    inflight = {}
     sample_future = None
     enable_future = None
     while True:
@@ -217,10 +245,7 @@ def main():
             if time.monotonic() >= next_sample and (sample_future is None or sample_future.done()):
                 sample_future = workers.submit(sample_leases, cfg)
                 next_sample = time.monotonic() + cfg['sample_seconds']
-            action = api('/compute/executor/poll', {})['action']
-            if action:
-                result = execute(action, cfg['routes'])
-                api('/compute/executor/complete', {'action_id': action['action_id'], 'result': result})
+            if dispatch_once(cfg, action_workers, inflight):
                 continue
         except (OSError, ValueError, KeyError, subprocess.SubprocessError, urllib.error.URLError):
             # An uncertain result is retried with the same action ID. Never

@@ -69,18 +69,21 @@ def settings():
         data = json.loads(Path(path).read_text())
         p = data['policy']
         p.setdefault('transport_failure_threshold', 3)
+        p.setdefault('action_claim_seconds', 240)
         for key in ('cpus_per_slot', 'mem_gb_per_slot', 'max_slots_per_session',
                     'max_slots_per_lease', 'max_slots_per_team', 'burst_max_seconds',
                     'long_max_seconds', 'absolute_max_seconds', 'idle_threshold_seconds',
                     'idle_answer_seconds', 'sample_max_gap_seconds', 'notice_limit',
                     'notice_expiry_guard_seconds', 'expiry_warning_seconds',
-                    'reclaim_notice_grace_seconds', 'transport_failure_threshold'):
+                    'reclaim_notice_grace_seconds', 'transport_failure_threshold', 'action_claim_seconds'):
             if not isinstance(p[key], int) or isinstance(p[key], bool) or p[key] <= 0:
                 raise ValueError(f'{key} must be a positive integer')
         operator = p.get('quarantine_operator_pid')
         if operator is not None:
             if not isinstance(operator, str) or not re.fullmatch(r'agent:[^:]+:[^:]+', operator):
                 raise ValueError('quarantine_operator_pid must be an agent:daemon_id:session_uid or null')
+        if p['action_claim_seconds'] < 210:
+            raise ValueError('action_claim_seconds must be at least 210')
         if p['reclaim_notice_grace_seconds'] < 600:
             raise ValueError('reclaim_notice_grace_seconds must be at least 600')
         if not isinstance(p['idle_percent'], (int, float)) or isinstance(p['idle_percent'], bool) or not 0 < p['idle_percent'] <= 100:
@@ -613,8 +616,12 @@ async def executor_enable(body: BoxEnable, request: Request):
     return {'enabled': True, 'box': body.box}
 
 
+class PollRequest(BaseModel):
+    exclude_boxes: list[str] = Field(default_factory=list)
+
+
 @router.post('/executor/poll')
-async def executor_poll(request: Request):
+async def executor_poll(request: Request, body: PollRequest | None = None):
     p, boxes = settings()
     async with _pool(request).acquire() as conn, conn.transaction():
         await _lock(conn)
@@ -645,13 +652,14 @@ async def executor_poll(request: Request):
             await conn.execute("UPDATE compute_leases SET status='releasing' WHERE id=$1", row['id'])
             await _action(conn, row['id'], 'release', {'box': row['box']})
         await _schedule(conn, p, boxes)
-        action = await conn.fetchrow("""SELECT * FROM compute_lease_actions
-            WHERE kind IN ('grant','extend','release') AND
-                  (status='pending' OR (status='claimed' AND claimed_until < now()))
-            ORDER BY created_at, id LIMIT 1 FOR UPDATE""")
+        action = await conn.fetchrow("""SELECT a.* FROM compute_lease_actions a
+            JOIN compute_leases l ON l.id=a.lease_id
+            WHERE a.kind IN ('grant','extend','release') AND NOT (l.box=ANY($1::text[])) AND
+                  (a.status='pending' OR (a.status='claimed' AND a.claimed_until < now()))
+            ORDER BY a.created_at, a.id LIMIT 1 FOR UPDATE OF a""", body.exclude_boxes if body else [])
         if not action:
             return {'action': None}
-        await conn.execute("UPDATE compute_lease_actions SET status='claimed', claimed_until=now() + interval '2 minutes' WHERE id=$1", action['id'])
+        await conn.execute("UPDATE compute_lease_actions SET status='claimed', claimed_until=now() + make_interval(secs => $2) WHERE id=$1", action['id'], float(p['action_claim_seconds']))
         payload = action['payload']
         if isinstance(payload, str):
             payload = json.loads(payload)
