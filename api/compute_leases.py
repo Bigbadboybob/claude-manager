@@ -269,7 +269,7 @@ async def request_lease(body: LeaseRequest, request: Request):
         enabled = {r['name'] for r in await conn.fetch('SELECT name FROM compute_boxes WHERE enabled')}
         enabled_boxes = [b for b in boxes if b.configured_enabled and b.name in enabled]
         if not _fits_any_box(requested, policy, enabled_boxes):
-            raise HTTPException(409, 'no compute box is enabled for this request yet; use lq until cutover')
+            raise HTTPException(409, 'no enabled box fits this request')
         team = await conn.fetchval("""SELECT m.primary_team_id::text FROM incarnations i
             JOIN members m ON m.id=i.member_id WHERE i.pid=$1 AND i.ended_at IS NULL""", owner)
         await conn.execute("""INSERT INTO compute_leases
@@ -492,6 +492,8 @@ async def executor_pre_enable(request: Request):
                   for row in queue_order(rows)]
         return {'queued_count': len(queued), 'queued': queued,
                 'has_ever_enabled': any(was_enabled(row) for row in box_rows),
+                'quarantined_boxes': [row['name'] for row in box_rows
+                                      if (_json_object(row['evidence']) or {}).get('quarantine_reason')],
                 'enabled_boxes': [box.name for box in boxes if box.configured_enabled and box.name in enabled
                                   and not reservation_state(box, rows, policy)[1]]}
 
@@ -613,15 +615,23 @@ async def executor_complete(body: ActionReceipt, request: Request):
                 if lease['expires_at'] and lease['expires_at'] <= datetime.now(timezone.utc):
                     quarantine = 'expired grant remains unconfirmed after retryable node error'
                     changed = await conn.fetchval('''UPDATE compute_boxes SET enabled=false, ever_enabled=true,
-                        checked_at=now(), evidence=$2::jsonb WHERE name=$1 AND enabled RETURNING name''',
+                        checked_at=now(), evidence=$2::jsonb WHERE name=$1
+                        AND COALESCE(evidence->>'quarantine_reason', '') = '' RETURNING name''',
                         lease['box'], json.dumps({'quarantine_reason': quarantine}))
                     if changed:
                         logger.warning('compute box %s quarantined: %s', lease['box'], quarantine)
                     await _owner_push(conn, lease,
                         f"[cm-lease] lease {lease['id']} expired while grant remains unconfirmed; box {lease['box']} quarantined: {reason}",
                         f"compute-lease-grant-retry-expired:{lease['id']}")
-                # Preserve claimed_until so an uncertain node operation is
-                # retried on the existing lease instead of in a tight loop.
+                if lease['release_requested']:
+                    # The grant may have partially succeeded. Release it on the
+                    # node before freeing the reservation.
+                    await conn.execute("UPDATE compute_leases SET status='releasing' WHERE id=$1", lease['id'])
+                    await _action(conn, lease['id'], 'release', {'box': lease['box']})
+                    await conn.execute("UPDATE compute_lease_actions SET status='done', result=$2::jsonb WHERE id=$1",
+                                       action['id'], json.dumps(body.result))
+                    return {'ok': True, 'releasing': True}
+                # Preserve claimed_until to avoid a tight retry loop.
                 return {'ok': True, 'retryable': True}
             if body.result.get('refused') is True:
                 reason = body.result.get('error')
@@ -633,7 +643,8 @@ async def executor_complete(body: ActionReceipt, request: Request):
                 if reason == 'box capacity exceeded':
                     quarantine = 'node refused grant: box capacity exceeded'
                     changed = await conn.fetchval('''UPDATE compute_boxes SET enabled=false, ever_enabled=true,
-                        checked_at=now(), evidence=$2::jsonb WHERE name=$1 AND enabled RETURNING name''',
+                        checked_at=now(), evidence=$2::jsonb WHERE name=$1
+                        AND COALESCE(evidence->>'quarantine_reason', '') = '' RETURNING name''',
                         lease['box'], json.dumps({'quarantine_reason': quarantine}))
                     if changed:
                         logger.warning('compute box %s quarantined: %s', lease['box'], quarantine)
@@ -646,14 +657,11 @@ async def executor_complete(body: ActionReceipt, request: Request):
                 await _owner_push(conn, lease, f"[cm-lease] lease {lease['id']} grant refused: {reason}",
                                   f"compute-lease-grant-refused:{action['id']}")
             elif body.result.get('expired') is True and body.result.get('released') is True:
-                if lease['granted_at'] is None:
-                    reason = lease['error'] or 'grant expired before activation'
-                    await conn.execute("UPDATE compute_leases SET status='failed', released_at=now(), error=$2 WHERE id=$1",
-                                       lease['id'], reason)
-                    await _owner_push(conn, lease, f"[cm-lease] lease {lease['id']} failed: {reason}",
-                                      f"compute-lease-grant-expired:{action['id']}")
-                else:
-                    await conn.execute("UPDATE compute_leases SET status='released', released_at=now() WHERE id=$1", lease['id'])
+                reason = lease['error'] or 'grant expired before activation'
+                await conn.execute("UPDATE compute_leases SET status='failed', released_at=now(), error=$2 WHERE id=$1",
+                                   lease['id'], reason)
+                await _owner_push(conn, lease, f"[cm-lease] lease {lease['id']} failed: {reason}",
+                                  f"compute-lease-grant-expired:{action['id']}")
             elif body.result.get('configured') and body.result.get('workdir'):
                 if lease['release_requested']:
                     await conn.execute("UPDATE compute_leases SET status='releasing', granted_at=now(), workdir=$2, error=NULL WHERE id=$1", lease['id'], body.result['workdir'])

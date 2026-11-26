@@ -21,7 +21,7 @@ other teams can use available capacity.
 An ETA is the earliest known capacity change, not a promised start; it can be
 unknown. A queue position of zero means a grant is being installed.
 Requests too large for every configured box are rejected. If no enabled box
-can fit a new request, use `lq` until cutover. Existing queued requests show
+can fit a new request, the request is refused. Existing queued requests show
 `waiting: no enabled box fits` until a suitable box is enabled; they do not
 prevent smaller requests from their team from running or count as opposing
 waiters for the team soft cap.

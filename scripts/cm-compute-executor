@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 LOG = logging.getLogger('cm-compute-executor')
+_last_queue_inventory = None
 
 
 def api(path, data):
@@ -98,6 +99,7 @@ def local_drained(box, directory):
 
 
 def enable_drained_boxes(cfg, enabled):
+    global _last_queue_inventory
     if cfg.get('cutover_ready') is not True:
         return
     try:
@@ -106,10 +108,15 @@ def enable_drained_boxes(cfg, enabled):
                 or queued['queued_count'] < 0 or not isinstance(queued.get('queued'), list)
                 or not isinstance(queued.get('enabled_boxes'), list)
                 or type(queued.get('has_ever_enabled')) is not bool
+                or not isinstance(queued.get('quarantined_boxes'), list)
+                or any(not isinstance(name, str) or not name for name in queued['quarantined_boxes'])
                 or any(not isinstance(name, str) or not name for name in queued['enabled_boxes'])
                 or queued['queued_count'] != len(queued['queued'])):
             raise ValueError('invalid pre-enable queue response')
-        LOG.info('pre-enable queue count=%s rows=%s', queued['queued_count'], json.dumps(queued['queued']))
+        inventory = json.dumps(queued['queued'], sort_keys=True)
+        if not queued['has_ever_enabled'] and inventory != _last_queue_inventory:
+            LOG.info('pre-enable queue count=%s rows=%s', queued['queued_count'], inventory)
+            _last_queue_inventory = inventory
         if queued['queued_count'] and not queued['has_ever_enabled'] and cfg.get('allow_queued_at_cutover') is not True:
             LOG.warning('keeping boxes disabled until queued requests are reviewed')
             return
@@ -118,7 +125,7 @@ def enable_drained_boxes(cfg, enabled):
         return
     for box, route in cfg['routes'].items():
         try:
-            if box in enabled or not local_drained(box, cfg['lq_directory']):
+            if box in enabled or box in queued['quarantined_boxes'] or not local_drained(box, cfg['lq_directory']):
                 continue
             remote = subprocess.run([*route['argv'], '--command',
                                      'sudo -n /usr/local/bin/cm-lease drain-check'],

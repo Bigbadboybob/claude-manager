@@ -229,6 +229,24 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(push['pid'], owner.actor.pid)
             self.assertIn('getpwnam: unknown user', push['text'])
 
+    async def test_release_requested_during_retryable_grant_releases_before_freeing(self):
+        owner = self.body('owner')
+        lease = await api.request_lease(owner, self.request)
+        action = (await api.executor_poll(self.request))['action']
+        await api.release(api.LeaseChange(actor=owner.actor, lease_id=lease['lease_id']), self.request)
+        receipt = api.ActionReceipt(action_id=action['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'retryable': True, 'error': 'config error'})
+        self.assertTrue((await api.executor_complete(receipt, self.request))['releasing'])
+        async with self.pool.acquire() as conn:
+            self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', lease['lease_id']), 'releasing')
+            self.assertTrue(await conn.fetchval('SELECT slot_ids FROM compute_leases WHERE id=$1', lease['lease_id']))
+        release = (await api.executor_poll(self.request))['action']
+        self.assertEqual(release['kind'], 'release')
+        await api.executor_complete(api.ActionReceipt(action_id=release['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'released': True}), self.request)
+        async with self.pool.acquire() as conn:
+            self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', lease['lease_id']), 'released')
+
     async def test_retryable_grant_error_clears_on_success(self):
         owner = self.body('owner')
         lease = await api.request_lease(owner, self.request)
@@ -248,6 +266,8 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         action = (await api.executor_poll(self.request))['action']
         async with self.pool.acquire() as conn:
             await conn.execute("UPDATE compute_leases SET expires_at=now()-interval '1 second' WHERE id=$1", lease['lease_id'])
+            # An operator may disable the box while the uncertain grant is in flight.
+            await conn.execute("UPDATE compute_boxes SET enabled=false WHERE name='d6'")
         receipt = api.ActionReceipt(action_id=action['action_id'], result={
             'lease_id': str(lease['lease_id']), 'retryable': True, 'error': 'invalid node config'})
         await api.executor_complete(receipt, self.request)
@@ -293,7 +313,7 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(api.HTTPException) as exc:
             await api.request_lease(self.body('one'), self.request)
         self.assertEqual(exc.exception.status_code, 409)
-        self.assertEqual(exc.exception.detail, 'no compute box is enabled for this request yet; use lq until cutover')
+        self.assertEqual(exc.exception.detail, 'no enabled box fits this request')
         status = await api.status(api.StatusRequest(actor=self.body('one').actor), self.request)
         self.assertFalse(status['pool'][0]['enabled'])
         self.assertEqual(status['queue'], [])
@@ -318,7 +338,7 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(api.HTTPException) as exc:
                 await api.request_lease(body, self.request)
             self.assertEqual(exc.exception.status_code, 409)
-            self.assertEqual(exc.exception.detail, 'no compute box is enabled for this request yet; use lq until cutover')
+            self.assertEqual(exc.exception.detail, 'no enabled box fits this request')
             async with self.pool.acquire() as conn:
                 self.assertEqual(await conn.fetchval('SELECT count(*) FROM compute_leases'), 0)
                 await conn.execute("INSERT INTO compute_boxes (name,enabled,checked_at,evidence) VALUES ('wide',true,now(),'{}'::jsonb)")
@@ -460,7 +480,7 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(api.HTTPException) as exc:
                 await api.request_lease(self.body('config-off'), self.request)
             self.assertEqual(exc.exception.status_code, 409)
-            self.assertEqual(exc.exception.detail, 'no compute box is enabled for this request yet; use lq until cutover')
+            self.assertEqual(exc.exception.detail, 'no enabled box fits this request')
             async with self.pool.acquire() as conn:
                 self.assertEqual(await conn.fetchval('SELECT count(*) FROM compute_leases'), 0)
         finally:

@@ -28,7 +28,7 @@ def test_cutover_is_fail_closed_and_enable_requires_both_drains(monkeypatch, tmp
     def api(path, body):
         calls.append((path, body))
         if path == '/compute/executor/pre-enable':
-            return {'queued_count': 0, 'queued': [], 'enabled_boxes': [], 'has_ever_enabled': False}
+            return {'queued_count': 0, 'queued': [], 'enabled_boxes': [], 'has_ever_enabled': False, 'quarantined_boxes': []}
         return {'enabled': True}
     monkeypatch.setattr(executor, 'api', api)
     enabled = set()
@@ -45,7 +45,7 @@ def test_cutover_is_fail_closed_and_enable_requires_both_drains(monkeypatch, tmp
 def test_pre_enable_lists_old_queue_and_blocks_first_enable_until_review(monkeypatch, tmp_path, caplog):
     calls = []
     queued = [{'lease_id': 'old', 'missing_justification': True}]
-    report = {'queued_count': 1, 'queued': queued, 'enabled_boxes': [], 'has_ever_enabled': False}
+    report = {'queued_count': 1, 'queued': queued, 'enabled_boxes': [], 'has_ever_enabled': False, 'quarantined_boxes': []}
     cfg = {'cutover_ready': True, 'lq_directory': str(tmp_path),
            'routes': {'box': {'argv': ['gcloud', 'compute', 'ssh', 'vm']}}}
     monkeypatch.setattr(executor, 'local_drained', lambda *_: calls.append('local') or True)
@@ -77,7 +77,7 @@ def test_pre_enable_lists_old_queue_and_blocks_first_enable_until_review(monkeyp
 def test_pre_enable_check_failure_keeps_boxes_disabled(monkeypatch, tmp_path):
     cfg = {'cutover_ready': True, 'lq_directory': str(tmp_path),
            'routes': {'box': {'argv': ['gcloud', 'compute', 'ssh', 'vm']}}}
-    monkeypatch.setattr(executor, 'api', lambda *_: {'queued_count': 0, 'queued': ['inconsistent'], 'enabled_boxes': [], 'has_ever_enabled': False})
+    monkeypatch.setattr(executor, 'api', lambda *_: {'queued_count': 0, 'queued': ['inconsistent'], 'enabled_boxes': [], 'has_ever_enabled': False, 'quarantined_boxes': []})
     monkeypatch.setattr(executor, 'local_drained', lambda *_: pytest.fail('must not start drain check'))
     enabled = set()
     executor.enable_drained_boxes(cfg, enabled)
@@ -150,3 +150,23 @@ def test_failed_extension_does_not_infer_absence_from_uncertain_probe(monkeypatc
                     subprocess.TimeoutExpired('probe', 90)])
     with pytest.raises(subprocess.TimeoutExpired):
         executor.execute(action, routes)
+
+
+def test_quarantine_skips_drain_and_inventory_logs_only_on_change(monkeypatch, tmp_path, caplog):
+    report = {'queued_count': 1, 'queued': [{'lease_id': 'old'}], 'enabled_boxes': [],
+              'has_ever_enabled': False, 'quarantined_boxes': ['box']}
+    cfg = {'cutover_ready': True, 'allow_queued_at_cutover': True, 'lq_directory': str(tmp_path),
+           'routes': {'box': {'argv': ['ssh', 'box']}}}
+    monkeypatch.setattr(executor, '_last_queue_inventory', None)
+    monkeypatch.setattr(executor, 'api', lambda *_: report)
+    monkeypatch.setattr(executor, 'local_drained', lambda *_: pytest.fail('quarantined box was checked'))
+    with caplog.at_level('INFO', logger='cm-compute-executor'):
+        executor.enable_drained_boxes(cfg, set())
+        executor.enable_drained_boxes(cfg, set())
+        report['queued'][0]['lease_id'] = 'new'
+        executor.enable_drained_boxes(cfg, set())
+        report['has_ever_enabled'] = True
+        report['queued'][0]['lease_id'] = 'later'
+        executor.enable_drained_boxes(cfg, set())
+    records = [r.message for r in caplog.records if 'pre-enable queue count' in r.message]
+    assert len(records) == 2 and 'old' in records[0] and 'new' in records[1]
