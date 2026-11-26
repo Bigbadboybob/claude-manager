@@ -47,6 +47,10 @@ def config():
     if any(not isinstance(data[k], int) or isinstance(data[k], bool) or data[k] <= 0
            for k in ('max_slots', 'cpus_per_slot', 'mem_gb_per_slot', 'max_duration_seconds')):
         raise Refused('invalid numeric config')
+    ignored = data.get('drain_ignore_datadirs', [])
+    if (not isinstance(ignored, list) or any(not isinstance(path, str) or
+            not path or '\0' in path or not os.path.isabs(path) for path in ignored)):
+        raise Refused('drain_ignore_datadirs must be a list of absolute paths')
     # A broken workdir must not prevent status, expiry or release. Grant and
     # cleanup validate it again before using it.
     try:
@@ -336,20 +340,58 @@ def main():
         elif args.action == 'drain-check':
             # A failed /proc read is not evidence that the box is empty.
             busy = []
+            ignored = []
+            ignored_dirs = cfg.get('drain_ignore_datadirs', [])
+            ignored_bytes = {os.fsencode(path): path for path in ignored_dirs}
+            processes = {}
             for proc in Path('/proc').iterdir():
                 if not proc.name.isdecimal():
                     continue
                 try:
-                    cmdline = (proc / 'cmdline').read_bytes().replace(b'\0', b' ')
-                except FileNotFoundError:
-                    continue
-                try:
+                    raw_cmdline = (proc / 'cmdline').read_bytes()
                     cwd = os.readlink(proc / 'cwd')
                 except FileNotFoundError:
                     continue
-                if b'/ep-lanes/' in cmdline or '/ep-lanes/' in cwd:
-                    busy.append(int(proc.name))
-            result = {'drained': not busy, 'matching_pids': busy, 'max_slots': cfg['max_slots'], 'max_duration_seconds': cfg['max_duration_seconds']}
+                parent = None
+                if ignored_dirs:
+                    try:
+                        stat = (proc / 'stat').read_text()
+                        parent = int(stat.rpartition(')')[2].split()[1])
+                    except (FileNotFoundError, IndexError, ValueError):
+                        # No reliable ancestry means this process cannot be
+                        # ignored on the strength of its parent.
+                        pass
+                processes[int(proc.name)] = (proc, raw_cmdline, cwd, parent)
+            roots = {}
+            for pid, (proc, cmdline, cwd, parent) in processes.items():
+                argv = cmdline.split(b'\0')
+                datadir = next((ignored_bytes[argv[i + 1]] for i in range(len(argv) - 1)
+                                if argv[i] == b'-D' and argv[i + 1] in ignored_bytes), None)
+                if datadir is not None:
+                    try:
+                        exe = os.readlink(proc / 'exe')
+                    except FileNotFoundError:
+                        continue
+                    if os.path.basename(exe) == 'postgres':
+                        roots[pid] = datadir
+            for pid, (proc, cmdline, cwd, parent) in processes.items():
+                if b'/ep-lanes/' not in cmdline.replace(b'\0', b' ') and '/ep-lanes/' not in cwd:
+                    continue
+                datadir = roots.get(pid)
+                ancestor = parent
+                seen = {pid}
+                while datadir is None and ancestor is not None and ancestor not in seen:
+                    seen.add(ancestor)
+                    datadir = roots.get(ancestor)
+                    ancestor = processes[ancestor][3] if ancestor in processes else None
+                if datadir is None and cwd in ignored_dirs:
+                    datadir = cwd
+                if datadir is None:
+                    busy.append(pid)
+                else:
+                    ignored.append({'pid': pid, 'datadir': datadir})
+            result = {'drained': not busy, 'matching_pids': busy, 'ignored_pids': ignored,
+                      'max_slots': cfg['max_slots'], 'max_duration_seconds': cfg['max_duration_seconds']}
             audit('drain-check', '*')
         else:
             row = load(args.lease_id)

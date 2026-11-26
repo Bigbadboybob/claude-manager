@@ -105,6 +105,10 @@ must restrict access to this one script; review the shared-user trust boundary
 before installing it. Configure the executor's environment and route file from
 `deploy/cm-compute-executor.example.json`; keep credentials out of the repo.
 
+The optional node `drain_ignore_datadirs` list names absolute PostgreSQL data
+directories for long-lived services. The drain check reports each excluded PID and its exact data directory in
+`ignored_pids`; other matching lane processes still prevent enablement.
+
 For the deployer, after reviewing each box's limits and creating the parent
 workdir, the node installation commands are:
 

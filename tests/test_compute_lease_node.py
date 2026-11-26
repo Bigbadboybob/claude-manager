@@ -530,4 +530,72 @@ def test_drain_check_reports_node_capacity(context, tmp_path, monkeypatch, capsy
     monkeypatch.setattr(node.sys, 'argv', ['cm-lease', 'drain-check'])
     node.main()
     result = json.loads(capsys.readouterr().out)
-    assert result == {'drained': True, 'matching_pids': [], 'max_slots': cfg['max_slots'], 'max_duration_seconds': cfg['max_duration_seconds']}
+    assert result == {'drained': True, 'matching_pids': [], 'ignored_pids': [], 'max_slots': cfg['max_slots'], 'max_duration_seconds': cfg['max_duration_seconds']}
+
+
+@pytest.mark.parametrize('bad', ['bad', None, [123], ['relative/path'], ['/ok', None], ['/bad\0path']])
+def test_config_refuses_invalid_drain_ignore_datadirs(context, monkeypatch, bad):
+    cfg, _, _ = context
+    cfg['drain_ignore_datadirs'] = bad
+    class RootOwnedConfig:
+        def lstat(self): return SimpleNamespace(st_uid=0, st_mode=0o600)
+        def is_file(self): return True
+        def is_symlink(self): return False
+        def read_text(self): return json.dumps(cfg)
+    monkeypatch.setattr(node, 'CONFIG', RootOwnedConfig())
+    with pytest.raises(node.Refused, match='drain_ignore_datadirs'):
+        node.config()
+
+
+def test_drain_check_ignores_only_configured_database_processes(context, tmp_path, monkeypatch, capsys):
+    cfg, _, _ = context
+    state = node.STATE
+    proc_root = tmp_path / 'proc'
+    proc_root.mkdir()
+    datadir = '/home/lucas/ep-lanes/pgtest/data'
+    class RootOwnedState:
+        def mkdir(self, **kwargs): return state.mkdir(**kwargs)
+        def lstat(self): return SimpleNamespace(st_uid=0, st_mode=0o700)
+        def is_symlink(self): return False
+        def __truediv__(self, name): return state / name
+    def process(pid, argv, cwd, exe, parent=1):
+        path = proc_root / str(pid)
+        path.mkdir()
+        (path / 'cmdline').write_bytes(b'\0'.join(x.encode() for x in argv) + b'\0')
+        (path / 'stat').write_text(f'{pid} (process name) S {parent} 0')
+        (path / 'cwd').symlink_to(cwd)
+        (path / 'exe').symlink_to(exe)
+    process(101, ['/usr/lib/postgresql/16/bin/postgres', '-D', datadir], '/tmp', '/usr/lib/postgresql/16/bin/postgres')
+    process(102, ['postgres: writer'], datadir + '/pg_wal', '/usr/lib/postgresql/16/bin/postgres', parent=101)
+    process(103, ['bash', '/home/lucas/ep-lanes/driver.sh'], '/home/lucas/ep-lanes/pgtest/other', '/usr/bin/bash')
+    process(104, ['bash', '/home/lucas/ep-lanes/job.sh'], '/home/lucas/ep-lanes/pgtest/other', '/usr/bin/bash')
+    process(105, ['postgres', '-D', datadir + '-other'], '/home/lucas/ep-lanes/pgtest/other', '/usr/lib/postgresql/16/bin/postgres')
+    process(106, ['postgres: backend'], datadir, '/usr/lib/postgresql/16/bin/postgres')
+    process(107, ['postgres: other'], datadir + '/pg_wal', '/usr/lib/postgresql/16/bin/postgres')
+    process(108, ['bash', '-D', datadir], '/home/lucas/ep-lanes/pgtest/other', '/usr/bin/bash')
+    real_path = node.Path
+    monkeypatch.setattr(node, 'STATE', RootOwnedState())
+    monkeypatch.setattr(node, 'config', lambda: cfg)
+    monkeypatch.setattr(node, 'Path', lambda value: proc_root if value == '/proc' else real_path(value))
+    monkeypatch.setattr(node.os, 'geteuid', lambda: 0)
+    monkeypatch.setattr(node.sys, 'argv', ['cm-lease', 'drain-check'])
+    node.main()
+    baseline = json.loads(capsys.readouterr().out)
+    assert set(baseline['matching_pids']) == {101, 102, 103, 104, 105, 106, 107, 108}
+    assert baseline['ignored_pids'] == [] and not baseline['drained']
+    cfg['drain_ignore_datadirs'] = []
+    node.main()
+    assert json.loads(capsys.readouterr().out) == baseline
+    cfg['drain_ignore_datadirs'] = [datadir]
+    node.main()
+    result = json.loads(capsys.readouterr().out)
+    assert {row['pid']: row['datadir'] for row in result['ignored_pids']} == {101: datadir, 102: datadir, 106: datadir}
+    assert set(result['matching_pids']) == {103, 104, 105, 107, 108}
+    assert not result['drained']
+    for pid in (103, 104, 105, 107, 108):
+        for entry in (proc_root / str(pid)).iterdir():
+            entry.unlink()
+        (proc_root / str(pid)).rmdir()
+    node.main()
+    drained = json.loads(capsys.readouterr().out)
+    assert drained['drained'] and {row['pid'] for row in drained['ignored_pids']} == {101, 102, 106}
