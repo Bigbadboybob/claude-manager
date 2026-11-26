@@ -638,7 +638,7 @@ async def executor_complete(body: ActionReceipt, request: Request):
                     # The grant may have partially succeeded. Release it on the
                     # node before freeing the reservation.
                     await conn.execute("UPDATE compute_leases SET status='releasing' WHERE id=$1", lease['id'])
-                    await _action(conn, lease['id'], 'release', {'box': lease['box']})
+                    await _action(conn, lease['id'], 'release', {'box': lease['box'], 'failed_grant': True})
                     await conn.execute("UPDATE compute_lease_actions SET status='done', result=$2::jsonb WHERE id=$1",
                                        action['id'], json.dumps(body.result))
                     return {'ok': True, 'releasing': True}
@@ -694,7 +694,23 @@ async def executor_complete(body: ActionReceipt, request: Request):
                     raise HTTPException(422, 'node expiry mismatch')
                 await conn.execute('UPDATE compute_leases SET expires_at=to_timestamp($2) WHERE id=$1', lease['id'], payload['expires_epoch'])
         elif action['kind'] == 'release':
-            if lease['status'] != 'releasing' or body.result.get('released') is not True:
+            if lease['status'] != 'releasing':
+                raise HTTPException(409, 'unexpected release result')
+            if body.result.get('retryable') is True:
+                reason = body.result.get('error')
+                if not isinstance(reason, str) or not reason.strip():
+                    raise HTTPException(422, 'retryable release error must include a reason')
+                reason = 'release attempt failed: ' + reason[:2000]
+                if lease['granted_at'] is not None or not lease['error']:
+                    await conn.execute('UPDATE compute_leases SET error=$2 WHERE id=$1', lease['id'], reason)
+                if lease['expires_at'] and lease['expires_at'] <= datetime.now(timezone.utc):
+                    quarantine = 'expired release remains unconfirmed after retryable node error'
+                    await _quarantine_box(conn, lease['box'], quarantine)
+                    await _owner_push(conn, lease,
+                        f"[cm-lease] lease {lease['id']} expired while release remains unconfirmed; box {lease['box']} quarantined: {reason}",
+                        f"compute-lease-release-retry-expired:{lease['id']}")
+                return {'ok': True, 'retryable': True}
+            if body.result.get('released') is not True:
                 raise HTTPException(409, 'unexpected release result')
             payload = action['payload']
             if isinstance(payload, str):

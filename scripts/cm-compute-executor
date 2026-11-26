@@ -40,7 +40,7 @@ def command_for(action):
     return shlex.join(args)
 
 
-def execute(action, routes):
+def _execute(action, routes):
     route = routes[action['payload']['box']]
     # Routes are configured locally, not supplied by an agent or the API.
     command = [*route['argv'], '--command', command_for(action)]
@@ -78,6 +78,27 @@ def execute(action, routes):
     if result.get('lease_id') != str(action['lease_id']):
         raise ValueError('node result does not match lease')
     return result
+
+
+def execute(action, routes):
+    try:
+        return _execute(action, routes)
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        if action['kind'] != 'release':
+            raise
+        # Neither a node failure nor a transport failure proves release.
+        # Report uncertainty so the API can quarantine after expiry.
+        reason = str(exc)
+        if isinstance(exc, subprocess.CalledProcessError):
+            for line in reversed((exc.stderr or '').splitlines()):
+                try:
+                    detail = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(detail, dict) and isinstance(detail.get('error'), str) and detail['error'].strip():
+                    reason = detail['error']
+                    break
+        return {'lease_id': str(action['lease_id']), 'retryable': True, 'error': reason or type(exc).__name__}
 
 
 def local_drained(box, directory):

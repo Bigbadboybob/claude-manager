@@ -170,3 +170,17 @@ def test_quarantine_skips_drain_and_inventory_logs_only_on_change(monkeypatch, t
         executor.enable_drained_boxes(cfg, set())
     records = [r.message for r in caplog.records if 'pre-enable queue count' in r.message]
     assert len(records) == 2 and 'old' in records[0] and 'new' in records[1]
+
+
+def test_release_failure_is_reported_as_uncertain(monkeypatch):
+    import subprocess
+    action = {'kind': 'release', 'lease_id': 'lease-id', 'payload': {'box': 'box'}}
+    routes = {'box': {'argv': ['ssh', 'box']}}
+    def failed(argv, **kwargs):
+        raise subprocess.CalledProcessError(3, argv, stderr='{"refused":false,"error":"bad node config"}')
+    monkeypatch.setattr(executor.subprocess, 'run', failed)
+    assert executor.execute(action, routes) == {'lease_id': 'lease-id', 'retryable': True, 'error': 'bad node config'}
+    def timed_out(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, 90)
+    monkeypatch.setattr(executor.subprocess, 'run', timed_out)
+    assert executor.execute(action, routes)['retryable'] is True

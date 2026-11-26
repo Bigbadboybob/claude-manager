@@ -245,6 +245,37 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         await api.executor_complete(api.ActionReceipt(action_id=release['action_id'], result={
             'lease_id': str(lease['lease_id']), 'released': True}), self.request)
         async with self.pool.acquire() as conn:
+            self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', lease['lease_id']), 'failed')
+
+    async def test_expired_unconfirmed_release_quarantines_without_freeing(self):
+        owner = self.body('owner')
+        lease = await api.request_lease(owner, self.request)
+        action = (await api.executor_poll(self.request))['action']
+        await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'configured': True, 'workdir': '/work/id'}), self.request)
+        await api.release(api.LeaseChange(actor=owner.actor, lease_id=lease['lease_id']), self.request)
+        release = (await api.executor_poll(self.request))['action']
+        receipt = api.ActionReceipt(action_id=release['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'retryable': True, 'error': 'broken config'})
+        await api.executor_complete(receipt, self.request)
+        async with self.pool.acquire() as conn:
+            self.assertTrue(await conn.fetchval("SELECT enabled FROM compute_boxes WHERE name='d6'"))
+            await conn.execute("UPDATE compute_leases SET expires_at=now()-interval '1 second' WHERE id=$1", lease['lease_id'])
+        with self.assertLogs('cm.api.compute', level='WARNING') as logs:
+            await api.executor_complete(receipt, self.request)
+            await api.executor_complete(receipt, self.request)
+        self.assertEqual(len(logs.output), 1)
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow('SELECT status,slot_ids,error FROM compute_leases WHERE id=$1', lease['lease_id'])
+            self.assertEqual(row['status'], 'releasing')
+            self.assertTrue(row['slot_ids'])
+            self.assertIn('broken config', row['error'])
+            self.assertEqual(await conn.fetchval('SELECT status FROM compute_lease_actions WHERE id=$1', release['action_id']), 'claimed')
+            self.assertEqual(await conn.fetchval("SELECT count(*) FROM item_pushes WHERE text LIKE '%release remains unconfirmed%'"), 1)
+            self.assertFalse(await conn.fetchval("SELECT enabled FROM compute_boxes WHERE name='d6'"))
+        await api.executor_complete(api.ActionReceipt(action_id=release['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'released': True}), self.request)
+        async with self.pool.acquire() as conn:
             self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', lease['lease_id']), 'released')
 
     async def test_retryable_grant_error_clears_on_success(self):
