@@ -178,7 +178,7 @@ async def _owner_push(conn, row, text, dedupe):
         pieces[1], pieces[2], row['owner'], text, dedupe)
 
 
-async def _quarantine_box(conn, box, reason, lease, policy):
+async def _quarantine_box(conn, box, reason, lease, policy, *, transport=False):
     # The caller holds the scheduling advisory lock. Older writes may have
     # encoded JSON twice, so inspect the decoded object rather than SQL ->>.
     row = await conn.fetchrow('SELECT evidence FROM compute_boxes WHERE name=$1', box)
@@ -186,6 +186,7 @@ async def _quarantine_box(conn, box, reason, lease, policy):
         raise ValueError(f'unknown compute box {box}')
     evidence = _json_object(row['evidence']) or {}
     original = evidence.get('quarantine_reason')
+    existing_outage = evidence.get('transport_outage_id')
     history = evidence.get('quarantine_reasons')
     if not isinstance(history, list):
         history = [original] if original else []
@@ -194,8 +195,12 @@ async def _quarantine_box(conn, box, reason, lease, policy):
         return False
     evidence['quarantine_reason'] = original or reason
     evidence['quarantine_reasons'] = [*history, reason]
+    if transport and not existing_outage:
+        evidence['transport_outage_id'] = str(uuid.uuid4())
     await conn.execute("""UPDATE compute_boxes SET enabled=false, ever_enabled=true, checked_at=now(),
         evidence=$2::jsonb WHERE name=$1""", box, evidence)
+    if transport and existing_outage:
+        return False
     logger.warning('compute box %s quarantined: %s', box, reason)
     operator = policy.get('quarantine_operator_pid')
     if operator and operator != lease['owner']:
@@ -203,6 +208,12 @@ async def _quarantine_box(conn, box, reason, lease, policy):
             f"[cm-lease] box {box} quarantined: {reason}; manual review required",
             f'compute-box-quarantine-operator:{uuid.uuid4()}')
     return True
+
+
+async def _outage_owner_push(conn, lease, text):
+    evidence = _json_object(await conn.fetchval('SELECT evidence FROM compute_boxes WHERE name=$1', lease['box'])) or {}
+    outage = evidence['transport_outage_id']
+    await _owner_push(conn, lease, text, f"compute-lease-outage:{lease['id']}:{outage}")
 
 
 async def _notice_action(conn, row, kind, extra=None):
@@ -648,10 +659,9 @@ async def executor_complete(body: ActionReceipt, request: Request):
                 await conn.execute('UPDATE compute_leases SET error=$2 WHERE id=$1', lease['id'], reason)
                 if lease['expires_at'] and lease['expires_at'] <= datetime.now(timezone.utc):
                     quarantine = 'expired grant remains unconfirmed after retryable node error'
-                    await _quarantine_box(conn, lease['box'], quarantine, lease, p)
-                    await _owner_push(conn, lease,
-                        f"[cm-lease] lease {lease['id']} expired while grant remains unconfirmed; box {lease['box']} quarantined: {reason}",
-                        f"compute-lease-grant-retry-expired:{lease['id']}")
+                    await _quarantine_box(conn, lease['box'], quarantine, lease, p, transport=True)
+                    await _outage_owner_push(conn, lease,
+                        f"[cm-lease] lease {lease['id']} expired while grant remains unconfirmed; box {lease['box']} quarantined: {reason}")
                 if lease['release_requested']:
                     # The grant may have partially succeeded. Release it on the
                     # node before freeing the reservation.
@@ -704,10 +714,9 @@ async def executor_complete(body: ActionReceipt, request: Request):
                 await conn.execute('UPDATE compute_leases SET error=$2 WHERE id=$1', lease['id'], reason)
                 if lease['expires_at'] and lease['expires_at'] <= datetime.now(timezone.utc):
                     quarantine = 'expired extension remains unconfirmed after retryable node error'
-                    await _quarantine_box(conn, lease['box'], quarantine, lease, p)
-                    await _owner_push(conn, lease,
-                        f"[cm-lease] lease {lease['id']} expired while extension remains unconfirmed; box {lease['box']} quarantined: {reason}",
-                        f"compute-lease-extend-retry-expired:{lease['id']}")
+                    await _quarantine_box(conn, lease['box'], quarantine, lease, p, transport=True)
+                    await _outage_owner_push(conn, lease,
+                        f"[cm-lease] lease {lease['id']} expired while extension remains unconfirmed; box {lease['box']} quarantined: {reason}")
                     # An extension may have reached the node. Reconcile by
                     # releasing it, retaining the reservation until confirmed.
                     await conn.execute("UPDATE compute_leases SET status='releasing' WHERE id=$1", lease['id'])
@@ -741,10 +750,9 @@ async def executor_complete(body: ActionReceipt, request: Request):
                     await conn.execute('UPDATE compute_leases SET error=$2 WHERE id=$1', lease['id'], reason)
                 if lease['expires_at'] and lease['expires_at'] <= datetime.now(timezone.utc):
                     quarantine = 'expired release remains unconfirmed after retryable node error'
-                    await _quarantine_box(conn, lease['box'], quarantine, lease, p)
-                    await _owner_push(conn, lease,
-                        f"[cm-lease] lease {lease['id']} expired while release remains unconfirmed; box {lease['box']} quarantined: {reason}",
-                        f"compute-lease-release-retry-expired:{lease['id']}")
+                    await _quarantine_box(conn, lease['box'], quarantine, lease, p, transport=True)
+                    await _outage_owner_push(conn, lease,
+                        f"[cm-lease] lease {lease['id']} expired while release remains unconfirmed; box {lease['box']} quarantined: {reason}")
                 return {'ok': True, 'retryable': True}
             if body.result.get('released') is not True:
                 raise HTTPException(409, 'unexpected release result')

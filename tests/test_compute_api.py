@@ -309,6 +309,28 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         async with self.pool.acquire() as conn:
             self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', lease['lease_id']), 'released')
 
+    async def test_expired_extension_and_failed_release_share_outage_notice(self):
+        owner = self.body('owner')
+        lease = await api.request_lease(owner, self.request)
+        grant = (await api.executor_poll(self.request))['action']
+        await api.executor_complete(api.ActionReceipt(action_id=grant['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'configured': True, 'workdir': '/work/id'}), self.request)
+        await api.extend(api.LeaseChange(actor=owner.actor, lease_id=lease['lease_id'], duration=60), self.request)
+        extension = (await api.executor_poll(self.request))['action']
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE compute_leases SET expires_at=now()-interval '1 second' WHERE id=$1", lease['lease_id'])
+        with self.assertLogs('cm.api.compute', level='WARNING') as logs:
+            await api.executor_complete(api.ActionReceipt(action_id=extension['action_id'], result={
+                'lease_id': str(lease['lease_id']), 'retryable': True, 'error': 'IAP unavailable'}), self.request)
+            release = (await api.executor_poll(self.request))['action']
+            await api.executor_complete(api.ActionReceipt(action_id=release['action_id'], result={
+                'lease_id': str(lease['lease_id']), 'retryable': True, 'error': 'IAP unavailable'}), self.request)
+        self.assertEqual(len(logs.output), 1)
+        async with self.pool.acquire() as conn:
+            self.assertEqual(await conn.fetchval('SELECT count(*) FROM item_pushes WHERE pid=$1', owner.actor.pid), 1)
+            evidence = api._json_object(await conn.fetchval("SELECT evidence FROM compute_boxes WHERE name='d6'"))
+            self.assertEqual(len(evidence['quarantine_reasons']), 2)
+
     async def test_retryable_grant_error_clears_on_success(self):
         owner = self.body('owner')
         lease = await api.request_lease(owner, self.request)
