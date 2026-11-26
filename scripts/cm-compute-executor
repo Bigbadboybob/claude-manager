@@ -45,7 +45,16 @@ def execute(action, routes):
     command = [*route['argv'], '--command', command_for(action)]
     try:
         completed = subprocess.run(command, check=True, text=True, capture_output=True, timeout=90)
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as exc:
+        if action['kind'] == 'grant' and exc.returncode == 3:
+            for line in reversed((exc.stderr or '').splitlines()):
+                try:
+                    error = json.loads(line)
+                except ValueError:
+                    continue
+                if (isinstance(error, dict) and error.get('refused') is True and
+                        isinstance(error.get('error'), str) and error['error'].strip()):
+                    return {'lease_id': str(action['lease_id']), 'refused': True, 'error': error['error']}
         if action['kind'] != 'extend':
             raise
         # A failed SSH command says nothing about node state. A separate,
@@ -93,9 +102,11 @@ def enable_drained_boxes(cfg, enabled):
             remote = subprocess.run([*route['argv'], '--command',
                                      'sudo -n /usr/local/bin/cm-lease drain-check'],
                                     check=True, text=True, capture_output=True, timeout=90)
-            if json.loads(remote.stdout).get('drained') is True:
+            evidence = json.loads(remote.stdout)
+            if evidence.get('drained') is True:
                 api('/compute/executor/enable', {'box': box, 'local_drained': True,
-                                                  'node_drained': True})
+                                                  'node_drained': True,
+                                                  'node_max_slots': evidence.get('max_slots')})
                 enabled.add(box)
         except (OSError, ValueError, KeyError, subprocess.SubprocessError, urllib.error.URLError):
             LOG.exception('box %s remains disabled', box)

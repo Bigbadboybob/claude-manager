@@ -22,7 +22,7 @@ def test_cutover_is_fail_closed_and_enable_requires_both_drains(monkeypatch, tmp
     cfg = {'cutover_ready': False, 'lq_directory': str(tmp_path),
            'routes': {'box': {'argv': ['gcloud', 'compute', 'ssh', 'vm']}}}
     monkeypatch.setattr(executor, 'local_drained', lambda *_: calls.append('local') or True)
-    monkeypatch.setattr(executor.subprocess, 'run', lambda *a, **kw: SimpleNamespace(stdout='{"drained":true}'))
+    monkeypatch.setattr(executor.subprocess, 'run', lambda *a, **kw: SimpleNamespace(stdout='{"drained":true,"max_slots":7}'))
     monkeypatch.setattr(executor, 'api', lambda path, body: calls.append((path, body)))
     enabled = set()
     executor.enable_drained_boxes(cfg, enabled)
@@ -30,9 +30,29 @@ def test_cutover_is_fail_closed_and_enable_requires_both_drains(monkeypatch, tmp
     cfg['cutover_ready'] = True
     executor.enable_drained_boxes(cfg, enabled)
     assert enabled == {'box'}
-    assert calls[-1][1] == {'box': 'box', 'local_drained': True, 'node_drained': True}
+    assert calls[-1][1] == {'box': 'box', 'local_drained': True, 'node_drained': True, 'node_max_slots': 7}
     executor.enable_drained_boxes(cfg, enabled)
     assert calls.count('local') == 1
+
+
+def test_node_grant_refusal_is_reported_but_transport_failure_is_not(monkeypatch):
+    import subprocess
+    import pytest
+    action = {'kind': 'grant', 'lease_id': 'lease-id', 'payload': {'box': 'box', 'owner': 'agent:d:s',
+              'slots': 1, 'mem_gb': 16, 'expires_epoch': 123}}
+    routes = {'box': {'argv': ['gcloud', 'compute', 'ssh', 'vm']}}
+    def fail(returncode, stderr):
+        def run(argv, **kwargs):
+            raise subprocess.CalledProcessError(returncode, argv, stderr=stderr)
+        return run
+    monkeypatch.setattr(executor.subprocess, 'run', fail(3, 'banner\n{"refused":true,"error":"box capacity exceeded"}\n'))
+    assert executor.execute(action, routes) == {'lease_id': 'lease-id', 'refused': True, 'error': 'box capacity exceeded'}
+    for code, stderr in [(255, '{"refused":true,"error":"connection lost"}'),
+                         (3, '{"error":"systemctl failed","refused":false}'),
+                         (3, 'transport failed')]:
+        monkeypatch.setattr(executor.subprocess, 'run', fail(code, stderr))
+        with pytest.raises(subprocess.CalledProcessError):
+            executor.execute(action, routes)
 
 
 def test_failed_extension_requires_explicit_node_absence(monkeypatch):

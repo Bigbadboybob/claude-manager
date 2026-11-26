@@ -140,21 +140,25 @@ async def _action(conn, lease_id, kind, payload):
     return action_id
 
 
-async def _notice_action(conn, row, kind, extra=None):
-    payload = {'box': row['box'], 'owner': row['owner'], **(extra or {})}
-    action_id = await _action(conn, row['id'], kind, payload)
+async def _owner_push(conn, row, text, dedupe):
     pieces = row['owner'].split(':', 2)
     if len(pieces) != 3 or pieces[0] != 'agent' or not pieces[1] or not pieces[2]:
         raise ValueError('invalid stored owner identity')
+    return await conn.fetchval("""INSERT INTO item_pushes
+        (daemon_id, session_uid, pid, kind, text, dedupe)
+        VALUES ($1,$2,$3,'compute_lease',$4,$5) RETURNING id""",
+        pieces[1], pieces[2], row['owner'], text, dedupe)
+
+
+async def _notice_action(conn, row, kind, extra=None):
+    payload = {'box': row['box'], 'owner': row['owner'], **(extra or {})}
+    action_id = await _action(conn, row['id'], kind, payload)
     text = {
         'idle_notice': f"[cm-lease] lease {row['id']} is idle; release, extend, or check its status",
         'reclaim_notice': f"[cm-lease] lease {row['id']} may be reclaimed after two unanswered idle notices",
         'expiry_notice': f"[cm-lease] lease {row['id']} is approaching expiry",
     }[kind]
-    push_id = await conn.fetchval("""INSERT INTO item_pushes
-        (daemon_id, session_uid, pid, kind, text, dedupe)
-        VALUES ($1,$2,$3,'compute_lease',$4,$5) RETURNING id""",
-        pieces[1], pieces[2], row['owner'], text, f'compute-lease:{action_id}')
+    push_id = await _owner_push(conn, row, text, f'compute-lease:{action_id}')
     await conn.execute('INSERT INTO compute_lease_notices (action_id, lease_id, push_id, answer_tracking) VALUES ($1,$2,$3,true)',
                        action_id, row['id'], push_id)
 
@@ -421,6 +425,7 @@ class BoxEnable(BaseModel):
     box: str
     local_drained: bool
     node_drained: bool
+    node_max_slots: int = Field(gt=0, strict=True)
 
 
 async def _reconcile_notices(conn, p, boxes):
@@ -443,14 +448,23 @@ async def _reconcile_notices(conn, p, boxes):
 @router.post('/executor/enable')
 async def executor_enable(body: BoxEnable, request: Request):
     p, boxes = settings()
-    if body.box not in {b.name for b in boxes if b.configured_enabled} or not body.local_drained or not body.node_drained:
+    box = next((b for b in boxes if b.name == body.box and b.configured_enabled), None)
+    if not box or not body.local_drained or not body.node_drained:
         raise HTTPException(409, 'box is not configured for cutover or has not drained')
+    if len(box.slots) > body.node_max_slots:
+        # Revalidation may discover drift on a previously enabled box. Stop
+        # new grants without disturbing its existing reservations.
+        async with _pool(request).acquire() as conn, conn.transaction():
+            await _lock(conn)
+            await conn.execute('UPDATE compute_boxes SET enabled=false WHERE name=$1', body.box)
+        raise HTTPException(409, 'configured pool slots exceed node max_slots')
     async with _pool(request).acquire() as conn, conn.transaction():
         await _lock(conn)
         await conn.execute("""INSERT INTO compute_boxes (name, enabled, checked_at, evidence)
             VALUES ($1,true,now(),$2::jsonb) ON CONFLICT (name) DO UPDATE
             SET enabled=true, checked_at=now(), evidence=EXCLUDED.evidence""",
-            body.box, json.dumps({'local_drained': True, 'node_drained': True}))
+            body.box, json.dumps({'local_drained': True, 'node_drained': True,
+                                  'node_max_slots': body.node_max_slots}))
         await _schedule(conn, p, boxes)
     return {'enabled': True, 'box': body.box}
 
@@ -516,7 +530,19 @@ async def executor_complete(body: ActionReceipt, request: Request):
         if action['kind'] == 'grant':
             if lease['status'] != 'granting':
                 raise HTTPException(409, 'unexpected or incomplete grant result')
-            if body.result.get('expired') is True and body.result.get('released') is True:
+            if body.result.get('refused') is True:
+                reason = body.result.get('error')
+                if not isinstance(reason, str) or not reason.strip():
+                    raise HTTPException(422, 'node refusal must include a reason')
+                reason = reason[:2000]
+                await conn.execute("UPDATE compute_leases SET status='releasing', error=$2 WHERE id=$1",
+                                   lease['id'], 'node refused grant: ' + reason)
+                # A refusal may follow a partial node operation. Keep the slot
+                # until release confirms that the node is no longer using it.
+                await _action(conn, lease['id'], 'release', {'box': lease['box'], 'failed_grant': True})
+                await _owner_push(conn, lease, f"[cm-lease] lease {lease['id']} grant refused: {reason}",
+                                  f"compute-lease-grant-refused:{action['id']}")
+            elif body.result.get('expired') is True and body.result.get('released') is True:
                 await conn.execute("UPDATE compute_leases SET status='released', released_at=now() WHERE id=$1", lease['id'])
             elif body.result.get('configured') and body.result.get('workdir'):
                 if lease['release_requested']:
@@ -545,7 +571,11 @@ async def executor_complete(body: ActionReceipt, request: Request):
         elif action['kind'] == 'release':
             if lease['status'] != 'releasing' or body.result.get('released') is not True:
                 raise HTTPException(409, 'unexpected release result')
-            await conn.execute("UPDATE compute_leases SET status='released', released_at=now() WHERE id=$1", lease['id'])
+            payload = action['payload']
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            terminal = 'failed' if payload.get('failed_grant') is True else 'released'
+            await conn.execute('UPDATE compute_leases SET status=$2, released_at=now() WHERE id=$1', lease['id'], terminal)
             await conn.execute('DELETE FROM compute_lease_samples WHERE lease_id=$1', lease['id'])
             await conn.execute('DELETE FROM compute_lease_sampling_epochs WHERE lease_id=$1', lease['id'])
         else:

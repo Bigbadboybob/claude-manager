@@ -35,12 +35,15 @@ for the remote command. Callers need Python 3, gcloud and the existing approved
 IAP access. Without `run_argv`, the prefix uses the configured SSH alias.
 This does not install keys or authorize a new route from cm-manager.
 Reservations remain occupied until release is confirmed.
+An explicit node grant refusal is reported to the owner; its lease becomes
+failed after the node confirms release, so a transport error never frees capacity.
 
 At cutover:
 
 1. Compute-Manager makes `lq` refuse new `NAME.in` submissions.
 2. Let existing runs drain, then set `cutover_ready`. The executor confirms
-   each box is drained before enabling it.
+   each box is drained and its node `max_slots` covers the configured pool
+   slots before enabling it.
 3. Leave the pool and executor examples disabled until those checks and the
    deployment review pass. Retire `lq` separately after the agreed week.
 

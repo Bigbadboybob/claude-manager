@@ -348,7 +348,7 @@ def main():
                     continue
                 if b'/ep-lanes/' in cmdline or '/ep-lanes/' in cwd:
                     busy.append(int(proc.name))
-            result = {'drained': not busy, 'matching_pids': busy}
+            result = {'drained': not busy, 'matching_pids': busy, 'max_slots': cfg['max_slots']}
             audit('drain-check', '*')
         else:
             row = load(args.lease_id)
@@ -412,5 +412,5 @@ if __name__ == '__main__':
                 audit('refused:' + (sys.argv[1] if len(sys.argv) > 1 else 'unknown'), '*')
             except OSError:
                 pass
-        print(json.dumps({'error': str(exc)}), file=sys.stderr)
+        print(json.dumps({'error': str(exc), 'refused': isinstance(exc, Refused)}), file=sys.stderr)
         sys.exit(3)

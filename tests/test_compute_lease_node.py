@@ -510,3 +510,24 @@ def test_status_works_with_bad_workdir_root(context, tmp_path, monkeypatch, caps
     result = json.loads(capsys.readouterr().out)
     assert result['lease_id'] == LEASE and result['cpu_usage_usec'] == 123
     assert node.unit(LEASE) in calls[-1]
+
+
+def test_drain_check_reports_node_capacity(context, tmp_path, monkeypatch, capsys):
+    cfg, _, _ = context
+    state = node.STATE
+    proc = tmp_path / 'empty-proc'
+    proc.mkdir()
+    class RootOwnedState:
+        def mkdir(self, **kwargs): return state.mkdir(**kwargs)
+        def lstat(self): return SimpleNamespace(st_uid=0, st_mode=0o700)
+        def is_symlink(self): return False
+        def __truediv__(self, name): return state / name
+    real_path = node.Path
+    monkeypatch.setattr(node, 'STATE', RootOwnedState())
+    monkeypatch.setattr(node, 'config', lambda: cfg)
+    monkeypatch.setattr(node, 'Path', lambda value: proc if value == '/proc' else real_path(value))
+    monkeypatch.setattr(node.os, 'geteuid', lambda: 0)
+    monkeypatch.setattr(node.sys, 'argv', ['cm-lease', 'drain-check'])
+    node.main()
+    result = json.loads(capsys.readouterr().out)
+    assert result == {'drained': True, 'matching_pids': [], 'max_slots': cfg['max_slots']}
