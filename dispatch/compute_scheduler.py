@@ -6,10 +6,12 @@ absence of a confirmed node release is never treated as free capacity.
 """
 from dataclasses import dataclass
 from datetime import datetime
+import logging
 from typing import Mapping, Sequence
 
 PRIORITIES = {"v221-gate": 0, "normal": 1, "low": 2}
 OCCUPYING = frozenset({"granting", "active", "releasing"})
+logger = logging.getLogger('cm.compute.scheduler')
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,7 @@ def select_box(lease: Mapping, leases: Sequence[Mapping], boxes: Sequence[Box],
     occupied = [x for x in leases if x['status'] in OCCUPYING]
     for box in boxes:
         used: set[str] = set()
+        inconsistent = False
         for current in occupied:
             if current.get("box") == box.name:
                 # A malformed reservation must never silently free capacity.
@@ -97,8 +100,13 @@ def select_box(lease: Mapping, leases: Sequence[Mapping], boxes: Sequence[Box],
                         or len(set(reservation)) != len(reservation)
                         or not set(reservation).issubset(set(box.slots))
                         or used.intersection(reservation)):
-                    raise ValueError(f"missing slot reservation on {box.name}")
+                    logger.error('skipping box %s: reservation %s does not match configured slots',
+                                 box.name, current.get('id'))
+                    inconsistent = True
+                    break
                 used.update(reservation)
+        if inconsistent:
+            continue
         free = tuple(slot for slot in box.slots if slot not in used)
         if len(free) >= count:
             return box, free[:count]

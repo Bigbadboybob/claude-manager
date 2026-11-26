@@ -2,8 +2,6 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 
-import pytest
-
 from dispatch.compute_scheduler import Box, Policy, limit_reason, queue_eta, queue_order, select_box, slots_needed
 
 NOW = datetime(2026, 11, 25, tzinfo=timezone.utc)
@@ -34,15 +32,17 @@ def test_fifo_with_priority_classes():
     assert [r["id"] for r in queue_order(rows)] == ["gate", "n1", "n2", "low"]
 
 
-def test_reservations_survive_inflight_grant_and_release():
+def test_reservations_survive_inflight_grant_and_release(caplog):
     existing = [lease("a", status="granting", box="lane", slot_ids=["0,8"]),
                 lease("b", status="releasing", box="lane", slot_ids=["1,9"])]
     request = lease("c", cpus=4, mem_gb=32)
     assert select_box(request, existing, [BOX], POLICY) == (BOX, ("2,10", "3,11"))
     assert select_box(lease("d", cpus=6), existing, [BOX], POLICY) is None
     existing[0]["slot_ids"] = None
-    with pytest.raises(ValueError, match="missing slot reservation"):
-        select_box(request, existing, [BOX], POLICY)
+    assert select_box(request, existing, [BOX], POLICY) is None
+    assert 'skipping box lane' in caplog.text
+    other = Box('other', 'other', BOX.slots)
+    assert select_box(request, existing, [BOX, other], POLICY) == (other, ('0,8', '1,9'))
 
 
 def test_memory_also_consumes_slots_and_session_limit_is_enforced():

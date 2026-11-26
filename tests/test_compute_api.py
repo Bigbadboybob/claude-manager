@@ -124,6 +124,31 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         finally:
             cfg_path.write_text(original)
 
+    async def test_changed_box_config_skips_mismatched_reservation_without_freeing_capacity(self):
+        cfg_path = self.root / 'pool.json'
+        original = cfg_path.read_text()
+        cfg = json.loads(original)
+        cfg['boxes'][0]['slots'] = ['0,8', '1,9']
+        cfg_path.write_text(json.dumps(cfg))
+        try:
+            owner = self.body('owner')
+            owner.cpus, owner.mem_gb = 4, 32
+            granted = await api.request_lease(owner, self.request)
+            action = (await api.executor_poll(self.request))['action']
+            await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+                'lease_id': str(granted['lease_id']), 'configured': True, 'workdir': '/work/id'}), self.request)
+            cfg['boxes'][0]['slots'] = ['0,8']
+            cfg_path.write_text(json.dumps(cfg))
+            with self.assertLogs('cm.compute.scheduler', level='ERROR') as logs:
+                waiting = await api.request_lease(self.body('waiting'), self.request)
+                self.assertEqual(waiting['status'], 'queued')
+                self.assertIsNone((await api.executor_poll(self.request))['action'])
+            self.assertIn('skipping box d6', '\n'.join(logs.output))
+            status = await api.status(api.StatusRequest(actor=owner.actor), self.request)
+            self.assertEqual(status['pool'][0]['occupied_slots'], 2)
+        finally:
+            cfg_path.write_text(original)
+
     async def test_release_cleanup_results_are_visible_only_to_owner(self):
         async def finish(owner, cleanup):
             body = self.body(owner)
