@@ -367,7 +367,7 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         config.write_text(json.dumps(cfg))
         try:
             async with self.pool.acquire() as conn:
-                await conn.execute("INSERT INTO compute_boxes (name,enabled,evidence) VALUES ('d7',true,'{}'::jsonb)")
+                await conn.execute("INSERT INTO compute_boxes (name,enabled,checked_at,evidence) VALUES ('d7',true,now(),'{}'::jsonb)")
             await api.request_lease(self.body('one'), self.request)
             await api.request_lease(self.body('two'), self.request)
             slow = (await api.executor_poll(self.request))['action']
@@ -422,6 +422,23 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('max_duration_seconds', exc.exception.detail)
         async with self.pool.acquire() as conn:
             self.assertFalse(await conn.fetchval("SELECT enabled FROM compute_boxes WHERE name='d6'"))
+
+    async def test_release_wins_after_extension_succeeds(self):
+        owner = self.body('owner')
+        lease = await api.request_lease(owner, self.request)
+        grant = (await api.executor_poll(self.request))['action']
+        await api.executor_complete(api.ActionReceipt(action_id=grant['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'configured': True, 'workdir': '/work/id'}), self.request)
+        await api.extend(api.LeaseChange(actor=owner.actor, lease_id=lease['lease_id'], duration=60), self.request)
+        extension = (await api.executor_poll(self.request))['action']
+        self.assertEqual((await api.release(api.LeaseChange(actor=owner.actor, lease_id=lease['lease_id']), self.request))['status'], 'release_requested')
+        await api.executor_complete(api.ActionReceipt(action_id=extension['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'expires': extension['payload']['expires_epoch']}), self.request)
+        release = (await api.executor_poll(self.request))['action']
+        self.assertEqual(release['kind'], 'release')
+        async with self.pool.acquire() as conn:
+            self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', lease['lease_id']), 'releasing')
+            self.assertTrue(await conn.fetchval('SELECT slot_ids FROM compute_leases WHERE id=$1', lease['lease_id']))
 
     async def test_retryable_grant_error_clears_on_success(self):
         owner = self.body('owner')
