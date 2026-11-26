@@ -97,8 +97,8 @@ Idle, reclaim and expiry notices use the native board-push delivery channel.
 The API counts an idle notice only after the recipient daemon reports that the
 session observed it; failed or ambiguous delivery cannot authorize reclaim.
 After the final reclaim notice is observed, at least ten more minutes must
-pass before reclaim. Failed reclaim-notice delivery is retried no more often
-than every ten minutes.
+pass before reclaim. The pool policy `reclaim_notice_grace_seconds` sets this
+delay and the failed-delivery retry interval; it must be at least 600 seconds.
 Release and expiry stop the slice even if the workdir cannot be safely cleaned;
 `compute_status` includes the owner's 50 most recent released or failed leases,
 and a specific older lease can still be requested by ID. Released leases show

@@ -23,7 +23,6 @@ router = APIRouter(prefix='/compute', dependencies=[Depends(verify_token)])
 logger = logging.getLogger('cm.api.compute')
 LOCK_KEY = 746392015
 RECENT_LEASE_LIMIT = 50
-RECLAIM_NOTICE_GRACE_SECONDS = 600
 
 
 class Actor(BaseModel):
@@ -73,9 +72,12 @@ def settings():
                     'max_slots_per_lease', 'max_slots_per_team', 'burst_max_seconds',
                     'long_max_seconds', 'absolute_max_seconds', 'idle_threshold_seconds',
                     'idle_answer_seconds', 'sample_max_gap_seconds', 'notice_limit',
-                    'notice_expiry_guard_seconds', 'expiry_warning_seconds'):
+                    'notice_expiry_guard_seconds', 'expiry_warning_seconds',
+                    'reclaim_notice_grace_seconds'):
             if not isinstance(p[key], int) or isinstance(p[key], bool) or p[key] <= 0:
                 raise ValueError(f'{key} must be a positive integer')
+        if p['reclaim_notice_grace_seconds'] < 600:
+            raise ValueError('reclaim_notice_grace_seconds must be at least 600')
         if not isinstance(p['idle_percent'], (int, float)) or isinstance(p['idle_percent'], bool) or not 0 < p['idle_percent'] <= 100:
             raise ValueError('idle_percent must be in (0, 100]')
         policy = Policy(**{k: p[k] for k in Policy.__dataclass_fields__})
@@ -694,7 +696,7 @@ async def sample(body: SampleReceipt, request: Request):
                     AND a.kind='reclaim_notice' AND n.answer_tracking AND n.answered_at IS NULL
                     AND n.invalidated_at IS NULL AND n.sent_at>$2""", row['id'], row['last_activity_at'])
                 pending_extend = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM compute_lease_actions WHERE lease_id=$1 AND kind='extend' AND status <> 'done')", row['id'])
-                if (notified_at and (now-notified_at).total_seconds() >= RECLAIM_NOTICE_GRACE_SECONDS
+                if (notified_at and (now-notified_at).total_seconds() >= p['reclaim_notice_grace_seconds']
                         and not pending_extend):
                     await conn.execute("UPDATE compute_leases SET status='releasing' WHERE id=$1", row['id'])
                     await _action(conn, row['id'], 'release', {'box': row['box']})
@@ -702,7 +704,7 @@ async def sample(body: SampleReceipt, request: Request):
                     attempted = await conn.fetchval("""SELECT EXISTS(SELECT 1 FROM compute_lease_actions
                         WHERE lease_id=$1 AND kind='reclaim_notice' AND created_at>$2
                         AND created_at>now()-make_interval(secs => $3))""",
-                        row['id'], row['last_activity_at'], float(RECLAIM_NOTICE_GRACE_SECONDS))
+                        row['id'], row['last_activity_at'], float(p['reclaim_notice_grace_seconds']))
                     if not attempted:
                         await _notice_action(conn, row, 'reclaim_notice')
             else:

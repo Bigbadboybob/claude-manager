@@ -425,6 +425,23 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         finally:
             cfg_path.write_text(original)
 
+    async def test_reclaim_grace_policy_requires_at_least_ten_minutes(self):
+        cfg_path = self.root / 'pool.json'
+        original = cfg_path.read_text()
+        cfg = json.loads(original)
+        try:
+            for value in (0, 599, True, 600.0, '600'):
+                cfg['policy']['reclaim_notice_grace_seconds'] = value
+                cfg_path.write_text(json.dumps(cfg))
+                with self.subTest(value=value), self.assertRaises(api.HTTPException) as exc:
+                    api.settings()
+                self.assertEqual(exc.exception.status_code, 503)
+            cfg['policy']['reclaim_notice_grace_seconds'] = 900
+            cfg_path.write_text(json.dumps(cfg))
+            self.assertEqual(api.settings()[0]['reclaim_notice_grace_seconds'], 900)
+        finally:
+            cfg_path.write_text(original)
+
     async def test_request_rejects_resources_larger_than_any_configured_box(self):
         body = self.body('large')
         body.cpus, body.mem_gb = 4, 16  # configured box has only one slot
@@ -594,7 +611,7 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         cfg_path = self.root / 'pool.json'
         original = cfg_path.read_text()
         cfg = json.loads(original)
-        cfg['policy'].update(idle_threshold_seconds=60, idle_answer_seconds=60,
+        cfg['policy'].update(idle_threshold_seconds=60, idle_answer_seconds=60, reclaim_notice_grace_seconds=900,
                              sample_max_gap_seconds=15, notice_expiry_guard_seconds=30)
         cfg_path.write_text(json.dumps(cfg))
         try:
@@ -627,7 +644,7 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             async with self.pool.acquire() as conn:
                 self.assertEqual(await conn.fetchval("SELECT count(*) FROM compute_lease_actions WHERE kind='reclaim_notice'"), 1)
                 await conn.execute("UPDATE compute_leases SET last_activity_at=now()-interval '1 hour' WHERE id=$1", granted['lease_id'])
-                await conn.execute("UPDATE compute_lease_actions SET created_at=now()-interval '601 seconds' WHERE kind='reclaim_notice'")
+                await conn.execute("UPDATE compute_lease_actions SET created_at=now()-interval '901 seconds' WHERE kind='reclaim_notice'")
             await api.sample(api.SampleReceipt(lease_id=granted['lease_id'], cpu_usage_usec=6_000_000), self.request)
             async with self.pool.acquire() as conn:
                 self.assertEqual(await conn.fetchval("SELECT count(*) FROM compute_lease_actions WHERE kind='reclaim_notice'"), 2)
@@ -635,11 +652,15 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
                     ON a.id=n.action_id WHERE a.kind='reclaim_notice' AND a.status <> 'done'""")
                 await conn.execute('UPDATE item_pushes SET delivered_at=now() WHERE id=$1', push)
             self.assertIsNone((await api.executor_poll(self.request))['action'])
-            # An observed final notice must remain unanswered for ten minutes.
+            # An observed final notice must wait for the configured 15 minutes.
             await api.sample(api.SampleReceipt(lease_id=granted['lease_id'], cpu_usage_usec=6_000_000), self.request)
             self.assertIsNone((await api.executor_poll(self.request))['action'])
             async with self.pool.acquire() as conn:
                 await conn.execute('UPDATE compute_lease_notices SET sent_at=now()-interval \'601 seconds\' WHERE push_id=$1', push)
+            await api.sample(api.SampleReceipt(lease_id=granted['lease_id'], cpu_usage_usec=6_000_000), self.request)
+            self.assertIsNone((await api.executor_poll(self.request))['action'])
+            async with self.pool.acquire() as conn:
+                await conn.execute('UPDATE compute_lease_notices SET sent_at=now()-interval \'901 seconds\' WHERE push_id=$1', push)
             await api.sample(api.SampleReceipt(lease_id=granted['lease_id'], cpu_usage_usec=6_000_000), self.request)
             release = (await api.executor_poll(self.request))['action']
             self.assertEqual(release['kind'], 'release')
