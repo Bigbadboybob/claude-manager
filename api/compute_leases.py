@@ -185,11 +185,17 @@ async def _quarantine_box(conn, box, reason, lease, policy):
     if row is None:
         raise ValueError(f'unknown compute box {box}')
     evidence = _json_object(row['evidence']) or {}
-    if evidence.get('quarantine_reason'):
+    original = evidence.get('quarantine_reason')
+    history = evidence.get('quarantine_reasons')
+    if not isinstance(history, list):
+        history = [original] if original else []
+    if reason in history or reason == original:
         await conn.execute('UPDATE compute_boxes SET enabled=false WHERE name=$1', box)
         return False
+    evidence['quarantine_reason'] = original or reason
+    evidence['quarantine_reasons'] = [*history, reason]
     await conn.execute("""UPDATE compute_boxes SET enabled=false, ever_enabled=true, checked_at=now(),
-        evidence=$2::jsonb WHERE name=$1""", box, {'quarantine_reason': reason})
+        evidence=$2::jsonb WHERE name=$1""", box, evidence)
     logger.warning('compute box %s quarantined: %s', box, reason)
     operator = policy.get('quarantine_operator_pid')
     if operator and operator != lease['owner']:
@@ -403,7 +409,8 @@ async def status(body: StatusRequest, request: Request):
                               'total_slots': len(b.slots),
                               'occupied_slots': sum(len(r['slot_ids'] or []) for r in rows
                                                     if r['box'] == b.name and r['status'] in ('granting', 'active', 'releasing')),
-                              'quarantined': bool(reason), 'quarantine_reason': reason})
+                              'quarantined': bool(reason), 'quarantine_reason': reason,
+                              'quarantine_reasons': (evidence or {}).get('quarantine_reasons', [reason] if reason else [])})
         return {'leases': mine, 'queue': queue, 'pool': occupancy,
                 'eta': queue_eta(rows, datetime.now(timezone.utc))}
 

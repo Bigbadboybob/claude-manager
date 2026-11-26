@@ -364,11 +364,11 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(api.logger, 'warning') as warning:
             await api.executor_complete(receipt, self.request)
             await api.executor_complete(receipt, self.request)
-        warning.assert_not_called()
+        warning.assert_called_once()
         async with self.pool.acquire() as conn:
-            evidence = await conn.fetchval("SELECT evidence FROM compute_boxes WHERE name='d6'")
-            self.assertIsInstance(evidence, str)
-            self.assertEqual(api._json_object(evidence)['quarantine_reason'], 'original capacity reason')
+            evidence = api._json_object(await conn.fetchval("SELECT evidence FROM compute_boxes WHERE name='d6'"))
+            self.assertEqual(evidence['quarantine_reason'], 'original capacity reason')
+            self.assertEqual(evidence['quarantine_reasons'], ['original capacity reason', 'expired grant remains unconfirmed after retryable node error'])
             self.assertEqual(await conn.fetchval("SELECT count(*) FROM item_pushes WHERE kind='compute_lease'"), 1)
 
     async def test_expiry_notices_deduplicate_legacy_and_new_jsonb_payloads(self):
@@ -558,6 +558,34 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         finally:
             config.write_text(original)
 
+    async def test_new_quarantine_reason_is_recorded_and_operator_notified_once(self):
+        config = self.root / 'pool.json'
+        original = config.read_text()
+        cfg = json.loads(original)
+        cfg['policy']['quarantine_operator_pid'] = 'agent:ops:watcher'
+        config.write_text(json.dumps(cfg))
+        try:
+            owner = self.body('owner')
+            lease = await api.request_lease(owner, self.request)
+            grant = (await api.executor_poll(self.request))['action']
+            await api.executor_complete(api.ActionReceipt(action_id=grant['action_id'], result={
+                'lease_id': str(lease['lease_id']), 'refused': True, 'error': 'box capacity exceeded'}), self.request)
+            release = (await api.executor_poll(self.request))['action']
+            async with self.pool.acquire() as conn:
+                await conn.execute("UPDATE compute_leases SET expires_at=now()-interval '1 second' WHERE id=$1", lease['lease_id'])
+            receipt = api.ActionReceipt(action_id=release['action_id'], result={
+                'lease_id': str(lease['lease_id']), 'retryable': True, 'error': 'bad config'})
+            await api.executor_complete(receipt, self.request)
+            await api.executor_complete(receipt, self.request)
+            result = await api.status(api.StatusRequest(actor=owner.actor, lease_id=lease['lease_id']), self.request)
+            self.assertEqual(result['pool'][0]['quarantine_reasons'], [
+                'node refused grant: box capacity exceeded',
+                'expired release remains unconfirmed after retryable node error'])
+            async with self.pool.acquire() as conn:
+                self.assertEqual(await conn.fetchval("SELECT count(*) FROM item_pushes WHERE pid='agent:ops:watcher'"), 2)
+        finally:
+            config.write_text(original)
+
     async def test_multiple_expired_grants_warn_and_notify_operator_once_per_box(self):
         config = self.root / 'pool.json'
         original = config.read_text()
@@ -571,11 +599,11 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             async with self.pool.acquire() as conn:
                 await conn.execute("UPDATE compute_leases SET expires_at=now()-interval '1 second'")
             with self.assertLogs('cm.api.compute', level='WARNING') as logs:
-                for action in actions:
-                    receipt = api.ActionReceipt(action_id=action['action_id'], result={
-                        'lease_id': str(action['lease_id']), 'retryable': True, 'error': 'bad config'})
-                    await api.executor_complete(receipt, self.request)
-                    await api.executor_complete(receipt, self.request)
+                receipts = [api.ActionReceipt(action_id=action['action_id'], result={
+                    'lease_id': str(action['lease_id']), 'retryable': True, 'error': 'bad config'})
+                    for action in actions]
+                await asyncio.gather(*(api.executor_complete(receipt, self.request) for receipt in receipts))
+                await asyncio.gather(*(api.executor_complete(receipt, self.request) for receipt in receipts))
             self.assertEqual(len(logs.output), 1)
             async with self.pool.acquire() as conn:
                 self.assertEqual(await conn.fetchval("SELECT count(*) FROM item_pushes WHERE pid='agent:ops:watcher'"), 1)

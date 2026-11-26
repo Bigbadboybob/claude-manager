@@ -47,12 +47,13 @@ After investigating and draining it, an operator can explicitly clear the
 quarantine through the executor enable endpoint with `clear_quarantine=true`,
 the drain checks and the verified node limit; the executor does not clear it
 automatically on restart. `compute_status` reports `quarantined` and
-`quarantine_reason` for both node-capacity refusals and reservations that no
-longer match the configured slots.
+`quarantine_reason` and `quarantine_reasons` for recorded node failures and
+reservations that no longer match the configured slots.
 
 Before starting the updated API, apply SQL migrations through
 `043_compute_box_ever_enabled.sql` and install the reviewed pool config,
-including `reclaim_notice_grace_seconds` and each box's `run_argv`.
+including `reclaim_notice_grace_seconds` and each box's `run_argv`. Deploy the
+updated API before starting the updated executor.
 
 At cutover:
 
