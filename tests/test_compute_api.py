@@ -327,7 +327,7 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
                 'lease_id': str(lease['lease_id']), 'retryable': True, 'error': 'IAP unavailable'}), self.request)
         self.assertEqual(len(logs.output), 1)
         async with self.pool.acquire() as conn:
-            self.assertEqual(await conn.fetchval('SELECT count(*) FROM item_pushes WHERE pid=$1', owner.actor.pid), 1)
+            self.assertEqual(await conn.fetchval("SELECT count(*) FROM item_pushes WHERE pid=$1 AND dedupe LIKE 'compute-lease-outage:%'", owner.actor.pid), 1)
             evidence = api._json_object(await conn.fetchval("SELECT evidence FROM compute_boxes WHERE name='d6'"))
             self.assertEqual(len(evidence['quarantine_reasons']), 2)
 
@@ -357,6 +357,28 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await conn.fetchval("SELECT enabled FROM compute_boxes WHERE name='d6'"))
             self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', lease['lease_id']), 'releasing')
             self.assertEqual(await conn.fetchval('SELECT count(*) FROM item_pushes WHERE pid=$1', owner.actor.pid), 1)
+
+    async def test_poll_excludes_busy_box_and_claim_uses_configured_seconds(self):
+        config = self.root / 'pool.json'
+        original = config.read_text()
+        cfg = json.loads(original)
+        cfg['boxes'].append(dict(cfg['boxes'][0], name='d7', ssh_target='d7', slots=['1,9']))
+        cfg['policy']['action_claim_seconds'] = 300
+        config.write_text(json.dumps(cfg))
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute("INSERT INTO compute_boxes (name,enabled,evidence) VALUES ('d7',true,'{}'::jsonb)")
+            await api.request_lease(self.body('one'), self.request)
+            await api.request_lease(self.body('two'), self.request)
+            slow = (await api.executor_poll(self.request))['action']
+            self.assertEqual(slow['payload']['box'], 'd6')
+            fast = (await api.executor_poll(self.request, api.PollRequest(exclude_boxes=['d6'])))['action']
+            self.assertEqual(fast['payload']['box'], 'd7')
+            async with self.pool.acquire() as conn:
+                seconds = await conn.fetchval('SELECT extract(epoch from claimed_until-now()) FROM compute_lease_actions WHERE id=$1', fast['action_id'])
+                self.assertGreater(float(seconds), 290)
+        finally:
+            config.write_text(original)
 
     async def test_release_wins_pending_extension_after_uncertain_result(self):
         owner = self.body('owner')
@@ -390,7 +412,7 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row['status'], 'active')
             self.assertIn('expiry outside configured window', row['error'])
             self.assertTrue(await conn.fetchval("SELECT enabled FROM compute_boxes WHERE name='d6'"))
-            self.assertEqual(await conn.fetchval('SELECT count(*) FROM item_pushes WHERE pid=$1', owner.actor.pid), 1)
+            self.assertEqual(await conn.fetchval("SELECT count(*) FROM item_pushes WHERE pid=$1 AND dedupe LIKE 'compute-lease-extend-refused:%'", owner.actor.pid), 1)
 
     async def test_enable_rejects_node_duration_below_pool_limit(self):
         with self.assertRaises(api.HTTPException) as exc:
