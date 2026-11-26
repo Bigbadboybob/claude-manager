@@ -244,6 +244,39 @@ def test_scope_timeout_stops_and_resets_failed_unit(monkeypatch):
                           ['/usr/bin/systemctl', 'reset-failed', 'cmlease-job-123.scope']]
 
 
+@pytest.mark.parametrize('pin', [None, '0,8'])
+def test_run_scope_requests_collection_on_success_or_failure(context, monkeypatch, pin):
+    cfg, args, _ = context
+    args.pin = pin
+    row = node.grant(args, cfg)
+    state = node.STATE
+    launched = []
+
+    class RootOwnedState:
+        def mkdir(self, **kwargs): return state.mkdir(**kwargs)
+        def lstat(self): return SimpleNamespace(st_uid=0, st_mode=0o700)
+        def is_symlink(self): return False
+        def __truediv__(self, name): return state / name
+
+    process = object()
+    monkeypatch.setattr(node, 'STATE', RootOwnedState())
+    monkeypatch.setattr(node, 'config', lambda: cfg)
+    monkeypatch.setattr(node.os, 'geteuid', lambda: 0)
+    monkeypatch.setattr(node.sys, 'argv', ['cm-lease', 'run', '--lease-id', LEASE, '--', '/bin/true'])
+    monkeypatch.setattr(node.subprocess, 'Popen', lambda argv: launched.append(argv) or process)
+    monkeypatch.setattr(node, 'wait_for_scope', lambda p, scope, lock: 247 if p is process else -1)
+    with pytest.raises(SystemExit) as exc:
+        node.main()
+    assert exc.value.code == 247
+    argv = launched[0]
+    assert argv[:3] == ['/usr/bin/systemd-run', '--quiet', '--scope']
+    assert '--slice=' + row['slice'] in argv
+    assert '--property=TimeoutStopSec=30s' in argv
+    assert '--property=CollectMode=inactive-or-failed' in argv[:argv.index('--')]
+    assert argv[-1] == '/bin/true'
+    assert ('/usr/bin/taskset' in argv) is bool(pin)
+
+
 def test_probe_requires_missing_record_and_inactive_empty_slice(context, monkeypatch):
     cfg, args, calls = context
     monkeypatch.setattr(node, 'run', lambda *a: calls.append(a) or 'LoadState=loaded\nActiveState=inactive\nControlGroup=')
@@ -339,16 +372,29 @@ def test_release_skips_symlink_to_another_lease_directory(context):
     assert sibling.exists()
 
 
-def test_release_skips_unresolvable_workdir(context):
+@pytest.mark.parametrize('non_raising_resolve', [False, True])
+def test_release_skips_unresolvable_workdir(context, monkeypatch, non_raising_resolve):
     cfg, args, calls = context
     node.grant(args, cfg)
     path = node.Path(cfg['workdir_root']) / LEASE
     (path / 'OWNER.md').unlink()
     path.rmdir()
     path.symlink_to(path)
+    # Python <=3.12 raises on a loop; 3.13 may return it as an unresolved
+    # path. In the latter case the real cleanup sees exists() is false.
+    if non_raising_resolve:
+        original_resolve = type(path).resolve
+        def resolve(self, *args, **kwargs):
+            return self if self == path else original_resolve(self, *args, **kwargs)
+        monkeypatch.setattr(type(path), 'resolve', resolve)
+    monkeypatch.setattr(node, 'workdir_size_and_remove_if_empty', REAL_CLEANUP_WORKDIR)
     result = node.release(LEASE, cfg)
-    assert result['released'] and result['cleanup_skipped']
+    assert result['released']
+    assert result.get('cleanup_skipped') or result.get('workdir_bytes') == 0
+    if non_raising_resolve:
+        assert result['workdir_bytes'] == 0
     assert node.load(LEASE) is None
+    assert path.is_symlink()
 
 
 def test_reap_stops_slice_and_skips_workdir_resolving_outside_root(context, tmp_path, monkeypatch):
