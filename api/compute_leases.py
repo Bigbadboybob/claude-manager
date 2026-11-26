@@ -23,6 +23,7 @@ router = APIRouter(prefix='/compute', dependencies=[Depends(verify_token)])
 logger = logging.getLogger('cm.api.compute')
 LOCK_KEY = 746392015
 RECENT_LEASE_LIMIT = 50
+RECLAIM_NOTICE_GRACE_SECONDS = 600
 
 
 class Actor(BaseModel):
@@ -671,16 +672,22 @@ async def sample(body: SampleReceipt, request: Request):
         decision = await _idle_decision(conn, dict(row), p, boxes, now)
         if decision and not pending:
             if decision == 'reclaim':
-                notified = await conn.fetchval("""SELECT EXISTS(SELECT 1 FROM compute_lease_notices n
+                notified_at = await conn.fetchval("""SELECT max(n.sent_at) FROM compute_lease_notices n
                     JOIN compute_lease_actions a ON a.id=n.action_id WHERE n.lease_id=$1
                     AND a.kind='reclaim_notice' AND n.answer_tracking AND n.answered_at IS NULL
-                    AND n.invalidated_at IS NULL AND n.sent_at>$2)""", row['id'], row['last_activity_at'])
+                    AND n.invalidated_at IS NULL AND n.sent_at>$2""", row['id'], row['last_activity_at'])
                 pending_extend = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM compute_lease_actions WHERE lease_id=$1 AND kind='extend' AND status <> 'done')", row['id'])
-                if notified and not pending_extend:
+                if (notified_at and (now-notified_at).total_seconds() >= RECLAIM_NOTICE_GRACE_SECONDS
+                        and not pending_extend):
                     await conn.execute("UPDATE compute_leases SET status='releasing' WHERE id=$1", row['id'])
                     await _action(conn, row['id'], 'release', {'box': row['box']})
-                elif not notified:
-                    await _notice_action(conn, row, 'reclaim_notice')
+                elif not notified_at:
+                    attempted = await conn.fetchval("""SELECT EXISTS(SELECT 1 FROM compute_lease_actions
+                        WHERE lease_id=$1 AND kind='reclaim_notice' AND created_at>$2
+                        AND created_at>now()-make_interval(secs => $3))""",
+                        row['id'], row['last_activity_at'], float(RECLAIM_NOTICE_GRACE_SECONDS))
+                    if not attempted:
+                        await _notice_action(conn, row, 'reclaim_notice')
             else:
                 # Failed deliveries do not count as unanswered notices and do
                 # not cause a tight requeue loop when a session is offline.

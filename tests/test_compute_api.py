@@ -581,9 +581,27 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', granted['lease_id']), 'active')
                 push = await conn.fetchval("SELECT n.push_id FROM compute_lease_notices n JOIN compute_lease_actions a ON a.id=n.action_id WHERE a.kind='reclaim_notice'")
                 self.assertIsNotNone(push)
+                await conn.execute("UPDATE item_pushes SET delivered_at=now(), dropped_reason='offline' WHERE id=$1", push)
+            self.assertIsNone((await api.executor_poll(self.request))['action'])
+            # Failed delivery must not create a new notice every sample.
+            for _ in range(2):
+                await api.sample(api.SampleReceipt(lease_id=granted['lease_id'], cpu_usage_usec=6_000_000), self.request)
+            async with self.pool.acquire() as conn:
+                self.assertEqual(await conn.fetchval("SELECT count(*) FROM compute_lease_actions WHERE kind='reclaim_notice'"), 1)
+                await conn.execute("UPDATE compute_leases SET last_activity_at=now()-interval '1 hour' WHERE id=$1", granted['lease_id'])
+                await conn.execute("UPDATE compute_lease_actions SET created_at=now()-interval '601 seconds' WHERE kind='reclaim_notice'")
+            await api.sample(api.SampleReceipt(lease_id=granted['lease_id'], cpu_usage_usec=6_000_000), self.request)
+            async with self.pool.acquire() as conn:
+                self.assertEqual(await conn.fetchval("SELECT count(*) FROM compute_lease_actions WHERE kind='reclaim_notice'"), 2)
+                push = await conn.fetchval("""SELECT n.push_id FROM compute_lease_notices n JOIN compute_lease_actions a
+                    ON a.id=n.action_id WHERE a.kind='reclaim_notice' AND a.status <> 'done'""")
                 await conn.execute('UPDATE item_pushes SET delivered_at=now() WHERE id=$1', push)
             self.assertIsNone((await api.executor_poll(self.request))['action'])
-            # A fresh interval after the final notice is required before kill.
+            # An observed final notice must remain unanswered for ten minutes.
+            await api.sample(api.SampleReceipt(lease_id=granted['lease_id'], cpu_usage_usec=6_000_000), self.request)
+            self.assertIsNone((await api.executor_poll(self.request))['action'])
+            async with self.pool.acquire() as conn:
+                await conn.execute('UPDATE compute_lease_notices SET sent_at=now()-interval \'601 seconds\' WHERE push_id=$1', push)
             await api.sample(api.SampleReceipt(lease_id=granted['lease_id'], cpu_usage_usec=6_000_000), self.request)
             release = (await api.executor_poll(self.request))['action']
             self.assertEqual(release['kind'], 'release')

@@ -57,7 +57,8 @@ Agents must use the prefix for work to be accounted and protected by the slice.
 
 The planned installation surface is SQL/API, daemon and MCP, the standalone
 executor service, and on each box the root-owned `/usr/local/bin/cm-lease`,
-`/etc/cm-lease.json`, and the reap service/timer. Copy
+`/etc/cm-lease.json` (the filename expected by the script; the brief's
+`.conf` name is not used), and the reap service/timer. Copy
 `deploy/cm-lease.example.json` and set the capacity for each box, create the
 workdir root, install the root-owned script and config, and install/enable the
 reap timer only as part of the separately coordinated deployment. Sudoers
@@ -95,6 +96,9 @@ node never frees its reservation.
 Idle, reclaim and expiry notices use the native board-push delivery channel.
 The API counts an idle notice only after the recipient daemon reports that the
 session observed it; failed or ambiguous delivery cannot authorize reclaim.
+After the final reclaim notice is observed, at least ten more minutes must
+pass before reclaim. Failed reclaim-notice delivery is retried no more often
+than every ten minutes.
 Release and expiry stop the slice even if the workdir cannot be safely cleaned;
 `compute_status` includes the owner's 50 most recent released or failed leases,
 and a specific older lease can still be requested by ID. Released leases show
