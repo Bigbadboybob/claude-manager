@@ -54,7 +54,7 @@ reservations that no longer match the configured slots.
 Before starting the updated API, apply SQL migrations through
 `043_compute_box_ever_enabled.sql` and install the reviewed pool config,
 including `reclaim_notice_grace_seconds`, `transport_failure_threshold`,
-`action_claim_seconds` and each box's `run_argv`. Deploy the
+`transport_failure_window_seconds`, `action_claim_seconds` and each box's `run_argv`. Deploy the
 updated API before starting the updated executor. Install the reviewed node
 script before enabling a box: its drain check reports the duration limit required
 by the updated API.

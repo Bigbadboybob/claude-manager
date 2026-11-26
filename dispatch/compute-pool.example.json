@@ -17,6 +17,7 @@
     "notice_expiry_guard_seconds": 600,
     "expiry_warning_seconds": 300,
     "transport_failure_threshold": 3,
+    "transport_failure_window_seconds": 300,
     "action_claim_seconds": 240,
     "quarantine_operator_pid": null
   },

@@ -362,9 +362,41 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         await api.executor_poll(self.request)
         await api.executor_complete(fail, self.request)
         async with self.pool.acquire() as conn:
+            self.assertTrue(await conn.fetchval("SELECT enabled FROM compute_boxes WHERE name='d6'"))
+            evidence = api._json_object(await conn.fetchval("SELECT evidence FROM compute_boxes WHERE name='d6'"))
+            evidence['transport_failure_started_at'] = (api.datetime.now(api.timezone.utc) - api.timedelta(seconds=301)).isoformat()
+            await conn.execute("UPDATE compute_boxes SET evidence=$1::jsonb WHERE name='d6'", evidence)
+            await conn.execute("UPDATE compute_lease_actions SET claimed_until=now()-interval '1 second' WHERE id=$1", release['action_id'])
+        await api.executor_poll(self.request)
+        await api.executor_complete(fail, self.request)
+        async with self.pool.acquire() as conn:
             self.assertFalse(await conn.fetchval("SELECT enabled FROM compute_boxes WHERE name='d6'"))
             self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', lease['lease_id']), 'releasing')
             self.assertEqual(await conn.fetchval('SELECT count(*) FROM item_pushes WHERE pid=$1', owner.actor.pid), 1)
+
+    async def test_three_short_outage_failures_do_not_quarantine_even_at_expiry(self):
+        config = self.root / 'pool.json'
+        original = config.read_text()
+        cfg = json.loads(original)
+        cfg['boxes'][0]['slots'] = ['0,8', '1,9', '2,10']
+        config.write_text(json.dumps(cfg))
+        try:
+            leases = [await api.request_lease(self.body(name), self.request) for name in ('one', 'two', 'three')]
+            actions = [(await api.executor_poll(self.request))['action'] for _ in leases]
+            async with self.pool.acquire() as conn:
+                await conn.execute("UPDATE compute_leases SET expires_at=now()-interval '1 second'")
+            for action in actions:
+                await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+                    'lease_id': str(action['lease_id']), 'retryable': True,
+                    'transport_error': True, 'error': 'IAP blip'}), self.request)
+            async with self.pool.acquire() as conn:
+                self.assertTrue(await conn.fetchval("SELECT enabled FROM compute_boxes WHERE name='d6'"))
+                evidence = api._json_object(await conn.fetchval("SELECT evidence FROM compute_boxes WHERE name='d6'"))
+                self.assertEqual(evidence['consecutive_transport_failures'], 3)
+                self.assertNotIn('quarantine_reason', evidence)
+                self.assertEqual(await conn.fetchval("SELECT count(*) FROM compute_leases WHERE status='granting'"), 3)
+        finally:
+            config.write_text(original)
 
     async def test_poll_excludes_busy_box_and_claim_uses_configured_seconds(self):
         config = self.root / 'pool.json'
@@ -884,6 +916,23 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn('run_argv', exc.exception.detail)
         finally:
             cfg_path.write_text(original)
+
+    async def test_transport_failure_window_must_be_a_positive_integer(self):
+        config = self.root / 'pool.json'
+        original = config.read_text()
+        cfg = json.loads(original)
+        try:
+            for value in (0, -1, True, 1.5, '300', None):
+                cfg['policy']['transport_failure_window_seconds'] = value
+                config.write_text(json.dumps(cfg))
+                with self.subTest(value=value), self.assertRaises(api.HTTPException) as exc:
+                    api.settings()
+                self.assertEqual(exc.exception.status_code, 503)
+            cfg['policy'].pop('transport_failure_window_seconds')
+            config.write_text(json.dumps(cfg))
+            self.assertEqual(api.settings()[0]['transport_failure_window_seconds'], 300)
+        finally:
+            config.write_text(original)
 
     async def test_reclaim_grace_policy_requires_at_least_ten_minutes(self):
         cfg_path = self.root / 'pool.json'

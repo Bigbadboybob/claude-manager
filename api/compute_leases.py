@@ -69,13 +69,14 @@ def settings():
         data = json.loads(Path(path).read_text())
         p = data['policy']
         p.setdefault('transport_failure_threshold', 3)
+        p.setdefault('transport_failure_window_seconds', 300)
         p.setdefault('action_claim_seconds', 240)
         for key in ('cpus_per_slot', 'mem_gb_per_slot', 'max_slots_per_session',
                     'max_slots_per_lease', 'max_slots_per_team', 'burst_max_seconds',
                     'long_max_seconds', 'absolute_max_seconds', 'idle_threshold_seconds',
                     'idle_answer_seconds', 'sample_max_gap_seconds', 'notice_limit',
                     'notice_expiry_guard_seconds', 'expiry_warning_seconds',
-                    'reclaim_notice_grace_seconds', 'transport_failure_threshold', 'action_claim_seconds'):
+                    'reclaim_notice_grace_seconds', 'transport_failure_threshold', 'transport_failure_window_seconds', 'action_claim_seconds'):
             if not isinstance(p[key], int) or isinstance(p[key], bool) or p[key] <= 0:
                 raise ValueError(f'{key} must be a positive integer')
         operator = p.get('quarantine_operator_pid')
@@ -225,11 +226,20 @@ async def _record_transport_failure(conn, lease, policy, action):
         return
     evidence['last_transport_failure_attempt'] = attempt
     evidence.setdefault('transport_outage_id', str(uuid.uuid4()))
+    now = await conn.fetchval('SELECT clock_timestamp()')
+    try:
+        started = datetime.fromisoformat(evidence['transport_failure_started_at'])
+        if started.tzinfo is None or started > now:
+            raise ValueError('invalid transport failure start')
+    except (KeyError, TypeError, ValueError):
+        started = now
+        evidence['transport_failure_started_at'] = now.isoformat()
     count = evidence.get('consecutive_transport_failures', 0)
     count = count if type(count) is int and count >= 0 else 0
     evidence['consecutive_transport_failures'] = count + 1
     await conn.execute('UPDATE compute_boxes SET evidence=$2::jsonb WHERE name=$1', box, evidence)
-    if count + 1 >= policy['transport_failure_threshold']:
+    if (count + 1 >= policy['transport_failure_threshold'] and
+            (now - started).total_seconds() >= policy['transport_failure_window_seconds']):
         reason = 'consecutive transport failures'
         await _quarantine_box(conn, box, reason, lease, policy, transport=True)
         await _outage_owner_push(conn, lease,
@@ -240,6 +250,7 @@ async def _record_transport_success(conn, box):
     evidence = _json_object(await conn.fetchval('SELECT evidence FROM compute_boxes WHERE name=$1', box)) or {}
     evidence.pop('consecutive_transport_failures', None)
     evidence.pop('last_transport_failure_attempt', None)
+    evidence.pop('transport_failure_started_at', None)
     if not evidence.get('quarantine_reason'):
         evidence.pop('transport_outage_id', None)
     await conn.execute('UPDATE compute_boxes SET evidence=$2::jsonb WHERE name=$1', box, evidence)
@@ -249,6 +260,18 @@ async def _outage_owner_push(conn, lease, text):
     evidence = _json_object(await conn.fetchval('SELECT evidence FROM compute_boxes WHERE name=$1', lease['box'])) or {}
     outage = evidence['transport_outage_id']
     await _owner_push(conn, lease, text, f"compute-lease-outage:{lease['id']}:{outage}")
+
+
+async def _expired_retry_notice(conn, lease, policy, kind, reason, transport):
+    quarantine = f'expired {kind} remains unconfirmed after retryable node error'
+    evidence = _json_object(await conn.fetchval('SELECT evidence FROM compute_boxes WHERE name=$1', lease['box'])) or {}
+    if not transport or evidence.get('transport_quarantined') is True:
+        await _quarantine_box(conn, lease['box'], quarantine, lease, policy, transport=True)
+        detail = f"box {lease['box']} quarantined"
+    else:
+        detail = f"box {lease['box']} transport failures under observation"
+    await _outage_owner_push(conn, lease,
+        f"[cm-lease] lease {lease['id']} expired while {kind} remains unconfirmed; {detail}: {reason}")
 
 
 async def _notice_action(conn, row, kind, extra=None):
@@ -710,10 +733,8 @@ async def executor_complete(body: ActionReceipt, request: Request):
                 reason = 'grant attempt failed: ' + reason[:2000]
                 await conn.execute('UPDATE compute_leases SET error=$2 WHERE id=$1', lease['id'], reason)
                 if lease['expires_at'] and lease['expires_at'] <= datetime.now(timezone.utc):
-                    quarantine = 'expired grant remains unconfirmed after retryable node error'
-                    await _quarantine_box(conn, lease['box'], quarantine, lease, p, transport=True)
-                    await _outage_owner_push(conn, lease,
-                        f"[cm-lease] lease {lease['id']} expired while grant remains unconfirmed; box {lease['box']} quarantined: {reason}")
+                    await _expired_retry_notice(conn, lease, p, 'grant', reason,
+                                                body.result.get('transport_error') is True)
                 if lease['release_requested']:
                     # The grant may have partially succeeded. Release it on the
                     # node before freeing the reservation.
@@ -765,10 +786,8 @@ async def executor_complete(body: ActionReceipt, request: Request):
                 reason = 'extension attempt failed: ' + reason[:2000]
                 await conn.execute('UPDATE compute_leases SET error=$2 WHERE id=$1', lease['id'], reason)
                 if lease['expires_at'] and lease['expires_at'] <= datetime.now(timezone.utc):
-                    quarantine = 'expired extension remains unconfirmed after retryable node error'
-                    await _quarantine_box(conn, lease['box'], quarantine, lease, p, transport=True)
-                    await _outage_owner_push(conn, lease,
-                        f"[cm-lease] lease {lease['id']} expired while extension remains unconfirmed; box {lease['box']} quarantined: {reason}")
+                    await _expired_retry_notice(conn, lease, p, 'extension', reason,
+                                                body.result.get('transport_error') is True)
                     # An extension may have reached the node. Reconcile by
                     # releasing it, retaining the reservation until confirmed.
                     await conn.execute("UPDATE compute_leases SET status='releasing' WHERE id=$1", lease['id'])
@@ -820,10 +839,8 @@ async def executor_complete(body: ActionReceipt, request: Request):
                 if lease['granted_at'] is not None or not lease['error']:
                     await conn.execute('UPDATE compute_leases SET error=$2 WHERE id=$1', lease['id'], reason)
                 if lease['expires_at'] and lease['expires_at'] <= datetime.now(timezone.utc):
-                    quarantine = 'expired release remains unconfirmed after retryable node error'
-                    await _quarantine_box(conn, lease['box'], quarantine, lease, p, transport=True)
-                    await _outage_owner_push(conn, lease,
-                        f"[cm-lease] lease {lease['id']} expired while release remains unconfirmed; box {lease['box']} quarantined: {reason}")
+                    await _expired_retry_notice(conn, lease, p, 'release', reason,
+                                                body.result.get('transport_error') is True)
                 return {'ok': True, 'retryable': True}
             if body.result.get('released') is not True:
                 raise HTTPException(409, 'unexpected release result')
