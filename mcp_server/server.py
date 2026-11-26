@@ -5613,7 +5613,7 @@ def _compute_class_alias(fn):
 def compute_request(cpus: int, mem_gb: int, duration: int, priority: str, purpose: str,
                     lease_class: Annotated[str, Field(alias="class")] = "burst",
                     pinned: bool = False, justification: str = "") -> dict:
-    """Request a compute lease; duration is in seconds. Poll compute_status for a queued grant."""
+    """Request a lease in seconds; above the slot cap (four by default), supply a separate justification. Poll compute_status for a queued grant."""
     params = {"cpus": cpus, "mem_gb": mem_gb,
         "duration": duration, "priority": priority, "purpose": purpose,
         "class": lease_class, "pinned": pinned}

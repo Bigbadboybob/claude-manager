@@ -47,6 +47,7 @@ def test_compute_request_accepts_class_alias_through_mcp_validation(requested_cl
     assert schema['properties']['class']['default'] == 'burst'
     assert schema['properties']['justification']['default'] == ''
     assert set(schema['required']) == {'cpus', 'mem_gb', 'duration', 'priority', 'purpose'}
+    assert 'justification' in server.mcp._tool_manager.get_tool('compute_request').description
 
 
 def test_compute_request_forwards_explicit_justification():
