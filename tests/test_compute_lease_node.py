@@ -530,4 +530,4 @@ def test_drain_check_reports_node_capacity(context, tmp_path, monkeypatch, capsy
     monkeypatch.setattr(node.sys, 'argv', ['cm-lease', 'drain-check'])
     node.main()
     result = json.loads(capsys.readouterr().out)
-    assert result == {'drained': True, 'matching_pids': [], 'max_slots': cfg['max_slots']}
+    assert result == {'drained': True, 'matching_pids': [], 'max_slots': cfg['max_slots'], 'max_duration_seconds': cfg['max_duration_seconds']}

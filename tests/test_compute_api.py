@@ -375,6 +375,32 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         async with self.pool.acquire() as conn:
             self.assertTrue(await conn.fetchval('SELECT slot_ids FROM compute_leases WHERE id=$1', lease['lease_id']))
 
+    async def test_extension_refusal_records_reason_without_quarantine(self):
+        owner = self.body('owner')
+        lease = await api.request_lease(owner, self.request)
+        grant = (await api.executor_poll(self.request))['action']
+        await api.executor_complete(api.ActionReceipt(action_id=grant['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'configured': True, 'workdir': '/work/id'}), self.request)
+        await api.extend(api.LeaseChange(actor=owner.actor, lease_id=lease['lease_id'], duration=60), self.request)
+        action = (await api.executor_poll(self.request))['action']
+        await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'refused': True, 'error': 'expiry outside configured window'}), self.request)
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow('SELECT status,error FROM compute_leases WHERE id=$1', lease['lease_id'])
+            self.assertEqual(row['status'], 'active')
+            self.assertIn('expiry outside configured window', row['error'])
+            self.assertTrue(await conn.fetchval("SELECT enabled FROM compute_boxes WHERE name='d6'"))
+            self.assertEqual(await conn.fetchval('SELECT count(*) FROM item_pushes WHERE pid=$1', owner.actor.pid), 1)
+
+    async def test_enable_rejects_node_duration_below_pool_limit(self):
+        with self.assertRaises(api.HTTPException) as exc:
+            await api.executor_enable(api.BoxEnable(box='d6', local_drained=True, node_drained=True,
+                node_max_slots=1, node_max_duration_seconds=43199), self.request)
+        self.assertEqual(exc.exception.status_code, 409)
+        self.assertIn('max_duration_seconds', exc.exception.detail)
+        async with self.pool.acquire() as conn:
+            self.assertFalse(await conn.fetchval("SELECT enabled FROM compute_boxes WHERE name='d6'"))
+
     async def test_retryable_grant_error_clears_on_success(self):
         owner = self.body('owner')
         lease = await api.request_lease(owner, self.request)
@@ -488,8 +514,8 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(status['pool'][0]['enabled'])
         self.assertEqual(status['queue'], [])
         with self.assertRaises(api.HTTPException):
-            await api.executor_enable(api.BoxEnable(box='d6', local_drained=True, node_drained=False, node_max_slots=1), self.request)
-        await api.executor_enable(api.BoxEnable(box='d6', local_drained=True, node_drained=True, node_max_slots=1), self.request)
+            await api.executor_enable(api.BoxEnable(box='d6', local_drained=True, node_drained=False, node_max_slots=1, node_max_duration_seconds=43200), self.request)
+        await api.executor_enable(api.BoxEnable(box='d6', local_drained=True, node_drained=True, node_max_slots=1, node_max_duration_seconds=43200), self.request)
         result = await api.request_lease(self.body('one'), self.request)
         self.assertEqual(result['status'], 'granting')
         async with self.pool.acquire() as conn:
@@ -527,13 +553,13 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             # discovers that its configured pool exceeds node capacity.
             with self.assertRaises(api.HTTPException) as exc:
                 await api.executor_enable(api.BoxEnable(box='d6', local_drained=True, node_drained=True,
-                                                       node_max_slots=1), self.request)
+                                                       node_max_slots=1, node_max_duration_seconds=43200), self.request)
             self.assertEqual(exc.exception.status_code, 409)
             self.assertIn('exceed node max_slots', exc.exception.detail)
             async with self.pool.acquire() as conn:
                 self.assertEqual(await conn.fetchval('SELECT count(*) FROM compute_boxes WHERE enabled'), 0)
             await api.executor_enable(api.BoxEnable(box='d6', local_drained=True, node_drained=True,
-                                                   node_max_slots=2), self.request)
+                                                   node_max_slots=2, node_max_duration_seconds=43200), self.request)
             async with self.pool.acquire() as conn:
                 self.assertTrue(await conn.fetchval("SELECT enabled FROM compute_boxes WHERE name='d6'"))
         finally:
@@ -588,7 +614,7 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status['pool'][0]['quarantine_reason'], 'node refused grant: box capacity exceeded')
         with self.assertRaises(api.HTTPException) as exc:
             await api.executor_enable(api.BoxEnable(box='d6', local_drained=True, node_drained=True,
-                                                   node_max_slots=1), self.request)
+                                                   node_max_slots=1, node_max_duration_seconds=43200), self.request)
         self.assertEqual(exc.exception.status_code, 409)
         self.assertIn('quarantined', exc.exception.detail)
         release = (await api.executor_poll(self.request))['action']
@@ -597,7 +623,7 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         status = await api.status(api.StatusRequest(actor=owner.actor, lease_id=granted['lease_id']), self.request)
         self.assertEqual(next(x for x in status['leases'] if x['id'] == granted['lease_id'])['status'], 'failed')
         await api.executor_enable(api.BoxEnable(box='d6', local_drained=True, node_drained=True,
-                                               node_max_slots=1, clear_quarantine=True), self.request)
+                                               node_max_slots=1, node_max_duration_seconds=43200, clear_quarantine=True), self.request)
         self.assertEqual((await api.request_lease(self.body('two'), self.request))['status'], 'granting')
 
     async def test_quarantine_notifies_configured_operator_once(self):
@@ -668,7 +694,18 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
                 receipts = [api.ActionReceipt(action_id=action['action_id'], result={
                     'lease_id': str(action['lease_id']), 'retryable': True, 'error': 'bad config'})
                     for action in actions]
-                await asyncio.gather(*(api.executor_complete(receipt, self.request) for receipt in receipts))
+                arrived = 0
+                barrier = asyncio.Event()
+                original_lock = api._lock
+                async def overlapping_lock(conn):
+                    nonlocal arrived
+                    arrived += 1
+                    if arrived == 2:
+                        barrier.set()
+                    await asyncio.wait_for(barrier.wait(), timeout=5)
+                    await original_lock(conn)
+                with patch.object(api, '_lock', side_effect=overlapping_lock):
+                    await asyncio.gather(*(api.executor_complete(receipt, self.request) for receipt in receipts))
                 await asyncio.gather(*(api.executor_complete(receipt, self.request) for receipt in receipts))
             self.assertEqual(len(logs.output), 1)
             async with self.pool.acquire() as conn:

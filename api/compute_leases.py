@@ -191,6 +191,7 @@ async def _quarantine_box(conn, box, reason, lease, policy, *, transport=False):
     evidence = _json_object(row['evidence']) or {}
     original = evidence.get('quarantine_reason')
     existing_outage = evidence.get('transport_outage_id')
+    transport_quarantined = evidence.get('transport_quarantined') is True
     history = evidence.get('quarantine_reasons')
     if not isinstance(history, list):
         history = [original] if original else []
@@ -199,11 +200,13 @@ async def _quarantine_box(conn, box, reason, lease, policy, *, transport=False):
         return False
     evidence['quarantine_reason'] = original or reason
     evidence['quarantine_reasons'] = [*history, reason]
-    if transport and not existing_outage:
-        evidence['transport_outage_id'] = str(uuid.uuid4())
+    if transport:
+        if not existing_outage:
+            evidence['transport_outage_id'] = str(uuid.uuid4())
+        evidence['transport_quarantined'] = True
     await conn.execute("""UPDATE compute_boxes SET enabled=false, ever_enabled=true, checked_at=now(),
         evidence=$2::jsonb WHERE name=$1""", box, evidence)
-    if transport and existing_outage and original:
+    if transport and transport_quarantined:
         return False
     logger.warning('compute box %s quarantined: %s', box, reason)
     operator = policy.get('quarantine_operator_pid')
@@ -540,6 +543,7 @@ class BoxEnable(BaseModel):
     local_drained: bool
     node_drained: bool
     node_max_slots: int = Field(gt=0, strict=True)
+    node_max_duration_seconds: int = Field(gt=0, strict=True)
     clear_quarantine: bool = False
 
 
@@ -599,6 +603,11 @@ async def executor_enable(body: BoxEnable, request: Request):
             await _lock(conn)
             await conn.execute('UPDATE compute_boxes SET enabled=false WHERE name=$1', body.box)
         raise HTTPException(409, 'configured pool slots exceed node max_slots')
+    if body.node_max_duration_seconds < p['absolute_max_seconds']:
+        async with _pool(request).acquire() as conn, conn.transaction():
+            await _lock(conn)
+            await conn.execute('UPDATE compute_boxes SET enabled=false WHERE name=$1', body.box)
+        raise HTTPException(409, 'configured absolute_max_seconds exceeds node max_duration_seconds')
     async with _pool(request).acquire() as conn, conn.transaction():
         await _lock(conn)
         existing = await conn.fetchrow('SELECT evidence FROM compute_boxes WHERE name=$1', body.box)
@@ -611,7 +620,8 @@ async def executor_enable(body: BoxEnable, request: Request):
             VALUES ($1,true,now(),$2::jsonb,true) ON CONFLICT (name) DO UPDATE
             SET enabled=true, checked_at=now(), evidence=EXCLUDED.evidence, ever_enabled=true""",
             body.box, {'local_drained': True, 'node_drained': True,
-                       'node_max_slots': body.node_max_slots})
+                       'node_max_slots': body.node_max_slots,
+                       'node_max_duration_seconds': body.node_max_duration_seconds})
         await _schedule(conn, p, boxes)
     return {'enabled': True, 'box': body.box}
 
@@ -767,7 +777,18 @@ async def executor_complete(body: ActionReceipt, request: Request):
                     await conn.execute("UPDATE compute_lease_actions SET status='done', result=$2::jsonb WHERE id=$1", action['id'], body.result)
                     return {'ok': True, 'releasing': True}
                 return {'ok': True, 'retryable': True}
-            if body.result.get('absent') is True and body.result.get('unit_inactive') is True:
+            if body.result.get('refused') is True:
+                reason = body.result.get('error')
+                if not isinstance(reason, str) or not reason.strip():
+                    raise HTTPException(422, 'node refusal must include a reason')
+                reason = 'extension refused: ' + reason[:2000]
+                await conn.execute('UPDATE compute_leases SET error=$2 WHERE id=$1', lease['id'], reason)
+                await _owner_push(conn, lease, f"[cm-lease] lease {lease['id']} {reason}",
+                                  f"compute-lease-extend-refused:{action['id']}")
+                if lease['release_requested'] or (lease['expires_at'] and lease['expires_at'] <= datetime.now(timezone.utc)):
+                    await conn.execute("UPDATE compute_leases SET status='releasing' WHERE id=$1", lease['id'])
+                    await _action(conn, lease['id'], 'release', {'box': lease['box']})
+            elif body.result.get('absent') is True and body.result.get('unit_inactive') is True:
                 # The extend failed and a node probe proved the slice absent.
                 # Still keep the reservation until release is acknowledged.
                 await conn.execute("UPDATE compute_leases SET status='releasing', error='extension failed: node lease absent' WHERE id=$1", lease['id'])

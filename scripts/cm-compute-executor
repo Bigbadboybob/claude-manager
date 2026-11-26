@@ -48,7 +48,7 @@ def _execute(action, routes):
     try:
         completed = subprocess.run(command, check=True, text=True, capture_output=True, timeout=90)
     except subprocess.CalledProcessError as exc:
-        if action['kind'] == 'grant' and exc.returncode == 3:
+        if action['kind'] in ('grant', 'extend') and exc.returncode == 3:
             for line in reversed((exc.stderr or '').splitlines()):
                 try:
                     error = json.loads(line)
@@ -165,7 +165,8 @@ def enable_drained_boxes(cfg, enabled):
             if evidence.get('drained') is True:
                 api('/compute/executor/enable', {'box': box, 'local_drained': True,
                                                   'node_drained': True,
-                                                  'node_max_slots': evidence.get('max_slots')})
+                                                  'node_max_slots': evidence.get('max_slots'),
+                                                  'node_max_duration_seconds': evidence.get('max_duration_seconds')})
                 enabled.add(box)
         except (OSError, ValueError, KeyError, subprocess.SubprocessError, urllib.error.URLError):
             LOG.exception('box %s remains disabled', box)

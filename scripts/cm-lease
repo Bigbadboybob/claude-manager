@@ -349,7 +349,7 @@ def main():
                     continue
                 if b'/ep-lanes/' in cmdline or '/ep-lanes/' in cwd:
                     busy.append(int(proc.name))
-            result = {'drained': not busy, 'matching_pids': busy, 'max_slots': cfg['max_slots']}
+            result = {'drained': not busy, 'matching_pids': busy, 'max_slots': cfg['max_slots'], 'max_duration_seconds': cfg['max_duration_seconds']}
             audit('drain-check', '*')
         else:
             row = load(args.lease_id)

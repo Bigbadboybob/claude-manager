@@ -24,7 +24,7 @@ def test_cutover_is_fail_closed_and_enable_requires_both_drains(monkeypatch, tmp
     cfg = {'cutover_ready': False, 'lq_directory': str(tmp_path),
            'routes': {'box': {'argv': ['gcloud', 'compute', 'ssh', 'vm']}}}
     monkeypatch.setattr(executor, 'local_drained', lambda *_: calls.append('local') or True)
-    monkeypatch.setattr(executor.subprocess, 'run', lambda *a, **kw: SimpleNamespace(stdout='{"drained":true,"max_slots":7}'))
+    monkeypatch.setattr(executor.subprocess, 'run', lambda *a, **kw: SimpleNamespace(stdout='{"drained":true,"max_slots":7,"max_duration_seconds":43200}'))
     def api(path, body):
         calls.append((path, body))
         if path == '/compute/executor/pre-enable':
@@ -38,7 +38,7 @@ def test_cutover_is_fail_closed_and_enable_requires_both_drains(monkeypatch, tmp
     cfg['cutover_ready'] = True
     executor.enable_drained_boxes(cfg, enabled)
     assert enabled == {'box'}
-    assert calls[-1][1] == {'box': 'box', 'local_drained': True, 'node_drained': True, 'node_max_slots': 7}
+    assert calls[-1][1] == {'box': 'box', 'local_drained': True, 'node_drained': True, 'node_max_slots': 7, 'node_max_duration_seconds': 43200}
     executor.enable_drained_boxes(cfg, enabled)
     assert calls.count('local') == 1
 
@@ -50,7 +50,7 @@ def test_pre_enable_lists_old_queue_and_blocks_first_enable_until_review(monkeyp
     cfg = {'cutover_ready': True, 'lq_directory': str(tmp_path),
            'routes': {'box': {'argv': ['gcloud', 'compute', 'ssh', 'vm']}}}
     monkeypatch.setattr(executor, 'local_drained', lambda *_: calls.append('local') or True)
-    monkeypatch.setattr(executor.subprocess, 'run', lambda *a, **kw: SimpleNamespace(stdout='{"drained":true,"max_slots":7}'))
+    monkeypatch.setattr(executor.subprocess, 'run', lambda *a, **kw: SimpleNamespace(stdout='{"drained":true,"max_slots":7,"max_duration_seconds":43200}'))
     def api(path, body):
         calls.append(path)
         if path == '/compute/executor/pre-enable':
@@ -243,3 +243,13 @@ def test_blocked_box_does_not_hold_healthy_box(monkeypatch):
             finish.set()
     finally:
         finish.set()
+
+
+def test_extension_node_refusal_is_reported_without_absence_probe(monkeypatch):
+    import subprocess
+    action = {'kind': 'extend', 'lease_id': 'id', 'payload': {'box': 'd6', 'expires_epoch': 123}}
+    def failed(argv, **kwargs):
+        raise subprocess.CalledProcessError(3, argv, stderr='{"refused":true,"error":"expiry outside configured window"}')
+    monkeypatch.setattr(executor.subprocess, 'run', failed)
+    assert executor.execute(action, {'d6': {'argv': ['ssh', 'd6']}}) == {
+        'lease_id': 'id', 'refused': True, 'error': 'expiry outside configured window'}

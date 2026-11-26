@@ -42,7 +42,8 @@ Set pool policy `quarantine_operator_pid` to the operator session's stable
 new quarantines. A null or omitted value disables this optional recipient; the
 lease owner still receives a notice and the executor logs quarantine changes.
 
-A node capacity-exceeded refusal disables and quarantines that box persistently.
+A node capacity refusal, repeated transport failures, or an unconfirmed expired
+node operation disables and quarantines the box persistently.
 After investigating and draining it, an operator can explicitly clear the
 quarantine through the executor enable endpoint with `clear_quarantine=true`,
 the drain checks and the verified node limit; the executor does not clear it
@@ -52,7 +53,8 @@ reservations that no longer match the configured slots.
 
 Before starting the updated API, apply SQL migrations through
 `043_compute_box_ever_enabled.sql` and install the reviewed pool config,
-including `reclaim_notice_grace_seconds` and each box's `run_argv`. Deploy the
+including `reclaim_notice_grace_seconds`, `transport_failure_threshold`,
+`action_claim_seconds` and each box's `run_argv`. Deploy the
 updated API before starting the updated executor.
 
 At cutover:
@@ -68,7 +70,8 @@ At cutover:
    `allow_queued_at_cutover=true` after review.
 3. Let existing runs drain, then set `cutover_ready`. The executor confirms
    each box is drained and its node `max_slots` covers the configured pool
-   slots before enabling it.
+   slots and its node duration limit covers the API total-duration limit before
+   enabling it.
 4. Leave the pool and executor examples disabled until those checks and the
    deployment review pass. Retire `lq` separately after the agreed week.
 
