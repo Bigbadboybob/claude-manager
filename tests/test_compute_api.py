@@ -994,7 +994,7 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             notice = await conn.fetchrow("SELECT n.sent_at,a.status,a.result FROM compute_lease_notices n JOIN compute_lease_actions a ON a.id=n.action_id WHERE n.push_id=$1", push)
             self.assertIsNone(notice['sent_at'])
             self.assertEqual(notice['status'], 'done')
-            self.assertEqual(json.loads(notice['result']), {'delivered': False})
+            self.assertEqual(notice['result'], {'delivered': False})
 
     async def test_gate_priority_is_visible_and_audited(self):
         body = self.body('gate')
@@ -1149,7 +1149,7 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         async with self.pool.acquire() as conn:
             self.assertEqual(await conn.fetchval('SELECT status FROM compute_leases WHERE id=$1', waiting['lease_id']), 'granting')
             self.assertIn('node lease absent', await conn.fetchval('SELECT error FROM compute_leases WHERE id=$1', granted['lease_id']))
-            result = json.loads(await conn.fetchval('SELECT result FROM compute_lease_actions WHERE id=$1', extend_action['action_id']))
+            result = await conn.fetchval('SELECT result FROM compute_lease_actions WHERE id=$1', extend_action['action_id'])
             self.assertIs(result['ok'], False)
         status = await api.status(api.StatusRequest(actor=owner.actor, lease_id=granted['lease_id']), self.request)
         terminal = next(lease for lease in status['leases'] if lease['id'] == granted['lease_id'])
