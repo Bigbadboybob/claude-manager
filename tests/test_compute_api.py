@@ -507,6 +507,30 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         async with self.pool.acquire() as conn:
             self.assertTrue(await conn.fetchval("SELECT last_activity_at > now()-interval '1 minute' FROM compute_leases WHERE id=$1", result['lease_id']))
 
+    async def test_status_only_answers_an_issued_notice(self):
+        owner = self.body('one')
+        granted = await api.request_lease(owner, self.request)
+        action = (await api.executor_poll(self.request))['action']
+        await api.executor_complete(api.ActionReceipt(action_id=action['action_id'], result={
+            'lease_id': str(granted['lease_id']), 'configured': True, 'workdir': '/work/id'}), self.request)
+        async with self.pool.acquire() as conn:
+            await conn.execute("UPDATE compute_leases SET last_activity_at=now()-interval '3 hours' WHERE id=$1", granted['lease_id'])
+        await api.status(api.StatusRequest(actor=owner.actor, lease_id=granted['lease_id']), self.request)
+        async with self.pool.acquire() as conn, conn.transaction():
+            before = await conn.fetchval('SELECT last_activity_at FROM compute_leases WHERE id=$1', granted['lease_id'])
+            self.assertTrue(await conn.fetchval("SELECT $1::timestamptz < now()-interval '2 hours'", before))
+            row = await conn.fetchrow('SELECT * FROM compute_leases WHERE id=$1', granted['lease_id'])
+            await api._notice_action(conn, row, 'idle_notice')
+        await api.status(api.StatusRequest(actor=owner.actor, lease_id=granted['lease_id']), self.request)
+        async with self.pool.acquire() as conn:
+            answered = await conn.fetchval('SELECT answered_at FROM compute_lease_notices WHERE lease_id=$1', granted['lease_id'])
+            self.assertIsNotNone(answered)
+            self.assertTrue(await conn.fetchval('SELECT last_activity_at > $2 FROM compute_leases WHERE id=$1', granted['lease_id'], before))
+            await conn.execute("UPDATE compute_leases SET last_activity_at=now()-interval '3 hours' WHERE id=$1", granted['lease_id'])
+        await api.status(api.StatusRequest(actor=owner.actor, lease_id=granted['lease_id']), self.request)
+        async with self.pool.acquire() as conn:
+            self.assertTrue(await conn.fetchval("SELECT last_activity_at < now()-interval '2 hours' FROM compute_leases WHERE id=$1", granted['lease_id']))
+
     async def test_cancel_during_grant_keeps_slot_until_node_teardown(self):
         owner = self.body('one')
         result = await api.request_lease(owner, self.request)

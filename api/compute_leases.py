@@ -117,13 +117,20 @@ def _fits_any_box(row, policy, boxes):
     return any(len(box.slots) >= slots_needed(row, policy) for box in boxes)
 
 
-async def _record_activity(conn, lease_id, owner=None, *, answer=True):
+async def _record_activity(conn, lease_id, owner=None, *, answer=True, only_issued_notice=False):
     """Reset idleness and close out every notice already issued for this lease.
 
     Delivery acknowledgements may arrive after this transaction, so comparing
     their timestamps alone can incorrectly turn an answer into silence. CPU
     activity invalidates notices without mislabeling it as an owner answer.
     """
+    if only_issued_notice:
+        issued = await conn.fetchval("""SELECT EXISTS(SELECT 1 FROM compute_lease_notices n
+            JOIN compute_lease_actions a ON a.id=n.action_id WHERE n.lease_id=$1
+            AND a.kind IN ('idle_notice','reclaim_notice') AND n.answered_at IS NULL
+            AND n.invalidated_at IS NULL)""", lease_id)
+        if not issued:
+            return False
     changed = await conn.fetchval('''UPDATE compute_leases SET last_activity_at=now()
         WHERE id=$1 AND ($2::text IS NULL OR owner=$2) RETURNING id''', lease_id, owner)
     if changed:
@@ -281,7 +288,7 @@ async def status(body: StatusRequest, request: Request):
             row = await conn.fetchrow('SELECT * FROM compute_leases WHERE id=$1 AND owner=$2', body.lease_id, owner)
             if not row:
                 raise HTTPException(404, 'lease not found')
-            await _record_activity(conn, body.lease_id, owner)
+            await _record_activity(conn, body.lease_id, owner, only_issued_notice=True)
         rows = await _rows(conn)
         enabled = {r['name'] for r in await conn.fetch('SELECT name FROM compute_boxes WHERE enabled')}
         enabled_boxes = [b for b in boxes if b.configured_enabled and b.name in enabled]
