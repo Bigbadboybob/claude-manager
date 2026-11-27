@@ -12,6 +12,7 @@ node = importlib.util.module_from_spec(spec)
 loader.exec_module(node)
 REAL_CREATE_WORKDIR = node.create_workdir
 REAL_CLEANUP_WORKDIR = node.workdir_size_and_remove_if_empty
+REAL_REFRESH_OWNER = node.refresh_retained_owner
 
 LEASE = '21da6f57-0d54-4e75-a19d-4a9faab79aaa'
 
@@ -39,6 +40,7 @@ def context(tmp_path, monkeypatch):
         return {'device': 1, 'inode': 2, 'sha256': 'test'}
     monkeypatch.setattr(node, 'create_workdir', make_workdir)
     monkeypatch.setattr(node, 'workdir_size_and_remove_if_empty', lambda path, user, marker: 1)
+    monkeypatch.setattr(node, 'refresh_retained_owner', lambda *args: None)
     calls = []
     monkeypatch.setattr(node, 'run', lambda *args: calls.append(args))
     cfg = dict(user='lucas', max_slots=4, cpus_per_slot=2, mem_gb_per_slot=16,
@@ -128,6 +130,7 @@ def _use_local_workdir_commands(monkeypatch):
         return ''
     monkeypatch.setattr(node, 'create_workdir', REAL_CREATE_WORKDIR)
     monkeypatch.setattr(node, 'workdir_size_and_remove_if_empty', REAL_CLEANUP_WORKDIR)
+    monkeypatch.setattr(node, 'refresh_retained_owner', REAL_REFRESH_OWNER)
     monkeypatch.setattr(node, 'run', run)
     return calls
 
@@ -155,6 +158,20 @@ def test_release_preserves_user_files_and_generated_marker(context, monkeypatch)
     assert result['released'] and result['workdir_bytes'] > 0
     assert (path / 'results.txt').read_text() == 'keep this'
     assert (path / 'OWNER.md').is_file()
+
+
+def test_release_recreates_deleted_owner_marker_for_retained_files(context, monkeypatch):
+    cfg, args, _ = context
+    _use_local_workdir_commands(monkeypatch)
+    row = node.grant(args, cfg)
+    path = node.Path(row['workdir'])
+    (path / 'OWNER.md').unlink()
+    (path / 'result').write_text('keep')
+    result = node.release(LEASE, cfg)
+    assert result['released'] and 'cleanup_skipped' not in result
+    marker = (path / 'OWNER.md').read_text()
+    assert args.owner in marker and LEASE in marker and 'delete-after:' in marker
+    assert (path / 'result').read_text() == 'keep'
 
 
 @pytest.mark.parametrize('change', ['edited', 'replaced', 'symlink', 'no_marker'])
@@ -274,6 +291,8 @@ def test_run_scope_requests_collection_on_success_or_failure(context, monkeypatc
     assert '--property=TimeoutStopSec=30s' in argv
     assert '--property=CollectMode=inactive-or-failed' in argv[:argv.index('--')]
     assert argv[-1] == '/bin/true'
+    assert '--chdir=' + row['workdir'] in argv
+    assert argv.index('/usr/sbin/runuser') < argv.index('--chdir=' + row['workdir'])
     assert ('/usr/bin/taskset' in argv) is bool(pin)
 
 
@@ -543,8 +562,9 @@ def test_config_refuses_invalid_drain_ignore_datadirs(context, monkeypatch, bad)
         def is_symlink(self): return False
         def read_text(self): return json.dumps(cfg)
     monkeypatch.setattr(node, 'CONFIG', RootOwnedConfig())
+    loaded = node.config()
     with pytest.raises(node.Refused, match='drain_ignore_datadirs'):
-        node.config()
+        node.drain_ignore_datadirs(loaded)
 
 
 def test_drain_check_ignores_only_configured_database_processes(context, tmp_path, monkeypatch, capsys):
@@ -573,6 +593,7 @@ def test_drain_check_ignores_only_configured_database_processes(context, tmp_pat
     process(106, ['postgres: backend'], datadir, '/usr/lib/postgresql/16/bin/postgres')
     process(107, ['postgres: other'], datadir + '/pg_wal', '/usr/lib/postgresql/16/bin/postgres')
     process(108, ['bash', '-D', datadir], '/home/lucas/ep-lanes/pgtest/other', '/usr/bin/bash')
+    process(109, ['bash', '/home/lucas/ep-lanes/job.sh'], datadir, '/usr/bin/bash')
     real_path = node.Path
     monkeypatch.setattr(node, 'STATE', RootOwnedState())
     monkeypatch.setattr(node, 'config', lambda: cfg)
@@ -581,7 +602,7 @@ def test_drain_check_ignores_only_configured_database_processes(context, tmp_pat
     monkeypatch.setattr(node.sys, 'argv', ['cm-lease', 'drain-check'])
     node.main()
     baseline = json.loads(capsys.readouterr().out)
-    assert set(baseline['matching_pids']) == {101, 102, 103, 104, 105, 106, 107, 108}
+    assert set(baseline['matching_pids']) == {101, 102, 103, 104, 105, 106, 107, 108, 109}
     assert baseline['ignored_pids'] == [] and not baseline['drained']
     cfg['drain_ignore_datadirs'] = []
     node.main()
@@ -590,9 +611,9 @@ def test_drain_check_ignores_only_configured_database_processes(context, tmp_pat
     node.main()
     result = json.loads(capsys.readouterr().out)
     assert {row['pid']: row['datadir'] for row in result['ignored_pids']} == {101: datadir, 102: datadir, 106: datadir}
-    assert set(result['matching_pids']) == {103, 104, 105, 107, 108}
+    assert set(result['matching_pids']) == {103, 104, 105, 107, 108, 109}
     assert not result['drained']
-    for pid in (103, 104, 105, 107, 108):
+    for pid in (103, 104, 105, 107, 108, 109):
         for entry in (proc_root / str(pid)).iterdir():
             entry.unlink()
         (proc_root / str(pid)).rmdir()

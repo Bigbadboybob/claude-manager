@@ -34,6 +34,8 @@ The returned prefix uses local Python 3 and quotes each appended job argument
 for the remote command. Callers need Python 3, gcloud and the existing approved
 IAP access. Without `run_argv`, the prefix uses the configured SSH alias.
 This does not install keys or authorize a new route from cm-manager.
+`cm-lease run` starts in the lease workdir; use `-- bash -lc 'commands'`
+when a shell is needed.
 Reservations remain occupied until release is confirmed.
 An explicit node grant refusal is reported to the owner; its lease becomes
 failed after the node confirms release, so a transport error never frees capacity.

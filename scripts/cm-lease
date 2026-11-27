@@ -47,10 +47,6 @@ def config():
     if any(not isinstance(data[k], int) or isinstance(data[k], bool) or data[k] <= 0
            for k in ('max_slots', 'cpus_per_slot', 'mem_gb_per_slot', 'max_duration_seconds')):
         raise Refused('invalid numeric config')
-    ignored = data.get('drain_ignore_datadirs', [])
-    if (not isinstance(ignored, list) or any(not isinstance(path, str) or
-            not path or '\0' in path or not os.path.isabs(path) for path in ignored)):
-        raise Refused('drain_ignore_datadirs must be a list of absolute paths')
     # A broken workdir must not prevent status, expiry or release. Grant and
     # cleanup validate it again before using it.
     try:
@@ -58,6 +54,14 @@ def config():
     except Refused:
         pass
     return data
+
+
+def drain_ignore_datadirs(cfg):
+    ignored = cfg.get('drain_ignore_datadirs', [])
+    if (not isinstance(ignored, list) or any(not isinstance(path, str) or
+            not path or '\0' in path or not os.path.isabs(path) for path in ignored)):
+        raise Refused('drain_ignore_datadirs must be a list of absolute paths')
+    return ignored
 
 
 def workdir_root(cfg):
@@ -158,6 +162,34 @@ except OSError:
     return int(out.split()[0])
 
 
+def refresh_retained_owner(path, row, ident):
+    # Do not replace a file the owner changed or a symlink. Recreate only a
+    # missing marker or replace the exact generated marker, as the lease user.
+    code = """import hashlib, json, os, pathlib, stat, sys, time
+p = pathlib.Path(sys.argv[1]); marker = json.loads(sys.argv[2] or 'null')
+target = p / 'OWNER.md'
+if not p.is_dir():
+    sys.exit(0)
+try:
+    fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+except FileNotFoundError:
+    pass
+else:
+    with os.fdopen(fd, 'rb') as f:
+        info = os.fstat(f.fileno())
+        if (not marker or not stat.S_ISREG(info.st_mode) or info.st_size > 65536 or
+            info.st_dev != marker.get('device') or info.st_ino != marker.get('inode') or
+            hashlib.sha256(f.read()).hexdigest() != marker.get('sha256')):
+            raise RuntimeError('OWNER.md changed; cannot refresh safely')
+    target.unlink()
+fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+with os.fdopen(fd, 'w') as f:
+    f.write('owner: %s\\nlease: %s\\nreleased: %s\\nkeep: retained lease files\\ndelete-after: owner review\\n' % (sys.argv[3], sys.argv[4], int(time.time())))
+"""
+    run('/usr/sbin/runuser', '-u', row['user'], '--', '/usr/bin/python3', '-c', code,
+        str(path), json.dumps(row.get('owner_marker')), row['owner'], ident)
+
+
 def expiry(value, cfg):
     now = int(time.time())
     if value <= now or value > now + cfg['max_duration_seconds']:
@@ -236,6 +268,8 @@ def release(ident, cfg):
         if path.resolve() != root / ident:
             raise Refused('workdir realpath must be the lease directory directly under workdir_root')
         result['workdir_bytes'] = workdir_size_and_remove_if_empty(path, row['user'], row.get('owner_marker'))
+        if path.exists():
+            refresh_retained_owner(path, row, ident)
     except (Refused, KeyError, TypeError, ValueError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
         result['cleanup_skipped'] = str(exc)
     return result
@@ -341,7 +375,7 @@ def main():
             # A failed /proc read is not evidence that the box is empty.
             busy = []
             ignored = []
-            ignored_dirs = cfg.get('drain_ignore_datadirs', [])
+            ignored_dirs = drain_ignore_datadirs(cfg)
             ignored_bytes = {os.fsencode(path): path for path in ignored_dirs}
             processes = {}
             for proc in Path('/proc').iterdir():
@@ -385,7 +419,12 @@ def main():
                     datadir = roots.get(ancestor)
                     ancestor = processes[ancestor][3] if ancestor in processes else None
                 if datadir is None and cwd in ignored_dirs:
-                    datadir = cwd
+                    try:
+                        exe = os.readlink(proc / 'exe')
+                    except FileNotFoundError:
+                        continue
+                    if os.path.basename(exe) == 'postgres':
+                        datadir = cwd
                 if datadir is None:
                     busy.append(pid)
                 else:
@@ -426,7 +465,11 @@ def main():
                     command = command[1:]
                 if not command:
                     raise Refused('missing command')
-                command = ['/usr/sbin/runuser', '-u', row['user'], '--', *command]
+                workdir = Path(row['workdir'])
+                if workdir.resolve(strict=True) != workdir_root(cfg) / args.lease_id:
+                    raise Refused('invalid lease workdir')
+                command = ['/usr/sbin/runuser', '-u', row['user'], '--',
+                           '/usr/bin/env', '--chdir=' + str(workdir), *command]
                 if row['pin']:
                     command = ['/usr/sbin/runuser', '-u', row['user'], '--',
                                '/usr/bin/taskset', '-c', row['pin'], *command[4:]]
