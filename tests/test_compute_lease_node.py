@@ -531,6 +531,24 @@ def test_status_works_with_bad_workdir_root(context, tmp_path, monkeypatch, caps
     assert node.unit(LEASE) in calls[-1]
 
 
+def test_invalid_drain_config_does_not_prevent_release_or_reap(context, monkeypatch):
+    cfg, args, _ = context
+    node.grant(args, cfg)
+    cfg['drain_ignore_datadirs'] = 'invalid'
+    class RootOwnedConfig:
+        def lstat(self): return SimpleNamespace(st_uid=0, st_mode=0o600)
+        def is_file(self): return True
+        def is_symlink(self): return False
+        def read_text(self): return json.dumps(cfg)
+    monkeypatch.setattr(node, 'CONFIG', RootOwnedConfig())
+    assert node.release(LEASE, node.config())['released']
+    node.save(LEASE, {'lease_id': LEASE, 'workdir': str(node.Path(cfg['workdir_root']) / LEASE),
+                      'user': cfg['user'], 'owner': args.owner, 'expires': 2000})
+    monkeypatch.setattr(node.time, 'time', lambda: 2001)
+    result = node.reap(node.config())
+    assert not result['failed'] and result['released'][0]['released']
+
+
 def test_drain_check_reports_node_capacity(context, tmp_path, monkeypatch, capsys):
     cfg, _, _ = context
     state = node.STATE
