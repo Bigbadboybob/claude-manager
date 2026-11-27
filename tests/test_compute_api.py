@@ -51,7 +51,7 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
         self.pool = await asyncpg.create_pool(host=str(self.root), port=55483, database='postgres',
                                                min_size=1, max_size=4, init=db._init_connection)
         async with self.pool.acquire() as conn:
-            await conn.execute('DROP TABLE IF EXISTS compute_lease_sampling_epochs, compute_lease_notices, compute_lease_samples, compute_lease_actions, compute_leases, compute_boxes, item_pushes, incarnations, members CASCADE')
+            await conn.execute('DROP TABLE IF EXISTS compute_iteration_affinity, compute_lease_run_details, compute_lease_sampling_epochs, compute_lease_notices, compute_lease_samples, compute_lease_actions, compute_leases, compute_boxes, item_pushes, incarnations, members CASCADE')
             await conn.execute('CREATE TABLE members (id text PRIMARY KEY, primary_team_id uuid)')
             await conn.execute('CREATE TABLE incarnations (member_id text, pid text, ended_at timestamptz)')
             await conn.execute('''CREATE TABLE item_pushes (id bigserial PRIMARY KEY, daemon_id text, session_uid text,
@@ -68,6 +68,12 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             history_sql = (ROOT / 'sql/043_compute_box_ever_enabled.sql').read_text()
             await conn.execute(history_sql)
             await conn.execute(history_sql)
+            run_sql = (ROOT / 'sql/044_compute_lease_run_details.sql').read_text()
+            await conn.execute(run_sql)
+            await conn.execute(run_sql)
+            iteration_sql = (ROOT / 'sql/045_compute_iteration_leases.sql').read_text()
+            await conn.execute(iteration_sql)
+            await conn.execute(iteration_sql)
             await conn.execute("INSERT INTO compute_boxes (name, enabled, checked_at, evidence) VALUES ('d6', true, now(), '{}'::jsonb)")
         self.request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(pool=self.pool)))
 
@@ -98,6 +104,108 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             result={'lease_id': str(action['lease_id']), 'released': True}), self.request)
         async with self.pool.acquire() as conn:
             self.assertEqual(await conn.fetchval("SELECT count(*) FROM compute_leases WHERE status='granting'"), 1)
+
+    async def test_iteration_affinity_wait_and_fresh_escape(self):
+        config = self.root / 'pool.json'
+        original = config.read_text()
+        cfg = json.loads(original)
+        cfg['boxes'].append(dict(cfg['boxes'][0], name='d7', ssh_target='d7', slots=['1,9']))
+        config.write_text(json.dumps(cfg))
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute("INSERT INTO compute_boxes (name,enabled,checked_at,evidence) VALUES ('d7',true,now(),'{}'::jsonb)")
+            owner = self.body('owner')
+            owner.actor.name = 'Lease-Svc'
+            owner.iteration = True
+            first = await api.request_lease(owner, self.request)
+            grant = (await api.executor_poll(self.request))['action']
+            self.assertEqual(grant['payload']['box'], 'd6')
+            self.assertEqual(grant['payload']['iteration_slug'], 'Lease-Svc')
+            with self.assertRaises(api.HTTPException) as exc:
+                await api.request_lease(owner, self.request)
+            self.assertEqual(exc.exception.status_code, 409)
+            await api.executor_complete(api.ActionReceipt(action_id=grant['action_id'], result={
+                'lease_id': str(first['lease_id']), 'configured': True,
+                'workdir': '/home/cmlease/owners/Lease-Svc'}), self.request)
+            await api.release(api.LeaseChange(actor=owner.actor, lease_id=first['lease_id']), self.request)
+            release = (await api.executor_poll(self.request))['action']
+            await api.executor_complete(api.ActionReceipt(action_id=release['action_id'], result={
+                'lease_id': str(first['lease_id']), 'released': True}), self.request)
+            async with self.pool.acquire() as conn:
+                await conn.execute("UPDATE compute_boxes SET enabled=false")
+            waiting = await api.request_lease(owner, self.request)
+            self.assertEqual(waiting['status'], 'queued')
+            result = await api.status(api.StatusRequest(actor=owner.actor, lease_id=waiting['lease_id']), self.request)
+            row = next(x for x in result['leases'] if x['id'] == waiting['lease_id'])
+            self.assertEqual((row['waiting_for_box'], row['waiting_reason']), ('d6', 'disabled'))
+            async with self.pool.acquire() as conn:
+                await conn.execute("UPDATE compute_boxes SET enabled=true WHERE name='d7'")
+            other_owner = self.body('other')
+            other = await api.request_lease(other_owner, self.request)
+            other_action = (await api.executor_poll(self.request))['action']
+            self.assertEqual(other_action['payload']['box'], 'd7')
+            await api.executor_complete(api.ActionReceipt(action_id=other_action['action_id'], result={
+                'lease_id': str(other['lease_id']), 'configured': True, 'workdir': '/work/other'}), self.request)
+            await api.release(api.LeaseChange(actor=other_owner.actor, lease_id=other['lease_id']), self.request)
+            other_release = (await api.executor_poll(self.request))['action']
+            await api.executor_complete(api.ActionReceipt(action_id=other_release['action_id'], result={
+                'lease_id': str(other['lease_id']), 'released': True}), self.request)
+            await api.release(api.LeaseChange(actor=owner.actor, lease_id=waiting['lease_id']), self.request)
+            owner.fresh = True
+            fresh = await api.request_lease(owner, self.request)
+            self.assertEqual(fresh['previous_iteration_box'], 'd6')
+            self.assertEqual(fresh['previous_iteration_workdir'], '/home/cmlease/owners/Lease-Svc')
+            self.assertTrue(fresh['iteration_slug'].startswith('Lease-Svc-'))
+            self.assertEqual(fresh['iteration_workdir'], '/home/cmlease/owners/' + fresh['iteration_slug'])
+            next_action = (await api.executor_poll(self.request))['action']
+            self.assertEqual(next_action['payload']['box'], 'd7')
+            self.assertEqual(next_action['payload']['iteration_slug'], fresh['iteration_slug'])
+        finally:
+            config.write_text(original)
+
+    async def test_concurrent_iteration_requests_allow_only_one(self):
+        owner = self.body('owner')
+        owner.iteration = True
+        results = await asyncio.gather(api.request_lease(owner, self.request),
+                                       api.request_lease(owner, self.request), return_exceptions=True)
+        accepted = [r for r in results if isinstance(r, dict)]
+        denied = [r for r in results if isinstance(r, api.HTTPException)]
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(len(denied), 1)
+        self.assertEqual(denied[0].status_code, 409)
+        async with self.pool.acquire() as conn:
+            self.assertEqual(await conn.fetchval("SELECT count(*) FROM compute_leases WHERE iteration"), 1)
+
+    async def test_fresh_iteration_same_minute_uses_unique_suffix(self):
+        owner = self.body('owner')
+        owner.actor.name = 'Lease-Svc'
+        owner.iteration = owner.fresh = True
+        first = await api.request_lease(owner, self.request)
+        grant = (await api.executor_poll(self.request))['action']
+        await api.executor_complete(api.ActionReceipt(action_id=grant['action_id'], result={
+            'lease_id': str(first['lease_id']), 'configured': True, 'workdir': first['iteration_workdir']}), self.request)
+        await api.release(api.LeaseChange(actor=owner.actor, lease_id=first['lease_id']), self.request)
+        release = (await api.executor_poll(self.request))['action']
+        await api.executor_complete(api.ActionReceipt(action_id=release['action_id'], result={
+            'lease_id': str(first['lease_id']), 'released': True}), self.request)
+        real_datetime = api.datetime
+        fixed = real_datetime.strptime(first['iteration_slug'][-13:], '%Y%m%dT%H%M').replace(tzinfo=api.timezone.utc)
+        class FixedDatetime(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed
+        with patch.object(api, 'datetime', FixedDatetime):
+            second = await api.request_lease(owner, self.request)
+        self.assertRegex(second['iteration_slug'], r'^Lease-Svc-\d{8}T\d{4}-[0-9a-f]{4}$')
+        self.assertEqual(second['previous_iteration_workdir'], first['iteration_workdir'])
+        self.assertNotEqual(second['iteration_workdir'], first['iteration_workdir'])
+
+    async def test_fresh_requires_iteration(self):
+        owner = self.body('owner')
+        owner.fresh = True
+        with self.assertRaises(api.HTTPException) as exc:
+            await api.request_lease(owner, self.request)
+        self.assertEqual(exc.exception.status_code, 422)
 
     async def test_session_capped_waiter_does_not_block_other_grants_or_extensions(self):
         import uuid
@@ -154,6 +262,26 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('does not match configured slots', status['pool'][0]['quarantine_reason'])
         finally:
             cfg_path.write_text(original)
+
+    async def test_run_detail_reaches_owner_status_and_terminal_release(self):
+        owner = self.body('owner')
+        lease = await api.request_lease(owner, self.request)
+        grant = (await api.executor_poll(self.request))['action']
+        await api.executor_complete(api.ActionReceipt(action_id=grant['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'configured': True, 'workdir': '/work/id'}), self.request)
+        detail = {'rc': 7, 'tail': 'test failed\n', 'path': '/work/id/runs/one'}
+        await api.sample(api.SampleReceipt(lease_id=lease['lease_id'], cpu_usage_usec=0, last_run=detail), self.request)
+        result = await api.status(api.StatusRequest(actor=owner.actor, lease_id=lease['lease_id']), self.request)
+        self.assertEqual(next(x for x in result['leases'] if x['id'] == lease['lease_id'])['last_run'], detail)
+        await api.release(api.LeaseChange(actor=owner.actor, lease_id=lease['lease_id']), self.request)
+        release = (await api.executor_poll(self.request))['action']
+        final = {'rc': 2, 'tail': 'last error\n', 'path': '/work/id/runs/two'}
+        await api.executor_complete(api.ActionReceipt(action_id=release['action_id'], result={
+            'lease_id': str(lease['lease_id']), 'released': True, 'last_run': final}), self.request)
+        result = await api.status(api.StatusRequest(actor=owner.actor, lease_id=lease['lease_id']), self.request)
+        self.assertEqual(next(x for x in result['leases'] if x['id'] == lease['lease_id'])['last_run'], final)
+        other = await api.status(api.StatusRequest(actor=self.body('other').actor), self.request)
+        self.assertFalse(any(x['id'] == lease['lease_id'] for x in other['leases']))
 
     async def test_release_cleanup_results_are_visible_only_to_owner(self):
         async def finish(owner, cleanup):
@@ -880,7 +1008,10 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(arguments[:-2], route[1:])
             self.assertEqual(arguments[-2], '--command')
             self.assertEqual(shlex.split(arguments[-1]), ['sudo', '-n', '/usr/local/bin/cm-lease',
-                             'run', '--lease-id', str(granted['lease_id']), '--', *job])
+                             'run', '--lease-id', str(granted['lease_id']), *job])
+            junit_command = lease['run_prefix'] + ' ' + shlex.join(['--junit', 'result.xml', '--', '/bin/true'])
+            arguments = json.loads(subprocess.run(['/bin/sh', '-c', junit_command], check=True, capture_output=True, text=True).stdout)
+            self.assertEqual(shlex.split(arguments[-1])[-4:], ['--junit', 'result.xml', '--', '/bin/true'])
         finally:
             cfg_path.write_text(original)
 
@@ -898,7 +1029,7 @@ class ComputeApiTests(unittest.IsolatedAsyncioTestCase):
                 'lease_id': str(granted['lease_id']), 'configured': True, 'workdir': '/work/id'}), self.request)
             status = await api.status(api.StatusRequest(actor=owner.actor), self.request)
             lease = next(x for x in status['leases'] if x['id'] == granted['lease_id'])
-            self.assertEqual(lease['run_prefix'], f"ssh d6 sudo -n /usr/local/bin/cm-lease run --lease-id {granted['lease_id']} --")
+            self.assertEqual(lease['run_prefix'], f"ssh d6 sudo -n /usr/local/bin/cm-lease run --lease-id {granted['lease_id']}")
         finally:
             cfg_path.write_text(original)
 

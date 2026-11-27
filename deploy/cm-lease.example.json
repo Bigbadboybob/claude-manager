@@ -4,6 +4,8 @@
   "mem_gb_per_slot": 16,
   "max_duration_seconds": 43200,
   "drain_ignore_datadirs": [],
+  "owner_dir_cap_gb": 20,
+  "min_free_gb": 15,
   "workdir_root": "/home/lucas/ep-lanes/lease",
   "user": "lucas"
 }

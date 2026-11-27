@@ -30,6 +30,7 @@ class Actor(BaseModel):
     session_uid: str
     daemon_id: str
     task_id: str | None = None
+    name: str | None = None
 
     def checked(self):
         if not self.session_uid or not self.daemon_id or self.pid != f'agent:{self.daemon_id}:{self.session_uid}':
@@ -48,6 +49,8 @@ class LeaseRequest(BaseModel):
     lease_class: str = Field(alias='class')
     pinned: bool = False
     justification: str = Field(default='', max_length=2000)
+    iteration: bool = False
+    fresh: bool = False
 
 
 class LeaseChange(BaseModel):
@@ -122,11 +125,14 @@ async def _lock(conn):
 
 async def _rows(conn):
     return [dict(row) for row in await conn.fetch(
-        "SELECT * FROM compute_leases WHERE status IN ('queued','granting','active','releasing')")]
+        """SELECT l.*, a.box AS iteration_affinity_box FROM compute_leases l
+           LEFT JOIN compute_iteration_affinity a ON a.owner=l.owner AND l.iteration
+           WHERE l.status IN ('queued','granting','active','releasing')""")]
 
 
 def _fits_any_box(row, policy, boxes):
-    return any(len(box.slots) >= slots_needed(row, policy) for box in boxes)
+    return any((not row.get('iteration_affinity_box') or box.name == row['iteration_affinity_box'])
+               and len(box.slots) >= slots_needed(row, policy) for box in boxes)
 
 
 def _json_object(value):
@@ -295,9 +301,11 @@ async def _schedule(conn, policy_data, boxes):
     held_boxes = set()
     deferred_teams = set()
     for row in queue_order(rows):
+        affinity = await conn.fetchrow('SELECT box,slug FROM compute_iteration_affinity WHERE owner=$1', row['owner']) if row.get('iteration') else None
+        eligible_boxes = [b for b in boxes if not affinity or not affinity['box'] or b.name == affinity['box']]
         # A box that is disabled or too small cannot help this request yet;
         # it must not hold up its team or reserve other boxes.
-        if not _fits_any_box(row, policy, boxes):
+        if not _fits_any_box(row, policy, eligible_boxes):
             continue
         if session_cap_blocked(row, rows, policy) or justification_missing(row, policy):
             continue
@@ -308,24 +316,31 @@ async def _schedule(conn, policy_data, boxes):
         if limit_reason(row, rows, policy, boxes) == 'soft_team':
             deferred_teams.add(row['team'])
             continue
-        choice = select_box(row, rows, [b for b in boxes if b.name not in held_boxes], policy,
+        choice = select_box(row, rows, [b for b in eligible_boxes if b.name not in held_boxes], policy,
                             enabled_boxes=boxes)
         if not choice:
             # Keep all boxes that could accommodate this request available for
             # it, even if their current free slots would fit a later request.
             # Boxes too small for it may still serve later requests.
             needed = slots_needed(row, policy)
-            held_boxes.update(b.name for b in boxes if len(b.slots) >= needed)
+            held_boxes.update(b.name for b in eligible_boxes if len(b.slots) >= needed)
             continue
         box, selected = choice
         expires = datetime.now(timezone.utc) + timedelta(seconds=row['duration_seconds'])
         cpuset = ','.join(selected)
         await conn.execute("UPDATE compute_leases SET status='granting', box=$2, cpuset=$3, slot_ids=$4, expires_at=$5, ssh_target=$6 WHERE id=$1",
                            row['id'], box.name, cpuset, list(selected), expires, box.ssh_target)
+        if row.get('iteration'):
+            await conn.execute("""INSERT INTO compute_iteration_affinity(owner,slug,box)
+                VALUES ($1,$2,$3) ON CONFLICT(owner) DO UPDATE SET slug=EXCLUDED.slug,box=EXCLUDED.box""",
+                row['owner'], row['iteration_slug'], box.name)
         await _action(conn, row['id'], 'grant', dict(box=box.name, owner=row['owner'],
                       slots=len(selected), mem_gb=row['mem_gb'], pin=cpuset if row['pinned'] else None,
-                      expires_epoch=int(expires.timestamp())))
+                      expires_epoch=int(expires.timestamp()), iteration=row.get('iteration', False),
+                      iteration_slug=row.get('iteration_slug')))
         row.update(status='granting', box=box.name, slot_ids=list(selected), expires_at=expires)
+        if row.get('iteration'):
+            row['iteration_affinity_box'] = box.name
 
 
 def _public(row, boxes):
@@ -334,7 +349,7 @@ def _public(row, boxes):
         if row['ssh_target'] and row['workdir']:
             box = next((b for b in boxes if b.name == row['box']), None)
             if box and box.run_argv:
-                remote = ['sudo', '-n', '/usr/local/bin/cm-lease', 'run', '--lease-id', str(row['id']), '--']
+                remote = ['sudo', '-n', '/usr/local/bin/cm-lease', 'run', '--lease-id', str(row['id'])]
                 # `gcloud --command` takes one shell string. Quote each
                 # appended job argument remotely, preserving the prefix API.
                 code = (f'import os, shlex, sys; argv = {list(box.run_argv)!r}; '
@@ -343,7 +358,7 @@ def _public(row, boxes):
                 result['run_prefix'] = shlex.join(['python3', '-c', code])
             else:
                 result['run_prefix'] = (f"ssh {shlex.quote(row['ssh_target'])} sudo -n /usr/local/bin/cm-lease run "
-                                        f"--lease-id {row['id']} --")
+                                        f"--lease-id {row['id']}")
     return result
 
 
@@ -363,20 +378,54 @@ async def request_lease(body: LeaseRequest, request: Request):
         raise HTTPException(422, 'justification is required for requests above the per-lease slot cap')
     if not _fits_any_box(requested, policy, boxes):
         raise HTTPException(422, 'request cannot fit any configured box')
+    if body.fresh and not body.iteration:
+        raise HTTPException(422, 'fresh requires iteration=true')
     ident = uuid.uuid4()
     async with _pool(request).acquire() as conn, conn.transaction():
         await _lock(conn)
         enabled = {r['name'] for r in await conn.fetch('SELECT name FROM compute_boxes WHERE enabled')}
         enabled_boxes = [b for b in boxes if b.configured_enabled and b.name in enabled]
-        if not _fits_any_box(requested, policy, enabled_boxes):
+        preexisting = await conn.fetchrow('SELECT * FROM compute_iteration_affinity WHERE owner=$1', owner) if body.iteration and not body.fresh else None
+        if not _fits_any_box(requested, policy, enabled_boxes) and not preexisting:
             raise HTTPException(409, 'no enabled box fits this request')
+        iteration_slug = None
+        previous = None
+        if body.iteration:
+            active = await conn.fetchval("""SELECT EXISTS(SELECT 1 FROM compute_leases WHERE owner=$1
+                AND iteration AND status IN ('queued','granting','active','releasing'))""", owner)
+            if active:
+                raise HTTPException(409, 'an iteration lease is already active for this owner')
+            previous = await conn.fetchrow('SELECT * FROM compute_iteration_affinity WHERE owner=$1', owner)
+            if previous and not body.fresh:
+                iteration_slug = previous['slug']
+            else:
+                base = re.sub(r'[^A-Za-z0-9_-]+', '-', body.actor.name or body.actor.session_uid).strip('-_')[:48]
+                base = base or body.actor.session_uid
+                iteration_slug = base
+                if body.fresh:
+                    iteration_slug = f"{base}-{datetime.now(timezone.utc):%Y%m%dT%H%M}"
+                existing = await conn.fetchval('''SELECT EXISTS(SELECT 1 FROM compute_leases WHERE iteration_slug=$1)
+                    OR EXISTS(SELECT 1 FROM compute_iteration_affinity WHERE slug=$1)''', iteration_slug)
+                if existing:
+                    stem = iteration_slug
+                    for _ in range(100):
+                        iteration_slug = stem + '-' + uuid.uuid4().hex[:4]
+                        used = await conn.fetchval('''SELECT EXISTS(SELECT 1 FROM compute_leases WHERE iteration_slug=$1)
+                            OR EXISTS(SELECT 1 FROM compute_iteration_affinity WHERE slug=$1)''', iteration_slug)
+                        if not used:
+                            break
+                    else:
+                        raise HTTPException(503, 'unable to allocate a unique iteration directory')
+        if body.fresh and previous:
+            await conn.execute('DELETE FROM compute_iteration_affinity WHERE owner=$1', owner)
         team = await conn.fetchval("""SELECT m.primary_team_id::text FROM incarnations i
             JOIN members m ON m.id=i.member_id WHERE i.pid=$1 AND i.ended_at IS NULL""", owner)
         await conn.execute("""INSERT INTO compute_leases
-            (id,owner,team,purpose,priority,class,cpus,mem_gb,duration_seconds,pinned,justification,status)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'queued')""", ident, owner,
+            (id,owner,team,purpose,priority,class,cpus,mem_gb,duration_seconds,pinned,justification,status,iteration,iteration_slug,previous_iteration_box,previous_iteration_workdir)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'queued',$12,$13,$14,$15)""", ident, owner,
             team, body.purpose, body.priority, body.lease_class, body.cpus,
-            body.mem_gb, body.duration, body.pinned, body.justification.strip() or None)
+            body.mem_gb, body.duration, body.pinned, body.justification.strip() or None, body.iteration, iteration_slug,
+            previous['box'] if body.fresh and previous else None, (previous['workdir'] or '/home/cmlease/owners/' + previous['slug']) if body.fresh and previous else None)
         await _schedule(conn, p, boxes)
         rows = await _rows(conn)
         row = next(x for x in rows if x['id'] == ident)
@@ -388,6 +437,12 @@ async def request_lease(body: LeaseRequest, request: Request):
         else:
             result = {'lease_id': ident, 'status': row['status'], 'queue_position': 0,
                       'eta': None}
+    if body.iteration:
+        result['iteration_slug'] = iteration_slug
+        result['iteration_workdir'] = '/home/cmlease/owners/' + iteration_slug
+    if body.iteration and body.fresh and previous:
+        result['previous_iteration_box'] = previous['box']
+        result['previous_iteration_workdir'] = previous['workdir'] or '/home/cmlease/owners/' + previous['slug']
     if body.priority == 'v221-gate':
         logger.info('v221-gate request lease=%s owner=%r team=%r purpose=%r time=%s',
                     ident, owner, team, body.purpose, row['created_at'].isoformat())
@@ -413,8 +468,19 @@ async def status(body: StatusRequest, request: Request):
         policy = Policy(**{k: p[k] for k in Policy.__dataclass_fields__})
         no_fit = {r['id'] for r in rows if r['status'] == 'queued' and not _fits_any_box(r, policy, enabled_boxes)}
         unjustified = {r['id'] for r in rows if r['status'] == 'queued' and justification_missing(r, policy)}
+        affinities = {r['owner']: r for r in await conn.fetch('SELECT owner,box FROM compute_iteration_affinity WHERE owner=$1', owner)}
         mine = [_public(r, boxes) for r in rows if r['owner'] == owner]
         for lease in mine:
+            affinity = affinities.get(owner) if lease.get('iteration') and lease['status'] == 'queued' else None
+            if affinity and affinity['box']:
+                box = affinity['box']
+                state = box_state.get(box)
+                evidence = _json_object(state['evidence']) if state else {}
+                target = next((b for b in boxes if b.name == box), None)
+                mismatch = reservation_state(target, rows, policy)[1] if target else None
+                lease['waiting_for_box'] = box
+                lease['waiting_reason'] = ('quarantined' if (evidence or {}).get('quarantine_reason') or mismatch else
+                                           'disabled' if box not in {b.name for b in enabled_boxes} else 'full')
             if lease['id'] in no_fit:
                 lease['waiting'] = 'no enabled box fits'
             elif lease['id'] in unjustified:
@@ -429,6 +495,13 @@ async def status(body: StatusRequest, request: Request):
         if (body.lease_id and row['status'] not in ('queued', 'granting', 'active', 'releasing')
                 and not any(lease['id'] == row['id'] for lease in mine)):
             mine.append(_public(dict(row), boxes))
+        if mine:
+            details = await conn.fetch('SELECT lease_id,detail FROM compute_lease_run_details WHERE lease_id=ANY($1::uuid[])',
+                                       [lease['id'] for lease in mine])
+            by_id = {entry['lease_id']: _json_object(entry['detail']) for entry in details}
+            for lease in mine:
+                if lease['id'] in by_id:
+                    lease['last_run'] = by_id[lease['id']]
         released = {lease['id']: lease for lease in mine
                     if lease['status'] == 'released' or (lease['status'] == 'failed' and lease['released_at'])}
         if released:
@@ -460,6 +533,8 @@ async def status(body: StatusRequest, request: Request):
                     released[action['lease_id']].update(
                         cleanup_skipped=result.get('cleanup_skipped'),
                         workdir_bytes=result.get('workdir_bytes'))
+                    if result.get('last_run') is not None:
+                        released[action['lease_id']]['last_run'] = result['last_run']
                     seen.add(action['lease_id'])
         ordered = queue_order(rows)
         queue = [{'lease_id': r['id'], 'priority': r['priority'], 'cpus': r['cpus'],
@@ -546,6 +621,7 @@ async def extend(body: LeaseChange, request: Request):
         policy = Policy(**{k: p[k] for k in Policy.__dataclass_fields__})
         if any(r['status'] == 'queued' and r['owner'] != owner and not session_cap_blocked(r, rows, policy) and
                not justification_missing(r, policy) and
+               (not r.get('iteration_affinity_box') or r['iteration_affinity_box'] == target.name) and
                slots_needed(r, policy) <= len(target.slots) for r in rows):
             raise HTTPException(409, 'other sessions are waiting')
         if body.duration > p[row['class'] + '_max_seconds']:
@@ -774,6 +850,8 @@ async def executor_complete(body: ActionReceipt, request: Request):
                     await _action(conn, lease['id'], 'release', {'box': lease['box']})
                 else:
                     await conn.execute("UPDATE compute_leases SET status='active', granted_at=now(), workdir=$2, error=NULL WHERE id=$1", lease['id'], body.result['workdir'])
+                if lease['iteration']:
+                    await conn.execute('UPDATE compute_iteration_affinity SET workdir=$2 WHERE owner=$1', lease['owner'], body.result['workdir'])
             else:
                 raise HTTPException(409, 'unexpected or incomplete grant result')
         elif action['kind'] == 'extend':
@@ -861,6 +939,7 @@ async def executor_complete(body: ActionReceipt, request: Request):
 class SampleReceipt(BaseModel):
     lease_id: uuid.UUID
     cpu_usage_usec: int = Field(ge=0)
+    last_run: dict | None = None
 
 
 @router.post('/executor/samples')
@@ -908,6 +987,10 @@ async def sample(body: SampleReceipt, request: Request):
         row = await conn.fetchrow("SELECT * FROM compute_leases WHERE id=$1 AND status='active'", body.lease_id)
         if not row:
             return {'accepted': False}
+        if body.last_run is not None:
+            await conn.execute('''INSERT INTO compute_lease_run_details (lease_id, detail)
+                VALUES ($1,$2::jsonb) ON CONFLICT (lease_id) DO UPDATE
+                SET detail=EXCLUDED.detail, updated_at=now()''', body.lease_id, body.last_run)
         now = datetime.now(timezone.utc)
         previous = await conn.fetchrow('''SELECT sampled_at, usage_usec FROM compute_lease_samples
             WHERE lease_id=$1 ORDER BY sampled_at DESC LIMIT 1''', body.lease_id)

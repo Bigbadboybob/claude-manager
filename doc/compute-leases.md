@@ -36,6 +36,17 @@ IAP access. Without `run_argv`, the prefix uses the configured SSH alias.
 This does not install keys or authorize a new route from cm-manager.
 `cm-lease run` starts in the lease workdir; use `-- bash -lc 'commands'`
 when a shell is needed.
+An iteration request (`iteration=true`) retains its owner directory and waits
+for its previously assigned box. A `fresh=true` iteration request starts a new
+directory and reports the old one. The node checks `owner_dir_cap_gb` (default
+20 GiB) before grant and run, and `min_free_gb` (default 15 GiB) before new
+grants. These are checks at those boundaries, not filesystem quotas.
+
+Runs retain combined output, command, and exit status under `runs/`; pass
+`--junit relative/path.xml` before `--` to copy an existing JUnit file. The
+latest 20 completed run directories are retained. Status and release report the
+last result for that lease and its final 40 output lines; active API status
+updates on the executor sampling interval.
 Reservations remain occupied until release is confirmed.
 An explicit node grant refusal is reported to the owner; its lease becomes
 failed after the node confirms release, so a transport error never frees capacity.
@@ -54,7 +65,7 @@ automatically on restart. `compute_status` reports `quarantined` and
 reservations that no longer match the configured slots.
 
 Before starting the updated API, apply SQL migrations through
-`043_compute_box_ever_enabled.sql` and install the reviewed pool config,
+`045_compute_iteration_leases.sql` and install the reviewed pool config,
 including `reclaim_notice_grace_seconds`, `transport_failure_threshold`,
 `transport_failure_window_seconds`, `action_claim_seconds` and each box's `run_argv`. Deploy the
 updated API before starting the updated executor. Install the reviewed node
@@ -101,7 +112,8 @@ executor service, and on each box the root-owned `/usr/local/bin/cm-lease`,
 `/etc/cm-lease.json` (the filename expected by the script; the brief's
 `.conf` name is not used), and the reap service/timer. Copy
 `deploy/cm-lease.example.json` and set the capacity for each box, create the
-workdir root, install the root-owned script and config, and install/enable the
+workdir root and `/home/cmlease/owners` owned by the lease user, install the
+root-owned script and config, and install/enable the
 reap timer only as part of the separately coordinated deployment. Sudoers
 must restrict access to this one script; review the shared-user trust boundary
 before installing it. Configure the executor's environment and route file from

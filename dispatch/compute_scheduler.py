@@ -74,7 +74,8 @@ def limit_reason(lease: Mapping, leases: Sequence[Mapping], policy: Policy,
     team = lease.get("team")
     other_waiters = team and any(x["status"] == "queued" and x.get("team") != team and
         not session_cap_blocked(x, leases, policy) and not justification_missing(x, policy) and
-        any(box.configured_enabled and len(box.slots) >= slots_needed(x, policy) for box in enabled_boxes)
+        any(box.configured_enabled and (not x.get('iteration_affinity_box') or x['iteration_affinity_box'] == box.name)
+            and len(box.slots) >= slots_needed(x, policy) for box in enabled_boxes)
         for x in leases)
     # Gate work bypasses the team soft cap, never the session hard cap above.
     if (lease.get('priority') != 'v221-gate' and other_waiters and
@@ -103,6 +104,8 @@ def select_box(lease: Mapping, leases: Sequence[Mapping], boxes: Sequence[Box],
         return None
     count = slots_needed(lease, policy)
     for box in boxes:
+        if lease.get('iteration_affinity_box') and lease['iteration_affinity_box'] != box.name:
+            continue
         used, reason = reservation_state(box, leases, policy)
         if reason:
             seen = _logged_quarantines.setdefault(box.name, set())

@@ -20,6 +20,7 @@ from pathlib import Path
 CONFIG = Path('/etc/cm-lease.json')
 STATE = Path('/run/cm-lease')
 LOG = Path('/var/log/cm-lease.log')
+OWNERS_ROOT = Path('/home/cmlease/owners')
 
 
 class Refused(Exception):
@@ -65,14 +66,16 @@ def drain_ignore_datadirs(cfg):
     return ignored
 
 
+def disk_value(cfg, key, default):
+    value = cfg.get(key, default)
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise Refused(f'{key} must be a positive integer')
+    return value
+
+
 def disk_policy(cfg):
-    result = {}
-    for key, default in (('owner_dir_cap_gb', 20), ('min_free_gb', 15)):
-        value = cfg.get(key, default)
-        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-            raise Refused(f'{key} must be a positive integer')
-        result[key] = value
-    return result
+    return {key: disk_value(cfg, key, default) for key, default in
+            (('owner_dir_cap_gb', 20), ('min_free_gb', 15))}
 
 
 def require_free_space(cfg):
@@ -208,6 +211,44 @@ with os.fdopen(fd, 'w') as f:
         str(path), json.dumps(row.get('owner_marker')), row['owner'], ident)
 
 
+def iteration_workdir(cfg, slug):
+    if not isinstance(slug, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,96}', slug):
+        raise Refused('invalid iteration owner slug')
+    root = OWNERS_ROOT
+    if not root.is_absolute() or not root.is_dir() or any(p.is_symlink() for p in (root, *root.parents)):
+        raise Refused('owners_root must be an existing absolute directory without symlinks')
+    path = root / slug
+    if path.is_symlink() or (path.exists() and path.resolve() != root.resolve() / slug):
+        raise Refused('invalid iteration workdir')
+    return root.resolve() / slug
+
+
+def check_owner_dir_cap(path, cfg):
+    limit = disk_value(cfg, 'owner_dir_cap_gb', 20) * 1024 ** 3
+    if not path.exists():
+        return
+    output = run('/usr/sbin/runuser', '-u', cfg['user'], '--', '/usr/bin/du', '-sb', '--', str(path))
+    size = int(output.split()[0])
+    if size > limit:
+        raise Refused(f'owner workdir {path} uses {size} bytes; cap is {limit} bytes')
+
+
+def prepare_iteration_workdir(path, owner, ident, user):
+    code = r"""import os, pathlib, sys, time
+p = pathlib.Path(sys.argv[1]); p.mkdir(mode=0o700, exist_ok=True)
+m = p / 'OWNER.md'
+try:
+    fd = os.open(m, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd) as f: text = f.read(65536)
+    if not text.startswith('owner: ' + sys.argv[2] + '\n'): raise RuntimeError('owner marker mismatch')
+except FileNotFoundError: pass
+fd = os.open(m, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+with os.fdopen(fd, 'w') as f:
+    f.write('owner: %s\nlast lease: %s\nlast used: %s\nkeep: iteration workspace\ndelete-after: owner review\n' % (sys.argv[2], sys.argv[3], int(time.time())))
+"""
+    run('/usr/sbin/runuser', '-u', user, '--', '/usr/bin/python3', '-c', code, str(path), owner, ident)
+
+
 def expiry(value, cfg):
     now = int(time.time())
     if value <= now or value > now + cfg['max_duration_seconds']:
@@ -228,9 +269,13 @@ def grant(args, cfg):
         if len(set(cpus)) != args.slots * cfg['cpus_per_slot'] or len(cpus) != len(set(cpus)):
             raise Refused('CPU list does not match slot count')
     old = load(args.lease_id)
+    iteration = getattr(args, 'iteration', False)
+    slug = getattr(args, 'owner_slug', None)
     proposed = {'lease_id': args.lease_id, 'owner': args.owner, 'user': cfg['user'],
                 'slots': args.slots, 'mem_gb': args.mem_gb, 'pin': args.pin,
                 'expires': args.expires_epoch}
+    if iteration:
+        proposed.update(iteration=True, iteration_slug=slug)
     if args.expires_epoch <= int(time.time()):
         if old and any(old.get(k) != v for k, v in proposed.items()):
             raise Refused('lease id already exists with different parameters')
@@ -240,7 +285,10 @@ def grant(args, cfg):
         return {'lease_id': args.lease_id, 'expired': True, 'released': True}
     if not old:
         require_free_space(cfg)
-    root = workdir_root(cfg)
+    root = workdir_root(cfg) if not iteration else None
+    if iteration:
+        path = iteration_workdir(cfg, slug)
+        check_owner_dir_cap(path, cfg)
     expiry(args.expires_epoch, cfg)
     if old:
         if any(old.get(k) != v for k, v in proposed.items()):
@@ -250,9 +298,17 @@ def grant(args, cfg):
         used = sum(json.loads(p.read_text())['slots'] for p in STATE.glob('*.json'))
         if used + args.slots > cfg['max_slots']:
             raise Refused('box capacity exceeded')
-        workdir = root / args.lease_id
+        workdir = path if iteration else root / args.lease_id
         pwd.getpwnam(cfg['user'])
-        marker = create_workdir(workdir, args.owner, args.lease_id, args.expires_epoch, cfg['user'])
+        if iteration:
+            for state_file in STATE.glob('*.json'):
+                other = json.loads(state_file.read_text())
+                if other.get('iteration') and other.get('iteration_slug') == slug:
+                    raise Refused('iteration owner directory already has an active lease')
+            prepare_iteration_workdir(workdir, args.owner, args.lease_id, cfg['user'])
+            marker = None
+        else:
+            marker = create_workdir(workdir, args.owner, args.lease_id, args.expires_epoch, cfg['user'])
         proposed.update(created=int(time.time()), workdir=str(workdir), slice=unit(args.lease_id), owner_marker=marker)
         # Persist before creating the unit; a crash cannot make allocated
         # capacity look free. A retry repeats configuration idempotently.
@@ -283,13 +339,19 @@ def release(ident, cfg):
     audit('release', ident)
     result = {'lease_id': ident, 'released': True, 'workdir': row.get('workdir')}
     try:
-        root = workdir_root(cfg)
+        root = workdir_root(cfg) if not row.get('iteration') else None
         path = Path(row['workdir'])
-        if path.resolve() != root / ident:
+        expected = iteration_workdir(cfg, row.get('iteration_slug')) if row.get('iteration') else root / ident
+        if path.resolve() != expected:
             raise Refused('workdir realpath must be the lease directory directly under workdir_root')
-        result['workdir_bytes'] = workdir_size_and_remove_if_empty(path, row['user'], row.get('owner_marker'))
-        if path.exists():
-            refresh_retained_owner(path, row, ident)
+        result.update(last_run_detail(path, row['user'], ident))
+        if row.get('iteration'):
+            result['workdir_bytes'] = int(run('/usr/sbin/runuser', '-u', row['user'], '--', '/usr/bin/du', '-sb', '--', str(path)).split()[0])
+            prepare_iteration_workdir(path, row['owner'], ident, row['user'])
+        else:
+            result['workdir_bytes'] = workdir_size_and_remove_if_empty(path, row['user'], row.get('owner_marker'))
+            if path.exists():
+                refresh_retained_owner(path, row, ident)
     except (Refused, KeyError, TypeError, ValueError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
         result['cleanup_skipped'] = str(exc)
     return result
@@ -323,6 +385,69 @@ def reap(cfg):
     return {'released': released, 'failed': failed}
 
 
+# This wrapper runs as the lease user, inside the lease scope. The job's
+# combined output is streamed to the caller while also being retained.
+CAPTURE_RUN = r"""
+import os, pathlib, re, shlex, shutil, subprocess, sys
+work = pathlib.Path(sys.argv[1]); junit = sys.argv[2]; name = sys.argv[3]; lease_id = sys.argv[4]; command = sys.argv[5:]
+runs = work / 'runs'
+if runs.is_symlink(): raise RuntimeError('runs must not be a symlink')
+runs.mkdir(mode=0o700, exist_ok=True)
+out = runs / name
+out.mkdir(mode=0o700)
+(out / 'lease_id').write_text(lease_id + '\n')
+(out / 'cmd').write_text(shlex.join(command) + '\n')
+try:
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    with (out / 'stdout.log').open('wb') as log:
+        while True:
+            block = process.stdout.read1(65536)
+            if not block: break
+            log.write(block); log.flush()
+            try:
+                sys.stdout.buffer.write(block); sys.stdout.buffer.flush()
+            except BrokenPipeError:
+                pass
+    rc = process.wait()
+except OSError as exc:
+    with (out / 'stdout.log').open('ab') as log: log.write((str(exc) + '\n').encode())
+    rc = 127
+(out / 'rc').write_text(str(rc) + '\n')
+if junit:
+    candidate = work / junit
+    try:
+        resolved = candidate.resolve(strict=True)
+        if resolved.is_relative_to(work.resolve()) and resolved.is_file():
+            shutil.copyfile(resolved, out / 'junit')
+    except (OSError, shutil.Error):
+        pass
+entries = sorted((p for p in runs.iterdir() if p.is_dir() and not p.is_symlink()
+                  and re.fullmatch(r'[0-9]{8}T[0-9]{6}\.[0-9]{6}Z-[0-9a-f]{8}', p.name)
+                  and (p / 'rc').is_file()))
+for old in entries[:-20]: shutil.rmtree(old)
+sys.exit(rc if rc >= 0 else 128 - rc)
+"""
+
+
+def last_run_detail(path, user, ident):
+    code = r"""import collections, json, pathlib, sys
+root = pathlib.Path(sys.argv[1]) / 'runs'
+if root.is_symlink() or not root.is_dir(): print('{}'); sys.exit()
+def matches(p):
+    try: return (p / 'lease_id').read_text().strip() == sys.argv[2]
+    except OSError: return False
+runs = sorted(p for p in root.iterdir() if p.is_dir() and not p.is_symlink() and (p / 'rc').is_file() and matches(p))
+if not runs: print('{}'); sys.exit()
+last = runs[-1]
+try:
+    rc = int((last / 'rc').read_text().strip())
+    with (last / 'stdout.log').open(errors='replace') as f: tail = ''.join(collections.deque(f, maxlen=40))
+    print(json.dumps({'last_run': {'rc': rc, 'tail': tail, 'path': str(last)}}))
+except (OSError, ValueError): print('{}')
+"""
+    return json.loads(run('/usr/sbin/runuser', '-u', user, '--', '/usr/bin/python3', '-c', code, str(path), ident))
+
+
 def parser():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest='action', required=True)
@@ -332,11 +457,14 @@ def parser():
     g.add_argument('--slots', type=int, required=True)
     g.add_argument('--mem-gb', type=int, required=True)
     g.add_argument('--pin')
+    g.add_argument('--iteration', action='store_true')
+    g.add_argument('--owner-slug')
     g.add_argument('--expires-epoch', type=int, required=True)
     for action in ('release', 'status', 'run', 'probe'):
         q = sub.add_parser(action)
         q.add_argument('--lease-id', type=lease_id, required=True)
         if action == 'run':
+            q.add_argument('--junit', default='')
             q.add_argument('command', nargs=argparse.REMAINDER)
     e = sub.add_parser('extend')
     e.add_argument('--lease-id', type=lease_id, required=True)
@@ -474,6 +602,10 @@ def main():
                 result = dict(row, cpu_usage_usec=int(cpu['usage_usec']),
                               memory_current=int((cgroup / 'memory.current').read_text()),
                               memory_peak=int((cgroup / 'memory.peak').read_text()))
+                try:
+                    result.update(last_run_detail(Path(row['workdir']), row['user'], args.lease_id))
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    pass
                 audit('status', args.lease_id)
             else:
                 if not row.get('configured'):
@@ -486,10 +618,18 @@ def main():
                 if not command:
                     raise Refused('missing command')
                 workdir = Path(row['workdir'])
-                if workdir.resolve(strict=True) != workdir_root(cfg) / args.lease_id:
+                expected = iteration_workdir(cfg, row.get('iteration_slug')) if row.get('iteration') else workdir_root(cfg) / args.lease_id
+                if workdir.resolve(strict=True) != expected:
                     raise Refused('invalid lease workdir')
+                if row.get('iteration'):
+                    check_owner_dir_cap(workdir, cfg)
+                if args.junit and (Path(args.junit).is_absolute() or '..' in Path(args.junit).parts):
+                    raise Refused('junit must be a relative path within the workdir')
+                job_command = command[:]
+                run_name = time.strftime('%Y%m%dT%H%M%S', time.gmtime()) + ('.%06dZ-' % ((time.time_ns() // 1000) % 1000000)) + uuid.uuid4().hex[:8]
                 command = ['/usr/sbin/runuser', '-u', row['user'], '--',
-                           '/usr/bin/env', '--chdir=' + str(workdir), *command]
+                           '/usr/bin/env', '--chdir=' + str(workdir), '/usr/bin/python3', '-c',
+                           CAPTURE_RUN, str(workdir), args.junit, run_name, args.lease_id, *command]
                 if row['pin']:
                     command = ['/usr/sbin/runuser', '-u', row['user'], '--',
                                '/usr/bin/taskset', '-c', row['pin'], *command[4:]]
@@ -503,7 +643,27 @@ def main():
                           '--unit=' + scope, '--slice=' + row['slice'],
                           '--property=TimeoutStopSec=30s', '--property=CollectMode=inactive-or-failed',
                           '--', *command])
-                sys.exit(wait_for_scope(process, scope, lock))
+                exit_code = wait_for_scope(process, scope, lock)
+                code = r"""import json, os, pathlib, shlex, sys
+runs = pathlib.Path(sys.argv[1]) / 'runs'
+if runs.is_symlink(): raise RuntimeError('runs must not be a symlink')
+runs.mkdir(mode=0o700, exist_ok=True)
+p = runs / sys.argv[2]
+if p.is_symlink(): raise RuntimeError('run directory must not be a symlink')
+p.mkdir(mode=0o700, exist_ok=True)
+for name, content in [('lease_id', sys.argv[5] + '\n'), ('cmd', shlex.join(json.loads(sys.argv[4])) + '\n'),
+                      ('stdout.log', ''), ('rc', sys.argv[3] + '\n')]:
+    try:
+        fd = os.open(p / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w') as f: f.write(content)
+    except FileExistsError: pass
+"""
+                try:
+                    run('/usr/sbin/runuser', '-u', row['user'], '--', '/usr/bin/python3', '-c',
+                        code, str(workdir), run_name, str(exit_code), json.dumps(job_command), args.lease_id)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                sys.exit(exit_code)
         print(json.dumps(result, sort_keys=True))
         if args.action == 'reap' and result['failed']:
             sys.exit(3)

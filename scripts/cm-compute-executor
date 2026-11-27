@@ -34,6 +34,8 @@ def command_for(action):
                  '--mem-gb', str(payload['mem_gb']), '--expires-epoch', str(payload['expires_epoch'])]
         if payload.get('pin'):
             args += ['--pin', payload['pin']]
+        if payload.get('iteration'):
+            args += ['--iteration', '--owner-slug', payload['iteration_slug']]
     elif action['kind'] == 'extend':
         args += ['--expires-epoch', str(payload['expires_epoch'])]
     elif action['kind'] != 'release':
@@ -184,7 +186,8 @@ def sample_leases(cfg):
             if result.get('lease_id') != str(target['lease_id']):
                 raise ValueError('sample lease mismatch')
             api('/compute/executor/sample', {'lease_id': target['lease_id'],
-                                             'cpu_usage_usec': result['cpu_usage_usec']})
+                                             'cpu_usage_usec': result['cpu_usage_usec'],
+                                             'last_run': result.get('last_run')})
         except (OSError, ValueError, KeyError, subprocess.SubprocessError, urllib.error.URLError):
             # Missing measurements are not evidence of idleness.
             LOG.exception('could not sample lease %s', target['lease_id'])

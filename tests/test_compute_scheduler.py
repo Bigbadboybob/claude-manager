@@ -110,3 +110,15 @@ def test_above_normal_lease_size_requires_explicit_justification():
     assert select_box(big, [], [box], POLICY) is None
     big['justification'] = 'explain why five slots are needed'
     assert select_box(big, [], [box], POLICY) == (box, box.slots[:5])
+
+
+def test_affined_waiter_cannot_trigger_soft_cap_on_another_box():
+    policy = Policy(2, 16, 8, 4, 1)
+    live = Box('live', 'live', ('0,8', '1,9'))
+    active = lease('active', team='a', status='active', box='live', slot_ids=['0,8'])
+    request = lease('request', team='a')
+    other = lease('other', team='b', iteration_affinity_box='disabled')
+    rows = [active, request, other]
+    assert limit_reason(request, rows, policy, [live]) is None
+    assert select_box(request, rows, [live], policy) == (live, ('1,9',))
+    assert select_box(other, rows, [live], policy) is None

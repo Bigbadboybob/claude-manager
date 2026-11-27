@@ -42,6 +42,7 @@ def context(tmp_path, monkeypatch):
     monkeypatch.setattr(node, 'create_workdir', make_workdir)
     monkeypatch.setattr(node, 'workdir_size_and_remove_if_empty', lambda path, user, marker: 1)
     monkeypatch.setattr(node, 'refresh_retained_owner', lambda *args: None)
+    monkeypatch.setattr(node, 'last_run_detail', lambda *args: {})
     calls = []
     monkeypatch.setattr(node, 'run', lambda *args: calls.append(args))
     cfg = dict(user='lucas', max_slots=4, cpus_per_slot=2, mem_gb_per_slot=16,
@@ -521,6 +522,9 @@ def test_status_works_with_bad_workdir_root(context, tmp_path, monkeypatch, caps
     cfg, args, calls = context
     node.grant(args, cfg)
     cfg['workdir_root'] = str(tmp_path / 'missing')
+    cfg['drain_ignore_datadirs'] = 'invalid'
+    cfg['owner_dir_cap_gb'] = 'invalid'
+    cfg['min_free_gb'] = False
     state = node.STATE
     cgroup = tmp_path / 'cgroup' / 'lease'
     cgroup.mkdir(parents=True)
@@ -660,3 +664,167 @@ def test_drain_check_ignores_only_configured_database_processes(context, tmp_pat
     node.main()
     drained = json.loads(capsys.readouterr().out)
     assert drained['drained'] and {row['pid'] for row in drained['ignored_pids']} == {101, 102, 106}
+
+
+def test_captured_run_records_command_output_rc_and_junit(tmp_path):
+    import sys
+    (tmp_path / 'result.xml').write_text('<testsuite/>')
+    result = subprocess.run([sys.executable, '-c', node.CAPTURE_RUN, str(tmp_path), 'result.xml', '20261127T040000.000000Z-01234567', LEASE,
+                             sys.executable, '-c', 'import sys; print("out"); print("err", file=sys.stderr); sys.exit(7)'],
+                            capture_output=True, text=True)
+    assert result.returncode == 7
+    run_dir = next((tmp_path / 'runs').iterdir())
+    assert 'out' in result.stdout and 'err' in result.stdout
+    assert 'out' in (run_dir / 'stdout.log').read_text() and 'err' in (run_dir / 'stdout.log').read_text()
+    assert (run_dir / 'rc').read_text().strip() == '7'
+    assert (run_dir / 'junit').read_text() == '<testsuite/>'
+    assert 'sys.exit(7)' in (run_dir / 'cmd').read_text()
+
+
+def test_iteration_directory_reused_and_single_active_lease(context, tmp_path, monkeypatch):
+    cfg, args, _ = context
+    _use_local_workdir_commands(monkeypatch)
+    owners = tmp_path / 'owners'
+    owners.mkdir()
+    monkeypatch.setattr(node, 'OWNERS_ROOT', owners)
+    args.iteration, args.owner_slug = True, 'lease-svc'
+    first = node.grant(args, cfg)
+    workdir = node.Path(first['workdir'])
+    (workdir / 'repo').mkdir()
+    second = SimpleNamespace(**vars(args))
+    second.lease_id = '00000000-0000-4000-8000-000000000001'
+    with pytest.raises(node.Refused, match='already has an active lease'):
+        node.grant(second, cfg)
+    result = node.release(LEASE, cfg)
+    assert result['released'] and workdir.exists() and (workdir / 'repo').is_dir()
+    again = node.grant(second, cfg)
+    assert again['workdir'] == str(workdir)
+    assert second.lease_id in (workdir / 'OWNER.md').read_text()
+
+
+def test_iteration_cap_refuses_oversized_workdir(context, tmp_path, monkeypatch):
+    cfg, args, _ = context
+    owners = tmp_path / 'owners'
+    owners.mkdir()
+    monkeypatch.setattr(node, 'OWNERS_ROOT', owners)
+    args.iteration, args.owner_slug = True, 'lease-svc'
+    path = owners / args.owner_slug
+    path.mkdir()
+    cfg['owner_dir_cap_gb'] = 1
+    monkeypatch.setattr(node, 'run', lambda *args: str(2 * 1024 ** 3) + ' x')
+    with pytest.raises(node.Refused, match='owner workdir') as exc:
+        node.grant(args, cfg)
+    assert str(path) in str(exc.value)
+    assert node.load(LEASE) is None
+
+
+def test_capture_prunes_only_completed_runs_and_reports_last_40_lines(tmp_path, monkeypatch):
+    import sys
+    runs = tmp_path / 'runs'
+    runs.mkdir()
+    for i in range(21):
+        path = runs / f'20261127T0400{i:02d}.000000Z-00000000'
+        path.mkdir()
+        (path / 'rc').write_text('0')
+        (path / 'stdout.log').write_text('old')
+    active = runs / '20261127T035959.000000Z-00000000'
+    active.mkdir()
+    foreign = runs / '20261127-this-is-not-a-run-dir-xxxx'
+    foreign.mkdir()
+    result = subprocess.run([sys.executable, '-c', node.CAPTURE_RUN, str(tmp_path), '',
+        '20261127T050000.000000Z-12345678', LEASE, sys.executable, '-c',
+        'for i in range(60): print(i)'], capture_output=True, text=True)
+    assert result.returncode == 0
+    assert active.exists() and foreign.exists()
+    assert len([p for p in runs.iterdir() if (p / 'rc').exists()]) == 20
+    different = runs / '20261127T060000.000000Z-abcdef12'
+    different.mkdir()
+    (different / 'lease_id').write_text('another-lease')
+    (different / 'rc').write_text('1')
+    (different / 'stdout.log').write_text('not this lease')
+    monkeypatch.setattr(node, 'run', lambda *args: subprocess.run(args[4:], check=True, text=True, capture_output=True).stdout.strip())
+    detail = node.last_run_detail(tmp_path, 'anyone', LEASE)['last_run']
+    assert detail['rc'] == 0
+    lines = detail['tail'].splitlines()
+    assert len(lines) == 40 and lines[0] == '20' and lines[-1] == '59'
+
+
+def test_iteration_cap_is_checked_before_run(context, tmp_path, monkeypatch):
+    cfg, args, _ = context
+    owners = tmp_path / 'owners'
+    owners.mkdir()
+    monkeypatch.setattr(node, 'OWNERS_ROOT', owners)
+    args.iteration, args.owner_slug = True, 'lease-svc'
+    monkeypatch.setattr(node, 'prepare_iteration_workdir', lambda path, *args: path.mkdir())
+    row = node.grant(args, cfg)
+    state = node.STATE
+    class RootOwnedState:
+        def mkdir(self, **kwargs): return state.mkdir(**kwargs)
+        def lstat(self): return SimpleNamespace(st_uid=0, st_mode=0o700)
+        def is_symlink(self): return False
+        def __truediv__(self, name): return state / name
+    monkeypatch.setattr(node, 'STATE', RootOwnedState())
+    monkeypatch.setattr(node, 'config', lambda: cfg)
+    monkeypatch.setattr(node.os, 'geteuid', lambda: 0)
+    monkeypatch.setattr(node.sys, 'argv', ['cm-lease', 'run', '--lease-id', LEASE, '--', '/bin/true'])
+    def over_cap(*args): raise node.Refused('owner workdir exceeds cap')
+    monkeypatch.setattr(node, 'check_owner_dir_cap', over_cap)
+    monkeypatch.setattr(node.subprocess, 'Popen', lambda *args, **kwargs: pytest.fail('must not start the job'))
+    with pytest.raises(node.Refused, match='exceeds cap'):
+        node.main()
+    assert node.load(LEASE)['workdir'] == row['workdir']
+
+
+def test_run_records_scope_failure_when_capture_was_killed(context, monkeypatch):
+    cfg, args, _ = context
+    row = node.grant(args, cfg)
+    state = node.STATE
+    class RootOwnedState:
+        def mkdir(self, **kwargs): return state.mkdir(**kwargs)
+        def lstat(self): return SimpleNamespace(st_uid=0, st_mode=0o700)
+        def is_symlink(self): return False
+        def __truediv__(self, name): return state / name
+    launched = []
+    original_popen = subprocess.Popen
+    monkeypatch.setattr(node, 'STATE', RootOwnedState())
+    monkeypatch.setattr(node, 'config', lambda: cfg)
+    monkeypatch.setattr(node.os, 'geteuid', lambda: 0)
+    monkeypatch.setattr(node.sys, 'argv', ['cm-lease', 'run', '--lease-id', LEASE, '--', '/bin/true'])
+    monkeypatch.setattr(node.subprocess, 'Popen', lambda argv: launched.append(argv) or object())
+    def killed(process, scope, lock):
+        argv = launched[0]
+        i = argv.index(node.CAPTURE_RUN)
+        workdir, run_name = node.Path(argv[i + 1]), argv[i + 3]
+        run_dir = workdir / 'runs' / run_name
+        run_dir.mkdir(parents=True)
+        (run_dir / 'stdout.log').write_text('oom\n')
+        return 247
+    monkeypatch.setattr(node, 'wait_for_scope', killed)
+    def run(*argv):
+        if argv[0] == '/usr/sbin/runuser':
+            monkeypatch.setattr(node.subprocess, 'Popen', original_popen)
+            return subprocess.run(argv[4:], check=True, text=True, capture_output=True).stdout.strip()
+        return ''
+    monkeypatch.setattr(node, 'run', run)
+    with pytest.raises(SystemExit) as exc:
+        node.main()
+    assert exc.value.code == 247
+    run_dir = next((node.Path(row['workdir']) / 'runs').iterdir())
+    assert (run_dir / 'rc').read_text().strip() == '247'
+    assert (run_dir / 'cmd').read_text().strip() == '/bin/true'
+    assert (run_dir / 'lease_id').read_text().strip() == LEASE
+    assert (run_dir / 'stdout.log').read_text() == 'oom\n'
+
+
+def test_run_parser_accepts_junit_before_command_separator():
+    args = node.parser().parse_args(['run', '--lease-id', LEASE, '--junit', 'results/junit.xml',
+                                     '--', 'bash', '-lc', 'echo ok'])
+    assert args.junit == 'results/junit.xml'
+    assert args.command == ['--', 'bash', '-lc', 'echo ok']
+
+
+def test_invalid_free_floor_does_not_block_existing_owner_directory_check(context, tmp_path, monkeypatch):
+    cfg, _, _ = context
+    cfg['min_free_gb'] = False
+    monkeypatch.setattr(node, 'run', lambda *args: '100 directory')
+    node.check_owner_dir_cap(tmp_path, cfg)

@@ -5612,13 +5612,18 @@ def _compute_class_alias(fn):
 @_compute_class_alias
 def compute_request(cpus: int, mem_gb: int, duration: int, priority: str, purpose: str,
                     lease_class: Annotated[str, Field(alias="class")] = "burst",
-                    pinned: bool = False, justification: str = "") -> dict:
-    """Request compute for duration seconds; requests above the per-lease slot limit (four by default) require justification. Poll compute_status for a queued grant."""
+                    pinned: bool = False, justification: str = "",
+                    iteration: bool = False, fresh: bool = False) -> dict:
+    """Request compute for duration seconds; requests above the per-lease slot limit (four by default) require justification. Iteration reuses the owner workspace; fresh starts a new one. Poll compute_status for a queued grant."""
     params = {"cpus": cpus, "mem_gb": mem_gb,
         "duration": duration, "priority": priority, "purpose": purpose,
         "class": lease_class, "pinned": pinned}
     if justification:
         params['justification'] = justification
+    if iteration:
+        params['iteration'] = True
+    if fresh:
+        params['fresh'] = True
     return control_client.call("compute.request", params)
 
 

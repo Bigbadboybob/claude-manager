@@ -56,3 +56,11 @@ def test_compute_request_forwards_explicit_justification():
     with patch.object(server.control_client, 'call', return_value={'status': 'queued'}) as call:
         asyncio.run(server.mcp._tool_manager.call_tool('compute_request', args))
     assert call.call_args.args[1]['justification'] == 'five parallel workers'
+
+
+def test_compute_request_forwards_iteration_and_fresh():
+    with patch.object(server.control_client, 'call', return_value={'status': 'queued'}) as call:
+        result = server.compute_request(2, 16, 300, 'normal', 'iteration', iteration=True, fresh=True)
+    assert result['status'] == 'queued'
+    assert call.call_args.args[1]['iteration'] is True
+    assert call.call_args.args[1]['fresh'] is True

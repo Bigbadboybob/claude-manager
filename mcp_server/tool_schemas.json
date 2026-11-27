@@ -677,6 +677,12 @@
     "duration": {
      "type": "integer"
     },
+    "fresh": {
+     "type": "boolean"
+    },
+    "iteration": {
+     "type": "boolean"
+    },
     "justification": {
      "type": "string"
     },

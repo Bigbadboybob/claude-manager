@@ -17,6 +17,9 @@ def test_node_command_keeps_owner_as_single_argument():
     parts = shlex.split(executor.command_for(action))
     assert parts[parts.index('--owner') + 1] == 'agent:d:s;echo bad'
     assert parts[parts.index('--pin') + 1] == '0,8,1,9'
+    action['payload'].update(iteration=True, iteration_slug='owner-1')
+    parts = shlex.split(executor.command_for(action))
+    assert '--iteration' in parts and parts[parts.index('--owner-slug') + 1] == 'owner-1'
 
 
 def test_cutover_is_fail_closed_and_enable_requires_both_drains(monkeypatch, tmp_path):
@@ -253,3 +256,18 @@ def test_extension_node_refusal_is_reported_without_absence_probe(monkeypatch):
     monkeypatch.setattr(executor.subprocess, 'run', failed)
     assert executor.execute(action, {'d6': {'argv': ['ssh', 'd6']}}) == {
         'lease_id': 'id', 'refused': True, 'error': 'expiry outside configured window'}
+
+
+def test_sample_forwards_last_run_detail(monkeypatch):
+    posted = []
+    detail = {'rc': 7, 'tail': 'failed\n', 'path': '/work/runs/one'}
+    def fake_api(path, data):
+        if path.endswith('/samples'):
+            return {'leases': [{'lease_id': 'id', 'box': 'd6'}]}
+        posted.append((path, data))
+        return {'accepted': True}
+    monkeypatch.setattr(executor, 'api', fake_api)
+    monkeypatch.setattr(executor.subprocess, 'run', lambda *args, **kwargs: SimpleNamespace(
+        stdout=__import__('json').dumps({'lease_id': 'id', 'cpu_usage_usec': 10, 'last_run': detail})))
+    executor.sample_leases({'routes': {'d6': {'argv': ['ssh', 'd6']}}, 'sample_parallelism': 1})
+    assert posted == [('/compute/executor/sample', {'lease_id': 'id', 'cpu_usage_usec': 10, 'last_run': detail})]
